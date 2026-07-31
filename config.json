@@ -1,0 +1,45 @@
+{
+  "port": 4173,
+  "refreshMinutes": 10,
+  "browserPollSeconds": 60,
+  "githubLogin": "SV-li-zhenhui",
+  "trackedRepositories": [
+    "SVisions/OCT-Software",
+    "SVisions/OCT-Product"
+  ],
+  "prResponsibility": {
+    "historicalAfterDays": 60
+  },
+  "brain": {
+    "enabled": true,
+    "provider": "ollama",
+    "model": "qwen3.5:9b",
+    "baseUrl": "http://127.0.0.1:11434",
+    "contextTokens": 8192,
+    "timeoutMs": 45000,
+    "maxAssessmentsPerRefresh": 3
+  },
+  "employees": {
+    "prReviewer": {
+      "enabled": true,
+      "name": "PR 推进员工",
+      "policyVersion": 1,
+      "tickMinutes": 2,
+      "maxJobsPerTick": 2,
+      "maxAttempts": 3,
+      "retryMinutes": [1, 5, 30],
+      "maxPatchCharacters": 24000,
+      "memoryLimit": 1000,
+      "memoryOutboxLimit": 100,
+      "jobLimit": 500,
+      "allowRemoteCodeContext": false,
+      "brain": {}
+    }
+  },
+  "dingtalk": {
+    "enabled": true,
+    "selfUserId": "1137300121374851",
+    "notifyMinimumScore": 80,
+    "maxNotificationsPerRun": 5
+  }
+}

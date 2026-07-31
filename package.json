@@ -1,0 +1,19 @@
+{
+  "name": "my-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local personal engineering dashboard for GitHub and DingTalk signals.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "refresh": "node src/cli.js refresh",
+    "refresh:notify": "node src/cli.js refresh --notify",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.0"
+  }
+}

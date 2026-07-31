@@ -1,0 +1,6 @@
+data/
+logs/
+validation-artifacts/
+node_modules/
+config.local.json
+.worktrees/
