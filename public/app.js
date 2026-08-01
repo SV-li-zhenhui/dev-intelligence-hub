@@ -1,3 +1,5 @@
+import { createWorkflowView } from "./workflow-view.js";
+
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
 const lastUpdated = document.querySelector("#last-updated");
@@ -39,7 +41,14 @@ const viewTitles = {
   signals: "钉钉中的行动信号",
   employees: "你的数字员工",
   memory: "搜索做过的事情",
+  workflow: "工作流指挥",
 };
+
+const workflowView = createWorkflowView({
+  onChange() {
+    if (dashboard && currentView === "workflow") render();
+  },
+});
 
 function escapeHtml(value = "") {
   return String(value)
@@ -385,6 +394,7 @@ function render() {
       section("钉钉行动信号", dashboard.groups.dingtalk, "当前没有 @我、待办或未读会话。"),
     employees: () => employeePanel({ expanded: true }),
     memory: memoryView,
+    workflow: () => workflowView.render(),
   };
   content.innerHTML = views[currentView]();
   content.querySelectorAll("[data-item-id]").forEach((button) => {
@@ -407,6 +417,7 @@ function render() {
     "submit",
     handleMemorySearch,
   );
+  workflowView.bind(content);
 }
 
 function detailRows(item) {
@@ -979,6 +990,7 @@ async function load({ showConfirmation = true } = {}) {
       return;
     }
     applyDashboard(nextDashboard, sequence);
+    if (currentView === "workflow") await workflowView.load();
     if (showConfirmation) queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
@@ -998,6 +1010,7 @@ async function refresh() {
     if (!response.ok) throw new Error(`刷新失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
     await refreshConfirmationQueue({ showConfirmation: false });
+    if (currentView === "workflow") await workflowView.load();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
@@ -1019,6 +1032,9 @@ document.querySelectorAll(".nav-item").forEach((button) => {
         statusBanner.hidden = false;
         statusBanner.textContent = error.message;
       });
+    }
+    if (currentView === "workflow" && workflowView.needsLoad()) {
+      workflowView.load();
     }
   });
 });
@@ -1044,7 +1060,8 @@ confirmationDialog.addEventListener("cancel", (event) => {
   document.querySelector(".confirmation-close").click();
 });
 document.addEventListener("keydown", (event) => {
-  if (/^[1-7]$/.test(event.key)) {
+  if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
+  if (/^[1-8]$/.test(event.key)) {
     document.querySelectorAll(".nav-item")[Number(event.key) - 1]?.click();
   }
 });
