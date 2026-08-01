@@ -198,7 +198,7 @@ async function validateConfirmationQueue() {
 
 await validateConfirmationQueue();
 
-async function validateEmployeeReviewQueue() {
+async function validateExternalReviewConfirmation() {
   const liveDashboard = await fetch(`${baseUrl}/api/dashboard`).then((response) =>
     response.json(),
   );
@@ -212,10 +212,10 @@ async function validateEmployeeReviewQueue() {
     number: 9,
     title: "员工主动生成的评审草稿",
     url: "https://example.invalid/local/fixture/pull/9",
-    headRefOid: "fixture-head-9",
+    headRefOid: "0123456789abcdef0123456789abcdef01234567",
     nextAction: "review",
     triggerReason: "等待你首次审核",
-    status: "ready_for_human",
+    status: "waiting_confirmation",
     summary: "发现错误路径缺少覆盖。",
     evidence: ["src/pay.js 修改了失败分支"],
     steps: ["补充失败路径测试"],
@@ -242,29 +242,105 @@ async function validateEmployeeReviewQueue() {
       lastError: "",
     },
     jobs: [reviewJob],
-    confirmationQueue: [reviewJob],
+    confirmationQueue: [],
   };
-  const accepted = structuredClone(fixture);
-  accepted.employee.jobs[0].status = "accepted";
-  accepted.employee.confirmationQueue = [];
-  accepted.employee.role.state = "observing";
-  accepted.employee.role.revision = 9;
+  const published = structuredClone(fixture);
+  published.employee.jobs[0].status = "published";
+  published.employee.role.state = "observing";
+  published.employee.role.revision = 9;
+
+  const confirmationItem = {
+    id: "confirmation-pr-work-fixture",
+    kind: "github.pull-request-review",
+    status: "pending",
+    queueRevision: 8,
+    itemRevision: 2,
+    requestedBy: { roleId: "pr-reviewer", workItemId: reviewJob.id },
+    actor: { provider: "github", accountId: "review-account" },
+    target: {
+      provider: "github",
+      resourceId: "local/fixture#9",
+      version: reviewJob.headRefOid,
+    },
+    display: {
+      title: "local/fixture #9 · 员工主动生成的评审草稿",
+      summary: reviewJob.summary,
+      actionLabel: "确认并发布到 GitHub",
+      evidence: reviewJob.evidence,
+      payload: {
+        actor: { provider: "github", accountId: "review-account" },
+        target: {
+          provider: "github",
+          resourceId: "local/fixture#9",
+          version: reviewJob.headRefOid,
+        },
+        action: {
+          type: "pull_request_review",
+          reviewEvent: "REQUEST_CHANGES",
+          body: reviewJob.reviewBody,
+        },
+      },
+    },
+    displayedPayloadDigest: "a".repeat(64),
+    approvalBindingDigest: "b".repeat(64),
+    retryable: false,
+  };
 
   const page = await browser.newPage({ viewport: { width: 1100, height: 820 } });
   const requests = [];
+  let wasPublished = false;
+  let confirmationPhase = "later";
   await page.route("**/api/dashboard", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(fixture),
+      body: JSON.stringify(wasPublished ? published : fixture),
     }),
   );
-  await page.route("**/api/pr-review-jobs/decide", async (route) => {
-    requests.push(route.request().postDataJSON());
+  await page.route("**/api/confirmations/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === "/api/confirmations/next") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          available: true,
+          queueRevision: wasPublished ? 10 : 8,
+          pendingCount: wasPublished ? 0 : 1,
+          item: wasPublished ? null : confirmationItem,
+        }),
+      });
+      return;
+    }
+    if (request.method() === "POST") {
+      requests.push({
+        phase: confirmationPhase,
+        pathname,
+        body: request.postDataJSON(),
+      });
+      if (
+        confirmationPhase === "approve" &&
+        pathname ===
+          "/api/confirmations/confirmation-pr-work-fixture/approve"
+      ) {
+        wasPublished = true;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            item: { ...confirmationItem, status: "completed" },
+            next: { queueRevision: 10, pendingCount: 0, item: null },
+            employeeSyncPending: false,
+          }),
+        });
+        return;
+      }
+    }
     await route.fulfill({
-      status: 200,
+      status: 400,
       contentType: "application/json",
-      body: JSON.stringify(accepted),
+      body: JSON.stringify({ error: "unexpected confirmation request" }),
     });
   });
   await page.route("**/api/memory/search**", (route) =>
@@ -289,32 +365,46 @@ async function validateEmployeeReviewQueue() {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.locator("#confirmation-dialog[open]").waitFor();
-  const localOnlyNote = await page
-    .getByText(/不会提交 GitHub Review/)
+  const actorVisible = await page
+    .getByText("review-account", { exact: true })
     .isVisible();
+  const headVisible = await page.getByText(reviewJob.headRefOid, { exact: true }).isVisible();
   const reviewBodyVisible = await page
     .getByText(reviewJob.reviewBody, { exact: true })
     .isVisible();
-  await page.getByRole("button", { name: "接受草稿", exact: true }).click();
+  await page.getByRole("button", { name: "稍后再看", exact: true }).click();
+  await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  const laterRequestCount = requests.filter(
+    (request) => request.phase === "later",
+  ).length;
+
+  confirmationPhase = "approve";
+  await page.reload({ waitUntil: "networkidle" });
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  await page
+    .getByRole("button", { name: "确认并发布到 GitHub", exact: true })
+    .click();
   await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
   await page.locator('[data-view="employees"]').click();
-  const acceptedVisible = await page
-    .getByText("你已接受", { exact: true })
+  const publishedVisible = await page
+    .getByText("已发布", { exact: true })
     .isVisible();
   await page.locator('[data-view="memory"]').click();
   await page.getByText(reviewJob.title, { exact: true }).waitFor();
 
   results.push({
-    name: "employee-review-queue",
-    localOnlyNote,
+    name: "external-review-confirmation",
+    actorVisible,
+    headVisible,
     reviewBodyVisible,
-    acceptedVisible,
-    request: requests[0],
+    publishedVisible,
+    laterRequestCount,
+    request: requests.find((request) => request.phase === "approve"),
   });
   await page.close();
 }
 
-await validateEmployeeReviewQueue();
+await validateExternalReviewConfirmation();
 await browser.close();
 
 await writeFile(
@@ -353,11 +443,27 @@ assert.equal(responsibilityResult.confirmedVisible, true);
 assert.equal(responsibilityResult.request.headRefOid, "fixture-head-1");
 
 const reviewResult = results.find(
-  (entry) => entry.name === "employee-review-queue",
+  (entry) => entry.name === "external-review-confirmation",
 );
-assert.equal(reviewResult.localOnlyNote, true);
+assert.equal(reviewResult.actorVisible, true);
+assert.equal(reviewResult.headVisible, true);
 assert.equal(reviewResult.reviewBodyVisible, true);
-assert.equal(reviewResult.acceptedVisible, true);
-assert.equal(reviewResult.request.headRefOid, "fixture-head-9");
+assert.equal(reviewResult.publishedVisible, true);
+assert.equal(reviewResult.laterRequestCount, 0);
+assert.equal(
+  reviewResult.request.pathname,
+  "/api/confirmations/confirmation-pr-work-fixture/approve",
+);
+assert.deepEqual(Object.keys(reviewResult.request.body).sort(), [
+  "approvalBindingDigest",
+  "displayedPayloadDigest",
+  "expectedItemRevision",
+  "expectedQueueRevision",
+  "requestId",
+]);
+assert.equal(reviewResult.request.body.expectedQueueRevision, 8);
+assert.equal(reviewResult.request.body.expectedItemRevision, 2);
+assert.equal(reviewResult.request.body.displayedPayloadDigest, "a".repeat(64));
+assert.equal(reviewResult.request.body.approvalBindingDigest, "b".repeat(64));
 
 console.log(JSON.stringify(results, null, 2));

@@ -18,6 +18,16 @@ let memoryQuery = "";
 let memoryLoaded = false;
 let requestSequence = 0;
 let lastAppliedRequest = 0;
+let confirmationRequestSequence = 0;
+let lastAppliedConfirmationRequest = 0;
+let confirmationQueueState = {
+  available: false,
+  queueRevision: 0,
+  pendingCount: 0,
+  item: null,
+};
+let confirmationQueueLoaded = false;
+let activeExternalConfirmation = null;
 let activeConfirmationKey = "";
 const deferredConfirmations = new Set();
 
@@ -101,6 +111,11 @@ function jobStateLabel(value) {
     retry_wait: "等待重试",
     ready: "方案已就绪",
     ready_for_human: "等待你确认",
+    confirmation_enqueue_pending: "正在加入确认队列",
+    confirmation_invalidation_pending: "正在安全失效旧确认",
+    waiting_confirmation: "等待发布确认",
+    waiting_retry_confirmation: "等待重试确认",
+    published: "已发布",
     accepted: "你已接受",
     rejected: "你已驳回",
     blocked: "处理受阻",
@@ -225,6 +240,9 @@ function employeePanel({ expanded = false } = {}) {
   const activity = activeJob
     ? `正在分析 ${activeJob.repo} #${activeJob.number}：${activeJob.triggerReason}`
     : lastRun?.summary || "等待第一次主动巡查";
+  const pendingConfirmationCount = confirmationQueueState.available
+    ? confirmationQueueState.pendingCount
+    : employee.confirmationQueue?.length || 0;
   return `
     <section class="section employee-panel" aria-labelledby="pr-employee-title">
       <div class="employee-heading">
@@ -239,7 +257,7 @@ function employeePanel({ expanded = false } = {}) {
         <div><dt>为什么启动</dt><dd>${escapeHtml(lastRun?.trigger || "等待事件")}${lastRun?.at ? ` · ${relativeTime(lastRun.at)}` : ""}</dd></div>
         <div><dt>正在做什么</dt><dd>${escapeHtml(activity)}</dd></div>
         <div><dt>当前大脑</dt><dd>${escapeHtml(brain)}</dd></div>
-        <div><dt>等待你确认</dt><dd>${employee.confirmationQueue.length} 条评审草稿</dd></div>
+        <div><dt>等待你确认</dt><dd>${pendingConfirmationCount} 条待确认动作</dd></div>
       </dl>
       ${role.lastError ? `<p class="employee-error">${escapeHtml(role.lastError)}</p>` : ""}
       <div class="employee-actions">
@@ -464,8 +482,31 @@ function applyDashboard(nextDashboard, sequence) {
   dashboard = nextDashboard;
   updateChrome();
   render();
-  queueMicrotask(showNextConfirmation);
   return true;
+}
+
+function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSequence) {
+  if (!nextState || sequence < lastAppliedConfirmationRequest) return false;
+  lastAppliedConfirmationRequest = sequence;
+  confirmationQueueState = {
+    available: Boolean(nextState.available),
+    queueRevision: nextState.queueRevision || 0,
+    pendingCount: nextState.pendingCount || 0,
+    item: nextState.item || null,
+  };
+  confirmationQueueLoaded = true;
+  return true;
+}
+
+function invalidateConfirmationQueueSnapshot() {
+  lastAppliedConfirmationRequest = ++confirmationRequestSequence;
+  confirmationQueueLoaded = false;
+  confirmationQueueState = {
+    available: false,
+    queueRevision: 0,
+    pendingCount: 0,
+    item: null,
+  };
 }
 
 async function handleEmployeeControl(event) {
@@ -506,6 +547,8 @@ async function handleEmployeeRun(event) {
     });
     if (!response.ok) throw new Error(`主动巡查失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
+    await refreshConfirmationQueue({ showConfirmation: false });
+    queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -559,19 +602,29 @@ function confirmationKey(kind, item) {
 }
 
 function pendingConfirmations() {
+  if (!confirmationQueueLoaded) return [];
+  const externalActions = confirmationQueueState.item
+    ? [
+        {
+          kind: "external_action",
+          item: confirmationQueueState.item,
+          key: `external\u0000${confirmationQueueState.item.id}\u0000${confirmationQueueState.item.approvalBindingDigest}`,
+        },
+      ]
+    : [];
   const responsibilities = pullRequestGroups().uncertain.map((item) => ({
     kind: "responsibility",
     item,
     key: confirmationKey("responsibility", item),
   }));
-  const reviewDrafts = (dashboard.employee?.confirmationQueue || []).map(
-    (job) => ({
-      kind: "review_draft",
-      job,
-      key: confirmationKey("review", job),
-    }),
-  );
-  return [...responsibilities, ...reviewDrafts].filter(
+  const legacyReviewDrafts = confirmationQueueState.available
+    ? []
+    : (dashboard.employee?.confirmationQueue || []).map((job) => ({
+        kind: "review_draft",
+        job,
+        key: confirmationKey("review", job),
+      }));
+  return [...externalActions, ...responsibilities, ...legacyReviewDrafts].filter(
     (entry) => !deferredConfirmations.has(entry.key),
   );
 }
@@ -598,12 +651,60 @@ function showResponsibilityConfirmation(entry, remaining) {
     .addEventListener("click", handleConfirmation);
 }
 
+function reviewEventLabel(value) {
+  return {
+    APPROVE: "Approve",
+    REQUEST_CHANGES: "Request changes",
+    COMMENT: "Comment Review",
+  }[value] || value || "未知动作";
+}
+
+function showExternalActionConfirmation(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeExternalConfirmation = item;
+  const payload = item.display?.payload || {};
+  const actor = payload.actor || item.actor || {};
+  const target = payload.target || item.target || {};
+  const action = payload.action || {};
+  const operation = item.retryable ? "retry" : "approve";
+  const actionLabel = item.retryable
+    ? "确认并重试发布到 GitHub"
+    : item.display?.actionLabel || "确认并发布到 GitHub";
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation">
+      <p class="eyebrow">EXTERNAL ACTION / ${remaining} LEFT</p>
+      <h2>${escapeHtml(item.display?.title || "确认外部动作")}</h2>
+      <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将执行外部写入")}</p>
+      <dl class="detail-grid confirmation-grid">
+        <dt>执行账号</dt><dd>${escapeHtml(actor.accountId || "未指定")}</dd>
+        <dt>目标</dt><dd>${escapeHtml(target.resourceId || "未知")}</dd>
+        <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
+        <dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}</dd>
+      </dl>
+      <div class="review-preview">
+        <strong>将发布的完整正文</strong>
+        <pre>${escapeHtml(action.body || "没有正文")}</pre>
+      </div>
+      <p class="confirmation-reason"><strong>依据</strong></p>
+      ${listMarkup(item.display?.evidence)}
+      <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
+        <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
+        <button class="secondary" data-external-operation="reject">驳回，不发布</button>
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+      <p class="confirmation-note">只有点击“${escapeHtml(actionLabel)}”才会写入 GitHub；动作、账号和 Head 均与本次展示内容绑定。</p>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
 function showReviewDraftConfirmation(entry, remaining) {
   const { job } = entry;
   confirmationContent.innerHTML = `
     <article class="confirmation review-confirmation">
-      <p class="eyebrow">EMPLOYEE REVIEW / ${remaining} LEFT</p>
-      <h2>PR 推进员工准备了一份评审草稿</h2>
+      <p class="eyebrow">LOCAL REVIEW / ${remaining} LEFT</p>
+      <h2>PR 推进员工准备了一份本地评审草稿</h2>
       <p class="confirmation-title">${escapeHtml(job.repo)} #${job.number} · ${escapeHtml(job.title)}</p>
       <p class="confirmation-reason">${escapeHtml(job.summary || job.triggerReason || "")}</p>
       <div class="review-preview">
@@ -617,7 +718,7 @@ function showReviewDraftConfirmation(entry, remaining) {
         <button class="secondary" data-review-decision="reject">驳回草稿</button>
         <button class="secondary wide" data-review-decision="later">稍后再看</button>
       </div>
-      <p class="confirmation-note">接受或驳回只记录在本机，不会提交 GitHub Review。草稿与当前 Head 绑定，PR 更新后自动失效。</p>
+      <p class="confirmation-note">当前未启用 GitHub 外部动作。接受或驳回只记录在本机，不会发布 GitHub Review。</p>
     </article>`;
   confirmationContent
     .querySelector(".confirmation-actions")
@@ -630,10 +731,14 @@ function showNextConfirmation() {
   const [entry] = pending;
   if (!entry) return;
   activeConfirmationKey = entry.key;
-  if (entry.kind === "responsibility") {
-    showResponsibilityConfirmation(entry, pending.length);
-  } else {
+  if (entry.kind === "external_action") {
+    showExternalActionConfirmation(entry, pending.length);
+  } else if (entry.kind === "review_draft") {
+    activeExternalConfirmation = null;
     showReviewDraftConfirmation(entry, pending.length);
+  } else {
+    activeExternalConfirmation = null;
+    showResponsibilityConfirmation(entry, pending.length);
   }
   confirmationDialog.showModal();
 }
@@ -677,6 +782,78 @@ async function handleConfirmation(event) {
     applyDashboard(await response.json(), sequence);
     activeConfirmationKey = "";
     confirmationDialog.close();
+    queueMicrotask(showNextConfirmation);
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    confirmationContent.querySelectorAll("button").forEach((candidate) => {
+      candidate.disabled = false;
+    });
+  }
+}
+
+async function handleExternalConfirmation(event) {
+  const button = event.target.closest("[data-external-operation]");
+  if (!button) return;
+  const operation = button.dataset.externalOperation;
+  if (operation === "later") {
+    deferredConfirmations.add(activeConfirmationKey);
+    activeConfirmationKey = "";
+    activeExternalConfirmation = null;
+    confirmationDialog.close();
+    queueMicrotask(showNextConfirmation);
+    return;
+  }
+  const item = activeExternalConfirmation;
+  if (!item || !["approve", "retry", "reject"].includes(operation)) return;
+  confirmationContent.querySelectorAll("button").forEach((candidate) => {
+    candidate.disabled = true;
+  });
+  try {
+    const response = await fetch(
+      `/api/confirmations/${encodeURIComponent(item.id)}/${operation}`,
+      {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-mydashboard-action": "1",
+      },
+      body: JSON.stringify({
+        requestId: crypto.randomUUID(),
+        expectedQueueRevision: item.queueRevision,
+        expectedItemRevision: item.itemRevision,
+        displayedPayloadDigest: item.displayedPayloadDigest,
+        approvalBindingDigest: item.approvalBindingDigest,
+        ...(operation === "reject" ? { reason: "用户在确认弹框中驳回" } : {}),
+      }),
+      },
+    );
+    if (response.status === 409) {
+      invalidateConfirmationQueueSnapshot();
+      confirmationDialog.close();
+      statusBanner.hidden = false;
+      statusBanner.textContent = "确认内容或目标状态已经变化，请查看最新内容后重新确认。";
+      activeExternalConfirmation = null;
+      activeConfirmationKey = "";
+      try {
+        await refreshConfirmationQueue({ showConfirmation: false });
+        const sequence = ++requestSequence;
+        const nextDashboard = await fetchDashboard();
+        if (nextDashboard) applyDashboard(nextDashboard, sequence);
+        queueMicrotask(showNextConfirmation);
+      } catch (error) {
+        statusBanner.textContent = `${error.message}。成功读取最新确认内容前不会再次弹出。`;
+      }
+      return;
+    }
+    if (!response.ok) throw new Error(`外部动作确认失败（${response.status}）`);
+    const result = await response.json();
+    applyConfirmationQueue({ available: true, ...result.next });
+    activeConfirmationKey = "";
+    activeExternalConfirmation = null;
+    confirmationDialog.close();
+    await load({ showConfirmation: false });
+    queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -717,16 +894,20 @@ async function handleReviewDraftDecision(event) {
       }),
     });
     if (response.status === 409) {
-      applyDashboard(await fetchDashboard(), sequence);
+      const nextDashboard = await fetchDashboard();
+      if (nextDashboard) applyDashboard(nextDashboard, sequence);
       confirmationDialog.close();
       statusBanner.hidden = false;
       statusBanner.textContent = "员工草稿对应的 PR 已更新，请查看最新结果。";
+      activeConfirmationKey = "";
+      queueMicrotask(showNextConfirmation);
       return;
     }
     if (!response.ok) throw new Error(`草稿确认失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
     activeConfirmationKey = "";
     confirmationDialog.close();
+    queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -769,15 +950,36 @@ async function fetchDashboard() {
   return response.json();
 }
 
-async function load() {
+async function fetchConfirmationQueue() {
+  const response = await fetch("/api/confirmations/next", { cache: "no-store" });
+  if (!response.ok) throw new Error(`读取确认队列失败（${response.status}）`);
+  return response.json();
+}
+
+async function refreshConfirmationQueue({ showConfirmation = true } = {}) {
+  const sequence = ++confirmationRequestSequence;
+  const nextState = await fetchConfirmationQueue();
+  const applied = applyConfirmationQueue(nextState, sequence);
+  if (applied && dashboard) render();
+  if (showConfirmation) queueMicrotask(showNextConfirmation);
+  return applied;
+}
+
+async function load({ showConfirmation = true } = {}) {
   const sequence = ++requestSequence;
+  const confirmationSequence = ++confirmationRequestSequence;
   try {
-    const nextDashboard = await fetchDashboard();
+    const [nextDashboard, nextConfirmationQueue] = await Promise.all([
+      fetchDashboard(),
+      fetchConfirmationQueue(),
+    ]);
+    applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
     if (!nextDashboard) {
       content.innerHTML = '<div class="empty">正在建立第一次数据快照，请稍候…</div>';
       return;
     }
     applyDashboard(nextDashboard, sequence);
+    if (showConfirmation) queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;
@@ -795,6 +997,8 @@ async function refresh() {
     });
     if (!response.ok) throw new Error(`刷新失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
+    await refreshConfirmationQueue({ showConfirmation: false });
+    queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -828,6 +1032,7 @@ document
       deferredConfirmations.add(activeConfirmationKey);
       activeConfirmationKey = "";
     }
+    activeExternalConfirmation = null;
     confirmationDialog.close();
     queueMicrotask(showNextConfirmation);
   });

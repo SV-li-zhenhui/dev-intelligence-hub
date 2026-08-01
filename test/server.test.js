@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createDashboardServer,
   startApplicationBackgroundWork,
+  startDashboardServer,
 } from "../src/server.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 
@@ -45,8 +46,295 @@ function request(server, {
   });
 }
 
-async function withServer(run, { legacyOnly = false } = {}) {
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function availablePort() {
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const port = probe.address().port;
+  await new Promise((resolve, reject) =>
+    probe.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+function requestPort(port, options = {}) {
+  const target = {
+    address() {
+      return { port };
+    },
+  };
+  return request(target, {
+    ...options,
+    headers: {
+      host: `127.0.0.1:${port}`,
+      ...(options.headers || {}),
+    },
+  });
+}
+
+function pendingConfirmationItem() {
+  return {
+    id: "confirmation-pr-work-startup",
+    kind: "github.pull-request-review",
+    status: "pending",
+    queueRevision: 8,
+    itemRevision: 2,
+    requestedBy: {
+      roleId: "pr-reviewer",
+      workItemId: "pr-work-startup",
+    },
+    actor: { provider: "github", accountId: "review-account" },
+    target: {
+      provider: "github",
+      resourceId: "acme/repo#42",
+      version: "a".repeat(40),
+    },
+    display: {
+      title: "acme/repo #42 · Checkout",
+      summary: "旧确认必须先与首次 GitHub 刷新对账",
+      actionLabel: "确认并发布到 GitHub",
+      evidence: ["Head 已复核"],
+      payload: {
+        actor: { provider: "github", accountId: "review-account" },
+        target: {
+          provider: "github",
+          resourceId: "acme/repo#42",
+          version: "a".repeat(40),
+        },
+        action: {
+          type: "pull_request_review",
+          reviewEvent: "APPROVE",
+          body: "Looks good.",
+        },
+      },
+    },
+    displayedPayloadDigest: "b".repeat(64),
+    approvalBindingDigest: "c".repeat(64),
+    retryable: false,
+  };
+}
+
+function healthyRefreshResult() {
+  return {
+    dashboard: {
+      sourceStatus: { githubPullRequests: { ok: true } },
+      items: [],
+    },
+  };
+}
+
+function startupApplication({
+  port = 0,
+  refresh,
+  runAll,
+  recoverConfirmations = async () => {},
+  close = async () => {},
+  queueCalls = [],
+} = {}) {
+  const item = pendingConfirmationItem();
+  let snapshot = null;
+  const performRefresh = refresh || (async () => healthyRefreshResult());
+  const employee = {
+    id: "pr-reviewer",
+    async recordConfirmationOutcome() {},
+    recoverConfirmations,
+  };
+  return {
+    config: {
+      port,
+      refreshMinutes: 10,
+      githubActions: { enabled: true },
+    },
+    store: {
+      async read(name) {
+        return name === "snapshot" ? structuredClone(snapshot) : null;
+      },
+    },
+    refreshService: {
+      running: null,
+      async refresh(options) {
+        const result = await performRefresh(options);
+        snapshot = structuredClone(result?.dashboard || null);
+        return result;
+      },
+    },
+    employeeRegistry: {
+      get(id) {
+        return id === employee.id ? employee : null;
+      },
+      async listRoles() {
+        return [];
+      },
+      async view() {
+        return {};
+      },
+      schedules() {
+        return [];
+      },
+      runAll: runAll || (async () => {}),
+    },
+    confirmationQueue: {
+      async next() {
+        queueCalls.push("next");
+        return {
+          queueRevision: 8,
+          pendingCount: 1,
+          item: structuredClone(item),
+        };
+      },
+      async approve() {
+        queueCalls.push("approve");
+        return { ...structuredClone(item), status: "completed" };
+      },
+      async retry() {
+        queueCalls.push("retry");
+        return { ...structuredClone(item), status: "completed" };
+      },
+      async reject() {
+        queueCalls.push("reject");
+        return { ...structuredClone(item), status: "rejected" };
+      },
+    },
+    close,
+  };
+}
+
+function confirmationApprovalRequest() {
+  return {
+    requestId: "request-startup-gate-0001",
+    expectedQueueRevision: 8,
+    expectedItemRevision: 2,
+    displayedPayloadDigest: "b".repeat(64),
+    approvalBindingDigest: "c".repeat(64),
+  };
+}
+
+async function exerciseConfirmationRefreshGate(trigger) {
+  const queueCalls = [];
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const reconcileStarted = deferred();
+  const releaseReconcile = deferred();
+  let refreshCalls = 0;
+  let reconcileCalls = 0;
+  const application = startupApplication({
+    port: 4173,
+    queueCalls,
+    async refresh() {
+      refreshCalls += 1;
+      if (refreshCalls === 1) return healthyRefreshResult();
+      refreshStarted.resolve();
+      await releaseRefresh.promise;
+      return healthyRefreshResult();
+    },
+    async runAll() {
+      reconcileCalls += 1;
+      if (reconcileCalls === 1) return;
+      reconcileStarted.resolve();
+      await releaseReconcile.promise;
+    },
+  });
+  const timers = [];
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+  await backgroundWork.initialRefresh;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let cycle = null;
+
+  try {
+    const initiallyOpen = await request(server, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(initiallyOpen.status, 200);
+    queueCalls.length = 0;
+
+    cycle =
+      trigger === "periodic"
+        ? timers[0].callback()
+        : request(server, {
+            method: "POST",
+            path: "/api/refresh",
+            headers: {
+              origin: "http://127.0.0.1:4173",
+              "x-mydashboard-action": "1",
+            },
+          });
+    await refreshStarted.promise;
+
+    const nextDuringRefresh = await request(server, {
+      path: "/api/confirmations/next",
+    });
+    const approveDuringRefresh = await request(server, {
+      method: "POST",
+      path: `/api/confirmations/${pendingConfirmationItem().id}/approve`,
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(confirmationApprovalRequest()),
+    });
+    assert.equal(nextDuringRefresh.status, 503);
+    assert.equal(approveDuringRefresh.status, 503);
+    assert.deepEqual(queueCalls, []);
+
+    releaseRefresh.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reconcileCalls, 2);
+    await reconcileStarted.promise;
+    const nextDuringReconcile = await request(server, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(nextDuringReconcile.status, 503);
+    assert.deepEqual(queueCalls, []);
+
+    releaseReconcile.resolve();
+    const cycleResult = await cycle;
+    if (trigger === "manual") assert.equal(cycleResult.status, 200);
+    const reopened = await request(server, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(reopened.status, 200);
+    assert.deepEqual(queueCalls, ["next"]);
+  } finally {
+    releaseRefresh.resolve();
+    releaseReconcile.resolve();
+    await Promise.resolve(cycle).catch(() => {});
+    await server.shutdown();
+  }
+}
+
+async function withServer(
+  run,
+  {
+    legacyOnly = false,
+    confirmationQueueEnabled = true,
+    onClose,
+    onDashboardRead,
+    backgroundWork,
+  } = {},
+) {
   const calls = [];
+  const reportedErrors = [];
   const dashboard = {
     meta: { refreshedAt: "2026-07-31T09:00:00.000Z" },
     secretMarker: "private-dashboard-data",
@@ -88,6 +376,9 @@ async function withServer(run, { legacyOnly = false } = {}) {
       calls.push({ operation: "memory_search", query, limit });
       return [{ id: "memory-1", title: "Checkout review" }];
     },
+    async recordConfirmationOutcome(item) {
+      calls.push({ operation: "employee_confirmation_outcome", item });
+    },
   };
   const requirementsAnalyst = {
     id: "requirements-analyst",
@@ -119,6 +410,7 @@ async function withServer(run, { legacyOnly = false } = {}) {
     config: { port: 4173, refreshMinutes: 10 },
     store: {
       async read() {
+        if (onDashboardRead) return onDashboardRead();
         return dashboard;
       },
     },
@@ -134,27 +426,92 @@ async function withServer(run, { legacyOnly = false } = {}) {
       },
     },
     prEmployee,
+    ...(typeof onClose === "function" ? { close: onClose } : {}),
   };
+  if (confirmationQueueEnabled) {
+    const confirmationItem = {
+      id: "confirmation-pr-work-1",
+      kind: "github.pull-request-review",
+      status: "pending",
+      queueRevision: 8,
+      itemRevision: 2,
+      requestedBy: { roleId: "pr-reviewer", workItemId: "pr-work-1" },
+      actor: { provider: "github", accountId: "review-account" },
+      target: {
+        provider: "github",
+        resourceId: "acme/repo#7",
+        version: "a".repeat(40),
+      },
+      display: {
+        title: "acme/repo #7 · Checkout",
+        summary: "Ready to publish",
+        actionLabel: "确认并发布到 GitHub",
+        evidence: ["Head 已复核"],
+        payload: {
+          actor: { provider: "github", accountId: "review-account" },
+          target: {
+            provider: "github",
+            resourceId: "acme/repo#7",
+            version: "a".repeat(40),
+          },
+          action: {
+            type: "pull_request_review",
+            reviewEvent: "APPROVE",
+            body: "Looks good.",
+          },
+        },
+      },
+      displayedPayloadDigest: "b".repeat(64),
+      approvalBindingDigest: "c".repeat(64),
+      retryable: false,
+    };
+    application.confirmationQueue = {
+      async next() {
+        calls.push({ operation: "confirmation_next" });
+        return {
+          queueRevision: 8,
+          pendingCount: 1,
+          item: structuredClone(confirmationItem),
+        };
+      },
+      async approve(id, input) {
+        calls.push({ operation: "confirmation_approve", id, input });
+        return { ...structuredClone(confirmationItem), status: "completed" };
+      },
+      async retry(id, input) {
+        calls.push({ operation: "confirmation_retry", id, input });
+        return { ...structuredClone(confirmationItem), status: "completed" };
+      },
+      async reject(id, input) {
+        calls.push({ operation: "confirmation_reject", id, input });
+        return { ...structuredClone(confirmationItem), status: "rejected" };
+      },
+    };
+  }
   if (!legacyOnly) {
     application.employeeRegistry = new EmployeeRegistry([
       prEmployee,
       requirementsAnalyst,
     ]);
   }
-  const server = createDashboardServer(application);
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
-    await run({ server, calls });
+    await run({ server, calls, reportedErrors });
   } finally {
-    await new Promise((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
+    await server.shutdown();
   }
 }
 
 test("background work runs every registered employee after the initial refresh and on schedule", async () => {
   const calls = [];
   const timers = [];
+  const clearedTimers = [];
   const employeeRegistry = {
     async runAll(options) {
       calls.push({ operation: "run_all", ...options });
@@ -193,6 +550,9 @@ test("background work runs every registered employee after the initial refresh a
 
   const backgroundWork = startApplicationBackgroundWork(application, {
     setIntervalFn,
+    clearIntervalFn(timer) {
+      clearedTimers.push(timer);
+    },
   });
   await backgroundWork.initialRefresh;
 
@@ -210,6 +570,7 @@ test("background work runs every registered employee after the initial refresh a
 
   assert.deepEqual(calls.slice(2), [
     { operation: "refresh", notify: false },
+    { operation: "run_all", trigger: "refresh_completed" },
     { operation: "run", id: "pr-reviewer", trigger: "scheduled" },
     {
       operation: "run",
@@ -217,6 +578,166 @@ test("background work runs every registered employee after the initial refresh a
       trigger: "scheduled",
     },
   ]);
+
+  await backgroundWork.stop();
+  assert.deepEqual(clearedTimers, timers);
+
+  const callsAfterStop = structuredClone(calls);
+  for (const timer of timers) await timer.callback();
+  assert.deepEqual(calls, callsAfterStop);
+});
+
+test("background stop waits for initial refresh and suppresses its employee callback", async () => {
+  let finishRefresh;
+  let refreshStarted;
+  const started = new Promise((resolve) => {
+    refreshStarted = resolve;
+  });
+  const calls = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [];
+      },
+      async runAll(options) {
+        calls.push({ operation: "run_all", ...options });
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        calls.push({ operation: "refresh", ...options });
+        refreshStarted();
+        await new Promise((resolve) => {
+          finishRefresh = resolve;
+        });
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application);
+  await started;
+
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+
+  finishRefresh();
+  await stopping;
+  assert.deepEqual(calls, [{ operation: "refresh", notify: false }]);
+});
+
+test("background stop waits for a tracked scheduled task", async () => {
+  let finishScheduledRun;
+  let scheduledRunStarted;
+  const started = new Promise((resolve) => {
+    scheduledRunStarted = resolve;
+  });
+  const timers = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [{ id: "pr-reviewer", intervalMinutes: 3 }];
+      },
+      async runAll() {},
+      async run() {
+        scheduledRunStarted();
+        await new Promise((resolve) => {
+          finishScheduledRun = resolve;
+        });
+      },
+    },
+    refreshService: {
+      async refresh() {},
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+  await backgroundWork.initialRefresh;
+
+  const scheduledRun = timers[1].callback();
+  await started;
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+
+  finishScheduledRun();
+  await Promise.all([scheduledRun, stopping]);
+  assert.equal(stopped, true);
+});
+
+test("periodic refresh fences confirmations until employee reconciliation completes", async () => {
+  await exerciseConfirmationRefreshGate("periodic");
+});
+
+test("manual refresh fences confirmations until employee reconciliation completes", async () => {
+  await exerciseConfirmationRefreshGate("manual");
+});
+
+test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () => {
+  const queueCalls = [];
+  const application = startupApplication({
+    port: 4173,
+    queueCalls,
+    async refresh() {
+      return {
+        dashboard: {
+          sourceStatus: {
+            githubPullRequests: {
+              ok: false,
+              stale: true,
+              error: "GitHub unavailable",
+            },
+          },
+          items: [],
+        },
+      };
+    },
+  });
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn() {
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+  });
+  await backgroundWork.initialRefresh;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const next = await request(server, { path: "/api/confirmations/next" });
+    const approve = await request(server, {
+      method: "POST",
+      path: `/api/confirmations/${pendingConfirmationItem().id}/approve`,
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(confirmationApprovalRequest()),
+    });
+
+    assert.equal(next.status, 503);
+    assert.equal(approve.status, 503);
+    assert.deepEqual(queueCalls, []);
+  } finally {
+    await server.shutdown();
+  }
 });
 
 test("server rejects an untrusted Host before exposing local data", async () => {
@@ -229,6 +750,39 @@ test("server rejects an untrusted Host before exposing local data", async () => 
     assert.equal(response.status, 421);
     assert.equal(response.body.includes("private-dashboard-data"), false);
   });
+});
+
+test("5xx responses hide internal details while 4xx responses stay actionable", async () => {
+  const privatePath = "D:\\private\\runtime\\confirmation-store.json";
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const internalFailure = await request(server, {
+        path: "/api/dashboard",
+      });
+      const clientFailure = await request(server, {
+        path: "/api/dashboard",
+        headers: { host: "evil.example:4173" },
+      });
+
+      assert.equal(internalFailure.status, 500);
+      assert.deepEqual(JSON.parse(internalFailure.body), {
+        error: "服务器内部错误",
+      });
+      assert.equal(internalFailure.body.includes(privatePath), false);
+      assert.equal(reportedErrors.length, 1);
+      assert.match(reportedErrors[0].message, /cannot open/);
+      assert.match(reportedErrors[0].message, /confirmation-store\.json/);
+      assert.equal(clientFailure.status, 421);
+      assert.deepEqual(JSON.parse(clientFailure.body), {
+        error: "请求 Host 不属于本地指挥中枢",
+      });
+    },
+    {
+      onDashboardRead() {
+        throw new Error(`cannot open ${privatePath}`);
+      },
+    },
+  );
 });
 
 test("the local UI cannot be framed by another site", async () => {
@@ -281,6 +835,346 @@ test("write endpoints require same-origin action headers and JSON", async () => 
   });
 });
 
+test("the confirmation API exposes only the next immutable projection", async () => {
+  await withServer(async ({ server, calls }) => {
+    const response = await request(server, {
+      path: "/api/confirmations/next",
+    });
+
+    assert.equal(response.status, 200);
+    const body = JSON.parse(response.body);
+    assert.equal(body.available, true);
+    assert.equal(body.pendingCount, 1);
+    assert.equal(body.item.id, "confirmation-pr-work-1");
+    assert.equal(body.item.display.payload.action.body, "Looks good.");
+    assert.equal("action" in body.item, false);
+    assert.deepEqual(calls, [{ operation: "confirmation_next" }]);
+  });
+});
+
+test("confirmation mutations forward only bound requests and sync the employee", async () => {
+  await withServer(async ({ server, calls }) => {
+    const headers = {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+      "content-type": "application/json",
+    };
+    const binding = {
+      requestId: "request-confirmation-0001",
+      expectedQueueRevision: 8,
+      expectedItemRevision: 2,
+      displayedPayloadDigest: "b".repeat(64),
+      approvalBindingDigest: "c".repeat(64),
+    };
+
+    for (const operation of ["approve", "retry", "reject"]) {
+      const response = await request(server, {
+        method: "POST",
+        path: `/api/confirmations/confirmation-pr-work-1/${operation}`,
+        headers,
+        body: JSON.stringify(
+          operation === "reject" ? { ...binding, reason: "暂不发布" } : binding,
+        ),
+      });
+      assert.equal(response.status, 200);
+      const result = JSON.parse(response.body);
+      assert.equal(result.item.status, operation === "reject" ? "rejected" : "completed");
+      assert.equal(result.next.pendingCount, 1);
+      assert.equal(result.employeeSyncPending, false);
+    }
+
+    for (const operation of ["approve", "retry", "reject"]) {
+      const call = calls.find(
+        (candidate) => candidate.operation === `confirmation_${operation}`,
+      );
+      assert.equal(call.id, "confirmation-pr-work-1");
+      assert.deepEqual(
+        call.input,
+        operation === "reject" ? { ...binding, reason: "暂不发布" } : binding,
+      );
+    }
+    assert.equal(
+      calls.filter((call) => call.operation === "employee_confirmation_outcome")
+        .length,
+      3,
+    );
+  });
+});
+
+test("confirmation writes reject untrusted callers and expose no enqueue route", async () => {
+  await withServer(async ({ server, calls }) => {
+    const body = JSON.stringify({ requestId: "request-confirmation-0001" });
+    const crossOrigin = await request(server, {
+      method: "POST",
+      path: "/api/confirmations/confirmation-pr-work-1/approve",
+      headers: {
+        origin: "https://evil.example",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body,
+    });
+    const wrongType = await request(server, {
+      method: "POST",
+      path: "/api/confirmations/confirmation-pr-work-1/reject",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "text/plain",
+      },
+      body,
+    });
+    const enqueue = await request(server, {
+      method: "POST",
+      path: "/api/confirmations/confirmation-pr-work-1/enqueue",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body,
+    });
+
+    assert.equal(crossOrigin.status, 403);
+    assert.equal(wrongType.status, 415);
+    assert.equal(enqueue.status, 404);
+    assert.equal(
+      calls.some((call) => call.operation.startsWith("confirmation_")),
+      false,
+    );
+  });
+});
+
+test("disabled external actions expose an empty read view and reject writes", async () => {
+  await withServer(
+    async ({ server }) => {
+      const next = await request(server, { path: "/api/confirmations/next" });
+      const approve = await request(server, {
+        method: "POST",
+        path: "/api/confirmations/confirmation-pr-work-1/approve",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ requestId: "request-confirmation-0001" }),
+      });
+
+      assert.deepEqual(JSON.parse(next.body), {
+        available: false,
+        queueRevision: 0,
+        pendingCount: 0,
+        item: null,
+      });
+      assert.equal(approve.status, 503);
+    },
+    { confirmationQueueEnabled: false },
+  );
+});
+
+test("closing the HTTP server releases application-owned runtimes", async () => {
+  let closed = 0;
+  await withServer(
+    async ({ server }) => {
+      await server.shutdown();
+    },
+    {
+      onClose() {
+        closed += 1;
+      },
+    },
+  );
+  assert.equal(closed, 1);
+});
+
+test("awaited shutdown releases a delayed runtime before an immediate restart", async () => {
+  let applicationNumber = 0;
+  let runtimeHeld = false;
+  let releaseFirstClose;
+  let firstCloseStarted;
+  const closeStarted = new Promise((resolve) => {
+    firstCloseStarted = resolve;
+  });
+  const createApplicationFn = async () => {
+    if (runtimeHeld) throw new Error("runtime lock still held");
+    runtimeHeld = true;
+    applicationNumber += 1;
+    const currentApplication = applicationNumber;
+    return {
+      config: { port: 0, refreshMinutes: 10 },
+      store: {
+        async read() {
+          return null;
+        },
+      },
+      refreshService: {
+        running: null,
+        async refresh() {},
+      },
+      employeeRegistry: {
+        get() {
+          return null;
+        },
+        async listRoles() {
+          return [];
+        },
+        schedules() {
+          return [];
+        },
+        async runAll() {},
+      },
+      async close() {
+        if (currentApplication === 1) {
+          firstCloseStarted();
+          await new Promise((resolve) => {
+            releaseFirstClose = resolve;
+          });
+        }
+        runtimeHeld = false;
+      },
+    };
+  };
+  const options = { createApplicationFn, log() {} };
+
+  const firstServer = await startDashboardServer(options);
+  assert.equal(firstServer instanceof http.Server, true);
+  assert.equal(typeof firstServer.shutdown, "function");
+
+  let shutdownFinished = false;
+  const stopping = firstServer.shutdown().then(() => {
+    shutdownFinished = true;
+  });
+  await closeStarted;
+  assert.equal(shutdownFinished, false);
+  await assert.rejects(
+    () => startDashboardServer(options),
+    /runtime lock still held/,
+  );
+
+  releaseFirstClose();
+  await stopping;
+  const restartedServer = await startDashboardServer(options);
+  await restartedServer.shutdown();
+  assert.equal(runtimeHeld, false);
+});
+
+test("startup does not listen until the first GitHub refresh and employee reconcile finish", async () => {
+  const port = await availablePort();
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const reconcileStarted = deferred();
+  const releaseReconcile = deferred();
+  const queueCalls = [];
+  let runAllCalls = 0;
+  const application = startupApplication({
+    port,
+    queueCalls,
+    async refresh() {
+      refreshStarted.resolve();
+      await releaseRefresh.promise;
+      return healthyRefreshResult();
+    },
+    async recoverConfirmations() {
+      reconcileStarted.resolve();
+      await releaseReconcile.promise;
+    },
+    async runAll(options) {
+      runAllCalls += 1;
+      assert.deepEqual(options, { trigger: "refresh_completed" });
+    },
+  });
+  let server = null;
+  let startupSettled = false;
+  const starting = startDashboardServer({
+    createApplicationFn: async () => application,
+    log() {},
+  }).then(
+    (startedServer) => {
+      startupSettled = true;
+      server = startedServer;
+      return startedServer;
+    },
+    (error) => {
+      startupSettled = true;
+      throw error;
+    },
+  );
+
+  try {
+    await refreshStarted.promise;
+    assert.equal(startupSettled, false);
+    await assert.rejects(
+      requestPort(port, { path: "/api/confirmations/next" }),
+      (error) => error.code === "ECONNREFUSED",
+    );
+
+    releaseRefresh.resolve();
+    await reconcileStarted.promise;
+    assert.equal(startupSettled, false);
+    await assert.rejects(
+      requestPort(port, { path: "/api/confirmations/next" }),
+      (error) => error.code === "ECONNREFUSED",
+    );
+
+    releaseReconcile.resolve();
+    server = await starting;
+    const confirmation = await requestPort(port, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(confirmation.status, 200);
+    assert.equal(JSON.parse(confirmation.body).pendingCount, 1);
+    assert.deepEqual(queueCalls, ["next"]);
+    assert.equal(runAllCalls, 1);
+  } finally {
+    releaseRefresh.resolve();
+    releaseReconcile.resolve();
+    if (!server) server = await starting.catch(() => null);
+    if (server) await server.shutdown();
+  }
+});
+
+test("initial refresh failure aborts listen and releases background and application resources", async () => {
+  const port = await availablePort();
+  const refreshFailure = new Error("initial GitHub refresh failed");
+  const initialRefresh = Promise.reject(refreshFailure);
+  initialRefresh.catch(() => {});
+  let backgroundStops = 0;
+  let applicationCloses = 0;
+  const application = startupApplication({
+    port,
+    async close() {
+      applicationCloses += 1;
+    },
+  });
+  const starting = startDashboardServer({
+    createApplicationFn: async () => application,
+    startBackgroundWorkFn() {
+      return {
+        initialRefresh,
+        async stop() {
+          backgroundStops += 1;
+        },
+      };
+    },
+    log() {},
+  });
+  let server = null;
+
+  try {
+    await assert.rejects(starting, (error) => error === refreshFailure);
+  } finally {
+    server = await starting.catch(() => null);
+    if (server) await server.shutdown();
+  }
+
+  assert.equal(backgroundStops, 1);
+  assert.equal(applicationCloses, 1);
+  await assert.rejects(
+    requestPort(port, { path: "/api/confirmations/next" }),
+    (error) => error.code === "ECONNREFUSED",
+  );
+});
+
 test("same-origin UI requests can refresh and confirm the displayed head", async () => {
   await withServer(async ({ server, calls }) => {
     const trustedHeaders = {
@@ -318,6 +1212,49 @@ test("same-origin UI requests can refresh and confirm the displayed head", async
       },
     ]);
   });
+});
+
+test("responsibility confirmation is routed through the fact-cycle gate", async () => {
+  const gateCalls = [];
+  await withServer(
+    async ({ server, calls }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: "/api/pr-responsibility/confirm",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({
+          id: "github:pr:acme/repo#7",
+          actionState: "waiting_other",
+          headRefOid: "head-7",
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(gateCalls, ["entered", "completed"]);
+      assert.deepEqual(calls, [
+        {
+          operation: "confirm",
+          id: "github:pr:acme/repo#7",
+          actionState: "waiting_other",
+          headRefOid: "head-7",
+        },
+      ]);
+    },
+    {
+      backgroundWork: {
+        async mutateFacts(operation) {
+          gateCalls.push("entered");
+          const result = await operation();
+          gateCalls.push("completed");
+          return result;
+        },
+      },
+    },
+  );
 });
 
 test("the scheduled service path can request notification delivery", async () => {

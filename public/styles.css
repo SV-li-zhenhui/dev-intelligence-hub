@@ -844,6 +844,15 @@ dialog::backdrop {
   line-height: 1.55;
 }
 
+.confirmation-grid {
+  margin: 16px 0;
+}
+
+.confirmation-grid code {
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 .confirmation-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;

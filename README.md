@@ -24,9 +24,9 @@ npm start
 ## PR 推进员工
 
 - 每 2 分钟巡查一次最新的成功 GitHub PR 快照；旧快照或失败源不会触发新工作。
-- 对需要 Review 的 PR 读取固定 head 的有限 diff，生成评审草稿并进入逐条确认弹窗。
+- 对需要 Review 的 PR 读取固定 head 的有限 diff，生成与该 Head 绑定的评审方案。
 - 对自己创建且需要推进的 PR 读取结构化元数据，生成本地执行方案。
-- 接受/拒绝当前只保存为本地决策，**不会提交 GitHub Review，也不会修改远端 PR**。
+- 未启用 GitHub 写入时，评审方案只保存在本机；启用后，新方案直接进入统一外部动作确认队列，不再二次“接受草稿”。
 - 作业带 revision、head 校验、运行租约和重试策略；模型完成后若 head 已变化，草稿会自动失效。
 - 分析、证据、步骤、来源 URL、head 和所用大脑会写入本地记忆，可在“记忆搜索”中查询。
 
@@ -49,6 +49,29 @@ npm start
 当前实现的岗位大脑适配器是 Ollama；岗位与模型已经解耦，后续可以增加第三方 Provider，而不改变作业状态机和确认边界。
 
 PR 正文、文件名和 diff 默认只允许发送到 loopback Ollama。若明确要连接远程 Ollama，必须在 `employees.prReviewer` 中设置 `allowRemoteCodeContext: true`；界面会持续提示代码上下文正在离开本机。远程 Provider 后续也应沿用这一显式授权边界。
+
+## GitHub 外部动作确认
+
+GitHub 写入默认关闭。启用后，PR 员工只能准备 `APPROVE`、`REQUEST_CHANGES` 或 `COMMENT` Review；三种动作都固定到确认时展示的 PR Head。普通 Issue Comment 写入被禁用，避免在 Head 变化后发布失去版本语境的评论。
+
+所有外部动作都经过同一个逐条弹框。弹框会展示写入账号、仓库与 PR、Head、Review 类型、完整正文和依据；浏览器只提交队列修订号与内容摘要，不能覆盖服务端保存的动作。点击“稍后”不会产生写入，点击“确认并发布到 GitHub”后才会执行。
+
+账号和凭据只配置在本机。`config.local.json` 保存账号、`gh.exe` 路径和凭据环境变量名，不保存 Token 本身：
+
+```json
+{
+  "githubActions": {
+    "enabled": true,
+    "actorAccountId": "用于发布 Review 的 GitHub 登录名",
+    "tokenEnv": "MYDASHBOARD_GITHUB_TOKEN",
+    "ghCommand": "C:\\Program Files\\GitHub CLI\\gh.exe"
+  }
+}
+```
+
+在启动服务的用户环境中设置 `MYDASHBOARD_GITHUB_TOKEN`，然后重启服务。系统启动时会用该固定 Token 核对实际 GitHub 账号；账号不一致会拒绝写入。若确实需要代理或自定义 CA，必须在 `githubActions.networkEnv` 中逐项显式配置，因为携带 Token 的网络链路会随之改变。
+
+确认队列先持久化意图，再允许外部调用；进程崩溃后会先对账再恢复。同一 Head 下若职责、下一动作或岗位策略已经变化，原岗位会先持久化失效旧确认，旧 Review 不能继续执行；结果未知时，同一 PR 的后续动作会保持阻塞，避免重复发布。启动、定时刷新、手动刷新和本地 PR 事实变更都会先关闭确认入口，只有 GitHub PR 数据健康且岗位复核完成后才重新开放。Windows 上使用 named pipe 保证同一时刻只有一个外部动作写入进程；服务关闭会先停止定时工作并等待运行时释放，崩溃时句柄由操作系统回收。
 
 ## 受控代码执行器
 
