@@ -1,6 +1,21 @@
 # Validation notes
 
-Date: 2026-07-31
+## 2026-08-01 — Stage 1 generic employee control layer
+
+- Automated regression: `npm test` passed 96/96; syntax checks and `git diff --check` passed.
+- Runtime restart: the service returned healthy on `127.0.0.1:4173`; the PR employee remained paused at revision 66 with all 18 jobs and an empty confirmation queue preserved.
+- API verification: `/api/employees` returned one lightweight `pr-reviewer` role; `/api/dashboard` retained its legacy PR employee projection without duplicating employee payloads.
+- Browser verification: desktop (1440×1000) and mobile (390×844) returned HTTP 200, had no console/page errors or horizontal overflow, and showed the preserved paused employee and 18 jobs.
+- Review result: one confirmed employee-ID/routing mismatch was fixed by enforcing the same URL-safe ID grammar at registration. Independent reliability review found no blocking issue.
+- Current degraded badge is the preserved PR employee error from an older Ollama timeout; the latest refresh itself completed with 122 GitHub records, 41 DingTalk signals, and no source or brain-refresh errors.
+
+### Post-restart monitoring
+
+- Check `/api/health`, `/api/employees`, and `logs/server-error.log` through the next scheduled refresh and employee intervals.
+- Treat loss of the paused state, revision/job regression, repeated one-second scheduling, HTTP failures, or new uncaught errors as rollback triggers.
+- If a trigger occurs, stop only the process listening on `127.0.0.1:4173`, keep the JSON state files untouched, and relaunch the last known-good local version before investigating.
+
+## 2026-07-31 — Initial dashboard validation
 
 ## Automated checks
 

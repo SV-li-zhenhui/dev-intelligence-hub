@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
-import { createDashboardServer } from "../src/server.js";
+import {
+  createDashboardServer,
+  startApplicationBackgroundWork,
+} from "../src/server.js";
+import { EmployeeRegistry } from "../src/services/employee-registry.js";
 
 function request(server, {
   method = "GET",
@@ -41,11 +45,75 @@ function request(server, {
   });
 }
 
-async function withServer(run) {
+async function withServer(run, { legacyOnly = false } = {}) {
   const calls = [];
   const dashboard = {
     meta: { refreshedAt: "2026-07-31T09:00:00.000Z" },
     secretMarker: "private-dashboard-data",
+  };
+  const prEmployee = {
+    id: "pr-reviewer",
+    running: null,
+    async view() {
+      return {
+        role: {
+          id: "pr-reviewer",
+          name: "PR 推进员工",
+          state: "observing",
+          revision: 4,
+        },
+        jobs: [],
+        confirmationQueue: [],
+      };
+    },
+    async roleView() {
+      return (await this.view()).role;
+    },
+    async run(options) {
+      calls.push({ operation: "employee_tick", ...options });
+      return this.view();
+    },
+    async tick(options) {
+      return this.run(options);
+    },
+    async control(command, expectedRevision) {
+      calls.push({ operation: "employee_control", command, expectedRevision });
+      return this.view();
+    },
+    async decide(id, decision, options) {
+      calls.push({ operation: "employee_decide", id, decision, ...options });
+      return this.view();
+    },
+    async searchMemory(query, limit) {
+      calls.push({ operation: "memory_search", query, limit });
+      return [{ id: "memory-1", title: "Checkout review" }];
+    },
+  };
+  const requirementsAnalyst = {
+    id: "requirements-analyst",
+    async view() {
+      return {
+        role: {
+          id: this.id,
+          name: "需求分析员工",
+          state: "observing",
+          revision: 2,
+        },
+        jobs: [],
+        confirmationQueue: [],
+      };
+    },
+    async roleView() {
+      return (await this.view()).role;
+    },
+    async run(options) {
+      calls.push({ operation: "analyst_tick", ...options });
+      return this.view();
+    },
+    async control(command, expectedRevision) {
+      calls.push({ operation: "analyst_control", command, expectedRevision });
+      return this.view();
+    },
   };
   const application = {
     config: { port: 4173, refreshMinutes: 10 },
@@ -65,38 +133,14 @@ async function withServer(run) {
         return dashboard;
       },
     },
-    prEmployee: {
-      running: null,
-      async view() {
-        return {
-          role: {
-            id: "pr-reviewer",
-            name: "PR 推进员工",
-            state: "observing",
-            revision: 4,
-          },
-          jobs: [],
-          confirmationQueue: [],
-        };
-      },
-      async tick(options) {
-        calls.push({ operation: "employee_tick", ...options });
-        return this.view();
-      },
-      async control(command, expectedRevision) {
-        calls.push({ operation: "employee_control", command, expectedRevision });
-        return this.view();
-      },
-      async decide(id, decision, options) {
-        calls.push({ operation: "employee_decide", id, decision, ...options });
-        return this.view();
-      },
-      async searchMemory(query, limit) {
-        calls.push({ operation: "memory_search", query, limit });
-        return [{ id: "memory-1", title: "Checkout review" }];
-      },
-    },
+    prEmployee,
   };
+  if (!legacyOnly) {
+    application.employeeRegistry = new EmployeeRegistry([
+      prEmployee,
+      requirementsAnalyst,
+    ]);
+  }
   const server = createDashboardServer(application);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
@@ -107,6 +151,73 @@ async function withServer(run) {
     );
   }
 }
+
+test("background work runs every registered employee after the initial refresh and on schedule", async () => {
+  const calls = [];
+  const timers = [];
+  const employeeRegistry = {
+    async runAll(options) {
+      calls.push({ operation: "run_all", ...options });
+    },
+    schedules() {
+      return [
+        { id: "pr-reviewer", intervalMinutes: 3 },
+        { id: "requirements-analyst", intervalMinutes: 11 },
+      ];
+    },
+    async run(id, options) {
+      calls.push({ operation: "run", id, ...options });
+    },
+  };
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry,
+    refreshService: {
+      async refresh(options) {
+        calls.push({ operation: "refresh", ...options });
+      },
+    },
+  };
+  const setIntervalFn = (callback, milliseconds) => {
+    const timer = {
+      callback,
+      milliseconds,
+      unreferenced: false,
+      unref() {
+        this.unreferenced = true;
+      },
+    };
+    timers.push(timer);
+    return timer;
+  };
+
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn,
+  });
+  await backgroundWork.initialRefresh;
+
+  assert.deepEqual(calls, [
+    { operation: "refresh", notify: false },
+    { operation: "run_all", trigger: "refresh_completed" },
+  ]);
+  assert.deepEqual(
+    timers.map((timer) => timer.milliseconds),
+    [7 * 60_000, 3 * 60_000, 11 * 60_000],
+  );
+  assert.equal(timers.every((timer) => timer.unreferenced), true);
+
+  for (const timer of timers) await timer.callback();
+
+  assert.deepEqual(calls.slice(2), [
+    { operation: "refresh", notify: false },
+    { operation: "run", id: "pr-reviewer", trigger: "scheduled" },
+    {
+      operation: "run",
+      id: "requirements-analyst",
+      trigger: "scheduled",
+    },
+  ]);
+});
 
 test("server rejects an untrusted Host before exposing local data", async () => {
   await withServer(async ({ server }) => {
@@ -231,8 +342,101 @@ test("dashboard and health expose the proactive employee without changing stored
     const health = await request(server, { path: "/api/health" });
 
     assert.equal(dashboard.status, 200);
-    assert.equal(JSON.parse(dashboard.body).employee.role.id, "pr-reviewer");
-    assert.equal(JSON.parse(health.body).employee.state, "observing");
+    const dashboardBody = JSON.parse(dashboard.body);
+    const healthBody = JSON.parse(health.body);
+    assert.equal(dashboardBody.employee.role.id, "pr-reviewer");
+    assert.equal("employees" in dashboardBody, false);
+    assert.equal(healthBody.employee.state, "observing");
+    assert.deepEqual(
+      healthBody.employees.map((employee) => employee.id),
+      ["pr-reviewer", "requirements-analyst"],
+    );
+  });
+});
+
+test("server keeps legacy prEmployee-only applications operational", async () => {
+  await withServer(async ({ server, calls }) => {
+    const health = await request(server, { path: "/api/health" });
+    const list = await request(server, { path: "/api/employees" });
+    const run = await request(server, {
+      method: "POST",
+      path: "/api/employees/pr-reviewer/run",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+      },
+    });
+
+    assert.equal(health.status, 200);
+    assert.deepEqual(
+      JSON.parse(health.body).employees.map((employee) => employee.id),
+      ["pr-reviewer"],
+    );
+    assert.equal(list.status, 200);
+    assert.equal(JSON.parse(list.body).items.length, 1);
+    assert.equal(run.status, 200);
+    assert.deepEqual(calls, [
+      { operation: "employee_tick", trigger: "manual" },
+    ]);
+  }, { legacyOnly: true });
+});
+
+test("employee discovery and dynamic routes work for every registered role", async () => {
+  await withServer(async ({ server, calls }) => {
+    const list = await request(server, { path: "/api/employees" });
+    const headers = {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+      "content-type": "application/json",
+    };
+    const control = await request(server, {
+      method: "POST",
+      path: "/api/employees/requirements-analyst/control",
+      headers,
+      body: JSON.stringify({ command: "pause", expectedRevision: 2 }),
+    });
+    const run = await request(server, {
+      method: "POST",
+      path: "/api/employees/requirements-analyst/run",
+      headers: {
+        origin: headers.origin,
+        "x-mydashboard-action": "1",
+      },
+    });
+    const missing = await request(server, {
+      method: "POST",
+      path: "/api/employees/missing-role/run",
+      headers: {
+        origin: headers.origin,
+        "x-mydashboard-action": "1",
+      },
+    });
+    const untrusted = await request(server, {
+      method: "POST",
+      path: "/api/employees/requirements-analyst/run",
+      headers: {
+        origin: "https://evil.example",
+        "x-mydashboard-action": "1",
+      },
+    });
+
+    assert.equal(list.status, 200);
+    assert.deepEqual(
+      JSON.parse(list.body).items.map((employee) => employee.id),
+      ["pr-reviewer", "requirements-analyst"],
+    );
+    assert.equal("jobs" in JSON.parse(list.body).items[0], false);
+    assert.equal(control.status, 200);
+    assert.equal(run.status, 200);
+    assert.equal(missing.status, 404);
+    assert.equal(untrusted.status, 403);
+    assert.deepEqual(
+      calls.filter((call) => call.operation.startsWith("analyst_")),
+      [
+        { operation: "analyst_control", command: "pause", expectedRevision: 2 },
+        { operation: "analyst_tick", trigger: "manual" },
+      ],
+    );
   });
 });
 

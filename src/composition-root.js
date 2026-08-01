@@ -7,6 +7,7 @@ import { loadConfig, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { StateStore } from "./lib/state-store.js";
 import { NotificationService } from "./services/notification-service.js";
+import { EmployeeRegistry } from "./services/employee-registry.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { RefreshService } from "./services/refresh-service.js";
 
@@ -39,6 +40,10 @@ export function createPrEmployeeReviewer(
   );
 }
 
+export function createEmployeeRegistry(employees = []) {
+  return new EmployeeRegistry(employees.filter(Boolean));
+}
+
 export async function createApplication() {
   const config = await loadConfig();
   const roleConfig = config.employees?.prReviewer || { enabled: false };
@@ -61,6 +66,7 @@ export async function createApplication() {
     config: roleConfig,
     operationQueue,
   });
+  const employeeRegistry = createEmployeeRegistry([prEmployee]);
   const notifier = new NotificationService(dingtalk, config.dingtalk);
   const refreshService = new RefreshService({
     github,
@@ -71,5 +77,11 @@ export async function createApplication() {
     config,
     operationQueue,
   });
-  return { config, store, refreshService, prEmployee };
+  return {
+    config,
+    store,
+    refreshService,
+    employeeRegistry,
+    prEmployee,
+  };
 }

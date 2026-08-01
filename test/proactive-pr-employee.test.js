@@ -242,6 +242,35 @@ test("pausing is persistent and prevents new analysis until resumed", async () =
   assert.equal(calls, 1);
 });
 
+test("existing PR employee state remains readable after controller migration", async () => {
+  const existingState = {
+    revision: 17,
+    paused: true,
+    jobs: [
+      {
+        id: "pr-work-existing",
+        subjectId: pullRequest().id,
+        status: "ready_for_human",
+        createdAt: "2026-07-30T08:00:00.000Z",
+      },
+    ],
+    memoryOutbox: [],
+    memoryOutboxError: "",
+    memoryOutboxDropped: 0,
+    lastRun: null,
+    lastError: "",
+  };
+  const store = new MemoryStore({ "pr-employee-state": existingState });
+
+  const restored = await createService({ store }).view();
+
+  assert.equal(restored.role.id, "pr-reviewer");
+  assert.equal(restored.role.revision, 17);
+  assert.equal(restored.role.paused, true);
+  assert.equal(restored.jobs[0].id, "pr-work-existing");
+  assert.equal(restored.confirmationQueue.length, 1);
+});
+
 test("a head change during model work supersedes the stale result", async () => {
   const original = pullRequest();
   const store = new MemoryStore({ snapshot: snapshot([original]) });

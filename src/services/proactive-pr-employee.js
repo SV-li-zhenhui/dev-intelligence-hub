@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { EmployeeController } from "./employee-controller.js";
 
 const STATE_KEY = "pr-employee-state";
 const MEMORY_KEY = "pr-employee-memory";
@@ -61,8 +62,6 @@ function serviceError(statusCode, message) {
 
 function defaultState() {
   return {
-    revision: 0,
-    paused: false,
     jobs: [],
     memoryOutbox: [],
     memoryOutboxError: "",
@@ -176,6 +175,19 @@ function memoryText(memory) {
     .toLocaleLowerCase("zh-CN");
 }
 
+function projectWork(state) {
+  const jobs = [...state.jobs].sort(
+    (left, right) =>
+      Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0),
+  );
+  return {
+    jobs,
+    confirmationQueue: jobs.filter(
+      (job) => job.status === "ready_for_human",
+    ),
+  };
+}
+
 export class ProactivePrEmployeeService {
   constructor({
     store,
@@ -193,6 +205,7 @@ export class ProactivePrEmployeeService {
       enabled: true,
       name: "PR 推进员工",
       policyVersion: 1,
+      tickMinutes: 2,
       maxJobsPerTick: 2,
       maxAttempts: 3,
       retryMinutes: [1, 5, 30],
@@ -201,37 +214,81 @@ export class ProactivePrEmployeeService {
       jobLimit: 500,
       ...config,
     };
-    this.operationQueue = operationQueue;
-    this.operations = Promise.resolve();
-    this.running = null;
+    this.controller = new EmployeeController({
+      definition: {
+        id: "pr-reviewer",
+        name: this.config.name,
+        mission: "主动巡查与你相关的 PR，生成评审草稿或推进方案",
+        enabled: this.config.enabled,
+      },
+      store,
+      stateKey: STATE_KEY,
+      createState: defaultState,
+      normalizeState: normalizedState,
+      resolveState: roleState,
+      applyControl: (state) => ({
+        ...state,
+        lastError: "",
+      }),
+      projectRole: (state) => ({
+        brain: {
+          provider: this.reviewer?.provider || "",
+          model: this.reviewer?.model || "",
+          remoteCodeContext: Boolean(this.reviewer?.remoteCodeContext),
+        },
+        lastRun: state.lastRun,
+        lastError:
+          latestJobError(state.jobs) ||
+          state.memoryOutboxError ||
+          state.lastError,
+      }),
+      projectWork,
+      operationQueue,
+      run: ({ trigger = "scheduled", state }) =>
+        this.#performTick(trigger, state),
+    });
   }
 
-  tick({ trigger = "scheduled" } = {}) {
-    if (this.running) return this.running;
-    const operation = this.#enqueue(() => this.#performTick(trigger));
-    const tracked = operation.finally(() => {
-      if (this.running === tracked) this.running = null;
-    });
-    this.running = tracked;
-    return tracked;
+  get id() {
+    return this.controller.id;
+  }
+
+  get running() {
+    return this.controller.running;
+  }
+
+  get scheduleMinutes() {
+    return Number(this.config.tickMinutes) || 0;
+  }
+
+  run(options = {}) {
+    return this.controller.run(options);
+  }
+
+  tick(options = {}) {
+    return this.run(options);
   }
 
   control(command, expectedRevision) {
-    return this.#enqueue(() => this.#control(command, expectedRevision));
+    return this.controller.control(command, expectedRevision);
   }
 
   decide(id, decision, options = {}) {
-    return this.#enqueue(() => this.#decide(id, decision, options));
+    return this.controller.enqueue(() => this.#decide(id, decision, options));
   }
 
   async view() {
-    return this.#projection(await this.#readState());
+    return this.controller.view();
+  }
+
+  async roleView() {
+    return this.controller.roleView();
   }
 
   async searchMemory(query = "", limit = 30) {
     const [storedMemories, state] = await Promise.all([
       this.store.read(MEMORY_KEY, []),
-      this.#readState(),
+      this.controller.readState(),
     ]);
     const memories = [
       ...(Array.isArray(state.memoryOutbox) ? state.memoryOutbox : []),
@@ -258,74 +315,6 @@ export class ProactivePrEmployeeService {
       .slice(0, cappedLimit);
   }
 
-  #enqueue(operation) {
-    if (this.operationQueue) return this.operationQueue.enqueue(operation);
-    const result = this.operations.then(operation, operation);
-    this.operations = result.catch(() => {});
-    return result;
-  }
-
-  async #readState() {
-    return normalizedState(await this.store.read(STATE_KEY, defaultState()));
-  }
-
-  async #writeState(state, { bumpRevision = true } = {}) {
-    const next = {
-      ...state,
-      revision: (state.revision || 0) + (bumpRevision ? 1 : 0),
-    };
-    await this.store.write(STATE_KEY, next);
-    return next;
-  }
-
-  #projection(state) {
-    const jobs = [...state.jobs].sort(
-      (left, right) =>
-        Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0),
-    );
-    const confirmationQueue = jobs.filter(
-      (job) => job.status === "ready_for_human",
-    );
-    return {
-      role: {
-        id: "pr-reviewer",
-        name: this.config.name,
-        mission: "主动巡查与你相关的 PR，生成评审草稿或推进方案",
-        state: roleState(state, this.config.enabled),
-        revision: state.revision,
-        brain: {
-          provider: this.reviewer?.provider || "",
-          model: this.reviewer?.model || "",
-          remoteCodeContext: Boolean(this.reviewer?.remoteCodeContext),
-        },
-        paused: state.paused,
-        lastRun: state.lastRun,
-        lastError:
-          latestJobError(state.jobs) ||
-          state.memoryOutboxError ||
-          state.lastError,
-      },
-      jobs,
-      confirmationQueue,
-    };
-  }
-
-  async #control(command, expectedRevision) {
-    if (!["pause", "resume"].includes(command)) {
-      throw serviceError(400, "command 只能是 pause 或 resume");
-    }
-    const state = await this.#readState();
-    this.#assertRevision(state, expectedRevision);
-    const shouldPause = command === "pause";
-    if (state.paused === shouldPause) return this.#projection(state);
-    const next = await this.#writeState({
-      ...state,
-      paused: shouldPause,
-      lastError: "",
-    });
-    return this.#projection(next);
-  }
-
   async #decide(id, decision, { headRefOid, expectedRevision } = {}) {
     if (typeof id !== "string" || !id.trim()) {
       throw serviceError(400, "作业 id 不能为空");
@@ -333,8 +322,8 @@ export class ProactivePrEmployeeService {
     if (!DECISIONS.has(decision)) {
       throw serviceError(400, "decision 只能是 accept 或 reject");
     }
-    let state = await this.#readState();
-    this.#assertRevision(state, expectedRevision);
+    let state = await this.controller.readState();
+    this.controller.assertRevision(state, expectedRevision);
     const index = state.jobs.findIndex((job) => job.id === id.trim());
     if (index < 0) throw serviceError(404, "找不到这条 PR 员工作业");
     const job = state.jobs[index];
@@ -352,7 +341,7 @@ export class ProactivePrEmployeeService {
         status: "superseded",
         completedAt: this.clock().toISOString(),
       };
-      await this.#writeState(state);
+      await this.controller.writeState(state);
       throw serviceError(409, "PR 状态或 head 已变化，旧草稿已失效");
     }
 
@@ -368,23 +357,12 @@ export class ProactivePrEmployeeService {
     state.jobs[index] = decidedJob;
     state.lastError = "";
     state = this.#queueMemory(state, decidedJob, `draft_${decision}`);
-    state = await this.#writeState(state);
+    state = await this.controller.writeState(state);
     state = await this.#flushMemoryOutbox(state);
-    return this.#projection(state);
+    return this.controller.project(state);
   }
 
-  #assertRevision(state, expectedRevision) {
-    if (!Number.isInteger(expectedRevision)) {
-      throw serviceError(400, "expectedRevision 必须是整数");
-    }
-    if (state.revision !== expectedRevision) {
-      throw serviceError(409, "员工状态已更新，请刷新后重新操作");
-    }
-  }
-
-  async #performTick(trigger) {
-    let state = await this.#readState();
-    if (!this.config.enabled || state.paused) return this.#projection(state);
+  async #performTick(trigger, state) {
     state = await this.#flushMemoryOutbox(state);
 
     const runAt = this.clock().toISOString();
@@ -399,8 +377,8 @@ export class ProactivePrEmployeeService {
         newJobs: 0,
         summary: "尚无事实快照，等待数据源完成首次刷新",
       };
-      state = await this.#writeState(state, { bumpRevision: false });
-      return this.#projection(state);
+      state = await this.controller.writeState(state, { bumpRevision: false });
+      return state;
     }
     if (snapshot.sourceStatus?.githubPullRequests?.ok !== true) {
       state.lastRun = {
@@ -409,8 +387,8 @@ export class ProactivePrEmployeeService {
         newJobs: 0,
         summary: "GitHub PR 本轮未刷新，未使用旧数据触发员工",
       };
-      state = await this.#writeState(state, { bumpRevision: false });
-      return this.#projection(state);
+      state = await this.controller.writeState(state, { bumpRevision: false });
+      return state;
     }
 
     const candidates = snapshot.items.filter(isCandidate);
@@ -462,7 +440,7 @@ export class ProactivePrEmployeeService {
         : "已主动巡查，没有发现需要启动的新 PR 作业",
     };
     state.lastError = "";
-    state = await this.#writeState(state, {
+    state = await this.controller.writeState(state, {
       bumpRevision: jobsChanged || newJobs.length > 0,
     });
 
@@ -472,7 +450,7 @@ export class ProactivePrEmployeeService {
     for (const job of readyToRun) {
       state = await this.#runJob(state, job.id);
     }
-    return this.#projection(state);
+    return state;
   }
 
   #newJob(item, fingerprint, createdAt) {
@@ -521,7 +499,7 @@ export class ProactivePrEmployeeService {
       error: "",
     };
     state.jobs[index] = claimed;
-    state = await this.#writeState(state);
+    state = await this.controller.writeState(state);
 
     try {
       if (!this.reviewer) throw new Error("岗位大脑未配置");
@@ -585,7 +563,7 @@ export class ProactivePrEmployeeService {
       state.jobs[index] = completed;
       state.lastError = "";
       state = this.#queueMemory(state, completed, "analysis_ready");
-      state = await this.#writeState(state);
+      state = await this.controller.writeState(state);
       return this.#flushMemoryOutbox(state);
     } catch (error) {
       index = state.jobs.findIndex((job) => job.id === claimed.id);
@@ -616,7 +594,7 @@ export class ProactivePrEmployeeService {
           "analysis_blocked",
         );
       }
-      state = await this.#writeState(state);
+      state = await this.controller.writeState(state);
       return this.#flushMemoryOutbox(state);
     }
   }
@@ -632,7 +610,7 @@ export class ProactivePrEmployeeService {
       updatedAt: completedAt,
       leaseUntil: null,
     };
-    return this.#writeState(state);
+    return this.controller.writeState(state);
   }
 
   #queueMemory(state, job, event) {
@@ -693,7 +671,7 @@ export class ProactivePrEmployeeService {
         )
         .slice(0, Math.max(1, this.config.memoryLimit));
       await this.store.write(MEMORY_KEY, next);
-      return this.#writeState(
+      return this.controller.writeState(
         { ...state, memoryOutbox: [], memoryOutboxError: "" },
         { bumpRevision: false },
       );
@@ -703,7 +681,9 @@ export class ProactivePrEmployeeService {
         memoryOutboxError: `记忆队列写入失败：${error.message || error}`,
       };
       try {
-        return await this.#writeState(failed, { bumpRevision: false });
+        return await this.controller.writeState(failed, {
+          bumpRevision: false,
+        });
       } catch {
         return failed;
       }

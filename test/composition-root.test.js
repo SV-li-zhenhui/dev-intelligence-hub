@@ -4,6 +4,7 @@ import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
   createBrain,
+  createEmployeeRegistry,
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
 
@@ -45,4 +46,21 @@ test("the PR employee can use its own model without changing its role", () => {
   assert.equal(reviewer.provider, "ollama");
   assert.equal(reviewer.model, "special-review-model");
   assert.equal(reviewer.contextTokens, 4096);
+});
+
+test("employee registry keeps role instances discoverable by id", () => {
+  const employee = (id) => ({
+    id,
+    async view() {},
+    async roleView() {},
+    async run() {},
+    async control() {},
+  });
+  const prEmployee = employee("pr-reviewer");
+  const analyst = employee("requirements-analyst");
+
+  const registry = createEmployeeRegistry([prEmployee, analyst]);
+
+  assert.strictEqual(registry.get("pr-reviewer"), prEmployee);
+  assert.strictEqual(registry.get("requirements-analyst"), analyst);
 });

@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createApplication } from "./composition-root.js";
 import { projectRoot } from "./lib/config.js";
+import { EmployeeRegistry } from "./services/employee-registry.js";
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -128,42 +129,58 @@ function serveStatic(response, requestPath) {
   });
 }
 
-async function readDashboard(application, fallback = null) {
+async function readDashboard(application, employeeRegistry, fallback = null) {
   const dashboard = fallback || (await application.store.read("dashboard"));
   if (!dashboard) return null;
-  if (!application.prEmployee) return dashboard;
+  const prEmployee = employeeRegistry.get("pr-reviewer")
+    ? await employeeRegistry.view("pr-reviewer")
+    : null;
   return {
     ...dashboard,
-    employee: await application.prEmployee.view(),
+    ...(prEmployee ? { employee: prEmployee } : {}),
   };
 }
 
-function requirePrEmployee(application) {
-  if (!application.prEmployee) {
+function resolveEmployeeRegistry(application) {
+  if (application.employeeRegistry) return application.employeeRegistry;
+  return new EmployeeRegistry(
+    application.prEmployee ? [application.prEmployee] : [],
+  );
+}
+
+function requirePrEmployee(employeeRegistry) {
+  const employee = employeeRegistry.get("pr-reviewer");
+  if (
+    !employee ||
+    typeof employee.decide !== "function" ||
+    typeof employee.searchMemory !== "function"
+  ) {
     throw httpError(503, "PR 推进员工未配置");
   }
-  return application.prEmployee;
+  return employee;
 }
 
 export function createDashboardServer(application) {
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
+  const employeeRegistry = resolveEmployeeRegistry(application);
   return http.createServer(async (request, response) => {
     try {
       assertTrustedHost(request, expectedOrigin);
       const url = new URL(request.url, expectedOrigin);
       if (request.method === "GET" && url.pathname === "/api/health") {
-        const employee = application.prEmployee
-          ? (await application.prEmployee.view()).role
-          : null;
+        const employees = await employeeRegistry.listRoles();
+        const employee =
+          employees.find((role) => role.id === "pr-reviewer") || null;
         sendJson(response, 200, {
           ok: true,
           refreshing: Boolean(application.refreshService.running),
           employee,
+          employees,
         });
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/dashboard") {
-        const dashboard = await readDashboard(application);
+        const dashboard = await readDashboard(application, employeeRegistry);
         sendJson(
           response,
           dashboard ? 200 : 404,
@@ -176,26 +193,51 @@ export function createDashboardServer(application) {
         const result = await application.refreshService.refresh({
           notify: url.searchParams.get("notify") === "1",
         });
-        sendJson(response, 200, await readDashboard(application, result.dashboard));
+        sendJson(
+          response,
+          200,
+          await readDashboard(application, employeeRegistry, result.dashboard),
+        );
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/employees") {
+        sendJson(response, 200, { items: await employeeRegistry.listRoles() });
+        return;
+      }
+      const employeeAction = url.pathname.match(
+        /^\/api\/employees\/([a-z0-9-]+)\/(control|run)$/,
+      );
       if (
         request.method === "POST" &&
-        url.pathname === "/api/employees/pr-reviewer/control"
+        employeeAction?.[2] === "control"
       ) {
         assertTrustedMutation(request, expectedOrigin, { json: true });
         const { command, expectedRevision } = await readJsonBody(request);
-        await requirePrEmployee(application).control(command, expectedRevision);
-        sendJson(response, 200, await readDashboard(application));
+        await employeeRegistry.control(
+          employeeAction[1],
+          command,
+          expectedRevision,
+        );
+        sendJson(
+          response,
+          200,
+          await readDashboard(application, employeeRegistry),
+        );
         return;
       }
       if (
         request.method === "POST" &&
-        url.pathname === "/api/employees/pr-reviewer/run"
+        employeeAction?.[2] === "run"
       ) {
         assertTrustedMutation(request, expectedOrigin);
-        await requirePrEmployee(application).tick({ trigger: "manual" });
-        sendJson(response, 200, await readDashboard(application));
+        await employeeRegistry.run(employeeAction[1], {
+          trigger: "manual",
+        });
+        sendJson(
+          response,
+          200,
+          await readDashboard(application, employeeRegistry),
+        );
         return;
       }
       if (
@@ -205,11 +247,15 @@ export function createDashboardServer(application) {
         assertTrustedMutation(request, expectedOrigin, { json: true });
         const { id, decision, headRefOid, expectedRevision } =
           await readJsonBody(request);
-        await requirePrEmployee(application).decide(id, decision, {
+        await requirePrEmployee(employeeRegistry).decide(id, decision, {
           headRefOid,
           expectedRevision,
         });
-        sendJson(response, 200, await readDashboard(application));
+        sendJson(
+          response,
+          200,
+          await readDashboard(application, employeeRegistry),
+        );
         return;
       }
       if (
@@ -221,7 +267,7 @@ export function createDashboardServer(application) {
           ? Math.max(1, Math.min(rawLimit, 100))
           : 30;
         const query = url.searchParams.get("q") || "";
-        const items = await requirePrEmployee(application).searchMemory(
+        const items = await requirePrEmployee(employeeRegistry).searchMemory(
           query,
           limit,
         );
@@ -253,6 +299,42 @@ export function createDashboardServer(application) {
   });
 }
 
+export function startApplicationBackgroundWork(
+  application,
+  { setIntervalFn = setInterval, reportError = console.error } = {},
+) {
+  const employeeRegistry = resolveEmployeeRegistry(application);
+  const initialRefresh = application.refreshService
+    .refresh({ notify: false })
+    .then(() => employeeRegistry.runAll({ trigger: "refresh_completed" }))
+    .catch(reportError);
+  const timers = [];
+
+  timers.push(
+    setIntervalFn(
+      () =>
+        application.refreshService
+          .refresh({ notify: false })
+          .catch(reportError),
+      application.config.refreshMinutes * 60_000,
+    ),
+  );
+  for (const schedule of employeeRegistry.schedules()) {
+    timers.push(
+      setIntervalFn(
+        () =>
+          employeeRegistry
+            .run(schedule.id, { trigger: "scheduled" })
+            .catch(reportError),
+        schedule.intervalMinutes * 60_000,
+      ),
+    );
+  }
+  for (const timer of timers) timer.unref?.();
+
+  return { initialRefresh, timers };
+}
+
 export async function startDashboardServer() {
   const application = await createApplication();
   const server = createDashboardServer(application);
@@ -260,21 +342,7 @@ export async function startDashboardServer() {
     console.log(`MyDashboard: http://127.0.0.1:${application.config.port}`);
   });
 
-  application.refreshService
-    .refresh({ notify: false })
-    .then(() => application.prEmployee?.tick({ trigger: "refresh_completed" }))
-    .catch(console.error);
-  setInterval(
-    () =>
-      application.refreshService.refresh({ notify: false }).catch(console.error),
-    application.config.refreshMinutes * 60_000,
-  ).unref();
-  if (application.prEmployee) {
-    setInterval(
-      () => application.prEmployee.tick({ trigger: "scheduled" }).catch(console.error),
-      (application.config.employees?.prReviewer?.tickMinutes || 2) * 60_000,
-    ).unref();
-  }
+  startApplicationBackgroundWork(application);
   return server;
 }
 
