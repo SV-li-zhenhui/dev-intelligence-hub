@@ -80,10 +80,13 @@ class FakeRunner {
     let response = this.responses.shift();
     if (typeof response === "function") response = await response(input);
     if (response instanceof Error) throw response;
+    const stdout = response?.__jsonLines
+      ? response.__jsonLines.map((value) => JSON.stringify(value)).join("\n")
+      : JSON.stringify(response);
     return {
       exitCode: 0,
       signal: null,
-      stdout: JSON.stringify(response),
+      stdout,
       stderr: "",
       durationMs: 1,
       truncated: false,
@@ -100,7 +103,7 @@ function head(value = HEAD) {
 }
 
 function pages(records = []) {
-  return [records];
+  return { __jsonLines: records };
 }
 
 function markerFromPost(call) {
@@ -238,7 +241,8 @@ test("reconciliation finds one exact COMMENT review marker across paginated resu
     "GET",
     "repos/SVisions/OCT-Software/pulls/42/reviews?per_page=100",
     "--paginate",
-    "--slurp",
+    "--jq",
+    `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
   ]);
 });
 
@@ -280,24 +284,19 @@ test("a GitHub receipt must identify the exact PR and review record", async () =
   }
 });
 
-test("marker reconciliation does not impose an arbitrary record-count cutoff", async () => {
+test("marker reconciliation asks gh to project only matching records", async () => {
   const marker = markerForGitHubAction(reviewEnvelope());
-  const unrelated = Array.from({ length: 1_001 }, (_, index) =>
-    reviewRecord("<!-- unrelated -->", {
-      id: index + 1,
-      html_url: `https://github.com/SVisions/OCT-Software/pull/42#pullrequestreview-${index + 1}`,
-      body: "unrelated",
-    }),
-  );
   const runner = new FakeRunner([
     actor(),
-    pages([...unrelated, reviewRecord(marker)]),
+    pages([reviewRecord(marker)]),
   ]);
 
   assert.equal(
     (await createAdapter(runner).reconcile(reviewEnvelope())).status,
     "already",
   );
+  assert.equal(runner.calls[1].args.includes("--jq"), true);
+  assert.equal(runner.calls[1].args.at(-1).includes(marker), true);
 });
 
 test("reconciliation reports absence only after marker and current head checks", async () => {
@@ -423,10 +422,12 @@ test("process and protocol failures expose only stable codes", async () => {
         details: { stdout: "", stderr: secret },
       }),
       code: "GITHUB_TIMEOUT",
+      trust: "absent",
     },
     {
       response: { malformed: true },
       code: "GITHUB_PROTOCOL",
+      trust: "absent",
     },
   ];
   for (const scenario of scenarios) {
@@ -447,10 +448,36 @@ test("process and protocol failures expose only stable codes", async () => {
     const result = await createAdapter(runner).execute(reviewEnvelope());
     assert.deepEqual(result, {
       status: "error",
-      error: { trust: "unknown", code: scenario.code },
+      error: { trust: scenario.trust, code: scenario.code },
     });
     assert.equal(JSON.stringify(result).includes(secret), false);
   }
+});
+
+test("a transport failure becomes unknown only after the GitHub POST starts", async () => {
+  const timeout = () =>
+    new ManagedProcessError("PROCESS_TIMEOUT", "timed out", {
+      details: { stdout: "", stderr: "private transport detail" },
+    });
+  const beforePost = new FakeRunner([actor(), timeout()]);
+  assert.deepEqual(await createAdapter(beforePost).execute(reviewEnvelope()), {
+    status: "error",
+    error: { trust: "absent", code: "GITHUB_TIMEOUT" },
+  });
+
+  const duringPost = new FakeRunner([
+    actor(),
+    pages([]),
+    head(),
+    actor(),
+    head(),
+    timeout(),
+  ]);
+  assert.deepEqual(await createAdapter(duringPost).execute(reviewEnvelope()), {
+    status: "error",
+    error: { trust: "unknown", code: "GITHUB_TIMEOUT" },
+  });
+  assert.equal(duringPost.calls.at(-1).args.includes("POST"), true);
 });
 
 test("approval is required before a write and repeated approval does not write twice", async () => {

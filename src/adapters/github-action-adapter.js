@@ -253,11 +253,14 @@ function stableError(error) {
   return actionError("GITHUB_UNAVAILABLE");
 }
 
-function errorResult(error) {
+function errorResult(error, { fallbackTrust = "unknown" } = {}) {
   const stable = stableError(error);
   return {
     status: "error",
-    error: { trust: stable.trust, code: stable.code },
+    error: {
+      trust: stable.trust === "unknown" ? fallbackTrust : stable.trust,
+      code: stable.code,
+    },
   };
 }
 
@@ -404,6 +407,7 @@ class GitHubActionAdapter {
 
   async execute(input) {
     let envelope;
+    let postStarted = false;
     try {
       envelope = normalizeEnvelope(input);
     } catch (error) {
@@ -430,12 +434,15 @@ class GitHubActionAdapter {
           actualVersion: finalHead,
         };
       }
+      postStarted = true;
       return {
         status: "applied",
         receipt: await this.#post(envelope),
       };
     } catch (error) {
-      return errorResult(error);
+      return errorResult(error, {
+        fallbackTrust: postStarted ? "unknown" : "absent",
+      });
     }
   }
 
@@ -465,22 +472,16 @@ class GitHubActionAdapter {
 
   async #findMarker(envelope) {
     const route = `repos/${envelope.target.repo}/pulls/${envelope.target.number}/reviews?per_page=100`;
-    const pages = await this.#runJson([
+    const marker = markerForEnvelope(envelope);
+    const records = await this.#runJsonLines([
       "api",
       "--method",
       "GET",
       route,
       "--paginate",
-      "--slurp",
+      "--jq",
+      `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
     ]);
-    if (
-      !Array.isArray(pages) ||
-      pages.some((page) => !Array.isArray(page))
-    ) {
-      throw actionError("GITHUB_PROTOCOL");
-    }
-    const records = pages.flat();
-    const marker = markerForEnvelope(envelope);
     const candidates = records.filter(
       (record) => typeof record?.body === "string" && record.body.includes(marker),
     );
@@ -531,6 +532,25 @@ class GitHubActionAdapter {
   }
 
   async #runJson(args, { input } = {}) {
+    const result = await this.#run(args, { input });
+    try {
+      return JSON.parse(result.stdout);
+    } catch {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+  }
+
+  async #runJsonLines(args) {
+    const result = await this.#run(args);
+    if (!result.stdout.trim()) return [];
+    try {
+      return result.stdout.split("\n").map((line) => JSON.parse(line));
+    } catch {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+  }
+
+  async #run(args, { input } = {}) {
     const fixedArgs =
       args[0] === "api"
         ? ["api", "--hostname", "github.com", ...args.slice(1)]
@@ -550,11 +570,7 @@ class GitHubActionAdapter {
     if (!result || result.exitCode !== 0) {
       throw actionError("GITHUB_REJECTED");
     }
-    try {
-      return JSON.parse(result.stdout);
-    } catch {
-      throw actionError("GITHUB_PROTOCOL");
-    }
+    return result;
   }
 }
 
