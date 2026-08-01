@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
+import { createPrReviewConfirmationPlan } from "../domain/pr-review-confirmation.js";
 import { EmployeeController } from "./employee-controller.js";
 
 const STATE_KEY = "pr-employee-state";
@@ -9,6 +11,10 @@ const ACTIVE_JOB_STATES = new Set([
   "retry_wait",
   "ready",
   "ready_for_human",
+  "confirmation_enqueue_pending",
+  "confirmation_invalidation_pending",
+  "waiting_confirmation",
+  "waiting_retry_confirmation",
 ]);
 const WORK_POLICY_BY_ACTION = Object.freeze({
   review: {
@@ -117,7 +123,22 @@ function roleState(state, enabled) {
   ) {
     return "working";
   }
-  if (state.jobs.some((job) => job.status === "ready_for_human")) {
+  if (
+    state.jobs.some(
+      (job) => job.status === "confirmation_invalidation_pending",
+    )
+  ) {
+    return "degraded";
+  }
+  if (
+    state.jobs.some((job) =>
+      [
+        "ready_for_human",
+        "waiting_confirmation",
+        "waiting_retry_confirmation",
+      ].includes(job.status),
+    )
+  ) {
     return "waiting_user";
   }
   if (state.jobs.some((job) => job.status === "blocked")) return "degraded";
@@ -175,6 +196,10 @@ function memoryText(memory) {
     .toLocaleLowerCase("zh-CN");
 }
 
+function sameJsonValue(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
 function projectWork(state) {
   const jobs = [...state.jobs].sort(
     (left, right) =>
@@ -196,6 +221,8 @@ export class ProactivePrEmployeeService {
     config = {},
     clock = () => new Date(),
     operationQueue = null,
+    producerQueue = null,
+    githubActions = { enabled: false },
   }) {
     this.store = store;
     this.github = github;
@@ -214,6 +241,19 @@ export class ProactivePrEmployeeService {
       jobLimit: 500,
       ...config,
     };
+    this.producerQueue = producerQueue;
+    this.githubActions = { ...githubActions };
+    if (
+      this.githubActions.enabled === true &&
+      (!this.producerQueue ||
+        typeof this.producerQueue.enqueue !== "function" ||
+        typeof this.producerQueue.get !== "function" ||
+        typeof this.producerQueue.invalidate !== "function")
+    ) {
+      throw new TypeError(
+        "Enabled GitHub actions require a confirmation queue",
+      );
+    }
     this.controller = new EmployeeController({
       definition: {
         id: "pr-reviewer",
@@ -277,6 +317,14 @@ export class ProactivePrEmployeeService {
     return this.controller.enqueue(() => this.#decide(id, decision, options));
   }
 
+  recoverConfirmations() {
+    return this.controller.enqueue(() => this.#recoverConfirmations());
+  }
+
+  recordConfirmationOutcome(item) {
+    return this.controller.enqueue(() => this.#recordConfirmationOutcome(item));
+  }
+
   async view() {
     return this.controller.view();
   }
@@ -313,6 +361,413 @@ export class ProactivePrEmployeeService {
           Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0),
       )
       .slice(0, cappedLimit);
+  }
+
+  #usesExternalConfirmations() {
+    return this.githubActions.enabled === true;
+  }
+
+  async #recoverConfirmations() {
+    let state = await this.controller.readState();
+    if (!this.#usesExternalConfirmations()) {
+      return this.controller.project(state);
+    }
+
+    const recoverableIds = state.jobs
+      .filter((job) =>
+        [
+          "ready_for_human",
+          "confirmation_enqueue_pending",
+          "confirmation_invalidation_pending",
+          "waiting_confirmation",
+          "waiting_retry_confirmation",
+          "blocked",
+          "superseded",
+        ].includes(job.status),
+      )
+      .map((job) => job.id);
+    for (const id of recoverableIds) {
+      let index = state.jobs.findIndex((job) => job.id === id);
+      if (index < 0) continue;
+      let job = state.jobs[index];
+      if (job.status === "ready_for_human") {
+        try {
+          const confirmationIntent = createPrReviewConfirmationPlan(job, {
+            githubActions: this.githubActions,
+          });
+          job = {
+            ...job,
+            status: "confirmation_enqueue_pending",
+            confirmationId: confirmationIntent.id,
+            confirmationIntent,
+            updatedAt: this.clock().toISOString(),
+          };
+        } catch {
+          job = {
+            ...job,
+            status: "blocked",
+            error: "PR Review 确认计划无效",
+            updatedAt: this.clock().toISOString(),
+          };
+        }
+        state.jobs[index] = job;
+        state = await this.controller.writeState(state);
+      }
+
+      index = state.jobs.findIndex((candidate) => candidate.id === id);
+      job = state.jobs[index];
+      if (
+        ["superseded", "confirmation_invalidation_pending"].includes(
+          job.status,
+        ) &&
+        job.confirmationId
+      ) {
+        const invalidated = await this.#invalidateSupersededConfirmation(
+          state,
+          job.id,
+          { failClosed: true },
+        );
+        state = invalidated.state;
+        continue;
+      }
+      if (job.status === "confirmation_enqueue_pending") {
+        state = await this.#enqueuePendingConfirmation(state, id);
+        continue;
+      }
+      if (job.confirmationId) {
+        try {
+          const item = await this.producerQueue.get(job.confirmationId);
+          state = await this.#applyConfirmationOutcome(state, item);
+        } catch {
+          const failedAt = this.clock().toISOString();
+          state.jobs[index] = {
+            ...job,
+            error: "无法恢复外部动作确认状态",
+            updatedAt: failedAt,
+          };
+          state.lastError = `#${job.number}: ${state.jobs[index].error}`;
+          state = await this.controller.writeState(state);
+        }
+      }
+    }
+    state = await this.#reconcileRecoveredJobs(state);
+    return this.controller.project(state);
+  }
+
+  async #recordConfirmationOutcome(item) {
+    let state = await this.controller.readState();
+    state = await this.#applyConfirmationOutcome(state, item);
+    return this.controller.project(state);
+  }
+
+  async #enqueuePendingConfirmation(state, id) {
+    const index = state.jobs.findIndex((job) => job.id === id);
+    if (index < 0) return state;
+    const job = state.jobs[index];
+    if (
+      job.status !== "confirmation_enqueue_pending" ||
+      !job.confirmationIntent
+    ) {
+      return state;
+    }
+    try {
+      const item = await this.producerQueue.enqueue(job.confirmationIntent);
+      return this.#applyConfirmationOutcome(state, item);
+    } catch {
+      const updatedAt = this.clock().toISOString();
+      state.jobs[index] = {
+        ...job,
+        error: "外部动作确认队列暂不可用，将在下次巡查时重试",
+        updatedAt,
+      };
+      state.lastError = `#${job.number}: ${state.jobs[index].error}`;
+      return this.controller.writeState(state);
+    }
+  }
+
+  #producerInvalidation(job) {
+    let intentBindingDigest = "";
+    if (job.confirmationIntent) {
+      try {
+        intentBindingDigest = normalizeConfirmationPlan(
+          job.confirmationIntent,
+        ).approvalBindingDigest;
+      } catch {
+        return null;
+      }
+    }
+    const approvalBindingDigest =
+      job.confirmationBindingDigest ||
+      intentBindingDigest;
+    if (!job.confirmationId || !approvalBindingDigest) return null;
+    return {
+      requestedBy: { roleId: this.id, workItemId: job.id },
+      approvalBindingDigest,
+      reason: "work_item_superseded",
+    };
+  }
+
+  async #prepareConfirmationInvalidation(state, id) {
+    const index = state.jobs.findIndex((job) => job.id === id);
+    if (index < 0) return { state, intent: null };
+    const job = state.jobs[index];
+    const intent = this.#producerInvalidation(job);
+    if (!intent) return { state, intent: null };
+    if (
+      job.confirmationInvalidationIntent &&
+      !sameJsonValue(job.confirmationInvalidationIntent, intent)
+    ) {
+      throw serviceError(409, "PR 作业失效意图与原确认绑定不一致");
+    }
+    const status =
+      job.status === "superseded"
+        ? "superseded"
+        : "confirmation_invalidation_pending";
+    if (
+      job.status === status &&
+      sameJsonValue(job.confirmationInvalidationIntent, intent)
+    ) {
+      return { state, intent };
+    }
+    const updatedAt = this.clock().toISOString();
+    state.jobs[index] = {
+      ...job,
+      status,
+      confirmationInvalidationIntent: intent,
+      error: "旧外部动作确认正在安全失效",
+      updatedAt,
+    };
+    state.lastError = `#${job.number}: ${state.jobs[index].error}`;
+    state = await this.controller.writeState(state);
+    return { state, intent };
+  }
+
+  async #completeMissingConfirmationInvalidation(state, id) {
+    const index = state.jobs.findIndex((job) => job.id === id);
+    if (index < 0) return state;
+    const completedAt = this.clock().toISOString();
+    state.jobs[index] = {
+      ...state.jobs[index],
+      status: "superseded",
+      confirmationInvalidationIntent: null,
+      error: "",
+      updatedAt: completedAt,
+      completedAt,
+    };
+    state.lastError = "";
+    return this.controller.writeState(state);
+  }
+
+  async #recordInvalidationFailure(state, id) {
+    const index = state.jobs.findIndex((job) => job.id === id);
+    if (index < 0) return state;
+    const job = state.jobs[index];
+    const updatedAt = this.clock().toISOString();
+    state.jobs[index] = {
+      ...job,
+      error: "无法安全失效旧的外部动作确认",
+      updatedAt,
+    };
+    state.lastError = `#${job.number}: ${state.jobs[index].error}`;
+    return this.controller.writeState(state, { bumpRevision: false });
+  }
+
+  async #reconcileRecoveredJobs(state) {
+    const snapshot = await this.store.read("snapshot", null);
+    if (snapshot?.sourceStatus?.githubPullRequests?.ok !== true) return state;
+    const currentBySubject = new Map(
+      snapshot.items.filter(isCandidate).map((item) => [item.id, item]),
+    );
+    const ids = state.jobs
+      .filter((job) => ACTIVE_JOB_STATES.has(job.status))
+      .map((job) => job.id);
+    for (const id of ids) {
+      const job = state.jobs.find((candidate) => candidate.id === id);
+      const current = currentBySubject.get(job.subjectId);
+      if (
+        current?.headRefOid === job.headRefOid &&
+        current?.nextAction === job.nextAction &&
+        job.policyVersion === this.config.policyVersion
+      ) {
+        continue;
+      }
+      if (job.confirmationId) {
+        const invalidated = await this.#invalidateSupersededConfirmation(
+          state,
+          id,
+          { failClosed: true },
+        );
+        state = invalidated.state;
+        continue;
+      }
+      const index = state.jobs.findIndex((candidate) => candidate.id === id);
+      const completedAt = this.clock().toISOString();
+      state.jobs[index] = {
+        ...job,
+        status: "superseded",
+        updatedAt: completedAt,
+        completedAt,
+      };
+      state = await this.controller.writeState(state);
+    }
+    return state;
+  }
+
+  async #invalidateSupersededConfirmation(
+    state,
+    id,
+    { failClosed = false } = {},
+  ) {
+    let prepared;
+    try {
+      prepared = await this.#prepareConfirmationInvalidation(state, id);
+    } catch (error) {
+      const job = state.jobs.find((candidate) => candidate.id === id);
+      const emergencyVeto = job ? this.#producerInvalidation(job) : null;
+      if (job && emergencyVeto) {
+        try {
+          await this.producerQueue.invalidate(job.confirmationId, emergencyVeto);
+        } catch {
+          // The queue installs its in-process veto before its durable write.
+        }
+      }
+      throw error;
+    }
+    state = prepared.state;
+    const job = state.jobs.find((candidate) => candidate.id === id);
+    const invalidation = prepared.intent;
+    if (!job || !invalidation) return { state, safe: true };
+
+    try {
+      const item = await this.producerQueue.invalidate(
+        job.confirmationId,
+        invalidation,
+      );
+      state = await this.#applyConfirmationOutcome(state, item);
+      return { state, safe: item.status === "stale" };
+    } catch (error) {
+      if (error?.statusCode === 404 && !job.confirmationBindingDigest) {
+        state = await this.#completeMissingConfirmationInvalidation(state, id);
+        return { state, safe: true };
+      }
+      try {
+        const item = await this.producerQueue.get(job.confirmationId);
+        if (
+          ["completed", "rejected", "stale"].includes(item.status) ||
+          (item.status === "failed" && !item.retryable)
+        ) {
+          state = await this.#applyConfirmationOutcome(state, item);
+          return { state, safe: item.status === "stale" };
+        }
+      } catch {
+        // The durable invalidation intent and queue veto remain authoritative.
+      }
+      state = await this.#recordInvalidationFailure(state, id);
+      if (failClosed) {
+        throw serviceError(
+          503,
+          "旧外部动作确认尚未安全失效，拒绝启动服务",
+        );
+      }
+      return { state, safe: false };
+    }
+  }
+
+  async #applyConfirmationOutcome(state, item) {
+    const workItemId = item?.requestedBy?.workItemId;
+    if (
+      item?.requestedBy?.roleId !== "pr-reviewer" ||
+      typeof workItemId !== "string"
+    ) {
+      throw serviceError(400, "确认项不属于 PR 推进员工");
+    }
+    const index = state.jobs.findIndex((job) => job.id === workItemId);
+    if (index < 0) throw serviceError(404, "找不到确认项对应的 PR 作业");
+    const job = state.jobs[index];
+    if (job.confirmationId && job.confirmationId !== item.id) {
+      throw serviceError(409, "PR 作业已绑定其他确认项");
+    }
+    if (
+      job.confirmationBindingDigest &&
+      job.confirmationBindingDigest !== item.approvalBindingDigest
+    ) {
+      throw serviceError(409, "PR 作业确认内容已变化");
+    }
+    const terminalStatus = {
+      superseded: "stale",
+      published: "completed",
+      rejected: "rejected",
+    }[job.status];
+    if (terminalStatus && item.status !== terminalStatus) {
+      throw serviceError(409, "终态 PR 作业不能被其他确认结果覆盖");
+    }
+
+    const projection = {
+      pending: "waiting_confirmation",
+      executing: "waiting_confirmation",
+      completed: "published",
+      rejected: "rejected",
+      stale: "superseded",
+      failed: item.retryable ? "waiting_retry_confirmation" : "blocked",
+    }[item.status];
+    if (!projection) throw serviceError(400, "确认项状态无效");
+
+    const updatedAt = this.clock().toISOString();
+    const terminal = new Set([
+      "published",
+      "rejected",
+      "superseded",
+      "blocked",
+    ]).has(projection);
+    const previousStatus = job.status;
+    if (
+      previousStatus === projection &&
+      job.confirmationId === item.id &&
+      job.confirmationBindingDigest === item.approvalBindingDigest &&
+      job.confirmationIntent === null &&
+      job.confirmationInvalidationIntent === null &&
+      job.confirmationStatus === item.status &&
+      sameJsonValue(job.confirmationReceipt, item.receipt) &&
+      sameJsonValue(job.confirmationFailure, item.failure) &&
+      sameJsonValue(job.confirmationRejection, item.rejection) &&
+      sameJsonValue(job.confirmationInvalidation, item.invalidation)
+    ) {
+      return state;
+    }
+    const updated = {
+      ...job,
+      status: projection,
+      confirmationId: item.id,
+      confirmationBindingDigest: item.approvalBindingDigest,
+      confirmationIntent: null,
+      confirmationInvalidationIntent: null,
+      confirmationStatus: item.status,
+      confirmationReceipt: item.receipt || null,
+      confirmationFailure: item.failure || null,
+      confirmationRejection: item.rejection || null,
+      confirmationInvalidation: item.invalidation || null,
+      error:
+        projection === "blocked"
+          ? `外部动作结果无法确认：${item.failure?.code || "UNKNOWN"}`
+          : "",
+      updatedAt,
+      ...(terminal ? { completedAt: updatedAt } : {}),
+      ...(projection === "published" ? { decision: "published" } : {}),
+      ...(projection === "rejected" ? { decision: "reject" } : {}),
+    };
+    state.jobs[index] = updated;
+    state.lastError = projection === "blocked" ? `#${job.number}: ${updated.error}` : "";
+    if (terminal && previousStatus !== projection) {
+      const event = {
+        published: "review_published",
+        rejected: "review_rejected",
+        superseded: "review_stale",
+        blocked: "review_outcome_unknown",
+      }[projection];
+      state = this.#queueMemory(state, updated, event);
+    }
+    state = await this.controller.writeState(state);
+    return this.#flushMemoryOutbox(state);
   }
 
   async #decide(id, decision, { headRefOid, expectedRevision } = {}) {
@@ -364,6 +819,45 @@ export class ProactivePrEmployeeService {
 
   async #performTick(trigger, state) {
     state = await this.#flushMemoryOutbox(state);
+    if (this.#usesExternalConfirmations()) {
+      const invalidationIds = state.jobs
+        .filter(
+          (job) => job.status === "confirmation_invalidation_pending",
+        )
+        .map((job) => job.id);
+      for (const id of invalidationIds) {
+        const invalidated = await this.#invalidateSupersededConfirmation(
+          state,
+          id,
+        );
+        state = invalidated.state;
+      }
+      const pendingIds = state.jobs
+        .filter((job) => job.status === "confirmation_enqueue_pending")
+        .map((job) => job.id);
+      for (const id of pendingIds) {
+        state = await this.#enqueuePendingConfirmation(state, id);
+      }
+      const linkedIds = state.jobs
+        .filter((job) =>
+          ["waiting_confirmation", "waiting_retry_confirmation"].includes(
+            job.status,
+          ),
+        )
+        .map((job) => job.id);
+      for (const id of linkedIds) {
+        const job = state.jobs.find((candidate) => candidate.id === id);
+        try {
+          const item = await this.producerQueue.get(job.confirmationId);
+          state = await this.#applyConfirmationOutcome(state, item);
+        } catch {
+          state.lastError = `#${job.number}: 暂时无法同步外部动作确认状态`;
+          state = await this.controller.writeState(state, {
+            bumpRevision: false,
+          });
+        }
+      }
+    }
 
     const runAt = this.clock().toISOString();
     const [snapshot, memories] = await Promise.all([
@@ -394,24 +888,52 @@ export class ProactivePrEmployeeService {
     const candidates = snapshot.items.filter(isCandidate);
     const currentBySubject = new Map(candidates.map((item) => [item.id, item]));
     let jobsChanged = false;
-    state.jobs = state.jobs.map((job) => {
-      if (!ACTIVE_JOB_STATES.has(job.status)) return job;
+    const unresolvedSubjects = new Set(
+      state.jobs
+        .filter(
+          (job) =>
+            job.status === "confirmation_invalidation_pending" ||
+            (job.status === "blocked" &&
+              job.confirmationFailure?.outcome === "unknown"),
+        )
+        .map((job) => job.subjectId),
+    );
+    const activeIds = state.jobs
+      .filter((job) => ACTIVE_JOB_STATES.has(job.status))
+      .map((job) => job.id);
+    for (const id of activeIds) {
+      let job = state.jobs.find((candidate) => candidate.id === id);
+      if (job.status === "confirmation_invalidation_pending") {
+        unresolvedSubjects.add(job.subjectId);
+        continue;
+      }
       const current = currentBySubject.get(job.subjectId);
       if (
         current?.headRefOid === job.headRefOid &&
         current?.nextAction === job.nextAction &&
         job.policyVersion === this.config.policyVersion
       ) {
-        return job;
+        continue;
+      }
+      if (this.#usesExternalConfirmations() && job.confirmationId) {
+        const invalidated = await this.#invalidateSupersededConfirmation(
+          state,
+          job.id,
+        );
+        state = invalidated.state;
+        job = state.jobs.find((candidate) => candidate.id === id);
+        if (!invalidated.safe) unresolvedSubjects.add(job.subjectId);
+        if (job.status === "superseded" || !invalidated.safe) continue;
       }
       jobsChanged = true;
-      return {
+      const index = state.jobs.findIndex((candidate) => candidate.id === id);
+      state.jobs[index] = {
         ...job,
         status: "superseded",
         completedAt: runAt,
         updatedAt: runAt,
       };
-    });
+    }
 
     const fingerprints = new Set(
       [
@@ -424,6 +946,7 @@ export class ProactivePrEmployeeService {
     );
     const newJobs = candidates
       .map((item) => ({ item, fingerprint: jobFingerprint(item, this.config.policyVersion) }))
+      .filter(({ item }) => !unresolvedSubjects.has(item.id))
       .filter(({ fingerprint }) => !fingerprints.has(fingerprint))
       .map(({ item, fingerprint }) => this.#newJob(item, fingerprint, runAt));
     state.jobs.push(...newJobs);
@@ -439,7 +962,13 @@ export class ProactivePrEmployeeService {
         ? `巡查 ${candidates.length} 条需行动 PR，新建 ${newJobs.length} 个作业`
         : "已主动巡查，没有发现需要启动的新 PR 作业",
     };
-    state.lastError = "";
+    if (
+      !state.jobs.some(
+        (job) => job.status === "confirmation_invalidation_pending",
+      )
+    ) {
+      state.lastError = "";
+    }
     state = await this.controller.writeState(state, {
       bumpRevision: jobsChanged || newJobs.length > 0,
     });
@@ -560,11 +1089,27 @@ export class ProactivePrEmployeeService {
         completedAt,
         leaseUntil: null,
       };
-      state.jobs[index] = completed;
+      if (policy.requiresApproval && this.#usesExternalConfirmations()) {
+        const confirmationIntent = createPrReviewConfirmationPlan(completed, {
+          githubActions: this.githubActions,
+        });
+        state.jobs[index] = {
+          ...completed,
+          status: "confirmation_enqueue_pending",
+          confirmationId: confirmationIntent.id,
+          confirmationIntent,
+        };
+      } else {
+        state.jobs[index] = completed;
+      }
       state.lastError = "";
-      state = this.#queueMemory(state, completed, "analysis_ready");
+      state = this.#queueMemory(state, state.jobs[index], "analysis_ready");
       state = await this.controller.writeState(state);
-      return this.#flushMemoryOutbox(state);
+      state = await this.#flushMemoryOutbox(state);
+      if (state.jobs[index].status === "confirmation_enqueue_pending") {
+        return this.#enqueuePendingConfirmation(state, claimed.id);
+      }
+      return state;
     } catch (error) {
       index = state.jobs.findIndex((job) => job.id === claimed.id);
       if (index < 0) return state;

@@ -13,6 +13,9 @@
   "codeExecutor": {
     "enabled": false
   },
+  "githubActions": {
+    "enabled": false
+  },
   "brain": {
     "enabled": true,
     "provider": "ollama",

@@ -54,6 +54,39 @@ test("local provider settings merge without erasing base defaults", () => {
   });
 });
 
+test("GitHub action settings merge without storing a credential value", () => {
+  const result = mergeConfig(
+    {
+      githubActions: {
+        enabled: false,
+        actorAccountId: "",
+        tokenEnv: "MYDASHBOARD_GITHUB_TOKEN",
+        networkEnv: { NO_PROXY: "github.com" },
+      },
+    },
+    {
+      githubActions: {
+        enabled: true,
+        actorAccountId: "review-account",
+        ghCommand: "C:\\Program Files\\GitHub CLI\\gh.exe",
+        networkEnv: { HTTPS_PROXY: "http://127.0.0.1:8080" },
+      },
+    },
+  );
+
+  assert.deepEqual(result.githubActions, {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "MYDASHBOARD_GITHUB_TOKEN",
+    ghCommand: "C:\\Program Files\\GitHub CLI\\gh.exe",
+    networkEnv: {
+      NO_PROXY: "github.com",
+      HTTPS_PROXY: "http://127.0.0.1:8080",
+    },
+  });
+  assert.equal("token" in result.githubActions, false);
+});
+
 test("code executor settings merge nested sections independently", () => {
   const baseWorkspaces = [
     { id: "dashboard", sourceRoot: "dashboard" },
@@ -164,11 +197,12 @@ test("code executor overrides preserve unspecified base defaults", () => {
   );
 });
 
-test("committed code executor configuration is disabled and path-free", async () => {
+test("committed privileged capabilities are disabled and secret-free", async () => {
   const configPath = path.resolve(testDirectory, "../config.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
 
   assert.deepEqual(config.codeExecutor, { enabled: false });
+  assert.deepEqual(config.githubActions, { enabled: false });
   const absolutePaths = Object.values(config.codeExecutor).filter(
     (value) =>
       typeof value === "string" &&
@@ -177,4 +211,5 @@ test("committed code executor configuration is disabled and path-free", async ()
         path.win32.isAbsolute(value)),
   );
   assert.deepEqual(absolutePaths, []);
+  assert.equal(JSON.stringify(config.githubActions).toLowerCase().includes("token"), false);
 });

@@ -39,6 +39,23 @@ export function mergeConfig(base, local = {}) {
     ...local,
     dingtalk: { ...base.dingtalk, ...local.dingtalk },
     brain: { ...base.brain, ...local.brain },
+    ...(base.githubActions !== undefined || local.githubActions !== undefined
+      ? {
+          githubActions: {
+            ...(base.githubActions || {}),
+            ...(local.githubActions || {}),
+            ...((base.githubActions?.networkEnv !== undefined ||
+              local.githubActions?.networkEnv !== undefined)
+              ? {
+                  networkEnv: {
+                    ...(base.githubActions?.networkEnv || {}),
+                    ...(local.githubActions?.networkEnv || {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
     prResponsibility: {
       ...base.prResponsibility,
       ...local.prResponsibility,

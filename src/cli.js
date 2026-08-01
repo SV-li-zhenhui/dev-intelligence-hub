@@ -7,7 +7,7 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  const application = await createApplication();
+  const application = await createApplication({ externalActions: false });
   const result = await application.refreshService.refresh({
     notify: flags.includes("--notify"),
   });
