@@ -11,10 +11,12 @@ class FakeStream extends EventEmitter {
   constructor() {
     super();
     this.ended = false;
+    this.input = undefined;
   }
 
-  end() {
+  end(input) {
     this.ended = true;
+    this.input = input;
   }
 }
 
@@ -67,11 +69,84 @@ test("managed processes spawn without a shell and preserve ordered output", asyn
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.windowsHide, true);
   assert.deepEqual(invocation.options.env, { SystemRoot: "C:\\Windows" });
+  assert.equal(child.stdin.ended, true);
   assert.deepEqual(lines, [
     { sequence: 1, stream: "stdout", line: "one" },
     { sequence: 2, stream: "stderr", line: "warn" },
     { sequence: 3, stream: "stdout", line: "two" },
   ]);
+});
+
+test("managed runners send bounded request input through stdin instead of argv", async () => {
+  const child = new FakeChild();
+  const runner = new ManagedProcessRunner({
+    managedProcessFactory: () =>
+      new ManagedProcess({ spawnImpl: () => child }),
+  });
+  const running = runner.run({
+    command: "C:\\Tools\\gh.exe",
+    args: ["api", "--input", "-"],
+    env: {},
+    input: '{"body":"private review"}',
+  });
+
+  child.stdout.emit("data", Buffer.from("{}\n"));
+  child.emit("close", 0, null);
+  const result = await running;
+
+  assert.equal(child.stdin.ended, true);
+  assert.equal(child.stdin.input, '{"body":"private review"}');
+  assert.equal(result.stdout, "{}");
+});
+
+test("managed runners reject oversized stdin before spawning", async () => {
+  let spawned = false;
+  const runner = new ManagedProcessRunner({
+    managedProcessFactory: () =>
+      new ManagedProcess({
+        spawnImpl: () => {
+          spawned = true;
+          return new FakeChild();
+        },
+      }),
+  });
+
+  await assert.rejects(
+    runner.run({
+      command: "C:\\Tools\\gh.exe",
+      input: "x".repeat(1024 * 1024 + 1),
+    }),
+    (error) =>
+      error instanceof ManagedProcessError &&
+      error.code === "INVALID_PROCESS_INPUT",
+  );
+  assert.equal(spawned, false);
+});
+
+test("managed runners contain stdin EPIPE failures", async () => {
+  const child = new FakeChild();
+  const runner = new ManagedProcessRunner({
+    managedProcessFactory: () =>
+      new ManagedProcess({
+        spawnImpl: () => child,
+        treeTerminator: async () => child.emit("close", 1, null),
+      }),
+  });
+  const running = runner.run({
+    command: "C:\\Tools\\gh.exe",
+    args: ["api", "--input", "-"],
+    input: "payload",
+  });
+
+  child.stdin.emit("error", Object.assign(new Error("broken pipe"), {
+    code: "EPIPE",
+  }));
+
+  await assert.rejects(
+    running,
+    (error) =>
+      error instanceof ManagedProcessError && error.code === "PROCESS_FAILED",
+  );
 });
 
 test("managed process stop terminates the complete process tree", async () => {

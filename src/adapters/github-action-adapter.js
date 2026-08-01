@@ -1,0 +1,571 @@
+import path from "node:path";
+import { digestValue } from "../domain/code-executor-contract.js";
+import {
+  ManagedProcess,
+  ManagedProcessError,
+  ManagedProcessRunner,
+} from "../lib/managed-process.js";
+
+const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})#([1-9][0-9]*)$/;
+const REQUEST_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{6,126}[A-Za-z0-9])$/;
+const REVIEW_EVENTS = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
+const REVIEW_STATES = Object.freeze({
+  APPROVE: "APPROVED",
+  REQUEST_CHANGES: "CHANGES_REQUESTED",
+  COMMENT: "COMMENTED",
+});
+const MARKER_PREFIX = "mydashboard-action:v1";
+const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const GITHUB_TOKEN = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
+const CHILD_ENV_KEYS = Object.freeze([
+  "SystemRoot",
+  "WINDIR",
+  "TEMP",
+  "TMP",
+]);
+const NETWORK_ENV_KEYS = Object.freeze([
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "ALL_PROXY",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+]);
+
+class GitHubActionError extends Error {
+  constructor(code, trust) {
+    super(code);
+    this.name = "GitHubActionError";
+    this.code = code;
+    this.trust = trust;
+  }
+}
+
+function actionError(code, trust = "unknown") {
+  return new GitHubActionError(code, trust);
+}
+
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+function exactObject(value, keys) {
+  if (!isPlainObject(value)) throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== keys.length ||
+    keys.some((key) => !ownKeys.includes(key))
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  for (const key of ownKeys) {
+    if (typeof key !== "string") throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    }
+  }
+  return value;
+}
+
+function exactString(value, pattern, maximumBytes = 256) {
+  if (
+    typeof value !== "string" ||
+    INVALID_CONTROL.test(value) ||
+    Buffer.byteLength(value, "utf8") > maximumBytes ||
+    !pattern.test(value)
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  return value;
+}
+
+function actionBody(value) {
+  if (
+    typeof value !== "string" ||
+    !value.length ||
+    INVALID_CONTROL.test(value) ||
+    Buffer.byteLength(value, "utf8") > 8 * 1024
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  return value;
+}
+
+function parseTarget(value) {
+  exactObject(value, ["provider", "resourceId", "version"]);
+  if (value.provider !== "github") {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  const match = exactString(value.resourceId, REPOSITORY, 256).match(REPOSITORY);
+  const number = Number(match[3]);
+  if (
+    !Number.isSafeInteger(number) ||
+    match[1].includes("--") ||
+    match[2].includes("..") ||
+    match[2].startsWith(".") ||
+    match[2].endsWith(".")
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  return {
+    provider: "github",
+    resourceId: value.resourceId,
+    version: exactString(value.version, SHA, 64),
+    repo: `${match[1]}/${match[2]}`,
+    number,
+  };
+}
+
+function normalizeAction(kind, value) {
+  if (kind === "github.pull-request-review") {
+    exactObject(value, ["type", "reviewEvent", "body"]);
+    if (
+      value.type !== "pull_request_review" ||
+      !REVIEW_EVENTS.has(value.reviewEvent)
+    ) {
+      throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    }
+    return {
+      type: "pull_request_review",
+      reviewEvent: value.reviewEvent,
+      body: actionBody(value.body),
+    };
+  }
+  throw actionError("INVALID_GITHUB_ACTION", "trusted");
+}
+
+function normalizeEnvelope(value) {
+  exactObject(value, [
+    "schemaVersion",
+    "id",
+    "idempotencyKey",
+    "kind",
+    "requestedBy",
+    "actor",
+    "target",
+    "action",
+    "displayedPayloadDigest",
+    "approvalBindingDigest",
+    "execution",
+  ]);
+  if (value.schemaVersion !== 1) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  const id = exactString(value.id, SAFE_ID, 128);
+  const kind = exactString(value.kind, SAFE_ID, 128);
+  exactObject(value.requestedBy, ["roleId", "workItemId"]);
+  const requestedBy = {
+    roleId: exactString(value.requestedBy.roleId, SAFE_ID, 128),
+    workItemId: exactString(value.requestedBy.workItemId, /^[^\u0000-\u001f\u007f]{1,256}$/, 256),
+  };
+  exactObject(value.actor, ["provider", "accountId"]);
+  if (value.actor.provider !== "github") {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  const actor = {
+    provider: "github",
+    accountId: exactString(value.actor.accountId, GITHUB_LOGIN, 39),
+  };
+  const target = parseTarget(value.target);
+  const action = normalizeAction(kind, value.action);
+  const displayedPayloadDigest = exactString(
+    value.displayedPayloadDigest,
+    SHA256,
+    64,
+  );
+  const approvalBindingDigest = exactString(
+    value.approvalBindingDigest,
+    SHA256,
+    64,
+  );
+  if (value.idempotencyKey !== `confirmation-${approvalBindingDigest}`) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  exactObject(value.execution, ["requestId", "attempt", "startedAt"]);
+  if (
+    !Number.isSafeInteger(value.execution.attempt) ||
+    value.execution.attempt < 1 ||
+    typeof value.execution.startedAt !== "string" ||
+    !Number.isFinite(Date.parse(value.execution.startedAt))
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  const execution = {
+    requestId: exactString(value.execution.requestId, REQUEST_ID, 128),
+    attempt: value.execution.attempt,
+    startedAt: new Date(value.execution.startedAt).toISOString(),
+  };
+  if (execution.startedAt !== value.execution.startedAt) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  return {
+    schemaVersion: 1,
+    id,
+    idempotencyKey: value.idempotencyKey,
+    kind,
+    requestedBy,
+    actor,
+    target,
+    action,
+    displayedPayloadDigest,
+    approvalBindingDigest,
+    execution,
+  };
+}
+
+function markerForEnvelope(envelope) {
+  const digest = digestValue({
+    schemaVersion: 1,
+    idempotencyKey: envelope.idempotencyKey,
+    kind: envelope.kind,
+    actor: envelope.actor,
+    target: {
+      provider: envelope.target.provider,
+      resourceId: envelope.target.resourceId,
+      version: envelope.target.version,
+    },
+    action: envelope.action,
+    approvalBindingDigest: envelope.approvalBindingDigest,
+  });
+  return `<!-- ${MARKER_PREFIX}:${digest} -->`;
+}
+
+function stableError(error) {
+  if (error instanceof GitHubActionError) return error;
+  if (error instanceof ManagedProcessError) {
+    const code = {
+      PROCESS_TIMEOUT: "GITHUB_TIMEOUT",
+      PROCESS_OUTPUT_LIMIT: "GITHUB_OUTPUT_LIMIT",
+      PROCESS_ABORTED: "GITHUB_UNAVAILABLE",
+    }[error.code];
+    return actionError(code || "GITHUB_UNAVAILABLE");
+  }
+  return actionError("GITHUB_UNAVAILABLE");
+}
+
+function errorResult(error) {
+  const stable = stableError(error);
+  return {
+    status: "error",
+    error: { trust: stable.trust, code: stable.code },
+  };
+}
+
+function githubReceipt(record, envelope) {
+  const id = record?.id;
+  if (
+    !(
+      (Number.isSafeInteger(id) && id > 0) ||
+      (typeof id === "string" && /^[1-9][0-9]*$/.test(id))
+    )
+  ) {
+    throw actionError("GITHUB_PROTOCOL");
+  }
+  if (typeof record.html_url !== "string") {
+    throw actionError("GITHUB_PROTOCOL");
+  }
+  let url;
+  try {
+    url = new URL(record.html_url);
+  } catch {
+    throw actionError("GITHUB_PROTOCOL");
+  }
+  if (
+    url.origin !== "https://github.com" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.pathname.toLowerCase() !==
+      `/${envelope.target.repo}/pull/${envelope.target.number}`.toLowerCase() ||
+    url.hash !== `#pullrequestreview-${String(id)}`
+  ) {
+    throw actionError("GITHUB_PROTOCOL");
+  }
+  url.hash = "";
+  const timestamp = record.created_at || record.submitted_at;
+  if (
+    typeof timestamp !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(
+      timestamp,
+    ) ||
+    !Number.isFinite(Date.parse(timestamp))
+  ) {
+    throw actionError("GITHUB_PROTOCOL");
+  }
+  const createdAt = new Date(timestamp).toISOString();
+  return { id: String(id), url: url.href, createdAt };
+}
+
+class GitHubActionAdapter {
+  #runner;
+  #command;
+  #env;
+  #timeoutMs;
+
+  constructor({
+    runner = new ManagedProcessRunner({
+      managedProcessFactory: () =>
+        new ManagedProcess({
+          maxLineBytes: 1024 * 1024,
+          maxOutputBytes: 4 * 1024 * 1024,
+        }),
+    }),
+    env = process.env,
+    networkEnv = {},
+    token = env?.GH_TOKEN || env?.GITHUB_TOKEN,
+    ghCommand,
+    timeoutMs = 60_000,
+  } = {}) {
+    if (!runner || typeof runner.run !== "function") {
+      throw new TypeError("runner must provide run");
+    }
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+      throw new TypeError("timeoutMs is outside the supported range");
+    }
+    if (
+      typeof ghCommand !== "string" ||
+      !path.isAbsolute(ghCommand) ||
+      INVALID_CONTROL.test(ghCommand) ||
+      Buffer.byteLength(ghCommand, "utf8") > 1_024
+    ) {
+      throw new TypeError("ghCommand must be an absolute executable path");
+    }
+    if (typeof token !== "string" || !GITHUB_TOKEN.test(token)) {
+      throw new TypeError("A fixed GitHub token is required");
+    }
+    if (!isPlainObject(networkEnv)) {
+      throw new TypeError("networkEnv must be a plain object");
+    }
+    this.#runner = runner;
+    this.#command = ghCommand;
+    const childEnv = {
+      GH_TOKEN: token,
+      GH_PROMPT_DISABLED: "1",
+      GH_NO_UPDATE_NOTIFIER: "1",
+      NO_COLOR: "1",
+    };
+    for (const key of CHILD_ENV_KEYS) {
+      if (typeof env?.[key] === "string") childEnv[key] = env[key];
+    }
+    for (const key of Reflect.ownKeys(networkEnv)) {
+      if (typeof key !== "string" || !NETWORK_ENV_KEYS.includes(key)) {
+        throw new TypeError("networkEnv contains an unsupported key");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(networkEnv, key);
+      if (
+        !descriptor?.enumerable ||
+        !("value" in descriptor) ||
+        typeof descriptor.value !== "string" ||
+        INVALID_CONTROL.test(descriptor.value) ||
+        Buffer.byteLength(descriptor.value, "utf8") > 4_096
+      ) {
+        throw new TypeError("networkEnv contains an invalid value");
+      }
+      childEnv[key] = descriptor.value;
+    }
+    this.#env = Object.freeze(childEnv);
+    this.#timeoutMs = timeoutMs;
+  }
+
+  async reconcile(input) {
+    let envelope;
+    try {
+      envelope = normalizeEnvelope(input);
+    } catch (error) {
+      return errorResult(error);
+    }
+    try {
+      await this.#assertActor(envelope.actor.accountId);
+      const matched = await this.#findMarker(envelope);
+      if (matched) return { status: "already", receipt: matched };
+      const currentHead = await this.#currentHead(envelope);
+      if (currentHead !== envelope.target.version) {
+        return {
+          status: "stale",
+          expectedVersion: envelope.target.version,
+          actualVersion: currentHead,
+        };
+      }
+      return { status: "absent", code: "GITHUB_MARKER_ABSENT" };
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+
+  async execute(input) {
+    let envelope;
+    try {
+      envelope = normalizeEnvelope(input);
+    } catch (error) {
+      return errorResult(error);
+    }
+    try {
+      await this.#assertActor(envelope.actor.accountId);
+      const matched = await this.#findMarker(envelope);
+      if (matched) return { status: "already", receipt: matched };
+      const observedHead = await this.#currentHead(envelope);
+      if (observedHead !== envelope.target.version) {
+        return {
+          status: "stale",
+          expectedVersion: envelope.target.version,
+          actualVersion: observedHead,
+        };
+      }
+      await this.#assertActor(envelope.actor.accountId);
+      const finalHead = await this.#currentHead(envelope);
+      if (finalHead !== envelope.target.version) {
+        return {
+          status: "stale",
+          expectedVersion: envelope.target.version,
+          actualVersion: finalHead,
+        };
+      }
+      return {
+        status: "applied",
+        receipt: await this.#post(envelope),
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+
+  async #assertActor(expectedLogin) {
+    const value = await this.#runJson(["api", "--method", "GET", "user"]);
+    if (!isPlainObject(value) || typeof value.login !== "string") {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+    if (value.login.toLowerCase() !== expectedLogin.toLowerCase()) {
+      throw actionError("GITHUB_ACTOR_MISMATCH", "trusted");
+    }
+  }
+
+  async #currentHead(envelope) {
+    const value = await this.#runJson([
+      "pr",
+      "view",
+      `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
+      "--json",
+      "headRefOid",
+    ]);
+    if (!isPlainObject(value) || typeof value.headRefOid !== "string") {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+    return value.headRefOid;
+  }
+
+  async #findMarker(envelope) {
+    const route = `repos/${envelope.target.repo}/pulls/${envelope.target.number}/reviews?per_page=100`;
+    const pages = await this.#runJson([
+      "api",
+      "--method",
+      "GET",
+      route,
+      "--paginate",
+      "--slurp",
+    ]);
+    if (
+      !Array.isArray(pages) ||
+      pages.some((page) => !Array.isArray(page))
+    ) {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+    const records = pages.flat();
+    const marker = markerForEnvelope(envelope);
+    const candidates = records.filter(
+      (record) => typeof record?.body === "string" && record.body.includes(marker),
+    );
+    if (!candidates.length) return null;
+    if (candidates.length !== 1 || !this.#matchesRecord(envelope, candidates[0], marker)) {
+      throw actionError("GITHUB_MARKER_CONFLICT");
+    }
+    return githubReceipt(candidates[0], envelope);
+  }
+
+  #matchesRecord(envelope, record, marker) {
+    if (
+      !isPlainObject(record) ||
+      record.body !== `${envelope.action.body}\n\n${marker}` ||
+      typeof record.user?.login !== "string" ||
+      record.user.login.toLowerCase() !== envelope.actor.accountId.toLowerCase()
+    ) {
+      return false;
+    }
+    return (
+      record.state === REVIEW_STATES[envelope.action.reviewEvent] &&
+      record.commit_id === envelope.target.version
+    );
+  }
+
+  async #post(envelope) {
+    const marker = markerForEnvelope(envelope);
+    const body = `${envelope.action.body}\n\n${marker}`;
+    const args = [
+      "api",
+      "--method",
+      "POST",
+      `repos/${envelope.target.repo}/pulls/${envelope.target.number}/reviews`,
+      "--input",
+      "-",
+    ];
+    const record = await this.#runJson(args, {
+      input: JSON.stringify({
+        event: envelope.action.reviewEvent,
+        body,
+        commit_id: envelope.target.version,
+      }),
+    });
+    if (!this.#matchesRecord(envelope, record, marker)) {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+    return githubReceipt(record, envelope);
+  }
+
+  async #runJson(args, { input } = {}) {
+    const fixedArgs =
+      args[0] === "api"
+        ? ["api", "--hostname", "github.com", ...args.slice(1)]
+        : args;
+    let result;
+    try {
+      result = await this.#runner.run({
+        command: this.#command,
+        args: fixedArgs,
+        env: { ...this.#env },
+        ...(input === undefined ? {} : { input }),
+        timeoutMs: this.#timeoutMs,
+      });
+    } catch (error) {
+      throw stableError(error);
+    }
+    if (!result || result.exitCode !== 0) {
+      throw actionError("GITHUB_REJECTED");
+    }
+    try {
+      return JSON.parse(result.stdout);
+    } catch {
+      throw actionError("GITHUB_PROTOCOL");
+    }
+  }
+}
+
+export function markerForGitHubAction(input) {
+  return markerForEnvelope(normalizeEnvelope(input));
+}
+
+export function createGitHubActionExecutor(options) {
+  const adapter = new GitHubActionAdapter(options);
+  return Object.freeze({
+    execute: (input) => adapter.execute(input),
+    reconcile: (input) => adapter.reconcile(input),
+  });
+}

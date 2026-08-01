@@ -84,6 +84,7 @@ export class ManagedProcess {
     args = [],
     cwd,
     env = {},
+    input,
     onLine = () => {},
     onExit = () => {},
     onError = () => {},
@@ -140,6 +141,7 @@ export class ManagedProcess {
     child.stdout?.on("data", (chunk) => acceptChunk("stdout", chunk));
     child.stderr?.on("data", (chunk) => acceptChunk("stderr", chunk));
     child.once("error", onError);
+    child.stdin?.once("error", onError);
     child.once("close", async (code, signal) => {
       if (this.exited) return;
       this.exited = true;
@@ -155,6 +157,7 @@ export class ManagedProcess {
         resolveDone({ code, signal });
       }
     });
+    child.stdin?.end(input);
     return { pid: child.pid };
   }
 
@@ -270,6 +273,7 @@ export class ManagedProcessRunner {
     args = [],
     cwd,
     env = {},
+    input,
     timeoutMs = 60_000,
     signal = null,
   }) {
@@ -281,6 +285,23 @@ export class ManagedProcessRunner {
     }
     if (signal?.aborted) {
       throw new ManagedProcessError("PROCESS_ABORTED", "Process was aborted");
+    }
+    if (
+      input !== undefined &&
+      typeof input !== "string" &&
+      !Buffer.isBuffer(input) &&
+      !(input instanceof Uint8Array)
+    ) {
+      throw new ManagedProcessError(
+        "INVALID_PROCESS_INPUT",
+        "Process input must be text or bytes",
+      );
+    }
+    if (input !== undefined && Buffer.byteLength(input) > 1024 * 1024) {
+      throw new ManagedProcessError(
+        "INVALID_PROCESS_INPUT",
+        "Process input exceeds its limit",
+      );
     }
     const processHandle = this.managedProcessFactory();
     const output = { stdout: [], stderr: [] };
@@ -330,6 +351,7 @@ export class ManagedProcessRunner {
           args,
           cwd,
           env,
+          input,
           onLine({ stream, line }) {
             if (stream === "stdout" || stream === "stderr") {
               output[stream].push(line);
