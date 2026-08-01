@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   ConfirmationExecutionError,
@@ -9,12 +10,16 @@ import {
 class MemoryStore {
   constructor(initial = null) {
     this.value = structuredClone(initial);
+    this.readCount = 0;
     this.writeCount = 0;
+    this.failReadAt = null;
     this.failWriteAt = null;
   }
 
   async read(name, fallback = null) {
     assert.equal(name, "confirmation-queue");
+    this.readCount += 1;
+    if (this.readCount === this.failReadAt) throw new Error("disk read unavailable");
     return this.value === null ? structuredClone(fallback) : structuredClone(this.value);
   }
 
@@ -129,6 +134,15 @@ function approvalRequest(next, requestId = "request-approve-0001") {
     expectedItemRevision: next.item.itemRevision,
     displayedPayloadDigest: next.item.displayedPayloadDigest,
     approvalBindingDigest: next.item.approvalBindingDigest,
+  };
+}
+
+function producerInvalidation(item, overrides = {}) {
+  return {
+    requestedBy: structuredClone(item.requestedBy),
+    approvalBindingDigest: item.approvalBindingDigest,
+    reason: "work_item_superseded",
+    ...overrides,
   };
 }
 
@@ -280,6 +294,373 @@ test("stale bindings and stale targets never invoke a second external action", a
   const result = await queue.approve(next.item.id, approvalRequest(next));
   assert.equal(result.status, "stale");
   assert.equal(actionExecutor.executeCalls.length, 1);
+});
+
+test("a trusted producer durably invalidates a pending action before concurrent approval", async () => {
+  const store = new MemoryStore();
+  const actionExecutor = executor();
+  const queue = await readyQueue({ store, actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  const invalidation = producerInvalidation(next.item);
+
+  const stalePromise = queue.invalidate(next.item.id, invalidation);
+  const approvalPromise = queue.approve(
+    next.item.id,
+    approvalRequest(next, "request-approve-after-invalidation"),
+  );
+  const [stale, approval] = await Promise.all([
+    stalePromise,
+    approvalPromise,
+  ]);
+
+  assert.equal(stale.status, "stale");
+  assert.equal(approval.status, "stale");
+  assert.equal(actionExecutor.executeCalls.length, 0);
+  assert.equal(store.value.items[0].status, "stale");
+  assert.equal(
+    store.value.items[0].invalidation.reason,
+    "work_item_superseded",
+  );
+  assert.deepEqual(
+    store.value.items[0].invalidation.requestedBy,
+    next.item.requestedBy,
+  );
+
+  const recovered = await readyQueue({ store, actionExecutor });
+  const recoveredItem = await recovered.get(next.item.id);
+  const repeated = await recovered.invalidate(
+    next.item.id,
+    producerInvalidation(recoveredItem),
+  );
+  const approvedAfterRecovery = await recovered.approve(
+    next.item.id,
+    approvalRequest(next, "request-approve-after-recovery"),
+  );
+
+  assert.equal(recoveredItem.status, "stale");
+  assert.equal(repeated.status, "stale");
+  assert.equal(approvedAfterRecovery.status, "stale");
+  assert.equal(actionExecutor.executeCalls.length, 0);
+  assert.equal(actionExecutor.reconcileCalls.length, 0);
+});
+
+test("a failed stale write leaves an in-process veto over every user action", async () => {
+  const store = new MemoryStore();
+  const actionExecutor = executor();
+  const queue = await readyQueue({ store, actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  store.failWriteAt = store.writeCount + 1;
+
+  await assert.rejects(
+    queue.invalidate(next.item.id, producerInvalidation(next.item)),
+    /disk unavailable/,
+  );
+
+  assert.equal(store.value.items[0].status, "pending");
+  assert.equal((await queue.next()).item, null);
+  await assert.rejects(
+    queue.approve(
+      next.item.id,
+      approvalRequest(next, "request-approve-vetoed-item"),
+    ),
+    (error) =>
+      error.statusCode === 409 &&
+      error.code === "CONFIRMATION_INVALIDATION_PENDING",
+  );
+  await assert.rejects(
+    queue.retry(
+      next.item.id,
+      approvalRequest(next, "request-retry-vetoed-item"),
+    ),
+    (error) =>
+      error.statusCode === 409 &&
+      error.code === "CONFIRMATION_INVALIDATION_PENDING",
+  );
+  await assert.rejects(
+    queue.reject(next.item.id, {
+      ...approvalRequest(next, "request-reject-vetoed-item"),
+      reason: "旧作业已经失效",
+    }),
+    (error) =>
+      error.statusCode === 409 &&
+      error.code === "CONFIRMATION_INVALIDATION_PENDING",
+  );
+  assert.equal(actionExecutor.executeCalls.length, 0);
+  assert.equal(actionExecutor.reconcileCalls.length, 0);
+
+  const stale = await queue.invalidate(
+    next.item.id,
+    producerInvalidation(next.item),
+  );
+  assert.equal(stale.status, "stale");
+  assert.equal((await queue.next()).item, null);
+});
+
+test("a queued producer mismatch cannot erase an earlier in-process veto", async () => {
+  const store = new MemoryStore();
+  const actionExecutor = executor();
+  const queue = await readyQueue({ store, actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  store.failWriteAt = store.writeCount + 1;
+
+  const failedInvalidation = queue.invalidate(
+    next.item.id,
+    producerInvalidation(next.item),
+  );
+  const mismatchedInvalidation = queue.invalidate(
+    next.item.id,
+    producerInvalidation(next.item, {
+      requestedBy: {
+        ...next.item.requestedBy,
+        workItemId: "pr-work-untrusted",
+      },
+    }),
+  );
+
+  await assert.rejects(failedInvalidation, /disk unavailable/);
+  await assert.rejects(
+    mismatchedInvalidation,
+    (error) => error.code === "CONFIRMATION_PRODUCER_MISMATCH",
+  );
+  assert.deepEqual(
+    queue.producerVetoes.get(next.item.id),
+    producerInvalidation(next.item),
+  );
+  assert.equal((await queue.next()).item, null);
+  await assert.rejects(
+    queue.approve(
+      next.item.id,
+      approvalRequest(next, "request-approve-after-mismatch"),
+    ),
+    (error) => error.code === "CONFIRMATION_INVALIDATION_PENDING",
+  );
+  assert.equal(actionExecutor.executeCalls.length, 0);
+});
+
+test("a later reload failure restores an earlier in-process veto", async () => {
+  const store = new MemoryStore();
+  const actionExecutor = executor();
+  const queue = await readyQueue({ store, actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  store.failWriteAt = store.writeCount + 1;
+
+  await assert.rejects(
+    queue.invalidate(next.item.id, producerInvalidation(next.item)),
+    /disk unavailable/,
+  );
+  store.failReadAt = store.readCount + 1;
+  await assert.rejects(
+    queue.invalidate(
+      next.item.id,
+      producerInvalidation(next.item, {
+        requestedBy: {
+          ...next.item.requestedBy,
+          workItemId: "pr-work-untrusted",
+        },
+      }),
+    ),
+    /disk read unavailable/,
+  );
+
+  assert.deepEqual(
+    queue.producerVetoes.get(next.item.id),
+    producerInvalidation(next.item),
+  );
+  assert.equal((await queue.next()).item, null);
+  await assert.rejects(
+    queue.approve(
+      next.item.id,
+      approvalRequest(next, "request-approve-after-reload-failure"),
+    ),
+    (error) => error.code === "CONFIRMATION_INVALIDATION_PENDING",
+  );
+  assert.equal(actionExecutor.executeCalls.length, 0);
+});
+
+test("a veto created by invalidate-before-enqueue makes a late plan durably stale", async () => {
+  const store = new MemoryStore();
+  const actionExecutor = executor();
+  const queue = await readyQueue({ store, actionExecutor });
+  const normalizedPlan = normalizeConfirmationPlan(actionPlan());
+  const invalidation = producerInvalidation(normalizedPlan);
+
+  await assert.rejects(
+    queue.invalidate(normalizedPlan.id, invalidation),
+    (error) => error.statusCode === 404,
+  );
+  const late = await queue.enqueue(actionPlan());
+
+  assert.equal(late.status, "stale");
+  assert.equal(late.invalidation.reason, "work_item_superseded");
+  assert.equal((await queue.next()).item, null);
+  const approved = await queue.approve(
+    late.id,
+    approvalRequest(
+      { queueRevision: late.queueRevision, item: late },
+      "request-approve-late-plan",
+    ),
+  );
+  assert.equal(approved.status, "stale");
+
+  const recovered = await readyQueue({ store, actionExecutor });
+  assert.equal((await recovered.get(late.id)).status, "stale");
+  assert.equal((await recovered.next()).item, null);
+  assert.equal(actionExecutor.executeCalls.length, 0);
+  assert.equal(actionExecutor.reconcileCalls.length, 0);
+});
+
+test("producer invalidation requires the exact original producer and binding", async () => {
+  const actionExecutor = executor();
+  const queue = await readyQueue({ actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+
+  await assert.rejects(
+    queue.invalidate(
+      next.item.id,
+      producerInvalidation(next.item, {
+        requestedBy: {
+          ...next.item.requestedBy,
+          workItemId: "pr-work-other",
+        },
+      }),
+    ),
+    (error) => error.statusCode === 409,
+  );
+  await assert.rejects(
+    queue.invalidate(
+      next.item.id,
+      producerInvalidation(next.item, {
+        approvalBindingDigest: "0".repeat(64),
+      }),
+    ),
+    (error) => error.statusCode === 409,
+  );
+
+  assert.equal((await queue.get(next.item.id)).status, "pending");
+  assert.equal(actionExecutor.executeCalls.length, 0);
+  assert.equal(actionExecutor.reconcileCalls.length, 0);
+});
+
+test("a proven-absent failed action can be invalidated without another Review", async () => {
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      throw new ConfirmationExecutionError("GITHUB_REJECTED", "absent");
+    },
+  });
+  const queue = await readyQueue({ actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  const failed = await queue.approve(next.item.id, approvalRequest(next));
+
+  const stale = await queue.invalidate(
+    failed.id,
+    producerInvalidation(failed),
+  );
+  const approvedAfterInvalidation = await queue.approve(
+    failed.id,
+    approvalRequest(next, "request-approve-after-absent"),
+  );
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.retryable, true);
+  assert.equal(stale.status, "stale");
+  assert.equal(approvedAfterInvalidation.status, "stale");
+  assert.equal(actionExecutor.executeCalls.length, 1);
+});
+
+test("executing, unknown, completed, and rejected actions cannot be invalidated", async (t) => {
+  await t.test("approval wins the race exactly once", async () => {
+    let releaseExecution;
+    const executionGate = new Promise((resolve) => {
+      releaseExecution = resolve;
+    });
+    const actionExecutor = executor({
+      async execute(envelope) {
+        this.executeCalls.push(structuredClone(envelope));
+        await executionGate;
+        return { status: "applied", receipt: { id: "review-42" } };
+      },
+    });
+    const queue = await readyQueue({ actionExecutor });
+    await queue.enqueue(actionPlan());
+    const next = await queue.next();
+    const approval = queue.approve(next.item.id, approvalRequest(next));
+    const invalidation = assert.rejects(
+      queue.invalidate(
+        next.item.id,
+        producerInvalidation(next.item),
+      ),
+      (error) => error.statusCode === 409,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseExecution();
+
+    assert.equal((await approval).status, "completed");
+    await invalidation;
+    assert.equal(actionExecutor.executeCalls.length, 1);
+  });
+
+  const terminalCases = [
+    {
+      name: "unknown",
+      actionExecutor: executor({
+        async execute(envelope) {
+          this.executeCalls.push(structuredClone(envelope));
+          throw new ConfirmationExecutionError("GITHUB_TIMEOUT", "unknown");
+        },
+      }),
+      finish: async (queue, next) =>
+        queue.approve(next.item.id, approvalRequest(next)),
+    },
+    {
+      name: "completed",
+      actionExecutor: executor(),
+      finish: async (queue, next) =>
+        queue.approve(next.item.id, approvalRequest(next)),
+    },
+    {
+      name: "rejected",
+      actionExecutor: executor(),
+      finish: async (queue, next) =>
+        queue.reject(next.item.id, {
+          ...approvalRequest(next, "request-reject-before-invalidation"),
+          reason: "不再发布",
+        }),
+    },
+  ];
+
+  for (const scenario of terminalCases) {
+    await t.test(scenario.name, async () => {
+      const queue = await readyQueue({
+        actionExecutor: scenario.actionExecutor,
+      });
+      await queue.enqueue(actionPlan());
+      const next = await queue.next();
+      const terminal = await scenario.finish(queue, next);
+      const callsBeforeInvalidation =
+        scenario.actionExecutor.executeCalls.length;
+
+      await assert.rejects(
+        queue.invalidate(
+          next.item.id,
+          producerInvalidation(next.item),
+        ),
+        (error) => error.statusCode === 409,
+      );
+
+      assert.equal((await queue.get(next.item.id)).status, terminal.status);
+      assert.equal(
+        scenario.actionExecutor.executeCalls.length,
+        callsBeforeInvalidation,
+      );
+    });
+  }
 });
 
 test("rejection is durable and cannot execute", async () => {

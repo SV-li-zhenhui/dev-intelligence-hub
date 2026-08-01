@@ -2,6 +2,7 @@ import {
   cloneConfirmationValue,
   ConfirmationQueueError,
   defaultConfirmationState,
+  normalizeConfirmationInvalidation,
   normalizeConfirmationPlan,
   normalizeConfirmationReceipt,
   normalizeConfirmationRequest,
@@ -140,6 +141,7 @@ export class ConfirmationQueue {
     this.ready = false;
     this.recoveryPromise = null;
     this.liveRequests = new Map();
+    this.producerVetoes = new Map();
   }
 
   async recover() {
@@ -184,6 +186,12 @@ export class ConfirmationQueue {
               409,
             );
           }
+          if (this.#isProducerVetoed(existing)) {
+            return this.#invalidate(
+              existing.id,
+              this.producerVetoes.get(existing.id),
+            );
+          }
           return this.#projectItem(existing);
         }
         if (this.state.items.length >= MAX_ITEMS) {
@@ -194,7 +202,7 @@ export class ConfirmationQueue {
           );
         }
         const timestamp = this.#now();
-        const item = {
+        let item = {
           ...plan,
           status: "pending",
           itemRevision: 1,
@@ -204,7 +212,16 @@ export class ConfirmationQueue {
           receipt: null,
           failure: null,
           rejection: null,
+          invalidation: null,
         };
+        const veto = this.producerVetoes.get(item.id);
+        if (this.#isProducerVetoed(item)) {
+          item = {
+            ...item,
+            status: "stale",
+            invalidation: { ...clone(veto), at: timestamp },
+          };
+        }
         await this.#persist({
           ...this.state,
           revision: this.state.revision + 1,
@@ -250,6 +267,33 @@ export class ConfirmationQueue {
     );
   }
 
+  async invalidate(id, input) {
+    this.#assertReady();
+    const invalidation = normalizeConfirmationInvalidation(input);
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        const previousVeto = this.producerVetoes.get(id);
+        this.#setProducerVeto(id, invalidation);
+        try {
+          await this.#reload();
+          return await this.#invalidate(id, invalidation);
+        } catch (error) {
+          if (previousVeto) {
+            this.producerVetoes.set(id, previousVeto);
+          } else if (
+            [
+              "CONFIRMATION_PRODUCER_MISMATCH",
+              "CONFIRMATION_NOT_INVALIDATABLE",
+            ].includes(error?.code)
+          ) {
+            this.producerVetoes.delete(id);
+          }
+          throw error;
+        }
+      }),
+    );
+  }
+
   #runIdempotent(operation, id, request, task) {
     const key = [
       operation,
@@ -280,6 +324,7 @@ export class ConfirmationQueue {
     if (["completed", "stale"].includes(item.status)) {
       return this.#projectItem(item);
     }
+    this.#assertNotProducerVetoed(item);
     if (item.status !== "pending") {
       throw queueError(
         "CONFIRMATION_NOT_PENDING",
@@ -293,6 +338,7 @@ export class ConfirmationQueue {
   async #retry(id, request) {
     let item = this.#requireItem(id);
     this.#assertBinding(item, request, { revisions: true });
+    this.#assertNotProducerVetoed(item);
     if (item.status !== "failed" || !item.failure?.retryable) {
       throw queueError(
         "CONFIRMATION_NOT_RETRYABLE",
@@ -318,6 +364,7 @@ export class ConfirmationQueue {
     if (item.status === "rejected" && item.rejection?.requestId === request.requestId) {
       return this.#projectItem(item);
     }
+    this.#assertNotProducerVetoed(item);
     if (!new Set(["pending", "failed"]).has(item.status)) {
       throw queueError(
         "CONFIRMATION_NOT_REJECTABLE",
@@ -339,6 +386,46 @@ export class ConfirmationQueue {
         reason: request.reason || "",
         at: timestamp,
       },
+      invalidation: null,
+    });
+    return this.#projectItem(this.#requireItem(id));
+  }
+
+  async #invalidate(id, invalidation) {
+    const item = this.#requireItem(id);
+    if (
+      item.approvalBindingDigest !== invalidation.approvalBindingDigest ||
+      item.requestedBy.roleId !== invalidation.requestedBy.roleId ||
+      item.requestedBy.workItemId !== invalidation.requestedBy.workItemId
+    ) {
+      throw queueError(
+        "CONFIRMATION_PRODUCER_MISMATCH",
+        "只有原岗位可以使该确认项失效",
+        409,
+      );
+    }
+    if (item.status === "stale") return this.#projectItem(item);
+    const provenAbsent =
+      item.status === "failed" && item.failure?.outcome === "absent";
+    if (item.status !== "pending" && !provenAbsent) {
+      throw queueError(
+        "CONFIRMATION_NOT_INVALIDATABLE",
+        "该动作已不能安全失效",
+        409,
+      );
+    }
+
+    this.#setProducerVeto(item.id, invalidation);
+    const timestamp = this.#now();
+    await this.#replaceItem(item.id, {
+      ...item,
+      status: "stale",
+      itemRevision: item.itemRevision + 1,
+      updatedAt: timestamp,
+      receipt: null,
+      failure: null,
+      rejection: null,
+      invalidation: { ...invalidation, at: timestamp },
     });
     return this.#projectItem(this.#requireItem(id));
   }
@@ -359,6 +446,7 @@ export class ConfirmationQueue {
       receipt: null,
       failure: null,
       rejection: null,
+      invalidation: null,
     };
     await this.#replaceItem(item.id, executing);
     const outcome = await this.#invokeExecute(executing);
@@ -414,6 +502,7 @@ export class ConfirmationQueue {
         execution,
         receipt: outcome.receipt,
         failure: null,
+        invalidation: null,
       };
     } else if (outcome.status === "stale") {
       finalized = {
@@ -422,6 +511,7 @@ export class ConfirmationQueue {
         execution,
         receipt: null,
         failure: null,
+        invalidation: null,
       };
     } else {
       const failureOutcome = outcome.status === "absent" ? "absent" : "unknown";
@@ -430,6 +520,7 @@ export class ConfirmationQueue {
         status: "failed",
         execution: { ...execution, outcome: failureOutcome },
         receipt: null,
+        invalidation: null,
         failure: {
           code: outcome.code || "EXTERNAL_OUTCOME_UNKNOWN",
           outcome: failureOutcome,
@@ -489,12 +580,43 @@ export class ConfirmationQueue {
     }
   }
 
+  #setProducerVeto(id, invalidation) {
+    this.producerVetoes.set(id, clone(invalidation));
+  }
+
+  #isProducerVetoed(item) {
+    const veto = this.producerVetoes.get(item.id);
+    return Boolean(
+      veto &&
+        veto.approvalBindingDigest === item.approvalBindingDigest &&
+        veto.requestedBy.roleId === item.requestedBy.roleId &&
+        veto.requestedBy.workItemId === item.requestedBy.workItemId,
+    );
+  }
+
+  #assertNotProducerVetoed(item) {
+    if (this.#isProducerVetoed(item)) {
+      throw queueError(
+        "CONFIRMATION_INVALIDATION_PENDING",
+        "该动作正在失效，不能再由用户执行",
+        409,
+      );
+    }
+  }
+
   #projectNext() {
     const pending = this.state.items
-      .filter((item) => item.status === "pending")
+      .filter(
+        (item) => item.status === "pending" && !this.#isProducerVetoed(item),
+      )
       .sort(byCreation);
     const retryable = this.state.items
-      .filter((item) => item.status === "failed" && item.failure?.retryable)
+      .filter(
+        (item) =>
+          item.status === "failed" &&
+          item.failure?.retryable &&
+          !this.#isProducerVetoed(item),
+      )
       .sort(byCreation);
     const actionable = [...pending, ...retryable];
     return {
@@ -521,6 +643,7 @@ export class ConfirmationQueue {
       ...(item.receipt ? { receipt: item.receipt } : {}),
       ...(item.failure ? { failure: item.failure } : {}),
       ...(item.rejection ? { rejection: item.rejection } : {}),
+      ...(item.invalidation ? { invalidation: item.invalidation } : {}),
     });
   }
 

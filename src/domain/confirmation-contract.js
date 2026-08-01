@@ -20,6 +20,7 @@ const EXECUTION_OUTCOMES = new Set([
   "absent",
   "stale",
 ]);
+const INVALIDATION_REASONS = new Set(["work_item_superseded"]);
 const MAX_PLAN_BYTES = 64 * 1024;
 const MAX_JSON_ENTRIES = 1_000;
 const MAX_JSON_DEPTH = 16;
@@ -360,6 +361,26 @@ export function normalizeConfirmationRequest(value, { allowReason = false } = {}
   };
 }
 
+export function normalizeConfirmationInvalidation(value) {
+  assertExactKeys(value, [
+    "requestedBy",
+    "approvalBindingDigest",
+    "reason",
+  ]);
+  if (!INVALIDATION_REASONS.has(value.reason)) {
+    throw invalidRequest("失效原因无效");
+  }
+  return {
+    requestedBy: normalizeRequestedBy(value.requestedBy),
+    approvalBindingDigest: boundedString(value.approvalBindingDigest, {
+      name: "approvalBindingDigest",
+      maxBytes: 64,
+      pattern: SHA256,
+    }),
+    reason: value.reason,
+  };
+}
+
 function validIsoTimestamp(value) {
   return (
     typeof value === "string" &&
@@ -467,8 +488,27 @@ function normalizeRejection(value) {
   };
 }
 
-function normalizePersistedItem(value) {
+function normalizeInvalidation(value) {
+  if (value === null) return null;
   assertExactKeys(value, [
+    "requestedBy",
+    "approvalBindingDigest",
+    "reason",
+    "at",
+  ]);
+  if (!validIsoTimestamp(value.at)) throw invalidRequest();
+  return {
+    ...normalizeConfirmationInvalidation({
+      requestedBy: value.requestedBy,
+      approvalBindingDigest: value.approvalBindingDigest,
+      reason: value.reason,
+    }),
+    at: value.at,
+  };
+}
+
+function normalizePersistedItem(value) {
+  const requiredKeys = [
     "id",
     "kind",
     "status",
@@ -486,7 +526,8 @@ function normalizePersistedItem(value) {
     "receipt",
     "failure",
     "rejection",
-  ]);
+  ];
+  assertAllowedKeys(value, [...requiredKeys, "invalidation"], requiredKeys);
   if (!STATUSES.has(value.status)) throw invalidRequest();
   if (!validIsoTimestamp(value.createdAt) || !validIsoTimestamp(value.updatedAt)) {
     throw invalidRequest();
@@ -519,15 +560,20 @@ function normalizePersistedItem(value) {
         : normalizeConfirmationReceipt(value.receipt),
     failure: normalizeFailure(value.failure),
     rejection: normalizeRejection(value.rejection),
+    invalidation: normalizeInvalidation(value.invalidation ?? null),
   };
   const validShape = {
     pending:
-      item.execution === null && item.receipt === null && item.failure === null && item.rejection === null,
-    executing: item.execution !== null && item.receipt === null && item.rejection === null,
-    completed: item.execution !== null && item.receipt !== null && item.failure === null && item.rejection === null,
-    failed: item.execution !== null && item.receipt === null && item.failure !== null && item.rejection === null,
-    stale: item.execution !== null && item.receipt === null && item.failure === null && item.rejection === null,
-    rejected: item.execution === null && item.receipt === null && item.failure === null && item.rejection !== null,
+      item.execution === null && item.receipt === null && item.failure === null && item.rejection === null && item.invalidation === null,
+    executing: item.execution !== null && item.receipt === null && item.rejection === null && item.invalidation === null,
+    completed: item.execution !== null && item.receipt !== null && item.failure === null && item.rejection === null && item.invalidation === null,
+    failed: item.execution !== null && item.receipt === null && item.failure !== null && item.rejection === null && item.invalidation === null,
+    stale:
+      item.receipt === null &&
+      item.failure === null &&
+      item.rejection === null &&
+      (item.invalidation !== null || item.execution !== null),
+    rejected: item.execution === null && item.receipt === null && item.failure === null && item.rejection !== null && item.invalidation === null,
   }[item.status];
   if (!validShape) throw invalidRequest();
   const validOutcome = {
@@ -535,7 +581,9 @@ function normalizePersistedItem(value) {
     executing: item.execution?.outcome === "unknown",
     completed: new Set(["applied", "already"]).has(item.execution?.outcome),
     failed: item.execution?.outcome === item.failure?.outcome,
-    stale: item.execution?.outcome === "stale",
+    stale: item.invalidation
+      ? item.execution === null || item.execution?.outcome === "absent"
+      : item.execution?.outcome === "stale",
     rejected: true,
   }[item.status];
   if (!validOutcome || Date.parse(item.createdAt) > Date.parse(item.updatedAt)) {
