@@ -174,6 +174,22 @@ function requireConfirmationQueue(application) {
   return queue;
 }
 
+function requireWorkflowRouting(application) {
+  const routing = application.workflowRouting;
+  if (
+    !routing ||
+    ![
+      "getConfig",
+      "dryRun",
+      "listAssignments",
+      "listAudit",
+    ].every((method) => typeof routing[method] === "function")
+  ) {
+    throw httpError(503, "工作流路由尚未配置");
+  }
+  return routing;
+}
+
 async function syncConfirmationOutcome(employeeRegistry, item) {
   const employee = employeeRegistry.get(item?.requestedBy?.roleId);
   if (!employee || typeof employee.recordConfirmationOutcome !== "function") {
@@ -360,6 +376,58 @@ export function createDashboardServer(
       }
       if (request.method === "GET" && url.pathname === "/api/employees") {
         sendJson(response, 200, { items: await employeeRegistry.listRoles() });
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/workflow/routing"
+      ) {
+        sendJson(
+          response,
+          200,
+          await requireWorkflowRouting(application).getConfig(),
+        );
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        ["/api/workflow/assignments", "/api/workflow/audit"].includes(
+          url.pathname,
+        )
+      ) {
+        const routing = requireWorkflowRouting(application);
+        const options = {
+          ...(url.searchParams.has("limit")
+            ? { limit: url.searchParams.get("limit") }
+            : {}),
+          ...(url.searchParams.has("cursor")
+            ? { cursor: url.searchParams.get("cursor") }
+            : {}),
+        };
+        const result = url.pathname.endsWith("/assignments")
+          ? await routing.listAssignments(options)
+          : await routing.listAudit(options);
+        sendJson(response, 200, result);
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/workflow/dry-run"
+      ) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const { event, definition } = await readJsonBody(
+          request,
+          128 * 1024,
+        );
+        const input = {
+          event,
+          ...(definition === undefined ? {} : { definition }),
+        };
+        sendJson(
+          response,
+          200,
+          await requireWorkflowRouting(application).dryRun(input),
+        );
         return;
       }
       if (
@@ -567,11 +635,23 @@ export function startApplicationBackgroundWork(
     }
   }
 
+  async function routeWorkflowSnapshot() {
+    if (typeof application.workflowRouting?.ingestSnapshot !== "function") {
+      return;
+    }
+    const snapshot = await application.store?.read?.("snapshot", null);
+    if (snapshot) {
+      await application.workflowRouting.ingestSnapshot({ snapshot });
+    }
+  }
+
   function enqueueFactCycle(factOperation) {
     const operation = async () => {
       await confirmationAccess.closeAndDrain();
       if (stopped) return undefined;
       const result = await factOperation();
+      if (stopped) return result;
+      await routeWorkflowSnapshot();
       if (stopped) return result;
       if (!(await hasFreshPullRequestFacts())) return result;
       await reconcileExternalConfirmations();

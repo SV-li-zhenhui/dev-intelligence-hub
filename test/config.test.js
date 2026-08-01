@@ -87,6 +87,28 @@ test("GitHub action settings merge without storing a credential value", () => {
   assert.equal("token" in result.githubActions, false);
 });
 
+test("workflow routing is replaced as one versioned definition", () => {
+  const base = {
+    workflowRouting: {
+      schemaVersion: 1,
+      enabled: true,
+      maxHops: 8,
+      rules: [{ id: "base-rule" }],
+    },
+  };
+  const localDefinition = {
+    schemaVersion: 1,
+    enabled: false,
+    maxHops: 4,
+    rules: [],
+  };
+
+  const result = mergeConfig(base, { workflowRouting: localDefinition });
+
+  assert.deepEqual(result.workflowRouting, localDefinition);
+  assert.equal(result.workflowRouting.rules.some((rule) => rule.id === "base-rule"), false);
+});
+
 test("code executor settings merge nested sections independently", () => {
   const baseWorkspaces = [
     { id: "dashboard", sourceRoot: "dashboard" },

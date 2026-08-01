@@ -16,6 +16,82 @@
   "githubActions": {
     "enabled": false
   },
+  "workflowRouting": {
+    "schemaVersion": 1,
+    "enabled": true,
+    "maxHops": 8,
+    "rules": [
+      {
+        "id": "pr-events-to-pr-reviewer",
+        "source": "root",
+        "enabled": true,
+        "priority": 100,
+        "fallback": false,
+        "condition": {
+          "op": "oneOf",
+          "path": "eventType",
+          "values": [
+            "pull_request.observed",
+            "pull_request.created",
+            "pull_request.updated",
+            "pull_request.completed",
+            "pull_request.left_scope",
+            "pull_request.classified",
+            "pull_request.status"
+          ]
+        },
+        "targets": [
+          {
+            "type": "role",
+            "id": "pr-reviewer"
+          }
+        ],
+        "onMatch": "stop"
+      },
+      {
+        "id": "issue-events-to-requirements",
+        "source": "root",
+        "enabled": true,
+        "priority": 90,
+        "fallback": false,
+        "condition": {
+          "op": "oneOf",
+          "path": "eventType",
+          "values": [
+            "issue.observed",
+            "issue.created",
+            "issue.updated",
+            "issue.completed",
+            "issue.left_scope",
+            "issue.classified",
+            "issue.status"
+          ]
+        },
+        "targets": [
+          {
+            "type": "role",
+            "id": "requirements-analyst"
+          }
+        ],
+        "onMatch": "stop"
+      },
+      {
+        "id": "owner-triage-fallback",
+        "source": "root",
+        "enabled": true,
+        "priority": 0,
+        "fallback": true,
+        "condition": null,
+        "targets": [
+          {
+            "type": "person",
+            "id": "SV-li-zhenhui"
+          }
+        ],
+        "onMatch": "stop"
+      }
+    ]
+  },
   "brain": {
     "enabled": true,
     "provider": "ollama",

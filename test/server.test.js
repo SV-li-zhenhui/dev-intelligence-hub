@@ -331,6 +331,7 @@ async function withServer(
     onClose,
     onDashboardRead,
     backgroundWork,
+    workflowRouting,
   } = {},
 ) {
   const calls = [];
@@ -494,6 +495,12 @@ async function withServer(
       requirementsAnalyst,
     ]);
   }
+  if (workflowRouting) {
+    application.workflowRouting =
+      typeof workflowRouting === "function"
+        ? workflowRouting(calls)
+        : workflowRouting;
+  }
   const server = createDashboardServer(application, {
     backgroundWork,
     reportError(error) {
@@ -585,6 +592,185 @@ test("background work runs every registered employee after the initial refresh a
   const callsAfterStop = structuredClone(calls);
   for (const timer of timers) await timer.callback();
   assert.deepEqual(calls, callsAfterStop);
+});
+
+test("workflow routing observes every refreshed snapshot before confirmations and employees", async () => {
+  const calls = [];
+  const timers = [];
+  let snapshot = null;
+  let refreshNumber = 0;
+  let backgroundWork;
+  const application = {
+    config: { refreshMinutes: 7 },
+    store: {
+      async read(name) {
+        return name === "snapshot" ? structuredClone(snapshot) : null;
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshNumber += 1;
+        snapshot = {
+          cycle: refreshNumber,
+          sourceStatus: { githubPullRequests: { ok: true } },
+        };
+        calls.push({ operation: "refresh", cycle: refreshNumber, ...options });
+      },
+    },
+    workflowRouting: {
+      async ingestSnapshot({ snapshot: routedSnapshot }) {
+        assert.equal(backgroundWork.confirmationReady(), false);
+        calls.push({ operation: "route", cycle: routedSnapshot.cycle });
+      },
+    },
+    employeeRegistry: {
+      get(id) {
+        if (id !== "pr-reviewer") return null;
+        return {
+          async recoverConfirmations() {
+            assert.equal(backgroundWork.confirmationReady(), false);
+            calls.push({ operation: "recover", cycle: snapshot.cycle });
+          },
+        };
+      },
+      schedules() {
+        return [];
+      },
+      async runAll(options) {
+        assert.equal(backgroundWork.confirmationReady(), false);
+        calls.push({ operation: "run_all", cycle: snapshot.cycle, ...options });
+      },
+    },
+    confirmationQueue: {},
+  };
+
+  backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    assert.equal(backgroundWork.confirmationReady(), true);
+
+    await timers[0].callback();
+    assert.equal(backgroundWork.confirmationReady(), true);
+
+    await backgroundWork.refresh({ notify: true });
+    assert.equal(backgroundWork.confirmationReady(), true);
+
+    assert.deepEqual(calls, [
+      { operation: "refresh", cycle: 1, notify: false },
+      { operation: "route", cycle: 1 },
+      { operation: "recover", cycle: 1 },
+      { operation: "run_all", cycle: 1, trigger: "refresh_completed" },
+      { operation: "refresh", cycle: 2, notify: false },
+      { operation: "route", cycle: 2 },
+      { operation: "recover", cycle: 2 },
+      { operation: "run_all", cycle: 2, trigger: "refresh_completed" },
+      { operation: "refresh", cycle: 3, notify: true },
+      { operation: "route", cycle: 3 },
+      { operation: "recover", cycle: 3 },
+      { operation: "run_all", cycle: 3, trigger: "refresh_completed" },
+    ]);
+  } finally {
+    await backgroundWork.stop();
+  }
+});
+
+test("workflow routing failure keeps confirmations closed and skips employees", async () => {
+  const calls = [];
+  const timers = [];
+  const reportedErrors = [];
+  const routingFailure = new Error("workflow routing failed");
+  let snapshot = null;
+  let refreshNumber = 0;
+  let routingCalls = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    store: {
+      async read(name) {
+        return name === "snapshot" ? structuredClone(snapshot) : null;
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshNumber += 1;
+        snapshot = {
+          cycle: refreshNumber,
+          sourceStatus: { githubPullRequests: { ok: true } },
+        };
+        calls.push({ operation: "refresh", cycle: refreshNumber, ...options });
+      },
+    },
+    workflowRouting: {
+      async ingestSnapshot({ snapshot: routedSnapshot }) {
+        routingCalls += 1;
+        calls.push({ operation: "route", cycle: routedSnapshot.cycle });
+        if (routingCalls > 1) throw routingFailure;
+      },
+    },
+    employeeRegistry: {
+      get(id) {
+        if (id !== "pr-reviewer") return null;
+        return {
+          async recoverConfirmations() {
+            calls.push({ operation: "recover", cycle: snapshot.cycle });
+          },
+        };
+      },
+      schedules() {
+        return [];
+      },
+      async runAll(options) {
+        calls.push({ operation: "run_all", cycle: snapshot.cycle, ...options });
+      },
+    },
+    confirmationQueue: {},
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    assert.equal(backgroundWork.confirmationReady(), true);
+
+    await timers[0].callback();
+    assert.equal(backgroundWork.confirmationReady(), false);
+
+    await assert.rejects(
+      backgroundWork.refresh({ notify: true }),
+      (error) => error === routingFailure,
+    );
+    assert.equal(backgroundWork.confirmationReady(), false);
+
+    assert.deepEqual(calls, [
+      { operation: "refresh", cycle: 1, notify: false },
+      { operation: "route", cycle: 1 },
+      { operation: "recover", cycle: 1 },
+      { operation: "run_all", cycle: 1, trigger: "refresh_completed" },
+      { operation: "refresh", cycle: 2, notify: false },
+      { operation: "route", cycle: 2 },
+      { operation: "refresh", cycle: 3, notify: true },
+      { operation: "route", cycle: 3 },
+    ]);
+    assert.deepEqual(reportedErrors, [routingFailure, routingFailure]);
+  } finally {
+    await backgroundWork.stop();
+  }
 });
 
 test("background stop waits for initial refresh and suppresses its employee callback", async () => {
@@ -832,6 +1018,261 @@ test("write endpoints require same-origin action headers and JSON", async () => 
     assert.equal(missingActionHeader.status, 403);
     assert.equal(plainText.status, 415);
     assert.deepEqual(calls, []);
+  });
+});
+
+test("workflow read APIs expose routing and forward only pagination filters", async () => {
+  const routing = {
+    current: {
+      version: 3,
+      digest: "routing-digest",
+      definition: { enabled: true, rules: [] },
+    },
+    history: [],
+  };
+  const assignments = {
+    items: [{ assignmentId: "assignment-1", target: { type: "role", id: "pr-reviewer" } }],
+    nextCursor: "assignment-next",
+  };
+  const audit = {
+    items: [{ auditId: "audit-1", outcome: "assigned" }],
+    nextCursor: "audit-next",
+  };
+
+  await withServer(
+    async ({ server, calls }) => {
+      const routingResponse = await request(server, {
+        path: "/api/workflow/routing",
+      });
+      const assignmentsResponse = await request(server, {
+        path: "/api/workflow/assignments?limit=17&cursor=assignment%3Apage%2B2&ignored=1",
+      });
+      const auditResponse = await request(server, {
+        path: "/api/workflow/audit?limit=9&cursor=audit%3Apage%2F2&ignored=1",
+      });
+
+      assert.equal(routingResponse.status, 200);
+      assert.deepEqual(JSON.parse(routingResponse.body), routing);
+      assert.equal(assignmentsResponse.status, 200);
+      assert.deepEqual(JSON.parse(assignmentsResponse.body), assignments);
+      assert.equal(auditResponse.status, 200);
+      assert.deepEqual(JSON.parse(auditResponse.body), audit);
+      assert.deepEqual(calls, [
+        { operation: "workflow_get_config" },
+        {
+          operation: "workflow_list_assignments",
+          options: { limit: "17", cursor: "assignment:page+2" },
+        },
+        {
+          operation: "workflow_list_audit",
+          options: { limit: "9", cursor: "audit:page/2" },
+        },
+      ]);
+    },
+    {
+      workflowRouting(calls) {
+        return {
+          async getConfig() {
+            calls.push({ operation: "workflow_get_config" });
+            return routing;
+          },
+          async dryRun() {
+            throw new Error("unexpected dry-run");
+          },
+          async listAssignments(options) {
+            calls.push({ operation: "workflow_list_assignments", options });
+            return assignments;
+          },
+          async listAudit(options) {
+            calls.push({ operation: "workflow_list_audit", options });
+            return audit;
+          },
+        };
+      },
+    },
+  );
+});
+
+test("workflow dry-run is same-origin JSON and forwards only event and definition", async () => {
+  const event = {
+    eventId: "workflow-event-1",
+    eventType: "pr.updated",
+    source: "github",
+  };
+  const definition = { enabled: true, rules: [] };
+  const explanation = {
+    ruleOrder: [],
+    usedFallback: false,
+    rules: [],
+  };
+  const body = JSON.stringify({
+    event,
+    definition,
+    context: { visitedNodes: ["root"] },
+    changedBy: "browser-user",
+    dispatch: true,
+  });
+
+  await withServer(
+    async ({ server, calls }) => {
+      const crossOrigin = await request(server, {
+        method: "POST",
+        path: "/api/workflow/dry-run",
+        headers: {
+          origin: "https://evil.example",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body,
+      });
+      const missingActionHeader = await request(server, {
+        method: "POST",
+        path: "/api/workflow/dry-run",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "content-type": "application/json",
+        },
+        body,
+      });
+      const plainText = await request(server, {
+        method: "POST",
+        path: "/api/workflow/dry-run",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "text/plain",
+        },
+        body,
+      });
+      const trusted = await request(server, {
+        method: "POST",
+        path: "/api/workflow/dry-run",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json; charset=utf-8",
+        },
+        body,
+      });
+
+      assert.equal(crossOrigin.status, 403);
+      assert.equal(missingActionHeader.status, 403);
+      assert.equal(plainText.status, 415);
+      assert.equal(trusted.status, 200);
+      assert.deepEqual(JSON.parse(trusted.body), {
+        dryRun: true,
+        persisted: false,
+        assignments: [],
+        explanation,
+      });
+      assert.deepEqual(calls, [
+        {
+          operation: "workflow_dry_run",
+          input: { event, definition },
+        },
+      ]);
+    },
+    {
+      workflowRouting(calls) {
+        return {
+          async getConfig() {
+            throw new Error("unexpected config read");
+          },
+          async dryRun(input) {
+            calls.push({ operation: "workflow_dry_run", input });
+            return {
+              dryRun: true,
+              persisted: false,
+              assignments: [],
+              explanation,
+            };
+          },
+          async listAssignments() {
+            throw new Error("unexpected assignment read");
+          },
+          async listAudit() {
+            throw new Error("unexpected audit read");
+          },
+        };
+      },
+    },
+  );
+});
+
+test("workflow API exposes no config replacement or dispatch mutation", async () => {
+  await withServer(
+    async ({ server, calls }) => {
+      const headers = {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      };
+      const responses = await Promise.all(
+        ["/api/workflow/routing", "/api/workflow/dispatch"].map((path) =>
+          request(server, {
+            method: "POST",
+            path,
+            headers,
+            body: JSON.stringify({ definition: {}, event: {} }),
+          }),
+        ),
+      );
+
+      assert.deepEqual(
+        responses.map((response) => response.status),
+        [404, 404],
+      );
+      assert.deepEqual(calls, []);
+    },
+    {
+      workflowRouting(calls) {
+        const unexpectedMutation = (operation) => async (input) => {
+          calls.push({ operation, input });
+        };
+        return {
+          async getConfig() {
+            return { current: null, history: [] };
+          },
+          async dryRun() {
+            return { dryRun: true, persisted: false };
+          },
+          async listAssignments() {
+            return { items: [], nextCursor: null };
+          },
+          async listAudit() {
+            return { items: [], nextCursor: null };
+          },
+          replaceConfig: unexpectedMutation("workflow_replace_config"),
+          ingest: unexpectedMutation("workflow_dispatch"),
+        };
+      },
+    },
+  );
+});
+
+test("workflow APIs fail closed when routing is unavailable", async () => {
+  await withServer(async ({ server }) => {
+    const trustedHeaders = {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+      "content-type": "application/json",
+    };
+    const responses = await Promise.all([
+      request(server, { path: "/api/workflow/routing" }),
+      request(server, { path: "/api/workflow/assignments" }),
+      request(server, { path: "/api/workflow/audit" }),
+      request(server, {
+        method: "POST",
+        path: "/api/workflow/dry-run",
+        headers: trustedHeaders,
+        body: JSON.stringify({ event: {} }),
+      }),
+    ]);
+
+    assert.deepEqual(
+      responses.map((response) => response.status),
+      [503, 503, 503, 503],
+    );
   });
 });
 

@@ -12,6 +12,7 @@ import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { RefreshService } from "./services/refresh-service.js";
+import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 
 export function createBrain(config = {}, dependencies = {}) {
   if (!config.enabled) return null;
@@ -53,6 +54,8 @@ export async function createApplication({
   codeExecutorDependencies = {},
   confirmationRuntimeFactory = createConfirmationRuntime,
   confirmationRuntimeDependencies = {},
+  workflowRoutingRuntimeFactory = createWorkflowRoutingRuntime,
+  workflowRoutingDependencies = {},
   externalActions = true,
 } = {}) {
   const config = suppliedConfig ?? (await loadConfig());
@@ -68,8 +71,13 @@ export async function createApplication({
     { ...codeExecutorDependencies, store },
   );
   const operationQueue = new OperationQueue();
+  let workflowRouting = null;
   let confirmationRuntime = null;
   try {
+    workflowRouting = await workflowRoutingRuntimeFactory(config, {
+      ...workflowRoutingDependencies,
+      store,
+    });
     confirmationRuntime = externalActions
       ? await confirmationRuntimeFactory(config, {
           ...confirmationRuntimeDependencies,
@@ -106,9 +114,13 @@ export async function createApplication({
     });
     let closePromise = null;
     const close = () => {
-      closePromise ||= confirmationRuntime
-        ? confirmationRuntime.close()
-        : Promise.resolve();
+      closePromise ||= Promise.allSettled([
+        Promise.resolve().then(() => confirmationRuntime?.close?.()),
+        Promise.resolve().then(() => workflowRouting?.close?.()),
+      ]).then((results) => {
+        const failure = results.find(({ status }) => status === "rejected");
+        if (failure) throw failure.reason;
+      });
       return closePromise;
     };
     return {
@@ -118,18 +130,17 @@ export async function createApplication({
       employeeRegistry,
       prEmployee,
       confirmationQueue: confirmationRuntime?.queue || null,
+      workflowRouting,
       codeExecutorRuntime,
       codeExecutor: codeExecutorRuntime?.executor || null,
       close,
     };
   } catch (error) {
-    if (confirmationRuntime) {
-      try {
-        await confirmationRuntime.close();
-      } catch {
-        // Preserve the startup error while the OS guard continues to fail closed.
-      }
-    }
+    const shutdowns = [
+      Promise.resolve().then(() => confirmationRuntime?.close?.()),
+      Promise.resolve().then(() => workflowRouting?.close?.()),
+    ];
+    await Promise.allSettled(shutdowns);
     throw error;
   }
 }

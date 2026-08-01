@@ -190,6 +190,98 @@ test("application composition keeps the disabled executor absent", async () => {
   assert.strictEqual(calls[0].dependencies.store, store);
 });
 
+test("application composes the recovered local workflow router", async () => {
+  const store = memoryStore();
+  const workflowRouting = { id: "workflow-routing" };
+  const calls = [];
+  const application = await createApplication({
+    config: {
+      ...applicationConfig(),
+      workflowRouting: {
+        schemaVersion: 1,
+        enabled: false,
+        maxHops: 8,
+        rules: [],
+      },
+    },
+    store,
+    workflowRoutingRuntimeFactory: async (config, dependencies) => {
+      calls.push({ config, dependencies });
+      return workflowRouting;
+    },
+  });
+
+  assert.strictEqual(application.workflowRouting, workflowRouting);
+  assert.strictEqual(calls[0].dependencies.store, store);
+  assert.equal(calls[0].config.workflowRouting.enabled, false);
+  await application.close();
+});
+
+test("application close starts and awaits both workflow and confirmation shutdown", async () => {
+  let releaseWorkflow;
+  let releaseConfirmation;
+  const workflowClosed = new Promise((resolve) => {
+    releaseWorkflow = resolve;
+  });
+  const confirmationClosed = new Promise((resolve) => {
+    releaseConfirmation = resolve;
+  });
+  const closeCalls = [];
+  const application = await createApplication({
+    config: applicationConfig(),
+    store: memoryStore(),
+    workflowRoutingRuntimeFactory: async () => ({
+      async close() {
+        closeCalls.push("workflow");
+        await workflowClosed;
+      },
+    }),
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() {
+        closeCalls.push("confirmation");
+        await confirmationClosed;
+      },
+    }),
+  });
+
+  let completed = false;
+  const closing = application.close().then(() => {
+    completed = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(new Set(closeCalls), new Set(["workflow", "confirmation"]));
+  releaseConfirmation();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completed, false);
+  releaseWorkflow();
+  await closing;
+  assert.equal(completed, true);
+});
+
+test("a later startup failure releases the acquired workflow runtime", async () => {
+  let workflowCloses = 0;
+  const startupFailure = new Error("confirmation startup failed");
+
+  await assert.rejects(
+    createApplication({
+      config: applicationConfig(),
+      store: memoryStore(),
+      workflowRoutingRuntimeFactory: async () => ({
+        async close() {
+          workflowCloses += 1;
+        },
+      }),
+      confirmationRuntimeFactory: async () => {
+        throw startupFailure;
+      },
+    }),
+    (error) => error === startupFailure,
+  );
+  assert.equal(workflowCloses, 1);
+});
+
 test("application awaits recovered executor composition and propagates failure", async () => {
   const executor = { id: "controlled-executor" };
   let release;
