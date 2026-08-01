@@ -5,6 +5,7 @@ import {
   open,
   readdir,
   readFile,
+  realpath,
   rename,
   rm,
   unlink,
@@ -28,6 +29,20 @@ const DEFAULT_LIMITS = Object.freeze({
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function revisionFromHashes(fileHashes) {
+  const digest = createHash("sha256");
+  const entries = [...fileHashes].sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  for (const [relativePath, fileHash] of entries) {
+    digest.update(relativePath, "utf8");
+    digest.update("\0");
+    digest.update(fileHash, "utf8");
+    digest.update("\0");
+  }
+  return digest.digest("hex");
 }
 
 function safeError(error, fallbackCode, fallbackMessage) {
@@ -166,13 +181,20 @@ export class CodeWorkspaceBroker {
           throw error;
         }
 
+        const sourceRevision = revisionFromHashes(baseline);
         this.executions.set(key, {
           workspace,
           root: executionRoot,
           baseline,
+          sourceRevision,
           tail: Promise.resolve(),
         });
-        return { workspaceId, executionId };
+        return {
+          workspaceId,
+          executionId,
+          sourceRevision,
+          workspaceRevision: sourceRevision,
+        };
       },
       "EXECUTION_CREATE_FAILED",
       "无法创建代码执行副本",
@@ -275,7 +297,17 @@ export class CodeWorkspaceBroker {
           action.workspaceId,
           action.executionId,
         );
-        return this.#enqueue(execution, () => this.#writeFile(execution, action));
+        return this.#enqueue(execution, async () => {
+          const beforeWorkspaceRevision =
+            await this.#currentWorkspaceRevision(execution);
+          this.#assertWorkspaceRevision(action, beforeWorkspaceRevision);
+          const result = await this.#writeFile(execution, action);
+          return {
+            ...result,
+            beforeWorkspaceRevision,
+            workspaceRevision: await this.#currentWorkspaceRevision(execution),
+          };
+        });
       },
       "WRITE_FAILED",
       "无法写入工作区文件",
@@ -289,7 +321,17 @@ export class CodeWorkspaceBroker {
           action.workspaceId,
           action.executionId,
         );
-        return this.#enqueue(execution, () => this.#deleteFile(execution, action));
+        return this.#enqueue(execution, async () => {
+          const beforeWorkspaceRevision =
+            await this.#currentWorkspaceRevision(execution);
+          this.#assertWorkspaceRevision(action, beforeWorkspaceRevision);
+          const result = await this.#deleteFile(execution, action);
+          return {
+            ...result,
+            beforeWorkspaceRevision,
+            workspaceRevision: await this.#currentWorkspaceRevision(execution),
+          };
+        });
       },
       "DELETE_FAILED",
       "无法删除工作区文件",
@@ -340,6 +382,55 @@ export class CodeWorkspaceBroker {
     );
   }
 
+  async getSandboxWorkspacePath({ workspaceId, executionId }) {
+    return guarded(
+      async () => {
+        const execution = this.#execution(workspaceId, executionId);
+        await this.#assertDirectory(
+          execution.root,
+          "EXECUTION_STORAGE_UNAVAILABLE",
+        );
+        return realpath(execution.root);
+      },
+      "EXECUTION_STORAGE_UNAVAILABLE",
+      "代码执行副本不可用",
+    );
+  }
+
+  async getWorkspaceRevision({ workspaceId, executionId }) {
+    return guarded(
+      async () => {
+        const execution = this.#execution(workspaceId, executionId);
+        return this.#enqueue(execution, () =>
+          this.#currentWorkspaceRevision(execution),
+        );
+      },
+      "REVISION_FAILED",
+      "无法计算代码执行副本版本",
+    );
+  }
+
+  async withLockedExecution({ workspaceId, executionId }, operation) {
+    if (typeof operation !== "function") {
+      throw new CodeExecutionError("INVALID_OPERATION", "受控操作无效");
+    }
+    const execution = this.#execution(workspaceId, executionId);
+    return this.#enqueue(execution, async () => {
+      const beforeWorkspaceRevision =
+        await this.#currentWorkspaceRevision(execution);
+      const result = await operation({
+        workspacePath: await realpath(execution.root),
+        workspaceRevision: beforeWorkspaceRevision,
+      });
+      return {
+        result,
+        beforeWorkspaceRevision,
+        afterWorkspaceRevision:
+          await this.#currentWorkspaceRevision(execution),
+      };
+    });
+  }
+
   #workspace(workspaceId) {
     validateWorkspaceId(workspaceId);
     const workspace = this.workspaces.get(workspaceId);
@@ -369,6 +460,31 @@ export class CodeWorkspaceBroker {
     const result = execution.tail.then(operation, operation);
     execution.tail = result.catch(() => {});
     return result;
+  }
+
+  #assertWorkspaceRevision(action, actualRevision) {
+    if (action.expectedWorkspaceRevision === undefined) return;
+    if (!/^[a-f0-9]{64}$/.test(action.expectedWorkspaceRevision)) {
+      throw new CodeExecutionError(
+        "INVALID_WORKSPACE_REVISION",
+        "工作区版本格式无效",
+      );
+    }
+    if (action.expectedWorkspaceRevision !== actualRevision) {
+      throw new CodeExecutionError(
+        "WORKSPACE_REVISION_MISMATCH",
+        "工作区已发生变化",
+      );
+    }
+  }
+
+  async #currentWorkspaceRevision(execution) {
+    const fileHashes = new Map();
+    for (const relativePath of await this.#collectFiles(execution, "")) {
+      const file = await this.#readFileBuffer(execution, relativePath);
+      fileHashes.set(relativePath, sha256(file.value));
+    }
+    return revisionFromHashes(fileHashes);
   }
 
   async #assertDirectory(directory, errorCode) {

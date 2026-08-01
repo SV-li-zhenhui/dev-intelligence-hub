@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -63,19 +72,29 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
     executionId: "run-one",
   });
 
-  assert.deepEqual(execution, { workspaceId: "dashboard", executionId: "run-one" });
+  assert.equal(execution.workspaceId, "dashboard");
+  assert.equal(execution.executionId, "run-one");
+  assert.match(execution.sourceRevision, /^[a-f0-9]{64}$/);
+  assert.equal(execution.workspaceRevision, execution.sourceRevision);
+  assert.equal(
+    await broker.getSandboxWorkspacePath(execution),
+    await realpath(path.join(broker.scratchRoot, "dashboard", "run-one")),
+  );
   assert.deepEqual(await broker.listFiles(execution), [
     "README.md",
     "src/app.js",
     "test/app.test.js",
   ]);
   const app = await broker.readFile({ ...execution, path: "src\\app.js" });
-  await broker.writeFile({
+  const written = await broker.writeFile({
     ...execution,
     path: "src/app.js",
     content: "export const value = 2;\n",
     expectedSha256: app.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
   });
+  assert.equal(written.beforeWorkspaceRevision, execution.workspaceRevision);
+  assert.notEqual(written.workspaceRevision, execution.workspaceRevision);
   await broker.writeFile({
     ...execution,
     path: "docs/notes.md",
@@ -101,6 +120,76 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
   assert.equal(await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"), original);
   assert.equal(await readFile(path.join(sourceRoot, "test", "app.test.js"), "utf8"), "test('old', () => {});\n");
   await assert.rejects(access(path.join(sourceRoot, "docs", "notes.md")));
+});
+
+test("workspace revisions guard writes and stay locked during sandbox work", async (t) => {
+  const { broker } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "revision-run",
+  });
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+  await assert.rejects(
+    broker.writeFile({
+      ...execution,
+      path: "src/app.js",
+      content: "stale\n",
+      expectedSha256: current.sha256,
+      expectedWorkspaceRevision: "0".repeat(64),
+    }),
+    (error) => error.code === "WORKSPACE_REVISION_MISMATCH",
+  );
+
+  let releaseLock;
+  let markLocked;
+  const locked = new Promise((resolve) => {
+    markLocked = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const checking = broker.withLockedExecution(execution, async (context) => {
+    assert.equal(context.workspaceRevision, execution.workspaceRevision);
+    assert.equal(path.isAbsolute(context.workspacePath), true);
+    markLocked();
+    await release;
+    return "checked";
+  });
+  await locked;
+  let writeFinished = false;
+  const writing = broker
+    .writeFile({
+      ...execution,
+      path: "src/app.js",
+      content: "updated\n",
+      expectedSha256: current.sha256,
+      expectedWorkspaceRevision: execution.workspaceRevision,
+    })
+    .then((result) => {
+      writeFinished = true;
+      return result;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writeFinished, false);
+  releaseLock();
+
+  const checked = await checking;
+  assert.equal(checked.result, "checked");
+  assert.equal(checked.beforeWorkspaceRevision, execution.workspaceRevision);
+  assert.equal(checked.afterWorkspaceRevision, execution.workspaceRevision);
+  const write = await writing;
+  assert.notEqual(write.workspaceRevision, execution.workspaceRevision);
+
+  const sandboxFailure = Object.assign(new Error("sandbox stopped"), {
+    code: "SANDBOX_TIMEOUT",
+    details: { cleanupPending: true },
+  });
+  await assert.rejects(
+    broker.withLockedExecution(execution, async () => {
+      throw sandboxFailure;
+    }),
+    (error) => error === sandboxFailure,
+  );
 });
 
 test("paths, secrets, write scope, and optimistic versions are enforced", async (t) => {
