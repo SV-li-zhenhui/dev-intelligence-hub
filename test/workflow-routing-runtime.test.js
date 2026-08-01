@@ -137,6 +137,13 @@ test("runtime acquires the named guard and exposes idempotent close", async () =
 
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(typeof runtime.close, "function");
+  assert.equal(typeof runtime.readAssignmentBatch, "function");
+  assert.deepEqual(await runtime.readAssignmentBatch({ afterSequence: 0 }), {
+    items: [],
+    nextSequence: 0,
+    highWatermark: 0,
+    oldestAvailableSequence: 1,
+  });
   assert.deepEqual(events.slice(0, 2), ["acquire", "run"]);
   const firstClose = runtime.close();
   const secondClose = runtime.close();

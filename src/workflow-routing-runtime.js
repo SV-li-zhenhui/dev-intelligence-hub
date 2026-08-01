@@ -10,6 +10,7 @@ const RUNTIME_METHODS = Object.freeze([
   "ingest",
   "ingestSnapshot",
   "listAssignments",
+  "readAssignmentBatch",
   "listAudit",
 ]);
 

@@ -7,18 +7,24 @@ import {
 import { OperationQueue } from "../lib/operation-queue.js";
 import { routeWorkflowWithIsolation } from "./workflow-route-result.js";
 import {
+  appendWorkflowAssignmentFeed,
+  readWorkflowAssignmentBatch,
+} from "./workflow-assignment-feed.js";
+import {
   pageWorkflowRecords,
   retainWorkflowConfigHistory,
   retainWorkflowState,
 } from "./workflow-routing-retention.js";
 import {
   emptyWorkflowState,
+  isLegacyWorkflowPersistedState,
   MAX_WORKFLOW_AUDIT_BYTES,
   MAX_WORKFLOW_BUNDLE_BYTES,
   MAX_WORKFLOW_CONFIG_HISTORY,
   MAX_WORKFLOW_RECORDS,
   MAX_WORKFLOW_STATE_BYTES,
   mergeWorkflowCheckpoint,
+  normalizeLegacyWorkflowPersistedStateForMigration,
   normalizeWorkflowPersistedState,
   WORKFLOW_STATE_KEY,
   workflowPersistedStateDigest,
@@ -113,7 +119,15 @@ export class WorkflowRoutingService {
           return this.getConfig();
         } catch (error) {
           this.ready = false;
-          if (error?.code === "WORKFLOW_STATE_CORRUPTED") throw error;
+          if (
+            [
+              "WORKFLOW_STATE_CORRUPTED",
+              "WORKFLOW_STATE_REVISION_CONFLICT",
+              "WORKFLOW_STATE_WRITE_FAILED",
+            ].includes(error?.code)
+          ) {
+            throw error;
+          }
           throw workflowServiceError(
             "WORKFLOW_STATE_CORRUPTED",
             "无法恢复工作流路由状态",
@@ -215,13 +229,16 @@ export class WorkflowRoutingService {
         config,
         createdAt,
       );
-      const candidate = {
-        ...this.state,
-        revision: this.state.revision + 1,
-        events: [...this.state.events, cloneWorkflowValue(normalizedEvent)],
-        assignments: [...this.state.assignments, ...assignments],
-        audit: [...this.state.audit, ...audit],
-      };
+      const candidate = this.#appendAssignmentFeed(
+        {
+          ...this.state,
+          revision: this.state.revision + 1,
+          events: [...this.state.events, cloneWorkflowValue(normalizedEvent)],
+          assignments: [...this.state.assignments, ...assignments],
+          audit: [...this.state.audit, ...audit],
+        },
+        assignments,
+      );
       const nextState = this.#retain(
         candidate,
         new Set([normalizedEvent.eventId]),
@@ -262,18 +279,21 @@ export class WorkflowRoutingService {
         assignments.push(...routed.assignments);
         audit.push(...routed.audit);
       }
-      const candidate = {
-        ...this.state,
-        revision: this.state.revision + 1,
-        events: [...this.state.events, ...events.map(cloneWorkflowValue)],
-        assignments: [...this.state.assignments, ...assignments],
-        audit: [...this.state.audit, ...audit],
-        checkpoint: mergeWorkflowCheckpoint(
-          this.state.checkpoint,
-          currentCheckpoint,
-        ),
-        lastSnapshot: cloneWorkflowValue(currentCheckpoint),
-      };
+      const candidate = this.#appendAssignmentFeed(
+        {
+          ...this.state,
+          revision: this.state.revision + 1,
+          events: [...this.state.events, ...events.map(cloneWorkflowValue)],
+          assignments: [...this.state.assignments, ...assignments],
+          audit: [...this.state.audit, ...audit],
+          checkpoint: mergeWorkflowCheckpoint(
+            this.state.checkpoint,
+            currentCheckpoint,
+          ),
+          lastSnapshot: cloneWorkflowValue(currentCheckpoint),
+        },
+        assignments,
+      );
       const nextState = this.#retain(
         candidate,
         new Set(events.map(({ eventId }) => eventId)),
@@ -294,6 +314,16 @@ export class WorkflowRoutingService {
       this.state.assignments,
       "assignmentId",
       options,
+    );
+  }
+
+  async readAssignmentBatch(options = {}) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        return readWorkflowAssignmentBatch(this.state, options);
+      }),
     );
   }
 
@@ -379,6 +409,13 @@ export class WorkflowRoutingService {
     return { assignments, audit };
   }
 
+  #appendAssignmentFeed(candidate, assignments) {
+    return {
+      ...candidate,
+      ...appendWorkflowAssignmentFeed(this.state, assignments),
+    };
+  }
+
   #retain(candidate, protectedEventIds = new Set()) {
     return retainWorkflowState(candidate, {
       protectedEventIds,
@@ -443,7 +480,17 @@ export class WorkflowRoutingService {
       }
       return emptyWorkflowState();
     }
-    const durable = normalizeWorkflowPersistedState(stored, this.limits);
+    const legacy = isLegacyWorkflowPersistedState(stored);
+    let durable = legacy
+      ? normalizeLegacyWorkflowPersistedStateForMigration(stored, this.limits)
+      : normalizeWorkflowPersistedState(stored, this.limits);
+    if (legacy && this.ready) {
+      throw workflowServiceError(
+        "WORKFLOW_STATE_REVISION_CONFLICT",
+        "持久化工作流状态架构发生回退",
+        409,
+      );
+    }
     if (
       this.ready &&
       (durable.revision < this.state.revision ||
@@ -456,6 +503,33 @@ export class WorkflowRoutingService {
         "持久化工作流状态版本发生回退或分叉",
         409,
       );
+    }
+    if (legacy) {
+      const upgraded = this.#retain({
+        ...durable,
+        revision: durable.revision + 1,
+      });
+      let normalized;
+      try {
+        normalized = normalizeWorkflowPersistedState(upgraded, this.limits);
+      } catch (error) {
+        if (error?.code === "WORKFLOW_STATE_CORRUPTED") throw error;
+        throw workflowServiceError(
+          "WORKFLOW_STATE_CORRUPTED",
+          "无法升级工作流路由状态",
+          503,
+        );
+      }
+      try {
+        await this.store.write(WORKFLOW_STATE_KEY, normalized);
+      } catch {
+        throw workflowServiceError(
+          "WORKFLOW_STATE_WRITE_FAILED",
+          "无法持久化工作流路由状态升级",
+          503,
+        );
+      }
+      durable = normalized;
     }
     return durable;
   }

@@ -2,6 +2,12 @@ import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import { projectWorkflowSnapshot } from "../domain/workflow-snapshot-events.js";
 import { validateWorkflowRouteResultAgainstTrustedEvaluation } from "./workflow-route-result.js";
+import {
+  assertWorkflowAssignmentFeedConsistency,
+  MAX_WORKFLOW_ASSIGNMENT_SEQUENCE,
+  migrateWorkflowAssignmentFeed,
+  normalizeWorkflowAssignmentFeedEntry,
+} from "./workflow-assignment-feed.js";
 import { assertWorkflowStateCapacity } from "./workflow-routing-retention.js";
 import {
   boundedWorkflowString,
@@ -18,7 +24,8 @@ import {
 } from "./workflow-routing-values.js";
 
 export const WORKFLOW_STATE_KEY = "workflow-routing-state";
-export const WORKFLOW_STATE_SCHEMA_VERSION = 1;
+export const WORKFLOW_STATE_SCHEMA_VERSION = 2;
+export const LEGACY_WORKFLOW_STATE_SCHEMA_VERSION = 1;
 export const MAX_WORKFLOW_RECORDS = 5_000;
 export const MAX_WORKFLOW_CONFIG_HISTORY = 100;
 export const MAX_WORKFLOW_STATE_BYTES = 32 * 1024 * 1024;
@@ -39,10 +46,47 @@ export function emptyWorkflowState() {
     configHistory: [],
     events: [],
     assignments: [],
+    assignmentFeed: [],
+    assignmentHighWatermark: 0,
+    assignmentOldestAvailableSequence: 1,
     audit: [],
     checkpoint: null,
     lastSnapshot: null,
   };
+}
+
+const LEGACY_STATE_KEYS = Object.freeze([
+  "schemaVersion",
+  "revision",
+  "currentConfig",
+  "configHistory",
+  "events",
+  "assignments",
+  "audit",
+  "checkpoint",
+  "lastSnapshot",
+]);
+
+const CURRENT_STATE_KEYS = Object.freeze([
+  "schemaVersion",
+  "revision",
+  "currentConfig",
+  "configHistory",
+  "events",
+  "assignments",
+  "assignmentFeed",
+  "assignmentHighWatermark",
+  "assignmentOldestAvailableSequence",
+  "audit",
+  "checkpoint",
+  "lastSnapshot",
+]);
+
+export function isLegacyWorkflowPersistedState(value) {
+  return (
+    hasExactWorkflowKeys(value, LEGACY_STATE_KEYS) &&
+    value.schemaVersion === LEGACY_WORKFLOW_STATE_SCHEMA_VERSION
+  );
 }
 
 function normalizeConfigEntry(value) {
@@ -245,6 +289,7 @@ function assertCrossRecordConsistency(state) {
   const assignments = new Map(
     state.assignments.map((assignment) => [assignment.assignmentId, assignment]),
   );
+  assertWorkflowAssignmentFeedConsistency(state, { events, assignments });
   const configs = new Map(
     state.configHistory.map((config) => [
       workflowConfigReference(config.version, config.digest),
@@ -358,7 +403,21 @@ function assertCrossRecordConsistency(state) {
   }
 }
 
-export function normalizeWorkflowPersistedState(
+function legacyWorkflowCapacityState(state) {
+  return {
+    schemaVersion: LEGACY_WORKFLOW_STATE_SCHEMA_VERSION,
+    revision: state.revision,
+    currentConfig: state.currentConfig,
+    configHistory: state.configHistory,
+    events: state.events,
+    assignments: state.assignments,
+    audit: state.audit,
+    checkpoint: state.checkpoint,
+    lastSnapshot: state.lastSnapshot,
+  };
+}
+
+function normalizeWorkflowPersistedStateInternal(
   value,
   {
     recordLimit = MAX_WORKFLOW_RECORDS,
@@ -367,20 +426,14 @@ export function normalizeWorkflowPersistedState(
     auditByteBudget = MAX_WORKFLOW_AUDIT_BYTES,
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
   } = {},
+  { allowLegacyMigrationOverflow = false } = {},
 ) {
+  const legacy = isLegacyWorkflowPersistedState(value);
+  const current =
+    hasExactWorkflowKeys(value, CURRENT_STATE_KEYS) &&
+    value.schemaVersion === WORKFLOW_STATE_SCHEMA_VERSION;
   if (
-    !hasExactWorkflowKeys(value, [
-      "schemaVersion",
-      "revision",
-      "currentConfig",
-      "configHistory",
-      "events",
-      "assignments",
-      "audit",
-      "checkpoint",
-      "lastSnapshot",
-    ]) ||
-    value.schemaVersion !== WORKFLOW_STATE_SCHEMA_VERSION ||
+    (!legacy && !current) ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 0 ||
     !Array.isArray(value.configHistory) ||
@@ -390,7 +443,17 @@ export function normalizeWorkflowPersistedState(
     value.configHistory.length > configHistoryLimit ||
     value.events.length > recordLimit ||
     value.assignments.length > recordLimit ||
-    value.audit.length > recordLimit
+    value.audit.length > recordLimit ||
+    (current &&
+      (!Array.isArray(value.assignmentFeed) ||
+        value.assignmentFeed.length > recordLimit ||
+        !Number.isSafeInteger(value.assignmentHighWatermark) ||
+        value.assignmentHighWatermark < 0 ||
+        value.assignmentHighWatermark > MAX_WORKFLOW_ASSIGNMENT_SEQUENCE ||
+        !Number.isSafeInteger(value.assignmentOldestAvailableSequence) ||
+        value.assignmentOldestAvailableSequence < 1 ||
+        value.assignmentOldestAvailableSequence >
+          value.assignmentHighWatermark + 1))
   ) {
     throw workflowServiceError(
       "WORKFLOW_STATE_CORRUPTED",
@@ -422,6 +485,17 @@ export function normalizeWorkflowPersistedState(
       503,
     );
   }
+  const assignments = value.assignments.map(normalizeAssignmentRecord);
+  const assignmentFeedState = legacy
+    ? migrateWorkflowAssignmentFeed(assignments)
+    : {
+        assignmentFeed: value.assignmentFeed.map(
+          normalizeWorkflowAssignmentFeedEntry,
+        ),
+        assignmentHighWatermark: value.assignmentHighWatermark,
+        assignmentOldestAvailableSequence:
+          value.assignmentOldestAvailableSequence,
+      };
   const state = {
     schemaVersion: WORKFLOW_STATE_SCHEMA_VERSION,
     revision: value.revision,
@@ -430,7 +504,8 @@ export function normalizeWorkflowPersistedState(
     events: value.events.map((event) =>
       cloneWorkflowValue(normalizeStoredWorkflowEvent(event)),
     ),
-    assignments: value.assignments.map(normalizeAssignmentRecord),
+    assignments,
+    ...assignmentFeedState,
     audit: value.audit.map(normalizeAuditRecord),
     checkpoint:
       value.checkpoint === null
@@ -454,7 +529,11 @@ export function normalizeWorkflowPersistedState(
   }
   assertCrossRecordConsistency(state);
   try {
-    assertWorkflowStateCapacity(state, {
+    const capacityState =
+      legacy && allowLegacyMigrationOverflow
+        ? legacyWorkflowCapacityState(state)
+        : state;
+    assertWorkflowStateCapacity(capacityState, {
       stateByteBudget,
       auditByteBudget,
       bundleByteBudget,
@@ -467,6 +546,26 @@ export function normalizeWorkflowPersistedState(
     );
   }
   return state;
+}
+
+export function normalizeWorkflowPersistedState(value, options) {
+  return normalizeWorkflowPersistedStateInternal(value, options);
+}
+
+export function normalizeLegacyWorkflowPersistedStateForMigration(
+  value,
+  options,
+) {
+  if (!isLegacyWorkflowPersistedState(value)) {
+    throw workflowServiceError(
+      "WORKFLOW_STATE_CORRUPTED",
+      "待迁移工作流状态不是受支持的 v1 状态",
+      503,
+    );
+  }
+  return normalizeWorkflowPersistedStateInternal(value, options, {
+    allowLegacyMigrationOverflow: true,
+  });
 }
 
 export function mergeWorkflowCheckpoint(previous, current) {

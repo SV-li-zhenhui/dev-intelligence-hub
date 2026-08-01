@@ -27,10 +27,15 @@ function recordsByEvent(records) {
 
 function workflowBundles(state) {
   const assignments = recordsByEvent(state.assignments);
+  const assignmentFeed = recordsByEvent(state.assignmentFeed || []);
   const audit = recordsByEvent(state.audit);
+  const hasAssignmentFeed = Array.isArray(state.assignmentFeed);
   return state.events.map((event) => ({
     event,
     assignments: assignments.get(event.eventId) || [],
+    ...(hasAssignmentFeed
+      ? { assignmentFeed: assignmentFeed.get(event.eventId) || [] }
+      : {}),
     audit: audit.get(event.eventId) || [],
   }));
 }
@@ -94,6 +99,9 @@ function limitsSatisfied({
   const remainingEvents = state.events.length - removed.events.count;
   const remainingAssignments =
     state.assignments.length - removed.assignments.count;
+  const remainingAssignmentFeed = Array.isArray(state.assignmentFeed)
+    ? state.assignmentFeed.length - removed.assignmentFeed.count
+    : 0;
   const remainingAudit = state.audit.length - removed.audit.count;
   const removedBytes =
     removedArrayBytes(
@@ -106,16 +114,37 @@ function limitsSatisfied({
       removed.assignments.count,
       removed.assignments.bytes,
     ) +
+    (Array.isArray(state.assignmentFeed)
+      ? removedArrayBytes(
+          state.assignmentFeed.length,
+          removed.assignmentFeed.count,
+          removed.assignmentFeed.bytes,
+        )
+      : 0) +
     removedArrayBytes(
       state.audit.length,
       removed.audit.count,
       removed.audit.bytes,
     );
+  const oldestSequenceByteDelta = Array.isArray(state.assignmentFeed)
+    ? Buffer.byteLength(
+        JSON.stringify(
+          state.assignmentFeed[removed.assignmentFeed.count]?.sequence ||
+            state.assignmentHighWatermark + 1,
+        ),
+        "utf8",
+      ) -
+      Buffer.byteLength(
+        JSON.stringify(state.assignmentOldestAvailableSequence),
+        "utf8",
+      )
+    : 0;
   return (
     remainingEvents <= recordLimit &&
     remainingAssignments <= recordLimit &&
+    remainingAssignmentFeed <= recordLimit &&
     remainingAudit <= recordLimit &&
-    initialBytes - removedBytes <= stateByteBudget
+    initialBytes - removedBytes + oldestSequenceByteDelta <= stateByteBudget
   );
 }
 
@@ -162,6 +191,7 @@ export function retainWorkflowState(
   const removed = {
     events: { count: 0, bytes: 0 },
     assignments: { count: 0, bytes: 0 },
+    assignmentFeed: { count: 0, bytes: 0 },
     audit: { count: 0, bytes: 0 },
   };
   const droppedEventIds = new Set();
@@ -191,6 +221,7 @@ export function retainWorkflowState(
     droppedEventIds.add(bundle.event.eventId);
     addRemoved(removed, "events", [bundle.event]);
     addRemoved(removed, "assignments", bundle.assignments);
+    addRemoved(removed, "assignmentFeed", bundle.assignmentFeed || []);
     addRemoved(removed, "audit", bundle.audit);
   }
 
@@ -209,6 +240,11 @@ export function retainWorkflowState(
       409,
     );
   }
+  const retainedAssignmentFeed = Array.isArray(state.assignmentFeed)
+    ? state.assignmentFeed.filter(
+        (entry) => !droppedEventIds.has(entry.eventId),
+      )
+    : null;
   const retained = {
     ...state,
     events: state.events.filter(
@@ -217,6 +253,14 @@ export function retainWorkflowState(
     assignments: state.assignments.filter(
       (assignment) => !droppedEventIds.has(assignment.eventId),
     ),
+    ...(retainedAssignmentFeed
+      ? {
+          assignmentFeed: retainedAssignmentFeed,
+          assignmentOldestAvailableSequence:
+            retainedAssignmentFeed[0]?.sequence ||
+            state.assignmentHighWatermark + 1,
+        }
+      : {}),
     audit: state.audit.filter(
       (entry) => !droppedEventIds.has(entry.eventId),
     ),
