@@ -4,9 +4,31 @@ import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
   createBrain,
+  createApplication,
   createEmployeeRegistry,
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
+
+function applicationConfig(codeExecutor = { enabled: false }) {
+  return {
+    refreshMinutes: 10,
+    trackedRepositories: [],
+    prResponsibility: {},
+    brain: { enabled: false },
+    employees: { prReviewer: { enabled: false } },
+    dingtalk: { enabled: false },
+    codeExecutor,
+  };
+}
+
+function memoryStore() {
+  return {
+    async read(_key, fallback = null) {
+      return fallback;
+    },
+    async write() {},
+  };
+}
 
 test("brain provider factory keeps the role independent from its model", () => {
   const brain = createBrain({
@@ -63,4 +85,61 @@ test("employee registry keeps role instances discoverable by id", () => {
 
   assert.strictEqual(registry.get("pr-reviewer"), prEmployee);
   assert.strictEqual(registry.get("requirements-analyst"), analyst);
+});
+
+test("application composition keeps the disabled executor absent", async () => {
+  const store = memoryStore();
+  const calls = [];
+  const application = await createApplication({
+    config: applicationConfig(),
+    store,
+    codeExecutorRuntimeFactory: async (config, dependencies) => {
+      calls.push({ config, dependencies });
+      return null;
+    },
+  });
+
+  assert.equal(application.codeExecutorRuntime, null);
+  assert.equal(application.codeExecutor, null);
+  assert.deepEqual(calls[0].config, { enabled: false });
+  assert.strictEqual(calls[0].dependencies.store, store);
+});
+
+test("application awaits recovered executor composition and propagates failure", async () => {
+  const executor = { id: "controlled-executor" };
+  let release;
+  const recovery = new Promise((resolve) => {
+    release = resolve;
+  });
+  let composed = false;
+  let factoryCalled = false;
+  const pending = createApplication({
+    config: applicationConfig({ enabled: true }),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: () => {
+      factoryCalled = true;
+      return recovery;
+    },
+  }).then((application) => {
+    composed = true;
+    return application;
+  });
+  assert.equal(factoryCalled, true);
+  assert.equal(composed, false);
+
+  release({ executor, recovery: { recovered: true, cleanupPending: 0 } });
+  const application = await pending;
+  assert.strictEqual(application.codeExecutor, executor);
+
+  const startupFailure = new Error("recovery failed");
+  await assert.rejects(
+    createApplication({
+      config: applicationConfig({ enabled: true }),
+      store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => {
+        throw startupFailure;
+      },
+    }),
+    (error) => error === startupFailure,
+  );
 });

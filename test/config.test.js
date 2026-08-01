@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { mergeConfig } from "../src/lib/config.js";
+
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 test("local provider settings merge without erasing base defaults", () => {
   const result = mergeConfig(
@@ -47,4 +52,129 @@ test("local provider settings merge without erasing base defaults", () => {
     maxJobsPerTick: 1,
     brain: { timeoutMs: 45_000, model: "employee-model" },
   });
+});
+
+test("code executor settings merge nested sections independently", () => {
+  const baseWorkspaces = [
+    { id: "dashboard", sourceRoot: "dashboard" },
+  ];
+  const localWorkspaces = [
+    { id: "product", sourceRoot: "product" },
+  ];
+  const result = mergeConfig(
+    {
+      codeExecutor: {
+        enabled: false,
+        docker: {
+          executable: "base-docker",
+          host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+        },
+        workspaces: baseWorkspaces,
+        profiles: {
+          "node-tests": { kind: "node-test", timeoutMs: 30_000 },
+          "fast-tests": { kind: "node-test", timeoutMs: 10_000 },
+        },
+        requiredProfilesByWorkspace: {
+          dashboard: ["node-tests"],
+          product: ["fast-tests"],
+        },
+        brokerLimits: { maxFiles: 5_000, maxFileBytes: 2_000_000 },
+        executorLimits: { maxSessions: 10, maxActionsPerSession: 100 },
+        maxArtifactBytes: 1_000_000,
+      },
+    },
+    {
+      codeExecutor: {
+        enabled: true,
+        docker: { executable: "podman" },
+        workspaces: localWorkspaces,
+        profiles: {
+          "fast-tests": { kind: "node-test", timeoutMs: 15_000 },
+        },
+        requiredProfilesByWorkspace: { product: ["fast-tests"] },
+        brokerLimits: { maxFiles: 4_000 },
+        executorLimits: { maxSessions: 20 },
+        maxArtifactBytes: 2_000_000,
+      },
+    },
+  );
+
+  assert.deepEqual(result.codeExecutor, {
+    enabled: true,
+    docker: {
+      executable: "podman",
+      host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+    },
+    workspaces: localWorkspaces,
+    profiles: {
+      "node-tests": { kind: "node-test", timeoutMs: 30_000 },
+      "fast-tests": { kind: "node-test", timeoutMs: 15_000 },
+    },
+    requiredProfilesByWorkspace: {
+      product: ["fast-tests"],
+    },
+    brokerLimits: { maxFiles: 4_000, maxFileBytes: 2_000_000 },
+    executorLimits: { maxSessions: 20, maxActionsPerSession: 100 },
+    maxArtifactBytes: 2_000_000,
+  });
+  assert.strictEqual(result.codeExecutor.workspaces, localWorkspaces);
+});
+
+test("replacing workspaces also replaces their profile bindings", () => {
+  const result = mergeConfig(
+    {
+      codeExecutor: {
+        workspaces: [{ id: "dashboard", sourceRoot: "dashboard" }],
+        requiredProfilesByWorkspace: { dashboard: ["node-tests"] },
+      },
+    },
+    {
+      codeExecutor: {
+        workspaces: [{ id: "product", sourceRoot: "product" }],
+      },
+    },
+  );
+
+  assert.deepEqual(result.codeExecutor.requiredProfilesByWorkspace, {});
+});
+
+test("code executor overrides preserve unspecified base defaults", () => {
+  const base = {
+    codeExecutor: {
+      enabled: false,
+      docker: {
+        executable: "docker",
+        host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+      },
+      workspaces: [{ id: "dashboard", sourceRoot: "base-path" }],
+      profiles: { "node-tests": { timeoutMs: 30_000 } },
+      requiredProfilesByWorkspace: { dashboard: ["node-tests"] },
+      brokerLimits: { maxFiles: 2_000 },
+      executorLimits: { maxSessions: 10 },
+      maxArtifactBytes: 1_000_000,
+    },
+  };
+
+  assert.deepEqual(
+    mergeConfig(base, { codeExecutor: { enabled: true } }).codeExecutor,
+    {
+      ...base.codeExecutor,
+      enabled: true,
+    },
+  );
+});
+
+test("committed code executor configuration is disabled and path-free", async () => {
+  const configPath = path.resolve(testDirectory, "../config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+
+  assert.deepEqual(config.codeExecutor, { enabled: false });
+  const absolutePaths = Object.values(config.codeExecutor).filter(
+    (value) =>
+      typeof value === "string" &&
+      (path.isAbsolute(value) ||
+        path.posix.isAbsolute(value) ||
+        path.win32.isAbsolute(value)),
+  );
+  assert.deepEqual(absolutePaths, []);
 });

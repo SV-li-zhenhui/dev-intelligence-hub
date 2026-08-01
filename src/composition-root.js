@@ -3,6 +3,7 @@ import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
+import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { loadConfig, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { StateStore } from "./lib/state-store.js";
@@ -44,15 +45,24 @@ export function createEmployeeRegistry(employees = []) {
   return new EmployeeRegistry(employees.filter(Boolean));
 }
 
-export async function createApplication() {
-  const config = await loadConfig();
+export async function createApplication({
+  config: suppliedConfig,
+  store: suppliedStore,
+  codeExecutorRuntimeFactory = createCodeExecutorRuntime,
+  codeExecutorDependencies = {},
+} = {}) {
+  const config = suppliedConfig ?? (await loadConfig());
   const roleConfig = config.employees?.prReviewer || { enabled: false };
   const github = new GitHubAdapter({
     maxPatchCharacters: roleConfig.maxPatchCharacters,
   });
   const dingtalk = new DingTalkAdapter();
   const brain = createBrain(config.brain);
-  const store = new StateStore(path.join(projectRoot, "data"));
+  const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
+  const codeExecutorRuntime = await codeExecutorRuntimeFactory(
+    config.codeExecutor,
+    { ...codeExecutorDependencies, store },
+  );
   const operationQueue = new OperationQueue();
   const prEmployee = new ProactivePrEmployeeService({
     github,
@@ -83,5 +93,7 @@ export async function createApplication() {
     refreshService,
     employeeRegistry,
     prEmployee,
+    codeExecutorRuntime,
+    codeExecutor: codeExecutorRuntime?.executor || null,
   };
 }

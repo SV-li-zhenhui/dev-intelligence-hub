@@ -10,6 +10,9 @@
   "prResponsibility": {
     "historicalAfterDays": 60
   },
+  "codeExecutor": {
+    "enabled": false
+  },
   "brain": {
     "enabled": true,
     "provider": "ollama",

@@ -50,6 +50,43 @@ npm start
 
 PR 正文、文件名和 diff 默认只允许发送到 loopback Ollama。若明确要连接远程 Ollama，必须在 `employees.prReviewer` 中设置 `allowRemoteCodeContext: true`；界面会持续提示代码上下文正在离开本机。远程 Provider 后续也应沿用这一显式授权边界。
 
+## 受控代码执行器
+
+代码执行基础能力默认关闭，并且尚未直接交给任何岗位或 HTTP 接口。启用后，系统会先恢复持久化会话；恢复校验失败时启动会直接失败，不会退回宿主机命令执行。
+
+私人工作区和 Docker 设置只写入不入库的 `config.local.json`。下面是本项目在 Windows Docker Desktop 上的示例；镜像必须固定到 digest，工作区写权限必须逐项列出：
+
+```json
+{
+  "codeExecutor": {
+    "enabled": true,
+    "docker": {
+      "executable": "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      "host": "npipe:////./pipe/dockerDesktopLinuxEngine"
+    },
+    "workspaces": [
+      {
+        "id": "my-dashboard",
+        "sourceRoot": ".",
+        "writablePaths": ["src", "test"]
+      }
+    ],
+    "profiles": {
+      "node-tests": {
+        "kind": "node-test",
+        "image": "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32",
+        "timeoutMs": 30000
+      }
+    },
+    "requiredProfilesByWorkspace": {
+      "my-dashboard": ["node-tests"]
+    }
+  }
+}
+```
+
+临时工作副本和不可变审计产物保存在被 Git 忽略的 `data/code-executor/`。源仓库保持只读；员工只能提交固定语义动作，不能传入任意 shell 命令。
+
 ## 本地安全边界
 
 服务只监听 `127.0.0.1`，校验 Host、同源写请求并禁止页面被其他站点嵌入。它是单用户本地工具，当前信任同一台机器上能够访问 loopback 的本地进程；不要把 4173 端口代理或暴露到局域网/公网。

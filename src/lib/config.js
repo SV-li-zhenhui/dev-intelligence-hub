@@ -7,9 +7,33 @@ export const projectRoot = path.resolve(
   "../..",
 );
 
+const codeExecutorNestedConfigs = [
+  "docker",
+  "profiles",
+  "requiredProfilesByWorkspace",
+  "brokerLimits",
+  "executorLimits",
+];
+
+function mergeCodeExecutorConfig(base = {}, local = {}) {
+  const merged = { ...base, ...local };
+  for (const name of codeExecutorNestedConfigs) {
+    if (base[name] === undefined && local[name] === undefined) continue;
+    merged[name] = { ...base[name], ...local[name] };
+  }
+  if (local.workspaces !== undefined) {
+    merged.requiredProfilesByWorkspace = {
+      ...(local.requiredProfilesByWorkspace || {}),
+    };
+  }
+  return merged;
+}
+
 export function mergeConfig(base, local = {}) {
   const basePrReviewer = base.employees?.prReviewer || {};
   const localPrReviewer = local.employees?.prReviewer || {};
+  const hasCodeExecutor =
+    base.codeExecutor !== undefined || local.codeExecutor !== undefined;
   return {
     ...base,
     ...local,
@@ -31,6 +55,14 @@ export function mergeConfig(base, local = {}) {
         },
       },
     },
+    ...(hasCodeExecutor
+      ? {
+          codeExecutor: mergeCodeExecutorConfig(
+            base.codeExecutor,
+            local.codeExecutor,
+          ),
+        }
+      : {}),
   };
 }
 
