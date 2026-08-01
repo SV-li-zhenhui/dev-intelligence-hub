@@ -192,6 +192,331 @@ test("workspace revisions guard writes and stay locked during sandbox work", asy
   );
 });
 
+test("version-guarded reads wait for queued mutations and reject stale snapshots", async (t) => {
+  const { broker } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "guarded-read-run",
+  });
+  const expectedRevision = {
+    ...execution,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  };
+  assert.deepEqual(await broker.listFiles(expectedRevision), ["src/app.js"]);
+  const current = await broker.readFile({
+    ...expectedRevision,
+    path: "src/app.js",
+  });
+  assert.equal(
+    (await broker.searchText({ ...expectedRevision, query: "value" })).matches
+      .length,
+    1,
+  );
+  assert.deepEqual(await broker.getChangeManifest(expectedRevision), {
+    created: [],
+    modified: [],
+    deleted: [],
+  });
+
+  let releaseLock;
+  let markLocked;
+  const locked = new Promise((resolve) => {
+    markLocked = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const holdingLock = broker.withLockedExecution(execution, async () => {
+    markLocked();
+    await release;
+  });
+  await locked;
+
+  const writing = broker.writeFile({
+    ...execution,
+    path: "src/app.js",
+    content: "export const value = 2;\n",
+    expectedSha256: current.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  let settledCount = 0;
+  const staleRevision = expectedRevision;
+  const guardedReads = [
+    broker.listFiles(staleRevision),
+    broker.readFile({ ...staleRevision, path: "src/app.js" }),
+    broker.searchText({ ...staleRevision, query: "value" }),
+    broker.getChangeManifest(staleRevision),
+  ].map((operation) =>
+    operation.then(
+      (value) => {
+        settledCount += 1;
+        return { value };
+      },
+      (error) => {
+        settledCount += 1;
+        return { error };
+      },
+    ),
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const settledWhileLocked = settledCount;
+  releaseLock();
+  await holdingLock;
+  await writing;
+  const results = await Promise.all(guardedReads);
+
+  assert.equal(settledWhileLocked, 0);
+  for (const result of results) {
+    assert.equal(result.error?.code, "WORKSPACE_REVISION_MISMATCH");
+  }
+});
+
+test("guarded reads reuse cached revisions while sealing scans scratch integrity", async (t) => {
+  const { broker } = await fixture(t, {
+    files: {
+      "src/app.js": "export const value = 1;\n",
+      "src/other.js": "export const other = 1;\n",
+    },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "cached-read-run",
+  });
+  const guardedRevision = {
+    ...execution,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  };
+
+  const scratchPath = await broker.getSandboxWorkspacePath(execution);
+  await writeFile(
+    path.join(scratchPath, "src", "other.js"),
+    "export const other = 2;\n",
+  );
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.deepEqual(await broker.listFiles(guardedRevision), [
+      "src/app.js",
+      "src/other.js",
+    ]);
+    assert.equal(
+      (
+        await broker.readFile({
+          ...guardedRevision,
+          path: "src/app.js",
+        })
+      ).content,
+      "export const value = 1;\n",
+    );
+    assert.deepEqual(
+      (
+        await broker.searchText({
+          ...guardedRevision,
+          query: "value",
+        })
+      ).matches.map((match) => match.path),
+      ["src/app.js"],
+    );
+  }
+  await assert.rejects(
+    broker.sealExecution({
+      ...execution,
+      expectedWorkspaceRevision: execution.workspaceRevision,
+    }),
+    (error) => error.code === "WORKSPACE_REVISION_MISMATCH",
+  );
+});
+
+test("successful writes and deletes atomically advance cached revision guards", async (t) => {
+  const { broker } = await fixture(t, {
+    files: {
+      "src/app.js": "export const value = 1;\n",
+      "src/old.js": "old\n",
+    },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "cached-mutation-run",
+  });
+  const app = await broker.readFile({ ...execution, path: "src/app.js" });
+  const old = await broker.readFile({ ...execution, path: "src/old.js" });
+
+  const written = await broker.writeFile({
+    ...execution,
+    path: "src/app.js",
+    content: "export const value = 2;\n",
+    expectedSha256: app.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  const deleted = await broker.deleteFile({
+    ...execution,
+    path: "src/old.js",
+    expectedSha256: old.sha256,
+    expectedWorkspaceRevision: written.workspaceRevision,
+  });
+
+  assert.equal(deleted.beforeWorkspaceRevision, written.workspaceRevision);
+  assert.notEqual(deleted.workspaceRevision, written.workspaceRevision);
+  await assert.rejects(
+    broker.readFile({
+      ...execution,
+      path: "src/app.js",
+      expectedWorkspaceRevision: written.workspaceRevision,
+    }),
+    (error) => error.code === "WORKSPACE_REVISION_MISMATCH",
+  );
+  assert.equal(
+    (
+      await broker.readFile({
+        ...execution,
+        path: "src/app.js",
+        expectedWorkspaceRevision: deleted.workspaceRevision,
+      })
+    ).content,
+    "export const value = 2;\n",
+  );
+  assert.equal(await broker.getWorkspaceRevision(execution), deleted.workspaceRevision);
+});
+
+test("sealing snapshots changes and rejects mutations queued behind it", async (t) => {
+  const { broker } = await fixture(t, {
+    files: {
+      "src/app.js": "export const value = 1;\n",
+      "src/old.js": "old\n",
+    },
+    writablePaths: ["src"],
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "seal-first-run",
+  });
+  const app = await broker.readFile({ ...execution, path: "src/app.js" });
+  const old = await broker.readFile({ ...execution, path: "src/old.js" });
+
+  let releaseLock;
+  let markLocked;
+  const locked = new Promise((resolve) => {
+    markLocked = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const holdingLock = broker.withLockedExecution(execution, async () => {
+    markLocked();
+    await release;
+  });
+  await locked;
+
+  const sealing = broker.sealExecution({
+    ...execution,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  const writingRejected = assert.rejects(
+    broker.writeFile({
+      ...execution,
+      path: "src/app.js",
+      content: "export const value = 2;\n",
+      expectedSha256: app.sha256,
+      expectedWorkspaceRevision: execution.workspaceRevision,
+    }),
+    (error) => error.code === "EXECUTION_SEALED",
+  );
+  const deletingRejected = assert.rejects(
+    broker.deleteFile({
+      ...execution,
+      path: "src/old.js",
+      expectedSha256: old.sha256,
+      expectedWorkspaceRevision: execution.workspaceRevision,
+    }),
+    (error) => error.code === "EXECUTION_SEALED",
+  );
+
+  releaseLock();
+  await holdingLock;
+  const sealed = await sealing;
+  await Promise.all([writingRejected, deletingRejected]);
+
+  assert.equal(sealed.workspaceRevision, execution.workspaceRevision);
+  assert.deepEqual(sealed.manifest, {
+    created: [],
+    modified: [],
+    deleted: [],
+  });
+  sealed.manifest.created.push({ path: "caller-mutation" });
+  const repeated = await broker.sealExecution({
+    ...execution,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  assert.deepEqual(repeated.manifest, {
+    created: [],
+    modified: [],
+    deleted: [],
+  });
+  await assert.rejects(
+    broker.sealExecution({
+      ...execution,
+      expectedWorkspaceRevision: "0".repeat(64),
+    }),
+    (error) => error.code === "WORKSPACE_REVISION_MISMATCH",
+  );
+});
+
+test("a mutation queued before sealing wins and makes the stale seal fail", async (t) => {
+  const { broker } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "write-first-run",
+  });
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+  await assert.rejects(
+    broker.sealExecution(execution),
+    (error) => error.code === "EXPECTED_WORKSPACE_REVISION_REQUIRED",
+  );
+
+  let releaseLock;
+  let markLocked;
+  const locked = new Promise((resolve) => {
+    markLocked = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const holdingLock = broker.withLockedExecution(execution, async () => {
+    markLocked();
+    await release;
+  });
+  await locked;
+
+  const writing = broker.writeFile({
+    ...execution,
+    path: "src/app.js",
+    content: "export const value = 2;\n",
+    expectedSha256: current.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  const staleSealRejected = assert.rejects(
+    broker.sealExecution({
+      ...execution,
+      expectedWorkspaceRevision: execution.workspaceRevision,
+    }),
+    (error) => error.code === "WORKSPACE_REVISION_MISMATCH",
+  );
+
+  releaseLock();
+  await holdingLock;
+  const written = await writing;
+  await staleSealRejected;
+
+  const sealed = await broker.sealExecution({
+    ...execution,
+    expectedWorkspaceRevision: written.workspaceRevision,
+  });
+  assert.equal(sealed.workspaceRevision, written.workspaceRevision);
+  assert.deepEqual(sealed.manifest.modified.map((entry) => entry.path), [
+    "src/app.js",
+  ]);
+});
+
 test("paths, secrets, write scope, and optimistic versions are enforced", async (t) => {
   const { broker, sourceRoot } = await fixture(t, {
     files: {

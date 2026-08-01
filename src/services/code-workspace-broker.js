@@ -187,6 +187,11 @@ export class CodeWorkspaceBroker {
           root: executionRoot,
           baseline,
           sourceRevision,
+          workspaceState: {
+            fileHashes: new Map(baseline),
+            revision: sourceRevision,
+          },
+          seal: null,
           tail: Promise.resolve(),
         });
         return {
@@ -201,48 +206,67 @@ export class CodeWorkspaceBroker {
     );
   }
 
-  async listFiles({ workspaceId, executionId, path: requestedPath = "" }) {
+  async listFiles(request) {
     return guarded(
       async () => {
+        const {
+          workspaceId,
+          executionId,
+          path: requestedPath = "",
+        } = request;
         const execution = this.#execution(workspaceId, executionId);
-        const relativePath = execution.workspace.policy.assertAccessible(
-          requestedPath,
-          { allowRoot: true },
+        return this.#enqueueAtExpectedRevision(
+          execution,
+          request,
+          async () => {
+            const relativePath = execution.workspace.policy.assertAccessible(
+              requestedPath,
+              { allowRoot: true },
+            );
+            return this.#collectFiles(execution, relativePath);
+          },
         );
-        return this.#collectFiles(execution, relativePath);
       },
       "LIST_FAILED",
       "无法列出工作区文件",
     );
   }
 
-  async readFile({ workspaceId, executionId, path: requestedPath }) {
+  async readFile(request) {
     return guarded(
       async () => {
+        const { workspaceId, executionId, path: requestedPath } = request;
         const execution = this.#execution(workspaceId, executionId);
-        const relativePath =
-          execution.workspace.policy.assertAccessible(requestedPath);
-        const file = await this.#readTextFile(execution, relativePath);
-        return {
-          path: relativePath,
-          content: file.content,
-          sha256: file.sha256,
-          bytes: file.bytes,
-        };
+        return this.#enqueueAtExpectedRevision(
+          execution,
+          request,
+          async () => {
+            const relativePath =
+              execution.workspace.policy.assertAccessible(requestedPath);
+            const file = await this.#readTextFile(execution, relativePath);
+            return {
+              path: relativePath,
+              content: file.content,
+              sha256: file.sha256,
+              bytes: file.bytes,
+            };
+          },
+        );
       },
       "READ_FAILED",
       "无法读取工作区文件",
     );
   }
 
-  async searchText({
-    workspaceId,
-    executionId,
-    query,
-    path: requestedPath = "",
-  }) {
+  async searchText(request) {
     return guarded(
       async () => {
+        const {
+          workspaceId,
+          executionId,
+          query,
+          path: requestedPath = "",
+        } = request;
         if (
           typeof query !== "string" ||
           query.length === 0 ||
@@ -252,38 +276,44 @@ export class CodeWorkspaceBroker {
           throw new CodeExecutionError("INVALID_QUERY", "搜索文本无效");
         }
         const execution = this.#execution(workspaceId, executionId);
-        const relativePath = execution.workspace.policy.assertAccessible(
-          requestedPath,
-          { allowRoot: true },
-        );
-        const files = await this.#collectFiles(execution, relativePath);
-        const matches = [];
-        for (const filePath of files) {
-          let file;
-          try {
-            file = await this.#readTextFile(execution, filePath);
-          } catch (error) {
-            if (error.code === "TEXT_REQUIRED") continue;
-            throw error;
-          }
-          const lines = file.content.split(/\r?\n/);
-          for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-            let column = lines[lineIndex].indexOf(query);
-            while (column !== -1) {
-              if (matches.length === this.limits.maxSearchMatches) {
-                return { matches, truncated: true };
+        return this.#enqueueAtExpectedRevision(
+          execution,
+          request,
+          async () => {
+            const relativePath = execution.workspace.policy.assertAccessible(
+              requestedPath,
+              { allowRoot: true },
+            );
+            const files = await this.#collectFiles(execution, relativePath);
+            const matches = [];
+            for (const filePath of files) {
+              let file;
+              try {
+                file = await this.#readTextFile(execution, filePath);
+              } catch (error) {
+                if (error.code === "TEXT_REQUIRED") continue;
+                throw error;
               }
-              matches.push({
-                path: filePath,
-                line: lineIndex + 1,
-                column: column + 1,
-                text: lines[lineIndex].slice(0, 500),
-              });
-              column = lines[lineIndex].indexOf(query, column + query.length);
+              const lines = file.content.split(/\r?\n/);
+              for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+                let column = lines[lineIndex].indexOf(query);
+                while (column !== -1) {
+                  if (matches.length === this.limits.maxSearchMatches) {
+                    return { matches, truncated: true };
+                  }
+                  matches.push({
+                    path: filePath,
+                    line: lineIndex + 1,
+                    column: column + 1,
+                    text: lines[lineIndex].slice(0, 500),
+                  });
+                  column = lines[lineIndex].indexOf(query, column + query.length);
+                }
+              }
             }
-          }
-        }
-        return { matches, truncated: false };
+            return { matches, truncated: false };
+          },
+        );
       },
       "SEARCH_FAILED",
       "无法搜索工作区文本",
@@ -298,14 +328,18 @@ export class CodeWorkspaceBroker {
           action.executionId,
         );
         return this.#enqueue(execution, async () => {
-          const beforeWorkspaceRevision =
-            await this.#currentWorkspaceRevision(execution);
+          this.#assertExecutionOpen(execution);
+          const beforeWorkspaceRevision = execution.workspaceState.revision;
           this.#assertWorkspaceRevision(action, beforeWorkspaceRevision);
           const result = await this.#writeFile(execution, action);
           return {
             ...result,
             beforeWorkspaceRevision,
-            workspaceRevision: await this.#currentWorkspaceRevision(execution),
+            workspaceRevision: this.#commitCachedFileHash(
+              execution,
+              result.path,
+              result.sha256,
+            ),
           };
         });
       },
@@ -322,14 +356,18 @@ export class CodeWorkspaceBroker {
           action.executionId,
         );
         return this.#enqueue(execution, async () => {
-          const beforeWorkspaceRevision =
-            await this.#currentWorkspaceRevision(execution);
+          this.#assertExecutionOpen(execution);
+          const beforeWorkspaceRevision = execution.workspaceState.revision;
           this.#assertWorkspaceRevision(action, beforeWorkspaceRevision);
           const result = await this.#deleteFile(execution, action);
           return {
             ...result,
             beforeWorkspaceRevision,
-            workspaceRevision: await this.#currentWorkspaceRevision(execution),
+            workspaceRevision: this.#commitCachedFileHash(
+              execution,
+              result.path,
+              null,
+            ),
           };
         });
       },
@@ -338,47 +376,45 @@ export class CodeWorkspaceBroker {
     );
   }
 
-  async getChangeManifest({ workspaceId, executionId }) {
+  async getChangeManifest(request) {
     return guarded(
       async () => {
+        const { workspaceId, executionId } = request;
         const execution = this.#execution(workspaceId, executionId);
         return this.#enqueue(execution, async () => {
-          const current = new Map();
-          for (const relativePath of await this.#collectFiles(execution, "")) {
-            const file = await this.#readFileBuffer(execution, relativePath);
-            current.set(relativePath, sha256(file.value));
-          }
-
-          const created = [];
-          const modified = [];
-          const deleted = [];
-          for (const [relativePath, currentSha256] of current) {
-            const baselineSha256 = execution.baseline.get(relativePath);
-            if (baselineSha256 === undefined) {
-              created.push({ path: relativePath, sha256: currentSha256 });
-            } else if (baselineSha256 !== currentSha256) {
-              modified.push({
-                path: relativePath,
-                beforeSha256: baselineSha256,
-                afterSha256: currentSha256,
-              });
-            }
-          }
-          for (const [relativePath, baselineSha256] of execution.baseline) {
-            if (!current.has(relativePath)) {
-              deleted.push({ path: relativePath, sha256: baselineSha256 });
-            }
-          }
-          const byPath = (left, right) => left.path.localeCompare(right.path);
-          return {
-            created: created.sort(byPath),
-            modified: modified.sort(byPath),
-            deleted: deleted.sort(byPath),
-          };
+          const snapshot = await this.#createWorkspaceSnapshot(execution);
+          this.#assertWorkspaceRevision(request, snapshot.workspaceRevision);
+          return snapshot.manifest;
         });
       },
       "MANIFEST_FAILED",
       "无法生成工作区变更清单",
+    );
+  }
+
+  async sealExecution(request) {
+    return guarded(
+      async () => {
+        const { workspaceId, executionId } = request;
+        const execution = this.#execution(workspaceId, executionId);
+        return this.#enqueue(execution, async () => {
+          this.#assertRequiredWorkspaceRevision(request);
+          if (execution.seal) {
+            this.#assertWorkspaceRevision(
+              request,
+              execution.seal.workspaceRevision,
+            );
+            return this.#copyWorkspaceSnapshot(execution.seal);
+          }
+
+          const snapshot = await this.#createWorkspaceSnapshot(execution);
+          this.#assertWorkspaceRevision(request, snapshot.workspaceRevision);
+          execution.seal = snapshot;
+          return this.#copyWorkspaceSnapshot(snapshot);
+        });
+      },
+      "SEAL_FAILED",
+      "无法封存代码执行副本",
     );
   }
 
@@ -462,6 +498,14 @@ export class CodeWorkspaceBroker {
     return result;
   }
 
+  #enqueueAtExpectedRevision(execution, request, operation) {
+    if (request.expectedWorkspaceRevision === undefined) return operation();
+    return this.#enqueue(execution, async () => {
+      this.#assertWorkspaceRevision(request, execution.workspaceState.revision);
+      return operation();
+    });
+  }
+
   #assertWorkspaceRevision(action, actualRevision) {
     if (action.expectedWorkspaceRevision === undefined) return;
     if (!/^[a-f0-9]{64}$/.test(action.expectedWorkspaceRevision)) {
@@ -478,13 +522,88 @@ export class CodeWorkspaceBroker {
     }
   }
 
+  #assertRequiredWorkspaceRevision(action) {
+    if (action.expectedWorkspaceRevision === undefined) {
+      throw new CodeExecutionError(
+        "EXPECTED_WORKSPACE_REVISION_REQUIRED",
+        "封存操作必须提供 expectedWorkspaceRevision",
+      );
+    }
+  }
+
+  #assertExecutionOpen(execution) {
+    if (execution.seal) {
+      throw new CodeExecutionError(
+        "EXECUTION_SEALED",
+        "代码执行副本已封存",
+      );
+    }
+  }
+
   async #currentWorkspaceRevision(execution) {
+    return revisionFromHashes(await this.#currentFileHashes(execution));
+  }
+
+  #commitCachedFileHash(execution, relativePath, fileHash) {
+    const fileHashes = new Map(execution.workspaceState.fileHashes);
+    if (fileHash === null) {
+      fileHashes.delete(relativePath);
+    } else {
+      fileHashes.set(relativePath, fileHash);
+    }
+    const revision = revisionFromHashes(fileHashes);
+    execution.workspaceState = { fileHashes, revision };
+    return revision;
+  }
+
+  async #createWorkspaceSnapshot(execution) {
+    const current = await this.#currentFileHashes(execution);
+    return {
+      workspaceRevision: revisionFromHashes(current),
+      manifest: this.#createChangeManifest(execution, current),
+    };
+  }
+
+  async #currentFileHashes(execution) {
     const fileHashes = new Map();
     for (const relativePath of await this.#collectFiles(execution, "")) {
       const file = await this.#readFileBuffer(execution, relativePath);
       fileHashes.set(relativePath, sha256(file.value));
     }
-    return revisionFromHashes(fileHashes);
+    return fileHashes;
+  }
+
+  #createChangeManifest(execution, current) {
+    const created = [];
+    const modified = [];
+    const deleted = [];
+    for (const [relativePath, currentSha256] of current) {
+      const baselineSha256 = execution.baseline.get(relativePath);
+      if (baselineSha256 === undefined) {
+        created.push({ path: relativePath, sha256: currentSha256 });
+      } else if (baselineSha256 !== currentSha256) {
+        modified.push({
+          path: relativePath,
+          beforeSha256: baselineSha256,
+          afterSha256: currentSha256,
+        });
+      }
+    }
+    for (const [relativePath, baselineSha256] of execution.baseline) {
+      if (!current.has(relativePath)) {
+        deleted.push({ path: relativePath, sha256: baselineSha256 });
+      }
+    }
+    const byPath = (left, right) => left.path.localeCompare(right.path);
+    return {
+      created: created.sort(byPath),
+      modified: modified.sort(byPath),
+      deleted: deleted.sort(byPath),
+    };
+  }
+
+  #copyWorkspaceSnapshot(snapshot) {
+    return structuredClone(snapshot);
   }
 
   async #assertDirectory(directory, errorCode) {

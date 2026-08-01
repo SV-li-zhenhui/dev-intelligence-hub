@@ -1,6 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { digestValue } from "../domain/code-executor-contract.js";
 import {
   ManagedProcessError,
   ManagedProcessRunner,
@@ -28,6 +29,7 @@ const NODE_TEST_ARGS = Object.freeze([
   "--test",
 ]);
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const REDACTED_HOST_VALUE = "[host-redacted]";
 
 export class DockerSandboxError extends Error {
   constructor(code, message, { cause, details } = {}) {
@@ -73,7 +75,18 @@ function normalizeProfiles(profiles) {
     ) {
       throw sandboxError("INVALID_SANDBOX_CONFIG", "Sandbox profile is invalid");
     }
-    normalized.set(id, Object.freeze({ ...profile }));
+    const definition = Object.freeze({
+      kind: profile.kind,
+      image: profile.image,
+      timeoutMs: profile.timeoutMs,
+    });
+    normalized.set(
+      id,
+      Object.freeze({
+        definition,
+        fingerprint: digestValue(definition),
+      }),
+    );
   }
   return normalized;
 }
@@ -100,6 +113,43 @@ function sanitizeOutput(value) {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "�");
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function redactionVariants(values) {
+  const variants = new Set();
+  for (const value of values) {
+    if (typeof value !== "string" || value.length < 4) continue;
+    const slashVariants = new Set([
+      value,
+      value.replaceAll("\\", "/"),
+      value.replaceAll("/", "\\"),
+    ]);
+    for (const candidate of slashVariants) {
+      variants.add(candidate);
+      variants.add(candidate.replaceAll("\\", "\\\\"));
+      variants.add(candidate.replaceAll("/", "\\/"));
+    }
+  }
+  return [...variants]
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+}
+
+function createOutputSanitizer(sensitiveValues) {
+  const patterns = redactionVariants(sensitiveValues).map(
+    (value) => new RegExp(escapeRegExp(value), "giu"),
+  );
+  return (value) => {
+    let sanitized = sanitizeOutput(value);
+    for (const pattern of patterns) {
+      sanitized = sanitized.replace(pattern, REDACTED_HOST_VALUE);
+    }
+    return sanitized;
+  };
+}
+
 function isMountableAbsolutePath(value) {
   return (
     typeof value === "string" &&
@@ -115,13 +165,18 @@ async function resolveDirectory(value) {
   let stats;
   try {
     stats = await lstat(value);
-  } catch (error) {
-    throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is unavailable", error);
+  } catch {
+    throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is unavailable");
   }
   if (!stats.isDirectory() || stats.isSymbolicLink()) {
     throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is invalid");
   }
-  const resolved = await realpath(value);
+  let resolved;
+  try {
+    resolved = await realpath(value);
+  } catch {
+    throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is unavailable");
+  }
   if (resolved.includes(",")) {
     throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is invalid");
   }
@@ -160,13 +215,16 @@ function isAbortSignal(value) {
   );
 }
 
-function sanitizedProcessDetails(details) {
+function sanitizedProcessDetails(
+  details,
+  sanitizeBoundaryOutput = sanitizeOutput,
+) {
   if (!isPlainRecord(details)) return undefined;
   return {
     exitCode: Number.isSafeInteger(details.exitCode) ? details.exitCode : null,
     signal: typeof details.signal === "string" ? details.signal : null,
-    stdout: sanitizeOutput(details.stdout),
-    stderr: sanitizeOutput(details.stderr),
+    stdout: sanitizeBoundaryOutput(details.stdout),
+    stderr: sanitizeBoundaryOutput(details.stderr),
     durationMs: Number.isFinite(details.durationMs)
       ? Math.max(0, Math.round(details.durationMs))
       : 0,
@@ -182,19 +240,19 @@ function containerName(executionId, actionId) {
   return `mydashboard-${digest}`;
 }
 
-function translateProcessError(error) {
+function translateProcessError(error, sanitizeBoundaryOutput = sanitizeOutput) {
   const code = {
     PROCESS_TIMEOUT: "SANDBOX_TIMEOUT",
     PROCESS_OUTPUT_LIMIT: "SANDBOX_OUTPUT_LIMIT",
     PROCESS_ABORTED: "SANDBOX_ABORTED",
   }[error.code];
-  const details = sanitizedProcessDetails(error.details);
+  const details = sanitizedProcessDetails(error.details, sanitizeBoundaryOutput);
   return code
-    ? sandboxError(code, "Sandbox execution was interrupted", error, details)
+    ? sandboxError(code, "Sandbox execution was interrupted", undefined, details)
     : sandboxError(
         "SANDBOX_START_FAILED",
         "Sandbox execution failed",
-        error,
+        undefined,
         details,
       );
 }
@@ -210,6 +268,8 @@ function retainCleanupState(error, cleanup) {
 }
 
 export class DockerTestSandbox {
+  #profiles;
+
   constructor({
     dockerExecutable,
     dockerHost,
@@ -241,36 +301,49 @@ export class DockerTestSandbox {
     this.dockerExecutable = dockerExecutable;
     this.dockerHost = dockerHost;
     this.allowedWorkspaceRoot = allowedWorkspaceRoot;
-    this.profiles = normalizeProfiles(profiles);
+    this.#profiles = normalizeProfiles(profiles);
     this.processRunner = processRunner;
     this.environment = fixedDockerEnvironment(sourceEnvironment);
   }
 
+  getProfileFingerprint(profileId) {
+    return this.#profile(profileId).fingerprint;
+  }
+
   async run(request) {
     this.assertRunRequest(request);
-    const profile = this.profiles.get(request.profileId);
-    if (!profile) {
-      throw sandboxError("SANDBOX_PROFILE_NOT_FOUND", "Sandbox profile was not found");
-    }
-    const workspacePath = await this.resolveWorkspace(request.workspacePath);
+    const profile = this.#profile(request.profileId);
+    const workspace = await this.#resolveWorkspace(request.workspacePath);
+    const sanitizeBoundaryOutput = createOutputSanitizer([
+      request.workspacePath,
+      workspace.workspacePath,
+      this.allowedWorkspaceRoot,
+      workspace.allowedWorkspaceRoot,
+      this.dockerExecutable,
+      this.dockerHost,
+    ]);
     const name = containerName(request.executionId, request.actionId);
-    const imageId = await this.probe(profile, request.signal);
+    const imageId = await this.probe(
+      profile.definition,
+      request.signal,
+      sanitizeBoundaryOutput,
+    );
     let result;
     try {
       result = await this.runDocker(
         this.runArguments({
           name,
-          profile,
-          workspacePath,
+          profile: profile.definition,
+          workspacePath: workspace.workspacePath,
         }),
-        profile.timeoutMs,
+        profile.definition.timeoutMs,
         request.signal,
       );
     } catch (error) {
       const cleanup = await this.removeContainer(name, { bestEffort: true });
       const failure = error instanceof ManagedProcessError
-        ? translateProcessError(error)
-        : sandboxError("SANDBOX_START_FAILED", "Sandbox execution failed", error);
+        ? translateProcessError(error, sanitizeBoundaryOutput)
+        : sandboxError("SANDBOX_START_FAILED", "Sandbox execution failed");
       throw retainCleanupState(failure, cleanup);
     }
     if (result.exitCode === 125) {
@@ -283,10 +356,11 @@ export class DockerTestSandbox {
     return {
       exitCode: result.exitCode,
       signal: result.signal,
-      stdout: sanitizeOutput(result.stdout),
-      stderr: sanitizeOutput(result.stderr),
+      stdout: sanitizeBoundaryOutput(result.stdout),
+      stderr: sanitizeBoundaryOutput(result.stderr),
       durationMs: result.durationMs,
       imageId,
+      profileFingerprint: profile.fingerprint,
       timedOut: false,
     };
   }
@@ -316,6 +390,22 @@ export class DockerTestSandbox {
   }
 
   async resolveWorkspace(requestedPath) {
+    return (await this.#resolveWorkspace(requestedPath)).workspacePath;
+  }
+
+  #profile(profileId) {
+    assertSafeId(profileId, "profileId");
+    const profile = this.#profiles.get(profileId);
+    if (!profile) {
+      throw sandboxError(
+        "SANDBOX_PROFILE_NOT_FOUND",
+        "Sandbox profile was not found",
+      );
+    }
+    return profile;
+  }
+
+  async #resolveWorkspace(requestedPath) {
     if (!isMountableAbsolutePath(requestedPath)) {
       throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is invalid");
     }
@@ -335,10 +425,17 @@ export class DockerTestSandbox {
         "Workspace is outside its allowed root",
       );
     }
-    return workspace;
+    return {
+      allowedWorkspaceRoot: allowedRoot,
+      workspacePath: workspace,
+    };
   }
 
-  async probe(profile, signal = null) {
+  async probe(
+    profile,
+    signal = null,
+    sanitizeBoundaryOutput = sanitizeOutput,
+  ) {
     let version;
     try {
       version = await this.runDocker(
@@ -348,9 +445,16 @@ export class DockerTestSandbox {
       );
     } catch (error) {
       if (error instanceof ManagedProcessError && error.code === "PROCESS_ABORTED") {
-        throw translateProcessError(error);
+        throw translateProcessError(error, sanitizeBoundaryOutput);
       }
-      throw sandboxError("SANDBOX_UNAVAILABLE", "Docker sandbox is unavailable", error);
+      throw sandboxError(
+        "SANDBOX_UNAVAILABLE",
+        "Docker sandbox is unavailable",
+        undefined,
+        error instanceof ManagedProcessError
+          ? sanitizedProcessDetails(error.details, sanitizeBoundaryOutput)
+          : undefined,
+      );
     }
     if (version.exitCode !== 0 || !sanitizeOutput(version.stdout).trim()) {
       throw sandboxError("SANDBOX_UNAVAILABLE", "Docker sandbox is unavailable");
@@ -364,12 +468,15 @@ export class DockerTestSandbox {
       );
     } catch (error) {
       if (error instanceof ManagedProcessError && error.code === "PROCESS_ABORTED") {
-        throw translateProcessError(error);
+        throw translateProcessError(error, sanitizeBoundaryOutput);
       }
       throw sandboxError(
         "SANDBOX_IMAGE_UNAVAILABLE",
         "Pinned sandbox image is unavailable",
-        error,
+        undefined,
+        error instanceof ManagedProcessError
+          ? sanitizedProcessDetails(error.details, sanitizeBoundaryOutput)
+          : undefined,
       );
     }
     const imageId = sanitizeOutput(image.stdout).trim();
@@ -439,16 +546,13 @@ export class DockerTestSandbox {
   }
 
   async removeContainer(name, { bestEffort = false } = {}) {
-    let removalError;
     let removal;
     try {
       removal = await this.runDocker(
         ["container", "rm", "-f", name],
         10_000,
       );
-    } catch (error) {
-      removalError = error;
-    }
+    } catch {}
     if (removal?.exitCode === 0) return { cleanupPending: false };
 
     let presence;
@@ -465,9 +569,7 @@ export class DockerTestSandbox {
         ],
         10_000,
       );
-    } catch (error) {
-      removalError ||= error;
-    }
+    } catch {}
     const names = sanitizeOutput(presence?.stdout)
       .split("\n")
       .map((value) => value.trim())
@@ -480,7 +582,7 @@ export class DockerTestSandbox {
     const error = sandboxError(
       "SANDBOX_CLEANUP_FAILED",
       "Sandbox container cleanup could not be confirmed",
-      removalError,
+      undefined,
       details,
     );
     if (bestEffort) return { ...details, error };

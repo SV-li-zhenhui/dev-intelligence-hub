@@ -8,10 +8,14 @@ import {
   DockerSandboxError,
   DockerTestSandbox,
 } from "../src/adapters/docker-test-sandbox.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ManagedProcessError } from "../src/lib/managed-process.js";
 
 const image =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
+const dockerExecutable =
+  "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe";
+const dockerHost = "npipe:////./pipe/dockerDesktopLinuxEngine";
 
 class FakeRunner {
   constructor(results) {
@@ -37,17 +41,25 @@ function result({ exitCode = 0, stdout = "", stderr = "" } = {}) {
   };
 }
 
-async function fixture(t, results) {
+async function fixture(
+  t,
+  results,
+  {
+    profile = { kind: "node-test", image, timeoutMs: 30_000 },
+  } = {},
+) {
   const root = await mkdtemp(path.join(tmpdir(), "docker-sandbox-test-"));
   const workspacePath = path.join(root, "workspace");
   await mkdir(workspacePath);
   t.after(() => rm(root, { recursive: true, force: true }));
-  const processRunner = new FakeRunner(results);
+  const plannedResults =
+    typeof results === "function" ? results({ root, workspacePath }) : results;
+  const processRunner = new FakeRunner(plannedResults);
   const sandbox = new DockerTestSandbox({
-    dockerExecutable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
-    dockerHost: "npipe:////./pipe/dockerDesktopLinuxEngine",
+    dockerExecutable,
+    dockerHost,
     allowedWorkspaceRoot: root,
-    profiles: { "node-tests": { kind: "node-test", image, timeoutMs: 30_000 } },
+    profiles: { "node-tests": profile },
     processRunner,
     sourceEnvironment: {
       SystemRoot: "C:\\Windows",
@@ -76,6 +88,61 @@ function expectedContainerName(executionId = "run-one", actionId = "action-one")
   return `mydashboard-${digest}`;
 }
 
+function hostValueVariants({ root, workspacePath }) {
+  return [
+    ...new Set(
+      [workspacePath, root, dockerExecutable, dockerHost].flatMap((value) => {
+        const slashNormalized = value.replaceAll("\\", "/");
+        return [
+          value,
+          slashNormalized,
+          value.replaceAll("\\", "\\\\").replaceAll("/", "\\/"),
+          slashNormalized.replaceAll("/", "\\/"),
+        ];
+      }),
+    ),
+  ];
+}
+
+function assertHostValuesRedacted(output, values) {
+  const normalizedOutput = output.toLowerCase();
+  for (const value of values) {
+    assert.equal(normalizedOutput.includes(value.toLowerCase()), false);
+  }
+}
+
+function probeProcessFailure(paths) {
+  return new ManagedProcessError("PROCESS_START_FAILED", "stopped", {
+    details: {
+      exitCode: null,
+      signal: null,
+      stdout: hostValueVariants(paths)
+        .map((value, index) => `host-${index}=${value}`)
+        .join("\n"),
+      stderr: "container=/workspace/test/app.test.js",
+      durationMs: 12,
+      truncated: false,
+    },
+  });
+}
+
+async function assertProbeFailureRedaction(t, expectedCode, results) {
+  const setup = await fixture(t, results);
+  let failure;
+  await assert.rejects(
+    setup.sandbox.run(request({ workspacePath: setup.workspacePath })),
+    (error) => {
+      failure = error;
+      return error instanceof DockerSandboxError && error.code === expectedCode;
+    },
+  );
+  assertHostValuesRedacted(
+    JSON.stringify(failure.details),
+    hostValueVariants(setup),
+  );
+  assert.match(failure.details.stderr, /container=\/workspace\/test\/app\.test\.js/);
+}
+
 test("Docker profiles run pinned Node tests with a read-only, offline boundary", async (t) => {
   const imageId = `sha256:${"a".repeat(64)}`;
   const setup = await fixture(t, [
@@ -93,6 +160,10 @@ test("Docker profiles run pinned Node tests with a read-only, offline boundary",
   assert.equal(output.exitCode, 0);
   assert.equal(output.stdout, "ok");
   assert.equal(output.imageId, imageId);
+  assert.equal(
+    output.profileFingerprint,
+    setup.sandbox.getProfileFingerprint("node-tests"),
+  );
   assert.equal(setup.processRunner.calls.length, 3);
   const invocation = setup.processRunner.calls[2];
   assert.equal(invocation.command.endsWith("docker.exe"), true);
@@ -136,6 +207,116 @@ test("Docker profiles run pinned Node tests with a read-only, offline boundary",
   assert.equal(invocation.args.includes("--allow-fs-read=/tmp"), true);
   assert.equal(invocation.args.includes("--allow-fs-read=/artifacts"), true);
   assert.equal(invocation.args.includes("--allow-worker"), false);
+});
+
+test("profile fingerprints use the sandbox's immutable validated configuration", async (t) => {
+  const configuredProfile = {
+    kind: "node-test",
+    image,
+    timeoutMs: 30_000,
+  };
+  const originalFingerprint = digestValue(configuredProfile);
+  const setup = await fixture(t, [], { profile: configuredProfile });
+
+  assert.equal(
+    setup.sandbox.getProfileFingerprint("node-tests"),
+    originalFingerprint,
+  );
+  configuredProfile.timeoutMs = 60_000;
+  assert.equal(
+    setup.sandbox.getProfileFingerprint("node-tests"),
+    originalFingerprint,
+  );
+  assert.equal("profiles" in setup.sandbox, false);
+
+  const changed = await fixture(t, [], {
+    profile: { ...configuredProfile },
+  });
+  assert.notEqual(
+    changed.sandbox.getProfileFingerprint("node-tests"),
+    originalFingerprint,
+  );
+  assert.throws(
+    () => setup.sandbox.getProfileFingerprint("missing"),
+    (error) => error.code === "SANDBOX_PROFILE_NOT_FOUND",
+  );
+});
+
+test("host paths and Docker endpoints are redacted from completed results", async (t) => {
+  const setup = await fixture(t, ({ root, workspacePath }) => [
+    result({ stdout: "29.2.1" }),
+    result({ stdout: `sha256:${"e".repeat(64)}` }),
+    result({
+      stdout: `source=${workspacePath}\ncontainer=/workspace/test/app.test.js`,
+      stderr: `root=${root.replaceAll("\\", "/")} command=${dockerExecutable}`,
+    }),
+  ]);
+
+  const output = await setup.sandbox.run(
+    request({ workspacePath: setup.workspacePath }),
+  );
+  assert.match(output.stdout, /container=\/workspace\/test\/app\.test\.js/);
+  assertHostValuesRedacted(
+    `${output.stdout}\n${output.stderr}`,
+    hostValueVariants(setup),
+  );
+});
+
+test("host paths and Docker endpoints are redacted from process failures", async (t) => {
+  const setup = await fixture(t, ({ root, workspacePath }) => [
+    result({ stdout: "29.2.1" }),
+    result({ stdout: `sha256:${"f".repeat(64)}` }),
+    new ManagedProcessError("PROCESS_TIMEOUT", "stopped", {
+      details: {
+        exitCode: 137,
+        signal: "SIGKILL",
+        stdout: `workspace=${workspacePath.replaceAll("\\", "\\\\")}`,
+        stderr: [
+          `mount=${workspacePath.replaceAll("\\", "/")}`,
+          `root=${root}`,
+          `command=${dockerExecutable.replaceAll("\\", "/")}`,
+          `endpoint=${dockerHost}`,
+          "container=/workspace/test/app.test.js",
+        ].join("\n"),
+        durationMs: 12,
+        truncated: false,
+      },
+    }),
+    result(),
+  ]);
+
+  let interruption;
+  await assert.rejects(
+    setup.sandbox.run(
+      request({ workspacePath: setup.workspacePath }),
+    ),
+    (error) => {
+      interruption = error;
+      return error.code === "SANDBOX_TIMEOUT";
+    },
+  );
+  assertHostValuesRedacted(
+    JSON.stringify(interruption.details),
+    hostValueVariants(setup),
+  );
+  assert.equal(interruption.cause, undefined);
+  assert.match(interruption.details.stderr, /container=\/workspace\/test\/app\.test\.js/);
+});
+
+test("host paths and Docker endpoints are redacted from probe failures", async (t) => {
+  await assertProbeFailureRedaction(
+    t,
+    "SANDBOX_UNAVAILABLE",
+    (paths) => [probeProcessFailure(paths)],
+  );
+  await assertProbeFailureRedaction(
+    t,
+    "SANDBOX_IMAGE_UNAVAILABLE",
+    (paths) => [
+      result({ stdout: "29.2.1" }),
+      probeProcessFailure(paths),
+    ],
+  );
 });
 
 test("unknown profiles and caller fields are rejected before spawn", async (t) => {

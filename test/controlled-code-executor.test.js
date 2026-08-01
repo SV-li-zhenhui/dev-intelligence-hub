@@ -1,0 +1,1547 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
+import { StateStore } from "../src/lib/state-store.js";
+import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
+import {
+  ControlledCodeExecutor,
+  ControlledCodeExecutorError,
+} from "../src/services/controlled-code-executor.js";
+import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+
+const profileImage =
+  "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
+const profileDefinitions = {
+  "node-tests": {
+    kind: "node-test",
+    image: profileImage,
+    timeoutMs: 30_000,
+  },
+};
+
+class FakeSandbox {
+  constructor({
+    results = [],
+    cleanupResults = [],
+    profiles = profileDefinitions,
+  } = {}) {
+    this.results = [...results];
+    this.cleanupResults = [...cleanupResults];
+    this.profiles = profiles;
+    this.calls = [];
+    this.cleanupCalls = [];
+  }
+
+  getProfileFingerprint(profileId) {
+    const profile = this.profiles[profileId];
+    if (!profile) return null;
+    return digestValue(profile);
+  }
+
+  async run(request) {
+    this.calls.push(request);
+    const next = this.results.shift() ?? sandboxResult();
+    if (typeof next === "function") return next(request);
+    if (next instanceof Error) throw next;
+    return next;
+  }
+
+  async cleanup(request) {
+    this.cleanupCalls.push(request);
+    const next = this.cleanupResults.shift();
+    if (typeof next === "function") return next(request);
+    if (next instanceof Error) throw next;
+    return next;
+  }
+}
+
+class FailingStore {
+  constructor(inner) {
+    this.inner = inner;
+    this.failNextWrite = false;
+  }
+
+  read(...args) {
+    return this.inner.read(...args);
+  }
+
+  write(...args) {
+    if (this.failNextWrite) {
+      this.failNextWrite = false;
+      throw new Error("state unavailable");
+    }
+    return this.inner.write(...args);
+  }
+}
+
+class RecordingJournal {
+  constructor(inner) {
+    this.inner = inner;
+    this.writeCalls = [];
+  }
+
+  readJson(...args) {
+    return this.inner.readJson(...args);
+  }
+
+  writeJson(request) {
+    this.writeCalls.push(request);
+    return this.inner.writeJson(request);
+  }
+}
+
+class FailingJournal extends RecordingJournal {
+  constructor(inner, failingKind) {
+    super(inner);
+    this.failingKind = failingKind;
+    this.failed = false;
+  }
+
+  writeJson(request) {
+    if (this.failingKind && !this.failed && request.kind === this.failingKind) {
+      this.failed = true;
+      throw new Error("journal unavailable");
+    }
+    return super.writeJson(request);
+  }
+}
+
+function sandboxResult(overrides = {}) {
+  return {
+    exitCode: 0,
+    signal: null,
+    stdout: "tests passed",
+    stderr: "",
+    durationMs: 5,
+    imageId: `sha256:${"a".repeat(64)}`,
+    profileFingerprint: digestValue(profileDefinitions["node-tests"]),
+    timedOut: false,
+    ...overrides,
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function overrideBroker(broker, overrides) {
+  return new Proxy(broker, {
+    get(target, property) {
+      if (Object.hasOwn(overrides, property)) return overrides[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+async function fixture(t, { sandbox = new FakeSandbox(), failingStore = false } = {}) {
+  const root = await mkdtemp(path.join(tmpdir(), "controlled-code-executor-"));
+  const sourceRoot = path.join(root, "source");
+  const scratchRoot = path.join(root, "scratch");
+  await mkdir(path.join(sourceRoot, "src"), { recursive: true });
+  await writeFile(
+    path.join(sourceRoot, "src", "app.js"),
+    "export const value = 1;\n",
+  );
+  const innerStore = new StateStore(path.join(root, "state"));
+  const store = failingStore ? new FailingStore(innerStore) : innerStore;
+  const journal = new CodeExecutionJournal({
+    root: path.join(root, "execution-artifacts"),
+  });
+  let tick = 0;
+  const clock = () =>
+    new Date(Date.UTC(2026, 7, 1, 0, 0, tick++)).toISOString();
+  const createBroker = () =>
+    new CodeWorkspaceBroker({
+      scratchRoot,
+      workspaces: [
+        {
+          id: "dashboard",
+          sourceRoot,
+          writablePaths: ["src", "test"],
+        },
+      ],
+    });
+  const createExecutor = ({
+    broker = createBroker(),
+    nextSandbox = sandbox,
+    nextJournal = journal,
+    profiles = profileDefinitions,
+    workspaceProfiles = { dashboard: ["node-tests"] },
+    limits,
+    nextClock = clock,
+  } = {}) => ({
+    broker,
+    executor: new ControlledCodeExecutor({
+      broker,
+      sandbox: nextSandbox,
+      store,
+      journal: nextJournal,
+      profileDefinitions: profiles,
+      requiredProfilesByWorkspace: workspaceProfiles,
+      clock: nextClock,
+      ...(limits ? { limits } : {}),
+    }),
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return {
+    root,
+    sourceRoot,
+    scratchRoot,
+    store,
+    innerStore,
+    journal,
+    sandbox,
+    createBroker,
+    createExecutor,
+  };
+}
+
+function startRequest(overrides = {}) {
+  return {
+    sessionId: "session-one",
+    workspaceId: "dashboard",
+    requestedBy: { roleId: "pr-reviewer", workItemId: "repo#1" },
+    ...overrides,
+  };
+}
+
+function actionRequest(session, action) {
+  return {
+    sessionId: session.id,
+    action: {
+      expectedWorkspaceRevision: session.workspaceRevision,
+      ...action,
+    },
+  };
+}
+
+function artifactFile(setup, reference) {
+  return path.join(
+    setup.root,
+    "execution-artifacts",
+    ...reference.path.split("/"),
+  );
+}
+
+async function replaceArtifact(setup, reference, value) {
+  const content = `${JSON.stringify(value)}\n`;
+  await writeFile(artifactFile(setup, reference), content);
+  reference.bytes = Buffer.byteLength(content);
+  reference.sha256 = createHash("sha256").update(content).digest("hex");
+}
+
+async function createCompletedSessionWithRead(setup) {
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-completion",
+      path: "src/app.js",
+    }),
+  );
+  const failedCompletion = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "complete",
+      actionId: "complete-before-checks",
+    }),
+  );
+  const checked = await first.executor.perform(
+    actionRequest(failedCompletion.session, {
+      type: "run_profile",
+      actionId: "test-before-completion",
+      profileId: "node-tests",
+    }),
+  );
+  const completed = await first.executor.perform(
+    actionRequest(checked.session, {
+      type: "complete",
+      actionId: "complete-after-checks",
+    }),
+  );
+  assert.equal(completed.session.status, "completed");
+  return { read, failedCompletion, completed };
+}
+
+function cleanupPendingError(message = "cleanup pending") {
+  return new DockerSandboxError("SANDBOX_CLEANUP_FAILED", message, {
+    details: { cleanupPending: true, containerName: "mydashboard-pending" },
+  });
+}
+
+function hasCode(code) {
+  return (error) =>
+    error instanceof ControlledCodeExecutorError && error.code === code;
+}
+
+test("startup recovery gates creation and create is idempotent", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+
+  await assert.rejects(executor.start(startRequest()), hasCode("EXECUTOR_NOT_READY"));
+  await executor.recover();
+  const created = await executor.start(startRequest());
+
+  assert.equal(created.id, "session-one");
+  assert.equal(created.status, "active");
+  assert.equal(created.attempt.number, 1);
+  assert.match(created.workspaceRevision, /^[a-f0-9]{64}$/);
+  assert.deepEqual(created.requiredProfiles, ["node-tests"]);
+  assert.equal(JSON.stringify(created).includes(setup.root), false);
+  assert.deepEqual(await executor.start(startRequest()), created);
+  await assert.rejects(
+    executor.start(
+      startRequest({
+        requestedBy: { roleId: "developer", workItemId: "repo#1" },
+      }),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+});
+
+test("writes, tests, and completion stay bound to an exact workspace revision", async (t) => {
+  const sandbox = new FakeSandbox({
+    results: [
+      sandboxResult(),
+      sandboxResult({ exitCode: 1, stdout: "", stderr: "assertion failed" }),
+      sandboxResult({ stdout: "fixed" }),
+    ],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  let session = await executor.start(startRequest());
+
+  const read = await executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-one",
+      path: "src/app.js",
+    }),
+  );
+  assert.equal(read.result.content, "export const value = 1;\n");
+  assert.deepEqual(
+    await executor.perform(
+      actionRequest(session, {
+        type: "read_text",
+        actionId: "read-one",
+        path: "src/app.js",
+      }),
+    ),
+    read,
+  );
+
+  const firstWrite = await executor.perform(
+    actionRequest(session, {
+      type: "write_text",
+      actionId: "write-one",
+      path: "src/app.js",
+      content: "export const value = 2;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  session = firstWrite.session;
+  assert.equal(firstWrite.action.status, "succeeded");
+  assert.notEqual(session.workspaceRevision, read.session.workspaceRevision);
+
+  const firstCheck = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-one",
+      profileId: "node-tests",
+    }),
+  );
+  session = firstCheck.session;
+  assert.equal(firstCheck.action.status, "succeeded");
+  assert.equal(sandbox.calls[0].workspacePath.startsWith(setup.scratchRoot), true);
+  assert.equal("command" in sandbox.calls[0], false);
+
+  const secondWrite = await executor.perform(
+    actionRequest(session, {
+      type: "write_text",
+      actionId: "write-two",
+      path: "src/app.js",
+      content: "export const value = 3;\n",
+      expectedSha256: firstWrite.result.sha256,
+    }),
+  );
+  session = secondWrite.session;
+  const staleCompletion = await executor.perform(
+    actionRequest(session, {
+      type: "complete",
+      actionId: "complete-stale",
+    }),
+  );
+  assert.equal(staleCompletion.action.status, "failed");
+  assert.equal(staleCompletion.result.error.code, "CHECKS_NOT_PASSED");
+  assert.equal(staleCompletion.session.status, "active");
+
+  const failedCheck = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-failed",
+      profileId: "node-tests",
+    }),
+  );
+  assert.equal(failedCheck.action.status, "failed");
+  assert.equal(failedCheck.result.error.code, "TESTS_FAILED");
+  assert.equal(failedCheck.result.stderr, "assertion failed");
+  assert.equal(failedCheck.session.status, "active");
+
+  const passedCheck = await executor.perform(
+    actionRequest(failedCheck.session, {
+      type: "run_profile",
+      actionId: "test-fixed",
+      profileId: "node-tests",
+    }),
+  );
+  const completed = await executor.perform(
+    actionRequest(passedCheck.session, {
+      type: "complete",
+      actionId: "complete-one",
+    }),
+  );
+  assert.equal(completed.action.status, "succeeded");
+  assert.equal(completed.session.status, "completed");
+  assert.deepEqual(
+    completed.result.modified.map((entry) => entry.path),
+    ["src/app.js"],
+  );
+  assert.equal(
+    await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+});
+
+test("action schemas and idempotency reject capability escalation", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+
+  await assert.rejects(
+    executor.perform({
+      sessionId: session.id,
+      action: {
+        type: "run_profile",
+        actionId: "raw-command",
+        expectedWorkspaceRevision: session.workspaceRevision,
+        profileId: "node-tests",
+        command: "powershell.exe",
+      },
+    }),
+    hasCode("INVALID_EXECUTION_REQUEST"),
+  );
+  const first = await executor.perform(
+    actionRequest(session, {
+      type: "list_files",
+      actionId: "list-one",
+      path: "",
+    }),
+  );
+  assert.deepEqual(first.result, ["src/app.js"]);
+  await assert.rejects(
+    executor.perform(
+      actionRequest(session, {
+        type: "list_files",
+        actionId: "list-one",
+        path: "src",
+      }),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+});
+
+test("the running record is durable before a write side effect", async (t) => {
+  const setup = await fixture(t, { failingStore: true });
+  const { broker, executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const read = await executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-failure",
+      path: "src/app.js",
+    }),
+  );
+  setup.store.failNextWrite = true;
+
+  await assert.rejects(
+    executor.perform(
+      actionRequest(read.session, {
+        type: "write_text",
+        actionId: "write-not-claimed",
+        path: "src/app.js",
+        content: "unsafe\n",
+        expectedSha256: read.result.sha256,
+      }),
+    ),
+    hasCode("STATE_WRITE_FAILED"),
+  );
+  const stored = await setup.innerStore.read("code-executor-state");
+  assert.equal(
+    stored.sessions[session.id].actions.some(
+      (action) => action.id === "write-not-claimed",
+    ),
+    false,
+  );
+  const brokerExecutionId = stored.sessions[session.id].attempts.at(-1).executionId;
+  assert.deepEqual(
+    await broker.getChangeManifest({
+      workspaceId: "dashboard",
+      executionId: brokerExecutionId,
+    }),
+    { created: [], modified: [], deleted: [] },
+  );
+});
+
+test("recovery interrupts unknown work and resumes confirmed writes", async (t) => {
+  const pending = deferred();
+  const firstSandbox = new FakeSandbox({ results: [() => pending.promise] });
+  const setup = await fixture(t, { sandbox: firstSandbox });
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-for-replay",
+      path: "src/app.js",
+    }),
+  );
+  const write = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "write-for-replay",
+      path: "src/app.js",
+      content: "export const recovered = true;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  session = write.session;
+  void first.executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-crashed",
+      profileId: "node-tests",
+    }),
+  );
+
+  let runningState;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    runningState = await setup.innerStore.read("code-executor-state");
+    if (
+      runningState.sessions[session.id].actions.some(
+        (action) => action.id === "test-crashed" && action.status === "running",
+      )
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(
+    runningState.sessions[session.id].actions.some(
+      (action) => action.id === "test-crashed" && action.status === "running",
+    ),
+    true,
+  );
+
+  const recoverySandbox = new FakeSandbox();
+  const recovered = setup.createExecutor({
+    broker: setup.createBroker(),
+    nextSandbox: recoverySandbox,
+  });
+  await recovered.executor.recover();
+  const interrupted = await recovered.executor.view({ sessionId: session.id });
+  assert.equal(interrupted.status, "interrupted");
+  assert.equal(
+    interrupted.actions.find((action) => action.id === "test-crashed").status,
+    "interrupted",
+  );
+  assert.equal(recoverySandbox.calls.length, 0);
+  assert.equal(recoverySandbox.cleanupCalls.length, 1);
+
+  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  assert.equal(resumed.status, "active");
+  assert.equal(resumed.attempt.number, 2);
+  assert.equal(resumed.workspaceRevision, session.workspaceRevision);
+  const reread = await recovered.executor.perform(
+    actionRequest(resumed, {
+      type: "read_text",
+      actionId: "read-after-resume",
+      path: "src/app.js",
+    }),
+  );
+  assert.equal(reread.result.content, "export const recovered = true;\n");
+  assert.equal(recoverySandbox.calls.length, 0);
+});
+
+test("cleanup uncertainty fences resume", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  await executor.start(startRequest());
+  const state = await setup.innerStore.read("code-executor-state");
+  const session = state.sessions["session-one"];
+  const unknownInput = await setup.journal.writeJson({
+    sessionId: "session-one",
+    actionId: "test-unknown",
+    kind: "input",
+    value: {
+      type: "run_profile",
+      actionId: "test-unknown",
+      expectedWorkspaceRevision: session.workspaceRevision,
+      profileId: "node-tests",
+    },
+  });
+  session.status = "running";
+  session.attempts.at(-1).status = "running";
+  session.actions.push({
+    id: "test-unknown",
+    type: "run_profile",
+    requestDigest: "0".repeat(64),
+    status: "running",
+    attemptNumber: 1,
+    inputArtifact: unknownInput,
+    outputArtifacts: {},
+    workspaceRevisionBefore: session.workspaceRevision,
+    workspaceRevisionAfter: null,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: null,
+  });
+  await setup.innerStore.write("code-executor-state", state);
+
+  const cleanupFailure = new DockerSandboxError(
+    "SANDBOX_CLEANUP_FAILED",
+    "cleanup pending",
+    {
+      details: { cleanupPending: true, containerName: "mydashboard-pending" },
+    },
+  );
+  const recoverySandbox = new FakeSandbox({
+    cleanupResults: [cleanupFailure, cleanupFailure],
+  });
+  const recovered = setup.createExecutor({
+    broker: setup.createBroker(),
+    nextSandbox: recoverySandbox,
+  });
+  await recovered.executor.recover();
+  const interrupted = await recovered.executor.view({ sessionId: "session-one" });
+  assert.equal(interrupted.cleanupPending, true);
+  await assert.rejects(
+    recovered.executor.resume({ sessionId: "session-one" }),
+    hasCode("CLEANUP_PENDING"),
+  );
+  assert.equal(recoverySandbox.cleanupCalls.length, 2);
+});
+
+test("prototype-shaped IDs remain ordinary session and profile IDs", async (t) => {
+  const profiles = {
+    constructor: {
+      kind: "node-test",
+      image: profileImage,
+      timeoutMs: 30_000,
+    },
+  };
+  const sandbox = new FakeSandbox({
+    profiles,
+    results: [
+      sandboxResult({ profileFingerprint: digestValue(profiles.constructor) }),
+    ],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({
+    profiles,
+    workspaceProfiles: { dashboard: ["constructor"] },
+  });
+  await executor.recover();
+
+  let session = await executor.start(startRequest({ sessionId: "constructor" }));
+  assert.equal(session.id, "constructor");
+  const checked = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-constructor",
+      profileId: "constructor",
+    }),
+  );
+  session = checked.session;
+  const completed = await executor.perform(
+    actionRequest(session, {
+      type: "complete",
+      actionId: "complete-constructor",
+    }),
+  );
+  assert.equal(completed.session.status, "completed");
+});
+
+test("recovery is startup-only and idempotent after the executor is ready", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const active = await executor.start(startRequest());
+
+  const secondRecovery = await executor.recover();
+  const unchanged = await executor.view({ sessionId: active.id });
+
+  assert.deepEqual(secondRecovery, { recovered: false, alreadyReady: true });
+  assert.equal(unchanged.status, "active");
+  assert.equal(unchanged.attempt.number, 1);
+});
+
+test("completed recovery rejects a missing earlier non-profile input artifact", async (t) => {
+  const setup = await fixture(t);
+  await createCompletedSessionWithRead(setup);
+  const state = await setup.innerStore.read("code-executor-state");
+  const readAction = state.sessions["session-one"].actions.find(
+    (action) => action.id === "read-before-completion",
+  );
+  await rm(artifactFile(setup, readAction.inputArtifact));
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await assert.rejects(
+    recovered.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+  await assert.rejects(
+    recovered.executor.view({ sessionId: "session-one" }),
+    hasCode("EXECUTOR_NOT_READY"),
+  );
+});
+
+test("completed recovery rejects a corrupt earlier non-profile result", async (t) => {
+  const setup = await fixture(t);
+  await createCompletedSessionWithRead(setup);
+  const state = await setup.innerStore.read("code-executor-state");
+  const readAction = state.sessions["session-one"].actions.find(
+    (action) => action.id === "read-before-completion",
+  );
+  await replaceArtifact(setup, readAction.outputArtifacts.output, {
+    path: "src/app.js",
+    content: "semantically corrupt",
+    sha256: "0".repeat(64),
+    bytes: 999,
+  });
+  await setup.innerStore.write("code-executor-state", state);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await assert.rejects(
+    recovered.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+});
+
+test("recovery reports no pending cleanup after every fence is cleared", async (t) => {
+  const initialSandbox = new FakeSandbox({
+    results: [cleanupPendingError()],
+  });
+  const setup = await fixture(t, { sandbox: initialSandbox });
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  const session = await first.executor.start(startRequest());
+  const interrupted = await first.executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-cleanup-success",
+      profileId: "node-tests",
+    }),
+  );
+  assert.equal(interrupted.session.cleanupPending, true);
+
+  const recoverySandbox = new FakeSandbox();
+  const recovered = setup.createExecutor({
+    broker: setup.createBroker(),
+    nextSandbox: recoverySandbox,
+  });
+  assert.deepEqual(await recovered.executor.recover(), {
+    recovered: true,
+    cleanupPending: 0,
+  });
+  assert.equal(
+    (await recovered.executor.view({ sessionId: "session-one" })).cleanupPending,
+    false,
+  );
+});
+
+test("recovery reports only cleanup fences that remain after mixed results", async (t) => {
+  const initialSandbox = new FakeSandbox({
+    results: [cleanupPendingError("first"), cleanupPendingError("second")],
+  });
+  const setup = await fixture(t, { sandbox: initialSandbox });
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  for (const sessionId of ["session-one", "session-two"]) {
+    const session = await first.executor.start(startRequest({ sessionId }));
+    const interrupted = await first.executor.perform(
+      actionRequest(session, {
+        type: "run_profile",
+        actionId: `test-${sessionId}`,
+        profileId: "node-tests",
+      }),
+    );
+    assert.equal(interrupted.session.cleanupPending, true);
+  }
+
+  const recoverySandbox = new FakeSandbox({
+    cleanupResults: [undefined, cleanupPendingError("still pending")],
+  });
+  const recovered = setup.createExecutor({
+    broker: setup.createBroker(),
+    nextSandbox: recoverySandbox,
+  });
+  const recovery = await recovered.executor.recover();
+  assert.deepEqual(recovery, { recovered: true, cleanupPending: 1 });
+  assert.equal(
+    (await recovered.executor.view({ sessionId: "session-one" })).cleanupPending,
+    false,
+  );
+  assert.equal(
+    (await recovered.executor.view({ sessionId: "session-two" })).cleanupPending,
+    true,
+  );
+});
+
+test("a recovered executor returns validated action result envelopes", async (t) => {
+  const setup = await fixture(t);
+  const { read, failedCompletion } = await createCompletedSessionWithRead(setup);
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+
+  const readEnvelope = await recovered.executor.getActionResult({
+    sessionId: "session-one",
+    actionId: "read-before-completion",
+  });
+  assert.deepEqual(Object.keys(readEnvelope).sort(), ["action", "result"]);
+  assert.equal(readEnvelope.action.status, "succeeded");
+  assert.deepEqual(readEnvelope.result, read.result);
+  assert.equal(JSON.stringify(readEnvelope).includes(setup.root), false);
+  assert.equal(JSON.stringify(readEnvelope).includes(setup.scratchRoot), false);
+
+  const failedEnvelope = await recovered.executor.getActionResult({
+    sessionId: "session-one",
+    actionId: "complete-before-checks",
+  });
+  assert.equal(failedEnvelope.action.status, "failed");
+  assert.deepEqual(failedEnvelope.result, failedCompletion.result);
+
+  const originalArtifactDigest = readEnvelope.action.outputArtifacts.output.sha256;
+  readEnvelope.action.outputArtifacts.output.sha256 = "0".repeat(64);
+  readEnvelope.result.content = "mutated by caller";
+  const reread = await recovered.executor.getActionResult({
+    sessionId: "session-one",
+    actionId: "read-before-completion",
+  });
+  assert.equal(reread.action.outputArtifacts.output.sha256, originalArtifactDigest);
+  assert.equal(reread.result.content, "export const value = 1;\n");
+});
+
+test("action result access is exact, ready-gated, and terminal-only", async (t) => {
+  const pending = deferred();
+  const sandbox = new FakeSandbox({ results: [() => pending.promise] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await assert.rejects(
+    executor.getActionResult({
+      sessionId: "session-one",
+      actionId: "test-running-result",
+    }),
+    hasCode("EXECUTOR_NOT_READY"),
+  );
+  await executor.recover();
+  const session = await executor.start(startRequest());
+
+  await assert.rejects(
+    executor.getActionResult({
+      sessionId: session.id,
+      actionId: "missing-action",
+      hostPath: setup.scratchRoot,
+    }),
+    hasCode("INVALID_EXECUTION_REQUEST"),
+  );
+  await assert.rejects(
+    executor.getActionResult({ sessionId: "missing-session", actionId: "action" }),
+    hasCode("SESSION_NOT_FOUND"),
+  );
+  await assert.rejects(
+    executor.getActionResult({ sessionId: session.id, actionId: "missing-action" }),
+    hasCode("ACTION_NOT_FOUND"),
+  );
+
+  const running = executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-running-result",
+      profileId: "node-tests",
+    }),
+  );
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const state = await setup.innerStore.read("code-executor-state");
+    if (
+      state.sessions[session.id].actions.some(
+        (action) =>
+          action.id === "test-running-result" && action.status === "running",
+      )
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  await assert.rejects(
+    executor.getActionResult({
+      sessionId: session.id,
+      actionId: "test-running-result",
+    }),
+    hasCode("EXECUTOR_ACTION_NOT_TERMINAL"),
+  );
+  pending.resolve(sandboxResult());
+  await running;
+});
+
+test("actions are rejected before creating orphan input artifacts", async (t) => {
+  const setup = await fixture(t);
+  const recordingJournal = new RecordingJournal(setup.journal);
+  const { executor } = setup.createExecutor({
+    nextJournal: recordingJournal,
+    limits: { maxSessions: 100, maxActionsPerSession: 1 },
+  });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+
+  await assert.rejects(
+    executor.perform({
+      sessionId: session.id,
+      action: {
+        type: "list_files",
+        actionId: "stale-action",
+        expectedWorkspaceRevision: "0".repeat(64),
+        path: "",
+      },
+    }),
+    hasCode("WORKSPACE_REVISION_MISMATCH"),
+  );
+  assert.equal(recordingJournal.writeCalls.length, 0);
+
+  const first = await executor.perform(
+    actionRequest(session, {
+      type: "list_files",
+      actionId: "allowed-action",
+      path: "",
+    }),
+  );
+  assert.equal(first.action.status, "succeeded");
+  const writesAfterAllowedAction = recordingJournal.writeCalls.length;
+  await assert.rejects(
+    executor.perform(
+      actionRequest(first.session, {
+        type: "list_files",
+        actionId: "over-limit-action",
+        path: "",
+      }),
+    ),
+    hasCode("ACTION_LIMIT"),
+  );
+  assert.equal(recordingJournal.writeCalls.length, writesAfterAllowedAction);
+});
+
+test("concurrent retries share one in-flight action", async (t) => {
+  const pending = deferred();
+  const sandbox = new FakeSandbox({ results: [() => pending.promise] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const request = actionRequest(session, {
+    type: "run_profile",
+    actionId: "same-flight",
+    profileId: "node-tests",
+  });
+
+  const first = executor.perform(request);
+  const second = executor.perform(request);
+  assert.equal(first, second);
+  for (let attempt = 0; attempt < 50 && sandbox.calls.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(sandbox.calls.length, 1);
+  pending.resolve(sandboxResult());
+  const result = await first;
+  assert.equal(result.action.status, "succeeded");
+  assert.equal(sandbox.calls.length, 1);
+});
+
+test("a crash after workspace creation can resume as first materialization", async (t) => {
+  const setup = await fixture(t, { failingStore: true });
+  const baseBroker = setup.createBroker();
+  let armFailure = true;
+  const broker = overrideBroker(baseBroker, {
+    createExecution: async (request) => {
+      const created = await baseBroker.createExecution(request);
+      if (armFailure) {
+        armFailure = false;
+        setup.store.failNextWrite = true;
+      }
+      return created;
+    },
+  });
+  const first = setup.createExecutor({ broker });
+  await first.executor.recover();
+  await assert.rejects(first.executor.start(startRequest()), hasCode("STATE_WRITE_FAILED"));
+  const preparing = await setup.innerStore.read("code-executor-state");
+  assert.equal(preparing.sessions["session-one"].sourceRevision, null);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const resumed = await recovered.executor.resume({ sessionId: "session-one" });
+  assert.equal(resumed.status, "active");
+  assert.equal(resumed.attempt.number, 2);
+  assert.match(resumed.sourceRevision, /^[a-f0-9]{64}$/);
+  assert.equal(resumed.workspaceRevision, resumed.sourceRevision);
+});
+
+test("an uncertain write interrupts the session and is never replayed", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const broker = overrideBroker(baseBroker, {
+    writeFile: async (request) => {
+      await baseBroker.writeFile(request);
+      throw new Error(`post-write failure at ${setup.scratchRoot}`);
+    },
+  });
+  const first = setup.createExecutor({ broker });
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-unknown",
+      path: "src/app.js",
+    }),
+  );
+  session = read.session;
+  const uncertain = await first.executor.perform(
+    actionRequest(session, {
+      type: "write_text",
+      actionId: "write-unknown",
+      path: "src/app.js",
+      content: "export const uncertain = true;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  assert.equal(uncertain.action.status, "interrupted");
+  assert.equal(uncertain.action.error.code, "RESULT_UNKNOWN");
+  assert.equal(uncertain.session.status, "interrupted");
+  assert.equal(JSON.stringify(uncertain).includes(setup.scratchRoot), false);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  const reread = await recovered.executor.perform(
+    actionRequest(resumed, {
+      type: "read_text",
+      actionId: "read-after-unknown",
+      path: "src/app.js",
+    }),
+  );
+  assert.equal(reread.result.content, "export const value = 1;\n");
+});
+
+test("an unverified change racing completion is rejected and interrupts the session", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const broker = overrideBroker(baseBroker, {
+    sealExecution: async (request) => {
+      await baseBroker.writeFile({
+        workspaceId: request.workspaceId,
+        executionId: request.executionId,
+        path: "src/unverified.js",
+        content: "export const unverified = true;\n",
+        expectedSha256: null,
+        expectedWorkspaceRevision: request.expectedWorkspaceRevision,
+      });
+      return baseBroker.sealExecution(request);
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  await executor.recover();
+  let session = await executor.start(startRequest());
+  const checked = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "test-before-race",
+      profileId: "node-tests",
+    }),
+  );
+  session = checked.session;
+  const completion = await executor.perform(
+    actionRequest(session, {
+      type: "complete",
+      actionId: "complete-racing-write",
+    }),
+  );
+
+  assert.equal(completion.action.status, "interrupted");
+  assert.equal(completion.action.error.code, "RESULT_UNKNOWN");
+  assert.equal(completion.session.status, "interrupted");
+  assert.notEqual(completion.session.status, "completed");
+});
+
+test("artifact persistence failure after a write requires restart recovery", async (t) => {
+  const setup = await fixture(t);
+  const failingJournal = new FailingJournal(setup.journal, null);
+  const first = setup.createExecutor({ nextJournal: failingJournal });
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-journal-failure",
+      path: "src/app.js",
+    }),
+  );
+  session = read.session;
+  failingJournal.failingKind = "output";
+  await assert.rejects(
+    first.executor.perform(
+      actionRequest(session, {
+        type: "write_text",
+        actionId: "write-before-journal-failure",
+        path: "src/app.js",
+        content: "export const journalUnknown = true;\n",
+        expectedSha256: read.result.sha256,
+      }),
+    ),
+    hasCode("EXECUTION_FENCED"),
+  );
+  const uncertainState = await setup.innerStore.read("code-executor-state");
+  assert.equal(
+    uncertainState.sessions[session.id].actions.at(-1).status,
+    "running",
+  );
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const interrupted = await recovered.executor.view({ sessionId: session.id });
+  assert.equal(interrupted.actions.at(-1).status, "interrupted");
+  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  const reread = await recovered.executor.perform(
+    actionRequest(resumed, {
+      type: "read_text",
+      actionId: "read-after-journal-failure",
+      path: "src/app.js",
+    }),
+  );
+  assert.equal(reread.result.content, "export const value = 1;\n");
+});
+
+test("resume rejects a changed trusted profile configuration", async (t) => {
+  const setup = await fixture(t);
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  await first.executor.start(startRequest());
+  const state = await setup.innerStore.read("code-executor-state");
+  const storedSession = state.sessions["session-one"];
+  storedSession.status = "interrupted";
+  storedSession.attempts.at(-1).status = "interrupted";
+  storedSession.attempts.at(-1).finishedAt = new Date().toISOString();
+  await setup.innerStore.write("code-executor-state", state);
+
+  const changedProfiles = {
+    "node-tests": { ...profileDefinitions["node-tests"], timeoutMs: 45_000 },
+  };
+  const recovered = setup.createExecutor({
+    profiles: changedProfiles,
+    nextSandbox: new FakeSandbox({ profiles: changedProfiles }),
+  });
+  await recovered.executor.recover();
+  await assert.rejects(
+    recovered.executor.resume({ sessionId: "session-one" }),
+    hasCode("PROFILE_CONFIG_CHANGED"),
+  );
+});
+
+test("malformed sandbox proof cannot satisfy completion checks", async (t) => {
+  const sandbox = new FakeSandbox({
+    results: [sandboxResult({ imageId: undefined })],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const checked = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "malformed-proof",
+      profileId: "node-tests",
+    }),
+  );
+  assert.equal(checked.action.status, "failed");
+  assert.equal(checked.action.error.code, "SANDBOX_RESULT_INVALID");
+  const completion = await executor.perform(
+    actionRequest(checked.session, {
+      type: "complete",
+      actionId: "complete-without-proof",
+    }),
+  );
+  assert.equal(completion.action.status, "failed");
+  assert.equal(completion.result.error.code, "CHECKS_NOT_PASSED");
+});
+
+test("a sandbox run cannot substitute a different profile fingerprint", async (t) => {
+  const sandbox = new FakeSandbox({
+    results: [sandboxResult({ profileFingerprint: "f".repeat(64) })],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const checked = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "substituted-profile",
+      profileId: "node-tests",
+    }),
+  );
+
+  assert.equal(checked.action.status, "failed");
+  assert.equal(checked.action.error.code, "SANDBOX_PROFILE_MISMATCH");
+  assert.equal(checked.session.status, "active");
+});
+
+test("recovery closes running replay records", async (t) => {
+  const setup = await fixture(t);
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-replay-state",
+      path: "src/app.js",
+    }),
+  );
+  const write = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "write-replay-state",
+      path: "src/app.js",
+      content: "export const replaying = true;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  session = write.session;
+  const state = await setup.innerStore.read("code-executor-state");
+  const storedSession = state.sessions[session.id];
+  const startedAt = new Date().toISOString();
+  storedSession.attempts.at(-1).status = "interrupted";
+  storedSession.attempts.at(-1).finishedAt = startedAt;
+  storedSession.attempts.push({
+    number: 2,
+    executionId: `attempt-${digestValue({ number: 2, sessionId: session.id }).slice(0, 24)}`,
+    status: "replaying",
+    startedAt,
+    finishedAt: null,
+    replays: [
+      {
+        sourceActionId: "write-replay-state",
+        status: "running",
+        startedAt,
+        finishedAt: null,
+      },
+    ],
+  });
+  storedSession.status = "replaying";
+  await setup.innerStore.write("code-executor-state", state);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const recoveredState = await setup.innerStore.read("code-executor-state");
+  const replay = recoveredState.sessions[session.id].attempts.at(-1).replays[0];
+  assert.equal(replay.status, "interrupted");
+  assert.ok(replay.finishedAt);
+});
+
+test("persisted null and cross-action artifact references fail closed", async (t) => {
+  const nullSetup = await fixture(t);
+  await nullSetup.innerStore.write("code-executor-state", null);
+  const nullExecutor = nullSetup.createExecutor().executor;
+  await assert.rejects(nullExecutor.recover(), hasCode("EXECUTOR_STATE_INVALID"));
+
+  const setup = await fixture(t);
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-owned-artifact",
+      path: "src/app.js",
+    }),
+  );
+  const write = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "write-owned-artifact",
+      path: "src/app.js",
+      content: "export const owned = true;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  session = write.session;
+  const state = await setup.innerStore.read("code-executor-state");
+  const storedAction = state.sessions[session.id].actions.find(
+    (action) => action.id === "write-owned-artifact",
+  );
+  const input = await setup.journal.readJson(storedAction.inputArtifact);
+  storedAction.inputArtifact = await setup.journal.writeJson({
+    sessionId: "another-session",
+    actionId: storedAction.id,
+    kind: "input",
+    value: input,
+  });
+  await setup.innerStore.write("code-executor-state", state);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await assert.rejects(recovered.executor.recover(), hasCode("EXECUTOR_STATE_INVALID"));
+});
+
+test("terminal sessions cannot contain running actions", async (t) => {
+  const setup = await fixture(t);
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  const session = await first.executor.start(startRequest());
+  await first.executor.perform(
+    actionRequest(session, {
+      type: "list_files",
+      actionId: "terminal-running-action",
+      path: "",
+    }),
+  );
+  const state = await setup.innerStore.read("code-executor-state");
+  const storedSession = state.sessions[session.id];
+  const storedAction = storedSession.actions.at(-1);
+  const finishedAt = new Date().toISOString();
+  storedAction.status = "running";
+  storedAction.workspaceRevisionAfter = null;
+  storedAction.finishedAt = null;
+  storedSession.status = "completed";
+  storedSession.completedAt = finishedAt;
+  storedSession.attempts.at(-1).status = "completed";
+  storedSession.attempts.at(-1).finishedAt = finishedAt;
+  await setup.innerStore.write("code-executor-state", state);
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await assert.rejects(recovered.executor.recover(), hasCode("EXECUTOR_STATE_INVALID"));
+});
+
+test("a failed profile proof cannot be forged into a passing proof", async (t) => {
+  const sandbox = new FakeSandbox({
+    results: [sandboxResult({ exitCode: 1, stderr: "failed" })],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const failed = await executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "failed-proof",
+      profileId: "node-tests",
+    }),
+  );
+  assert.equal(failed.action.status, "failed");
+  const state = await setup.innerStore.read("code-executor-state");
+  state.sessions[session.id].verifiedProfiles["node-tests"].passed = true;
+  await setup.innerStore.write("code-executor-state", state);
+
+  await assert.rejects(
+    executor.perform(
+      actionRequest(failed.session, {
+        type: "complete",
+        actionId: "forged-completion",
+      }),
+    ),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+
+  const fullyForgedState = await setup.innerStore.read("code-executor-state");
+  const forgedAction = fullyForgedState.sessions[session.id].actions.find(
+    (action) => action.id === "failed-proof",
+  );
+  forgedAction.status = "succeeded";
+  forgedAction.error = null;
+  await setup.innerStore.write("code-executor-state", fullyForgedState);
+  const artifactChecked = await executor.perform(
+    actionRequest(failed.session, {
+      type: "complete",
+      actionId: "forged-completion",
+    }),
+  );
+  assert.equal(artifactChecked.action.status, "interrupted");
+  assert.equal(artifactChecked.action.error.code, "RESULT_UNKNOWN");
+  assert.equal(artifactChecked.session.status, "interrupted");
+});
+
+test("completed state requires semantic actions, proofs, and durable artifacts", async (t) => {
+  const forgedSetup = await fixture(t);
+  const forged = forgedSetup.createExecutor();
+  await forged.executor.recover();
+  const active = await forged.executor.start(startRequest());
+  const forgedState = await forgedSetup.innerStore.read("code-executor-state");
+  const forgedSession = forgedState.sessions[active.id];
+  const completedAt = new Date().toISOString();
+  forgedSession.status = "completed";
+  forgedSession.completedAt = completedAt;
+  forgedSession.attempts.at(-1).status = "completed";
+  forgedSession.attempts.at(-1).finishedAt = completedAt;
+  await forgedSetup.innerStore.write("code-executor-state", forgedState);
+  const forgedRecovery = forgedSetup.createExecutor({
+    broker: forgedSetup.createBroker(),
+  });
+  await assert.rejects(
+    forgedRecovery.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+
+  const missingSetup = await fixture(t);
+  const first = missingSetup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const checked = await first.executor.perform(
+    actionRequest(session, {
+      type: "run_profile",
+      actionId: "durable-proof",
+      profileId: "node-tests",
+    }),
+  );
+  session = checked.session;
+  const completed = await first.executor.perform(
+    actionRequest(session, {
+      type: "complete",
+      actionId: "durable-completion",
+    }),
+  );
+  assert.equal(completed.session.status, "completed");
+  await rm(path.join(missingSetup.root, "execution-artifacts"), {
+    recursive: true,
+    force: true,
+  });
+  const missingRecovery = missingSetup.createExecutor({
+    broker: missingSetup.createBroker(),
+  });
+  await assert.rejects(
+    missingRecovery.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+});
+
+test("persisted projections and cleanup fences reject unrelated fields and IDs", async (t) => {
+  const projectionSetup = await fixture(t);
+  const first = projectionSetup.createExecutor();
+  await first.executor.recover();
+  const session = await first.executor.start(startRequest());
+  const projectionState = await projectionSetup.innerStore.read(
+    "code-executor-state",
+  );
+  projectionState.sessions[session.id].requestedBy.hostPath =
+    "D:\\private\\token.txt";
+  await projectionSetup.innerStore.write(
+    "code-executor-state",
+    projectionState,
+  );
+  const projectionRecovery = projectionSetup.createExecutor({
+    broker: projectionSetup.createBroker(),
+  });
+  await assert.rejects(
+    projectionRecovery.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+
+  const fenceSetup = await fixture(t);
+  const fenceSandbox = new FakeSandbox();
+  const initial = fenceSetup.createExecutor({ nextSandbox: fenceSandbox });
+  await initial.executor.recover();
+  await initial.executor.start(startRequest());
+  const fenceState = await fenceSetup.innerStore.read("code-executor-state");
+  const fencedSession = fenceState.sessions["session-one"];
+  const interruptedAt = new Date().toISOString();
+  fencedSession.status = "interrupted";
+  fencedSession.attempts.at(-1).status = "interrupted";
+  fencedSession.attempts.at(-1).finishedAt = interruptedAt;
+  fencedSession.cleanupFence = {
+    executionId: "unrelated-execution",
+    actionId: "unrelated-action",
+    containerName: null,
+    since: interruptedAt,
+    lastError: { code: "RESULT_UNKNOWN", message: "unknown" },
+  };
+  await fenceSetup.innerStore.write("code-executor-state", fenceState);
+  const fenceRecovery = fenceSetup.createExecutor({
+    broker: fenceSetup.createBroker(),
+    nextSandbox: fenceSandbox,
+  });
+  await assert.rejects(
+    fenceRecovery.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+  assert.equal(fenceSandbox.cleanupCalls.length, 0);
+});
+
+test("invalid clocks and broker creation results never corrupt persisted revisions", async (t) => {
+  const clockSetup = await fixture(t);
+  const invalidClock = clockSetup.createExecutor({
+    nextClock: () => "not-a-date",
+  });
+  await invalidClock.executor.recover();
+  await assert.rejects(
+    invalidClock.executor.start(startRequest()),
+    hasCode("INVALID_EXECUTOR_CONFIG"),
+  );
+  assert.equal(
+    await clockSetup.innerStore.read("code-executor-state", null),
+    null,
+  );
+
+  const brokerSetup = await fixture(t);
+  const baseBroker = brokerSetup.createBroker();
+  const invalidBroker = overrideBroker(baseBroker, {
+    createExecution: async (request) => {
+      await baseBroker.createExecution(request);
+      return {
+        workspaceId: request.workspaceId,
+        executionId: request.executionId,
+        sourceRevision: "bad",
+        workspaceRevision: "bad",
+      };
+    },
+  });
+  const invalidCreation = brokerSetup.createExecutor({ broker: invalidBroker });
+  await invalidCreation.executor.recover();
+  await assert.rejects(
+    invalidCreation.executor.start(startRequest()),
+    hasCode("START_FAILED"),
+  );
+  const stored = await brokerSetup.innerStore.read("code-executor-state");
+  assert.equal(stored.sessions["session-one"].status, "failed");
+  assert.equal(stored.sessions["session-one"].sourceRevision, null);
+  assert.equal(stored.sessions["session-one"].workspaceRevision, null);
+});
