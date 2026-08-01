@@ -1,0 +1,264 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  ControlledCodeExecutorError,
+  digestValue,
+  normalizeActionRequest,
+  normalizeResumeRequest,
+  normalizeRuntimeOptions,
+  normalizeStartRequest,
+} from "../src/domain/code-executor-contract.js";
+
+const REVISION = "a".repeat(64);
+
+function assertInvalid(operation) {
+  assert.throws(
+    operation,
+    (error) =>
+      error instanceof ControlledCodeExecutorError &&
+      error.code === "INVALID_EXECUTION_REQUEST",
+  );
+}
+
+test("start and resume requests normalize exact plain DTOs", () => {
+  const start = normalizeStartRequest({
+    workspaceId: "dashboard",
+    requestedBy: { workItemId: "PR-42", roleId: "pr-engineer" },
+    sessionId: "session-1",
+  });
+
+  assert.deepEqual(start, {
+    sessionId: "session-1",
+    workspaceId: "dashboard",
+    requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+  });
+  assert.deepEqual(normalizeResumeRequest({ sessionId: "session-1" }), {
+    sessionId: "session-1",
+  });
+  assert.deepEqual(normalizeResumeRequest({ sessionId: "a".repeat(64) }), {
+    sessionId: "a".repeat(64),
+  });
+
+  assertInvalid(() =>
+    normalizeStartRequest({
+      sessionId: "session-1",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "pr-engineer", workItemId: null },
+      command: "npm test",
+    }),
+  );
+  assertInvalid(() =>
+    normalizeStartRequest({
+      sessionId: "Session-1",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "pr-engineer", workItemId: null },
+    }),
+  );
+  assertInvalid(() =>
+    normalizeStartRequest({
+      sessionId: "session-1",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "pr-engineer", workItemId: "bad\u0000item" },
+    }),
+  );
+  assertInvalid(() =>
+    normalizeStartRequest({
+      sessionId: "session-1",
+      workspaceId: "dashboard",
+      requestedBy: Object.assign(Object.create({ inherited: true }), {
+        roleId: "pr-engineer",
+        workItemId: null,
+      }),
+    }),
+  );
+  assertInvalid(() =>
+    normalizeResumeRequest({ sessionId: "session-1", workspaceId: "dashboard" }),
+  );
+  assertInvalid(() => normalizeResumeRequest({ sessionId: "a".repeat(65) }));
+});
+
+test("each semantic action has an exact, ordered normalized schema", () => {
+  const cases = [
+    [
+      { path: "src", expectedWorkspaceRevision: REVISION, actionId: "a-1", type: "list_files" },
+      {
+        type: "list_files",
+        actionId: "a-1",
+        expectedWorkspaceRevision: REVISION,
+        path: "src",
+      },
+    ],
+    [
+      {
+        path: "src/app.js",
+        type: "read_text",
+        actionId: "a-2",
+        expectedWorkspaceRevision: REVISION,
+      },
+      {
+        type: "read_text",
+        actionId: "a-2",
+        expectedWorkspaceRevision: REVISION,
+        path: "src/app.js",
+      },
+    ],
+    [
+      {
+        query: "needle",
+        path: "",
+        type: "search_text",
+        actionId: "a-3",
+        expectedWorkspaceRevision: REVISION,
+      },
+      {
+        type: "search_text",
+        actionId: "a-3",
+        expectedWorkspaceRevision: REVISION,
+        path: "",
+        query: "needle",
+      },
+    ],
+    [
+      {
+        expectedSha256: null,
+        content: "export const answer = 42;\n",
+        path: "src/answer.js",
+        type: "write_text",
+        actionId: "a-4",
+        expectedWorkspaceRevision: REVISION,
+      },
+      {
+        type: "write_text",
+        actionId: "a-4",
+        expectedWorkspaceRevision: REVISION,
+        path: "src/answer.js",
+        content: "export const answer = 42;\n",
+        expectedSha256: null,
+      },
+    ],
+    [
+      {
+        profileId: "node-test",
+        type: "run_profile",
+        actionId: "a-5",
+        expectedWorkspaceRevision: REVISION,
+      },
+      {
+        type: "run_profile",
+        actionId: "a-5",
+        expectedWorkspaceRevision: REVISION,
+        profileId: "node-test",
+      },
+    ],
+    [
+      { expectedWorkspaceRevision: REVISION, actionId: "a-6", type: "complete" },
+      {
+        type: "complete",
+        actionId: "a-6",
+        expectedWorkspaceRevision: REVISION,
+      },
+    ],
+  ];
+
+  for (const [action, expected] of cases) {
+    const result = normalizeActionRequest({ action, sessionId: "session-1" });
+    assert.deepEqual(result, { sessionId: "session-1", action: expected });
+    assert.deepEqual(Object.keys(result.action), Object.keys(expected));
+  }
+});
+
+test("action requests reject capabilities and malformed fields outside the contract", () => {
+  const base = {
+    type: "read_text",
+    actionId: "action-1",
+    expectedWorkspaceRevision: REVISION,
+    path: "src/app.js",
+  };
+
+  for (const action of [
+    { ...base, type: "delete" },
+    { ...base, command: "npm" },
+    { ...base, args: ["test"] },
+    { ...base, env: { TOKEN: "secret" } },
+    { ...base, cwd: "." },
+    { ...base, workspacePath: "D:/repo" },
+    { ...base, expectedWorkspaceRevision: "A".repeat(64) },
+    { ...base, actionId: "action_1" },
+    { ...base, path: 42 },
+  ]) {
+    assertInvalid(() =>
+      normalizeActionRequest({ sessionId: "session-1", action }),
+    );
+  }
+
+  assertInvalid(() =>
+    normalizeActionRequest({ sessionId: "session-1", action: base, signal: null }),
+  );
+  assertInvalid(() =>
+    normalizeActionRequest({
+      sessionId: "session-1",
+      action: { ...base, type: "write_text", content: "x", expectedSha256: "bad" },
+    }),
+  );
+});
+
+test("DTO validation rejects arrays, custom prototypes, inherited and accessor fields", () => {
+  assertInvalid(() => normalizeResumeRequest(["session-1"]));
+  assertInvalid(() =>
+    normalizeResumeRequest(Object.assign(Object.create(null), { sessionId: "session-1" })),
+  );
+  assertInvalid(() =>
+    normalizeResumeRequest(Object.create({ sessionId: "session-1" })),
+  );
+
+  const accessor = {};
+  Object.defineProperty(accessor, "sessionId", {
+    enumerable: true,
+    get: () => "session-1",
+  });
+  assertInvalid(() => normalizeResumeRequest(accessor));
+
+  const symbolKey = { sessionId: "session-1" };
+  symbolKey[Symbol("extra")] = true;
+  assertInvalid(() => normalizeResumeRequest(symbolKey));
+});
+
+test("runtime options accept only an optional AbortSignal-like signal", () => {
+  const controller = new AbortController();
+  assert.deepEqual(normalizeRuntimeOptions(), { signal: null });
+  assert.deepEqual(normalizeRuntimeOptions({}), { signal: null });
+  assert.deepEqual(normalizeRuntimeOptions({ signal: null }), { signal: null });
+  assert.equal(normalizeRuntimeOptions({ signal: controller.signal }).signal, controller.signal);
+
+  for (const options of [
+    { timeoutMs: 1_000 },
+    { signal: undefined },
+    { signal: { aborted: false } },
+    null,
+  ]) {
+    assertInvalid(() => normalizeRuntimeOptions(options));
+  }
+});
+
+test("digestValue recursively sorts JSON object keys", () => {
+  const left = {
+    z: [{ b: 2, a: 1 }],
+    a: { d: 4, c: 3 },
+  };
+  const right = {
+    a: { c: 3, d: 4 },
+    z: [{ a: 1, b: 2 }],
+  };
+
+  assert.match(digestValue(left), /^[a-f0-9]{64}$/);
+  assert.equal(digestValue(left), digestValue(right));
+  assert.notEqual(digestValue(left), digestValue({ ...right, z: [{ a: 1, b: 3 }] }));
+  const specialLeft = JSON.parse('{"z":1,"__proto__":{"safe":true}}');
+  const specialRight = JSON.parse('{"__proto__":{"safe":true},"z":1}');
+  assert.equal(digestValue(specialLeft), digestValue(specialRight));
+  assertInvalid(() => digestValue({ value: undefined }));
+  assertInvalid(() => digestValue({ value: Number.NaN }));
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assertInvalid(() => digestValue(cyclic));
+});
