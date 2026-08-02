@@ -65,6 +65,10 @@ async function skipCodeJobs() {
   return { skipped: "not_configured" };
 }
 
+async function skipCodeJobMemory() {
+  return { skipped: "not_configured" };
+}
+
 function stageFailure(stage, error) {
   const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
@@ -75,6 +79,7 @@ function stageFailure(stage, error) {
 export class WorkCoordinationService {
   #intake;
   #runCodeJobs;
+  #projectCodeJobMemory;
   #runProposals;
   #reconcileProposals;
   #reconcileAttention;
@@ -88,6 +93,7 @@ export class WorkCoordinationService {
   constructor({
     ledger,
     codeJobRunner,
+    codeJobMemoryProjector,
     proposalRunner,
     proposalResultReconciler,
     attentionResultReconciler,
@@ -101,11 +107,19 @@ export class WorkCoordinationService {
     proposalLimit = 50,
     conditionLimit = 50,
     codeJobLimit = 10,
+    codeJobMemoryLimit = 50,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
     this.#runCodeJobs = codeJobRunner == null
       ? skipCodeJobs
       : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
+    this.#projectCodeJobMemory = codeJobMemoryProjector == null
+      ? skipCodeJobMemory
+      : requirePort(
+          codeJobMemoryProjector,
+          "runCycle",
+          "codeJobMemoryProjector",
+        );
     this.#runProposals = proposalRunner == null
       ? skipProposalExecution
       : requirePort(proposalRunner, "runCycle", "proposalRunner");
@@ -134,6 +148,10 @@ export class WorkCoordinationService {
       proposalLimit: positiveLimit(proposalLimit, "proposalLimit"),
       conditionLimit: positiveLimit(conditionLimit, "conditionLimit"),
       codeJobLimit: positiveLimit(codeJobLimit, "codeJobLimit"),
+      codeJobMemoryLimit: positiveLimit(
+        codeJobMemoryLimit,
+        "codeJobMemoryLimit",
+      ),
     });
   }
 
@@ -167,6 +185,10 @@ export class WorkCoordinationService {
           ...(options.includeWork && options.roleId !== null
             ? { roleId: options.roleId }
             : {}),
+        })],
+      ["code_job_memory", () =>
+        this.#projectCodeJobMemory({
+          limit: this.#defaults.codeJobMemoryLimit,
         })],
       ["proposal_execution", () =>
         this.#runProposals({ limit: this.#defaults.proposalLimit })],

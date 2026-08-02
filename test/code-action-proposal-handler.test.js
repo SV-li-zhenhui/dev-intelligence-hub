@@ -298,6 +298,54 @@ test("an exact completed approval and queued job advance only to running", async
   assert.notEqual(transition.status, "succeeded");
 });
 
+test("a terminal code job waits for verified memory before completing its proposal", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(
+    queuedJob(grant, {
+      status: "completed",
+      revision: 5,
+      terminalResult: { kind: "completed", recordedAt: CREATED_AT },
+      updatedAt: "2026-08-02T03:00:02.000Z",
+    }),
+  );
+  const instance = handler(producer, reader, grant);
+  const waiting = await instance.value.handle(handlerInput());
+  producer.status = "completed";
+
+  const pendingMemory = await instance.value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+  assert.equal(pendingMemory.status, "running");
+
+  reader.value = {
+    ...reader.value,
+    revision: 6,
+    memoryProjection: {
+      recordId: `memory-${"d".repeat(64)}`,
+      projectedAt: "2026-08-02T03:00:03.000Z",
+    },
+    updatedAt: "2026-08-02T03:00:03.000Z",
+  };
+  const completed = await instance.value.handle(
+    handlerInput({
+      status: "running",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.equal(completed.status, "succeeded");
+  assert.deepEqual(completed.evidence, [
+    `confirmation:${waiting.downstreamRef}`,
+    `code-job:${codeJobIdForGrant(grant)}`,
+    "code-job-status:completed",
+    `memory:memory-${"d".repeat(64)}`,
+  ]);
+});
+
 test("a legacy queued reader projection remains compatible during local upgrade", async () => {
   const grant = grantFor();
   const legacy = queuedJob(grant);

@@ -721,7 +721,10 @@ export class CodeActionProposalHandler {
       createdAt: receipt.createdAt ?? value.createdAt,
     };
     const job = normalizeCodeJobProjection(value, grant, effectiveReceipt);
-    if (isActiveCodeJobBrowserStatus(job.status)) {
+    if (
+      isActiveCodeJobBrowserStatus(job.status) ||
+      job.memoryProjection === null
+    ) {
       return active(
         "running",
         confirmationId,
