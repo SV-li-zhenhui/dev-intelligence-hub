@@ -65,7 +65,7 @@ const OPTIONAL_CONFIRMATION_KEYS = new Set([
   "rejection",
   "invalidation",
 ]);
-const JOB_KEYS = Object.freeze([
+const JOB_KEYS_WITHOUT_UNCERTAINTY = Object.freeze([
   "jobId",
   "status",
   "revision",
@@ -85,9 +85,69 @@ const JOB_KEYS = Object.freeze([
   "allowedActions",
   "writablePaths",
   "requiredProfiles",
+  "turn",
+  "pendingActionType",
+  "observationCount",
+  "latestObservation",
+  "terminalResult",
+  "memoryProjection",
+  "pause",
   "createdAt",
   "updatedAt",
 ]);
+const JOB_KEYS = Object.freeze([
+  ...JOB_KEYS_WITHOUT_UNCERTAINTY,
+  "uncertainty",
+]);
+const JOB_PROGRESS_KEYS = new Set([
+  "turn",
+  "pendingActionType",
+  "observationCount",
+  "latestObservation",
+  "terminalResult",
+  "memoryProjection",
+  "pause",
+  "uncertainty",
+]);
+const LEGACY_JOB_KEYS = Object.freeze(
+  JOB_KEYS_WITHOUT_UNCERTAINTY.filter(
+    (key) => !JOB_PROGRESS_KEYS.has(key),
+  ),
+);
+const CODE_JOB_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "unknown",
+  "paused",
+  "completed",
+  "failed",
+  "fenced",
+]);
+const ACTIVE_CODE_JOB_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "unknown",
+  "paused",
+]);
+const TERMINAL_CODE_JOB_STATUSES = new Set(["completed", "failed", "fenced"]);
+const CODE_ACTION_TYPES = new Set([
+  "list_files",
+  "read_text",
+  "search_text",
+  "write_text",
+  "run_profile",
+  "complete",
+]);
+const CODE_OBSERVATION_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "interrupted",
+]);
+const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/;
 const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
@@ -463,13 +523,151 @@ function confirmationFailureTransition(item, clock, pollIntervalMs) {
   );
 }
 
-function normalizeQueuedJob(value, grant, receipt) {
+function normalizeOptionalJobRecord(value, keys, error) {
+  if (value === null) return null;
+  assertWorkProposalExactKeys(value, keys, error);
+  return cloneWorkProposalValue(value);
+}
+
+function normalizeCodeJobProjection(value, grant, receipt) {
   const error = invalidJob();
-  assertWorkProposalExactKeys(value, JOB_KEYS, error);
-  const job = cloneWorkProposalValue(value);
+  const suppliedKeys = workProposalDataEntries(value, error).map(([key]) => key);
+  const legacy =
+    suppliedKeys.length === LEGACY_JOB_KEYS.length &&
+    LEGACY_JOB_KEYS.every((key) => suppliedKeys.includes(key));
+  const withoutUncertainty =
+    suppliedKeys.length === JOB_KEYS_WITHOUT_UNCERTAINTY.length &&
+    JOB_KEYS_WITHOUT_UNCERTAINTY.every((key) => suppliedKeys.includes(key));
+  assertWorkProposalExactKeys(
+    value,
+    legacy
+      ? LEGACY_JOB_KEYS
+      : withoutUncertainty
+        ? JOB_KEYS_WITHOUT_UNCERTAINTY
+        : JOB_KEYS,
+    error,
+  );
+  const job = {
+    ...cloneWorkProposalValue(value),
+    ...(legacy
+      ? {
+          turn: 0,
+          pendingActionType: null,
+          observationCount: 0,
+          latestObservation: null,
+          terminalResult: null,
+          memoryProjection: null,
+          pause: null,
+          uncertainty: null,
+        }
+      : {}),
+    ...(withoutUncertainty
+      ? {
+          uncertainty: value.status === "unknown"
+            ? {
+                from: "pausing",
+                code: "LEGACY_ACTION_RESULT_UNKNOWN",
+                message:
+                  value.pause?.reason ??
+                  "Legacy unknown action requires reconciliation",
+                at: value.pause?.at ?? value.updatedAt,
+              }
+            : null,
+        }
+      : {}),
+  };
   const expectedJobId = codeJobIdForGrant(grant);
   const createdAt = normalizeWorkProposalTimestamp(job.createdAt, error);
   const updatedAt = normalizeWorkProposalTimestamp(job.updatedAt, error);
+  const turn = safeWorkProposalInteger(job.turn, "turn", {
+    minimum: 0,
+    maximum: 128,
+    error,
+  });
+  const observationCount = safeWorkProposalInteger(
+    job.observationCount,
+    "observationCount",
+    { minimum: 0, maximum: 128, error },
+  );
+  const pendingActionType = job.pendingActionType;
+  if (
+    pendingActionType !== null &&
+    !CODE_ACTION_TYPES.has(pendingActionType)
+  ) {
+    throw error;
+  }
+  const latestObservation = normalizeOptionalJobRecord(
+    job.latestObservation,
+    ["actionType", "status", "recordedAt"],
+    error,
+  );
+  if (
+    latestObservation !== null &&
+    (!CODE_ACTION_TYPES.has(latestObservation.actionType) ||
+      !CODE_OBSERVATION_STATUSES.has(latestObservation.status))
+  ) {
+    throw error;
+  }
+  const latestRecordedAt = latestObservation === null
+    ? null
+    : normalizeWorkProposalTimestamp(latestObservation.recordedAt, error);
+  const terminalResult = normalizeOptionalJobRecord(
+    job.terminalResult,
+    ["kind", "recordedAt"],
+    error,
+  );
+  const terminalRecordedAt = terminalResult === null
+    ? null
+    : normalizeWorkProposalTimestamp(terminalResult.recordedAt, error);
+  const memoryProjection = normalizeOptionalJobRecord(
+    job.memoryProjection,
+    ["recordId", "projectedAt"],
+    error,
+  );
+  const memoryProjectedAt = memoryProjection === null
+    ? null
+    : normalizeWorkProposalTimestamp(memoryProjection.projectedAt, error);
+  if (
+    memoryProjection !== null &&
+    (typeof memoryProjection.recordId !== "string" ||
+      !MEMORY_RECORD_ID.test(memoryProjection.recordId))
+  ) {
+    throw error;
+  }
+  const pause = normalizeOptionalJobRecord(
+    job.pause,
+    ["reason", "at"],
+    error,
+  );
+  const pausedAt = pause === null
+    ? null
+    : normalizeWorkProposalTimestamp(pause.at, error);
+  if (
+    pause !== null &&
+    (typeof pause.reason !== "string" ||
+      Buffer.byteLength(pause.reason, "utf8") > 2_048)
+  ) {
+    throw error;
+  }
+  const uncertainty = normalizeOptionalJobRecord(
+    job.uncertainty,
+    ["from", "code", "message", "at"],
+    error,
+  );
+  const uncertaintyAt = uncertainty === null
+    ? null
+    : normalizeWorkProposalTimestamp(uncertainty.at, error);
+  if (
+    uncertainty !== null &&
+    (!["active", "pausing"].includes(uncertainty.from) ||
+      typeof uncertainty.code !== "string" ||
+      !FAILURE_CODE.test(uncertainty.code))
+  ) {
+    throw error;
+  }
+  if (uncertainty !== null) {
+    boundedReference(uncertainty.message, error, { maximumBytes: 2_048 });
+  }
   const expected = {
     requestedBy: grant.requestedBy,
     subject: grant.subject,
@@ -485,7 +683,7 @@ function normalizeQueuedJob(value, grant, receipt) {
   if (
     job.jobId !== expectedJobId ||
     receipt.id !== expectedJobId ||
-    job.status !== "queued" ||
+    !CODE_JOB_STATUSES.has(job.status) ||
     !Number.isSafeInteger(job.revision) ||
     job.revision < 1 ||
     job.proposalId !== grant.proposalId ||
@@ -500,7 +698,53 @@ function normalizeQueuedJob(value, grant, receipt) {
     job.reason !== grant.reason ||
     !sameValue(actual, expected) ||
     createdAt !== receipt.createdAt ||
-    updatedAt !== createdAt
+    Date.parse(updatedAt) < Date.parse(createdAt) ||
+    observationCount !== turn ||
+    (latestObservation === null) !== (observationCount === 0) ||
+    (latestRecordedAt !== null &&
+      (Date.parse(latestRecordedAt) < Date.parse(createdAt) ||
+        Date.parse(latestRecordedAt) > Date.parse(updatedAt))) ||
+    (pendingActionType !== null &&
+      !grant.allowedActions.includes(pendingActionType)) ||
+    (job.status === "queued" &&
+      (updatedAt !== createdAt ||
+        turn !== 0 ||
+        pendingActionType !== null ||
+        terminalResult !== null ||
+        pause !== null ||
+        memoryProjection !== null)) ||
+    (job.status === "starting" &&
+      (turn !== 0 ||
+        pendingActionType !== null ||
+        terminalResult !== null ||
+        pause !== null ||
+        memoryProjection !== null)) ||
+    (["active", "pausing", "unknown", "paused"].includes(job.status) &&
+      (terminalResult !== null || memoryProjection !== null)) ||
+    (!["pausing", "unknown", "paused"].includes(job.status) &&
+      pause !== null) ||
+    (["pausing", "paused"].includes(job.status) && pause === null) ||
+    (job.status === "unknown") !== (uncertainty !== null) ||
+    (uncertainty?.from === "active" && pause !== null) ||
+    (uncertainty?.from === "pausing" && pause === null) ||
+    (job.status === "unknown" && pendingActionType === null) ||
+    (pausedAt !== null &&
+      (Date.parse(pausedAt) < Date.parse(createdAt) ||
+        Date.parse(pausedAt) > Date.parse(updatedAt))) ||
+    (uncertaintyAt !== null &&
+      (Date.parse(uncertaintyAt) < Date.parse(createdAt) ||
+        Date.parse(uncertaintyAt) > Date.parse(updatedAt))) ||
+    (TERMINAL_CODE_JOB_STATUSES.has(job.status) &&
+      (terminalResult?.kind !== job.status ||
+        pendingActionType !== null ||
+        pause !== null)) ||
+    (ACTIVE_CODE_JOB_STATUSES.has(job.status) && terminalResult !== null) ||
+    (terminalRecordedAt !== null &&
+      (Date.parse(terminalRecordedAt) < Date.parse(createdAt) ||
+        Date.parse(terminalRecordedAt) > Date.parse(updatedAt))) ||
+    (memoryProjectedAt !== null &&
+      (Date.parse(memoryProjectedAt) < Date.parse(createdAt) ||
+        Date.parse(memoryProjectedAt) > Date.parse(updatedAt)))
   ) {
     throw error;
   }
@@ -744,12 +988,43 @@ export class CodeActionProposalHandler {
       id: jobId,
       createdAt: receipt.createdAt ?? value.createdAt,
     };
-    const job = normalizeQueuedJob(value, grant, effectiveReceipt);
-    return active(
-      "running",
-      confirmationId,
-      this.#clock,
-      this.#pollIntervalMs,
+    const job = normalizeCodeJobProjection(value, grant, effectiveReceipt);
+    if (ACTIVE_CODE_JOB_STATUSES.has(job.status)) {
+      return active(
+        "running",
+        confirmationId,
+        this.#clock,
+        this.#pollIntervalMs,
+      );
+    }
+    const evidence = [
+      `code-job:${job.jobId}`,
+      `code-job-status:${job.status}`,
+      ...(job.memoryProjection === null
+        ? []
+        : [`memory:${job.memoryProjection.recordId}`]),
+    ];
+    if (job.status === "completed") {
+      return terminal(
+        "succeeded",
+        "本地代码任务已完成并通过可信检查",
+        { id: confirmationId },
+        evidence,
+      );
+    }
+    if (job.status === "failed") {
+      return terminal(
+        "failed",
+        "本地代码任务执行失败",
+        { id: confirmationId },
+        evidence,
+      );
+    }
+    return terminal(
+      "unknown",
+      "本地代码任务因安全边界被隔离",
+      { id: confirmationId },
+      evidence,
     );
   }
 }

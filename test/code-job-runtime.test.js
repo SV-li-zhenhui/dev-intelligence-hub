@@ -143,7 +143,13 @@ function envelope({ requestId = "approval-request-0001" } = {}) {
   };
 }
 
-async function runtimeFixture({ store = new MemoryStore(), guard = new FakeGuard() } = {}) {
+async function runtimeFixture({
+  store = new MemoryStore(),
+  guard = new FakeGuard(),
+  executor,
+  brainDirectory,
+  workerFactory,
+} = {}) {
   const runtime = await createCodeJobRuntime({
     store,
     grantVerifier: { async verify(value) { return structuredClone(value); } },
@@ -153,6 +159,9 @@ async function runtimeFixture({ store = new MemoryStore(), guard = new FakeGuard
       guard.name = name;
       return guard;
     },
+    ...(executor === undefined ? {} : { executor }),
+    ...(brainDirectory === undefined ? {} : { brainDirectory }),
+    ...(workerFactory === undefined ? {} : { workerFactory }),
   });
   return { runtime, store, guard };
 }
@@ -168,10 +177,14 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.confirmationExecutor), true);
   assert.equal(Object.isFrozen(runtime.reader), true);
+  assert.equal(Object.isFrozen(runtime.control), true);
+  assert.equal(runtime.worker, null);
   assert.deepEqual(Object.keys(runtime).sort(), [
     "close",
     "confirmationExecutor",
+    "control",
     "reader",
+    "worker",
   ]);
 
   const first = await runtime.confirmationExecutor.execute(envelope());
@@ -212,6 +225,96 @@ test("close is idempotent and all ports fail closed afterwards", async () => {
     runtime.confirmationExecutor.reconcile(envelope()),
     (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
   );
+  await assert.rejects(
+    runtime.control.pause({
+      jobId: codeJobIdForGrant(grant()),
+      expectedRevision: 1,
+      reason: "pause",
+    }),
+    (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
+  );
+});
+
+test("worker cycles stay private and close drains the complete admitted cycle", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let workerOptions;
+  const { runtime, guard } = await runtimeFixture({
+    executor: {},
+    brainDirectory: {},
+    workerFactory(options) {
+      workerOptions = options;
+      return {
+        runCycle(value) {
+          return options.operationQueue.enqueue(async () => {
+            entered.resolve();
+            await release.promise;
+            return { selected: value.limit, outcomes: [] };
+          });
+        },
+      };
+    },
+  });
+
+  assert.equal(Object.isFrozen(runtime.worker), true);
+  assert.equal(typeof workerOptions.jobStore.getForWorker, "function");
+  assert.equal("jobStore" in runtime, false);
+  const cycle = runtime.worker.runCycle({ limit: 1 });
+  await entered.promise;
+  const closing = runtime.close();
+  await Promise.resolve();
+  assert.equal(guard.closeCount, 0);
+
+  release.resolve();
+  assert.deepEqual(await cycle, { selected: 1, outcomes: [] });
+  await closing;
+  assert.equal(guard.closeCount, 1);
+  await assert.rejects(
+    runtime.worker.runCycle({ limit: 1 }),
+    (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
+  );
+});
+
+test("pause control is admitted while a worker cycle is still running", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const { runtime } = await runtimeFixture({
+    executor: {},
+    brainDirectory: {},
+    workerFactory(options) {
+      return {
+        runCycle() {
+          return options.operationQueue.enqueue(async () => {
+            entered.resolve();
+            await release.promise;
+            return { selected: 1, outcomes: [] };
+          });
+        },
+      };
+    },
+  });
+  const created = await runtime.confirmationExecutor.execute(envelope());
+  const queued = await runtime.reader.get(created.receipt.id);
+  const cycle = runtime.worker.runCycle({ limit: 1 });
+  await entered.promise;
+
+  const pause = runtime.control.pause({
+    jobId: queued.jobId,
+    expectedRevision: queued.revision,
+    reason: "用户请求安全暂停",
+  });
+  const observed = await Promise.race([
+    pause.then((value) => ({ kind: "pause", value })),
+    new Promise((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 50)),
+  ]);
+
+  release.resolve();
+  await cycle;
+  const paused = await pause;
+  await runtime.close();
+
+  assert.equal(observed.kind, "pause");
+  assert.equal(paused.job.status, "paused");
 });
 
 test("close drains an admitted approval before releasing the process guard", async () => {
@@ -242,6 +345,15 @@ test("close drains an admitted approval before releasing the process guard", asy
   assert.equal((await creation).status, "applied");
   await closing;
   assert.equal(guard.closeCount, 1);
+
+  await assert.rejects(
+    createCodeJobRuntime({
+      store: new MemoryStore(),
+      executor: {},
+      createGuard: () => new FakeGuard(),
+    }),
+    /executor and brainDirectory/,
+  );
 });
 
 test("recovery failure releases the independent guard and preserves its cause", async () => {

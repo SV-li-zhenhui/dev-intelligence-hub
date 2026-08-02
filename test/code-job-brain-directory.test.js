@@ -78,6 +78,10 @@ function fakeRouter(responses = [decision()]) {
   };
 }
 
+function authorized(callback = async () => {}) {
+  return { beforeGenerate: callback };
+}
+
 test("a role brain receives only bounded semantic code context", async () => {
   const router = fakeRouter();
   const directory = new CodeJobBrainDirectory({
@@ -85,7 +89,10 @@ test("a role brain receives only bounded semantic code context", async () => {
     roles: roleBrain(),
   });
 
-  assert.deepEqual(await directory.decide(input()), JSON.parse(decision()));
+  assert.deepEqual(
+    await directory.decide(input(), authorized()),
+    JSON.parse(decision()),
+  );
   assert.equal(router.calls.length, 1);
   assert.deepEqual(router.calls[0].dataClasses, ["requirements", "code"]);
   assert.equal(router.calls[0].brain.model, "qwen3.5:9b");
@@ -117,9 +124,49 @@ test("one invalid model response gets exactly one local correction attempt", asy
     roles: roleBrain(),
   });
 
-  assert.equal((await directory.decide(input())).action.type, "run_profile");
+  assert.equal(
+    (await directory.decide(input(), authorized())).action.type,
+    "run_profile",
+  );
   assert.equal(router.calls.length, 2);
   assert.equal(router.calls[1].messages.length, 3);
+});
+
+test("authority is rechecked before a local correction reaches the provider", async () => {
+  const router = fakeRouter(["not json", decision({ type: "run_profile" })]);
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+  const revoked = Object.assign(new Error("revoked before correction"), {
+    code: "INVALID_CODE_JOB_AUTHORITY",
+  });
+  let checks = 0;
+
+  await assert.rejects(
+    directory.decide(
+      input(),
+      authorized(async () => {
+        checks += 1;
+        if (checks === 2) throw revoked;
+      }),
+    ),
+    (error) => error === revoked,
+  );
+
+  assert.equal(checks, 2);
+  assert.equal(router.calls.length, 1);
+});
+
+test("generation fails closed without a trusted authorization callback", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+
+  await assert.rejects(directory.decide(input()), TypeError);
+  assert.equal(router.calls.length, 0);
 });
 
 test("sealed capabilities reject model escalation and premature completion", async () => {
@@ -133,14 +180,19 @@ test("sealed capabilities reject model escalation and premature completion", asy
       roles: roleBrain(),
     });
     await assert.rejects(
-      directory.decide(input({
-        capabilities: {
-          ...input().capabilities,
-          allowedActions: ["read_text", "complete"],
-        },
-      })),
+      directory.decide(
+        input({
+          capabilities: {
+            ...input().capabilities,
+            allowedActions: ["read_text", "complete"],
+          },
+        }),
+        authorized(),
+      ),
       (error) =>
-        error instanceof CodeJobBrainDirectoryError && error.code === expectedCode,
+        error instanceof CodeJobBrainDirectoryError &&
+        error.code === "CODE_BRAIN_RESPONSE_INVALID" &&
+        error.cause?.code === expectedCode,
     );
     assert.equal(router.calls.length, 2);
   }
@@ -154,15 +206,19 @@ test("the host rejects repeated profile runs after all checks pass", async () =>
   });
 
   await assert.rejects(
-    directory.decide(input({
-      capabilities: {
-        ...input().capabilities,
-        requiredProfilesRemaining: 0,
-      },
-    })),
+    directory.decide(
+      input({
+        capabilities: {
+          ...input().capabilities,
+          requiredProfilesRemaining: 0,
+        },
+      }),
+      authorized(),
+    ),
     (error) =>
       error instanceof CodeJobBrainDirectoryError &&
-      error.code === "CODE_BRAIN_CHECKS_ALREADY_PASSED",
+      error.code === "CODE_BRAIN_RESPONSE_INVALID" &&
+      error.cause?.code === "CODE_BRAIN_CHECKS_ALREADY_PASSED",
   );
   assert.equal(router.calls.length, 2);
 });
@@ -186,7 +242,7 @@ test("remote brains require explicit requirements and code authorization", async
     roles: roleBrain(),
   });
   await assert.rejects(
-    denied.decide(input()),
+    denied.decide(input(), authorized()),
     (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
   );
   assert.equal(providerCalls.length, 0);
@@ -195,7 +251,10 @@ test("remote brains require explicit requirements and code authorization", async
     brainRouter: router,
     roles: roleBrain({ requirements: true, code: true, memory: false }),
   });
-  assert.equal((await allowed.decide(input())).action.type, "read_text");
+  assert.equal(
+    (await allowed.decide(input(), authorized())).action.type,
+    "read_text",
+  );
   assert.equal(providerCalls.length, 1);
 });
 
@@ -206,16 +265,74 @@ test("unknown roles and malformed untrusted context fail before generation", asy
     roles: roleBrain(),
   });
   await assert.rejects(
-    directory.decide(input({ roleId: "tester" })),
+    directory.decide(input({ roleId: "tester" }), authorized()),
     (error) => error?.code === "CODE_BRAIN_ROLE_NOT_CONFIGURED",
   );
   await assert.rejects(
-    directory.decide(input({
-      observations: [
-        { actionType: "read_text", status: "succeeded", detail: "bad\u0000" },
-      ],
-    })),
+    directory.decide(
+      input({
+        observations: [
+          { actionType: "read_text", status: "succeeded", detail: "bad\u0000" },
+        ],
+      }),
+      authorized(),
+    ),
     TypeError,
+  );
+  assert.equal(router.calls.length, 0);
+});
+
+test("oversize observation history is packed once before generation", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+  const observations = Array.from({ length: 8 }, (_, index) => ({
+    actionType: "read_text",
+    status: "succeeded",
+    detail: JSON.stringify({
+      path: `src/file-${index}.js`,
+      content: `${index}-${"x".repeat(30_000)}`,
+    }),
+  }));
+
+  await directory.decide(input({ observations, turn: 9 }), authorized());
+
+  assert.equal(router.calls.length, 1);
+  const packed = JSON.parse(router.calls[0].messages[1].content);
+  assert.ok(Buffer.byteLength(JSON.stringify(packed), "utf8") <= 128 * 1024);
+  assert.equal(packed.observations.at(-1).detail, observations.at(-1).detail);
+  assert.equal(
+    packed.observations.slice(0, -1).every((entry) =>
+      JSON.parse(entry.detail).compacted === true),
+    true,
+  );
+});
+
+test("unfit fixed context never reaches the provider", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+  const largeEntries = Array.from(
+    { length: 40 },
+    (_, index) => `${index}-${"x".repeat(1_800)}`,
+  );
+
+  await assert.rejects(
+    directory.decide(
+      input({
+        task: {
+          ...input().task,
+          acceptanceCriteria: largeEntries,
+          evidence: largeEntries.map((entry) => `evidence-${entry}`),
+        },
+      }),
+      authorized(),
+    ),
+    (error) => error.code === "CODE_BRAIN_CONTEXT_UNFIT",
   );
   assert.equal(router.calls.length, 0);
 });

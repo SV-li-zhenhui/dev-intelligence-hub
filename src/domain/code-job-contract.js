@@ -1,4 +1,7 @@
-import { digestValue } from "./code-executor-contract.js";
+import {
+  digestValue,
+  normalizeActionRequest,
+} from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -7,11 +10,32 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_REFERENCE = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,190}[A-Za-z0-9])?$/;
 const SAFE_CONFIRMATION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
 const SAFE_ACTION = /^[a-z](?:[a-z_]{0,62}[a-z])?$/;
+const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
+const MEMORY_RECORD_ID = /^memory-([a-f0-9]{64})$/;
 const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})$/;
 const CONTROL_CHARACTER = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
-const JOB_STATUSES = new Set(["queued"]);
+export const CODE_JOB_STATUSES = Object.freeze([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "unknown",
+  "paused",
+  "completed",
+  "failed",
+  "fenced",
+]);
+const JOB_STATUSES = new Set(CODE_JOB_STATUSES);
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "fenced"]);
+const PAUSABLE_JOB_STATUSES = new Set(["queued", "starting", "active"]);
+const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
+const MAX_OBSERVATIONS = 128;
+const MAX_DETAIL_BYTES = 128 * 1024;
+const MAX_PENDING_ACTION_BYTES = 128 * 1024;
+const MAX_JSON_DEPTH = 20;
+const MAX_JSON_COLLECTION_SIZE = 10_000;
 
 export const CODE_JOB_ACTIONS_BY_OPERATION = Object.freeze({
   inspect: Object.freeze([
@@ -477,59 +501,669 @@ export function normalizeCodeJobTimestamp(value, error = invalidJob()) {
   return timestamp;
 }
 
-export function createQueuedCodeJob(
-  value,
-  { sequence, revision, createdAt } = {},
-) {
-  const approval = normalizeApprovedCodeJobRequest(value);
-  const at = normalizeCodeJobTimestamp(createdAt);
-  const content = {
-    jobId: codeJobIdForGrant(approval.grant),
-    status: "queued",
-    sequence: safeInteger(sequence, "sequence", {
-      minimum: 1,
-      error: invalidJob(),
-    }),
-    revision: safeInteger(revision, "revision", {
-      minimum: 1,
-      error: invalidJob(),
-    }),
-    approval: {
-      confirmationId: approval.confirmationId,
-      requestId: approval.requestId,
-      displayedPayloadDigest: approval.displayedPayloadDigest,
-      approvalBindingDigest: approval.approvalBindingDigest,
-    },
-    proposal: {
-      proposalId: approval.grant.proposalId,
-      contentDigest: approval.grant.contentDigest,
-    },
-    grant: approval.grant,
-    createdAt: at,
-    updatedAt: at,
-  };
-  return { ...content, recordDigest: digestValue(content) };
+function normalizeJsonValue(value, error, depth = 0, ancestors = new Set()) {
+  if (depth > MAX_JSON_DEPTH) throw error;
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    !Object.is(value, -0)
+  ) {
+    return value;
+  }
+  if (typeof value !== "object" || ancestors.has(value)) throw error;
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const values = denseArray(value, MAX_JSON_COLLECTION_SIZE, error);
+      return values.map((entry) =>
+        normalizeJsonValue(entry, error, depth + 1, ancestors),
+      );
+    }
+    const entries = plainDataEntries(value, error);
+    if (entries.length > MAX_JSON_COLLECTION_SIZE) throw error;
+    const normalized = {};
+    for (const [key, entry] of entries.sort(([left], [right]) =>
+      left.localeCompare(right, "en"),
+    )) {
+      text(key, "detail.key", { maximumBytes: 128, error });
+      normalized[key] = normalizeJsonValue(
+        entry,
+        error,
+        depth + 1,
+        ancestors,
+      );
+    }
+    return normalized;
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
-export function normalizeCodeJob(value) {
-  const error = invalidJob();
-  const entries = exactObject(
+function normalizeDetail(value, error) {
+  const detail = normalizeJsonValue(value, error);
+  if (Buffer.byteLength(JSON.stringify(detail), "utf8") > MAX_DETAIL_BYTES) {
+    throw error;
+  }
+  return detail;
+}
+
+function normalizePendingAction(value, sessionId, error) {
+  if (value === null) return null;
+  const fields = exactObject(
+    value,
+    ["turn", "actionId", "actionDigest", "action", "preparedAt"],
+    error,
+  );
+  let action;
+  try {
+    action = normalizeActionRequest({
+      sessionId,
+      action: fields.get("action"),
+    }).action;
+  } catch {
+    throw error;
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(action), "utf8") > MAX_PENDING_ACTION_BYTES
+  ) {
+    throw error;
+  }
+  const actionId = safeId(fields.get("actionId"), "pendingAction.actionId", error);
+  const actionDigest = sha256(
+    fields.get("actionDigest"),
+    "pendingAction.actionDigest",
+    error,
+  );
+  if (action.actionId !== actionId || digestValue(action) !== actionDigest) {
+    throw error;
+  }
+  return {
+    turn: safeInteger(fields.get("turn"), "pendingAction.turn", {
+      minimum: 1,
+      maximum: MAX_OBSERVATIONS,
+      error,
+    }),
+    actionId,
+    actionDigest,
+    action,
+    preparedAt: normalizeCodeJobTimestamp(fields.get("preparedAt"), error),
+  };
+}
+
+function normalizeActionAdmission(value, pendingAction, revision, error) {
+  if (value === null) return null;
+  const fields = exactObject(
+    value,
+    ["actionId", "actionDigest", "epoch", "admittedAt"],
+    error,
+  );
+  const actionId = safeId(
+    fields.get("actionId"),
+    "actionAdmission.actionId",
+    error,
+  );
+  const actionDigest = sha256(
+    fields.get("actionDigest"),
+    "actionAdmission.actionDigest",
+    error,
+  );
+  const epoch = safeInteger(fields.get("epoch"), "actionAdmission.epoch", {
+    minimum: 1,
+    maximum: revision,
+    error,
+  });
+  if (
+    pendingAction === null ||
+    pendingAction.actionId !== actionId ||
+    pendingAction.actionDigest !== actionDigest
+  ) {
+    throw error;
+  }
+  return {
+    actionId,
+    actionDigest,
+    epoch,
+    admittedAt: normalizeCodeJobTimestamp(fields.get("admittedAt"), error),
+  };
+}
+
+function assertActionAllowedByGrant(action, grant, error) {
+  if (!grant.allowedActions.includes(action.type)) throw error;
+  if (action.type === "write_text") {
+    let relativePath;
+    try {
+      relativePath = normalizeWorkspacePath(action.path);
+    } catch {
+      throw error;
+    }
+    if (
+      !grant.writablePaths.some(
+        (writablePath) =>
+          relativePath === writablePath ||
+          relativePath.startsWith(`${writablePath}/`),
+      )
+    ) {
+      throw error;
+    }
+  }
+  if (
+    action.type === "run_profile" &&
+    !grant.requiredProfiles.some(({ id }) => id === action.profileId)
+  ) {
+    throw error;
+  }
+}
+
+function normalizeObservation(value, sessionId, grant, error) {
+  const fields = exactObject(
     value,
     [
-      "jobId",
+      "turn",
+      "actionId",
+      "actionType",
+      "actionDigest",
+      "action",
       "status",
-      "sequence",
-      "revision",
-      "approval",
-      "proposal",
-      "grant",
-      "createdAt",
-      "updatedAt",
-      "recordDigest",
+      "workspaceRevision",
+      "detail",
+      "detailDigest",
+      "recordedAt",
     ],
     error,
   );
-  if (!JOB_STATUSES.has(entries.get("status"))) throw error;
+  const status = fields.get("status");
+  if (!OBSERVATION_STATUSES.has(status)) throw error;
+  let action;
+  try {
+    action = normalizeActionRequest({
+      sessionId,
+      action: fields.get("action"),
+    }).action;
+  } catch {
+    throw error;
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(action), "utf8") >
+      MAX_PENDING_ACTION_BYTES
+  ) {
+    throw error;
+  }
+  assertActionAllowedByGrant(action, grant, error);
+  const detail = normalizeDetail(fields.get("detail"), error);
+  const detailDigest = sha256(
+    fields.get("detailDigest"),
+    "observation.detailDigest",
+    error,
+  );
+  if (digestValue(detail) !== detailDigest) throw error;
+  const actionId = safeId(
+    fields.get("actionId"),
+    "observation.actionId",
+    error,
+  );
+  const actionType = text(
+    fields.get("actionType"),
+    "observation.actionType",
+    { maximumBytes: 64, pattern: SAFE_ACTION, error },
+  );
+  const actionDigest = sha256(
+    fields.get("actionDigest"),
+    "observation.actionDigest",
+    error,
+  );
+  if (
+    action.actionId !== actionId ||
+    action.type !== actionType ||
+    digestValue(action) !== actionDigest
+  ) {
+    throw error;
+  }
+  return {
+    turn: safeInteger(fields.get("turn"), "observation.turn", {
+      minimum: 1,
+      maximum: MAX_OBSERVATIONS,
+      error,
+    }),
+    actionId,
+    actionType,
+    actionDigest,
+    action,
+    status,
+    workspaceRevision: sha256(
+      fields.get("workspaceRevision"),
+      "observation.workspaceRevision",
+      error,
+    ),
+    detail,
+    detailDigest,
+    recordedAt: normalizeCodeJobTimestamp(fields.get("recordedAt"), error),
+  };
+}
+
+function normalizeTerminalResult(value, error) {
+  if (value === null) return null;
+  const fields = exactObject(
+    value,
+    ["kind", "detail", "detailDigest", "recordedAt"],
+    error,
+  );
+  const kind = fields.get("kind");
+  if (!TERMINAL_JOB_STATUSES.has(kind)) throw error;
+  const detail = normalizeDetail(fields.get("detail"), error);
+  const detailDigest = sha256(
+    fields.get("detailDigest"),
+    "result.detailDigest",
+    error,
+  );
+  if (digestValue(detail) !== detailDigest) throw error;
+  return {
+    kind,
+    detail,
+    detailDigest,
+    recordedAt: normalizeCodeJobTimestamp(fields.get("recordedAt"), error),
+  };
+}
+
+function normalizePause(value, error) {
+  if (value === null) return null;
+  const fields = exactObject(value, ["from", "reason", "at"], error);
+  const from = fields.get("from");
+  if (!PAUSABLE_JOB_STATUSES.has(from)) throw error;
+  return {
+    from,
+    reason: text(fields.get("reason"), "pause.reason", {
+      maximumBytes: 2_048,
+      error,
+    }),
+    at: normalizeCodeJobTimestamp(fields.get("at"), error),
+  };
+}
+
+function normalizeUncertainty(value, error) {
+  if (value === null) return null;
+  const fields = exactObject(value, ["from", "code", "message", "at"], error);
+  const from = fields.get("from");
+  if (!["active", "pausing"].includes(from)) throw error;
+  return {
+    from,
+    code: text(fields.get("code"), "uncertainty.code", {
+      maximumBytes: 128,
+      pattern: SAFE_ERROR_CODE,
+      error,
+    }),
+    message: text(fields.get("message"), "uncertainty.message", {
+      maximumBytes: 2_048,
+      error,
+    }),
+    at: normalizeCodeJobTimestamp(fields.get("at"), error),
+  };
+}
+
+function normalizeMemoryProjection(value, jobId, error) {
+  if (value === null) return null;
+  const fields = exactObject(
+    value,
+    [
+      "jobId",
+      "sourceRecordDigest",
+      "sourceRevision",
+      "sourceUpdatedAt",
+      "memoryRecordId",
+      "memoryRecordDigest",
+      "projectedAt",
+    ],
+    error,
+  );
+  const memoryRecordId = text(
+    fields.get("memoryRecordId"),
+    "memoryProjection.memoryRecordId",
+    { maximumBytes: 71, pattern: MEMORY_RECORD_ID, error },
+  );
+  const memoryRecordDigest = sha256(
+    fields.get("memoryRecordDigest"),
+    "memoryProjection.memoryRecordDigest",
+    error,
+  );
+  if (memoryRecordId !== `memory-${memoryRecordDigest}`) throw error;
+  return {
+    jobId: safeId(fields.get("jobId"), "memoryProjection.jobId", error),
+    sourceRecordDigest: sha256(
+      fields.get("sourceRecordDigest"),
+      "memoryProjection.sourceRecordDigest",
+      error,
+    ),
+    sourceRevision: safeInteger(
+      fields.get("sourceRevision"),
+      "memoryProjection.sourceRevision",
+      { minimum: 1, error },
+    ),
+    sourceUpdatedAt: normalizeCodeJobTimestamp(
+      fields.get("sourceUpdatedAt"),
+      error,
+    ),
+    memoryRecordId,
+    memoryRecordDigest,
+    projectedAt: normalizeCodeJobTimestamp(fields.get("projectedAt"), error),
+  };
+}
+
+function emptyExecution() {
+  return {
+    sessionId: null,
+    workspaceRevision: null,
+    turn: 0,
+    pendingAction: null,
+    actionAdmission: null,
+    observations: [],
+    result: null,
+    pause: null,
+    uncertainty: null,
+    memoryProjection: null,
+  };
+}
+
+function normalizeExecution(
+  value,
+  status,
+  jobId,
+  grant,
+  revision,
+  createdAt,
+  updatedAt,
+  error,
+) {
+  const executionEntries = plainDataEntries(value, error);
+  const executionKeys = executionEntries.map(([key]) => key);
+  const baseKeys = [
+    "sessionId",
+    "workspaceRevision",
+    "turn",
+    "pendingAction",
+    "observations",
+    "result",
+    "pause",
+  ];
+  const memoryKeys = [...baseKeys, "memoryProjection"];
+  const admissionKeys = [...memoryKeys, "actionAdmission"];
+  const currentKeys = [...admissionKeys, "uncertainty"];
+  const withoutMemory =
+    executionKeys.length === baseKeys.length &&
+    baseKeys.every((key) => executionKeys.includes(key));
+  const withoutAdmission =
+    executionKeys.length === memoryKeys.length &&
+    memoryKeys.every((key) => executionKeys.includes(key));
+  const withoutUncertainty =
+    executionKeys.length === admissionKeys.length &&
+    admissionKeys.every((key) => executionKeys.includes(key));
+  const fields = exactObject(
+    value,
+    withoutMemory
+      ? baseKeys
+      : withoutAdmission
+        ? memoryKeys
+        : withoutUncertainty
+          ? admissionKeys
+          : currentKeys,
+    error,
+  );
+  const sessionId = fields.get("sessionId") === null
+    ? null
+    : safeId(fields.get("sessionId"), "execution.sessionId", error);
+  const workspaceRevision = fields.get("workspaceRevision") === null
+    ? null
+    : sha256(
+      fields.get("workspaceRevision"),
+      "execution.workspaceRevision",
+      error,
+    );
+  const turn = safeInteger(fields.get("turn"), "execution.turn", {
+    minimum: 0,
+    maximum: MAX_OBSERVATIONS,
+    error,
+  });
+  const observations = denseArray(
+    fields.get("observations"),
+    MAX_OBSERVATIONS,
+    error,
+  ).map((entry) => normalizeObservation(entry, sessionId, grant, error));
+  const pendingAction = normalizePendingAction(
+    fields.get("pendingAction"),
+    sessionId,
+    error,
+  );
+  if (pendingAction !== null) {
+    assertActionAllowedByGrant(pendingAction.action, grant, error);
+  }
+  const legacyAdmittedPending =
+    (withoutMemory || withoutAdmission) && pendingAction !== null;
+  const actionAdmission = legacyAdmittedPending
+    ? {
+        actionId: pendingAction.actionId,
+        actionDigest: pendingAction.actionDigest,
+        epoch: revision,
+        admittedAt: pendingAction.preparedAt,
+      }
+    : withoutMemory || withoutAdmission
+      ? null
+      : normalizeActionAdmission(
+        fields.get("actionAdmission"),
+        pendingAction,
+        revision,
+        error,
+      );
+  const result = normalizeTerminalResult(fields.get("result"), error);
+  const pause = normalizePause(fields.get("pause"), error);
+  const uncertainty = legacyAdmittedPending
+    ? {
+        from: pause === null ? "active" : "pausing",
+        code: "LEGACY_ACTION_RESULT_UNKNOWN",
+        message: "Legacy pending action requires executor reconciliation",
+        at: updatedAt,
+      }
+    : withoutMemory || withoutAdmission || withoutUncertainty
+      ? status === "unknown"
+        ? {
+            from: "pausing",
+            code: "LEGACY_ACTION_RESULT_UNKNOWN",
+            message: pause?.reason ?? "Legacy unknown action requires reconciliation",
+            at: pause?.at ?? updatedAt,
+          }
+        : null
+      : normalizeUncertainty(fields.get("uncertainty"), error);
+  const memoryProjection = withoutMemory
+    ? null
+    : normalizeMemoryProjection(fields.get("memoryProjection"), jobId, error);
+  const execution = {
+    sessionId,
+    workspaceRevision,
+    turn,
+    pendingAction,
+    actionAdmission,
+    observations,
+    result,
+    pause,
+    uncertainty,
+    memoryProjection,
+  };
+
+  if (
+    observations.length !== turn ||
+    observations.some(
+      ({ actionType }) => !grant.allowedActions.includes(actionType),
+    ) ||
+    observations.some((observation, index) => observation.turn !== index + 1) ||
+    observations.some(
+      (observation, index) =>
+        index > 0 &&
+        observation.action.expectedWorkspaceRevision !==
+          observations[index - 1].workspaceRevision,
+    ) ||
+    new Set(observations.map(({ actionId }) => actionId)).size !==
+      observations.length ||
+    new Set(observations.map(({ actionDigest }) => actionDigest)).size !==
+      observations.length ||
+    (sessionId !== null && sessionId !== jobId) ||
+    (workspaceRevision !== null && sessionId === null) ||
+    (observations.length > 0 &&
+      observations.at(-1).workspaceRevision !== workspaceRevision) ||
+    (pendingAction !== null &&
+      (pendingAction.turn !== turn + 1 ||
+        observations.some(({ actionId }) => actionId === pendingAction.actionId) ||
+        observations.some(
+          ({ actionDigest }) => actionDigest === pendingAction.actionDigest,
+        ) ||
+        pendingAction.action.expectedWorkspaceRevision !== workspaceRevision)) ||
+    (actionAdmission !== null &&
+      (pendingAction === null ||
+        Date.parse(actionAdmission.admittedAt) < Date.parse(createdAt) ||
+        Date.parse(actionAdmission.admittedAt) > Date.parse(updatedAt))) ||
+    observations.some(
+      (observation, index) =>
+        Date.parse(observation.recordedAt) < Date.parse(createdAt) ||
+        Date.parse(observation.recordedAt) > Date.parse(updatedAt) ||
+        (index > 0 &&
+          Date.parse(observation.recordedAt) <
+            Date.parse(observations[index - 1].recordedAt)),
+    ) ||
+    (pendingAction !== null &&
+      (Date.parse(pendingAction.preparedAt) < Date.parse(createdAt) ||
+        Date.parse(pendingAction.preparedAt) > Date.parse(updatedAt))) ||
+    (result !== null &&
+      (Date.parse(result.recordedAt) < Date.parse(createdAt) ||
+        Date.parse(result.recordedAt) > Date.parse(updatedAt))) ||
+    (pause !== null &&
+      (Date.parse(pause.at) < Date.parse(createdAt) ||
+        Date.parse(pause.at) > Date.parse(updatedAt))) ||
+    (uncertainty !== null &&
+      (Date.parse(uncertainty.at) < Date.parse(createdAt) ||
+        Date.parse(uncertainty.at) > Date.parse(updatedAt))) ||
+    (memoryProjection !== null &&
+      (memoryProjection.jobId !== jobId ||
+        Date.parse(memoryProjection.sourceUpdatedAt) < Date.parse(createdAt) ||
+        Date.parse(memoryProjection.projectedAt) <
+          Date.parse(memoryProjection.sourceUpdatedAt) ||
+        Date.parse(memoryProjection.projectedAt) > Date.parse(updatedAt)))
+  ) {
+    throw error;
+  }
+
+  const isEmpty =
+    sessionId === null &&
+    workspaceRevision === null &&
+    turn === 0 &&
+    pendingAction === null &&
+    actionAdmission === null &&
+    observations.length === 0 &&
+    result === null &&
+    uncertainty === null &&
+    memoryProjection === null;
+  const reconcilingSessionStart =
+    pause?.from === "starting" &&
+    sessionId === jobId &&
+    workspaceRevision === null &&
+    turn === 0 &&
+    pendingAction === null &&
+    actionAdmission === null &&
+    observations.length === 0;
+  const reconcilingAction =
+    pause?.from === "active" &&
+    sessionId === jobId &&
+    workspaceRevision !== null &&
+    pendingAction !== null &&
+    actionAdmission !== null;
+  if (
+    (status === "queued" && (!isEmpty || pause !== null)) ||
+    (status === "starting" &&
+      (sessionId !== jobId ||
+        workspaceRevision !== null ||
+        turn !== 0 ||
+        pendingAction !== null ||
+        actionAdmission !== null ||
+        observations.length !== 0 ||
+        result !== null ||
+        pause !== null ||
+        uncertainty !== null ||
+        memoryProjection !== null)) ||
+    (status === "active" &&
+      (sessionId !== jobId ||
+        workspaceRevision === null ||
+        result !== null ||
+        pause !== null ||
+        uncertainty !== null ||
+        memoryProjection !== null)) ||
+    (status === "pausing" &&
+      ((!reconcilingSessionStart && !reconcilingAction) ||
+        result !== null ||
+        uncertainty !== null ||
+        memoryProjection !== null)) ||
+    (status === "unknown" &&
+      (sessionId !== jobId ||
+        workspaceRevision === null ||
+        pendingAction === null ||
+        actionAdmission === null ||
+        uncertainty === null ||
+        result !== null ||
+        memoryProjection !== null ||
+        (uncertainty?.from === "active" && pause !== null) ||
+        (uncertainty?.from === "pausing" && pause?.from !== "active"))) ||
+    (status === "paused" &&
+      (pause === null ||
+        result !== null ||
+        actionAdmission !== null ||
+        uncertainty !== null ||
+        memoryProjection !== null ||
+        (pause?.from === "queued" && !isEmpty) ||
+        (pause?.from === "starting" &&
+          (sessionId !== jobId ||
+            workspaceRevision !== null ||
+            turn !== 0 ||
+            pendingAction !== null ||
+            observations.length !== 0)) ||
+        (pause?.from === "active" &&
+          (sessionId !== jobId || workspaceRevision === null)))) ||
+    (TERMINAL_JOB_STATUSES.has(status) &&
+      (result?.kind !== status ||
+        pause !== null ||
+        uncertainty !== null ||
+        pendingAction !== null ||
+        actionAdmission !== null ||
+        (status === "completed" &&
+          (sessionId !== jobId ||
+            workspaceRevision === null ||
+            observations.at(-1)?.actionType !== "complete" ||
+            observations.at(-1)?.status !== "succeeded"))))
+  ) {
+    throw error;
+  }
+  return execution;
+}
+
+const LEGACY_JOB_KEYS = Object.freeze([
+  "jobId",
+  "status",
+  "sequence",
+  "revision",
+  "approval",
+  "proposal",
+  "grant",
+  "createdAt",
+  "updatedAt",
+  "recordDigest",
+]);
+const JOB_KEYS = Object.freeze([
+  ...LEGACY_JOB_KEYS.slice(0, -1),
+  "execution",
+  "recordDigest",
+]);
+
+function normalizeCodeJobBase(entries, error) {
   const approvalFields = exactObject(
     entries.get("approval"),
     [
@@ -546,7 +1180,7 @@ export function normalizeCodeJob(value) {
     error,
   );
   const grant = normalizeCodeJobGrant(entries.get("grant"));
-  const content = {
+  return {
     jobId: safeId(entries.get("jobId"), "jobId", error),
     status: entries.get("status"),
     sequence: safeInteger(entries.get("sequence"), "sequence", {
@@ -597,17 +1231,222 @@ export function normalizeCodeJob(value) {
     createdAt: normalizeCodeJobTimestamp(entries.get("createdAt"), error),
     updatedAt: normalizeCodeJobTimestamp(entries.get("updatedAt"), error),
   };
-  const recordDigest = sha256(entries.get("recordDigest"), "recordDigest", error);
+}
+
+function assertCodeJobBindings(content, recordDigest, error) {
   if (
-    content.jobId !== codeJobIdForGrant(grant) ||
-    content.proposal.proposalId !== grant.proposalId ||
-    content.proposal.contentDigest !== grant.contentDigest ||
-    content.createdAt !== content.updatedAt ||
+    !JOB_STATUSES.has(content.status) ||
+    content.jobId !== codeJobIdForGrant(content.grant) ||
+    content.proposal.proposalId !== content.grant.proposalId ||
+    content.proposal.contentDigest !== content.grant.contentDigest ||
+    Date.parse(content.updatedAt) < Date.parse(content.createdAt) ||
     recordDigest !== digestValue(content)
   ) {
     throw error;
   }
-  return { ...content, recordDigest };
+}
+
+function assertMemoryProjectionBinding(content, error) {
+  const receipt = content.execution.memoryProjection;
+  if (receipt === null) return;
+  const sourceExecution = { ...content.execution, memoryProjection: null };
+  const sourceContent = {
+    ...content,
+    revision: receipt.sourceRevision,
+    updatedAt: receipt.sourceUpdatedAt,
+    execution: sourceExecution,
+  };
+  const executionCandidates = [sourceExecution];
+  if (sourceExecution.uncertainty === null) {
+    const { uncertainty: _uncertainty, ...withoutUncertainty } = sourceExecution;
+    executionCandidates.push(withoutUncertainty);
+  }
+  if (sourceExecution.actionAdmission === null) {
+    for (const candidate of [...executionCandidates]) {
+      const { actionAdmission: _actionAdmission, ...withoutAdmission } = candidate;
+      executionCandidates.push(withoutAdmission);
+    }
+  }
+  const sourceDigests = new Set(
+    executionCandidates.map((execution) =>
+      digestValue({ ...sourceContent, execution }),
+    ),
+  );
+  if (
+    !TERMINAL_JOB_STATUSES.has(content.status) ||
+    content.revision !== receipt.sourceRevision + 1 ||
+    content.updatedAt !== receipt.projectedAt ||
+    !sourceDigests.has(receipt.sourceRecordDigest)
+  ) {
+    throw error;
+  }
+}
+
+export function createQueuedCodeJob(
+  value,
+  { sequence, revision, createdAt } = {},
+) {
+  const approval = normalizeApprovedCodeJobRequest(value);
+  const at = normalizeCodeJobTimestamp(createdAt);
+  const content = {
+    jobId: codeJobIdForGrant(approval.grant),
+    status: "queued",
+    sequence: safeInteger(sequence, "sequence", {
+      minimum: 1,
+      error: invalidJob(),
+    }),
+    revision: safeInteger(revision, "revision", {
+      minimum: 1,
+      error: invalidJob(),
+    }),
+    approval: {
+      confirmationId: approval.confirmationId,
+      requestId: approval.requestId,
+      displayedPayloadDigest: approval.displayedPayloadDigest,
+      approvalBindingDigest: approval.approvalBindingDigest,
+    },
+    proposal: {
+      proposalId: approval.grant.proposalId,
+      contentDigest: approval.grant.contentDigest,
+    },
+    grant: approval.grant,
+    createdAt: at,
+    updatedAt: at,
+    execution: emptyExecution(),
+  };
+  return { ...content, recordDigest: digestValue(content) };
+}
+
+export function normalizeCodeJob(value) {
+  const error = invalidJob();
+  const keys = plainDataEntries(value, error).map(([key]) => key);
+  const legacy =
+    keys.length === LEGACY_JOB_KEYS.length &&
+    LEGACY_JOB_KEYS.every((key) => keys.includes(key));
+  const entries = exactObject(value, legacy ? LEGACY_JOB_KEYS : JOB_KEYS, error);
+  const base = normalizeCodeJobBase(entries, error);
+  const suppliedDigest = sha256(
+    entries.get("recordDigest"),
+    "recordDigest",
+    error,
+  );
+  if (legacy) {
+    if (
+      base.status !== "queued" ||
+      base.createdAt !== base.updatedAt
+    ) {
+      throw error;
+    }
+    assertCodeJobBindings(base, suppliedDigest, error);
+    const upgraded = { ...base, execution: emptyExecution() };
+    return { ...upgraded, recordDigest: digestValue(upgraded) };
+  }
+  const rawExecutionEntries = plainDataEntries(entries.get("execution"), error);
+  const executionBaseKeys = [
+    "sessionId",
+    "workspaceRevision",
+    "turn",
+    "pendingAction",
+    "observations",
+    "result",
+    "pause",
+  ];
+  const executionMemoryKeys = [...executionBaseKeys, "memoryProjection"];
+  const executionAdmissionKeys = [...executionMemoryKeys, "actionAdmission"];
+  const legacyWithoutMemory =
+    rawExecutionEntries.length === executionBaseKeys.length &&
+    executionBaseKeys.every((key) =>
+      rawExecutionEntries.some(([actual]) => actual === key),
+    );
+  const legacyWithoutAdmission =
+    rawExecutionEntries.length === executionMemoryKeys.length &&
+    executionMemoryKeys.every((key) =>
+      rawExecutionEntries.some(([actual]) => actual === key),
+    );
+  const legacyWithoutUncertainty =
+    rawExecutionEntries.length === executionAdmissionKeys.length &&
+    executionAdmissionKeys.every((key) =>
+      rawExecutionEntries.some(([actual]) => actual === key),
+    );
+  const rawExecution = Object.fromEntries(rawExecutionEntries);
+  const legacyAdmittedPending =
+    (legacyWithoutMemory || legacyWithoutAdmission) &&
+    rawExecution.pendingAction !== null;
+  if (
+    legacyAdmittedPending &&
+    !["active", "pausing", "paused"].includes(base.status)
+  ) {
+    throw error;
+  }
+  const effectiveStatus = legacyAdmittedPending ? "unknown" : base.status;
+  const content = {
+    ...base,
+    status: effectiveStatus,
+    execution: normalizeExecution(
+      entries.get("execution"),
+      effectiveStatus,
+      base.jobId,
+      base.grant,
+      base.revision,
+      base.createdAt,
+      base.updatedAt,
+      error,
+    ),
+  };
+  if (
+    legacyWithoutMemory ||
+    legacyWithoutAdmission ||
+    legacyWithoutUncertainty
+  ) {
+    const execution = { ...content.execution };
+    delete execution.uncertainty;
+    if (legacyWithoutMemory || legacyWithoutAdmission) {
+      delete execution.actionAdmission;
+    }
+    if (legacyWithoutMemory) delete execution.memoryProjection;
+    const legacyContent = { ...base, execution };
+    assertCodeJobBindings(legacyContent, suppliedDigest, error);
+    assertMemoryProjectionBinding(content, error);
+    return { ...content, recordDigest: digestValue(content) };
+  }
+  assertCodeJobBindings(content, suppliedDigest, error);
+  assertMemoryProjectionBinding(content, error);
+  return { ...content, recordDigest: suppliedDigest };
+}
+
+export function updateCodeJobLifecycle(
+  value,
+  { status, revision, updatedAt, execution },
+) {
+  const current = normalizeCodeJob(value);
+  const content = {
+    ...current,
+    status,
+    revision: safeInteger(revision, "revision", {
+      minimum: current.revision + 1,
+      error: invalidJob(),
+    }),
+    updatedAt: normalizeCodeJobTimestamp(updatedAt),
+    execution: cloneCodeJobValue(execution),
+  };
+  delete content.recordDigest;
+  return normalizeCodeJob({ ...content, recordDigest: digestValue(content) });
+}
+
+export function createCodeJobDetail(value) {
+  return normalizeDetail(value, invalidJob("代码任务执行详情无效"));
+}
+
+export function isTerminalCodeJobStatus(value) {
+  return TERMINAL_JOB_STATUSES.has(value);
+}
+
+export function isRetentionEligibleCodeJob(value) {
+  const job = normalizeCodeJob(value);
+  return (
+    TERMINAL_JOB_STATUSES.has(job.status) &&
+    job.execution.memoryProjection !== null
+  );
 }
 
 export function projectCodeJobForBrowser(value) {
@@ -632,6 +1471,42 @@ export function projectCodeJobForBrowser(value) {
     allowedActions: job.grant.allowedActions,
     writablePaths: job.grant.writablePaths,
     requiredProfiles: job.grant.requiredProfiles.map(({ id }) => id),
+    turn: job.execution.turn,
+    pendingActionType: job.execution.pendingAction?.action.type ?? null,
+    observationCount: job.execution.observations.length,
+    latestObservation: job.execution.observations.length === 0
+      ? null
+      : {
+        actionType: job.execution.observations.at(-1).actionType,
+        status: job.execution.observations.at(-1).status,
+        recordedAt: job.execution.observations.at(-1).recordedAt,
+      },
+    terminalResult: job.execution.result === null
+      ? null
+      : {
+        kind: job.execution.result.kind,
+        recordedAt: job.execution.result.recordedAt,
+      },
+    memoryProjection: job.execution.memoryProjection === null
+      ? null
+      : {
+        recordId: job.execution.memoryProjection.memoryRecordId,
+        projectedAt: job.execution.memoryProjection.projectedAt,
+      },
+    pause: job.execution.pause === null
+      ? null
+      : {
+          reason: job.execution.pause.reason,
+          at: job.execution.pause.at,
+        },
+    uncertainty: job.execution.uncertainty === null
+      ? null
+      : {
+          from: job.execution.uncertainty.from,
+          code: job.execution.uncertainty.code,
+          message: job.execution.uncertainty.message,
+          at: job.execution.uncertainty.at,
+        },
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   });

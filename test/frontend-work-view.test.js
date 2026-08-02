@@ -45,21 +45,28 @@ test("work view escapes records and clearly displays safety posture", () => {
     codeJobsEnabled: true,
     codeJobsError: "",
     codeJobs: [{
-      id: "code-job-1",
-      roleId: "developer",
+      jobId: "code-job-1",
+      requestedBy: { roleId: "developer", workItemId: "work-1" },
       repository: "acme/repo",
       workspaceId: "acme-workspace",
       operation: "modify",
       status: "completed",
-      phase: "seal",
-      lastActionType: "complete",
-      turnCount: 3,
+      turn: 3,
+      pendingActionType: null,
+      latestObservation: {
+        actionType: "complete",
+        status: "succeeded",
+        recordedAt: "2026-08-02T03:59:44.000Z",
+      },
+      terminalResult: {
+        kind: "completed",
+        recordedAt: "2026-08-02T03:59:45.000Z",
+      },
+      pause: null,
+      uncertainty: null,
       updatedAt: "2026-08-02T03:59:45.000Z",
       result: {
-        summary: "<img src=x onerror=alert(1)>",
-        modifiedFiles: ["src/<unsafe>.js"],
-        profiles: [{ id: "node-tests", status: "passed" }],
-        manifestDigest: "a".repeat(64),
+        summary: "PRIVATE EXECUTOR RESULT",
       },
     }],
   }, { now: Date.parse("2026-08-02T04:00:00.000Z") });
@@ -70,9 +77,79 @@ test("work view escapes records and clearly displays safety posture", () => {
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert/);
   assert.match(html, /本地代码任务/);
-  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
-  assert.match(html, /src\/&lt;unsafe&gt;\.js/);
+  assert.match(html, /最近动作 complete · 成功/);
+  assert.match(html, /终态：已完成/);
+  assert.doesNotMatch(html, /PRIVATE EXECUTOR RESULT/);
   assert.equal(escapeWorkHtml('"<&'), "&quot;&lt;&amp;");
+});
+
+test("code jobs render every safe lifecycle state from browser projections", () => {
+  const statuses = [
+    ["queued", "已授权，等待执行"],
+    ["starting", "正在准备隔离工作区"],
+    ["active", "受控执行中"],
+    ["pausing", "正在安全暂停"],
+    ["unknown", "状态待核验"],
+    ["paused", "已暂停"],
+    ["completed", "已完成"],
+    ["failed", "执行失败"],
+    ["fenced", "安全隔离，等待核验"],
+  ];
+  const html = renderWorkView({
+    loaded: true,
+    error: "",
+    summary: { itemCounts: {}, safeguards: {} },
+    items: [],
+    timeline: [],
+    codeJobsEnabled: true,
+    codeJobsError: "",
+    codeJobs: statuses.map(([status], index) => ({
+      jobId: `code-job-${status}`,
+      status,
+      requestedBy: { roleId: "developer", workItemId: `work-${index}` },
+      repository: "acme/repo",
+      workspaceId: "acme-workspace",
+      operation: "modify",
+      turn: index,
+      pendingActionType: ["active", "unknown"].includes(status)
+        ? "write_text"
+        : null,
+      latestObservation: status === "starting"
+        ? {
+            actionType: "list_files",
+            status: "succeeded",
+            recordedAt: "2026-08-02T03:58:00.000Z",
+          }
+        : null,
+      terminalResult: ["completed", "failed", "fenced"].includes(status)
+        ? { kind: status, recordedAt: "2026-08-02T03:59:00.000Z" }
+        : null,
+      pause: status === "paused"
+        ? { reason: "等待用户检查 <workspace>", at: "2026-08-02T03:59:00.000Z" }
+        : null,
+      uncertainty: status === "unknown"
+        ? {
+            from: "active",
+            code: "EXECUTOR_RESULT_UNKNOWN",
+            message: "结果来自 <executor>，等待核验",
+            at: "2026-08-02T03:59:00.000Z",
+          }
+        : null,
+      updatedAt: "2026-08-02T03:59:00.000Z",
+    })),
+  }, { now: Date.parse("2026-08-02T04:00:00.000Z") });
+
+  for (const [status, label] of statuses) {
+    assert.match(html, new RegExp(`status-${status}[^>]*>${label}`));
+  }
+  assert.match(html, /待执行 write_text/);
+  assert.match(html, /最近动作 list_files · 成功/);
+  assert.match(html, /暂停原因：等待用户检查 &lt;workspace&gt;/);
+  assert.match(
+    html,
+    /待核验：EXECUTOR_RESULT_UNKNOWN · 结果来自 &lt;executor&gt;，等待核验/,
+  );
+  assert.doesNotMatch(html, /暂停原因：结果来自/);
 });
 
 test("work view reads only newest-first projection endpoints", async () => {

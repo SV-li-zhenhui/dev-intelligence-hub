@@ -91,47 +91,93 @@ function timelineRows(entries, now) {
     </article>`).join("")}</div>`;
 }
 
+const CODE_JOB_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "paused",
+  "completed",
+  "failed",
+  "fenced",
+  "unknown",
+]);
+
+function codeJobStatus(status) {
+  return CODE_JOB_STATUSES.has(status) ? status : "unknown";
+}
+
 function codeJobStatusLabel(status) {
   return {
     queued: "已授权，等待执行",
+    starting: "正在准备隔离工作区",
     active: "受控执行中",
+    pausing: "正在安全暂停",
+    paused: "已暂停",
     completed: "已完成",
     failed: "执行失败",
-    stale: "授权已失效",
-    fenced: "需要恢复核验",
-  }[status] || status || "未知";
+    fenced: "安全隔离，等待核验",
+    unknown: "状态待核验",
+  }[codeJobStatus(status)];
 }
 
-function codeJobResultMarkup(result = {}) {
-  const files = [
-    ...(result.createdFiles || []).map((value) => `新增 ${value}`),
-    ...(result.modifiedFiles || []).map((value) => `修改 ${value}`),
-    ...(result.deletedFiles || []).map((value) => `删除 ${value}`),
-  ];
-  const profiles = (result.profiles || []).map(
-    ({ id, status }) => `${id} · ${status}`,
-  );
-  const details = [...files, ...profiles];
-  return `${result.summary ? `<small>${escapeWorkHtml(result.summary)}</small>` : ""}
-    ${details.length ? `<small>${details.map(escapeWorkHtml).join(" · ")}</small>` : ""}
-    ${result.manifestDigest ? `<small>manifest · ${escapeWorkHtml(result.manifestDigest)}</small>` : ""}`;
+function codeJobActionStatusLabel(status) {
+  return {
+    succeeded: "成功",
+    failed: "失败",
+    interrupted: "已中断",
+  }[status] || "状态未知";
+}
+
+function codeJobProgressMarkup(job, now) {
+  const turn = Number.isSafeInteger(job.turn) && job.turn >= 0 ? job.turn : 0;
+  const progress = [`${turn} 轮`];
+  if (job.pendingActionType) {
+    progress.push(`待执行 ${job.pendingActionType}`);
+  } else if (job.latestObservation?.actionType) {
+    progress.push(
+      `最近动作 ${job.latestObservation.actionType} · ${codeJobActionStatusLabel(job.latestObservation.status)}`,
+    );
+  } else {
+    progress.push("尚无动作");
+  }
+
+  const details = [];
+  if (job.uncertainty?.code && job.uncertainty?.message) {
+    details.push(
+      `待核验：${job.uncertainty.code} · ${job.uncertainty.message} · ${relativeTime(job.uncertainty.at, now)}`,
+    );
+  }
+  if (job.pause?.reason) {
+    details.push(
+      `暂停原因：${job.pause.reason} · ${relativeTime(job.pause.at, now)}`,
+    );
+  }
+  if (job.terminalResult?.kind) {
+    details.push(
+      `终态：${codeJobStatusLabel(job.terminalResult.kind)} · ${relativeTime(job.terminalResult.recordedAt, now)}`,
+    );
+  }
+  return `<span>${progress.map(escapeWorkHtml).join(" · ")} · ${relativeTime(job.updatedAt, now)}</span>
+    ${details.map((detail) => `<small>${escapeWorkHtml(detail)}</small>`).join("")}`;
 }
 
 function codeJobRows(items, now) {
   if (!items.length) {
     return '<div class="empty">尚无已授权的本地代码任务。</div>';
   }
-  return `<div class="work-list">${items.map((job) => `
+  return `<div class="work-list">${items.map((job) => {
+    const status = codeJobStatus(job.status);
+    return `
     <article class="work-row code-job-row">
       <div class="work-row-heading">
         <strong>${escapeWorkHtml(job.repository || "未知仓库")} · ${escapeWorkHtml(job.operation || "unknown")}</strong>
-        <span class="status-pill status-${escapeWorkHtml(job.status)}">${escapeWorkHtml(codeJobStatusLabel(job.status))}</span>
+        <span class="status-pill status-${status}">${escapeWorkHtml(codeJobStatusLabel(status))}</span>
       </div>
-      <p>${escapeWorkHtml(job.roleId || job.requestedBy?.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
-      <span>${escapeWorkHtml(job.phase || "queued")} · ${escapeWorkHtml(job.lastActionType || "尚无动作")} · ${Number(job.turnCount) || 0} 轮 · ${relativeTime(job.updatedAt, now)}</span>
-      ${job.errorCode ? `<small>${escapeWorkHtml(job.errorCode)}</small>` : ""}
-      ${codeJobResultMarkup(job.result)}
-    </article>`).join("")}</div>`;
+      <p>${escapeWorkHtml(job.requestedBy?.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
+      ${codeJobProgressMarkup(job, now)}
+    </article>`;
+  }).join("")}</div>`;
 }
 
 function count(summary, status) {

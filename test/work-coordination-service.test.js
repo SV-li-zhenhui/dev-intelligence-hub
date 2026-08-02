@@ -22,6 +22,7 @@ function fixture(overrides = {}) {
   });
   const service = new WorkCoordinationService({
     ledger: port("intake", "intake"),
+    codeJobRunner: port("code_jobs", "runCycle"),
     proposalRunner: port("proposal_execution", "runCycle"),
     proposalResultReconciler: port("proposals", "runCycle"),
     attentionResultReconciler: port("attention", "runCycle"),
@@ -48,11 +49,13 @@ test("agency executes proposals before reconciling their durable results", async
     attentionLimit: 9,
     proposalLimit: 11,
     conditionLimit: 10,
+    codeJobLimit: 6,
   });
 
   const result = await service.runCycle({ trigger: "refresh_completed" });
 
   assert.deepEqual(calls, [
+    ["code_jobs", { limit: 6 }],
     ["proposal_execution", { limit: 11 }],
     ["proposals", { limit: 11 }],
     ["attention", { limit: 9 }],
@@ -88,6 +91,9 @@ test("proposal execution is a safe no-op when no runner is configured", async ()
   const result = await service.runCycle();
 
   assert.equal(result.stages.proposal_execution.ok, true);
+  assert.deepEqual(result.stages.code_jobs.result, {
+    skipped: "not_configured",
+  });
   assert.deepEqual(calls, [["proposals", { limit: 17 }]]);
 });
 
@@ -100,6 +106,7 @@ test("housekeeping cycles reconcile and dispatch without making role decisions",
   });
 
   assert.deepEqual(calls, [
+    ["code_jobs", { limit: 10 }],
     ["proposal_execution", { limit: 12 }],
     ["proposals", { limit: 12 }],
     ["attention", { limit: 50 }],
@@ -126,6 +133,10 @@ test("role cycles forward the role scope to the proactive work loop", async () =
       workLimit: 20,
       roleId: "developer",
     },
+  ]);
+  assert.deepEqual(calls.find(([name]) => name === "code_jobs"), [
+    "code_jobs",
+    { limit: 10, roleId: "developer" },
   ]);
   assert.equal(result.roleId, "developer");
 });
@@ -169,6 +180,7 @@ test("all independent stage failures are reported after every stage is attempted
   });
   const service = new WorkCoordinationService({
     ledger: { async intake() {} },
+    codeJobRunner: failing("code_jobs", "runCycle"),
     proposalRunner: failing("proposal_execution", "runCycle"),
     proposalResultReconciler: failing("proposals", "runCycle"),
     attentionResultReconciler: failing("attention", "runCycle"),
@@ -180,6 +192,7 @@ test("all independent stage failures are reported after every stage is attempted
   await assert.rejects(service.runCycle(), (error) => {
     assert.ok(error instanceof AggregateError);
     assert.deepEqual(error.errors.map(({ stage }) => stage), [
+      "code_jobs",
       "proposal_execution",
       "proposal_results",
       "attention_results",
@@ -190,6 +203,7 @@ test("all independent stage failures are reported after every stage is attempted
     return true;
   });
   assert.deepEqual(calls, [
+    "code_jobs",
     "proposal_execution",
     "proposals",
     "attention",

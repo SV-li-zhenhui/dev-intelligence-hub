@@ -1,20 +1,46 @@
 import {
+  CODE_JOB_STATUSES,
   cloneCodeJobValue,
   codeJobError,
   codeJobIdForGrant,
+  createCodeJobDetail,
   createQueuedCodeJob,
+  isRetentionEligibleCodeJob,
+  isTerminalCodeJobStatus,
   normalizeApprovedCodeJobRequest,
   normalizeCodeJob,
   normalizeCodeJobTimestamp,
   projectCodeJobForBrowser,
+  updateCodeJobLifecycle,
 } from "../domain/code-job-contract.js";
+import {
+  digestValue,
+  normalizeActionRequest,
+} from "../domain/code-executor-contract.js";
 
 export const CODE_JOB_STATE_KEY = "code-job-state";
+const CODE_JOB_TOMBSTONE_PREFIX = "code-job-tombstone";
 
 const MAX_JOBS = 1_000;
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
+const MAX_ARCHIVED_JOBS = 10_000;
+const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const ACTION_COMMIT_HEADROOM_BYTES = 320 * 1024;
+const TERMINAL_HEADROOM_BYTES = 160 * 1024;
+const MEMORY_RECEIPT_HEADROOM_BYTES = 16 * 1024;
 const JOB_ID = /^code-job-[a-f0-9]{55}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const STATUS_SET = new Set(CODE_JOB_STATUSES);
+const RUNNABLE_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+]);
+const RECONCILABLE_STATUSES = new Set(["unknown"]);
+const RESUMED_STATUSES = new Set(["queued", "starting", "active"]);
+const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
 
 function storeError(code, message, statusCode = 400, options) {
   return codeJobError(code, message, statusCode, options);
@@ -40,6 +66,56 @@ function bindingConflict() {
 
 function capacityExceeded() {
   return storeError("CODE_JOB_CAPACITY_EXCEEDED", "代码任务本地容量已满", 507);
+}
+
+function retentionBlocked() {
+  return storeError(
+    "CODE_JOB_RETENTION_BLOCKED",
+    "代码任务归档被未完成的前缀任务或缺失的记忆投影阻塞",
+    409,
+  );
+}
+
+function revisionConflict() {
+  return storeError(
+    "CODE_JOB_REVISION_CONFLICT",
+    "代码任务版本已变化，请基于最新状态重试",
+    409,
+  );
+}
+
+function transitionConflict(message = "代码任务当前状态不允许该迁移") {
+  return storeError("CODE_JOB_TRANSITION_CONFLICT", message, 409);
+}
+
+function memoryBindingConflict() {
+  return storeError(
+    "CODE_JOB_MEMORY_BINDING_CONFLICT",
+    "代码任务已绑定不同的记忆投影凭据",
+    409,
+  );
+}
+
+function memoryReceiptUnverified(cause) {
+  return storeError(
+    "CODE_JOB_MEMORY_RECEIPT_UNVERIFIED",
+    "无法验证代码任务的持久记忆投影",
+    409,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function corruptedArchive(cause) {
+  return storeError(
+    "CODE_JOB_ARCHIVE_CORRUPTED",
+    "代码任务归档索引或墓碑损坏",
+    500,
+    { cause },
+  );
+}
+
+function jobNotFound() {
+  return storeError("CODE_JOB_NOT_FOUND", "代码任务不存在", 404);
 }
 
 function uncertainState(writeError, recoveryError) {
@@ -124,7 +200,12 @@ function safeInteger(value, minimum, maximum, error) {
 
 function normalizeLimits(value = {}) {
   const error = new TypeError("limits is invalid");
-  const allowed = ["maximumJobs", "maximumStateBytes"];
+  const allowed = [
+    "maximumJobs",
+    "maximumStateBytes",
+    "maximumArchivedJobs",
+    "maximumArchiveBytes",
+  ];
   const keys = plainDataKeys(value, error);
   if (keys.some((key) => !allowed.includes(key))) throw error;
   const positive = (candidate, fallback, maximum) => {
@@ -145,19 +226,183 @@ function normalizeLimits(value = {}) {
       MAX_STATE_BYTES,
       MAX_STATE_BYTES,
     ),
+    maximumArchivedJobs: positive(
+      value.maximumArchivedJobs,
+      MAX_ARCHIVED_JOBS,
+      MAX_ARCHIVED_JOBS,
+    ),
+    maximumArchiveBytes: positive(
+      value.maximumArchiveBytes,
+      MAX_ARCHIVE_BYTES,
+      MAX_ARCHIVE_BYTES,
+    ),
   });
 }
 
+function sealArchive(value) {
+  const content = {
+    throughSequence: value.throughSequence,
+    jobCount: value.jobCount,
+    revision: value.revision,
+    digest: value.digest,
+    lastCreatedAt: value.lastCreatedAt,
+    lastUpdatedAt: value.lastUpdatedAt,
+    storageBytes: value.storageBytes,
+    lastManifestDigest: value.lastManifestDigest,
+  };
+  return { ...content, checkpointDigest: digestValue(content) };
+}
+
 function defaultState() {
-  return { schemaVersion: 1, revision: 0, nextJobSequence: 1, jobs: [] };
+  return {
+    schemaVersion: 6,
+    revision: 0,
+    nextJobSequence: 1,
+    archive: sealArchive({
+      throughSequence: 0,
+      jobCount: 0,
+      revision: 0,
+      digest: null,
+      lastCreatedAt: null,
+      lastUpdatedAt: null,
+      storageBytes: 0,
+      lastManifestDigest: null,
+    }),
+    archiveIndex: [],
+    lastCompaction: null,
+    jobs: [],
+  };
 }
 
 function sameValue(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function normalizeStateValue(value, limits) {
-  const error = invalidState();
+function emptyArchive() {
+  return defaultState().archive;
+}
+
+function normalizeArchive(value, error) {
+  const legacyKeys = [
+    "throughSequence",
+    "jobCount",
+    "revision",
+    "digest",
+    "lastCreatedAt",
+    "lastUpdatedAt",
+    "checkpointDigest",
+  ];
+  const currentKeys = [
+    ...legacyKeys.slice(0, -1),
+    "storageBytes",
+    "lastManifestDigest",
+    "checkpointDigest",
+  ];
+  const keys = plainDataKeys(value, error);
+  const legacy =
+    keys.length === legacyKeys.length &&
+    legacyKeys.every((key) => keys.includes(key));
+  assertExactKeys(value, legacy ? legacyKeys : currentKeys, error);
+  const throughSequence = safeInteger(
+    value.throughSequence,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const jobCount = safeInteger(
+    value.jobCount,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const revision = safeInteger(
+    value.revision,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const digest = value.digest === null
+    ? null
+    : normalizeSha256(value.digest, error);
+  const lastCreatedAt = value.lastCreatedAt === null
+    ? null
+    : normalizeCodeJobTimestamp(value.lastCreatedAt, error);
+  const lastUpdatedAt = value.lastUpdatedAt === null
+    ? null
+    : normalizeCodeJobTimestamp(value.lastUpdatedAt, error);
+  const storageBytes = legacy
+    ? 0
+    : safeInteger(
+      value.storageBytes,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    );
+  const lastManifestDigest = legacy || value.lastManifestDigest === null
+    ? null
+    : normalizeSha256(value.lastManifestDigest, error);
+  const checkpointDigest = normalizeSha256(value.checkpointDigest, error);
+  const content = {
+    throughSequence,
+    jobCount,
+    revision,
+    digest,
+    lastCreatedAt,
+    lastUpdatedAt,
+    storageBytes,
+    lastManifestDigest,
+  };
+  const suppliedCheckpointContent = legacy
+    ? Object.fromEntries(
+      legacyKeys
+        .filter((key) => key !== "checkpointDigest")
+        .map((key) => [key, value[key]]),
+    )
+    : content;
+  if (
+    jobCount !== throughSequence ||
+    (throughSequence === 0) !== (revision === 0) ||
+    (throughSequence === 0) !== (digest === null) ||
+    (throughSequence === 0) !== (lastCreatedAt === null) ||
+    (throughSequence === 0) !== (lastUpdatedAt === null) ||
+    (throughSequence === 0) !== (lastManifestDigest === null) ||
+    (throughSequence === 0) !== (storageBytes === 0) ||
+    (lastCreatedAt !== null &&
+      Date.parse(lastUpdatedAt) < Date.parse(lastCreatedAt)) ||
+    checkpointDigest !== digestValue(suppliedCheckpointContent) ||
+    (legacy && throughSequence !== 0)
+  ) {
+    throw error;
+  }
+  return legacy ? sealArchive(content) : { ...content, checkpointDigest };
+}
+
+function normalizeJobs(value, limits, error) {
+  return denseArray(value, limits.maximumJobs, error).map((entry) => {
+    try {
+      return normalizeCodeJob(entry);
+    } catch {
+      throw error;
+    }
+  });
+}
+
+function validateUniqueJobs(jobs, error) {
+  const unique = (selector) =>
+    new Set(jobs.map(selector)).size === jobs.length;
+  if (
+    !unique((job) => job.sequence) ||
+    !unique((job) => job.revision) ||
+    !unique((job) => job.jobId) ||
+    !unique((job) => job.proposal.proposalId) ||
+    !unique((job) => job.approval.confirmationId) ||
+    !unique((job) => job.approval.approvalBindingDigest)
+  ) {
+    throw error;
+  }
+}
+
+function normalizeLegacyState(value, limits, error) {
   assertExactKeys(
     value,
     ["schemaVersion", "revision", "nextJobSequence", "jobs"],
@@ -170,15 +415,7 @@ function normalizeStateValue(value, limits) {
     Number.MAX_SAFE_INTEGER,
     error,
   );
-  const jobs = denseArray(value.jobs, limits.maximumJobs, error).map((entry) => {
-    try {
-      return normalizeCodeJob(entry);
-    } catch {
-      throw error;
-    }
-  });
-  const unique = (selector) =>
-    new Set(jobs.map(selector)).size === jobs.length;
+  const jobs = normalizeJobs(value.jobs, limits, error);
   const nextJobSequence = safeInteger(
     value.nextJobSequence,
     1,
@@ -193,15 +430,11 @@ function normalizeStateValue(value, limits) {
     revision < jobs.length ||
     maximumRevision !== revision ||
     nextJobSequence !== jobs.length + 1 ||
-    !unique((job) => job.sequence) ||
-    !unique((job) => job.revision) ||
-    !unique((job) => job.jobId) ||
-    !unique((job) => job.proposal.proposalId) ||
-    !unique((job) => job.approval.confirmationId) ||
-    !unique((job) => job.approval.approvalBindingDigest)
+    jobs.some(({ status }) => status !== "queued")
   ) {
     throw error;
   }
+  validateUniqueJobs(jobs, error);
   const created = [...jobs].sort((left, right) => left.sequence - right.sequence);
   for (let index = 0; index < created.length; index += 1) {
     if (
@@ -213,7 +446,118 @@ function normalizeStateValue(value, limits) {
       throw error;
     }
   }
-  const state = { schemaVersion: 1, revision, nextJobSequence, jobs };
+  const state = {
+    schemaVersion: 6,
+    revision,
+    nextJobSequence,
+    archive: emptyArchive(),
+    archiveIndex: [],
+    lastCompaction: null,
+    jobs,
+  };
+  if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
+    throw error;
+  }
+  return state;
+}
+
+function normalizeStateValue(value, limits) {
+  const error = invalidState();
+  if (value?.schemaVersion === 1) {
+    return normalizeLegacyState(value, limits, error);
+  }
+  if (![2, 3, 4, 5, 6].includes(value.schemaVersion)) throw error;
+  const legacyVersion = value.schemaVersion === 2;
+  const manifestVersion = value.schemaVersion === 3;
+  assertExactKeys(
+    value,
+    legacyVersion
+      ? ["schemaVersion", "revision", "nextJobSequence", "archive", "jobs"]
+      : manifestVersion
+        ? [
+          "schemaVersion",
+          "revision",
+          "nextJobSequence",
+          "archive",
+          "archiveIndex",
+          "jobs",
+        ]
+        : [
+        "schemaVersion",
+        "revision",
+        "nextJobSequence",
+        "archive",
+        "archiveIndex",
+        "lastCompaction",
+        "jobs",
+      ],
+    error,
+  );
+  const revision = safeInteger(
+    value.revision,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const nextJobSequence = safeInteger(
+    value.nextJobSequence,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const archive = normalizeArchive(value.archive, error);
+  if (legacyVersion && archive.throughSequence !== 0) throw error;
+  const archiveIndex = legacyVersion
+    ? []
+    : normalizeArchiveManifestList(value.archiveIndex, archive, limits, error);
+  const lastCompaction = value.schemaVersion >= 4
+    ? normalizeLastCompaction(value.lastCompaction, archive, archiveIndex, error)
+    : null;
+  const jobs = normalizeJobs(value.jobs, limits, error);
+  validateUniqueJobs(jobs, error);
+  if (
+    nextJobSequence !== archive.throughSequence + jobs.length + 1 ||
+    archive.jobCount !== archiveIndex.length ||
+    archive.jobCount > limits.maximumArchivedJobs ||
+    archive.storageBytes > limits.maximumArchiveBytes ||
+    jobs.some(({ revision: jobRevision }) => jobRevision > revision) ||
+    Math.max(
+      archive.revision,
+      jobs.reduce(
+        (maximum, job) => Math.max(maximum, job.revision),
+        0,
+      ),
+    ) !== revision ||
+    (revision === 0 &&
+      (nextJobSequence !== 1 ||
+        archive.throughSequence !== 0 ||
+        jobs.length !== 0)) ||
+    (revision > 0 && nextJobSequence === 1)
+  ) {
+    throw error;
+  }
+  const ordered = [...jobs].sort((left, right) => left.sequence - right.sequence);
+  for (let index = 0; index < ordered.length; index += 1) {
+    const previousCreatedAt = index === 0
+      ? archive.lastCreatedAt
+      : ordered[index - 1].createdAt;
+    if (
+      ordered[index].sequence !== archive.throughSequence + index + 1 ||
+      (previousCreatedAt !== null &&
+        Date.parse(ordered[index].createdAt) < Date.parse(previousCreatedAt))
+    ) {
+      throw error;
+    }
+  }
+  const state = {
+    schemaVersion: 6,
+    revision,
+    nextJobSequence,
+    archive,
+    archiveIndex,
+    lastCompaction,
+    jobs: ordered,
+  };
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
     throw error;
   }
@@ -236,6 +580,139 @@ function normalizeJobId(value) {
   return value;
 }
 
+function normalizeSha256(value, error) {
+  if (typeof value !== "string" || !SHA256.test(value)) throw error;
+  return value;
+}
+
+function normalizeSafeId(value, error) {
+  if (
+    typeof value !== "string" ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(value)
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+function compactionCommand(value) {
+  return {
+    compactionId: value.compactionId,
+    expectedRevision: value.expectedRevision,
+    targetThroughSequence: value.targetThroughSequence,
+    preArchiveDigest: value.preArchiveDigest,
+  };
+}
+
+function normalizeLastCompaction(value, archive, archiveIndex, error) {
+  if (value === null) return null;
+  assertExactKeys(
+    value,
+    [
+      "compactionId",
+      "expectedRevision",
+      "targetThroughSequence",
+      "preArchiveDigest",
+      "postArchiveDigest",
+      "archived",
+      "appliedRevision",
+      "commandDigest",
+    ],
+    error,
+  );
+  const content = {
+    compactionId: normalizeSafeId(value.compactionId, error),
+    expectedRevision: safeInteger(
+      value.expectedRevision,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    targetThroughSequence: safeInteger(
+      value.targetThroughSequence,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    preArchiveDigest: value.preArchiveDigest === null
+      ? null
+      : normalizeSha256(value.preArchiveDigest, error),
+    postArchiveDigest: normalizeSha256(value.postArchiveDigest, error),
+    archived: safeInteger(
+      value.archived,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    appliedRevision: safeInteger(
+      value.appliedRevision,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+  };
+  const commandDigest = normalizeSha256(value.commandDigest, error);
+  const previousThroughSequence =
+    content.targetThroughSequence - content.archived;
+  const previousManifest = previousThroughSequence === 0
+    ? null
+    : archiveIndex[previousThroughSequence - 1];
+  const targetManifest = archiveIndex[content.targetThroughSequence - 1];
+  if (
+    previousThroughSequence < 0 ||
+    content.appliedRevision !== content.expectedRevision + 1 ||
+    content.appliedRevision > archive.revision ||
+    content.targetThroughSequence > archive.throughSequence ||
+    (previousManifest?.archiveDigest ?? null) !== content.preArchiveDigest ||
+    targetManifest?.archiveDigest !== content.postArchiveDigest ||
+    commandDigest !== digestValue(compactionCommand(content))
+  ) {
+    throw error;
+  }
+  return { ...content, commandDigest };
+}
+
+function normalizeMemoryRecordId(value, digest, error) {
+  if (
+    typeof value !== "string" ||
+    value !== `memory-${digest}`
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+export function codeJobMemorySourceId(jobId, sourceRecordDigest) {
+  const error = storeError(
+    "INVALID_CODE_JOB_MUTATION",
+    "代码任务记忆来源绑定无效",
+  );
+  return `code-job:${normalizeJobId(jobId)}:${normalizeSha256(
+    sourceRecordDigest,
+    error,
+  )}`;
+}
+
+function normalizeVerifiedMemoryReceipt(value, expected) {
+  const error = memoryReceiptUnverified();
+  assertExactKeys(
+    value,
+    ["recordId", "contentDigest", "source", "persisted"],
+    error,
+  );
+  assertExactKeys(value.source, ["kind", "id"], error);
+  if (
+    value.recordId !== expected.recordId ||
+    value.contentDigest !== expected.contentDigest ||
+    value.source.kind !== expected.source.kind ||
+    value.source.id !== expected.source.id ||
+    value.persisted !== true
+  ) {
+    throw error;
+  }
+  return cloneCodeJobValue(value);
+}
+
 function normalizeListOptions(value = {}) {
   const error = storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效");
   const keys = plainDataKeys(value, error);
@@ -253,7 +730,7 @@ function normalizeListOptions(value = {}) {
       : rawLimit;
   const order = value.order ?? "newest";
   const status = value.status ?? null;
-  if (order !== "newest" || (status !== null && status !== "queued")) {
+  if (order !== "newest" || (status !== null && !STATUS_SET.has(status))) {
     throw error;
   }
   return {
@@ -295,6 +772,782 @@ function findBoundJob(state, request) {
   ) || null;
 }
 
+function normalizeMutationBase(value, extraKeys = []) {
+  const error = storeError("INVALID_CODE_JOB_MUTATION", "代码任务迁移请求无效");
+  assertExactKeys(value, ["jobId", "expectedRevision", ...extraKeys], error);
+  return {
+    error,
+    jobId: normalizeJobId(value.jobId),
+    expectedRevision: safeInteger(
+      value.expectedRevision,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+  };
+}
+
+function normalizeReason(value, error) {
+  if (
+    typeof value !== "string" ||
+    Buffer.byteLength(value, "utf8") < 1 ||
+    Buffer.byteLength(value, "utf8") > 2_048 ||
+    /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+function normalizeFailureCode(value, error) {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Z][A-Z0-9_]{0,127}$/.test(value)
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+function normalizeActionBinding(value, error, { includeEpoch = false } = {}) {
+  const actionId = normalizeSafeId(value.actionId, error);
+  const actionDigest = normalizeSha256(value.actionDigest, error);
+  return {
+    actionId,
+    actionDigest,
+    ...(includeEpoch
+      ? {
+          epoch: safeInteger(
+            value.epoch,
+            1,
+            Number.MAX_SAFE_INTEGER,
+            error,
+          ),
+        }
+      : {}),
+  };
+}
+
+function workerMutationResult(status, job) {
+  return cloneCodeJobValue({ status, job });
+}
+
+function compactionResult(status, receipt) {
+  return cloneCodeJobValue({ status, receipt });
+}
+
+const ARCHIVE_BINDING_KINDS = Object.freeze([
+  "job",
+  "proposal",
+  "confirmation",
+  "approval",
+]);
+const ARCHIVE_BINDING_KIND_SET = new Set(ARCHIVE_BINDING_KINDS);
+
+function archiveBindingValuesFromJob(job) {
+  return {
+    job: job.jobId,
+    proposal: job.proposal.proposalId,
+    confirmation: job.approval.confirmationId,
+    approval: job.approval.approvalBindingDigest,
+  };
+}
+
+function archiveBindingValuesFromTombstone(tombstone) {
+  return {
+    job: tombstone.jobId,
+    proposal: tombstone.proposal.proposalId,
+    confirmation: tombstone.approval.confirmationId,
+    approval: tombstone.approval.approvalBindingDigest,
+  };
+}
+
+function archiveBindingValuesFromRequest(request) {
+  return {
+    job: codeJobIdForGrant(request.grant),
+    proposal: request.grant.proposalId,
+    confirmation: request.confirmationId,
+    approval: request.approvalBindingDigest,
+  };
+}
+
+function archiveBindingDigest(kind, value) {
+  return digestValue({ schemaVersion: 1, kind, value });
+}
+
+function archiveIndexKey(kind, value) {
+  return `${CODE_JOB_TOMBSTONE_PREFIX}-index-${archiveBindingDigest(kind, value)}`;
+}
+
+function archiveRecordKey(jobId) {
+  return `${CODE_JOB_TOMBSTONE_PREFIX}-record-${jobId}`;
+}
+
+function archiveLinkDigest(previousDigest, job) {
+  return digestValue({
+    schemaVersion: 1,
+    previousDigest,
+    sequence: job.sequence,
+    jobId: job.jobId,
+    status: job.status,
+    recordDigest: job.recordDigest,
+  });
+}
+
+function createArchiveTombstone(entry) {
+  const job = normalizeCodeJob(entry.job);
+  if (!isRetentionEligibleCodeJob(job)) {
+    throw invalidState("代码任务尚未获得记忆投影凭据");
+  }
+  const latestObservation = job.execution.observations.length === 0
+    ? null
+    : {
+      actionType: job.execution.observations.at(-1).actionType,
+      status: job.execution.observations.at(-1).status,
+      recordedAt: job.execution.observations.at(-1).recordedAt,
+    };
+  const content = {
+    schemaVersion: 1,
+    previousArchiveDigest: entry.previousArchiveDigest,
+    archiveDigest: entry.archiveDigest,
+    sequence: job.sequence,
+    jobId: job.jobId,
+    status: job.status,
+    revision: job.revision,
+    approval: job.approval,
+    proposal: job.proposal,
+    grant: job.grant,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    recordDigest: job.recordDigest,
+    outcome: {
+      turn: job.execution.turn,
+      observationCount: job.execution.observations.length,
+      latestObservation,
+      terminalResult: {
+        kind: job.execution.result.kind,
+        recordedAt: job.execution.result.recordedAt,
+      },
+      memoryProjection: job.execution.memoryProjection,
+    },
+  };
+  if (
+    (content.previousArchiveDigest !== null &&
+      (typeof content.previousArchiveDigest !== "string" ||
+        !SHA256.test(content.previousArchiveDigest))) ||
+    typeof content.archiveDigest !== "string" ||
+    !SHA256.test(content.archiveDigest) ||
+    archiveLinkDigest(content.previousArchiveDigest, content) !==
+      content.archiveDigest
+  ) {
+    throw invalidState("代码任务归档墓碑无效");
+  }
+  return { ...content, tombstoneDigest: digestValue(content) };
+}
+
+function normalizeArchiveTombstone(value) {
+  const error = corruptedArchive();
+  assertExactKeys(
+    value,
+    [
+      "schemaVersion",
+      "previousArchiveDigest",
+      "archiveDigest",
+      "sequence",
+      "jobId",
+      "status",
+      "revision",
+      "approval",
+      "proposal",
+      "grant",
+      "createdAt",
+      "updatedAt",
+      "recordDigest",
+      "outcome",
+      "tombstoneDigest",
+    ],
+    error,
+  );
+  if (value.schemaVersion !== 1) throw error;
+  const previousArchiveDigest = value.previousArchiveDigest === null
+    ? null
+    : normalizeSha256(value.previousArchiveDigest, error);
+  const archiveDigest = normalizeSha256(value.archiveDigest, error);
+  let request;
+  try {
+    request = normalizeApprovedCodeJobRequest({
+      confirmationId: value.approval?.confirmationId,
+      requestId: value.approval?.requestId,
+      displayedPayloadDigest: value.approval?.displayedPayloadDigest,
+      approvalBindingDigest: value.approval?.approvalBindingDigest,
+      grant: value.grant,
+    });
+  } catch (cause) {
+    throw corruptedArchive(cause);
+  }
+  assertExactKeys(value.proposal, ["proposalId", "contentDigest"], error);
+  const createdAt = normalizeCodeJobTimestamp(value.createdAt, error);
+  const updatedAt = normalizeCodeJobTimestamp(value.updatedAt, error);
+  const outcome = normalizeArchivedOutcome(
+    value.outcome,
+    { updatedAt },
+    error,
+  );
+  const content = {
+    schemaVersion: 1,
+    previousArchiveDigest,
+    archiveDigest,
+    sequence: safeInteger(
+      value.sequence,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    jobId: normalizeJobId(value.jobId),
+    status: value.status,
+    revision: safeInteger(
+      value.revision,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    approval: {
+      confirmationId: request.confirmationId,
+      requestId: request.requestId,
+      displayedPayloadDigest: request.displayedPayloadDigest,
+      approvalBindingDigest: request.approvalBindingDigest,
+    },
+    proposal: {
+      proposalId: value.proposal.proposalId,
+      contentDigest: normalizeSha256(value.proposal.contentDigest, error),
+    },
+    grant: request.grant,
+    createdAt,
+    updatedAt,
+    recordDigest: normalizeSha256(value.recordDigest, error),
+    outcome,
+  };
+  const tombstoneDigest = normalizeSha256(value.tombstoneDigest, error);
+  if (
+    !isTerminalCodeJobStatus(content.status) ||
+    content.jobId !== codeJobIdForGrant(content.grant) ||
+    content.proposal.proposalId !== content.grant.proposalId ||
+    content.proposal.contentDigest !== content.grant.contentDigest ||
+    Date.parse(content.updatedAt) < Date.parse(content.createdAt) ||
+    outcome.terminalResult.kind !== content.status ||
+    outcome.memoryProjection.jobId !== content.jobId ||
+    outcome.memoryProjection.sourceRevision + 1 !== content.revision ||
+    outcome.memoryProjection.projectedAt !== content.updatedAt ||
+    archiveLinkDigest(previousArchiveDigest, content) !== archiveDigest ||
+    tombstoneDigest !== digestValue(content)
+  ) {
+    throw error;
+  }
+  return { ...content, tombstoneDigest };
+}
+
+function normalizeArchivedOutcome(value, tombstone, error) {
+  assertExactKeys(
+    value,
+    [
+      "turn",
+      "observationCount",
+      "latestObservation",
+      "terminalResult",
+      "memoryProjection",
+    ],
+    error,
+  );
+  const turn = safeInteger(value.turn, 0, 128, error);
+  const observationCount = safeInteger(value.observationCount, 0, 128, error);
+  let latestObservation = null;
+  if (value.latestObservation !== null) {
+    assertExactKeys(
+      value.latestObservation,
+      ["actionType", "status", "recordedAt"],
+      error,
+    );
+    if (
+      typeof value.latestObservation.actionType !== "string" ||
+      !/^[a-z](?:[a-z_]{0,62}[a-z])?$/.test(
+        value.latestObservation.actionType,
+      ) ||
+      !OBSERVATION_STATUSES.has(value.latestObservation.status)
+    ) {
+      throw error;
+    }
+    latestObservation = {
+      actionType: value.latestObservation.actionType,
+      status: value.latestObservation.status,
+      recordedAt: normalizeCodeJobTimestamp(
+        value.latestObservation.recordedAt,
+        error,
+      ),
+    };
+  }
+  assertExactKeys(value.terminalResult, ["kind", "recordedAt"], error);
+  const terminalResult = {
+    kind: value.terminalResult.kind,
+    recordedAt: normalizeCodeJobTimestamp(
+      value.terminalResult.recordedAt,
+      error,
+    ),
+  };
+  const memory = value.memoryProjection;
+  assertExactKeys(
+    memory,
+    [
+      "jobId",
+      "sourceRecordDigest",
+      "sourceRevision",
+      "sourceUpdatedAt",
+      "memoryRecordId",
+      "memoryRecordDigest",
+      "projectedAt",
+    ],
+    error,
+  );
+  const memoryRecordDigest = normalizeSha256(memory.memoryRecordDigest, error);
+  const memoryProjection = {
+    jobId: normalizeJobId(memory.jobId),
+    sourceRecordDigest: normalizeSha256(memory.sourceRecordDigest, error),
+    sourceRevision: safeInteger(
+      memory.sourceRevision,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    sourceUpdatedAt: normalizeCodeJobTimestamp(memory.sourceUpdatedAt, error),
+    memoryRecordId: normalizeMemoryRecordId(
+      memory.memoryRecordId,
+      memoryRecordDigest,
+      error,
+    ),
+    memoryRecordDigest,
+    projectedAt: normalizeCodeJobTimestamp(memory.projectedAt, error),
+  };
+  if (
+    turn !== observationCount ||
+    (turn === 0) !== (latestObservation === null) ||
+    Date.parse(terminalResult.recordedAt) > Date.parse(tombstone.updatedAt) ||
+    Date.parse(memoryProjection.sourceUpdatedAt) >
+      Date.parse(memoryProjection.projectedAt)
+  ) {
+    throw error;
+  }
+  return {
+    turn,
+    observationCount,
+    latestObservation,
+    terminalResult,
+    memoryProjection,
+  };
+}
+
+function archivedBrowserOutcome(tombstone) {
+  const grant = tombstone.grant;
+  return cloneCodeJobValue({
+    jobId: tombstone.jobId,
+    status: tombstone.status,
+    revision: tombstone.revision,
+    proposalId: tombstone.proposal.proposalId,
+    proposalContentDigest: tombstone.proposal.contentDigest,
+    grantDigest: grant.grantDigest,
+    requestedBy: grant.requestedBy,
+    subject: grant.subject,
+    repository: grant.repository,
+    workspaceId: grant.workspaceId,
+    operation: grant.operation,
+    objective: grant.objective,
+    acceptanceCriteria: grant.acceptanceCriteria,
+    evidence: grant.evidence,
+    summary: grant.summary,
+    reason: grant.reason,
+    allowedActions: grant.allowedActions,
+    writablePaths: grant.writablePaths,
+    requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
+    turn: tombstone.outcome.turn,
+    pendingActionType: null,
+    observationCount: tombstone.outcome.observationCount,
+    latestObservation: tombstone.outcome.latestObservation,
+    terminalResult: tombstone.outcome.terminalResult,
+    memoryProjection: {
+      recordId: tombstone.outcome.memoryProjection.memoryRecordId,
+      projectedAt: tombstone.outcome.memoryProjection.projectedAt,
+    },
+    pause: null,
+    uncertainty: null,
+    createdAt: tombstone.createdAt,
+    updatedAt: tombstone.updatedAt,
+  });
+}
+
+function sameArchivedAuthorization(tombstone, request) {
+  return (
+    tombstone.jobId === codeJobIdForGrant(request.grant) &&
+    tombstone.approval.confirmationId === request.confirmationId &&
+    tombstone.approval.displayedPayloadDigest ===
+      request.displayedPayloadDigest &&
+    tombstone.approval.approvalBindingDigest ===
+      request.approvalBindingDigest &&
+    tombstone.proposal.proposalId === request.grant.proposalId &&
+    tombstone.proposal.contentDigest === request.grant.contentDigest &&
+    sameValue(tombstone.grant, request.grant)
+  );
+}
+
+function archivedCreationResult(status, tombstone) {
+  return cloneCodeJobValue({
+    status,
+    receipt: { id: tombstone.jobId, createdAt: tombstone.createdAt },
+    job: archivedBrowserOutcome(tombstone),
+  });
+}
+
+function createArchiveIndex(kind, value, tombstone) {
+  if (!ARCHIVE_BINDING_KIND_SET.has(kind)) throw invalidState();
+  const content = {
+    schemaVersion: 1,
+    kind,
+    bindingDigest: archiveBindingDigest(kind, value),
+    jobId: tombstone.jobId,
+    tombstoneDigest: tombstone.tombstoneDigest,
+  };
+  return { ...content, indexDigest: digestValue(content) };
+}
+
+function normalizeArchiveIndex(value, kind, bindingValue) {
+  const error = corruptedArchive();
+  assertExactKeys(
+    value,
+    [
+      "schemaVersion",
+      "kind",
+      "bindingDigest",
+      "jobId",
+      "tombstoneDigest",
+      "indexDigest",
+    ],
+    error,
+  );
+  const content = {
+    schemaVersion: value.schemaVersion,
+    kind: value.kind,
+    bindingDigest: normalizeSha256(value.bindingDigest, error),
+    jobId: normalizeJobId(value.jobId),
+    tombstoneDigest: normalizeSha256(value.tombstoneDigest, error),
+  };
+  if (
+    content.schemaVersion !== 1 ||
+    content.kind !== kind ||
+    content.bindingDigest !== archiveBindingDigest(kind, bindingValue) ||
+    normalizeSha256(value.indexDigest, error) !== digestValue(content)
+  ) {
+    throw error;
+  }
+  return { ...content, indexDigest: value.indexDigest };
+}
+
+function serializedArchiveBytes(value) {
+  return Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function createArchiveManifest(
+  tombstone,
+  indexes,
+  storageBytes,
+  previousManifestDigest,
+) {
+  const bindings = Object.fromEntries(
+    ARCHIVE_BINDING_KINDS.map((kind) => [kind, indexes[kind].bindingDigest]),
+  );
+  const content = {
+    sequence: tombstone.sequence,
+    jobId: tombstone.jobId,
+    status: tombstone.status,
+    recordDigest: tombstone.recordDigest,
+    previousArchiveDigest: tombstone.previousArchiveDigest,
+    archiveDigest: tombstone.archiveDigest,
+    tombstoneDigest: tombstone.tombstoneDigest,
+    previousManifestDigest,
+    bindings,
+    storageBytes,
+  };
+  return { ...content, manifestDigest: digestValue(content) };
+}
+
+function normalizeArchiveManifest(value, error) {
+  assertExactKeys(
+    value,
+    [
+      "sequence",
+      "jobId",
+      "status",
+      "recordDigest",
+      "previousArchiveDigest",
+      "archiveDigest",
+      "tombstoneDigest",
+      "previousManifestDigest",
+      "bindings",
+      "storageBytes",
+      "manifestDigest",
+    ],
+    error,
+  );
+  assertExactKeys(value.bindings, ARCHIVE_BINDING_KINDS, error);
+  const content = {
+    sequence: safeInteger(
+      value.sequence,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    jobId: normalizeJobId(value.jobId),
+    status: value.status,
+    recordDigest: normalizeSha256(value.recordDigest, error),
+    previousArchiveDigest: value.previousArchiveDigest === null
+      ? null
+      : normalizeSha256(value.previousArchiveDigest, error),
+    archiveDigest: normalizeSha256(value.archiveDigest, error),
+    tombstoneDigest: normalizeSha256(value.tombstoneDigest, error),
+    previousManifestDigest: value.previousManifestDigest === null
+      ? null
+      : normalizeSha256(value.previousManifestDigest, error),
+    bindings: Object.fromEntries(
+      ARCHIVE_BINDING_KINDS.map((kind) => [
+        kind,
+        normalizeSha256(value.bindings[kind], error),
+      ]),
+    ),
+    storageBytes: safeInteger(
+      value.storageBytes,
+      1,
+      MAX_ARCHIVE_BYTES,
+      error,
+    ),
+  };
+  const manifestDigest = normalizeSha256(value.manifestDigest, error);
+  if (
+    !isTerminalCodeJobStatus(content.status) ||
+    archiveLinkDigest(content.previousArchiveDigest, content) !==
+      content.archiveDigest ||
+    manifestDigest !== digestValue(content)
+  ) {
+    throw error;
+  }
+  return { ...content, manifestDigest };
+}
+
+function normalizeArchiveManifestList(value, archive, limits, error) {
+  const manifests = denseArray(
+    value,
+    limits.maximumArchivedJobs,
+    error,
+  ).map((entry) => normalizeArchiveManifest(entry, error));
+  let previousArchiveDigest = null;
+  let previousManifestDigest = null;
+  let storageBytes = 0;
+  const unique = Object.fromEntries(
+    ARCHIVE_BINDING_KINDS.map((kind) => [kind, new Set()]),
+  );
+  const jobIds = new Set();
+  for (let index = 0; index < manifests.length; index += 1) {
+    const manifest = manifests[index];
+    if (
+      manifest.sequence !== index + 1 ||
+      manifest.previousArchiveDigest !== previousArchiveDigest ||
+      manifest.previousManifestDigest !== previousManifestDigest ||
+      jobIds.has(manifest.jobId)
+    ) {
+      throw error;
+    }
+    jobIds.add(manifest.jobId);
+    for (const kind of ARCHIVE_BINDING_KINDS) {
+      if (unique[kind].has(manifest.bindings[kind])) throw error;
+      unique[kind].add(manifest.bindings[kind]);
+    }
+    previousArchiveDigest = manifest.archiveDigest;
+    previousManifestDigest = manifest.manifestDigest;
+    storageBytes += manifest.storageBytes;
+  }
+  if (
+    manifests.length !== archive.jobCount ||
+    storageBytes !== archive.storageBytes ||
+    (manifests.at(-1)?.archiveDigest ?? null) !== archive.digest ||
+    (manifests.at(-1)?.manifestDigest ?? null) !==
+      archive.lastManifestDigest
+  ) {
+    throw error;
+  }
+  return manifests;
+}
+
+function createArchiveManifestLookup(state) {
+  const lookup = Object.fromEntries(
+    ARCHIVE_BINDING_KINDS.map((kind) => [kind, new Map()]),
+  );
+  for (const manifest of state.archiveIndex) {
+    for (const kind of ARCHIVE_BINDING_KINDS) {
+      lookup[kind].set(manifest.bindings[kind], manifest);
+    }
+  }
+  return lookup;
+}
+
+function assertTombstoneMatchesManifest(tombstone, manifest) {
+  const bindings = archiveBindingValuesFromTombstone(tombstone);
+  if (
+    tombstone.jobId !== manifest.jobId ||
+    tombstone.sequence !== manifest.sequence ||
+    tombstone.status !== manifest.status ||
+    tombstone.recordDigest !== manifest.recordDigest ||
+    tombstone.previousArchiveDigest !== manifest.previousArchiveDigest ||
+    tombstone.archiveDigest !== manifest.archiveDigest ||
+    tombstone.tombstoneDigest !== manifest.tombstoneDigest ||
+    ARCHIVE_BINDING_KINDS.some(
+      (kind) =>
+        archiveBindingDigest(kind, bindings[kind]) !== manifest.bindings[kind],
+    )
+  ) {
+    throw corruptedArchive();
+  }
+  return bindings;
+}
+
+function prepareArchiveEntry(archive, job, revision, limits) {
+  if (
+    job.sequence !== archive.throughSequence + 1 ||
+    !isRetentionEligibleCodeJob(job)
+  ) {
+    throw invalidState("代码任务归档前缀不连续");
+  }
+  const previousArchiveDigest = archive.digest;
+  const archiveDigest = archiveLinkDigest(previousArchiveDigest, job);
+  const tombstone = createArchiveTombstone({
+    job,
+    previousArchiveDigest,
+    archiveDigest,
+  });
+  const bindings = archiveBindingValuesFromTombstone(tombstone);
+  const indexes = Object.fromEntries(
+    ARCHIVE_BINDING_KINDS.map((kind) => [
+      kind,
+      createArchiveIndex(kind, bindings[kind], tombstone),
+    ]),
+  );
+  const storageBytes = serializedArchiveBytes(tombstone) +
+    Object.values(indexes).reduce(
+      (total, index) => total + serializedArchiveBytes(index),
+      0,
+    );
+  const manifest = createArchiveManifest(
+    tombstone,
+    indexes,
+    storageBytes,
+    archive.lastManifestDigest,
+  );
+  if (
+    archive.jobCount + 1 > limits.maximumArchivedJobs ||
+    archive.storageBytes + storageBytes > limits.maximumArchiveBytes
+  ) {
+    throw capacityExceeded();
+  }
+  const nextArchive = sealArchive({
+    throughSequence: job.sequence,
+    jobCount: archive.jobCount + 1,
+    revision,
+    digest: archiveDigest,
+    lastCreatedAt: job.createdAt,
+    lastUpdatedAt:
+      archive.lastUpdatedAt === null ||
+      Date.parse(job.updatedAt) > Date.parse(archive.lastUpdatedAt)
+        ? job.updatedAt
+        : archive.lastUpdatedAt,
+    storageBytes: archive.storageBytes + storageBytes,
+    lastManifestDigest: manifest.manifestDigest,
+  });
+  return { archive: nextArchive, tombstone, indexes, manifest };
+}
+
+function archiveTerminalPrefix(
+  state,
+  {
+    protectedSequences = new Set(),
+    all = false,
+    targetThroughSequence = Number.MAX_SAFE_INTEGER,
+    limits,
+  } = {},
+) {
+  let archive = state.archive;
+  let archiveIndex = state.archiveIndex;
+  let jobs = state.jobs;
+  let archived = 0;
+  const archivedEntries = [];
+  while (
+    jobs.length > 0 &&
+    jobs[0].sequence <= targetThroughSequence &&
+    isRetentionEligibleCodeJob(jobs[0]) &&
+    !protectedSequences.has(jobs[0].sequence)
+  ) {
+    if (!all && archived > 0) break;
+    const job = jobs[0];
+    const prepared = prepareArchiveEntry(archive, job, state.revision, limits);
+    archive = prepared.archive;
+    archiveIndex = [...archiveIndex, prepared.manifest];
+    archivedEntries.push(prepared);
+    jobs = jobs.slice(1);
+    archived += 1;
+  }
+  return {
+    state: archived === 0
+      ? state
+      : { ...state, archive, archiveIndex, jobs },
+    archived,
+    archivedEntries,
+  };
+}
+
+function stateExceedsLimits(state, limits, requiredHeadroomBytes = 0) {
+  return (
+    state.jobs.length > limits.maximumJobs ||
+    Buffer.byteLength(JSON.stringify(state), "utf8") >
+      limits.maximumStateBytes - requiredHeadroomBytes
+  );
+}
+
+function normalizeRunnableOptions(value = {}) {
+  const error = storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效");
+  const keys = plainDataKeys(value, error);
+  if (keys.some((key) => !["limit", "roleId", "afterSequence"].includes(key))) {
+    throw error;
+  }
+  const roleId = value.roleId ?? null;
+  if (
+    roleId !== null &&
+    (typeof roleId !== "string" ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(roleId))
+  ) {
+    throw error;
+  }
+  return {
+    limit: safeInteger(value.limit ?? 50, 1, 100, error),
+    roleId,
+    afterSequence: safeInteger(
+      value.afterSequence ?? 0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+  };
+}
+
+function rotateWorkerCandidates(items, afterSequence, limit) {
+  if (items.length === 0) return [];
+  const nextIndex = items.findIndex(({ sequence }) => sequence > afterSequence);
+  const start = nextIndex < 0 ? 0 : nextIndex;
+  return [...items.slice(start), ...items.slice(0, start)].slice(0, limit);
+}
+
 export class CodeJobStore {
   constructor({
     store,
@@ -302,17 +1555,26 @@ export class CodeJobStore {
     operationQueue,
     clock = () => new Date(),
     limits = {},
+    memoryReceiptVerifier = null,
   } = {}) {
     validateDependency(store, ["read", "write"], "store");
     validateDependency(exclusiveLease, ["run"], "exclusiveLease");
     validateDependency(operationQueue, ["enqueue"], "operationQueue");
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
+    if (
+      memoryReceiptVerifier !== null &&
+      typeof memoryReceiptVerifier?.verify !== "function"
+    ) {
+      throw new TypeError("memoryReceiptVerifier is invalid");
+    }
     this.store = store;
     this.exclusiveLease = exclusiveLease;
     this.operationQueue = operationQueue;
     this.clock = clock;
     this.limits = normalizeLimits(limits);
+    this.memoryReceiptVerifier = memoryReceiptVerifier;
     this.state = defaultState();
+    this.archiveManifestLookup = createArchiveManifestLookup(this.state);
     this.ready = false;
   }
 
@@ -322,16 +1584,21 @@ export class CodeJobStore {
       return this.exclusiveLease.run(async () => {
         const durable = await this.store.read(CODE_JOB_STATE_KEY, defaultState());
         const recovered = normalizeState(durable, this.limits);
+        await this.#validateArchiveArtifacts(recovered);
         this.#acceptDurableState(recovered);
         this.ready = true;
-        return { revision: recovered.revision, count: recovered.jobs.length };
+        return {
+          revision: recovered.revision,
+          count: recovered.jobs.length,
+          archive: cloneCodeJobValue(recovered.archive),
+        };
       });
     });
   }
 
   createApprovedJob(value) {
     const request = normalizeApprovedCodeJobRequest(value);
-    return this.#mutate((state) => {
+    return this.#mutate(async (state) => {
       const existing = findBoundJob(state, request);
       if (existing) {
         if (!sameAuthorization(existing, request)) throw bindingConflict();
@@ -341,7 +1608,17 @@ export class CodeJobStore {
           write: false,
         };
       }
-      if (state.jobs.length >= this.limits.maximumJobs) throw capacityExceeded();
+      const archived = await this.#findArchivedBinding(state, request);
+      if (archived !== null) {
+        if (!sameArchivedAuthorization(archived, request)) {
+          throw bindingConflict();
+        }
+        return {
+          state,
+          value: archivedCreationResult("already", archived),
+          write: false,
+        };
+      }
       const revision = state.revision + 1;
       const created = createQueuedCodeJob(request, {
         sequence: state.nextJobSequence,
@@ -357,26 +1634,731 @@ export class CodeJobStore {
         },
         value: creationResult("applied", created),
         write: true,
+        protectedSequences: new Set([created.sequence]),
       };
     });
   }
 
   reconcileApprovedJob(value) {
     const request = normalizeApprovedCodeJobRequest(value);
-    return this.#query(() => {
+    return this.#query(async () => {
       const existing = findBoundJob(this.state, request);
-      if (!existing) return { status: "absent" };
-      if (!sameAuthorization(existing, request)) throw bindingConflict();
-      return creationResult("already", existing);
+      if (existing) {
+        if (!sameAuthorization(existing, request)) throw bindingConflict();
+        return creationResult("already", existing);
+      }
+      const archived = await this.#findArchivedBinding(this.state, request);
+      if (archived === null) return { status: "absent" };
+      if (!sameArchivedAuthorization(archived, request)) {
+        throw bindingConflict();
+      }
+      return archivedCreationResult("already", archived);
+    });
+  }
+
+  claimStarting(value) {
+    const request = normalizeMutationBase(value);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (job.execution.sessionId === job.jobId) {
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "queued") throw transitionConflict();
+      const changed = this.#updateJob(
+        state,
+        index,
+        "starting",
+        () => ({ ...job.execution, sessionId: job.jobId }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  activate(value) {
+    const request = normalizeMutationBase(value, ["workspaceRevision"]);
+    const workspaceRevision = normalizeSha256(
+      value.workspaceRevision,
+      request.error,
+    );
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (job.execution.workspaceRevision !== null) {
+        if (job.execution.workspaceRevision !== workspaceRevision) {
+          throw transitionConflict("代码任务已绑定不同的工作区版本");
+        }
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "starting") throw transitionConflict();
+      const changed = this.#updateJob(
+        state,
+        index,
+        "active",
+        () => ({ ...job.execution, workspaceRevision }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  acknowledgeAbsentSession(value) {
+    const request = normalizeMutationBase(value);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (
+        job.status !== "pausing" ||
+        job.execution.pause?.from !== "starting" ||
+        job.execution.workspaceRevision !== null
+      ) {
+        throw transitionConflict();
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        "paused",
+        () => ({ ...job.execution }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  acknowledgeStartedSession(value) {
+    const request = normalizeMutationBase(value, ["workspaceRevision"]);
+    const workspaceRevision = normalizeSha256(
+      value.workspaceRevision,
+      request.error,
+    );
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (
+        job.status === "paused" &&
+        job.execution.pause?.from === "active" &&
+        job.execution.workspaceRevision === workspaceRevision
+      ) {
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (
+        job.status !== "pausing" ||
+        job.execution.pause?.from !== "starting" ||
+        job.execution.workspaceRevision !== null
+      ) {
+        throw transitionConflict();
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        "paused",
+        () => ({
+          ...job.execution,
+          workspaceRevision,
+          pause: { ...job.execution.pause, from: "active" },
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  prepareAction(value) {
+    const request = normalizeMutationBase(value, ["action"]);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      let action;
+      try {
+        action = normalizeActionRequest({
+          sessionId: job.jobId,
+          action: value.action,
+        }).action;
+      } catch (cause) {
+        throw storeError(
+          "INVALID_CODE_JOB_MUTATION",
+          "代码任务可信动作无效",
+          400,
+          { cause },
+        );
+      }
+      if (!job.grant.allowedActions.includes(action.type)) {
+        throw transitionConflict("可信动作超出代码任务授权范围");
+      }
+      if (
+        action.type === "run_profile" &&
+        !job.grant.requiredProfiles.some(({ id }) => id === action.profileId)
+      ) {
+        throw transitionConflict("测试配置不在代码任务授权范围内");
+      }
+      const actionDigest = digestValue(action);
+      const pending = job.execution.pendingAction;
+      const observed = job.execution.observations.find(
+        (entry) => entry.actionId === action.actionId,
+      );
+      if (
+        (pending !== null &&
+          pending.actionId === action.actionId &&
+          pending.actionDigest === actionDigest) ||
+        (observed !== undefined && observed.actionDigest === actionDigest)
+      ) {
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      if (pending !== null || observed !== undefined) {
+        throw transitionConflict("actionId 已绑定不同的可信动作");
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "active") throw transitionConflict();
+      if (job.execution.turn >= 128) {
+        throw storeError("CODE_JOB_TURN_LIMIT", "代码任务已达到最大动作轮数", 409);
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        "active",
+        (at) => ({
+          ...job.execution,
+          pendingAction: {
+            turn: job.execution.turn + 1,
+            actionId: action.actionId,
+            actionDigest,
+            action,
+            preparedAt: at,
+          },
+          actionAdmission: null,
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  admitAction(value) {
+    const request = normalizeMutationBase(value, ["actionId", "actionDigest"]);
+    const binding = normalizeActionBinding(value, request.error);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      const pending = job.execution.pendingAction;
+      if (
+        pending === null ||
+        pending.actionId !== binding.actionId ||
+        pending.actionDigest !== binding.actionDigest
+      ) {
+        throw transitionConflict("动作入场请求与待执行动作不匹配");
+      }
+      const existing = job.execution.actionAdmission;
+      if (existing !== null) {
+        if (
+          existing.actionId !== binding.actionId ||
+          existing.actionDigest !== binding.actionDigest
+        ) {
+          throw transitionConflict("待执行动作已绑定不同的入场凭据");
+        }
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "active") throw transitionConflict();
+      const epoch = state.revision + 1;
+      const changed = this.#updateJob(
+        state,
+        index,
+        "active",
+        (at) => ({
+          ...job.execution,
+          actionAdmission: {
+            actionId: binding.actionId,
+            actionDigest: binding.actionDigest,
+            epoch,
+            admittedAt: at,
+          },
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  acknowledgeAbsentAction(value) {
+    const request = normalizeMutationBase(value, [
+      "actionId",
+      "actionDigest",
+      "epoch",
+    ]);
+    const binding = normalizeActionBinding(value, request.error, {
+      includeEpoch: true,
+    });
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      const pending = job.execution.pendingAction;
+      const admission = job.execution.actionAdmission;
+      if (
+        pending === null ||
+        admission === null ||
+        pending.actionId !== binding.actionId ||
+        pending.actionDigest !== binding.actionDigest ||
+        admission.actionId !== binding.actionId ||
+        admission.actionDigest !== binding.actionDigest ||
+        admission.epoch !== binding.epoch
+      ) {
+        throw transitionConflict("动作撤回请求与入场凭据不匹配");
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!RECONCILABLE_STATUSES.has(job.status) && job.status !== "pausing") {
+        throw transitionConflict();
+      }
+      const recoveryStatus =
+        job.status === "unknown" &&
+        job.execution.uncertainty?.from === "active"
+          ? "active"
+          : "paused";
+      const changed = this.#updateJob(
+        state,
+        index,
+        recoveryStatus,
+        () => ({
+          ...job.execution,
+          actionAdmission: null,
+          uncertainty: null,
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  markActionUnknown(value) {
+    const request = normalizeMutationBase(value, [
+      "actionId",
+      "actionDigest",
+      "epoch",
+      "code",
+      "message",
+    ]);
+    const binding = normalizeActionBinding(value, request.error, {
+      includeEpoch: true,
+    });
+    const code = normalizeFailureCode(value.code, request.error);
+    const message = normalizeReason(value.message, request.error);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      const pending = job.execution.pendingAction;
+      const admission = job.execution.actionAdmission;
+      if (
+        pending === null ||
+        admission === null ||
+        pending.actionId !== binding.actionId ||
+        pending.actionDigest !== binding.actionDigest ||
+        admission.actionId !== binding.actionId ||
+        admission.actionDigest !== binding.actionDigest ||
+        admission.epoch !== binding.epoch
+      ) {
+        throw transitionConflict("未知动作请求与入场凭据不匹配");
+      }
+      if (job.status === "unknown") {
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!["active", "pausing"].includes(job.status)) {
+        throw transitionConflict();
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        "unknown",
+        (at) => ({
+          ...job.execution,
+          uncertainty: {
+            from: job.status === "pausing" ? "pausing" : "active",
+            code,
+            message,
+            at,
+          },
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  recordObservation(value) {
+    const hasActionDigest = Object.hasOwn(value, "actionDigest");
+    const hasEpoch = Object.hasOwn(value, "epoch");
+    if (hasActionDigest !== hasEpoch) {
+      throw storeError("INVALID_CODE_JOB_MUTATION", "代码任务迁移请求无效");
+    }
+    const request = normalizeMutationBase(value, [
+      "actionId",
+      "status",
+      "workspaceRevision",
+      "detail",
+      ...(hasActionDigest ? ["actionDigest", "epoch"] : []),
+    ]);
+    const actionId = normalizeSafeId(value.actionId, request.error);
+    const reconciliationBinding = hasActionDigest
+      ? normalizeActionBinding(value, request.error, { includeEpoch: true })
+      : null;
+    const status = value.status;
+    if (!OBSERVATION_STATUSES.has(status)) throw request.error;
+    const workspaceRevision = normalizeSha256(
+      value.workspaceRevision,
+      request.error,
+    );
+    const detail = createCodeJobDetail(value.detail);
+    const detailDigest = digestValue(detail);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      const pending = job.execution.pendingAction;
+      if (pending === null) {
+        const observed = job.execution.observations.find(
+          (entry) => entry.actionId === actionId,
+        );
+        if (
+          observed !== undefined &&
+          observed.status === status &&
+          observed.workspaceRevision === workspaceRevision &&
+          observed.detailDigest === detailDigest
+        ) {
+          return {
+            state,
+            value: workerMutationResult("already", job),
+            write: false,
+          };
+        }
+        throw transitionConflict("代码任务没有匹配的待执行动作");
+      }
+      if (pending.actionId !== actionId) {
+        throw transitionConflict("动作结果与待执行动作不匹配");
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!["active", "pausing", "unknown"].includes(job.status)) {
+        throw transitionConflict();
+      }
+      if (job.status === "unknown") {
+        const admission = job.execution.actionAdmission;
+        if (
+          reconciliationBinding === null ||
+          admission === null ||
+          pending.actionDigest !== reconciliationBinding.actionDigest ||
+          admission.actionId !== reconciliationBinding.actionId ||
+          admission.actionDigest !== reconciliationBinding.actionDigest ||
+          admission.epoch !== reconciliationBinding.epoch
+        ) {
+          throw transitionConflict("对账结果与未知动作入场凭据不匹配");
+        }
+      } else if (reconciliationBinding !== null) {
+        throw transitionConflict("普通动作结果不能携带未知动作凭据");
+      }
+      const nextStatus =
+        job.status === "active" ||
+        (job.status === "unknown" &&
+          job.execution.uncertainty?.from === "active")
+          ? "active"
+          : "paused";
+      const changed = this.#updateJob(
+        state,
+        index,
+        nextStatus,
+        (at) => ({
+          ...job.execution,
+          workspaceRevision,
+          turn: pending.turn,
+          pendingAction: null,
+          actionAdmission: null,
+          uncertainty: null,
+          observations: [
+            ...job.execution.observations,
+            {
+              turn: pending.turn,
+              actionId,
+              actionType: pending.action.type,
+              actionDigest: pending.actionDigest,
+              action: pending.action,
+              status,
+              workspaceRevision,
+              detail,
+              detailDigest,
+              recordedAt: at,
+            },
+          ],
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  pause(value) {
+    const request = normalizeMutationBase(value, ["reason"]);
+    const reason = normalizeReason(value.reason, request.error);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (["pausing", "unknown", "paused"].includes(job.status)) {
+        if (job.status === "unknown") {
+          if (job.execution.uncertainty?.from === "pausing") {
+            if (job.execution.pause?.reason !== reason) {
+              throw transitionConflict();
+            }
+            return {
+              state,
+              value: workerMutationResult("already", job),
+              write: false,
+            };
+          }
+          this.#assertJobRevision(job, request.expectedRevision);
+          const changed = this.#updateJob(
+            state,
+            index,
+            "unknown",
+            (at) => ({
+              ...job.execution,
+              pause: { from: "active", reason, at },
+              uncertainty: {
+                ...job.execution.uncertainty,
+                from: "pausing",
+              },
+            }),
+          );
+          return this.#appliedLifecycleChange(changed);
+        }
+        if (job.execution.pause.reason !== reason) throw transitionConflict();
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!RESUMED_STATUSES.has(job.status)) throw transitionConflict();
+      const nextStatus =
+        job.status === "starting" ||
+        (job.status === "active" && job.execution.actionAdmission !== null)
+          ? "pausing"
+          : "paused";
+      const changed = this.#updateJob(
+        state,
+        index,
+        nextStatus,
+        (at) => ({
+          ...job.execution,
+          pause: { from: job.status, reason, at },
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  resume(value) {
+    const request = normalizeMutationBase(value);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (
+        RESUMED_STATUSES.has(job.status) &&
+        job.revision > request.expectedRevision
+      ) {
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "paused") throw transitionConflict();
+      const target = job.execution.pause.from;
+      const changed = this.#updateJob(
+        state,
+        index,
+        target,
+        () => ({ ...job.execution, pause: null }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  complete(value) {
+    return this.#finish(value, "completed");
+  }
+
+  fail(value) {
+    return this.#finish(value, "failed");
+  }
+
+  fence(value) {
+    return this.#finish(value, "fenced");
+  }
+
+  markMemoryProjected(value) {
+    const request = normalizeMutationBase(value, [
+      "sourceRecordDigest",
+      "memoryRecordId",
+      "memoryRecordDigest",
+    ]);
+    const sourceRecordDigest = normalizeSha256(
+      value.sourceRecordDigest,
+      request.error,
+    );
+    const memoryRecordDigest = normalizeSha256(
+      value.memoryRecordDigest,
+      request.error,
+    );
+    const memoryRecordId = normalizeMemoryRecordId(
+      value.memoryRecordId,
+      memoryRecordDigest,
+      request.error,
+    );
+    const verificationRequest = Object.freeze({
+      recordId: memoryRecordId,
+      contentDigest: memoryRecordDigest,
+      source: Object.freeze({
+        kind: "code_job",
+        id: codeJobMemorySourceId(request.jobId, sourceRecordDigest),
+      }),
+    });
+    const assertSameProjection = (existing) => {
+      if (
+        existing.sourceRecordDigest !== sourceRecordDigest ||
+        existing.memoryRecordId !== memoryRecordId ||
+        existing.memoryRecordDigest !== memoryRecordDigest
+      ) {
+        throw memoryBindingConflict();
+      }
+    };
+    return this.#mutate(async (state) => {
+      const index = state.jobs.findIndex(
+        (candidate) => candidate.jobId === request.jobId,
+      );
+      if (index < 0) {
+        const archived = await this.#readArchivedByJobId(state, request.jobId);
+        if (archived === null) throw jobNotFound();
+        assertSameProjection(archived.outcome.memoryProjection);
+        return {
+          state,
+          value: cloneCodeJobValue({
+            status: "already",
+            archived: true,
+            job: archivedBrowserOutcome(archived),
+          }),
+          write: false,
+        };
+      }
+      const job = state.jobs[index];
+      const existing = job.execution.memoryProjection;
+      if (existing !== null) {
+        assertSameProjection(existing);
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!isTerminalCodeJobStatus(job.status)) throw transitionConflict();
+      if (job.recordDigest !== sourceRecordDigest) {
+        throw memoryBindingConflict();
+      }
+      if (this.memoryReceiptVerifier === null) {
+        throw memoryReceiptUnverified();
+      }
+      try {
+        const verified = await this.memoryReceiptVerifier.verify(
+          cloneCodeJobValue(verificationRequest),
+        );
+        normalizeVerifiedMemoryReceipt(verified, verificationRequest);
+      } catch (error) {
+        if (error?.code === "CODE_JOB_MEMORY_RECEIPT_UNVERIFIED") throw error;
+        throw memoryReceiptUnverified(error);
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        job.status,
+        (at) => ({
+          ...job.execution,
+          memoryProjection: {
+            jobId: job.jobId,
+            sourceRecordDigest,
+            sourceRevision: job.revision,
+            sourceUpdatedAt: job.updatedAt,
+            memoryRecordId,
+            memoryRecordDigest,
+            projectedAt: at,
+          },
+        }),
+      );
+      return {
+        ...this.#appliedLifecycleChange(changed, 0),
+        protectedSequences: new Set(),
+      };
     });
   }
 
   get(value) {
     const jobId = normalizeJobId(value);
-    return this.#query(() => {
+    return this.#query(async () => {
       const job = this.state.jobs.find((candidate) => candidate.jobId === jobId);
-      return job ? projectCodeJobForBrowser(job) : null;
+      if (job) return projectCodeJobForBrowser(job);
+      const archived = await this.#readArchivedByJobId(this.state, jobId);
+      return archived ? archivedBrowserOutcome(archived) : null;
     });
+  }
+
+  getForWorker(value) {
+    const jobId = normalizeJobId(value);
+    return this.#query(async () => {
+      const job = this.state.jobs.find((candidate) => candidate.jobId === jobId);
+      if (job) return cloneCodeJobValue(job);
+      return null;
+    });
+  }
+
+  listRunnable(value = {}) {
+    const { limit, roleId, afterSequence } = normalizeRunnableOptions(value);
+    return this.#query(() => ({
+      revision: this.state.revision,
+      items: rotateWorkerCandidates(
+        this.state.jobs
+          .filter(
+            ({ status, grant }) =>
+              RUNNABLE_STATUSES.has(status) &&
+              (roleId === null || grant.requestedBy.roleId === roleId),
+          )
+          .sort((left, right) => left.sequence - right.sequence),
+        afterSequence,
+        limit,
+      ).map(cloneCodeJobValue),
+    }));
+  }
+
+  listReconcilable(value = {}) {
+    const { limit, roleId, afterSequence } = normalizeRunnableOptions(value);
+    return this.#query(() => ({
+      revision: this.state.revision,
+      items: rotateWorkerCandidates(
+        this.state.jobs
+          .filter(
+            ({ status, grant }) =>
+              RECONCILABLE_STATUSES.has(status) &&
+              (roleId === null || grant.requestedBy.roleId === roleId),
+          )
+          .sort((left, right) => left.sequence - right.sequence),
+        afterSequence,
+        limit,
+      ).map(cloneCodeJobValue),
+    }));
   }
 
   list(value = {}) {
@@ -399,6 +2381,11 @@ export class CodeJobStore {
       const page = ordered.slice(start, start + limit);
       return {
         revision: this.state.revision,
+        archive: {
+          throughSequence: this.state.archive.throughSequence,
+          jobCount: this.state.archive.jobCount,
+          lastUpdatedAt: this.state.archive.lastUpdatedAt,
+        },
         total: ordered.length,
         items: page.map(projectCodeJobForBrowser),
         nextCursor:
@@ -409,6 +2396,315 @@ export class CodeJobStore {
 
   listNewest(value = {}) {
     return this.list(value);
+  }
+
+  compactTerminalPrefix(value) {
+    const error = storeError(
+      "INVALID_CODE_JOB_MUTATION",
+      "代码任务归档请求无效",
+    );
+    assertExactKeys(
+      value,
+      [
+        "compactionId",
+        "expectedRevision",
+        "targetThroughSequence",
+        "preArchiveDigest",
+      ],
+      error,
+    );
+    const command = {
+      compactionId: normalizeSafeId(value.compactionId, error),
+      expectedRevision: safeInteger(
+        value.expectedRevision,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        error,
+      ),
+      targetThroughSequence: safeInteger(
+        value.targetThroughSequence,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        error,
+      ),
+      preArchiveDigest: value.preArchiveDigest === null
+        ? null
+        : normalizeSha256(value.preArchiveDigest, error),
+    };
+    const commandDigest = digestValue(command);
+    return this.#mutate((state) => {
+      if (state.lastCompaction?.commandDigest === commandDigest) {
+        return {
+          state,
+          value: compactionResult("already", state.lastCompaction),
+          write: false,
+        };
+      }
+      if (state.revision !== command.expectedRevision) throw revisionConflict();
+      if (state.archive.digest !== command.preArchiveDigest) {
+        throw transitionConflict("代码任务归档前置摘要已变化");
+      }
+      if (command.targetThroughSequence < state.archive.throughSequence) {
+        throw transitionConflict("代码任务归档目标已被越过");
+      }
+      if (command.targetThroughSequence === state.archive.throughSequence) {
+        return {
+          state,
+          value: compactionResult("already", {
+            ...command,
+            postArchiveDigest: state.archive.digest,
+            archived: 0,
+            appliedRevision: state.revision,
+            commandDigest,
+          }),
+          write: false,
+        };
+      }
+      const compacted = archiveTerminalPrefix(
+        { ...state, revision: state.revision + 1 },
+        {
+          all: true,
+          targetThroughSequence: command.targetThroughSequence,
+          limits: this.limits,
+        },
+      );
+      if (
+        compacted.archived === 0 ||
+        compacted.state.archive.throughSequence !==
+          command.targetThroughSequence
+      ) {
+        throw retentionBlocked();
+      }
+      const receipt = {
+        ...command,
+        postArchiveDigest: compacted.state.archive.digest,
+        archived: compacted.archived,
+        appliedRevision: compacted.state.revision,
+        commandDigest,
+      };
+      const next = { ...compacted.state, lastCompaction: receipt };
+      return {
+        state: next,
+        value: compactionResult("applied", receipt),
+        write: true,
+        requiredHeadroomBytes: 0,
+        archivedEntries: compacted.archivedEntries,
+      };
+    });
+  }
+
+  #finish(value, terminalStatus) {
+    const request = normalizeMutationBase(value, ["result"]);
+    const detail = createCodeJobDetail(value.result);
+    const detailDigest = digestValue(detail);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (isTerminalCodeJobStatus(job.status)) {
+        if (
+          job.status !== terminalStatus ||
+          job.execution.result.detailDigest !== detailDigest
+        ) {
+          throw transitionConflict("代码任务已以不同结果结束");
+        }
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.execution.actionAdmission !== null) {
+        throw transitionConflict("已入场动作完成对账前不能结束代码任务");
+      }
+      if (
+        terminalStatus === "completed" &&
+        (!["active", "paused"].includes(job.status) ||
+          job.execution.pendingAction !== null ||
+          job.execution.observations.at(-1)?.actionType !== "complete" ||
+          job.execution.observations.at(-1)?.status !== "succeeded")
+      ) {
+        throw transitionConflict("代码任务尚未完成全部可信动作");
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        terminalStatus,
+        (at) => ({
+          ...job.execution,
+          pendingAction: null,
+          pause: null,
+          uncertainty: null,
+          result: {
+            kind: terminalStatus,
+            detail,
+            detailDigest,
+            recordedAt: at,
+          },
+        }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  #requireJob(state, jobId) {
+    const index = state.jobs.findIndex((candidate) => candidate.jobId === jobId);
+    if (index < 0) throw jobNotFound();
+    return { job: state.jobs[index], index };
+  }
+
+  #assertJobRevision(job, expectedRevision) {
+    if (job.revision !== expectedRevision) throw revisionConflict();
+  }
+
+  #updateJob(state, index, status, executionFactory) {
+    const revision = state.revision + 1;
+    const updatedAt = this.#now(state);
+    const current = state.jobs[index];
+    const job = updateCodeJobLifecycle(current, {
+      status,
+      revision,
+      updatedAt,
+      execution: executionFactory(updatedAt),
+    });
+    const jobs = [...state.jobs];
+    jobs[index] = job;
+    return {
+      state: { ...state, revision, jobs },
+      job,
+    };
+  }
+
+  #appliedLifecycleChange(
+    { state, job },
+    requiredHeadroomBytes = TERMINAL_HEADROOM_BYTES,
+  ) {
+    return {
+      state,
+      value: workerMutationResult("applied", job),
+      write: true,
+      protectedSequences: isRetentionEligibleCodeJob(job)
+        ? new Set()
+        : new Set([job.sequence]),
+      requiredHeadroomBytes,
+    };
+  }
+
+  async #findArchivedBinding(state, request) {
+    const bindings = archiveBindingValuesFromRequest(request);
+    let found = null;
+    for (const kind of ARCHIVE_BINDING_KINDS) {
+      const tombstone = await this.#readArchivedIndex(
+        state,
+        kind,
+        bindings[kind],
+      );
+      if (tombstone === null) continue;
+      if (found !== null && found.jobId !== tombstone.jobId) {
+        throw bindingConflict();
+      }
+      found = tombstone;
+    }
+    return found;
+  }
+
+  async #readArchivedByJobId(state, jobId) {
+    return this.#readArchivedIndex(state, "job", jobId);
+  }
+
+  async #validateArchiveArtifacts(state) {
+    for (const manifest of state.archiveIndex) {
+      const rawTombstone = await this.store.read(
+        archiveRecordKey(manifest.jobId),
+        null,
+      );
+      if (rawTombstone === null) throw corruptedArchive();
+      const tombstone = normalizeArchiveTombstone(rawTombstone);
+      const bindings = assertTombstoneMatchesManifest(tombstone, manifest);
+      for (const kind of ARCHIVE_BINDING_KINDS) {
+        const rawIndex = await this.store.read(
+          archiveIndexKey(kind, bindings[kind]),
+          null,
+        );
+        if (rawIndex === null) throw corruptedArchive();
+        const index = normalizeArchiveIndex(rawIndex, kind, bindings[kind]);
+        if (
+          index.jobId !== tombstone.jobId ||
+          index.tombstoneDigest !== tombstone.tombstoneDigest
+        ) {
+          throw corruptedArchive();
+        }
+      }
+    }
+  }
+
+  async #readArchivedIndex(state, kind, bindingValue) {
+    try {
+      const bindingDigest = archiveBindingDigest(kind, bindingValue);
+      const manifest = this.archiveManifestLookup[kind].get(bindingDigest);
+      if (manifest === undefined) return null;
+      const rawIndex = await this.store.read(
+        archiveIndexKey(kind, bindingValue),
+        null,
+      );
+      if (rawIndex === null) throw corruptedArchive();
+      const index = normalizeArchiveIndex(rawIndex, kind, bindingValue);
+      const rawTombstone = await this.store.read(
+        archiveRecordKey(index.jobId),
+        null,
+      );
+      if (rawTombstone === null) throw corruptedArchive();
+      const tombstone = normalizeArchiveTombstone(rawTombstone);
+      const actualBindings = assertTombstoneMatchesManifest(
+        tombstone,
+        manifest,
+      );
+      if (
+        tombstone.tombstoneDigest !== index.tombstoneDigest ||
+        tombstone.jobId !== index.jobId ||
+        actualBindings[kind] !== bindingValue
+      ) {
+        throw corruptedArchive();
+      }
+      return tombstone;
+    } catch (error) {
+      if (error?.code === "CODE_JOB_ARCHIVE_CORRUPTED") {
+        this.ready = false;
+        throw error;
+      }
+      const wrapped = corruptedArchive(error);
+      this.ready = false;
+      throw wrapped;
+    }
+  }
+
+  async #persistArchiveEntries(entries) {
+    for (const entry of entries) {
+      const { tombstone, indexes } = entry;
+      await this.#writeImmutableArchive(
+        archiveRecordKey(tombstone.jobId),
+        tombstone,
+      );
+      const bindings = archiveBindingValuesFromTombstone(tombstone);
+      for (const kind of ARCHIVE_BINDING_KINDS) {
+        await this.#writeImmutableArchive(
+          archiveIndexKey(kind, bindings[kind]),
+          indexes[kind],
+        );
+      }
+    }
+  }
+
+  async #writeImmutableArchive(key, value) {
+    const existing = await this.store.read(key, null);
+    if (existing !== null) {
+      try {
+        if (digestValue(existing) === digestValue(value)) return;
+      } catch (cause) {
+        throw corruptedArchive(cause);
+      }
+      throw corruptedArchive();
+    }
+    await this.store.write(key, value);
   }
 
   #query(operation) {
@@ -423,17 +2719,26 @@ export class CodeJobStore {
       this.#assertReady();
       return this.exclusiveLease.run(async () => {
         const durable = await this.#readDurableState();
-        const change = operation(durable);
+        const change = await operation(durable);
         if (!change.write) return change.value;
-        this.#assertCapacity(change.state);
-        const candidate = normalizeState(change.state, this.limits);
+        const fitted = this.#fitState(
+          change.state,
+          change.protectedSequences ?? new Set(),
+          change.requiredHeadroomBytes ?? TERMINAL_HEADROOM_BYTES,
+        );
+        const candidate = normalizeState(fitted.state, this.limits);
+        const archivedEntries = [
+          ...(change.archivedEntries ?? []),
+          ...fitted.archivedEntries,
+        ];
         try {
+          await this.#persistArchiveEntries(archivedEntries);
           await this.store.write(CODE_JOB_STATE_KEY, candidate);
         } catch (writeError) {
           await this.#reconcileFailedWrite(writeError);
           throw writeError;
         }
-        this.state = candidate;
+        this.#acceptDurableState(candidate);
         return change.value;
       });
     });
@@ -477,17 +2782,66 @@ export class CodeJobStore {
         500,
       );
     }
+    if (
+      durable.archive.throughSequence < this.state.archive.throughSequence ||
+      durable.nextJobSequence < this.state.nextJobSequence ||
+      (durable.archive.throughSequence === this.state.archive.throughSequence &&
+        durable.archive.digest !== this.state.archive.digest)
+    ) {
+      throw storeError(
+        "CODE_JOB_ARCHIVE_FORKED",
+        "代码任务归档链发生回退或分叉",
+        500,
+      );
+    }
+    for (let index = 0; index < this.state.archiveIndex.length; index += 1) {
+      if (!sameValue(this.state.archiveIndex[index], durable.archiveIndex[index])) {
+        throw storeError(
+          "CODE_JOB_ARCHIVE_FORKED",
+          "代码任务归档清单发生分叉",
+          500,
+        );
+      }
+    }
+    for (const manifest of durable.archiveIndex.slice(
+      this.state.archiveIndex.length,
+    )) {
+      if (manifest.sequence >= this.state.nextJobSequence) break;
+      const current = this.state.jobs.find(
+        (job) => job.sequence === manifest.sequence,
+      );
+      if (current === undefined || current.recordDigest !== manifest.recordDigest) {
+        throw storeError(
+          "CODE_JOB_ARCHIVE_FORKED",
+          "代码任务归档记录无法衔接",
+          500,
+        );
+      }
+    }
     this.state = durable;
+    this.archiveManifestLookup = createArchiveManifestLookup(durable);
   }
 
-  #assertCapacity(state) {
-    if (
-      state.jobs.length > this.limits.maximumJobs ||
-      Buffer.byteLength(JSON.stringify(state), "utf8") >
-        this.limits.maximumStateBytes
+  #fitState(state, protectedSequences, requiredHeadroomBytes) {
+    let candidate = state;
+    const archivedEntries = [];
+    while (
+      stateExceedsLimits(candidate, this.limits, requiredHeadroomBytes)
     ) {
-      throw capacityExceeded();
+      const compacted = archiveTerminalPrefix(candidate, {
+        protectedSequences,
+        limits: this.limits,
+      });
+      if (compacted.archived === 0) {
+        if (stateExceedsLimits(candidate, this.limits, 0)) {
+          throw capacityExceeded();
+        }
+        throw retentionBlocked();
+      }
+      candidate = compacted.state;
+      archivedEntries.push(...compacted.archivedEntries);
     }
+    return { state: candidate, archivedEntries };
   }
 
   #assertReady() {
@@ -506,7 +2860,7 @@ export class CodeJobStore {
     const latest = state.jobs.reduce(
       (maximum, job) =>
         Date.parse(job.updatedAt) > Date.parse(maximum) ? job.updatedAt : maximum,
-      "1970-01-01T00:00:00.000Z",
+      state.archive.lastUpdatedAt ?? "1970-01-01T00:00:00.000Z",
     );
     if (Date.parse(now) < Date.parse(latest)) throw error;
     return now;

@@ -25,6 +25,7 @@ import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { WorkCoordinationService } from "./services/work-coordination-service.js";
 import { createCodeActionProposalRunnerService } from "./services/code-action-proposal-handler.js";
 import { CodeJobGrantFactory } from "./services/code-job-grant-factory.js";
+import { createConfiguredCodeJobBrainDirectory } from "./services/code-job-brain-directory.js";
 import { createGitHubReviewProposalRunnerService } from "./services/github-review-proposal-handler.js";
 import { WorkIntentDispatcher } from "./services/work-intent-dispatcher.js";
 import { WorkProposalResultReconciler } from "./services/work-proposal-result-reconciler.js";
@@ -151,6 +152,7 @@ export async function createApplication({
   githubReviewProposalRunnerFactory =
     createGitHubReviewProposalRunnerService,
   codeJobGrantFactory = (options) => new CodeJobGrantFactory(options),
+  codeJobBrainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
   codeActionProposalRunnerFactory =
     createCodeActionProposalRunnerService,
   workProposalRunnerGroupFactory = createWorkProposalRunnerGroup,
@@ -189,6 +191,8 @@ export async function createApplication({
   let codeJobRuntime = null;
     let confirmationRuntime = null;
     let codeJobReader = null;
+    let codeJobControl = null;
+    let codeJobWorker = null;
     let grantFactory = null;
   try {
     codeExecutorRuntime = trackRuntime(
@@ -285,6 +289,11 @@ export async function createApplication({
         brainByRole: brainConfigurationsByRole(config.employees?.roles),
         brainProviders: config.brainProviders || {},
       });
+      const codeJobBrainDirectory = codeJobBrainDirectoryFactory({
+        brainProviders: config.brainProviders || {},
+        roles: config.employees?.roles || {},
+        dependencies: workCoordinationDependencies.brainDependencies || {},
+      });
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
           ...codeJobRuntimeDependencies,
@@ -295,6 +304,34 @@ export async function createApplication({
             ["verify"],
             "codeJobGrantFactory",
           ),
+          executor: frozenPort(
+            codeExecutorRuntime.executor,
+            [
+              "start",
+              "view",
+              "resume",
+              "perform",
+              "getActionResult",
+              "reconcileAction",
+            ],
+            "codeExecutorRuntime.executor",
+          ),
+          brainDirectory: frozenPort(
+            codeJobBrainDirectory,
+            ["decide"],
+            "codeJobBrainDirectory",
+          ),
+          workerLimits: {
+            ...(coordinationConfig.codeJobMaximumTurns === undefined
+              ? {}
+              : { maxTurns: coordinationConfig.codeJobMaximumTurns }),
+            ...(coordinationConfig.codeJobObservationLimit === undefined
+              ? {}
+              : {
+                  observationLimit:
+                    coordinationConfig.codeJobObservationLimit,
+                }),
+          },
         }),
       );
       if (!codeJobRuntime) {
@@ -309,6 +346,16 @@ export async function createApplication({
         codeJobRuntime.reader,
         ["get", "list", "listNewest"],
         "codeJobRuntime.reader",
+      );
+      codeJobControl = frozenPort(
+        codeJobRuntime.control,
+        ["pause", "resume"],
+        "codeJobRuntime.control",
+      );
+      codeJobWorker = frozenPort(
+        codeJobRuntime.worker,
+        ["runCycle"],
+        "codeJobRuntime.worker",
       );
       confirmationRuntime = trackRuntime(
         await confirmationRuntimeFactory(config, {
@@ -475,6 +522,7 @@ export async function createApplication({
       });
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
+        codeJobRunner: codeJobWorker,
         proposalRunner,
         proposalResultReconciler,
         attentionResultReconciler,
@@ -487,6 +535,7 @@ export async function createApplication({
         attentionLimit: coordinationConfig.attentionLimit,
         proposalLimit: coordinationConfig.proposalLimit,
         conditionLimit: coordinationConfig.conditionLimit,
+        codeJobLimit: coordinationConfig.codeJobLimit,
       });
       const coordinator = attentionCoordinatorFactory({
         externalQueue: confirmationRuntime?.queue || null,
@@ -554,9 +603,8 @@ export async function createApplication({
       prEmployee,
       confirmationQueue: confirmationRuntime?.queue || null,
       workflowRouting,
-      codeExecutorRuntime,
-      codeExecutor: codeExecutorRuntime?.executor || null,
       codeJobReader,
+      codeJobControl,
       workLedgerView,
       attentionBrowser,
       attentionCoordinator,

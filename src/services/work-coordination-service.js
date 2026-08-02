@@ -61,6 +61,10 @@ async function skipProposalExecution() {
   return { skipped: "not_configured" };
 }
 
+async function skipCodeJobs() {
+  return { skipped: "not_configured" };
+}
+
 function stageFailure(stage, error) {
   const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
@@ -70,6 +74,7 @@ function stageFailure(stage, error) {
 
 export class WorkCoordinationService {
   #intake;
+  #runCodeJobs;
   #runProposals;
   #reconcileProposals;
   #reconcileAttention;
@@ -82,6 +87,7 @@ export class WorkCoordinationService {
 
   constructor({
     ledger,
+    codeJobRunner,
     proposalRunner,
     proposalResultReconciler,
     attentionResultReconciler,
@@ -94,8 +100,12 @@ export class WorkCoordinationService {
     attentionLimit = 50,
     proposalLimit = 50,
     conditionLimit = 50,
+    codeJobLimit = 10,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
+    this.#runCodeJobs = codeJobRunner == null
+      ? skipCodeJobs
+      : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
     this.#runProposals = proposalRunner == null
       ? skipProposalExecution
       : requirePort(proposalRunner, "runCycle", "proposalRunner");
@@ -123,6 +133,7 @@ export class WorkCoordinationService {
       attentionLimit: positiveLimit(attentionLimit, "attentionLimit"),
       proposalLimit: positiveLimit(proposalLimit, "proposalLimit"),
       conditionLimit: positiveLimit(conditionLimit, "conditionLimit"),
+      codeJobLimit: positiveLimit(codeJobLimit, "codeJobLimit"),
     });
   }
 
@@ -150,6 +161,13 @@ export class WorkCoordinationService {
 
   async #performCycle(options) {
     const stages = [
+      ["code_jobs", () =>
+        this.#runCodeJobs({
+          limit: this.#defaults.codeJobLimit,
+          ...(options.includeWork && options.roleId !== null
+            ? { roleId: options.roleId }
+            : {}),
+        })],
       ["proposal_execution", () =>
         this.#runProposals({ limit: this.#defaults.proposalLimit })],
       ["proposal_results", () =>

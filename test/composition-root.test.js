@@ -52,6 +52,9 @@ function workCoordinationConfig({ externalActions = true } = {}) {
       attentionLimit: 14,
       proposalLimit: 16,
       conditionLimit: 15,
+      codeJobLimit: 9,
+      codeJobMaximumTurns: 64,
+      codeJobObservationLimit: 20,
       leaseDurationMs: 16_000,
       resolveTimeoutMs: 2_000,
       decisionTimeoutMs: 3_000,
@@ -141,6 +144,26 @@ function confirmationProducerPort(overrides = {}) {
     async invalidate() {},
     ...overrides,
   });
+}
+
+function controlledCodeExecutorPort(overrides = {}) {
+  return {
+    async start() {},
+    async view() {},
+    async resume() {},
+    async perform() {},
+    async getActionResult() {},
+    async reconcileAction() {},
+    ...overrides,
+  };
+}
+
+function codeJobControlPort() {
+  return { async pause() {}, async resume() {} };
+}
+
+function codeJobWorkerPort() {
+  return { async runCycle() {} };
 }
 
 function workProposalRuntimePort(overrides = {}) {
@@ -354,8 +377,8 @@ test("application composition keeps the disabled executor absent", async () => {
     },
   });
 
-  assert.equal(application.codeExecutorRuntime, null);
-  assert.equal(application.codeExecutor, null);
+  assert.equal(Object.hasOwn(application, "codeExecutorRuntime"), false);
+  assert.equal(Object.hasOwn(application, "codeExecutor"), false);
   assert.deepEqual(calls[0].config, { enabled: false });
   assert.strictEqual(calls[0].dependencies.store, store);
 });
@@ -975,7 +998,7 @@ test("application awaits recovered executor composition and propagates failure",
 
   release({ executor, recovery: { recovered: true, cleanupPending: 0 } });
   const application = await pending;
-  assert.strictEqual(application.codeExecutor, executor);
+  assert.equal(Object.hasOwn(application, "codeExecutor"), false);
 
   const startupFailure = new Error("recovery failed");
   await assert.rejects(
@@ -1210,7 +1233,7 @@ test("local code composition binds authority, both proposal runners, and one saf
     store: memoryStore(),
     codeExecutorRuntimeFactory: async () => ({
       authority: executorAuthority,
-      executor: { id: "controlled-code-executor" },
+      executor: controlledCodeExecutorPort(),
       async close() {
         closeCalls.push("code-executor");
       },
@@ -1228,6 +1251,8 @@ test("local code composition binds authority, both proposal runners, and one saf
       return {
         confirmationExecutor: localExecutor,
         reader: codeJobReader,
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
         async close() {
           closeCalls.push("code-job");
         },
@@ -1274,6 +1299,20 @@ test("local code composition binds authority, both proposal runners, and one saf
     },
   ]);
   assert.strictEqual(calls.codeJobRuntime.store, application.store);
+  assert.equal(Object.isFrozen(calls.codeJobRuntime.executor), true);
+  assert.deepEqual(Object.keys(calls.codeJobRuntime.executor).sort(), [
+    "getActionResult",
+    "perform",
+    "reconcileAction",
+    "resume",
+    "start",
+    "view",
+  ]);
+  assert.equal(Object.isFrozen(calls.codeJobRuntime.brainDirectory), true);
+  assert.deepEqual(calls.codeJobRuntime.workerLimits, {
+    maxTurns: 64,
+    observationLimit: 20,
+  });
   assert.equal(Object.isFrozen(calls.confirmation.localExecutor), true);
   assert.deepEqual(Object.keys(calls.confirmation.localExecutor).sort(), [
     "execute",
@@ -1319,8 +1358,16 @@ test("local code composition binds authority, both proposal runners, and one saf
   assert.equal(typeof calls.codeRunner.grantFactory.create, "function");
   assert.deepEqual(calls.runnerGroup, [githubRunner, codeRunner]);
   assert.strictEqual(calls.coordination.proposalRunner, runnerGroup);
+  assert.equal(Object.isFrozen(calls.coordination.codeJobRunner), true);
+  assert.equal(typeof calls.coordination.codeJobRunner.runCycle, "function");
+  assert.equal(calls.coordination.codeJobLimit, 9);
 
   assert.equal(Object.isFrozen(application.codeJobReader), true);
+  assert.equal(Object.isFrozen(application.codeJobControl), true);
+  assert.deepEqual(Object.keys(application.codeJobControl).sort(), [
+    "pause",
+    "resume",
+  ]);
   assert.deepEqual(Object.keys(application.codeJobReader).sort(), [
     "get",
     "list",
@@ -1331,6 +1378,7 @@ test("local code composition binds authority, both proposal runners, and one saf
     "codeJobRuntime",
     "codeJobStore",
     "codeJobExecutor",
+    "codeJobWorker",
     "confirmationExecutor",
   ]) {
     assert.equal(privateName in application, false);
@@ -1359,6 +1407,7 @@ test("local-only code actions still create confirmation while maintenance acquir
     store: memoryStore(),
     codeExecutorRuntimeFactory: async () => ({
       authority: { workspaces: [] },
+      executor: controlledCodeExecutorPort(),
       async close() {
         closeCalls.push("code-executor");
       },
@@ -1375,6 +1424,8 @@ test("local-only code actions still create confirmation while maintenance acquir
         reader: {
           async get() {}, async list() {}, async listNewest() {},
         },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
         async close() {
           closeCalls.push("code-job");
         },
@@ -1419,6 +1470,7 @@ test("local-only code actions still create confirmation while maintenance acquir
   assert.equal(codeJobCalls, 0);
   assert.equal(confirmationCalls, 0);
   assert.equal(maintenance.codeJobReader, null);
+  assert.equal(maintenance.codeJobControl, null);
   assert.deepEqual(calls.proposalRuntime.runnerScopes, []);
   await maintenance.close();
 });
@@ -1441,7 +1493,10 @@ test("local composition constructs the real grant, handler, and runner group cha
   const application = await createApplication({
     config: localCodeCoordinationConfig({ githubActions: false }),
     store: memoryStore(),
-    codeExecutorRuntimeFactory: async () => ({ authority }),
+    codeExecutorRuntimeFactory: async () => ({
+      authority,
+      executor: controlledCodeExecutorPort(),
+    }),
     ...localCoordinationStubs({
       calls,
       closeCalls,
@@ -1452,6 +1507,8 @@ test("local composition constructs the real grant, handler, and runner group cha
     codeJobRuntimeFactory: async () => ({
       confirmationExecutor: { async execute() {}, async reconcile() {} },
       reader: { async get() {}, async list() {}, async listNewest() {} },
+      control: codeJobControlPort(),
+      worker: codeJobWorkerPort(),
       async close() {},
     }),
     confirmationRuntimeFactory: async () => ({
@@ -1477,6 +1534,7 @@ test("confirmation startup failure closes the already acquired local code runtim
       store: memoryStore(),
       codeExecutorRuntimeFactory: async () => ({
         authority: { workspaces: [] },
+        executor: controlledCodeExecutorPort(),
         async close() {
           closeCalls.push("code-executor");
         },
@@ -1491,6 +1549,8 @@ test("confirmation startup failure closes the already acquired local code runtim
       codeJobRuntimeFactory: async () => ({
         confirmationExecutor: { async execute() {}, async reconcile() {} },
         reader: { async get() {}, async list() {}, async listNewest() {} },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
         async close() {
           closeCalls.push("code-job");
         },

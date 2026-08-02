@@ -6,6 +6,7 @@ import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
 import { CodeJobApprovalExecutor } from "./services/code-job-approval-executor.js";
 import { CodeJobStore } from "./services/code-job-store.js";
+import { CodeJobWorkerService } from "./services/code-job-worker-service.js";
 
 const GUARD_NAME = "mydashboard-code-job-v1";
 
@@ -52,6 +53,21 @@ function frozenPort(methods) {
   return Object.freeze(methods);
 }
 
+function normalizeWorkerLimits(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.keys(value).some(
+      (key) => !["maxTurns", "observationLimit"].includes(key),
+    )
+  ) {
+    throw new TypeError("workerLimits is invalid");
+  }
+  return { ...value };
+}
+
 function operationAdmission() {
   let accepting = true;
   const active = new Set();
@@ -81,15 +97,33 @@ function operationAdmission() {
 export async function createCodeJobRuntime({
   store,
   grantVerifier,
+  executor,
+  brainDirectory,
   dataDirectory,
   operationQueue = new OperationQueue(),
+  workerOperationQueue = new OperationQueue(),
   clock,
   limits,
+  workerLimits = {},
+  workerFactory = (options) => new CodeJobWorkerService(options),
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
   }
+  if (typeof workerFactory !== "function") {
+    throw new TypeError("workerFactory must be a function");
+  }
+  if (
+    !workerOperationQueue ||
+    typeof workerOperationQueue.enqueue !== "function"
+  ) {
+    throw new TypeError("workerOperationQueue is invalid");
+  }
+  if ((executor === undefined) !== (brainDirectory === undefined)) {
+    throw new TypeError("executor and brainDirectory must be configured together");
+  }
+  const normalizedWorkerLimits = normalizeWorkerLimits(workerLimits);
   const durableStore = validateStore(
     store === undefined
       ? new StateStore(runtimeDataDirectory(dataDirectory))
@@ -119,6 +153,27 @@ export async function createCodeJobRuntime({
       codeJobStore: jobs,
       grantVerifier,
     });
+    const worker = executor === undefined
+      ? null
+      : workerFactory({
+          ...normalizedWorkerLimits,
+          jobStore: jobs,
+          executor,
+          brainDirectory,
+          grantVerifier,
+          operationQueue: workerOperationQueue,
+        });
+    if (worker !== null && typeof worker?.runCycle !== "function") {
+      throw new TypeError("code job worker is invalid");
+    }
+    const controlMutation = (method, value) =>
+      admission.run(async () => {
+        const changed = await jobs[method](value);
+        return Object.freeze({
+          status: changed.status,
+          job: await jobs.get(changed.job.jobId),
+        });
+      });
     return Object.freeze({
       confirmationExecutor: frozenPort({
         execute: (value) => admission.run(() => approvalExecutor.execute(value)),
@@ -130,6 +185,16 @@ export async function createCodeJobRuntime({
         list: (value) => admission.run(() => jobs.list(value)),
         listNewest: (value) => admission.run(() => jobs.listNewest(value)),
       }),
+      control: frozenPort({
+        pause: (value) => controlMutation("pause", value),
+        resume: (value) => controlMutation("resume", value),
+      }),
+      worker: worker === null
+        ? null
+        : frozenPort({
+            runCycle: (value) =>
+              admission.run(() => worker.runCycle(value)),
+          }),
       close,
     });
   } catch (error) {

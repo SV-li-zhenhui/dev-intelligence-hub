@@ -474,19 +474,25 @@ h1 {
 .status-working,
 .status-running,
 .status-queued,
+.status-starting,
+.status-active,
 .status-retry_wait {
   color: var(--blue);
   background: var(--blue-soft);
 }
 
 .status-waiting_user,
+.status-pausing,
 .status-ready_for_human {
   color: var(--amber);
   background: var(--amber-soft);
 }
 
 .status-degraded,
-.status-blocked {
+.status-blocked,
+.status-failed,
+.status-fenced,
+.status-unknown {
   color: var(--red);
   background: var(--red-soft);
 }

@@ -5,25 +5,39 @@ import {
 } from "../domain/structured-code-action-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { normalizeBrainConfig } from "./brain-router.js";
+import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { createConfiguredBrainRouter } from "./configured-workforce.js";
 
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const OPERATIONS = new Set(["inspect", "modify", "verify"]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed"]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-const MAXIMUM_CONTEXT_BYTES = 128 * 1024;
 
 export class CodeJobBrainDirectoryError extends Error {
-  constructor(code, message, statusCode = 400) {
-    super(message);
+  constructor(code, message, statusCode = 400, options = {}) {
+    super(message, options);
     this.name = "CodeJobBrainDirectoryError";
     this.code = code;
     this.statusCode = statusCode;
   }
 }
 
-function directoryError(code, message, statusCode) {
-  return new CodeJobBrainDirectoryError(code, message, statusCode);
+function directoryError(code, message, statusCode, options) {
+  return new CodeJobBrainDirectoryError(code, message, statusCode, options);
+}
+
+function requireDecisionAuthorization(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== 1 ||
+    typeof value.beforeGenerate !== "function"
+  ) {
+    throw new TypeError("code brain authorization is invalid");
+  }
+  return value.beforeGenerate;
 }
 
 function dataEntries(value, name) {
@@ -210,19 +224,12 @@ function normalizeDecisionInput(value) {
   if (!Number.isSafeInteger(input.turn) || input.turn < 1 || input.turn > 200) {
     throw new TypeError("code brain turn is invalid");
   }
-  const context = {
+  const context = packCodeJobBrainContext({
     task: normalizeTask(input.task),
     capabilities: normalizeCapabilities(input.capabilities),
     turn: input.turn,
     observations: normalizeObservations(input.observations),
-  };
-  if (Buffer.byteLength(JSON.stringify(context), "utf8") > MAXIMUM_CONTEXT_BYTES) {
-    throw directoryError(
-      "CODE_BRAIN_CONTEXT_TOO_LARGE",
-      "Code brain context exceeds the configured limit",
-      413,
-    );
-  }
+  });
   return { roleId: input.roleId, context };
 }
 
@@ -279,8 +286,9 @@ export class CodeJobBrainDirectory {
     Object.freeze(this);
   }
 
-  async decide(value) {
+  async decide(value, authorization) {
     const { roleId, context } = normalizeDecisionInput(value);
+    const beforeGenerate = requireDecisionAuthorization(authorization);
     const brain = this.#brains.get(roleId);
     if (!brain) {
       throw directoryError(
@@ -294,6 +302,7 @@ export class CodeJobBrainDirectory {
       { role: "user", content: JSON.stringify(context) },
     ];
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      await beforeGenerate();
       const response = await this.#router.generate({
         brain,
         schema: CODE_ACTION_DECISION_JSON_SCHEMA,
@@ -341,7 +350,14 @@ export class CodeJobBrainDirectory {
         }
         return decision;
       } catch (error) {
-        if (attempt === 1) throw error;
+        if (attempt === 1) {
+          throw directoryError(
+            "CODE_BRAIN_RESPONSE_INVALID",
+            "Code brain response failed local validation twice",
+            400,
+            { cause: error },
+          );
+        }
       }
     }
     throw directoryError(

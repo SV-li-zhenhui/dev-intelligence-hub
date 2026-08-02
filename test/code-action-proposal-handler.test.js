@@ -213,6 +213,14 @@ function queuedJob(grant, overrides = {}) {
     allowedActions: grant.allowedActions,
     writablePaths: grant.writablePaths,
     requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
+    turn: 0,
+    pendingActionType: null,
+    observationCount: 0,
+    latestObservation: null,
+    terminalResult: null,
+    memoryProjection: null,
+    pause: null,
+    uncertainty: null,
     createdAt: CREATED_AT,
     updatedAt: CREATED_AT,
     ...overrides,
@@ -290,6 +298,38 @@ test("an exact completed approval and queued job advance only to running", async
   assert.notEqual(transition.status, "succeeded");
 });
 
+test("a legacy queued reader projection remains compatible during local upgrade", async () => {
+  const grant = grantFor();
+  const legacy = queuedJob(grant);
+  for (const key of [
+    "turn",
+    "pendingActionType",
+    "observationCount",
+    "latestObservation",
+    "terminalResult",
+    "memoryProjection",
+    "pause",
+    "uncertainty",
+  ]) {
+    delete legacy[key];
+  }
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(legacy);
+  const instance = handler(producer, reader, grant);
+  const waiting = await instance.value.handle(handlerInput());
+  producer.status = "completed";
+
+  const transition = await instance.value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.equal(transition.status, "running");
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+});
+
 test("a queued job remains running without consulting or executing confirmation again", async () => {
   const grant = grantFor();
   const producer = new FakeConfirmationProducer();
@@ -315,6 +355,101 @@ test("a queued job remains running without consulting or executing confirmation 
   assert.equal(producer.enqueueCalls.length, 0);
   assert.equal(producer.getCalls.length, 1);
   assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+});
+
+test("a pausing code job remains running until admitted work is reconciled", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  producer.plan = createCodeActionProposalConfirmationPlan(
+    proposal(),
+    await authority(grant).factory.create(proposal()),
+  );
+  const reader = new FakeCodeJobReader(
+    queuedJob(grant, {
+      status: "pausing",
+      revision: 4,
+      pause: {
+        reason: "等待已入场动作完成对账",
+        at: CREATED_AT,
+      },
+      updatedAt: "2026-08-02T03:00:02.000Z",
+    }),
+  );
+  const instance = handler(producer, reader, grant);
+
+  const transition = await instance.value.handle(
+    handlerInput({
+      status: "running",
+      downstreamRef: codeJobConfirmationIdForGrant(grant),
+    }),
+  );
+
+  assert.equal(transition.status, "running");
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.getCalls.length, 1);
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+});
+
+test("current and legacy unknown projections remain explicitly reconcilable", async (t) => {
+  const cases = [
+    {
+      name: "active-origin uncertainty",
+      createJob(grant) {
+        return queuedJob(grant, {
+          status: "unknown",
+          revision: 5,
+          pendingActionType: "read_text",
+          uncertainty: {
+            from: "active",
+            code: "EXECUTOR_RESULT_UNKNOWN",
+            message: "执行结果待核验",
+            at: "2026-08-02T03:00:02.000Z",
+          },
+          updatedAt: "2026-08-02T03:00:02.000Z",
+        });
+      },
+    },
+    {
+      name: "v5 pause-backed uncertainty",
+      createJob(grant) {
+        const legacy = queuedJob(grant, {
+          status: "unknown",
+          revision: 5,
+          pendingActionType: "read_text",
+          pause: {
+            reason: "旧版未知动作等待核验",
+            at: "2026-08-02T03:00:02.000Z",
+          },
+          updatedAt: "2026-08-02T03:00:02.000Z",
+        });
+        delete legacy.uncertainty;
+        return legacy;
+      },
+    },
+  ];
+
+  for (const { name, createJob } of cases) {
+    await t.test(name, async () => {
+      const grant = grantFor();
+      const producer = new FakeConfirmationProducer();
+      producer.plan = createCodeActionProposalConfirmationPlan(
+        proposal(),
+        await authority(grant).factory.create(proposal()),
+      );
+      const reader = new FakeCodeJobReader(createJob(grant));
+      const instance = handler(producer, reader, grant);
+
+      const transition = await instance.value.handle(
+        handlerInput({
+          status: "running",
+          downstreamRef: codeJobConfirmationIdForGrant(grant),
+        }),
+      );
+
+      assert.equal(transition.status, "running");
+      assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+    });
+  }
 });
 
 test("changed authorization invalidates the old pending confirmation", async () => {
@@ -552,6 +687,20 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     {
       confirmation: {},
       job: queuedJob(grant, { updatedAt: "2026-08-02T03:00:02.000Z" }),
+    },
+    {
+      confirmation: {},
+      job: queuedJob(grant, {
+        status: "unknown",
+        pendingActionType: "read_text",
+        pause: { reason: "伪造暂停", at: CREATED_AT },
+        uncertainty: {
+          from: "active",
+          code: "EXECUTOR_RESULT_UNKNOWN",
+          message: "来源与暂停状态冲突",
+          at: CREATED_AT,
+        },
+      }),
     },
     { confirmation: {}, job: null },
   ];
