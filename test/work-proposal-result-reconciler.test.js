@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { WorkProposalResultReconciler } from "../src/services/work-proposal-result-reconciler.js";
 
+const JOB_ID = `code-job-${"a".repeat(55)}`;
+const OTHER_JOB_ID = `code-job-${"b".repeat(55)}`;
+const MEMORY_ID = `memory-${"c".repeat(64)}`;
+const OTHER_MEMORY_ID = `memory-${"d".repeat(64)}`;
+const PROJECTED_AT = "2026-08-02T08:00:00.000Z";
+
 function resultBatch(sequence = 1) {
   return {
     items: [{ sequence }],
@@ -9,6 +15,42 @@ function resultBatch(sequence = 1) {
     highWatermark: sequence,
     oldestAvailableSequence: 1,
   };
+}
+
+function codeResult({
+  sequence = 1,
+  outcome = "succeeded",
+  evidence = [`code-job:${JOB_ID}`, `memory:${MEMORY_ID}`],
+} = {}) {
+  return {
+    sequence,
+    kind: "code_action_proposal",
+    outcome,
+    evidence,
+  };
+}
+
+function gateBatch(items, {
+  highWatermark = items.at(-1)?.sequence ?? 0,
+  oldestAvailableSequence = items.length === 0 ? null : 1,
+} = {}) {
+  return {
+    items,
+    nextSequence: items.at(-1)?.sequence ?? 0,
+    highWatermark,
+    oldestAvailableSequence,
+  };
+}
+
+function codeJob({
+  jobId = JOB_ID,
+  status = "completed",
+  memoryProjection = {
+    recordId: MEMORY_ID,
+    projectedAt: PROJECTED_AT,
+  },
+} = {}) {
+  return { jobId, status, memoryProjection };
 }
 
 function ports(overrides = {}) {
@@ -172,4 +214,333 @@ test("reconciler strictly validates cycle options", () => {
   const accessor = {};
   Object.defineProperty(accessor, "limit", { enumerable: true, get: () => 1 });
   assert.throws(() => reconciler.runCycle(accessor), /runCycle options/);
+});
+
+test("reconciler applies a completed code result only after its memory receipt is visible", async () => {
+  const item = codeResult();
+  const batch = gateBatch([item]);
+  const calls = [];
+  const reader = {
+    marker: "bound-reader",
+    async get(jobId) {
+      assert.equal(this.marker, "bound-reader");
+      calls.push(["get", jobId]);
+      return codeJob();
+    },
+  };
+  let applied;
+  const dependencies = ports({
+    proposalConsumer: { readResultBatch: async () => batch },
+    ledger: {
+      async applyProposalBatch(value) {
+        applied = value;
+        calls.push(["apply"]);
+        return { applied: 1, cursor: 1 };
+      },
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: reader,
+  });
+
+  assert.deepEqual(await reconciler.runCycle(), { applied: 1, cursor: 1 });
+  assert.deepEqual(calls, [["get", JOB_ID], ["apply"]]);
+  assert.notStrictEqual(applied, batch);
+  assert.strictEqual(applied.items[0], item);
+  assert.deepEqual(applied, batch);
+});
+
+test("reconciler waits at active, unknown, and unprojected terminal code jobs", async (t) => {
+  for (const status of ["active", "unknown", "completed"]) {
+    await t.test(status, async () => {
+      const batch = gateBatch([codeResult()], { highWatermark: 3 });
+      let applied;
+      const dependencies = ports({
+        proposalConsumer: { readResultBatch: async () => batch },
+        ledger: {
+          async applyProposalBatch(value) {
+            applied = value;
+            return { applied: 0, cursor: 0 };
+          },
+        },
+      });
+      const reconciler = new WorkProposalResultReconciler({
+        ...dependencies,
+        codeJobReader: {
+          get: async () => codeJob({ status, memoryProjection: null }),
+        },
+      });
+
+      assert.deepEqual(await reconciler.runCycle(), { applied: 0, cursor: 0 });
+      assert.deepEqual(applied, {
+        items: [],
+        nextSequence: 0,
+        highWatermark: 3,
+        oldestAvailableSequence: 1,
+      });
+    });
+  }
+});
+
+test("reconciler applies only the longest ready prefix and never overtakes a blocked result", async () => {
+  const first = { sequence: 1, kind: "github_review_proposal" };
+  const blocked = codeResult({ sequence: 2 });
+  const later = { sequence: 3, kind: "github_review_proposal" };
+  const batch = gateBatch([first, blocked, later], { highWatermark: 5 });
+  const reads = [];
+  let applied;
+  const dependencies = ports({
+    proposalConsumer: { readResultBatch: async () => batch },
+    ledger: {
+      async applyProposalBatch(value) {
+        applied = value;
+        return { applied: 1, cursor: 1 };
+      },
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: {
+      async get(jobId) {
+        reads.push(jobId);
+        return codeJob({ status: "active", memoryProjection: null });
+      },
+    },
+  });
+
+  await reconciler.runCycle();
+
+  assert.deepEqual(reads, [JOB_ID]);
+  assert.deepEqual(applied, {
+    items: [first],
+    nextSequence: 1,
+    highWatermark: 5,
+    oldestAvailableSequence: 1,
+  });
+  assert.equal(applied.items.includes(later), false);
+});
+
+test("reconciler rejects missing, ambiguous, and contradictory code-job evidence", async (t) => {
+  const cases = [
+    {
+      name: "missing job",
+      item: codeResult(),
+      job: null,
+      reads: 1,
+    },
+    {
+      name: "ambiguous job references",
+      item: codeResult({
+        evidence: [`code-job:${JOB_ID}`, `code-job:${OTHER_JOB_ID}`],
+      }),
+      job: codeJob(),
+      reads: 0,
+    },
+    {
+      name: "succeeded without job reference",
+      item: codeResult({ evidence: [] }),
+      job: codeJob(),
+      reads: 0,
+    },
+    {
+      name: "memory receipt mismatch",
+      item: codeResult({
+        evidence: [`code-job:${JOB_ID}`, `memory:${OTHER_MEMORY_ID}`],
+      }),
+      job: codeJob(),
+      reads: 1,
+    },
+    {
+      name: "missing memory citation",
+      item: codeResult({ evidence: [`code-job:${JOB_ID}`] }),
+      job: codeJob(),
+      reads: 1,
+    },
+    {
+      name: "duplicate memory citations",
+      item: codeResult({
+        evidence: [
+          `code-job:${JOB_ID}`,
+          `memory:${MEMORY_ID}`,
+          `memory:${MEMORY_ID}`,
+        ],
+      }),
+      job: codeJob(),
+      reads: 1,
+    },
+    {
+      name: "succeeded result bound to failed job",
+      item: codeResult(),
+      job: codeJob({ status: "failed" }),
+      reads: 1,
+    },
+    {
+      name: "failed result bound to completed job",
+      item: codeResult({ outcome: "failed" }),
+      job: codeJob({ status: "completed" }),
+      reads: 1,
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      let reads = 0;
+      let applications = 0;
+      const dependencies = ports({
+        proposalConsumer: {
+          readResultBatch: async () => gateBatch([fixture.item]),
+        },
+        ledger: {
+          async applyProposalBatch() {
+            applications += 1;
+          },
+        },
+      });
+      const reconciler = new WorkProposalResultReconciler({
+        ...dependencies,
+        codeJobReader: {
+          async get() {
+            reads += 1;
+            return fixture.job;
+          },
+        },
+      });
+
+      await assert.rejects(
+        reconciler.runCycle(),
+        (error) =>
+          error.code === "WORK_PROPOSAL_CODE_JOB_EVIDENCE_INVALID" &&
+          error.statusCode === 502,
+      );
+      assert.equal(reads, fixture.reads);
+      assert.equal(applications, 0);
+    });
+  }
+});
+
+test("reconciler permits non-code results and code failures without job evidence", async () => {
+  let evidenceAccessorRead = false;
+  const otherKind = { sequence: 1, kind: "github_review_proposal" };
+  Object.defineProperty(otherKind, "evidence", {
+    enumerable: true,
+    get() {
+      evidenceAccessorRead = true;
+      throw new Error("must remain opaque");
+    },
+  });
+  const rejectedBeforeExecution = codeResult({
+    sequence: 2,
+    outcome: "rejected",
+    evidence: ["confirmation:declined"],
+  });
+  const batch = gateBatch([otherKind, rejectedBeforeExecution]);
+  let reads = 0;
+  let applied;
+  const dependencies = ports({
+    proposalConsumer: { readResultBatch: async () => batch },
+    ledger: {
+      async applyProposalBatch(value) {
+        applied = value;
+        return { applied: 2, cursor: 2 };
+      },
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: {
+      async get() {
+        reads += 1;
+        return null;
+      },
+    },
+  });
+
+  await reconciler.runCycle();
+
+  assert.equal(reads, 0);
+  assert.equal(evidenceAccessorRead, false);
+  assert.strictEqual(applied.items[0], otherKind);
+  assert.strictEqual(applied.items[1], rejectedBeforeExecution);
+});
+
+test("reconciler accepts a projected terminal failure with matching evidence", async () => {
+  const item = codeResult({ sequence: 1, outcome: "failed" });
+  let applied;
+  const dependencies = ports({
+    proposalConsumer: {
+      readResultBatch: async () => gateBatch([item]),
+    },
+    ledger: {
+      async applyProposalBatch(value) {
+        applied = value;
+        return { applied: 1, cursor: 1 };
+      },
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: {
+      get: async () => codeJob({ status: "failed" }),
+    },
+  });
+
+  await reconciler.runCycle();
+
+  assert.deepEqual(applied.items, [item]);
+  assert.equal(applied.nextSequence, 1);
+});
+
+test("reconciler strictly validates and binds the optional code job reader", async () => {
+  const valid = ports();
+  assert.throws(
+    () => new WorkProposalResultReconciler({ ...valid, codeJobReader: null }),
+    /codeJobReader/,
+  );
+  assert.throws(
+    () => new WorkProposalResultReconciler({ ...valid, codeJobReader: {} }),
+    /codeJobReader/,
+  );
+
+  let getterRead = false;
+  const accessorPort = {};
+  Object.defineProperty(accessorPort, "get", {
+    enumerable: true,
+    get() {
+      getterRead = true;
+      return async () => null;
+    },
+  });
+  assert.throws(
+    () => new WorkProposalResultReconciler({
+      ...valid,
+      codeJobReader: accessorPort,
+    }),
+    /codeJobReader/,
+  );
+  assert.equal(getterRead, false);
+
+  let statusRead = false;
+  const accessorJob = { jobId: JOB_ID, memoryProjection: null };
+  Object.defineProperty(accessorJob, "status", {
+    enumerable: true,
+    get() {
+      statusRead = true;
+      return "active";
+    },
+  });
+  const dependencies = ports({
+    proposalConsumer: {
+      readResultBatch: async () => gateBatch([codeResult()]),
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: { get: async () => accessorJob },
+  });
+  await assert.rejects(
+    reconciler.runCycle(),
+    (error) => error.code === "WORK_PROPOSAL_CODE_JOB_EVIDENCE_INVALID",
+  );
+  assert.equal(statusRead, false);
 });

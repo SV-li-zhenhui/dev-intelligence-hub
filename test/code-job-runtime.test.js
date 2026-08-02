@@ -6,6 +6,8 @@ import {
   createCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { codeJobConfirmationIdForGrant } from "../src/domain/code-action-proposal-confirmation.js";
+import { memoryRecordForCodeJobEvent } from "../src/domain/code-job-memory-event.js";
+import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
 import { createCodeJobRuntime } from "../src/code-job-runtime.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
@@ -149,6 +151,7 @@ async function runtimeFixture({
   executor,
   brainDirectory,
   workerFactory,
+  memoryReceiptVerifier,
 } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
@@ -162,6 +165,9 @@ async function runtimeFixture({
     ...(executor === undefined ? {} : { executor }),
     ...(brainDirectory === undefined ? {} : { brainDirectory }),
     ...(workerFactory === undefined ? {} : { workerFactory }),
+    ...(memoryReceiptVerifier === undefined
+      ? {}
+      : { memoryReceiptVerifier }),
   });
   return { runtime, store, guard };
 }
@@ -178,11 +184,13 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal(Object.isFrozen(runtime.confirmationExecutor), true);
   assert.equal(Object.isFrozen(runtime.reader), true);
   assert.equal(Object.isFrozen(runtime.control), true);
+  assert.equal(Object.isFrozen(runtime.projectionSource), true);
   assert.equal(runtime.worker, null);
   assert.deepEqual(Object.keys(runtime).sort(), [
     "close",
     "confirmationExecutor",
     "control",
+    "projectionSource",
     "reader",
     "worker",
   ]);
@@ -208,6 +216,109 @@ test("runtime acquires and recovers before exposing local approval and reader po
   await runtime.close();
 });
 
+test("projection source is private, ordered, and bound to the memory verifier", async () => {
+  const verificationRequests = [];
+  const { runtime } = await runtimeFixture({
+    memoryReceiptVerifier: {
+      async verify(value) {
+        verificationRequests.push(structuredClone(value));
+        return { ...structuredClone(value), persisted: true };
+      },
+    },
+  });
+  const created = await runtime.confirmationExecutor.execute(envelope());
+  const queued = await runtime.reader.get(created.receipt.id);
+  await runtime.control.pause({
+    jobId: queued.jobId,
+    expectedRevision: queued.revision,
+    reason: "等待本地记忆投影",
+  });
+
+  const batch = await runtime.projectionSource.readBatch({ limit: 1 });
+  assert.equal(batch.cursor, 0);
+  assert.equal(batch.highWatermark, 1);
+  assert.equal(batch.items[0].kind, "paused");
+  const event = batch.items[0];
+  const record = normalizeMemoryRecord(memoryRecordForCodeJobEvent(event));
+  const request = {
+    sequence: event.sequence,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    jobId: event.jobId,
+    sourceRecordDigest: event.sourceRecordDigest,
+    memoryRecordId: record.recordId,
+    memoryRecordDigest: record.contentDigest,
+  };
+
+  assert.deepEqual(await runtime.projectionSource.ack(request), {
+    status: "applied",
+    cursor: 1,
+    highWatermark: 1,
+  });
+  assert.deepEqual(verificationRequests, [{
+    recordId: record.recordId,
+    contentDigest: record.contentDigest,
+    source: record.source,
+  }]);
+  assert.deepEqual(await runtime.projectionSource.readBatch(), {
+    cursor: 1,
+    highWatermark: 1,
+    items: [],
+  });
+  assert.equal("jobStore" in runtime, false);
+  await runtime.close();
+});
+
+test("runtime supports projection-only recovery without execution authority", async () => {
+  const store = new MemoryStore();
+  const guard = new FakeGuard();
+  const runtime = await createCodeJobRuntime({
+    store,
+    operationQueue: new OperationQueue(),
+    memoryReceiptVerifier: {
+      async verify(value) { return { ...value, persisted: true }; },
+    },
+    createGuard: () => guard,
+  });
+
+  assert.equal(runtime.confirmationExecutor, null);
+  assert.equal(runtime.worker, null);
+  assert.equal(Object.isFrozen(runtime.reader), true);
+  assert.equal(Object.isFrozen(runtime.control), true);
+  assert.equal(Object.isFrozen(runtime.projectionSource), true);
+  assert.deepEqual(await runtime.projectionSource.readBatch(), {
+    cursor: 0,
+    highWatermark: 0,
+    items: [],
+  });
+  await runtime.close();
+});
+
+test("executor authority cannot bypass grant verification through a custom worker", async () => {
+  const events = [];
+  let workerFactoryCalled = false;
+
+  await assert.rejects(
+    createCodeJobRuntime({
+      store: new MemoryStore({ events }),
+      executor: {},
+      brainDirectory: {},
+      operationQueue: new OperationQueue(),
+      createGuard: () => new FakeGuard({ events }),
+      workerFactory() {
+        workerFactoryCalled = true;
+        return { async runCycle() {} };
+      },
+    }),
+    (error) =>
+      error instanceof TypeError &&
+      error.message === "grantVerifier is required when executor is configured",
+  );
+
+  assert.equal(workerFactoryCalled, false);
+  assert.deepEqual(events, []);
+});
+
 test("close is idempotent and all ports fail closed afterwards", async () => {
   const { runtime, guard } = await runtimeFixture();
   const firstClose = runtime.close();
@@ -231,6 +342,10 @@ test("close is idempotent and all ports fail closed afterwards", async () => {
       expectedRevision: 1,
       reason: "pause",
     }),
+    (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    runtime.projectionSource.readBatch({ limit: 1 }),
     (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
   );
 });

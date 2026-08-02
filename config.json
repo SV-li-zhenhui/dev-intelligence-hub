@@ -101,6 +101,8 @@
     "attentionLimit": 50,
     "proposalLimit": 50,
     "conditionLimit": 50,
+    "codeJobLimit": 10,
+    "codeJobMemoryLimit": 50,
     "leaseDurationMs": 180000,
     "resolveTimeoutMs": 5000,
     "decisionTimeoutMs": 150000,

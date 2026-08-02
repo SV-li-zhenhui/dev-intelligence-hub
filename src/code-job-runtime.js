@@ -104,6 +104,7 @@ export async function createCodeJobRuntime({
   workerOperationQueue = new OperationQueue(),
   clock,
   limits,
+  memoryReceiptVerifier,
   workerLimits = {},
   workerFactory = (options) => new CodeJobWorkerService(options),
   createGuard = (options) => new ProcessExclusiveGuard(options),
@@ -122,6 +123,9 @@ export async function createCodeJobRuntime({
   }
   if ((executor === undefined) !== (brainDirectory === undefined)) {
     throw new TypeError("executor and brainDirectory must be configured together");
+  }
+  if (executor !== undefined && grantVerifier === undefined) {
+    throw new TypeError("grantVerifier is required when executor is configured");
   }
   const normalizedWorkerLimits = normalizeWorkerLimits(workerLimits);
   const durableStore = validateStore(
@@ -147,12 +151,17 @@ export async function createCodeJobRuntime({
       operationQueue,
       ...(clock ? { clock } : {}),
       ...(limits ? { limits } : {}),
+      ...(memoryReceiptVerifier === undefined
+        ? {}
+        : { memoryReceiptVerifier }),
     });
     await jobs.recover();
-    const approvalExecutor = new CodeJobApprovalExecutor({
-      codeJobStore: jobs,
-      grantVerifier,
-    });
+    const approvalExecutor = grantVerifier === undefined
+      ? null
+      : new CodeJobApprovalExecutor({
+          codeJobStore: jobs,
+          grantVerifier,
+        });
     const worker = executor === undefined
       ? null
       : workerFactory({
@@ -175,11 +184,14 @@ export async function createCodeJobRuntime({
         });
       });
     return Object.freeze({
-      confirmationExecutor: frozenPort({
-        execute: (value) => admission.run(() => approvalExecutor.execute(value)),
-        reconcile: (value) =>
-          admission.run(() => approvalExecutor.reconcile(value)),
-      }),
+      confirmationExecutor: approvalExecutor === null
+        ? null
+        : frozenPort({
+            execute: (value) =>
+              admission.run(() => approvalExecutor.execute(value)),
+            reconcile: (value) =>
+              admission.run(() => approvalExecutor.reconcile(value)),
+          }),
       reader: frozenPort({
         get: (value) => admission.run(() => jobs.get(value)),
         list: (value) => admission.run(() => jobs.list(value)),
@@ -188,6 +200,12 @@ export async function createCodeJobRuntime({
       control: frozenPort({
         pause: (value) => controlMutation("pause", value),
         resume: (value) => controlMutation("resume", value),
+      }),
+      projectionSource: frozenPort({
+        readBatch: (value) =>
+          admission.run(() => jobs.readMemoryProjectionBatch(value)),
+        ack: (value) =>
+          admission.run(() => jobs.acknowledgeMemoryProjection(value)),
       }),
       worker: worker === null
         ? null

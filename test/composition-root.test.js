@@ -53,6 +53,7 @@ function workCoordinationConfig({ externalActions = true } = {}) {
       proposalLimit: 16,
       conditionLimit: 15,
       codeJobLimit: 9,
+      codeJobMemoryLimit: 18,
       codeJobMaximumTurns: 64,
       codeJobObservationLimit: 20,
       leaseDurationMs: 16_000,
@@ -78,6 +79,7 @@ function localCodeCoordinationConfig({ githubActions = true } = {}) {
   return {
     ...base,
     codeExecutor: { enabled: true },
+    memory: { enabled: true },
     githubActions: githubActions
       ? { enabled: true, actorAccountId: "review-account" }
       : { enabled: false },
@@ -166,6 +168,15 @@ function codeJobWorkerPort() {
   return { async runCycle() {} };
 }
 
+function codeJobProjectionSourcePort() {
+  return {
+    async readBatch() {
+      return { cursor: 0, highWatermark: 0, items: [] };
+    },
+    async ack() {},
+  };
+}
+
 function workProposalRuntimePort(overrides = {}) {
   const runner = { async claim() {}, async advance() {} };
   return {
@@ -211,6 +222,17 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       closeCalls.push("proposals");
     },
   });
+  const memory = {
+    producer: { async append() {}, async appendBatch() {} },
+    search: { async search() {}, async getHealth() {} },
+    receiptVerifier: {
+      async verify(value) { return { ...value, persisted: true }; },
+    },
+    maintenance: { async rebuildIndex() {} },
+    async close() {
+      closeCalls.push("memory");
+    },
+  };
   return {
     workflowRoutingRuntimeFactory: async () => workflow,
     workLedgerRuntimeFactory: async () => ledger,
@@ -219,12 +241,19 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       calls.proposalRuntime = options;
       return proposals;
     },
+    memoryRuntimeFactory: async (options) => {
+      calls.memoryRuntime = options;
+      return memory;
+    },
     configuredWorkforceFactory: () => ({ employees: [], workers: [] }),
     workIntentPolicyFactory: () => ({ async bind() {} }),
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
     workflowFactSourceFactory: () => ({ async read() {} }),
     attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
-    workProposalResultReconcilerFactory: () => ({ async runCycle() {} }),
+    workProposalResultReconcilerFactory: (options) => {
+      calls.proposalResultReconciler = options;
+      return { async runCycle() {} };
+    },
     workConditionWakerFactory: () => ({ async runCycle() {} }),
     proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
     workIntentDispatcherFactory: () => ({ async dispatchPending() {} }),
@@ -788,6 +817,9 @@ test("enabled unified memory exposes search only and projects the existing work 
       async search(value) { return { items: [value], nextCursor: null }; },
       async getHealth() { return { ready: true }; },
     },
+    receiptVerifier: {
+      async verify(value) { return { ...value, persisted: true }; },
+    },
     maintenance: { async rebuildIndex() {} },
     async close() {},
   };
@@ -817,6 +849,17 @@ test("enabled unified memory exposes search only and projects the existing work 
     memoryRuntimeFactory: async (options) => {
       calls.memory = options;
       return memoryRuntime;
+    },
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      return {
+        confirmationExecutor: null,
+        reader: { async get() {}, async list() {}, async listNewest() {} },
+        control: codeJobControlPort(),
+        worker: null,
+        projectionSource: codeJobProjectionSourcePort(),
+        async close() {},
+      };
     },
     memoryProjectorFactory: (options) => {
       calls.projector = options;
@@ -1202,6 +1245,48 @@ test("maintenance composition never acquires the external-action runtime", async
   await application.close();
 });
 
+test("local code execution fails closed when unified memory is disabled", async () => {
+  const config = localCodeCoordinationConfig({ githubActions: false });
+  config.memory.enabled = false;
+  const calls = {};
+  const closeCalls = [];
+  let codeJobCalls = 0;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => ({
+        authority: { workspaces: [] },
+        executor: controlledCodeExecutorPort(),
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      }),
+      ...localCoordinationStubs({
+        calls,
+        closeCalls,
+        runners: {
+          "code-action-runner": { async claim() {}, async advance() {} },
+        },
+      }),
+      codeJobRuntimeFactory: async () => {
+        codeJobCalls += 1;
+      },
+    }),
+    /需要启用统一记忆运行时/,
+  );
+
+  assert.equal(codeJobCalls, 0);
+  assert.deepEqual(closeCalls, [
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+    "code-executor",
+  ]);
+});
+
 test("local code composition binds authority, both proposal runners, and one safe reader", async () => {
   const calls = {};
   const closeCalls = [];
@@ -1210,6 +1295,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   const githubRunner = { id: "github-runner", async runCycle() {} };
   const codeRunner = { id: "code-runner", async runCycle() {} };
   const runnerGroup = { async runCycle() {} };
+  const codeJobMemoryProjector = { async runCycle() {} };
   const localExecutor = { async execute() {}, async reconcile() {} };
   const codeJobReader = {
     async get(id) { return { id }; },
@@ -1253,10 +1339,15 @@ test("local code composition binds authority, both proposal runners, and one saf
         reader: codeJobReader,
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
         async close() {
           closeCalls.push("code-job");
         },
       };
+    },
+    codeJobMemoryProjectorFactory: (options) => {
+      calls.codeJobMemoryProjector = options;
+      return codeJobMemoryProjector;
     },
     confirmationRuntimeFactory: async (_config, dependencies) => {
       calls.confirmation = dependencies;
@@ -1309,6 +1400,11 @@ test("local code composition binds authority, both proposal runners, and one saf
     "view",
   ]);
   assert.equal(Object.isFrozen(calls.codeJobRuntime.brainDirectory), true);
+  assert.equal(Object.isFrozen(calls.codeJobRuntime.memoryReceiptVerifier), true);
+  assert.deepEqual(
+    Object.keys(calls.codeJobRuntime.memoryReceiptVerifier),
+    ["verify"],
+  );
   assert.deepEqual(calls.codeJobRuntime.workerLimits, {
     maxTurns: 64,
     observationLimit: 20,
@@ -1355,12 +1451,32 @@ test("local code composition binds authority, both proposal runners, and one saf
     "list",
     "listNewest",
   ]);
+  assert.strictEqual(
+    calls.proposalResultReconciler.codeJobReader,
+    calls.codeRunner.codeJobReader,
+  );
   assert.equal(typeof calls.codeRunner.grantFactory.create, "function");
   assert.deepEqual(calls.runnerGroup, [githubRunner, codeRunner]);
   assert.strictEqual(calls.coordination.proposalRunner, runnerGroup);
   assert.equal(Object.isFrozen(calls.coordination.codeJobRunner), true);
   assert.equal(typeof calls.coordination.codeJobRunner.runCycle, "function");
   assert.equal(calls.coordination.codeJobLimit, 9);
+  assert.equal(Object.isFrozen(calls.codeJobMemoryProjector.projectionSource), true);
+  assert.deepEqual(
+    Object.keys(calls.codeJobMemoryProjector.projectionSource).sort(),
+    ["ack", "readBatch"],
+  );
+  assert.equal(Object.isFrozen(calls.codeJobMemoryProjector.memoryProducer), true);
+  assert.deepEqual(
+    Object.keys(calls.codeJobMemoryProjector.memoryProducer),
+    ["appendBatch"],
+  );
+  assert.equal(Object.isFrozen(calls.coordination.codeJobMemoryProjector), true);
+  assert.equal(
+    typeof calls.coordination.codeJobMemoryProjector.runCycle,
+    "function",
+  );
+  assert.equal(calls.coordination.codeJobMemoryLimit, 18);
 
   assert.equal(Object.isFrozen(application.codeJobReader), true);
   assert.equal(Object.isFrozen(application.codeJobControl), true);
@@ -1379,6 +1495,8 @@ test("local code composition binds authority, both proposal runners, and one saf
     "codeJobStore",
     "codeJobExecutor",
     "codeJobWorker",
+    "codeJobMemoryProjector",
+    "projectionSource",
     "confirmationExecutor",
   ]) {
     assert.equal(privateName in application, false);
@@ -1388,6 +1506,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   assert.deepEqual(closeCalls, [
     "confirmation",
     "code-job",
+    "memory",
     "proposals",
     "attention",
     "ledger",
@@ -1396,7 +1515,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   ]);
 });
 
-test("local-only code actions still create confirmation while maintenance acquires neither guard", async () => {
+test("local-only code actions create confirmation while maintenance keeps projection recovery", async () => {
   const calls = {};
   const closeCalls = [];
   const codeRunnerPort = { async claim() {}, async advance() {} };
@@ -1417,8 +1536,9 @@ test("local-only code actions still create confirmation while maintenance acquir
       closeCalls,
       runners: { "code-action-runner": codeRunnerPort },
     }),
-    codeJobRuntimeFactory: async () => {
+    codeJobRuntimeFactory: async (options) => {
       codeJobCalls += 1;
+      calls.codeJobRuntime = options;
       return {
         confirmationExecutor: { async execute() {}, async reconcile() {} },
         reader: {
@@ -1426,6 +1546,7 @@ test("local-only code actions still create confirmation while maintenance acquir
         },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
         async close() {
           closeCalls.push("code-job");
         },
@@ -1467,11 +1588,19 @@ test("local-only code actions still create confirmation while maintenance acquir
     ...baseOptions,
     externalActions: false,
   });
-  assert.equal(codeJobCalls, 0);
+  assert.equal(codeJobCalls, 1);
   assert.equal(confirmationCalls, 0);
-  assert.equal(maintenance.codeJobReader, null);
-  assert.equal(maintenance.codeJobControl, null);
+  assert.equal(Object.isFrozen(maintenance.codeJobReader), true);
+  assert.equal(Object.isFrozen(maintenance.codeJobControl), true);
   assert.deepEqual(calls.proposalRuntime.runnerScopes, []);
+  assert.equal(calls.coordination.codeJobRunner, null);
+  assert.equal(
+    typeof calls.coordination.codeJobMemoryProjector.runCycle,
+    "function",
+  );
+  assert.equal("executor" in calls.codeJobRuntime, false);
+  assert.equal("brainDirectory" in calls.codeJobRuntime, false);
+  assert.equal("grantVerifier" in calls.codeJobRuntime, false);
   await maintenance.close();
 });
 
@@ -1509,6 +1638,7 @@ test("local composition constructs the real grant, handler, and runner group cha
       reader: { async get() {}, async list() {}, async listNewest() {} },
       control: codeJobControlPort(),
       worker: codeJobWorkerPort(),
+      projectionSource: codeJobProjectionSourcePort(),
       async close() {},
     }),
     confirmationRuntimeFactory: async () => ({
@@ -1551,6 +1681,7 @@ test("confirmation startup failure closes the already acquired local code runtim
         reader: { async get() {}, async list() {}, async listNewest() {} },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
         async close() {
           closeCalls.push("code-job");
         },
@@ -1567,6 +1698,7 @@ test("confirmation startup failure closes the already acquired local code runtim
   );
   assert.deepEqual(closeCalls, [
     "code-job",
+    "memory",
     "proposals",
     "attention",
     "ledger",

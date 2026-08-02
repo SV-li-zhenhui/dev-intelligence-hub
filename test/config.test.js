@@ -404,6 +404,8 @@ test("committed command-center roles route PR work to the durable PR engineer", 
     developer: ["inspect", "modify", "verify"],
     tester: ["inspect", "verify"],
   });
+  assert.equal(config.workCoordination.codeJobLimit, 10);
+  assert.equal(config.workCoordination.codeJobMemoryLimit, 50);
   assert.equal(
     config.employees.roles["pr-engineer"].permissions.allowedIntents.includes(
       "propose_github_review",

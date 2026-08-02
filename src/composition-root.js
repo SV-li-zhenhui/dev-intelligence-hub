@@ -16,6 +16,7 @@ import { AttentionResultReconciler } from "./services/attention-result-reconcile
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import { createConfiguredWorkforce } from "./services/configured-workforce.js";
+import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
 import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
@@ -141,6 +142,8 @@ export async function createApplication({
   memoryRuntimeFactory = createMemoryRuntime,
   memoryRuntimeDependencies = {},
   memoryProjectorFactory = (options) => new MemoryProjector(options),
+  codeJobMemoryProjectorFactory = (options) =>
+    new CodeJobMemoryProjector(options),
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   configuredWorkforceFactory = createConfiguredWorkforce,
@@ -189,11 +192,12 @@ export async function createApplication({
   let workProposalRuntime = null;
   let memoryRuntime = null;
   let codeJobRuntime = null;
-    let confirmationRuntime = null;
-    let codeJobReader = null;
-    let codeJobControl = null;
-    let codeJobWorker = null;
-    let grantFactory = null;
+  let confirmationRuntime = null;
+  let codeJobReader = null;
+  let codeJobControl = null;
+  let codeJobWorker = null;
+  let codeJobMemoryProjector = null;
+  let grantFactory = null;
   try {
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
@@ -277,6 +281,10 @@ export async function createApplication({
         }),
       );
     }
+    if (localCodeExecutionEnabled && !memoryRuntime) {
+      throw new Error("本地代码工作提案需要启用统一记忆运行时");
+    }
+    let activeCodeJobOptions = null;
     if (localCodeExecutionEnabled) {
       grantFactory = codeJobGrantFactory({
         executorAuthority: codeExecutorRuntime.authority,
@@ -294,54 +302,59 @@ export async function createApplication({
         roles: config.employees?.roles || {},
         dependencies: workCoordinationDependencies.brainDependencies || {},
       });
+      activeCodeJobOptions = {
+        grantVerifier: frozenPort(
+          grantFactory,
+          ["verify"],
+          "codeJobGrantFactory",
+        ),
+        executor: frozenPort(
+          codeExecutorRuntime.executor,
+          [
+            "start",
+            "view",
+            "resume",
+            "perform",
+            "getActionResult",
+            "reconcileAction",
+          ],
+          "codeExecutorRuntime.executor",
+        ),
+        brainDirectory: frozenPort(
+          codeJobBrainDirectory,
+          ["decide"],
+          "codeJobBrainDirectory",
+        ),
+        workerLimits: {
+          ...(coordinationConfig.codeJobMaximumTurns === undefined
+            ? {}
+            : { maxTurns: coordinationConfig.codeJobMaximumTurns }),
+          ...(coordinationConfig.codeJobObservationLimit === undefined
+            ? {}
+            : {
+                observationLimit:
+                  coordinationConfig.codeJobObservationLimit,
+              }),
+        },
+      };
+    }
+    if (coordinationEnabled && memoryRuntime) {
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
           ...codeJobRuntimeDependencies,
           store,
           operationQueue: new OperationQueue(),
-          grantVerifier: frozenPort(
-            grantFactory,
+          memoryReceiptVerifier: frozenPort(
+            memoryRuntime.receiptVerifier,
             ["verify"],
-            "codeJobGrantFactory",
+            "memoryRuntime.receiptVerifier",
           ),
-          executor: frozenPort(
-            codeExecutorRuntime.executor,
-            [
-              "start",
-              "view",
-              "resume",
-              "perform",
-              "getActionResult",
-              "reconcileAction",
-            ],
-            "codeExecutorRuntime.executor",
-          ),
-          brainDirectory: frozenPort(
-            codeJobBrainDirectory,
-            ["decide"],
-            "codeJobBrainDirectory",
-          ),
-          workerLimits: {
-            ...(coordinationConfig.codeJobMaximumTurns === undefined
-              ? {}
-              : { maxTurns: coordinationConfig.codeJobMaximumTurns }),
-            ...(coordinationConfig.codeJobObservationLimit === undefined
-              ? {}
-              : {
-                  observationLimit:
-                    coordinationConfig.codeJobObservationLimit,
-                }),
-          },
+          ...(activeCodeJobOptions ?? {}),
         }),
       );
       if (!codeJobRuntime) {
-        throw new Error("本地代码工作提案需要可用的代码任务运行时");
+        throw new Error("代码任务记忆投影需要可用的代码任务运行时");
       }
-      const localExecutor = frozenPort(
-        codeJobRuntime.confirmationExecutor,
-        ["execute", "reconcile"],
-        "codeJobRuntime.confirmationExecutor",
-      );
       codeJobReader = frozenPort(
         codeJobRuntime.reader,
         ["get", "list", "listNewest"],
@@ -351,6 +364,29 @@ export async function createApplication({
         codeJobRuntime.control,
         ["pause", "resume"],
         "codeJobRuntime.control",
+      );
+      codeJobMemoryProjector = frozenPort(
+        codeJobMemoryProjectorFactory({
+          projectionSource: frozenPort(
+            codeJobRuntime.projectionSource,
+            ["readBatch", "ack"],
+            "codeJobRuntime.projectionSource",
+          ),
+          memoryProducer: frozenPort(
+            memoryRuntime.producer,
+            ["appendBatch"],
+            "memoryRuntime.producer",
+          ),
+        }),
+        ["runCycle"],
+        "codeJobMemoryProjector",
+      );
+    }
+    if (localCodeExecutionEnabled) {
+      const localExecutor = frozenPort(
+        codeJobRuntime.confirmationExecutor,
+        ["execute", "reconcile"],
+        "codeJobRuntime.confirmationExecutor",
       );
       codeJobWorker = frozenPort(
         codeJobRuntime.worker,
@@ -496,6 +532,7 @@ export async function createApplication({
       const proposalResultReconciler = workProposalResultReconcilerFactory({
         proposalConsumer: workProposalRuntime.consumer,
         ledger: workLedgerRuntime,
+        ...(codeJobReader === null ? {} : { codeJobReader }),
       });
       const conditionWaker = workConditionWakerFactory({
         ledger: workLedgerRuntime,
@@ -523,6 +560,7 @@ export async function createApplication({
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
         codeJobRunner: codeJobWorker,
+        codeJobMemoryProjector,
         proposalRunner,
         proposalResultReconciler,
         attentionResultReconciler,
@@ -536,6 +574,7 @@ export async function createApplication({
         proposalLimit: coordinationConfig.proposalLimit,
         conditionLimit: coordinationConfig.conditionLimit,
         codeJobLimit: coordinationConfig.codeJobLimit,
+        codeJobMemoryLimit: coordinationConfig.codeJobMemoryLimit,
       });
       const coordinator = attentionCoordinatorFactory({
         externalQueue: confirmationRuntime?.queue || null,
