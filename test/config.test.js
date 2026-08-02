@@ -269,12 +269,32 @@ test("work coordination overrides merge trusted policy maps without losing defau
   });
 });
 
+test("memory overrides preserve local capacity defaults", () => {
+  const result = mergeConfig(
+    {
+      memory: {
+        enabled: true,
+        maximumRecords: 20_000,
+        maximumStateBytes: 64 * 1024 * 1024,
+      },
+    },
+    { memory: { maximumRecords: 5_000 } },
+  );
+
+  assert.deepEqual(result.memory, {
+    enabled: true,
+    maximumRecords: 5_000,
+    maximumStateBytes: 64 * 1024 * 1024,
+  });
+});
+
 test("committed privileged capabilities are disabled and secret-free", async () => {
   const configPath = path.resolve(testDirectory, "../config.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
 
   assert.deepEqual(config.codeExecutor, { enabled: false });
   assert.deepEqual(config.githubActions, { enabled: false });
+  assert.equal(config.memory.enabled, true);
   const absolutePaths = Object.values(config.codeExecutor).filter(
     (value) =>
       typeof value === "string" &&

@@ -542,6 +542,84 @@ test("disabled work coordination does not acquire private runtimes or services",
   await application.close();
 });
 
+test("enabled unified memory exposes search only and projects the existing work ledger", async () => {
+  const config = {
+    ...workCoordinationConfig({ externalActions: false }),
+    memory: {
+      enabled: true,
+      maximumRecords: 1234,
+      maximumStateBytes: 5_000_000,
+    },
+  };
+  const calls = {};
+  const memoryRuntime = {
+    producer: { async appendBatch() {} },
+    search: {
+      async search(value) { return { items: [value], nextCursor: null }; },
+      async getHealth() { return { ready: true }; },
+    },
+    maintenance: { async rebuildIndex() {} },
+    async close() {},
+  };
+  const projector = { async runCycle() { return { added: 0 }; } };
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    workflowRoutingRuntimeFactory: async () => ({
+      async readAssignmentBatch() {},
+      async close() {},
+    }),
+    workLedgerRuntimeFactory: async () => ({
+      async getSummary() {},
+      async listItems() { return { items: [], nextCursor: null }; },
+      async listTimeline() { return { items: [], nextCursor: null }; },
+      async close() {},
+    }),
+    attentionInboxRuntimeFactory: async () => ({
+      producer: { async create() {} },
+      consumer: { async readOutbox() {} },
+      browser: {
+        async next() {}, async answer() {}, async reject() {}, async later() {},
+      },
+      async close() {},
+    }),
+    memoryRuntimeFactory: async (options) => {
+      calls.memory = options;
+      return memoryRuntime;
+    },
+    memoryProjectorFactory: (options) => {
+      calls.projector = options;
+      return projector;
+    },
+    workIntentPolicyFactory: () => ({ async bind() {} }),
+    roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
+    workflowFactSourceFactory: () => ({ async read() {} }),
+    attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
+    workConditionWakerFactory: () => ({ async runCycle() {} }),
+    proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
+    workIntentDispatcherFactory: () => ({ async dispatchPending() {} }),
+    workCoordinationFactory: () => ({ async intake() {}, async runCycle() {} }),
+    attentionCoordinatorFactory: () => ({ async next() {} }),
+  });
+
+  assert.equal(calls.memory.maximumRecords, 1234);
+  assert.equal(calls.memory.maximumStateBytes, 5_000_000);
+  assert.strictEqual(calls.projector.memoryProducer, memoryRuntime.producer);
+  assert.equal(Object.isFrozen(application.memorySearch), true);
+  assert.deepEqual(Object.keys(application.memorySearch).sort(), [
+    "getHealth",
+    "search",
+  ]);
+  assert.deepEqual(Object.keys(application.memoryProjector), ["runCycle"]);
+  assert.equal("memoryRuntime" in application, false);
+  assert.equal("memoryProducer" in application, false);
+  assert.deepEqual(await application.memorySearch.search({ q: "test" }), {
+    items: [{ q: "test" }],
+    nextCursor: null,
+  });
+  await application.close();
+});
+
 test("application close is idempotent and attempts every runtime in reverse order", async () => {
   const closeCalls = [];
   const closeFailure = new Error("confirmation close failed");

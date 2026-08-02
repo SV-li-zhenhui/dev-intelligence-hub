@@ -110,6 +110,14 @@ export function mergeConfig(base, local = {}) {
           ),
         }
       : {}),
+    ...(base.memory !== undefined || local.memory !== undefined
+      ? {
+          memory: {
+            ...(base.memory || {}),
+            ...(local.memory || {}),
+          },
+        }
+      : {}),
   };
 }
 

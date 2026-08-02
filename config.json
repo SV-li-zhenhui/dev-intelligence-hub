@@ -125,6 +125,11 @@
       "workspaceByRepository": {}
     }
   },
+  "memory": {
+    "enabled": true,
+    "maximumRecords": 20000,
+    "maximumStateBytes": 67108864
+  },
   "brain": {
     "enabled": true,
     "provider": "ollama",

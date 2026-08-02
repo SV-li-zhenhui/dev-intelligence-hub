@@ -9,10 +9,12 @@ import { createConfirmationRuntime } from "./confirmation-runtime.js";
 import { loadConfig, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { StateStore } from "./lib/state-store.js";
+import { createMemoryRuntime } from "./memory-runtime.js";
 import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
+import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { RefreshService } from "./services/refresh-service.js";
@@ -94,6 +96,9 @@ export async function createApplication({
   workLedgerDependencies = {},
   attentionInboxRuntimeFactory = createAttentionInboxRuntime,
   attentionInboxDependencies = {},
+  memoryRuntimeFactory = createMemoryRuntime,
+  memoryRuntimeDependencies = {},
+  memoryProjectorFactory = (options) => new MemoryProjector(options),
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   workflowFactSourceFactory = (options) => new WorkflowFactSource(options),
@@ -129,6 +134,7 @@ export async function createApplication({
   let workflowRouting = null;
   let workLedgerRuntime = null;
   let attentionInboxRuntime = null;
+  let memoryRuntime = null;
   let confirmationRuntime = null;
   try {
     codeExecutorRuntime = trackRuntime(
@@ -162,6 +168,17 @@ export async function createApplication({
         }),
       );
     }
+    if (config.memory?.enabled === true) {
+      memoryRuntime = trackRuntime(
+        await memoryRuntimeFactory({
+          ...memoryRuntimeDependencies,
+          store,
+          operationQueue: new OperationQueue(),
+          maximumRecords: config.memory.maximumRecords,
+          maximumStateBytes: config.memory.maximumStateBytes,
+        }),
+      );
+    }
     confirmationRuntime =
       externalActions && config.githubActions?.enabled === true
         ? trackRuntime(await confirmationRuntimeFactory(config, {
@@ -191,6 +208,7 @@ export async function createApplication({
     let attentionBrowser = null;
     let attentionCoordinator = null;
     let workCoordination = null;
+    let memoryProjector = null;
     if (coordinationEnabled) {
       const clockOptions = workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
@@ -268,7 +286,25 @@ export async function createApplication({
         ["intake", "runCycle"],
         "workCoordination",
       );
+      if (memoryRuntime) {
+        memoryProjector = frozenPort(
+          memoryProjectorFactory({
+            memoryProducer: memoryRuntime.producer,
+            ledgerView: workLedgerRuntime,
+            store,
+          }),
+          ["runCycle"],
+          "memoryProjector",
+        );
+      }
     }
+    const memorySearch = memoryRuntime
+      ? frozenPort(
+          memoryRuntime.search,
+          ["search", "getHealth"],
+          "memoryRuntime.search",
+        )
+      : null;
     const notifier = new NotificationService(dingtalk, config.dingtalk);
     const refreshService = new RefreshService({
       github,
@@ -298,6 +334,8 @@ export async function createApplication({
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      memorySearch,
+      memoryProjector,
       close,
     };
   } catch (error) {
