@@ -5,11 +5,12 @@ function assertReadPort(value, name) {
   return value || null;
 }
 
-function emptyProjection(externalQueueRevision) {
+function emptyProjection(externalQueueRevision, externalEnabled) {
   return {
     available: false,
     source: null,
     pendingCount: 0,
+    externalEnabled,
     externalQueueRevision,
     item: null,
   };
@@ -18,10 +19,12 @@ function emptyProjection(externalQueueRevision) {
 export class AttentionCoordinator {
   #externalNext;
   #internalNext;
+  #externalEnabled;
 
   constructor({ externalQueue = null, internalInbox = null } = {}) {
     const external = assertReadPort(externalQueue, "externalQueue");
     const internal = assertReadPort(internalInbox, "internalInbox");
+    this.#externalEnabled = Boolean(external);
     this.#externalNext = external ? external.next.bind(external) : null;
     this.#internalNext = internal ? internal.next.bind(internal) : null;
     Object.freeze(this);
@@ -41,6 +44,7 @@ export class AttentionCoordinator {
           pendingCount: Number.isSafeInteger(external.pendingCount)
             ? external.pendingCount
             : 1,
+          externalEnabled: true,
           externalQueueRevision,
           item: external.item,
         });
@@ -50,11 +54,14 @@ export class AttentionCoordinator {
     const internal = this.#internalNext
       ? await this.#internalNext()
       : null;
-    if (!internal) return emptyProjection(externalQueueRevision);
+    if (!internal) {
+      return emptyProjection(externalQueueRevision, this.#externalEnabled);
+    }
     return structuredClone({
       available: true,
       source: "internal_request",
       pendingCount: 1,
+      externalEnabled: this.#externalEnabled,
       externalQueueRevision,
       item: internal,
     });

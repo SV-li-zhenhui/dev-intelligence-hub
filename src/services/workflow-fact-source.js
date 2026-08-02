@@ -1,0 +1,188 @@
+const FACT_FIELDS = new Map([
+  ["action-state", "actionState"],
+  ["ci-status", "ciStatus"],
+  ["merge-state", "mergeStateStatus"],
+  ["next-action", "nextAction"],
+  ["review-decision", "reviewDecision"],
+  ["state", "state"],
+]);
+const SAFE_FACT = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+const DEFAULT_MAXIMUM_AGE_MS = 15 * 60 * 1_000;
+
+function invalid(message) {
+  return new TypeError(message);
+}
+
+function ownData(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+  const result = new Map();
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !descriptor?.enumerable ||
+      !("value" in descriptor)
+    ) {
+      return null;
+    }
+    result.set(key, descriptor.value);
+  }
+  return result;
+}
+
+function exactInput(value) {
+  const entries = ownData(value);
+  if (
+    !entries ||
+    entries.size !== 2 ||
+    !entries.has("item") ||
+    !entries.has("fact")
+  ) {
+    throw invalid("workflow fact request is invalid");
+  }
+  const fact = entries.get("fact");
+  if (typeof fact !== "string" || !SAFE_FACT.test(fact)) {
+    throw invalid("workflow fact is invalid");
+  }
+  return { item: entries.get("item"), fact };
+}
+
+function isoTimestamp(value) {
+  if (
+    typeof value !== "string" ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(Date.parse(value)).toISOString() !== value
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function nowTimestamp(clock) {
+  let value;
+  try {
+    value = clock();
+  } catch (error) {
+    throw invalid("workflow fact clock failed", { cause: error });
+  }
+  const timestamp = value instanceof Date ? value.toISOString() : value;
+  if (!isoTimestamp(timestamp)) throw invalid("workflow fact clock is invalid");
+  return timestamp;
+}
+
+function subjectId(item) {
+  const itemEntries = ownData(item);
+  const eventEntries = ownData(itemEntries?.get("event"));
+  const subjectEntries = ownData(eventEntries?.get("subject"));
+  const id = subjectEntries?.get("id");
+  return typeof id === "string" && id.length <= 512 ? id : null;
+}
+
+function sourceKey(item) {
+  const itemEntries = ownData(item);
+  const eventEntries = ownData(itemEntries?.get("event"));
+  const eventType = eventEntries?.get("eventType");
+  if (typeof eventType !== "string") return null;
+  if (eventType.startsWith("pull_request.")) return "githubPullRequests";
+  if (eventType.startsWith("issue.")) return "githubIssues";
+  return null;
+}
+
+function normalizedFactValue(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
+    return String(value);
+  }
+  return null;
+}
+
+function result({ healthy, fresh, value = null, observedAt = null }) {
+  return Object.freeze({ healthy, fresh, value, observedAt });
+}
+
+export class WorkflowFactSource {
+  #store;
+  #clock;
+  #maximumAgeMs;
+
+  constructor({
+    store,
+    clock = () => new Date(),
+    maximumAgeMs = DEFAULT_MAXIMUM_AGE_MS,
+  } = {}) {
+    if (!store || typeof store.read !== "function") {
+      throw invalid("WorkflowFactSource requires a store");
+    }
+    if (typeof clock !== "function") throw invalid("clock is invalid");
+    if (
+      !Number.isSafeInteger(maximumAgeMs) ||
+      maximumAgeMs < 1_000 ||
+      maximumAgeMs > 24 * 60 * 60 * 1_000
+    ) {
+      throw invalid("maximumAgeMs is invalid");
+    }
+    this.#store = store;
+    this.#clock = clock;
+    this.#maximumAgeMs = maximumAgeMs;
+    Object.freeze(this);
+  }
+
+  async read(value) {
+    const { item, fact } = exactInput(value);
+    const expectedSubjectId = subjectId(item);
+    const expectedSource = sourceKey(item);
+    if (!expectedSubjectId || !expectedSource) {
+      return result({ healthy: false, fresh: false });
+    }
+
+    const snapshot = await this.#store.read("snapshot", null);
+    const snapshotEntries = ownData(snapshot);
+    const observedAt = isoTimestamp(snapshotEntries?.get("refreshedAt"));
+    const sourceStatus = ownData(snapshotEntries?.get("sourceStatus"));
+    const health = ownData(sourceStatus?.get(expectedSource));
+    const healthy = health?.get("ok") === true && health?.get("stale") !== true;
+    const now = Date.parse(nowTimestamp(this.#clock));
+    const observed = observedAt ? Date.parse(observedAt) : Number.NaN;
+    const age = now - observed;
+    const fresh =
+      healthy &&
+      Number.isFinite(age) &&
+      age >= -60_000 &&
+      age <= this.#maximumAgeMs;
+    if (!healthy || !fresh) {
+      return result({ healthy, fresh, observedAt });
+    }
+
+    const items = snapshotEntries.get("items");
+    if (!Array.isArray(items) || Object.getPrototypeOf(items) !== Array.prototype) {
+      return result({ healthy, fresh, observedAt });
+    }
+    let matched = null;
+    for (let index = 0; index < items.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(items, `${index}`);
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        return result({ healthy: false, fresh: false, observedAt });
+      }
+      const entry = ownData(descriptor.value);
+      if (!entry) return result({ healthy: false, fresh: false, observedAt });
+      if (entry.get("id") === expectedSubjectId) {
+        matched = entry;
+        break;
+      }
+    }
+    const field = FACT_FIELDS.get(fact);
+    return result({
+      healthy,
+      fresh,
+      value: field && matched ? normalizedFactValue(matched.get(field)) : null,
+      observedAt,
+    });
+  }
+}

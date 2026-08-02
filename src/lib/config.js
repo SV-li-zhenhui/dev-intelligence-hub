@@ -29,6 +29,27 @@ function mergeCodeExecutorConfig(base = {}, local = {}) {
   return merged;
 }
 
+function mergeWorkCoordinationConfig(base = {}, local = {}) {
+  const basePolicy = base.policy || {};
+  const localPolicy = local.policy || {};
+  return {
+    ...base,
+    ...local,
+    policy: {
+      ...basePolicy,
+      ...localPolicy,
+      capabilityRoles: {
+        ...(basePolicy.capabilityRoles || {}),
+        ...(localPolicy.capabilityRoles || {}),
+      },
+      workspaceByRepository: {
+        ...(basePolicy.workspaceByRepository || {}),
+        ...(localPolicy.workspaceByRepository || {}),
+      },
+    },
+  };
+}
+
 export function mergeConfig(base, local = {}) {
   const basePrReviewer = base.employees?.prReviewer || {};
   const localPrReviewer = local.employees?.prReviewer || {};
@@ -77,6 +98,15 @@ export function mergeConfig(base, local = {}) {
           codeExecutor: mergeCodeExecutorConfig(
             base.codeExecutor,
             local.codeExecutor,
+          ),
+        }
+      : {}),
+    ...(base.workCoordination !== undefined ||
+      local.workCoordination !== undefined
+      ? {
+          workCoordination: mergeWorkCoordinationConfig(
+            base.workCoordination,
+            local.workCoordination,
           ),
         }
       : {}),

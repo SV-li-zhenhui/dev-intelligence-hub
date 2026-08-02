@@ -92,6 +92,39 @@
       }
     ]
   },
+  "workCoordination": {
+    "enabled": true,
+    "tickSeconds": 30,
+    "intakeLimit": 100,
+    "workLimit": 20,
+    "dispatchLimit": 50,
+    "attentionLimit": 50,
+    "conditionLimit": 50,
+    "leaseDurationMs": 120000,
+    "resolveTimeoutMs": 5000,
+    "decisionTimeoutMs": 60000,
+    "maxAttempts": 3,
+    "retryBaseMs": 30000,
+    "retryMaxMs": 900000,
+    "factMaximumAgeMs": 900000,
+    "policy": {
+      "version": 1,
+      "capabilityRoles": {
+        "coordination": "orchestrator",
+        "requirements": "requirements-analyst",
+        "pr-review": "pr-reviewer",
+        "development": "developer",
+        "testing": "tester"
+      },
+      "githubReviewRoles": [
+        "pr-reviewer"
+      ],
+      "codeActionRoles": [
+        "developer"
+      ],
+      "workspaceByRepository": {}
+    }
+  },
   "brain": {
     "enabled": true,
     "provider": "ollama",
@@ -105,6 +138,7 @@
     "prReviewer": {
       "enabled": true,
       "name": "PR 推进员工",
+      "initialPaused": true,
       "policyVersion": 1,
       "tickMinutes": 2,
       "maxJobsPerTick": 2,

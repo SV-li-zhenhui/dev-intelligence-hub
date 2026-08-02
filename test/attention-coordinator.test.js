@@ -52,6 +52,7 @@ test("external authorization stays first and storage/action ports remain separat
     available: true,
     source: "external_confirmation",
     pendingCount: 3,
+    externalEnabled: true,
     externalQueueRevision: 4,
     item: externalItem(),
   });
@@ -77,6 +78,7 @@ test("falls through to exactly one internal request when no external action wait
     available: true,
     source: "internal_request",
     pendingCount: 1,
+    externalEnabled: true,
     externalQueueRevision: 9,
     item: internalItem(),
   });
@@ -99,6 +101,7 @@ test("works with either queue disabled and returns one stable empty projection",
     available: false,
     source: null,
     pendingCount: 0,
+    externalEnabled: true,
     externalQueueRevision: 2,
     item: null,
   });
@@ -107,6 +110,7 @@ test("works with either queue disabled and returns one stable empty projection",
     available: false,
     source: null,
     pendingCount: 0,
+    externalEnabled: false,
     externalQueueRevision: 0,
     item: null,
   });

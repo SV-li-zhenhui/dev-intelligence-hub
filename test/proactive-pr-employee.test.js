@@ -80,6 +80,23 @@ function createService({ store, github, reviewer, now, config = {} } = {}) {
   });
 }
 
+test("a fresh installation can reserve the legacy PR employee in paused state", async () => {
+  const store = new MemoryStore();
+  const service = createService({
+    store,
+    github: {},
+    reviewer: null,
+    config: { initialPaused: true },
+  });
+
+  const view = await service.view();
+
+  assert.equal(view.role.paused, true);
+  assert.equal(view.role.state, "paused");
+  assert.equal(view.role.revision, 0);
+  assert.deepEqual(view.jobs, []);
+});
+
 test("a new review head is analyzed proactively once and queued for human review", async () => {
   const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
   const loaded = [];

@@ -239,6 +239,7 @@ export class ProactivePrEmployeeService {
       memoryLimit: 1_000,
       memoryOutboxLimit: 100,
       jobLimit: 500,
+      initialPaused: false,
       ...config,
     };
     this.producerQueue = producerQueue;
@@ -263,7 +264,10 @@ export class ProactivePrEmployeeService {
       },
       store,
       stateKey: STATE_KEY,
-      createState: defaultState,
+      createState: () => ({
+        ...defaultState(),
+        paused: Boolean(this.config.initialPaused),
+      }),
       normalizeState: normalizedState,
       resolveState: roleState,
       applyControl: (state) => ({

@@ -219,6 +219,56 @@ test("code executor overrides preserve unspecified base defaults", () => {
   );
 });
 
+test("work coordination overrides merge trusted policy maps without losing defaults", () => {
+  const result = mergeConfig(
+    {
+      workCoordination: {
+        enabled: true,
+        workLimit: 20,
+        policy: {
+          version: 1,
+          capabilityRoles: {
+            requirements: "requirements-analyst",
+            testing: "tester",
+          },
+          githubReviewRoles: ["pr-reviewer"],
+          workspaceByRepository: {
+            "acme/base": "base-workspace",
+          },
+        },
+      },
+    },
+    {
+      workCoordination: {
+        workLimit: 5,
+        policy: {
+          capabilityRoles: { testing: "qa-specialist" },
+          workspaceByRepository: {
+            "acme/local": "local-workspace",
+          },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(result.workCoordination, {
+    enabled: true,
+    workLimit: 5,
+    policy: {
+      version: 1,
+      capabilityRoles: {
+        requirements: "requirements-analyst",
+        testing: "qa-specialist",
+      },
+      githubReviewRoles: ["pr-reviewer"],
+      workspaceByRepository: {
+        "acme/base": "base-workspace",
+        "acme/local": "local-workspace",
+      },
+    },
+  });
+});
+
 test("committed privileged capabilities are disabled and secret-free", async () => {
   const configPath = path.resolve(testDirectory, "../config.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
