@@ -357,6 +357,7 @@ async function withServer(
     codeJobControl,
     changePackageReader,
     changePackageApplicationRequester,
+    changePackageApplicationStatusReader,
     codeJobEvidenceReader,
   } = {},
 ) {
@@ -545,6 +546,10 @@ async function withServer(
   if (changePackageApplicationRequester) {
     application.changePackageApplicationRequester =
       changePackageApplicationRequester;
+  }
+  if (changePackageApplicationStatusReader) {
+    application.changePackageApplicationStatusReader =
+      changePackageApplicationStatusReader;
   }
   if (codeJobEvidenceReader) {
     application.codeJobEvidenceReader = codeJobEvidenceReader;
@@ -1968,6 +1973,113 @@ test("code job detail forwards bounded pagination and reports missing jobs", asy
   );
 });
 
+test("code job detail binds and whitelists durable change package application status", async () => {
+  const jobId = `code-job-${"e".repeat(55)}`;
+  const packageDigest = "f".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const detail = {
+    job: {
+      jobId,
+      revision: 9,
+      requestedBy: { roleId: "developer", workItemId: "work-application" },
+    },
+    archived: false,
+    historyAvailable: true,
+    observations: [],
+    nextCursor: null,
+    terminalDetail: null,
+    changePackage: {
+      status: "ready",
+      receipt: {
+        packageId,
+        packageDigest,
+        deliveredAt: "2026-08-03T02:00:00.000Z",
+      },
+    },
+  };
+  let projection = { status: "not_requested" };
+  let getterCalls = 0;
+
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const available = await request(server, {
+        path: `/api/code/jobs/${jobId}`,
+      });
+      assert.equal(available.status, 200);
+      assert.deepEqual(
+        JSON.parse(available.body).detail.changePackage.application,
+        { status: "not_requested", canRequest: true },
+      );
+
+      projection = {
+        confirmationId: `confirmation-change-package-apply-${"1".repeat(64)}`,
+        approvalBindingDigest: "2".repeat(64),
+        requestedBy: {
+          roleId: "developer",
+          workItemId: "work-application",
+        },
+        job: { id: jobId, revision: 8, recordDigest: "3".repeat(64) },
+        packageId,
+        packageDigest,
+        workspaceId: "dashboard",
+        itemRevision: 3,
+        createdAt: "2026-08-03T02:01:00.000Z",
+        updatedAt: "2026-08-03T02:02:00.000Z",
+        status: "applied",
+        receipt: {
+          id: `change-package-application-${"4".repeat(64)}`,
+          createdAt: "2026-08-03T02:01:30.000Z",
+        },
+        failure: null,
+        rejectedAt: null,
+        privatePath: "D:\\private\\checkout",
+      };
+      const applied = await request(server, {
+        path: `/api/code/jobs/${jobId}`,
+      });
+      assert.equal(applied.status, 200);
+      const application = JSON.parse(applied.body).detail.changePackage.application;
+      assert.deepEqual(application, {
+        status: "applied",
+        canRequest: false,
+        confirmationId: projection.confirmationId,
+        updatedAt: projection.updatedAt,
+        retryable: false,
+        receipt: projection.receipt,
+        failure: null,
+        rejectedAt: null,
+      });
+      assert.equal(applied.body.includes("private\\checkout"), false);
+      assert.equal(applied.body.includes("approvalBindingDigest"), false);
+
+      projection = { status: "not_requested" };
+      Object.defineProperty(projection, "privatePath", {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return "D:\\private\\secret";
+        },
+      });
+      const hostile = await request(server, {
+        path: `/api/code/jobs/${jobId}`,
+      });
+      assert.equal(hostile.status, 500);
+      assert.equal(hostile.body.includes("private"), false);
+      assert.equal(getterCalls, 0);
+      assert.equal(reportedErrors.length, 1);
+    },
+    {
+      codeJobReader: { async getDetail() { return detail; } },
+      changePackageApplicationStatusReader: {
+        async getForJob(requestedJobId) {
+          assert.equal(requestedJobId, jobId);
+          return projection;
+        },
+      },
+    },
+  );
+});
+
 test("code job controls bind identity to the path and reject extra fields", async () => {
   const jobId = `code-job-${"c".repeat(55)}`;
   const calls = [];
@@ -2296,6 +2408,7 @@ test("code job package apply derives authority and only requests confirmation", 
   const packageId = `change-package-${packageDigest}`;
   const requestedBy = { roleId: "developer", workItemId: "work-9" };
   const calls = [];
+  const agencySignals = [];
   const detail = {
     job: { jobId, revision: 13, requestedBy },
     changePackage: {
@@ -2350,14 +2463,24 @@ test("code job package apply derives authority and only requests confirmation", 
       assert.deepEqual(calls, [
         { packageId, requestedBy },
       ]);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(agencySignals, [
+        { trigger: "change_package_application_requested" },
+      ]);
     },
     {
       codeJobReader: { async getDetail() { return detail; } },
+      changePackageApplicationStatusReader: {
+        async getForJob() { return { status: "not_requested" }; },
+      },
       changePackageApplicationRequester: {
         async request(input) {
           calls.push(input);
           return { id: "confirmation-package-1", status: "pending" };
         },
+      },
+      backgroundWork: {
+        signalAgency(options) { agencySignals.push(options); },
       },
     },
   );
@@ -2382,6 +2505,9 @@ test("code job package apply derives authority and only requests confirmation", 
       },
       {
         codeJobReader: { async getDetail() { return detail; } },
+        changePackageApplicationStatusReader: {
+          async getForJob() { return { status: "not_requested" }; },
+        },
         changePackageApplicationRequester: {
           async request() {
             throw Object.assign(new Error("application request rejected"), {
@@ -2392,6 +2518,111 @@ test("code job package apply derives authority and only requests confirmation", 
       },
     );
   }
+});
+
+test("package apply fails closed when its lifecycle reader is unavailable", async () => {
+  const jobId = `code-job-${"5".repeat(55)}`;
+  const packageDigest = "6".repeat(64);
+  let requesterCalls = 0;
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 4 }),
+      });
+
+      assert.equal(response.status, 503);
+      assert.equal(requesterCalls, 0);
+    },
+    {
+      codeJobReader: {
+        async getDetail() {
+          return {
+            job: {
+              jobId,
+              revision: 4,
+              requestedBy: { roleId: "developer", workItemId: "work-4" },
+            },
+            changePackage: {
+              status: "ready",
+              receipt: {
+                packageId: `change-package-${packageDigest}`,
+                packageDigest,
+              },
+            },
+          };
+        },
+      },
+      changePackageApplicationRequester: {
+        async request() { requesterCalls += 1; },
+      },
+    },
+  );
+});
+
+test("a projected application lifecycle blocks duplicate package requests", async () => {
+  const jobId = `code-job-${"6".repeat(55)}`;
+  const packageDigest = "7".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  let requesterCalls = 0;
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 4 }),
+      });
+      assert.equal(response.status, 409);
+      assert.equal(requesterCalls, 0);
+    },
+    {
+      codeJobReader: {
+        async getDetail() {
+          return {
+            job: {
+              jobId,
+              revision: 4,
+              requestedBy: { roleId: "developer", workItemId: "work-4" },
+            },
+            changePackage: {
+              status: "ready",
+              receipt: { packageId, packageDigest },
+            },
+          };
+        },
+      },
+      changePackageApplicationStatusReader: {
+        async getForJob() {
+          return {
+            status: "pending",
+            confirmationId: `confirmation-change-package-apply-${"8".repeat(64)}`,
+            requestedBy: { roleId: "developer", workItemId: "work-4" },
+            job: { id: jobId, revision: 3, recordDigest: "9".repeat(64) },
+            packageId,
+            packageDigest,
+            workspaceId: "dashboard",
+            itemRevision: 1,
+            createdAt: "2026-08-03T02:00:00.000Z",
+            updatedAt: "2026-08-03T02:00:00.000Z",
+          };
+        },
+      },
+      changePackageApplicationRequester: {
+        async request() { requesterCalls += 1; },
+      },
+    },
+  );
 });
 
 test("code job detail and mutation routes fail closed without required ports", async () => {
@@ -2677,6 +2908,11 @@ test("the confirmation API exposes only the next immutable projection", async ()
 });
 
 test("confirmation mutations forward only bound requests and sync the employee", async () => {
+  const signals = [];
+  const backgroundWork = {
+    runConfirmationOperation(operation) { return operation(); },
+    signalAgency(options) { signals.push(options); },
+  };
   await withServer(async ({ server, calls }) => {
     const headers = {
       origin: "http://127.0.0.1:4173",
@@ -2706,6 +2942,7 @@ test("confirmation mutations forward only bound requests and sync the employee",
       assert.equal(result.next.pendingCount, 1);
       assert.equal(result.employeeSyncPending, false);
     }
+    await new Promise((resolve) => setImmediate(resolve));
 
     for (const operation of ["approve", "retry", "reject"]) {
       const call = calls.find(
@@ -2722,7 +2959,10 @@ test("confirmation mutations forward only bound requests and sync the employee",
         .length,
       3,
     );
-  });
+    assert.deepEqual(signals, Array.from({ length: 3 }, () => ({
+      trigger: "confirmation_answered",
+    })));
+  }, { backgroundWork });
 });
 
 test("confirmation writes reject untrusted callers and expose no enqueue route", async () => {

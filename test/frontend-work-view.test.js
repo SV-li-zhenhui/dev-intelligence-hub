@@ -24,6 +24,46 @@ function deferred() {
   return { promise, resolve };
 }
 
+function applicationDetailState(application, {
+  manifest = { packageId: `change-package-${"a".repeat(64)}` },
+  packageStatus = "ready",
+} = {}) {
+  return {
+    loading: false,
+    error: "",
+    detail: {
+      job: {
+        jobId: "code-job-application-ui",
+        revision: 8,
+        status: "completed",
+        requestedBy: { roleId: "developer", workItemId: "work-1" },
+      },
+      archived: false,
+      historyAvailable: true,
+      observations: [],
+      nextCursor: null,
+      terminalDetail: null,
+      changePackage: {
+        status: packageStatus,
+        receipt: packageStatus === "ready"
+          ? {
+              packageId: `change-package-${"a".repeat(64)}`,
+              packageDigest: "a".repeat(64),
+              deliveredAt: "2026-08-03T01:00:00.000Z",
+            }
+          : null,
+        application,
+      },
+    },
+    manifest,
+    historyLoading: false,
+    packageLoading: false,
+    controlLoading: false,
+    applyLoading: false,
+    actionError: "",
+  };
+}
+
 test("work view escapes records and clearly displays safety posture", () => {
   const html = renderWorkView({
     loaded: true,
@@ -209,6 +249,10 @@ test("code job detail renders safe evidence, history, controls, and package meta
           packageId: `change-package-${"c".repeat(64)}`,
           packageDigest: "c".repeat(64),
         },
+        application: {
+          status: "not_requested",
+          canRequest: true,
+        },
       },
     },
     manifest: {
@@ -320,6 +364,10 @@ test("change package application stays hidden until the owner inspects the manif
           packageDigest: "a".repeat(64),
           deliveredAt: "2026-08-02T04:00:00.000Z",
         },
+        application: {
+          status: "not_requested",
+          canRequest: true,
+        },
       },
     },
     manifest: null,
@@ -332,6 +380,184 @@ test("change package application stays hidden until the owner inspects the manif
 
   assert.match(html, /查看变更包/);
   assert.doesNotMatch(html, /申请应用变更包/);
+});
+
+test("change package application renders every authoritative lifecycle state", () => {
+  const statuses = [
+    ["not_requested", "尚未申请"],
+    ["pending", "等待你确认"],
+    ["applying", "正在应用"],
+    ["rejected", "已拒绝"],
+    ["stale", "已失效"],
+    ["failed", "应用失败"],
+    ["applied", "应用完成"],
+    ["already", "已确认应用"],
+  ];
+
+  for (const [status, label] of statuses) {
+    const html = renderCodeJobDetail(applicationDetailState({
+      status,
+      canRequest: false,
+    }));
+    assert.match(
+      html,
+      new RegExp(`data-application-status="${status}"[\\s\\S]*${label}`),
+      status,
+    );
+    assert.doesNotMatch(html, /申请应用变更包/, status);
+  }
+});
+
+test("change package application renders only whitelisted terminal metadata", () => {
+  const failed = renderCodeJobDetail(applicationDetailState({
+    status: "failed",
+    canRequest: false,
+    confirmationId: "confirmation-change-package-apply-safe",
+    updatedAt: "2026-08-03T01:02:03.000Z",
+    retryable: true,
+    failure: {
+      code: "CHANGE_PACKAGE_TARGET_DIRTY",
+      outcome: "absent",
+      retryable: true,
+      at: "2026-08-03T01:02:02.000Z",
+    },
+  }));
+  assert.match(failed, /confirmation-change-package-apply-safe/);
+  assert.match(failed, /CHANGE_PACKAGE_TARGET_DIRTY/);
+  assert.match(failed, /absent/);
+  assert.match(failed, /请在确认队列重试/);
+
+  const applied = renderCodeJobDetail(applicationDetailState({
+    status: "applied",
+    canRequest: false,
+    receipt: {
+      id: "change-package-application-safe",
+      createdAt: "2026-08-03T01:03:00.000Z",
+    },
+  }));
+  assert.match(applied, /change-package-application-safe/);
+
+  const rejected = renderCodeJobDetail(applicationDetailState({
+    status: "rejected",
+    canRequest: false,
+    rejectedAt: "2026-08-03T01:04:00.000Z",
+  }));
+  assert.match(rejected, /拒绝时间/);
+});
+
+test("application request button requires ready package, inspected manifest, and exact backend permission", () => {
+  const allowed = { status: "not_requested", canRequest: true };
+  assert.match(
+    renderCodeJobDetail(applicationDetailState(allowed)),
+    /申请应用变更包/,
+  );
+
+  for (const state of [
+    applicationDetailState({ status: "not_requested", canRequest: false }),
+    applicationDetailState(allowed, { manifest: null }),
+    applicationDetailState(allowed, { packageStatus: "pending" }),
+    applicationDetailState(null),
+    applicationDetailState({ status: "future_state", canRequest: true }),
+    applicationDetailState({ status: "not_requested" }),
+  ]) {
+    assert.doesNotMatch(renderCodeJobDetail(state), /申请应用变更包/);
+  }
+});
+
+test("programmatic application requests obey the same manifest and backend permission gate", async () => {
+  const createGuardedView = (application) => {
+    const calls = [];
+    const view = createWorkView({
+      fetchImpl: async (url, options = {}) => {
+        calls.push({ url, options });
+        if (url.endsWith("/change-package/apply")) {
+          return response({ queued: true });
+        }
+        if (url.endsWith("/change-package")) {
+          return response({
+            manifest: { packageId: `change-package-${"a".repeat(64)}` },
+          });
+        }
+        return response({
+          enabled: true,
+          detail: applicationDetailState(application).detail,
+        });
+      },
+      onDetail: () => {},
+    });
+    return { calls, view };
+  };
+
+  const notInspected = createGuardedView({
+    status: "not_requested",
+    canRequest: true,
+  });
+  await notInspected.view.openCodeJob("code-job-application-ui");
+  await notInspected.view.requestCodeJobChangePackageApply();
+  assert.equal(
+    notInspected.calls.some(({ url }) => url.endsWith("/change-package/apply")),
+    false,
+  );
+
+  const denied = createGuardedView({
+    status: "not_requested",
+    canRequest: false,
+  });
+  await denied.view.openCodeJob("code-job-application-ui");
+  await denied.view.loadCodeJobChangePackage();
+  await denied.view.requestCodeJobChangePackageApply();
+  assert.equal(
+    denied.calls.some(({ url }) => url.endsWith("/change-package/apply")),
+    false,
+  );
+});
+
+test("malformed application metadata fails closed without invoking accessors or leaking text", () => {
+  let getterCalls = 0;
+  const accessor = { status: "not_requested" };
+  Object.defineProperty(accessor, "canRequest", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return true;
+    },
+  });
+  const hostileValues = [
+    accessor,
+    {
+      status: "failed",
+      canRequest: true,
+      retryable: true,
+      failure: {
+        code: "CHANGE_PACKAGE_TARGET_DIRTY",
+        outcome: "absent",
+        retryable: true,
+        at: "2026-08-03T01:00:00.000Z",
+        message: "<script>PRIVATE FAILURE</script>",
+      },
+    },
+    {
+      status: "applied",
+      canRequest: true,
+      receipt: {
+        id: "change-package-application-safe",
+        createdAt: "2026-08-03T01:00:00.000Z",
+        privatePath: "C:\\private\\secret.txt",
+      },
+    },
+    {
+      status: "not_requested",
+      canRequest: true,
+      confirmationId: "<img src=x onerror=alert(1)>",
+    },
+  ];
+
+  for (const application of hostileValues) {
+    const html = renderCodeJobDetail(applicationDetailState(application));
+    assert.match(html, /应用状态不可用；申请入口已安全关闭/);
+    assert.doesNotMatch(html, /申请应用变更包|PRIVATE FAILURE|private\\secret|<img/);
+  }
+  assert.equal(getterCalls, 0);
 });
 
 test("code job controller uses exact trusted endpoints and queues package application", async () => {
@@ -348,6 +574,10 @@ test("code job controller uses exact trusted endpoints and queues package applic
       changePackage: {
         status: "ready",
         receipt: { packageId: `change-package-${"a".repeat(64)}` },
+        application: {
+          status: "not_requested",
+          canRequest: true,
+        },
       },
     },
   };
@@ -384,6 +614,7 @@ test("code job controller uses exact trusted endpoints and queues package applic
   await view.loadMoreCodeJobObservations();
   await view.loadCodeJobChangePackage();
   await view.controlCodeJob("pause");
+  await view.loadCodeJobChangePackage();
   await view.requestCodeJobChangePackageApply();
 
   assert.equal(
@@ -469,6 +700,10 @@ test("a stale package read also invalidates the shared detail", async () => {
           changePackage: {
             status: "ready",
             receipt: { packageId: `change-package-${"a".repeat(64)}` },
+            application: {
+              status: "not_requested",
+              canRequest: true,
+            },
           },
         },
       });
@@ -521,6 +756,9 @@ test("a stale mutation response from an old job cannot close a newly opened deta
           if (url === "/api/code/jobs/code-job-b?limit=20") {
             return response(detailFor("code-job-b"));
           }
+          if (url.endsWith("/change-package")) {
+            return response({ manifest: { packageId: `change-package-${"a".repeat(64)}` } });
+          }
           throw new Error(`unexpected request: ${url}`);
         },
         onDetail: (markup) => details.push(markup),
@@ -529,6 +767,7 @@ test("a stale mutation response from an old job cannot close a newly opened deta
       });
 
       await view.openCodeJob("code-job-a");
+      if (operation === "apply") await view.loadCodeJobChangePackage();
       const pendingMutation = operation === "control"
         ? view.controlCodeJob("pause")
         : view.requestCodeJobChangePackageApply();

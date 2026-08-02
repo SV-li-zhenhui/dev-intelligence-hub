@@ -1298,6 +1298,39 @@ dialog::backdrop {
   color: var(--muted);
 }
 
+.code-job-application-state {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--paper);
+  border-left: 3px solid var(--green);
+}
+
+.code-job-application-state h4,
+.code-job-application-state p {
+  margin: 0;
+}
+
+.code-job-application-state p,
+.code-job-application-state dd small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.code-job-application-state .detail-grid {
+  margin-top: 10px;
+}
+
+.code-job-application-unavailable {
+  border-left-color: var(--muted);
+}
+
+.code-job-application-guidance {
+  color: var(--red) !important;
+  font-weight: 650;
+}
+
 .code-job-observations {
   border-top: 1px solid var(--line-strong);
 }

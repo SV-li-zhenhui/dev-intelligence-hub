@@ -298,6 +298,226 @@ function codeJobManifestMarkup(manifest) {
   </div>`;
 }
 
+const CHANGE_PACKAGE_APPLICATION_STATUSES = Object.freeze({
+  not_requested: {
+    label: "尚未申请",
+    description: "变更包尚未进入确认队列。",
+  },
+  pending: {
+    label: "等待你确认",
+    description: "应用请求已进入确认队列，正在等待你的决定。",
+  },
+  applying: {
+    label: "正在应用",
+    description: "确认已经通过，系统正在安全应用变更。",
+  },
+  rejected: {
+    label: "已拒绝",
+    description: "这次变更包应用请求已被拒绝。",
+  },
+  stale: {
+    label: "已失效",
+    description: "应用绑定已经变化，需要重新核验任务和目标。",
+  },
+  failed: {
+    label: "应用失败",
+    description: "变更包未能完成应用。",
+  },
+  applied: {
+    label: "应用完成",
+    description: "变更包已经成功应用到目标工作区。",
+  },
+  already: {
+    label: "已确认应用",
+    description: "目标工作区已经包含这次变更，无需重复应用。",
+  },
+});
+
+const SAFE_APPLICATION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,254}[A-Za-z0-9])?$/;
+const SAFE_FAILURE_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
+
+function exactApplicationFields(value, allowed, required = allowed) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    return null;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.some((key) => typeof key !== "string" || !allowed.includes(key)) ||
+    required.some((key) => !keys.includes(key))
+  ) {
+    return null;
+  }
+  const fields = new Map();
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+    fields.set(key, descriptor.value);
+  }
+  return fields;
+}
+
+function canonicalApplicationTime(value) {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(Date.parse(value)).toISOString() === value
+  );
+}
+
+function optionalApplicationId(fields, name) {
+  const value = fields.has(name) ? fields.get(name) : null;
+  if (value === null) return null;
+  return typeof value === "string" && SAFE_APPLICATION_ID.test(value)
+    ? value
+    : undefined;
+}
+
+function optionalApplicationTime(fields, name) {
+  const value = fields.has(name) ? fields.get(name) : null;
+  if (value === null) return null;
+  return canonicalApplicationTime(value) ? value : undefined;
+}
+
+function normalizeApplicationReceipt(value) {
+  if (value === undefined || value === null) return null;
+  const fields = exactApplicationFields(value, ["id", "createdAt"]);
+  if (!fields) return undefined;
+  const id = optionalApplicationId(fields, "id");
+  const createdAt = optionalApplicationTime(fields, "createdAt");
+  return id && createdAt ? { id, createdAt } : undefined;
+}
+
+function normalizeApplicationFailure(value) {
+  if (value === undefined || value === null) return null;
+  const fields = exactApplicationFields(value, [
+    "code",
+    "outcome",
+    "retryable",
+    "at",
+  ]);
+  if (
+    !fields ||
+    typeof fields.get("code") !== "string" ||
+    !SAFE_FAILURE_CODE.test(fields.get("code")) ||
+    !["absent", "unknown"].includes(fields.get("outcome")) ||
+    typeof fields.get("retryable") !== "boolean" ||
+    !canonicalApplicationTime(fields.get("at"))
+  ) {
+    return undefined;
+  }
+  return {
+    code: fields.get("code"),
+    outcome: fields.get("outcome"),
+    retryable: fields.get("retryable"),
+    at: fields.get("at"),
+  };
+}
+
+function normalizeChangePackageApplication(value) {
+  const fields = exactApplicationFields(
+    value,
+    [
+      "status",
+      "canRequest",
+      "confirmationId",
+      "updatedAt",
+      "retryable",
+      "receipt",
+      "failure",
+      "rejectedAt",
+    ],
+    ["status", "canRequest"],
+  );
+  if (
+    !fields ||
+    typeof fields.get("status") !== "string" ||
+    !Object.hasOwn(CHANGE_PACKAGE_APPLICATION_STATUSES, fields.get("status")) ||
+    typeof fields.get("canRequest") !== "boolean"
+  ) {
+    return null;
+  }
+  const confirmationId = optionalApplicationId(fields, "confirmationId");
+  const updatedAt = optionalApplicationTime(fields, "updatedAt");
+  const rejectedAt = optionalApplicationTime(fields, "rejectedAt");
+  const retryable = fields.has("retryable")
+    ? fields.get("retryable")
+    : false;
+  const receipt = normalizeApplicationReceipt(fields.get("receipt"));
+  const failure = normalizeApplicationFailure(fields.get("failure"));
+  if (
+    confirmationId === undefined ||
+    updatedAt === undefined ||
+    rejectedAt === undefined ||
+    typeof retryable !== "boolean" ||
+    receipt === undefined ||
+    failure === undefined ||
+    (failure !== null && failure.retryable !== retryable)
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    status: fields.get("status"),
+    canRequest: fields.get("canRequest"),
+    confirmationId,
+    updatedAt,
+    retryable,
+    receipt,
+    failure,
+    rejectedAt,
+  });
+}
+
+function applicationTimeMarkup(value) {
+  return escapeWorkHtml(new Date(value).toLocaleString("zh-CN"));
+}
+
+function changePackageApplicationMarkup(value) {
+  const application = normalizeChangePackageApplication(value);
+  if (!application) {
+    return `<div class="code-job-application-state code-job-application-unavailable">
+      <h4>应用状态</h4>
+      <p>应用状态不可用；申请入口已安全关闭。</p>
+    </div>`;
+  }
+  const lifecycle = CHANGE_PACKAGE_APPLICATION_STATUSES[application.status];
+  const metadata = [
+    application.confirmationId
+      ? `<dt>确认项</dt><dd><code>${escapeWorkHtml(application.confirmationId)}</code></dd>`
+      : "",
+    application.updatedAt
+      ? `<dt>状态更新时间</dt><dd>${applicationTimeMarkup(application.updatedAt)}</dd>`
+      : "",
+    application.receipt
+      ? `<dt>应用凭据</dt><dd><code>${escapeWorkHtml(application.receipt.id)}</code><small>${applicationTimeMarkup(application.receipt.createdAt)}</small></dd>`
+      : "",
+    application.failure
+      ? `<dt>失败代码</dt><dd><code>${escapeWorkHtml(application.failure.code)}</code><small>${escapeWorkHtml(application.failure.outcome)} · ${applicationTimeMarkup(application.failure.at)}</small></dd>`
+      : "",
+    application.rejectedAt
+      ? `<dt>拒绝时间</dt><dd>${applicationTimeMarkup(application.rejectedAt)}</dd>`
+      : "",
+  ].filter(Boolean);
+  const retryGuidance =
+    application.status === "failed" && application.retryable
+      ? '<p class="code-job-application-guidance">本次应用可以安全重试，请在确认队列重试。</p>'
+      : "";
+  return `<div class="code-job-application-state" data-application-status="${escapeWorkHtml(application.status)}">
+    <div class="code-job-section-heading">
+      <h4>应用状态</h4>
+      <strong>${escapeWorkHtml(lifecycle.label)}</strong>
+    </div>
+    <p>${escapeWorkHtml(lifecycle.description)}</p>
+    ${metadata.length ? `<dl class="detail-grid">${metadata.join("")}</dl>` : ""}
+    ${retryGuidance}
+  </div>`;
+}
+
 function codeJobObservationsMarkup(observations, now) {
   const items = Array.isArray(observations) ? observations : [];
   if (!items.length) return '<p class="code-job-detail-empty">尚无安全观察记录。</p>';
@@ -329,6 +549,12 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
   const canPause = !detail.archived && ["queued", "starting", "active"].includes(status);
   const canResume = !detail.archived && status === "paused";
   const packageReady = detail.changePackage?.status === "ready" && receipt;
+  const application = normalizeChangePackageApplication(
+    detail.changePackage?.application,
+  );
+  const canRequestApplication = Boolean(
+    packageReady && state.manifest && application?.canRequest === true,
+  );
   const requester = job.requestedBy || {};
   const memory = job.memoryProjection;
   return `<article class="detail code-job-detail">
@@ -369,6 +595,7 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
         <dt>凭据摘要</dt><dd><code>${escapeWorkHtml(receipt?.packageDigest || "尚未生成")}</code></dd>
         <dt>生成时间</dt><dd>${escapeWorkHtml(receipt?.deliveredAt ? new Date(receipt.deliveredAt).toLocaleString("zh-CN") : "尚未生成")}</dd>
       </dl>
+      ${changePackageApplicationMarkup(detail.changePackage?.application)}
       ${codeJobManifestMarkup(state.manifest)}
       ${packageReady && !state.manifest ? `<button type="button" class="secondary-action" data-code-job-package ${state.packageLoading ? "disabled" : ""}>${state.packageLoading ? "正在读取…" : "查看变更包"}</button>` : ""}
     </section>
@@ -376,7 +603,7 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
     <div class="code-job-detail-actions">
       ${canPause ? `<button type="button" data-code-job-control="pause" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "安全暂停"}</button>` : ""}
       ${canResume ? `<button type="button" data-code-job-control="resume" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "恢复执行"}</button>` : ""}
-      ${packageReady && state.manifest ? `<button type="button" data-code-job-apply ${state.applyLoading ? "disabled" : ""}>${state.applyLoading ? "正在加入确认队列…" : "申请应用变更包"}</button>` : ""}
+      ${canRequestApplication ? `<button type="button" data-code-job-apply ${state.applyLoading ? "disabled" : ""}>${state.applyLoading ? "正在加入确认队列…" : "申请应用变更包"}</button>` : ""}
     </div>
   </article>`;
 }
@@ -670,11 +897,16 @@ export function createWorkView({
     const current = detailState;
     const job = current?.detail?.job;
     const changePackage = current?.detail?.changePackage;
+    const application = normalizeChangePackageApplication(
+      changePackage?.application,
+    );
     if (
       !job ||
       current.applyLoading ||
       changePackage?.status !== "ready" ||
-      !changePackage.receipt
+      !changePackage.receipt ||
+      !current.manifest ||
+      application?.canRequest !== true
     ) return;
     const sequence = detailRequestSequence;
     updateDetail({ applyLoading: true, actionError: "" });

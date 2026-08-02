@@ -342,6 +342,19 @@ const changePackageApplicationConflictCodes = new Set([
   "CHANGE_PACKAGE_APPLICATION_BINDING_CONFLICT",
   "CHANGE_PACKAGE_APPLICATION_SOURCE_CHANGED",
 ]);
+const changePackageApplicationProjectionStatuses = new Set([
+  "not_requested",
+  "pending",
+  "applying",
+  "rejected",
+  "stale",
+  "failed",
+  "applied",
+  "already",
+]);
+const safeChangePackageApplicationId =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,254}[A-Za-z0-9])?$/;
+const safeChangePackageApplicationCode = /^[A-Z][A-Z0-9_]{2,63}$/;
 
 function codeJobDetailQueryOptions(url) {
   const keys = [...url.searchParams.keys()];
@@ -405,6 +418,202 @@ function requireExpectedRevision(value) {
   return value;
 }
 
+function dataFieldMap(value, required, message, maximumFields = 32) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw httpError(500, message);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.length > maximumFields ||
+    keys.some(
+      (key) =>
+        typeof key !== "string" ||
+        !descriptors[key]?.enumerable ||
+        !("value" in descriptors[key]),
+    ) ||
+    required.some((field) => !Object.hasOwn(descriptors, field))
+  ) {
+    throw httpError(500, message);
+  }
+  return new Map(keys.map((key) => [key, descriptors[key].value]));
+}
+
+function canonicalApplicationTimestamp(value) {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(Date.parse(value)).toISOString() === value
+  );
+}
+
+function normalizedApplicationReceipt(value, message) {
+  if (value === null) return null;
+  const fields = dataFieldMap(value, ["id", "createdAt"], message, 2);
+  if (
+    fields.size !== 2 ||
+    !/^change-package-application-[a-f0-9]{64}$/.test(fields.get("id") || "") ||
+    !canonicalApplicationTimestamp(fields.get("createdAt"))
+  ) {
+    throw httpError(500, message);
+  }
+  return { id: fields.get("id"), createdAt: fields.get("createdAt") };
+}
+
+function normalizedApplicationFailure(value, message) {
+  if (value === null) return null;
+  const fields = dataFieldMap(
+    value,
+    ["code", "outcome", "retryable", "at"],
+    message,
+    4,
+  );
+  if (
+    fields.size !== 4 ||
+    !safeChangePackageApplicationCode.test(fields.get("code") || "") ||
+    !["absent", "unknown"].includes(fields.get("outcome")) ||
+    typeof fields.get("retryable") !== "boolean" ||
+    !canonicalApplicationTimestamp(fields.get("at"))
+  ) {
+    throw httpError(500, message);
+  }
+  return {
+    code: fields.get("code"),
+    outcome: fields.get("outcome"),
+    retryable: fields.get("retryable"),
+    at: fields.get("at"),
+  };
+}
+
+function normalizedChangePackageApplicationProjection(
+  value,
+  { jobId, receipt, packageReady },
+) {
+  const message = "change package 应用状态绑定无效";
+  const fields = dataFieldMap(value, ["status"], message);
+  const status = fields.get("status");
+  if (!changePackageApplicationProjectionStatuses.has(status)) {
+    throw httpError(500, message);
+  }
+  if (status === "not_requested") {
+    if (fields.size !== 1) throw httpError(500, message);
+    return Object.freeze({ status, canRequest: packageReady });
+  }
+
+  for (const field of [
+    "confirmationId",
+    "job",
+    "packageId",
+    "packageDigest",
+    "itemRevision",
+    "createdAt",
+    "updatedAt",
+  ]) {
+    if (!fields.has(field)) throw httpError(500, message);
+  }
+  const job = dataFieldMap(
+    fields.get("job"),
+    ["id", "revision", "recordDigest"],
+    message,
+    3,
+  );
+  if (
+    job.size !== 3 ||
+    job.get("id") !== jobId ||
+    !Number.isSafeInteger(job.get("revision")) ||
+    job.get("revision") < 1 ||
+    !sha256Pattern.test(job.get("recordDigest") || "") ||
+    !sha256Pattern.test(fields.get("packageDigest") || "") ||
+    fields.get("packageId") !==
+      `change-package-${fields.get("packageDigest")}` ||
+    fields.get("packageId") !== receipt?.packageId ||
+    fields.get("packageDigest") !== receipt?.packageDigest ||
+    !safeChangePackageApplicationId.test(fields.get("confirmationId") || "") ||
+    !Number.isSafeInteger(fields.get("itemRevision")) ||
+    fields.get("itemRevision") < 1 ||
+    !canonicalApplicationTimestamp(fields.get("createdAt")) ||
+    !canonicalApplicationTimestamp(fields.get("updatedAt")) ||
+    Date.parse(fields.get("updatedAt")) < Date.parse(fields.get("createdAt"))
+  ) {
+    throw httpError(500, message);
+  }
+  const projectedReceipt = normalizedApplicationReceipt(
+    fields.has("receipt") ? fields.get("receipt") : null,
+    message,
+  );
+  const failure = normalizedApplicationFailure(
+    fields.has("failure") ? fields.get("failure") : null,
+    message,
+  );
+  const rejectedAt = fields.has("rejectedAt")
+    ? fields.get("rejectedAt")
+    : null;
+  if (rejectedAt !== null && !canonicalApplicationTimestamp(rejectedAt)) {
+    throw httpError(500, message);
+  }
+  if (
+    (["applied", "already"].includes(status) !== (projectedReceipt !== null)) ||
+    ((status === "failed") !== (failure !== null)) ||
+    ((status === "rejected") !== (rejectedAt !== null))
+  ) {
+    throw httpError(500, message);
+  }
+  return Object.freeze({
+    status,
+    canRequest: false,
+    confirmationId: fields.get("confirmationId"),
+    updatedAt: fields.get("updatedAt"),
+    retryable: failure?.retryable ?? false,
+    receipt: projectedReceipt,
+    failure,
+    rejectedAt,
+  });
+}
+
+async function attachChangePackageApplicationProjection(
+  application,
+  detail,
+  jobId,
+) {
+  if (!application.changePackageApplicationStatusReader) return detail;
+  const reader = requireApplicationPort(
+    application,
+    "changePackageApplicationStatusReader",
+    ["getForJob"],
+    "change package 应用状态读取端口无效",
+  );
+  let projection;
+  try {
+    projection = await reader.getForJob(jobId);
+  } catch (error) {
+    if (error?.code === "CHANGE_PACKAGE_APPLICATION_PROJECTION_NOT_READY") {
+      throw httpError(503, "change package 应用状态尚未就绪");
+    }
+    throw error;
+  }
+  const changePackage = detail.changePackage;
+  const receipt = changePackage?.receipt ?? null;
+  const packageReady = changePackage?.status === "ready" && receipt !== null;
+  const normalized = normalizedChangePackageApplicationProjection(projection, {
+    jobId,
+    receipt,
+    packageReady,
+  });
+  return {
+    ...detail,
+    changePackage: {
+      ...changePackage,
+      application: normalized,
+    },
+  };
+}
+
 async function readCodeJobDetail(application, jobId, options = {}) {
   const reader = requireApplicationPort(
     application,
@@ -424,7 +633,7 @@ async function readCodeJobDetail(application, jobId, options = {}) {
   ) {
     throw httpError(409, "代码任务详情绑定无效");
   }
-  return detail;
+  return attachChangePackageApplicationProjection(application, detail, jobId);
 }
 
 function readyChangePackageReceipt(detail) {
@@ -901,11 +1110,20 @@ export function createDashboardServer(
         );
         const expectedRevision = requireExpectedRevision(input.expectedRevision);
         const jobId = codeJobChangePackageApplication[1];
+        requireApplicationPort(
+          application,
+          "changePackageApplicationStatusReader",
+          ["getForJob"],
+          "change package 应用状态读取端口无效",
+        );
         const detail = await readCodeJobDetail(application, jobId);
         if (detail.job.revision !== expectedRevision) {
           throw httpError(409, "代码任务版本已变化，请基于最新状态重试");
         }
         const receipt = readyChangePackageReceipt(detail);
+        if (detail.changePackage.application?.canRequest !== true) {
+          throw httpError(409, "该 change package 已经进入应用流程");
+        }
         const requester = requireApplicationPort(
           application,
           "changePackageApplicationRequester",
@@ -917,6 +1135,11 @@ export function createDashboardServer(
           requestedBy: detail.job.requestedBy,
         });
         sendJson(response, 200, { request: queued });
+        signalBackgroundAgency(
+          backgroundWork,
+          { trigger: "change_package_application_requested" },
+          reportError,
+        );
         return;
       }
       const codeJobEvidence = url.pathname.match(
@@ -1108,6 +1331,11 @@ export function createDashboardServer(
             employeeSyncPending,
           });
         });
+        signalBackgroundAgency(
+          backgroundWork,
+          { trigger: "confirmation_answered" },
+          reportError,
+        );
         return;
       }
       const employeeAction = url.pathname.match(

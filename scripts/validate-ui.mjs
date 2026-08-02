@@ -296,6 +296,14 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     changePackage: {
       status: "ready",
       receipt: { packageId, packageDigest, deliveredAt: now },
+      application: applyQueued
+        ? {
+            status: "pending",
+            canRequest: false,
+            confirmationId: confirmationItem.id,
+            updatedAt: now,
+          }
+        : { status: "not_requested", canRequest: true },
     },
   });
   const manifest = {
@@ -554,6 +562,9 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     .getByText("修复付款失败路径并保留受控证据", { exact: true })
     .waitFor();
   const objectiveVisible = true;
+  const applicationStatusVisible = await page
+    .getByText("尚未申请", { exact: true })
+    .isVisible();
   await recordHorizontalOverflow("detail-open");
   await page.getByRole("button", { name: "安全暂停", exact: true }).click();
   await page.getByRole("button", { name: "恢复执行", exact: true }).waitFor();
@@ -630,6 +641,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
   results.push({
     name: `code-job-control-package-${name}`,
     objectiveVisible,
+    applicationStatusVisible,
     manifestVisible,
     evidenceDownloadDigestMatches,
     escapeClosedDetail,
@@ -934,6 +946,7 @@ const codeJobResults = results.filter((entry) =>
 assert.equal(codeJobResults.length, 2);
 for (const codeJobResult of codeJobResults) {
   assert.equal(codeJobResult.objectiveVisible, true, codeJobResult.name);
+  assert.equal(codeJobResult.applicationStatusVisible, true, codeJobResult.name);
   assert.equal(codeJobResult.manifestVisible, true, codeJobResult.name);
   assert.equal(
     codeJobResult.evidenceDownloadDigestMatches,
