@@ -1,10 +1,30 @@
-import { digestValue } from "../domain/code-executor-contract.js";
-import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
+import {
+  assertSessionBinding,
+  bindTrustedAction,
+  cleanText,
+  isAuthorityErrorCode,
+  isDeterministicFailureCode,
+  isFencingExecutorCode,
+  isRestartRequiredCode,
+  modelObservation,
+  normalizeActionResponse,
+  normalizeCycleOptions,
+  observationDetail,
+  positiveInteger,
+  requiresOperatorPause,
+  safeErrorCode,
+  sameValue,
+  selectCycleCandidates,
+  successfulProfiles,
+  terminalResult,
+  trustedObservationAction,
+  workerError,
+} from "./code-job-worker-policy.js";
 
-const SHA256 = /^[a-f0-9]{64}$/;
-const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+export { CodeJobWorkerError } from "./code-job-worker-policy.js";
+
 const RUNNABLE_STATUSES = new Set([
   "queued",
   "starting",
@@ -12,60 +32,6 @@ const RUNNABLE_STATUSES = new Set([
   "pausing",
 ]);
 const TERMINAL_STATUSES = new Set(["completed", "failed", "fenced"]);
-const EXECUTOR_TERMINAL_ACTIONS = new Set([
-  "succeeded",
-  "failed",
-  "interrupted",
-]);
-const AUTHORITY_ERROR_CODES = new Set(["INVALID_CODE_JOB_AUTHORITY"]);
-const FENCING_EXECUTOR_CODES = new Set([
-  "CODE_JOB_AUTHORITY_PROTOCOL_ERROR",
-  "CODE_JOB_ADMISSION_MISSING",
-  "CODE_JOB_AUDIT_RESULT_INVALID",
-  "CODE_JOB_EXECUTOR_RESULT_INVALID",
-  "CODE_JOB_PENDING_ACTION_MISSING",
-  "CODE_JOB_SESSION_BINDING_INVALID",
-  "CODE_JOB_SESSION_DIVERGED",
-  "CODE_JOB_SESSION_NOT_ACTIVE",
-  "CODE_JOB_WORKSPACE_DIVERGED",
-  "EXECUTOR_STATE_INVALID",
-  "IDEMPOTENCY_CONFLICT",
-  "SESSION_NOT_FOUND",
-  "WORKSPACE_NOT_CONFIGURED",
-  "PROFILE_CONFIG_CHANGED",
-  "SOURCE_REVISION_CHANGED",
-  "REPLAY_ARTIFACT_INVALID",
-  "REPLAY_DIVERGED",
-]);
-const RESTART_REQUIRED_CODES = new Set(["EXECUTION_FENCED"]);
-const DETERMINISTIC_FAILURE_CODES = new Set([
-  "CODE_BRAIN_CONTEXT_TOO_LARGE",
-  "CODE_BRAIN_CONTEXT_UNFIT",
-]);
-const OPERATOR_PAUSE_CODES = new Set([
-  "BRAIN_PROVIDER_NOT_CONFIGURED",
-  "CODE_BRAIN_ACTION_NOT_PERMITTED",
-  "CODE_BRAIN_CHECKS_ALREADY_PASSED",
-  "CODE_BRAIN_COMPLETION_NOT_READY",
-  "CODE_BRAIN_PATH_INVALID",
-  "CODE_BRAIN_ROLE_NOT_CONFIGURED",
-  "CODE_BRAIN_RESPONSE_INVALID",
-  "CODE_BRAIN_WRITE_NOT_PERMITTED",
-  "REMOTE_DATA_NOT_AUTHORIZED",
-]);
-const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
-
-export class CodeJobWorkerError extends Error {
-  constructor(code, message, options = {}) {
-    super(message, options);
-    this.name = "CodeJobWorkerError";
-    this.code = code;
-  }
-}
-
-function workerError(code, message, options) {
-  return new CodeJobWorkerError(code, message, options);
-}
 
 function requirePort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -76,449 +42,6 @@ function requirePort(value, methods, name) {
       methods.map((method) => [method, value[method].bind(value)]),
     ),
   );
-}
-
-function positiveInteger(value, name, maximum) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
-    throw new TypeError(`${name} is invalid`);
-  }
-  return value;
-}
-
-function normalizeCycleOptions(value = {}) {
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some((key) => !["limit", "roleId"].includes(key))
-  ) {
-    throw new TypeError("code job worker options are invalid");
-  }
-  const roleId = value.roleId ?? null;
-  if (
-    roleId !== null &&
-    (typeof roleId !== "string" || !SAFE_ROLE_ID.test(roleId))
-  ) {
-    throw new TypeError("code job worker roleId is invalid");
-  }
-  return {
-    limit: positiveInteger(value.limit ?? 10, "code job worker limit", 100),
-    roleId,
-  };
-}
-
-function selectCycleCandidates(
-  reconcilable,
-  runnable,
-  limit,
-  preferReconcilable,
-) {
-  const selected = [];
-  let reconciliationIndex = 0;
-  let runnableIndex = 0;
-  let preferReconciliation = preferReconcilable;
-  while (
-    selected.length < limit &&
-    (reconciliationIndex < reconcilable.length || runnableIndex < runnable.length)
-  ) {
-    const canReconcile = reconciliationIndex < reconcilable.length;
-    const canRun = runnableIndex < runnable.length;
-    if ((preferReconciliation && canReconcile) || !canRun) {
-      selected.push(reconcilable[reconciliationIndex]);
-      reconciliationIndex += 1;
-    } else {
-      selected.push(runnable[runnableIndex]);
-      runnableIndex += 1;
-    }
-    if (canReconcile && canRun) {
-      preferReconciliation = !preferReconciliation;
-    }
-  }
-  return { selected, preferReconcilable: preferReconciliation };
-}
-
-function isSha256(value) {
-  return typeof value === "string" && SHA256.test(value);
-}
-
-function cleanText(value, maximumBytes) {
-  const clean = String(value ?? "").replace(INVALID_CONTROL, " ");
-  const encoded = Buffer.from(clean, "utf8");
-  if (encoded.length <= maximumBytes) return clean;
-  return encoded
-    .subarray(0, maximumBytes)
-    .toString("utf8")
-    .replace(/\uFFFD$/u, "");
-}
-
-function safeErrorCode(error, fallback = "CODE_JOB_WORKER_FAILED") {
-  return typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,127}$/.test(error.code)
-    ? error.code
-    : fallback;
-}
-
-function requiresOperatorPause(code) {
-  return OPERATOR_PAUSE_CODES.has(code) || code.startsWith("STRUCTURED_PROVIDER_");
-}
-
-function sameValue(left, right) {
-  try {
-    return digestValue(left) === digestValue(right);
-  } catch {
-    return false;
-  }
-}
-
-function normalizeSemanticPath(value, { allowRoot = false } = {}) {
-  try {
-    return normalizeWorkspacePath(value, { allowRoot });
-  } catch (cause) {
-    throw workerError("CODE_BRAIN_PATH_INVALID", "Code brain selected an unsafe path", {
-      cause,
-    });
-  }
-}
-
-function compactManifestEntry(entry, kind) {
-  const result = { path: cleanText(entry?.path, 1_024) };
-  if (kind === "modified") {
-    if (isSha256(entry?.beforeSha256)) result.beforeSha256 = entry.beforeSha256;
-    if (isSha256(entry?.afterSha256)) result.afterSha256 = entry.afterSha256;
-  } else if (isSha256(entry?.sha256)) {
-    result.sha256 = entry.sha256;
-  }
-  return result;
-}
-
-function compactExecutorResult(action, result) {
-  const error = result?.error
-    ? {
-        code: safeErrorCode(result.error, "ACTION_FAILED"),
-        message: cleanText(result.error.message, 2_048),
-      }
-    : null;
-  if (action.type === "list_files") {
-    const files = Array.isArray(result) ? result : [];
-    return {
-      files: files.slice(0, 500).map((entry) => cleanText(entry, 1_024)),
-      truncated: files.length > 500,
-      error,
-    };
-  }
-  if (action.type === "read_text") {
-    const content = cleanText(result?.content, 64 * 1_024);
-    return {
-      path: cleanText(result?.path ?? action.path, 1_024),
-      content,
-      sha256: isSha256(result?.sha256) ? result.sha256 : null,
-      bytes: Number.isSafeInteger(result?.bytes) ? result.bytes : 0,
-      truncated:
-        Buffer.byteLength(String(result?.content ?? ""), "utf8") >
-        Buffer.byteLength(content, "utf8"),
-      error,
-    };
-  }
-  if (action.type === "search_text") {
-    const matches = Array.isArray(result?.matches) ? result.matches : [];
-    return {
-      matches: matches.slice(0, 200).map((entry) => ({
-        path: cleanText(entry?.path, 1_024),
-        line: Number.isSafeInteger(entry?.line) ? entry.line : 0,
-        column: Number.isSafeInteger(entry?.column) ? entry.column : 0,
-        text: cleanText(entry?.text, 2_048),
-      })),
-      truncated: result?.truncated === true || matches.length > 200,
-      error,
-    };
-  }
-  if (action.type === "write_text") {
-    return {
-      path: cleanText(result?.path ?? action.path, 1_024),
-      sha256: isSha256(result?.sha256) ? result.sha256 : null,
-      bytes: Number.isSafeInteger(result?.bytes) ? result.bytes : 0,
-      error,
-    };
-  }
-  if (action.type === "run_profile") {
-    return {
-      exitCode: Number.isSafeInteger(result?.exitCode) ? result.exitCode : null,
-      signal: result?.signal == null ? null : cleanText(result.signal, 64),
-      durationMs: Number.isFinite(result?.durationMs) ? result.durationMs : 0,
-      timedOut: result?.timedOut === true,
-      stdout: cleanText(result?.stdout, 16 * 1_024),
-      stderr: cleanText(result?.stderr, 16 * 1_024),
-      error,
-    };
-  }
-  const manifest = result && typeof result === "object" ? result : {};
-  const compacted = {};
-  for (const kind of ["created", "modified", "deleted"]) {
-    const entries = Array.isArray(manifest[kind]) ? manifest[kind] : [];
-    compacted[kind] = entries
-      .slice(0, 200)
-      .map((entry) => compactManifestEntry(entry, kind));
-    compacted[`${kind}Count`] = entries.length;
-  }
-  compacted.truncated = ["created", "modified", "deleted"].some(
-    (kind) => compacted[`${kind}Count`] > compacted[kind].length,
-  );
-  compacted.manifestDigest = digestValue(manifest);
-  compacted.error = error;
-  return compacted;
-}
-
-function observationDetail(action, response, result) {
-  return {
-    schemaVersion: 1,
-    executor: {
-      sessionStatus: response.session.status,
-      sessionAttemptNumber: response.session.attempt.number,
-      actionStatus: response.action.status,
-      actionAttemptNumber: response.action.attemptNumber,
-    },
-    result: compactExecutorResult(action, result),
-  };
-}
-
-function trustedObservationAction(observation) {
-  const action = observation?.action;
-  if (
-    !action ||
-    typeof action !== "object" ||
-    Array.isArray(action) ||
-    action.type !== observation.actionType ||
-    action.actionId !== observation.actionId ||
-    digestValue(action) !== observation.actionDigest
-  ) {
-    throw workerError(
-      "CODE_JOB_OBSERVATION_INVALID",
-      "Persisted code job observation is not bound to its trusted action",
-    );
-  }
-  return action;
-}
-
-function modelObservation(observation) {
-  const action = trustedObservationAction(observation);
-  const result = observation.detail.result ?? {};
-  let detail;
-  if (action.type === "list_files") {
-    detail = { path: action.path, ...result };
-  } else if (action.type === "read_text") {
-    detail = {
-      path: action.path,
-      content: cleanText(result.content, 24 * 1_024),
-      truncated: result.truncated === true,
-      error: result.error ?? null,
-    };
-  } else if (action.type === "search_text") {
-    detail = {
-      path: action.path,
-      query: action.query,
-      matches: Array.isArray(result.matches) ? result.matches.slice(0, 100) : [],
-      truncated: result.truncated === true,
-      error: result.error ?? null,
-    };
-  } else if (action.type === "write_text") {
-    detail = {
-      path: action.path,
-      bytes: result.bytes ?? 0,
-      error: result.error ?? null,
-    };
-  } else if (action.type === "run_profile") {
-    detail = {
-      exitCode: result.exitCode ?? null,
-      durationMs: result.durationMs ?? 0,
-      timedOut: result.timedOut === true,
-      stdout: cleanText(result.stdout, 8 * 1_024),
-      stderr: cleanText(result.stderr, 8 * 1_024),
-      error: result.error ?? null,
-    };
-  } else {
-    detail = {
-      created: (result.created ?? []).map(({ path }) => ({ path })),
-      modified: (result.modified ?? []).map(({ path }) => ({ path })),
-      deleted: (result.deleted ?? []).map(({ path }) => ({ path })),
-      truncated: result.truncated === true,
-      error: result.error ?? null,
-    };
-  }
-  return {
-    actionType: observation.actionType,
-    status: observation.status === "succeeded" ? "succeeded" : "failed",
-    detail: cleanText(JSON.stringify(detail), 30 * 1_024),
-  };
-}
-
-function assertSessionBinding(job, session) {
-  const expectedProfiles = job.grant.requiredProfiles.map(({ id }) => id).sort();
-  const actualProfiles = Array.isArray(session?.requiredProfiles)
-    ? [...session.requiredProfiles].sort()
-    : [];
-  if (
-    session?.id !== job.jobId ||
-    session.workspaceId !== job.grant.workspaceId ||
-    !sameValue(session.requestedBy, job.grant.requestedBy) ||
-    !sameValue(actualProfiles, expectedProfiles) ||
-    !isSha256(session.workspaceRevision) ||
-    !Number.isSafeInteger(session.attempt?.number) ||
-    session.attempt.number < 1
-  ) {
-    throw workerError(
-      "CODE_JOB_SESSION_BINDING_INVALID",
-      "Controlled executor session does not match the sealed code job",
-    );
-  }
-  return session;
-}
-
-function successfulProfiles(job, session) {
-  const result = new Set();
-  for (const observation of job.execution.observations) {
-    if (
-      observation.actionType !== "run_profile" ||
-      observation.status !== "succeeded" ||
-      observation.workspaceRevision !== session.workspaceRevision
-    ) {
-      continue;
-    }
-    const action = trustedObservationAction(observation);
-    if (
-      observation.detail?.executor?.actionAttemptNumber === session.attempt.number &&
-      job.grant.requiredProfiles.some(({ id }) => id === action.profileId)
-    ) {
-      result.add(action.profileId);
-    }
-  }
-  return result;
-}
-
-function expectedWriteSha(job, path, workspaceRevision) {
-  for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
-    const observation = job.execution.observations[index];
-    if (
-      observation.status !== "succeeded" ||
-      observation.workspaceRevision !== workspaceRevision ||
-      observation.actionType !== "read_text"
-    ) {
-      continue;
-    }
-    const action = trustedObservationAction(observation);
-    const sha256 = observation.detail?.result?.sha256;
-    if (action.path === path && isSha256(sha256)) return sha256;
-  }
-  return null;
-}
-
-function actionId(job, semanticAction) {
-  const digest = digestValue({
-    schemaVersion: 1,
-    jobId: job.jobId,
-    turn: job.execution.turn + 1,
-    semanticAction,
-  });
-  return `action-${digest.slice(0, 55)}`;
-}
-
-function bindTrustedAction(job, session, semanticAction, remainingProfiles) {
-  if (!job.grant.allowedActions.includes(semanticAction.type)) {
-    throw workerError(
-      "CODE_BRAIN_ACTION_NOT_PERMITTED",
-      "Code brain selected an action outside the sealed grant",
-    );
-  }
-  const common = {
-    type: semanticAction.type,
-    actionId: actionId(job, semanticAction),
-    expectedWorkspaceRevision: session.workspaceRevision,
-  };
-  if (semanticAction.type === "list_files") {
-    return {
-      ...common,
-      path: normalizeSemanticPath(semanticAction.path, { allowRoot: true }),
-    };
-  }
-  if (semanticAction.type === "read_text") {
-    return { ...common, path: normalizeSemanticPath(semanticAction.path) };
-  }
-  if (semanticAction.type === "search_text") {
-    return {
-      ...common,
-      path: normalizeSemanticPath(semanticAction.path, { allowRoot: true }),
-      query: semanticAction.query,
-    };
-  }
-  if (semanticAction.type === "write_text") {
-    const path = normalizeSemanticPath(semanticAction.path);
-    const writable = job.grant.writablePaths.some(
-      (candidate) => path === candidate || path.startsWith(`${candidate}/`),
-    );
-    if (!writable) {
-      throw workerError(
-        "CODE_BRAIN_WRITE_NOT_PERMITTED",
-        "Code brain selected a path outside the sealed write scope",
-      );
-    }
-    return {
-      ...common,
-      path,
-      content: semanticAction.content,
-      expectedSha256: expectedWriteSha(
-        job,
-        path,
-        session.workspaceRevision,
-      ),
-    };
-  }
-  if (semanticAction.type === "run_profile") {
-    if (remainingProfiles.length === 0) {
-      throw workerError(
-        "CODE_BRAIN_CHECKS_ALREADY_PASSED",
-        "No trusted test profile remains",
-      );
-    }
-    return { ...common, profileId: remainingProfiles[0].id };
-  }
-  if (remainingProfiles.length !== 0) {
-    throw workerError(
-      "CODE_BRAIN_COMPLETION_NOT_READY",
-      "Required trusted checks have not passed",
-    );
-  }
-  return common;
-}
-
-function terminalResult(job, action, detail, workspaceRevision) {
-  const result = detail?.result ?? {};
-  return {
-    schemaVersion: 1,
-    outcome: job.grant.summary,
-    evidence: [...job.grant.evidence],
-    checks: job.grant.requiredProfiles.map(({ id }) => id),
-    workspaceRevision,
-    manifest: result,
-    completedActionId: action.actionId,
-  };
-}
-
-function normalizeActionResponse(pending, response) {
-  if (
-    !response ||
-    typeof response !== "object" ||
-    response.action?.id !== pending.actionId ||
-    response.action.type !== pending.action.type ||
-    response.action.workspaceRevisionBefore !==
-      pending.action.expectedWorkspaceRevision ||
-    !EXECUTOR_TERMINAL_ACTIONS.has(response.action.status) ||
-    !isSha256(response.session?.workspaceRevision)
-  ) {
-    throw workerError(
-      "CODE_JOB_EXECUTOR_RESULT_INVALID",
-      "Controlled executor returned an invalid action result",
-    );
-  }
-  return response;
 }
 
 export class CodeJobWorkerService {
@@ -1329,7 +852,7 @@ export class CodeJobWorkerService {
         };
       }
     }
-    if (RESTART_REQUIRED_CODES.has(code)) {
+    if (isRestartRequiredCode(code)) {
       return {
         jobId,
         status: "restart_required",
@@ -1338,7 +861,7 @@ export class CodeJobWorkerService {
       };
     }
     if (
-      DETERMINISTIC_FAILURE_CODES.has(code) &&
+      isDeterministicFailureCode(code) &&
       current &&
       !TERMINAL_STATUSES.has(current.status)
     ) {
@@ -1393,7 +916,7 @@ export class CodeJobWorkerService {
         code,
       };
     }
-    if (AUTHORITY_ERROR_CODES.has(code) || FENCING_EXECUTOR_CODES.has(code)) {
+    if (isAuthorityErrorCode(code) || isFencingExecutorCode(code)) {
       try {
         if (current && !TERMINAL_STATUSES.has(current.status)) {
           const changed = await this.#jobs.fence({
