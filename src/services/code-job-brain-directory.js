@@ -331,12 +331,7 @@ export class CodeJobBrainDirectory {
         }
         return decision;
       } catch (error) {
-        if (
-          error instanceof CodeJobBrainDirectoryError ||
-          attempt === 1
-        ) {
-          throw error;
-        }
+        if (attempt === 1) throw error;
       }
     }
     throw directoryError(

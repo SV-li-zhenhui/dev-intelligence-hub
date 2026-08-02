@@ -4,6 +4,7 @@ import {
   CodeJobBrainDirectory,
   CodeJobBrainDirectoryError,
 } from "../src/services/code-job-brain-directory.js";
+import { BrainRouter } from "../src/services/brain-router.js";
 
 function roleBrain(remoteData = {
   requirements: false,
@@ -141,8 +142,40 @@ test("sealed capabilities reject model escalation and premature completion", asy
       (error) =>
         error instanceof CodeJobBrainDirectoryError && error.code === expectedCode,
     );
-    assert.equal(router.calls.length, 1);
+    assert.equal(router.calls.length, 2);
   }
+});
+
+test("remote brains require explicit requirements and code authorization", async () => {
+  const providerCalls = [];
+  const router = new BrainRouter({
+    providers: [
+      {
+        id: "brain-one",
+        remote: true,
+        async generate(value) {
+          providerCalls.push(structuredClone(value));
+          return decision();
+        },
+      },
+    ],
+  });
+  const denied = new CodeJobBrainDirectory({
+    brainRouter: router,
+    roles: roleBrain(),
+  });
+  await assert.rejects(
+    denied.decide(input()),
+    (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.equal(providerCalls.length, 0);
+
+  const allowed = new CodeJobBrainDirectory({
+    brainRouter: router,
+    roles: roleBrain({ requirements: true, code: true, memory: false }),
+  });
+  assert.equal((await allowed.decide(input())).action.type, "read_text");
+  assert.equal(providerCalls.length, 1);
 });
 
 test("unknown roles and malformed untrusted context fail before generation", async () => {
