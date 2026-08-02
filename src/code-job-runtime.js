@@ -168,6 +168,15 @@ function operationAdmission() {
   });
 }
 
+function sessionTransitionLease() {
+  const queue = new OperationQueue();
+  return Object.freeze({
+    run(operation) {
+      return queue.enqueue(operation);
+    },
+  });
+}
+
 export async function createCodeJobRuntime({
   store,
   grantVerifier,
@@ -217,6 +226,7 @@ export async function createCodeJobRuntime({
   );
   const guard = validateGuard(createGuard({ name: GUARD_NAME }));
   const admission = operationAdmission();
+  const sessionTransitions = sessionTransitionLease();
   let closePromise = null;
   const close = () => {
     if (closePromise) return closePromise;
@@ -267,16 +277,40 @@ export async function createCodeJobRuntime({
           brainDirectory,
           grantVerifier,
           operationQueue: workerOperationQueue,
+          sessionTransitionLease: sessionTransitions,
           ...(changePackageDispatcher === null
             ? {}
             : { changePackageDeliveryEnabled: true }),
         });
-    if (worker !== null && typeof worker?.runCycle !== "function") {
-      throw new TypeError("code job worker is invalid");
-    }
+    const workerPort = worker === null
+      ? null
+      : bindPort(
+          worker,
+          ["runCycle", "requestCancellation"],
+          "code job worker",
+        );
+    const signalWorkerCancellation = (jobId) => {
+      if (workerPort === null) return;
+      try {
+        Promise.resolve(workerPort.requestCancellation(jobId)).catch(() => {});
+      } catch {
+        // The durable cancellation remains authoritative if interruption fails.
+      }
+    };
     const controlMutation = (method, value) =>
       admission.run(async () => {
-        const changed = await jobs[method](value);
+        const changed = await sessionTransitions.run(() => jobs[method](value));
+        return Object.freeze({
+          status: changed.status,
+          job: await jobs.get(changed.job.jobId),
+        });
+      });
+    const cancelMutation = (value) =>
+      admission.run(async () => {
+        const changed = await sessionTransitions.run(() => jobs.cancel(value));
+        if (changed.job.status === "cancelling") {
+          signalWorkerCancellation(changed.job.jobId);
+        }
         return Object.freeze({
           status: changed.status,
           job: await jobs.get(changed.job.jobId),
@@ -300,6 +334,7 @@ export async function createCodeJobRuntime({
       control: frozenPort({
         pause: (value) => controlMutation("pause", value),
         resume: (value) => controlMutation("resume", value),
+        cancel: cancelMutation,
       }),
       projectionSource: frozenPort({
         readBatch: (value) =>
@@ -313,11 +348,11 @@ export async function createCodeJobRuntime({
             runCycle: (value) =>
               admission.run(() => changePackageDispatcher.runCycle(value)),
           }),
-      worker: worker === null
+      worker: workerPort === null
         ? null
         : frozenPort({
             runCycle: (value) =>
-              admission.run(() => worker.runCycle(value)),
+              admission.run(() => workerPort.runCycle(value)),
           }),
       close,
     });

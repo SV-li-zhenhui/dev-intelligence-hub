@@ -12,11 +12,13 @@ const TERMINAL_CODE_JOB_STATUSES = new Set([
   "completed",
   "failed",
   "fenced",
+  "cancelled",
 ]);
 const CODE_JOB_STATUS_BY_OUTCOME = new Map([
   ["succeeded", "completed"],
   ["failed", "failed"],
   ["unknown", "fenced"],
+  ["rejected", "cancelled"],
 ]);
 const CODE_JOB_STATUSES = new Set([
   "queued",
@@ -25,6 +27,7 @@ const CODE_JOB_STATUSES = new Set([
   "pausing",
   "unknown",
   "paused",
+  "cancelling",
   ...TERMINAL_CODE_JOB_STATUSES,
 ]);
 const BATCH_KEYS = Object.freeze([

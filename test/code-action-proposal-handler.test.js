@@ -346,6 +346,54 @@ test("a terminal code job waits for verified memory before completing its propos
   ]);
 });
 
+test("a cancelling job stays active and a projected cancellation becomes rejected", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  producer.plan = createCodeActionProposalConfirmationPlan(
+    proposal(),
+    await authority(grant).factory.create(proposal()),
+  );
+  const reader = new FakeCodeJobReader(
+    queuedJob(grant, {
+      status: "cancelling",
+      revision: 5,
+      updatedAt: "2026-08-02T03:00:02.000Z",
+    }),
+  );
+  const instance = handler(producer, reader, grant);
+  const downstreamRef = codeJobConfirmationIdForGrant(grant);
+
+  const cancelling = await instance.value.handle(
+    handlerInput({ status: "running", downstreamRef }),
+  );
+  assert.equal(cancelling.status, "running");
+
+  reader.value = queuedJob(grant, {
+    status: "cancelled",
+    revision: 7,
+    terminalResult: { kind: "cancelled", recordedAt: CREATED_AT },
+    memoryProjection: {
+      recordId: `memory-${"e".repeat(64)}`,
+      projectedAt: "2026-08-02T03:00:04.000Z",
+    },
+    updatedAt: "2026-08-02T03:00:04.000Z",
+  });
+  const cancelled = await instance.value.handle(
+    handlerInput({ status: "running", downstreamRef }),
+  );
+
+  assert.deepEqual(cancelled, {
+    status: "rejected",
+    summary: "本地代码任务已由用户取消",
+    evidence: [
+      `confirmation:${downstreamRef}`,
+      `code-job:${codeJobIdForGrant(grant)}`,
+      "code-job-status:cancelled",
+      `memory:memory-${"e".repeat(64)}`,
+    ],
+  });
+});
+
 test("a legacy queued reader projection remains compatible during local upgrade", async () => {
   const grant = grantFor();
   const legacy = queuedJob(grant);

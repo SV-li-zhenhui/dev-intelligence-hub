@@ -122,6 +122,214 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
   await assert.rejects(access(path.join(sourceRoot, "docs", "notes.md")));
 });
 
+test("discard waits for queued work and removes only the requested execution", async (t) => {
+  const { broker, scratchRoot, sourceRoot } = await fixture(t);
+  const discardedExecution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "discarded-run",
+  });
+  const siblingExecution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "sibling-run",
+  });
+  const discardedRoot = path.join(scratchRoot, "dashboard", "discarded-run");
+
+  let releaseLock;
+  let markLocked;
+  const locked = new Promise((resolve) => {
+    markLocked = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const holdingLock = broker.withLockedExecution(
+    discardedExecution,
+    async () => {
+      markLocked();
+      await release;
+    },
+  );
+  await locked;
+
+  let discardFinished = false;
+  const discarding = broker.discardExecution(discardedExecution).then((result) => {
+    discardFinished = true;
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(discardFinished, false);
+  await access(discardedRoot);
+
+  releaseLock();
+  await holdingLock;
+  assert.deepEqual(await discarding, {
+    workspaceId: "dashboard",
+    executionId: "discarded-run",
+    discarded: true,
+  });
+  await assert.rejects(access(discardedRoot));
+  await assert.rejects(
+    broker.listFiles(discardedExecution),
+    (error) => error.code === "EXECUTION_NOT_FOUND",
+  );
+  assert.deepEqual(await broker.listFiles(siblingExecution), ["src/app.js"]);
+  assert.equal(
+    await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+});
+
+test("discard is idempotent and removes executions not indexed after restart", async (t) => {
+  const { broker, scratchRoot, sourceRoot } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "restart-run",
+  });
+  const restartedBroker = new CodeWorkspaceBroker({
+    scratchRoot,
+    workspaces: [
+      {
+        id: "dashboard",
+        sourceRoot,
+        writablePaths: ["src"],
+      },
+    ],
+  });
+
+  const expected = {
+    workspaceId: "dashboard",
+    executionId: "restart-run",
+    discarded: true,
+  };
+  assert.deepEqual(await restartedBroker.discardExecution(execution), expected);
+  assert.deepEqual(await restartedBroker.discardExecution(execution), expected);
+  await assert.rejects(
+    access(path.join(scratchRoot, "dashboard", "restart-run")),
+  );
+});
+
+test("discard after restart does not require the old workspace registration", async (t) => {
+  const { broker, scratchRoot, sourceRoot } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "removed-workspace-run",
+  });
+  const restartedBroker = new CodeWorkspaceBroker({
+    scratchRoot,
+    workspaces: [],
+  });
+  const expected = {
+    workspaceId: "dashboard",
+    executionId: "removed-workspace-run",
+    discarded: true,
+  };
+
+  assert.deepEqual(await restartedBroker.discardExecution(execution), expected);
+  assert.deepEqual(await restartedBroker.discardExecution(execution), expected);
+  await assert.rejects(
+    access(path.join(scratchRoot, "dashboard", "removed-workspace-run")),
+  );
+  assert.equal(
+    await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+});
+
+test("discard rejects escaping identifiers and symlinked storage roots", async (t) => {
+  const { broker, root, scratchRoot, sourceRoot } = await fixture(t);
+  const outsideRoot = path.join(root, "outside");
+  await mkdir(outsideRoot);
+  await writeFile(path.join(outsideRoot, "keep.txt"), "keep");
+
+  await assert.rejects(
+    broker.discardExecution({
+      workspaceId: "dashboard",
+      executionId: "../outside",
+    }),
+    (error) => error.code === "INVALID_EXECUTION_ID",
+  );
+
+  const workspaceScratch = path.join(scratchRoot, "dashboard");
+  await mkdir(workspaceScratch, { recursive: true });
+  try {
+    await symlink(
+      outsideRoot,
+      path.join(workspaceScratch, "linked-run"),
+      "junction",
+    );
+  } catch (error) {
+    if (error.code === "EPERM") {
+      t.skip("symlink creation is unavailable on this host");
+      return;
+    }
+    throw error;
+  }
+  const restartedBroker = new CodeWorkspaceBroker({
+    scratchRoot,
+    workspaces: [
+      {
+        id: "dashboard",
+        sourceRoot,
+        writablePaths: ["src"],
+      },
+    ],
+  });
+
+  await assert.rejects(
+    restartedBroker.discardExecution({
+      workspaceId: "dashboard",
+      executionId: "linked-run",
+    }),
+    (error) => error.code === "SYMLINK_REJECTED",
+  );
+  assert.equal(await readFile(path.join(outsideRoot, "keep.txt"), "utf8"), "keep");
+
+  await rm(workspaceScratch, { recursive: true, force: true });
+  await symlink(outsideRoot, workspaceScratch, "junction");
+  await assert.rejects(
+    restartedBroker.discardExecution({
+      workspaceId: "dashboard",
+      executionId: "escaped-run",
+    }),
+    (error) => error.code === "SYMLINK_REJECTED",
+  );
+  assert.equal(await readFile(path.join(outsideRoot, "keep.txt"), "utf8"), "keep");
+});
+
+test("discard unlinks nested symlinks without following them", async (t) => {
+  const { broker, root, scratchRoot } = await fixture(t);
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "nested-link-run",
+  });
+  const outsideRoot = path.join(root, "outside-nested");
+  await mkdir(outsideRoot);
+  await writeFile(path.join(outsideRoot, "keep.txt"), "keep");
+  const executionRoot = path.join(
+    scratchRoot,
+    "dashboard",
+    "nested-link-run",
+  );
+  try {
+    await symlink(
+      outsideRoot,
+      path.join(executionRoot, "linked-outside"),
+      "junction",
+    );
+  } catch (error) {
+    if (error.code === "EPERM") {
+      t.skip("symlink creation is unavailable on this host");
+      return;
+    }
+    throw error;
+  }
+
+  await broker.discardExecution(execution);
+
+  await assert.rejects(access(executionRoot));
+  assert.equal(await readFile(path.join(outsideRoot, "keep.txt"), "utf8"), "keep");
+});
+
 test("workspace revisions guard writes and stay locked during sandbox work", async (t) => {
   const { broker } = await fixture(t);
   const execution = await broker.createExecution({

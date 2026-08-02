@@ -1,4 +1,5 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { digestValue } from "../domain/code-executor-contract.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import {
   assertSessionBinding,
@@ -30,8 +31,14 @@ const RUNNABLE_STATUSES = new Set([
   "starting",
   "active",
   "pausing",
+  "cancelling",
 ]);
-const TERMINAL_STATUSES = new Set(["completed", "failed", "fenced"]);
+const TERMINAL_STATUSES = new Set([
+  "cancelled",
+  "completed",
+  "failed",
+  "fenced",
+]);
 
 function requirePort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -44,18 +51,128 @@ function requirePort(value, methods, name) {
   );
 }
 
+function sameSessionTransitionFence(expected, current) {
+  return current !== null &&
+    current.status === expected.status &&
+    current.revision === expected.revision &&
+    current.execution.workspaceRevision ===
+      expected.execution.workspaceRevision &&
+    sameValue(
+      current.execution.pendingAction,
+      expected.execution.pendingAction,
+    ) &&
+    sameValue(
+      current.execution.actionAdmission,
+      expected.execution.actionAdmission,
+    );
+}
+
+function currentJobOutcome(jobId, current) {
+  return {
+    jobId,
+    status: current?.status ?? "missing",
+    actionType: current?.execution.pendingAction?.action.type ?? null,
+  };
+}
+
+function sessionTransitionLease(operationQueue = new OperationQueue()) {
+  return Object.freeze({
+    run(operation) {
+      return operationQueue.enqueue(operation);
+    },
+  });
+}
+
+function cancellationSettlement(job, response) {
+  const proof = response?.proof;
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
+    throw workerError(
+      "CODE_JOB_CANCELLATION_PROOF_INVALID",
+      "Controlled executor did not return a cancellation proof",
+    );
+  }
+  const { proofDigest, ...proofContent } = proof;
+  const pending = job.execution.pendingAction;
+  const resolution = proof.actionResolution;
+  const commonInvalid =
+    response.status !== "settled" ||
+    proof.schemaVersion !== 1 ||
+    proof.sessionId !== job.jobId ||
+    proof.cancellationDigest !== job.execution.result?.detailDigest ||
+    proof.sandboxCleanupConfirmed !== true ||
+    digestValue(proofContent) !== proofDigest ||
+    (pending === null) !== (resolution === null) ||
+    (pending !== null &&
+      (resolution.actionId !== pending.actionId ||
+        resolution.actionDigest !== pending.actionDigest ||
+        resolution.workspaceRevisionBefore !==
+          pending.action.expectedWorkspaceRevision));
+  if (commonInvalid) {
+    throw workerError(
+      "CODE_JOB_CANCELLATION_PROOF_INVALID",
+      "Cancellation proof does not match the durable code job",
+    );
+  }
+  if (proof.kind === "controlled_execution_absent") {
+    if (
+      response.session !== null ||
+      job.execution.workspaceRevision !== null ||
+      pending !== null ||
+      job.execution.actionAdmission !== null ||
+      proof.sourceRevision !== null ||
+      proof.trustedWorkspaceRevision !== null ||
+      !Array.isArray(proof.discardedAttempts) ||
+      proof.discardedAttempts.length !== 0
+    ) {
+      throw workerError(
+        "CODE_JOB_CANCELLATION_PROOF_INVALID",
+        "Missing-session proof does not match the durable code job",
+      );
+    }
+    return proof;
+  }
+  const session = response.session;
+  const expectedProfiles = job.grant.requiredProfiles.map(({ id }) => id).sort();
+  const actualProfiles = Array.isArray(session?.requiredProfiles)
+    ? [...session.requiredProfiles].sort()
+    : [];
+  if (
+    proof.kind !== "controlled_execution_cancelled" ||
+    session?.id !== job.jobId ||
+    session.workspaceId !== job.grant.workspaceId ||
+    !sameValue(session.requestedBy, job.grant.requestedBy) ||
+    !sameValue(actualProfiles, expectedProfiles) ||
+    session.status !== "cancelled" ||
+    session.cleanupPending !== false ||
+    session.workspaceRevision !== proof.trustedWorkspaceRevision ||
+    session.updatedAt !== proof.settledAt ||
+    !Array.isArray(proof.discardedAttempts) ||
+    proof.discardedAttempts.length < 1 ||
+    session.attempt?.number !== proof.discardedAttempts.at(-1)?.attemptNumber ||
+    session.attempt?.status !== "cancelled"
+  ) {
+    throw workerError(
+      "CODE_JOB_CANCELLATION_PROOF_INVALID",
+      "Settled executor session does not match its cancellation proof",
+    );
+  }
+  return proof;
+}
+
 export class CodeJobWorkerService {
   #jobs;
   #executor;
   #brain;
   #verifyGrant;
   #queue;
+  #sessionTransitions;
   #maxTurns;
   #observationLimit;
   #changePackageDeliveryEnabled;
   #runnableCursor;
   #reconcilableCursor;
   #preferReconcilable;
+  #cancellationControllers;
 
   constructor({
     jobStore,
@@ -63,6 +180,8 @@ export class CodeJobWorkerService {
     brainDirectory,
     grantVerifier,
     operationQueue = new OperationQueue(),
+    sessionTransitionLease: suppliedSessionTransitionLease =
+      sessionTransitionLease(),
     maxTurns = 64,
     observationLimit = 20,
     changePackageDeliveryEnabled = false,
@@ -82,6 +201,7 @@ export class CodeJobWorkerService {
         "acknowledgeAbsentAction",
         "markActionUnknown",
         "recordObservation",
+        "finalizeCancellation",
         "pause",
         "complete",
         "fail",
@@ -98,6 +218,7 @@ export class CodeJobWorkerService {
         "perform",
         "getActionResult",
         "reconcileAction",
+        "reconcileCancellation",
       ],
       "controlled code executor",
     );
@@ -114,6 +235,11 @@ export class CodeJobWorkerService {
       throw new TypeError("changePackageDeliveryEnabled must be a boolean");
     }
     this.#queue = operationQueue;
+    this.#sessionTransitions = requirePort(
+      suppliedSessionTransitionLease,
+      ["run"],
+      "code job session transition lease",
+    );
     this.#maxTurns = positiveInteger(maxTurns, "maxTurns", 128);
     this.#observationLimit = positiveInteger(
       observationLimit,
@@ -124,12 +250,23 @@ export class CodeJobWorkerService {
     this.#runnableCursor = 0;
     this.#reconcilableCursor = 0;
     this.#preferReconcilable = true;
+    this.#cancellationControllers = new Map();
     Object.freeze(this);
   }
 
   runCycle(value = {}) {
     const options = normalizeCycleOptions(value);
     return this.#queue.enqueue(() => this.#runCycle(options));
+  }
+
+  requestCancellation(jobId) {
+    if (typeof jobId !== "string" || jobId.length === 0) {
+      throw new TypeError("code job id is invalid");
+    }
+    const controller = this.#cancellationControllers.get(jobId);
+    if (controller === undefined) return false;
+    controller.abort();
+    return true;
   }
 
   async #runCycle(options) {
@@ -173,6 +310,7 @@ export class CodeJobWorkerService {
       selected: selected.items.length,
       processed: outcomes.length,
       succeeded: outcomes.filter(({ status }) => status === "completed").length,
+      cancelled: outcomes.filter(({ status }) => status === "cancelled").length,
       fenced: outcomes.filter(({ status }) => status === "fenced").length,
       failed: outcomes.filter(({ status }) => status === "failed").length,
       outcomes,
@@ -183,6 +321,9 @@ export class CodeJobWorkerService {
     let job = await this.#requireRunnableJob(jobId);
     if (job.status === "unknown") {
       return this.#reconcileUnknown(job);
+    }
+    if (job.status === "cancelling") {
+      return this.#reconcileCancellation(job);
     }
     if (!RUNNABLE_STATUSES.has(job.status)) {
       return { jobId, status: job.status, actionType: null };
@@ -200,11 +341,21 @@ export class CodeJobWorkerService {
       let session = await this.#viewOptionalSession(job.jobId);
       if (session === null) {
         await this.#verifyAuthority(job.grant);
-        session = await this.#executor.start({
-          sessionId: job.jobId,
-          workspaceId: job.grant.workspaceId,
-          requestedBy: job.grant.requestedBy,
-        });
+        const started = await this.#startUnchangedSession(job);
+        if (started.session === null) {
+          if (
+            started.job?.status === "pausing" &&
+            started.job.execution.pause?.from === "starting"
+          ) {
+            return this.#reconcileStartingPause(started.job);
+          }
+          if (started.job?.status === "cancelling") {
+            return this.#reconcileCancellation(started.job);
+          }
+          return currentJobOutcome(job.jobId, started.job);
+        }
+        job = started.job;
+        session = started.session;
       }
       let current = await this.#jobs.getForWorker(job.jobId);
       if (
@@ -212,6 +363,9 @@ export class CodeJobWorkerService {
         current.execution.pause?.from === "starting"
       ) {
         return this.#reconcileStartingPause(current, session);
+      }
+      if (current?.status === "cancelling") {
+        return this.#reconcileCancellation(current, session);
       }
       if (current?.status !== "starting") {
         return {
@@ -223,7 +377,12 @@ export class CodeJobWorkerService {
       job = current;
       if (session.status === "interrupted") {
         await this.#verifyAuthority(job.grant);
-        session = await this.#executor.resume({ sessionId: job.jobId });
+        const resumed = await this.#resumeUnchangedSession(job);
+        if (resumed.session === null) {
+          return currentJobOutcome(job.jobId, resumed.job);
+        }
+        job = resumed.job;
+        session = resumed.session;
       }
       current = await this.#jobs.getForWorker(job.jobId);
       if (
@@ -231,6 +390,9 @@ export class CodeJobWorkerService {
         current.execution.pause?.from === "starting"
       ) {
         return this.#reconcileStartingPause(current, session);
+      }
+      if (current?.status === "cancelling") {
+        return this.#reconcileCancellation(current, session);
       }
       if (current?.status !== "starting") {
         return {
@@ -294,7 +456,12 @@ export class CodeJobWorkerService {
     }
     if (session.status === "interrupted") {
       await this.#verifyAuthority(job.grant);
-      session = await this.#executor.resume({ sessionId: job.jobId });
+      const resumed = await this.#resumeUnchangedSession(job);
+      if (resumed.session === null) {
+        return currentJobOutcome(job.jobId, resumed.job);
+      }
+      job = resumed.job;
+      session = resumed.session;
     }
     if (session.status !== "active") {
       throw workerError(
@@ -401,6 +568,45 @@ export class CodeJobWorkerService {
     };
   }
 
+  async #reconcileCancellation(job) {
+    const pending = job.execution.pendingAction;
+    const response = await this.#executor.reconcileCancellation({
+      sessionId: job.jobId,
+      cancellationDigest: job.execution.result.detailDigest,
+      expectedWorkspaceRevision: job.execution.workspaceRevision,
+      expectedAction: pending === null
+        ? null
+        : {
+            actionId: pending.actionId,
+            actionDigest: pending.actionDigest,
+          },
+    });
+    const settlement = cancellationSettlement(job, response);
+    const current = await this.#jobs.getForWorker(job.jobId);
+    if (
+      current?.status !== "cancelling" ||
+      current.execution.result?.detailDigest !==
+        job.execution.result.detailDigest ||
+      !sameValue(current.execution.pendingAction, pending) ||
+      !sameValue(
+        current.execution.actionAdmission,
+        job.execution.actionAdmission,
+      )
+    ) {
+      return currentJobOutcome(job.jobId, current);
+    }
+    const changed = await this.#jobs.finalizeCancellation({
+      jobId: job.jobId,
+      expectedRevision: current.revision,
+      settlement,
+    });
+    return {
+      jobId: job.jobId,
+      status: changed.job.status,
+      actionType: null,
+    };
+  }
+
   async #continuePending(job) {
     let authorityError = null;
     if (job.status !== "pausing") {
@@ -458,7 +664,7 @@ export class CodeJobWorkerService {
       if (admission === null) {
         throw workerError(
           "CODE_JOB_ADMISSION_MISSING",
-          "Pausing code job lost its action admission",
+          "Reconciling code job lost its action admission",
         );
       }
       const changed = await this.#jobs.acknowledgeAbsentAction({
@@ -480,7 +686,12 @@ export class CodeJobWorkerService {
     let session = await this.#executor.view({ sessionId: job.jobId });
     if (session.status === "interrupted") {
       await this.#verifyAuthority(job.grant);
-      session = await this.#executor.resume({ sessionId: job.jobId });
+      const resumed = await this.#resumeUnchangedSession(job);
+      if (resumed.session === null) {
+        return currentJobOutcome(job.jobId, resumed.job);
+      }
+      job = resumed.job;
+      session = resumed.session;
     }
     if (session.status !== "active") {
       throw workerError(
@@ -528,9 +739,12 @@ export class CodeJobWorkerService {
         }
         let recoveredSession = interrupted.session;
         if (recoveredSession.status === "interrupted") {
-          recoveredSession = await this.#executor.resume({
-            sessionId: job.jobId,
-          });
+          const resumed = await this.#resumeUnchangedSession(job);
+          if (resumed.session === null) {
+            return currentJobOutcome(job.jobId, resumed.job);
+          }
+          job = resumed.job;
+          recoveredSession = resumed.session;
           assertSessionBinding(job, recoveredSession);
         }
         if (
@@ -572,6 +786,46 @@ export class CodeJobWorkerService {
       status: changed.job.status,
       actionType: pending.action.type,
     };
+  }
+
+  async #resumeUnchangedSession(job) {
+    return this.#runUnchangedSessionTransition(job, () =>
+      this.#executor.resume({ sessionId: job.jobId }),
+    );
+  }
+
+  async #startUnchangedSession(job) {
+    return this.#runUnchangedSessionTransition(job, () =>
+      this.#executor.start({
+        sessionId: job.jobId,
+        workspaceId: job.grant.workspaceId,
+        requestedBy: job.grant.requestedBy,
+      }),
+    );
+  }
+
+  async #runUnchangedSessionTransition(job, invoke) {
+    const admitted = await this.#sessionTransitions.run(async () => {
+      const current = await this.#jobs.getForWorker(job.jobId);
+      if (!sameSessionTransitionFence(job, current)) {
+        return { job: current, operation: null };
+      }
+
+      // Invocation must enqueue synchronously. The returned Promise is carried
+      // as data so this narrow lease never waits for the executor operation.
+      const operation = Promise.resolve(invoke());
+      return { job: current, operation };
+    });
+    if (admitted.operation === null) {
+      return { job: admitted.job, session: null };
+    }
+
+    const session = await admitted.operation;
+    const current = await this.#jobs.getForWorker(job.jobId);
+    if (!sameSessionTransitionFence(admitted.job, current)) {
+      return { job: current, session: null };
+    }
+    return { job: current, session };
   }
 
   async #performPending(
@@ -640,13 +894,43 @@ export class CodeJobWorkerService {
         actionId: pending.actionId,
         actionDigest: pending.actionDigest,
       })).job;
-      response = normalizeActionResponse(
-        pending,
-        await this.#executor.perform({
-          sessionId: job.jobId,
-          action: pending.action,
-        }),
-      );
+      const controller = new AbortController();
+      this.#cancellationControllers.set(job.jobId, controller);
+      try {
+        const admitted = await this.#jobs.getForWorker(job.jobId);
+        if (
+          admitted?.status === "cancelling" &&
+          admitted.execution.pendingAction?.actionDigest === pending.actionDigest
+        ) {
+          return this.#reconcileCancellation(admitted);
+        }
+        if (
+          admitted?.status !== "active" ||
+          admitted.execution.actionAdmission?.actionDigest !==
+            pending.actionDigest
+        ) {
+          return {
+            jobId: job.jobId,
+            status: admitted?.status ?? "missing",
+            actionType: null,
+          };
+        }
+        job = admitted;
+        response = normalizeActionResponse(
+          pending,
+          await this.#executor.perform(
+            {
+              sessionId: job.jobId,
+              action: pending.action,
+            },
+            { signal: controller.signal },
+          ),
+        );
+      } finally {
+        if (this.#cancellationControllers.get(job.jobId) === controller) {
+          this.#cancellationControllers.delete(job.jobId);
+        }
+      }
     }
     assertSessionBinding(job, response.session);
     if (
@@ -692,6 +976,9 @@ export class CodeJobWorkerService {
     }
     const detail = observationDetail(pending.action, response, result);
     const latest = await this.#jobs.getForWorker(job.jobId);
+    if (latest?.status === "cancelling") {
+      return this.#reconcileCancellation(latest);
+    }
     if (
       !latest ||
       !["active", "pausing", "unknown"].includes(latest.status) ||
@@ -704,10 +991,10 @@ export class CodeJobWorkerService {
       };
     }
     job = latest;
-    const admission = latest.status === "unknown"
+    const admission = latest.execution.uncertainty !== null
       ? latest.execution.actionAdmission
       : null;
-    if (latest.status === "unknown" && admission === null) {
+    if (latest.execution.uncertainty !== null && admission === null) {
       throw workerError(
         "CODE_JOB_ADMISSION_MISSING",
         "Unknown code job lost its durable action admission",
@@ -727,6 +1014,13 @@ export class CodeJobWorkerService {
             epoch: admission.epoch,
           }),
     })).job;
+    if (job.status === "cancelled") {
+      return {
+        jobId: job.jobId,
+        status: "cancelled",
+        actionType: pending.action.type,
+      };
+    }
     if (pending.action.type === "complete" && status === "succeeded") {
       job = await this.#completeJob(
         job,
@@ -828,6 +1122,14 @@ export class CodeJobWorkerService {
       return {
         jobId,
         status: "unknown",
+        actionType: current.execution.pendingAction?.action.type ?? null,
+        code,
+      };
+    }
+    if (["cancelling", "cancelled"].includes(current?.status)) {
+      return {
+        jobId,
+        status: current.status,
         actionType: current.execution.pendingAction?.action.type ?? null,
         code,
       };

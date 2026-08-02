@@ -5,6 +5,8 @@ export const CODE_JOB_STATUSES = Object.freeze([
   "pausing",
   "unknown",
   "paused",
+  "cancelling",
+  "cancelled",
   "completed",
   "failed",
   "fenced",

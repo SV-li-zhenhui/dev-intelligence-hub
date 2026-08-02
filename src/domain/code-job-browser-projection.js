@@ -1,5 +1,6 @@
 import { CODE_JOB_STATUSES } from "./code-job-vocabulary.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
+import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
 
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -31,8 +32,10 @@ const ACTIVE_CODE_JOB_STATUSES = new Set([
   "pausing",
   "unknown",
   "paused",
+  "cancelling",
 ]);
 const TERMINAL_CODE_JOB_STATUSES = new Set([
+  "cancelled",
   "completed",
   "failed",
   "fenced",
@@ -344,6 +347,7 @@ function projectedTerminalDetail(detail) {
     "summary",
     "code",
     "message",
+    "reason",
     "completedActionId",
   ]) {
     if (["string", "number"].includes(typeof detail[key])) {
@@ -391,7 +395,8 @@ export function projectCodeJobObservationForBrowser(observation) {
 }
 
 export function projectCodeJobTerminalDetailForBrowser(job) {
-  return job.execution.result === null
+  return !TERMINAL_CODE_JOB_STATUSES.has(job.status) ||
+    job.execution.result === null
     ? null
     : structuredClone(projectedTerminalDetail(job.execution.result.detail));
 }
@@ -663,13 +668,17 @@ function assertProjectionLifecycle(projection, progress, error) {
         terminalResult !== null ||
         pause !== null ||
         memoryProjection !== null)) ||
-    (["active", "pausing", "unknown", "paused"].includes(
+    (["active", "pausing", "unknown", "paused", "cancelling"].includes(
       projection.status,
     ) && (terminalResult !== null || memoryProjection !== null)) ||
-    (!["pausing", "unknown", "paused"].includes(projection.status) &&
+    (!["pausing", "unknown", "paused", "cancelling"].includes(
+      projection.status,
+    ) &&
       pause !== null) ||
     (["pausing", "paused"].includes(projection.status) && pause === null) ||
-    (projection.status === "unknown") !== (uncertainty !== null) ||
+    (projection.status === "unknown" && uncertainty === null) ||
+    (uncertainty !== null &&
+      !["unknown", "cancelling"].includes(projection.status)) ||
     (uncertainty?.from === "active" && pause !== null) ||
     (uncertainty?.from === "pausing" && pause === null) ||
     (projection.status === "unknown" && pendingActionType === null) ||
@@ -760,11 +769,12 @@ export function projectNormalizedCodeJobForBrowser(job) {
             status: execution.observations.at(-1).status,
             recordedAt: execution.observations.at(-1).recordedAt,
           },
-      terminalResult: execution.result === null
+      terminalResult: !TERMINAL_CODE_JOB_STATUSES.has(job.status) ||
+        execution.result === null
         ? null
         : {
             kind: execution.result.kind,
-            recordedAt: execution.result.recordedAt,
+            recordedAt: codeJobTerminalLifecycleAt(job),
           },
       memoryProjection: execution.memoryProjection === null
         ? null
@@ -797,7 +807,10 @@ export function projectArchivedCodeJobForBrowser(tombstone) {
       pendingActionType: null,
       observationCount: tombstone.outcome.observationCount,
       latestObservation: tombstone.outcome.latestObservation,
-      terminalResult: tombstone.outcome.terminalResult,
+      terminalResult: {
+        ...tombstone.outcome.terminalResult,
+        recordedAt: tombstone.outcome.memoryProjection.sourceUpdatedAt,
+      },
       memoryProjection: {
         recordId: tombstone.outcome.memoryProjection.memoryRecordId,
         projectedAt: tombstone.outcome.memoryProjection.projectedAt,

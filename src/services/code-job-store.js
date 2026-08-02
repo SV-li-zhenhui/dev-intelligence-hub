@@ -18,6 +18,7 @@ import {
   projectCodeJobTerminalDetailForBrowser,
   projectArchivedCodeJobForBrowser,
 } from "../domain/code-job-browser-projection.js";
+import { codeJobTerminalLifecycleAt } from "../domain/code-job-terminal-time.js";
 import {
   digestValue,
   normalizeActionRequest,
@@ -61,11 +62,21 @@ const RUNNABLE_STATUSES = new Set([
   "starting",
   "active",
   "pausing",
+  "cancelling",
 ]);
 const RECONCILABLE_STATUSES = new Set(["unknown"]);
 const RESUMED_STATUSES = new Set(["queued", "starting", "active"]);
+const CANCELLABLE_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "unknown",
+  "paused",
+]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
 const TERMINAL_MEMORY_EVENT_KINDS = new Set([
+  "cancelled",
   "completed",
   "failed",
   "fenced",
@@ -1639,6 +1650,172 @@ function normalizeReason(value, error) {
   return value;
 }
 
+function cancellationIntent(reason, requestedFrom, recordedAt) {
+  const detail = createCodeJobDetail({
+    schemaVersion: 1,
+    outcome: "cancelled",
+    code: "CODE_JOB_CANCELLED",
+    message: "代码任务已按用户请求取消",
+    reason,
+    requestedFrom,
+  });
+  return {
+    kind: "cancelled",
+    detail,
+    detailDigest: digestValue(detail),
+    recordedAt,
+  };
+}
+
+function cancellationSettlementReceipt(proof) {
+  return {
+    kind: proof.kind,
+    sessionId: proof.sessionId,
+    cancellationDigest: proof.cancellationDigest,
+    workspaceRevision: proof.trustedWorkspaceRevision,
+    proofDigest: proof.proofDigest,
+    settledAt: proof.settledAt,
+  };
+}
+
+function cancelledExecution(
+  execution,
+  workspaceRevision = undefined,
+  cancellationSettlement = undefined,
+) {
+  return {
+    ...execution,
+    ...(workspaceRevision === undefined ? {} : { workspaceRevision }),
+    ...(cancellationSettlement === undefined
+      ? {}
+      : { cancellationSettlement }),
+    pendingAction: null,
+    actionAdmission: null,
+    pause: null,
+    uncertainty: null,
+  };
+}
+
+function normalizeNullableSha256(value, error) {
+  return value === null ? null : normalizeSha256(value, error);
+}
+
+function normalizeCancellationActionResolution(value, error) {
+  if (value === null) return null;
+  assertExactKeys(
+    value,
+    [
+      "actionId",
+      "actionDigest",
+      "disposition",
+      "workspaceRevisionBefore",
+      "workspaceRevisionAfter",
+    ],
+    error,
+  );
+  if (
+    ![
+      "absent",
+      "audited_succeeded",
+      "audited_failed",
+      "discarded_unknown",
+    ].includes(value.disposition)
+  ) {
+    throw error;
+  }
+  return {
+    actionId: normalizeSafeId(value.actionId, error),
+    actionDigest: normalizeSha256(value.actionDigest, error),
+    disposition: value.disposition,
+    workspaceRevisionBefore: normalizeSha256(
+      value.workspaceRevisionBefore,
+      error,
+    ),
+    workspaceRevisionAfter: normalizeNullableSha256(
+      value.workspaceRevisionAfter,
+      error,
+    ),
+  };
+}
+
+function normalizeCancellationSettlement(value, error) {
+  const proofKeys = [
+    "schemaVersion",
+    "kind",
+    "sessionId",
+    "cancellationDigest",
+    "sourceRevision",
+    "trustedWorkspaceRevision",
+    "actionResolution",
+    "sandboxCleanupConfirmed",
+    "discardedAttempts",
+    "settledAt",
+    "proofDigest",
+  ];
+  assertExactKeys(value, proofKeys, error);
+  const discardedAttempts = denseArray(
+    value.discardedAttempts,
+    1_000,
+    error,
+  ).map((attempt) => {
+    assertExactKeys(
+      attempt,
+      ["attemptNumber", "executionId", "disposition"],
+      error,
+    );
+    if (attempt.disposition !== "discarded") throw error;
+    return {
+      attemptNumber: safeInteger(
+        attempt.attemptNumber,
+        1,
+        1_000,
+        error,
+      ),
+      executionId: normalizeSafeId(attempt.executionId, error),
+      disposition: "discarded",
+    };
+  });
+  if (
+    value.schemaVersion !== 1 ||
+    ![
+      "controlled_execution_absent",
+      "controlled_execution_cancelled",
+    ].includes(value.kind) ||
+    value.sandboxCleanupConfirmed !== true ||
+    (value.kind === "controlled_execution_absent"
+      ? discardedAttempts.length !== 0
+      : discardedAttempts.length < 1) ||
+    discardedAttempts.some(
+      ({ attemptNumber }, index) => attemptNumber !== index + 1,
+    ) ||
+    new Set(discardedAttempts.map(({ executionId }) => executionId)).size !==
+      discardedAttempts.length
+  ) {
+    throw error;
+  }
+  const proof = {
+    schemaVersion: 1,
+    kind: value.kind,
+    sessionId: normalizeJobId(value.sessionId, error),
+    cancellationDigest: normalizeSha256(value.cancellationDigest, error),
+    sourceRevision: normalizeNullableSha256(value.sourceRevision, error),
+    trustedWorkspaceRevision: normalizeNullableSha256(
+      value.trustedWorkspaceRevision,
+      error,
+    ),
+    actionResolution: normalizeCancellationActionResolution(
+      value.actionResolution,
+      error,
+    ),
+    sandboxCleanupConfirmed: true,
+    discardedAttempts,
+    settledAt: normalizeCodeJobTimestamp(value.settledAt, error),
+  };
+  const proofDigest = normalizeSha256(value.proofDigest, error);
+  if (digestValue(proof) !== proofDigest) throw error;
+  return { ...proof, proofDigest };
+}
+
 function normalizeFailureCode(value, error) {
   if (
     typeof value !== "string" ||
@@ -1766,7 +1943,7 @@ function createArchiveTombstone(entry) {
       latestObservation,
       terminalResult: {
         kind: job.execution.result.kind,
-        recordedAt: job.execution.result.recordedAt,
+        recordedAt: codeJobTerminalLifecycleAt(job),
       },
       memoryProjection: job.execution.memoryProjection,
       changePackageDelivery: entry.changePackageDelivery,
@@ -2764,7 +2941,10 @@ export class CodeJobStore {
         throw transitionConflict("动作撤回请求与入场凭据不匹配");
       }
       this.#assertJobRevision(job, request.expectedRevision);
-      if (!RECONCILABLE_STATUSES.has(job.status) && job.status !== "pausing") {
+      if (
+        !RECONCILABLE_STATUSES.has(job.status) &&
+        job.status !== "pausing"
+      ) {
         throw transitionConflict();
       }
       const recoveryStatus =
@@ -2896,7 +3076,7 @@ export class CodeJobStore {
       if (!["active", "pausing", "unknown"].includes(job.status)) {
         throw transitionConflict();
       }
-      if (job.status === "unknown") {
+      if (job.execution.uncertainty !== null) {
         const admission = job.execution.actionAdmission;
         if (
           reconciliationBinding === null ||
@@ -2921,29 +3101,32 @@ export class CodeJobStore {
         state,
         index,
         nextStatus,
-        (at) => ({
-          ...job.execution,
-          workspaceRevision,
-          turn: pending.turn,
-          pendingAction: null,
-          actionAdmission: null,
-          uncertainty: null,
-          observations: [
-            ...job.execution.observations,
-            {
-              turn: pending.turn,
-              actionId,
-              actionType: pending.action.type,
-              actionDigest: pending.actionDigest,
-              action: pending.action,
-              status,
-              workspaceRevision,
-              detail,
-              detailDigest,
-              recordedAt: at,
-            },
-          ],
-        }),
+        (at) => {
+          const observedExecution = {
+            ...job.execution,
+            workspaceRevision,
+            turn: pending.turn,
+            pendingAction: null,
+            actionAdmission: null,
+            uncertainty: null,
+            observations: [
+              ...job.execution.observations,
+              {
+                turn: pending.turn,
+                actionId,
+                actionType: pending.action.type,
+                actionDigest: pending.actionDigest,
+                action: pending.action,
+                status,
+                workspaceRevision,
+                detail,
+                detailDigest,
+                recordedAt: at,
+              },
+            ],
+          };
+          return observedExecution;
+        },
       );
       return this.#appliedLifecycleChange(changed);
     });
@@ -3031,6 +3214,137 @@ export class CodeJobStore {
         index,
         target,
         () => ({ ...job.execution, pause: null }),
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  cancel(value) {
+    const request = normalizeMutationBase(value, ["reason"]);
+    const reason = normalizeReason(value.reason, request.error);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (["cancelling", "cancelled"].includes(job.status)) {
+        if (job.execution.result?.detail?.reason !== reason) {
+          throw transitionConflict("代码任务已绑定不同的取消原因");
+        }
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      if (isTerminalCodeJobStatus(job.status)) {
+        throw transitionConflict("代码任务已以不同结果结束");
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (!CANCELLABLE_STATUSES.has(job.status)) throw transitionConflict();
+      const mustReconcile =
+        job.execution.sessionId !== null;
+      const changed = this.#updateJob(
+        state,
+        index,
+        mustReconcile ? "cancelling" : "cancelled",
+        (at) => {
+          const execution = {
+            ...job.execution,
+            result: cancellationIntent(reason, job.status, at),
+          };
+          return mustReconcile ? execution : cancelledExecution(execution);
+        },
+      );
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
+  finalizeCancellation(value) {
+    const request = normalizeMutationBase(value, ["settlement"]);
+    const settlement = normalizeCancellationSettlement(
+      value.settlement,
+      request.error,
+    );
+    const receipt = cancellationSettlementReceipt(settlement);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      if (job.status === "cancelled") {
+        if (
+          job.execution.cancellationSettlement === null ||
+          digestValue(job.execution.cancellationSettlement) !==
+            digestValue(receipt)
+        ) {
+          throw transitionConflict("代码任务已绑定不同的取消结算证明");
+        }
+        return {
+          state,
+          value: workerMutationResult("already", job),
+          write: false,
+        };
+      }
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (
+        job.status !== "cancelling" ||
+        settlement.sessionId !== job.jobId ||
+        settlement.cancellationDigest !==
+          job.execution.result?.detailDigest ||
+        Date.parse(settlement.settledAt) <
+          Date.parse(job.execution.result.recordedAt) ||
+        ((settlement.sourceRevision === null) !==
+          (settlement.trustedWorkspaceRevision === null))
+      ) {
+        throw transitionConflict();
+      }
+      const pending = job.execution.pendingAction;
+      const admission = job.execution.actionAdmission;
+      const resolution = settlement.actionResolution;
+      if (
+        settlement.kind === "controlled_execution_absent" &&
+        (job.execution.workspaceRevision !== null ||
+          pending !== null ||
+          admission !== null ||
+          settlement.sourceRevision !== null ||
+          settlement.trustedWorkspaceRevision !== null ||
+          resolution !== null)
+      ) {
+        throw transitionConflict("会话缺失证明与代码任务状态不匹配");
+      }
+      if (
+        (pending === null) !== (resolution === null) ||
+        (pending !== null &&
+          (resolution.actionId !== pending.actionId ||
+            resolution.actionDigest !== pending.actionDigest ||
+            resolution.workspaceRevisionBefore !==
+              pending.action.expectedWorkspaceRevision)) ||
+        (admission === null &&
+          resolution !== null &&
+          resolution.disposition !== "absent") ||
+        (admission !== null &&
+          (pending === null ||
+            admission.actionId !== pending.actionId ||
+            admission.actionDigest !== pending.actionDigest))
+      ) {
+        throw transitionConflict("取消结算证明与待执行动作不匹配");
+      }
+      const currentRevision = job.execution.workspaceRevision;
+      const resolvedRevision = resolution?.workspaceRevisionAfter ??
+        resolution?.workspaceRevisionBefore ?? currentRevision;
+      if (
+        (currentRevision !== null &&
+          resolution !== null &&
+          resolution.workspaceRevisionBefore !== currentRevision) ||
+        (currentRevision !== null &&
+          settlement.trustedWorkspaceRevision !== resolvedRevision)
+      ) {
+        throw transitionConflict("取消结算证明与可信工作区版本不匹配");
+      }
+      const changed = this.#updateJob(
+        state,
+        index,
+        "cancelled",
+        () => cancelledExecution(
+          job.execution,
+          settlement.trustedWorkspaceRevision,
+          receipt,
+        ),
       );
       return this.#appliedLifecycleChange(changed);
     });
@@ -3559,6 +3873,9 @@ export class CodeJobStore {
         };
       }
       this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status === "cancelling") {
+        throw transitionConflict("正在取消的代码任务不能改写为其他终态");
+      }
       if (job.execution.actionAdmission !== null) {
         throw transitionConflict("已入场动作完成对账前不能结束代码任务");
       }

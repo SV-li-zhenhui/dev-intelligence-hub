@@ -282,6 +282,48 @@ function terminalJob(kind) {
   });
 }
 
+function cancellingJob() {
+  const unknown = unknownJob();
+  const detail = {
+    schemaVersion: 1,
+    outcome: "cancelled",
+    code: "CODE_JOB_CANCELLED",
+    message: "代码任务已按用户请求取消",
+    reason: "用户不再需要这项任务",
+    requestedFrom: "unknown",
+  };
+  return updateCodeJobLifecycle(unknown, {
+    status: "cancelling",
+    revision: 4,
+    updatedAt: "2026-08-02T06:03:00.000Z",
+    execution: {
+      ...unknown.execution,
+      result: {
+        kind: "cancelled",
+        detail,
+        detailDigest: digestValue(detail),
+        recordedAt: "2026-08-02T06:03:00.000Z",
+      },
+    },
+  });
+}
+
+function cancelledJob() {
+  const cancelling = cancellingJob();
+  return updateCodeJobLifecycle(cancelling, {
+    status: "cancelled",
+    revision: 5,
+    updatedAt: "2026-08-02T06:04:00.000Z",
+    execution: {
+      ...cancelling.execution,
+      pendingAction: null,
+      actionAdmission: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+}
+
 test("creates a content-addressed safe Code Job memory event", () => {
   const job = completedJob();
   const event = createCodeJobMemoryEvent({
@@ -418,12 +460,16 @@ test("classifies and creates every supported lifecycle event kind", () => {
   const reconciled = reconciledJob();
   const failed = terminalJob("failed");
   const fenced = terminalJob("fenced");
+  const cancelling = cancellingJob();
+  const cancelled = cancelledJob();
   const cases = [
     [null, active, "observation"],
     [queued, paused, "paused"],
     [paused, resumed, "resumed"],
     [active, unknown, "unknown"],
     [unknown, reconciled, "reconciled"],
+    [unknown, cancelling, "cancelling"],
+    [cancelling, cancelled, "cancelled"],
     [queued, failed, "failed"],
     [queued, fenced, "fenced"],
   ];
@@ -438,5 +484,15 @@ test("classifies and creates every supported lifecycle event kind", () => {
     });
     assert.equal(event.kind, kind);
     assert.doesNotThrow(() => normalizeCodeJobMemoryEvent(event));
+    if (kind === "cancelling") {
+      assert.equal(JSON.parse(event.memoryRecord.content).terminal, null);
+    }
+    if (kind === "cancelled") {
+      assert.equal(event.occurredAt, "2026-08-02T06:04:00.000Z");
+      assert.equal(
+        JSON.parse(event.memoryRecord.content).terminal.recordedAt,
+        "2026-08-02T06:04:00.000Z",
+      );
+    }
   }
 });

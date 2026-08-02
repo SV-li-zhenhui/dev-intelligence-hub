@@ -922,7 +922,10 @@ function codeJobActionFocusIntent(element) {
 
 function codeJobFocusSelectors(intent) {
   if (intent?.type === "control") {
-    const sameCommand = intent.command === "resume" ? "resume" : "pause";
+    const sameCommand = ["pause", "resume", "cancel"].includes(intent.command)
+      ? intent.command
+      : null;
+    if (sameCommand === null) return [];
     return [
       `[data-code-job-control="${sameCommand}"]`,
       "[data-code-job-control]",

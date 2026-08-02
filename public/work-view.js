@@ -97,11 +97,26 @@ const CODE_JOB_STATUSES = new Set([
   "active",
   "pausing",
   "paused",
+  "cancelling",
+  "cancelled",
   "completed",
   "failed",
   "fenced",
   "unknown",
 ]);
+
+const CODE_JOB_CONTROL_STATUSES = Object.freeze({
+  pause: Object.freeze(["queued", "starting", "active"]),
+  resume: Object.freeze(["paused"]),
+  cancel: Object.freeze([
+    "queued",
+    "starting",
+    "active",
+    "pausing",
+    "unknown",
+    "paused",
+  ]),
+});
 
 function codeJobStatus(status) {
   return CODE_JOB_STATUSES.has(status) ? status : "unknown";
@@ -114,11 +129,30 @@ function codeJobStatusLabel(status) {
     active: "受控执行中",
     pausing: "正在安全暂停",
     paused: "已暂停",
+    cancelling: "正在安全取消",
+    cancelled: "已取消",
     completed: "已完成",
     failed: "执行失败",
     fenced: "安全隔离，等待核验",
     unknown: "状态待核验",
   }[codeJobStatus(status)];
+}
+
+function canControlCodeJob(detail, command) {
+  const job = detail?.job;
+  if (
+    typeof command !== "string" ||
+    !Object.hasOwn(CODE_JOB_CONTROL_STATUSES, command)
+  ) return false;
+  const allowedStatuses = CODE_JOB_CONTROL_STATUSES[command];
+  return Boolean(
+    detail?.archived === false &&
+      typeof job?.jobId === "string" &&
+      job.jobId.length > 0 &&
+      Number.isSafeInteger(job.revision) &&
+      job.revision >= 1 &&
+      allowedStatuses.includes(job.status),
+  );
 }
 
 function codeJobActionStatusLabel(status) {
@@ -546,8 +580,9 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
   }
   const status = codeJobStatus(job.status);
   const receipt = detail.changePackage?.receipt;
-  const canPause = !detail.archived && ["queued", "starting", "active"].includes(status);
-  const canResume = !detail.archived && status === "paused";
+  const canPause = canControlCodeJob(detail, "pause");
+  const canResume = canControlCodeJob(detail, "resume");
+  const canCancel = canControlCodeJob(detail, "cancel");
   const packageReady = detail.changePackage?.status === "ready" && receipt;
   const application = normalizeChangePackageApplication(
     detail.changePackage?.application,
@@ -601,8 +636,9 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
     </section>
     ${state.actionError ? `<p class="code-job-action-error" role="alert">${escapeWorkHtml(state.actionError)}</p>` : ""}
     <div class="code-job-detail-actions">
-      ${canPause ? `<button type="button" data-code-job-control="pause" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "安全暂停"}</button>` : ""}
-      ${canResume ? `<button type="button" data-code-job-control="resume" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "恢复执行"}</button>` : ""}
+      ${canPause ? `<button type="button" data-code-job-control="pause" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading && state.controlCommand === "pause" ? "正在请求暂停…" : "安全暂停"}</button>` : ""}
+      ${canResume ? `<button type="button" data-code-job-control="resume" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading && state.controlCommand === "resume" ? "正在请求恢复…" : "恢复执行"}</button>` : ""}
+      ${canCancel ? `<button type="button" class="code-job-cancel-action" data-code-job-control="cancel" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading && state.controlCommand === "cancel" ? "正在请求取消…" : "取消任务"}</button>` : ""}
       ${canRequestApplication ? `<button type="button" data-code-job-apply ${state.applyLoading ? "disabled" : ""}>${state.applyLoading ? "正在加入确认队列…" : "申请应用变更包"}</button>` : ""}
     </div>
   </article>`;
@@ -763,6 +799,7 @@ export function createWorkView({
       historyLoading: false,
       packageLoading: false,
       controlLoading: false,
+      controlCommand: null,
       applyLoading: false,
       actionError: "",
     };
@@ -860,13 +897,13 @@ export function createWorkView({
   async function controlCodeJob(command) {
     const current = detailState;
     const job = current?.detail?.job;
-    if (!job || current.controlLoading) return;
-    const allowed =
-      (command === "pause" && ["queued", "starting", "active"].includes(job.status)) ||
-      (command === "resume" && job.status === "paused");
-    if (!allowed || current.detail.archived) return;
+    if (
+      !job ||
+      current.controlLoading ||
+      !canControlCodeJob(current.detail, command)
+    ) return;
     const sequence = detailRequestSequence;
-    updateDetail({ controlLoading: true, actionError: "" });
+    updateDetail({ controlLoading: true, controlCommand: command, actionError: "" });
     try {
       const response = await fetchImpl(
         `/api/code/jobs/${encodeURIComponent(job.jobId)}/control`,
@@ -889,7 +926,11 @@ export function createWorkView({
       if (sequence === detailRequestSequence) await openCodeJob(job.jobId);
     } catch (error) {
       if (sequence !== detailRequestSequence) return;
-      updateDetail({ controlLoading: false, actionError: errorMessage(error) });
+      updateDetail({
+        controlLoading: false,
+        controlCommand: null,
+        actionError: errorMessage(error),
+      });
     }
   }
 

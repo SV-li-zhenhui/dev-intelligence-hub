@@ -193,6 +193,11 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal(Object.isFrozen(runtime.confirmationExecutor), true);
   assert.equal(Object.isFrozen(runtime.reader), true);
   assert.equal(Object.isFrozen(runtime.control), true);
+  assert.deepEqual(Object.keys(runtime.control).sort(), [
+    "cancel",
+    "pause",
+    "resume",
+  ]);
   assert.equal(Object.isFrozen(runtime.projectionSource), true);
   assert.equal(runtime.worker, null);
   assert.equal(runtime.changePackageDelivery, null);
@@ -335,7 +340,10 @@ test("change-package delivery is atomically configured, narrow, and drained on c
     changePackageReader,
     workerFactory(options) {
       workerOptions = options;
-      return { async runCycle() { return { selected: 0, outcomes: [] }; } };
+      return {
+        async runCycle() { return { selected: 0, outcomes: [] }; },
+        requestCancellation() { return false; },
+      };
     },
   });
 
@@ -581,6 +589,7 @@ test("worker cycles stay private and close drains the complete admitted cycle", 
             return { selected: value.limit, outcomes: [] };
           });
         },
+        requestCancellation() { return false; },
       };
     },
   });
@@ -619,6 +628,7 @@ test("pause control is admitted while a worker cycle is still running", async ()
             return { selected: 1, outcomes: [] };
           });
         },
+        requestCancellation() { return false; },
       };
     },
   });
@@ -644,6 +654,114 @@ test("pause control is admitted while a worker cycle is still running", async ()
 
   assert.equal(observed.kind, "pause");
   assert.equal(paused.job.status, "paused");
+});
+
+test("control transitions share the worker session-transition lease", async () => {
+  let workerOptions;
+  const { runtime } = await runtimeFixture({
+    executor: {},
+    brainDirectory: {},
+    workerFactory(options) {
+      workerOptions = options;
+      return {
+        async runCycle() { return { selected: 0, outcomes: [] }; },
+        requestCancellation() { return false; },
+      };
+    },
+  });
+  const created = await runtime.confirmationExecutor.execute(envelope());
+  const whileLeaseIsHeld = async (operation) => {
+    const entered = deferred();
+    const release = deferred();
+    const held = workerOptions.sessionTransitionLease.run(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const mutation = operation();
+    const observed = await Promise.race([
+      mutation.then(() => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("waiting"), 20)),
+    ]);
+    assert.equal(observed, "waiting");
+    release.resolve();
+    await held;
+    return mutation;
+  };
+
+  let current = await runtime.reader.get(created.receipt.id);
+  const paused = await whileLeaseIsHeld(() => runtime.control.pause({
+    jobId: current.jobId,
+    expectedRevision: current.revision,
+    reason: "用户请求安全暂停",
+  }));
+  assert.equal(paused.job.status, "paused");
+
+  current = paused.job;
+  const resumed = await whileLeaseIsHeld(() => runtime.control.resume({
+    jobId: current.jobId,
+    expectedRevision: current.revision,
+  }));
+  assert.equal(resumed.job.status, "queued");
+
+  current = resumed.job;
+  const cancelled = await whileLeaseIsHeld(() => runtime.control.cancel({
+    jobId: current.jobId,
+    expectedRevision: current.revision,
+    reason: "用户取消任务",
+  }));
+  assert.equal(cancelled.job.status, "cancelled");
+  assert.equal(Object.isFrozen(workerOptions.sessionTransitionLease), true);
+  assert.equal("sessionTransitionLease" in runtime, false);
+  await runtime.close();
+});
+
+test("cancel persists before best-effort worker interruption and keeps it private", async () => {
+  const events = [];
+  const store = new MemoryStore({ events });
+  let workerOptions;
+  const { runtime } = await runtimeFixture({
+    store,
+    executor: {},
+    brainDirectory: {},
+    workerFactory(options) {
+      workerOptions = options;
+      return {
+        async runCycle() {
+          return options.operationQueue.enqueue(() => ({
+            selected: 0,
+            outcomes: [],
+          }));
+        },
+        requestCancellation(jobId) {
+          events.push(`request-cancellation:${jobId}`);
+          throw new Error("best-effort interruption failed");
+        },
+      };
+    },
+  });
+  const created = await runtime.confirmationExecutor.execute(envelope());
+  const queued = await runtime.reader.get(created.receipt.id);
+  const starting = await workerOptions.jobStore.claimStarting({
+    jobId: queued.jobId,
+    expectedRevision: queued.revision,
+  });
+  events.length = 0;
+
+  const cancelled = await runtime.control.cancel({
+    jobId: starting.job.jobId,
+    expectedRevision: starting.job.revision,
+    reason: "用户从本地指挥中枢取消代码任务",
+  });
+
+  const writeIndex = events.lastIndexOf("write");
+  const signalIndex = events.indexOf(`request-cancellation:${queued.jobId}`);
+  assert.equal(cancelled.status, "applied");
+  assert.equal(cancelled.job.status, "cancelling");
+  assert.equal(writeIndex >= 0, true);
+  assert.equal(signalIndex > writeIndex, true);
+  assert.deepEqual(Object.keys(runtime.worker), ["runCycle"]);
+  await runtime.close();
 });
 
 test("close drains an admitted approval before releasing the process guard", async () => {
@@ -704,6 +822,20 @@ test("recovery failure releases the independent guard and preserves its cause", 
     (error) => error === recoveryFailure,
   );
   assert.equal(guard.closeCount, 1);
+
+  const invalidWorkerGuard = new FakeGuard();
+  await assert.rejects(
+    createCodeJobRuntime({
+      store: new MemoryStore(),
+      executor: {},
+      brainDirectory: {},
+      grantVerifier: { async verify(value) { return value; } },
+      workerFactory: () => ({ async runCycle() {} }),
+      createGuard: () => invalidWorkerGuard,
+    }),
+    /code job worker is invalid/,
+  );
+  assert.equal(invalidWorkerGuard.closeCount, 1);
 });
 
 test("guard acquisition failure also closes once and never reads durable state", async () => {

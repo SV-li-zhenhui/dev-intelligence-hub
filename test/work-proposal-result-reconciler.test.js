@@ -251,8 +251,14 @@ test("reconciler applies a completed code result only after its memory receipt i
   assert.deepEqual(applied, batch);
 });
 
-test("reconciler waits at active, unknown, and unprojected terminal code jobs", async (t) => {
-  for (const status of ["active", "unknown", "completed"]) {
+test("reconciler waits at active, unknown, cancelling, and unprojected terminal code jobs", async (t) => {
+  for (const status of [
+    "active",
+    "unknown",
+    "cancelling",
+    "completed",
+    "cancelled",
+  ]) {
     await t.test(status, async () => {
       const batch = gateBatch([codeResult()], { highWatermark: 3 });
       let applied;
@@ -381,6 +387,12 @@ test("reconciler rejects missing, ambiguous, and contradictory code-job evidence
       job: codeJob({ status: "completed" }),
       reads: 1,
     },
+    {
+      name: "rejected result bound to a non-cancelled job",
+      item: codeResult({ outcome: "rejected" }),
+      job: codeJob({ status: "failed" }),
+      reads: 1,
+    },
   ];
 
   for (const fixture of cases) {
@@ -489,6 +501,31 @@ test("reconciler accepts a projected terminal failure with matching evidence", a
 
   assert.deepEqual(applied.items, [item]);
   assert.equal(applied.nextSequence, 1);
+});
+
+test("reconciler accepts a projected cancellation only as rejected", async () => {
+  const item = codeResult({ sequence: 1, outcome: "rejected" });
+  let applied;
+  const dependencies = ports({
+    proposalConsumer: {
+      readResultBatch: async () => gateBatch([item]),
+    },
+    ledger: {
+      async applyProposalBatch(value) {
+        applied = value;
+        return { applied: 1, cursor: 1 };
+      },
+    },
+  });
+  const reconciler = new WorkProposalResultReconciler({
+    ...dependencies,
+    codeJobReader: {
+      get: async () => codeJob({ status: "cancelled" }),
+    },
+  });
+
+  assert.deepEqual(await reconciler.runCycle(), { applied: 1, cursor: 1 });
+  assert.deepEqual(applied.items, [item]);
 });
 
 test("reconciler strictly validates and binds the optional code job reader", async () => {

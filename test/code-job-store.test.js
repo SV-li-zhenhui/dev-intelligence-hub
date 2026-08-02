@@ -8,7 +8,9 @@ import {
 } from "../src/domain/code-job-contract.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
+import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
 import {
+  createCodeJobMemoryEvent,
   memoryRecordForCodeJobEvent,
 } from "../src/domain/code-job-memory-event.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
@@ -148,6 +150,13 @@ function memoryAcknowledgement(event, overrides = {}) {
   };
 }
 
+function legacyJobWithoutCancellationSettlement(job) {
+  const content = structuredClone(job);
+  delete content.recordDigest;
+  delete content.execution.cancellationSettlement;
+  return { ...content, recordDigest: digestValue(content) };
+}
+
 function compactionRequest(
   store,
   { compactionId = "code-job-compaction-test", targetThroughSequence } = {},
@@ -158,6 +167,48 @@ function compactionRequest(
     targetThroughSequence,
     preArchiveDigest: store.value.archive.digest,
   };
+}
+
+function executorCancellationProof(
+  job,
+  {
+    kind = "controlled_execution_cancelled",
+    workspaceRevision = job.execution.workspaceRevision,
+    disposition = "discarded_unknown",
+    settledAt = job.updatedAt,
+  } = {},
+) {
+  const pending = job.execution.pendingAction;
+  const actionResolution = pending === null
+    ? null
+    : {
+        actionId: pending.actionId,
+        actionDigest: pending.actionDigest,
+        disposition,
+        workspaceRevisionBefore: pending.action.expectedWorkspaceRevision,
+        workspaceRevisionAfter: disposition.startsWith("audited_")
+          ? workspaceRevision
+          : null,
+      };
+  const proof = {
+    schemaVersion: 1,
+    kind,
+    sessionId: job.jobId,
+    cancellationDigest: job.execution.result.detailDigest,
+    sourceRevision: workspaceRevision === null ? null : "6".repeat(64),
+    trustedWorkspaceRevision: workspaceRevision,
+    actionResolution,
+    sandboxCleanupConfirmed: true,
+    discardedAttempts: kind === "controlled_execution_absent"
+      ? []
+      : [{
+          attemptNumber: 1,
+          executionId: "attempt-cancel-proof",
+          disposition: "discarded",
+        }],
+    settledAt,
+  };
+  return { ...proof, proofDigest: digestValue(proof) };
 }
 
 async function readyStore({
@@ -1292,6 +1343,232 @@ test("an admitted action cannot be failed or fenced before reconciliation", asyn
   );
 });
 
+test("cancellation is durable, idempotent, and archived only after memory receipt", async () => {
+  const { jobs, store } = await readyStore();
+  const created = await jobs.createApprovedJob(approval());
+  const request = {
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    reason: "用户取消不再需要的检查任务",
+  };
+
+  const cancelled = await jobs.cancel(request);
+  assert.equal(cancelled.status, "applied");
+  assert.equal(cancelled.job.status, "cancelled");
+  assert.equal(cancelled.job.execution.result.kind, "cancelled");
+  assert.deepEqual(cancelled.job.execution.result.detail, {
+    schemaVersion: 1,
+    outcome: "cancelled",
+    code: "CODE_JOB_CANCELLED",
+    message: "代码任务已按用户请求取消",
+    reason: request.reason,
+    requestedFrom: "queued",
+  });
+  assert.equal((await jobs.listRunnable()).items.length, 0);
+
+  const retry = await jobs.cancel(request);
+  assert.equal(retry.status, "already");
+  assert.equal(retry.job.recordDigest, cancelled.job.recordDigest);
+  await assert.rejects(
+    jobs.cancel({ ...request, reason: "不同的取消原因" }),
+    { code: "CODE_JOB_TRANSITION_CONFLICT" },
+  );
+  await assert.rejects(
+    jobs.fail({
+      jobId: cancelled.job.jobId,
+      expectedRevision: cancelled.job.revision,
+      result: { code: "LATE_FAILURE", message: "must not overwrite cancel" },
+    }),
+    { code: "CODE_JOB_TRANSITION_CONFLICT" },
+  );
+
+  await assert.rejects(
+    jobs.compactTerminalPrefix(compactionRequest(store, {
+      targetThroughSequence: cancelled.job.sequence,
+    })),
+    { code: "CODE_JOB_RETENTION_BLOCKED" },
+  );
+  const batch = await jobs.readMemoryProjectionBatch({ limit: 10 });
+  assert.equal(batch.items.at(-1).kind, "cancelled");
+  await jobs.acknowledgeMemoryProjection(
+    memoryAcknowledgement(batch.items.at(-1)),
+  );
+  const compacted = await jobs.compactTerminalPrefix(compactionRequest(store, {
+    targetThroughSequence: cancelled.job.sequence,
+  }));
+  assert.equal(compacted.status, "applied");
+  assert.equal((await jobs.get(cancelled.job.jobId)).status, "cancelled");
+});
+
+test("session-start cancellation preserves request time and projects its real terminal time", async () => {
+  const { jobs, store, time } = await readyStore();
+  const created = await jobs.createApprovedJob(approval());
+  const starting = await jobs.claimStarting({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+  });
+  time.advance(1_000);
+  const cancelling = await jobs.cancel({
+    jobId: starting.job.jobId,
+    expectedRevision: starting.job.revision,
+    reason: "用户停止已入场的启动流程",
+  });
+
+  assert.equal(cancelling.job.status, "cancelling");
+  assert.equal(cancelling.job.execution.result.detail.requestedFrom, "starting");
+  assert.equal((await jobs.listRunnable()).items[0].status, "cancelling");
+  const intent = structuredClone(cancelling.job.execution.result);
+  time.advance(60_000);
+  const workspaceRevision = "8".repeat(64);
+  const settlement = executorCancellationProof(cancelling.job, {
+    workspaceRevision,
+    settledAt: time.clock().toISOString(),
+  });
+  const cancelled = await jobs.finalizeCancellation({
+    jobId: cancelling.job.jobId,
+    expectedRevision: cancelling.job.revision,
+    settlement,
+  });
+  assert.equal(cancelled.job.status, "cancelled");
+  assert.equal(cancelled.job.execution.workspaceRevision, workspaceRevision);
+  assert.deepEqual(cancelled.job.execution.result, intent);
+  assert.notEqual(cancelled.job.updatedAt, intent.recordedAt);
+  assert.equal(
+    (await jobs.get(cancelled.job.jobId)).terminalResult.recordedAt,
+    cancelled.job.updatedAt,
+  );
+  const retry = await jobs.finalizeCancellation({
+    jobId: cancelling.job.jobId,
+    expectedRevision: cancelling.job.revision,
+    settlement,
+  });
+  assert.equal(retry.status, "already");
+  const events = (await jobs.readMemoryProjectionBatch({ limit: 10 })).items;
+  const cancellingEvent = events.find(({ kind }) => kind === "cancelling");
+  const cancelledEvent = events.find(({ kind }) => kind === "cancelled");
+  assert.equal(cancellingEvent.occurredAt, intent.recordedAt);
+  assert.equal(cancelledEvent.occurredAt, cancelled.job.updatedAt);
+  assert.equal(
+    JSON.parse(cancelledEvent.memoryRecord.content).terminal.recordedAt,
+    cancelled.job.updatedAt,
+  );
+  for (const event of events) {
+    time.advance(1_000);
+    await jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  }
+  assert.equal(
+    (await jobs.get(cancelled.job.jobId)).terminalResult.recordedAt,
+    cancelled.job.updatedAt,
+  );
+  await jobs.compactTerminalPrefix(compactionRequest(store, {
+    targetThroughSequence: cancelled.job.sequence,
+  }));
+  assert.equal(
+    (await jobs.get(cancelled.job.jobId)).terminalResult.recordedAt,
+    cancelled.job.updatedAt,
+  );
+});
+
+test("admitted and uncertain cancellations require an exact cleanup settlement", async () => {
+  for (const uncertain of [false, true]) {
+    const fixture = await readyStore();
+    const created = await fixture.jobs.createApprovedJob(approval({
+      requestId: uncertain ? "approval-request-unknown" : "approval-request-active",
+    }));
+    const starting = await fixture.jobs.claimStarting({
+      jobId: created.job.jobId,
+      expectedRevision: created.job.revision,
+    });
+    const workspaceRevision = "7".repeat(64);
+    const active = await fixture.jobs.activate({
+      jobId: created.job.jobId,
+      expectedRevision: starting.job.revision,
+      workspaceRevision,
+    });
+    const prepared = await fixture.jobs.prepareAction({
+      jobId: created.job.jobId,
+      expectedRevision: active.job.revision,
+      action: {
+        type: "list_files",
+        actionId: "cancel-admitted-action",
+        expectedWorkspaceRevision: workspaceRevision,
+        path: ".",
+      },
+    });
+    const pending = prepared.job.execution.pendingAction;
+    const admitted = await fixture.jobs.admitAction({
+      jobId: created.job.jobId,
+      expectedRevision: prepared.job.revision,
+      actionId: pending.actionId,
+      actionDigest: pending.actionDigest,
+    });
+    const source = uncertain
+      ? await fixture.jobs.markActionUnknown({
+          jobId: created.job.jobId,
+          expectedRevision: admitted.job.revision,
+          actionId: pending.actionId,
+          actionDigest: pending.actionDigest,
+          epoch: admitted.job.execution.actionAdmission.epoch,
+          code: "ACTION_RESULT_UNKNOWN",
+          message: "等待执行器核验",
+        })
+      : admitted;
+    const cancelling = await fixture.jobs.cancel({
+      jobId: created.job.jobId,
+      expectedRevision: source.job.revision,
+      reason: "用户要求停止在途动作",
+    });
+    assert.equal(cancelling.job.status, "cancelling");
+    assert.equal(cancelling.job.execution.result.detail.requestedFrom,
+      uncertain ? "unknown" : "active");
+
+    const admission = cancelling.job.execution.actionAdmission;
+    await assert.rejects(
+      fixture.jobs.recordObservation({
+      jobId: created.job.jobId,
+      expectedRevision: cancelling.job.revision,
+      actionId: pending.actionId,
+      actionDigest: admission.actionDigest,
+      epoch: admission.epoch,
+      status: uncertain ? "failed" : "succeeded",
+      workspaceRevision,
+      detail: { reconciled: true },
+      }),
+      { code: "CODE_JOB_TRANSITION_CONFLICT" },
+    );
+    const settlement = executorCancellationProof(cancelling.job);
+    await assert.rejects(
+      async () => fixture.jobs.finalizeCancellation({
+        jobId: created.job.jobId,
+        expectedRevision: cancelling.job.revision,
+        settlement: {
+          ...settlement,
+          actionResolution: {
+            ...settlement.actionResolution,
+            actionDigest: "0".repeat(64),
+          },
+        },
+      }),
+      { code: "INVALID_CODE_JOB_MUTATION" },
+    );
+    const cancelled = await fixture.jobs.finalizeCancellation({
+      jobId: created.job.jobId,
+      expectedRevision: cancelling.job.revision,
+      settlement,
+    });
+    assert.equal(cancelled.job.status, "cancelled");
+    assert.equal(cancelled.job.execution.observations.length, 0);
+    assert.equal(cancelled.job.execution.pendingAction, null);
+    assert.equal(cancelled.job.execution.actionAdmission, null);
+    assert.equal(cancelled.job.execution.uncertainty, null);
+    assert.equal(cancelled.job.execution.pause, null);
+    assert.equal(
+      cancelled.job.execution.cancellationSettlement.proofDigest,
+      settlement.proofDigest,
+    );
+  }
+});
+
 test("an absent uncertain action returns to its requested pause before re-admission", async () => {
   const { jobs } = await readyStore();
   const created = await jobs.createApprovedJob(approval());
@@ -1533,7 +1810,11 @@ test("schema v5 explicit null admission remains prepared but not admitted", asyn
   delete legacy.memoryProjection;
   delete legacy.changePackageDelivery;
   legacy.jobs = legacy.jobs.map((jobValue) => {
-    const { uncertainty: _uncertainty, ...execution } = jobValue.execution;
+    const {
+      uncertainty: _uncertainty,
+      cancellationSettlement: _cancellationSettlement,
+      ...execution
+    } = jobValue.execution;
     const content = { ...jobValue, execution };
     delete content.recordDigest;
     return { ...content, recordDigest: digestValue(content) };
@@ -1574,6 +1855,7 @@ test("schema v2 and v3 outer states recover and write back as v8", async (t) => 
           memoryProjection: _memoryProjection,
           actionAdmission: _actionAdmission,
           uncertainty: _uncertainty,
+          cancellationSettlement: _cancellationSettlement,
           ...execution
         } = jobValue.execution;
         const content = { ...jobValue, execution };
@@ -1619,6 +1901,162 @@ test("schema v7 recovery starts package delivery empty and writes back as v8", a
     reason: "升级 schema v7",
   });
   assert.equal(store.value.schemaVersion, 8);
+});
+
+test("schema v8 jobs without cancellation settlement retain durable outbox bindings", async (t) => {
+  async function legacyCompletedState({ delivered }) {
+    let manifest = null;
+    const fixture = await completedDeliveryFixture({
+      changePackageReader: {
+        async get(packageId) {
+          assert.equal(packageId, manifest.packageId);
+          return structuredClone(manifest);
+        },
+      },
+    });
+    let memoryBatch = await fixture.jobs.readMemoryProjectionBatch();
+    while (memoryBatch.items[0]?.kind !== "completed") {
+      await fixture.jobs.acknowledgeMemoryProjection(
+        memoryAcknowledgement(memoryBatch.items[0]),
+      );
+      memoryBatch = await fixture.jobs.readMemoryProjectionBatch();
+    }
+    assert.equal(memoryBatch.items.length, 1);
+
+    const [packageEvent] = (
+      await fixture.jobs.readChangePackageDeliveryBatch()
+    ).items;
+    manifest = changePackageForEvent(packageEvent);
+    if (delivered) {
+      await fixture.jobs.acknowledgeChangePackageDelivery(
+        changePackageAcknowledgement(packageEvent, manifest),
+      );
+    }
+
+    const state = structuredClone(fixture.store.value);
+    const legacyJob = legacyJobWithoutCancellationSettlement(state.jobs[0]);
+    state.jobs = [legacyJob];
+
+    const previousMemoryEvent = state.memoryProjection.pending[0];
+    const memoryEvent = createCodeJobMemoryEvent({
+      sequence: previousMemoryEvent.sequence,
+      previousDigest: previousMemoryEvent.previousDigest,
+      job: legacyJob,
+      kind: previousMemoryEvent.kind,
+    });
+    state.memoryProjection.pending = [memoryEvent];
+
+    const previousPackageEvent = delivered
+      ? state.changePackageDelivery.delivered[0]
+      : state.changePackageDelivery.pending[0];
+    const packageSequence = delivered
+      ? previousPackageEvent.receipt.sequence
+      : previousPackageEvent.sequence;
+    const packagePreviousDigest = previousPackageEvent.previousDigest;
+    const rebuiltPackageEvent = createCodeJobChangePackageEvent({
+      sequence: packageSequence,
+      previousDigest: packagePreviousDigest,
+      job: legacyJob,
+    });
+    manifest = changePackageForEvent(rebuiltPackageEvent);
+    if (delivered) {
+      state.changePackageDelivery.delivered[0] = {
+        previousDigest: packagePreviousDigest,
+        receipt: {
+          ...previousPackageEvent.receipt,
+          eventId: rebuiltPackageEvent.eventId,
+          eventDigest: rebuiltPackageEvent.eventDigest,
+          jobId: rebuiltPackageEvent.job.id,
+          sourceRecordDigest: rebuiltPackageEvent.job.recordDigest,
+          packageId: manifest.packageId,
+          packageDigest: manifest.packageDigest,
+        },
+      };
+      state.changePackageDelivery.checkpointDigest =
+        rebuiltPackageEvent.eventDigest;
+    } else {
+      state.changePackageDelivery.pending = [rebuiltPackageEvent];
+    }
+    return {
+      state,
+      memoryEvent,
+      packageEvent: rebuiltPackageEvent,
+      manifest,
+      changePackageReader: {
+        async get(packageId) {
+          assert.equal(packageId, manifest.packageId);
+          return structuredClone(manifest);
+        },
+      },
+    };
+  }
+
+  await t.test("pending terminal memory and package events", async () => {
+    const legacy = await legacyCompletedState({ delivered: false });
+    const store = new MemoryStore(legacy.state);
+    const recovered = await readyStore({
+      store,
+      changePackageReader: legacy.changePackageReader,
+    });
+
+    assert.deepEqual(
+      (await recovered.jobs.readMemoryProjectionBatch()).items,
+      [legacy.memoryEvent],
+    );
+    assert.deepEqual(
+      (await recovered.jobs.readChangePackageDeliveryBatch()).items,
+      [legacy.packageEvent],
+    );
+    await recovered.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(legacy.memoryEvent),
+    );
+    assert.equal(
+      (await recovered.jobs.getForWorker(legacy.memoryEvent.jobId))
+        .execution.memoryProjection.sourceRecordDigest,
+      legacy.memoryEvent.sourceRecordDigest,
+    );
+    assert.equal(
+      (await recovered.jobs.acknowledgeChangePackageDelivery(
+        changePackageAcknowledgement(
+          legacy.packageEvent,
+          legacy.manifest,
+        ),
+      )).status,
+      "applied",
+    );
+  });
+
+  await t.test("delivered package receipt", async () => {
+    const legacy = await legacyCompletedState({ delivered: true });
+    const store = new MemoryStore(legacy.state);
+    const recovered = await readyStore({ store });
+    const deliveredReceipt = store.value.changePackageDelivery.delivered[0]
+      .receipt;
+    const {
+      deliveredAt: _deliveredAt,
+      ...acknowledgement
+    } = deliveredReceipt;
+
+    assert.deepEqual(await recovered.jobs.readChangePackageDeliveryBatch(), {
+      cursor: 1,
+      highWatermark: 1,
+      items: [],
+    });
+    assert.equal(
+      (await recovered.jobs.acknowledgeChangePackageDelivery(acknowledgement))
+        .status,
+      "already",
+    );
+    await recovered.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(legacy.memoryEvent),
+    );
+    const restarted = await readyStore({ store });
+    assert.equal(
+      (await restarted.jobs.getForWorker(legacy.memoryEvent.jobId))
+        .execution.memoryProjection.sourceRecordDigest,
+      legacy.memoryEvent.sourceRecordDigest,
+    );
+  });
 });
 
 test("schema v6 recovery deterministically seeds current meaningful memory events", async (t) => {
@@ -1837,6 +2275,7 @@ test("legacy pending actions migrate to explicit admitted uncertainty", async ()
     const {
       actionAdmission: _actionAdmission,
       uncertainty: _uncertainty,
+      cancellationSettlement: _cancellationSettlement,
       ...execution
     } = jobValue.execution;
     const content = { ...jobValue, execution };
@@ -2758,6 +3197,7 @@ test("schema v5 terminal digest and memory receipt recover without uncertainty",
     const receipt = projectedContent.execution.memoryProjection;
     const {
       uncertainty: _sourceUncertainty,
+      cancellationSettlement: _sourceCancellationSettlement,
       ...sourceExecution
     } = {
       ...projectedContent.execution,
@@ -2772,6 +3212,7 @@ test("schema v5 terminal digest and memory receipt recover without uncertainty",
     const oldSourceRecordDigest = digestValue(oldSourceContent);
     const {
       uncertainty: _projectedUncertainty,
+      cancellationSettlement: _projectedCancellationSettlement,
       ...projectedExecution
     } = projectedContent.execution;
     projectedExecution.memoryProjection = {

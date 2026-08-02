@@ -263,7 +263,9 @@ async function validateCodeJobControlAndPackage(name, viewport) {
       status: "succeeded",
       recordedAt: now,
     },
-    terminalResult: null,
+    terminalResult: jobStatus === "cancelled"
+      ? { kind: "cancelled", recordedAt: now }
+      : null,
     memoryProjection: null,
     pause: jobStatus === "paused" ? { reason: "UI validation", at: now } : null,
     uncertainty: null,
@@ -476,7 +478,29 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     if (request.method() === "POST") {
       requests.push({ pathname, body: request.postDataJSON() });
       if (pathname.endsWith("/control")) {
-        jobStatus = "paused";
+        const input = request.postDataJSON();
+        if (input.expectedRevision !== jobRevision) {
+          await route.fulfill({
+            status: 409,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "stale code job revision" }),
+          });
+          return;
+        }
+        if (input.command === "pause") {
+          jobStatus = "paused";
+        } else if (input.command === "resume") {
+          jobStatus = "active";
+        } else if (input.command === "cancel") {
+          jobStatus = "cancelled";
+        } else {
+          await route.fulfill({
+            status: 400,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "unexpected code job command" }),
+          });
+          return;
+        }
         jobRevision += 1;
         await route.fulfill({
           status: 200,
@@ -637,6 +661,21 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     .locator("#confirmation-dialog")
     .getByRole("button", { name: "稍后再看", exact: true })
     .click();
+  await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  await page.locator(`[data-code-job-id="${jobId}"]`).click();
+  await page.locator("#detail-dialog[open]").waitFor();
+  await page.getByRole("button", { name: "取消任务", exact: true }).click();
+  await page
+    .locator("#detail-dialog")
+    .getByText("已取消", { exact: true })
+    .waitFor();
+  const cancellationStatusVisible = true;
+  const cancellationRemovedControls =
+    (await page.locator("#detail-dialog [data-code-job-control]").count()) === 0;
+  const cancellationSingleOpenDialog =
+    (await page.locator("dialog[open]").count()) === 1;
+  await recordDialogFocus("cancel-successor", ".dialog-close");
+  await recordHorizontalOverflow("cancelled");
 
   results.push({
     name: `code-job-control-package-${name}`,
@@ -649,6 +688,9 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     packageConfirmationVisible,
     singleOpenDialog,
     confirmationFocusInsideDialog,
+    cancellationStatusVisible,
+    cancellationRemovedControls,
+    cancellationSingleOpenDialog,
     focusChecks,
     horizontalOverflow: overflowChecks.some((check) => check.overflow),
     overflowChecks,
@@ -958,6 +1000,9 @@ for (const codeJobResult of codeJobResults) {
   assert.equal(codeJobResult.packageConfirmationVisible, true, codeJobResult.name);
   assert.equal(codeJobResult.singleOpenDialog, true, codeJobResult.name);
   assert.equal(codeJobResult.confirmationFocusInsideDialog, true, codeJobResult.name);
+  assert.equal(codeJobResult.cancellationStatusVisible, true, codeJobResult.name);
+  assert.equal(codeJobResult.cancellationRemovedControls, true, codeJobResult.name);
+  assert.equal(codeJobResult.cancellationSingleOpenDialog, true, codeJobResult.name);
   assert.equal(codeJobResult.horizontalOverflow, false, codeJobResult.name);
   assert.deepEqual(codeJobResult.consoleErrors, [], `${codeJobResult.name}: console errors`);
   assert.deepEqual(codeJobResult.pageErrors, [], `${codeJobResult.name}: page errors`);
@@ -971,6 +1016,7 @@ for (const codeJobResult of codeJobResults) {
     [
       `/api/code/jobs/${`code-job-${"c".repeat(55)}`}/control`,
       `/api/code/jobs/${`code-job-${"c".repeat(55)}`}/change-package/apply`,
+      `/api/code/jobs/${`code-job-${"c".repeat(55)}`}/control`,
     ],
   );
   assert.deepEqual(codeJobResult.requests[0].body, {
@@ -978,6 +1024,10 @@ for (const codeJobResult of codeJobResults) {
     expectedRevision: 7,
   });
   assert.deepEqual(codeJobResult.requests[1].body, { expectedRevision: 8 });
+  assert.deepEqual(codeJobResult.requests[2].body, {
+    command: "cancel",
+    expectedRevision: 8,
+  });
 }
 
 console.log(JSON.stringify(results, null, 2));

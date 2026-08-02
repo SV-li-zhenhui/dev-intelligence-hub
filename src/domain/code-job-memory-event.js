@@ -2,6 +2,7 @@ import {
   CODE_JOB_STATUSES,
   normalizeCodeJob,
 } from "./code-job-contract.js";
+import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeMemoryRecord } from "./memory-record.js";
 
@@ -16,11 +17,18 @@ const EVENT_KINDS = new Set([
   "unknown",
   "reconciled",
   "resumed",
+  "cancelling",
+  "cancelled",
   "completed",
   "failed",
   "fenced",
 ]);
-const TERMINAL_KINDS = new Set(["completed", "failed", "fenced"]);
+const TERMINAL_KINDS = new Set([
+  "cancelled",
+  "completed",
+  "failed",
+  "fenced",
+]);
 const OPERATIONS = new Set(["inspect", "modify", "verify"]);
 const JOB_STATUS_SET = new Set(CODE_JOB_STATUSES);
 const MAX_EVENT_BYTES = 64 * 1024;
@@ -306,6 +314,7 @@ function uncertaintySummary(job) {
 }
 
 function terminalSummary(job) {
+  if (!TERMINAL_KINDS.has(job.status)) return null;
   const result = job.execution.result;
   if (result === null) return null;
   const detail = dataFieldsOrNull(result.detail);
@@ -317,7 +326,7 @@ function terminalSummary(job) {
     : job.execution.workspaceRevision;
   return {
     kind: result.kind,
-    recordedAt: result.recordedAt,
+    recordedAt: codeJobTerminalLifecycleAt(job),
     detailDigest: result.detailDigest,
     errorCode,
     workspaceRevision,
@@ -354,6 +363,8 @@ const TITLES = Object.freeze({
   unknown: "代码任务结果待核验",
   reconciled: "代码任务已完成对账",
   resumed: "代码任务已恢复",
+  cancelling: "代码任务正在取消",
+  cancelled: "代码任务已取消",
   completed: "代码任务已完成",
   failed: "代码任务失败",
   fenced: "代码任务已隔离",
@@ -398,6 +409,7 @@ function memoryRecordFromSnapshot(event, snapshot) {
 function assertKindMatchesStatus(kind, status, observation) {
   if (
     (TERMINAL_KINDS.has(kind) && status !== kind) ||
+    (kind === "cancelling" && status !== "cancelling") ||
     (kind === "paused" && status !== "paused") ||
     (kind === "unknown" && status !== "unknown") ||
     (kind === "reconciled" && !["active", "paused"].includes(status)) ||
@@ -830,6 +842,7 @@ export function classifyCodeJobMemoryEvent(previousValue, nextValue) {
   if (previous === null) {
     if (next.execution.memoryProjection !== null) return null;
     if (TERMINAL_KINDS.has(next.status)) return next.status;
+    if (next.status === "cancelling") return "cancelling";
     if (next.status === "unknown") return "unknown";
     if (next.status === "paused") return "paused";
     return next.status === "active" && next.execution.observations.length > 0
@@ -849,6 +862,9 @@ export function classifyCodeJobMemoryEvent(previousValue, nextValue) {
   }
   if (TERMINAL_KINDS.has(next.status) && previous.status !== next.status) {
     return next.status;
+  }
+  if (next.status === "cancelling" && previous.status !== "cancelling") {
+    return "cancelling";
   }
   if (previous.status === "unknown" && next.status !== "unknown") {
     return "reconciled";

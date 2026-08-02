@@ -64,6 +64,39 @@ function applicationDetailState(application, {
   };
 }
 
+function codeJobControlDetailState(status, {
+  archived = false,
+  revision = 8,
+  controlLoading = false,
+  controlCommand = null,
+} = {}) {
+  return {
+    loading: false,
+    error: "",
+    detail: {
+      job: {
+        jobId: "code-job-control-ui",
+        revision,
+        status,
+        requestedBy: { roleId: "developer", workItemId: "work-control" },
+      },
+      archived,
+      historyAvailable: true,
+      observations: [],
+      nextCursor: null,
+      terminalDetail: null,
+      changePackage: { status: "pending", receipt: null },
+    },
+    manifest: null,
+    historyLoading: false,
+    packageLoading: false,
+    controlLoading,
+    controlCommand,
+    applyLoading: false,
+    actionError: "",
+  };
+}
+
 test("work view escapes records and clearly displays safety posture", () => {
   const html = renderWorkView({
     loaded: true,
@@ -140,6 +173,8 @@ test("code jobs render every safe lifecycle state from browser projections", () 
     ["pausing", "正在安全暂停"],
     ["unknown", "状态待核验"],
     ["paused", "已暂停"],
+    ["cancelling", "正在安全取消"],
+    ["cancelled", "已取消"],
     ["completed", "已完成"],
     ["failed", "执行失败"],
     ["fenced", "安全隔离，等待核验"],
@@ -170,7 +205,7 @@ test("code jobs render every safe lifecycle state from browser projections", () 
             recordedAt: "2026-08-02T03:58:00.000Z",
           }
         : null,
-      terminalResult: ["completed", "failed", "fenced"].includes(status)
+      terminalResult: ["cancelled", "completed", "failed", "fenced"].includes(status)
         ? { kind: status, recordedAt: "2026-08-02T03:59:00.000Z" }
         : null,
       pause: status === "paused"
@@ -200,6 +235,59 @@ test("code jobs render every safe lifecycle state from browser projections", () 
   );
   assert.doesNotMatch(html, /暂停原因：结果来自/);
   assert.match(html, /<button[^>]+data-code-job-id="code-job-active"/);
+});
+
+test("code job controls use exact live lifecycle eligibility", () => {
+  const commandsFor = (state) => [
+    ...renderCodeJobDetail(state).matchAll(/data-code-job-control="([^"]+)"/g),
+  ].map((match) => match[1]);
+  const cases = [
+    ["queued", ["pause", "cancel"]],
+    ["starting", ["pause", "cancel"]],
+    ["active", ["pause", "cancel"]],
+    ["pausing", ["cancel"]],
+    ["unknown", ["cancel"]],
+    ["paused", ["resume", "cancel"]],
+    ["cancelling", []],
+    ["cancelled", []],
+    ["completed", []],
+    ["failed", []],
+    ["fenced", []],
+    ["future_state", []],
+  ];
+
+  for (const [status, expected] of cases) {
+    const state = codeJobControlDetailState(status);
+    const html = renderCodeJobDetail(state);
+    assert.deepEqual(commandsFor(state), expected, status);
+    if (status === "cancelling") assert.match(html, /正在安全取消/);
+    if (status === "cancelled") assert.match(html, /已取消/);
+  }
+
+  assert.deepEqual(
+    commandsFor(codeJobControlDetailState("active", { archived: true })),
+    [],
+  );
+  assert.deepEqual(
+    commandsFor(codeJobControlDetailState("active", { revision: 0 })),
+    [],
+  );
+  const missingArchived = codeJobControlDetailState("active");
+  delete missingArchived.detail.archived;
+  assert.deepEqual(commandsFor(missingArchived), []);
+
+  const cancelling = renderCodeJobDetail(codeJobControlDetailState("active", {
+    controlLoading: true,
+    controlCommand: "cancel",
+  }));
+  assert.match(
+    cancelling,
+    /data-code-job-control="cancel" disabled>正在请求取消…<\/button>/,
+  );
+  assert.match(
+    cancelling,
+    /data-code-job-control="pause" disabled>安全暂停<\/button>/,
+  );
 });
 
 test("code job detail renders safe evidence, history, controls, and package metadata", () => {
@@ -317,6 +405,7 @@ test("code job detail renders safe evidence, history, controls, and package meta
     "node-tests",
     "加载更多观察",
     "安全暂停",
+    "取消任务",
     "申请应用变更包",
   ]) {
     assert.equal(html.includes(visible), true, visible);
@@ -643,6 +732,102 @@ test("code job controller uses exact trusted endpoints and queues package applic
   assert.equal(detailViews.some((markup) => markup.includes("complete")), true);
 });
 
+test("programmatic cancellation uses the same exact lifecycle and revision gate", async () => {
+  const jobId = "code-job-cancel-ui";
+  let status = "unknown";
+  let revision = 11;
+  const calls = [];
+  const detail = () => ({
+    ...codeJobControlDetailState(status, { revision }).detail,
+    job: {
+      ...codeJobControlDetailState(status, { revision }).detail.job,
+      jobId,
+    },
+  });
+  const detailViews = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === `/api/code/jobs/${jobId}?limit=20`) {
+        return response({ enabled: true, detail: detail() });
+      }
+      if (url === `/api/code/jobs/${jobId}/control`) {
+        status = "cancelling";
+        revision += 1;
+        return response({ status: "applied", job: detail().job });
+      }
+      if (url === "/api/code/jobs?limit=50&order=newest") {
+        return response({ enabled: true, items: [detail().job] });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+    onDetail: (markup) => detailViews.push(markup),
+  });
+
+  await view.openCodeJob(jobId);
+  await view.controlCodeJob("cancel");
+
+  const mutation = calls.find(({ url }) => url.endsWith("/control"));
+  assert.equal(mutation.options.method, "POST");
+  assert.equal(mutation.options.headers["content-type"], "application/json");
+  assert.equal(mutation.options.headers["x-mydashboard-action"], "1");
+  assert.deepEqual(JSON.parse(mutation.options.body), {
+    command: "cancel",
+    expectedRevision: 11,
+  });
+  assert.match(detailViews.at(-1), /正在安全取消/);
+  assert.doesNotMatch(detailViews.at(-1), /data-code-job-control=/);
+});
+
+test("programmatic cancellation fails closed for untrusted detail states", async () => {
+  const missingArchived = codeJobControlDetailState("active").detail;
+  delete missingArchived.archived;
+  const cases = [
+    ["future status", codeJobControlDetailState("future_state").detail],
+    ["cancelling", codeJobControlDetailState("cancelling").detail],
+    ["cancelled", codeJobControlDetailState("cancelled").detail],
+    ["terminal", codeJobControlDetailState("completed").detail],
+    ["archived", codeJobControlDetailState("active", { archived: true }).detail],
+    ["missing archived", missingArchived],
+    ["zero revision", codeJobControlDetailState("active", { revision: 0 }).detail],
+    ["fractional revision", codeJobControlDetailState("active", { revision: 1.5 }).detail],
+  ];
+
+  for (const [label, detail] of cases) {
+    const calls = [];
+    const view = createWorkView({
+      fetchImpl: async (url, options = {}) => {
+        calls.push({ url, options });
+        return response({ enabled: true, detail });
+      },
+      onDetail: () => {},
+    });
+    await view.openCodeJob(detail.job.jobId);
+    await view.controlCodeJob("cancel");
+    assert.equal(
+      calls.some(({ options }) => options.method === "POST"),
+      false,
+      label,
+    );
+  }
+
+  const validCalls = [];
+  const valid = codeJobControlDetailState("active").detail;
+  const validView = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      validCalls.push({ url, options });
+      return response({ enabled: true, detail: valid });
+    },
+    onDetail: () => {},
+  });
+  await validView.openCodeJob(valid.job.jobId);
+  await validView.controlCodeJob("destroy");
+  assert.equal(
+    validCalls.some(({ options }) => options.method === "POST"),
+    false,
+  );
+});
+
 test("a stale code job control closes detail and reloads the list", async () => {
   const calls = [];
   let closed = 0;
@@ -660,6 +845,7 @@ test("a stale code job control closes detail and reloads the list", async () => 
         enabled: true,
         detail: {
           job: { jobId: "code-job-stale", revision: 2, status: "paused" },
+          archived: false,
           observations: [],
           nextCursor: null,
           changePackage: { status: "pending", receipt: null },
@@ -720,7 +906,7 @@ test("a stale package read also invalidates the shared detail", async () => {
 });
 
 test("a stale mutation response from an old job cannot close a newly opened detail", async (t) => {
-  for (const operation of ["control", "apply"]) {
+  for (const operation of ["control", "cancel", "apply"]) {
     await t.test(operation, async () => {
       const pendingResponse = deferred();
       const details = [];
@@ -738,6 +924,10 @@ test("a stale mutation response from an old job cannot close a newly opened deta
           changePackage: {
             status: "ready",
             receipt: { packageId: `change-package-${"a".repeat(64)}` },
+            application: {
+              status: "not_requested",
+              canRequest: true,
+            },
           },
         },
       });
@@ -745,7 +935,7 @@ test("a stale mutation response from an old job cannot close a newly opened deta
         fetchImpl: async (url, options = {}) => {
           if (
             options.method === "POST" &&
-            ((operation === "control" && url.endsWith("/control")) ||
+            ((["control", "cancel"].includes(operation) && url.endsWith("/control")) ||
               (operation === "apply" && url.endsWith("/change-package/apply")))
           ) {
             return pendingResponse.promise;
@@ -770,7 +960,9 @@ test("a stale mutation response from an old job cannot close a newly opened deta
       if (operation === "apply") await view.loadCodeJobChangePackage();
       const pendingMutation = operation === "control"
         ? view.controlCodeJob("pause")
-        : view.requestCodeJobChangePackageApply();
+        : operation === "cancel"
+          ? view.controlCodeJob("cancel")
+          : view.requestCodeJobChangePackageApply();
       view.closeDetail();
       await view.openCodeJob("code-job-b");
       pendingResponse.resolve(response({ error: "stale" }, false, 409));

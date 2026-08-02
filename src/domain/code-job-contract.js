@@ -24,8 +24,21 @@ const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
 export const CODE_JOB_STATUSES = SHARED_CODE_JOB_STATUSES;
 const JOB_STATUSES = new Set(CODE_JOB_STATUSES);
-const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "fenced"]);
+const TERMINAL_JOB_STATUSES = new Set([
+  "cancelled",
+  "completed",
+  "failed",
+  "fenced",
+]);
 const PAUSABLE_JOB_STATUSES = new Set(["queued", "starting", "active"]);
+const CANCELLABLE_JOB_STATUSES = new Set([
+  "queued",
+  "starting",
+  "active",
+  "pausing",
+  "unknown",
+  "paused",
+]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
 const MAX_OBSERVATIONS = 128;
 const MAX_DETAIL_BYTES = 128 * 1024;
@@ -767,6 +780,83 @@ function normalizeTerminalResult(value, error) {
   };
 }
 
+function normalizeCancellationSettlement(value, error) {
+  if (value === null) return null;
+  const fields = exactObject(
+    value,
+    [
+      "kind",
+      "sessionId",
+      "cancellationDigest",
+      "workspaceRevision",
+      "proofDigest",
+      "settledAt",
+    ],
+    error,
+  );
+  if (
+    ![
+      "controlled_execution_absent",
+      "controlled_execution_cancelled",
+    ].includes(fields.get("kind"))
+  ) {
+    throw error;
+  }
+  return {
+    kind: fields.get("kind"),
+    sessionId: safeId(
+      fields.get("sessionId"),
+      "cancellationSettlement.sessionId",
+      error,
+    ),
+    cancellationDigest: sha256(
+      fields.get("cancellationDigest"),
+      "cancellationSettlement.cancellationDigest",
+      error,
+    ),
+    workspaceRevision: fields.get("workspaceRevision") === null
+      ? null
+      : sha256(
+        fields.get("workspaceRevision"),
+        "cancellationSettlement.workspaceRevision",
+        error,
+      ),
+    proofDigest: sha256(
+      fields.get("proofDigest"),
+      "cancellationSettlement.proofDigest",
+      error,
+    ),
+    settledAt: normalizeCodeJobTimestamp(fields.get("settledAt"), error),
+  };
+}
+
+function cancellationOrigin(result, error) {
+  if (result?.kind !== "cancelled") throw error;
+  const fields = exactObject(
+    result.detail,
+    ["schemaVersion", "outcome", "code", "message", "reason", "requestedFrom"],
+    error,
+  );
+  const requestedFrom = fields.get("requestedFrom");
+  if (
+    fields.get("schemaVersion") !== 1 ||
+    fields.get("outcome") !== "cancelled" ||
+    fields.get("code") !== "CODE_JOB_CANCELLED" ||
+    !CANCELLABLE_JOB_STATUSES.has(requestedFrom)
+  ) {
+    throw error;
+  }
+  text(fields.get("message"), "result.detail.message", {
+    maximumBytes: 2_048,
+    error,
+  });
+  text(fields.get("reason"), "result.detail.reason", {
+    maximumBytes: 2_048,
+    error,
+  });
+  return requestedFrom;
+}
+
 function normalizePause(value, error) {
   if (value === null) return null;
   const fields = exactObject(value, ["from", "reason", "at"], error);
@@ -861,6 +951,7 @@ function emptyExecution() {
     result: null,
     pause: null,
     uncertainty: null,
+    cancellationSettlement: null,
     memoryProjection: null,
   };
 }
@@ -889,6 +980,7 @@ function normalizeExecution(
   const memoryKeys = [...baseKeys, "memoryProjection"];
   const admissionKeys = [...memoryKeys, "actionAdmission"];
   const currentKeys = [...admissionKeys, "uncertainty"];
+  const settlementKeys = [...currentKeys, "cancellationSettlement"];
   const withoutMemory =
     executionKeys.length === baseKeys.length &&
     baseKeys.every((key) => executionKeys.includes(key));
@@ -898,6 +990,9 @@ function normalizeExecution(
   const withoutUncertainty =
     executionKeys.length === admissionKeys.length &&
     admissionKeys.every((key) => executionKeys.includes(key));
+  const withoutSettlement =
+    executionKeys.length === currentKeys.length &&
+    currentKeys.every((key) => executionKeys.includes(key));
   const fields = exactObject(
     value,
     withoutMemory
@@ -906,7 +1001,9 @@ function normalizeExecution(
         ? memoryKeys
         : withoutUncertainty
           ? admissionKeys
-          : currentKeys,
+          : withoutSettlement
+            ? currentKeys
+            : settlementKeys,
     error,
   );
   const sessionId = fields.get("sessionId") === null
@@ -976,6 +1073,16 @@ function normalizeExecution(
   const memoryProjection = withoutMemory
     ? null
     : normalizeMemoryProjection(fields.get("memoryProjection"), jobId, error);
+  const cancellationSettlement =
+    withoutMemory ||
+    withoutAdmission ||
+    withoutUncertainty ||
+    withoutSettlement
+      ? null
+      : normalizeCancellationSettlement(
+        fields.get("cancellationSettlement"),
+        error,
+      );
   const execution = {
     sessionId,
     workspaceRevision,
@@ -986,6 +1093,7 @@ function normalizeExecution(
     result,
     pause,
     uncertainty,
+    cancellationSettlement,
     memoryProjection,
   };
 
@@ -1040,6 +1148,14 @@ function normalizeExecution(
     (uncertainty !== null &&
       (Date.parse(uncertainty.at) < Date.parse(createdAt) ||
         Date.parse(uncertainty.at) > Date.parse(updatedAt))) ||
+    (cancellationSettlement !== null &&
+      (cancellationSettlement.sessionId !== jobId ||
+        cancellationSettlement.cancellationDigest !== result?.detailDigest ||
+        cancellationSettlement.workspaceRevision !== workspaceRevision ||
+        Date.parse(cancellationSettlement.settledAt) <
+          Date.parse(result?.recordedAt ?? createdAt) ||
+        Date.parse(cancellationSettlement.settledAt) > Date.parse(updatedAt) ||
+        status !== "cancelled")) ||
     (memoryProjection !== null &&
       (memoryProjection.jobId !== jobId ||
         Date.parse(memoryProjection.sourceUpdatedAt) < Date.parse(createdAt) ||
@@ -1074,6 +1190,70 @@ function normalizeExecution(
     workspaceRevision !== null &&
     pendingAction !== null &&
     actionAdmission !== null;
+  const cancellationFrom = ["cancelling", "cancelled"].includes(status)
+    ? cancellationOrigin(result, error)
+    : null;
+  const cancellingFromStarting =
+    cancellationFrom === "starting" &&
+    sessionId === jobId &&
+    workspaceRevision === null &&
+    turn === 0 &&
+    pendingAction === null &&
+    actionAdmission === null &&
+    observations.length === 0 &&
+    uncertainty === null &&
+    pause === null;
+  const cancellingFromPausingStart =
+    cancellationFrom === "pausing" &&
+    sessionId === jobId &&
+    workspaceRevision === null &&
+    turn === 0 &&
+    pendingAction === null &&
+    actionAdmission === null &&
+    observations.length === 0 &&
+    uncertainty === null &&
+    pause?.from === "starting";
+  const cancellingFromActive =
+    cancellationFrom === "active" &&
+    sessionId === jobId &&
+    workspaceRevision !== null &&
+    pause === null &&
+    uncertainty === null;
+  const cancellingFromPausing =
+    cancellationFrom === "pausing" &&
+    sessionId === jobId &&
+    workspaceRevision !== null &&
+    pendingAction !== null &&
+    actionAdmission !== null &&
+    pause?.from === "active" &&
+    uncertainty === null;
+  const cancellingFromUnknown =
+    cancellationFrom === "unknown" &&
+    sessionId === jobId &&
+    workspaceRevision !== null &&
+    pendingAction !== null &&
+    actionAdmission !== null &&
+    uncertainty !== null &&
+    ((uncertainty.from === "active" && pause === null) ||
+      (uncertainty.from === "pausing" && pause?.from === "active"));
+  const cancellingFromPaused =
+    cancellationFrom === "paused" &&
+    sessionId === jobId &&
+    actionAdmission === null &&
+    uncertainty === null &&
+    ((pause?.from === "starting" &&
+      workspaceRevision === null &&
+      turn === 0 &&
+      pendingAction === null &&
+      observations.length === 0) ||
+      (pause?.from === "active" && workspaceRevision !== null));
+  const validCancellationReconciliation =
+    cancellingFromStarting ||
+    cancellingFromPausingStart ||
+    cancellingFromActive ||
+    cancellingFromPausing ||
+    cancellingFromUnknown ||
+    cancellingFromPaused;
   if (
     (status === "queued" && (!isEmpty || pause !== null)) ||
     (status === "starting" &&
@@ -1124,6 +1304,10 @@ function normalizeExecution(
             observations.length !== 0)) ||
         (pause?.from === "active" &&
           (sessionId !== jobId || workspaceRevision === null)))) ||
+    (status === "cancelling" &&
+      (!validCancellationReconciliation ||
+        cancellationSettlement !== null ||
+        memoryProjection !== null)) ||
     (TERMINAL_JOB_STATUSES.has(status) &&
       (result?.kind !== status ||
         pause !== null ||
@@ -1229,6 +1413,18 @@ function normalizeCodeJobBase(entries, error) {
   };
 }
 
+function codeJobRecordDigestCandidates(content) {
+  const candidates = [digestValue(content)];
+  if (content.execution?.cancellationSettlement === null) {
+    const {
+      cancellationSettlement: _cancellationSettlement,
+      ...legacyExecution
+    } = content.execution;
+    candidates.push(digestValue({ ...content, execution: legacyExecution }));
+  }
+  return candidates;
+}
+
 function assertCodeJobBindings(content, recordDigest, error) {
   if (
     !JOB_STATUSES.has(content.status) ||
@@ -1236,7 +1432,7 @@ function assertCodeJobBindings(content, recordDigest, error) {
     content.proposal.proposalId !== content.grant.proposalId ||
     content.proposal.contentDigest !== content.grant.contentDigest ||
     Date.parse(content.updatedAt) < Date.parse(content.createdAt) ||
-    recordDigest !== digestValue(content)
+    !codeJobRecordDigestCandidates(content).includes(recordDigest)
   ) {
     throw error;
   }
@@ -1253,9 +1449,18 @@ function assertMemoryProjectionBinding(content, error) {
     execution: sourceExecution,
   };
   const executionCandidates = [sourceExecution];
+  if (sourceExecution.cancellationSettlement === null) {
+    const {
+      cancellationSettlement: _cancellationSettlement,
+      ...withoutCancellationSettlement
+    } = sourceExecution;
+    executionCandidates.push(withoutCancellationSettlement);
+  }
   if (sourceExecution.uncertainty === null) {
-    const { uncertainty: _uncertainty, ...withoutUncertainty } = sourceExecution;
-    executionCandidates.push(withoutUncertainty);
+    for (const candidate of [...executionCandidates]) {
+      const { uncertainty: _uncertainty, ...withoutUncertainty } = candidate;
+      executionCandidates.push(withoutUncertainty);
+    }
   }
   if (sourceExecution.actionAdmission === null) {
     for (const candidate of [...executionCandidates]) {
@@ -1349,6 +1554,7 @@ export function normalizeCodeJob(value) {
   ];
   const executionMemoryKeys = [...executionBaseKeys, "memoryProjection"];
   const executionAdmissionKeys = [...executionMemoryKeys, "actionAdmission"];
+  const executionCurrentKeys = [...executionAdmissionKeys, "uncertainty"];
   const legacyWithoutMemory =
     rawExecutionEntries.length === executionBaseKeys.length &&
     executionBaseKeys.every((key) =>
@@ -1362,6 +1568,11 @@ export function normalizeCodeJob(value) {
   const legacyWithoutUncertainty =
     rawExecutionEntries.length === executionAdmissionKeys.length &&
     executionAdmissionKeys.every((key) =>
+      rawExecutionEntries.some(([actual]) => actual === key),
+    );
+  const legacyWithoutSettlement =
+    rawExecutionEntries.length === executionCurrentKeys.length &&
+    executionCurrentKeys.every((key) =>
       rawExecutionEntries.some(([actual]) => actual === key),
     );
   const rawExecution = Object.fromEntries(rawExecutionEntries);
@@ -1392,10 +1603,18 @@ export function normalizeCodeJob(value) {
   if (
     legacyWithoutMemory ||
     legacyWithoutAdmission ||
-    legacyWithoutUncertainty
+    legacyWithoutUncertainty ||
+    legacyWithoutSettlement
   ) {
     const execution = { ...content.execution };
-    delete execution.uncertainty;
+    delete execution.cancellationSettlement;
+    if (
+      legacyWithoutMemory ||
+      legacyWithoutAdmission ||
+      legacyWithoutUncertainty
+    ) {
+      delete execution.uncertainty;
+    }
     if (legacyWithoutMemory || legacyWithoutAdmission) {
       delete execution.actionAdmission;
     }
@@ -1403,7 +1622,16 @@ export function normalizeCodeJob(value) {
     const legacyContent = { ...base, execution };
     assertCodeJobBindings(legacyContent, suppliedDigest, error);
     assertMemoryProjectionBinding(content, error);
-    return { ...content, recordDigest: digestValue(content) };
+    return {
+      ...content,
+      recordDigest:
+        legacyWithoutSettlement &&
+        !legacyWithoutMemory &&
+        !legacyWithoutAdmission &&
+        !legacyWithoutUncertainty
+          ? suppliedDigest
+          : digestValue(content),
+    };
   }
   assertCodeJobBindings(content, suppliedDigest, error);
   assertMemoryProjectionBinding(content, error);

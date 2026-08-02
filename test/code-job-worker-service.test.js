@@ -79,6 +79,7 @@ function job(overrides = {}) {
       result: null,
       pause: null,
       uncertainty: null,
+      cancellationSettlement: null,
     },
     ...overrides,
   };
@@ -134,7 +135,7 @@ class FakeJobStore {
       items: [...this.jobs.values()]
         .filter(
           (entry) =>
-            ["queued", "starting", "active", "pausing"].includes(entry.status) &&
+            ["queued", "starting", "active", "pausing", "cancelling"].includes(entry.status) &&
             (roleId === undefined || entry.grant.requestedBy.roleId === roleId),
         )
         .slice(0, limit)
@@ -206,6 +207,30 @@ class FakeJobStore {
     }, "session-started");
   }
 
+  async finalizeCancellation({
+    jobId,
+    expectedRevision,
+    settlement,
+  }) {
+    return this.#mutate(jobId, expectedRevision, (current) => {
+      assert.equal(current.status, "cancelling");
+      current.status = "cancelled";
+      current.execution.workspaceRevision = settlement.trustedWorkspaceRevision;
+      current.execution.cancellationSettlement = {
+        kind: settlement.kind,
+        sessionId: settlement.sessionId,
+        cancellationDigest: settlement.cancellationDigest,
+        workspaceRevision: settlement.trustedWorkspaceRevision,
+        proofDigest: settlement.proofDigest,
+        settledAt: settlement.settledAt,
+      };
+      current.execution.pendingAction = null;
+      current.execution.actionAdmission = null;
+      current.execution.pause = null;
+      current.execution.uncertainty = null;
+    }, "cancelled");
+  }
+
   async prepareAction({ jobId, expectedRevision, action }) {
     return this.#mutate(jobId, expectedRevision, (current) => {
       current.execution.pendingAction = {
@@ -249,17 +274,22 @@ class FakeJobStore {
     epoch,
   }) {
     return this.#mutate(jobId, expectedRevision, (current) => {
-      assert.ok(["pausing", "unknown"].includes(current.status));
+      assert.ok(["pausing", "unknown", "cancelling"].includes(current.status));
       assert.equal(current.execution.pendingAction.actionId, actionId);
       assert.equal(current.execution.pendingAction.actionDigest, actionDigest);
       assert.equal(current.execution.actionAdmission.epoch, epoch);
-      current.status =
-        current.status === "unknown" &&
+      current.status = current.status === "cancelling"
+        ? "cancelled"
+        : current.status === "unknown" &&
         current.execution.uncertainty?.from === "active"
           ? "active"
           : "paused";
+      current.execution.pendingAction = current.status === "cancelled"
+        ? null
+        : current.execution.pendingAction;
       current.execution.actionAdmission = null;
       current.execution.uncertainty = null;
+      if (current.status === "cancelled") current.execution.pause = null;
     }, "pause-acknowledged");
   }
 
@@ -314,6 +344,34 @@ class FakeJobStore {
     }, "pause");
   }
 
+  async cancel({ jobId, expectedRevision, reason }) {
+    return this.#mutate(jobId, expectedRevision, (current) => {
+      const requestedFrom = current.status;
+      const mustReconcile = current.execution.sessionId !== null;
+      current.status = mustReconcile ? "cancelling" : "cancelled";
+      const detail = {
+        schemaVersion: 1,
+        outcome: "cancelled",
+        code: "CODE_JOB_CANCELLED",
+        message: "cancelled by test",
+        reason,
+        requestedFrom,
+      };
+      current.execution.result = {
+        kind: "cancelled",
+        detail,
+        detailDigest: digestValue(detail),
+        recordedAt: "2026-08-01T00:00:02.000Z",
+      };
+      if (!mustReconcile) {
+        current.execution.pendingAction = null;
+        current.execution.actionAdmission = null;
+        current.execution.pause = null;
+        current.execution.uncertainty = null;
+      }
+    }, "cancel");
+  }
+
   async recordObservation({
     jobId,
     expectedRevision,
@@ -329,14 +387,16 @@ class FakeJobStore {
       current.execution.turn = pending.turn;
       current.execution.pendingAction = null;
       current.execution.actionAdmission = null;
-      current.status =
-        current.status === "unknown" &&
+      current.status = current.status === "cancelling"
+        ? "cancelled"
+        : current.status === "unknown" &&
         current.execution.uncertainty?.from === "active"
           ? "active"
           : current.status === "pausing" || current.status === "unknown"
             ? "paused"
             : current.status;
       current.execution.uncertainty = null;
+      if (current.status === "cancelled") current.execution.pause = null;
       current.execution.observations.push({
         turn: pending.turn,
         actionId,
@@ -380,6 +440,7 @@ class FakeExecutor {
     this.events = events;
     this.calls = [];
     this.last = null;
+    this.lastSignal = null;
     this.exists = !["queued", "starting"].includes(jobValue.status);
     this.session = {
       id: jobValue.jobId,
@@ -420,7 +481,8 @@ class FakeExecutor {
     return structuredClone(this.session);
   }
 
-  async perform(value) {
+  async perform(value, { signal = null } = {}) {
+    this.lastSignal = signal;
     this.calls.push({ method: "perform", value: structuredClone(value) });
     this.events.push("executor.perform");
     const action = value.action;
@@ -528,6 +590,86 @@ class FakeExecutor {
       session: structuredClone(this.session),
       action: structuredClone(action),
       result,
+    };
+  }
+
+  async reconcileCancellation(value) {
+    this.calls.push({
+      method: "reconcileCancellation",
+      value: structuredClone(value),
+    });
+    const settledAt = "2026-08-01T00:00:03.000Z";
+    if (!this.exists) {
+      const proof = {
+        schemaVersion: 1,
+        kind: "controlled_execution_absent",
+        sessionId: value.sessionId,
+        cancellationDigest: value.cancellationDigest,
+        sourceRevision: null,
+        trustedWorkspaceRevision: null,
+        actionResolution: null,
+        sandboxCleanupConfirmed: true,
+        discardedAttempts: [],
+        settledAt,
+      };
+      return {
+        status: "settled",
+        session: null,
+        proof: { ...proof, proofDigest: digestValue(proof) },
+      };
+    }
+    if (this.session.actions.some(({ status }) => status === "running")) {
+      throw Object.assign(new Error("controlled action is still running"), {
+        code: "CANCELLATION_PENDING",
+      });
+    }
+    const expected = value.expectedAction;
+    const action = expected === null
+      ? null
+      : this.session.actions.find(({ id }) => id === expected.actionId);
+    const actionResolution = expected === null
+      ? null
+      : {
+          actionId: expected.actionId,
+          actionDigest: expected.actionDigest,
+          disposition: action === undefined
+            ? "absent"
+            : action.status === "succeeded"
+              ? "audited_succeeded"
+              : action.status === "failed"
+                ? "audited_failed"
+                : "discarded_unknown",
+          workspaceRevisionBefore:
+            action?.workspaceRevisionBefore ?? value.expectedWorkspaceRevision,
+          workspaceRevisionAfter: action?.workspaceRevisionAfter ?? null,
+        };
+    this.session.status = "cancelled";
+    this.session.attempt.status = "cancelled";
+    this.session.cleanupPending = false;
+    this.session.updatedAt = settledAt;
+    const proof = {
+      schemaVersion: 1,
+      kind: "controlled_execution_cancelled",
+      sessionId: value.sessionId,
+      cancellationDigest: value.cancellationDigest,
+      sourceRevision: REVISION_A,
+      trustedWorkspaceRevision: this.session.workspaceRevision,
+      actionResolution,
+      sandboxCleanupConfirmed: true,
+      discardedAttempts: Array.from(
+        { length: this.session.attempt.number },
+        (_, index) => ({
+          attemptNumber: index + 1,
+          executionId: `attempt-${index + 1}`,
+          disposition: "discarded",
+        }),
+      ),
+      settledAt,
+    };
+    return {
+      status: "settled",
+      session: structuredClone(this.session),
+      proof: { ...proof, proofDigest: digestValue(proof) },
     };
   }
 }
@@ -2057,4 +2199,737 @@ test("session binding divergence fences once instead of retrying forever", async
   assert.equal(first.outcomes[0].status, "fenced");
   assert.equal(first.outcomes[0].code, "CODE_JOB_SESSION_BINDING_INVALID");
   assert.equal(second.selected, 0);
+});
+
+test("a cancelled admitted action is reconciled without entering the executor", async () => {
+  const initial = job({
+    status: "active",
+    revision: 3,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  store.afterAdmit = async () => {
+    const admitted = await store.getForWorker(initial.jobId);
+    await store.cancel({
+      jobId: admitted.jobId,
+      expectedRevision: admitted.revision,
+      reason: "cancel won after admission",
+    });
+  };
+  const decisions = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "read_text", path: "src/app.js" }], decisions),
+    grantVerifier: verifier([]),
+  });
+
+  const result = await worker.runCycle();
+  const stored = await store.getForWorker(initial.jobId);
+
+  assert.equal(result.outcomes[0].status, "cancelled");
+  assert.equal(result.cancelled, 1);
+  assert.equal(stored.status, "cancelled");
+  assert.equal(decisions.length, 1);
+  assert.equal(
+    executor.calls.some(({ method }) => method === "perform"),
+    false,
+  );
+});
+
+test("durable cancellation aborts an in-flight action only as a best effort", async () => {
+  const initial = job({
+    status: "active",
+    revision: 3,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const entered = deferred();
+  const release = deferred();
+  executor.perform = async (_value, { signal }) => {
+    executor.lastSignal = signal;
+    entered.resolve(signal);
+    await release.promise;
+    throw Object.assign(new Error("action aborted"), {
+      code: "CODE_JOB_ACTION_INTERRUPTED",
+    });
+  };
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "run_profile", profileId: "node-tests" }]),
+    grantVerifier: verifier([]),
+  });
+
+  const cycle = worker.runCycle();
+  const signal = await entered.promise;
+  assert.equal(signal.aborted, false);
+  const admitted = await store.getForWorker(initial.jobId);
+  const cancelling = await store.cancel({
+    jobId: admitted.jobId,
+    expectedRevision: admitted.revision,
+    reason: "stop the running profile",
+  });
+  assert.equal(cancelling.job.status, "cancelling");
+  assert.equal(worker.requestCancellation(initial.jobId), true);
+  assert.equal(signal.aborted, true);
+  release.resolve();
+
+  const first = await cycle;
+  assert.equal(first.outcomes[0].status, "cancelling");
+  const second = await worker.runCycle();
+  assert.equal(second.outcomes[0].status, "cancelled");
+  assert.equal((await store.getForWorker(initial.jobId)).status, "cancelled");
+  assert.equal(worker.requestCancellation(initial.jobId), false);
+});
+
+test("cancelling work waits for running actions before cleanup settlement", async () => {
+  const action = {
+    type: "complete",
+    actionId: "cancel-running-action",
+    expectedWorkspaceRevision: REVISION_A,
+  };
+  const actionDigest = digestValue(action);
+  const initial = job({
+    status: "active",
+    revision: 4,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: {
+        turn: 1,
+        actionId: action.actionId,
+        actionDigest,
+        action,
+        preparedAt: "2026-08-01T00:00:01.000Z",
+      },
+      actionAdmission: {
+        actionId: action.actionId,
+        actionDigest,
+        epoch: 4,
+        admittedAt: "2026-08-01T00:00:01.500Z",
+      },
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  executor.session.actions.push({
+    id: action.actionId,
+    type: action.type,
+    status: "running",
+    attemptNumber: 1,
+    workspaceRevisionBefore: REVISION_A,
+    workspaceRevisionAfter: null,
+    error: null,
+  });
+  const cancelling = await store.cancel({
+    jobId: initial.jobId,
+    expectedRevision: initial.revision,
+    reason: "wait for exact reconciliation",
+  });
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: {
+      async verify() {
+        throw new Error("cancelling work must not re-check revoked authority");
+      },
+    },
+  });
+
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].status, "cancelling");
+  assert.equal((await store.getForWorker(initial.jobId)).revision,
+    cancelling.job.revision);
+
+  executor.session.actions[0] = {
+    ...executor.session.actions[0],
+    status: "succeeded",
+    workspaceRevisionAfter: REVISION_A,
+  };
+  executor.session.status = "completed";
+  executor.session.attempt.status = "completed";
+  const second = await worker.runCycle();
+  const stored = await store.getForWorker(initial.jobId);
+  assert.equal(second.outcomes[0].status, "cancelled");
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.execution.observations.length, 0);
+  assert.equal(store.completionRequests.length, 0);
+  assert.equal(brainCalls.length, 0);
+});
+
+test("a cancelling admitted session converges after the executor is absent", async () => {
+  const initial = job({
+    status: "starting",
+    revision: 2,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: null,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  await store.cancel({
+    jobId: initial.jobId,
+    expectedRevision: initial.revision,
+    reason: "cancel session start",
+  });
+  const executor = new FakeExecutor(initial);
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: verifier([]),
+  });
+
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "cancelled");
+  assert.equal((await store.getForWorker(initial.jobId)).status, "cancelled");
+  assert.equal(brainCalls.length, 0);
+  assert.equal(executor.calls.filter(({ method }) => method === "start").length, 0);
+});
+
+test("an interrupted action is settled only by cleanup proof without replay", async () => {
+  const action = {
+    type: "write_text",
+    actionId: "cancel-unknown-write",
+    expectedWorkspaceRevision: REVISION_A,
+    path: "src/app.js",
+    content: "export const value = 2;\n",
+    expectedFileSha256: FILE_SHA,
+  };
+  const actionDigest = digestValue(action);
+  const initial = job({
+    status: "active",
+    revision: 4,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: {
+        turn: 1,
+        actionId: action.actionId,
+        actionDigest,
+        action,
+        preparedAt: "2026-08-01T00:00:01.000Z",
+      },
+      actionAdmission: {
+        actionId: action.actionId,
+        actionDigest,
+        epoch: 4,
+        admittedAt: "2026-08-01T00:00:01.500Z",
+      },
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  await store.cancel({
+    jobId: initial.jobId,
+    expectedRevision: initial.revision,
+    reason: "stop an uncertain write",
+  });
+  const executor = new FakeExecutor(initial, [], { sessionStatus: "interrupted" });
+  executor.session.actions.push({
+    id: action.actionId,
+    type: action.type,
+    status: "interrupted",
+    attemptNumber: 1,
+    workspaceRevisionBefore: REVISION_A,
+    workspaceRevisionAfter: null,
+    error: {
+      code: "RESULT_UNKNOWN",
+      message: "the write may have changed the isolated workspace",
+      details: { cleanupPending: true },
+    },
+  });
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: verifier([]),
+  });
+
+  const first = await worker.runCycle();
+  const stored = await store.getForWorker(initial.jobId);
+
+  assert.equal(first.outcomes[0].status, "cancelled");
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.execution.observations.length, 0);
+  assert.equal(stored.execution.pendingAction, null);
+  assert.equal(stored.execution.actionAdmission, null);
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.equal(store.completionRequests.length, 0);
+  assert.equal(brainCalls.length, 0);
+});
+
+test("cancel-first transition prevents an admitted session start", async () => {
+  const initial = job();
+  const events = [];
+  const store = new FakeJobStore([initial], events);
+  const executor = new FakeExecutor(initial, events);
+  const transitionQueue = new OperationQueue();
+  const sessionTransitionLease = {
+    run(operation) { return transitionQueue.enqueue(operation); },
+  };
+  const beforeStartAdmission = deferred();
+  const releaseVerification = deferred();
+  let verifyCount = 0;
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    sessionTransitionLease,
+    grantVerifier: {
+      async verify(value) {
+        verifyCount += 1;
+        if (verifyCount === 2) {
+          beforeStartAdmission.resolve();
+          await releaseVerification.promise;
+        }
+        return structuredClone(value);
+      },
+    },
+  });
+
+  const cycle = worker.runCycle();
+  await beforeStartAdmission.promise;
+  const starting = await store.getForWorker(initial.jobId);
+  const cancellation = sessionTransitionLease.run(() => store.cancel({
+    jobId: starting.jobId,
+    expectedRevision: starting.revision,
+    reason: "cancel wins the session admission",
+  }));
+  await cancellation;
+  releaseVerification.resolve();
+  const result = await cycle;
+
+  assert.equal(result.outcomes[0].status, "cancelled");
+  assert.equal(executor.calls.some(({ method }) => method === "start"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(brainCalls.length, 0);
+  assert.ok(events.indexOf("cancel") > events.indexOf("claim"));
+});
+
+test("start-first admission releases the gate before the long start settles", async () => {
+  const initial = job();
+  const events = [];
+  const store = new FakeJobStore([initial], events);
+  const executor = new FakeExecutor(initial, events);
+  const startEntered = deferred();
+  const startResult = deferred();
+  executor.start = (value) => {
+    executor.calls.push({ method: "start", value: structuredClone(value) });
+    events.push("executor.start");
+    startEntered.resolve();
+    return startResult.promise;
+  };
+  const transitionQueue = new OperationQueue();
+  const sessionTransitionLease = {
+    run(operation) { return transitionQueue.enqueue(operation); },
+  };
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: verifier(events),
+    sessionTransitionLease,
+  });
+
+  const cycle = worker.runCycle();
+  await startEntered.promise;
+  const starting = await store.getForWorker(initial.jobId);
+  const cancellation = sessionTransitionLease.run(() => store.cancel({
+    jobId: starting.jobId,
+    expectedRevision: starting.revision,
+    reason: "cancel after start admission",
+  }));
+  const observed = await Promise.race([
+    cancellation.then(() => "cancelled"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 30)),
+  ]);
+
+  assert.equal(observed, "cancelled");
+  assert.equal(events.indexOf("executor.start") < events.indexOf("cancel"), true);
+  executor.exists = true;
+  startResult.resolve(structuredClone(executor.session));
+  const result = await cycle;
+
+  assert.ok(["cancelling", "cancelled"].includes(result.outcomes[0].status));
+  assert.equal(
+    executor.calls.filter(({ method }) => method === "start").length,
+    1,
+  );
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.equal(brainCalls.length, 0);
+});
+
+test("resume-first admission releases the gate before the long resume settles", async () => {
+  const initial = job({
+    status: "starting",
+    revision: 2,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: null,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const events = [];
+  const store = new FakeJobStore([initial], events);
+  const executor = new FakeExecutor(initial, events, {
+    sessionStatus: "interrupted",
+  });
+  executor.exists = true;
+  const resumeEntered = deferred();
+  const resumeResult = deferred();
+  executor.resume = (value) => {
+    executor.calls.push({ method: "resume", value: structuredClone(value) });
+    events.push("executor.resume");
+    resumeEntered.resolve();
+    return resumeResult.promise;
+  };
+  const transitionQueue = new OperationQueue();
+  const sessionTransitionLease = {
+    run(operation) { return transitionQueue.enqueue(operation); },
+  };
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: verifier(events),
+    sessionTransitionLease,
+  });
+
+  const cycle = worker.runCycle();
+  await resumeEntered.promise;
+  const starting = await store.getForWorker(initial.jobId);
+  const cancellation = sessionTransitionLease.run(() => store.cancel({
+    jobId: starting.jobId,
+    expectedRevision: starting.revision,
+    reason: "cancel after resume admission",
+  }));
+  const observed = await Promise.race([
+    cancellation.then(() => "cancelled"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 30)),
+  ]);
+
+  assert.equal(observed, "cancelled");
+  assert.equal(events.indexOf("executor.resume") < events.indexOf("cancel"), true);
+  assert.equal((await store.getForWorker(initial.jobId)).status, "cancelling");
+  resumeResult.resolve({
+    ...structuredClone(executor.session),
+    status: "active",
+    attempt: { number: 2, status: "active" },
+  });
+  const result = await cycle;
+
+  assert.equal(result.outcomes[0].status, "cancelling");
+  assert.equal(
+    executor.calls.filter(({ method }) => method === "resume").length,
+    1,
+  );
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.equal(brainCalls.length, 0);
+});
+
+test("cancellation committed during starting recovery prevents session resume", async () => {
+  const initial = job({
+    status: "starting",
+    revision: 2,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: null,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial, [], { sessionStatus: "interrupted" });
+  executor.exists = true;
+  let verifyCount = 0;
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: {
+      async verify(value) {
+        verifyCount += 1;
+        if (verifyCount === 2) {
+          const current = await store.getForWorker(initial.jobId);
+          await store.cancel({
+            jobId: current.jobId,
+            expectedRevision: current.revision,
+            reason: "cancel before session recovery",
+          });
+        }
+        return structuredClone(value);
+      },
+    },
+  });
+
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].status, "cancelling");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(brainCalls.length, 0);
+
+  const second = await worker.runCycle();
+  assert.equal(second.outcomes[0].status, "cancelled");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+});
+
+test("cancellation committed during idle recovery prevents session resume", async () => {
+  const initial = job({
+    status: "active",
+    revision: 3,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial, [], { sessionStatus: "interrupted" });
+  let verifyCount = 0;
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: {
+      async verify(value) {
+        verifyCount += 1;
+        if (verifyCount === 2) {
+          const current = await store.getForWorker(initial.jobId);
+          await store.cancel({
+            jobId: current.jobId,
+            expectedRevision: current.revision,
+            reason: "cancel before idle recovery",
+          });
+        }
+        return structuredClone(value);
+      },
+    },
+  });
+
+  const result = await worker.runCycle();
+
+  assert.equal(result.outcomes[0].status, "cancelling");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.equal(brainCalls.length, 0);
+  const settled = await worker.runCycle();
+  assert.equal(settled.outcomes[0].status, "cancelled");
+});
+
+test("cancellation committed during prepared recovery prevents session resume", async () => {
+  const action = {
+    type: "read_text",
+    actionId: "cancel-before-prepared-resume",
+    expectedWorkspaceRevision: REVISION_A,
+    path: "src/app.js",
+  };
+  const actionDigest = digestValue(action);
+  const initial = job({
+    status: "active",
+    revision: 4,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: {
+        turn: 1,
+        actionId: action.actionId,
+        actionDigest,
+        action,
+        preparedAt: "2026-08-01T00:00:01.000Z",
+      },
+      actionAdmission: {
+        actionId: action.actionId,
+        actionDigest,
+        epoch: 4,
+        admittedAt: "2026-08-01T00:00:01.500Z",
+      },
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial, [], { sessionStatus: "interrupted" });
+  let verifyCount = 0;
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([]),
+    grantVerifier: {
+      async verify(value) {
+        verifyCount += 1;
+        if (verifyCount === 3) {
+          const current = await store.getForWorker(initial.jobId);
+          await store.cancel({
+            jobId: current.jobId,
+            expectedRevision: current.revision,
+            reason: "cancel before prepared recovery",
+          });
+        }
+        return structuredClone(value);
+      },
+    },
+  });
+
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].status, "cancelling");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+
+  const second = await worker.runCycle();
+  assert.equal(second.outcomes[0].status, "cancelled");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+});
+
+test("cancellation committed during unknown recovery prevents session resume", async () => {
+  const action = {
+    type: "write_text",
+    actionId: "cancel-before-unknown-resume",
+    expectedWorkspaceRevision: REVISION_A,
+    path: "src/app.js",
+    content: "export const value = 3;\n",
+    expectedFileSha256: FILE_SHA,
+  };
+  const actionDigest = digestValue(action);
+  const initial = job({
+    status: "unknown",
+    revision: 5,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: {
+        turn: 1,
+        actionId: action.actionId,
+        actionDigest,
+        action,
+        preparedAt: "2026-08-01T00:00:01.000Z",
+      },
+      actionAdmission: {
+        actionId: action.actionId,
+        actionDigest,
+        epoch: 4,
+        admittedAt: "2026-08-01T00:00:01.500Z",
+      },
+      observations: [],
+      result: null,
+      pause: null,
+      uncertainty: {
+        from: "active",
+        code: "RESULT_UNKNOWN",
+        message: "the action result requires reconciliation",
+        at: "2026-08-01T00:00:02.000Z",
+      },
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial, [], { sessionStatus: "interrupted" });
+  executor.session.actions.push({
+    id: action.actionId,
+    type: action.type,
+    status: "interrupted",
+    attemptNumber: 1,
+    workspaceRevisionBefore: REVISION_A,
+    workspaceRevisionAfter: null,
+    error: { code: "RESULT_UNKNOWN", message: "result unknown" },
+  });
+  const reconcile = executor.reconcileAction.bind(executor);
+  let cancelled = false;
+  executor.reconcileAction = async (value) => {
+    const result = await reconcile(value);
+    if (!cancelled) {
+      cancelled = true;
+      const current = await store.getForWorker(initial.jobId);
+      await store.cancel({
+        jobId: current.jobId,
+        expectedRevision: current.revision,
+        reason: "cancel before unknown recovery",
+      });
+    }
+    return result;
+  };
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([]),
+    grantVerifier: verifier([]),
+  });
+
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].status, "cancelling");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+
+  const second = await worker.runCycle();
+  assert.equal(second.outcomes[0].status, "cancelled");
+  assert.equal((await store.getForWorker(initial.jobId)).status, "cancelled");
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
 });

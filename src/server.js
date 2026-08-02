@@ -334,6 +334,7 @@ function queryOptions(url, { status = false, order = false } = {}) {
 }
 
 const codeJobPauseReason = "用户从本地指挥中枢暂停代码任务";
+const codeJobCancelReason = "用户从本地指挥中枢取消代码任务";
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const changePackageApplicationConflictCodes = new Set([
   "CHANGE_PACKAGE_APPLICATION_STALE",
@@ -1077,24 +1078,38 @@ export function createDashboardServer(
           ["command", "expectedRevision"],
           "代码任务控制请求字段无效",
         );
-        if (!["pause", "resume"].includes(input.command)) {
-          throw httpError(400, "command 只能是 pause 或 resume");
+        if (!["pause", "resume", "cancel"].includes(input.command)) {
+          throw httpError(400, "command 只能是 pause、resume 或 cancel");
         }
         const expectedRevision = requireExpectedRevision(input.expectedRevision);
         const control = requireApplicationPort(
           application,
           "codeJobControl",
-          ["pause", "resume"],
+          ["pause", "resume", "cancel"],
           "本地代码任务控制端口无效",
         );
         const jobId = codeJobControlAction[1];
-        const result = input.command === "pause"
-          ? await control.pause({
-              jobId,
-              expectedRevision,
-              reason: codeJobPauseReason,
-            })
-          : await control.resume({ jobId, expectedRevision });
+        let result;
+        if (input.command === "pause") {
+          result = await control.pause({
+            jobId,
+            expectedRevision,
+            reason: codeJobPauseReason,
+          });
+        } else if (input.command === "resume") {
+          result = await control.resume({ jobId, expectedRevision });
+        } else {
+          result = await control.cancel({
+            jobId,
+            expectedRevision,
+            reason: codeJobCancelReason,
+          });
+          signalBackgroundAgency(
+            backgroundWork,
+            { trigger: "code_job_cancel_requested" },
+            reportError,
+          );
+        }
         sendJson(response, 200, result);
         return;
       }

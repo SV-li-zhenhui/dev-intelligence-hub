@@ -94,6 +94,7 @@ export class CodeWorkspaceBroker {
     this.limits = validateLimits(limits);
     this.workspaces = new Map();
     this.executions = new Map();
+    this.executionLifecycles = new Map();
     for (const workspace of workspaces) this.#registerWorkspace(workspace);
   }
 
@@ -127,69 +128,104 @@ export class CodeWorkspaceBroker {
         const workspace = this.#workspace(workspaceId);
         validateExecutionId(executionId);
         const key = this.#executionKey(workspaceId, executionId);
-        if (this.executions.has(key)) {
-          throw new CodeExecutionError(
-            "EXECUTION_ALREADY_EXISTS",
-            "executionId 已存在",
-          );
-        }
-
-        await mkdir(this.scratchRoot, { recursive: true });
-        await this.#assertDirectory(this.scratchRoot, "EXECUTION_STORAGE_UNAVAILABLE");
-        const workspaceRoot = path.join(this.scratchRoot, workspaceId);
-        await mkdir(workspaceRoot, { recursive: true });
-        await this.#assertDirectory(workspaceRoot, "EXECUTION_STORAGE_UNAVAILABLE");
-        const executionRoot = path.join(workspaceRoot, executionId);
-        try {
-          await mkdir(executionRoot);
-        } catch (error) {
-          if (error?.code === "EEXIST") {
+        return this.#enqueueExecutionLifecycle(key, async () => {
+          if (this.executions.has(key)) {
             throw new CodeExecutionError(
               "EXECUTION_ALREADY_EXISTS",
               "executionId 已存在",
             );
           }
-          throw error;
-        }
 
-        const baseline = new Map();
-        const copyState = { fileCount: 0, totalBytes: 0 };
-        try {
-          await this.#copySanitizedDirectory({
+          await mkdir(this.scratchRoot, { recursive: true });
+          await this.#assertDirectory(
+            this.scratchRoot,
+            "EXECUTION_STORAGE_UNAVAILABLE",
+          );
+          const { workspaceRoot, executionRoot } = this.#executionStoragePaths(
+            workspaceId,
+            executionId,
+          );
+          await mkdir(workspaceRoot, { recursive: true });
+          await this.#assertDirectory(
+            workspaceRoot,
+            "EXECUTION_STORAGE_UNAVAILABLE",
+          );
+          try {
+            await mkdir(executionRoot);
+          } catch (error) {
+            if (error?.code === "EEXIST") {
+              throw new CodeExecutionError(
+                "EXECUTION_ALREADY_EXISTS",
+                "executionId 已存在",
+              );
+            }
+            throw error;
+          }
+
+          const baseline = new Map();
+          const copyState = { fileCount: 0, totalBytes: 0 };
+          try {
+            await this.#copySanitizedDirectory({
+              workspace,
+              sourceDirectory: workspace.sourceRoot,
+              targetDirectory: executionRoot,
+              relativeDirectory: "",
+              baseline,
+              copyState,
+            });
+          } catch (error) {
+            await rm(executionRoot, { recursive: true, force: true }).catch(
+              () => {},
+            );
+            throw error;
+          }
+
+          const sourceRevision = workspaceRevisionFromFileHashes(baseline);
+          this.executions.set(key, {
             workspace,
-            sourceDirectory: workspace.sourceRoot,
-            targetDirectory: executionRoot,
-            relativeDirectory: "",
+            root: executionRoot,
             baseline,
-            copyState,
+            sourceRevision,
+            workspaceState: {
+              fileHashes: new Map(baseline),
+              revision: sourceRevision,
+            },
+            seal: null,
+            tail: Promise.resolve(),
           });
-        } catch (error) {
-          await rm(executionRoot, { recursive: true, force: true }).catch(() => {});
-          throw error;
-        }
-
-        const sourceRevision = workspaceRevisionFromFileHashes(baseline);
-        this.executions.set(key, {
-          workspace,
-          root: executionRoot,
-          baseline,
-          sourceRevision,
-          workspaceState: {
-            fileHashes: new Map(baseline),
-            revision: sourceRevision,
-          },
-          seal: null,
-          tail: Promise.resolve(),
+          return {
+            workspaceId,
+            executionId,
+            sourceRevision,
+            workspaceRevision: sourceRevision,
+          };
         });
-        return {
-          workspaceId,
-          executionId,
-          sourceRevision,
-          workspaceRevision: sourceRevision,
-        };
       },
       "EXECUTION_CREATE_FAILED",
       "无法创建代码执行副本",
+    );
+  }
+
+  async discardExecution({ workspaceId, executionId }) {
+    return guarded(
+      async () => {
+        validateWorkspaceId(workspaceId);
+        validateExecutionId(executionId);
+        const key = this.#executionKey(workspaceId, executionId);
+        return this.#enqueueExecutionLifecycle(key, async () => {
+          const execution = this.executions.get(key);
+          const discard = async () => {
+            await this.#discardExecutionDirectory(workspaceId, executionId);
+            if (this.executions.get(key) === execution) {
+              this.executions.delete(key);
+            }
+            return { workspaceId, executionId, discarded: true };
+          };
+          return execution ? this.#enqueue(execution, discard) : discard();
+        });
+      },
+      "EXECUTION_DISCARD_FAILED",
+      "无法丢弃代码执行副本",
     );
   }
 
@@ -479,10 +515,102 @@ export class CodeWorkspaceBroker {
     return `${workspaceId}:${executionId}`;
   }
 
+  #executionStoragePaths(workspaceId, executionId) {
+    const workspaceRoot = path.resolve(this.scratchRoot, workspaceId);
+    const executionRoot = path.resolve(workspaceRoot, executionId);
+    if (
+      !this.#samePath(path.dirname(workspaceRoot), this.scratchRoot) ||
+      !this.#samePath(path.dirname(executionRoot), workspaceRoot)
+    ) {
+      throw new CodeExecutionError(
+        "EXECUTION_STORAGE_UNAVAILABLE",
+        "代码执行副本路径不安全",
+      );
+    }
+    return { workspaceRoot, executionRoot };
+  }
+
+  #samePath(left, right) {
+    const normalizedLeft = path.resolve(left);
+    const normalizedRight = path.resolve(right);
+    return process.platform === "win32"
+      ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+      : normalizedLeft === normalizedRight;
+  }
+
+  #enqueueExecutionLifecycle(key, operation) {
+    const previous = this.executionLifecycles.get(key) ?? Promise.resolve();
+    const result = previous.then(operation, operation);
+    const tail = result.catch(() => {});
+    this.executionLifecycles.set(key, tail);
+    void tail.then(() => {
+      if (this.executionLifecycles.get(key) === tail) {
+        this.executionLifecycles.delete(key);
+      }
+    });
+    return result;
+  }
+
   #enqueue(execution, operation) {
     const result = execution.tail.then(operation, operation);
     execution.tail = result.catch(() => {});
     return result;
+  }
+
+  async #discardExecutionDirectory(workspaceId, executionId) {
+    const { workspaceRoot, executionRoot } = this.#executionStoragePaths(
+      workspaceId,
+      executionId,
+    );
+    if (!(await this.#assertOptionalManagedDirectory(this.scratchRoot))) return;
+    if (!(await this.#assertOptionalManagedDirectory(workspaceRoot))) return;
+    await this.#assertCanonicalChild(this.scratchRoot, workspaceRoot);
+    if (!(await this.#assertOptionalManagedDirectory(executionRoot))) return;
+    await this.#assertCanonicalChild(workspaceRoot, executionRoot);
+    await rm(executionRoot, { recursive: true, force: true });
+    if (await this.#lstatIfExists(executionRoot)) {
+      throw new CodeExecutionError(
+        "EXECUTION_STORAGE_UNAVAILABLE",
+        "代码执行副本未能完全丢弃",
+      );
+    }
+  }
+
+  async #assertOptionalManagedDirectory(directory) {
+    const stats = await this.#lstatIfExists(directory);
+    if (!stats) return false;
+    if (stats.isSymbolicLink()) {
+      throw new CodeExecutionError("SYMLINK_REJECTED", "符号链接不可访问");
+    }
+    if (!stats.isDirectory()) {
+      throw new CodeExecutionError(
+        "EXECUTION_STORAGE_UNAVAILABLE",
+        "代码执行副本目录不可用",
+      );
+    }
+    return true;
+  }
+
+  async #lstatIfExists(target) {
+    try {
+      return await lstat(target);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async #assertCanonicalChild(parent, child) {
+    const [canonicalParent, canonicalChild] = await Promise.all([
+      realpath(parent),
+      realpath(child),
+    ]);
+    if (!this.#samePath(path.dirname(canonicalChild), canonicalParent)) {
+      throw new CodeExecutionError(
+        "EXECUTION_STORAGE_UNAVAILABLE",
+        "代码执行副本路径不安全",
+      );
+    }
   }
 
   #enqueueAtExpectedRevision(execution, request, operation) {

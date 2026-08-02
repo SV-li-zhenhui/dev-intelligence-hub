@@ -375,6 +375,7 @@ export async function createApplication({
             "perform",
             "getActionResult",
             "reconcileAction",
+            "reconcileCancellation",
           ],
           "codeExecutorRuntime.executor",
         ),
@@ -435,7 +436,7 @@ export async function createApplication({
       );
       codeJobControl = frozenPort(
         codeJobRuntime.control,
-        ["pause", "resume"],
+        ["pause", "resume", "cancel"],
         "codeJobRuntime.control",
       );
       if (codeJobChangePackageDeliveryEnabled) {

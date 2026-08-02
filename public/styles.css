@@ -464,6 +464,7 @@ h1 {
 }
 
 .status-paused,
+.status-cancelled,
 .status-disabled,
 .status-superseded,
 .status-rejected {
@@ -483,6 +484,7 @@ h1 {
 
 .status-waiting_user,
 .status-pausing,
+.status-cancelling,
 .status-ready_for_human {
   color: var(--amber);
   background: var(--amber-soft);
@@ -1398,6 +1400,12 @@ dialog::backdrop {
   margin-top: 0;
   color: white;
   background: var(--green);
+}
+
+.code-job-detail-actions .code-job-cancel-action {
+  color: var(--red);
+  background: transparent;
+  border-color: var(--red);
 }
 
 .code-job-action-error {

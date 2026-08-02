@@ -233,6 +233,32 @@ function actionRequest(session, action) {
   };
 }
 
+function cancellationRequest(session, overrides = {}) {
+  return {
+    sessionId: session.id,
+    cancellationDigest: digestValue({
+      kind: "cancel-code-session",
+      sessionId: session.id,
+    }),
+    expectedWorkspaceRevision: session.workspaceRevision,
+    expectedAction: null,
+    ...overrides,
+  };
+}
+
+function attemptExecutionIdFor(sessionId, number) {
+  return `attempt-${digestValue({ number, sessionId }).slice(0, 24)}`;
+}
+
+function attemptFile(setup, sessionId, number, relativePath = "src/app.js") {
+  return path.join(
+    setup.scratchRoot,
+    "dashboard",
+    attemptExecutionIdFor(sessionId, number),
+    ...relativePath.split("/"),
+  );
+}
+
 function artifactFile(setup, reference) {
   return path.join(
     setup.root,
@@ -1816,4 +1842,325 @@ test("invalid clocks and broker creation results never corrupt persisted revisio
   assert.equal(stored.sessions["session-one"].status, "failed");
   assert.equal(stored.sessions["session-one"].sourceRevision, null);
   assert.equal(stored.sessions["session-one"].workspaceRevision, null);
+});
+
+test("active cancellation discards its workspace and returns one stable proof", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const request = cancellationRequest(session);
+  const executionId = attemptExecutionIdFor(session.id, 1);
+
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 1), "utf8"),
+    "export const value = 1;\n",
+  );
+  const settled = await executor.reconcileCancellation(request);
+
+  assert.equal(settled.status, "settled");
+  assert.equal(settled.session.status, "cancelled");
+  assert.equal(settled.session.attempt.status, "cancelled");
+  assert.deepEqual(settled.proof, {
+    schemaVersion: 1,
+    kind: "controlled_execution_cancelled",
+    sessionId: session.id,
+    cancellationDigest: request.cancellationDigest,
+    sourceRevision: session.sourceRevision,
+    trustedWorkspaceRevision: session.workspaceRevision,
+    actionResolution: null,
+    sandboxCleanupConfirmed: true,
+    discardedAttempts: [
+      {
+        attemptNumber: 1,
+        executionId,
+        disposition: "discarded",
+      },
+    ],
+    settledAt: settled.proof.settledAt,
+    proofDigest: settled.proof.proofDigest,
+  });
+  assert.match(settled.proof.proofDigest, /^[a-f0-9]{64}$/);
+  assert.match(settled.proof.settledAt, /^2026-08-01T/);
+  await assert.rejects(
+    readFile(attemptFile(setup, session.id, 1)),
+    (error) => error?.code === "ENOENT",
+  );
+  assert.equal(
+    await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+
+  assert.deepEqual(await executor.reconcileCancellation(request), settled);
+  await assert.rejects(
+    executor.perform(
+      actionRequest(settled.session, {
+        type: "list_files",
+        actionId: "list-after-cancel",
+        path: "",
+      }),
+    ),
+    hasCode("SESSION_NOT_ACTIVE"),
+  );
+  await assert.rejects(
+    executor.resume({ sessionId: session.id }),
+    hasCode("SESSION_NOT_INTERRUPTED"),
+  );
+  await assert.rejects(
+    executor.exportCompletedChangeSet({
+      sessionId: session.id,
+      completedActionId: "complete-after-cancel",
+      expectedWorkspaceRevision: session.workspaceRevision,
+    }),
+    hasCode("EXECUTOR_SESSION_NOT_COMPLETED"),
+  );
+});
+
+test("cancelling an unknown write never resumes or replays it", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  let createCalls = 0;
+  let writeCalls = 0;
+  const broker = overrideBroker(baseBroker, {
+    createExecution: async (request) => {
+      createCalls += 1;
+      return baseBroker.createExecution(request);
+    },
+    writeFile: async (request) => {
+      writeCalls += 1;
+      await baseBroker.writeFile(request);
+      throw new Error("write result was lost");
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const read = await executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-cancelled-write",
+      path: "src/app.js",
+    }),
+  );
+  const unknownAction = {
+    type: "write_text",
+    actionId: "unknown-write-to-cancel",
+    expectedWorkspaceRevision: read.session.workspaceRevision,
+    path: "src/app.js",
+    content: "export const uncertain = true;\n",
+    expectedSha256: read.result.sha256,
+  };
+  const interrupted = await executor.perform({
+    sessionId: session.id,
+    action: unknownAction,
+  });
+
+  assert.equal(interrupted.action.status, "interrupted");
+  assert.equal(interrupted.action.error.code, "RESULT_UNKNOWN");
+  assert.equal(interrupted.session.status, "interrupted");
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 1), "utf8"),
+    "export const uncertain = true;\n",
+  );
+  const settled = await executor.reconcileCancellation(
+    cancellationRequest(interrupted.session, {
+      expectedWorkspaceRevision: unknownAction.expectedWorkspaceRevision,
+      expectedAction: {
+        actionId: unknownAction.actionId,
+        actionDigest: digestValue(unknownAction),
+      },
+    }),
+  );
+
+  assert.equal(settled.session.status, "cancelled");
+  assert.deepEqual(settled.proof.actionResolution, {
+    actionId: unknownAction.actionId,
+    actionDigest: digestValue(unknownAction),
+    disposition: "discarded_unknown",
+    workspaceRevisionBefore: unknownAction.expectedWorkspaceRevision,
+    workspaceRevisionAfter: null,
+  });
+  assert.equal(settled.session.attempt.number, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(writeCalls, 1);
+  await assert.rejects(
+    readFile(attemptFile(setup, session.id, 1)),
+    (error) => error?.code === "ENOENT",
+  );
+  assert.equal(
+    await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+});
+
+test("cancellation remains retryable until sandbox cleanup is confirmed", async (t) => {
+  const sandbox = new FakeSandbox({
+    results: [cleanupPendingError("profile cleanup uncertain")],
+    cleanupResults: [cleanupPendingError("still cleaning"), undefined],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const profileAction = {
+    type: "run_profile",
+    actionId: "profile-before-cancel",
+    expectedWorkspaceRevision: session.workspaceRevision,
+    profileId: "node-tests",
+  };
+  const interrupted = await executor.perform({
+    sessionId: session.id,
+    action: profileAction,
+  });
+  const request = cancellationRequest(interrupted.session, {
+    expectedWorkspaceRevision: profileAction.expectedWorkspaceRevision,
+    expectedAction: {
+      actionId: profileAction.actionId,
+      actionDigest: digestValue(profileAction),
+    },
+  });
+
+  assert.equal(interrupted.session.status, "interrupted");
+  assert.equal(interrupted.session.cleanupPending, true);
+  await assert.rejects(
+    executor.reconcileCancellation(request),
+    hasCode("CLEANUP_PENDING"),
+  );
+  const pending = await executor.view({ sessionId: session.id });
+  assert.equal(pending.status, "cancelling");
+  assert.equal(pending.cleanupPending, true);
+  assert.equal(sandbox.cleanupCalls.length, 1);
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 1), "utf8"),
+    "export const value = 1;\n",
+  );
+
+  const settled = await executor.reconcileCancellation(request);
+  assert.equal(settled.session.status, "cancelled");
+  assert.equal(settled.session.cleanupPending, false);
+  assert.equal(settled.proof.sandboxCleanupConfirmed, true);
+  assert.equal(sandbox.cleanupCalls.length, 2);
+  await assert.rejects(
+    readFile(attemptFile(setup, session.id, 1)),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("cancellation discards every workspace from a resumed session", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  let loseFirstWriteResult = true;
+  const broker = overrideBroker(baseBroker, {
+    writeFile: async (request) => {
+      const result = await baseBroker.writeFile(request);
+      if (loseFirstWriteResult) {
+        loseFirstWriteResult = false;
+        throw new Error("first attempt write result was lost");
+      }
+      return result;
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const read = await executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-multi-attempt",
+      path: "src/app.js",
+    }),
+  );
+  const interrupted = await executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "unknown-first-attempt",
+      path: "src/app.js",
+      content: "export const discarded = true;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  assert.equal(interrupted.session.status, "interrupted");
+  const resumed = await executor.resume({ sessionId: session.id });
+  assert.equal(resumed.status, "active");
+  assert.equal(resumed.attempt.number, 2);
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 1), "utf8"),
+    "export const discarded = true;\n",
+  );
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 2), "utf8"),
+    "export const value = 1;\n",
+  );
+
+  const settled = await executor.reconcileCancellation(
+    cancellationRequest(resumed),
+  );
+  assert.deepEqual(
+    settled.proof.discardedAttempts,
+    [1, 2].map((number) => ({
+      attemptNumber: number,
+      executionId: attemptExecutionIdFor(session.id, number),
+      disposition: "discarded",
+    })),
+  );
+  for (const number of [1, 2]) {
+    await assert.rejects(
+      readFile(attemptFile(setup, session.id, number)),
+      (error) => error?.code === "ENOENT",
+    );
+  }
+});
+
+test("cancellation binds both its digest and the exact admitted action", async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor();
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const readAction = {
+    type: "read_text",
+    actionId: "read-bound-to-cancel",
+    expectedWorkspaceRevision: session.workspaceRevision,
+    path: "src/app.js",
+  };
+  const read = await executor.perform({
+    sessionId: session.id,
+    action: readAction,
+  });
+  const request = cancellationRequest(read.session, {
+    expectedWorkspaceRevision: readAction.expectedWorkspaceRevision,
+    expectedAction: {
+      actionId: readAction.actionId,
+      actionDigest: digestValue(readAction),
+    },
+  });
+
+  await assert.rejects(
+    executor.reconcileCancellation({
+      ...request,
+      expectedAction: {
+        ...request.expectedAction,
+        actionDigest: "f".repeat(64),
+      },
+    }),
+    hasCode("EXECUTION_BINDING_MISMATCH"),
+  );
+  const settled = await executor.reconcileCancellation(request);
+  assert.equal(settled.session.status, "cancelled");
+  await assert.rejects(
+    executor.reconcileCancellation({
+      ...request,
+      cancellationDigest: "e".repeat(64),
+    }),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  await assert.rejects(
+    executor.reconcileCancellation({
+      ...request,
+      expectedAction: {
+        actionId: "different-action",
+        actionDigest: digestValue({ action: "different" }),
+      },
+    }),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
 });

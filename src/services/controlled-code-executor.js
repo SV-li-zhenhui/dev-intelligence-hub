@@ -32,6 +32,8 @@ const RECOVERABLE_STATUSES = new Set([
 const SESSION_STATUSES = new Set([
   ...RECOVERABLE_STATUSES,
   "interrupted",
+  "cancelling",
+  "cancelled",
   "completed",
   "failed",
 ]);
@@ -326,6 +328,7 @@ function validateSession(sessionId, session) {
       "events",
       "nextSequence",
       "cleanupFence",
+      "cancellation",
       "createdAt",
       "updatedAt",
       "completedAt",
@@ -484,6 +487,33 @@ function validateSession(sessionId, session) {
       invalidState();
     }
   }
+  if (session.cancellation !== null) {
+    const cancellation = session.cancellation;
+    if (
+      !hasExactKeys(cancellation, [
+        "digest",
+        "expectedWorkspaceRevision",
+        "expectedAction",
+        "startedAt",
+        "settledAt",
+      ]) ||
+      !isRevision(cancellation.digest) ||
+      !isRevision(cancellation.expectedWorkspaceRevision, { nullable: true }) ||
+      !isTimestamp(cancellation.startedAt) ||
+      !isTimestamp(cancellation.settledAt, { nullable: true }) ||
+      !(
+        cancellation.expectedAction === null ||
+        (hasExactKeys(cancellation.expectedAction, [
+          "actionId",
+          "actionDigest",
+        ]) &&
+          SAFE_ID.test(cancellation.expectedAction.actionId) &&
+          isRevision(cancellation.expectedAction.actionDigest))
+      )
+    ) {
+      invalidState();
+    }
+  }
   if (session.status === "completed" && !isTimestamp(session.completedAt)) {
     invalidState();
   }
@@ -525,10 +555,34 @@ function validateSession(sessionId, session) {
     (session.status !== "completed" && session.completedAt !== null) ||
     (session.status === "failed" && !isRecordedError(session.error, { nullable: false })) ||
     (session.status !== "failed" && session.error !== null) ||
-    (session.cleanupFence !== null && session.status !== "interrupted")
+    (session.cleanupFence !== null &&
+      !["interrupted", "cancelling"].includes(session.status)) ||
+    (["cancelling", "cancelled"].includes(session.status) !==
+      (session.cancellation !== null)) ||
+    (session.status === "cancelling" &&
+      session.cancellation?.settledAt !== null) ||
+    (session.status === "cancelled" &&
+      (!isTimestamp(session.cancellation?.settledAt) ||
+        session.cleanupFence !== null))
   ) {
     invalidState();
   }
+}
+
+function upgradeLegacyState(value) {
+  if (
+    !isPlainRecord(value) ||
+    value.schemaVersion !== SCHEMA_VERSION ||
+    !isPlainRecord(value.sessions)
+  ) {
+    return value;
+  }
+  for (const session of Object.values(value.sessions)) {
+    if (isPlainRecord(session) && !Object.hasOwn(session, "cancellation")) {
+      session.cancellation = null;
+    }
+  }
+  return value;
 }
 
 function validateState(value) {
@@ -617,6 +671,50 @@ function normalizeCompletedChangeExportRequest(value) {
     normalized[key] = descriptor.value;
   }
   return normalized;
+}
+
+function normalizeCancellationRequest(value) {
+  if (!isPlainRecord(value)) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  const expectedKeys = [
+    "sessionId",
+    "cancellationDigest",
+    "expectedWorkspaceRevision",
+    "expectedAction",
+  ];
+  if (!hasExactKeys(value, expectedKeys)) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  if (
+    typeof value.sessionId !== "string" ||
+    !SAFE_ID.test(value.sessionId) ||
+    !isRevision(value.cancellationDigest) ||
+    !isRevision(value.expectedWorkspaceRevision, { nullable: true })
+  ) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  let expectedAction = null;
+  if (value.expectedAction !== null) {
+    if (
+      !hasExactKeys(value.expectedAction, ["actionId", "actionDigest"]) ||
+      typeof value.expectedAction.actionId !== "string" ||
+      !SAFE_ID.test(value.expectedAction.actionId) ||
+      !isRevision(value.expectedAction.actionDigest)
+    ) {
+      throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+    }
+    expectedAction = {
+      actionId: value.expectedAction.actionId,
+      actionDigest: value.expectedAction.actionDigest,
+    };
+  }
+  return {
+    sessionId: value.sessionId,
+    cancellationDigest: value.cancellationDigest,
+    expectedWorkspaceRevision: value.expectedWorkspaceRevision,
+    expectedAction,
+  };
 }
 
 function contentSha256(value) {
@@ -735,6 +833,87 @@ function sameCleanupFence(current, expected) {
       current.executionId === expected.executionId &&
       current.actionId === expected.actionId,
   );
+}
+
+function sameCancellationRequest(cancellation, request) {
+  const sameExpectedAction =
+    cancellation?.expectedAction === null && request.expectedAction === null
+      ? true
+      : cancellation?.expectedAction !== null &&
+        request.expectedAction !== null &&
+        cancellation?.expectedAction.actionId === request.expectedAction.actionId &&
+        cancellation.expectedAction.actionDigest ===
+          request.expectedAction.actionDigest;
+  return Boolean(
+    cancellation &&
+      cancellation.digest === request.cancellationDigest &&
+      cancellation.expectedWorkspaceRevision ===
+        request.expectedWorkspaceRevision &&
+      sameExpectedAction,
+  );
+}
+
+function cancellationActionResolution(session) {
+  const expected = session.cancellation.expectedAction;
+  if (expected === null) return null;
+  const action = session.actions.find(({ id }) => id === expected.actionId);
+  if (!action) {
+    return {
+      actionId: expected.actionId,
+      actionDigest: expected.actionDigest,
+      disposition: "absent",
+      workspaceRevisionBefore: session.cancellation.expectedWorkspaceRevision,
+      workspaceRevisionAfter: null,
+    };
+  }
+  const dispositions = {
+    succeeded: "audited_succeeded",
+    failed: "audited_failed",
+    interrupted: "discarded_unknown",
+  };
+  return {
+    actionId: action.id,
+    actionDigest: action.requestDigest,
+    disposition: dispositions[action.status],
+    workspaceRevisionBefore: action.workspaceRevisionBefore,
+    workspaceRevisionAfter: action.workspaceRevisionAfter,
+  };
+}
+
+function projectCancellationProof(session) {
+  const proof = {
+    schemaVersion: 1,
+    kind: "controlled_execution_cancelled",
+    sessionId: session.id,
+    cancellationDigest: session.cancellation.digest,
+    sourceRevision: session.sourceRevision,
+    trustedWorkspaceRevision: session.workspaceRevision,
+    actionResolution: cancellationActionResolution(session),
+    sandboxCleanupConfirmed: session.cleanupFence === null,
+    discardedAttempts: session.attempts.map((attempt) => ({
+      attemptNumber: attempt.number,
+      executionId: attempt.executionId,
+      disposition: "discarded",
+    })),
+    settledAt: session.cancellation.settledAt,
+  };
+  return { ...proof, proofDigest: digestValue(proof) };
+}
+
+function projectAbsentCancellationProof(request, settledAt) {
+  const proof = {
+    schemaVersion: 1,
+    kind: "controlled_execution_absent",
+    sessionId: request.sessionId,
+    cancellationDigest: request.cancellationDigest,
+    sourceRevision: null,
+    trustedWorkspaceRevision: null,
+    actionResolution: null,
+    sandboxCleanupConfirmed: true,
+    discardedAttempts: [],
+    settledAt,
+  };
+  return { ...proof, proofDigest: digestValue(proof) };
 }
 
 function safeRecordedError(error, fallbackCode = "ACTION_FAILED") {
@@ -1245,6 +1424,7 @@ export class ControlledCodeExecutor {
         "getWorkspaceRevision",
         "sealExecution",
         "withLockedExecution",
+        "discardExecution",
       ],
       "工作区 Broker",
     );
@@ -1311,9 +1491,14 @@ export class ControlledCodeExecutor {
     return recovery;
   }
 
-  async start(request) {
-    const normalized = normalizeStartRequest(request);
-    this.#assertReady();
+  start(request) {
+    let normalized;
+    try {
+      normalized = normalizeStartRequest(request);
+      this.#assertReady();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
       this.#start(normalized),
     );
@@ -1396,9 +1581,20 @@ export class ControlledCodeExecutor {
     }
   }
 
-  async exportCompletedChangeSet(value) {
-    const request = normalizeCompletedChangeExportRequest(value);
-    this.#assertReady();
+  exportCompletedChangeSet(value) {
+    let request;
+    try {
+      request = normalizeCompletedChangeExportRequest(value);
+      this.#assertReady();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#queueForSession(request.sessionId).enqueue(() =>
+      this.#exportCompletedChangeSet(request),
+    );
+  }
+
+  async #exportCompletedChangeSet(request) {
     this.#assertRuntimeAvailable(request.sessionId);
     const session = await this.stateQueue.enqueue(async () => {
       const state = await this.#readState();
@@ -1512,11 +1708,29 @@ export class ControlledCodeExecutor {
     });
   }
 
-  async resume(request) {
-    const normalized = normalizeResumeRequest(request);
-    this.#assertReady();
+  resume(request) {
+    let normalized;
+    try {
+      normalized = normalizeResumeRequest(request);
+      this.#assertReady();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
       this.#resume(normalized.sessionId),
+    );
+  }
+
+  reconcileCancellation(value) {
+    let request;
+    try {
+      request = normalizeCancellationRequest(value);
+      this.#assertReady();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#queueForSession(request.sessionId).enqueue(() =>
+      this.#reconcileCancellation(request),
     );
   }
 
@@ -1563,7 +1777,7 @@ export class ControlledCodeExecutor {
       throw executorError("STATE_READ_FAILED", "无法读取代码执行状态");
     }
     if (stored === MISSING_STATE) return emptyState();
-    return validateState(stored);
+    return validateState(upgradeLegacyState(stored));
   }
 
   async #writeState(state) {
@@ -1656,6 +1870,7 @@ export class ControlledCodeExecutor {
         events: [],
         nextSequence: 1,
         cleanupFence: null,
+        cancellation: null,
         createdAt: at,
         updatedAt: at,
         completedAt: null,
@@ -2588,6 +2803,250 @@ export class ControlledCodeExecutor {
     for (const session of completedSessions) {
       await this.#validateCompletedSessionArtifacts(session);
     }
+  }
+
+  #assertCancellationBinding(session, request) {
+    const expectedRevision = request.expectedWorkspaceRevision;
+    const expectedAction = request.expectedAction;
+    if (expectedAction === null) {
+      if (
+        expectedRevision !== null &&
+        session.workspaceRevision !== expectedRevision
+      ) {
+        throw executorError(
+          "EXECUTION_BINDING_MISMATCH",
+          "取消请求与可信工作区版本不匹配",
+        );
+      }
+      return;
+    }
+    if (expectedRevision === null) {
+      throw executorError(
+        "EXECUTION_BINDING_MISMATCH",
+        "取消动作缺少可信工作区版本",
+      );
+    }
+    const action = session.actions.find(
+      ({ id }) => id === expectedAction.actionId,
+    );
+    if (!action) {
+      if (session.workspaceRevision !== expectedRevision) {
+        throw executorError(
+          "EXECUTION_BINDING_MISMATCH",
+          "缺失动作对应的工作区版本已经变化",
+        );
+      }
+      return;
+    }
+    if (
+      action.requestDigest !== expectedAction.actionDigest ||
+      action.workspaceRevisionBefore !== expectedRevision ||
+      action.status === "running"
+    ) {
+      throw executorError(
+        "EXECUTION_BINDING_MISMATCH",
+        "取消请求与受控动作不匹配",
+      );
+    }
+    const resultingRevision =
+      action.workspaceRevisionAfter ?? action.workspaceRevisionBefore;
+    if (session.workspaceRevision !== resultingRevision) {
+      throw executorError(
+        "EXECUTION_BINDING_MISMATCH",
+        "取消动作的工作区版本链无效",
+      );
+    }
+  }
+
+  async #reconcileCancellation(request) {
+    this.#assertRuntimeAvailable(request.sessionId);
+    const sessionExists = await this.stateQueue.enqueue(async () => {
+      const state = await this.#readState();
+      return Object.hasOwn(state.sessions, request.sessionId);
+    });
+    if (!sessionExists) {
+      if (
+        request.expectedWorkspaceRevision !== null ||
+        request.expectedAction !== null
+      ) {
+        throw executorError(
+          "SESSION_NOT_FOUND",
+          "代码执行会话不存在，无法证明已有执行副本已清理",
+        );
+      }
+      return {
+        status: "settled",
+        session: null,
+        proof: projectAbsentCancellationProof(request, this.#now()),
+      };
+    }
+    const claimed = await this.#mutateState((state) => {
+      const session = this.#requireSession(state, request.sessionId);
+      if (session.cancellation !== null) {
+        if (!sameCancellationRequest(session.cancellation, request)) {
+          throw executorError(
+            "IDEMPOTENCY_CONFLICT",
+            "代码执行会话已绑定不同的取消请求",
+          );
+        }
+        if (!["cancelling", "cancelled"].includes(session.status)) {
+          throw executorError("EXECUTOR_STATE_INVALID", "取消状态无效");
+        }
+        return {
+          changed: false,
+          value: { settled: session.status === "cancelled" },
+        };
+      }
+      this.#assertCancellationBinding(session, request);
+      const runningAction = session.actions.find(
+        ({ status }) => status === "running",
+      );
+      const runningReplay = currentAttempt(session).replays.find(
+        ({ status }) => status === "running",
+      );
+      if (runningAction || runningReplay) {
+        throw executorError(
+          "CANCELLATION_PENDING",
+          "受控操作尚未静默，取消清理需要稍后重试",
+        );
+      }
+      const at = this.#now();
+      session.status = "cancelling";
+      currentAttempt(session).status = "cancelling";
+      currentAttempt(session).finishedAt ??= at;
+      session.completedAt = null;
+      session.error = null;
+      session.cancellation = {
+        digest: request.cancellationDigest,
+        expectedWorkspaceRevision: request.expectedWorkspaceRevision,
+        expectedAction: request.expectedAction,
+        startedAt: at,
+        settledAt: null,
+      };
+      appendEvent(session, "cancellation_started", at);
+      touchSession(session, at);
+      return { value: { settled: false } };
+    });
+
+    if (claimed.settled) {
+      const session = await this.stateQueue.enqueue(async () => {
+        const state = await this.#readState();
+        return structuredClone(this.#requireSession(state, request.sessionId));
+      });
+      return structuredClone({
+        status: "settled",
+        session: projectSession(session),
+        proof: projectCancellationProof(session),
+      });
+    }
+
+    const fence = await this.stateQueue.enqueue(async () => {
+      const state = await this.#readState();
+      const session = this.#requireSession(state, request.sessionId);
+      if (!sameCancellationRequest(session.cancellation, request)) {
+        throw executorError("EXECUTION_FENCED", "取消清理已被其他请求替代");
+      }
+      return session.cleanupFence === null
+        ? null
+        : structuredClone(session.cleanupFence);
+    });
+    if (fence !== null) {
+      try {
+        await this.sandbox.cleanup({
+          executionId: fence.executionId,
+          actionId: fence.actionId,
+        });
+      } catch (error) {
+        await this.#mutateState((state) => {
+          const session = this.#requireSession(state, request.sessionId);
+          if (
+            !sameCancellationRequest(session.cancellation, request) ||
+            !sameCleanupFence(session.cleanupFence, fence)
+          ) {
+            return { changed: false };
+          }
+          const at = this.#now();
+          session.cleanupFence.lastError = safeRecordedError(
+            error,
+            "SANDBOX_CLEANUP_FAILED",
+          );
+          appendEvent(session, "cleanup_pending", at, fence.actionId);
+          touchSession(session, at);
+          return {};
+        });
+        throw executorError("CLEANUP_PENDING", "残留容器清理尚未确认");
+      }
+      await this.#mutateState((state) => {
+        const session = this.#requireSession(state, request.sessionId);
+        if (
+          !sameCancellationRequest(session.cancellation, request) ||
+          !sameCleanupFence(session.cleanupFence, fence)
+        ) {
+          throw executorError("EXECUTION_FENCED", "取消清理状态已经变化");
+        }
+        const at = this.#now();
+        session.cleanupFence = null;
+        appendEvent(session, "cleanup_confirmed", at, fence.actionId);
+        touchSession(session, at);
+        return {};
+      });
+    }
+
+    const attempts = await this.stateQueue.enqueue(async () => {
+      const state = await this.#readState();
+      const session = this.#requireSession(state, request.sessionId);
+      if (
+        session.status !== "cancelling" ||
+        !sameCancellationRequest(session.cancellation, request) ||
+        session.cleanupFence !== null
+      ) {
+        throw executorError("EXECUTION_FENCED", "取消清理状态已经变化");
+      }
+      return {
+        workspaceId: session.workspaceId,
+        attempts: session.attempts.map(({ number, executionId }) => ({
+          number,
+          executionId,
+        })),
+      };
+    });
+    try {
+      for (const attempt of attempts.attempts) {
+        await this.broker.discardExecution({
+          workspaceId: attempts.workspaceId,
+          executionId: attempt.executionId,
+        });
+      }
+    } catch {
+      throw executorError(
+        "WORKSPACE_DISPOSAL_PENDING",
+        "隔离工作区清理尚未确认",
+      );
+    }
+
+    const settled = await this.#mutateState((state) => {
+      const session = this.#requireSession(state, request.sessionId);
+      if (
+        session.status !== "cancelling" ||
+        !sameCancellationRequest(session.cancellation, request) ||
+        session.cleanupFence !== null
+      ) {
+        throw executorError("EXECUTION_FENCED", "取消结算状态已经变化");
+      }
+      const at = this.#now();
+      session.status = "cancelled";
+      currentAttempt(session).status = "cancelled";
+      currentAttempt(session).finishedAt = at;
+      session.cancellation.settledAt = at;
+      appendEvent(session, "cancellation_settled", at);
+      touchSession(session, at);
+      return { value: structuredClone(session) };
+    });
+    return structuredClone({
+      status: "settled",
+      session: projectSession(settled),
+      proof: projectCancellationProof(settled),
+    });
   }
 
   async #recover() {

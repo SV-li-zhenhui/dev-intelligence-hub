@@ -2083,6 +2083,8 @@ test("code job detail binds and whitelists durable change package application st
 test("code job controls bind identity to the path and reject extra fields", async () => {
   const jobId = `code-job-${"c".repeat(55)}`;
   const calls = [];
+  const agencySignals = [];
+  const signalFailure = new Error("agency wake failed");
   const codeJobControl = {
     async pause(input) {
       calls.push(["pause", input]);
@@ -2092,6 +2094,16 @@ test("code job controls bind identity to the path and reject extra fields", asyn
       calls.push(["resume", input]);
       return { status: "applied", job: { jobId, status: "active" } };
     },
+    async cancel(input) {
+      calls.push(["cancel", input]);
+      if (input.expectedRevision === 10) {
+        throw Object.assign(new Error("stale code job revision"), {
+          code: "CODE_JOB_REVISION_CONFLICT",
+          statusCode: 409,
+        });
+      }
+      return { status: "applied", job: { jobId, status: "cancelled" } };
+    },
   };
   const headers = {
     origin: "http://127.0.0.1:4173",
@@ -2099,7 +2111,7 @@ test("code job controls bind identity to the path and reject extra fields", asyn
     "content-type": "application/json",
   };
   await withServer(
-    async ({ server }) => {
+    async ({ server, reportedErrors }) => {
       const paused = await request(server, {
         method: "POST",
         path: `/api/code/jobs/${jobId}/control`,
@@ -2111,6 +2123,12 @@ test("code job controls bind identity to the path and reject extra fields", asyn
         path: `/api/code/jobs/${jobId}/control`,
         headers,
         body: JSON.stringify({ command: "resume", expectedRevision: 8 }),
+      });
+      const cancelled = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "cancel", expectedRevision: 9 }),
       });
       const bodyBoundJob = await request(server, {
         method: "POST",
@@ -2138,15 +2156,41 @@ test("code job controls bind identity to the path and reject extra fields", asyn
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ command: "pause", expectedRevision: 9 }),
       });
+      const unsupported = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "delete", expectedRevision: 9 }),
+      });
+      const staleCancel = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "cancel", expectedRevision: 10 }),
+      });
+      await new Promise((resolve) => setImmediate(resolve));
 
-      assert.deepEqual([paused.status, resumed.status], [200, 200]);
+      assert.deepEqual(
+        [paused.status, resumed.status, cancelled.status],
+        [200, 200, 200],
+      );
       assert.deepEqual(JSON.parse(paused.body), {
         status: "applied",
         job: { jobId, status: "paused" },
       });
+      assert.deepEqual(JSON.parse(cancelled.body), {
+        status: "applied",
+        job: { jobId, status: "cancelled" },
+      });
       assert.deepEqual(
-        [bodyBoundJob.status, clientReason.status, untrusted.status],
-        [400, 400, 403],
+        [
+          bodyBoundJob.status,
+          clientReason.status,
+          untrusted.status,
+          unsupported.status,
+          staleCancel.status,
+        ],
+        [400, 400, 403, 400, 409],
       );
       assert.deepEqual(calls, [
         [
@@ -2158,9 +2202,37 @@ test("code job controls bind identity to the path and reject extra fields", asyn
           },
         ],
         ["resume", { jobId, expectedRevision: 8 }],
+        [
+          "cancel",
+          {
+            jobId,
+            expectedRevision: 9,
+            reason: "用户从本地指挥中枢取消代码任务",
+          },
+        ],
+        [
+          "cancel",
+          {
+            jobId,
+            expectedRevision: 10,
+            reason: "用户从本地指挥中枢取消代码任务",
+          },
+        ],
       ]);
+      assert.deepEqual(agencySignals, [
+        { trigger: "code_job_cancel_requested" },
+      ]);
+      assert.deepEqual(reportedErrors, [signalFailure]);
     },
-    { codeJobControl },
+    {
+      codeJobControl,
+      backgroundWork: {
+        async signalAgency(options) {
+          agencySignals.push(options);
+          throw signalFailure;
+        },
+      },
+    },
   );
 });
 

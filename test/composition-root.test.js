@@ -156,12 +156,13 @@ function controlledCodeExecutorPort(overrides = {}) {
     async perform() {},
     async getActionResult() {},
     async reconcileAction() {},
+    async reconcileCancellation() {},
     ...overrides,
   };
 }
 
 function codeJobControlPort() {
-  return { async pause() {}, async resume() {} };
+  return { async pause() {}, async resume() {}, async cancel() {} };
 }
 
 function codeJobWorkerPort() {
@@ -1754,6 +1755,7 @@ test("local code composition binds authority, both proposal runners, and one saf
     "getActionResult",
     "perform",
     "reconcileAction",
+    "reconcileCancellation",
     "resume",
     "start",
     "view",
@@ -1856,6 +1858,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   assert.equal(Object.isFrozen(application.codeJobReader), true);
   assert.equal(Object.isFrozen(application.codeJobControl), true);
   assert.deepEqual(Object.keys(application.codeJobControl).sort(), [
+    "cancel",
     "pause",
     "resume",
   ]);

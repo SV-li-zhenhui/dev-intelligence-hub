@@ -755,6 +755,14 @@ export class CodeActionProposalHandler {
         evidence,
       );
     }
+    if (job.status === "cancelled") {
+      return terminal(
+        "rejected",
+        "本地代码任务已由用户取消",
+        { id: confirmationId },
+        evidence,
+      );
+    }
     return terminal(
       "unknown",
       "本地代码任务因安全边界被隔离",
