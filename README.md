@@ -1,6 +1,6 @@
 # MyDashboard
 
-本机个人研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与钉钉 @我、待办、未读会话合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及一个可暂停、可追踪的 PR 推进员工。
+本机个人研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与钉钉 @我、待办、未读会话合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及可独立配置职责、权限、调度和大脑的主控、需求、PR、开发与测试岗位。
 
 PR 责任语义遵循团队当前流程：
 
@@ -21,7 +21,11 @@ npm start
 
 “跟踪版本”按版本的创建/发布时间倒序展示，最近添加或发布的记录在最上方。
 
-## PR 推进员工
+## PR 能力与岗位
+
+新的 PR 工作默认路由到持久化工作台账中的 `pr-engineer`；旧 `pr-reviewer` 保留原有数据、作业和兼容接口，不再是默认工作流目标。两个岗位首次创建都保持暂停，必须由你在“岗位”页面明确恢复后才会主动领取新工作。
+
+旧 PR 员工的兼容链路仍保留以下能力：
 
 - 每 2 分钟巡查一次最新的成功 GitHub PR 快照；旧快照或失败源不会触发新工作。
 - 对需要 Review 的 PR 读取固定 head 的有限 diff，生成与该 Head 绑定的评审方案。
@@ -30,25 +34,41 @@ npm start
 - 作业带 revision、head 校验、运行租约和重试策略；模型完成后若 head 已变化，草稿会自动失效。
 - 分析、证据、步骤、来源 URL、head 和所用大脑会写入本地记忆，可在“记忆搜索”中查询。
 
-岗位默认继承全局 `brain`，也可以在 `employees.prReviewer.brain` 中覆盖模型。例如只给 PR 岗位换一个更强的本地 Ollama 模型：
+## 多岗位与多大脑
+
+当前配置包含 `pr-engineer`、`orchestrator`、`requirements-analyst`、`developer` 和 `tester` 五个新岗位；每个岗位分别持久化暂停状态、运行修订号、职责、权限、调度频率和模型。默认大脑是本机 Ollama 的 `qwen3.5:9b`。
+
+`brainProviders` 支持本地 Ollama 和 OpenAI-compatible 第三方接口。密钥只从指定环境变量读取，不写入配置或日志。例如，只给需求分析师接入第三方大脑：
 
 ```json
 {
+  "brainProviders": {
+    "remote-smart": {
+      "kind": "openai-compatible",
+      "baseUrl": "https://models.example/v1",
+      "apiKeyEnv": "MYDASHBOARD_MODEL_TOKEN",
+      "timeoutMs": 120000
+    }
+  },
   "employees": {
-    "prReviewer": {
-      "brain": {
-        "enabled": true,
-        "provider": "ollama",
-        "model": "更强的本地模型名"
+    "roles": {
+      "requirements-analyst": {
+        "brain": {
+          "provider": "remote-smart",
+          "model": "更强的第三方模型名",
+          "remoteData": {
+            "requirements": true,
+            "code": false,
+            "memory": false
+          }
+        }
       }
     }
   }
 }
 ```
 
-当前实现的岗位大脑适配器是 Ollama；岗位与模型已经解耦，后续可以增加第三方 Provider，而不改变作业状态机和确认边界。
-
-PR 正文、文件名和 diff 默认只允许发送到 loopback Ollama。若明确要连接远程 Ollama，必须在 `employees.prReviewer` 中设置 `allowRemoteCodeContext: true`；界面会持续提示代码上下文正在离开本机。远程 Provider 后续也应沿用这一显式授权边界。
+远程地址必须使用 HTTPS。需求、代码和记忆三类数据分别默认拒绝出机；只有岗位的 `remoteData` 对应分类显式为 `true` 时才允许发送。页面持续显示岗位实际使用的 Provider、模型以及是否为远程大脑。旧 PR 员工的正文、文件名和 diff 仍默认只允许发送到 loopback Ollama；它的远程代码授权继续由 `employees.prReviewer.allowRemoteCodeContext` 单独控制。
 
 ## GitHub 外部动作确认
 
@@ -77,7 +97,7 @@ GitHub 写入默认关闭。启用后，PR 员工只能准备 `APPROVE`、`REQUE
 
 GitHub PR 和 Issue 的首次观察、创建、更新、分类、状态变化、完成及离开当前范围都会转换成只包含安全事实的本地事件。刷新成功后，系统按照 `config.json` 中的 `workflowRouting` 整份规则定义进行分派，并保留事件、配置版本、分派结果和完整匹配解释。
 
-规则按优先级从高到低判断；同优先级保持配置顺序。普通规则均未命中时才使用兜底规则。目标可以是岗位（`role`）、具体人员（`person`）或后续流程节点（`node`）；节点路由有静态环路检查、运行时已访问节点检查和最大跳数限制。当前默认把 PR 事件交给 `pr-reviewer`，Issue 事件交给 `requirements-analyst`，其他事项回到本人分诊。
+规则按优先级从高到低判断；同优先级保持配置顺序。普通规则均未命中时才使用兜底规则。目标可以是岗位（`role`）、具体人员（`person`）或后续流程节点（`node`）；节点路由有静态环路检查、运行时已访问节点检查和最大跳数限制。当前默认把 PR 事件交给 `pr-engineer`，Issue 事件交给 `requirements-analyst`，其他事项回到本人分诊。
 
 页面“工作流”视图可读取当前版本、规则、最新分派和审计解释，也可以用候选事件做不落盘试跑。HTTP 不提供规则替换或直接 dispatch 接口；目前修改规则需要编辑本机配置并安全重启。路由只回答“交给谁”，不会调用 GitHub、受控代码执行器或确认队列，更不能绕过外部写入与高风险执行的逐项确认。
 
@@ -91,11 +111,13 @@ GitHub PR 和 Issue 的首次观察、创建、更新、分类、状态变化、
 
 员工需要你决定时，会进入与 GitHub 外部动作共用的唯一弹框。每次只展示一项；回答必须带当前 revision 和内容摘要，旧页面不能覆盖已经变化的问题。“稍后”不会改变工作或执行动作。内部答复只写本地请示箱，随后由主动循环对账并继续；它不会直接执行代码或写入 GitHub。
 
-当前第 5 阶段已经接通完整的主动循环基础设施，但智能多岗位仍属于下一阶段：PR 工作继续由旧 `pr-reviewer` 独占并默认暂停；`requirements-analyst` 尚未接入大脑时，系统会为该目标生成一个去重请示，而不会静默丢弃或擅自改派。
+第 6 阶段已经把五个新岗位接入主动循环和可替换大脑。相同岗位的重复定时信号会合并，事实刷新优先淘汰过期定时 tick；用户手动运行保持有界、保序，并且不会在刷新竞争中静默丢失。所有岗位目前默认暂停，先由你检查路由、权限和模型后再逐个启用。
+
+PR Review 提案已有持久化 runner、岗位与提案类型双重权限范围，以及固定账号/仓库/PR/Head 的确认计划；只有 GitHub 外部动作总开关和 GitHub 写入开关同时开启时才会进入逐项确认。默认配置下两者关闭，不会写入 GitHub。开发和测试岗位目前可以形成受策略约束的代码提案，但把批准后的提案接到受控代码执行器、持续工具循环和变更包回写仍属于第 7 阶段。
 
 ## 受控代码执行器
 
-代码执行基础能力默认关闭，并且尚未直接交给任何岗位或 HTTP 接口。启用后，系统会先恢复持久化会话；恢复校验失败时启动会直接失败，不会退回宿主机命令执行。
+代码执行基础能力默认关闭，并且尚未直接交给任何岗位或 HTTP 接口。开发、测试岗位当前只能生成本地持久化提案，不能因此取得执行能力。第 7 阶段完成确认授权与 Code Job 桥接后，系统仍会先恢复持久化会话；恢复校验失败时启动会直接失败，不会退回宿主机命令执行。
 
 私人工作区和 Docker 设置只写入不入库的 `config.local.json`。下面是本项目在 Windows Docker Desktop 上的示例；镜像必须固定到 digest，工作区写权限必须逐项列出：
 

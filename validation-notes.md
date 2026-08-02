@@ -1,5 +1,18 @@
 # Validation notes
 
+## 2026-08-02 — Stage 6 multi-role and multi-brain command center
+
+- Automated regression: the final complete Node suite passed with 686 passing and one opt-in real Docker test skipped; 49 server lifecycle/scheduling tests and the independent 60-test Stage 6 review set passed. Syntax checks and `git diff --check` also passed.
+- Runtime restart: the accepted service is listening only on `127.0.0.1:4173` as PID 54124. `/`, static assets, health, employees, dashboard, attention, memory, work-ledger and workflow-routing endpoints all returned HTTP 200; `logs/server-stage6-accepted.stderr.log` is empty.
+- Live refresh: 122 GitHub records and 41 DingTalk signals were collected in 23.079 seconds with zero source errors and zero brain-refresh errors. Routing version 2 targets PR events to `pr-engineer` and Issue events to `requirements-analyst`.
+- Workforce state: six roles are discoverable. The five configured roles and the legacy `pr-reviewer` are all paused; each configured role reports local `ollama / qwen3.5:9b`, `remote=false`, and all remote data classifications denied.
+- Real brain smoke: direct structured decisions through the configured Ollama model succeeded for requirements analysis and PR engineering. The PR result produced the allowed `propose_github_review` intent without invoking GitHub.
+- Durable state: the work ledger is at revision 269 with 130 unique items (129 queued, one waiting for the user). The unified attention endpoint exposes exactly that internal request; external actions remain disabled. Unified local memory is healthy and reports 547 searchable records.
+- Scheduling safety: facts, scheduled work and manual work share one serialized boundary. Same-scope scheduled ticks and same-kind refreshes coalesce; pending facts discard only obsolete scheduled work, while manual work remains ordered across one or multiple refresh cycles and returns 503 if no valid facts exist.
+- Provider safety: Ollama and OpenAI-compatible options are isolated by adapter kind; remote credentials come only from the named environment variable, and requirements/code/memory each require explicit per-role remote authorization.
+- Review result: independent review reproduced and drove fixes for the no-confirmation-queue fact race, slow-tick backlog, manual-run loss, Provider option leakage and stale frontend response ordering. Final review found no remaining high-confidence P0/P1/P2 in the Stage 6 scope.
+- Browser automation was not used because the selected in-app browser bootstrap remained unavailable; frontend behavior is covered by static contracts and real local HTTP checks.
+
 ## 2026-08-02 — Stage 5 proactive work loop
 
 - Automated regression: the complete Node test suite passed after composition with 563 passing and one opt-in Docker test skipped; syntax checks, frontend static contracts and `git diff --check` passed.
