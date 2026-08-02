@@ -1,5 +1,15 @@
 # Validation notes
 
+## 2026-08-02 — Stage 5 proactive work loop
+
+- Automated regression: the complete Node test suite passed after composition with 563 passing and one opt-in Docker test skipped; syntax checks, frontend static contracts and `git diff --check` passed.
+- Runtime restart: the new service is listening on `127.0.0.1:4173` as PID 22072 with an empty error log. `/`, `/app.js`, `/work-view.js`, `/api/work/items` and `/api/attention/next` all returned HTTP 200.
+- Durable migration: `workflow-routing-state` migrated from schema 1 to schema 2 with a contiguous assignment feed from sequence 1 through 122. The work ledger then recorded exactly 122 unique items with intake cursor/high-watermark 122.
+- Live safety state: 72 PR items remain queued because the legacy PR role is paused; one requirements item is waiting for the user and the other same-target items remain queued. Only one internal request and one delivered attention intent exist, so scheduled reruns did not duplicate the question.
+- Preserved state: the PR employee remains paused at revision 66 with all 18 historical jobs. GitHub actions are disabled, the external confirmation runtime was not acquired, and no external write was performed.
+- Recovery rehearsal: a separate temporary copy of the pre-migration JSON state completed v1→v2 migration, first intake and a second idempotent cycle without modifying production data.
+- Browser automation was not used for acceptance because the selected in-app browser bootstrap was unavailable in this environment; frontend behavior is covered by static contract tests and real local HTTP checks.
+
 ## 2026-08-01 — Stage 1 generic employee control layer
 
 - Automated regression: `npm test` passed 96/96; syntax checks and `git diff --check` passed.
