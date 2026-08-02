@@ -97,6 +97,8 @@ test("local search supports Chinese keywords, filters, newest order, and stable 
     "梳理结算失败路径",
   ]);
   assert.equal(secondPage.nextCursor, null);
+  assert.equal(firstPage.totalMatched, 3);
+  assert.equal(secondPage.totalMatched, 3);
 });
 
 test("an index write outage never rolls back raw memory and search stays local", async () => {

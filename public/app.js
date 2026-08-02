@@ -17,7 +17,17 @@ let currentView = "overview";
 let itemIndex = new Map();
 let jobIndex = new Map();
 let memoryResults = [];
-let memoryQuery = "";
+let memoryFilters = {
+  query: "",
+  roleId: "",
+  repository: "",
+  eventType: "",
+  from: "",
+  to: "",
+};
+let memoryNextCursor = null;
+let memoryTotalMatched = 0;
+let memoryIndexHealthy = true;
 let memoryLoaded = false;
 let requestSequence = 0;
 let lastAppliedRequest = 0;
@@ -334,7 +344,7 @@ function memoryRows() {
             <span>${relativeTime(memory.createdAt)}</span>
           </div>
           <p>${escapeHtml(memory.summary || "")}</p>
-          <span>${escapeHtml(memory.repository || "")} ${memory.number ? `#${memory.number}` : ""} · ${escapeHtml(memory.event || "observation")}</span>
+          <span>${escapeHtml(memory.roleId || "未标注岗位")} · ${escapeHtml(memory.repository || "未标注仓库")} ${memory.number ? `#${memory.number}` : ""} · ${escapeHtml(memory.event || "observation")}</span>
           ${memory.sourceUrl ? `<a href="${escapeHtml(memory.sourceUrl)}" target="_blank" rel="noreferrer">打开来源 →</a>` : ""}
         </article>`,
     )
@@ -343,12 +353,20 @@ function memoryRows() {
 
 function memoryView() {
   return `<section class="section memory-section">
-    <div class="section-heading"><h2>本地员工记忆</h2><span>${memoryResults.length} RESULTS</span></div>
+    <div class="section-heading"><h2>统一本地记忆</h2><span>${memoryResults.length}/${memoryTotalMatched} RESULTS · ${memoryIndexHealthy ? "本地索引正常" : "本地索引降级"}</span></div>
     <form class="memory-search" id="memory-search-form">
       <label for="memory-query">搜索 PR、仓库、问题或处理结论</label>
-      <div><input id="memory-query" name="query" value="${escapeHtml(memoryQuery)}" autocomplete="off" /><button class="refresh-button" type="submit">搜索</button></div>
+      <div class="memory-search-primary"><input id="memory-query" name="query" value="${escapeHtml(memoryFilters.query)}" autocomplete="off" /><button class="refresh-button" type="submit">搜索</button></div>
+      <div class="memory-filters">
+        <label>岗位<input name="roleId" value="${escapeHtml(memoryFilters.roleId)}" placeholder="例如 developer" autocomplete="off" /></label>
+        <label>仓库<input name="repository" value="${escapeHtml(memoryFilters.repository)}" placeholder="owner/repo" autocomplete="off" /></label>
+        <label>事件类型<input name="eventType" value="${escapeHtml(memoryFilters.eventType)}" placeholder="例如 work.completed" autocomplete="off" /></label>
+        <label>开始日期<input name="from" type="date" value="${escapeHtml(memoryFilters.from)}" /></label>
+        <label>结束日期<input name="to" type="date" value="${escapeHtml(memoryFilters.to)}" /></label>
+      </div>
     </form>
     ${memoryRows()}
+    ${memoryNextCursor ? '<button class="secondary-button memory-more" id="memory-load-more" type="button">加载更早记录</button>' : ""}
   </section>`;
 }
 
@@ -456,6 +474,10 @@ function render() {
   content.querySelector("#memory-search-form")?.addEventListener(
     "submit",
     handleMemorySearch,
+  );
+  content.querySelector("#memory-load-more")?.addEventListener(
+    "click",
+    handleMemoryLoadMore,
   );
   workflowView.bind(content);
   workView.bind(content);
@@ -614,15 +636,46 @@ async function handleEmployeeRun(event) {
   }
 }
 
-async function loadMemories(query = "") {
-  memoryQuery = query;
-  const response = await fetch(
-    `/api/memory/search?q=${encodeURIComponent(query)}&limit=50`,
-    { cache: "no-store" },
+function memoryTimestamp(date, endOfDay = false) {
+  if (!date) return "";
+  const suffix = endOfDay ? "T23:59:59.999" : "T00:00:00.000";
+  return new Date(`${date}${suffix}`).toISOString();
+}
+
+function memoryQueryUrl(filters, cursor = null) {
+  const params = new URLSearchParams({ limit: "50" });
+  const values = {
+    q: filters.query,
+    roleId: filters.roleId,
+    repository: filters.repository,
+    eventType: filters.eventType,
+    from: memoryTimestamp(filters.from),
+    to: memoryTimestamp(filters.to, true),
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value) params.set(key, value);
+  }
+  if (cursor) params.set("cursor", cursor);
+  return `/api/memory/query?${params}`;
+}
+
+async function loadMemories(filters = memoryFilters, { append = false } = {}) {
+  const normalized = Object.fromEntries(
+    Object.keys(memoryFilters).map((key) => [key, String(filters[key] || "").trim()]),
   );
+  const cursor = append ? memoryNextCursor : null;
+  const response = await fetch(memoryQueryUrl(normalized, cursor), {
+    cache: "no-store",
+  });
   if (!response.ok) throw new Error(`记忆搜索失败（${response.status}）`);
   const result = await response.json();
-  memoryResults = result.items || [];
+  memoryFilters = normalized;
+  memoryResults = append
+    ? [...memoryResults, ...(result.items || [])]
+    : result.items || [];
+  memoryNextCursor = result.nextCursor || null;
+  memoryTotalMatched = Number(result.totalMatched) || 0;
+  memoryIndexHealthy = result.indexHealthy !== false;
   memoryLoaded = true;
   if (currentView === "memory") render();
 }
@@ -633,11 +686,23 @@ async function handleMemorySearch(event) {
   const submit = form.querySelector("button[type=submit]");
   submit.disabled = true;
   try {
-    await loadMemories(new FormData(form).get("query") || "");
+    await loadMemories(Object.fromEntries(new FormData(form)));
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
     submit.disabled = false;
+  }
+}
+
+async function handleMemoryLoadMore(event) {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await loadMemories(memoryFilters, { append: true });
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    button.disabled = false;
   }
 }
 

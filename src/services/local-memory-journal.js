@@ -502,7 +502,7 @@ export class LocalMemoryJournal {
     );
     const queryTerms = lexicalTerms(options.q);
     const cursor = options.cursor;
-    const filtered = this.#journal.records
+    const matched = this.#journal.records
       .filter((record) => !candidates || candidates.has(record.recordId))
       .filter((record) => !options.roleId || record.roleId === options.roleId)
       .filter(
@@ -519,16 +519,18 @@ export class LocalMemoryJournal {
         const haystack = recordText(record);
         return queryTerms.every((term) => haystack.includes(term));
       })
-      .filter((record) => !cursor || newestFirst(record, cursor) > 0)
       .sort(newestFirst);
-    const selected = filtered.slice(0, options.limit);
+    const available = matched.filter(
+      (record) => !cursor || newestFirst(record, cursor) > 0,
+    );
+    const selected = available.slice(0, options.limit);
     return {
       items: selected.map(projectMemoryRecord),
       nextCursor:
-        filtered.length > selected.length && selected.length
+        available.length > selected.length && selected.length
           ? encodeCursor(selected.at(-1))
           : null,
-      totalMatched: filtered.length,
+      totalMatched: matched.length,
       indexHealthy: !this.#lastIndexError,
     };
   }

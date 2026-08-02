@@ -513,7 +513,7 @@ h1 {
   font-size: 11px;
 }
 
-.memory-search div {
+.memory-search-primary {
   display: flex;
   gap: 8px;
 }
@@ -526,6 +526,26 @@ h1 {
   background: var(--surface);
   border: 1px solid var(--line-strong);
   border-radius: 6px;
+}
+
+.memory-filters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.memory-filters label {
+  margin: 0;
+}
+
+.memory-filters input {
+  width: 100%;
+  margin-top: 5px;
+}
+
+.memory-more {
+  margin-top: 14px;
 }
 
 .memory-item {
@@ -1299,6 +1319,10 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .memory-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .employee-summary div:nth-child(even) {
     padding-left: 0;
     border-left: 0;
@@ -1341,6 +1365,10 @@ dialog::backdrop {
 
   .employee-actions button {
     justify-content: center;
+  }
+
+  .memory-filters {
+    grid-template-columns: 1fr;
   }
 
   .workflow-summary {
