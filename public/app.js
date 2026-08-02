@@ -1,4 +1,5 @@
 import { createWorkflowView } from "./workflow-view.js";
+import { createWorkView } from "./work-view.js";
 
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
@@ -24,12 +25,15 @@ let confirmationRequestSequence = 0;
 let lastAppliedConfirmationRequest = 0;
 let confirmationQueueState = {
   available: false,
+  source: null,
+  externalEnabled: false,
   queueRevision: 0,
   pendingCount: 0,
   item: null,
 };
 let confirmationQueueLoaded = false;
 let activeExternalConfirmation = null;
+let activeInternalAttention = null;
 let activeConfirmationKey = "";
 const deferredConfirmations = new Set();
 
@@ -42,11 +46,18 @@ const viewTitles = {
   employees: "你的数字员工",
   memory: "搜索做过的事情",
   workflow: "工作流指挥",
+  work: "主动工作台账",
 };
 
 const workflowView = createWorkflowView({
   onChange() {
     if (dashboard && currentView === "workflow") render();
+  },
+});
+
+const workView = createWorkView({
+  onChange() {
+    if (dashboard && currentView === "work") render();
   },
 });
 
@@ -395,6 +406,7 @@ function render() {
     employees: () => employeePanel({ expanded: true }),
     memory: memoryView,
     workflow: () => workflowView.render(),
+    work: () => workView.render(),
   };
   content.innerHTML = views[currentView]();
   content.querySelectorAll("[data-item-id]").forEach((button) => {
@@ -418,6 +430,7 @@ function render() {
     handleMemorySearch,
   );
   workflowView.bind(content);
+  workView.bind(content);
 }
 
 function detailRows(item) {
@@ -501,7 +514,10 @@ function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSeque
   lastAppliedConfirmationRequest = sequence;
   confirmationQueueState = {
     available: Boolean(nextState.available),
-    queueRevision: nextState.queueRevision || 0,
+    source: nextState.source || null,
+    externalEnabled: Boolean(nextState.externalEnabled),
+    queueRevision:
+      nextState.externalQueueRevision || nextState.queueRevision || 0,
     pendingCount: nextState.pendingCount || 0,
     item: nextState.item || null,
   };
@@ -514,6 +530,8 @@ function invalidateConfirmationQueueSnapshot() {
   confirmationQueueLoaded = false;
   confirmationQueueState = {
     available: false,
+    source: null,
+    externalEnabled: false,
     queueRevision: 0,
     pendingCount: 0,
     item: null,
@@ -614,7 +632,9 @@ function confirmationKey(kind, item) {
 
 function pendingConfirmations() {
   if (!confirmationQueueLoaded) return [];
-  const externalActions = confirmationQueueState.item
+  const externalActions =
+    confirmationQueueState.source === "external_confirmation" &&
+    confirmationQueueState.item
     ? [
         {
           kind: "external_action",
@@ -623,19 +643,35 @@ function pendingConfirmations() {
         },
       ]
     : [];
+  const internalRequests =
+    confirmationQueueState.source === "internal_request" &&
+    confirmationQueueState.item
+      ? [
+          {
+            kind: "internal_request",
+            item: confirmationQueueState.item,
+            key: `internal\u0000${confirmationQueueState.item.requestId}\u0000${confirmationQueueState.item.contentDigest}`,
+          },
+        ]
+      : [];
   const responsibilities = pullRequestGroups().uncertain.map((item) => ({
     kind: "responsibility",
     item,
     key: confirmationKey("responsibility", item),
   }));
-  const legacyReviewDrafts = confirmationQueueState.available
+  const legacyReviewDrafts = confirmationQueueState.externalEnabled
     ? []
     : (dashboard.employee?.confirmationQueue || []).map((job) => ({
         kind: "review_draft",
         job,
         key: confirmationKey("review", job),
       }));
-  return [...externalActions, ...responsibilities, ...legacyReviewDrafts].filter(
+  return [
+    ...externalActions,
+    ...responsibilities,
+    ...internalRequests,
+    ...legacyReviewDrafts,
+  ].filter(
     (entry) => !deferredConfirmations.has(entry.key),
   );
 }
@@ -672,6 +708,7 @@ function reviewEventLabel(value) {
 
 function showExternalActionConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
+  activeInternalAttention = null;
   activeExternalConfirmation = item;
   const payload = item.display?.payload || {};
   const actor = payload.actor || item.actor || {};
@@ -710,6 +747,140 @@ function showExternalActionConfirmation(entry, remaining) {
     .addEventListener("click", handleExternalConfirmation);
 }
 
+function internalContextMarkup(context = []) {
+  if (!context.length) return "";
+  return `<dl class="detail-grid confirmation-grid">${context
+    .map(
+      ({ label, value }) =>
+        `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`,
+    )
+    .join("")}</dl>`;
+}
+
+function showInternalAttention(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeInternalAttention = item;
+  activeExternalConfirmation = null;
+  const choices = (item.choices || [])
+    .map(
+      (choice) => `
+        <button type="button" data-internal-choice="${escapeHtml(choice.id)}">
+          ${escapeHtml(choice.label)}
+          ${choice.description ? `<small>${escapeHtml(choice.description)}</small>` : ""}
+        </button>`,
+    )
+    .join("");
+  confirmationContent.innerHTML = `
+    <article class="confirmation internal-attention">
+      <p class="eyebrow">EMPLOYEE CONSULTATION / ${remaining} LEFT</p>
+      <h2>${escapeHtml(item.question || "员工需要你做一个决定")}</h2>
+      <p class="confirmation-reason">来自 ${escapeHtml(item.producer?.roleId || "orchestrator")} · 回答只会写入本地工作台账</p>
+      ${internalContextMarkup(item.context)}
+      ${choices ? `<div class="confirmation-actions internal-choice-actions">${choices}</div>` : ""}
+      <form class="internal-answer-form">
+        <label for="internal-answer-text">补充文字答复</label>
+        <textarea id="internal-answer-text" name="answer" maxlength="4096" placeholder="输入你的判断或补充信息"></textarea>
+        <div class="confirmation-actions">
+          <button type="submit">提交文字答复</button>
+          <button type="button" class="secondary" data-internal-operation="reject">驳回请示</button>
+          <button type="button" class="secondary wide" data-internal-operation="later">稍后再看</button>
+        </div>
+      </form>
+      <p class="confirmation-note">答复绑定当前请求版本和内容摘要；内容变化后必须重新确认。这里不会直接执行代码或写入 GitHub。</p>
+    </article>`;
+  const root = confirmationContent.querySelector(".internal-attention");
+  root.addEventListener("click", handleInternalAttentionClick);
+  root
+    .querySelector(".internal-answer-form")
+    .addEventListener("submit", handleInternalTextAnswer);
+}
+
+function setInternalButtonsDisabled(disabled) {
+  confirmationContent.querySelectorAll("button, textarea").forEach((control) => {
+    control.disabled = disabled;
+  });
+}
+
+async function submitInternalAttention(operation, answer) {
+  const item = activeInternalAttention;
+  if (!item || !["answer", "reject", "later"].includes(operation)) return;
+  setInternalButtonsDisabled(true);
+  try {
+    const response = await fetch(
+      `/api/attention/internal/${encodeURIComponent(item.requestId)}/${operation}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify({
+          expectedRevision: item.revision,
+          contentDigest: item.contentDigest,
+          answer,
+        }),
+      },
+    );
+    if (response.status === 409) {
+      activeInternalAttention = null;
+      activeConfirmationKey = "";
+      confirmationDialog.close();
+      invalidateConfirmationQueueSnapshot();
+      statusBanner.hidden = false;
+      statusBanner.textContent = "员工请示内容已经变化，请查看最新问题后重新答复。";
+      await refreshConfirmationQueue({ showConfirmation: false });
+      queueMicrotask(showNextConfirmation);
+      return;
+    }
+    if (!response.ok) throw new Error(`员工请示处理失败（${response.status}）`);
+    await response.json();
+    if (operation === "later") deferredConfirmations.add(activeConfirmationKey);
+    activeInternalAttention = null;
+    activeConfirmationKey = "";
+    confirmationDialog.close();
+    invalidateConfirmationQueueSnapshot();
+    await refreshConfirmationQueue({ showConfirmation: false });
+    if (currentView === "work") await workView.load();
+    queueMicrotask(showNextConfirmation);
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    setInternalButtonsDisabled(false);
+  }
+}
+
+function handleInternalAttentionClick(event) {
+  const choice = event.target.closest("[data-internal-choice]");
+  if (choice) {
+    submitInternalAttention("answer", {
+      type: "choice",
+      choiceId: choice.dataset.internalChoice,
+    });
+    return;
+  }
+  const operation = event.target.closest("[data-internal-operation]")
+    ?.dataset.internalOperation;
+  if (operation === "reject") {
+    submitInternalAttention("reject", {
+      type: "reject",
+      reason: "用户在统一确认弹框中驳回请示",
+    });
+  } else if (operation === "later") {
+    submitInternalAttention("later", { type: "later" });
+  }
+}
+
+function handleInternalTextAnswer(event) {
+  event.preventDefault();
+  const text = new FormData(event.currentTarget).get("answer")?.trim() || "";
+  if (!text) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = "请输入答复内容，或选择一个选项。";
+    return;
+  }
+  submitInternalAttention("answer", { type: "text", text });
+}
+
 function showReviewDraftConfirmation(entry, remaining) {
   const { job } = entry;
   confirmationContent.innerHTML = `
@@ -744,10 +915,14 @@ function showNextConfirmation() {
   activeConfirmationKey = entry.key;
   if (entry.kind === "external_action") {
     showExternalActionConfirmation(entry, pending.length);
+  } else if (entry.kind === "internal_request") {
+    showInternalAttention(entry, pending.length);
   } else if (entry.kind === "review_draft") {
+    activeInternalAttention = null;
     activeExternalConfirmation = null;
     showReviewDraftConfirmation(entry, pending.length);
   } else {
+    activeInternalAttention = null;
     activeExternalConfirmation = null;
     showResponsibilityConfirmation(entry, pending.length);
   }
@@ -858,8 +1033,8 @@ async function handleExternalConfirmation(event) {
       return;
     }
     if (!response.ok) throw new Error(`外部动作确认失败（${response.status}）`);
-    const result = await response.json();
-    applyConfirmationQueue({ available: true, ...result.next });
+    await response.json();
+    invalidateConfirmationQueueSnapshot();
     activeConfirmationKey = "";
     activeExternalConfirmation = null;
     confirmationDialog.close();
@@ -962,7 +1137,7 @@ async function fetchDashboard() {
 }
 
 async function fetchConfirmationQueue() {
-  const response = await fetch("/api/confirmations/next", { cache: "no-store" });
+  const response = await fetch("/api/attention/next", { cache: "no-store" });
   if (!response.ok) throw new Error(`读取确认队列失败（${response.status}）`);
   return response.json();
 }
@@ -991,6 +1166,7 @@ async function load({ showConfirmation = true } = {}) {
     }
     applyDashboard(nextDashboard, sequence);
     if (currentView === "workflow") await workflowView.load();
+    if (currentView === "work") await workView.load();
     if (showConfirmation) queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
@@ -1011,6 +1187,7 @@ async function refresh() {
     applyDashboard(await response.json(), sequence);
     await refreshConfirmationQueue({ showConfirmation: false });
     if (currentView === "workflow") await workflowView.load();
+    if (currentView === "work") await workView.load();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
@@ -1036,6 +1213,9 @@ document.querySelectorAll(".nav-item").forEach((button) => {
     if (currentView === "workflow" && workflowView.needsLoad()) {
       workflowView.load();
     }
+    if (currentView === "work" && workView.needsLoad()) {
+      workView.load();
+    }
   });
 });
 
@@ -1044,10 +1224,15 @@ document.querySelector(".dialog-close").addEventListener("click", () => dialog.c
 document
   .querySelector(".confirmation-close")
   .addEventListener("click", () => {
+    if (activeInternalAttention) {
+      submitInternalAttention("later", { type: "later" });
+      return;
+    }
     if (activeConfirmationKey) {
       deferredConfirmations.add(activeConfirmationKey);
       activeConfirmationKey = "";
     }
+    activeInternalAttention = null;
     activeExternalConfirmation = null;
     confirmationDialog.close();
     queueMicrotask(showNextConfirmation);
@@ -1061,7 +1246,7 @@ confirmationDialog.addEventListener("cancel", (event) => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
-  if (/^[1-8]$/.test(event.key)) {
+  if (/^[1-9]$/.test(event.key)) {
     document.querySelectorAll(".nav-item")[Number(event.key) - 1]?.click();
   }
 });

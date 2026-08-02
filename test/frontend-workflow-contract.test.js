@@ -56,7 +56,7 @@ test("workflow command view remains isolated behind the app render seam", async 
   assert.match(app, /workflow:\s*"工作流指挥"/);
   assert.match(app, /workflow:\s*\(\) => workflowView\.render\(\)/);
   assert.match(app, /workflowView\.bind\(content\)/);
-  assert.match(app, /\^\[1-8\]\$/);
+  assert.match(app, /\^\[1-9\]\$/);
   assert.equal(app.includes("/api/workflow/"), false);
   assert.equal((html.match(/id="confirmation-dialog"/g) || []).length, 1);
 });

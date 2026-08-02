@@ -301,11 +301,11 @@ async function exerciseConfirmationRefreshGate(trigger) {
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(reconcileCalls, 2);
     await reconcileStarted.promise;
-    const nextDuringReconcile = await request(server, {
+    const nextDuringAgency = await request(server, {
       path: "/api/confirmations/next",
     });
-    assert.equal(nextDuringReconcile.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(nextDuringAgency.status, 200);
+    assert.deepEqual(queueCalls, ["next"]);
 
     releaseReconcile.resolve();
     const cycleResult = await cycle;
@@ -314,7 +314,7 @@ async function exerciseConfirmationRefreshGate(trigger) {
       path: "/api/confirmations/next",
     });
     assert.equal(reopened.status, 200);
-    assert.deepEqual(queueCalls, ["next"]);
+    assert.deepEqual(queueCalls, ["next", "next"]);
   } finally {
     releaseRefresh.resolve();
     releaseReconcile.resolve();
@@ -332,6 +332,9 @@ async function withServer(
     onDashboardRead,
     backgroundWork,
     workflowRouting,
+    workLedgerView,
+    attentionCoordinator,
+    attentionBrowser,
   } = {},
 ) {
   const calls = [];
@@ -350,6 +353,8 @@ async function withServer(
           name: "PR 推进员工",
           state: "observing",
           revision: 4,
+          paused: true,
+          enabled: true,
         },
         jobs: [],
         confirmationQueue: [],
@@ -408,7 +413,11 @@ async function withServer(
     },
   };
   const application = {
-    config: { port: 4173, refreshMinutes: 10 },
+    config: {
+      port: 4173,
+      refreshMinutes: 10,
+      githubActions: { enabled: false },
+    },
     store: {
       async read() {
         if (onDashboardRead) return onDashboardRead();
@@ -501,6 +510,11 @@ async function withServer(
         ? workflowRouting(calls)
         : workflowRouting;
   }
+  if (workLedgerView) application.workLedgerView = workLedgerView;
+  if (attentionCoordinator) {
+    application.attentionCoordinator = attentionCoordinator;
+  }
+  if (attentionBrowser) application.attentionBrowser = attentionBrowser;
   const server = createDashboardServer(application, {
     backgroundWork,
     reportError(error) {
@@ -637,7 +651,7 @@ test("workflow routing observes every refreshed snapshot before confirmations an
         return [];
       },
       async runAll(options) {
-        assert.equal(backgroundWork.confirmationReady(), false);
+        assert.equal(backgroundWork.confirmationReady(), true);
         calls.push({ operation: "run_all", cycle: snapshot.cycle, ...options });
       },
     },
@@ -864,11 +878,11 @@ test("background stop waits for a tracked scheduled task", async () => {
   assert.equal(stopped, true);
 });
 
-test("periodic refresh fences confirmations until employee reconciliation completes", async () => {
+test("periodic refresh fences facts but reopens confirmations before slow agency", async () => {
   await exerciseConfirmationRefreshGate("periodic");
 });
 
-test("manual refresh fences confirmations until employee reconciliation completes", async () => {
+test("manual refresh fences facts but reopens confirmations before slow agency", async () => {
   await exerciseConfirmationRefreshGate("manual");
 });
 
@@ -1274,6 +1288,291 @@ test("workflow APIs fail closed when routing is unavailable", async () => {
       [503, 503, 503, 503],
     );
   });
+});
+
+test("work APIs expose only newest-first ledger projections", async () => {
+  const calls = [];
+  const workLedgerView = {
+    async getSummary() {
+      calls.push({ operation: "summary" });
+      return { revision: 7, itemCounts: { queued: 3 } };
+    },
+    async listItems(options) {
+      calls.push({ operation: "items", options });
+      return { items: [{ itemId: "work-1" }], nextCursor: null };
+    },
+    async listTimeline(options) {
+      calls.push({ operation: "timeline", options });
+      return { items: [{ timelineId: "timeline-1" }], nextCursor: null };
+    },
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const summary = await request(server, { path: "/api/work/summary" });
+      const items = await request(server, {
+        path: "/api/work/items?limit=17&cursor=item%3A2&status=queued&order=newest&ignored=1",
+      });
+      const timeline = await request(server, {
+        path: "/api/work/timeline?limit=9&cursor=timeline%3A2&order=newest&status=blocked",
+      });
+
+      assert.equal(summary.status, 200);
+      assert.deepEqual(JSON.parse(summary.body), {
+        revision: 7,
+        itemCounts: { queued: 3 },
+        safeguards: {
+          prEmployeePaused: true,
+          externalActionsEnabled: false,
+        },
+      });
+      assert.deepEqual(JSON.parse(items.body), {
+        items: [{ itemId: "work-1" }],
+        nextCursor: null,
+      });
+      assert.deepEqual(JSON.parse(timeline.body), {
+        items: [{ timelineId: "timeline-1" }],
+        nextCursor: null,
+      });
+      assert.deepEqual(calls, [
+        { operation: "summary" },
+        {
+          operation: "items",
+          options: {
+            limit: "17",
+            cursor: "item:2",
+            status: "queued",
+            order: "newest",
+          },
+        },
+        {
+          operation: "timeline",
+          options: {
+            limit: "9",
+            cursor: "timeline:2",
+            order: "newest",
+          },
+        },
+      ]);
+    },
+    { workLedgerView },
+  );
+});
+
+test("work HTTP boundary exposes no intake, claim, stage, dispatch, or outbox", async () => {
+  await withServer(
+    async ({ server, calls }) => {
+      const headers = {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      };
+      const responses = await Promise.all(
+        ["intake", "claim", "stage", "dispatch", "outbox"].map((name) =>
+          request(server, {
+            method: "POST",
+            path: `/api/work/${name}`,
+            headers,
+            body: JSON.stringify({ itemId: "work-1" }),
+          }),
+        ),
+      );
+
+      assert.deepEqual(responses.map(({ status }) => status), [404, 404, 404, 404, 404]);
+      assert.deepEqual(calls, []);
+    },
+    {
+      workLedgerView: {
+        async getSummary() {},
+        async listItems() {},
+        async listTimeline() {},
+        async intake() { throw new Error("must remain private"); },
+        async claim() { throw new Error("must remain private"); },
+      },
+    },
+  );
+});
+
+test("work APIs fail closed when the ledger projection is unavailable", async () => {
+  await withServer(async ({ server }) => {
+    const responses = await Promise.all([
+      request(server, { path: "/api/work/summary" }),
+      request(server, { path: "/api/work/items" }),
+      request(server, { path: "/api/work/timeline" }),
+    ]);
+    assert.deepEqual(responses.map(({ status }) => status), [503, 503, 503]);
+  });
+});
+
+test("unified attention read projects external authorization without exposing actions", async () => {
+  await withServer(async ({ server, calls }) => {
+    const response = await request(server, { path: "/api/attention/next" });
+    assert.equal(response.status, 200);
+    const body = JSON.parse(response.body);
+    assert.equal(body.available, true);
+    assert.equal(body.source, "external_confirmation");
+    assert.equal(body.externalEnabled, true);
+    assert.equal(body.externalQueueRevision, 8);
+    assert.equal(body.item.id, "confirmation-pr-work-1");
+    assert.deepEqual(calls, [{ operation: "confirmation_next" }]);
+  });
+});
+
+test("internal attention mutations are source-bound and only signal background work", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  const digest = "b".repeat(64);
+  const calls = [];
+  const attentionBrowser = Object.fromEntries(
+    ["answer", "reject", "later"].map((operation) => [
+      operation,
+      async (input) => {
+        calls.push({ operation, input });
+        return {
+          requestId,
+          contentDigest: digest,
+          status: operation === "later" ? "pending" : operation === "reject" ? "rejected" : "answered",
+          revision: operation === "later" ? 3 : 4,
+        };
+      },
+    ]),
+  );
+  const backgroundWork = {
+    runConfirmationOperation(operation) { return operation(); },
+    signalAgency(options) { calls.push({ operation: "signal", options }); },
+  };
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const answer = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/answer`,
+        headers,
+        body: JSON.stringify({
+          expectedRevision: 3,
+          contentDigest: digest,
+          answer: { type: "text", text: "按最近一年迁移" },
+        }),
+      });
+      const reject = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/reject`,
+        headers,
+        body: JSON.stringify({
+          expectedRevision: 3,
+          contentDigest: digest,
+          answer: { type: "reject", reason: "缺少上下文" },
+        }),
+      });
+      const later = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/later`,
+        headers,
+        body: JSON.stringify({
+          expectedRevision: 3,
+          contentDigest: digest,
+          answer: { type: "later" },
+        }),
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual([answer.status, reject.status, later.status], [200, 200, 200]);
+      assert.deepEqual(calls, [
+        {
+          operation: "answer",
+          input: {
+            expectedRevision: 3,
+            contentDigest: digest,
+            answer: { type: "text", text: "按最近一年迁移" },
+            requestId,
+          },
+        },
+        { operation: "signal", options: { trigger: "user_answered" } },
+        {
+          operation: "reject",
+          input: {
+            expectedRevision: 3,
+            contentDigest: digest,
+            answer: { type: "reject", reason: "缺少上下文" },
+            requestId,
+          },
+        },
+        { operation: "signal", options: { trigger: "user_answered" } },
+        {
+          operation: "later",
+          input: {
+            expectedRevision: 3,
+            contentDigest: digest,
+            answer: { type: "later" },
+            requestId,
+          },
+        },
+      ]);
+    },
+    { attentionBrowser, backgroundWork },
+  );
+});
+
+test("internal attention rejects untrusted callers and body-supplied request ids", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  const body = JSON.stringify({
+    requestId,
+    expectedRevision: 3,
+    contentDigest: "b".repeat(64),
+    answer: { type: "later" },
+  });
+  let browserCalls = 0;
+  await withServer(
+    async ({ server }) => {
+      const crossOrigin = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/later`,
+        headers: {
+          origin: "https://evil.example",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body,
+      });
+      const suppliedId = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/later`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body,
+      });
+      const wrongNamespace = await request(server, {
+        method: "POST",
+        path: `/api/confirmations/${requestId}/answer`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+      assert.deepEqual(
+        [crossOrigin.status, suppliedId.status, wrongNamespace.status],
+        [403, 400, 404],
+      );
+      assert.equal(browserCalls, 0);
+    },
+    {
+      attentionBrowser: {
+        async answer() { browserCalls += 1; },
+        async reject() { browserCalls += 1; },
+        async later() { browserCalls += 1; },
+      },
+    },
+  );
 });
 
 test("the confirmation API exposes only the next immutable projection", async () => {

@@ -11,13 +11,14 @@ test("the dashboard keeps one confirmation dialog for local and external decisio
 
   assert.equal((html.match(/id="confirmation-dialog"/g) || []).length, 1);
   assert.match(app, /kind: "external_action"/);
+  assert.match(app, /kind: "internal_request"/);
   assert.match(app, /kind: "responsibility"/);
   assert.match(app, /kind: "review_draft"/);
   assert.equal(app.includes("showReviewDraftConfirmation"), true);
   assert.equal(app.includes("/api/pr-review-jobs/decide"), true);
   assert.match(
     app,
-    /const legacyReviewDrafts = confirmationQueueState\.available\s*\? \[\]/,
+    /const legacyReviewDrafts = confirmationQueueState\.externalEnabled\s*\? \[\]/,
   );
 });
 

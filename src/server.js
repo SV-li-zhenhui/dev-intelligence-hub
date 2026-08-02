@@ -190,6 +190,78 @@ function requireWorkflowRouting(application) {
   return routing;
 }
 
+function requireWorkLedgerView(application) {
+  const view = application.workLedgerView;
+  if (
+    !view ||
+    !["getSummary", "listItems", "listTimeline"].every(
+      (method) => typeof view[method] === "function",
+    )
+  ) {
+    throw httpError(503, "员工工作台账尚未启用");
+  }
+  return view;
+}
+
+function requireAttentionBrowser(application) {
+  const browser = application.attentionBrowser;
+  if (
+    !browser ||
+    !["answer", "reject", "later"].every(
+      (method) => typeof browser[method] === "function",
+    )
+  ) {
+    throw httpError(503, "内部请示队列尚未启用");
+  }
+  return browser;
+}
+
+async function readUnifiedAttention(application) {
+  if (typeof application.attentionCoordinator?.next === "function") {
+    return application.attentionCoordinator.next();
+  }
+  if (application.confirmationQueue) {
+    const external = await requireConfirmationQueue(application).next();
+    return {
+      available: Boolean(external.item),
+      source: external.item ? "external_confirmation" : null,
+      pendingCount: Number.isSafeInteger(external.pendingCount)
+        ? external.pendingCount
+        : 0,
+      externalEnabled: true,
+      externalQueueRevision: Number.isSafeInteger(external.queueRevision)
+        ? external.queueRevision
+        : 0,
+      item: external.item || null,
+    };
+  }
+  return {
+    available: false,
+    source: null,
+    pendingCount: 0,
+    externalEnabled: false,
+    externalQueueRevision: 0,
+    item: null,
+  };
+}
+
+function queryOptions(url, { status = false, order = false } = {}) {
+  return {
+    ...(url.searchParams.has("limit")
+      ? { limit: url.searchParams.get("limit") }
+      : {}),
+    ...(url.searchParams.has("cursor")
+      ? { cursor: url.searchParams.get("cursor") }
+      : {}),
+    ...(status && url.searchParams.has("status")
+      ? { status: url.searchParams.get("status") }
+      : {}),
+    ...(order && url.searchParams.has("order")
+      ? { order: url.searchParams.get("order") }
+      : {}),
+  };
+}
+
 async function syncConfirmationOutcome(employeeRegistry, item) {
   const employee = employeeRegistry.get(item?.requestedBy?.roleId);
   if (!employee || typeof employee.recordConfirmationOutcome !== "function") {
@@ -249,6 +321,19 @@ function runConfirmationOperation(backgroundWork, operation) {
     return operation();
   }
   return backgroundWork.runConfirmationOperation(operation);
+}
+
+function signalBackgroundAgency(backgroundWork, options, reportError) {
+  if (typeof backgroundWork?.signalAgency !== "function") return;
+  Promise.resolve()
+    .then(() => backgroundWork.signalAgency(options))
+    .catch((error) => {
+      try {
+        reportError(error);
+      } catch {
+        // Background diagnostics must never change the saved user answer.
+      }
+    });
 }
 
 function closeHttpServer(closeServer) {
@@ -380,6 +465,35 @@ export function createDashboardServer(
       }
       if (
         request.method === "GET" &&
+        url.pathname === "/api/work/summary"
+      ) {
+        const summary = await requireWorkLedgerView(application).getSummary();
+        const prRole = employeeRegistry.get("pr-reviewer")
+          ? await employeeRegistry.get("pr-reviewer").roleView()
+          : null;
+        sendJson(response, 200, {
+          ...summary,
+          safeguards: {
+            prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
+            externalActionsEnabled:
+              application.config.githubActions?.enabled === true,
+          },
+        });
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        ["/api/work/items", "/api/work/timeline"].includes(url.pathname)
+      ) {
+        const view = requireWorkLedgerView(application);
+        const result = url.pathname.endsWith("/items")
+          ? await view.listItems(queryOptions(url, { status: true, order: true }))
+          : await view.listTimeline(queryOptions(url, { order: true }));
+        sendJson(response, 200, result);
+        return;
+      }
+      if (
+        request.method === "GET" &&
         url.pathname === "/api/workflow/routing"
       ) {
         sendJson(
@@ -428,6 +542,40 @@ export function createDashboardServer(
           200,
           await requireWorkflowRouting(application).dryRun(input),
         );
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/attention/next"
+      ) {
+        const next = await runConfirmationOperation(backgroundWork, () =>
+          readUnifiedAttention(application),
+        );
+        sendJson(response, 200, next);
+        return;
+      }
+      const internalAttentionAction = url.pathname.match(
+        /^\/api\/attention\/internal\/(attention-[a-f0-9]{64})\/(answer|reject|later)$/,
+      );
+      if (request.method === "POST" && internalAttentionAction) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = await readJsonBody(request, 16 * 1024);
+        if (Object.hasOwn(input, "requestId")) {
+          throw httpError(400, "requestId 只能来自请求路径");
+        }
+        const operation = internalAttentionAction[2];
+        const item = await requireAttentionBrowser(application)[operation]({
+          ...input,
+          requestId: internalAttentionAction[1],
+        });
+        if (operation !== "later") {
+          signalBackgroundAgency(
+            backgroundWork,
+            { trigger: "user_answered" },
+            reportError,
+          );
+        }
+        sendJson(response, 200, { item });
         return;
       }
       if (
@@ -599,7 +747,16 @@ export function startApplicationBackgroundWork(
   );
   let stopped = false;
   let stopPromise = null;
-  let refreshTail = Promise.resolve();
+  let factTail = Promise.resolve();
+  let agencyTail = Promise.resolve();
+
+  function reportBackgroundError(error) {
+    try {
+      reportError(error);
+    } catch {
+      // A diagnostics failure must not alter lifecycle safety.
+    }
+  }
 
   function runTracked(operation, { rethrow = false } = {}) {
     if (stopped) return Promise.resolve();
@@ -609,11 +766,7 @@ export function startApplicationBackgroundWork(
       try {
         return await operation();
       } catch (error) {
-        try {
-          reportError(error);
-        } catch {
-          // A diagnostics failure must not alter lifecycle safety.
-        }
+        reportBackgroundError(error);
         if (rethrow) throw error;
       }
     })().finally(() => activeTasks.delete(task));
@@ -645,23 +798,76 @@ export function startApplicationBackgroundWork(
     }
   }
 
+  async function intakeWorkflowAssignments() {
+    if (typeof application.workCoordination?.intake === "function") {
+      await application.workCoordination.intake();
+    }
+  }
+
+  async function performAgencyCycle({
+    trigger,
+    includeLegacyEmployees = false,
+  }) {
+    if (stopped || !confirmationAccess.isReady()) {
+      return { skipped: "confirmation_not_ready" };
+    }
+    const failures = [];
+    if (typeof application.workCoordination?.runCycle === "function") {
+      try {
+        await application.workCoordination.runCycle({ trigger });
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (includeLegacyEmployees && !stopped) {
+      try {
+        await employeeRegistry.runAll({ trigger });
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "员工主动循环与旧岗位巡查均失败");
+    }
+    return { skipped: null };
+  }
+
+  function enqueueAgencyCycle(options) {
+    const operation = () => performAgencyCycle(options);
+    const result = agencyTail.then(operation, operation);
+    agencyTail = result.catch(() => {});
+    return result;
+  }
+
   function enqueueFactCycle(factOperation) {
     const operation = async () => {
+      await agencyTail;
+      if (stopped) return undefined;
       await confirmationAccess.closeAndDrain();
       if (stopped) return undefined;
       const result = await factOperation();
       if (stopped) return result;
       await routeWorkflowSnapshot();
       if (stopped) return result;
+      await intakeWorkflowAssignments();
+      if (stopped) return result;
       if (!(await hasFreshPullRequestFacts())) return result;
       await reconcileExternalConfirmations();
       if (stopped) return result;
-      await employeeRegistry.runAll({ trigger: "refresh_completed" });
-      if (!stopped) confirmationAccess.open();
+      confirmationAccess.open();
+      try {
+        await enqueueAgencyCycle({
+          trigger: "refresh_completed",
+          includeLegacyEmployees: true,
+        });
+      } catch (error) {
+        reportBackgroundError(error);
+      }
       return result;
     };
-    const result = refreshTail.then(operation, operation);
-    refreshTail = result.catch(() => {});
+    const result = factTail.then(operation, operation);
+    factTail = result.catch(() => {});
     return result;
   }
 
@@ -673,7 +879,7 @@ export function startApplicationBackgroundWork(
 
   const initialRefresh = runTracked(
     () => enqueueRefresh({ notify: false }),
-    { rethrow: Boolean(application.confirmationQueue) },
+    { rethrow: true },
   );
 
   timers.push(
@@ -683,6 +889,27 @@ export function startApplicationBackgroundWork(
       application.config.refreshMinutes * 60_000,
     ),
   );
+  const agencyTickSeconds = Number(
+    application.config.workCoordination?.tickSeconds,
+  );
+  if (
+    typeof application.workCoordination?.runCycle === "function" &&
+    Number.isFinite(agencyTickSeconds) &&
+    agencyTickSeconds > 0
+  ) {
+    timers.push(
+      setIntervalFn(
+        () =>
+          runTracked(() =>
+            enqueueAgencyCycle({
+              trigger: "scheduled",
+              includeLegacyEmployees: false,
+            }),
+          ),
+        agencyTickSeconds * 1_000,
+      ),
+    );
+  }
   for (const schedule of employeeRegistry.schedules()) {
     timers.push(
       setIntervalFn(
@@ -717,6 +944,10 @@ export function startApplicationBackgroundWork(
       runTracked(() => enqueueRefresh(options), { rethrow: true }),
     mutateFacts: (operation) =>
       runTracked(() => enqueueFactCycle(operation), { rethrow: true }),
+    signalAgency: ({ trigger = "signal" } = {}) =>
+      runTracked(() =>
+        enqueueAgencyCycle({ trigger, includeLegacyEmployees: false }),
+      ),
     runConfirmationOperation: (operation) => confirmationAccess.run(operation),
     confirmationReady: () => confirmationAccess.isReady(),
   };
@@ -746,9 +977,7 @@ export async function startDashboardServer(
   try {
     backgroundWork = startBackgroundWorkFn(application);
     server = createDashboardServer(application, { backgroundWork });
-    if (application.confirmationQueue) {
-      await backgroundWork.initialRefresh;
-    }
+    await backgroundWork.initialRefresh;
     await listenForLocalConnections(server, application.config.port);
   } catch (error) {
     try {
