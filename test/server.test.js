@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
 import {
@@ -32,10 +33,12 @@ function request(server, {
         const chunks = [];
         response.on("data", (chunk) => chunks.push(chunk));
         response.on("end", () => {
+          const rawBody = Buffer.concat(chunks);
           resolve({
             status: response.statusCode,
             headers: response.headers,
-            body: Buffer.concat(chunks).toString("utf8"),
+            body: rawBody.toString("utf8"),
+            rawBody,
           });
         });
       },
@@ -354,6 +357,7 @@ async function withServer(
     codeJobControl,
     changePackageReader,
     changePackageApplicationRequester,
+    codeJobEvidenceReader,
   } = {},
 ) {
   const calls = [];
@@ -541,6 +545,9 @@ async function withServer(
   if (changePackageApplicationRequester) {
     application.changePackageApplicationRequester =
       changePackageApplicationRequester;
+  }
+  if (codeJobEvidenceReader) {
+    application.codeJobEvidenceReader = codeJobEvidenceReader;
   }
   const server = createDashboardServer(application, {
     backgroundWork,
@@ -2134,6 +2141,155 @@ test("code job package reads require a ready receipt bound to the manifest", asy
   );
 });
 
+test("code job evidence downloads exact digest-bound bytes without accepting paths", async () => {
+  const jobId = `code-job-${"8".repeat(55)}`;
+  const packageDigest = "9".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const profileId = "node-tests";
+  const kind = "stdout";
+  const content = Buffer.from('{"stdout":"tests passed"}\n', "utf8");
+  const sha256 = createHash("sha256").update(content).digest("hex");
+  const calls = [];
+  const endpoint = `/api/code/jobs/${jobId}/change-package/${packageId}/evidence/${profileId}/${kind}?packageDigest=${packageDigest}&sha256=${sha256}`;
+  await withServer(
+    async ({ server }) => {
+      const downloaded = await request(server, { path: endpoint });
+      assert.equal(downloaded.status, 200);
+      assert.deepEqual(downloaded.rawBody, content);
+      assert.equal(downloaded.headers["content-length"], String(content.length));
+      assert.equal(downloaded.headers["x-content-sha256"], sha256);
+      assert.equal(downloaded.headers.etag, `"${sha256}"`);
+      assert.equal(
+        downloaded.headers["content-digest"],
+        `sha-256=:${Buffer.from(sha256, "hex").toString("base64")}:`,
+      );
+      assert.match(
+        downloaded.headers["content-disposition"],
+        new RegExp(`attachment; filename="${profileId}-${kind}-${sha256.slice(0, 12)}\\.json"`),
+      );
+      assert.equal(downloaded.headers["x-content-type-options"], "nosniff");
+
+      const invalid = await Promise.all([
+        request(server, {
+          path: endpoint.replace(`&sha256=${sha256}`, ""),
+        }),
+        request(server, { path: `${endpoint}&path=private.txt` }),
+        request(server, { path: `${endpoint}&sha256=${sha256}` }),
+        request(server, {
+          path: endpoint.replace(`/${profileId}/${kind}`, "/..%2Fprivate/stdout"),
+        }),
+      ]);
+      assert.deepEqual(invalid.map(({ status }) => status), [400, 400, 400, 404]);
+      assert.equal(calls.length, 1);
+    },
+    {
+      codeJobEvidenceReader: {
+        async read(input) {
+          calls.push(input);
+          return {
+            jobId,
+            packageId,
+            packageDigest,
+            profileId,
+            kind,
+            sha256,
+            bytes: content.length,
+            content,
+          };
+        },
+      },
+    },
+  );
+  assert.deepEqual(calls, [{
+    jobId,
+    packageId,
+    packageDigest,
+    profileId,
+    kind,
+    expectedSha256: sha256,
+  }]);
+});
+
+test("code job evidence fails before streaming when the reader result is corrupt", async () => {
+  const jobId = `code-job-${"7".repeat(55)}`;
+  const packageDigest = "6".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const sha256 = "5".repeat(64);
+  const endpoint = `/api/code/jobs/${jobId}/change-package/${packageId}/evidence/node-tests/output?packageDigest=${packageDigest}&sha256=${sha256}`;
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const response = await request(server, { path: endpoint });
+      assert.equal(response.status, 500);
+      assert.doesNotMatch(response.body, /PRIVATE ARTIFACT/);
+      assert.equal(response.headers["content-disposition"], undefined);
+      assert.equal(reportedErrors.length, 1);
+      assert.equal(reportedErrors[0].statusCode, 500);
+    },
+    {
+      codeJobEvidenceReader: {
+        async read() {
+          return {
+            jobId,
+            packageId,
+            packageDigest,
+            profileId: "node-tests",
+            kind: "output",
+            sha256,
+            bytes: 16,
+            content: Buffer.from("PRIVATE ARTIFACT", "utf8"),
+          };
+        },
+      },
+    },
+  );
+});
+
+test("code job evidence keeps an immutable URL binding across an untrusted await", async () => {
+  const jobId = `code-job-${"a".repeat(55)}`;
+  const packageDigest = "b".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const expectedSha256 = "c".repeat(64);
+  const secret = Buffer.from("PRIVATE CROSS-JOB ARTIFACT\n", "utf8");
+  const secretSha256 = createHash("sha256").update(secret).digest("hex");
+  const endpoint = `/api/code/jobs/${jobId}/change-package/${packageId}/evidence/node-tests/output?packageDigest=${packageDigest}&sha256=${expectedSha256}`;
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const response = await request(server, { path: endpoint });
+      assert.equal(response.status, 500);
+      assert.doesNotMatch(response.body, /PRIVATE CROSS-JOB ARTIFACT/);
+      assert.equal(response.headers["content-disposition"], undefined);
+      assert.equal(reportedErrors.length, 1);
+    },
+    {
+      codeJobEvidenceReader: {
+        async read(input) {
+          assert.equal(Object.isFrozen(input), true);
+          for (const [field, value] of Object.entries({
+            jobId: `code-job-${"d".repeat(55)}`,
+            packageId: `change-package-${"e".repeat(64)}`,
+            packageDigest: "e".repeat(64),
+            profileId: "foreign-tests",
+            kind: "stderr",
+            expectedSha256: secretSha256,
+          })) {
+            assert.equal(Reflect.set(input, field, value), false);
+          }
+          return {
+            jobId: `code-job-${"d".repeat(55)}`,
+            packageId: `change-package-${"e".repeat(64)}`,
+            packageDigest: "e".repeat(64),
+            profileId: "foreign-tests",
+            kind: "stderr",
+            sha256: secretSha256,
+            bytes: secret.length,
+            content: secret,
+          };
+        },
+      },
+    },
+  );
+});
+
 test("code job package apply derives authority and only requests confirmation", async () => {
   const jobId = `code-job-${"1".repeat(55)}`;
   const packageDigest = "2".repeat(64);
@@ -2256,13 +2412,19 @@ test("code job detail and mutation routes fail closed without required ports", a
       }),
       request(server, { path: `/api/code/jobs/${jobId}/change-package` }),
       request(server, {
+        path: `/api/code/jobs/${jobId}/change-package/change-package-${"4".repeat(64)}/evidence/node-tests/output?packageDigest=${"4".repeat(64)}&sha256=${"5".repeat(64)}`,
+      }),
+      request(server, {
         method: "POST",
         path: `/api/code/jobs/${jobId}/change-package/apply`,
         headers,
         body: JSON.stringify({ expectedRevision: 1 }),
       }),
     ]);
-    assert.deepEqual(responses.map(({ status }) => status), [503, 503, 503, 503]);
+    assert.deepEqual(
+      responses.map(({ status }) => status),
+      [503, 503, 503, 503, 503],
+    );
   });
 });
 

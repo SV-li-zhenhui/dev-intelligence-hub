@@ -220,21 +220,41 @@ function manifestChangeRows(changes = {}) {
     : '<p class="code-job-detail-empty">变更集合为空。</p>';
 }
 
-function manifestArtifactMarkup(artifacts = {}) {
+function evidenceDownloadUrl(binding) {
+  const safeProfileId = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
+  if (
+    !/^code-job-[a-f0-9]{55}$/.test(binding?.jobId || "") ||
+    !/^[a-f0-9]{64}$/.test(binding.packageDigest || "") ||
+    binding?.packageId !== `change-package-${binding.packageDigest}` ||
+    !safeProfileId.test(binding?.profileId || "") ||
+    !["output", "stdout", "stderr"].includes(binding.kind) ||
+    !/^[a-f0-9]{64}$/.test(binding.expectedSha256 || "")
+  ) {
+    return null;
+  }
+  return `/api/code/jobs/${encodeURIComponent(binding.jobId)}/change-package/${encodeURIComponent(binding.packageId)}/evidence/${encodeURIComponent(binding.profileId)}/${binding.kind}?packageDigest=${encodeURIComponent(binding.packageDigest)}&sha256=${encodeURIComponent(binding.expectedSha256)}`;
+}
+
+function manifestArtifactMarkup(artifacts = {}, binding = {}) {
   const rows = ["output", "stdout", "stderr"].flatMap((kind) => {
     const artifact = artifacts?.[kind];
     if (!artifact) return [];
     const bytes = Number.isFinite(artifact.bytes)
       ? `${artifact.bytes} bytes`
       : "大小未知";
-    return [`<dt>${escapeWorkHtml(kind)}</dt><dd><code>${escapeWorkHtml(artifact.sha256 || "未知摘要")}</code><small>${escapeWorkHtml(bytes)} · ${escapeWorkHtml(artifact.path || "未知路径")}</small></dd>`];
+    const href = evidenceDownloadUrl({
+      ...binding,
+      kind,
+      expectedSha256: artifact.sha256,
+    });
+    return [`<dt>${escapeWorkHtml(kind)}</dt><dd><code>${escapeWorkHtml(artifact.sha256 || "未知摘要")}</code><small>${escapeWorkHtml(bytes)} · ${escapeWorkHtml(artifact.path || "未知路径")}</small>${href ? `<a class="code-job-evidence-download" href="${escapeWorkHtml(href)}" download>下载原始证据</a>` : ""}</dd>`];
   });
   return rows.length
     ? `<dl class="detail-grid code-job-profile-artifacts">${rows.join("")}</dl>`
     : '<p class="code-job-detail-empty">未提供测试产物引用。</p>';
 }
 
-function manifestProfileMarkup(profiles) {
+function manifestProfileMarkup(profiles, manifest) {
   const values = Array.isArray(profiles) ? profiles : [];
   if (!values.length) {
     return '<p class="code-job-detail-empty">尚无测试凭据</p>';
@@ -251,7 +271,12 @@ function manifestProfileMarkup(profiles) {
         <dt>工作区修订</dt><dd><code>${escapeWorkHtml(profile?.workspaceRevision || "未知")}</code></dd>
         <dt>执行动作</dt><dd>${escapeWorkHtml(profile?.actionId || "未知")}</dd>
       </dl>
-      ${manifestArtifactMarkup(profile?.artifacts)}
+      ${manifestArtifactMarkup(profile?.artifacts, {
+        jobId: manifest?.job?.id,
+        packageId: manifest?.packageId,
+        packageDigest: manifest?.packageDigest,
+        profileId: profile?.id,
+      })}
     </article>`).join("")}</div>`;
 }
 
@@ -269,7 +294,7 @@ function codeJobManifestMarkup(manifest) {
     <h4>变更集合</h4>
     ${manifestChangeRows(manifest.changes)}
     <h4>已通过固定测试</h4>
-    ${manifestProfileMarkup(manifest.passedProfiles)}
+    ${manifestProfileMarkup(manifest.passedProfiles, manifest)}
   </div>`;
 }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
@@ -17,7 +18,7 @@ function sectionByTitle(page, title) {
 }
 
 async function validate(name, viewport) {
-  const page = await browser.newPage({ viewport });
+  const page = await browser.newPage({ viewport, acceptDownloads: true });
   const consoleErrors = [];
   const pageErrors = [];
   page.on("console", (message) => {
@@ -214,6 +215,21 @@ async function validateCodeJobControlAndPackage(name, viewport) {
   const sourceRevision = "f".repeat(64);
   const recordDigest = "1".repeat(64);
   const now = "2026-08-02T05:00:00.000Z";
+  const evidenceByKind = Object.fromEntries(
+    ["output", "stdout", "stderr"].map((kind) => {
+      const content = Buffer.from(
+        `${JSON.stringify({ kind, status: "passed" })}\n`,
+        "utf8",
+      );
+      return [
+        kind,
+        {
+          content,
+          sha256: createHash("sha256").update(content).digest("hex"),
+        },
+      ];
+    }),
+  );
   let jobStatus = "active";
   let jobRevision = 7;
   let applyQueued = false;
@@ -291,7 +307,21 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     passedProfiles: [
       {
         id: "node-tests",
+        configDigest: "4".repeat(64),
+        workspaceRevision,
+        actionId: "action-ui-validation",
+        attemptNumber: 1,
         imageId: "node@sha256:fixture",
+        artifacts: Object.fromEntries(
+          Object.entries(evidenceByKind).map(([kind, evidence]) => [
+            kind,
+            {
+              path: `${jobId}/action-ui-validation/${kind}.json`,
+              sha256: evidence.sha256,
+              bytes: evidence.content.length,
+            },
+          ]),
+        ),
       },
     ],
     changes: {
@@ -359,7 +389,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     retryable: false,
   };
 
-  const page = await browser.newPage({ viewport });
+  const page = await browser.newPage({ viewport, acceptDownloads: true });
   const consoleErrors = [];
   const pageErrors = [];
   const overflowChecks = [];
@@ -473,6 +503,34 @@ async function validateCodeJobControlAndPackage(name, viewport) {
       });
       return;
     }
+    if (request.method() === "GET" && pathname.includes("/evidence/")) {
+      const kind = pathname.split("/").at(-1);
+      const evidence = evidenceByKind[kind];
+      const packageBinding = url.searchParams.get("packageDigest");
+      const shaBinding = url.searchParams.get("sha256");
+      if (
+        !evidence ||
+        packageBinding !== packageDigest ||
+        shaBinding !== evidence.sha256
+      ) {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "stale evidence binding" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json; charset=utf-8",
+        headers: {
+          "content-disposition": `attachment; filename="node-tests-${kind}.json"`,
+          "x-content-sha256": evidence.sha256,
+        },
+        body: evidence.content,
+      });
+      return;
+    }
     if (request.method() === "GET" && pathname === `/api/code/jobs/${jobId}`) {
       await route.fulfill({
         status: 200,
@@ -510,6 +568,26 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     .isVisible();
   await recordDialogFocus("package-successor", "[data-code-job-apply]");
   await recordHorizontalOverflow("manifest-open");
+  const stdoutEvidence = evidenceByKind.stdout;
+  const stdoutEvidenceRow = page
+    .locator(".code-job-profile-artifacts dd")
+    .filter({ hasText: stdoutEvidence.sha256 });
+  const downloadStarted = page.waitForEvent("download");
+  await stdoutEvidenceRow.getByRole("link", { name: "下载原始证据" }).click();
+  const download = await downloadStarted;
+  const downloadUrl = download.url();
+  const downloadedEvidence = Buffer.from(
+    await page.evaluate(async (url) => {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`evidence download failed: ${response.status}`);
+      return [...new Uint8Array(await response.arrayBuffer())];
+    }, downloadUrl),
+  );
+  await download.cancel().catch(() => {});
+  const evidenceDownloadDigestMatches =
+    createHash("sha256").update(downloadedEvidence).digest("hex") ===
+      stdoutEvidence.sha256 &&
+    downloadedEvidence.equals(stdoutEvidence.content);
 
   await page.keyboard.press("Escape");
   await page.locator("#detail-dialog").waitFor({ state: "hidden" });
@@ -553,6 +631,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     name: `code-job-control-package-${name}`,
     objectiveVisible,
     manifestVisible,
+    evidenceDownloadDigestMatches,
     escapeClosedDetail,
     staleActionFocusAfterReopen,
     packageConfirmationVisible,
@@ -856,6 +935,11 @@ assert.equal(codeJobResults.length, 2);
 for (const codeJobResult of codeJobResults) {
   assert.equal(codeJobResult.objectiveVisible, true, codeJobResult.name);
   assert.equal(codeJobResult.manifestVisible, true, codeJobResult.name);
+  assert.equal(
+    codeJobResult.evidenceDownloadDigestMatches,
+    true,
+    `${codeJobResult.name}: evidence download digest`,
+  );
   assert.equal(codeJobResult.escapeClosedDetail, true, codeJobResult.name);
   assert.equal(codeJobResult.staleActionFocusAfterReopen, false, codeJobResult.name);
   assert.equal(codeJobResult.packageConfirmationVisible, true, codeJobResult.name);

@@ -163,12 +163,13 @@ test("code jobs render every safe lifecycle state from browser projections", () 
 });
 
 test("code job detail renders safe evidence, history, controls, and package metadata", () => {
+  const detailJobId = `code-job-${"1".repeat(55)}`;
   const html = renderCodeJobDetail({
     loading: false,
     error: "",
     detail: {
       job: {
-        jobId: "code-job-1",
+        jobId: detailJobId,
         revision: 7,
         status: "active",
         requestedBy: { roleId: "developer", workItemId: "work-1" },
@@ -213,6 +214,7 @@ test("code job detail renders safe evidence, history, controls, and package meta
     manifest: {
       packageId: `change-package-${"c".repeat(64)}`,
       packageDigest: "c".repeat(64),
+      job: { id: detailJobId },
       workspace: {
         id: "acme-workspace",
         sourceRevision: "d".repeat(64),
@@ -235,17 +237,17 @@ test("code job detail renders safe evidence, history, controls, and package meta
         imageId: "node@sha256:test",
         artifacts: {
           output: {
-            path: "code-job-1/action-node-tests/output.json",
+            path: `${detailJobId}/action-node-tests/output.json`,
             sha256: "5".repeat(64),
             bytes: 101,
           },
           stdout: {
-            path: "code-job-1/action-node-tests/stdout.json",
+            path: `${detailJobId}/action-node-tests/stdout.json`,
             sha256: "6".repeat(64),
             bytes: 102,
           },
           stderr: {
-            path: "code-job-1/action-node-tests/stderr.json",
+            path: `${detailJobId}/action-node-tests/stderr.json`,
             sha256: "7".repeat(64),
             bytes: 103,
           },
@@ -285,6 +287,13 @@ test("code job detail renders safe evidence, history, controls, and package meta
   assert.match(html, new RegExp(`${"5".repeat(64)}[\\s\\S]*101 bytes[\\s\\S]*output\\.json`));
   assert.match(html, new RegExp(`${"6".repeat(64)}[\\s\\S]*102 bytes[\\s\\S]*stdout\\.json`));
   assert.match(html, new RegExp(`${"7".repeat(64)}[\\s\\S]*103 bytes[\\s\\S]*stderr\\.json`));
+  assert.equal((html.match(/class="code-job-evidence-download"/g) || []).length, 3);
+  assert.match(
+    html,
+    new RegExp(
+      `/api/code/jobs/${detailJobId}/change-package/change-package-${"c".repeat(64)}/evidence/node-tests/output\\?packageDigest=${"c".repeat(64)}&amp;sha256=${"5".repeat(64)}`,
+    ),
+  );
   assert.doesNotMatch(html, /<unsafe>|<secret>|<terminal>|<img src=x/);
 });
 
@@ -603,6 +612,7 @@ test("frontend work module exposes only revision-bound controls and no execution
     source.indexOf("function codeJobObservationsMarkup"),
   );
   assert.doesNotMatch(manifestRenderer, /JSON\.stringify/);
+  assert.doesNotMatch(manifestRenderer, /href=[^\n]*artifact\.path/);
 });
 
 test("a code job read failure does not blank the core work ledger", async () => {

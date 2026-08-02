@@ -1415,6 +1415,9 @@ test("local code and change package composition injects only frozen delivery por
       executor: controlledCodeExecutorPort(),
       changePackageTargets: [{ workspaceId: "dashboard" }],
       completedChangeExporter: { async export() {} },
+      auditArtifactReader: {
+        async read(value) { return Buffer.from(JSON.stringify(value)); },
+      },
       async close() {},
     }),
     changePackageRuntimeFactory: async () => ({
@@ -1446,6 +1449,14 @@ test("local code and change package composition injects only frozen delivery por
         async close() {},
       };
     },
+    codeJobEvidenceReaderFactory: (options) => {
+      calls.codeJobEvidenceReader = options;
+      return {
+        async read(value) {
+          return { request: value };
+        },
+      };
+    },
     confirmationRuntimeFactory: async () => ({
       queue: confirmationQueuePort(),
       producerQueue: confirmationProducerPort(),
@@ -1475,6 +1486,23 @@ test("local code and change package composition injects only frozen delivery por
   assert.deepEqual(
     Object.keys(calls.coordination.codeJobChangePackageDispatcher),
     ["runCycle"],
+  );
+  for (const [name, methods] of [
+    ["codeJobReader", ["get", "getDetail", "list", "listNewest"]],
+    ["changePackageReader", ["get"]],
+    ["auditArtifactReader", ["read"]],
+  ]) {
+    assert.equal(Object.isFrozen(calls.codeJobEvidenceReader[name]), true);
+    assert.deepEqual(
+      Object.keys(calls.codeJobEvidenceReader[name]).sort(),
+      methods.sort(),
+    );
+  }
+  assert.equal(Object.isFrozen(application.codeJobEvidenceReader), true);
+  assert.deepEqual(Object.keys(application.codeJobEvidenceReader), ["read"]);
+  assert.deepEqual(
+    await application.codeJobEvidenceReader.read({ evidence: "request" }),
+    { request: { evidence: "request" } },
   );
   for (const privateName of [
     "completedChangeExporter",

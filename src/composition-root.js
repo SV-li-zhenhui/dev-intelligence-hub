@@ -18,6 +18,7 @@ import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import { createConfiguredWorkforce } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
+import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
@@ -147,6 +148,8 @@ export async function createApplication({
   memoryProjectorFactory = (options) => new MemoryProjector(options),
   codeJobMemoryProjectorFactory = (options) =>
     new CodeJobMemoryProjector(options),
+  codeJobEvidenceReaderFactory = (options) =>
+    new CodeJobEvidenceReader(options),
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   configuredWorkforceFactory = createConfiguredWorkforce,
@@ -201,6 +204,7 @@ export async function createApplication({
   let codeJobControl = null;
   let codeJobWorker = null;
   let codeJobMemoryProjector = null;
+  let codeJobEvidenceReader = null;
   let codeJobChangePackageDispatcher = null;
   let changePackageReader = null;
   let changePackageApplicationReader = null;
@@ -423,6 +427,21 @@ export async function createApplication({
         ["pause", "resume"],
         "codeJobRuntime.control",
       );
+      if (codeJobChangePackageDeliveryEnabled) {
+        codeJobEvidenceReader = frozenPort(
+          codeJobEvidenceReaderFactory({
+            codeJobReader,
+            changePackageReader,
+            auditArtifactReader: frozenPort(
+              codeExecutorRuntime.auditArtifactReader,
+              ["read"],
+              "codeExecutorRuntime.auditArtifactReader",
+            ),
+          }),
+          ["read"],
+          "codeJobEvidenceReader",
+        );
+      }
       codeJobMemoryProjector = frozenPort(
         codeJobMemoryProjectorFactory({
           projectionSource: frozenPort(
@@ -743,6 +762,7 @@ export async function createApplication({
       workflowRouting,
       codeJobReader,
       codeJobControl,
+      codeJobEvidenceReader,
       workLedgerView,
       attentionBrowser,
       attentionCoordinator,

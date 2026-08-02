@@ -115,6 +115,18 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
   assert.equal(Object.isFrozen(runtime.changePackageTargets[0]), true);
   assert.deepEqual(Object.keys(runtime.completedChangeExporter), ["export"]);
   assert.equal(Object.isFrozen(runtime.completedChangeExporter), true);
+  assert.deepEqual(Object.keys(runtime.auditArtifactReader), ["read"]);
+  assert.equal(Object.isFrozen(runtime.auditArtifactReader), true);
+  const artifactRef = await runtime.journal.writeJson({
+    sessionId: "runtime-session",
+    actionId: "runtime-proof",
+    kind: "output",
+    value: { passed: true },
+  });
+  assert.deepEqual(
+    await runtime.auditArtifactReader.read(artifactRef),
+    Buffer.from('{"passed":true}\n'),
+  );
   const session = await runtime.executor.start({
     sessionId: "runtime-session",
     workspaceId: "dashboard",

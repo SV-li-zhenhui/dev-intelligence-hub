@@ -45,18 +45,39 @@ function validateReference(ref) {
     ref === null ||
     typeof ref !== "object" ||
     Array.isArray(ref) ||
-    Object.getPrototypeOf(ref) !== Object.prototype ||
-    Object.keys(ref).sort().join(",") !== "bytes,path,sha256" ||
-    typeof ref.path !== "string" ||
-    typeof ref.sha256 !== "string" ||
-    !/^[a-f0-9]{64}$/.test(ref.sha256) ||
-    !Number.isSafeInteger(ref.bytes) ||
-    ref.bytes < 1
+    Object.getPrototypeOf(ref) !== Object.prototype
   ) {
     throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
   }
-
-  const segments = ref.path.split("/");
+  const keys = Reflect.ownKeys(ref);
+  if (
+    keys.length !== 3 ||
+    !["bytes", "path", "sha256"].every((key) => keys.includes(key)) ||
+    keys.some((key) => typeof key !== "string")
+  ) {
+    throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
+  }
+  const fields = new Map();
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(ref, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
+    }
+    fields.set(key, descriptor.value);
+  }
+  const relativePath = fields.get("path");
+  const digest = fields.get("sha256");
+  const bytes = fields.get("bytes");
+  if (
+    typeof relativePath !== "string" ||
+    typeof digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(digest) ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < 1
+  ) {
+    throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
+  }
+  const segments = relativePath.split("/");
   if (segments.length !== 3 || !segments[2].endsWith(".json")) {
     throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
   }
@@ -66,11 +87,11 @@ function validateReference(ref) {
     !SAFE_ID.test(sessionId) ||
     !SAFE_ID.test(actionId) ||
     !KINDS.has(kind) ||
-    artifactPath(sessionId, actionId, kind) !== ref.path
+    artifactPath(sessionId, actionId, kind) !== relativePath
   ) {
     throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
   }
-  return { sessionId, actionId, kind };
+  return { sessionId, actionId, kind, sha256: digest, bytes };
 }
 
 export class CodeExecutionJournal {
@@ -120,8 +141,21 @@ export class CodeExecutionJournal {
   }
 
   async readJson(ref) {
+    const content = await this.#readVerifiedBytes(ref);
+    try {
+      return JSON.parse(content.toString("utf8"));
+    } catch {
+      throw journalError("ARTIFACT_CORRUPTED", "审计产物完整性校验失败");
+    }
+  }
+
+  async readBytes(ref) {
+    return this.#readVerifiedBytes(ref);
+  }
+
+  async #readVerifiedBytes(ref) {
     const location = validateReference(ref);
-    if (ref.bytes > this.maxArtifactBytes) {
+    if (location.bytes > this.maxArtifactBytes) {
       throw journalError("INVALID_ARTIFACT_REF", "审计产物引用无效");
     }
     const target = path.join(
@@ -144,7 +178,7 @@ export class CodeExecutionJournal {
     if (!stats.isFile() || stats.isSymbolicLink()) {
       throw journalError("ARTIFACT_CORRUPTED", "审计产物完整性校验失败");
     }
-    if (stats.size !== ref.bytes || stats.size > this.maxArtifactBytes) {
+    if (stats.size !== location.bytes || stats.size > this.maxArtifactBytes) {
       throw journalError("ARTIFACT_CORRUPTED", "审计产物完整性校验失败");
     }
 
@@ -154,14 +188,13 @@ export class CodeExecutionJournal {
     } catch {
       throw journalError("ARTIFACT_READ_FAILED", "无法读取审计产物");
     }
-    if (content.length !== ref.bytes || sha256(content) !== ref.sha256) {
+    if (
+      content.length !== location.bytes ||
+      sha256(content) !== location.sha256
+    ) {
       throw journalError("ARTIFACT_CORRUPTED", "审计产物完整性校验失败");
     }
-    try {
-      return JSON.parse(content.toString("utf8"));
-    } catch {
-      throw journalError("ARTIFACT_CORRUPTED", "审计产物完整性校验失败");
-    }
+    return content;
   }
 
   #enqueue(key, operation) {

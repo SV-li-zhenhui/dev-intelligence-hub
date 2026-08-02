@@ -167,6 +167,12 @@ function createCompletedChangeExporter(executor) {
   });
 }
 
+function createAuditArtifactReader(journal) {
+  return Object.freeze({
+    read: journal.readBytes.bind(journal),
+  });
+}
+
 export async function createCodeExecutorRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
   if (!enabledConfig) return null;
@@ -239,6 +245,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     authority,
   );
   const completedChangeExporter = createCompletedChangeExporter(executor);
+  const auditArtifactReader = createAuditArtifactReader(journal);
   return Object.freeze({
     broker,
     sandbox,
@@ -247,6 +254,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     authority,
     changePackageTargets,
     completedChangeExporter,
+    auditArtifactReader,
     recovery,
   });
 }

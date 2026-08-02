@@ -38,6 +38,18 @@ test("journal writes deterministic JSON and returns a content-addressed referenc
   assert.equal(ref.path, "session-1/action-1/input.json");
   assert.match(ref.sha256, /^[a-f0-9]{64}$/);
   assert.equal(ref.bytes, Buffer.byteLength('{"task":"review","count":2}\n'));
+  assert.deepEqual(
+    await journal.readBytes(ref),
+    Buffer.from('{"task":"review","count":2}\n'),
+  );
+  const mutableRef = { ...ref };
+  const pendingRead = journal.readBytes(mutableRef);
+  mutableRef.bytes = 1;
+  mutableRef.sha256 = "0".repeat(64);
+  assert.deepEqual(
+    await pendingRead,
+    Buffer.from('{"task":"review","count":2}\n'),
+  );
   assert.deepEqual(await journal.readJson(ref), { task: "review", count: 2 });
   assert.equal(
     await readFile(path.join(root, "session-1", "action-1", "input.json"), "utf8"),
@@ -126,6 +138,21 @@ test("readJson requires an exact safe reference", async (t) => {
   ]) {
     await assert.rejects(journal.readJson(invalid), hasCode("INVALID_ARTIFACT_REF"));
   }
+
+  let getterCalls = 0;
+  const accessor = { ...ref };
+  Object.defineProperty(accessor, "path", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return ref.path;
+    },
+  });
+  await assert.rejects(
+    journal.readBytes(accessor),
+    hasCode("INVALID_ARTIFACT_REF"),
+  );
+  assert.equal(getterCalls, 0);
 });
 
 test("a valid reference to a missing artifact has a stable not-found error", async (t) => {
@@ -141,7 +168,7 @@ test("a valid reference to a missing artifact has a stable not-found error", asy
   );
 });
 
-test("readJson detects changed bytes, hashes, and invalid JSON", async (t) => {
+test("readBytes and readJson detect changed bytes, hashes, and invalid JSON", async (t) => {
   const { root, journal } = await fixture(t);
   const ref = await journal.writeJson({
     sessionId: "session-1",
@@ -152,17 +179,20 @@ test("readJson detects changed bytes, hashes, and invalid JSON", async (t) => {
   const target = path.join(root, ...ref.path.split("/"));
 
   await writeFile(target, '{"ok":false}\n');
+  await assert.rejects(journal.readBytes(ref), hasCode("ARTIFACT_CORRUPTED"));
   await assert.rejects(journal.readJson(ref), hasCode("ARTIFACT_CORRUPTED"));
 
   const malformed = Buffer.from("not-json\n");
   const crypto = await import("node:crypto");
   await writeFile(target, malformed);
+  const malformedRef = {
+    ...ref,
+    bytes: malformed.length,
+    sha256: crypto.createHash("sha256").update(malformed).digest("hex"),
+  };
+  assert.deepEqual(await journal.readBytes(malformedRef), malformed);
   await assert.rejects(
-    journal.readJson({
-      ...ref,
-      bytes: malformed.length,
-      sha256: crypto.createHash("sha256").update(malformed).digest("hex"),
-    }),
+    journal.readJson(malformedRef),
     hasCode("ARTIFACT_CORRUPTED"),
   );
 });

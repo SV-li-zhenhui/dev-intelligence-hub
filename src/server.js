@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -333,6 +334,7 @@ function queryOptions(url, { status = false, order = false } = {}) {
 }
 
 const codeJobPauseReason = "用户从本地指挥中枢暂停代码任务";
+const sha256Pattern = /^[a-f0-9]{64}$/;
 const changePackageApplicationConflictCodes = new Set([
   "CHANGE_PACKAGE_APPLICATION_STALE",
   "CHANGE_PACKAGE_TARGET_DIRTY",
@@ -350,6 +352,27 @@ function codeJobDetailQueryOptions(url) {
     throw httpError(400, "代码任务详情查询参数无效");
   }
   return queryOptions(url);
+}
+
+function codeJobEvidenceQueryOptions(url) {
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.length !== 2 ||
+    !keys.includes("packageDigest") ||
+    !keys.includes("sha256") ||
+    keys.some((key) => url.searchParams.getAll(key).length !== 1)
+  ) {
+    throw httpError(400, "测试证据查询绑定无效");
+  }
+  const packageDigest = url.searchParams.get("packageDigest");
+  const expectedSha256 = url.searchParams.get("sha256");
+  if (
+    !sha256Pattern.test(packageDigest || "") ||
+    !sha256Pattern.test(expectedSha256 || "")
+  ) {
+    throw httpError(400, "测试证据查询绑定无效");
+  }
+  return { packageDigest, expectedSha256 };
 }
 
 function requireApplicationPort(application, property, methods, message) {
@@ -463,6 +486,112 @@ async function requestChangePackageApplication(requester, input) {
     }
     throw error;
   }
+}
+
+async function readCodeJobEvidence(reader, input) {
+  try {
+    return await reader.read(input);
+  } catch (error) {
+    const statusByCode = {
+      INVALID_CODE_JOB_EVIDENCE_REQUEST: 400,
+      CODE_JOB_EVIDENCE_NOT_FOUND: 404,
+      CODE_JOB_EVIDENCE_STALE: 409,
+      CODE_JOB_EVIDENCE_CORRUPTED: 500,
+      CODE_JOB_EVIDENCE_UNAVAILABLE: 503,
+    };
+    const status = statusByCode[error?.code];
+    if (status) {
+      throw httpError(
+        status,
+        status >= 500 ? "测试证据暂时无法读取" : error.message,
+      );
+    }
+    throw error;
+  }
+}
+
+function verifiedCodeJobEvidence(value, expected) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw httpError(500, "测试证据读取结果绑定无效");
+  }
+  const fields = [
+    "jobId",
+    "packageId",
+    "packageDigest",
+    "profileId",
+    "kind",
+    "sha256",
+    "bytes",
+    "content",
+  ];
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    Reflect.ownKeys(descriptors).length !== fields.length ||
+    fields.some(
+      (field) =>
+        !descriptors[field]?.enumerable ||
+        !("value" in descriptors[field]),
+    )
+  ) {
+    throw httpError(500, "测试证据读取结果绑定无效");
+  }
+  const result = Object.fromEntries(
+    fields.map((field) => [field, descriptors[field].value]),
+  );
+  for (const field of [
+    "jobId",
+    "packageId",
+    "packageDigest",
+    "profileId",
+    "kind",
+  ]) {
+    if (result[field] !== expected[field]) {
+      throw httpError(500, "测试证据读取结果绑定无效");
+    }
+  }
+  if (
+    result.sha256 !== expected.expectedSha256 ||
+    !sha256Pattern.test(result.sha256 || "") ||
+    !Number.isSafeInteger(result.bytes) ||
+    result.bytes < 1 ||
+    !(Buffer.isBuffer(result.content) || result.content instanceof Uint8Array)
+  ) {
+    throw httpError(500, "测试证据读取结果绑定无效");
+  }
+  const content = Buffer.from(result.content);
+  if (
+    content.length !== result.bytes ||
+    createHash("sha256").update(content).digest("hex") !== result.sha256
+  ) {
+    throw httpError(500, "测试证据完整性校验失败");
+  }
+  return { ...result, content };
+}
+
+function sendCodeJobEvidence(response, evidence) {
+  const digestBase64 = Buffer.from(evidence.sha256, "hex").toString("base64");
+  const filename = [
+    evidence.profileId,
+    evidence.kind,
+    evidence.sha256.slice(0, 12),
+  ].join("-");
+  response.writeHead(200, {
+    "content-type": "application/json; charset=utf-8",
+    "content-disposition": `attachment; filename="${filename}.json"`,
+    "content-length": evidence.bytes,
+    "content-digest": `sha-256=:${digestBase64}:`,
+    "x-content-sha256": evidence.sha256,
+    etag: `"${evidence.sha256}"`,
+    "cache-control": "private, no-store",
+    "cross-origin-resource-policy": "same-origin",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(evidence.content);
 }
 
 async function syncConfirmationOutcome(employeeRegistry, item) {
@@ -788,6 +917,32 @@ export function createDashboardServer(
           requestedBy: detail.job.requestedBy,
         });
         sendJson(response, 200, { request: queued });
+        return;
+      }
+      const codeJobEvidence = url.pathname.match(
+        /^\/api\/code\/jobs\/(code-job-[a-f0-9]{55})\/change-package\/(change-package-[a-f0-9]{64})\/evidence\/([A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?)\/(output|stdout|stderr)$/,
+      );
+      if (request.method === "GET" && codeJobEvidence) {
+        const [, jobId, packageId, profileId, kind] = codeJobEvidence;
+        const binding = Object.freeze({
+          jobId,
+          packageId,
+          profileId,
+          kind,
+          ...codeJobEvidenceQueryOptions(url),
+        });
+        const readerRequest = Object.freeze({ ...binding });
+        const reader = requireApplicationPort(
+          application,
+          "codeJobEvidenceReader",
+          ["read"],
+          "代码任务测试证据读取端口无效",
+        );
+        const evidence = verifiedCodeJobEvidence(
+          await readCodeJobEvidence(reader, readerRequest),
+          binding,
+        );
+        sendCodeJobEvidence(response, evidence);
         return;
       }
       const codeJobChangePackage = url.pathname.match(
