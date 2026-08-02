@@ -73,6 +73,17 @@ export class EmployeeRegistry {
     );
   }
 
+  async runSelected(ids, options = {}) {
+    if (
+      !Array.isArray(ids) ||
+      Object.getPrototypeOf(ids) !== Array.prototype ||
+      new Set(ids).size !== ids.length
+    ) {
+      throw registryError(400, "岗位列表无效");
+    }
+    return Promise.all(ids.map((id) => this.require(id).run(options)));
+  }
+
   schedules() {
     return [...this.employees.values()]
       .map((employee) => ({

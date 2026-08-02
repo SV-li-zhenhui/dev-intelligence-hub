@@ -54,6 +54,70 @@ test("local provider settings merge without erasing base defaults", () => {
   });
 });
 
+test("configured brains and role permissions merge independently by id", () => {
+  const result = mergeConfig(
+    {
+      brainProviders: {
+        ollama: {
+          kind: "ollama",
+          baseUrl: "http://127.0.0.1:11434",
+          timeoutMs: 45_000,
+        },
+      },
+      employees: {
+        roles: {
+          developer: {
+            name: "开发工程师",
+            enabled: true,
+            permissions: { allowedIntents: ["ask_user", "complete"] },
+            brain: {
+              provider: "ollama",
+              model: "qwen3.5:9b",
+              remoteData: {
+                requirements: false,
+                code: false,
+                memory: false,
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      brainProviders: { ollama: { timeoutMs: 60_000 } },
+      employees: {
+        roles: {
+          developer: {
+            brain: { remoteData: { memory: true } },
+          },
+          tester: { name: "测试工程师" },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(result.brainProviders.ollama, {
+    kind: "ollama",
+    baseUrl: "http://127.0.0.1:11434",
+    timeoutMs: 60_000,
+  });
+  assert.deepEqual(result.employees.roles.developer, {
+    name: "开发工程师",
+    enabled: true,
+    permissions: { allowedIntents: ["ask_user", "complete"] },
+    brain: {
+      provider: "ollama",
+      model: "qwen3.5:9b",
+      remoteData: {
+        requirements: false,
+        code: false,
+        memory: true,
+      },
+    },
+  });
+  assert.deepEqual(result.employees.roles.tester, { name: "测试工程师" });
+});
+
 test("GitHub action settings merge without storing a credential value", () => {
   const result = mergeConfig(
     {
@@ -304,4 +368,38 @@ test("committed privileged capabilities are disabled and secret-free", async () 
   );
   assert.deepEqual(absolutePaths, []);
   assert.equal(JSON.stringify(config.githubActions).toLowerCase().includes("token"), false);
+});
+
+test("committed command-center roles route PR work to the durable PR engineer", async () => {
+  const configPath = path.resolve(testDirectory, "../config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+
+  assert.deepEqual(Object.keys(config.employees.roles), [
+    "pr-engineer",
+    "orchestrator",
+    "requirements-analyst",
+    "developer",
+    "tester",
+  ]);
+  assert.equal(
+    config.workflowRouting.rules.find(({ id }) =>
+      id === "pr-events-to-pr-engineer"
+    ).targets[0].id,
+    "pr-engineer",
+  );
+  assert.deepEqual(config.workCoordination.policy.githubReviewRoles, [
+    "pr-engineer",
+  ]);
+  assert.equal(
+    config.employees.roles["pr-engineer"].permissions.allowedIntents.includes(
+      "propose_github_review",
+    ),
+    true,
+  );
+  assert.equal(
+    Object.values(config.employees.roles).every(({ initialPaused }) =>
+      initialPaused === true
+    ),
+    true,
+  );
 });

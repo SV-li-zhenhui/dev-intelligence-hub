@@ -58,6 +58,29 @@ test("Ollama defaults to loopback and sends a bounded schema request without red
   assert.equal(calls[0].options.redirect, "error");
   assert.deepEqual(calls[0].body.format, SCHEMA);
   assert.equal(calls[0].body.stream, false);
+  assert.equal(calls[0].body.keep_alive, "30m");
+});
+
+test("Ollama removes only an exact JSON transport fence", async () => {
+  const fenced = new OllamaStructuredProvider({
+    fetch: async () =>
+      textResponse({ message: { content: "```json\n{\"ok\":true}\n```" } }),
+  });
+  const prose = new OllamaStructuredProvider({
+    fetch: async () =>
+      textResponse({
+        message: { content: "Result:\n```json\n{\"ok\":true}\n```" },
+      }),
+  });
+
+  assert.equal(
+    await fenced.generate({ model: "qwen", messages: MESSAGES, schema: SCHEMA }),
+    '{"ok":true}',
+  );
+  assert.equal(
+    await prose.generate({ model: "qwen", messages: MESSAGES, schema: SCHEMA }),
+    "Result:\n```json\n{\"ok\":true}\n```",
+  );
 });
 
 test("remote endpoints require HTTPS and every endpoint rejects userinfo", () => {

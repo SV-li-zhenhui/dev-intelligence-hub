@@ -14,6 +14,7 @@ import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
+import { createConfiguredWorkforce } from "./services/configured-workforce.js";
 import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
@@ -21,11 +22,16 @@ import { RefreshService } from "./services/refresh-service.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { WorkCoordinationService } from "./services/work-coordination-service.js";
+import { createGitHubReviewProposalRunnerService } from "./services/github-review-proposal-handler.js";
 import { WorkIntentDispatcher } from "./services/work-intent-dispatcher.js";
+import { WorkProposalResultReconciler } from "./services/work-proposal-result-reconciler.js";
 import { createWorkIntentPolicy } from "./services/work-intent-policy.js";
 import { WorkflowFactSource } from "./services/workflow-fact-source.js";
 import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
+import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
+
+const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
 
 function frozenPort(source, methods, name) {
   if (!source || methods.some((method) => typeof source[method] !== "function")) {
@@ -96,14 +102,21 @@ export async function createApplication({
   workLedgerDependencies = {},
   attentionInboxRuntimeFactory = createAttentionInboxRuntime,
   attentionInboxDependencies = {},
+  workProposalRuntimeFactory = createWorkProposalRuntime,
+  workProposalDependencies = {},
   memoryRuntimeFactory = createMemoryRuntime,
   memoryRuntimeDependencies = {},
   memoryProjectorFactory = (options) => new MemoryProjector(options),
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
+  configuredWorkforceFactory = createConfiguredWorkforce,
   workflowFactSourceFactory = (options) => new WorkflowFactSource(options),
   attentionResultReconcilerFactory = (options) =>
     new AttentionResultReconciler(options),
+  workProposalResultReconcilerFactory = (options) =>
+    new WorkProposalResultReconciler(options),
+  githubReviewProposalRunnerFactory =
+    createGitHubReviewProposalRunnerService,
   workConditionWakerFactory = (options) => new WorkConditionWaker(options),
   proactiveWorkLoopFactory = (options) => new ProactiveWorkLoop(options),
   workIntentDispatcherFactory = (options) =>
@@ -134,6 +147,7 @@ export async function createApplication({
   let workflowRouting = null;
   let workLedgerRuntime = null;
   let attentionInboxRuntime = null;
+  let workProposalRuntime = null;
   let memoryRuntime = null;
   let confirmationRuntime = null;
   try {
@@ -151,6 +165,10 @@ export async function createApplication({
     );
     const coordinationConfig = config.workCoordination || {};
     const coordinationEnabled = coordinationConfig.enabled === true;
+    const githubProposalExecutionEnabled =
+      coordinationEnabled &&
+      externalActions &&
+      config.githubActions?.enabled === true;
     if (coordinationEnabled) {
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({
@@ -165,6 +183,23 @@ export async function createApplication({
           ...attentionInboxDependencies,
           store,
           operationQueue: new OperationQueue(),
+        }),
+      );
+      workProposalRuntime = trackRuntime(
+        await workProposalRuntimeFactory({
+          ...workProposalDependencies,
+          store,
+          operationQueue: new OperationQueue(),
+          runnerScopes: githubProposalExecutionEnabled
+            ? [
+                {
+                  runnerId: GITHUB_REVIEW_PROPOSAL_RUNNER_ID,
+                  allowedKinds: ["github_review_proposal"],
+                  allowedRoleIds:
+                    coordinationConfig.policy?.githubReviewRoles || [],
+                },
+              ]
+            : [],
         }),
       );
     }
@@ -186,6 +221,31 @@ export async function createApplication({
           store,
         }))
         : null;
+    if (githubProposalExecutionEnabled && !confirmationRuntime) {
+      throw new Error("GitHub 工作提案需要可用的确认运行时");
+    }
+    const proposalRunner = coordinationEnabled
+      ? githubReviewProposalRunnerFactory({
+          enabled: githubProposalExecutionEnabled,
+          ...(githubProposalExecutionEnabled
+            ? {
+                runner:
+                  workProposalRuntime.runners[
+                    GITHUB_REVIEW_PROPOSAL_RUNNER_ID
+                  ],
+                confirmationProducer: confirmationRuntime.producerQueue,
+                actorAccountId: config.githubActions.actorAccountId,
+                leaseDurationMs: coordinationConfig.leaseDurationMs,
+                retryBaseMs: coordinationConfig.retryBaseMs,
+                retryMaxMs: coordinationConfig.retryMaxMs,
+                defaultBatchLimit: coordinationConfig.proposalLimit,
+                ...(workCoordinationDependencies.clock
+                  ? { clock: workCoordinationDependencies.clock }
+                  : {}),
+              }
+            : {}),
+        })
+      : null;
     const prEmployee = new ProactivePrEmployeeService({
       github,
       reviewer: roleConfig.enabled
@@ -203,19 +263,49 @@ export async function createApplication({
         : { enabled: false },
     });
     if (confirmationRuntime) await prEmployee.recoverConfirmations();
-    const employeeRegistry = createEmployeeRegistry([prEmployee]);
+    let workCoordination = null;
+    const configuredWorkforce = coordinationEnabled
+      ? configuredWorkforceFactory({
+          brainProviders: config.brainProviders || {},
+          roles: config.employees?.roles || {},
+          store,
+          ...(workCoordinationDependencies.clock
+            ? { clock: workCoordinationDependencies.clock }
+            : {}),
+          dependencies: workCoordinationDependencies.brainDependencies || {},
+          onRun: ({ roleId }) => {
+            if (!workCoordination) {
+              const error = new Error("员工主动循环尚未就绪");
+              error.code = "WORK_COORDINATION_NOT_READY";
+              throw error;
+            }
+            return workCoordination.runCycle({
+              trigger: `employee:${roleId}`,
+              includeWork: true,
+              roleId,
+            });
+          },
+        })
+      : { employees: [], workers: [] };
+    const employeeRegistry = createEmployeeRegistry([
+      prEmployee,
+      ...configuredWorkforce.employees,
+    ]);
     let workLedgerView = null;
     let attentionBrowser = null;
     let attentionCoordinator = null;
-    let workCoordination = null;
     let memoryProjector = null;
     if (coordinationEnabled) {
       const clockOptions = workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
         : {};
       const policy = workIntentPolicyFactory(coordinationConfig.policy || {});
+      const suppliedWorkers = workCoordinationDependencies.workers || [];
+      const roleWorkers = configuredWorkforce.workers.length
+        ? [...configuredWorkforce.workers, ...suppliedWorkers]
+        : suppliedWorkers;
       const roleDirectory = roleWorkerDirectoryFactory({
-        workers: workCoordinationDependencies.workers || [],
+        workers: roleWorkers,
         legacyEmployeeRegistry: employeeRegistry,
         legacyOwnedRoleIds: ["pr-reviewer"],
       });
@@ -226,6 +316,10 @@ export async function createApplication({
       });
       const attentionResultReconciler = attentionResultReconcilerFactory({
         attentionConsumer: attentionInboxRuntime.consumer,
+        ledger: workLedgerRuntime,
+      });
+      const proposalResultReconciler = workProposalResultReconcilerFactory({
+        proposalConsumer: workProposalRuntime.consumer,
         ledger: workLedgerRuntime,
       });
       const conditionWaker = workConditionWakerFactory({
@@ -248,10 +342,13 @@ export async function createApplication({
         ledger: workLedgerRuntime,
         policy,
         attentionProducer: attentionInboxRuntime.producer,
+        proposalProducer: workProposalRuntime.producer,
         ...clockOptions,
       });
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
+        proposalRunner,
+        proposalResultReconciler,
         attentionResultReconciler,
         conditionWaker,
         workLoop,
@@ -260,6 +357,7 @@ export async function createApplication({
         workLimit: coordinationConfig.workLimit,
         dispatchLimit: coordinationConfig.dispatchLimit,
         attentionLimit: coordinationConfig.attentionLimit,
+        proposalLimit: coordinationConfig.proposalLimit,
         conditionLimit: coordinationConfig.conditionLimit,
       });
       const coordinator = attentionCoordinatorFactory({

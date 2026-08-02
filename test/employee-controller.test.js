@@ -90,6 +90,21 @@ test("two employees are discovered and controlled independently", async () => {
   );
 });
 
+test("registry can run only legacy-selected employees", async () => {
+  const store = new MemoryStore();
+  const calls = [];
+  const registry = new EmployeeRegistry([
+    createEmployee({ id: "pr-reviewer", store, calls }),
+    createEmployee({ id: "requirements-analyst", store, calls }),
+  ]);
+
+  await registry.runSelected(["pr-reviewer"], { trigger: "refresh_completed" });
+
+  assert.deepEqual(calls, [
+    { id: "pr-reviewer", operation: "run", trigger: "refresh_completed" },
+  ]);
+});
+
 test("employee lifecycle state survives controller recreation", async () => {
   const store = new MemoryStore();
   const first = createEmployee({ id: "pr-reviewer", store, calls: [] });

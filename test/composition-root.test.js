@@ -50,6 +50,7 @@ function workCoordinationConfig({ externalActions = true } = {}) {
       workLimit: 12,
       dispatchLimit: 13,
       attentionLimit: 14,
+      proposalLimit: 16,
       conditionLimit: 15,
       leaseDurationMs: 16_000,
       resolveTimeoutMs: 2_000,
@@ -88,6 +89,17 @@ function confirmationProducerPort(overrides = {}) {
     async invalidate() {},
     ...overrides,
   });
+}
+
+function workProposalRuntimePort(overrides = {}) {
+  const runner = { async claim() {}, async advance() {} };
+  return {
+    producer: { async create() {} },
+    runners: { "github-review-runner": runner },
+    consumer: { async readResultBatch() {} },
+    async close() {},
+    ...overrides,
+  };
 }
 
 function memoryStore() {
@@ -271,6 +283,25 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const closeCalls = [];
   const calls = {};
   const workers = [{ roleId: "developer" }];
+  const configuredWorker = { roleId: "requirements-analyst" };
+  const configuredEmployee = {
+    id: "requirements-analyst",
+    scheduleMinutes: 3,
+    async view() { return { role: await this.roleView() }; },
+    async roleView() {
+      return {
+        id: this.id,
+        name: "需求分析师",
+        mission: "梳理需求",
+        enabled: true,
+        state: "paused",
+        revision: 0,
+        paused: true,
+      };
+    },
+    async run() {},
+    async control() {},
+  };
   const workflowRouting = {
     async readAssignmentBatch() {},
     async close() {
@@ -307,11 +338,14 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       return value;
     },
   };
+  const proposalProducer = { async create() {} };
+  const proposalConsumer = { async readResultBatch() {} };
   const confirmationQueue = confirmationQueuePort();
   const policy = { async bind() {} };
   const roleDirectory = { async resolve() {} };
   const factSource = { async read() {} };
   const reconciler = { async runCycle() {} };
+  const proposalReconciler = { async runCycle() {} };
   const conditionWaker = { async runCycle() {} };
   const workLoop = { async runCycle() {} };
   const dispatcher = { async dispatchPending() {} };
@@ -362,6 +396,17 @@ test("enabled work coordination composes private runtimes into frozen applicatio
         },
       };
     },
+    workProposalRuntimeFactory: async (options) => {
+      runtimeOrder.push("proposals");
+      calls.proposals = options;
+      return workProposalRuntimePort({
+        producer: proposalProducer,
+        consumer: proposalConsumer,
+        async close() {
+          closeCalls.push("proposals");
+        },
+      });
+    },
     confirmationRuntimeFactory: async () => {
       runtimeOrder.push("confirmation");
       return {
@@ -370,6 +415,13 @@ test("enabled work coordination composes private runtimes into frozen applicatio
         async close() {
           closeCalls.push("confirmation");
         },
+      };
+    },
+    configuredWorkforceFactory: (options) => {
+      calls.workforce = options;
+      return {
+        employees: [configuredEmployee],
+        workers: [configuredWorker],
       };
     },
     workIntentPolicyFactory: (options) => {
@@ -391,6 +443,11 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       serviceOrder.push("reconciler");
       calls.reconciler = options;
       return reconciler;
+    },
+    workProposalResultReconcilerFactory: (options) => {
+      serviceOrder.push("proposal-reconciler");
+      calls.proposalReconciler = options;
+      return proposalReconciler;
     },
     workConditionWakerFactory: (options) => {
       serviceOrder.push("waker");
@@ -424,6 +481,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "workflow",
     "ledger",
     "attention",
+    "proposals",
     "confirmation",
   ]);
   assert.deepEqual(serviceOrder, [
@@ -431,6 +489,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "directory",
     "facts",
     "reconciler",
+    "proposal-reconciler",
     "waker",
     "loop",
     "dispatcher",
@@ -444,25 +503,61 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     calls.ledger.operationQueue,
     calls.attention.operationQueue,
   );
+  assert.notStrictEqual(
+    calls.attention.operationQueue,
+    calls.proposals.operationQueue,
+  );
+  assert.deepEqual(calls.proposals.runnerScopes, [
+    {
+      runnerId: "github-review-runner",
+      allowedKinds: ["github_review_proposal"],
+      allowedRoleIds: ["pr-reviewer"],
+    },
+  ]);
   assert.strictEqual(
     calls.directory.legacyEmployeeRegistry,
     application.employeeRegistry,
   );
   assert.deepEqual(calls.directory.legacyOwnedRoleIds, ["pr-reviewer"]);
-  assert.strictEqual(calls.directory.workers, workers);
+  assert.deepEqual(calls.directory.workers, [configuredWorker, ...workers]);
+  assert.strictEqual(
+    application.employeeRegistry.get("requirements-analyst"),
+    configuredEmployee,
+  );
+  assert.deepEqual(calls.workforce.brainProviders, {});
+  assert.deepEqual(calls.workforce.roles, {});
+  assert.strictEqual(calls.workforce.store, store);
+  assert.equal(typeof calls.workforce.onRun, "function");
+  assert.deepEqual(
+    await calls.workforce.onRun({ roleId: "requirements-analyst" }),
+    {
+      trigger: "employee:requirements-analyst",
+      includeWork: true,
+      roleId: "requirements-analyst",
+    },
+  );
   assert.deepEqual(calls.policy, workCoordinationConfig().workCoordination.policy);
   assert.equal(calls.facts.maximumAgeMs, 7_000);
   assert.strictEqual(calls.reconciler.attentionConsumer, attentionConsumer);
   assert.strictEqual(calls.reconciler.ledger, ledgerRuntime);
+  assert.strictEqual(calls.proposalReconciler.proposalConsumer, proposalConsumer);
+  assert.strictEqual(calls.proposalReconciler.ledger, ledgerRuntime);
   assert.strictEqual(calls.waker.factSource, factSource);
   assert.strictEqual(calls.waker.ledger, ledgerRuntime);
   assert.strictEqual(calls.loop.roleDirectory, roleDirectory);
   assert.equal(calls.loop.decideTimeoutMs, 3_000);
   assert.strictEqual(calls.dispatcher.policy, policy);
   assert.strictEqual(calls.dispatcher.attentionProducer, attentionProducer);
+  assert.strictEqual(calls.dispatcher.proposalProducer, proposalProducer);
   assert.strictEqual(calls.coordination.workLoop, workLoop);
+  assert.equal(typeof calls.coordination.proposalRunner.runCycle, "function");
   assert.strictEqual(calls.coordination.dispatcher, dispatcher);
   assert.equal(calls.coordination.attentionLimit, 14);
+  assert.equal(calls.coordination.proposalLimit, 16);
+  assert.strictEqual(
+    calls.coordination.proposalResultReconciler,
+    proposalReconciler,
+  );
   assert.strictEqual(calls.coordinator.externalQueue, confirmationQueue);
   assert.strictEqual(calls.coordinator.internalInbox, attentionBrowser);
 
@@ -497,6 +592,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "attentionInboxRuntime",
     "attentionProducer",
     "attentionConsumer",
+    "workProposalRuntime",
+    "proposalProducer",
+    "proposalConsumer",
   ]) {
     assert.equal(privateName in application, false);
   }
@@ -512,6 +610,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   await application.close();
   assert.deepEqual(closeCalls, [
     "confirmation",
+    "proposals",
     "attention",
     "ledger",
     "workflow",
@@ -530,8 +629,10 @@ test("disabled work coordination does not acquire private runtimes or services",
     store: memoryStore(),
     workLedgerRuntimeFactory: unexpectedFactory,
     attentionInboxRuntimeFactory: unexpectedFactory,
+    workProposalRuntimeFactory: unexpectedFactory,
     workIntentPolicyFactory: unexpectedFactory,
     workCoordinationFactory: unexpectedFactory,
+    workProposalResultReconcilerFactory: unexpectedFactory,
   });
 
   assert.equal(workFactoryCalls, 0);
@@ -583,6 +684,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       },
       async close() {},
     }),
+    workProposalRuntimeFactory: async () => workProposalRuntimePort(),
     memoryRuntimeFactory: async (options) => {
       calls.memory = options;
       return memoryRuntime;
@@ -595,6 +697,7 @@ test("enabled unified memory exposes search only and projects the existing work 
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
     workflowFactSourceFactory: () => ({ async read() {} }),
     attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
+    workProposalResultReconcilerFactory: () => ({ async runCycle() {} }),
     workConditionWakerFactory: () => ({ async runCycle() {} }),
     proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
     workIntentDispatcherFactory: () => ({ async dispatchPending() {} }),

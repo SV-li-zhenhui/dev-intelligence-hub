@@ -130,7 +130,7 @@ const intentVariants = [
       type: "string",
       enum: ["approve", "request_changes", "comment"],
     },
-    body: stringSchema(32 * 1_024),
+    body: stringSchema(16 * 1_024),
     evidence,
   }),
   intentSchema("propose_code_action", {

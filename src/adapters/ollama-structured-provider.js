@@ -234,7 +234,10 @@ function responseContent(text) {
       502,
     );
   }
-  return content;
+  const fenced = /^```(?:json)?\r?\n([\s\S]*?)\r?\n```$/i.exec(
+    content.trim(),
+  );
+  return fenced ? fenced[1].trim() : content;
 }
 
 export class OllamaStructuredProvider {
@@ -291,6 +294,7 @@ export class OllamaStructuredProvider {
       model: safeText(model, "model", 256),
       stream: false,
       think: false,
+      keep_alive: "30m",
       format: normalizeSchema(schema),
       options: { temperature: 0, num_ctx: this.#contextTokens },
       messages: normalizeMessages(messages),

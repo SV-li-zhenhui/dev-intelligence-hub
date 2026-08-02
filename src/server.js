@@ -901,6 +901,7 @@ export function startApplicationBackgroundWork(
   async function performAgencyCycle({
     trigger,
     includeLegacyEmployees = false,
+    employeeIds = [],
   }) {
     if (stopped || !confirmationAccess.isReady()) {
       return { skipped: "confirmation_not_ready" };
@@ -908,14 +909,35 @@ export function startApplicationBackgroundWork(
     const failures = [];
     if (typeof application.workCoordination?.runCycle === "function") {
       try {
-        await application.workCoordination.runCycle({ trigger });
+        await application.workCoordination.runCycle({
+          trigger,
+          includeWork: false,
+        });
       } catch (error) {
         failures.push(error);
       }
     }
-    if (includeLegacyEmployees && !stopped) {
+    const selectedEmployeeIds = [
+      ...(includeLegacyEmployees ? ["pr-reviewer"] : []),
+      ...employeeIds,
+    ].filter((id, index, ids) => ids.indexOf(id) === index);
+    if (selectedEmployeeIds.length > 0 && !stopped) {
       try {
-        await employeeRegistry.runAll({ trigger });
+        if (typeof employeeRegistry.runSelected === "function") {
+          await employeeRegistry.runSelected(selectedEmployeeIds, { trigger });
+        } else if (
+          includeLegacyEmployees &&
+          typeof employeeRegistry.runAll === "function"
+        ) {
+          await employeeRegistry.runAll({ trigger });
+        } else if (
+          selectedEmployeeIds.length === 1 &&
+          typeof employeeRegistry.run === "function"
+        ) {
+          await employeeRegistry.run(selectedEmployeeIds[0], { trigger });
+        } else {
+          await employeeRegistry.runAll({ trigger });
+        }
       } catch (error) {
         failures.push(error);
       }
@@ -1019,7 +1041,10 @@ export function startApplicationBackgroundWork(
       setIntervalFn(
         () =>
           runTracked(() =>
-            employeeRegistry.run(schedule.id, { trigger: "scheduled" }),
+            enqueueAgencyCycle({
+              trigger: "scheduled",
+              employeeIds: [schedule.id],
+            }),
           ),
         schedule.intervalMinutes * 60_000,
       ),
@@ -1081,8 +1106,8 @@ export async function startDashboardServer(
   try {
     backgroundWork = startBackgroundWorkFn(application);
     server = createDashboardServer(application, { backgroundWork });
-    await backgroundWork.initialRefresh;
     await listenForLocalConnections(server, application.config.port);
+    await backgroundWork.initialRefresh;
   } catch (error) {
     try {
       if (server) {

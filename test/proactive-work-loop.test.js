@@ -6,6 +6,16 @@ function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function controlledClock() {
   let milliseconds = Date.parse("2026-08-02T08:00:00.000Z");
   return {
@@ -498,6 +508,101 @@ test("concurrent runCycle calls share one in-flight decision", async () => {
   assert.equal(ledger.calls.intake.length, 1);
   assert.equal(ledger.calls.claim.length, 1);
   assert.equal(ledger.calls.stageIntent.length, 1);
+});
+
+test("a role-scoped cycle only decides work resolved to that role", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [
+      workItem(1, { type: "role", id: "requirements-analyst" }),
+      workItem(2, { type: "role", id: "developer" }),
+    ],
+    time,
+  });
+  const directory = new FakeRoleDirectory({
+    "requirements-analyst": worker({ roleId: "requirements-analyst" }),
+    developer: worker({ roleId: "developer" }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({
+    trigger: "employee:requirements-analyst",
+    roleId: "requirements-analyst",
+  });
+
+  assert.equal(result.roleId, "requirements-analyst");
+  assert.deepEqual(directory.calls, [
+    { type: "role", id: "requirements-analyst" },
+  ]);
+  assert.deepEqual(
+    ledger.calls.claim.map(({ itemId }) => itemId),
+    ["work-item-1"],
+  );
+  assert.deepEqual(
+    ledger.items.map(({ status }) => status),
+    ["dispatch_pending", "queued"],
+  );
+});
+
+test("same role signals coalesce while different role cycles remain isolated", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [
+      workItem(1, { type: "role", id: "requirements-analyst" }),
+      workItem(2, { type: "role", id: "developer" }),
+    ],
+    time,
+  });
+  const requirementsStarted = deferred();
+  const releaseRequirements = deferred();
+  let developerStarted = false;
+  const directory = new FakeRoleDirectory({
+    "requirements-analyst": worker({
+      roleId: "requirements-analyst",
+      decide: async () => {
+        requirementsStarted.resolve();
+        await releaseRequirements.promise;
+        return completeDecision("需求已梳理");
+      },
+    }),
+    developer: worker({
+      roleId: "developer",
+      decide: async () => {
+        developerStarted = true;
+        return completeDecision("开发已判断");
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const requirements = loop.runCycle({
+    trigger: "employee:requirements-analyst",
+    roleId: "requirements-analyst",
+  });
+  await requirementsStarted.promise;
+  const duplicateRequirements = loop.runCycle({
+    trigger: "manual",
+    roleId: "requirements-analyst",
+  });
+  const developer = loop.runCycle({
+    trigger: "employee:developer",
+    roleId: "developer",
+  });
+
+  assert.strictEqual(duplicateRequirements, requirements);
+  assert.notStrictEqual(developer, requirements);
+  assert.equal(developerStarted, false);
+
+  releaseRequirements.resolve();
+  const [requirementsResult, duplicateResult, developerResult] =
+    await Promise.all([requirements, duplicateRequirements, developer]);
+
+  assert.deepEqual(duplicateResult, requirementsResult);
+  assert.equal(developerResult.roleId, "developer");
+  assert.deepEqual(
+    ledger.calls.claim.map(({ itemId }) => itemId),
+    ["work-item-1", "work-item-2"],
+  );
 });
 
 test("workLimit processes the oldest available items first", async () => {

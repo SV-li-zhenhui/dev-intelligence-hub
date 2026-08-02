@@ -155,6 +155,43 @@ test("RoleDecisionEngine rejects intents outside the independent role permission
   );
 });
 
+test("RoleDecisionEngine retries one invalid structured response without replaying it", async () => {
+  const calls = [];
+  const invalidResponse = "untrusted invalid model output";
+  const router = {
+    async generate(request) {
+      calls.push(request);
+      return calls.length === 1
+        ? invalidResponse
+        : JSON.stringify(completeDecision());
+    },
+    describe(config) {
+      return {
+        provider: config.provider,
+        model: config.model,
+        remote: false,
+        remoteData: structuredClone(config.remoteData),
+      };
+    },
+  };
+  const engine = new RoleDecisionEngine({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: router,
+  });
+
+  const result = await engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+    trigger: "assigned",
+  });
+
+  assert.equal(result.intent.type, "complete");
+  assert.equal(calls.length, 2);
+  assert.equal(JSON.stringify(calls[1]).includes(invalidResponse), false);
+  assert.match(calls[1].messages.at(-1).content, /corrected JSON object/);
+});
+
 test("the default role context separates PR code from minimum requirements data", async () => {
   let routed;
   const engine = new RoleDecisionEngine({

@@ -175,6 +175,7 @@ test("rejects unknown schemas, malformed variants, and oversized text", () => {
     { ...common("wait_condition"), condition: { kind: "time", notBefore: "tomorrow" }, checkAfterSeconds: 300 },
     { ...common("wait_condition"), condition: { kind: "time", notBefore: "2026-08-03T01:02:03.000Z" }, checkAfterSeconds: 1 },
     { ...common("propose_github_review"), verdict: "merge", body: "merge", evidence: [] },
+    { ...common("propose_github_review"), verdict: "comment", body: "x".repeat(16 * 1024 + 1), evidence: [] },
     { ...common("propose_code_action"), operation: "shell", objective: "run", acceptanceCriteria: [], evidence: [] },
     { ...common("complete"), outcome: "blocked", evidence: [] },
   ]) {

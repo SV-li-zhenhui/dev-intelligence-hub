@@ -310,6 +310,70 @@ h1 {
   border-radius: 8px;
 }
 
+.employee-roster {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.employee-role-card {
+  min-width: 0;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.employee-role-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.employee-role-card h3,
+.employee-role-card p {
+  margin: 0;
+}
+
+.employee-role-card h3 {
+  font: 500 17px/1.3 Georgia, "Noto Serif SC", serif;
+}
+
+.employee-role-card > p {
+  min-height: 38px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.employee-role-meta {
+  display: grid;
+  gap: 7px;
+  margin: 13px 0 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+}
+
+.employee-role-meta div {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.employee-role-meta dt,
+.employee-role-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.employee-role-meta dt {
+  color: var(--faint);
+}
+
 .employee-heading,
 .memory-heading {
   display: flex;
@@ -1316,6 +1380,10 @@ dialog::backdrop {
   }
 
   .employee-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .employee-roster {
     grid-template-columns: 1fr;
   }
 

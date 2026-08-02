@@ -81,6 +81,20 @@ function requestPort(port, options = {}) {
   });
 }
 
+async function waitForPort(port, options = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      return await requestPort(port, options);
+    } catch (error) {
+      if (error.code !== "ECONNREFUSED") throw error;
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw lastError;
+}
+
 function pendingConfirmationItem() {
   return {
     id: "confirmation-pr-work-startup",
@@ -653,7 +667,11 @@ test("background work projects durable activity into unified memory after employ
     assert.deepEqual(calls, [
       { operation: "refresh", notify: false },
       { operation: "intake" },
-      { operation: "work_cycle", trigger: "refresh_completed" },
+      {
+        operation: "work_cycle",
+        trigger: "refresh_completed",
+        includeWork: false,
+      },
       { operation: "run_all", trigger: "refresh_completed" },
       { operation: "memory_projection" },
     ]);
@@ -930,6 +948,58 @@ test("background stop waits for a tracked scheduled task", async () => {
   finishScheduledRun();
   await Promise.all([scheduledRun, stopping]);
   assert.equal(stopped, true);
+});
+
+test("scheduled employees stay behind the confirmation gate when facts are stale", async () => {
+  const timers = [];
+  const employeeRuns = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    confirmationQueue: {},
+    store: {
+      async read(name) {
+        if (name !== "snapshot") return null;
+        return {
+          sourceStatus: {
+            githubPullRequests: { ok: false, stale: true },
+          },
+        };
+      },
+    },
+    employeeRegistry: {
+      get() {
+        return null;
+      },
+      schedules() {
+        return [{ id: "requirements-analyst", intervalMinutes: 11 }];
+      },
+      async runSelected(ids, options) {
+        employeeRuns.push({ ids, ...options });
+      },
+    },
+    refreshService: {
+      async refresh() {},
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    assert.equal(backgroundWork.confirmationReady(), false);
+
+    await timers[1].callback();
+
+    assert.deepEqual(employeeRuns, []);
+  } finally {
+    await backgroundWork.stop();
+  }
 });
 
 test("periodic refresh fences facts but reopens confirmations before slow agency", async () => {
@@ -1912,7 +1982,7 @@ test("awaited shutdown releases a delayed runtime before an immediate restart", 
   assert.equal(runtimeHeld, false);
 });
 
-test("startup does not listen until the first GitHub refresh and employee reconcile finish", async () => {
+test("startup listens immediately but confirmations stay closed until initial reconcile finishes", async () => {
   const port = await availablePort();
   const refreshStarted = deferred();
   const releaseRefresh = deferred();
@@ -1957,18 +2027,24 @@ test("startup does not listen until the first GitHub refresh and employee reconc
   try {
     await refreshStarted.promise;
     assert.equal(startupSettled, false);
-    await assert.rejects(
-      requestPort(port, { path: "/api/confirmations/next" }),
-      (error) => error.code === "ECONNREFUSED",
-    );
+    const healthDuringRefresh = await waitForPort(port, {
+      path: "/api/health",
+    });
+    assert.equal(healthDuringRefresh.status, 200);
+    const confirmationDuringRefresh = await requestPort(port, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(confirmationDuringRefresh.status, 503);
+    assert.deepEqual(queueCalls, []);
 
     releaseRefresh.resolve();
     await reconcileStarted.promise;
     assert.equal(startupSettled, false);
-    await assert.rejects(
-      requestPort(port, { path: "/api/confirmations/next" }),
-      (error) => error.code === "ECONNREFUSED",
-    );
+    const confirmationDuringReconcile = await requestPort(port, {
+      path: "/api/confirmations/next",
+    });
+    assert.equal(confirmationDuringReconcile.status, 503);
+    assert.deepEqual(queueCalls, []);
 
     releaseReconcile.resolve();
     server = await starting;
@@ -1987,11 +2063,10 @@ test("startup does not listen until the first GitHub refresh and employee reconc
   }
 });
 
-test("initial refresh failure aborts listen and releases background and application resources", async () => {
+test("initial refresh failure closes the listening server and releases resources", async () => {
   const port = await availablePort();
   const refreshFailure = new Error("initial GitHub refresh failed");
-  const initialRefresh = Promise.reject(refreshFailure);
-  initialRefresh.catch(() => {});
+  const initialRefresh = deferred();
   let backgroundStops = 0;
   let applicationCloses = 0;
   const application = startupApplication({
@@ -2004,7 +2079,7 @@ test("initial refresh failure aborts listen and releases background and applicat
     createApplicationFn: async () => application,
     startBackgroundWorkFn() {
       return {
-        initialRefresh,
+        initialRefresh: initialRefresh.promise,
         async stop() {
           backgroundStops += 1;
         },
@@ -2015,8 +2090,12 @@ test("initial refresh failure aborts listen and releases background and applicat
   let server = null;
 
   try {
+    const health = await waitForPort(port, { path: "/api/health" });
+    assert.equal(health.status, 200);
+    initialRefresh.reject(refreshFailure);
     await assert.rejects(starting, (error) => error === refreshFailure);
   } finally {
+    initialRefresh.reject(refreshFailure);
     server = await starting.catch(() => null);
     if (server) await server.shutdown();
   }
@@ -2025,7 +2104,7 @@ test("initial refresh failure aborts listen and releases background and applicat
   assert.equal(applicationCloses, 1);
   await assert.rejects(
     requestPort(port, { path: "/api/confirmations/next" }),
-    (error) => error.code === "ECONNREFUSED",
+    (error) => ["ECONNREFUSED", "ECONNRESET"].includes(error.code),
   );
 });
 

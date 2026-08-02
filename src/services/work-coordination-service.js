@@ -1,4 +1,6 @@
 const SAFE_TRIGGER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
+const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+const NO_ROLE_SCOPE = "*";
 
 function requirePort(value, method, name) {
   if (!value || typeof value[method] !== "function") {
@@ -21,6 +23,44 @@ function safeTrigger(value) {
   return value;
 }
 
+function safeRoleId(value) {
+  if (typeof value !== "string" || !SAFE_ROLE_ID.test(value)) {
+    throw new TypeError("roleId is invalid");
+  }
+  return value;
+}
+
+function cycleOptions(value = {}) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.keys(value).some(
+      (key) => !["trigger", "includeWork", "roleId"].includes(key),
+    )
+  ) {
+    throw new TypeError("runCycle options are invalid");
+  }
+  const includeWork = value.includeWork ?? true;
+  if (typeof includeWork !== "boolean") {
+    throw new TypeError("includeWork is invalid");
+  }
+  const roleId = value.roleId == null ? null : safeRoleId(value.roleId);
+  if (!includeWork && roleId !== null) {
+    throw new TypeError("roleId requires includeWork");
+  }
+  return Object.freeze({
+    trigger: safeTrigger(value.trigger ?? "scheduled"),
+    includeWork,
+    roleId,
+  });
+}
+
+async function skipProposalExecution() {
+  return { skipped: "not_configured" };
+}
+
 function stageFailure(stage, error) {
   const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
@@ -30,15 +70,20 @@ function stageFailure(stage, error) {
 
 export class WorkCoordinationService {
   #intake;
+  #runProposals;
+  #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
   #runWork;
   #dispatch;
   #defaults;
-  #inFlight = null;
+  #inFlightByScope = new Map();
+  #cycleTail = Promise.resolve();
 
   constructor({
     ledger,
+    proposalRunner,
+    proposalResultReconciler,
     attentionResultReconciler,
     conditionWaker,
     workLoop,
@@ -47,9 +92,18 @@ export class WorkCoordinationService {
     workLimit = 20,
     dispatchLimit = 50,
     attentionLimit = 50,
+    proposalLimit = 50,
     conditionLimit = 50,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
+    this.#runProposals = proposalRunner == null
+      ? skipProposalExecution
+      : requirePort(proposalRunner, "runCycle", "proposalRunner");
+    this.#reconcileProposals = requirePort(
+      proposalResultReconciler,
+      "runCycle",
+      "proposalResultReconciler",
+    );
     this.#reconcileAttention = requirePort(
       attentionResultReconciler,
       "runCycle",
@@ -67,6 +121,7 @@ export class WorkCoordinationService {
       workLimit: positiveLimit(workLimit, "workLimit"),
       dispatchLimit: positiveLimit(dispatchLimit, "dispatchLimit"),
       attentionLimit: positiveLimit(attentionLimit, "attentionLimit"),
+      proposalLimit: positiveLimit(proposalLimit, "proposalLimit"),
       conditionLimit: positiveLimit(conditionLimit, "conditionLimit"),
     });
   }
@@ -75,35 +130,57 @@ export class WorkCoordinationService {
     return this.#intake({ limit: this.#defaults.intakeLimit });
   }
 
-  runCycle({ trigger = "scheduled" } = {}) {
-    if (this.#inFlight) return this.#inFlight;
-    const normalizedTrigger = safeTrigger(trigger);
-    const execution = Promise.resolve().then(() =>
-      this.#performCycle(normalizedTrigger),
-    );
+  runCycle(input = {}) {
+    const options = cycleOptions(input);
+    const scope = options.includeWork
+      ? `work:${options.roleId ?? NO_ROLE_SCOPE}`
+      : "housekeeping";
+    const running = this.#inFlightByScope.get(scope);
+    if (running) return running;
+    const execution = this.#cycleTail.then(() => this.#performCycle(options));
     const tracked = execution.finally(() => {
-      if (this.#inFlight === tracked) this.#inFlight = null;
+      if (this.#inFlightByScope.get(scope) === tracked) {
+        this.#inFlightByScope.delete(scope);
+      }
     });
-    this.#inFlight = tracked;
+    this.#inFlightByScope.set(scope, tracked);
+    this.#cycleTail = tracked.catch(() => {});
     return tracked;
   }
 
-  async #performCycle(trigger) {
+  async #performCycle(options) {
     const stages = [
+      ["proposal_execution", () =>
+        this.#runProposals({ limit: this.#defaults.proposalLimit })],
+      ["proposal_results", () =>
+        this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
       ["attention_results", () =>
         this.#reconcileAttention({ limit: this.#defaults.attentionLimit })],
       ["conditions", () =>
         this.#wakeConditions({ limit: this.#defaults.conditionLimit })],
-      ["work", () =>
-        this.#runWork({
-          trigger,
-          intakeLimit: this.#defaults.intakeLimit,
-          workLimit: this.#defaults.workLimit,
-        })],
-      ["dispatch", () =>
-        this.#dispatch({ limit: this.#defaults.dispatchLimit })],
     ];
-    const result = { trigger, stages: {} };
+    if (options.includeWork) {
+      stages.push([
+        "work",
+        () =>
+          this.#runWork({
+            trigger: options.trigger,
+            intakeLimit: this.#defaults.intakeLimit,
+            workLimit: this.#defaults.workLimit,
+            ...(options.roleId === null ? {} : { roleId: options.roleId }),
+          }),
+      ]);
+    }
+    stages.push([
+      "dispatch",
+      () => this.#dispatch({ limit: this.#defaults.dispatchLimit }),
+    ]);
+    const result = {
+      trigger: options.trigger,
+      includeWork: options.includeWork,
+      roleId: options.roleId,
+      stages: {},
+    };
     const failures = [];
     for (const [name, operation] of stages) {
       try {

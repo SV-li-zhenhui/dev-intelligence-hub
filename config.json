@@ -22,7 +22,7 @@
     "maxHops": 8,
     "rules": [
       {
-        "id": "pr-events-to-pr-reviewer",
+        "id": "pr-events-to-pr-engineer",
         "source": "root",
         "enabled": true,
         "priority": 100,
@@ -43,7 +43,7 @@
         "targets": [
           {
             "type": "role",
-            "id": "pr-reviewer"
+            "id": "pr-engineer"
           }
         ],
         "onMatch": "stop"
@@ -99,10 +99,11 @@
     "workLimit": 20,
     "dispatchLimit": 50,
     "attentionLimit": 50,
+    "proposalLimit": 50,
     "conditionLimit": 50,
-    "leaseDurationMs": 120000,
+    "leaseDurationMs": 180000,
     "resolveTimeoutMs": 5000,
-    "decisionTimeoutMs": 60000,
+    "decisionTimeoutMs": 150000,
     "maxAttempts": 3,
     "retryBaseMs": 30000,
     "retryMaxMs": 900000,
@@ -112,15 +113,16 @@
       "capabilityRoles": {
         "coordination": "orchestrator",
         "requirements": "requirements-analyst",
-        "pr-review": "pr-reviewer",
+        "pr-review": "pr-engineer",
         "development": "developer",
         "testing": "tester"
       },
       "githubReviewRoles": [
-        "pr-reviewer"
+        "pr-engineer"
       ],
       "codeActionRoles": [
-        "developer"
+        "developer",
+        "tester"
       ],
       "workspaceByRepository": {}
     }
@@ -139,6 +141,16 @@
     "timeoutMs": 45000,
     "maxAssessmentsPerRefresh": 3
   },
+  "brainProviders": {
+    "ollama": {
+      "kind": "ollama",
+      "baseUrl": "http://127.0.0.1:11434",
+      "contextTokens": 8192,
+      "timeoutMs": 120000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    }
+  },
   "employees": {
     "prReviewer": {
       "enabled": true,
@@ -155,6 +167,131 @@
       "jobLimit": 500,
       "allowRemoteCodeContext": false,
       "brain": {}
+    },
+    "roles": {
+      "pr-engineer": {
+        "name": "PR 工程师",
+        "mission": "主动分析与你相关的 PR，形成有证据的 Review 建议；任何 GitHub Review 都先生成持久提案并逐条进入用户确认队列。",
+        "enabled": true,
+        "scheduleMinutes": 2,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_github_review",
+            "handoff",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "orchestrator": {
+        "name": "主控调度员",
+        "mission": "主动观察全局工作，判断下一步，协调岗位交接；遇到需要所有者决策或授权的事项时提出清晰问题。",
+        "enabled": true,
+        "scheduleMinutes": 2,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "handoff",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "requirements-analyst": {
+        "name": "需求分析师",
+        "mission": "主动梳理需求、识别歧义和验收条件；能自行判断的就推进，需要产品决策时把一个明确问题送入确认队列。",
+        "enabled": true,
+        "scheduleMinutes": 3,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "handoff",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "developer": {
+        "name": "开发工程师",
+        "mission": "主动分析实现方案和风险，提出受策略约束的代码动作；任何真实代码变更都必须经过受控执行器。",
+        "enabled": true,
+        "scheduleMinutes": 3,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_code_action",
+            "handoff",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "tester": {
+        "name": "测试工程师",
+        "mission": "主动检查验收标准、设计验证并反馈风险，必要时提出只在受控执行器中运行的测试动作。",
+        "enabled": true,
+        "scheduleMinutes": 4,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_code_action",
+            "handoff",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      }
     }
   },
   "dingtalk": {

@@ -5,6 +5,7 @@ const DEFAULT_INTAKE_LIMIT = 100;
 const DEFAULT_WORK_LIMIT = 20;
 const MAX_PAGE_COUNT = 100;
 const PAGE_SIZE = 100;
+const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
 
@@ -34,6 +35,13 @@ function boundedString(value, name, maximumBytes = 128) {
 function positiveInteger(value, name, maximum) {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function safeRoleId(value) {
+  if (typeof value !== "string" || !SAFE_ROLE_ID.test(value)) {
+    throw new TypeError("roleId is invalid");
   }
   return value;
 }
@@ -68,7 +76,8 @@ function cycleOptions(value = {}) {
   const input = Object.fromEntries(entries);
   if (
     Object.keys(input).some(
-      (key) => !["trigger", "intakeLimit", "workLimit"].includes(key),
+      (key) =>
+        !["trigger", "intakeLimit", "workLimit", "roleId"].includes(key),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
@@ -86,6 +95,7 @@ function cycleOptions(value = {}) {
       input.workLimit === undefined
         ? DEFAULT_WORK_LIMIT
         : positiveInteger(input.workLimit, "workLimit", 100),
+    roleId: input.roleId === undefined ? null : safeRoleId(input.roleId),
   });
 }
 
@@ -279,17 +289,23 @@ export class ProactiveWorkLoop {
     ) {
       throw new TypeError("role timeouts must be shorter than leaseDurationMs");
     }
-    this.inFlight = null;
+    this.inFlightByScope = new Map();
+    this.cycleTail = Promise.resolve();
   }
 
   runCycle(input = {}) {
-    if (this.inFlight) return this.inFlight;
     const options = cycleOptions(input);
-    const execution = Promise.resolve().then(() => this.#executeCycle(options));
+    const scope = options.roleId ?? "*";
+    const running = this.inFlightByScope.get(scope);
+    if (running) return running;
+    const execution = this.cycleTail.then(() => this.#executeCycle(options));
     const tracked = execution.finally(() => {
-      if (this.inFlight === tracked) this.inFlight = null;
+      if (this.inFlightByScope.get(scope) === tracked) {
+        this.inFlightByScope.delete(scope);
+      }
     });
-    this.inFlight = tracked;
+    this.inFlightByScope.set(scope, tracked);
+    this.cycleTail = tracked.catch(() => {});
     return tracked;
   }
 
@@ -305,6 +321,14 @@ export class ProactiveWorkLoop {
     for (const item of items) {
       if (claimAttempts >= options.workLimit) break;
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      if (
+        options.roleId !== null &&
+        options.roleId !== ORCHESTRATOR_ROLE_ID &&
+        (item.currentTarget.type !== "role" ||
+          item.currentTarget.id !== options.roleId)
+      ) {
+        continue;
+      }
       const key = targetKey(item.currentTarget);
       let resolution;
       try {
@@ -322,6 +346,9 @@ export class ProactiveWorkLoop {
       }
       if (resolution.status === "resolution_failed") {
         outcomes.push({ itemId: item.itemId, status: "resolution_failed" });
+        continue;
+      }
+      if (options.roleId !== null && resolution.roleId !== options.roleId) {
         continue;
       }
       if (resolution.status === "paused") {
@@ -361,6 +388,7 @@ export class ProactiveWorkLoop {
 
     return {
       trigger: options.trigger,
+      roleId: options.roleId,
       intake,
       scanned: items.length,
       claimAttempts,
@@ -398,7 +426,12 @@ export class ProactiveWorkLoop {
     }
     const workerId = boundedString(candidate.workerId, "workerId");
     if (!candidate.enabled || candidate.paused) {
-      return { status: "paused", orchestrator: false, workerId };
+      return {
+        status: "paused",
+        orchestrator: false,
+        roleId: candidate.roleId,
+        workerId,
+      };
     }
     return {
       status: "active",

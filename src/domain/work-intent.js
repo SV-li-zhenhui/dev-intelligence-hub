@@ -249,7 +249,7 @@ function normalizeIntentVariant(value) {
       return {
         ...common(value, keys),
         verdict,
-        body: text(entries.get("body"), "body", 32 * 1024),
+        body: text(entries.get("body"), "body", 16 * 1024),
         evidence: normalizeEvidence(entries.get("evidence")),
       };
     }

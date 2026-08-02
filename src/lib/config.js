@@ -50,6 +50,43 @@ function mergeWorkCoordinationConfig(base = {}, local = {}) {
   };
 }
 
+function mergeNamedConfigs(base = {}, local = {}, mergeValue) {
+  const merged = {};
+  for (const key of new Set([...Object.keys(base), ...Object.keys(local)])) {
+    merged[key] = mergeValue(base[key] || {}, local[key] || {});
+  }
+  return merged;
+}
+
+function mergeRoleConfig(base = {}, local = {}) {
+  const baseBrain = base.brain || {};
+  const localBrain = local.brain || {};
+  return {
+    ...base,
+    ...local,
+    ...(base.permissions !== undefined || local.permissions !== undefined
+      ? { permissions: { ...(base.permissions || {}), ...(local.permissions || {}) } }
+      : {}),
+    ...(base.brain !== undefined || local.brain !== undefined
+      ? {
+          brain: {
+            ...baseBrain,
+            ...localBrain,
+            ...(baseBrain.remoteData !== undefined ||
+            localBrain.remoteData !== undefined
+              ? {
+                  remoteData: {
+                    ...(baseBrain.remoteData || {}),
+                    ...(localBrain.remoteData || {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 export function mergeConfig(base, local = {}) {
   const basePrReviewer = base.employees?.prReviewer || {};
   const localPrReviewer = local.employees?.prReviewer || {};
@@ -60,6 +97,18 @@ export function mergeConfig(base, local = {}) {
     ...local,
     dingtalk: { ...base.dingtalk, ...local.dingtalk },
     brain: { ...base.brain, ...local.brain },
+    ...(base.brainProviders !== undefined || local.brainProviders !== undefined
+      ? {
+          brainProviders: mergeNamedConfigs(
+            base.brainProviders,
+            local.brainProviders,
+            (baseProvider, localProvider) => ({
+              ...baseProvider,
+              ...localProvider,
+            }),
+          ),
+        }
+      : {}),
     ...(base.githubActions !== undefined || local.githubActions !== undefined
       ? {
           githubActions: {
@@ -92,6 +141,16 @@ export function mergeConfig(base, local = {}) {
           ...(localPrReviewer.brain || {}),
         },
       },
+      ...(base.employees?.roles !== undefined ||
+      local.employees?.roles !== undefined
+        ? {
+            roles: mergeNamedConfigs(
+              base.employees?.roles,
+              local.employees?.roles,
+              mergeRoleConfig,
+            ),
+          }
+        : {}),
     },
     ...(hasCodeExecutor
       ? {

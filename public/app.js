@@ -13,6 +13,12 @@ const confirmationContent = document.querySelector("#confirmation-content");
 const pageTitle = document.querySelector("#page-title");
 
 let dashboard = null;
+let employeeRoles = [];
+let employeeRolesLoaded = false;
+let employeeRolesError = "";
+let employeeRolesRequestSequence = 0;
+let lastAppliedEmployeeRolesRequest = 0;
+let employeeRolesAbortController = null;
 let currentView = "overview";
 let itemIndex = new Map();
 let jobIndex = new Map();
@@ -330,6 +336,55 @@ function employeePanel({ expanded = false } = {}) {
     </section>`;
 }
 
+function roleBrainLabel(role) {
+  const brain = role?.brain;
+  if (!brain?.provider) return "未配置大脑";
+  const location = brain.remote === true ? "第三方" : "本地";
+  return `${brain.provider} / ${brain.model || "默认模型"} · ${location}`;
+}
+
+function employeeRoleCard(role) {
+  const lastRun = role.lastRun;
+  const permissions = role.permissions?.allowedIntents || [];
+  return `<article class="employee-role-card">
+    <div class="employee-role-card-heading">
+      <div><p class="eyebrow">${escapeHtml(role.id)}</p><h3>${escapeHtml(role.name)}</h3></div>
+      <span class="status-pill status-${escapeHtml(role.state)}">${escapeHtml(employeeStateLabel(role.state))}</span>
+    </div>
+    <p>${escapeHtml(role.mission || "尚未配置岗位使命")}</p>
+    <dl class="employee-role-meta">
+      <div><dt>大脑</dt><dd>${escapeHtml(roleBrainLabel(role))}</dd></div>
+      <div><dt>最近行动</dt><dd>${lastRun?.at ? `${relativeTime(lastRun.at)} · ${escapeHtml(lastRun.trigger || "主动循环")}` : "尚未运行"}</dd></div>
+      <div><dt>权限</dt><dd>${escapeHtml(permissions.length ? permissions.join(" · ") : "岗位专用能力")}</dd></div>
+    </dl>
+    ${role.lastError || role.lastErrorCode ? `<p class="employee-error">${escapeHtml(role.lastError || role.lastErrorCode)}</p>` : ""}
+    <div class="employee-actions">
+      <button class="refresh-button" data-role-run="${escapeHtml(role.id)}" ${role.paused || !role.enabled ? "disabled" : ""}>立即运行</button>
+      <button class="secondary-button" data-role-control="${role.paused ? "resume" : "pause"}" data-role-id="${escapeHtml(role.id)}" data-role-revision="${escapeHtml(role.revision)}" ${!role.enabled ? "disabled" : ""}>${role.paused ? "恢复岗位" : "暂停岗位"}</button>
+    </div>
+  </article>`;
+}
+
+function employeesView() {
+  if (!employeeRolesLoaded) {
+    return '<section class="section"><div class="empty">正在读取岗位编制…</div></section>';
+  }
+  const loadError = employeeRolesError
+    ? `<p class="employee-error">${escapeHtml(employeeRolesError)}。系统会自动重试，其他指挥功能不受影响。</p>`
+    : "";
+  const roster = employeeRoles.length
+    ? `<div class="employee-roster">${employeeRoles.map(employeeRoleCard).join("")}</div>`
+    : employeeRolesError
+      ? '<div class="empty">暂时无法显示岗位编制。</div>'
+      : '<div class="empty">尚未配置数字员工。</div>';
+  return `<section class="section">
+      <div class="section-heading"><h2>岗位编制</h2><span>${employeeRoles.length} ROLES · 每个岗位可独立配置大脑与权限</span></div>
+      ${loadError}
+      ${roster}
+    </section>
+    ${employeePanel({ expanded: true })}`;
+}
+
 function memoryRows() {
   if (!memoryLoaded) return '<div class="empty">正在读取本地记忆…</div>';
   if (!memoryResults.length) {
@@ -449,7 +504,7 @@ function render() {
     versions: versionsView,
     signals: () =>
       section("钉钉行动信号", dashboard.groups.dingtalk, "当前没有 @我、待办或未读会话。"),
-    employees: () => employeePanel({ expanded: true }),
+    employees: employeesView,
     memory: memoryView,
     workflow: () => workflowView.render(),
     work: () => workView.render(),
@@ -471,6 +526,12 @@ function render() {
     "click",
     handleEmployeeRun,
   );
+  content.querySelectorAll("[data-role-control]").forEach((button) => {
+    button.addEventListener("click", handleRoleControl);
+  });
+  content.querySelectorAll("[data-role-run]").forEach((button) => {
+    button.addEventListener("click", handleRoleRun);
+  });
   content.querySelector("#memory-search-form")?.addEventListener(
     "submit",
     handleMemorySearch,
@@ -607,6 +668,7 @@ async function handleEmployeeControl(event) {
     });
     if (!response.ok) throw new Error(`员工控制失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
+    void loadEmployeeRoles();
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -626,6 +688,7 @@ async function handleEmployeeRun(event) {
     });
     if (!response.ok) throw new Error(`主动巡查失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
+    void loadEmployeeRoles();
     await refreshConfirmationQueue({ showConfirmation: false });
     queueMicrotask(showNextConfirmation);
   } catch (error) {
@@ -633,6 +696,99 @@ async function handleEmployeeRun(event) {
     statusBanner.textContent = error.message;
     button.disabled = false;
     button.textContent = "立即巡查";
+  }
+}
+
+async function loadEmployeeRoles() {
+  const sequence = ++employeeRolesRequestSequence;
+  employeeRolesAbortController?.abort();
+  const controller = new AbortController();
+  employeeRolesAbortController = controller;
+  try {
+    const response = await fetch("/api/employees", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`读取岗位失败（${response.status}）`);
+    const payload = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== employeeRolesRequestSequence ||
+      sequence < lastAppliedEmployeeRolesRequest
+    ) {
+      return false;
+    }
+    lastAppliedEmployeeRolesRequest = sequence;
+    employeeRoles = Array.isArray(payload.items) ? payload.items : [];
+    employeeRolesLoaded = true;
+    employeeRolesError = "";
+    if (dashboard && currentView === "employees") render();
+    return true;
+  } catch (error) {
+    if (
+      controller.signal.aborted ||
+      error?.name === "AbortError" ||
+      sequence !== employeeRolesRequestSequence
+    ) {
+      return false;
+    }
+    employeeRolesLoaded = true;
+    employeeRolesError = error.message || "读取岗位失败";
+    if (dashboard && currentView === "employees") render();
+    return false;
+  } finally {
+    if (employeeRolesAbortController === controller) {
+      employeeRolesAbortController = null;
+    }
+  }
+}
+
+async function handleRoleControl(event) {
+  const button = event.currentTarget;
+  const roleId = button.dataset.roleId;
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/employees/${encodeURIComponent(roleId)}/control`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-mydashboard-action": "1",
+      },
+      body: JSON.stringify({
+        command: button.dataset.roleControl,
+        expectedRevision: Number(button.dataset.roleRevision),
+      }),
+    });
+    if (!response.ok) throw new Error(`岗位控制失败（${response.status}）`);
+    applyDashboard(await response.json(), ++requestSequence);
+    void loadEmployeeRoles();
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    button.disabled = false;
+  }
+}
+
+async function handleRoleRun(event) {
+  const button = event.currentTarget;
+  const roleId = button.dataset.roleRun;
+  button.disabled = true;
+  button.textContent = "运行中…";
+  try {
+    const response = await fetch(`/api/employees/${encodeURIComponent(roleId)}/run`, {
+      method: "POST",
+      headers: { "x-mydashboard-action": "1" },
+    });
+    if (!response.ok) throw new Error(`岗位运行失败（${response.status}）`);
+    applyDashboard(await response.json(), ++requestSequence);
+    void loadEmployeeRoles();
+    await refreshConfirmationQueue({ showConfirmation: false });
+    queueMicrotask(showNextConfirmation);
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    button.disabled = false;
+    button.textContent = "立即运行";
   }
 }
 
@@ -1263,6 +1419,7 @@ async function refreshAfterDeferral() {
 async function load({ showConfirmation = true } = {}) {
   const sequence = ++requestSequence;
   const confirmationSequence = ++confirmationRequestSequence;
+  void loadEmployeeRoles();
   try {
     const [nextDashboard, nextConfirmationQueue] = await Promise.all([
       fetchDashboard(),
@@ -1294,6 +1451,7 @@ async function refresh() {
     });
     if (!response.ok) throw new Error(`刷新失败（${response.status}）`);
     applyDashboard(await response.json(), sequence);
+    void loadEmployeeRoles();
     await refreshConfirmationQueue({ showConfirmation: false });
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
