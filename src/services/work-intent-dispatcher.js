@@ -1,3 +1,5 @@
+import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
+
 const MAX_DISPATCH_BATCH = 100;
 const QUERY_PAGE_SIZE = 100;
 const MAX_QUERY_PAGES = 100;
@@ -35,6 +37,25 @@ const ATTENTION_BLOCK_CODES = new Set([
 const ATTENTION_RETRY_CODES = new Set([
   "ATTENTION_CAPACITY_EXCEEDED",
   "ATTENTION_INBOX_NOT_READY",
+]);
+const PROPOSAL_BLOCK_CODES = new Set([
+  "INVALID_WORK_PROPOSAL",
+  "WORK_PROPOSAL_ID_CONFLICT",
+]);
+const PROPOSAL_RETRY_CODES = new Set([
+  "WORK_PROPOSAL_CAPACITY_EXCEEDED",
+  "WORK_PROPOSAL_STORE_NOT_READY",
+]);
+const PROPOSAL_STATUSES = new Set([
+  "pending_delivery",
+  "waiting_confirmation",
+  "running",
+  "waiting_retry",
+  "succeeded",
+  "rejected",
+  "stale",
+  "failed",
+  "unknown",
 ]);
 
 export class WorkIntentDispatcherError extends Error {
@@ -370,10 +391,63 @@ function validateBoundIntent(bound, item, intent, requester) {
   }
   return {
     intentId: entries.get("intentId"),
+    policyVersion: entries.get("policyVersion"),
     kind: entries.get("kind"),
+    requestedBy: {
+      roleId: requestedBy.get("roleId"),
+      workItemId: requestedBy.get("workItemId"),
+    },
+    source: {
+      assignmentId: source.get("assignmentId"),
+      eventId: source.get("eventId"),
+    },
     binding: entries.get("binding"),
     payload: entries.get("payload"),
     roleId: requester.roleId,
+  };
+}
+
+function proposalInput(bound) {
+  const input = {
+    proposalId: bound.intentId,
+    policyVersion: bound.policyVersion,
+    kind: bound.kind,
+    requestedBy: bound.requestedBy,
+    source: bound.source,
+    binding: bound.binding,
+    payload: bound.payload,
+  };
+  return { input, normalized: normalizeBoundWorkProposal(input) };
+}
+
+function proposalReceipt(value, proposal) {
+  const entries = exactDataMap(value, [
+    "proposalId",
+    "contentDigest",
+    "kind",
+    "status",
+    "revision",
+    "createdAt",
+  ]);
+  if (
+    !entries ||
+    entries.get("proposalId") !== proposal.proposalId ||
+    entries.get("contentDigest") !== proposal.contentDigest ||
+    entries.get("kind") !== proposal.kind ||
+    !PROPOSAL_STATUSES.has(entries.get("status")) ||
+    !Number.isSafeInteger(entries.get("revision")) ||
+    entries.get("revision") < 1
+  ) {
+    throw dispatcherError(
+      "WORK_INTENT_DOWNSTREAM_RESULT_UNCERTAIN",
+      "工作提案存储返回了不可确认的绑定",
+      503,
+    );
+  }
+  normalizedTimestamp(entries.get("createdAt"));
+  return {
+    proposalId: entries.get("proposalId"),
+    contentDigest: entries.get("contentDigest"),
   };
 }
 
@@ -435,6 +509,7 @@ export class WorkIntentDispatcher {
   #ledger;
   #bind;
   #createAttention;
+  #createProposal;
   #clock;
   #dispatcherId;
   #leaseDurationMs;
@@ -444,6 +519,7 @@ export class WorkIntentDispatcher {
     ledger,
     policy,
     attentionProducer,
+    proposalProducer,
     clock = () => new Date(),
     dispatcherId = "work-intent-dispatcher",
     leaseDurationMs = DEFAULT_LEASE_MS,
@@ -459,6 +535,11 @@ export class WorkIntentDispatcher {
       attentionProducer,
       ["create"],
       "attentionProducer",
+    ).create;
+    this.#createProposal = validateDependency(
+      proposalProducer,
+      ["create"],
+      "proposalProducer",
     ).create;
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.#clock = clock;
@@ -681,6 +762,12 @@ export class WorkIntentDispatcher {
     if (bound.kind === "attention_request") {
       return this.#dispatchAttention(claimed, item, bound);
     }
+    if (
+      bound.kind === "github_review_proposal" ||
+      bound.kind === "code_action_proposal"
+    ) {
+      return this.#dispatchProposal(claimed, item, bound);
+    }
     return this.#ackBoundIntent(claimed, item, bound);
   }
 
@@ -733,6 +820,55 @@ export class WorkIntentDispatcher {
     });
   }
 
+  async #dispatchProposal(claimed, item, bound) {
+    let proposal;
+    try {
+      proposal = proposalInput(bound);
+    } catch {
+      return this.#ackFailure(claimed, item, {
+        nextStatus: "blocked",
+        code: "proposal-binding-invalid",
+      });
+    }
+    let receipt;
+    try {
+      receipt = proposalReceipt(
+        await this.#createProposal(proposal.input),
+        proposal.normalized,
+      );
+    } catch (error) {
+      const code = ownErrorCode(error);
+      if (PROPOSAL_BLOCK_CODES.has(code)) {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "blocked",
+          code: "proposal-conflict",
+        });
+      }
+      if (PROPOSAL_RETRY_CODES.has(code)) {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "retry_wait",
+          code: "proposal-temporarily-unavailable",
+        });
+      }
+      return {
+        claimed: true,
+        counter: "uncertain",
+        result: {
+          intentId: claimed.intentId,
+          status: "uncertain",
+          code: "proposal-result-uncertain",
+        },
+      };
+    }
+    return this.#ackDelivered(claimed, item, {
+      nextStatus: "waiting_external",
+      details: {
+        downstreamRef: receipt.proposalId,
+        proposalDigest: receipt.contentDigest,
+      },
+    });
+  }
+
   #ackBoundIntent(claimed, item, bound) {
     if (bound.kind === "wait_condition") {
       return this.#ackDelivered(claimed, item, {
@@ -763,15 +899,6 @@ export class WorkIntentDispatcher {
       return this.#ackDelivered(claimed, item, {
         nextStatus: "queued",
         target,
-        details: { downstreamRef: bound.intentId },
-      });
-    }
-    if (
-      bound.kind === "github_review_proposal" ||
-      bound.kind === "code_action_proposal"
-    ) {
-      return this.#ackDelivered(claimed, item, {
-        nextStatus: "waiting_external",
         details: { downstreamRef: bound.intentId },
       });
     }

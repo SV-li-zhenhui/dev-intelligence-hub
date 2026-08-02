@@ -18,6 +18,7 @@ const RUNTIME_METHODS = Object.freeze([
   "claimIntent",
   "ackIntent",
   "applyAttentionBatch",
+  "applyProposalBatch",
   "wakeCondition",
 ]);
 

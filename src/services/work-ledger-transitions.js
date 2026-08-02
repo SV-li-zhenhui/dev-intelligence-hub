@@ -61,6 +61,7 @@ export function normalizeWorkDetails(value = {}) {
     "evidenceRefs",
     "note",
     "outcome",
+    "proposalDigest",
     "questionRef",
     "resultRef",
   ]);

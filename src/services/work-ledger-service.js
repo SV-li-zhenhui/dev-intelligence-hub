@@ -7,6 +7,7 @@ import {
   planWorkItemTransition,
 } from "./work-ledger-item-commands.js";
 import { planAttentionBatchApplication } from "./work-ledger-attention-commands.js";
+import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
 import {
   planIntentAcknowledgement,
@@ -184,6 +185,8 @@ export class WorkLedgerService {
       sourceHighWatermark: this.state.sourceHighWatermark,
       attentionCursor: this.state.attentionCursor,
       attentionHighWatermark: this.state.attentionHighWatermark,
+      proposalCursor: this.state.proposalCursor,
+      proposalHighWatermark: this.state.proposalHighWatermark,
       timelineStartSequence: this.state.timelineStartSequence,
       nextTimelineSequence: this.state.nextTimelineSequence,
       itemCounts,
@@ -293,6 +296,10 @@ export class WorkLedgerService {
 
   async applyAttentionBatch(input = {}) {
     return this.#executeCommand(planAttentionBatchApplication, input);
+  }
+
+  async applyProposalBatch(input = {}) {
+    return this.#executeCommand(planProposalBatchApplication, input);
   }
 
   async wakeCondition(input = {}) {

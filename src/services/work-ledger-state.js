@@ -18,7 +18,7 @@ import {
 } from "./work-ledger-values.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 1;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 2;
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
@@ -43,6 +43,7 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "intent_acknowledged",
   "attention_answer_applied",
   "attention_rejection_applied",
+  "proposal_result_applied",
   "condition_satisfied",
 ]);
 
@@ -163,6 +164,8 @@ export function emptyWorkLedgerState() {
     sourceHighWatermark: 0,
     attentionCursor: 0,
     attentionHighWatermark: 0,
+    proposalCursor: 0,
+    proposalHighWatermark: 0,
     timelineStartSequence: 1,
     nextTimelineSequence: 1,
     items: [],
@@ -171,11 +174,19 @@ export function emptyWorkLedgerState() {
   };
 }
 
-const DECISION_CONTEXT_SOURCES = new Set(["attention", "condition"]);
+const DECISION_CONTEXT_SOURCES = new Set([
+  "attention",
+  "condition",
+  "proposal",
+]);
 const DECISION_CONTEXT_OUTCOMES = new Set([
   "answered",
   "rejected",
   "satisfied",
+  "succeeded",
+  "stale",
+  "failed",
+  "unknown",
 ]);
 
 export function createWorkDecisionContext({
@@ -194,7 +205,15 @@ export function createWorkDecisionContext({
   if (
     !DECISION_CONTEXT_OUTCOMES.has(outcome) ||
     (source === "attention" && !new Set(["answered", "rejected"]).has(outcome)) ||
-    (source === "condition" && outcome !== "satisfied")
+    (source === "condition" && outcome !== "satisfied") ||
+    (source === "proposal" &&
+      !new Set([
+        "succeeded",
+        "rejected",
+        "stale",
+        "failed",
+        "unknown",
+      ]).has(outcome))
   ) {
     throw workLedgerError(
       "WORK_LEDGER_DECISION_CONTEXT_INVALID",
@@ -544,6 +563,29 @@ export function assertWorkLedgerCapacity(state, limits) {
 export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   const limits = normalizeWorkLedgerLimits(limitsInput);
   if (
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+    ]) &&
+    value.schemaVersion === 1
+  ) {
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      proposalCursor: 0,
+      proposalHighWatermark: 0,
+    };
+  }
+  if (
     !hasExactLedgerKeys(value, [
       "schemaVersion",
       "revision",
@@ -551,6 +593,8 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       "sourceHighWatermark",
       "attentionCursor",
       "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
       "timelineStartSequence",
       "nextTimelineSequence",
       "items",
@@ -568,6 +612,10 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     value.attentionCursor < 0 ||
     !Number.isSafeInteger(value.attentionHighWatermark) ||
     value.attentionHighWatermark < value.attentionCursor ||
+    !Number.isSafeInteger(value.proposalCursor) ||
+    value.proposalCursor < 0 ||
+    !Number.isSafeInteger(value.proposalHighWatermark) ||
+    value.proposalHighWatermark < value.proposalCursor ||
     !Number.isSafeInteger(value.timelineStartSequence) ||
     value.timelineStartSequence < 1 ||
     !Number.isSafeInteger(value.nextTimelineSequence) ||
@@ -588,6 +636,8 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     sourceHighWatermark: value.sourceHighWatermark,
     attentionCursor: value.attentionCursor,
     attentionHighWatermark: value.attentionHighWatermark,
+    proposalCursor: value.proposalCursor,
+    proposalHighWatermark: value.proposalHighWatermark,
     timelineStartSequence: value.timelineStartSequence,
     nextTimelineSequence: value.nextTimelineSequence,
     items: value.items.map((item) => normalizeItem(item, value.revision, limits)),

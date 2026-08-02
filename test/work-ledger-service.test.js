@@ -5,6 +5,10 @@ import {
   createAttentionItem,
   resolveAttentionItem,
 } from "../src/services/attention-inbox-state.js";
+import {
+  createWorkProposalResult,
+  normalizeBoundWorkProposal,
+} from "../src/domain/work-proposal-contract.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 
 const STATE_KEY = "work-ledger-state";
@@ -1732,6 +1736,167 @@ test("a rejected attention result blocks work while a gap advances nothing", asy
   const item = (await fixture.service.listItems()).items[0];
   assert.equal(item.status, "blocked");
   assert.equal(item.decisionContext.outcome, "rejected");
+});
+
+async function prepareProposalResult(
+  fixture,
+  { outcome = "succeeded", sequence = 1 } = {},
+) {
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-reviewer",
+    roleId: "pr-reviewer",
+    intent: reviewIntent(),
+  });
+  const proposal = normalizeBoundWorkProposal({
+    proposalId: staged.outbox.intentId,
+    policyVersion: 1,
+    kind: "github_review_proposal",
+    requestedBy: {
+      roleId: "pr-reviewer",
+      workItemId: staged.item.itemId,
+    },
+    source: {
+      assignmentId: staged.item.assignmentId,
+      eventId: staged.item.event.eventId,
+    },
+    binding: { repository: "acme/repo", pullRequestNumber: 1 },
+    payload: { verdict: "approve", body: "本地审查通过。" },
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  await fixture.service.ackIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision,
+    outcome: "delivered",
+    nextStatus: "waiting_external",
+    actorId: "work-intent-dispatcher",
+    details: {
+      downstreamRef: proposal.proposalId,
+      proposalDigest: proposal.contentDigest,
+    },
+  });
+  return createWorkProposalResult({
+    proposal,
+    sequence,
+    transition: {
+      status: outcome,
+      summary: `提案结果：${outcome}`,
+      evidence: ["proposal-audit-1"],
+    },
+    downstreamRef: "confirmation-1",
+    at: fixture.time.clock(),
+  });
+}
+
+test("a succeeded proposal result atomically completes its bound work and cursor", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture);
+  const batch = {
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  };
+
+  const applied = await fixture.service.applyProposalBatch(batch);
+  const item = (await fixture.service.listItems()).items[0];
+  const summary = await fixture.service.getSummary();
+
+  assert.equal(applied.applied, 1);
+  assert.equal(item.status, "completed");
+  assert.equal(item.activeIntentId, null);
+  assert.equal(item.statusReason, "proposal_succeeded");
+  assert.equal(item.decisionContext.source, "proposal");
+  assert.equal(item.decisionContext.outcome, "succeeded");
+  assert.equal(item.decisionContext.value.resultId, result.resultId);
+  assert.equal(summary.proposalCursor, 1);
+  assert.equal(summary.proposalHighWatermark, 1);
+  assert.equal(
+    (await fixture.service.listTimeline({ order: "newest" })).items[0].type,
+    "proposal_result_applied",
+  );
+
+  const writesBeforeReplay = fixture.store.writes.length;
+  const replayed = await fixture.service.applyProposalBatch(batch);
+  assert.equal(replayed.applied, 0);
+  assert.equal(replayed.deduplicated, 1);
+  assert.equal(fixture.store.writes.length, writesBeforeReplay);
+});
+
+test("a failed proposal blocks work while gaps and binding changes fail closed", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture, { outcome: "unknown" });
+
+  await assert.rejects(
+    fixture.service.applyProposalBatch({
+      items: [],
+      nextSequence: 0,
+      highWatermark: 1,
+      oldestAvailableSequence: 2,
+    }),
+    (error) => error.code === "WORK_LEDGER_PROPOSAL_GAP",
+  );
+  assert.equal((await fixture.service.getSummary()).proposalCursor, 0);
+
+  await assert.rejects(
+    fixture.service.applyProposalBatch({
+      items: [{ ...result, proposalContentDigest: "0".repeat(64) }],
+      nextSequence: 1,
+      highWatermark: 1,
+      oldestAvailableSequence: 1,
+    }),
+    (error) => error.code === "WORK_LEDGER_PROPOSAL_BATCH_INVALID",
+  );
+
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.status, "blocked");
+  assert.equal(item.statusReason, "proposal_unknown");
+});
+
+test("work ledger recovers schema v1 state with an empty proposal checkpoint", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 1;
+  delete legacy.proposalCursor;
+  delete legacy.proposalHighWatermark;
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  const summary = await recovered.recover();
+
+  assert.equal(summary.proposalCursor, 0);
+  assert.equal(summary.proposalHighWatermark, 0);
+  assert.equal(summary.intakeCursor, 1);
 });
 
 async function prepareWaitingCondition(fixture, condition) {

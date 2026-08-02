@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
@@ -310,6 +311,41 @@ class FakeAttentionProducer {
   }
 }
 
+class FakeProposalProducer {
+  constructor() {
+    this.calls = [];
+    this.records = new Map();
+    this.error = null;
+    this.failAfterCreateOnce = false;
+  }
+
+  async create(value) {
+    const proposal = normalizeBoundWorkProposal(value);
+    this.calls.push(clone(proposal));
+    if (this.error) throw this.error;
+    const existing = this.records.get(proposal.proposalId);
+    if (existing && existing.contentDigest !== proposal.contentDigest) {
+      throw Object.assign(new Error("different proposal"), {
+        code: "WORK_PROPOSAL_ID_CONFLICT",
+      });
+    }
+    const receipt = existing ?? {
+      proposalId: proposal.proposalId,
+      contentDigest: proposal.contentDigest,
+      kind: proposal.kind,
+      status: "pending_delivery",
+      revision: 1,
+      createdAt: "2026-08-02T04:00:00.000Z",
+    };
+    this.records.set(proposal.proposalId, receipt);
+    if (this.failAfterCreateOnce) {
+      this.failAfterCreateOnce = false;
+      throw new Error("proposal response lost");
+    }
+    return clone(receipt);
+  }
+}
+
 function policy(overrides = {}) {
   return createWorkIntentPolicy({
     version: 4,
@@ -331,15 +367,17 @@ function fixture(pairs, options = {}) {
   const time = options.time ?? controlledClock();
   const ledger = options.ledger ?? new FakeLedger(pairs, time);
   const attention = options.attention ?? new FakeAttentionProducer();
+  const proposals = options.proposals ?? new FakeProposalProducer();
   const dispatcher = new WorkIntentDispatcher({
     ledger,
     policy: options.policy ?? policy(),
     attentionProducer: attention,
+    proposalProducer: proposals,
     clock: time.clock,
     leaseDurationMs: options.leaseDurationMs ?? 1_000,
     retryDelayMs: options.retryDelayMs ?? 60_000,
   });
-  return { dispatcher, ledger, attention, time };
+  return { dispatcher, ledger, attention, proposals, time };
 }
 
 test("ask_user is content-addressed in the internal inbox before waiting_user acknowledgement", async () => {
@@ -387,7 +425,7 @@ test("ask_user is content-addressed in the internal inbox before waiting_user ac
 
 const WORK_INTENT_REF = /^work-intent-[a-f0-9]{64}$/;
 
-test("internal waits, completion, and non-executing proposals map to explicit ledger states", async (t) => {
+test("internal outcomes and durable proposals map to explicit ledger states", async (t) => {
   const cases = [
     { name: "wait", intent: waitIntent(), role: "pr-reviewer", next: "waiting_condition" },
     { name: "complete", intent: completeIntent(), role: "pr-reviewer", next: "completed" },
@@ -399,13 +437,22 @@ test("internal waits, completion, and non-executing proposals map to explicit le
       const pair = workPair(index + 2, entry.intent, {
         target: { type: "role", id: entry.role },
       });
-      const { dispatcher, ledger, attention } = fixture([pair]);
+      const { dispatcher, ledger, attention, proposals } = fixture([pair]);
       const result = await dispatcher.dispatchPending();
 
       assert.equal(result.delivered, 1);
       assert.equal(ledger.items[0].status, entry.next);
       assert.match(ledger.ackCalls[0].details.downstreamRef ?? ledger.ackCalls[0].details.resultRef, WORK_INTENT_REF);
       assert.equal(attention.calls.length, 0);
+      if (["github", "code"].includes(entry.name)) {
+        assert.equal(proposals.calls.length, 1);
+        assert.equal(
+          ledger.ackCalls[0].details.proposalDigest,
+          proposals.calls[0].contentDigest,
+        );
+      } else {
+        assert.equal(proposals.calls.length, 0);
+      }
       assert.equal(Object.hasOwn(ledger.ackCalls[0], "command"), false);
       assert.equal(Object.hasOwn(ledger.ackCalls[0], "accountId"), false);
     });
@@ -476,6 +523,28 @@ test("unknown attention side effects stay dispatching until idempotent lease rec
   assert.equal(recovered.delivered, 1);
   assert.equal(attention.records.size, 1);
   assert.equal(ledger.ackCalls.length, 1);
+});
+
+test("an idempotent proposal survives a lost response and is acknowledged after lease recovery", async () => {
+  const pair = workPair(10, codeIntent(), {
+    target: { type: "role", id: "developer" },
+  });
+  const proposals = new FakeProposalProducer();
+  proposals.failAfterCreateOnce = true;
+  const { dispatcher, ledger, time } = fixture([pair], { proposals });
+
+  const uncertain = await dispatcher.dispatchPending();
+  assert.equal(uncertain.uncertain, 1);
+  assert.equal(ledger.outbox[0].status, "dispatching");
+  assert.equal(proposals.records.size, 1);
+
+  time.advance(1_000);
+  const recovered = await dispatcher.dispatchPending();
+  assert.equal(recovered.delivered, 1);
+  assert.equal(proposals.calls.length, 2);
+  assert.equal(proposals.records.size, 1);
+  assert.equal(ledger.items[0].status, "waiting_external");
+  assert.match(ledger.ackCalls[0].details.proposalDigest, /^[a-f0-9]{64}$/);
 });
 
 test("policy rejection blocks safely and attention conflicts split blocked from retry_wait", async (t) => {
@@ -564,6 +633,20 @@ test("constructor and dispatch options reject incomplete ports and unsafe batch 
   assert.throws(
     () => new WorkIntentDispatcher({ ledger: {}, policy: {}, attentionProducer: {} }),
     /ledger must provide/,
+  );
+  assert.throws(
+    () =>
+      new WorkIntentDispatcher({
+        ledger: {
+          listOutbox() {},
+          listItems() {},
+          claimIntent() {},
+          ackIntent() {},
+        },
+        policy: { bind() {} },
+        attentionProducer: { create() {} },
+      }),
+    /proposalProducer/,
   );
   const pair = workPair(1, waitIntent());
   const { dispatcher } = fixture([pair]);
