@@ -223,6 +223,10 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal("approval" in found, false);
   assert.equal("requestId" in found, false);
   assert.equal(JSON.stringify(found).includes("configDigest"), false);
+  const detail = await runtime.reader.getDetail({ jobId: first.receipt.id });
+  assert.equal(detail.job.jobId, first.receipt.id);
+  assert.equal(detail.archived, false);
+  assert.equal(detail.historyAvailable, true);
 
   await runtime.close();
 });

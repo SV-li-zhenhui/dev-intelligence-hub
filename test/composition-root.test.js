@@ -854,7 +854,9 @@ test("enabled unified memory exposes search only and projects the existing work 
       calls.codeJobRuntime = options;
       return {
         confirmationExecutor: null,
-        reader: { async get() {}, async list() {}, async listNewest() {} },
+        reader: {
+          async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
+        },
         control: codeJobControlPort(),
         worker: null,
         projectionSource: codeJobProjectionSourcePort(),
@@ -1434,7 +1436,9 @@ test("local code and change package composition injects only frozen delivery por
       calls.codeJobRuntime = options;
       return {
         confirmationExecutor: { async execute() {}, async reconcile() {} },
-        reader: { async get() {}, async list() {}, async listNewest() {} },
+        reader: {
+          async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
+        },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
         projectionSource: codeJobProjectionSourcePort(),
@@ -1538,6 +1542,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   const localExecutor = { async execute() {}, async reconcile() {} };
   const codeJobReader = {
     async get(id) { return { id }; },
+    async getDetail(value) { return { detail: value }; },
     async list(value) { return { value }; },
     async listNewest(value) { return { newest: value }; },
   };
@@ -1698,6 +1703,7 @@ test("local code composition binds authority, both proposal runners, and one saf
   assert.equal(Object.isFrozen(calls.codeRunner.codeJobReader), true);
   assert.deepEqual(Object.keys(calls.codeRunner.codeJobReader).sort(), [
     "get",
+    "getDetail",
     "list",
     "listNewest",
   ]);
@@ -1740,10 +1746,15 @@ test("local code composition binds authority, both proposal runners, and one saf
   ]);
   assert.deepEqual(Object.keys(application.codeJobReader).sort(), [
     "get",
+    "getDetail",
     "list",
     "listNewest",
   ]);
   assert.deepEqual(await application.codeJobReader.get("job-1"), { id: "job-1" });
+  assert.deepEqual(
+    await application.codeJobReader.getDetail({ jobId: "job-1" }),
+    { detail: { jobId: "job-1" } },
+  );
   for (const privateName of [
     "codeJobRuntime",
     "codeJobStore",
@@ -1796,7 +1807,7 @@ test("local-only code actions create confirmation while maintenance keeps projec
       return {
         confirmationExecutor: { async execute() {}, async reconcile() {} },
         reader: {
-          async get() {}, async list() {}, async listNewest() {},
+          async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
         },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
@@ -1893,7 +1904,9 @@ test("local composition constructs the real grant, handler, and runner group cha
     }),
     codeJobRuntimeFactory: async () => ({
       confirmationExecutor: { async execute() {}, async reconcile() {} },
-      reader: { async get() {}, async list() {}, async listNewest() {} },
+      reader: {
+        async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
+      },
       control: codeJobControlPort(),
       worker: codeJobWorkerPort(),
       projectionSource: codeJobProjectionSourcePort(),
@@ -1936,7 +1949,9 @@ test("confirmation startup failure closes the already acquired local code runtim
       }),
       codeJobRuntimeFactory: async () => ({
         confirmationExecutor: { async execute() {}, async reconcile() {} },
-        reader: { async get() {}, async list() {}, async listNewest() {} },
+        reader: {
+          async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
+        },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
         projectionSource: codeJobProjectionSourcePort(),

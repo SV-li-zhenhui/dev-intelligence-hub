@@ -8,6 +8,7 @@ const sourceHealth = document.querySelector("#source-health");
 const statusBanner = document.querySelector("#status-banner");
 const dialog = document.querySelector("#detail-dialog");
 const dialogContent = document.querySelector("#dialog-content");
+const detailCloseButton = dialog.querySelector(".dialog-close");
 const confirmationDialog = document.querySelector("#confirmation-dialog");
 const confirmationContent = document.querySelector("#confirmation-content");
 const pageTitle = document.querySelector("#page-title");
@@ -51,6 +52,7 @@ let confirmationQueueLoaded = false;
 let activeExternalConfirmation = null;
 let activeInternalAttention = null;
 let activeConfirmationKey = "";
+let codeJobDetailFocusIntent = null;
 const MAX_DEFERRED_CONFIRMATIONS = 32;
 const deferredConfirmations = new Set();
 
@@ -102,6 +104,28 @@ const workflowView = createWorkflowView({
 const workView = createWorkView({
   onChange() {
     if (dashboard && currentView === "work") render();
+  },
+  onDetail(markup) {
+    showCodeJobDetail(markup);
+  },
+  onDetailClose() {
+    codeJobDetailFocusIntent = null;
+    if (dialog.open) dialog.close();
+  },
+  onNotice(message) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = message;
+  },
+  async onApplyRequested() {
+    codeJobDetailFocusIntent = null;
+    if (dialog.open) dialog.close();
+    try {
+      await refreshConfirmationQueue({ showConfirmation: false });
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = `${error.message}。页面会自动重试读取确认队列。`;
+    }
+    queueMicrotask(showNextConfirmation);
   },
 });
 
@@ -584,6 +608,7 @@ function listMarkup(items) {
 
 function showEmployeeJob(job) {
   if (!job) return;
+  codeJobDetailFocusIntent = null;
   const review = job.reviewBody
     ? `<section class="review-preview">
         <strong>${escapeHtml(reviewVerdictLabel(job.reviewVerdict))}</strong>
@@ -866,6 +891,7 @@ async function handleMemoryLoadMore(event) {
 
 function showDetail(item) {
   if (!item) return;
+  codeJobDetailFocusIntent = null;
   dialogContent.innerHTML = `
     <article class="detail">
       <p class="eyebrow">${kindLabel(item)} / EVIDENCE</p>
@@ -875,6 +901,88 @@ function showDetail(item) {
       ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">在来源中打开 →</a>` : ""}
     </article>`;
   dialog.showModal();
+}
+
+function codeJobActionFocusIntent(element) {
+  if (!element?.matches || !dialogContent.contains(element)) return null;
+  if (element.matches("[data-code-job-control]")) {
+    return { type: "control", command: element.dataset.codeJobControl };
+  }
+  if (element.matches("[data-code-job-history-more]")) {
+    return { type: "history" };
+  }
+  if (element.matches("[data-code-job-package]")) {
+    return { type: "package" };
+  }
+  if (element.matches("[data-code-job-apply]")) {
+    return { type: "apply" };
+  }
+  return null;
+}
+
+function codeJobFocusSelectors(intent) {
+  if (intent?.type === "control") {
+    const sameCommand = intent.command === "resume" ? "resume" : "pause";
+    return [
+      `[data-code-job-control="${sameCommand}"]`,
+      "[data-code-job-control]",
+    ];
+  }
+  if (intent?.type === "history") return ["[data-code-job-history-more]"];
+  if (intent?.type === "package") {
+    return ["[data-code-job-package]", "[data-code-job-apply]"];
+  }
+  if (intent?.type === "apply") return ["[data-code-job-apply]"];
+  return [];
+}
+
+function restoreCodeJobDetailFocus() {
+  if (!codeJobDetailFocusIntent || !dialog.open) return;
+  const candidate = codeJobFocusSelectors(codeJobDetailFocusIntent)
+    .map((selector) => dialogContent.querySelector(selector))
+    .find((element) => element && !element.disabled && !element.closest("[hidden]"));
+  (candidate || detailCloseButton).focus({ preventScroll: true });
+}
+
+function showCodeJobDetail(markup) {
+  const activeIntent = codeJobActionFocusIntent(document.activeElement);
+  if (activeIntent) codeJobDetailFocusIntent = activeIntent;
+  dialogContent.innerHTML = markup;
+  dialogContent.querySelectorAll("[data-code-job-control]").forEach((button) => {
+    button.addEventListener("click", () => {
+      codeJobDetailFocusIntent = codeJobActionFocusIntent(button);
+      workView.controlCodeJob(button.dataset.codeJobControl);
+    });
+  });
+  dialogContent.querySelector("[data-code-job-history-more]")?.addEventListener(
+    "click",
+    (event) => {
+      codeJobDetailFocusIntent = codeJobActionFocusIntent(event.currentTarget);
+      workView.loadMoreCodeJobObservations();
+    },
+  );
+  dialogContent.querySelector("[data-code-job-package]")?.addEventListener(
+    "click",
+    (event) => {
+      codeJobDetailFocusIntent = codeJobActionFocusIntent(event.currentTarget);
+      workView.loadCodeJobChangePackage();
+    },
+  );
+  dialogContent.querySelector("[data-code-job-apply]")?.addEventListener(
+    "click",
+    (event) => {
+      codeJobDetailFocusIntent = codeJobActionFocusIntent(event.currentTarget);
+      workView.requestCodeJobChangePackageApply();
+    },
+  );
+  if (!dialog.open) dialog.showModal();
+  restoreCodeJobDetailFocus();
+}
+
+function closeDetailDialog() {
+  codeJobDetailFocusIntent = null;
+  workView.closeDetail();
+  if (dialog.open) dialog.close();
 }
 
 function confirmationKey(kind, item) {
@@ -1059,6 +1167,49 @@ function showCodeJobConfirmation(entry, remaining) {
     .addEventListener("click", handleExternalConfirmation);
 }
 
+function showChangePackageApplicationConfirmation(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
+  const payload = item.display?.payload || {};
+  const action = payload.action || {};
+  const target = payload.target || item.target || {};
+  const job = action.job || {};
+  const workspace = action.workspace || {};
+  const operation = item.retryable ? "retry" : "approve";
+  const actionLabel = item.retryable
+    ? "确认并重试应用变更包"
+    : item.display?.actionLabel || "确认并应用变更包";
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation change-package-confirmation">
+      <p class="eyebrow">LOCAL CHANGE PACKAGE / ${remaining} LEFT</p>
+      <h2>${escapeHtml(item.display?.title || "应用已验证的本地变更包")}</h2>
+      <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将把已验证的变更应用到目标 checkout")}</p>
+      <dl class="detail-grid confirmation-grid">
+        <dt>目标工作区</dt><dd>${escapeHtml(target.resourceId || workspace.id || "未知")}</dd>
+        <dt>预期 Head</dt><dd><code>${escapeHtml(target.version || action.expectedHeadOid || "未知")}</code></dd>
+        <dt>变更包 ID</dt><dd><code>${escapeHtml(action.packageId || "未知")}</code></dd>
+        <dt>变更包摘要</dt><dd><code>${escapeHtml(action.packageDigest || "未知")}</code></dd>
+        <dt>任务绑定</dt><dd>${escapeHtml(job.id || "未知")} · revision ${escapeHtml(job.revision ?? "未知")}</dd>
+        <dt>源修订</dt><dd><code>${escapeHtml(workspace.sourceRevision || "未知")}</code></dd>
+        <dt>工作区修订</dt><dd><code>${escapeHtml(workspace.workspaceRevision || "未知")}</code></dd>
+        <dt>变更集合摘要</dt><dd><code>${escapeHtml(action.changeSetDigest || "未知")}</code></dd>
+        <dt>测试证据摘要</dt><dd><code>${escapeHtml(action.testEvidenceDigest || "未知")}</code></dd>
+      </dl>
+      <p class="confirmation-reason"><strong>依据</strong></p>
+      ${listMarkup(item.display?.evidence)}
+      <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
+        <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
+        <button class="secondary" data-external-operation="reject">驳回，不应用</button>
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+      <p class="confirmation-note">确认只应用当前展示且已通过固定测试的变更包，并绑定目标工作区与预期 Head；目标状态变化后必须重新确认。</p>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
 function showUnsupportedExternalConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
   activeInternalAttention = null;
@@ -1080,6 +1231,10 @@ function showUnsupportedExternalConfirmation(entry, remaining) {
 function showExternalActionConfirmation(entry, remaining) {
   if (entry.item?.kind === "local.code-job-create") {
     showCodeJobConfirmation(entry, remaining);
+    return;
+  }
+  if (entry.item?.kind === "local.change-package-apply") {
+    showChangePackageApplicationConfirmation(entry, remaining);
     return;
   }
   if (
@@ -1583,7 +1738,7 @@ document.querySelectorAll(".nav-item").forEach((button) => {
 });
 
 refreshButton.addEventListener("click", refresh);
-document.querySelector(".dialog-close").addEventListener("click", () => dialog.close());
+document.querySelector(".dialog-close").addEventListener("click", closeDetailDialog);
 document
   .querySelector(".confirmation-close")
   .addEventListener("click", async () => {
@@ -1601,7 +1756,14 @@ document
     await refreshAfterDeferral();
   });
 dialog.addEventListener("click", (event) => {
-  if (event.target === dialog) dialog.close();
+  if (event.target === dialog) closeDetailDialog();
+});
+dialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeDetailDialog();
+});
+dialog.addEventListener("close", () => {
+  codeJobDetailFocusIntent = null;
 });
 confirmationDialog.addEventListener("cancel", (event) => {
   event.preventDefault();

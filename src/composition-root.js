@@ -415,7 +415,7 @@ export async function createApplication({
       }
       codeJobReader = frozenPort(
         codeJobRuntime.reader,
-        ["get", "list", "listNewest"],
+        ["get", "getDetail", "list", "listNewest"],
         "codeJobRuntime.reader",
       );
       codeJobControl = frozenPort(

@@ -62,6 +62,40 @@ test("code authorization uses local-only wording and an exact kind branch", asyn
   }
 });
 
+test("change package application uses an exact immutable confirmation branch", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+
+  assert.match(app, /item\?\.kind === "local\.change-package-apply"/);
+  for (const visibleLabel of [
+    "应用已验证的本地变更包",
+    "目标工作区",
+    "预期 Head",
+    "变更包摘要",
+    "变更集合摘要",
+    "测试证据摘要",
+    "确认并应用变更包",
+  ]) {
+    assert.equal(app.includes(visibleLabel), true, visibleLabel);
+  }
+  const start = app.indexOf("function showChangePackageApplicationConfirmation");
+  const end = app.indexOf("\nfunction showUnsupportedExternalConfirmation", start);
+  const renderer = app.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(renderer, /sourceRoot|writablePaths|data-external-operation="execute"/);
+});
+
+test("a package application closes detail before refreshing and showing the unified queue", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("async onApplyRequested()");
+  const end = app.indexOf("\n  },", start);
+  const callback = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.ok(callback.indexOf("dialog.close()") < callback.indexOf("refreshConfirmationQueue"));
+  assert.ok(callback.indexOf("refreshConfirmationQueue") < callback.indexOf("queueMicrotask(showNextConfirmation)"));
+  assert.doesNotMatch(callback, /confirmationDialog\.showModal/);
+});
+
 test("unknown confirmation kinds have no approve or reject control", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("function showUnsupportedExternalConfirmation");

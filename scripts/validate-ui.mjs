@@ -198,6 +198,385 @@ async function validateConfirmationQueue() {
 
 await validateConfirmationQueue();
 
+async function validateCodeJobControlAndPackage(name, viewport) {
+  const liveDashboard = await fetch(`${baseUrl}/api/dashboard`).then((response) =>
+    response.json(),
+  );
+  const fixture = structuredClone(liveDashboard);
+  fixture.groups.uncertainPullRequests = [];
+  fixture.counts.uncertainPullRequests = 0;
+  if (fixture.employee) fixture.employee.confirmationQueue = [];
+
+  const jobId = `code-job-${"c".repeat(55)}`;
+  const packageDigest = "d".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const workspaceRevision = "e".repeat(64);
+  const sourceRevision = "f".repeat(64);
+  const recordDigest = "1".repeat(64);
+  const now = "2026-08-02T05:00:00.000Z";
+  let jobStatus = "active";
+  let jobRevision = 7;
+  let applyQueued = false;
+  const requests = [];
+
+  const job = () => ({
+    jobId,
+    status: jobStatus,
+    revision: jobRevision,
+    proposalId: "proposal-ui-validation",
+    proposalContentDigest: "2".repeat(64),
+    grantDigest: "3".repeat(64),
+    requestedBy: { roleId: "developer", workItemId: "work-ui-validation" },
+    subject: { kind: "issue", id: "local/fixture#12" },
+    repository: "local/fixture",
+    workspaceId: "fixture-workspace",
+    operation: "modify",
+    objective: "修复付款失败路径并保留受控证据",
+    acceptanceCriteria: ["固定测试通过", "只修改 src/pay.js"],
+    evidence: ["Issue #12 复现失败"],
+    summary: "验证 Code Job 详情与变更包流程",
+    reason: "本地 UI 验收",
+    allowedActions: ["read_text", "write_text", "run_profile", "complete"],
+    writablePaths: ["src/pay.js"],
+    requiredProfiles: ["node-tests"],
+    turn: 1,
+    pendingActionType: null,
+    observationCount: 1,
+    latestObservation: {
+      actionType: "run_profile",
+      status: "succeeded",
+      recordedAt: now,
+    },
+    terminalResult: null,
+    memoryProjection: null,
+    pause: jobStatus === "paused" ? { reason: "UI validation", at: now } : null,
+    uncertainty: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const detail = () => ({
+    job: job(),
+    archived: false,
+    historyAvailable: true,
+    observations: [
+      {
+        turn: 1,
+        actionId: "action-ui-validation",
+        actionType: "run_profile",
+        actionDigest: "4".repeat(64),
+        status: "succeeded",
+        workspaceRevision,
+        detailDigest: "5".repeat(64),
+        detail: {
+          schemaVersion: 1,
+          executor: { actionStatus: "succeeded", actionAttemptNumber: 1 },
+          result: { exitCode: 0, durationMs: 812, timedOut: false, error: null },
+        },
+        recordedAt: now,
+      },
+    ],
+    nextCursor: null,
+    terminalDetail: null,
+    changePackage: {
+      status: "ready",
+      receipt: { packageId, packageDigest, deliveredAt: now },
+    },
+  });
+  const manifest = {
+    schemaVersion: 1,
+    job: { id: jobId, revision: jobRevision, recordDigest },
+    proposal: { id: "proposal-ui-validation", contentDigest: "2".repeat(64) },
+    grant: { digest: "3".repeat(64) },
+    workspace: { id: "fixture-workspace", sourceRevision, workspaceRevision },
+    passedProfiles: [
+      {
+        id: "node-tests",
+        imageId: "node@sha256:fixture",
+      },
+    ],
+    changes: {
+      created: [],
+      modified: [
+        {
+          path: "src/pay.js",
+          beforeSha256: "6".repeat(64),
+          blob: { sha256: "7".repeat(64), bytes: 128 },
+        },
+      ],
+      deleted: [],
+    },
+    packageId,
+    packageDigest,
+  };
+  const confirmationItem = {
+    id: "confirmation-change-package-ui-validation",
+    kind: "local.change-package-apply",
+    status: "pending",
+    queueRevision: 12,
+    itemRevision: 1,
+    requestedBy: { roleId: "developer", workItemId: "work-ui-validation" },
+    actor: {
+      provider: "local-code",
+      accountId: "change-package-application-service",
+    },
+    target: {
+      provider: "local-code",
+      resourceId: "fixture-workspace",
+      version: "8".repeat(40),
+    },
+    display: {
+      title: "应用已验证的本地变更包",
+      summary: "将 1 项文件变更应用到已选择的本地 checkout。",
+      actionLabel: "确认并应用变更包",
+      evidence: ["修改 1 个文件", "已通过 node-tests"],
+      payload: {
+        actor: {
+          provider: "local-code",
+          accountId: "change-package-application-service",
+        },
+        target: {
+          provider: "local-code",
+          resourceId: "fixture-workspace",
+          version: "8".repeat(40),
+        },
+        action: {
+          type: "apply_change_package",
+          packageId,
+          packageDigest,
+          job: { id: jobId, revision: jobRevision, recordDigest },
+          proposal: { id: "proposal-ui-validation", contentDigest: "2".repeat(64) },
+          grant: { digest: "3".repeat(64) },
+          workspace: { id: "fixture-workspace", sourceRevision, workspaceRevision },
+          changeSetDigest: "9".repeat(64),
+          testEvidenceDigest: "a".repeat(64),
+          targetAuthorityDigest: "b".repeat(64),
+          expectedHeadOid: "8".repeat(40),
+        },
+      },
+    },
+    displayedPayloadDigest: "a".repeat(64),
+    approvalBindingDigest: "b".repeat(64),
+    retryable: false,
+  };
+
+  const page = await browser.newPage({ viewport });
+  const consoleErrors = [];
+  const pageErrors = [];
+  const overflowChecks = [];
+  const focusChecks = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  async function recordHorizontalOverflow(stage) {
+    overflowChecks.push({
+      stage,
+      overflow: await page.evaluate(
+        () => document.documentElement.scrollWidth > window.innerWidth,
+      ),
+    });
+  }
+  async function recordDialogFocus(stage, selector) {
+    focusChecks.push({
+      stage,
+      inside: await page.evaluate(
+        ({ dialogSelector, actionSelector }) => {
+          const activeElement = document.activeElement;
+          return Boolean(
+            document.querySelector(dialogSelector)?.contains(activeElement) &&
+              (!actionSelector || activeElement?.matches(actionSelector)),
+          );
+        },
+        { dialogSelector: "#detail-dialog", actionSelector: selector },
+      ),
+    });
+  }
+  await page.route("**/api/dashboard", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(fixture),
+    }),
+  );
+  await page.route("**/api/attention/next**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        available: applyQueued,
+        source: applyQueued ? "external_confirmation" : null,
+        pendingCount: applyQueued ? 1 : 0,
+        externalEnabled: true,
+        externalQueueRevision: 12,
+        item: applyQueued ? confirmationItem : null,
+      }),
+    }),
+  );
+  await page.route("**/api/work/summary", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        itemCounts: {},
+        safeguards: { prEmployeePaused: true, externalActionsEnabled: false },
+      }),
+    }),
+  );
+  for (const endpoint of ["items", "timeline"]) {
+    await page.route(`**/api/work/${endpoint}**`, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
+  }
+  await page.route("**/api/code/jobs**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const pathname = url.pathname;
+    if (request.method() === "POST") {
+      requests.push({ pathname, body: request.postDataJSON() });
+      if (pathname.endsWith("/control")) {
+        jobStatus = "paused";
+        jobRevision += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "applied", job: job() }),
+        });
+        return;
+      }
+      if (pathname.endsWith("/change-package/apply")) {
+        applyQueued = true;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ request: { id: confirmationItem.id, status: "pending" } }),
+        });
+        return;
+      }
+    }
+    if (request.method() === "GET" && pathname === "/api/code/jobs") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ enabled: true, items: [job()], nextCursor: null }),
+      });
+      return;
+    }
+    if (request.method() === "GET" && pathname.endsWith("/change-package")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ manifest: { ...manifest, job: { ...manifest.job, revision: jobRevision } } }),
+      });
+      return;
+    }
+    if (request.method() === "GET" && pathname === `/api/code/jobs/${jobId}`) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ enabled: true, detail: detail() }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "unexpected code job request" }),
+    });
+  });
+
+  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  await page.locator('[data-view="work"]').click();
+  await page.locator(`[data-code-job-id="${jobId}"]`).click();
+  await page.locator("#detail-dialog[open]").waitFor();
+  await page
+    .getByText("修复付款失败路径并保留受控证据", { exact: true })
+    .waitFor();
+  const objectiveVisible = true;
+  await recordHorizontalOverflow("detail-open");
+  await page.getByRole("button", { name: "安全暂停", exact: true }).click();
+  await page.getByRole("button", { name: "恢复执行", exact: true }).waitFor();
+  await recordDialogFocus("pause-successor", '[data-code-job-control="resume"]');
+  await page.getByRole("button", { name: "查看变更包", exact: true }).click();
+  await page
+    .getByRole("button", { name: "申请应用变更包", exact: true })
+    .waitFor();
+  const manifestVisible = await page
+    .locator(".code-job-manifest .code-job-change-list li")
+    .filter({ hasText: "src/pay.js" })
+    .isVisible();
+  await recordDialogFocus("package-successor", "[data-code-job-apply]");
+  await recordHorizontalOverflow("manifest-open");
+
+  await page.keyboard.press("Escape");
+  await page.locator("#detail-dialog").waitFor({ state: "hidden" });
+  const escapeClosedDetail = true;
+  await page.locator(`[data-code-job-id="${jobId}"]`).click();
+  await page.locator("#detail-dialog[open]").waitFor();
+  await page
+    .getByText("修复付款失败路径并保留受控证据", { exact: true })
+    .waitFor();
+  const staleActionFocusAfterReopen = await page.evaluate(() =>
+    document.activeElement?.matches?.(
+      "[data-code-job-control], [data-code-job-history-more], [data-code-job-package], [data-code-job-apply]",
+    ),
+  );
+  await page.getByRole("button", { name: "查看变更包", exact: true }).click();
+  await page
+    .getByRole("button", { name: "申请应用变更包", exact: true })
+    .waitFor();
+  await recordDialogFocus("package-successor-after-reopen", "[data-code-job-apply]");
+  await page
+    .getByRole("button", { name: "申请应用变更包", exact: true })
+    .click();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  const packageConfirmationVisible = await page
+    .locator("#confirmation-dialog")
+    .getByText(packageId, { exact: true })
+    .isVisible();
+  const singleOpenDialog = (await page.locator("dialog[open]").count()) === 1;
+  const confirmationFocusInsideDialog = await page.evaluate(() =>
+    document
+      .querySelector("#confirmation-dialog")
+      ?.contains(document.activeElement),
+  );
+  await recordHorizontalOverflow("confirmation-open");
+  await page
+    .locator("#confirmation-dialog")
+    .getByRole("button", { name: "稍后再看", exact: true })
+    .click();
+
+  results.push({
+    name: `code-job-control-package-${name}`,
+    objectiveVisible,
+    manifestVisible,
+    escapeClosedDetail,
+    staleActionFocusAfterReopen,
+    packageConfirmationVisible,
+    singleOpenDialog,
+    confirmationFocusInsideDialog,
+    focusChecks,
+    horizontalOverflow: overflowChecks.some((check) => check.overflow),
+    overflowChecks,
+    consoleErrors,
+    pageErrors,
+    requests,
+  });
+  await page.close();
+}
+
+await validateCodeJobControlAndPackage("desktop-1100", {
+  width: 1100,
+  height: 820,
+});
+await validateCodeJobControlAndPackage("mobile-390", {
+  width: 390,
+  height: 844,
+});
+
 async function validateExternalReviewConfirmation() {
   const liveDashboard = await fetch(`${baseUrl}/api/dashboard`).then((response) =>
     response.json(),
@@ -297,22 +676,23 @@ async function validateExternalReviewConfirmation() {
       body: JSON.stringify(wasPublished ? published : fixture),
     }),
   );
+  await page.route("**/api/attention/next**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        available: !wasPublished,
+        source: wasPublished ? null : "external_confirmation",
+        pendingCount: wasPublished ? 0 : 1,
+        externalEnabled: true,
+        externalQueueRevision: wasPublished ? 10 : 8,
+        item: wasPublished ? null : confirmationItem,
+      }),
+    }),
+  );
   await page.route("**/api/confirmations/**", async (route) => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
-    if (request.method() === "GET" && pathname === "/api/confirmations/next") {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          available: true,
-          queueRevision: wasPublished ? 10 : 8,
-          pendingCount: wasPublished ? 0 : 1,
-          item: wasPublished ? null : confirmationItem,
-        }),
-      });
-      return;
-    }
     if (request.method() === "POST") {
       requests.push({
         phase: confirmationPhase,
@@ -343,7 +723,7 @@ async function validateExternalReviewConfirmation() {
       body: JSON.stringify({ error: "unexpected confirmation request" }),
     });
   });
-  await page.route("**/api/memory/search**", (route) =>
+  await page.route("**/api/memory/query**", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -359,6 +739,9 @@ async function validateExternalReviewConfirmation() {
             createdAt: reviewJob.createdAt,
           },
         ],
+        totalMatched: 1,
+        nextCursor: null,
+        indexHealthy: true,
       }),
     }),
   );
@@ -465,5 +848,39 @@ assert.equal(reviewResult.request.body.expectedQueueRevision, 8);
 assert.equal(reviewResult.request.body.expectedItemRevision, 2);
 assert.equal(reviewResult.request.body.displayedPayloadDigest, "a".repeat(64));
 assert.equal(reviewResult.request.body.approvalBindingDigest, "b".repeat(64));
+
+const codeJobResults = results.filter((entry) =>
+  entry.name.startsWith("code-job-control-package-"),
+);
+assert.equal(codeJobResults.length, 2);
+for (const codeJobResult of codeJobResults) {
+  assert.equal(codeJobResult.objectiveVisible, true, codeJobResult.name);
+  assert.equal(codeJobResult.manifestVisible, true, codeJobResult.name);
+  assert.equal(codeJobResult.escapeClosedDetail, true, codeJobResult.name);
+  assert.equal(codeJobResult.staleActionFocusAfterReopen, false, codeJobResult.name);
+  assert.equal(codeJobResult.packageConfirmationVisible, true, codeJobResult.name);
+  assert.equal(codeJobResult.singleOpenDialog, true, codeJobResult.name);
+  assert.equal(codeJobResult.confirmationFocusInsideDialog, true, codeJobResult.name);
+  assert.equal(codeJobResult.horizontalOverflow, false, codeJobResult.name);
+  assert.deepEqual(codeJobResult.consoleErrors, [], `${codeJobResult.name}: console errors`);
+  assert.deepEqual(codeJobResult.pageErrors, [], `${codeJobResult.name}: page errors`);
+  assert.equal(
+    codeJobResult.focusChecks.every((check) => check.inside),
+    true,
+    `${codeJobResult.name}: focus must remain on the intended dialog action`,
+  );
+  assert.deepEqual(
+    codeJobResult.requests.map(({ pathname }) => pathname),
+    [
+      `/api/code/jobs/${`code-job-${"c".repeat(55)}`}/control`,
+      `/api/code/jobs/${`code-job-${"c".repeat(55)}`}/change-package/apply`,
+    ],
+  );
+  assert.deepEqual(codeJobResult.requests[0].body, {
+    command: "pause",
+    expectedRevision: 7,
+  });
+  assert.deepEqual(codeJobResult.requests[1].body, { expectedRevision: 8 });
+}
 
 console.log(JSON.stringify(results, null, 2));

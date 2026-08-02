@@ -332,6 +332,139 @@ function queryOptions(url, { status = false, order = false } = {}) {
   };
 }
 
+const codeJobPauseReason = "用户从本地指挥中枢暂停代码任务";
+const changePackageApplicationConflictCodes = new Set([
+  "CHANGE_PACKAGE_APPLICATION_STALE",
+  "CHANGE_PACKAGE_TARGET_DIRTY",
+  "CHANGE_PACKAGE_TARGET_STALE",
+  "CHANGE_PACKAGE_APPLICATION_BINDING_CONFLICT",
+  "CHANGE_PACKAGE_APPLICATION_SOURCE_CHANGED",
+]);
+
+function codeJobDetailQueryOptions(url) {
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.some((key) => !["limit", "cursor"].includes(key)) ||
+    new Set(keys).size !== keys.length
+  ) {
+    throw httpError(400, "代码任务详情查询参数无效");
+  }
+  return queryOptions(url);
+}
+
+function requireApplicationPort(application, property, methods, message) {
+  const port = application[property];
+  if (
+    !port ||
+    !methods.every((method) => typeof port[method] === "function")
+  ) {
+    throw httpError(503, message);
+  }
+  return port;
+}
+
+function requireExactJsonFields(value, fields, message) {
+  const keys = Object.keys(value).sort();
+  const expected = [...fields].sort();
+  if (
+    keys.length !== expected.length ||
+    !expected.every((field, index) => keys[index] === field)
+  ) {
+    throw httpError(400, message);
+  }
+  return value;
+}
+
+function requireExpectedRevision(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw httpError(400, "expectedRevision 无效");
+  }
+  return value;
+}
+
+async function readCodeJobDetail(application, jobId, options = {}) {
+  const reader = requireApplicationPort(
+    application,
+    "codeJobReader",
+    ["getDetail"],
+    "本地代码任务详情读取端口无效",
+  );
+  const detail = await reader.getDetail({ jobId, ...options });
+  if (detail === null) throw httpError(404, "代码任务不存在");
+  if (
+    !detail ||
+    typeof detail !== "object" ||
+    Array.isArray(detail) ||
+    !detail.job ||
+    typeof detail.job !== "object" ||
+    detail.job.jobId !== jobId
+  ) {
+    throw httpError(409, "代码任务详情绑定无效");
+  }
+  return detail;
+}
+
+function readyChangePackageReceipt(detail) {
+  const receipt = detail.changePackage?.receipt;
+  if (
+    detail.changePackage?.status !== "ready" ||
+    !receipt ||
+    typeof receipt !== "object" ||
+    Array.isArray(receipt) ||
+    typeof receipt.packageDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(receipt.packageDigest) ||
+    receipt.packageId !== `change-package-${receipt.packageDigest}`
+  ) {
+    throw httpError(409, "代码任务 change package 尚未就绪");
+  }
+  return receipt;
+}
+
+function requireBoundChangePackageManifest(manifest, receipt, jobId) {
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    Array.isArray(manifest) ||
+    manifest.packageId !== receipt.packageId ||
+    manifest.packageDigest !== receipt.packageDigest ||
+    manifest.job?.id !== jobId
+  ) {
+    throw httpError(409, "change package 与代码任务绑定不一致");
+  }
+  return manifest;
+}
+
+async function readChangePackageManifest(reader, packageId) {
+  try {
+    return await reader.get(packageId);
+  } catch (error) {
+    if (error?.code === "CHANGE_PACKAGE_NOT_FOUND") {
+      throw httpError(404, "change package 不存在");
+    }
+    if (error?.code === "CHANGE_PACKAGE_STORE_NOT_READY") {
+      throw httpError(503, "change package 存储尚未就绪");
+    }
+    throw error;
+  }
+}
+
+async function requestChangePackageApplication(requester, input) {
+  try {
+    return await requester.request(input);
+  } catch (error) {
+    if (changePackageApplicationConflictCodes.has(error?.code)) {
+      throw httpError(409, error.message);
+    }
+    if (error?.code === "INVALID_CHANGE_PACKAGE_APPLICATION") {
+      throw httpError(400, error.message);
+    }
+    if (error?.code === "CHANGE_PACKAGE_APPLICATION_PACKAGE_UNAVAILABLE") {
+      throw httpError(503, "change package 暂时无法验证");
+    }
+    throw error;
+  }
+}
+
 async function syncConfirmationOutcome(employeeRegistry, item) {
   const employee = employeeRegistry.get(item?.requestedBy?.roleId);
   if (!employee || typeof employee.recordConfirmationOutcome !== "function") {
@@ -594,6 +727,100 @@ export function createDashboardServer(
             queryOptions(url, { status: true, order: true }),
           )),
         });
+        return;
+      }
+      const codeJobControlAction = url.pathname.match(
+        /^\/api\/code\/jobs\/([^/]+)\/control$/,
+      );
+      if (request.method === "POST" && codeJobControlAction) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request),
+          ["command", "expectedRevision"],
+          "代码任务控制请求字段无效",
+        );
+        if (!["pause", "resume"].includes(input.command)) {
+          throw httpError(400, "command 只能是 pause 或 resume");
+        }
+        const expectedRevision = requireExpectedRevision(input.expectedRevision);
+        const control = requireApplicationPort(
+          application,
+          "codeJobControl",
+          ["pause", "resume"],
+          "本地代码任务控制端口无效",
+        );
+        const jobId = codeJobControlAction[1];
+        const result = input.command === "pause"
+          ? await control.pause({
+              jobId,
+              expectedRevision,
+              reason: codeJobPauseReason,
+            })
+          : await control.resume({ jobId, expectedRevision });
+        sendJson(response, 200, result);
+        return;
+      }
+      const codeJobChangePackageApplication = url.pathname.match(
+        /^\/api\/code\/jobs\/([^/]+)\/change-package\/apply$/,
+      );
+      if (request.method === "POST" && codeJobChangePackageApplication) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request),
+          ["expectedRevision"],
+          "change package 应用请求字段无效",
+        );
+        const expectedRevision = requireExpectedRevision(input.expectedRevision);
+        const jobId = codeJobChangePackageApplication[1];
+        const detail = await readCodeJobDetail(application, jobId);
+        if (detail.job.revision !== expectedRevision) {
+          throw httpError(409, "代码任务版本已变化，请基于最新状态重试");
+        }
+        const receipt = readyChangePackageReceipt(detail);
+        const requester = requireApplicationPort(
+          application,
+          "changePackageApplicationRequester",
+          ["request"],
+          "change package 应用请求端口无效",
+        );
+        const queued = await requestChangePackageApplication(requester, {
+          packageId: receipt.packageId,
+          requestedBy: detail.job.requestedBy,
+        });
+        sendJson(response, 200, { request: queued });
+        return;
+      }
+      const codeJobChangePackage = url.pathname.match(
+        /^\/api\/code\/jobs\/([^/]+)\/change-package$/,
+      );
+      if (request.method === "GET" && codeJobChangePackage) {
+        const jobId = codeJobChangePackage[1];
+        const detail = await readCodeJobDetail(application, jobId);
+        const receipt = readyChangePackageReceipt(detail);
+        const reader = requireApplicationPort(
+          application,
+          "changePackageReader",
+          ["get"],
+          "change package 读取端口无效",
+        );
+        const manifest = requireBoundChangePackageManifest(
+          await readChangePackageManifest(reader, receipt.packageId),
+          receipt,
+          jobId,
+        );
+        sendJson(response, 200, { manifest });
+        return;
+      }
+      const codeJobDetail = url.pathname.match(
+        /^\/api\/code\/jobs\/([^/]+)$/,
+      );
+      if (request.method === "GET" && codeJobDetail) {
+        const detail = await readCodeJobDetail(
+          application,
+          codeJobDetail[1],
+          codeJobDetailQueryOptions(url),
+        );
+        sendJson(response, 200, { enabled: true, detail });
         return;
       }
       if (

@@ -169,15 +169,191 @@ function codeJobRows(items, now) {
   return `<div class="work-list">${items.map((job) => {
     const status = codeJobStatus(job.status);
     return `
-    <article class="work-row code-job-row">
-      <div class="work-row-heading">
+    <button type="button" class="work-row code-job-row" data-code-job-id="${escapeWorkHtml(job.jobId)}">
+      <span class="work-row-heading">
         <strong>${escapeWorkHtml(job.repository || "未知仓库")} · ${escapeWorkHtml(job.operation || "unknown")}</strong>
         <span class="status-pill status-${status}">${escapeWorkHtml(codeJobStatusLabel(status))}</span>
-      </div>
-      <p>${escapeWorkHtml(job.requestedBy?.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
+      </span>
+      <span class="code-job-row-context">${escapeWorkHtml(job.requestedBy?.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</span>
       ${codeJobProgressMarkup(job, now)}
-    </article>`;
+    </button>`;
   }).join("")}</div>`;
+}
+
+function detailList(values, empty = "未提供") {
+  const items = Array.isArray(values) ? values : [];
+  if (!items.length) return `<p class="code-job-detail-empty">${escapeWorkHtml(empty)}</p>`;
+  return `<ul class="code-job-detail-list">${items
+    .map((value) => `<li>${escapeWorkHtml(value)}</li>`)
+    .join("")}</ul>`;
+}
+
+function safeObjectMarkup(value) {
+  if (value === null || value === undefined) return "未提供";
+  try {
+    return escapeWorkHtml(JSON.stringify(value, null, 2));
+  } catch {
+    return escapeWorkHtml(String(value));
+  }
+}
+
+function manifestChangeRows(changes = {}) {
+  const rows = [
+    ...(Array.isArray(changes.created) ? changes.created : []).map((entry) => {
+      const bytes = Number.isFinite(entry?.blob?.bytes)
+        ? ` · ${entry.blob.bytes} bytes`
+        : "";
+      return `<li><strong>新建</strong> · ${escapeWorkHtml(entry?.path || "未知路径")}<small>内容摘要 <code>${escapeWorkHtml(entry?.blob?.sha256 || "未知")}</code>${escapeWorkHtml(bytes)}</small></li>`;
+    }),
+    ...(Array.isArray(changes.modified) ? changes.modified : []).map((entry) => {
+      const bytes = Number.isFinite(entry?.blob?.bytes)
+        ? ` · ${entry.blob.bytes} bytes`
+        : "";
+      return `<li><strong>修改</strong> · ${escapeWorkHtml(entry?.path || "未知路径")}<small>变更前 <code>${escapeWorkHtml(entry?.beforeSha256 || "未知")}</code> → 变更后 <code>${escapeWorkHtml(entry?.blob?.sha256 || "未知")}</code>${escapeWorkHtml(bytes)}</small></li>`;
+    }),
+    ...(Array.isArray(changes.deleted) ? changes.deleted : []).map((entry) =>
+      `<li><strong>删除</strong> · ${escapeWorkHtml(entry?.path || "未知路径")}<small>变更前摘要 <code>${escapeWorkHtml(entry?.beforeSha256 || "未知")}</code></small></li>`,
+    ),
+  ];
+  return rows.length
+    ? `<ul class="code-job-detail-list code-job-change-list">${rows.join("")}</ul>`
+    : '<p class="code-job-detail-empty">变更集合为空。</p>';
+}
+
+function manifestArtifactMarkup(artifacts = {}) {
+  const rows = ["output", "stdout", "stderr"].flatMap((kind) => {
+    const artifact = artifacts?.[kind];
+    if (!artifact) return [];
+    const bytes = Number.isFinite(artifact.bytes)
+      ? `${artifact.bytes} bytes`
+      : "大小未知";
+    return [`<dt>${escapeWorkHtml(kind)}</dt><dd><code>${escapeWorkHtml(artifact.sha256 || "未知摘要")}</code><small>${escapeWorkHtml(bytes)} · ${escapeWorkHtml(artifact.path || "未知路径")}</small></dd>`];
+  });
+  return rows.length
+    ? `<dl class="detail-grid code-job-profile-artifacts">${rows.join("")}</dl>`
+    : '<p class="code-job-detail-empty">未提供测试产物引用。</p>';
+}
+
+function manifestProfileMarkup(profiles) {
+  const values = Array.isArray(profiles) ? profiles : [];
+  if (!values.length) {
+    return '<p class="code-job-detail-empty">尚无测试凭据</p>';
+  }
+  return `<div class="code-job-test-profiles">${values.map((profile) => `
+    <article>
+      <div class="work-row-heading">
+        <strong>${escapeWorkHtml(profile?.id || "未知测试")}</strong>
+        <span>尝试 ${escapeWorkHtml(profile?.attemptNumber ?? "未知")}</span>
+      </div>
+      <dl class="detail-grid">
+        <dt>固定镜像</dt><dd><code>${escapeWorkHtml(profile?.imageId || "未知")}</code></dd>
+        <dt>配置摘要</dt><dd><code>${escapeWorkHtml(profile?.configDigest || "未知")}</code></dd>
+        <dt>工作区修订</dt><dd><code>${escapeWorkHtml(profile?.workspaceRevision || "未知")}</code></dd>
+        <dt>执行动作</dt><dd>${escapeWorkHtml(profile?.actionId || "未知")}</dd>
+      </dl>
+      ${manifestArtifactMarkup(profile?.artifacts)}
+    </article>`).join("")}</div>`;
+}
+
+function codeJobManifestMarkup(manifest) {
+  if (!manifest) return "";
+  const workspace = manifest.workspace || {};
+  return `<div class="code-job-manifest">
+    <dl class="detail-grid">
+      <dt>变更包 ID</dt><dd><code>${escapeWorkHtml(manifest.packageId || "未知")}</code></dd>
+      <dt>变更包摘要</dt><dd><code>${escapeWorkHtml(manifest.packageDigest || "未知")}</code></dd>
+      <dt>目标工作区</dt><dd>${escapeWorkHtml(workspace.id || "未知")}</dd>
+      <dt>源修订</dt><dd><code>${escapeWorkHtml(workspace.sourceRevision || "未知")}</code></dd>
+      <dt>工作区修订</dt><dd><code>${escapeWorkHtml(workspace.workspaceRevision || "未知")}</code></dd>
+    </dl>
+    <h4>变更集合</h4>
+    ${manifestChangeRows(manifest.changes)}
+    <h4>已通过固定测试</h4>
+    ${manifestProfileMarkup(manifest.passedProfiles)}
+  </div>`;
+}
+
+function codeJobObservationsMarkup(observations, now) {
+  const items = Array.isArray(observations) ? observations : [];
+  if (!items.length) return '<p class="code-job-detail-empty">尚无安全观察记录。</p>';
+  return `<div class="code-job-observations">${items.map((observation) => `
+    <article>
+      <div class="work-row-heading">
+        <strong>${escapeWorkHtml(observation?.actionType || "unknown")}</strong>
+        <span>${escapeWorkHtml(codeJobActionStatusLabel(observation?.status))}</span>
+      </div>
+      <small>${escapeWorkHtml(observation?.detailDigest || "无详情摘要")} · ${relativeTime(observation?.recordedAt, now)}</small>
+      ${observation?.detail === undefined ? "" : `<pre>${safeObjectMarkup(observation.detail)}</pre>`}
+    </article>`).join("")}</div>`;
+}
+
+export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
+  if (state?.loading && !state?.detail) {
+    return '<article class="detail code-job-detail"><div class="empty">正在读取代码任务详情…</div></article>';
+  }
+  if (state?.error && !state?.detail) {
+    return `<article class="detail code-job-detail"><h2>代码任务暂不可读取</h2><div class="empty">${escapeWorkHtml(state.error)}</div></article>`;
+  }
+  const detail = state?.detail;
+  const job = detail?.job;
+  if (!job) {
+    return '<article class="detail code-job-detail"><div class="empty">代码任务详情不可用。</div></article>';
+  }
+  const status = codeJobStatus(job.status);
+  const receipt = detail.changePackage?.receipt;
+  const canPause = !detail.archived && ["queued", "starting", "active"].includes(status);
+  const canResume = !detail.archived && status === "paused";
+  const packageReady = detail.changePackage?.status === "ready" && receipt;
+  const requester = job.requestedBy || {};
+  const memory = job.memoryProjection;
+  return `<article class="detail code-job-detail">
+    <p class="eyebrow">LOCAL CODE JOB / REVISION ${escapeWorkHtml(job.revision ?? "未知")}</p>
+    <div class="code-job-detail-heading">
+      <h2>${escapeWorkHtml(job.repository || job.jobId || "本地代码任务")}</h2>
+      <span class="status-pill status-${status}">${escapeWorkHtml(codeJobStatusLabel(status))}</span>
+    </div>
+    <dl class="detail-grid">
+      <dt>任务 ID</dt><dd><code>${escapeWorkHtml(job.jobId || "未知")}</code></dd>
+      <dt>请求岗位</dt><dd>${escapeWorkHtml(requester.roleId || "未知")}</dd>
+      <dt>关联工作项</dt><dd>${escapeWorkHtml(requester.workItemId || "未绑定")}</dd>
+      <dt>工作区</dt><dd>${escapeWorkHtml(job.workspaceId || "未知")}</dd>
+      <dt>操作</dt><dd>${escapeWorkHtml(job.operation || "未知")}</dd>
+      <dt>更新时间</dt><dd>${escapeWorkHtml(job.updatedAt ? new Date(job.updatedAt).toLocaleString("zh-CN") : "未知")}</dd>
+    </dl>
+    <section class="code-job-detail-section"><h3>任务目标</h3><p>${escapeWorkHtml(job.objective || "未提供")}</p></section>
+    <section class="code-job-detail-section"><h3>验收条件</h3>${detailList(job.acceptanceCriteria)}</section>
+    <section class="code-job-detail-section"><h3>授权依据</h3>${detailList(job.evidence)}</section>
+    <section class="code-job-detail-section"><h3>执行边界</h3>
+      <p><strong>允许动作</strong></p>${detailList(job.allowedActions)}
+      <p><strong>可写路径</strong></p>${detailList(job.writablePaths, "无（只读任务）")}
+      <p><strong>固定测试</strong></p>${detailList(job.requiredProfiles)}
+    </section>
+    ${job.summary || job.reason ? `<section class="code-job-detail-section"><h3>任务说明</h3><p>${escapeWorkHtml(job.summary || "")}</p><p>${escapeWorkHtml(job.reason || "")}</p></section>` : ""}
+    <section class="code-job-detail-section">
+      <div class="code-job-section-heading"><h3>安全观察历史</h3><span>${escapeWorkHtml(job.observationCount ?? detail.observations?.length ?? 0)} 条</span></div>
+      ${detail.archived && !detail.historyAvailable ? '<p class="code-job-detail-empty">该任务已归档；这里只保留最终摘要，完整观察历史不再在线。</p>' : ""}
+      ${codeJobObservationsMarkup(detail.observations, now)}
+      ${detail.nextCursor ? `<button type="button" class="secondary-action" data-code-job-history-more ${state.historyLoading ? "disabled" : ""}>${state.historyLoading ? "正在加载…" : "加载更多观察"}</button>` : ""}
+    </section>
+    ${detail.terminalDetail === null || detail.terminalDetail === undefined ? "" : `<section class="code-job-detail-section"><h3>终态详情</h3><pre>${safeObjectMarkup(detail.terminalDetail)}</pre></section>`}
+    <section class="code-job-detail-section"><h3>记忆投影</h3>${memory ? `<dl class="detail-grid"><dt>记录</dt><dd><code>${escapeWorkHtml(memory.recordId || "未知")}</code></dd><dt>投影时间</dt><dd>${escapeWorkHtml(memory.projectedAt ? new Date(memory.projectedAt).toLocaleString("zh-CN") : "未知")}</dd></dl>` : '<p class="code-job-detail-empty">尚未生成记忆投影。</p>'}</section>
+    <section class="code-job-detail-section"><h3>变更包</h3>
+      <dl class="detail-grid">
+        <dt>状态</dt><dd>${escapeWorkHtml(detail.changePackage?.status || "不可用")}</dd>
+        <dt>凭据 ID</dt><dd><code>${escapeWorkHtml(receipt?.packageId || "尚未生成")}</code></dd>
+        <dt>凭据摘要</dt><dd><code>${escapeWorkHtml(receipt?.packageDigest || "尚未生成")}</code></dd>
+        <dt>生成时间</dt><dd>${escapeWorkHtml(receipt?.deliveredAt ? new Date(receipt.deliveredAt).toLocaleString("zh-CN") : "尚未生成")}</dd>
+      </dl>
+      ${codeJobManifestMarkup(state.manifest)}
+      ${packageReady && !state.manifest ? `<button type="button" class="secondary-action" data-code-job-package ${state.packageLoading ? "disabled" : ""}>${state.packageLoading ? "正在读取…" : "查看变更包"}</button>` : ""}
+    </section>
+    ${state.actionError ? `<p class="code-job-action-error" role="alert">${escapeWorkHtml(state.actionError)}</p>` : ""}
+    <div class="code-job-detail-actions">
+      ${canPause ? `<button type="button" data-code-job-control="pause" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "安全暂停"}</button>` : ""}
+      ${canResume ? `<button type="button" data-code-job-control="resume" ${state.controlLoading ? "disabled" : ""}>${state.controlLoading ? "正在请求…" : "恢复执行"}</button>` : ""}
+      ${packageReady && state.manifest ? `<button type="button" data-code-job-apply ${state.applyLoading ? "disabled" : ""}>${state.applyLoading ? "正在加入确认队列…" : "申请应用变更包"}</button>` : ""}
+    </div>
+  </article>`;
 }
 
 function count(summary, status) {
@@ -225,7 +401,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       </section>
     </div>
     <section class="section work-panel code-job-panel">
-      <div class="section-heading"><h2>本地代码任务</h2><span>${state.codeJobs?.length || 0} JOBS · 只读结果</span></div>
+      <div class="section-heading"><h2>本地代码任务</h2><span>${state.codeJobs?.length || 0} JOBS · 详情 / 受控操作</span></div>
       ${state.codeJobsError
         ? `<div class="empty">代码任务暂不可读取：${escapeWorkHtml(state.codeJobsError)}</div>`
         : state.codeJobsEnabled
@@ -252,13 +428,256 @@ function errorMessage(error) {
 export function createWorkView({
   fetchImpl = globalThis.fetch,
   onChange = () => {},
+  onDetail = () => {},
+  onDetailClose = () => {},
+  onNotice = () => {},
+  onApplyRequested = async () => {},
   clock = () => Date.now(),
 } = {}) {
   let state = initialState();
+  let detailState = null;
+  let detailRequestSequence = 0;
 
   function change(patch) {
     state = { ...state, ...patch };
     onChange();
+  }
+
+  function emitDetail() {
+    if (detailState) onDetail(renderCodeJobDetail(detailState, { now: clock() }));
+  }
+
+  function updateDetail(patch) {
+    if (!detailState) return;
+    detailState = { ...detailState, ...patch };
+    emitDetail();
+  }
+
+  function detailEndpoint(jobId, cursor) {
+    const base = `/api/code/jobs/${encodeURIComponent(jobId)}?limit=20`;
+    return cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base;
+  }
+
+  async function readCodeJobs() {
+    const response = await fetchImpl(
+      "/api/code/jobs?limit=50&order=newest",
+      { cache: "no-store" },
+    ).catch(() => null);
+    if (!response) {
+      return { enabled: false, items: [], error: "读取代码任务失败" };
+    }
+    try {
+      const payload = await responseJson(response, "读取代码任务");
+      return {
+        enabled: payload.enabled === true,
+        items: payload.items || [],
+        error: "",
+      };
+    } catch (error) {
+      return { enabled: false, items: [], error: errorMessage(error) };
+    }
+  }
+
+  async function reloadCodeJobs() {
+    const codeJobs = await readCodeJobs();
+    change({
+      codeJobsEnabled: codeJobs.enabled,
+      codeJobs: codeJobs.items,
+      codeJobsError: codeJobs.error,
+    });
+  }
+
+  function closeDetail() {
+    detailRequestSequence += 1;
+    detailState = null;
+  }
+
+  async function handleConflict() {
+    closeDetail();
+    onDetailClose();
+    onNotice("代码任务状态已经变化，请查看最新状态。");
+    await reloadCodeJobs();
+  }
+
+  async function openCodeJob(jobId) {
+    if (!jobId) return;
+    const sequence = ++detailRequestSequence;
+    detailState = {
+      jobId,
+      loading: true,
+      error: "",
+      detail: null,
+      manifest: null,
+      historyLoading: false,
+      packageLoading: false,
+      controlLoading: false,
+      applyLoading: false,
+      actionError: "",
+    };
+    emitDetail();
+    try {
+      const response = await fetchImpl(detailEndpoint(jobId), { cache: "no-store" });
+      if (response.status === 409) {
+        if (sequence === detailRequestSequence) await handleConflict();
+        return;
+      }
+      const payload = await responseJson(
+        response,
+        "读取代码任务详情",
+      );
+      if (sequence !== detailRequestSequence) return;
+      if (payload.enabled !== true || !payload.detail) {
+        throw new Error("代码任务详情不可用");
+      }
+      updateDetail({ loading: false, detail: payload.detail });
+    } catch (error) {
+      if (sequence !== detailRequestSequence) return;
+      updateDetail({ loading: false, error: errorMessage(error) });
+    }
+  }
+
+  async function loadMoreCodeJobObservations() {
+    const current = detailState;
+    const cursor = current?.detail?.nextCursor;
+    const jobId = current?.detail?.job?.jobId || current?.jobId;
+    if (!current || !cursor || !jobId || current.historyLoading) return;
+    const sequence = detailRequestSequence;
+    updateDetail({ historyLoading: true, actionError: "" });
+    try {
+      const response = await fetchImpl(detailEndpoint(jobId, cursor), {
+        cache: "no-store",
+      });
+      if (response.status === 409) {
+        if (sequence === detailRequestSequence) await handleConflict();
+        return;
+      }
+      const payload = await responseJson(
+        response,
+        "读取更多安全观察",
+      );
+      if (sequence !== detailRequestSequence || !detailState) return;
+      if (payload.enabled !== true || !payload.detail) {
+        throw new Error("安全观察历史不可用");
+      }
+      updateDetail({
+        historyLoading: false,
+        detail: {
+          ...detailState.detail,
+          ...payload.detail,
+          observations: [
+            ...(detailState.detail?.observations || []),
+            ...(payload.detail.observations || []),
+          ],
+        },
+      });
+    } catch (error) {
+      if (sequence !== detailRequestSequence) return;
+      updateDetail({ historyLoading: false, actionError: errorMessage(error) });
+    }
+  }
+
+  async function loadCodeJobChangePackage() {
+    const current = detailState;
+    const jobId = current?.detail?.job?.jobId || current?.jobId;
+    if (!current || !jobId || current.packageLoading) return;
+    const sequence = detailRequestSequence;
+    updateDetail({ packageLoading: true, actionError: "" });
+    try {
+      const response = await fetchImpl(
+        `/api/code/jobs/${encodeURIComponent(jobId)}/change-package`,
+        {
+          cache: "no-store",
+        },
+      );
+      if (response.status === 409) {
+        if (sequence === detailRequestSequence) await handleConflict();
+        return;
+      }
+      const payload = await responseJson(
+        response,
+        "读取变更包",
+      );
+      if (sequence !== detailRequestSequence || !detailState) return;
+      updateDetail({ packageLoading: false, manifest: payload.manifest || null });
+    } catch (error) {
+      if (sequence !== detailRequestSequence) return;
+      updateDetail({ packageLoading: false, actionError: errorMessage(error) });
+    }
+  }
+
+  async function controlCodeJob(command) {
+    const current = detailState;
+    const job = current?.detail?.job;
+    if (!job || current.controlLoading) return;
+    const allowed =
+      (command === "pause" && ["queued", "starting", "active"].includes(job.status)) ||
+      (command === "resume" && job.status === "paused");
+    if (!allowed || current.detail.archived) return;
+    const sequence = detailRequestSequence;
+    updateDetail({ controlLoading: true, actionError: "" });
+    try {
+      const response = await fetchImpl(
+        `/api/code/jobs/${encodeURIComponent(job.jobId)}/control`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-mydashboard-action": "1",
+          },
+          body: JSON.stringify({ command, expectedRevision: job.revision }),
+        },
+      );
+      if (response.status === 409) {
+        if (sequence === detailRequestSequence) await handleConflict();
+        return;
+      }
+      await responseJson(response, "更新代码任务");
+      if (sequence !== detailRequestSequence) return;
+      await reloadCodeJobs();
+      if (sequence === detailRequestSequence) await openCodeJob(job.jobId);
+    } catch (error) {
+      if (sequence !== detailRequestSequence) return;
+      updateDetail({ controlLoading: false, actionError: errorMessage(error) });
+    }
+  }
+
+  async function requestCodeJobChangePackageApply() {
+    const current = detailState;
+    const job = current?.detail?.job;
+    const changePackage = current?.detail?.changePackage;
+    if (
+      !job ||
+      current.applyLoading ||
+      changePackage?.status !== "ready" ||
+      !changePackage.receipt
+    ) return;
+    const sequence = detailRequestSequence;
+    updateDetail({ applyLoading: true, actionError: "" });
+    try {
+      const response = await fetchImpl(
+        `/api/code/jobs/${encodeURIComponent(job.jobId)}/change-package/apply`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-mydashboard-action": "1",
+          },
+          body: JSON.stringify({ expectedRevision: job.revision }),
+        },
+      );
+      if (response.status === 409) {
+        if (sequence === detailRequestSequence) await handleConflict();
+        return;
+      }
+      await responseJson(response, "申请应用变更包");
+      if (sequence !== detailRequestSequence) return;
+      closeDetail();
+      await reloadCodeJobs();
+      await onApplyRequested();
+    } catch (error) {
+      if (sequence !== detailRequestSequence) return;
+      updateDetail({ applyLoading: false, actionError: errorMessage(error) });
+    }
   }
 
   async function load() {
@@ -270,26 +689,13 @@ export function createWorkView({
         fetchImpl("/api/work/items?limit=50&order=newest", { cache: "no-store" }),
         fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
       ]);
-      const codeJobsResponse = await fetchImpl(
-        "/api/code/jobs?limit=50&order=newest",
-        { cache: "no-store" },
-      ).catch(() => null);
+      const codeJobsPromise = readCodeJobs();
       const [summary, items, timeline] = await Promise.all([
         responseJson(responses[0], "读取工作摘要"),
         responseJson(responses[1], "读取工作项"),
         responseJson(responses[2], "读取工作时间线"),
       ]);
-      let codeJobs = { enabled: false, items: [] };
-      let codeJobsError = "";
-      if (codeJobsResponse) {
-        try {
-          codeJobs = await responseJson(codeJobsResponse, "读取代码任务");
-        } catch (error) {
-          codeJobsError = errorMessage(error);
-        }
-      } else {
-        codeJobsError = "读取代码任务失败";
-      }
+      const codeJobs = await codeJobsPromise;
       change({
         loaded: true,
         loading: false,
@@ -297,9 +703,9 @@ export function createWorkView({
         summary,
         items: items.items || [],
         timeline: timeline.items || [],
-        codeJobsEnabled: codeJobs.enabled === true,
+        codeJobsEnabled: codeJobs.enabled,
         codeJobs: codeJobs.items || [],
-        codeJobsError,
+        codeJobsError: codeJobs.error,
       });
     } catch (error) {
       change({ loaded: true, loading: false, error: errorMessage(error) });
@@ -307,9 +713,19 @@ export function createWorkView({
   }
 
   return {
-    bind() {},
+    bind(root) {
+      root.querySelectorAll("[data-code-job-id]").forEach((button) => {
+        button.addEventListener("click", () => openCodeJob(button.dataset.codeJobId));
+      });
+    },
+    closeDetail,
+    controlCodeJob,
     load,
+    loadCodeJobChangePackage,
+    loadMoreCodeJobObservations,
     needsLoad: () => !state.loaded || Boolean(state.error),
+    openCodeJob,
     render: () => renderWorkView(state, { now: clock() }),
+    requestCodeJobChangePackageApply,
   };
 }

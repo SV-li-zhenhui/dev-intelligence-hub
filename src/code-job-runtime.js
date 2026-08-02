@@ -293,6 +293,7 @@ export async function createCodeJobRuntime({
           }),
       reader: frozenPort({
         get: (value) => admission.run(() => jobs.get(value)),
+        getDetail: (value) => admission.run(() => jobs.getDetail(value)),
         list: (value) => admission.run(() => jobs.list(value)),
         listNewest: (value) => admission.run(() => jobs.listNewest(value)),
       }),

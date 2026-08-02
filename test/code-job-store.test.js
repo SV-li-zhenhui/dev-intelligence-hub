@@ -428,6 +428,147 @@ test("createApprovedJob persists one queued job with all four digest bindings", 
   assert.match(durable.recordDigest, /^[a-f0-9]{64}$/);
 });
 
+test("live job detail paginates revision-bound sanitized observations", async () => {
+  const fixture = await readyStore();
+  const request = approval({
+    grant: grant({
+      operation: "modify",
+      objective: "Update one file without exposing its contents in the UI.",
+      allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+      writablePaths: ["src"],
+    }),
+  });
+  const created = await fixture.jobs.createApprovedJob(request);
+  const starting = await fixture.jobs.claimStarting({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+  });
+  let current = await fixture.jobs.activate({
+    jobId: created.job.jobId,
+    expectedRevision: starting.job.revision,
+    workspaceRevision: "4".repeat(64),
+  });
+  current = await fixture.jobs.prepareAction({
+    jobId: created.job.jobId,
+    expectedRevision: current.job.revision,
+    action: {
+      type: "write_text",
+      actionId: "write-secret-file",
+      expectedWorkspaceRevision: "4".repeat(64),
+      path: "src/secret.js",
+      content: "TOP_SECRET_WRITE_CONTENT",
+      expectedSha256: "3".repeat(64),
+    },
+  });
+  current = await fixture.jobs.recordObservation({
+    jobId: created.job.jobId,
+    expectedRevision: current.job.revision,
+    actionId: "write-secret-file",
+    status: "succeeded",
+    workspaceRevision: "5".repeat(64),
+    detail: {
+      result: {
+        path: "src/secret.js",
+        content: "TOP_SECRET_OBSERVATION_CONTENT",
+        Content: "TOP_SECRET_CASE_VARIANT",
+        expectedSha256: "3".repeat(64),
+        EXPECTEDSHA256: "2".repeat(64),
+        absolutePath: "D:/private/checkout/src/secret.js",
+        device: "private-volume-7",
+        bytes: 24,
+      },
+    },
+  });
+  current = await fixture.jobs.prepareAction({
+    jobId: created.job.jobId,
+    expectedRevision: current.job.revision,
+    action: {
+      type: "read_text",
+      actionId: "read-secret-file",
+      expectedWorkspaceRevision: "5".repeat(64),
+      path: "src/secret.js",
+    },
+  });
+  current = await fixture.jobs.recordObservation({
+    jobId: created.job.jobId,
+    expectedRevision: current.job.revision,
+    actionId: "read-secret-file",
+    status: "succeeded",
+    workspaceRevision: "5".repeat(64),
+    detail: {
+      result: {
+        path: "src/secret.js",
+        content: "TOP_SECRET_READ_CONTENT",
+        sha256: "5".repeat(64),
+      },
+    },
+  });
+
+  const first = await fixture.jobs.getDetail({
+    jobId: created.job.jobId,
+    limit: 1,
+  });
+  assert.equal(first.archived, false);
+  assert.equal(first.historyAvailable, true);
+  assert.equal(first.observations.length, 1);
+  assert.equal(first.observations[0].actionType, "write_text");
+  assert.match(first.observations[0].actionDigest, /^[a-f0-9]{64}$/);
+  assert.match(first.observations[0].detailDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(first.observations[0].detail, {
+    schemaVersion: 1,
+    executor: null,
+    result: {
+      path: "src/secret.js",
+      sha256: null,
+      bytes: 24,
+      error: null,
+    },
+  });
+  assert.match(first.nextCursor, /^[A-Za-z0-9_-]+$/);
+  assert.deepEqual(first.changePackage, {
+    status: "none",
+    receipt: null,
+  });
+  assert.equal(first.terminalDetail, null);
+  const serialized = JSON.stringify(first);
+  assert.equal(serialized.includes("TOP_SECRET"), false);
+  assert.equal(serialized.includes("expectedSha256"), false);
+  assert.equal(serialized.includes("absolutePath"), false);
+  assert.equal(serialized.includes("D:/private"), false);
+  assert.equal(serialized.includes("private-volume"), false);
+  assert.equal(serialized.includes("src/secret.js"), true);
+
+  const second = await fixture.jobs.getDetail({
+    jobId: created.job.jobId,
+    limit: 1,
+    cursor: first.nextCursor,
+  });
+  assert.deepEqual(second.observations.map(({ turn }) => turn), [2]);
+  assert.equal(second.nextCursor, null);
+
+  await fixture.jobs.pause({
+    jobId: created.job.jobId,
+    expectedRevision: current.job.revision,
+    reason: "Make the previous detail cursor stale",
+  });
+  await assert.rejects(
+    fixture.jobs.getDetail({
+      jobId: created.job.jobId,
+      limit: 1,
+      cursor: first.nextCursor,
+    }),
+    (error) => error.code === "CODE_JOB_DETAIL_CURSOR_STALE",
+  );
+  assert.throws(
+    () => fixture.jobs.getDetail({ jobId: created.job.jobId, limit: 21 }),
+    (error) => error.code === "INVALID_CODE_JOB_QUERY",
+  );
+  assert.equal(
+    await fixture.jobs.getDetail({ jobId: `code-job-${"f".repeat(55)}` }),
+    null,
+  );
+});
+
 test("approval retries with a new requestId converge on the same durable job", async () => {
   const { jobs, store } = await readyStore();
   const first = await jobs.createApprovedJob(approval());
@@ -2187,6 +2328,68 @@ test("archived package delivery remains bound to the exact completed job version
       (error) => error.code === "CODE_JOB_ARCHIVE_CORRUPTED",
     );
   }
+});
+
+test("job detail reports authoritative pending, ready, and archived package delivery", async () => {
+  let manifest = null;
+  const fixture = await completedDeliveryFixture({
+    changePackageReader: {
+      async get() {
+        return structuredClone(manifest);
+      },
+    },
+  });
+  const pending = await fixture.jobs.getDetail({
+    jobId: fixture.completed.job.jobId,
+  });
+  assert.deepEqual(pending.changePackage, {
+    status: "pending",
+    receipt: null,
+  });
+  assert.deepEqual(pending.terminalDetail, fixture.result);
+
+  const [event] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })
+  ).items;
+  manifest = changePackageForEvent(event);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(event, manifest),
+  );
+  const ready = await fixture.jobs.getDetail({
+    jobId: fixture.completed.job.jobId,
+  });
+  assert.deepEqual(ready.changePackage, {
+    status: "ready",
+    receipt: {
+      packageId: manifest.packageId,
+      packageDigest: manifest.packageDigest,
+      deliveredAt:
+        fixture.store.value.changePackageDelivery.delivered[0].receipt.deliveredAt,
+    },
+  });
+
+  const memoryEvents = await fixture.jobs.readMemoryProjectionBatch({ limit: 20 });
+  for (const memoryEvent of memoryEvents.items) {
+    await fixture.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(memoryEvent),
+    );
+  }
+  await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "job-detail-archive",
+      targetThroughSequence: fixture.completed.job.sequence,
+    }),
+  );
+  const archived = await fixture.jobs.getDetail({
+    jobId: fixture.completed.job.jobId,
+  });
+  assert.equal(archived.archived, true);
+  assert.equal(archived.historyAvailable, false);
+  assert.deepEqual(archived.observations, []);
+  assert.equal(archived.nextCursor, null);
+  assert.equal(archived.terminalDetail, null);
+  assert.deepEqual(archived.changePackage, ready.changePackage);
+  assert.deepEqual(archived.job.evidence, fixture.completed.job.grant.evidence);
 });
 
 test("meaningful lifecycle changes append one ordered durable memory event", async () => {

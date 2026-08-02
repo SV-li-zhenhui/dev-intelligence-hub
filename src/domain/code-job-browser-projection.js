@@ -1,6 +1,8 @@
 import { CODE_JOB_STATUSES } from "./code-job-vocabulary.js";
+import { normalizeWorkspacePath } from "./code-execution-policy.js";
 
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/;
 const INVALID_TEXT_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -196,6 +198,202 @@ function cloneProjectionValue(
   } finally {
     context.ancestors.delete(value);
   }
+}
+
+function safeWorkspacePath(value) {
+  try {
+    return normalizeWorkspacePath(value);
+  } catch {
+    return null;
+  }
+}
+
+function projectedError(value) {
+  return value &&
+      typeof value === "object" &&
+      typeof value.code === "string" &&
+      FAILURE_CODE.test(value.code)
+    ? {
+        code: value.code,
+        ...(typeof value.message === "string"
+          ? { message: value.message }
+          : {}),
+      }
+    : null;
+}
+
+function projectedExecutor(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    sessionStatus: typeof value.sessionStatus === "string"
+      ? value.sessionStatus
+      : null,
+    sessionAttemptNumber: Number.isSafeInteger(value.sessionAttemptNumber)
+      ? value.sessionAttemptNumber
+      : null,
+    actionStatus: typeof value.actionStatus === "string"
+      ? value.actionStatus
+      : null,
+    actionAttemptNumber: Number.isSafeInteger(value.actionAttemptNumber)
+      ? value.actionAttemptNumber
+      : null,
+  };
+}
+
+function projectedPathEntries(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const source = typeof entry === "string" ? { path: entry } : entry;
+    const path = safeWorkspacePath(source?.path);
+    if (path === null) return [];
+    const projected = { path };
+    for (const key of ["sha256", "beforeSha256", "afterSha256"]) {
+      if (typeof source[key] === "string" && SHA256.test(source[key])) {
+        projected[key] = source[key];
+      }
+    }
+    if (Number.isSafeInteger(source.bytes) && source.bytes >= 0) {
+      projected.bytes = source.bytes;
+    }
+    if (
+      source.blob &&
+      typeof source.blob === "object" &&
+      typeof source.blob.sha256 === "string" &&
+      SHA256.test(source.blob.sha256) &&
+      Number.isSafeInteger(source.blob.bytes) &&
+      source.blob.bytes >= 0
+    ) {
+      projected.blob = {
+        sha256: source.blob.sha256,
+        bytes: source.blob.bytes,
+      };
+    }
+    return [projected];
+  });
+}
+
+function projectedObservationResult(observation) {
+  const source = observation.detail?.result ?? observation.detail ?? {};
+  const error = projectedError(source.error);
+  if (observation.actionType === "list_files") {
+    return {
+      files: projectedPathEntries(source.files).map(({ path }) => path),
+      truncated: source.truncated === true,
+      error,
+    };
+  }
+  if (["read_text", "write_text"].includes(observation.actionType)) {
+    return {
+      path: safeWorkspacePath(observation.action.path),
+      sha256: typeof source.sha256 === "string" && SHA256.test(source.sha256)
+        ? source.sha256
+        : null,
+      bytes: Number.isSafeInteger(source.bytes) && source.bytes >= 0
+        ? source.bytes
+        : 0,
+      ...(observation.actionType === "read_text"
+        ? { truncated: source.truncated === true }
+        : {}),
+      error,
+    };
+  }
+  if (observation.actionType === "search_text") {
+    return {
+      matches: Array.isArray(source.matches)
+        ? source.matches.flatMap((entry) => {
+            const path = safeWorkspacePath(entry?.path);
+            return path === null
+              ? []
+              : [{
+                  path,
+                  line: Number.isSafeInteger(entry.line) ? entry.line : 0,
+                  column: Number.isSafeInteger(entry.column) ? entry.column : 0,
+                }];
+          })
+        : [],
+      truncated: source.truncated === true,
+      error,
+    };
+  }
+  if (observation.actionType === "run_profile") {
+    return {
+      exitCode: Number.isSafeInteger(source.exitCode) ? source.exitCode : null,
+      signal: typeof source.signal === "string" ? source.signal : null,
+      durationMs: Number.isFinite(source.durationMs) ? source.durationMs : 0,
+      timedOut: source.timedOut === true,
+      error,
+    };
+  }
+  return {
+    created: projectedPathEntries(source.created),
+    modified: projectedPathEntries(source.modified),
+    deleted: projectedPathEntries(source.deleted),
+    truncated: source.truncated === true,
+    error,
+  };
+}
+
+function projectedTerminalDetail(detail) {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) {
+    return {};
+  }
+  const result = {};
+  for (const key of [
+    "schemaVersion",
+    "outcome",
+    "summary",
+    "code",
+    "message",
+    "completedActionId",
+  ]) {
+    if (["string", "number"].includes(typeof detail[key])) {
+      result[key] = detail[key];
+    }
+  }
+  if (
+    typeof detail.workspaceRevision === "string" &&
+    SHA256.test(detail.workspaceRevision)
+  ) {
+    result.workspaceRevision = detail.workspaceRevision;
+  }
+  for (const key of ["evidence", "checks"]) {
+    if (Array.isArray(detail[key])) {
+      result[key] = detail[key].filter((entry) => typeof entry === "string");
+    }
+  }
+  if (detail.manifest && typeof detail.manifest === "object") {
+    result.manifest = {
+      created: projectedPathEntries(detail.manifest.created),
+      modified: projectedPathEntries(detail.manifest.modified),
+      deleted: projectedPathEntries(detail.manifest.deleted),
+      ...(detail.manifest.truncated === true ? { truncated: true } : {}),
+    };
+  }
+  return result;
+}
+
+export function projectCodeJobObservationForBrowser(observation) {
+  return structuredClone({
+    turn: observation.turn,
+    actionId: observation.actionId,
+    actionType: observation.actionType,
+    actionDigest: observation.actionDigest,
+    status: observation.status,
+    workspaceRevision: observation.workspaceRevision,
+    detailDigest: observation.detailDigest,
+    detail: {
+      schemaVersion: observation.detail?.schemaVersion ?? 1,
+      executor: projectedExecutor(observation.detail?.executor),
+      result: projectedObservationResult(observation),
+    },
+    recordedAt: observation.recordedAt,
+  });
+}
+
+export function projectCodeJobTerminalDetailForBrowser(job) {
+  return job.execution.result === null
+    ? null
+    : structuredClone(projectedTerminalDetail(job.execution.result.detail));
 }
 
 function boundedText(

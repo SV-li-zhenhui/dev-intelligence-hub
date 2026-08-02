@@ -351,6 +351,9 @@ async function withServer(
     attentionBrowser,
     memorySearch,
     codeJobReader,
+    codeJobControl,
+    changePackageReader,
+    changePackageApplicationRequester,
   } = {},
 ) {
   const calls = [];
@@ -533,6 +536,12 @@ async function withServer(
   if (attentionBrowser) application.attentionBrowser = attentionBrowser;
   if (memorySearch) application.memorySearch = memorySearch;
   if (codeJobReader) application.codeJobReader = codeJobReader;
+  if (codeJobControl) application.codeJobControl = codeJobControl;
+  if (changePackageReader) application.changePackageReader = changePackageReader;
+  if (changePackageApplicationRequester) {
+    application.changePackageApplicationRequester =
+      changePackageApplicationRequester;
+  }
   const server = createDashboardServer(application, {
     backgroundWork,
     reportError(error) {
@@ -1898,6 +1907,362 @@ test("disabled code jobs remain a stable empty read-only API", async () => {
       items: [],
       nextCursor: null,
     });
+  });
+});
+
+test("code job detail forwards bounded pagination and reports missing jobs", async () => {
+  const jobId = `code-job-${"a".repeat(55)}`;
+  const calls = [];
+  const detail = {
+    job: {
+      jobId,
+      revision: 7,
+      requestedBy: { roleId: "developer", workItemId: "work-1" },
+    },
+    archived: false,
+    historyAvailable: true,
+    observations: [],
+    nextCursor: null,
+    terminalDetail: null,
+    changePackage: { status: "pending", receipt: null },
+  };
+  await withServer(
+    async ({ server }) => {
+      const found = await request(server, {
+        path: `/api/code/jobs/${jobId}?limit=8&cursor=observation%3A2`,
+      });
+      const missing = await request(server, {
+        path: `/api/code/jobs/code-job-${"b".repeat(55)}`,
+      });
+      const unknownQuery = await request(server, {
+        path: `/api/code/jobs/${jobId}?status=active`,
+      });
+      const repeatedQuery = await request(server, {
+        path: `/api/code/jobs/${jobId}?limit=4&limit=5`,
+      });
+
+      assert.equal(found.status, 200);
+      assert.deepEqual(JSON.parse(found.body), { enabled: true, detail });
+      assert.equal(missing.status, 404);
+      assert.deepEqual([unknownQuery.status, repeatedQuery.status], [400, 400]);
+      assert.deepEqual(calls, [
+        { jobId, limit: "8", cursor: "observation:2" },
+        { jobId: `code-job-${"b".repeat(55)}` },
+      ]);
+    },
+    {
+      codeJobReader: {
+        async getDetail(options) {
+          calls.push(options);
+          return options.jobId === jobId ? detail : null;
+        },
+      },
+    },
+  );
+});
+
+test("code job controls bind identity to the path and reject extra fields", async () => {
+  const jobId = `code-job-${"c".repeat(55)}`;
+  const calls = [];
+  const codeJobControl = {
+    async pause(input) {
+      calls.push(["pause", input]);
+      return { status: "applied", job: { jobId, status: "paused" } };
+    },
+    async resume(input) {
+      calls.push(["resume", input]);
+      return { status: "applied", job: { jobId, status: "active" } };
+    },
+  };
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+  await withServer(
+    async ({ server }) => {
+      const paused = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "pause", expectedRevision: 7 }),
+      });
+      const resumed = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "resume", expectedRevision: 8 }),
+      });
+      const bodyBoundJob = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({
+          command: "pause",
+          expectedRevision: 9,
+          jobId: `code-job-${"d".repeat(55)}`,
+        }),
+      });
+      const clientReason = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({
+          command: "pause",
+          expectedRevision: 9,
+          reason: "client supplied",
+        }),
+      });
+      const untrusted = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ command: "pause", expectedRevision: 9 }),
+      });
+
+      assert.deepEqual([paused.status, resumed.status], [200, 200]);
+      assert.deepEqual(JSON.parse(paused.body), {
+        status: "applied",
+        job: { jobId, status: "paused" },
+      });
+      assert.deepEqual(
+        [bodyBoundJob.status, clientReason.status, untrusted.status],
+        [400, 400, 403],
+      );
+      assert.deepEqual(calls, [
+        [
+          "pause",
+          {
+            jobId,
+            expectedRevision: 7,
+            reason: "用户从本地指挥中枢暂停代码任务",
+          },
+        ],
+        ["resume", { jobId, expectedRevision: 8 }],
+      ]);
+    },
+    { codeJobControl },
+  );
+});
+
+test("code job package reads require a ready receipt bound to the manifest", async () => {
+  const jobId = `code-job-${"e".repeat(55)}`;
+  const packageDigest = "f".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const calls = [];
+  const detail = {
+    job: {
+      jobId,
+      revision: 11,
+      requestedBy: { roleId: "developer", workItemId: "work-1" },
+    },
+    changePackage: {
+      status: "ready",
+      receipt: {
+        packageId,
+        packageDigest,
+        deliveredAt: "2026-08-03T01:00:00.000Z",
+      },
+    },
+  };
+  const manifest = {
+    packageId,
+    packageDigest,
+    job: { id: jobId },
+    changes: { created: [], modified: [], deleted: [] },
+  };
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: `/api/code/jobs/${jobId}/change-package`,
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(JSON.parse(response.body), { manifest });
+      assert.deepEqual(calls, [
+        ["detail", { jobId }],
+        ["package", packageId],
+      ]);
+    },
+    {
+      codeJobReader: {
+        async getDetail(input) {
+          calls.push(["detail", input]);
+          return detail;
+        },
+      },
+      changePackageReader: {
+        async get(input) {
+          calls.push(["package", input]);
+          return manifest;
+        },
+      },
+    },
+  );
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: `/api/code/jobs/${jobId}/change-package`,
+      });
+      assert.equal(response.status, 409);
+    },
+    {
+      codeJobReader: { async getDetail() { return detail; } },
+      changePackageReader: {
+        async get() {
+          return { ...manifest, packageDigest: "0".repeat(64) };
+        },
+      },
+    },
+  );
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: `/api/code/jobs/${jobId}/change-package`,
+      });
+      assert.equal(response.status, 404);
+    },
+    {
+      codeJobReader: { async getDetail() { return detail; } },
+      changePackageReader: {
+        async get() {
+          throw Object.assign(new Error("missing package"), {
+            code: "CHANGE_PACKAGE_NOT_FOUND",
+          });
+        },
+      },
+    },
+  );
+});
+
+test("code job package apply derives authority and only requests confirmation", async () => {
+  const jobId = `code-job-${"1".repeat(55)}`;
+  const packageDigest = "2".repeat(64);
+  const packageId = `change-package-${packageDigest}`;
+  const requestedBy = { roleId: "developer", workItemId: "work-9" };
+  const calls = [];
+  const detail = {
+    job: { jobId, revision: 13, requestedBy },
+    changePackage: {
+      status: "ready",
+      receipt: {
+        packageId,
+        packageDigest,
+        deliveredAt: "2026-08-03T02:00:00.000Z",
+      },
+    },
+  };
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+  await withServer(
+    async ({ server }) => {
+      const accepted = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers,
+        body: JSON.stringify({ expectedRevision: 13 }),
+      });
+      const stale = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers,
+        body: JSON.stringify({ expectedRevision: 12 }),
+      });
+      const forged = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers,
+        body: JSON.stringify({ expectedRevision: 13, packageId: "forged" }),
+      });
+      const wrongContentType = await request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers: { ...headers, "content-type": "text/plain" },
+        body: JSON.stringify({ expectedRevision: 13 }),
+      });
+
+      assert.equal(accepted.status, 200);
+      assert.deepEqual(JSON.parse(accepted.body), {
+        request: { id: "confirmation-package-1", status: "pending" },
+      });
+      assert.deepEqual(
+        [stale.status, forged.status, wrongContentType.status],
+        [409, 400, 415],
+      );
+      assert.deepEqual(calls, [
+        { packageId, requestedBy },
+      ]);
+    },
+    {
+      codeJobReader: { async getDetail() { return detail; } },
+      changePackageApplicationRequester: {
+        async request(input) {
+          calls.push(input);
+          return { id: "confirmation-package-1", status: "pending" };
+        },
+      },
+    },
+  );
+
+  for (const [code, status] of [
+    ["CHANGE_PACKAGE_APPLICATION_STALE", 409],
+    ["CHANGE_PACKAGE_TARGET_DIRTY", 409],
+    ["CHANGE_PACKAGE_TARGET_STALE", 409],
+    ["CHANGE_PACKAGE_APPLICATION_BINDING_CONFLICT", 409],
+    ["INVALID_CHANGE_PACKAGE_APPLICATION", 400],
+    ["CHANGE_PACKAGE_APPLICATION_PACKAGE_UNAVAILABLE", 503],
+  ]) {
+    await withServer(
+      async ({ server }) => {
+        const response = await request(server, {
+          method: "POST",
+          path: `/api/code/jobs/${jobId}/change-package/apply`,
+          headers,
+          body: JSON.stringify({ expectedRevision: 13 }),
+        });
+        assert.equal(response.status, status, code);
+      },
+      {
+        codeJobReader: { async getDetail() { return detail; } },
+        changePackageApplicationRequester: {
+          async request() {
+            throw Object.assign(new Error("application request rejected"), {
+              code,
+            });
+          },
+        },
+      },
+    );
+  }
+});
+
+test("code job detail and mutation routes fail closed without required ports", async () => {
+  const jobId = `code-job-${"3".repeat(55)}`;
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+  await withServer(async ({ server }) => {
+    const responses = await Promise.all([
+      request(server, { path: `/api/code/jobs/${jobId}` }),
+      request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/control`,
+        headers,
+        body: JSON.stringify({ command: "pause", expectedRevision: 1 }),
+      }),
+      request(server, { path: `/api/code/jobs/${jobId}/change-package` }),
+      request(server, {
+        method: "POST",
+        path: `/api/code/jobs/${jobId}/change-package/apply`,
+        headers,
+        body: JSON.stringify({ expectedRevision: 1 }),
+      }),
+    ]);
+    assert.deepEqual(responses.map(({ status }) => status), [503, 503, 503, 503]);
   });
 });
 

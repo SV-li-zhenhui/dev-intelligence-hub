@@ -14,6 +14,8 @@ import {
   updateCodeJobLifecycle,
 } from "../domain/code-job-contract.js";
 import {
+  projectCodeJobObservationForBrowser,
+  projectCodeJobTerminalDetailForBrowser,
   projectArchivedCodeJobForBrowser,
 } from "../domain/code-job-browser-projection.js";
 import {
@@ -1375,6 +1377,120 @@ function normalizeListOptions(value = {}) {
       value.cursor === undefined ? null : normalizeJobId(value.cursor),
     status,
   };
+}
+
+function detailCursorStale() {
+  return storeError(
+    "CODE_JOB_DETAIL_CURSOR_STALE",
+    "代码任务详情分页游标已失效",
+    409,
+  );
+}
+
+function createDetailCursor(jobId, revision, offset) {
+  const content = { schemaVersion: 1, jobId, revision, offset };
+  return Buffer.from(JSON.stringify({
+    ...content,
+    digest: digestValue(content),
+  }), "utf8").toString("base64url");
+}
+
+function normalizeDetailCursor(value, error) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 1_024 ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) {
+    throw error;
+  }
+  let decoded;
+  try {
+    const json = Buffer.from(value, "base64url").toString("utf8");
+    if (Buffer.from(json, "utf8").toString("base64url") !== value) throw error;
+    decoded = JSON.parse(json);
+  } catch {
+    throw error;
+  }
+  assertExactKeys(
+    decoded,
+    ["schemaVersion", "jobId", "revision", "offset", "digest"],
+    error,
+  );
+  const content = {
+    schemaVersion: decoded.schemaVersion,
+    jobId: normalizeJobId(decoded.jobId, error),
+    revision: safeInteger(
+      decoded.revision,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    offset: safeInteger(decoded.offset, 1, 128, error),
+  };
+  if (
+    content.schemaVersion !== 1 ||
+    normalizeSha256(decoded.digest, error) !== digestValue(content)
+  ) {
+    throw error;
+  }
+  return content;
+}
+
+function normalizeDetailOptions(value) {
+  const error = storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效");
+  const keys = plainDataKeys(value, error);
+  if (
+    !keys.includes("jobId") ||
+    keys.some((key) => !["jobId", "limit", "cursor"].includes(key))
+  ) {
+    throw error;
+  }
+  const rawLimit = value.limit ?? 20;
+  const limit = typeof rawLimit === "string" && /^[1-9][0-9]?$/.test(rawLimit)
+    ? Number(rawLimit)
+    : rawLimit;
+  return {
+    jobId: normalizeJobId(value.jobId, error),
+    limit: safeInteger(limit, 1, 20, error),
+    cursor: value.cursor === undefined || value.cursor === null
+      ? null
+      : normalizeDetailCursor(value.cursor, error),
+  };
+}
+
+function deliveryReceiptForBrowser(entry) {
+  return entry === null || entry === undefined
+    ? null
+    : {
+        packageId: entry.receipt.packageId,
+        packageDigest: entry.receipt.packageDigest,
+        deliveredAt: entry.receipt.deliveredAt,
+      };
+}
+
+function liveChangePackageProjection(state, jobId) {
+  if (
+    state.changePackageDelivery.pending.some(({ job }) => job.id === jobId)
+  ) {
+    return { status: "pending", receipt: null };
+  }
+  const delivered = state.changePackageDelivery.delivered.find(
+    ({ receipt }) => receipt.jobId === jobId,
+  );
+  const receipt = deliveryReceiptForBrowser(delivered);
+  return receipt === null
+    ? { status: "none", receipt: null }
+    : { status: "ready", receipt };
+}
+
+function archivedChangePackageProjection(tombstone) {
+  const receipt = deliveryReceiptForBrowser(
+    tombstone.outcome.changePackageDelivery,
+  );
+  return receipt === null
+    ? { status: "none", receipt: null }
+    : { status: "ready", receipt };
 }
 
 function normalizeMemoryBatchOptions(value = {}) {
@@ -3187,6 +3303,58 @@ export class CodeJobStore {
       if (job) return projectCodeJobForBrowser(job);
       const archived = await this.#readArchivedByJobId(this.state, jobId);
       return archived ? projectArchivedCodeJobForBrowser(archived) : null;
+    });
+  }
+
+  getDetail(value) {
+    const options = normalizeDetailOptions(value);
+    return this.#query(async () => {
+      const job = this.state.jobs.find(
+        (candidate) => candidate.jobId === options.jobId,
+      );
+      if (job) {
+        const offset = options.cursor?.offset ?? 0;
+        if (
+          options.cursor !== null &&
+          (options.cursor.jobId !== job.jobId ||
+            options.cursor.revision !== job.revision ||
+            offset >= job.execution.observations.length)
+        ) {
+          throw detailCursorStale();
+        }
+        const end = Math.min(
+          offset + options.limit,
+          job.execution.observations.length,
+        );
+        return cloneCodeJobValue({
+          job: projectCodeJobForBrowser(job),
+          archived: false,
+          historyAvailable: true,
+          observations: job.execution.observations
+            .slice(offset, end)
+            .map(projectCodeJobObservationForBrowser),
+          nextCursor: end < job.execution.observations.length
+            ? createDetailCursor(job.jobId, job.revision, end)
+            : null,
+          terminalDetail: projectCodeJobTerminalDetailForBrowser(job),
+          changePackage: liveChangePackageProjection(this.state, job.jobId),
+        });
+      }
+      const archived = await this.#readArchivedByJobId(
+        this.state,
+        options.jobId,
+      );
+      if (archived === null) return null;
+      if (options.cursor !== null) throw detailCursorStale();
+      return cloneCodeJobValue({
+        job: projectArchivedCodeJobForBrowser(archived),
+        archived: true,
+        historyAvailable: false,
+        observations: [],
+        nextCursor: null,
+        terminalDetail: null,
+        changePackage: archivedChangePackageProjection(archived),
+      });
     });
   }
 

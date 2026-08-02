@@ -619,8 +619,14 @@ h1 {
 }
 
 .memory-item {
+  min-width: 0;
   padding: 15px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.memory-item strong,
+.memory-item p {
+  overflow-wrap: anywhere;
 }
 
 .memory-item p {
@@ -631,6 +637,7 @@ h1 {
 
 .memory-item span,
 .memory-item a {
+  overflow-wrap: anywhere;
   color: var(--muted);
   font-size: 10px;
 }
@@ -798,6 +805,37 @@ h1 {
 .work-row small {
   margin-top: 6px;
   color: var(--faint);
+}
+
+.code-job-row {
+  display: block;
+  width: 100%;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.code-job-row:hover {
+  background: var(--green-soft);
+}
+
+.code-job-row:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+.code-job-row > span,
+.code-job-row-context {
+  display: block;
+}
+
+.code-job-row-context {
+  margin: 7px 0;
 }
 
 .work-timeline-row strong {
@@ -1186,6 +1224,152 @@ dialog::backdrop {
   text-decoration: none;
 }
 
+.code-job-detail-heading,
+.code-job-section-heading {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.code-job-detail-heading h2,
+.code-job-section-heading h3 {
+  margin-right: 0;
+}
+
+.code-job-detail-section {
+  margin-top: 24px;
+}
+
+.code-job-detail-section h3,
+.code-job-manifest h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+}
+
+.code-job-detail-section p,
+.code-job-detail-list,
+.code-job-detail-empty {
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.code-job-detail-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.code-job-detail-list small {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  font: 9px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.code-job-test-profiles {
+  border-top: 1px solid var(--line-strong);
+}
+
+.code-job-test-profiles > article {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.code-job-test-profiles .detail-grid {
+  margin-top: 8px;
+  grid-template-columns: 105px minmax(0, 1fr);
+}
+
+.code-job-profile-artifacts dd small {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.code-job-detail-empty,
+.code-job-section-heading span {
+  color: var(--muted);
+}
+
+.code-job-observations {
+  border-top: 1px solid var(--line-strong);
+}
+
+.code-job-observations article {
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.code-job-observations small {
+  display: block;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.code-job-detail pre,
+.code-job-observations pre {
+  max-width: 100%;
+  margin: 9px 0 0;
+  padding: 10px;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 10px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.code-job-detail code {
+  overflow-wrap: anywhere;
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.secondary-action,
+.code-job-detail-actions button {
+  margin-top: 12px;
+  padding: 9px 12px;
+  color: var(--green);
+  background: transparent;
+  border: 1px solid var(--green);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.secondary-action:disabled,
+.code-job-detail-actions button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.code-job-detail-actions {
+  display: flex;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-top: 20px;
+}
+
+.code-job-detail-actions button {
+  margin-top: 0;
+  color: white;
+  background: var(--green);
+}
+
+.code-job-action-error {
+  margin-top: 18px;
+  padding: 10px 12px;
+  color: var(--red);
+  background: var(--red-soft);
+  border-left: 3px solid var(--red);
+  font-size: 11px;
+}
+
 .brain-assessment {
   margin: 0 0 18px;
   padding: 12px 14px;
@@ -1463,6 +1647,32 @@ dialog::backdrop {
 
   .work-summary div:nth-child(n + 3) {
     border-top: 1px solid var(--line);
+  }
+
+  .code-job-detail {
+    padding: 24px 18px;
+  }
+
+  .code-job-detail .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .code-job-detail .detail-grid dt {
+    padding-bottom: 2px;
+    border-bottom: 0;
+  }
+
+  .code-job-detail .detail-grid dd {
+    padding-top: 2px;
+  }
+
+  .code-job-detail-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .code-job-detail-actions button {
+    width: 100%;
   }
 
   .workflow-summary div:nth-child(3) {
