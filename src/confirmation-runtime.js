@@ -36,6 +36,10 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "networkEnv",
   "timeoutMs",
 ]);
+const LOCAL_EXECUTOR_KINDS = new Set([
+  "local.code-job-create",
+  "local.change-package-apply",
+]);
 
 export class ConfirmationRuntimeError extends Error {
   constructor(code, message) {
@@ -210,6 +214,47 @@ function assertPort(value, methods, name) {
   return value;
 }
 
+function normalizeLocalExecutors(dependencies) {
+  const executors = {};
+  const configured = dataProperty(dependencies, "localExecutors");
+  if (configured !== undefined) {
+    if (!isPlainRecord(configured)) {
+      throw new TypeError("localExecutors must be a plain object");
+    }
+    for (const kind of Reflect.ownKeys(configured)) {
+      const descriptor = Object.getOwnPropertyDescriptor(configured, kind);
+      if (
+        typeof kind !== "string" ||
+        !LOCAL_EXECUTOR_KINDS.has(kind) ||
+        !descriptor?.enumerable ||
+        !("value" in descriptor)
+      ) {
+        throw new TypeError("localExecutors contains an unsupported kind");
+      }
+      executors[kind] = assertPort(
+        descriptor.value,
+        ["execute", "reconcile"],
+        `localExecutors[${kind}]`,
+      );
+    }
+  }
+
+  const legacy = dataProperty(dependencies, "localExecutor");
+  if (legacy !== undefined && legacy !== null) {
+    if (Object.hasOwn(executors, "local.code-job-create")) {
+      throw new TypeError(
+        "localExecutor conflicts with localExecutors[local.code-job-create]",
+      );
+    }
+    executors["local.code-job-create"] = assertPort(
+      legacy,
+      ["execute", "reconcile"],
+      "localExecutor",
+    );
+  }
+  return Object.freeze(executors);
+}
+
 function createQueueFacade(queue, methods) {
   const facade = {};
   for (const method of methods) {
@@ -229,16 +274,8 @@ function closeOnce(guard) {
 
 export async function createConfirmationRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
-  const configuredLocalExecutor = dataProperty(dependencies, "localExecutor");
-  const localExecutor =
-    configuredLocalExecutor === undefined || configuredLocalExecutor === null
-      ? null
-      : assertPort(
-          configuredLocalExecutor,
-          ["execute", "reconcile"],
-          "localExecutor",
-        );
-  if (!enabledConfig && !localExecutor) return null;
+  const localExecutors = normalizeLocalExecutors(dependencies);
+  if (!enabledConfig && Object.keys(localExecutors).length === 0) return null;
 
   const factories = validateDependencies(dependencies);
   let githubExecutorOptions = null;
@@ -286,7 +323,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           "github.work-proposal-review": githubExecutor,
         }
       : {}),
-    ...(localExecutor ? { "local.code-job-create": localExecutor } : {}),
+    ...localExecutors,
   };
   const executor = assertPort(
     factories.createExecutorRouter({ executors }),

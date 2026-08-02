@@ -265,6 +265,57 @@ test("a local-only runtime starts without reading GitHub credentials", async () 
   await runtime.close();
 });
 
+test("multiple local confirmation kinds share one routed queue", async () => {
+  const codeJobExecutor = { execute() {}, reconcile() {} };
+  const applicationExecutor = { execute() {}, reconcile() {} };
+  let routed;
+  const runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    runtimeDependencies({
+      localExecutors: {
+        "local.code-job-create": codeJobExecutor,
+        "local.change-package-apply": applicationExecutor,
+      },
+      createExecutorRouter({ executors }) {
+        routed = executors;
+        return codeJobExecutor;
+      },
+    }),
+  );
+
+  assert.deepEqual(Object.keys(routed).sort(), [
+    "local.change-package-apply",
+    "local.code-job-create",
+  ]);
+  assert.strictEqual(routed["local.code-job-create"], codeJobExecutor);
+  assert.strictEqual(
+    routed["local.change-package-apply"],
+    applicationExecutor,
+  );
+  await runtime.close();
+});
+
+test("local executor registration rejects unknown or ambiguous kinds", async () => {
+  const executor = { execute() {}, reconcile() {} };
+  await assert.rejects(
+    createConfirmationRuntime(
+      { githubActions: { enabled: false } },
+      runtimeDependencies({ localExecutors: { "local.unknown": executor } }),
+    ),
+    /localExecutors/,
+  );
+  await assert.rejects(
+    createConfirmationRuntime(
+      { githubActions: { enabled: false } },
+      runtimeDependencies({
+        localExecutor: executor,
+        localExecutors: { "local.code-job-create": executor },
+      }),
+    ),
+    /localExecutor/,
+  );
+});
+
 test("recover failure closes the guard before rethrowing the same error", async () => {
   const events = [];
   const failure = new Error("invalid durable state");
