@@ -42,6 +42,39 @@ test("external confirmation renders the exact authorization context", async () =
   );
 });
 
+test("code authorization uses local-only wording and an exact kind branch", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+
+  assert.match(app, /item\?\.kind === "local\.code-job-create"/);
+  for (const visibleLabel of [
+    "请求岗位",
+    "可信工作区",
+    "代码操作",
+    "任务目标",
+    "验收条件",
+    "可写相对路径",
+    "允许的受控动作",
+    "必须运行的固定测试",
+    "批准创建本地代码任务",
+    "本次点击不会调用模型、修改源目录、提交或推送 GitHub",
+  ]) {
+    assert.equal(app.includes(visibleLabel), true, visibleLabel);
+  }
+});
+
+test("unknown confirmation kinds have no approve or reject control", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function showUnsupportedExternalConfirmation");
+  const end = app.indexOf("\nfunction showExternalActionConfirmation", start);
+  const renderer = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(renderer, /data-external-operation="later"/);
+  assert.equal(renderer.includes('data-external-operation="approve"'), false);
+  assert.equal(renderer.includes('data-external-operation="retry"'), false);
+  assert.equal(renderer.includes('data-external-operation="reject"'), false);
+});
+
 test("browser mutations send binding metadata and never submit an action payload", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("async function handleExternalConfirmation");

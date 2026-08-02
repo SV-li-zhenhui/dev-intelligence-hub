@@ -350,6 +350,7 @@ async function withServer(
     attentionCoordinator,
     attentionBrowser,
     memorySearch,
+    codeJobReader,
   } = {},
 ) {
   const calls = [];
@@ -531,6 +532,7 @@ async function withServer(
   }
   if (attentionBrowser) application.attentionBrowser = attentionBrowser;
   if (memorySearch) application.memorySearch = memorySearch;
+  if (codeJobReader) application.codeJobReader = codeJobReader;
   const server = createDashboardServer(application, {
     backgroundWork,
     reportError(error) {
@@ -1854,6 +1856,48 @@ test("work APIs fail closed when the ledger projection is unavailable", async ()
       request(server, { path: "/api/work/timeline" }),
     ]);
     assert.deepEqual(responses.map(({ status }) => status), [503, 503, 503]);
+  });
+});
+
+test("code jobs expose only their safe newest-first reader projection", async () => {
+  const calls = [];
+  const codeJobReader = {
+    async list(options) {
+      calls.push(options);
+      return {
+        items: [{ id: "code-job-1", status: "queued" }],
+        nextCursor: null,
+      };
+    },
+  };
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: "/api/code/jobs?limit=9&order=newest&status=queued&cursor=job%3A2",
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(JSON.parse(response.body), {
+        enabled: true,
+        items: [{ id: "code-job-1", status: "queued" }],
+        nextCursor: null,
+      });
+      assert.deepEqual(calls, [
+        { limit: "9", cursor: "job:2", status: "queued", order: "newest" },
+      ]);
+    },
+    { codeJobReader },
+  );
+});
+
+test("disabled code jobs remain a stable empty read-only API", async () => {
+  await withServer(async ({ server }) => {
+    const response = await request(server, { path: "/api/code/jobs" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(response.body), {
+      enabled: false,
+      items: [],
+      nextCursor: null,
+    });
   });
 });
 

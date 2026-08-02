@@ -6,6 +6,9 @@ function initialState() {
     summary: null,
     items: [],
     timeline: [],
+    codeJobsEnabled: false,
+    codeJobs: [],
+    codeJobsError: "",
   };
 }
 
@@ -88,6 +91,49 @@ function timelineRows(entries, now) {
     </article>`).join("")}</div>`;
 }
 
+function codeJobStatusLabel(status) {
+  return {
+    queued: "已授权，等待执行",
+    active: "受控执行中",
+    completed: "已完成",
+    failed: "执行失败",
+    stale: "授权已失效",
+    fenced: "需要恢复核验",
+  }[status] || status || "未知";
+}
+
+function codeJobResultMarkup(result = {}) {
+  const files = [
+    ...(result.createdFiles || []).map((value) => `新增 ${value}`),
+    ...(result.modifiedFiles || []).map((value) => `修改 ${value}`),
+    ...(result.deletedFiles || []).map((value) => `删除 ${value}`),
+  ];
+  const profiles = (result.profiles || []).map(
+    ({ id, status }) => `${id} · ${status}`,
+  );
+  const details = [...files, ...profiles];
+  return `${result.summary ? `<small>${escapeWorkHtml(result.summary)}</small>` : ""}
+    ${details.length ? `<small>${details.map(escapeWorkHtml).join(" · ")}</small>` : ""}
+    ${result.manifestDigest ? `<small>manifest · ${escapeWorkHtml(result.manifestDigest)}</small>` : ""}`;
+}
+
+function codeJobRows(items, now) {
+  if (!items.length) {
+    return '<div class="empty">尚无已授权的本地代码任务。</div>';
+  }
+  return `<div class="work-list">${items.map((job) => `
+    <article class="work-row code-job-row">
+      <div class="work-row-heading">
+        <strong>${escapeWorkHtml(job.repository || "未知仓库")} · ${escapeWorkHtml(job.operation || "unknown")}</strong>
+        <span class="status-pill status-${escapeWorkHtml(job.status)}">${escapeWorkHtml(codeJobStatusLabel(job.status))}</span>
+      </div>
+      <p>${escapeWorkHtml(job.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
+      <span>${escapeWorkHtml(job.phase || "queued")} · ${escapeWorkHtml(job.lastActionType || "尚无动作")} · ${Number(job.turnCount) || 0} 轮 · ${relativeTime(job.updatedAt, now)}</span>
+      ${job.errorCode ? `<small>${escapeWorkHtml(job.errorCode)}</small>` : ""}
+      ${codeJobResultMarkup(job.result)}
+    </article>`).join("")}</div>`;
+}
+
 function count(summary, status) {
   return Number(summary?.itemCounts?.[status]) || 0;
 }
@@ -131,7 +177,15 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
         <div class="section-heading"><h2>审计时间线</h2><span>${state.timeline.length} EVENTS · 最新在前</span></div>
         ${timelineRows(state.timeline, now)}
       </section>
-    </div>`;
+    </div>
+    <section class="section work-panel code-job-panel">
+      <div class="section-heading"><h2>本地代码任务</h2><span>${state.codeJobs?.length || 0} JOBS · 只读结果</span></div>
+      ${state.codeJobsError
+        ? `<div class="empty">代码任务暂不可读取：${escapeWorkHtml(state.codeJobsError)}</div>`
+        : state.codeJobsEnabled
+          ? codeJobRows(state.codeJobs || [], now)
+          : '<div class="empty">受控代码任务尚未启用。</div>'}
+    </section>`;
 }
 
 async function responseJson(response, label) {
@@ -170,11 +224,26 @@ export function createWorkView({
         fetchImpl("/api/work/items?limit=50&order=newest", { cache: "no-store" }),
         fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
       ]);
+      const codeJobsResponse = await fetchImpl(
+        "/api/code/jobs?limit=50&order=newest",
+        { cache: "no-store" },
+      ).catch(() => null);
       const [summary, items, timeline] = await Promise.all([
         responseJson(responses[0], "读取工作摘要"),
         responseJson(responses[1], "读取工作项"),
         responseJson(responses[2], "读取工作时间线"),
       ]);
+      let codeJobs = { enabled: false, items: [] };
+      let codeJobsError = "";
+      if (codeJobsResponse) {
+        try {
+          codeJobs = await responseJson(codeJobsResponse, "读取代码任务");
+        } catch (error) {
+          codeJobsError = errorMessage(error);
+        }
+      } else {
+        codeJobsError = "读取代码任务失败";
+      }
       change({
         loaded: true,
         loading: false,
@@ -182,6 +251,9 @@ export function createWorkView({
         summary,
         items: items.items || [],
         timeline: timeline.items || [],
+        codeJobsEnabled: codeJobs.enabled === true,
+        codeJobs: codeJobs.items || [],
+        codeJobsError,
       });
     } catch (error) {
       change({ loaded: true, loading: false, error: errorMessage(error) });

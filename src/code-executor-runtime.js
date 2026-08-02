@@ -114,6 +114,27 @@ function resolveRuntimeRoot(value) {
   return path.resolve(runtimeRoot);
 }
 
+function createWorkspaceAuthority(workspaces, requiredProfiles, sandbox) {
+  return Object.freeze({
+    workspaces: Object.freeze(
+      workspaces.map((workspace) =>
+        Object.freeze({
+          id: workspace.id,
+          writablePaths: Object.freeze([...workspace.writablePaths]),
+          requiredProfiles: Object.freeze(
+            requiredProfiles[workspace.id].map((id) =>
+              Object.freeze({
+                id,
+                configDigest: sandbox.getProfileFingerprint(id),
+              }),
+            ),
+          ),
+        }),
+      ),
+    ),
+  });
+}
+
 export async function createCodeExecutorRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
   if (!enabledConfig) return null;
@@ -176,5 +197,10 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     limits: enabledConfig.executorLimits || {},
   });
   const recovery = await executor.recover();
-  return Object.freeze({ broker, sandbox, journal, executor, recovery });
+  const authority = createWorkspaceAuthority(
+    workspaces,
+    enabledConfig.requiredProfilesByWorkspace,
+    sandbox,
+  );
+  return Object.freeze({ broker, sandbox, journal, executor, authority, recovery });
 }

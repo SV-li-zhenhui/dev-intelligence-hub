@@ -299,6 +299,9 @@ test("work coordination overrides merge trusted policy maps without losing defau
           workspaceByRepository: {
             "acme/base": "base-workspace",
           },
+          codeOperationsByRole: {
+            developer: ["inspect", "modify", "verify"],
+          },
         },
       },
     },
@@ -309,6 +312,9 @@ test("work coordination overrides merge trusted policy maps without losing defau
           capabilityRoles: { testing: "qa-specialist" },
           workspaceByRepository: {
             "acme/local": "local-workspace",
+          },
+          codeOperationsByRole: {
+            tester: ["inspect", "verify"],
           },
         },
       },
@@ -328,6 +334,10 @@ test("work coordination overrides merge trusted policy maps without losing defau
       workspaceByRepository: {
         "acme/base": "base-workspace",
         "acme/local": "local-workspace",
+      },
+      codeOperationsByRole: {
+        developer: ["inspect", "modify", "verify"],
+        tester: ["inspect", "verify"],
       },
     },
   });
@@ -390,6 +400,10 @@ test("committed command-center roles route PR work to the durable PR engineer", 
   assert.deepEqual(config.workCoordination.policy.githubReviewRoles, [
     "pr-engineer",
   ]);
+  assert.deepEqual(config.workCoordination.policy.codeOperationsByRole, {
+    developer: ["inspect", "modify", "verify"],
+    tester: ["inspect", "verify"],
+  });
   assert.equal(
     config.employees.roles["pr-engineer"].permissions.allowedIntents.includes(
       "propose_github_review",

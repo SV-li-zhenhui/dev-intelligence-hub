@@ -21,6 +21,7 @@ const ACTIVE_PR_EVENTS = new Set([
   "pull_request.classified",
   "pull_request.status",
 ]);
+const CODE_OPERATIONS = Object.freeze(["inspect", "modify", "verify"]);
 
 export class WorkIntentPolicyError extends Error {
   constructor(code, message) {
@@ -145,6 +146,29 @@ function normalizeWorkspaces(value) {
   return result;
 }
 
+function normalizeCodeOperations(value, codeRoles) {
+  const entries = plainEntries(value);
+  const result = new Map();
+  for (const [roleId, rawOperations] of entries) {
+    const normalizedRoleId = safeId(roleId, "codeOperationsByRole.roleId");
+    if (!codeRoles.has(normalizedRoleId) || result.has(normalizedRoleId)) {
+      contextError("codeOperationsByRole.roleId 无效");
+    }
+    const operations = strictArray(rawOperations, CODE_OPERATIONS.length, () =>
+      contextError("codeOperationsByRole.operations 无效"),
+    );
+    if (
+      operations.length < 1 ||
+      operations.some((operation) => !CODE_OPERATIONS.includes(operation)) ||
+      new Set(operations).size !== operations.length
+    ) {
+      contextError("codeOperationsByRole.operations 无效");
+    }
+    result.set(normalizedRoleId, new Set(operations));
+  }
+  return result;
+}
+
 function cloneAndFreeze(value) {
   const cloned = structuredClone(value);
   const freeze = (entry) => {
@@ -215,6 +239,7 @@ export function createWorkIntentPolicy({
   githubReviewRoles = [],
   codeActionRoles = [],
   workspaceByRepository = {},
+  codeOperationsByRole = {},
 } = {}) {
   if (!Number.isSafeInteger(version) || version < 1) {
     contextError("policy version 无效");
@@ -226,6 +251,10 @@ export function createWorkIntentPolicy({
   );
   const trustedCodeRoles = normalizeRoleList(codeActionRoles, "codeActionRoles");
   const trustedWorkspaces = normalizeWorkspaces(workspaceByRepository);
+  const trustedCodeOperations = normalizeCodeOperations(
+    codeOperationsByRole,
+    trustedCodeRoles,
+  );
 
   function bind({ context: contextValue, intent: intentValue } = {}) {
     const context = normalizeContext(contextValue);
@@ -287,6 +316,10 @@ export function createWorkIntentPolicy({
     }
     if (intent.type === "propose_code_action") {
       if (!trustedCodeRoles.has(context.roleId)) denied();
+      const allowedOperations = trustedCodeOperations.get(context.roleId);
+      if (allowedOperations && !allowedOperations.has(intent.operation)) {
+        denied("岗位无权提出该代码操作");
+      }
       const repository = context.event.subject.repository;
       const workspaceId = trustedWorkspaces.get(repository);
       if (!workspaceId) denied("事件仓库没有受信工作区映射");

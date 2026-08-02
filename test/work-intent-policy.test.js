@@ -54,6 +54,9 @@ function policy(overrides = {}) {
     },
     githubReviewRoles: ["pr-reviewer"],
     codeActionRoles: ["developer"],
+    codeOperationsByRole: {
+      developer: ["inspect", "modify", "verify"],
+    },
     workspaceByRepository: { "acme/repo": "acme-workspace" },
     ...overrides,
   });
@@ -168,6 +171,33 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(handoff.kind, "handoff");
   assert.equal(handoff.binding.targetRoleId, "tester");
   assert.equal(handoff.payload.capability, "testing");
+});
+
+test("code operations are configurable per trusted role", () => {
+  const configured = policy({
+    codeActionRoles: ["developer", "tester"],
+    codeOperationsByRole: {
+      developer: ["inspect", "modify", "verify"],
+      tester: ["inspect", "verify"],
+    },
+  });
+
+  assert.throws(
+    () =>
+      configured.bind({
+        context: context({ roleId: "tester" }),
+        intent: {
+          ...common("propose_code_action"),
+          operation: "modify",
+          objective: "修改实现",
+          acceptanceCriteria: ["测试通过"],
+          evidence: [],
+        },
+      }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
 });
 
 test("completion remains internal and carries no execution capability", () => {

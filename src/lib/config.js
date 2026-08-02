@@ -46,6 +46,15 @@ function mergeWorkCoordinationConfig(base = {}, local = {}) {
         ...(basePolicy.workspaceByRepository || {}),
         ...(localPolicy.workspaceByRepository || {}),
       },
+      ...(basePolicy.codeOperationsByRole !== undefined ||
+      localPolicy.codeOperationsByRole !== undefined
+        ? {
+            codeOperationsByRole: {
+              ...(basePolicy.codeOperationsByRole || {}),
+              ...(localPolicy.codeOperationsByRole || {}),
+            },
+          }
+        : {}),
     },
   };
 }

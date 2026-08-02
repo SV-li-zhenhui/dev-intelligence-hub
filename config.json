@@ -124,6 +124,17 @@
         "developer",
         "tester"
       ],
+      "codeOperationsByRole": {
+        "developer": [
+          "inspect",
+          "modify",
+          "verify"
+        ],
+        "tester": [
+          "inspect",
+          "verify"
+        ]
+      },
       "workspaceByRepository": {}
     }
   },

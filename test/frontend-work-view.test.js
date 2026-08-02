@@ -42,6 +42,26 @@ test("work view escapes records and clearly displays safety posture", () => {
       itemId: "work-1",
       at: "2026-08-02T03:59:30.000Z",
     }],
+    codeJobsEnabled: true,
+    codeJobsError: "",
+    codeJobs: [{
+      id: "code-job-1",
+      roleId: "developer",
+      repository: "acme/repo",
+      workspaceId: "acme-workspace",
+      operation: "modify",
+      status: "completed",
+      phase: "seal",
+      lastActionType: "complete",
+      turnCount: 3,
+      updatedAt: "2026-08-02T03:59:45.000Z",
+      result: {
+        summary: "<img src=x onerror=alert(1)>",
+        modifiedFiles: ["src/<unsafe>.js"],
+        profiles: [{ id: "node-tests", status: "passed" }],
+        manifestDigest: "a".repeat(64),
+      },
+    }],
   }, { now: Date.parse("2026-08-02T04:00:00.000Z") });
 
   assert.match(html, /PR 新循环：暂停 \/ 旧员工独占/);
@@ -49,6 +69,9 @@ test("work view escapes records and clearly displays safety posture", () => {
   assert.match(html, /requirements-analyst/);
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert/);
+  assert.match(html, /本地代码任务/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /src\/&lt;unsafe&gt;\.js/);
   assert.equal(escapeWorkHtml('"<&'), "&quot;&lt;&amp;");
 });
 
@@ -58,6 +81,7 @@ test("work view reads only newest-first projection endpoints", async () => {
     { itemCounts: {}, safeguards: {} },
     { items: [{ assignmentId: "newest", status: "queued" }] },
     { items: [{ type: "latest" }] },
+    { enabled: true, items: [{ id: "code-job-newest", status: "queued" }] },
   ];
   const view = createWorkView({
     fetchImpl: async (url, options) => {
@@ -72,10 +96,12 @@ test("work view reads only newest-first projection endpoints", async () => {
     "/api/work/summary",
     "/api/work/items?limit=50&order=newest",
     "/api/work/timeline?limit=50&order=newest",
+    "/api/code/jobs?limit=50&order=newest",
   ]);
   assert.equal(calls.every(([, options]) => options.cache === "no-store"), true);
   assert.match(view.render(), /newest/);
   assert.match(view.render(), /latest/);
+  assert.match(view.render(), /code-job-newest|已授权，等待执行/);
 });
 
 test("work view renders loading, empty, and safe read failures", async () => {
@@ -108,4 +134,23 @@ test("frontend work module contains no mutation or internal execution route", as
   assert.doesNotMatch(source, /method:\s*["']POST["']/);
   assert.doesNotMatch(source, /\/api\/work\/(?:intake|claim|stage|dispatch|outbox)/);
   assert.doesNotMatch(source, /data-(?:claim|dispatch|execute)/);
+  assert.doesNotMatch(source, /\/api\/code\/jobs[^"']*\/(?:run|apply|commit|push)/);
+});
+
+test("a code job read failure does not blank the core work ledger", async () => {
+  const view = createWorkView({
+    fetchImpl: async (url) => {
+      if (url.startsWith("/api/code/jobs")) {
+        return response({ error: "code subsystem unavailable" }, false, 503);
+      }
+      if (url === "/api/work/summary") {
+        return response({ itemCounts: {}, safeguards: {} });
+      }
+      return response({ items: [{ assignmentId: "core-still-visible", status: "queued" }] });
+    },
+  });
+
+  await view.load();
+  assert.match(view.render(), /core-still-visible/);
+  assert.match(view.render(), /code subsystem unavailable/);
 });

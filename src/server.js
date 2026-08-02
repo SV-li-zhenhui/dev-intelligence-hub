@@ -575,6 +575,29 @@ export function createDashboardServer(
       }
       if (
         request.method === "GET" &&
+        url.pathname === "/api/code/jobs"
+      ) {
+        if (!application.codeJobReader) {
+          sendJson(response, 200, {
+            enabled: false,
+            items: [],
+            nextCursor: null,
+          });
+          return;
+        }
+        if (typeof application.codeJobReader.list !== "function") {
+          throw httpError(503, "本地代码任务读取端口无效");
+        }
+        sendJson(response, 200, {
+          enabled: true,
+          ...(await application.codeJobReader.list(
+            queryOptions(url, { status: true, order: true }),
+          )),
+        });
+        return;
+      }
+      if (
+        request.method === "GET" &&
         url.pathname === "/api/workflow/routing"
       ) {
         sendJson(

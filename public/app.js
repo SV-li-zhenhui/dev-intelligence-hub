@@ -957,7 +957,7 @@ function reviewEventLabel(value) {
   }[value] || value || "未知动作";
 }
 
-function showExternalActionConfirmation(entry, remaining) {
+function showGitHubActionConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
   activeInternalAttention = null;
   activeExternalConfirmation = item;
@@ -996,6 +996,100 @@ function showExternalActionConfirmation(entry, remaining) {
   confirmationContent
     .querySelector(".confirmation-actions")
     .addEventListener("click", handleExternalConfirmation);
+}
+
+function codeOperationLabel(value) {
+  return {
+    inspect: "检查代码",
+    modify: "修改隔离副本",
+    verify: "验证代码",
+  }[value] || value || "未知操作";
+}
+
+function showCodeJobConfirmation(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
+  const payload = item.display?.payload || {};
+  const action = payload.action || {};
+  const grant = action.grant || {};
+  const operation = item.retryable ? "retry" : "approve";
+  const actionLabel = item.retryable
+    ? "确认并重试创建本地代码任务"
+    : item.display?.actionLabel || "批准创建本地代码任务";
+  const profiles = (grant.requiredProfiles || []).map(
+    (profile) => `${profile.id} · ${profile.configDigest}`,
+  );
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation code-job-confirmation">
+      <p class="eyebrow">LOCAL CODE AUTHORIZATION / ${remaining} LEFT</p>
+      <h2>${escapeHtml(item.display?.title || "确认本地代码任务")}</h2>
+      <p class="confirmation-reason">${escapeHtml(item.display?.summary || grant.summary || "确认后只创建一个本地隔离任务")}</p>
+      <dl class="detail-grid confirmation-grid">
+        <dt>请求岗位</dt><dd>${escapeHtml(item.requestedBy?.roleId || "未指定")}</dd>
+        <dt>仓库</dt><dd>${escapeHtml(grant.repository || "未知")}</dd>
+        <dt>可信工作区</dt><dd>${escapeHtml(grant.workspaceId || "未知")}</dd>
+        <dt>代码操作</dt><dd>${escapeHtml(codeOperationLabel(grant.operation))}</dd>
+        <dt>绑定提案</dt><dd><code>${escapeHtml(grant.proposalContentDigest || item.target?.version || "未知")}</code></dd>
+        <dt>授权大脑</dt><dd><code>${escapeHtml(grant.brainDigest || "未知")}</code></dd>
+      </dl>
+      <div class="review-preview">
+        <strong>任务目标</strong>
+        <pre>${escapeHtml(grant.objective || "未提供")}</pre>
+      </div>
+      <p class="confirmation-reason"><strong>验收条件</strong></p>
+      ${listMarkup(grant.acceptanceCriteria)}
+      <p class="confirmation-reason"><strong>可写相对路径</strong></p>
+      ${listMarkup(grant.writablePaths?.length ? grant.writablePaths : ["无（只读任务）"])}
+      <p class="confirmation-reason"><strong>允许的受控动作</strong></p>
+      ${listMarkup(grant.allowedActions)}
+      <p class="confirmation-reason"><strong>必须运行的固定测试</strong></p>
+      ${listMarkup(profiles)}
+      <p class="confirmation-reason"><strong>依据</strong></p>
+      ${listMarkup(item.display?.evidence)}
+      <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
+        <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
+        <button class="secondary" data-external-operation="reject">驳回，不创建</button>
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+      <p class="confirmation-note">批准只创建持久化的隔离本地代码任务；本次点击不会调用模型、修改源目录、提交或推送 GitHub。后续动作仍受固定工具、路径和 Docker 测试约束。</p>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
+function showUnsupportedExternalConfirmation(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation">
+      <p class="eyebrow">UNSUPPORTED AUTHORIZATION / ${remaining} LEFT</p>
+      <h2>暂不支持这类确认</h2>
+      <p class="confirmation-reason">系统不会为未知动作显示批准入口。请稍后查看升级后的确认内容。</p>
+      <div class="confirmation-actions">
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
+function showExternalActionConfirmation(entry, remaining) {
+  if (entry.item?.kind === "local.code-job-create") {
+    showCodeJobConfirmation(entry, remaining);
+    return;
+  }
+  if (
+    entry.item?.kind === "github.pull-request-review" ||
+    entry.item?.kind === "github.work-proposal-review"
+  ) {
+    showGitHubActionConfirmation(entry, remaining);
+    return;
+  }
+  showUnsupportedExternalConfirmation(entry, remaining);
 }
 
 function internalContextMarkup(context = []) {

@@ -82,6 +82,21 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
   });
 
   assert.deepEqual(runtime.recovery, { recovered: true, cleanupPending: 0 });
+  assert.deepEqual(runtime.authority, {
+    workspaces: [
+      {
+        id: "dashboard",
+        writablePaths: ["src"],
+        requiredProfiles: [
+          {
+            id: "node-tests",
+            configDigest: runtime.sandbox.getProfileFingerprint("node-tests"),
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(Object.isFrozen(runtime.authority.workspaces[0]), true);
   const session = await runtime.executor.start({
     sessionId: "runtime-session",
     workspaceId: "dashboard",
