@@ -1,0 +1,292 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { EmployeeRegistry } from "../src/services/employee-registry.js";
+import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
+import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
+import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
+
+class MemoryStore {
+  constructor() {
+    this.values = new Map();
+  }
+
+  async read(name, fallback = null) {
+    return structuredClone(this.values.has(name) ? this.values.get(name) : fallback);
+  }
+
+  async write(name, value) {
+    this.values.set(name, structuredClone(value));
+  }
+}
+
+function completeDecision(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    confidence: 88,
+    summary: "已形成岗位判断。",
+    intent: {
+      schemaVersion: 1,
+      type: "complete",
+      summary: "工作已完成。",
+      reason: "已经具备充分证据。",
+      outcome: "done",
+      evidence: ["验证记录"],
+    },
+    ...overrides,
+  };
+}
+
+function definition(id, scheduleMinutes = 5) {
+  return {
+    id,
+    name: `岗位 ${id}`,
+    mission: `负责 ${id} 工作`,
+    enabled: true,
+    scheduleMinutes,
+  };
+}
+
+function permissions(...allowedIntents) {
+  return { allowedIntents };
+}
+
+function brain(overrides = {}) {
+  return {
+    provider: "local-brain",
+    model: "role-model",
+    remoteData: { requirements: false, code: false, memory: false },
+    ...overrides,
+  };
+}
+
+function fakeDecisionEngine(id, calls = []) {
+  return {
+    async decide(input) {
+      calls.push({ id, input: structuredClone(input) });
+      return completeDecision();
+    },
+    view() {
+      return {
+        definition: definition(id),
+        permissions: permissions("complete"),
+        brain: { ...brain(), remote: false },
+      };
+    },
+  };
+}
+
+test("RoleDecisionEngine classifies context, routes the configured brain, and normalizes output", async () => {
+  const calls = [];
+  const router = {
+    async generate(request) {
+      calls.push(request);
+      return JSON.stringify(completeDecision());
+    },
+    describe(config) {
+      return Object.freeze({
+        provider: config.provider,
+        model: config.model,
+        remote: true,
+        remoteData: structuredClone(config.remoteData),
+      });
+    },
+  };
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete", "propose_code_action"),
+    brain: brain({
+      provider: "remote-brain",
+      remoteData: { requirements: true, code: true, memory: false },
+    }),
+    brainRouter: router,
+    contextFactory: async ({ item, trigger }) => ({
+      requirements: { trigger, title: item.event.subject.title },
+      code: { files: ["src/app.js"] },
+    }),
+  });
+
+  const result = await engine.decide({
+    item: { event: { subject: { title: "修复登录" } } },
+    trigger: "assigned",
+  });
+
+  assert.deepEqual(result, completeDecision());
+  assert.deepEqual(calls[0].dataClasses, ["requirements", "code"]);
+  assert.match(calls[0].messages[0].content, /developer/);
+  assert.match(calls[0].messages[0].content, /untrusted|不可信/i);
+  assert.deepEqual(JSON.parse(calls[0].messages[1].content), {
+    requirements: { trigger: "assigned", title: "修复登录" },
+    code: { files: ["src/app.js"] },
+  });
+  assert.equal(engine.view().brain.remoteData.memory, false);
+});
+
+test("RoleDecisionEngine rejects intents outside the independent role permissions", async () => {
+  const forbidden = completeDecision({
+    intent: {
+      schemaVersion: 1,
+      type: "propose_code_action",
+      summary: "修改代码。",
+      reason: "发现了缺陷。",
+      operation: "modify",
+      objective: "修复缺陷",
+      acceptanceCriteria: ["测试通过"],
+      evidence: ["失败测试"],
+    },
+  });
+  const engine = new RoleDecisionEngine({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("ask_user", "handoff", "complete"),
+    brain: brain(),
+    brainRouter: {
+      async generate() {
+        return JSON.stringify(forbidden);
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+
+  await assert.rejects(
+    engine.decide({ item: { id: "work-1" }, trigger: "assigned" }),
+    (error) => error.code === "ROLE_INTENT_NOT_PERMITTED",
+  );
+});
+
+test("the default role context classifies pull requests as code data", async () => {
+  let routed;
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      async generate(request) {
+        routed = request;
+        return JSON.stringify(completeDecision());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+
+  await engine.decide({
+    item: { event: { eventType: "pull_request.observed" } },
+    trigger: "assigned",
+  });
+
+  assert.deepEqual(routed.dataClasses, ["code"]);
+  assert.equal(Object.hasOwn(JSON.parse(routed.messages[1].content), "code"), true);
+});
+
+test("four configured roles keep definition, permissions, brain, pause, and revision independent", async () => {
+  const store = new MemoryStore();
+  const roleSpecs = [
+    ["orchestrator", ["ask_user", "handoff", "complete"], "orchestrator-model"],
+    ["requirements-analyst", ["ask_user", "handoff", "complete"], "requirements-model"],
+    ["developer", ["ask_user", "propose_code_action", "complete"], "developer-model"],
+    ["tester", ["ask_user", "handoff", "complete"], "tester-model"],
+  ];
+  const employees = roleSpecs.map(([id, intents, model]) =>
+    new ConfiguredRoleEmployee({
+      definition: definition(id),
+      permissions: permissions(...intents),
+      brain: brain({ model }),
+      decisionEngine: fakeDecisionEngine(id),
+      store,
+    }),
+  );
+  const registry = new EmployeeRegistry(employees);
+  const before = await registry.list();
+  const analyst = before.find(({ role }) => role.id === "requirements-analyst");
+  await registry.control("requirements-analyst", "pause", analyst.role.revision);
+  const after = await registry.list();
+
+  assert.deepEqual(after.map(({ role }) => role.id), roleSpecs.map(([id]) => id));
+  assert.equal(
+    after.find(({ role }) => role.id === "requirements-analyst").role.paused,
+    true,
+  );
+  assert.equal(
+    after.find(({ role }) => role.id === "requirements-analyst").role.revision,
+    1,
+  );
+  assert.equal(after.find(({ role }) => role.id === "developer").role.revision, 0);
+  assert.equal(
+    after.find(({ role }) => role.id === "developer").role.brain.model,
+    "developer-model",
+  );
+
+  const restored = new ConfiguredRoleEmployee({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("ask_user", "handoff", "complete"),
+    brain: brain({ model: "requirements-model" }),
+    decisionEngine: fakeDecisionEngine("requirements-analyst"),
+    store,
+  });
+  assert.equal((await restored.roleView()).paused, true);
+  assert.equal((await restored.roleView()).revision, 1);
+});
+
+test("the explicit role worker port resolves and decide never deadlocks an onRun central cycle", async () => {
+  const store = new MemoryStore();
+  const decideCalls = [];
+  let employee;
+  employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: fakeDecisionEngine("developer", decideCalls),
+    store,
+    onRun: async ({ trigger }) => {
+      const result = await employee.decide({ item: { itemId: "work-1" }, trigger });
+      assert.equal(result.intent.type, "complete");
+    },
+  });
+  const directory = new RoleWorkerDirectory({
+    workers: [employee.asRoleWorker()],
+    legacyOwnedRoleIds: [],
+  });
+  const resolved = await directory.resolve({ type: "role", id: "developer" });
+
+  const run = employee.run({ trigger: "manual" });
+  await Promise.race([
+    run,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("configured role run deadlocked")), 200),
+    ),
+  ]);
+
+  assert.equal(resolved.roleId, "developer");
+  assert.equal(resolved.workerId, employee.workerId);
+  assert.equal(resolved.paused, false);
+  assert.equal(decideCalls.length, 1);
+  assert.equal((await employee.view()).runCount, 1);
+});
+
+test("persisted failures and public state never contain provider secrets", async () => {
+  const store = new MemoryStore();
+  const secret = "provider-secret-value";
+  const error = Object.assign(new Error(`vendor leaked ${secret}`), {
+    code: "REMOTE_PROVIDER_FAILED",
+  });
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("tester"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: fakeDecisionEngine("tester"),
+    store,
+    onRun: async () => {
+      throw error;
+    },
+  });
+
+  await assert.rejects(employee.run({ trigger: "scheduled" }), (value) => value === error);
+  const view = await employee.view();
+  const persisted = await store.read("configured-role-tester-state");
+
+  assert.equal(view.lastErrorCode, "REMOTE_PROVIDER_FAILED");
+  assert.equal(JSON.stringify(view).includes(secret), false);
+  assert.equal(JSON.stringify(persisted).includes(secret), false);
+});

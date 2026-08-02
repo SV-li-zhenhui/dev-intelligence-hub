@@ -1,0 +1,187 @@
+const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
+const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
+
+export class BrainRouterError extends Error {
+  constructor(code, message, statusCode = 400) {
+    super(message);
+    this.name = "BrainRouterError";
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+function routerError(code, message, statusCode) {
+  return new BrainRouterError(code, message, statusCode);
+}
+
+function dataEntries(value, name) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  const entries = [];
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !descriptor?.enumerable ||
+      !("value" in descriptor)
+    ) {
+      throw new TypeError(`${name} is invalid`);
+    }
+    entries.push([key, descriptor.value]);
+  }
+  return entries;
+}
+
+function exactData(value, keys, name) {
+  const entries = dataEntries(value, name);
+  const actual = new Set(entries.map(([key]) => key));
+  if (actual.size !== keys.length || keys.some((key) => !actual.has(key))) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return Object.fromEntries(entries);
+}
+
+function safeId(value, name) {
+  if (typeof value !== "string" || !SAFE_ID.test(value)) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function safeModel(value) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    INVALID_CONTROL.test(value) ||
+    Buffer.byteLength(value, "utf8") > 256
+  ) {
+    throw new TypeError("brain.model is invalid");
+  }
+  return value;
+}
+
+function normalizeRemoteData(value) {
+  const normalized = exactData(value, DATA_CLASSES, "brain.remoteData");
+  if (DATA_CLASSES.some((name) => typeof normalized[name] !== "boolean")) {
+    throw new TypeError("brain.remoteData is invalid");
+  }
+  return Object.freeze(
+    Object.fromEntries(DATA_CLASSES.map((name) => [name, normalized[name]])),
+  );
+}
+
+export function normalizeBrainConfig(value) {
+  const config = exactData(
+    value,
+    ["provider", "model", "remoteData"],
+    "brain",
+  );
+  return Object.freeze({
+    provider: safeId(config.provider, "brain.provider"),
+    model: safeModel(config.model),
+    remoteData: normalizeRemoteData(config.remoteData),
+  });
+}
+
+function normalizeDataClasses(value = []) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1 ||
+    value.some((entry) => !DATA_CLASSES.includes(entry)) ||
+    new Set(value).size !== value.length
+  ) {
+    throw new TypeError("dataClasses are invalid");
+  }
+  return [...value];
+}
+
+function normalizeProvider(value) {
+  if (!value || typeof value !== "object") {
+    throw new TypeError("brain provider is invalid");
+  }
+  const id = safeId(value.id, "provider.id");
+  if (
+    typeof value.remote !== "boolean" ||
+    typeof value.generate !== "function"
+  ) {
+    throw new TypeError("brain provider is invalid");
+  }
+  return Object.freeze({
+    id,
+    remote: value.remote,
+    generate: value.generate.bind(value),
+  });
+}
+
+function frozenDescription(provider, brain) {
+  return Object.freeze({
+    provider: provider.id,
+    model: brain.model,
+    remote: provider.remote,
+    remoteData: Object.freeze({ ...brain.remoteData }),
+  });
+}
+
+export class BrainRouter {
+  #providers;
+
+  constructor({ providers = [] } = {}) {
+    if (
+      !Array.isArray(providers) ||
+      Object.getPrototypeOf(providers) !== Array.prototype
+    ) {
+      throw new TypeError("providers are invalid");
+    }
+    this.#providers = new Map();
+    for (const value of providers) {
+      const provider = normalizeProvider(value);
+      if (this.#providers.has(provider.id)) {
+        throw new TypeError(`brain provider is duplicated: ${provider.id}`);
+      }
+      this.#providers.set(provider.id, provider);
+    }
+    Object.freeze(this);
+  }
+
+  async generate({ brain: brainValue, messages, schema, dataClasses = [] } = {}) {
+    const brain = normalizeBrainConfig(brainValue);
+    const provider = this.#provider(brain.provider);
+    const classes = normalizeDataClasses(dataClasses);
+    if (provider.remote) {
+      const denied = classes.find((name) => brain.remoteData[name] !== true);
+      if (denied) {
+        throw routerError(
+          "REMOTE_DATA_NOT_AUTHORIZED",
+          `Remote brain is not authorized for ${denied} data`,
+          403,
+        );
+      }
+    }
+    return provider.generate({ model: brain.model, messages, schema });
+  }
+
+  describe(brainValue) {
+    const brain = normalizeBrainConfig(brainValue);
+    return frozenDescription(this.#provider(brain.provider), brain);
+  }
+
+  #provider(id) {
+    const provider = this.#providers.get(id);
+    if (!provider) {
+      throw routerError(
+        "BRAIN_PROVIDER_NOT_CONFIGURED",
+        "Configured brain provider is unavailable",
+        503,
+      );
+    }
+    return provider;
+  }
+}
