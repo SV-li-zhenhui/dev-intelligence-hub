@@ -573,6 +573,225 @@ test("rejects rewritten history and newly appended deliveries for stale contract
   assert.deepEqual(validateWorkGraphTransition(previous, currentAppend), currentAppend);
 });
 
+test("enforces forward-only task status transitions and immutable terminal tasks", () => {
+  const transition = (fromTask, toTask) => {
+    const previous = createWorkGraphSnapshot(
+      draft([fromTask], { revision: 7 }),
+    );
+    const next = createWorkGraphSnapshot(draft([toTask], { revision: 8 }));
+    return () => validateWorkGraphTransition(previous, next);
+  };
+
+  assert.doesNotThrow(
+    transition(
+      task("one"),
+      task("one", { revision: 2, status: "in_progress" }),
+    ),
+  );
+  assert.doesNotThrow(
+    transition(
+      task("one", { status: "in_progress" }),
+      task("one", { revision: 2, status: "failed" }),
+    ),
+  );
+  assert.throws(
+    transition(
+      task("one", { status: "in_progress" }),
+      task("one", { revision: 2, status: "pending" }),
+    ),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+
+  for (const terminalStatus of ["completed", "failed", "cancelled"]) {
+    const terminalTask = task("one", {
+      revision: 2,
+      status: terminalStatus,
+      deliveries: terminalStatus === "completed" ? [delivery()] : [],
+    });
+    const revived = task("one", {
+      ...terminalTask,
+      revision: 3,
+      status: "in_progress",
+    });
+    assert.throws(
+      transition(terminalTask, revived),
+      hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+    );
+  }
+});
+
+test("rejects new tasks below terminal ancestors", () => {
+  for (const terminalStatus of ["failed", "cancelled"]) {
+    assert.throws(
+      () =>
+        createWorkGraphSnapshot(
+          draft(
+            [
+              task("root", { status: terminalStatus }),
+              task("new-child", { parentTaskId: "root" }),
+            ],
+            { revision: 8 },
+          ),
+        ),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+  }
+
+  assert.throws(
+    () =>
+      createWorkGraphSnapshot(
+        draft([
+          task("root", {
+            status: "completed",
+            acceptanceContracts: [
+              contract({ acceptanceCriteria: [], expectedDeliverables: [] }),
+            ],
+          }),
+          task("new-child", { parentTaskId: "root" }),
+        ]),
+      ),
+    hasCode("WORK_GRAPH_INVALID"),
+  );
+});
+
+test("binds task revisions to direct child identities and revisions", () => {
+  const groupingContract = contract({
+    acceptanceCriteria: [],
+    expectedDeliverables: [],
+  });
+  const previous = createWorkGraphSnapshot(
+    draft(
+      [
+        task("root", {
+          status: "in_progress",
+          acceptanceContracts: [groupingContract],
+        }),
+        task("child", { parentTaskId: "root" }),
+      ],
+      { revision: 7 },
+    ),
+  );
+  const staleParent = createWorkGraphSnapshot(
+    draft(
+      [
+        task("root", {
+          status: "in_progress",
+          acceptanceContracts: [groupingContract],
+        }),
+        task("child", {
+          revision: 2,
+          parentTaskId: "root",
+          status: "in_progress",
+        }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, staleParent),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+
+  const currentParent = createWorkGraphSnapshot(
+    draft(
+      [
+        task("root", {
+          revision: 2,
+          status: "in_progress",
+          acceptanceContracts: [groupingContract],
+        }),
+        task("child", {
+          revision: 2,
+          parentTaskId: "root",
+          status: "in_progress",
+        }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.deepEqual(
+    validateWorkGraphTransition(previous, currentParent),
+    currentParent,
+  );
+
+  const pureParentBump = createWorkGraphSnapshot(
+    draft(
+      [
+        task("root", {
+          revision: 2,
+          status: "in_progress",
+          acceptanceContracts: [groupingContract],
+        }),
+        task("child", { parentTaskId: "root" }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, pureParentBump),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+});
+
+test("requires child-set and descendant changes to bump every ancestor once", () => {
+  const groupingContract = contract({
+    acceptanceCriteria: [],
+    expectedDeliverables: [],
+  });
+  const group = (taskId, overrides = {}) =>
+    task(taskId, {
+      status: "in_progress",
+      acceptanceContracts: [groupingContract],
+      ...overrides,
+    });
+  const previous = createWorkGraphSnapshot(
+    draft(
+      [
+        group("root"),
+        group("branch", { parentTaskId: "root" }),
+        task("leaf", { parentTaskId: "branch" }),
+      ],
+      { revision: 7 },
+    ),
+  );
+  const nextTasks = (rootRevision) => [
+    group("root", { revision: rootRevision }),
+    group("branch", { revision: 2, parentTaskId: "root" }),
+    task("leaf", {
+      revision: 2,
+      parentTaskId: "branch",
+      status: "in_progress",
+    }),
+  ];
+  const staleRoot = createWorkGraphSnapshot(
+    draft(nextTasks(1), { revision: 8 }),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, staleRoot),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+  const fullyBound = createWorkGraphSnapshot(
+    draft(nextTasks(2), { revision: 8 }),
+  );
+  assert.deepEqual(validateWorkGraphTransition(previous, fullyBound), fullyBound);
+
+  const withNewChild = createWorkGraphSnapshot(
+    draft(
+      [
+        group("root", { revision: 2 }),
+        group("branch", { revision: 2, parentTaskId: "root" }),
+        task("leaf", { parentTaskId: "branch" }),
+        task("new-leaf", { parentTaskId: "branch" }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.deepEqual(
+    validateWorkGraphTransition(previous, withNewChild),
+    withNewChild,
+  );
+});
+
 test("enforces delivery revision, evidence, count, and serialized byte limits", () => {
   assert.throws(
     () =>

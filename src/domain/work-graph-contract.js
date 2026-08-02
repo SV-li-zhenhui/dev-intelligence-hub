@@ -12,6 +12,7 @@ const TASK_STATUSES = new Set([
   "failed",
   "cancelled",
 ]);
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const RESPONSIBILITY_TYPES = new Set(["role", "person", "node"]);
 const DELIVERY_STATUSES = new Set(["submitted", "accepted", "rejected"]);
 
@@ -435,6 +436,14 @@ function assertReferencesAndHierarchy(tasks, limits) {
     ) {
       throw invalid("completed 任务仍有未完成的依赖或直接子任务");
     }
+    if (
+      ["failed", "cancelled"].includes(task.status) &&
+      childIds.some((childId) =>
+        ["pending", "in_progress"].includes(byId.get(childId).status),
+      )
+    ) {
+      throw invalid("终态父任务仍有活动的直接子任务");
+    }
   }
 
   const hierarchyVisiting = new Set();
@@ -574,6 +583,58 @@ function assertHistoryPrefix(previousEntries, nextEntries, name) {
   }
 }
 
+function childrenByParent(tasks) {
+  const children = new Map();
+  for (const task of tasks) {
+    const childIds = children.get(task.parentTaskId) ?? [];
+    childIds.push(task.taskId);
+    children.set(task.parentTaskId, childIds);
+  }
+  return children;
+}
+
+function revisionBoundTaskContent(task, children, tasksById) {
+  const { revision, ...ownContent } = task;
+  return {
+    ...ownContent,
+    directChildren: (children.get(task.taskId) ?? [])
+      .map((taskId) => ({ taskId, revision: tasksById.get(taskId).revision }))
+      .sort((left, right) => compareText(left.taskId, right.taskId)),
+  };
+}
+
+function assertTaskStatusTransition(previousTask, nextTask) {
+  if (
+    TERMINAL_TASK_STATUSES.has(previousTask.status) &&
+    !sameValue(previousTask, nextTask)
+  ) {
+    throw graphError(
+      "WORK_GRAPH_INVALID_TRANSITION",
+      `终态任务 ${previousTask.taskId} 不可改写或复活`,
+    );
+  }
+  if (previousTask.status === "in_progress" && nextTask.status === "pending") {
+    throw graphError(
+      "WORK_GRAPH_INVALID_TRANSITION",
+      `任务 ${previousTask.taskId} 不可从 in_progress 回退到 pending`,
+    );
+  }
+}
+
+function assertNoTerminalAncestor(task, tasksById) {
+  let ancestorId = task.parentTaskId;
+  while (ancestorId !== null) {
+    const ancestor = tasksById.get(ancestorId);
+    if (TERMINAL_TASK_STATUSES.has(ancestor.status)) {
+      throw graphError(
+        "WORK_GRAPH_INVALID_TRANSITION",
+        `新任务 ${task.taskId} 不可挂在终态祖先 ${ancestorId} 下`,
+      );
+    }
+    ancestorId = ancestor.parentTaskId;
+  }
+}
+
 export function validateWorkGraphTransition(previousValue, nextValue, optionsValue) {
   const options = normalizeOptions(optionsValue, ["limits"]);
   const normalizationOptions = Object.hasOwn(options, "limits")
@@ -592,7 +653,12 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
     throw staleRevision("工作图 transition 必须保持 graphId 且修订恰好递增 1");
   }
 
+  const previousById = new Map(
+    previous.tasks.map((task) => [task.taskId, task]),
+  );
   const nextById = new Map(next.tasks.map((task) => [task.taskId, task]));
+  const previousChildren = childrenByParent(previous.tasks);
+  const nextChildren = childrenByParent(next.tasks);
   const previousTaskIds = new Set(
     previous.tasks.map((task) => task.taskId),
   );
@@ -604,7 +670,15 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
         `既有任务 ${previousTask.taskId} 不可删除`,
       );
     }
-    const changed = !sameValue(previousTask, nextTask);
+    assertTaskStatusTransition(previousTask, nextTask);
+    const changed = !sameValue(
+      revisionBoundTaskContent(
+        previousTask,
+        previousChildren,
+        previousById,
+      ),
+      revisionBoundTaskContent(nextTask, nextChildren, nextById),
+    );
     if (
       (changed && nextTask.revision !== previousTask.revision + 1) ||
       (!changed && nextTask.revision !== previousTask.revision)
@@ -649,6 +723,7 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
         `新任务 ${nextTask.taskId} 必须从无历史的 pending 修订 1 开始`,
       );
     }
+    assertNoTerminalAncestor(nextTask, nextById);
   }
   return next;
 }
