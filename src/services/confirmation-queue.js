@@ -9,12 +9,18 @@ import {
   normalizeConfirmationState,
 } from "../domain/confirmation-contract.js";
 import {
+  normalizeChangePackageApplicationEnvelope,
+} from "../domain/change-package-application-confirmation.js";
+import { digestValue } from "../domain/code-executor-contract.js";
+import {
   normalizeExternalDeferredOptions,
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 
 const STATE_KEY = "confirmation-queue";
 const MAX_ITEMS = 1_000;
+const APPLICATION_RESULT_KIND = "local.change-package-apply";
+const APPLICATION_SNAPSHOT_REQUEST_ID = "application-snapshot-read";
 
 export class ConfirmationExecutionError extends Error {
   constructor(code, outcome, { cause } = {}) {
@@ -108,6 +114,133 @@ function byCreation(left, right) {
     Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
     left.id.localeCompare(right.id)
   );
+}
+
+function exactDataFields(value, expected, error) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw error;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expected.length ||
+    expected.some((key) => !keys.includes(key)) ||
+    keys.some((key) => typeof key !== "string")
+  ) {
+    throw error;
+  }
+  const fields = new Map();
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw error;
+    fields.set(key, descriptor.value);
+  }
+  return fields;
+}
+
+function normalizeSnapshotRequest(value) {
+  const error = queueError(
+    "INVALID_APPLICATION_RESULT_SNAPSHOT_REQUEST",
+    "变更包应用结果快照请求无效",
+    400,
+  );
+  const fields = exactDataFields(value, ["afterRevision"], error);
+  const afterRevision = fields.get("afterRevision");
+  if (!Number.isSafeInteger(afterRevision) || afterRevision < 0) throw error;
+  return { afterRevision };
+}
+
+function applicationResultSourceCorrupted() {
+  return queueError(
+    "APPLICATION_RESULT_SOURCE_CORRUPTED",
+    "变更包应用结果来源无效",
+    500,
+  );
+}
+
+function deepFreeze(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function applicationEnvelope(item) {
+  const execution = item.execution
+    ? {
+        requestId: item.execution.requestId,
+        attempt: item.execution.attempt,
+        startedAt: item.execution.startedAt,
+      }
+    : {
+        requestId: APPLICATION_SNAPSHOT_REQUEST_ID,
+        attempt: 1,
+        startedAt: item.createdAt,
+      };
+  try {
+    return normalizeChangePackageApplicationEnvelope({
+      schemaVersion: 1,
+      id: item.id,
+      idempotencyKey: `confirmation-${item.approvalBindingDigest}`,
+      kind: item.kind,
+      requestedBy: item.requestedBy,
+      actor: item.actor,
+      target: item.target,
+      action: item.action,
+      displayedPayloadDigest: item.displayedPayloadDigest,
+      approvalBindingDigest: item.approvalBindingDigest,
+      execution,
+    });
+  } catch {
+    throw applicationResultSourceCorrupted();
+  }
+}
+
+function applicationReceipt(item, envelope) {
+  if (item.receipt === null) return null;
+  const error = applicationResultSourceCorrupted();
+  const fields = exactDataFields(item.receipt, ["id", "createdAt"], error);
+  const expectedId = `change-package-application-${digestValue({
+    confirmationId: envelope.id,
+    approvalBindingDigest: envelope.approvalBindingDigest,
+  })}`;
+  if (
+    fields.get("id") !== expectedId ||
+    typeof fields.get("createdAt") !== "string"
+  ) {
+    throw error;
+  }
+  return { id: expectedId, createdAt: fields.get("createdAt") };
+}
+
+function projectApplicationResult(item) {
+  const envelope = applicationEnvelope(item);
+  return {
+    confirmationId: envelope.id,
+    approvalBindingDigest: envelope.approvalBindingDigest,
+    requestedBy: { ...envelope.requestedBy },
+    job: { ...envelope.action.job },
+    packageId: envelope.action.packageId,
+    packageDigest: envelope.action.packageDigest,
+    workspaceId: envelope.action.workspace.id,
+    itemRevision: item.itemRevision,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    queueStatus: item.status,
+    executionOutcome: item.execution?.outcome ?? null,
+    receipt: applicationReceipt(item, envelope),
+    failure: item.failure ? { ...item.failure } : null,
+    rejectedAt: item.rejection?.at ?? null,
+  };
+}
+
+function byConfirmationId(left, right) {
+  return left.confirmationId.localeCompare(right.confirmationId);
 }
 
 export class ConfirmationQueue {
@@ -245,6 +378,42 @@ export class ConfirmationQueue {
     this.#assertReady();
     const item = this.#requireItem(id);
     return this.#projectItem(item);
+  }
+
+  async readSnapshot(input) {
+    this.#assertReady();
+    const { afterRevision } = normalizeSnapshotRequest(input);
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        let state;
+        try {
+          await this.#reload();
+          state = normalizeConfirmationState(this.state);
+        } catch {
+          throw applicationResultSourceCorrupted();
+        }
+        const sourceRevision = state.revision;
+        if (afterRevision > sourceRevision) {
+          throw queueError(
+            "APPLICATION_RESULT_SOURCE_REVISION_CONFLICT",
+            "变更包应用结果来源修订落后于读取位置",
+            409,
+          );
+        }
+        const items = state.items
+          .filter(({ kind }) => kind === APPLICATION_RESULT_KIND)
+          .map(projectApplicationResult)
+          .sort(byConfirmationId);
+        const snapshotDigest = digestValue({ sourceRevision, items });
+        const unchanged = afterRevision === sourceRevision;
+        return deepFreeze({
+          sourceRevision,
+          unchanged,
+          snapshotDigest,
+          items: unchanged ? [] : items,
+        });
+      }),
+    );
   }
 
   async approve(id, input) {

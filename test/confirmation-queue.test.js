@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   ConfirmationExecutionError,
@@ -89,6 +90,65 @@ function actionPlan(overrides = {}) {
   };
 }
 
+function applicationPlan({
+  packageDigest = "8".repeat(64),
+  jobId = "code-job-application-1",
+  workItemId = "work-application-1",
+  actionOverrides = {},
+} = {}) {
+  const requestedBy = { roleId: "developer", workItemId };
+  const actor = {
+    provider: "local-code",
+    accountId: "change-package-application-service",
+  };
+  const target = {
+    provider: "local-code",
+    resourceId: "workspace-1",
+    version: "0123456789abcdef0123456789abcdef01234567",
+  };
+  const action = {
+    type: "apply_change_package",
+    packageId: `change-package-${packageDigest}`,
+    packageDigest,
+    job: {
+      id: jobId,
+      revision: 7,
+      recordDigest: "1".repeat(64),
+    },
+    proposal: { id: "proposal-1", contentDigest: "2".repeat(64) },
+    grant: { digest: "3".repeat(64) },
+    workspace: {
+      id: "workspace-1",
+      sourceRevision: "4".repeat(64),
+      workspaceRevision: "5".repeat(64),
+    },
+    changeSetDigest: "6".repeat(64),
+    testEvidenceDigest: "7".repeat(64),
+    targetAuthorityDigest: "9".repeat(64),
+    expectedHeadOid: target.version,
+    ...actionOverrides,
+  };
+  const id = `confirmation-change-package-apply-${digestValue({
+    requestedBy,
+    action,
+  })}`;
+  return actionPlan({
+    id,
+    kind: "local.change-package-apply",
+    requestedBy,
+    actor,
+    target,
+    action,
+    display: {
+      title: "应用已验证的本地变更包",
+      summary: "敏感路径和内容只存在于展示层，不得进入结果快照。",
+      actionLabel: "确认并应用变更包",
+      evidence: ["C:\\private\\secret.txt", "token=must-not-project"],
+      payload: { actor, target, action },
+    },
+  });
+}
+
 function executor(overrides = {}) {
   return {
     executeCalls: [],
@@ -158,6 +218,10 @@ test("the queue stays closed until durable recovery succeeds", async () => {
     queue.enqueue(actionPlan()),
     (error) => error.code === "CONFIRMATION_QUEUE_NOT_READY" && error.statusCode === 503,
   );
+  await assert.rejects(
+    queue.readSnapshot({ afterRevision: 0 }),
+    (error) => error.code === "CONFIRMATION_QUEUE_NOT_READY",
+  );
 });
 
 test("enqueue freezes an exact plan and is idempotent only for the same binding", async () => {
@@ -172,6 +236,227 @@ test("enqueue freezes an exact plan and is idempotent only for the same binding"
   await assert.rejects(
     queue.enqueue(actionPlan({ action: { type: "pull_request_review", reviewEvent: "COMMENT", body: "changed" } })),
     (error) => error.code === "CONFIRMATION_ID_CONFLICT" && error.statusCode === 409,
+  );
+});
+
+test("application result snapshots expose only immutable minimal projections", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(actionPlan());
+  const queued = await queue.enqueue(applicationPlan());
+  const writesBeforeRead = store.writeCount;
+
+  const snapshot = await queue.readSnapshot({ afterRevision: 0 });
+
+  assert.equal(snapshot.sourceRevision, 2);
+  assert.equal(snapshot.unchanged, false);
+  assert.match(snapshot.snapshotDigest, /^[a-f0-9]{64}$/);
+  assert.equal(snapshot.items.length, 1);
+  assert.deepEqual(snapshot.items[0], {
+    confirmationId: queued.id,
+    approvalBindingDigest: queued.approvalBindingDigest,
+    requestedBy: { roleId: "developer", workItemId: "work-application-1" },
+    job: {
+      id: "code-job-application-1",
+      revision: 7,
+      recordDigest: "1".repeat(64),
+    },
+    packageId: `change-package-${"8".repeat(64)}`,
+    packageDigest: "8".repeat(64),
+    workspaceId: "workspace-1",
+    itemRevision: 1,
+    createdAt: "2026-08-02T01:00:01.000Z",
+    updatedAt: "2026-08-02T01:00:01.000Z",
+    queueStatus: "pending",
+    executionOutcome: null,
+    receipt: null,
+    failure: null,
+    rejectedAt: null,
+  });
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.items), true);
+  assert.equal(Object.isFrozen(snapshot.items[0]), true);
+  assert.equal(Object.isFrozen(snapshot.items[0].requestedBy), true);
+  assert.equal(Object.isFrozen(snapshot.items[0].job), true);
+  const serialized = JSON.stringify(snapshot);
+  for (const forbidden of [
+    "token=must-not-project",
+    "private\\\\secret.txt",
+    "display",
+    "action",
+    "targetAuthorityDigest",
+    "expectedHeadOid",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
+  assert.equal(store.writeCount, writesBeforeRead);
+
+  const unchanged = await queue.readSnapshot({ afterRevision: 2 });
+  assert.deepEqual(unchanged, {
+    sourceRevision: 2,
+    unchanged: true,
+    snapshotDigest: snapshot.snapshotDigest,
+    items: [],
+  });
+  assert.equal(Object.isFrozen(unchanged.items), true);
+});
+
+test("application result snapshots sort deterministically and reject invalid cursors", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(applicationPlan({
+    packageDigest: "b".repeat(64),
+    jobId: "code-job-b",
+    workItemId: "work-b",
+  }));
+  await queue.enqueue(applicationPlan({
+    packageDigest: "a".repeat(64),
+    jobId: "code-job-a",
+    workItemId: "work-a",
+  }));
+  const first = await queue.readSnapshot({ afterRevision: 0 });
+  assert.deepEqual(
+    first.items.map(({ confirmationId }) => confirmationId),
+    first.items.map(({ confirmationId }) => confirmationId).toSorted(),
+  );
+
+  const reorderedState = structuredClone(store.value);
+  reorderedState.items.reverse();
+  const recovered = await readyQueue({
+    store: new MemoryStore(reorderedState),
+  });
+  assert.deepEqual(await recovered.readSnapshot({ afterRevision: 0 }), first);
+
+  let getterCalls = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "afterRevision", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 0;
+    },
+  });
+  for (const input of [
+    undefined,
+    null,
+    {},
+    [],
+    { afterRevision: -1 },
+    { afterRevision: 1.5 },
+    { afterRevision: "0" },
+    { afterRevision: 0, extra: true },
+    accessor,
+  ]) {
+    await assert.rejects(
+      queue.readSnapshot(input),
+      (error) =>
+        error.code === "INVALID_APPLICATION_RESULT_SNAPSHOT_REQUEST" &&
+        error.statusCode === 400,
+    );
+  }
+  assert.equal(getterCalls, 0);
+  await assert.rejects(
+    queue.readSnapshot({ afterRevision: first.sourceRevision + 1 }),
+    (error) =>
+      error.code === "APPLICATION_RESULT_SOURCE_REVISION_CONFLICT" &&
+      error.statusCode === 409,
+  );
+});
+
+test("application result snapshots whitelist terminal receipts, failures, and rejection time", async () => {
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      if (envelope.requestedBy.workItemId === "work-completed") {
+        return {
+          status: "applied",
+          receipt: {
+            id: `change-package-application-${digestValue({
+              confirmationId: envelope.id,
+              approvalBindingDigest: envelope.approvalBindingDigest,
+            })}`,
+            createdAt: envelope.execution.startedAt,
+          },
+        };
+      }
+      throw new ConfirmationExecutionError("APPLICATION_REJECTED", "absent");
+    },
+  });
+  const queue = await readyQueue({ actionExecutor });
+
+  await queue.enqueue(applicationPlan({ workItemId: "work-completed" }));
+  let next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next));
+
+  await queue.enqueue(applicationPlan({
+    packageDigest: "a".repeat(64),
+    jobId: "code-job-failed",
+    workItemId: "work-failed",
+  }));
+  next = await queue.next();
+  await queue.approve(
+    next.item.id,
+    approvalRequest(next, "request-approve-0002"),
+  );
+
+  await queue.enqueue(applicationPlan({
+    packageDigest: "b".repeat(64),
+    jobId: "code-job-rejected",
+    workItemId: "work-rejected",
+  }));
+  next = await queue.next();
+  await queue.reject(next.item.id, {
+    ...approvalRequest(next, "request-reject-0001"),
+    reason: "contains private implementation notes",
+  });
+
+  const snapshot = await queue.readSnapshot({ afterRevision: 0 });
+  const completed = snapshot.items.find(
+    ({ requestedBy }) => requestedBy.workItemId === "work-completed",
+  );
+  assert.equal(completed.queueStatus, "completed");
+  assert.equal(completed.executionOutcome, "applied");
+  assert.deepEqual(completed.receipt, {
+    id: `change-package-application-${digestValue({
+      confirmationId: completed.confirmationId,
+      approvalBindingDigest: completed.approvalBindingDigest,
+    })}`,
+    createdAt: "2026-08-02T01:00:01.000Z",
+  });
+
+  const failed = snapshot.items.find(
+    ({ requestedBy }) => requestedBy.workItemId === "work-failed",
+  );
+  assert.equal(failed.queueStatus, "failed");
+  assert.equal(failed.executionOutcome, "absent");
+  assert.deepEqual(failed.failure, {
+    code: "APPLICATION_REJECTED",
+    outcome: "absent",
+    retryable: true,
+    at: "2026-08-02T01:00:04.000Z",
+  });
+
+  const rejected = snapshot.items.find(
+    ({ requestedBy }) => requestedBy.workItemId === "work-rejected",
+  );
+  assert.equal(rejected.queueStatus, "rejected");
+  assert.equal(rejected.executionOutcome, null);
+  assert.equal(rejected.rejectedAt, "2026-08-02T01:00:04.000Z");
+  assert.equal(JSON.stringify(rejected).includes("private implementation"), false);
+});
+
+test("application result snapshots fail closed on a generic malformed local action", async () => {
+  const queue = await readyQueue();
+  await queue.enqueue(applicationPlan({
+    actionOverrides: { privatePath: "C:\\private\\secret.txt" },
+  }));
+
+  await assert.rejects(
+    queue.readSnapshot({ afterRevision: 0 }),
+    (error) =>
+      error.code === "APPLICATION_RESULT_SOURCE_CORRUPTED" &&
+      error.statusCode === 500 &&
+      !error.message.includes("secret"),
   );
 });
 
@@ -340,6 +625,44 @@ test("a shared exclusive lease prevents two queue instances from writing twice",
   assert.equal((await secondApproval).status, "completed");
   assert.equal(writesBeforeRelease, 1);
   assert.equal(actionExecutor.executeCalls.length, 1);
+});
+
+test("application snapshots reload updates written by another queue instance", async () => {
+  const store = new MemoryStore();
+  const exclusiveLease = new ExclusiveLease();
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      return {
+        status: "applied",
+        receipt: {
+          id: `change-package-application-${digestValue({
+            confirmationId: envelope.id,
+            approvalBindingDigest: envelope.approvalBindingDigest,
+          })}`,
+          createdAt: envelope.execution.startedAt,
+        },
+      };
+    },
+  });
+  const first = await readyQueue({ store, actionExecutor, exclusiveLease });
+  const second = await readyQueue({ store, actionExecutor, exclusiveLease });
+  const initial = await first.readSnapshot({ afterRevision: 0 });
+  assert.equal(initial.unchanged, true);
+
+  await second.enqueue(applicationPlan());
+  const pending = await first.readSnapshot({ afterRevision: 0 });
+  assert.equal(pending.unchanged, false);
+  assert.equal(pending.items[0].queueStatus, "pending");
+
+  const next = await second.next();
+  await second.approve(next.item.id, approvalRequest(next));
+  const completed = await first.readSnapshot({
+    afterRevision: pending.sourceRevision,
+  });
+  assert.equal(completed.unchanged, false);
+  assert.equal(completed.items[0].queueStatus, "completed");
+  assert.equal(completed.items[0].executionOutcome, "applied");
 });
 
 test("stale bindings and stale targets never invoke a second external action", async () => {

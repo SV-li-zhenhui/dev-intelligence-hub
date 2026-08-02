@@ -49,6 +49,9 @@ function queuePort(events = []) {
     invalidate(id, input) {
       return ["invalidate", id, input];
     },
+    readSnapshot(input) {
+      return ["readSnapshot", input];
+    },
   };
 }
 
@@ -201,11 +204,18 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   );
 
   assert.equal(Object.isFrozen(runtime), true);
-  assert.deepEqual(Object.keys(runtime), ["queue", "producerQueue", "close"]);
+  assert.deepEqual(Object.keys(runtime), [
+    "queue",
+    "producerQueue",
+    "applicationResultSource",
+    "close",
+  ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
   assert.equal(Object.isFrozen(runtime.producerQueue), true);
+  assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
   assert.notEqual(runtime.queue, rawQueue);
   assert.notEqual(runtime.producerQueue, rawQueue);
+  assert.notEqual(runtime.applicationResultSource, rawQueue);
   assert.equal("recover" in runtime.queue, false);
   assert.equal("enqueue" in runtime.queue, false);
   assert.equal("invalidate" in runtime.queue, false);
@@ -216,6 +226,20 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(detachedNext(), "next");
   assert.deepEqual(runtime.queue.get("item-1"), ["get", "item-1"]);
   assert.equal("approve" in runtime.producerQueue, false);
+  assert.equal("readSnapshot" in runtime.queue, false);
+  assert.equal("readSnapshot" in runtime.producerQueue, false);
+  assert.deepEqual(Object.keys(runtime.applicationResultSource), [
+    "readSnapshot",
+  ]);
+  assert.deepEqual(
+    runtime.applicationResultSource.readSnapshot({ afterRevision: 7 }),
+    ["readSnapshot", { afterRevision: 7 }],
+  );
+  const detachedReadSnapshot = runtime.applicationResultSource.readSnapshot;
+  assert.deepEqual(detachedReadSnapshot({ afterRevision: 8 }), [
+    "readSnapshot",
+    { afterRevision: 8 },
+  ]);
   assert.deepEqual(runtime.producerQueue.enqueue("plan"), ["enqueue", "plan"]);
   assert.deepEqual(runtime.producerQueue.invalidate("item-1", "reason"), [
     "invalidate",

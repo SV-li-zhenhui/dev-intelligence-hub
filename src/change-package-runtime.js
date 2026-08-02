@@ -5,6 +5,7 @@ import { projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
+import { ChangePackageApplicationProjectionStore } from "./services/change-package-application-projection-store.js";
 import { ChangePackageApplicationService } from "./services/change-package-application-service.js";
 import { ChangePackageStore } from "./services/change-package-store.js";
 
@@ -84,6 +85,8 @@ function validateDependencies(value) {
     throw new TypeError("dependencies must be a plain object");
   }
   const defaults = {
+    createApplicationProjectionStore: (options) =>
+      new ChangePackageApplicationProjectionStore(options),
     createApplicationService: (options) =>
       new ChangePackageApplicationService(options),
     createGitInspector: (options) => new GitCheckoutInspector(options),
@@ -285,6 +288,20 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
       ["enqueue"],
       "operationQueue",
     );
+    const applicationProjectionStore = bindPort(
+      factories.createApplicationProjectionStore({
+        store,
+        exclusiveLease: guard,
+        operationQueue,
+      }),
+      ["recover", "reader", "getCheckpoint", "applySnapshot"],
+      "applicationProjectionStore",
+    );
+    const applicationProjectionReader = bindPort(
+      applicationProjectionStore.reader(),
+      ["getForJob", "getForPackage", "getSummary"],
+      "applicationProjectionReader",
+    );
     const applicationOptions = {
       packageReader,
       trustedTargets,
@@ -302,6 +319,7 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
     await packageStore.recover();
     await guard.acquire();
     await application.recover();
+    await applicationProjectionStore.recover();
     return Object.freeze({
       packageProducer: admittedPort(
         packageProducer,
@@ -331,6 +349,18 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
         application.reader(),
         ["getResult"],
         "applicationReader",
+        admission,
+      ),
+      applicationProjectionReader: admittedPort(
+        applicationProjectionReader,
+        ["getForJob", "getForPackage", "getSummary"],
+        "applicationProjectionReader",
+        admission,
+      ),
+      applicationProjectionWriter: admittedPort(
+        applicationProjectionStore,
+        ["getCheckpoint", "applySnapshot"],
+        "applicationProjectionWriter",
         admission,
       ),
       close,

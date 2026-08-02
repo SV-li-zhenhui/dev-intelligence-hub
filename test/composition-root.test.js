@@ -1276,6 +1276,15 @@ test("change package composition derives trusted targets and shares the confirma
     applicationReader: {
       async getResult(id) { return { confirmationId: id }; },
     },
+    applicationProjectionReader: {
+      async getForJob(id) { return { status: "not_requested", jobId: id }; },
+      async getForPackage() {},
+      async getSummary() {},
+    },
+    applicationProjectionWriter: {
+      async getCheckpoint() {},
+      async applySnapshot() {},
+    },
     async close() { closeCalls.push("change-package"); },
   };
   const confirmationProducer = confirmationProducerPort({
@@ -1338,6 +1347,16 @@ test("change package composition derives trusted targets and shares the confirma
     ),
     { confirmationId: "confirmation-change-package-1" },
   );
+  assert.deepEqual(
+    await application.changePackageApplicationStatusReader.getForJob(
+      "code-job-1",
+    ),
+    { status: "not_requested", jobId: "code-job-1" },
+  );
+  assert.deepEqual(
+    Object.keys(application.changePackageApplicationStatusReader),
+    ["getForJob"],
+  );
   const request = {
     packageId: "change-package-1",
     requestedBy: { roleId: "developer", workItemId: "work-1" },
@@ -1393,12 +1412,14 @@ test("maintenance mode does not acquire change package write authority", async (
   assert.equal(confirmationCalls, 0);
   assert.equal(application.changePackageReader, null);
   assert.equal(application.changePackageApplicationReader, null);
+  assert.equal(application.changePackageApplicationStatusReader, null);
   assert.equal(application.changePackageApplicationRequester, null);
   await application.close();
 });
 
 test("local code and change package composition injects only frozen delivery ports", async () => {
   const calls = {};
+  const applicationRequestOrder = [];
   const closeCalls = [];
   const config = {
     ...localCodeCoordinationConfig({ githubActions: false }),
@@ -1423,9 +1444,24 @@ test("local code and change package composition injects only frozen delivery por
     changePackageRuntimeFactory: async () => ({
       packageProducer: { async create() {} },
       packageReader: { async get() {}, async readFile() {} },
-      applicationProducer: { async prepareConfirmation() {} },
+      applicationProducer: {
+        async prepareConfirmation(value) {
+          applicationRequestOrder.push("prepare");
+          calls.applicationRequest = value;
+          return { id: "confirmation-change-package-1" };
+        },
+      },
       applicationExecutor: { async execute() {}, async reconcile() {} },
       applicationReader: { async getResult() {} },
+      applicationProjectionReader: {
+        async getForJob() {}, async getForPackage() {}, async getSummary() {},
+      },
+      applicationProjectionWriter: {
+        async getCheckpoint() {
+          return { sourceRevision: 0, sourceSnapshotDigest: "0".repeat(64) };
+        },
+        async applySnapshot() {},
+      },
       async close() {},
     }),
     ...localCoordinationStubs({
@@ -1459,8 +1495,25 @@ test("local code and change package composition injects only frozen delivery por
     },
     confirmationRuntimeFactory: async () => ({
       queue: confirmationQueuePort(),
-      producerQueue: confirmationProducerPort(),
+      producerQueue: confirmationProducerPort({
+        async enqueue(value) {
+          applicationRequestOrder.push("enqueue");
+          calls.applicationPlan = value;
+          return { id: value.id, status: "pending", queueRevision: 9 };
+        },
+      }),
+      applicationResultSource: { async readSnapshot() {} },
       async close() {},
+    }),
+    changePackageApplicationResultReconcilerFactory: () => ({
+      async runCycle() {
+        return { status: "applied" };
+      },
+      async runThrough(sourceRevision) {
+        applicationRequestOrder.push("reconcile");
+        calls.applicationSourceRevision = sourceRevision;
+        return { status: "applied", sourceRevision };
+      },
     }),
     codeJobGrantFactory: () => ({
       async create() {},
@@ -1487,6 +1540,40 @@ test("local code and change package composition injects only frozen delivery por
     Object.keys(calls.coordination.codeJobChangePackageDispatcher),
     ["runCycle"],
   );
+  assert.equal(
+    Object.isFrozen(
+      calls.coordination.changePackageApplicationResultReconciler,
+    ),
+    true,
+  );
+  assert.deepEqual(
+    Object.keys(calls.coordination.changePackageApplicationResultReconciler),
+    ["runCycle"],
+  );
+  const applicationRequest = {
+    packageId: "change-package-1",
+    requestedBy: { roleId: "developer", workItemId: "work-1" },
+  };
+  assert.deepEqual(
+    await application.changePackageApplicationRequester.request(
+      applicationRequest,
+    ),
+    {
+      id: "confirmation-change-package-1",
+      status: "pending",
+      queueRevision: 9,
+    },
+  );
+  assert.strictEqual(calls.applicationRequest, applicationRequest);
+  assert.deepEqual(calls.applicationPlan, {
+    id: "confirmation-change-package-1",
+  });
+  assert.deepEqual(applicationRequestOrder, [
+    "prepare",
+    "enqueue",
+    "reconcile",
+  ]);
+  assert.equal(calls.applicationSourceRevision, 9);
   for (const [name, methods] of [
     ["codeJobReader", ["get", "getDetail", "list", "listNewest"]],
     ["changePackageReader", ["get"]],

@@ -27,6 +27,10 @@ function fixture(overrides = {}) {
       "code_job_change_packages",
       "runCycle",
     ),
+    changePackageApplicationResultReconciler: port(
+      "change_package_application_results",
+      "runCycle",
+    ),
     codeJobMemoryProjector: port("code_job_memory", "runCycle"),
     proposalRunner: port("proposal_execution", "runCycle"),
     proposalResultReconciler: port("proposals", "runCycle"),
@@ -63,6 +67,7 @@ test("agency executes proposals before reconciling their durable results", async
   assert.deepEqual(calls, [
     ["code_jobs", { limit: 6 }],
     ["code_job_change_packages", { limit: 6 }],
+    ["change_package_application_results", undefined],
     ["code_job_memory", { limit: 13 }],
     ["proposal_execution", { limit: 11 }],
     ["proposals", { limit: 11 }],
@@ -80,6 +85,10 @@ test("agency executes proposals before reconciling their durable results", async
   assert.deepEqual(result.stages.code_job_change_packages, {
     ok: true,
     result: { name: "code_job_change_packages" },
+  });
+  assert.deepEqual(result.stages.change_package_application_results, {
+    ok: true,
+    result: { name: "change_package_application_results" },
   });
   assert.equal(result.stages.dispatch.ok, true);
 });
@@ -109,6 +118,9 @@ test("proposal execution is a safe no-op when no runner is configured", async ()
   assert.deepEqual(result.stages.code_job_change_packages.result, {
     skipped: "not_configured",
   });
+  assert.deepEqual(result.stages.change_package_application_results.result, {
+    skipped: "not_configured",
+  });
   assert.deepEqual(result.stages.code_job_memory.result, {
     skipped: "not_configured",
   });
@@ -126,6 +138,7 @@ test("housekeeping cycles reconcile and dispatch without making role decisions",
   assert.deepEqual(calls, [
     ["code_jobs", { limit: 10 }],
     ["code_job_change_packages", { limit: 10 }],
+    ["change_package_application_results", undefined],
     ["code_job_memory", { limit: 50 }],
     ["proposal_execution", { limit: 12 }],
     ["proposals", { limit: 12 }],
@@ -213,6 +226,10 @@ test("all independent stage failures are reported after every stage is attempted
       "code_job_change_packages",
       "runCycle",
     ),
+    changePackageApplicationResultReconciler: failing(
+      "change_package_application_results",
+      "runCycle",
+    ),
     codeJobMemoryProjector: failing("code_job_memory", "runCycle"),
     proposalRunner: failing("proposal_execution", "runCycle"),
     proposalResultReconciler: failing("proposals", "runCycle"),
@@ -227,6 +244,7 @@ test("all independent stage failures are reported after every stage is attempted
     assert.deepEqual(error.errors.map(({ stage }) => stage), [
       "code_jobs",
       "code_job_change_packages",
+      "change_package_application_results",
       "code_job_memory",
       "proposal_execution",
       "proposal_results",
@@ -240,6 +258,7 @@ test("all independent stage failures are reported after every stage is attempted
   assert.deepEqual(calls, [
     "code_jobs",
     "code_job_change_packages",
+    "change_package_application_results",
     "code_job_memory",
     "proposal_execution",
     "proposals",

@@ -69,6 +69,10 @@ async function skipCodeJobChangePackages() {
   return { skipped: "not_configured" };
 }
 
+async function skipChangePackageApplicationResults() {
+  return { skipped: "not_configured" };
+}
+
 async function skipCodeJobMemory() {
   return { skipped: "not_configured" };
 }
@@ -84,6 +88,7 @@ export class WorkCoordinationService {
   #intake;
   #runCodeJobs;
   #dispatchCodeJobChangePackages;
+  #reconcileChangePackageApplicationResults;
   #projectCodeJobMemory;
   #runProposals;
   #reconcileProposals;
@@ -99,6 +104,7 @@ export class WorkCoordinationService {
     ledger,
     codeJobRunner,
     codeJobChangePackageDispatcher,
+    changePackageApplicationResultReconciler,
     codeJobMemoryProjector,
     proposalRunner,
     proposalResultReconciler,
@@ -126,6 +132,14 @@ export class WorkCoordinationService {
             codeJobChangePackageDispatcher,
             "runCycle",
             "codeJobChangePackageDispatcher",
+          );
+    this.#reconcileChangePackageApplicationResults =
+      changePackageApplicationResultReconciler == null
+        ? skipChangePackageApplicationResults
+        : requirePort(
+            changePackageApplicationResultReconciler,
+            "runCycle",
+            "changePackageApplicationResultReconciler",
           );
     this.#projectCodeJobMemory = codeJobMemoryProjector == null
       ? skipCodeJobMemory
@@ -204,6 +218,8 @@ export class WorkCoordinationService {
         this.#dispatchCodeJobChangePackages({
           limit: this.#defaults.codeJobLimit,
         })],
+      ["change_package_application_results", () =>
+        this.#reconcileChangePackageApplicationResults()],
       ["code_job_memory", () =>
         this.#projectCodeJobMemory({
           limit: this.#defaults.codeJobMemoryLimit,

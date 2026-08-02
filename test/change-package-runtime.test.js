@@ -33,6 +33,7 @@ test("disabled change packages construct no runtime dependency", async () => {
     throw new Error("must not construct");
   };
   const dependencies = {
+    createApplicationProjectionStore: fail,
     createApplicationService: fail,
     createGitInspector: fail,
     createGuard: fail,
@@ -67,6 +68,17 @@ test("runtime recovers packages before the application and exposes only narrow p
   const applicationProducer = fakePort(["prepareConfirmation"]);
   const applicationExecutor = fakePort(["execute", "reconcile"]);
   const applicationReader = fakePort(["getResult"]);
+  const applicationProjectionReader = fakePort([
+    "getForJob",
+    "getForPackage",
+    "getSummary",
+  ]);
+  const applicationProjectionStore = {
+    async recover() { events.push("application-projection-recover"); },
+    reader() { return applicationProjectionReader; },
+    async getCheckpoint() {},
+    async applySnapshot() {},
+  };
   const gitInspector = fakePort(["inspect"]);
   const guard = {
     async acquire() { events.push("acquire"); },
@@ -94,6 +106,7 @@ test("runtime recovers packages before the application and exposes only narrow p
   let packageOptions;
   let inspectorOptions;
   let applicationOptions;
+  let applicationProjectionOptions;
 
   const runtime = await createChangePackageRuntime(enabledConfig(), {
     dataDirectory,
@@ -118,6 +131,11 @@ test("runtime recovers packages before the application and exposes only narrow p
       events.push("operation-queue");
       return operationQueue;
     },
+    createApplicationProjectionStore(options) {
+      events.push("application-projection-store");
+      applicationProjectionOptions = options;
+      return applicationProjectionStore;
+    },
     createApplicationService(options) {
       events.push("application-service");
       applicationOptions = options;
@@ -133,10 +151,12 @@ test("runtime recovers packages before the application and exposes only narrow p
     "git-inspector",
     "guard:mydashboard-change-package-application-v1",
     "operation-queue",
+    "application-projection-store",
     "application-service",
     "package-recover",
     "acquire",
     "application-recover",
+    "application-projection-recover",
   ]);
   assert.equal(packageOptions.root, packageRoot);
   assert.equal(typeof packageOptions.createGuard, "function");
@@ -158,10 +178,21 @@ test("runtime recovers packages before the application and exposes only narrow p
   );
   assert.deepEqual(Object.keys(applicationOptions.operationQueue), ["enqueue"]);
   assert.deepEqual(applicationOptions.trustedTargets, trustedTargets);
+  assert.strictEqual(applicationProjectionOptions.store, applicationOptions.store);
+  assert.strictEqual(
+    applicationProjectionOptions.exclusiveLease,
+    applicationOptions.exclusiveLease,
+  );
+  assert.strictEqual(
+    applicationProjectionOptions.operationQueue,
+    applicationOptions.operationQueue,
+  );
 
   assert.equal(Object.isFrozen(runtime), true);
   assert.deepEqual(Object.keys(runtime).sort(), [
     "applicationExecutor",
+    "applicationProjectionReader",
+    "applicationProjectionWriter",
     "applicationProducer",
     "applicationReader",
     "close",
@@ -182,12 +213,23 @@ test("runtime recovers packages before the application and exposes only narrow p
     ["execute", "reconcile"].sort(),
   );
   assert.deepEqual(Object.keys(runtime.applicationReader).sort(), ["getResult"]);
+  assert.deepEqual(Object.keys(runtime.applicationProjectionReader).sort(), [
+    "getForJob",
+    "getForPackage",
+    "getSummary",
+  ]);
+  assert.deepEqual(Object.keys(runtime.applicationProjectionWriter).sort(), [
+    "applySnapshot",
+    "getCheckpoint",
+  ]);
   for (const port of [
     runtime.packageProducer,
     runtime.packageReader,
     runtime.applicationProducer,
     runtime.applicationExecutor,
     runtime.applicationReader,
+    runtime.applicationProjectionReader,
+    runtime.applicationProjectionWriter,
   ]) {
     assert.equal(Object.isFrozen(port), true);
   }
@@ -220,6 +262,12 @@ test("close drains accepted package writes before releasing authority", async ()
     createStore: () => fakePort(["read", "write"]),
     createGuard: () => guard,
     createOperationQueue: () => ({ enqueue: (operation) => operation() }),
+    createApplicationProjectionStore: () => ({
+      async recover() {},
+      reader: () => fakePort(["getForJob", "getForPackage", "getSummary"]),
+      async getCheckpoint() {},
+      async applySnapshot() {},
+    }),
     createGitInspector: () => fakePort(["inspect"]),
     createPackageStore: () => ({
       async recover() {},
@@ -306,6 +354,53 @@ test("application recovery failure closes the acquired guard", async () => {
     "package-recover",
     "acquire",
     "application-recover",
+    "close",
+  ]);
+});
+
+test("application projection recovery failure closes the acquired guard", async () => {
+  const failure = new Error("corrupt application projection state");
+  const events = [];
+  const guard = {
+    async acquire() { events.push("acquire"); },
+    async run(operation) { return operation(); },
+    async close() { events.push("close"); },
+  };
+  await assert.rejects(
+    createChangePackageRuntime(enabledConfig(), {
+      trustedTargets: [],
+      createPackageStore: () => ({
+        async recover() { events.push("package-recover"); },
+        producer: () => fakePort(["create"]),
+        reader: () => fakePort(["get", "readFile"]),
+      }),
+      createGitInspector: () => fakePort(["inspect"]),
+      createGuard: () => guard,
+      createOperationQueue: () => ({ enqueue: (operation) => operation() }),
+      createStore: () => fakePort(["read", "write"]),
+      createApplicationService: () => ({
+        async recover() { events.push("application-recover"); },
+        producer: () => fakePort(["prepareConfirmation"]),
+        executor: () => fakePort(["execute", "reconcile"]),
+        reader: () => fakePort(["getResult"]),
+      }),
+      createApplicationProjectionStore: () => ({
+        async recover() {
+          events.push("application-projection-recover");
+          throw failure;
+        },
+        reader: () => fakePort(["getForJob", "getForPackage", "getSummary"]),
+        async getCheckpoint() {},
+        async applySnapshot() {},
+      }),
+    }),
+    (error) => error === failure,
+  );
+  assert.deepEqual(events, [
+    "package-recover",
+    "acquire",
+    "application-recover",
+    "application-projection-recover",
     "close",
   ]);
 });

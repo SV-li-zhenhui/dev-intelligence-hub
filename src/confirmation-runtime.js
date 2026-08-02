@@ -28,6 +28,7 @@ const USER_QUEUE_METHODS = [
   "reject",
 ];
 const PRODUCER_QUEUE_METHODS = ["enqueue", "get", "invalidate"];
+const APPLICATION_RESULT_SOURCE_METHODS = ["readSnapshot"];
 const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabled",
   "actorAccountId",
@@ -347,7 +348,11 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       }),
       [
         "recover",
-        ...new Set([...USER_QUEUE_METHODS, ...PRODUCER_QUEUE_METHODS]),
+        ...new Set([
+          ...USER_QUEUE_METHODS,
+          ...PRODUCER_QUEUE_METHODS,
+          ...APPLICATION_RESULT_SOURCE_METHODS,
+        ]),
       ],
       "queue",
     );
@@ -356,6 +361,10 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     return Object.freeze({
       queue: createQueueFacade(queue, USER_QUEUE_METHODS),
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),
+      applicationResultSource: createQueueFacade(
+        queue,
+        APPLICATION_RESULT_SOURCE_METHODS,
+      ),
       close,
     });
   } catch (error) {

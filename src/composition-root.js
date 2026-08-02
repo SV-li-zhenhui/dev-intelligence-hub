@@ -19,6 +19,7 @@ import { EmployeeRegistry } from "./services/employee-registry.js";
 import { createConfiguredWorkforce } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
+import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
@@ -150,6 +151,8 @@ export async function createApplication({
     new CodeJobMemoryProjector(options),
   codeJobEvidenceReaderFactory = (options) =>
     new CodeJobEvidenceReader(options),
+  changePackageApplicationResultReconcilerFactory = (options) =>
+    new ChangePackageApplicationResultReconciler(options),
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   configuredWorkforceFactory = createConfiguredWorkforce,
@@ -208,6 +211,9 @@ export async function createApplication({
   let codeJobChangePackageDispatcher = null;
   let changePackageReader = null;
   let changePackageApplicationReader = null;
+  let changePackageApplicationStatusReader = null;
+  let changePackageApplicationResultReconciler = null;
+  let changePackageApplicationResultBarrier = null;
   let changePackageApplicationRequester = null;
   let grantFactory = null;
   try {
@@ -248,6 +254,11 @@ export async function createApplication({
         changePackageRuntime.applicationReader,
         ["getResult"],
         "changePackageRuntime.applicationReader",
+      );
+      changePackageApplicationStatusReader = frozenPort(
+        changePackageRuntime.applicationProjectionReader,
+        ["getForJob"],
+        "changePackageRuntime.applicationProjectionReader",
       );
     }
     workflowRouting = trackRuntime(
@@ -521,10 +532,40 @@ export async function createApplication({
         ["enqueue"],
         "confirmationRuntime.producerQueue",
       );
+      if (codeJobChangePackageDeliveryEnabled) {
+        const resultReconciler =
+          changePackageApplicationResultReconcilerFactory({
+            applicationResultSource: frozenPort(
+              confirmationRuntime.applicationResultSource,
+              ["readSnapshot"],
+              "confirmationRuntime.applicationResultSource",
+            ),
+            applicationReader: changePackageApplicationReader,
+            projectionStore: frozenPort(
+              changePackageRuntime.applicationProjectionWriter,
+              ["getCheckpoint", "applySnapshot"],
+              "changePackageRuntime.applicationProjectionWriter",
+            ),
+          });
+        changePackageApplicationResultReconciler = frozenPort(
+          resultReconciler,
+          ["runCycle"],
+          "changePackageApplicationResultReconciler",
+        );
+        changePackageApplicationResultBarrier = frozenPort(
+          resultReconciler,
+          ["runThrough"],
+          "changePackageApplicationResultBarrier",
+        );
+      }
       changePackageApplicationRequester = Object.freeze({
         async request(value) {
           const plan = await applicationProducer.prepareConfirmation(value);
-          return confirmationProducer.enqueue(plan);
+          const queued = await confirmationProducer.enqueue(plan);
+          await changePackageApplicationResultBarrier?.runThrough(
+            queued.queueRevision,
+          );
+          return queued;
         },
       });
     }
@@ -676,6 +717,7 @@ export async function createApplication({
         codeJobRunner: codeJobWorker,
         codeJobMemoryProjector,
         codeJobChangePackageDispatcher,
+        changePackageApplicationResultReconciler,
         proposalRunner,
         proposalResultReconciler,
         attentionResultReconciler,
@@ -758,6 +800,7 @@ export async function createApplication({
       confirmationQueue: confirmationRuntime?.queue || null,
       changePackageReader,
       changePackageApplicationReader,
+      changePackageApplicationStatusReader,
       changePackageApplicationRequester,
       workflowRouting,
       codeJobReader,
