@@ -8,6 +8,9 @@ import {
   normalizeConfirmationRequest,
   normalizeConfirmationState,
 } from "../domain/confirmation-contract.js";
+import {
+  normalizeExternalDeferredOptions,
+} from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 
 const STATE_KEY = "confirmation-queue";
@@ -232,9 +235,10 @@ export class ConfirmationQueue {
     );
   }
 
-  async next() {
+  async next(options) {
     this.#assertReady();
-    return this.#projectNext();
+    const { deferred } = normalizeExternalDeferredOptions(options);
+    return this.#projectNext(deferred);
   }
 
   async get(id) {
@@ -604,10 +608,20 @@ export class ConfirmationQueue {
     }
   }
 
-  #projectNext() {
+  #projectNext(deferred = []) {
+    const deferredBindings = new Set(
+      deferred.map(
+        (entry) => `${entry.id}\u0000${entry.approvalBindingDigest}`,
+      ),
+    );
+    const isVisible = (item) =>
+      !deferredBindings.has(`${item.id}\u0000${item.approvalBindingDigest}`);
     const pending = this.state.items
       .filter(
-        (item) => item.status === "pending" && !this.#isProducerVetoed(item),
+        (item) =>
+          item.status === "pending" &&
+          !this.#isProducerVetoed(item) &&
+          isVisible(item),
       )
       .sort(byCreation);
     const retryable = this.state.items
@@ -615,7 +629,8 @@ export class ConfirmationQueue {
         (item) =>
           item.status === "failed" &&
           item.failure?.retryable &&
-          !this.#isProducerVetoed(item),
+          !this.#isProducerVetoed(item) &&
+          isVisible(item),
       )
       .sort(byCreation);
     const actionable = [...pending, ...retryable];

@@ -8,6 +8,9 @@ import {
   normalizeAttentionTimestamp,
   safeAttentionInteger,
 } from "../domain/attention-contract.js";
+import {
+  normalizeInternalDeferredOptions,
+} from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   ATTENTION_STATE_LIMITS,
@@ -164,10 +167,22 @@ export class AttentionInbox {
     });
   }
 
-  next() {
+  next(options) {
     return this.#query(() => {
+      const { deferred } = normalizeInternalDeferredOptions(options);
+      const deferredBindings = new Set(
+        deferred.map(
+          (entry) => `${entry.requestId}\u0000${entry.contentDigest}`,
+        ),
+      );
       const item = this.state.items
-        .filter((entry) => entry.status === "pending")
+        .filter(
+          (entry) =>
+            entry.status === "pending" &&
+            !deferredBindings.has(
+              `${entry.requestId}\u0000${entry.contentDigest}`,
+            ),
+        )
         .reduce(
           (oldest, entry) =>
             !oldest || entry.timeline[0].revision < oldest.timeline[0].revision

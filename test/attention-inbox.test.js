@@ -130,7 +130,7 @@ test("a trusted producer persists a content-addressed request before it is visib
 test("next returns the oldest actionable request and only advances after a terminal response", async () => {
   const { inbox, store } = await readyInbox();
   const first = await inbox.create(attentionRequest());
-  await inbox.create(
+  const second = await inbox.create(
     attentionRequest({
       requestKey: "work-43-question-1",
       producer: { roleId: "requirements-analyst", workItemId: "work-43" },
@@ -146,9 +146,64 @@ test("next returns the oldest actionable request and only advances after a termi
   assert.equal(store.writeCount, writesBeforeLater);
   assert.equal(store.value.revision, revisionBeforeLater);
   assert.equal((await inbox.next()).requestId, first.requestId);
+  assert.equal(
+    (
+      await inbox.next({
+        deferred: [
+          {
+            requestId: first.requestId,
+            contentDigest: first.contentDigest,
+          },
+        ],
+      })
+    ).requestId,
+    second.requestId,
+  );
+  assert.equal(store.writeCount, writesBeforeLater);
+  assert.equal(
+    (
+      await inbox.next({
+        deferred: [
+          {
+            requestId: first.requestId,
+            contentDigest: "0".repeat(64),
+          },
+        ],
+      })
+    ).requestId,
+    first.requestId,
+  );
 
   await inbox.answer(response(first, { type: "choice", choiceId: "yes" }));
   assert.notEqual((await inbox.next()).requestId, first.requestId);
+});
+
+test("next strictly bounds deferred request bindings without invoking accessors", async () => {
+  const { inbox } = await readyInbox();
+  let invoked = false;
+  const accessorOptions = {};
+  Object.defineProperty(accessorOptions, "deferred", {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    inbox.next(accessorOptions),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
+  assert.equal(invoked, false);
+  await assert.rejects(
+    inbox.next({
+      deferred: Array.from({ length: 33 }, (_, index) => ({
+        requestId: `attention-${index.toString(16).padStart(64, "0")}`,
+        contentDigest: index.toString(16).padStart(64, "0"),
+      })),
+    }),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
 });
 
 test("answer and reject only persist internal results and an immutable outbox", async () => {

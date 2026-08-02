@@ -84,6 +84,68 @@ test("falls through to exactly one internal request when no external action wait
   });
 });
 
+test("forwards bounded source-specific exclusions and falls through past deferred external work", async () => {
+  const externalDeferred = {
+    id: "github-review-1",
+    approvalBindingDigest: "c".repeat(64),
+  };
+  const internalDeferred = {
+    requestId: `attention-${"d".repeat(64)}`,
+    contentDigest: "e".repeat(64),
+  };
+  const reads = [];
+  const coordinator = new AttentionCoordinator({
+    externalQueue: {
+      async next(options) {
+        reads.push({ source: "external", options });
+        return { queueRevision: 10, pendingCount: 0, item: null };
+      },
+    },
+    internalInbox: {
+      async next(options) {
+        reads.push({ source: "internal", options });
+        return internalItem();
+      },
+    },
+  });
+
+  const result = await coordinator.next({
+    external: [externalDeferred],
+    internal: [internalDeferred],
+  });
+
+  assert.equal(result.source, "internal_request");
+  assert.deepEqual(reads, [
+    { source: "external", options: { deferred: [externalDeferred] } },
+    { source: "internal", options: { deferred: [internalDeferred] } },
+  ]);
+});
+
+test("rejects more than 32 aggregate exclusions before reading either source", async () => {
+  let reads = 0;
+  const coordinator = new AttentionCoordinator({
+    externalQueue: { async next() { reads += 1; return null; } },
+    internalInbox: { async next() { reads += 1; return null; } },
+  });
+
+  await assert.rejects(
+    coordinator.next({
+      external: Array.from({ length: 32 }, (_, index) => ({
+        id: `github-review-${index}`,
+        approvalBindingDigest: index.toString(16).padStart(64, "0"),
+      })),
+      internal: [
+        {
+          requestId: `attention-${"a".repeat(64)}`,
+          contentDigest: "b".repeat(64),
+        },
+      ],
+    }),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
+  assert.equal(reads, 0);
+});
+
 test("works with either queue disabled and returns one stable empty projection", async () => {
   const internalOnly = new AttentionCoordinator({
     internalInbox: { async next() { return internalItem(); } },

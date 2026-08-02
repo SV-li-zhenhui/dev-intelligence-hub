@@ -35,7 +35,35 @@ let confirmationQueueLoaded = false;
 let activeExternalConfirmation = null;
 let activeInternalAttention = null;
 let activeConfirmationKey = "";
+const MAX_DEFERRED_CONFIRMATIONS = 32;
 const deferredConfirmations = new Set();
+
+function rememberDeferredConfirmation(key) {
+  if (!key) return;
+  deferredConfirmations.delete(key);
+  deferredConfirmations.add(key);
+  while (deferredConfirmations.size > MAX_DEFERRED_CONFIRMATIONS) {
+    deferredConfirmations.delete(deferredConfirmations.values().next().value);
+  }
+}
+
+function attentionNextUrl() {
+  const params = new URLSearchParams();
+  for (const key of deferredConfirmations) {
+    const [source, id, digest, extra] = key.split("\u0000");
+    if (
+      extra !== undefined ||
+      !["external", "internal"].includes(source) ||
+      !id ||
+      !/^[a-f0-9]{64}$/.test(digest)
+    ) {
+      continue;
+    }
+    params.append("deferred", `${source}:${id}:${digest}`);
+  }
+  const query = params.toString();
+  return `/api/attention/next${query ? `?${query}` : ""}`;
+}
 
 const viewTitles = {
   overview: "今天需要你推动什么",
@@ -834,14 +862,20 @@ async function submitInternalAttention(operation, answer) {
     }
     if (!response.ok) throw new Error(`员工请示处理失败（${response.status}）`);
     await response.json();
-    if (operation === "later") deferredConfirmations.add(activeConfirmationKey);
+    if (operation === "later") {
+      rememberDeferredConfirmation(activeConfirmationKey);
+    }
     activeInternalAttention = null;
     activeConfirmationKey = "";
     confirmationDialog.close();
     invalidateConfirmationQueueSnapshot();
-    await refreshConfirmationQueue({ showConfirmation: false });
+    if (operation === "later") {
+      await refreshAfterDeferral();
+    } else {
+      await refreshConfirmationQueue({ showConfirmation: false });
+    }
     if (currentView === "work") await workView.load();
-    queueMicrotask(showNextConfirmation);
+    if (operation !== "later") queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
@@ -936,10 +970,10 @@ async function handleConfirmation(event) {
   const headRefOid = button.closest("[data-confirmation-id]").dataset.headRefOid;
   const decision = button.dataset.decision;
   if (decision === "later") {
-    deferredConfirmations.add(activeConfirmationKey);
+    rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
     confirmationDialog.close();
-    queueMicrotask(showNextConfirmation);
+    await refreshAfterDeferral();
     return;
   }
 
@@ -983,11 +1017,11 @@ async function handleExternalConfirmation(event) {
   if (!button) return;
   const operation = button.dataset.externalOperation;
   if (operation === "later") {
-    deferredConfirmations.add(activeConfirmationKey);
+    rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
     activeExternalConfirmation = null;
     confirmationDialog.close();
-    queueMicrotask(showNextConfirmation);
+    await refreshAfterDeferral();
     return;
   }
   const item = activeExternalConfirmation;
@@ -1055,10 +1089,10 @@ async function handleReviewDraftDecision(event) {
   const container = button.closest("[data-review-job-id]");
   const decision = button.dataset.reviewDecision;
   if (decision === "later") {
-    deferredConfirmations.add(activeConfirmationKey);
+    rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
     confirmationDialog.close();
-    queueMicrotask(showNextConfirmation);
+    await refreshAfterDeferral();
     return;
   }
   confirmationContent.querySelectorAll("button").forEach((candidate) => {
@@ -1137,7 +1171,7 @@ async function fetchDashboard() {
 }
 
 async function fetchConfirmationQueue() {
-  const response = await fetch("/api/attention/next", { cache: "no-store" });
+  const response = await fetch(attentionNextUrl(), { cache: "no-store" });
   if (!response.ok) throw new Error(`读取确认队列失败（${response.status}）`);
   return response.json();
 }
@@ -1149,6 +1183,16 @@ async function refreshConfirmationQueue({ showConfirmation = true } = {}) {
   if (applied && dashboard) render();
   if (showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
+}
+
+async function refreshAfterDeferral() {
+  try {
+    await refreshConfirmationQueue({ showConfirmation: false });
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = `${error.message}。页面会自动重试读取确认队列。`;
+  }
+  queueMicrotask(showNextConfirmation);
 }
 
 async function load({ showConfirmation = true } = {}) {
@@ -1223,19 +1267,19 @@ refreshButton.addEventListener("click", refresh);
 document.querySelector(".dialog-close").addEventListener("click", () => dialog.close());
 document
   .querySelector(".confirmation-close")
-  .addEventListener("click", () => {
+  .addEventListener("click", async () => {
     if (activeInternalAttention) {
-      submitInternalAttention("later", { type: "later" });
+      await submitInternalAttention("later", { type: "later" });
       return;
     }
     if (activeConfirmationKey) {
-      deferredConfirmations.add(activeConfirmationKey);
+      rememberDeferredConfirmation(activeConfirmationKey);
       activeConfirmationKey = "";
     }
     activeInternalAttention = null;
     activeExternalConfirmation = null;
     confirmationDialog.close();
-    queueMicrotask(showNextConfirmation);
+    await refreshAfterDeferral();
   });
 dialog.addEventListener("click", (event) => {
   if (event.target === dialog) dialog.close();

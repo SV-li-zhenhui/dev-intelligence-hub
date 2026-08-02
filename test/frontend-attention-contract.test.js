@@ -19,10 +19,20 @@ test("all attention sources share one dialog and one unified next endpoint", asy
 
   assert.equal((html.match(/<dialog\b/g) || []).length, 2);
   assert.equal((html.match(/id="confirmation-dialog"/g) || []).length, 1);
-  assert.match(app, /fetch\("\/api\/attention\/next"/);
+  assert.match(app, /fetch\(attentionNextUrl\(\)/);
   assert.doesNotMatch(app, /fetch\("\/api\/confirmations\/next"/);
   assert.match(app, /source === "external_confirmation"/);
   assert.match(app, /source === "internal_request"/);
+});
+
+test("session deferrals are bounded and sent as exact source bindings", async () => {
+  const { app } = await sources();
+
+  assert.match(app, /const MAX_DEFERRED_CONFIRMATIONS = 32/);
+  assert.match(app, /function rememberDeferredConfirmation/);
+  assert.match(app, /while \(deferredConfirmations\.size > MAX_DEFERRED_CONFIRMATIONS\)/);
+  assert.match(app, /params\.append\("deferred", `\$\{source\}:\$\{id\}:\$\{digest\}`\)/);
+  assert.match(app, /async function refreshAfterDeferral/);
 });
 
 test("internal renderer cannot manufacture an external action control", async () => {

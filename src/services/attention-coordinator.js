@@ -1,3 +1,5 @@
+import { normalizeUnifiedDeferredOptions } from "../domain/attention-deferred-contract.js";
+
 function assertReadPort(value, name) {
   if (value !== null && value !== undefined && typeof value.next !== "function") {
     throw new TypeError(`${name}.next must be a function`);
@@ -30,10 +32,17 @@ export class AttentionCoordinator {
     Object.freeze(this);
   }
 
-  async next() {
+  async next(options) {
+    const hasOptions = options !== undefined;
+    const deferred = normalizeUnifiedDeferredOptions(options);
     let externalQueueRevision = 0;
     if (this.#externalNext) {
-      const external = await this.#externalNext();
+      let external;
+      if (hasOptions) {
+        external = await this.#externalNext({ deferred: deferred.external });
+      } else {
+        external = await this.#externalNext();
+      }
       externalQueueRevision = Number.isSafeInteger(external?.queueRevision)
         ? external.queueRevision
         : 0;
@@ -51,9 +60,12 @@ export class AttentionCoordinator {
       }
     }
 
-    const internal = this.#internalNext
-      ? await this.#internalNext()
-      : null;
+    let internal = null;
+    if (this.#internalNext) {
+      internal = hasOptions
+        ? await this.#internalNext({ deferred: deferred.internal })
+        : await this.#internalNext();
+    }
     if (!internal) {
       return emptyProjection(externalQueueRevision, this.#externalEnabled);
     }

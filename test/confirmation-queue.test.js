@@ -191,6 +191,74 @@ test("next returns exactly the oldest actionable item without its private action
   );
 });
 
+test("next skips only exact deferred bindings without mutating the queue", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(actionPlan());
+  await queue.enqueue(actionPlan({ id: "confirmation-review-43" }));
+  const first = await queue.next();
+  const writesBeforeRead = store.writeCount;
+
+  const deferred = await queue.next({
+    deferred: [
+      {
+        id: first.item.id,
+        approvalBindingDigest: first.item.approvalBindingDigest,
+      },
+    ],
+  });
+
+  assert.equal(deferred.item.id, "confirmation-review-43");
+  assert.equal(deferred.pendingCount, 1);
+  assert.equal(store.writeCount, writesBeforeRead);
+  assert.equal(
+    (
+      await queue.next({
+        deferred: [
+          {
+            id: first.item.id,
+            approvalBindingDigest: "0".repeat(64),
+          },
+        ],
+      })
+    ).item.id,
+    first.item.id,
+  );
+  assert.equal((await queue.next()).item.id, first.item.id);
+});
+
+test("next rejects malformed or oversized deferred binding lists without invoking accessors", async () => {
+  const queue = await readyQueue();
+  let invoked = false;
+  const accessorOptions = {};
+  Object.defineProperty(accessorOptions, "deferred", {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    queue.next(accessorOptions),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
+  assert.equal(invoked, false);
+  await assert.rejects(
+    queue.next({
+      deferred: Array.from({ length: 33 }, (_, index) => ({
+        id: `confirmation-deferred-${index}`,
+        approvalBindingDigest: index.toString(16).padStart(64, "0"),
+      })),
+    }),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
+  await assert.rejects(
+    queue.next({ deferred: [], unexpected: true }),
+    (error) => error.code === "INVALID_ATTENTION_DEFERRED" && error.statusCode === 400,
+  );
+});
+
 test("approval persists executing before the external executor is called", async () => {
   const store = new MemoryStore();
   const actionExecutor = executor();

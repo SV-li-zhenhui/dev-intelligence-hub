@@ -66,6 +66,7 @@ test("later closes the popup without entering the mutation branch", async () => 
 
   assert.match(laterBranch, /if \(operation === "later"\)/);
   assert.match(laterBranch, /confirmationDialog\.close\(\)/);
+  assert.match(laterBranch, /await refreshAfterDeferral\(\)/);
   assert.match(laterBranch, /return;/);
   assert.equal(laterBranch.includes("fetch("), false);
 });
