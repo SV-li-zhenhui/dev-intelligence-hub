@@ -10,6 +10,8 @@ export const MEMORY_INDEX_KEY = "unified-memory-index";
 const MAX_BATCH = 100;
 const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
+const MAX_INDEX_ASSOCIATIONS = 250_000;
+const MAX_RECORD_INDEX_TOKENS = 4_096;
 const QUERY_KEYS = [
   "q",
   "roleId",
@@ -177,22 +179,37 @@ function lexicalTerms(value) {
   return normalizedSearchText(value).match(/[\p{L}\p{N}]+/gu) || [];
 }
 
-function indexTokens(value) {
+function indexTokens(value, maximum = Number.POSITIVE_INFINITY) {
   const tokens = new Set();
+  let complete = true;
+  const add = (token) => {
+    if (tokens.has(token)) return true;
+    if (tokens.size >= maximum) {
+      complete = false;
+      return false;
+    }
+    tokens.add(token);
+    return true;
+  };
+  terms:
   for (const term of lexicalTerms(value)) {
     if (!/\p{Script=Han}/u.test(term)) {
-      if (Buffer.byteLength(term, "utf8") <= 256) tokens.add(term);
+      if (Buffer.byteLength(term, "utf8") <= 256 && !add(term)) break;
       continue;
     }
     const characters = [...term];
-    for (const character of characters) tokens.add(character);
+    for (const character of characters) {
+      if (!add(character)) break terms;
+    }
     for (const width of [2, 3]) {
       for (let index = 0; index + width <= characters.length; index += 1) {
-        tokens.add(characters.slice(index, index + width).join(""));
+        if (!add(characters.slice(index, index + width).join(""))) {
+          break terms;
+        }
       }
     }
   }
-  return tokens;
+  return { tokens, complete };
 }
 
 function recordText(record) {
@@ -214,11 +231,21 @@ function recordText(record) {
 
 function buildIndex(records, revision) {
   const tokenMap = new Map();
+  let associations = 0;
+  let complete = true;
+  records:
   for (const record of records) {
-    for (const token of indexTokens(recordText(record))) {
+    const generated = indexTokens(recordText(record), MAX_RECORD_INDEX_TOKENS);
+    if (!generated.complete) complete = false;
+    for (const token of generated.tokens) {
+      if (associations >= MAX_INDEX_ASSOCIATIONS) {
+        complete = false;
+        break records;
+      }
       const ids = tokenMap.get(token) || [];
       ids.push(record.recordId);
       tokenMap.set(token, ids);
+      associations += 1;
     }
   }
   const entries = Object.fromEntries(
@@ -231,9 +258,11 @@ function buildIndex(records, revision) {
       schemaVersion: 1,
       journalRevision: revision,
       journalDigest: journalDigest(records),
+      complete,
       entries,
     },
     tokenMap,
+    complete,
   };
 }
 
@@ -241,13 +270,20 @@ function indexMatches(value, expected) {
   try {
     const index = exact(
       value,
-      ["schemaVersion", "journalRevision", "journalDigest", "entries"],
+      [
+        "schemaVersion",
+        "journalRevision",
+        "journalDigest",
+        "complete",
+        "entries",
+      ],
       "memory index",
     );
     return (
       index.schemaVersion === 1 &&
       index.journalRevision === expected.journalRevision &&
       index.journalDigest === expected.journalDigest &&
+      index.complete === expected.complete &&
       index.entries !== null &&
       typeof index.entries === "object" &&
       !Array.isArray(index.entries)
@@ -342,8 +378,9 @@ function newestFirst(left, right) {
   );
 }
 
-function candidateIds(index, q) {
-  const tokens = [...indexTokens(q)];
+function candidateIds(index, q, indexComplete) {
+  if (!indexComplete) return null;
+  const tokens = [...indexTokens(q).tokens];
   if (!tokens.length) return null;
   let candidates = null;
   for (const token of tokens) {
@@ -363,6 +400,7 @@ export class LocalMemoryJournal {
   #limits;
   #journal = emptyJournal();
   #index = new Map();
+  #indexComplete = true;
   #ready = false;
   #recovering = null;
   #lastIndexError = "";
@@ -410,6 +448,7 @@ export class LocalMemoryJournal {
         const storedIndex = await this.#store.read(MEMORY_INDEX_KEY, null);
         this.#journal = journal;
         this.#index = built.tokenMap;
+        this.#indexComplete = built.complete;
         this.#lastIndexError = "";
         if (!indexMatches(storedIndex, built.persisted)) {
           await this.#persistIndex(built.persisted);
@@ -456,7 +495,11 @@ export class LocalMemoryJournal {
   search(value = {}) {
     this.#assertReady();
     const options = queryOptions(value);
-    const candidates = candidateIds(this.#index, options.q);
+    const candidates = candidateIds(
+      this.#index,
+      options.q,
+      this.#indexComplete,
+    );
     const queryTerms = lexicalTerms(options.q);
     const cursor = options.cursor;
     const filtered = this.#journal.records
@@ -500,6 +543,7 @@ export class LocalMemoryJournal {
         );
         await this.#store.write(MEMORY_INDEX_KEY, built.persisted);
         this.#index = built.tokenMap;
+        this.#indexComplete = built.complete;
         this.#lastIndexError = "";
         return this.getHealth();
       }),
@@ -546,6 +590,7 @@ export class LocalMemoryJournal {
     this.#journal = candidate;
     const built = buildIndex(candidate.records, candidate.revision);
     this.#index = built.tokenMap;
+    this.#indexComplete = built.complete;
     this.#lastIndexError = "";
     await this.#persistIndex(built.persisted);
     return {

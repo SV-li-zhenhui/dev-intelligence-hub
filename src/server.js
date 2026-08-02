@@ -3,6 +3,9 @@ import http from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createApplication } from "./composition-root.js";
+import {
+  normalizeUnifiedDeferredOptions,
+} from "./domain/attention-deferred-contract.js";
 import { projectRoot } from "./lib/config.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 
@@ -216,12 +219,79 @@ function requireAttentionBrowser(application) {
   return browser;
 }
 
-async function readUnifiedAttention(application) {
+function requireMemorySearch(application) {
+  const search = application.memorySearch;
+  if (
+    !search ||
+    !["search", "getHealth"].every(
+      (method) => typeof search[method] === "function",
+    )
+  ) {
+    throw httpError(503, "统一记忆尚未启用");
+  }
+  return search;
+}
+
+function memoryQueryOptions(url) {
+  const allowed = new Set([
+    "q",
+    "roleId",
+    "repository",
+    "eventType",
+    "from",
+    "to",
+    "limit",
+    "cursor",
+  ]);
+  if (
+    [...url.searchParams.keys()].some(
+      (key) => !allowed.has(key) || url.searchParams.getAll(key).length !== 1,
+    )
+  ) {
+    throw httpError(400, "记忆查询参数无效");
+  }
+  return Object.fromEntries(
+    [...allowed]
+      .filter((key) => url.searchParams.has(key))
+      .map((key) => [key, url.searchParams.get(key)]),
+  );
+}
+
+function unifiedAttentionOptions(url) {
+  if ([...url.searchParams.keys()].some((key) => key !== "deferred")) {
+    throw httpError(400, "统一确认队列查询参数无效");
+  }
+  const values = url.searchParams.getAll("deferred");
+  if (!values.length) return undefined;
+  const deferred = { external: [], internal: [] };
+  for (const value of values) {
+    const parts = value.split(":");
+    if (parts.length !== 3) {
+      throw httpError(400, "稍后处理绑定格式无效");
+    }
+    const [source, id, digest] = parts;
+    if (source === "external") {
+      deferred.external.push({ id, approvalBindingDigest: digest });
+    } else if (source === "internal") {
+      deferred.internal.push({ requestId: id, contentDigest: digest });
+    } else {
+      throw httpError(400, "稍后处理来源无效");
+    }
+  }
+  return normalizeUnifiedDeferredOptions(deferred);
+}
+
+async function readUnifiedAttention(application, options) {
   if (typeof application.attentionCoordinator?.next === "function") {
-    return application.attentionCoordinator.next();
+    return options === undefined
+      ? application.attentionCoordinator.next()
+      : application.attentionCoordinator.next(options);
   }
   if (application.confirmationQueue) {
-    const external = await requireConfirmationQueue(application).next();
+    const queue = requireConfirmationQueue(application);
+    const external = options === undefined
+      ? await queue.next()
+      : await queue.next({ deferred: options.external });
     return {
       available: Boolean(external.item),
       source: external.item ? "external_confirmation" : null,
@@ -428,11 +498,15 @@ export function createDashboardServer(
         const employees = await employeeRegistry.listRoles();
         const employee =
           employees.find((role) => role.id === "pr-reviewer") || null;
+        const memory = application.memorySearch
+          ? await requireMemorySearch(application).getHealth()
+          : null;
         sendJson(response, 200, {
           ok: true,
           refreshing: Boolean(application.refreshService.running),
           employee,
           employees,
+          ...(memory ? { memory } : {}),
         });
         return;
       }
@@ -548,8 +622,9 @@ export function createDashboardServer(
         request.method === "GET" &&
         url.pathname === "/api/attention/next"
       ) {
+        const options = unifiedAttentionOptions(url);
         const next = await runConfirmationOperation(backgroundWork, () =>
-          readUnifiedAttention(application),
+          readUnifiedAttention(application, options),
         );
         sendJson(response, 200, next);
         return;
@@ -681,16 +756,35 @@ export function createDashboardServer(
         request.method === "GET" &&
         url.pathname === "/api/memory/search"
       ) {
-        const rawLimit = Number(url.searchParams.get("limit"));
+        const rawLimit = url.searchParams.has("limit")
+          ? Number(url.searchParams.get("limit"))
+          : Number.NaN;
         const limit = Number.isFinite(rawLimit)
           ? Math.max(1, Math.min(rawLimit, 100))
           : 30;
         const query = url.searchParams.get("q") || "";
-        const items = await requirePrEmployee(employeeRegistry).searchMemory(
-          query,
-          limit,
-        );
+        const items = application.memorySearch
+          ? (
+              await requireMemorySearch(application).search({
+                q: query,
+                limit,
+              })
+            ).items
+          : await requirePrEmployee(employeeRegistry).searchMemory(query, limit);
         sendJson(response, 200, { query, items });
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/memory/query"
+      ) {
+        sendJson(
+          response,
+          200,
+          await requireMemorySearch(application).search(
+            memoryQueryOptions(url),
+          ),
+        );
         return;
       }
       if (
@@ -826,9 +920,19 @@ export function startApplicationBackgroundWork(
         failures.push(error);
       }
     }
+    if (typeof application.memoryProjector?.runCycle === "function" && !stopped) {
+      try {
+        await application.memoryProjector.runCycle();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) {
-      throw new AggregateError(failures, "员工主动循环与旧岗位巡查均失败");
+      throw new AggregateError(
+        failures,
+        "员工主动循环、旧岗位巡查或记忆投影失败",
+      );
     }
     return { skipped: null };
   }

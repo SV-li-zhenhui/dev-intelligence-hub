@@ -335,6 +335,7 @@ async function withServer(
     workLedgerView,
     attentionCoordinator,
     attentionBrowser,
+    memorySearch,
   } = {},
 ) {
   const calls = [];
@@ -515,6 +516,7 @@ async function withServer(
     application.attentionCoordinator = attentionCoordinator;
   }
   if (attentionBrowser) application.attentionBrowser = attentionBrowser;
+  if (memorySearch) application.memorySearch = memorySearch;
   const server = createDashboardServer(application, {
     backgroundWork,
     reportError(error) {
@@ -606,6 +608,58 @@ test("background work runs every registered employee after the initial refresh a
   const callsAfterStop = structuredClone(calls);
   for (const timer of timers) await timer.callback();
   assert.deepEqual(calls, callsAfterStop);
+});
+
+test("background work projects durable activity into unified memory after employees run", async () => {
+  const calls = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [];
+      },
+      async runAll(options) {
+        calls.push({ operation: "run_all", ...options });
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        calls.push({ operation: "refresh", ...options });
+      },
+    },
+    workCoordination: {
+      async intake() {
+        calls.push({ operation: "intake" });
+      },
+      async runCycle(options) {
+        calls.push({ operation: "work_cycle", ...options });
+      },
+    },
+    memoryProjector: {
+      async runCycle() {
+        calls.push({ operation: "memory_projection" });
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn() {
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    assert.deepEqual(calls, [
+      { operation: "refresh", notify: false },
+      { operation: "intake" },
+      { operation: "work_cycle", trigger: "refresh_completed" },
+      { operation: "run_all", trigger: "refresh_completed" },
+      { operation: "memory_projection" },
+    ]);
+  } finally {
+    await backgroundWork.stop();
+  }
 });
 
 test("workflow routing observes every refreshed snapshot before confirmations and employees", async () => {
@@ -1418,6 +1472,66 @@ test("unified attention read projects external authorization without exposing ac
   });
 });
 
+test("unified attention read strictly parses bounded session exclusions", async () => {
+  const external = {
+    id: "confirmation-pr-work-1",
+    approvalBindingDigest: "c".repeat(64),
+  };
+  const internal = {
+    requestId: `attention-${"a".repeat(64)}`,
+    contentDigest: "b".repeat(64),
+  };
+  const reads = [];
+  const attentionCoordinator = {
+    async next(options) {
+      reads.push(options);
+      return {
+        available: false,
+        source: null,
+        pendingCount: 0,
+        externalEnabled: true,
+        externalQueueRevision: 8,
+        item: null,
+      };
+    },
+  };
+  const deferred = [
+    `external:${external.id}:${external.approvalBindingDigest}`,
+    `internal:${internal.requestId}:${internal.contentDigest}`,
+  ];
+
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: `/api/attention/next?${deferred
+          .map((value) => `deferred=${encodeURIComponent(value)}`)
+          .join("&")}`,
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(reads, [{ external: [external], internal: [internal] }]);
+
+      const invalidPaths = [
+        "/api/attention/next?unknown=1",
+        `/api/attention/next?deferred=${encodeURIComponent("external:bad::binding")}`,
+        `/api/attention/next?deferred=${encodeURIComponent(deferred[0])}&deferred=${encodeURIComponent(deferred[0])}`,
+        `/api/attention/next?${Array.from(
+          { length: 33 },
+          (_, index) =>
+            `deferred=${encodeURIComponent(
+              `external:confirmation-${index}:${index.toString(16).padStart(64, "0")}`,
+            )}`,
+        ).join("&")}`,
+      ];
+      for (const path of invalidPaths) {
+        const invalid = await request(server, { path });
+        assert.equal(invalid.status, 400, path);
+      }
+      assert.equal(reads.length, 1);
+    },
+    { attentionCoordinator },
+  );
+});
+
 test("internal attention mutations are source-bound and only signal background work", async () => {
   const requestId = `attention-${"a".repeat(64)}`;
   const digest = "b".repeat(64);
@@ -2175,15 +2289,136 @@ test("memory search is local, bounded, and read-only", async () => {
     const response = await request(server, {
       path: "/api/memory/search?q=checkout&limit=999",
     });
+    const defaultLimit = await request(server, {
+      path: "/api/memory/search?q=checkout",
+    });
 
     assert.equal(response.status, 200);
+    assert.equal(defaultLimit.status, 200);
     assert.deepEqual(JSON.parse(response.body).items, [
       { id: "memory-1", title: "Checkout review" },
     ]);
-    assert.deepEqual(calls.at(-1), {
-      operation: "memory_search",
-      query: "checkout",
-      limit: 100,
-    });
+    assert.deepEqual(calls.slice(-2), [
+      {
+        operation: "memory_search",
+        query: "checkout",
+        limit: 100,
+      },
+      {
+        operation: "memory_search",
+        query: "checkout",
+        limit: 30,
+      },
+    ]);
+  });
+});
+
+test("unified memory keeps the legacy search shape and reports local health", async () => {
+  const memorySearch = {
+    async search(options) {
+      assert.deepEqual(options, { q: "checkout", limit: 100 });
+      return {
+        items: [{ id: "memory-2", title: "Unified checkout memory" }],
+        nextCursor: null,
+        totalMatched: 1,
+        indexHealthy: true,
+      };
+    },
+    async getHealth() {
+      return {
+        ready: true,
+        revision: 3,
+        recordCount: 8,
+        indexHealthy: true,
+        lastIndexError: "",
+      };
+    },
+  };
+  await withServer(
+    async ({ server }) => {
+      const search = await request(server, {
+        path: "/api/memory/search?q=checkout&limit=999",
+      });
+      const health = await request(server, { path: "/api/health" });
+
+      assert.equal(search.status, 200);
+      assert.deepEqual(JSON.parse(search.body), {
+        query: "checkout",
+        items: [{ id: "memory-2", title: "Unified checkout memory" }],
+      });
+      assert.deepEqual(JSON.parse(health.body).memory, {
+        ready: true,
+        revision: 3,
+        recordCount: 8,
+        indexHealthy: true,
+        lastIndexError: "",
+      });
+    },
+    { memorySearch },
+  );
+});
+
+test("unified memory query forwards only bounded filters and pagination", async () => {
+  const calls = [];
+  const cursor = Buffer.from(
+    JSON.stringify(["2026-08-02T01:02:03.000Z", `memory-${"a".repeat(64)}`]),
+  ).toString("base64url");
+  const memorySearch = {
+    async search(options) {
+      calls.push(options);
+      return {
+        items: [],
+        nextCursor: null,
+        totalMatched: 0,
+        indexHealthy: true,
+      };
+    },
+    async getHealth() {
+      return { ready: true };
+    },
+  };
+  const query = new URLSearchParams({
+    q: "结算失败",
+    roleId: "requirements-analyst",
+    repository: "acme/repo",
+    eventType: "requirements.clarified",
+    from: "2026-08-01T00:00:00.000Z",
+    to: "2026-08-02T00:00:00.000Z",
+    limit: "5",
+    cursor,
+  });
+
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        path: `/api/memory/query?${query}`,
+      });
+      const unknown = await request(server, {
+        path: "/api/memory/query?debug=1",
+      });
+      const duplicate = await request(server, {
+        path: "/api/memory/query?q=one&q=two",
+      });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(JSON.parse(response.body), {
+        items: [],
+        nextCursor: null,
+        totalMatched: 0,
+        indexHealthy: true,
+      });
+      assert.deepEqual(calls, [Object.fromEntries(query)]);
+      assert.equal(unknown.status, 400);
+      assert.equal(duplicate.status, 400);
+    },
+    { memorySearch },
+  );
+});
+
+test("unified memory query fails closed when the local journal is unavailable", async () => {
+  await withServer(async ({ server }) => {
+    const response = await request(server, { path: "/api/memory/query?q=test" });
+
+    assert.equal(response.status, 503);
   });
 });

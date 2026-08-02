@@ -66,6 +66,7 @@ test("journal append is durable, content-idempotent, and persists a separate ind
   assert.equal(journal.getHealth().recordCount, 3);
   assert.equal(store.values.get(MEMORY_JOURNAL_KEY).records.length, 3);
   assert.equal(store.values.get(MEMORY_INDEX_KEY).journalRevision, 2);
+  assert.equal(store.values.get(MEMORY_INDEX_KEY).complete, true);
   assert.equal(store.values.get(MEMORY_INDEX_KEY).entries["失败"].length, 2);
 });
 
@@ -131,6 +132,7 @@ test("a missing or stale index is rebuilt without changing raw records", async (
     schemaVersion: 1,
     journalRevision: 0,
     journalDigest: "0".repeat(64),
+    complete: true,
     entries: {},
   });
   const recovered = new LocalMemoryJournal({ store, exclusiveLease: lease });
@@ -139,6 +141,15 @@ test("a missing or stale index is rebuilt without changing raw records", async (
   assert.deepEqual(store.values.get(MEMORY_JOURNAL_KEY), rawBefore);
   assert.equal(store.values.get(MEMORY_INDEX_KEY).journalRevision, 1);
   assert.equal(recovered.search({ q: "结算" }).items.length, 1);
+});
+
+test("an intentionally bounded index falls back to a complete local scan", async () => {
+  const { store, journal } = await fixture();
+  const terms = Array.from({ length: 4_200 }, (_, index) => `t${index}`).join(" ");
+  await journal.append(record(1, { content: terms }));
+
+  assert.equal(store.values.get(MEMORY_INDEX_KEY).complete, false);
+  assert.equal(journal.search({ q: "t4199" }).items.length, 1);
 });
 
 test("capacity is fail-closed and malformed journal state refuses recovery", async () => {
