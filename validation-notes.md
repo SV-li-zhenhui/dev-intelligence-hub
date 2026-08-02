@@ -1,5 +1,16 @@
 # Validation notes
 
+## 2026-08-03 — Stage 7 controlled code delivery loop
+
+- Complete regression: `npm test` passed 1112/1114 with zero failures; the two skips are host-unavailable Windows symbolic-link cases. Focused ledger, end-to-end, and restart recovery checks passed 51/51 after the final review fix.
+- Real end to end: a disposable Git checkout traversed workflow routing, durable ledger intake, a developer decision, owner confirmation, Code Job read/write/test/complete actions, immutable Change Package delivery, searchable local memory, proposal reconciliation, and a separately confirmed source application. The source stayed unchanged until that second confirmation, and replay retained one application and one receipt.
+- Restart recovery: cancellation cleanup was interrupted after the first of two isolated attempts, then recovered from the same durable state without another brain call, grant verification, executor start/resume/action, package creation, or source mutation. Both attempts were removed and one cancellation memory record was projected.
+- Docker boundary: the opt-in real Docker smoke passed against the pinned `node:22-alpine` digest with network disabled, source mounted read-only, sensitive environment data absent, and artifacts returned only through the controlled boundary.
+- UI regression: desktop (1440 px) and mobile (390 px) checks passed with one confirmation dialog at a time, correct focus after pause/package/cancel actions, verified evidence downloads, visible application/cancellation state, no horizontal overflow, and no console or page errors.
+- Binding repair: the full composition test found that raw employee intent IDs and policy-bound proposal IDs are intentionally distinct. Work Ledger reconciliation now locates the current trusted outbox through `activeIntentId` and requires one unique matching `downstreamRef`, plus matching proposal digest, role, kind, item and input digest. Forged and ambiguous bindings fail closed.
+- Independent review: no P0/P1/P2 remained. Its one P3 finding was fixed by allowing the Git-dependent end-to-end test to skip only an explicit locator miss; other process or permission failures now fail the test.
+- Delivery policy: all changes and commits remain local. No GitHub push, PR creation, remote branch update, merge, Review, or comment was performed.
+
 ## 2026-08-02 — Stage 6 multi-role and multi-brain command center
 
 - Automated regression: the final complete Node suite passed with 686 passing and one opt-in real Docker test skipped; 49 server lifecycle/scheduling tests and the independent 60-test Stage 6 review set passed. Syntax checks and `git diff --check` also passed.

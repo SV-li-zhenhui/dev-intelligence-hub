@@ -614,6 +614,20 @@ function reviewIntent(overrides = {}) {
   };
 }
 
+function codeActionIntent(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    type: "propose_code_action",
+    summary: "修改受控代码",
+    reason: "需要验证修复",
+    operation: "modify",
+    objective: "修复并发覆盖",
+    acceptanceCriteria: ["回归测试通过"],
+    evidence: ["revision 未校验"],
+    ...overrides,
+  };
+}
+
 function handoffIntent(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -1740,38 +1754,55 @@ test("a rejected attention result blocks work while a gap advances nothing", asy
 
 async function prepareProposalResult(
   fixture,
-  { outcome = "succeeded", sequence = 1 } = {},
+  {
+    outcome = "succeeded",
+    sequence = 1,
+    kind = "github_review_proposal",
+    downstreamRef,
+    proposalDigest,
+  } = {},
 ) {
   await fixture.service.intake();
   let item = (await fixture.service.listItems()).items[0];
+  const codeProposal = kind === "code_action_proposal";
+  const roleId = codeProposal ? "developer" : "pr-reviewer";
+  const workerId = `employee-${roleId}`;
   item = await fixture.service.claim({
     itemId: item.itemId,
     expectedRevision: item.revision,
-    workerId: "employee-pr-reviewer",
+    workerId,
     leaseDurationMs: 30_000,
   });
   const staged = await fixture.service.stageIntent({
     itemId: item.itemId,
     expectedRevision: item.revision,
     leaseId: item.leaseId,
-    actorId: "employee-pr-reviewer",
-    roleId: "pr-reviewer",
-    intent: reviewIntent(),
+    actorId: workerId,
+    roleId,
+    intent: codeProposal ? codeActionIntent() : reviewIntent(),
   });
   const proposal = normalizeBoundWorkProposal({
-    proposalId: staged.outbox.intentId,
+    proposalId: `work-intent-${codeProposal ? "c".repeat(64) : "b".repeat(64)}`,
     policyVersion: 1,
-    kind: "github_review_proposal",
+    kind,
     requestedBy: {
-      roleId: "pr-reviewer",
+      roleId,
       workItemId: staged.item.itemId,
     },
     source: {
       assignmentId: staged.item.assignmentId,
       eventId: staged.item.event.eventId,
     },
-    binding: { repository: "acme/repo", pullRequestNumber: 1 },
-    payload: { verdict: "approve", body: "本地审查通过。" },
+    binding: codeProposal
+      ? { repository: "acme/repo", workspaceId: "dashboard" }
+      : { repository: "acme/repo", pullRequestNumber: 1 },
+    payload: codeProposal
+      ? {
+          operation: "modify",
+          objective: "修复并发覆盖",
+          acceptanceCriteria: ["回归测试通过"],
+        }
+      : { verdict: "approve", body: "本地审查通过。" },
   });
   const claimed = await fixture.service.claimIntent({
     intentId: staged.outbox.intentId,
@@ -1788,8 +1819,8 @@ async function prepareProposalResult(
     nextStatus: "waiting_external",
     actorId: "work-intent-dispatcher",
     details: {
-      downstreamRef: proposal.proposalId,
-      proposalDigest: proposal.contentDigest,
+      downstreamRef: downstreamRef ?? proposal.proposalId,
+      proposalDigest: proposalDigest ?? proposal.contentDigest,
     },
   });
   return createWorkProposalResult({
@@ -1805,9 +1836,13 @@ async function prepareProposalResult(
   });
 }
 
-test("a succeeded proposal result atomically completes its bound work and cursor", async () => {
+test("a bound GitHub proposal id distinct from its staged intent completes work", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   const result = await prepareProposalResult(fixture);
+  assert.notEqual(
+    fixture.store.stored().outbox[0].intentId,
+    result.proposalId,
+  );
   const batch = {
     items: [result],
     nextSequence: 1,
@@ -1838,6 +1873,139 @@ test("a succeeded proposal result atomically completes its bound work and cursor
   assert.equal(replayed.applied, 0);
   assert.equal(replayed.deduplicated, 1);
   assert.equal(fixture.store.writes.length, writesBeforeReplay);
+});
+
+test("a bound code proposal id distinct from its staged intent completes work", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1, { type: "role", id: "developer" })],
+  });
+  const result = await prepareProposalResult(fixture, {
+    kind: "code_action_proposal",
+  });
+
+  assert.notEqual(
+    fixture.store.stored().outbox[0].intentId,
+    result.proposalId,
+  );
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const item = (await fixture.service.listItems()).items[0];
+
+  assert.equal(applied.applied, 1);
+  assert.equal(item.status, "completed");
+  assert.equal(item.statusReason, "proposal_succeeded");
+});
+
+test("proposal results reject forged downstream and digest bindings", async (t) => {
+  for (const field of ["downstreamRef", "proposalDigest"]) {
+    await t.test(field, async () => {
+      const fixture = await createFixture({ records: [assignment(1)] });
+      const result = await prepareProposalResult(fixture, {
+        ...(field === "downstreamRef"
+          ? { downstreamRef: `work-intent-${"d".repeat(64)}` }
+          : { proposalDigest: "d".repeat(64) }),
+      });
+
+      await assert.rejects(
+        fixture.service.applyProposalBatch({
+          items: [result],
+          nextSequence: 1,
+          highWatermark: 1,
+          oldestAvailableSequence: 1,
+        }),
+        (error) => error.code === "WORK_LEDGER_PROPOSAL_BINDING_CONFLICT",
+      );
+      assert.equal((await fixture.service.listItems()).items[0].status, "waiting_external");
+    });
+  }
+});
+
+test("proposal results fail closed when two outbox records claim one downstream", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const items = (await fixture.service.listItems()).items;
+  const proposal = normalizeBoundWorkProposal({
+    proposalId: `work-intent-${"e".repeat(64)}`,
+    policyVersion: 1,
+    kind: "github_review_proposal",
+    requestedBy: {
+      roleId: "pr-reviewer",
+      workItemId: items[0].itemId,
+    },
+    source: {
+      assignmentId: items[0].assignmentId,
+      eventId: items[0].event.eventId,
+    },
+    binding: { repository: "acme/repo", pullRequestNumber: 1 },
+    payload: { verdict: "approve", body: "本地审查通过。" },
+  });
+
+  for (const [index, item] of items.entries()) {
+    const claimedItem = await fixture.service.claim({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      workerId: "employee-pr-reviewer",
+      leaseDurationMs: 30_000,
+    });
+    const staged = await fixture.service.stageIntent({
+      itemId: claimedItem.itemId,
+      expectedRevision: claimedItem.revision,
+      leaseId: claimedItem.leaseId,
+      actorId: "employee-pr-reviewer",
+      roleId: "pr-reviewer",
+      intent: reviewIntent({ body: `本地审查通过 ${index + 1}。` }),
+    });
+    const claimedIntent = await fixture.service.claimIntent({
+      intentId: staged.outbox.intentId,
+      expectedRevision: staged.outbox.revision,
+      dispatcherId: "work-intent-dispatcher",
+      leaseDurationMs: 30_000,
+    });
+    await fixture.service.ackIntent({
+      intentId: claimedIntent.intentId,
+      expectedRevision: claimedIntent.revision,
+      dispatchLeaseId: claimedIntent.dispatchLeaseId,
+      itemExpectedRevision: staged.item.revision,
+      outcome: "delivered",
+      nextStatus: "waiting_external",
+      actorId: "work-intent-dispatcher",
+      details: {
+        downstreamRef: proposal.proposalId,
+        proposalDigest: proposal.contentDigest,
+      },
+    });
+  }
+  const result = createWorkProposalResult({
+    proposal,
+    sequence: 1,
+    transition: {
+      status: "succeeded",
+      summary: "提案已成功",
+      evidence: [],
+    },
+    downstreamRef: "confirmation-1",
+    at: fixture.time.clock(),
+  });
+
+  await assert.rejects(
+    fixture.service.applyProposalBatch({
+      items: [result],
+      nextSequence: 1,
+      highWatermark: 1,
+      oldestAvailableSequence: 1,
+    }),
+    (error) => error.code === "WORK_LEDGER_PROPOSAL_BINDING_CONFLICT",
+  );
+  assert.deepEqual(
+    (await fixture.service.listItems()).items.map(({ status }) => status),
+    ["waiting_external", "waiting_external"],
+  );
 });
 
 test("a failed proposal blocks work while gaps and binding changes fail closed", async () => {

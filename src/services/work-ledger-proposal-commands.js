@@ -116,11 +116,19 @@ function normalizeBatch(input, state) {
 function requireBoundProposal(state, result) {
   const item = requireWorkLedgerItem(state, result.requestedBy.workItemId);
   const outbox = state.outbox.find(
-    (candidate) => candidate.intentId === result.proposalId,
+    (candidate) => candidate.intentId === item.activeIntentId,
+  );
+  const matchingDownstreams = state.outbox.filter(
+    (candidate) =>
+      candidate.status === "delivered" &&
+      candidate.outcome?.status === "delivered" &&
+      candidate.outcome.details?.downstreamRef === result.proposalId,
   );
   const expectedIntentType = PROPOSAL_INTENT_TYPES.get(result.kind);
   if (
     !outbox ||
+    matchingDownstreams.length !== 1 ||
+    matchingDownstreams[0].intentId !== outbox.intentId ||
     !expectedIntentType ||
     outbox.itemId !== item.itemId ||
     outbox.inputDigest !== item.inputDigest ||
