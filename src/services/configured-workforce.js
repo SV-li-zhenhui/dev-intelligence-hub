@@ -101,6 +101,15 @@ function createProviders(value, dependencies) {
   );
 }
 
+export function createConfiguredBrainRouter({
+  brainProviders = {},
+  dependencies = {},
+} = {}) {
+  return new BrainRouter({
+    providers: createProviders(brainProviders, dependencies),
+  });
+}
+
 function roleOptions(id, value) {
   if (!SAFE_ROLE_ID.test(id) || id === "pr-reviewer") {
     throw new TypeError(`configured role id is invalid: ${id}`);
@@ -121,8 +130,9 @@ export function createConfiguredWorkforce({
   dependencies = {},
 } = {}) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
-  const brainRouter = new BrainRouter({
-    providers: createProviders(brainProviders, dependencies),
+  const brainRouter = createConfiguredBrainRouter({
+    brainProviders,
+    dependencies,
   });
   const employees = [];
   const workers = [];
