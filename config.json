@@ -13,6 +13,9 @@
   "codeExecutor": {
     "enabled": false
   },
+  "changePackages": {
+    "enabled": false
+  },
   "githubActions": {
     "enabled": false
   },

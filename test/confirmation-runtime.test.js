@@ -295,12 +295,48 @@ test("multiple local confirmation kinds share one routed queue", async () => {
   await runtime.close();
 });
 
+test("a change-package-only runtime never reads GitHub credentials", async () => {
+  const applicationExecutor = { execute() {}, reconcile() {} };
+  let routed;
+  const dependencies = runtimeDependencies({
+    localExecutors: {
+      "local.change-package-apply": applicationExecutor,
+    },
+    createExecutor() {
+      throw new Error("must not create GitHub executor");
+    },
+    createExecutorRouter({ executors }) {
+      routed = executors;
+      return applicationExecutor;
+    },
+  });
+  Object.defineProperty(dependencies, "env", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error("must not read GitHub environment");
+    },
+  });
+
+  const runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    dependencies,
+  );
+
+  assert.deepEqual(Object.keys(routed), ["local.change-package-apply"]);
+  await runtime.close();
+});
+
 test("local executor registration rejects unknown or ambiguous kinds", async () => {
   const executor = { execute() {}, reconcile() {} };
+  let constructions = 0;
   await assert.rejects(
     createConfirmationRuntime(
       { githubActions: { enabled: false } },
-      runtimeDependencies({ localExecutors: { "local.unknown": executor } }),
+      runtimeDependencies({
+        localExecutors: { "local.unknown": executor },
+        createStore() { constructions += 1; },
+      }),
     ),
     /localExecutors/,
   );
@@ -314,6 +350,7 @@ test("local executor registration rejects unknown or ambiguous kinds", async () 
     ),
     /localExecutor/,
   );
+  assert.equal(constructions, 0);
 });
 
 test("recover failure closes the guard before rethrowing the same error", async () => {

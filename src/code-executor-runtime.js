@@ -143,6 +143,24 @@ function createWorkspaceAuthority(workspaces, requiredProfiles, sandbox) {
   });
 }
 
+function createChangePackageTargets(workspaces, authority) {
+  const authorityByWorkspace = new Map(
+    authority.workspaces.map((workspace) => [workspace.id, workspace]),
+  );
+  return Object.freeze(
+    workspaces.map((workspace) =>
+      Object.freeze({
+        workspaceId: workspace.id,
+        sourceRoot: workspace.sourceRoot,
+        targetAuthorityDigest:
+          authorityByWorkspace.get(workspace.id).authorityDigest,
+        writablePaths: Object.freeze([...workspace.writablePaths]),
+        excludePaths: Object.freeze([...workspace.excludePaths]),
+      }),
+    ),
+  );
+}
+
 export async function createCodeExecutorRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
   if (!enabledConfig) return null;
@@ -210,5 +228,17 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     enabledConfig.requiredProfilesByWorkspace,
     sandbox,
   );
-  return Object.freeze({ broker, sandbox, journal, executor, authority, recovery });
+  const changePackageTargets = createChangePackageTargets(
+    workspaces,
+    authority,
+  );
+  return Object.freeze({
+    broker,
+    sandbox,
+    journal,
+    executor,
+    authority,
+    changePackageTargets,
+    recovery,
+  });
 }

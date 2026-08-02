@@ -4,6 +4,7 @@ import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
+import { createChangePackageRuntime } from "./change-package-runtime.js";
 import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
@@ -127,6 +128,8 @@ export async function createApplication({
   store: suppliedStore,
   codeExecutorRuntimeFactory = createCodeExecutorRuntime,
   codeExecutorDependencies = {},
+  changePackageRuntimeFactory = createChangePackageRuntime,
+  changePackageRuntimeDependencies = {},
   codeJobRuntimeFactory = createCodeJobRuntime,
   codeJobRuntimeDependencies = {},
   confirmationRuntimeFactory = createConfirmationRuntime,
@@ -186,6 +189,7 @@ export async function createApplication({
     return runtime;
   };
   let codeExecutorRuntime = null;
+  let changePackageRuntime = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
   let attentionInboxRuntime = null;
@@ -197,6 +201,9 @@ export async function createApplication({
   let codeJobControl = null;
   let codeJobWorker = null;
   let codeJobMemoryProjector = null;
+  let changePackageReader = null;
+  let changePackageApplicationReader = null;
+  let changePackageApplicationRequester = null;
   let grantFactory = null;
   try {
     codeExecutorRuntime = trackRuntime(
@@ -205,6 +212,39 @@ export async function createApplication({
         store,
       }),
     );
+    const changePackageActionsEnabled =
+      externalActions && config.changePackages?.enabled === true;
+    if (changePackageActionsEnabled) {
+      if (!codeExecutorRuntime) {
+        throw new Error("change package 应用需要可用的代码执行器运行时");
+      }
+      if (
+        !Array.isArray(codeExecutorRuntime.changePackageTargets) ||
+        codeExecutorRuntime.changePackageTargets.length === 0
+      ) {
+        throw new Error("代码执行器没有可用于 change package 的可信工作区");
+      }
+      changePackageRuntime = trackRuntime(
+        await changePackageRuntimeFactory(config.changePackages, {
+          ...changePackageRuntimeDependencies,
+          store,
+          trustedTargets: codeExecutorRuntime.changePackageTargets,
+        }),
+      );
+      if (!changePackageRuntime) {
+        throw new Error("change package 配置已启用但运行时不可用");
+      }
+      changePackageReader = frozenPort(
+        changePackageRuntime.packageReader,
+        ["get"],
+        "changePackageRuntime.packageReader",
+      );
+      changePackageApplicationReader = frozenPort(
+        changePackageRuntime.applicationReader,
+        ["getResult"],
+        "changePackageRuntime.applicationReader",
+      );
+    }
     workflowRouting = trackRuntime(
       await workflowRoutingRuntimeFactory(config, {
         ...workflowRoutingDependencies,
@@ -382,8 +422,9 @@ export async function createApplication({
         "codeJobMemoryProjector",
       );
     }
+    const localExecutors = {};
     if (localCodeExecutionEnabled) {
-      const localExecutor = frozenPort(
+      localExecutors["local.code-job-create"] = frozenPort(
         codeJobRuntime.confirmationExecutor,
         ["execute", "reconcile"],
         "codeJobRuntime.confirmationExecutor",
@@ -393,18 +434,26 @@ export async function createApplication({
         ["runCycle"],
         "codeJobRuntime.worker",
       );
-      confirmationRuntime = trackRuntime(
-        await confirmationRuntimeFactory(config, {
-          ...confirmationRuntimeDependencies,
-          store,
-          localExecutor,
-        }),
+    }
+    if (changePackageActionsEnabled) {
+      localExecutors["local.change-package-apply"] = frozenPort(
+        changePackageRuntime.applicationExecutor,
+        ["execute", "reconcile"],
+        "changePackageRuntime.applicationExecutor",
       );
-    } else if (externalActions && config.githubActions?.enabled === true) {
+    }
+    if (
+      externalActions &&
+      (Object.keys(localExecutors).length > 0 ||
+        config.githubActions?.enabled === true)
+    ) {
       confirmationRuntime = trackRuntime(
         await confirmationRuntimeFactory(config, {
           ...confirmationRuntimeDependencies,
           store,
+          ...(Object.keys(localExecutors).length === 0
+            ? {}
+            : { localExecutors: Object.freeze(localExecutors) }),
         }),
       );
     }
@@ -413,6 +462,27 @@ export async function createApplication({
     }
     if (githubProposalExecutionEnabled && !confirmationRuntime) {
       throw new Error("GitHub 工作提案需要可用的确认运行时");
+    }
+    if (changePackageActionsEnabled && !confirmationRuntime) {
+      throw new Error("change package 应用需要可用的确认运行时");
+    }
+    if (changePackageActionsEnabled) {
+      const applicationProducer = frozenPort(
+        changePackageRuntime.applicationProducer,
+        ["prepareConfirmation"],
+        "changePackageRuntime.applicationProducer",
+      );
+      const confirmationProducer = frozenPort(
+        confirmationRuntime.producerQueue,
+        ["enqueue"],
+        "confirmationRuntime.producerQueue",
+      );
+      changePackageApplicationRequester = Object.freeze({
+        async request(value) {
+          const plan = await applicationProducer.prepareConfirmation(value);
+          return confirmationProducer.enqueue(plan);
+        },
+      });
     }
     const proposalRunners = [];
     if (githubProposalExecutionEnabled) {
@@ -641,6 +711,9 @@ export async function createApplication({
       employeeRegistry,
       prEmployee,
       confirmationQueue: confirmationRuntime?.queue || null,
+      changePackageReader,
+      changePackageApplicationReader,
+      changePackageApplicationRequester,
       workflowRouting,
       codeJobReader,
       codeJobControl,

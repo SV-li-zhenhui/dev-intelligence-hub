@@ -1245,6 +1245,156 @@ test("maintenance composition never acquires the external-action runtime", async
   await application.close();
 });
 
+test("change package composition derives trusted targets and shares the confirmation queue", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const trustedTargets = Object.freeze([
+    Object.freeze({
+      workspaceId: "dashboard",
+      sourceRoot: "D:\\trusted\\dashboard",
+      targetAuthorityDigest: "a".repeat(64),
+      writablePaths: Object.freeze(["src"]),
+      excludePaths: Object.freeze(["node_modules"]),
+    }),
+  ]);
+  const applicationExecutor = { async execute() {}, async reconcile() {} };
+  const preparedPlan = { id: "confirmation-change-package-1" };
+  const runtime = {
+    packageReader: {
+      async get(id) { return { packageId: id }; },
+      async readFile() { throw new Error("must remain private"); },
+    },
+    applicationProducer: {
+      async prepareConfirmation(value) {
+        calls.prepared = value;
+        return preparedPlan;
+      },
+    },
+    applicationExecutor,
+    applicationReader: {
+      async getResult(id) { return { confirmationId: id }; },
+    },
+    async close() { closeCalls.push("change-package"); },
+  };
+  const confirmationProducer = confirmationProducerPort({
+    async enqueue(plan) {
+      calls.enqueued = plan;
+      return { status: "applied", id: plan.id };
+    },
+  });
+  const config = {
+    ...applicationConfig({ enabled: true }),
+    changePackages: {
+      enabled: true,
+      gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+    },
+  };
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      authority: { workspaces: [] },
+      changePackageTargets: trustedTargets,
+      async close() { closeCalls.push("code-executor"); },
+    }),
+    changePackageRuntimeFactory: async (runtimeConfig, dependencies) => {
+      calls.runtimeConfig = runtimeConfig;
+      calls.runtimeDependencies = dependencies;
+      return runtime;
+    },
+    confirmationRuntimeFactory: async (_runtimeConfig, dependencies) => {
+      calls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducer,
+        async close() { closeCalls.push("confirmation"); },
+      };
+    },
+  });
+
+  assert.strictEqual(calls.runtimeConfig, config.changePackages);
+  assert.strictEqual(calls.runtimeDependencies.trustedTargets, trustedTargets);
+  assert.strictEqual(calls.runtimeDependencies.store, application.store);
+  assert.deepEqual(Object.keys(calls.confirmation.localExecutors), [
+    "local.change-package-apply",
+  ]);
+  assert.equal(Object.isFrozen(calls.confirmation.localExecutors), true);
+  assert.equal(
+    Object.isFrozen(
+      calls.confirmation.localExecutors["local.change-package-apply"],
+    ),
+    true,
+  );
+  assert.deepEqual(Object.keys(application.changePackageReader), ["get"]);
+  assert.deepEqual(
+    await application.changePackageReader.get("change-package-1"),
+    { packageId: "change-package-1" },
+  );
+  assert.deepEqual(
+    await application.changePackageApplicationReader.getResult(
+      "confirmation-change-package-1",
+    ),
+    { confirmationId: "confirmation-change-package-1" },
+  );
+  const request = {
+    packageId: "change-package-1",
+    requestedBy: { roleId: "developer", workItemId: "work-1" },
+  };
+  assert.deepEqual(
+    await application.changePackageApplicationRequester.request(request),
+    { status: "applied", id: preparedPlan.id },
+  );
+  assert.strictEqual(calls.prepared, request);
+  assert.strictEqual(calls.enqueued, preparedPlan);
+  for (const privateName of [
+    "changePackageRuntime",
+    "changePackageProducer",
+    "changePackageApplicationExecutor",
+    "changePackageApplicationProducer",
+  ]) {
+    assert.equal(privateName in application, false);
+  }
+
+  await application.close();
+  assert.deepEqual(closeCalls, [
+    "confirmation",
+    "change-package",
+    "code-executor",
+  ]);
+});
+
+test("maintenance mode does not acquire change package write authority", async () => {
+  let changePackageCalls = 0;
+  let confirmationCalls = 0;
+  const application = await createApplication({
+    config: {
+      ...applicationConfig({ enabled: true }),
+      changePackages: {
+        enabled: true,
+        gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+      },
+    },
+    store: memoryStore(),
+    externalActions: false,
+    codeExecutorRuntimeFactory: async () => ({
+      changePackageTargets: [{}],
+    }),
+    changePackageRuntimeFactory: async () => {
+      changePackageCalls += 1;
+    },
+    confirmationRuntimeFactory: async () => {
+      confirmationCalls += 1;
+    },
+  });
+
+  assert.equal(changePackageCalls, 0);
+  assert.equal(confirmationCalls, 0);
+  assert.equal(application.changePackageReader, null);
+  assert.equal(application.changePackageApplicationReader, null);
+  assert.equal(application.changePackageApplicationRequester, null);
+  await application.close();
+});
+
 test("local code execution fails closed when unified memory is disabled", async () => {
   const config = localCodeCoordinationConfig({ githubActions: false });
   config.memory.enabled = false;
@@ -1409,8 +1559,19 @@ test("local code composition binds authority, both proposal runners, and one saf
     maxTurns: 64,
     observationLimit: 20,
   });
-  assert.equal(Object.isFrozen(calls.confirmation.localExecutor), true);
-  assert.deepEqual(Object.keys(calls.confirmation.localExecutor).sort(), [
+  assert.equal(Object.isFrozen(calls.confirmation.localExecutors), true);
+  assert.deepEqual(Object.keys(calls.confirmation.localExecutors), [
+    "local.code-job-create",
+  ]);
+  assert.equal(
+    Object.isFrozen(
+      calls.confirmation.localExecutors["local.code-job-create"],
+    ),
+    true,
+  );
+  assert.deepEqual(Object.keys(
+    calls.confirmation.localExecutors["local.code-job-create"],
+  ).sort(), [
     "execute",
     "reconcile",
   ]);

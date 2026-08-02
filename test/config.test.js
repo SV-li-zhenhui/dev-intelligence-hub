@@ -283,6 +283,30 @@ test("code executor overrides preserve unspecified base defaults", () => {
   );
 });
 
+test("change package overrides preserve local runtime defaults", () => {
+  assert.deepEqual(
+    mergeConfig(
+      {
+        changePackages: {
+          enabled: false,
+          gitTimeoutMs: 15_000,
+        },
+      },
+      {
+        changePackages: {
+          enabled: true,
+          gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+        },
+      },
+    ).changePackages,
+    {
+      enabled: true,
+      gitTimeoutMs: 15_000,
+      gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+    },
+  );
+});
+
 test("work coordination overrides merge trusted policy maps without losing defaults", () => {
   const result = mergeConfig(
     {
@@ -367,6 +391,7 @@ test("committed privileged capabilities are disabled and secret-free", async () 
   const config = JSON.parse(await readFile(configPath, "utf8"));
 
   assert.deepEqual(config.codeExecutor, { enabled: false });
+  assert.deepEqual(config.changePackages, { enabled: false });
   assert.deepEqual(config.githubActions, { enabled: false });
   assert.equal(config.memory.enabled, true);
   const absolutePaths = Object.values(config.codeExecutor).filter(

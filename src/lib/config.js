@@ -169,6 +169,14 @@ export function mergeConfig(base, local = {}) {
           ),
         }
       : {}),
+    ...(base.changePackages !== undefined || local.changePackages !== undefined
+      ? {
+          changePackages: {
+            ...(base.changePackages || {}),
+            ...(local.changePackages || {}),
+          },
+        }
+      : {}),
     ...(base.workCoordination !== undefined ||
       local.workCoordination !== undefined
       ? {

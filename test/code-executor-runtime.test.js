@@ -102,6 +102,17 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
     /^[a-f0-9]{64}$/,
   );
   assert.equal(Object.isFrozen(runtime.authority.workspaces[0]), true);
+  assert.deepEqual(runtime.changePackageTargets, [
+    {
+      workspaceId: "dashboard",
+      sourceRoot: path.join(setup.sourceBaseRoot, "dashboard"),
+      targetAuthorityDigest: runtime.authority.workspaces[0].authorityDigest,
+      writablePaths: ["src"],
+      excludePaths: [],
+    },
+  ]);
+  assert.equal(Object.isFrozen(runtime.changePackageTargets), true);
+  assert.equal(Object.isFrozen(runtime.changePackageTargets[0]), true);
   const session = await runtime.executor.start({
     sessionId: "runtime-session",
     workspaceId: "dashboard",
