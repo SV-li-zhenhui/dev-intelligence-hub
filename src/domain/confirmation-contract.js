@@ -20,7 +20,10 @@ const EXECUTION_OUTCOMES = new Set([
   "absent",
   "stale",
 ]);
-const INVALIDATION_REASONS = new Set(["work_item_superseded"]);
+const INVALIDATION_REASONS = new Set([
+  "work_item_superseded",
+  "authorization_changed",
+]);
 const MAX_PLAN_BYTES = 64 * 1024;
 const MAX_JSON_ENTRIES = 1_000;
 const MAX_JSON_DEPTH = 16;

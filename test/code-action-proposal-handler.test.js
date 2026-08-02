@@ -1,0 +1,573 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  CODE_JOB_ACTIONS_BY_OPERATION,
+  codeJobIdForGrant,
+  createCodeJobGrant,
+} from "../src/domain/code-job-contract.js";
+import {
+  codeJobConfirmationIdForGrant,
+  createCodeActionProposalConfirmationPlan,
+} from "../src/domain/code-action-proposal-confirmation.js";
+import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
+import {
+  CodeActionProposalHandler,
+  createCodeActionProposalRunnerService,
+} from "../src/services/code-action-proposal-handler.js";
+import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
+
+const CREATED_AT = "2026-08-02T03:00:01.000Z";
+
+function proposal(number = 42) {
+  return normalizeBoundWorkProposal({
+    proposalId: `work-intent-${"a".repeat(63)}${number % 10}`,
+    policyVersion: 7,
+    kind: "code_action_proposal",
+    requestedBy: { roleId: "developer", workItemId: `work-${number}` },
+    source: { assignmentId: `assignment-${number}`, eventId: `event-${number}` },
+    binding: {
+      eventId: `event-${number}`,
+      subject: {
+        id: `github:pr:acme/repo#${number}`,
+        repository: "acme/repo",
+        number,
+      },
+      repository: "acme/repo",
+      workspaceId: "acme-workspace",
+    },
+    payload: {
+      operation: "modify",
+      objective: "修复并发覆盖",
+      acceptanceCriteria: ["回归测试通过"],
+      evidence: ["revision 未校验"],
+      summary: "创建受控代码任务",
+      reason: "需要在隔离副本中验证修复",
+    },
+  });
+}
+
+function grantFor(value = proposal()) {
+  return createCodeJobGrant({
+    proposalId: value.proposalId,
+    contentDigest: value.contentDigest,
+    policyVersion: value.policyVersion,
+    requestedBy: value.requestedBy,
+    source: value.source,
+    subject: value.binding.subject,
+    repository: value.binding.repository,
+    workspaceId: value.binding.workspaceId,
+    workspaceAuthorityDigest: "9".repeat(64),
+    operation: value.payload.operation,
+    objective: value.payload.objective,
+    acceptanceCriteria: value.payload.acceptanceCriteria,
+    evidence: value.payload.evidence,
+    summary: value.payload.summary,
+    reason: value.payload.reason,
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: ["src"],
+    requiredProfiles: [
+      { id: "node-tests", configDigest: "b".repeat(64) },
+    ],
+    brainDigest: "c".repeat(64),
+  });
+}
+
+function authority(grant) {
+  const calls = [];
+  return {
+    calls,
+    factory: {
+      async create(value) {
+        calls.push(structuredClone(value));
+        return {
+          grant: structuredClone(grant),
+          allowedOperationsByRole: {
+            developer: ["inspect", "modify", "verify"],
+            tester: ["inspect", "verify"],
+          },
+        };
+      }
+    },
+  };
+}
+
+function handlerInput(overrides = {}) {
+  return {
+    proposal: proposal(),
+    status: "pending_delivery",
+    attempt: 1,
+    downstreamRef: null,
+    ...overrides,
+  };
+}
+
+function confirmationItem(plan, status, overrides = {}) {
+  const normalized = normalizeConfirmationPlan(plan);
+  const terminal = {
+    completed: {
+      receipt: {
+        id: codeJobIdForGrant(normalized.action.grant),
+        createdAt: CREATED_AT,
+      },
+    },
+    rejected: {
+      rejection: {
+        requestId: "reject-request-1",
+        reason: "不执行",
+        at: "2026-08-02T03:00:00.000Z",
+      },
+    },
+    stale: {
+      invalidation: {
+        reason: "work_item_superseded",
+        requestedBy: normalized.requestedBy,
+        approvalBindingDigest: normalized.approvalBindingDigest,
+        at: "2026-08-02T03:00:00.000Z",
+      },
+    },
+  }[status] ?? {};
+  return {
+    id: normalized.id,
+    kind: normalized.kind,
+    status,
+    queueRevision: 1,
+    itemRevision: 1,
+    requestedBy: normalized.requestedBy,
+    actor: normalized.actor,
+    target: normalized.target,
+    display: normalized.display,
+    displayedPayloadDigest: normalized.displayedPayloadDigest,
+    approvalBindingDigest: normalized.approvalBindingDigest,
+    retryable: false,
+    ...terminal,
+    ...overrides,
+  };
+}
+
+class FakeConfirmationProducer {
+  constructor(status = "pending", overrides = {}) {
+    this.status = status;
+    this.overrides = overrides;
+    this.plan = null;
+    this.enqueueCalls = [];
+    this.getCalls = [];
+    this.invalidateCalls = [];
+  }
+
+  async enqueue(plan) {
+    this.plan = structuredClone(plan);
+    this.enqueueCalls.push(structuredClone(plan));
+    return confirmationItem(plan, this.status, this.overrides);
+  }
+
+  async get(id) {
+    this.getCalls.push(id);
+    return confirmationItem(this.plan, this.status, this.overrides);
+  }
+
+  async invalidate(id, input) {
+    this.invalidateCalls.push([id, structuredClone(input)]);
+    this.status = "stale";
+    this.overrides = {
+      invalidation: {
+        ...structuredClone(input),
+        at: "2026-08-02T03:00:00.000Z",
+      },
+    };
+    return confirmationItem(this.plan, this.status, this.overrides);
+  }
+}
+
+function queuedJob(grant, overrides = {}) {
+  return {
+    jobId: codeJobIdForGrant(grant),
+    status: "queued",
+    revision: 1,
+    proposalId: grant.proposalId,
+    proposalContentDigest: grant.contentDigest,
+    grantDigest: grant.grantDigest,
+    requestedBy: grant.requestedBy,
+    subject: grant.subject,
+    repository: grant.repository,
+    workspaceId: grant.workspaceId,
+    operation: grant.operation,
+    objective: grant.objective,
+    acceptanceCriteria: grant.acceptanceCriteria,
+    evidence: grant.evidence,
+    summary: grant.summary,
+    reason: grant.reason,
+    allowedActions: grant.allowedActions,
+    writablePaths: grant.writablePaths,
+    requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
+    createdAt: CREATED_AT,
+    updatedAt: CREATED_AT,
+    ...overrides,
+  };
+}
+
+class FakeCodeJobReader {
+  constructor(value) {
+    this.value = value;
+    this.getCalls = [];
+  }
+
+  async get(id) {
+    this.getCalls.push(id);
+    return this.value === null ? null : structuredClone(this.value);
+  }
+}
+
+function handler(producer, reader, grant = grantFor(), overrides = {}) {
+  const trusted = authority(grant);
+  return {
+    trusted,
+    value: new CodeActionProposalHandler({
+      confirmationProducer: producer,
+      codeJobReader: reader,
+      grantFactory: trusted.factory,
+      clock: () => new Date("2026-08-02T03:00:00.000Z"),
+      pollIntervalMs: 5_000,
+      ...overrides,
+    }),
+  };
+}
+
+test("a proposal is enqueued once and waits on the exact code confirmation", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant);
+
+  const transition = await instance.value.handle(handlerInput());
+
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.getCalls.length, 0);
+  assert.equal(reader.getCalls.length, 0);
+  assert.equal(instance.trusted.calls.length, 1);
+  assert.deepEqual(transition, {
+    status: "waiting_confirmation",
+    downstreamRef: producer.plan.id,
+    nextAttemptAt: "2026-08-02T03:00:05.000Z",
+  });
+});
+
+test("an exact completed approval and queued job advance only to running", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant);
+  const waiting = await instance.value.handle(handlerInput());
+  producer.status = "completed";
+
+  const transition = await instance.value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.deepEqual(transition, {
+    status: "running",
+    downstreamRef: waiting.downstreamRef,
+    nextAttemptAt: "2026-08-02T03:00:05.000Z",
+  });
+  assert.deepEqual(producer.getCalls, [waiting.downstreamRef]);
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+  assert.notEqual(transition.status, "succeeded");
+});
+
+test("a queued job remains running without consulting or executing confirmation again", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  producer.plan = createCodeActionProposalConfirmationPlan(
+    proposal(),
+    await authority(grant).factory.create(proposal()),
+  );
+  const reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant);
+
+  const transition = await instance.value.handle(
+    handlerInput({
+      status: "running",
+      downstreamRef: codeJobConfirmationIdForGrant(grant),
+    }),
+  );
+
+  assert.equal(transition.status, "running");
+  assert.equal(
+    transition.downstreamRef,
+    codeJobConfirmationIdForGrant(grant),
+  );
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.getCalls.length, 1);
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
+});
+
+test("changed authorization invalidates the old pending confirmation", async () => {
+  const firstGrant = grantFor();
+  const { grantDigest: _grantDigest, ...firstGrantContent } = firstGrant;
+  const secondGrant = createCodeJobGrant({
+    ...firstGrantContent,
+    brainDigest: "d".repeat(64),
+  });
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(firstGrant));
+  let currentGrant = firstGrant;
+  const value = new CodeActionProposalHandler({
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: {
+      async create() {
+        return authority(currentGrant).factory.create(proposal());
+      },
+    },
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    pollIntervalMs: 5_000,
+  });
+  const waiting = await value.handle(handlerInput());
+  currentGrant = secondGrant;
+
+  const transition = await value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.equal(transition.status, "stale");
+  assert.deepEqual(producer.invalidateCalls, [
+    [
+      waiting.downstreamRef,
+      {
+        requestedBy: proposal().requestedBy,
+        approvalBindingDigest:
+          normalizeConfirmationPlan(producer.plan).approvalBindingDigest,
+        reason: "authorization_changed",
+      },
+    ],
+  ]);
+  assert.equal(reader.getCalls.length, 0);
+});
+
+test("revoked policy invalidates an existing confirmation before it can run", async () => {
+  const firstGrant = grantFor();
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(firstGrant));
+  let revoked = false;
+  const value = new CodeActionProposalHandler({
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: {
+      async create() {
+        if (revoked) {
+          const error = new Error("policy revoked");
+          error.code = "INVALID_CODE_JOB_AUTHORITY";
+          throw error;
+        }
+        return authority(firstGrant).factory.create(proposal());
+      },
+    },
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    pollIntervalMs: 5_000,
+  });
+  const waiting = await value.handle(handlerInput());
+  revoked = true;
+
+  const transition = await value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.equal(transition.status, "stale");
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.invalidateCalls[0][1].reason, "authorization_changed");
+  assert.equal(reader.getCalls.length, 0);
+});
+
+test("rejected, stale, and failed confirmations never start a code job", async (t) => {
+  const failureAt = "2026-08-02T03:00:00.000Z";
+  const cases = [
+    [
+      "rejected",
+      {
+        rejection: {
+          requestId: "reject-request-1",
+          reason: "",
+          at: failureAt,
+        },
+      },
+      "rejected",
+    ],
+    ["stale", {}, "stale"],
+    [
+      "failed",
+      {
+        failure: {
+          code: "CODE_JOB_NOT_CREATED",
+          outcome: "absent",
+          retryable: true,
+          at: failureAt,
+        },
+        retryable: true,
+      },
+      "waiting_retry",
+    ],
+    [
+      "failed",
+      {
+        failure: {
+          code: "CODE_JOB_OUTCOME_UNKNOWN",
+          outcome: "unknown",
+          retryable: false,
+          at: failureAt,
+        },
+      },
+      "unknown",
+    ],
+  ];
+
+  for (const [status, overrides, expectedStatus] of cases) {
+    await t.test(`${status} -> ${expectedStatus}`, async () => {
+      const grant = grantFor();
+      const producer = new FakeConfirmationProducer(status, overrides);
+      const reader = new FakeCodeJobReader(queuedJob(grant));
+      const instance = handler(producer, reader, grant);
+      const transition = await instance.value.handle(handlerInput());
+      assert.equal(transition.status, expectedStatus);
+      assert.equal(reader.getCalls.length, 0);
+      assert.notEqual(transition.status, "running");
+      assert.notEqual(transition.status, "succeeded");
+    });
+  }
+});
+
+test("receipt, confirmation, and job binding mismatches fail closed", async () => {
+  const grant = grantFor();
+  const jobId = codeJobIdForGrant(grant);
+  const cases = [
+    {
+      confirmation: {
+        approvalBindingDigest: "f".repeat(64),
+      },
+      job: queuedJob(grant),
+    },
+    {
+      confirmation: {
+        receipt: { id: jobId, createdAt: "2026-08-02T03:00:02.000Z" },
+      },
+      job: queuedJob(grant),
+    },
+    {
+      confirmation: {},
+      job: queuedJob(grant, { grantDigest: "f".repeat(64) }),
+    },
+    {
+      confirmation: {},
+      job: queuedJob(grant, { updatedAt: "2026-08-02T03:00:02.000Z" }),
+    },
+    { confirmation: {}, job: null },
+  ];
+
+  for (const { confirmation, job } of cases) {
+    const producer = new FakeConfirmationProducer("completed", confirmation);
+    const reader = new FakeCodeJobReader(job);
+    const instance = handler(producer, reader, grant);
+    await assert.rejects(
+      instance.value.handle(handlerInput()),
+      (error) =>
+        [
+          "INVALID_CODE_ACTION_CONFIRMATION",
+          "INVALID_CODE_JOB_RESULT",
+        ].includes(error?.code),
+    );
+  }
+});
+
+test("runner factory stays disabled by default and rejects incomplete authority", () => {
+  assert.equal(createCodeActionProposalRunnerService({}), null);
+  assert.equal(
+    createCodeActionProposalRunnerService({ enabled: false }),
+    null,
+  );
+  assert.throws(
+    () => createCodeActionProposalRunnerService({ enabled: true }),
+    /runner|confirmation|codeJob|grantFactory/,
+  );
+});
+
+class MemoryStore {
+  constructor() {
+    this.value = null;
+  }
+
+  async read(_name, fallback) {
+    return structuredClone(this.value ?? fallback);
+  }
+
+  async write(_name, value) {
+    this.value = structuredClone(value);
+  }
+}
+
+class Guard {
+  async acquire() {}
+  run(operation) {
+    return operation();
+  }
+  async close() {}
+}
+
+test("the real proposal runner stops at running while the local job is queued", async () => {
+  const value = proposal();
+  const grant = grantFor(value);
+  const store = new MemoryStore();
+  let now = Date.parse("2026-08-02T03:00:00.000Z");
+  const runtime = await createWorkProposalRuntime({
+    store,
+    clock: () => new Date(now),
+    idFactory: () => "code-proposal-lease",
+    runnerScopes: [
+      {
+        runnerId: "code-runner",
+        allowedKinds: ["code_action_proposal"],
+        allowedRoleIds: ["developer"],
+      },
+    ],
+    createGuard: () => new Guard(),
+  });
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(grant));
+  const trusted = authority(grant);
+  const service = createCodeActionProposalRunnerService({
+    enabled: true,
+    runner: runtime.runners["code-runner"],
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: trusted.factory,
+    clock: () => new Date(now),
+    pollIntervalMs: 1_000,
+    leaseDurationMs: 30_000,
+  });
+  const { contentDigest: _contentDigest, ...input } = value;
+  await runtime.producer.create(input);
+
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+  assert.equal(store.value.results.length, 0);
+
+  producer.status = "completed";
+  now += 1_000;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "running");
+  assert.equal(store.value.proposals[0].downstreamRef, producer.plan.id);
+  assert.equal(store.value.results.length, 0);
+
+  now += 1_000;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "running");
+  assert.equal(store.value.results.length, 0);
+  await runtime.close();
+});

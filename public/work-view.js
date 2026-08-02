@@ -127,7 +127,7 @@ function codeJobRows(items, now) {
         <strong>${escapeWorkHtml(job.repository || "未知仓库")} · ${escapeWorkHtml(job.operation || "unknown")}</strong>
         <span class="status-pill status-${escapeWorkHtml(job.status)}">${escapeWorkHtml(codeJobStatusLabel(job.status))}</span>
       </div>
-      <p>${escapeWorkHtml(job.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
+      <p>${escapeWorkHtml(job.roleId || job.requestedBy?.roleId || "未知岗位")} · ${escapeWorkHtml(job.workspaceId || "未知工作区")}</p>
       <span>${escapeWorkHtml(job.phase || "queued")} · ${escapeWorkHtml(job.lastActionType || "尚无动作")} · ${Number(job.turnCount) || 0} 轮 · ${relativeTime(job.updatedAt, now)}</span>
       ${job.errorCode ? `<small>${escapeWorkHtml(job.errorCode)}</small>` : ""}
       ${codeJobResultMarkup(job.result)}

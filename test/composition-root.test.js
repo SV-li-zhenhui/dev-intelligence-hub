@@ -70,6 +70,58 @@ function workCoordinationConfig({ externalActions = true } = {}) {
   };
 }
 
+function localCodeCoordinationConfig({ githubActions = true } = {}) {
+  const base = workCoordinationConfig({ externalActions: githubActions });
+  return {
+    ...base,
+    codeExecutor: { enabled: true },
+    githubActions: githubActions
+      ? { enabled: true, actorAccountId: "review-account" }
+      : { enabled: false },
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+    },
+    employees: {
+      ...base.employees,
+      roles: {
+        developer: {
+          brain: {
+            provider: "ollama",
+            model: "developer-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+        },
+        tester: {
+          brain: {
+            provider: "ollama",
+            model: "tester-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+        },
+        "policy-only-role": {
+          brain: {
+            provider: "ollama",
+            model: "policy-only-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+        },
+      },
+    },
+    workCoordination: {
+      ...base.workCoordination,
+      policy: {
+        ...base.workCoordination.policy,
+        codeActionRoles: ["developer", "tester", "role-without-policy"],
+        codeOperationsByRole: {
+          developer: ["inspect", "modify", "verify"],
+          tester: ["inspect", "verify"],
+          "policy-only-role": ["inspect"],
+        },
+      },
+    },
+  };
+}
+
 function confirmationQueuePort() {
   return Object.freeze({
     async next() {
@@ -99,6 +151,65 @@ function workProposalRuntimePort(overrides = {}) {
     consumer: { async readResultBatch() {} },
     async close() {},
     ...overrides,
+  };
+}
+
+function localCoordinationStubs({ calls, closeCalls, runners }) {
+  const workflow = {
+    async readAssignmentBatch() {},
+    async close() {
+      closeCalls.push("workflow");
+    },
+  };
+  const ledger = {
+    async getSummary() {},
+    async listItems() { return { items: [], nextCursor: null }; },
+    async listTimeline() { return { items: [], nextCursor: null }; },
+    async close() {
+      closeCalls.push("ledger");
+    },
+  };
+  const attention = {
+    producer: { async create() {} },
+    consumer: { async readOutbox() {} },
+    browser: {
+      async next() {},
+      async answer() {},
+      async reject() {},
+      async later() {},
+    },
+    async close() {
+      closeCalls.push("attention");
+    },
+  };
+  const proposals = workProposalRuntimePort({
+    runners,
+    async close() {
+      closeCalls.push("proposals");
+    },
+  });
+  return {
+    workflowRoutingRuntimeFactory: async () => workflow,
+    workLedgerRuntimeFactory: async () => ledger,
+    attentionInboxRuntimeFactory: async () => attention,
+    workProposalRuntimeFactory: async (options) => {
+      calls.proposalRuntime = options;
+      return proposals;
+    },
+    configuredWorkforceFactory: () => ({ employees: [], workers: [] }),
+    workIntentPolicyFactory: () => ({ async bind() {} }),
+    roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
+    workflowFactSourceFactory: () => ({ async read() {} }),
+    attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
+    workProposalResultReconcilerFactory: () => ({ async runCycle() {} }),
+    workConditionWakerFactory: () => ({ async runCycle() {} }),
+    proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
+    workIntentDispatcherFactory: () => ({ async dispatchPending() {} }),
+    workCoordinationFactory: (options) => {
+      calls.coordination = options;
+      return { async intake() {}, async runCycle() {} };
+    },
+    attentionCoordinatorFactory: () => ({ async next() {} }),
   };
 }
 
@@ -369,11 +480,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     workCoordinationDependencies: { workers },
     codeExecutorRuntimeFactory: async () => {
       runtimeOrder.push("code-executor");
-      return {
-        async close() {
-          closeCalls.push("code-executor");
-        },
-      };
+      return null;
     },
     workflowRoutingRuntimeFactory: async () => {
       runtimeOrder.push("workflow");
@@ -614,7 +721,6 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "attention",
     "ledger",
     "workflow",
-    "code-executor",
   ]);
 });
 
@@ -793,6 +899,7 @@ test("work coordination startup preserves its error while closing every acquired
     createApplication({
       config: workCoordinationConfig({ externalActions: false }),
       store: memoryStore(),
+      externalActions: false,
       codeExecutorRuntimeFactory: async () => ({
         async close() {
           closeCalls.push("code-executor");
@@ -1070,4 +1177,369 @@ test("maintenance composition never acquires the external-action runtime", async
   assert.equal(confirmationFactoryCalls, 0);
   assert.equal(application.confirmationQueue, null);
   await application.close();
+});
+
+test("local code composition binds authority, both proposal runners, and one safe reader", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const githubRunnerPort = { async claim() {}, async advance() {} };
+  const codeRunnerPort = { async claim() {}, async advance() {} };
+  const githubRunner = { id: "github-runner", async runCycle() {} };
+  const codeRunner = { id: "code-runner", async runCycle() {} };
+  const runnerGroup = { async runCycle() {} };
+  const localExecutor = { async execute() {}, async reconcile() {} };
+  const codeJobReader = {
+    async get(id) { return { id }; },
+    async list(value) { return { value }; },
+    async listNewest(value) { return { newest: value }; },
+  };
+  const executorAuthority = Object.freeze({
+    workspaces: Object.freeze([
+      Object.freeze({
+        id: "acme-workspace",
+        writablePaths: Object.freeze(["src"]),
+        requiredProfiles: Object.freeze([
+          Object.freeze({ id: "node-tests", configDigest: "a".repeat(64) }),
+        ]),
+        authorityDigest: "b".repeat(64),
+      }),
+    ]),
+  });
+  const application = await createApplication({
+    config: localCodeCoordinationConfig(),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      authority: executorAuthority,
+      executor: { id: "controlled-code-executor" },
+      async close() {
+        closeCalls.push("code-executor");
+      },
+    }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "github-review-runner": githubRunnerPort,
+        "code-action-runner": codeRunnerPort,
+      },
+    }),
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      return {
+        confirmationExecutor: localExecutor,
+        reader: codeJobReader,
+        async close() {
+          closeCalls.push("code-job");
+        },
+      };
+    },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {
+          closeCalls.push("confirmation");
+        },
+      };
+    },
+    codeJobGrantFactory: (options) => {
+      calls.grantFactory = options;
+      return { async create() {} };
+    },
+    githubReviewProposalRunnerFactory: (options) => {
+      calls.githubRunner = options;
+      return githubRunner;
+    },
+    codeActionProposalRunnerFactory: (options) => {
+      calls.codeRunner = options;
+      return codeRunner;
+    },
+    workProposalRunnerGroupFactory: (runners) => {
+      calls.runnerGroup = runners;
+      return runnerGroup;
+    },
+  });
+
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, [
+    {
+      runnerId: "github-review-runner",
+      allowedKinds: ["github_review_proposal"],
+      allowedRoleIds: ["pr-reviewer"],
+    },
+    {
+      runnerId: "code-action-runner",
+      allowedKinds: ["code_action_proposal"],
+      allowedRoleIds: ["developer", "tester"],
+    },
+  ]);
+  assert.strictEqual(calls.codeJobRuntime.store, application.store);
+  assert.equal(Object.isFrozen(calls.confirmation.localExecutor), true);
+  assert.deepEqual(Object.keys(calls.confirmation.localExecutor).sort(), [
+    "execute",
+    "reconcile",
+  ]);
+  assert.strictEqual(calls.grantFactory.executorAuthority, executorAuthority);
+  assert.equal(calls.grantFactory.policyVersion, 2);
+  assert.deepEqual(calls.grantFactory.workspaceByRepository, {
+    "acme/repo": "acme-workspace",
+  });
+  assert.deepEqual(calls.grantFactory.codeActionRoles, [
+    "developer",
+    "tester",
+    "role-without-policy",
+  ]);
+  assert.deepEqual(calls.grantFactory.codeOperationsByRole, {
+    developer: ["inspect", "modify", "verify"],
+    tester: ["inspect", "verify"],
+    "policy-only-role": ["inspect"],
+  });
+  assert.deepEqual(calls.grantFactory.brainByRole, {
+    developer: localCodeCoordinationConfig().employees.roles.developer.brain,
+    tester: localCodeCoordinationConfig().employees.roles.tester.brain,
+    "policy-only-role":
+      localCodeCoordinationConfig().employees.roles["policy-only-role"].brain,
+  });
+  assert.deepEqual(
+    calls.grantFactory.brainProviders,
+    localCodeCoordinationConfig().brainProviders,
+  );
+  assert.strictEqual(calls.githubRunner.runner, githubRunnerPort);
+  assert.strictEqual(calls.codeRunner.runner, codeRunnerPort);
+  assert.strictEqual(
+    calls.codeRunner.confirmationProducer,
+    calls.githubRunner.confirmationProducer,
+  );
+  assert.equal(Object.isFrozen(calls.codeRunner.codeJobReader), true);
+  assert.deepEqual(Object.keys(calls.codeRunner.codeJobReader).sort(), [
+    "get",
+    "list",
+    "listNewest",
+  ]);
+  assert.equal(typeof calls.codeRunner.grantFactory.create, "function");
+  assert.deepEqual(calls.runnerGroup, [githubRunner, codeRunner]);
+  assert.strictEqual(calls.coordination.proposalRunner, runnerGroup);
+
+  assert.equal(Object.isFrozen(application.codeJobReader), true);
+  assert.deepEqual(Object.keys(application.codeJobReader).sort(), [
+    "get",
+    "list",
+    "listNewest",
+  ]);
+  assert.deepEqual(await application.codeJobReader.get("job-1"), { id: "job-1" });
+  for (const privateName of [
+    "codeJobRuntime",
+    "codeJobStore",
+    "codeJobExecutor",
+    "confirmationExecutor",
+  ]) {
+    assert.equal(privateName in application, false);
+  }
+
+  await application.close();
+  assert.deepEqual(closeCalls, [
+    "confirmation",
+    "code-job",
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+    "code-executor",
+  ]);
+});
+
+test("local-only code actions still create confirmation while maintenance acquires neither guard", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const codeRunnerPort = { async claim() {}, async advance() {} };
+  let codeJobCalls = 0;
+  let confirmationCalls = 0;
+  const baseOptions = {
+    config: localCodeCoordinationConfig({ githubActions: false }),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      authority: { workspaces: [] },
+      async close() {
+        closeCalls.push("code-executor");
+      },
+    }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: { "code-action-runner": codeRunnerPort },
+    }),
+    codeJobRuntimeFactory: async () => {
+      codeJobCalls += 1;
+      return {
+        confirmationExecutor: { async execute() {}, async reconcile() {} },
+        reader: {
+          async get() {}, async list() {}, async listNewest() {},
+        },
+        async close() {
+          closeCalls.push("code-job");
+        },
+      };
+    },
+    confirmationRuntimeFactory: async () => {
+      confirmationCalls += 1;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {
+          closeCalls.push("confirmation");
+        },
+      };
+    },
+    codeJobGrantFactory: () => ({ async create() {} }),
+    codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: (runners) => runners[0] || null,
+  };
+
+  const application = await createApplication(baseOptions);
+  assert.equal(codeJobCalls, 1);
+  assert.equal(confirmationCalls, 1);
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, [
+    {
+      runnerId: "code-action-runner",
+      allowedKinds: ["code_action_proposal"],
+      allowedRoleIds: ["developer", "tester"],
+    },
+  ]);
+  await application.close();
+
+  codeJobCalls = 0;
+  confirmationCalls = 0;
+  const maintenance = await createApplication({
+    ...baseOptions,
+    externalActions: false,
+  });
+  assert.equal(codeJobCalls, 0);
+  assert.equal(confirmationCalls, 0);
+  assert.equal(maintenance.codeJobReader, null);
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, []);
+  await maintenance.close();
+});
+
+test("local composition constructs the real grant, handler, and runner group chain", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const authority = {
+    workspaces: [
+      {
+        id: "acme-workspace",
+        writablePaths: ["src"],
+        requiredProfiles: [
+          { id: "node-tests", configDigest: "a".repeat(64) },
+        ],
+        authorityDigest: "b".repeat(64),
+      },
+    ],
+  };
+  const application = await createApplication({
+    config: localCodeCoordinationConfig({ githubActions: false }),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({ authority }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "code-action-runner": { async claim() {}, async advance() {} },
+      },
+    }),
+    codeJobRuntimeFactory: async () => ({
+      confirmationExecutor: { async execute() {}, async reconcile() {} },
+      reader: { async get() {}, async list() {}, async listNewest() {} },
+      async close() {},
+    }),
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() {},
+    }),
+  });
+
+  assert.equal(typeof calls.coordination.proposalRunner.runCycle, "function");
+  assert.equal(Object.isFrozen(application.codeJobReader), true);
+  await application.close();
+});
+
+test("confirmation startup failure closes the already acquired local code runtime in reverse order", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const startupFailure = new Error("confirmation startup failed");
+
+  await assert.rejects(
+    createApplication({
+      config: localCodeCoordinationConfig({ githubActions: false }),
+      store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => ({
+        authority: { workspaces: [] },
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      }),
+      ...localCoordinationStubs({
+        calls,
+        closeCalls,
+        runners: {
+          "code-action-runner": { async claim() {}, async advance() {} },
+        },
+      }),
+      codeJobRuntimeFactory: async () => ({
+        confirmationExecutor: { async execute() {}, async reconcile() {} },
+        reader: { async get() {}, async list() {}, async listNewest() {} },
+        async close() {
+          closeCalls.push("code-job");
+        },
+      }),
+      confirmationRuntimeFactory: async () => {
+        throw startupFailure;
+      },
+    }),
+    (error) => error === startupFailure,
+  );
+  assert.deepEqual(closeCalls, [
+    "code-job",
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+    "code-executor",
+  ]);
+});
+
+test("local code startup rejects an empty role-policy intersection before acquiring later guards", async () => {
+  const config = localCodeCoordinationConfig({ githubActions: false });
+  config.workCoordination.policy.codeActionRoles = ["role-without-policy"];
+  const closeCalls = [];
+  let codeJobCalls = 0;
+  let confirmationCalls = 0;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => ({
+        authority: { workspaces: [] },
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      }),
+      workflowRoutingRuntimeFactory: async () => ({
+        async close() {
+          closeCalls.push("workflow");
+        },
+      }),
+      codeJobRuntimeFactory: async () => {
+        codeJobCalls += 1;
+      },
+      confirmationRuntimeFactory: async () => {
+        confirmationCalls += 1;
+      },
+    }),
+    /没有同时满足岗位和操作策略的执行角色/,
+  );
+  assert.equal(codeJobCalls, 0);
+  assert.equal(confirmationCalls, 0);
+  assert.deepEqual(closeCalls, ["workflow", "code-executor"]);
 });

@@ -5,6 +5,7 @@ import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
 import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
+import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
 import { loadConfig, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
@@ -22,16 +23,20 @@ import { RefreshService } from "./services/refresh-service.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { WorkCoordinationService } from "./services/work-coordination-service.js";
+import { createCodeActionProposalRunnerService } from "./services/code-action-proposal-handler.js";
+import { CodeJobGrantFactory } from "./services/code-job-grant-factory.js";
 import { createGitHubReviewProposalRunnerService } from "./services/github-review-proposal-handler.js";
 import { WorkIntentDispatcher } from "./services/work-intent-dispatcher.js";
 import { WorkProposalResultReconciler } from "./services/work-proposal-result-reconciler.js";
 import { createWorkIntentPolicy } from "./services/work-intent-policy.js";
+import { createWorkProposalRunnerGroup } from "./services/work-proposal-runner-group.js";
 import { WorkflowFactSource } from "./services/workflow-fact-source.js";
 import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
+const CODE_ACTION_PROPOSAL_RUNNER_ID = "code-action-runner";
 
 function frozenPort(source, methods, name) {
   if (!source || methods.some((method) => typeof source[method] !== "function")) {
@@ -54,6 +59,32 @@ async function closeRuntimes(runtimes) {
     }
   }
   if (firstFailure) throw firstFailure;
+}
+
+function codeActionRunnerRoles(policy = {}) {
+  const declaredRoles = Array.isArray(policy.codeActionRoles)
+    ? policy.codeActionRoles
+    : [];
+  const operationsByRole =
+    policy.codeOperationsByRole &&
+    typeof policy.codeOperationsByRole === "object" &&
+    !Array.isArray(policy.codeOperationsByRole)
+      ? policy.codeOperationsByRole
+      : {};
+  const eligibleRoles =
+    declaredRoles.filter(
+      (roleId) =>
+        typeof roleId === "string" && Object.hasOwn(operationsByRole, roleId),
+    );
+  return [...new Set(eligibleRoles)];
+}
+
+function brainConfigurationsByRole(roles) {
+  const configured =
+    roles && typeof roles === "object" && !Array.isArray(roles) ? roles : {};
+  return Object.fromEntries(
+    Object.entries(configured).map(([roleId, role]) => [roleId, role?.brain]),
+  );
 }
 
 export function createBrain(config = {}, dependencies = {}) {
@@ -94,6 +125,8 @@ export async function createApplication({
   store: suppliedStore,
   codeExecutorRuntimeFactory = createCodeExecutorRuntime,
   codeExecutorDependencies = {},
+  codeJobRuntimeFactory = createCodeJobRuntime,
+  codeJobRuntimeDependencies = {},
   confirmationRuntimeFactory = createConfirmationRuntime,
   confirmationRuntimeDependencies = {},
   workflowRoutingRuntimeFactory = createWorkflowRoutingRuntime,
@@ -117,6 +150,10 @@ export async function createApplication({
     new WorkProposalResultReconciler(options),
   githubReviewProposalRunnerFactory =
     createGitHubReviewProposalRunnerService,
+  codeJobGrantFactory = (options) => new CodeJobGrantFactory(options),
+  codeActionProposalRunnerFactory =
+    createCodeActionProposalRunnerService,
+  workProposalRunnerGroupFactory = createWorkProposalRunnerGroup,
   workConditionWakerFactory = (options) => new WorkConditionWaker(options),
   proactiveWorkLoopFactory = (options) => new ProactiveWorkLoop(options),
   workIntentDispatcherFactory = (options) =>
@@ -149,7 +186,9 @@ export async function createApplication({
   let attentionInboxRuntime = null;
   let workProposalRuntime = null;
   let memoryRuntime = null;
+  let codeJobRuntime = null;
   let confirmationRuntime = null;
+  let codeJobReader = null;
   try {
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
@@ -169,6 +208,14 @@ export async function createApplication({
       coordinationEnabled &&
       externalActions &&
       config.githubActions?.enabled === true;
+    const localCodeExecutionEnabled =
+      coordinationEnabled && externalActions && Boolean(codeExecutorRuntime);
+    const codeRunnerRoleIds = localCodeExecutionEnabled
+      ? codeActionRunnerRoles(coordinationConfig.policy)
+      : [];
+    if (localCodeExecutionEnabled && codeRunnerRoleIds.length === 0) {
+      throw new Error("本地代码工作提案没有同时满足岗位和操作策略的执行角色");
+    }
     if (coordinationEnabled) {
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({
@@ -190,16 +237,27 @@ export async function createApplication({
           ...workProposalDependencies,
           store,
           operationQueue: new OperationQueue(),
-          runnerScopes: githubProposalExecutionEnabled
-            ? [
-                {
-                  runnerId: GITHUB_REVIEW_PROPOSAL_RUNNER_ID,
-                  allowedKinds: ["github_review_proposal"],
-                  allowedRoleIds:
-                    coordinationConfig.policy?.githubReviewRoles || [],
-                },
-              ]
-            : [],
+          runnerScopes: [
+            ...(githubProposalExecutionEnabled
+              ? [
+                  {
+                    runnerId: GITHUB_REVIEW_PROPOSAL_RUNNER_ID,
+                    allowedKinds: ["github_review_proposal"],
+                    allowedRoleIds:
+                      coordinationConfig.policy?.githubReviewRoles || [],
+                  },
+                ]
+              : []),
+            ...(localCodeExecutionEnabled
+              ? [
+                  {
+                    runnerId: CODE_ACTION_PROPOSAL_RUNNER_ID,
+                    allowedKinds: ["code_action_proposal"],
+                    allowedRoleIds: codeRunnerRoleIds,
+                  },
+                ]
+              : []),
+          ],
         }),
       );
     }
@@ -214,38 +272,102 @@ export async function createApplication({
         }),
       );
     }
-    confirmationRuntime =
-      externalActions && config.githubActions?.enabled === true
-        ? trackRuntime(await confirmationRuntimeFactory(config, {
+    if (localCodeExecutionEnabled) {
+      codeJobRuntime = trackRuntime(
+        await codeJobRuntimeFactory({
+          ...codeJobRuntimeDependencies,
+          store,
+          operationQueue: new OperationQueue(),
+        }),
+      );
+      if (!codeJobRuntime) {
+        throw new Error("本地代码工作提案需要可用的代码任务运行时");
+      }
+      const localExecutor = frozenPort(
+        codeJobRuntime.confirmationExecutor,
+        ["execute", "reconcile"],
+        "codeJobRuntime.confirmationExecutor",
+      );
+      codeJobReader = frozenPort(
+        codeJobRuntime.reader,
+        ["get", "list", "listNewest"],
+        "codeJobRuntime.reader",
+      );
+      confirmationRuntime = trackRuntime(
+        await confirmationRuntimeFactory(config, {
           ...confirmationRuntimeDependencies,
           store,
-        }))
-        : null;
+          localExecutor,
+        }),
+      );
+    } else if (externalActions && config.githubActions?.enabled === true) {
+      confirmationRuntime = trackRuntime(
+        await confirmationRuntimeFactory(config, {
+          ...confirmationRuntimeDependencies,
+          store,
+        }),
+      );
+    }
+    if (localCodeExecutionEnabled && !confirmationRuntime) {
+      throw new Error("本地代码工作提案需要可用的确认运行时");
+    }
     if (githubProposalExecutionEnabled && !confirmationRuntime) {
       throw new Error("GitHub 工作提案需要可用的确认运行时");
     }
-    const proposalRunner = coordinationEnabled
-      ? githubReviewProposalRunnerFactory({
-          enabled: githubProposalExecutionEnabled,
-          ...(githubProposalExecutionEnabled
-            ? {
-                runner:
-                  workProposalRuntime.runners[
-                    GITHUB_REVIEW_PROPOSAL_RUNNER_ID
-                  ],
-                confirmationProducer: confirmationRuntime.producerQueue,
-                actorAccountId: config.githubActions.actorAccountId,
-                leaseDurationMs: coordinationConfig.leaseDurationMs,
-                retryBaseMs: coordinationConfig.retryBaseMs,
-                retryMaxMs: coordinationConfig.retryMaxMs,
-                defaultBatchLimit: coordinationConfig.proposalLimit,
-                ...(workCoordinationDependencies.clock
-                  ? { clock: workCoordinationDependencies.clock }
-                  : {}),
-              }
+    const proposalRunners = [];
+    if (githubProposalExecutionEnabled) {
+      proposalRunners.push(
+        githubReviewProposalRunnerFactory({
+          enabled: true,
+          runner:
+            workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
+          confirmationProducer: confirmationRuntime.producerQueue,
+          actorAccountId: config.githubActions.actorAccountId,
+          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          retryBaseMs: coordinationConfig.retryBaseMs,
+          retryMaxMs: coordinationConfig.retryMaxMs,
+          defaultBatchLimit: coordinationConfig.proposalLimit,
+          ...(workCoordinationDependencies.clock
+            ? { clock: workCoordinationDependencies.clock }
             : {}),
-        })
+        }),
+      );
+    }
+    if (localCodeExecutionEnabled) {
+      const grantFactory = codeJobGrantFactory({
+        executorAuthority: codeExecutorRuntime.authority,
+        policyVersion: coordinationConfig.policy?.version ?? 1,
+        workspaceByRepository:
+          coordinationConfig.policy?.workspaceByRepository || {},
+        codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
+        codeOperationsByRole:
+          coordinationConfig.policy?.codeOperationsByRole || {},
+        brainByRole: brainConfigurationsByRole(config.employees?.roles),
+        brainProviders: config.brainProviders || {},
+      });
+      proposalRunners.push(
+        codeActionProposalRunnerFactory({
+          enabled: true,
+          runner: workProposalRuntime.runners[CODE_ACTION_PROPOSAL_RUNNER_ID],
+          confirmationProducer: confirmationRuntime.producerQueue,
+          codeJobReader,
+          grantFactory,
+          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          retryBaseMs: coordinationConfig.retryBaseMs,
+          retryMaxMs: coordinationConfig.retryMaxMs,
+          defaultBatchLimit: coordinationConfig.proposalLimit,
+          ...(workCoordinationDependencies.clock
+            ? { clock: workCoordinationDependencies.clock }
+            : {}),
+        }),
+      );
+    }
+    const proposalRunner = proposalRunners.length
+      ? workProposalRunnerGroupFactory(proposalRunners)
       : null;
+    if (proposalRunners.length && !proposalRunner) {
+      throw new Error("工作提案 runner 组合失败");
+    }
     const prEmployee = new ProactivePrEmployeeService({
       github,
       reviewer: roleConfig.enabled
@@ -428,6 +550,7 @@ export async function createApplication({
       workflowRouting,
       codeExecutorRuntime,
       codeExecutor: codeExecutorRuntime?.executor || null,
+      codeJobReader,
       workLedgerView,
       attentionBrowser,
       attentionCoordinator,

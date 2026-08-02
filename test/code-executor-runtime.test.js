@@ -93,14 +93,19 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
             configDigest: runtime.sandbox.getProfileFingerprint("node-tests"),
           },
         ],
+        authorityDigest: runtime.authority.workspaces[0].authorityDigest,
       },
     ],
   });
+  assert.match(
+    runtime.authority.workspaces[0].authorityDigest,
+    /^[a-f0-9]{64}$/,
+  );
   assert.equal(Object.isFrozen(runtime.authority.workspaces[0]), true);
   const session = await runtime.executor.start({
     sessionId: "runtime-session",
     workspaceId: "dashboard",
-    requestedBy: { roleId: "developer", workItemId: "dashboard#unit4" },
+    requestedBy: { roleId: "r".repeat(65), workItemId: "dashboard#unit4" },
   });
   const read = await runtime.executor.perform({
     sessionId: session.id,
@@ -114,6 +119,33 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
 
   assert.equal(read.result.content, "export const value = 1;\n");
   assert.equal(read.session.status, "active");
+});
+
+test("workspace authority binds source, exclusions, writes, and fixed profiles", async (t) => {
+  const setup = await fixture(t);
+  const makeRuntime = (config, suffix) =>
+    createCodeExecutorRuntime(config, {
+      runtimeRoot: path.join(setup.root, `runtime-${suffix}`),
+      sourceBaseRoot: setup.sourceBaseRoot,
+      store: new StateStore(path.join(setup.root, `state-${suffix}`)),
+    });
+  const base = enabledConfig(setup.root);
+  const first = await makeRuntime(base, "base");
+  const changedSource = structuredClone(base);
+  changedSource.workspaces[0].sourceRoot = "product";
+  const second = await makeRuntime(changedSource, "source");
+  const changedExclusions = structuredClone(base);
+  changedExclusions.workspaces[0].excludePaths = ["src/private"];
+  const third = await makeRuntime(changedExclusions, "exclude");
+
+  assert.notEqual(
+    first.authority.workspaces[0].authorityDigest,
+    second.authority.workspaces[0].authorityDigest,
+  );
+  assert.notEqual(
+    first.authority.workspaces[0].authorityDigest,
+    third.authority.workspaces[0].authorityDigest,
+  );
 });
 
 test("invalid runtime state fails startup instead of exposing the executor", async (t) => {

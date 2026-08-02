@@ -2,6 +2,7 @@ import path from "node:path";
 import { DockerTestSandbox } from "./adapters/docker-test-sandbox.js";
 import { projectRoot } from "./lib/config.js";
 import { StateStore } from "./lib/state-store.js";
+import { digestValue } from "./domain/code-executor-contract.js";
 import { CodeExecutionJournal } from "./services/code-execution-journal.js";
 import { CodeWorkspaceBroker } from "./services/code-workspace-broker.js";
 import { ControlledCodeExecutor } from "./services/controlled-code-executor.js";
@@ -117,20 +118,27 @@ function resolveRuntimeRoot(value) {
 function createWorkspaceAuthority(workspaces, requiredProfiles, sandbox) {
   return Object.freeze({
     workspaces: Object.freeze(
-      workspaces.map((workspace) =>
-        Object.freeze({
+      workspaces.map((workspace) => {
+        const profiles = requiredProfiles[workspace.id].map((id) =>
+          Object.freeze({
+            id,
+            configDigest: sandbox.getProfileFingerprint(id),
+          }),
+        );
+        return Object.freeze({
           id: workspace.id,
           writablePaths: Object.freeze([...workspace.writablePaths]),
-          requiredProfiles: Object.freeze(
-            requiredProfiles[workspace.id].map((id) =>
-              Object.freeze({
-                id,
-                configDigest: sandbox.getProfileFingerprint(id),
-              }),
-            ),
-          ),
-        }),
-      ),
+          requiredProfiles: Object.freeze(profiles),
+          authorityDigest: digestValue({
+            schemaVersion: 1,
+            workspaceId: workspace.id,
+            sourceRoot: workspace.sourceRoot,
+            writablePaths: workspace.writablePaths,
+            excludePaths: workspace.excludePaths,
+            requiredProfiles: profiles,
+          }),
+        });
+      }),
     ),
   });
 }

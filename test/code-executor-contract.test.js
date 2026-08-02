@@ -32,6 +32,14 @@ test("start and resume requests normalize exact plain DTOs", () => {
     workspaceId: "dashboard",
     requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
   });
+  assert.equal(
+    normalizeStartRequest({
+      sessionId: "session-long-role",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "r".repeat(65), workItemId: "PR-43" },
+    }).requestedBy.roleId.length,
+    65,
+  );
   assert.deepEqual(normalizeResumeRequest({ sessionId: "session-1" }), {
     sessionId: "session-1",
   });

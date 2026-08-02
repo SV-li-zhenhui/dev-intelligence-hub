@@ -1030,7 +1030,7 @@ function showCodeJobConfirmation(entry, remaining) {
         <dt>仓库</dt><dd>${escapeHtml(grant.repository || "未知")}</dd>
         <dt>可信工作区</dt><dd>${escapeHtml(grant.workspaceId || "未知")}</dd>
         <dt>代码操作</dt><dd>${escapeHtml(codeOperationLabel(grant.operation))}</dd>
-        <dt>绑定提案</dt><dd><code>${escapeHtml(grant.proposalContentDigest || item.target?.version || "未知")}</code></dd>
+        <dt>绑定提案</dt><dd><code>${escapeHtml(grant.contentDigest || item.target?.version || "未知")}</code></dd>
         <dt>授权大脑</dt><dd><code>${escapeHtml(grant.brainDigest || "未知")}</code></dd>
       </dl>
       <div class="review-preview">

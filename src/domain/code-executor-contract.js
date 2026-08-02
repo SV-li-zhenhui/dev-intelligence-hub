@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const CONTROL_CHARACTER = /\p{Cc}/u;
 
@@ -129,8 +130,11 @@ function assertWorkItemId(value) {
 
 function normalizeRequestedBy(value) {
   assertExactKeys(value, ["roleId", "workItemId"]);
+  if (typeof value.roleId !== "string" || !SAFE_ROLE_ID.test(value.roleId)) {
+    throw invalidRequest();
+  }
   return {
-    roleId: assertSafeId(value.roleId),
+    roleId: value.roleId,
     workItemId: assertWorkItemId(value.workItemId),
   };
 }

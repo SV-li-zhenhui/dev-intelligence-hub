@@ -17,6 +17,7 @@ const SCHEMA_VERSION = 1;
 const SHA256 = /^[a-f0-9]{64}$/;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_CONTAINER_NAME = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 const CONTROL_CHARACTER = /\p{Cc}/u;
 const MISSING_STATE = Object.freeze({ missing: true });
@@ -332,7 +333,7 @@ function validateSession(sessionId, session) {
     session.id !== sessionId ||
     !SAFE_ID.test(session.workspaceId) ||
     !hasExactKeys(session.requestedBy, ["roleId", "workItemId"]) ||
-    !SAFE_ID.test(session.requestedBy.roleId) ||
+    !SAFE_ROLE_ID.test(session.requestedBy.roleId) ||
     !(
       session.requestedBy.workItemId === null ||
       (typeof session.requestedBy.workItemId === "string" &&
