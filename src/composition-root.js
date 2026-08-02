@@ -201,6 +201,7 @@ export async function createApplication({
   let codeJobControl = null;
   let codeJobWorker = null;
   let codeJobMemoryProjector = null;
+  let codeJobChangePackageDispatcher = null;
   let changePackageReader = null;
   let changePackageApplicationReader = null;
   let changePackageApplicationRequester = null;
@@ -259,6 +260,8 @@ export async function createApplication({
       config.githubActions?.enabled === true;
     const localCodeExecutionEnabled =
       coordinationEnabled && externalActions && Boolean(codeExecutorRuntime);
+    const codeJobChangePackageDeliveryEnabled =
+      localCodeExecutionEnabled && changePackageActionsEnabled;
     const codeRunnerRoleIds = localCodeExecutionEnabled
       ? codeActionRunnerRoles(coordinationConfig.policy)
       : [];
@@ -376,6 +379,21 @@ export async function createApplication({
                   coordinationConfig.codeJobObservationLimit,
               }),
         },
+        ...(codeJobChangePackageDeliveryEnabled
+          ? {
+              completedChangeExporter: frozenPort(
+                codeExecutorRuntime.completedChangeExporter,
+                ["export"],
+                "codeExecutorRuntime.completedChangeExporter",
+              ),
+              changePackageProducer: frozenPort(
+                changePackageRuntime.packageProducer,
+                ["create"],
+                "changePackageRuntime.packageProducer",
+              ),
+              changePackageReader,
+            }
+          : {}),
       };
     }
     if (coordinationEnabled && memoryRuntime) {
@@ -421,6 +439,13 @@ export async function createApplication({
         ["runCycle"],
         "codeJobMemoryProjector",
       );
+      if (codeJobChangePackageDeliveryEnabled) {
+        codeJobChangePackageDispatcher = frozenPort(
+          codeJobRuntime.changePackageDelivery,
+          ["runCycle"],
+          "codeJobRuntime.changePackageDelivery",
+        );
+      }
     }
     const localExecutors = {};
     if (localCodeExecutionEnabled) {
@@ -631,6 +656,7 @@ export async function createApplication({
         ledger: workLedgerRuntime,
         codeJobRunner: codeJobWorker,
         codeJobMemoryProjector,
+        codeJobChangePackageDispatcher,
         proposalRunner,
         proposalResultReconciler,
         attentionResultReconciler,

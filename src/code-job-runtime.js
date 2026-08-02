@@ -5,6 +5,7 @@ import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
 import { CodeJobApprovalExecutor } from "./services/code-job-approval-executor.js";
+import { CodeJobChangePackageDispatcher } from "./services/code-job-change-package-dispatcher.js";
 import { CodeJobStore } from "./services/code-job-store.js";
 import { CodeJobWorkerService } from "./services/code-job-worker-service.js";
 
@@ -51,6 +52,79 @@ function runtimeDataDirectory(value) {
 
 function frozenPort(methods) {
   return Object.freeze(methods);
+}
+
+function methodDescriptor(value, name) {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return null;
+  }
+  let owner = value;
+  while (
+    owner !== null &&
+    owner !== Object.prototype &&
+    owner !== Function.prototype
+  ) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+    if (descriptor) return descriptor;
+    owner = Object.getPrototypeOf(owner);
+  }
+  return null;
+}
+
+function bindPort(value, methods, name) {
+  const entries = methods.map((method) => {
+    const descriptor = methodDescriptor(value, method);
+    if (
+      !descriptor ||
+      !("value" in descriptor) ||
+      typeof descriptor.value !== "function"
+    ) {
+      throw new TypeError(`${name} is invalid`);
+    }
+    return [
+      method,
+      (...args) => Reflect.apply(descriptor.value, value, args),
+    ];
+  });
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+function changePackageDeliveryPorts({
+  completedChangeExporter,
+  changePackageProducer,
+  changePackageReader,
+}) {
+  const supplied = [
+    completedChangeExporter,
+    changePackageProducer,
+    changePackageReader,
+  ].filter((value) => value !== undefined).length;
+  if (supplied === 0) return null;
+  if (supplied !== 3) {
+    throw new TypeError(
+      "change package delivery dependencies must be configured together",
+    );
+  }
+  return Object.freeze({
+    completedChangeExporter: bindPort(
+      completedChangeExporter,
+      ["export"],
+      "completed change package exporter",
+    ),
+    changePackageProducer: bindPort(
+      changePackageProducer,
+      ["create"],
+      "change package producer",
+    ),
+    changePackageReader: bindPort(
+      changePackageReader,
+      ["get"],
+      "change package reader",
+    ),
+  });
 }
 
 function normalizeWorkerLimits(value) {
@@ -105,6 +179,9 @@ export async function createCodeJobRuntime({
   clock,
   limits,
   memoryReceiptVerifier,
+  completedChangeExporter,
+  changePackageProducer,
+  changePackageReader,
   workerLimits = {},
   workerFactory = (options) => new CodeJobWorkerService(options),
   createGuard = (options) => new ProcessExclusiveGuard(options),
@@ -127,6 +204,11 @@ export async function createCodeJobRuntime({
   if (executor !== undefined && grantVerifier === undefined) {
     throw new TypeError("grantVerifier is required when executor is configured");
   }
+  const changePackagePorts = changePackageDeliveryPorts({
+    completedChangeExporter,
+    changePackageProducer,
+    changePackageReader,
+  });
   const normalizedWorkerLimits = normalizeWorkerLimits(workerLimits);
   const durableStore = validateStore(
     store === undefined
@@ -154,8 +236,22 @@ export async function createCodeJobRuntime({
       ...(memoryReceiptVerifier === undefined
         ? {}
         : { memoryReceiptVerifier }),
+      ...(changePackagePorts === null
+        ? {}
+        : { changePackageReader: changePackagePorts.changePackageReader }),
     });
     await jobs.recover();
+    const changePackageDispatcher = changePackagePorts === null
+      ? null
+      : new CodeJobChangePackageDispatcher({
+          deliverySource: {
+            readBatch: (value) => jobs.readChangePackageDeliveryBatch(value),
+            ack: (value) => jobs.acknowledgeChangePackageDelivery(value),
+          },
+          completedChangeExporter:
+            changePackagePorts.completedChangeExporter,
+          packageProducer: changePackagePorts.changePackageProducer,
+        });
     const approvalExecutor = grantVerifier === undefined
       ? null
       : new CodeJobApprovalExecutor({
@@ -171,6 +267,9 @@ export async function createCodeJobRuntime({
           brainDirectory,
           grantVerifier,
           operationQueue: workerOperationQueue,
+          ...(changePackageDispatcher === null
+            ? {}
+            : { changePackageDeliveryEnabled: true }),
         });
     if (worker !== null && typeof worker?.runCycle !== "function") {
       throw new TypeError("code job worker is invalid");
@@ -207,6 +306,12 @@ export async function createCodeJobRuntime({
         ack: (value) =>
           admission.run(() => jobs.acknowledgeMemoryProjection(value)),
       }),
+      changePackageDelivery: changePackageDispatcher === null
+        ? null
+        : frozenPort({
+            runCycle: (value) =>
+              admission.run(() => changePackageDispatcher.runCycle(value)),
+          }),
       worker: worker === null
         ? null
         : frozenPort({

@@ -123,6 +123,7 @@ class FakeJobStore {
       return [entry.jobId, copy];
     }));
     this.events = events;
+    this.completionRequests = [];
     this.beforeAdmit = null;
     this.afterAdmit = null;
   }
@@ -351,7 +352,9 @@ class FakeJobStore {
     }, "observe");
   }
 
-  async complete({ jobId, expectedRevision, result }) {
+  async complete(value) {
+    this.completionRequests.push(structuredClone(value));
+    const { jobId, expectedRevision, result } = value;
     return this.#terminal(jobId, expectedRevision, "completed", result);
   }
 
@@ -1293,6 +1296,7 @@ test("the host selects fixed profiles and completes only after current-attempt p
       { type: "complete", outcome: "fixed", evidence: ["tests"] },
     ], brainCalls),
     grantVerifier: verifier(events),
+    changePackageDeliveryEnabled: true,
   });
 
   const result = await worker.runCycle();
@@ -1302,6 +1306,8 @@ test("the host selects fixed profiles and completes only after current-attempt p
   const stored = await store.getForWorker(initial.jobId);
   assert.equal(stored.status, "completed");
   assert.equal(stored.execution.result.detail.manifest.modified[0].path, "src/app.js");
+  assert.equal(store.completionRequests.length, 1);
+  assert.equal(store.completionRequests[0].changePackageDelivery, true);
 });
 
 test("revoked authority fences the job before brain or executor access", async () => {
@@ -1548,6 +1554,7 @@ test("a durable complete observation finishes locally after authority revocation
     executor,
     brainDirectory: brain([]),
     grantVerifier: verifier(events, authorityError),
+    changePackageDeliveryEnabled: true,
   });
 
   const result = await worker.runCycle();
@@ -1556,6 +1563,52 @@ test("a durable complete observation finishes locally after authority revocation
   assert.deepEqual(executor.calls, []);
   assert.equal(events.includes("verify"), false);
   assert.equal((await store.getForWorker(initial.jobId)).status, "completed");
+  assert.equal(store.completionRequests.length, 1);
+  assert.equal(store.completionRequests[0].changePackageDelivery, true);
+});
+
+test("change package delivery defaults off and requires a strict boolean", async () => {
+  const completeAction = {
+    type: "complete",
+    actionId: "complete-without-delivery",
+    expectedWorkspaceRevision: REVISION_A,
+  };
+  const initial = job({
+    status: "active",
+    revision: 8,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 1,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [observation(completeAction)],
+      result: null,
+      pause: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const dependencies = {
+    jobStore: store,
+    executor: new FakeExecutor(initial),
+    brainDirectory: brain([]),
+    grantVerifier: verifier([]),
+  };
+  const worker = new CodeJobWorkerService(dependencies);
+
+  await worker.runCycle();
+
+  assert.equal(store.completionRequests.length, 1);
+  assert.equal("changePackageDelivery" in store.completionRequests[0], false);
+  for (const invalid of [null, 0, 1, "true", {}, []]) {
+    assert.throws(
+      () => new CodeJobWorkerService({
+        ...dependencies,
+        changePackageDeliveryEnabled: invalid,
+      }),
+      /changePackageDeliveryEnabled must be a boolean/,
+    );
+  }
 });
 
 test("resuming an interrupted session invalidates prior-attempt profile proof", async () => {

@@ -7,6 +7,7 @@ import {
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { createChangePackage } from "../src/domain/change-package-contract.js";
 import {
   memoryRecordForCodeJobEvent,
 } from "../src/domain/code-job-memory-event.js";
@@ -168,6 +169,7 @@ async function readyStore({
       return { ...structuredClone(value), persisted: true };
     },
   },
+  changePackageReader = null,
 } = {}) {
   const exclusiveLease = new ExclusiveLease();
   const jobs = new CodeJobStore({
@@ -176,10 +178,145 @@ async function readyStore({
     operationQueue: new OperationQueue(),
     clock: time.clock,
     memoryReceiptVerifier,
+    changePackageReader,
     ...(limits ? { limits } : {}),
   });
   await jobs.recover();
   return { jobs, store, time, exclusiveLease };
+}
+
+async function completedDeliveryFixture(options = {}) {
+  const fixture = await readyStore(options);
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const starting = await fixture.jobs.claimStarting({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+  });
+  const workspaceRevision = "4".repeat(64);
+  const active = await fixture.jobs.activate({
+    jobId: created.job.jobId,
+    expectedRevision: starting.job.revision,
+    workspaceRevision,
+  });
+  const actionId = "complete-change-package";
+  const prepared = await fixture.jobs.prepareAction({
+    jobId: created.job.jobId,
+    expectedRevision: active.job.revision,
+    action: {
+      type: "complete",
+      actionId,
+      expectedWorkspaceRevision: workspaceRevision,
+    },
+  });
+  const detail = { created: [], modified: [], deleted: [] };
+  const observed = await fixture.jobs.recordObservation({
+    jobId: created.job.jobId,
+    expectedRevision: prepared.job.revision,
+    actionId,
+    status: "succeeded",
+    workspaceRevision,
+    detail,
+  });
+  const result = { summary: "Change package ready", manifest: detail };
+  const completed = await fixture.jobs.complete({
+    jobId: created.job.jobId,
+    expectedRevision: observed.job.revision,
+    result,
+    changePackageDelivery: true,
+  });
+  return {
+    ...fixture,
+    completed,
+    observed,
+    result,
+    workspaceRevision,
+    actionId,
+  };
+}
+
+async function appendCompletedDelivery(
+  jobs,
+  jobApproval,
+  actionId,
+  workspaceRevision = "4".repeat(64),
+) {
+  const created = await jobs.createApprovedJob(jobApproval);
+  const starting = await jobs.claimStarting({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+  });
+  const active = await jobs.activate({
+    jobId: created.job.jobId,
+    expectedRevision: starting.job.revision,
+    workspaceRevision,
+  });
+  const prepared = await jobs.prepareAction({
+    jobId: created.job.jobId,
+    expectedRevision: active.job.revision,
+    action: {
+      type: "complete",
+      actionId,
+      expectedWorkspaceRevision: workspaceRevision,
+    },
+  });
+  const detail = { created: [], modified: [], deleted: [] };
+  const observed = await jobs.recordObservation({
+    jobId: created.job.jobId,
+    expectedRevision: prepared.job.revision,
+    actionId,
+    status: "succeeded",
+    workspaceRevision,
+    detail,
+  });
+  return jobs.complete({
+    jobId: created.job.jobId,
+    expectedRevision: observed.job.revision,
+    result: { summary: `${actionId} ready`, manifest: detail },
+    changePackageDelivery: true,
+  });
+}
+
+function changePackageForEvent(event, overrides = {}) {
+  const draft = {
+    job: event.job,
+    proposal: event.proposal,
+    grant: event.grant,
+    workspace: {
+      id: "widgets-local",
+      sourceRevision: "3".repeat(64),
+      workspaceRevision: event.exportRequest.expectedWorkspaceRevision,
+    },
+    passedProfiles: [{
+      id: "node-tests",
+      configDigest: "b".repeat(64),
+      workspaceRevision: event.exportRequest.expectedWorkspaceRevision,
+      actionId: "run-node-tests",
+      attemptNumber: 1,
+      imageId: `sha256:${"a".repeat(64)}`,
+      artifacts: {
+        output: { path: "proof/output.json", sha256: "5".repeat(64), bytes: 1 },
+        stdout: { path: "proof/stdout.json", sha256: "6".repeat(64), bytes: 1 },
+        stderr: { path: "proof/stderr.json", sha256: "7".repeat(64), bytes: 1 },
+      },
+    }],
+    created: [],
+    modified: [],
+    deleted: [],
+  };
+  return createChangePackage({ ...draft, ...overrides }).manifest;
+}
+
+function changePackageAcknowledgement(event, manifest, overrides = {}) {
+  return {
+    sequence: event.sequence,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    jobId: event.job.id,
+    sourceRecordDigest: event.job.recordDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    ...overrides,
+  };
 }
 
 async function preparedActionFixture(actionId) {
@@ -1253,6 +1390,7 @@ test("schema v5 explicit null admission remains prepared but not admitted", asyn
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 5;
   delete legacy.memoryProjection;
+  delete legacy.changePackageDelivery;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const { uncertainty: _uncertainty, ...execution } = jobValue.execution;
     const content = { ...jobValue, execution };
@@ -1271,10 +1409,10 @@ test("schema v5 explicit null admission remains prepared but not admitted", asyn
     expectedRevision: pending.revision,
     reason: "迁移后暂停",
   });
-  assert.equal(store.value.schemaVersion, 7);
+  assert.equal(store.value.schemaVersion, 8);
 });
 
-test("schema v2 and v3 outer states recover and write back as v7", async (t) => {
+test("schema v2 and v3 outer states recover and write back as v8", async (t) => {
   for (const schemaVersion of [2, 3]) {
     await t.test(`schema v${schemaVersion}`, async () => {
       const fixture = await readyStore();
@@ -1282,6 +1420,7 @@ test("schema v2 and v3 outer states recover and write back as v7", async (t) => 
       const legacy = structuredClone(fixture.store.value);
       legacy.schemaVersion = schemaVersion;
       delete legacy.memoryProjection;
+      delete legacy.changePackageDelivery;
       delete legacy.lastCompaction;
       if (schemaVersion === 2) delete legacy.archiveIndex;
       legacy.jobs = legacy.jobs.map((jobValue) => {
@@ -1311,11 +1450,34 @@ test("schema v2 and v3 outer states recover and write back as v7", async (t) => 
         reason: `升级 schema v${schemaVersion}`,
       });
 
-      assert.equal(store.value.schemaVersion, 7);
+      assert.equal(store.value.schemaVersion, 8);
       assert.ok(Array.isArray(store.value.archiveIndex));
       assert.equal(Object.hasOwn(store.value, "lastCompaction"), true);
     });
   }
+});
+
+test("schema v7 recovery starts package delivery empty and writes back as v8", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const legacy = structuredClone(fixture.store.value);
+  legacy.schemaVersion = 7;
+  delete legacy.changePackageDelivery;
+  const store = new MemoryStore(legacy);
+  const recovered = await readyStore({ store });
+
+  assert.deepEqual(await recovered.jobs.readChangePackageDeliveryBatch(), {
+    cursor: 0,
+    highWatermark: 0,
+    items: [],
+  });
+  assert.equal(store.value.schemaVersion, 7);
+  await recovered.jobs.pause({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    reason: "升级 schema v7",
+  });
+  assert.equal(store.value.schemaVersion, 8);
 });
 
 test("schema v6 recovery deterministically seeds current meaningful memory events", async (t) => {
@@ -1383,6 +1545,7 @@ test("schema v6 recovery deterministically seeds current meaningful memory event
       const legacy = structuredClone(fixture.store.value);
       legacy.schemaVersion = 6;
       delete legacy.memoryProjection;
+      delete legacy.changePackageDelivery;
       const store = new MemoryStore(legacy);
       const recovered = await readyStore({ store });
       const batch = await recovered.jobs.readMemoryProjectionBatch();
@@ -1395,7 +1558,7 @@ test("schema v6 recovery deterministically seeds current meaningful memory event
         await recovered.jobs.acknowledgeMemoryProjection(
           memoryAcknowledgement(batch.items[0]),
         );
-        assert.equal(store.value.schemaVersion, 7);
+        assert.equal(store.value.schemaVersion, 8);
       }
     });
   }
@@ -1413,6 +1576,7 @@ test("schema v6 does not replay a terminal event that already has a memory recei
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 6;
   delete legacy.memoryProjection;
+  delete legacy.changePackageDelivery;
 
   const recovered = await readyStore({ store: new MemoryStore(legacy) });
   assert.deepEqual(await recovered.jobs.readMemoryProjectionBatch(), {
@@ -1527,6 +1691,7 @@ test("legacy pending actions migrate to explicit admitted uncertainty", async ()
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 4;
   delete legacy.memoryProjection;
+  delete legacy.changePackageDelivery;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const {
       actionAdmission: _actionAdmission,
@@ -1586,7 +1751,7 @@ test("legacy pending actions migrate to explicit admitted uncertainty", async ()
   assert.equal(paused.job.execution.uncertainty, null);
   assert.equal(paused.job.execution.actionAdmission, null);
   assert.equal(paused.job.execution.pendingAction.actionId, pending.actionId);
-  assert.equal(store.value.schemaVersion, 7);
+  assert.equal(store.value.schemaVersion, 8);
 });
 
 test("terminal transitions are sealed, idempotent, and browser-safe", async () => {
@@ -1661,6 +1826,369 @@ test("terminal transitions are sealed, idempotent, and browser-safe", async () =
   assert.equal(JSON.stringify(browser).includes("Inspection completed"), false);
 });
 
+test("completed package delivery intent is atomic, durable, and idempotent", async () => {
+  const fixture = await completedDeliveryFixture();
+  const batch = await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 });
+
+  assert.equal(fixture.store.value.schemaVersion, 8);
+  assert.equal(batch.cursor, 0);
+  assert.equal(batch.highWatermark, 1);
+  assert.equal(batch.items.length, 1);
+  assert.deepEqual(batch.items[0].job, {
+    id: fixture.completed.job.jobId,
+    revision: fixture.completed.job.revision,
+    recordDigest: fixture.completed.job.recordDigest,
+  });
+  assert.deepEqual(batch.items[0].proposal, {
+    id: fixture.completed.job.proposal.proposalId,
+    contentDigest: fixture.completed.job.proposal.contentDigest,
+  });
+  assert.deepEqual(batch.items[0].grant, {
+    digest: fixture.completed.job.grant.grantDigest,
+  });
+  assert.deepEqual(batch.items[0].exportRequest, {
+    sessionId: fixture.completed.job.jobId,
+    completedActionId: fixture.actionId,
+    expectedWorkspaceRevision: fixture.workspaceRevision,
+  });
+
+  const writeCount = fixture.store.writeCount;
+  const repeated = await fixture.jobs.complete({
+    jobId: fixture.completed.job.jobId,
+    expectedRevision: fixture.observed.job.revision,
+    result: fixture.result,
+    changePackageDelivery: true,
+  });
+  assert.equal(repeated.status, "already");
+  assert.equal(fixture.store.writeCount, writeCount);
+  assert.equal(
+    (await fixture.jobs.readChangePackageDeliveryBatch()).items.length,
+    1,
+  );
+
+  const recovered = await readyStore({ store: fixture.store });
+  assert.deepEqual(
+    await recovered.jobs.readChangePackageDeliveryBatch({ limit: 10 }),
+    batch,
+  );
+});
+
+test("package delivery chain corruption is rejected before work is served", async () => {
+  const fixture = await completedDeliveryFixture();
+  const tampered = structuredClone(fixture.store.value);
+  tampered.changePackageDelivery.pending[0].eventDigest = "0".repeat(64);
+
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(tampered) }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+});
+
+test("package delivery acknowledgements verify immutable packages and survive lost responses", async () => {
+  let manifest = null;
+  const changePackageReader = {
+    async get(packageId) {
+      assert.equal(packageId, manifest.packageId);
+      return structuredClone(manifest);
+    },
+  };
+  const fixture = await completedDeliveryFixture({ changePackageReader });
+  const [event] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  manifest = changePackageForEvent(event);
+  const acknowledgement = changePackageAcknowledgement(event, manifest);
+
+  await assert.rejects(
+    fixture.jobs.acknowledgeChangePackageDelivery({
+      ...acknowledgement,
+      sourceRecordDigest: "0".repeat(64),
+    }),
+    (error) => error.code === "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT",
+  );
+  fixture.store.writeThenFailAt = fixture.store.writeCount + 1;
+  await assert.rejects(
+    fixture.jobs.acknowledgeChangePackageDelivery(acknowledgement),
+    /disk acknowledgement unavailable/,
+  );
+  const repeated = await fixture.jobs.acknowledgeChangePackageDelivery(
+    acknowledgement,
+  );
+  assert.deepEqual(repeated, {
+    status: "already",
+    cursor: 1,
+    highWatermark: 1,
+  });
+  assert.deepEqual(await fixture.jobs.readChangePackageDeliveryBatch(), {
+    cursor: 1,
+    highWatermark: 1,
+    items: [],
+  });
+});
+
+test("any retained package acknowledgement stays idempotent after later progress", async () => {
+  const manifests = new Map();
+  const fixture = await completedDeliveryFixture({
+    changePackageReader: {
+      async get(packageId) {
+        return structuredClone(manifests.get(packageId));
+      },
+    },
+  });
+  const [firstEvent] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  const firstManifest = changePackageForEvent(firstEvent);
+  manifests.set(firstManifest.packageId, firstManifest);
+  const firstAcknowledgement = changePackageAcknowledgement(
+    firstEvent,
+    firstManifest,
+  );
+  await fixture.jobs.acknowledgeChangePackageDelivery(firstAcknowledgement);
+
+  const secondGrant = grant({
+    proposalId: "work-intent-proposal-package-second",
+    contentDigest: "1".repeat(64),
+    requestedBy: { roleId: "tester", workItemId: "work-package-second" },
+    source: {
+      assignmentId: "assignment-package-second",
+      eventId: "event-package-second",
+    },
+  });
+  await appendCompletedDelivery(
+    fixture.jobs,
+    approval({
+      confirmationId: "confirmation-code-job-package-second",
+      requestId: "approval-request-package-second",
+      displayedPayloadDigest: "2".repeat(64),
+      approvalBindingDigest: "3".repeat(64),
+      grant: secondGrant,
+    }),
+    "complete-change-package-second",
+  );
+  const [secondEvent] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  const secondManifest = changePackageForEvent(secondEvent);
+  manifests.set(secondManifest.packageId, secondManifest);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(secondEvent, secondManifest),
+  );
+
+  assert.deepEqual(
+    Object.keys(fixture.store.value.changePackageDelivery.delivered[0]),
+    ["previousDigest", "receipt"],
+  );
+  assert.deepEqual(
+    await fixture.jobs.acknowledgeChangePackageDelivery(firstAcknowledgement),
+    { status: "already", cursor: 2, highWatermark: 2 },
+  );
+});
+
+test("package delivery remains pending when the immutable package is wrong or unavailable", async () => {
+  let manifest = null;
+  let readerFailure = null;
+  const fixture = await completedDeliveryFixture({
+    changePackageReader: {
+      async get() {
+        if (readerFailure !== null) throw readerFailure;
+        return structuredClone(manifest);
+      },
+    },
+  });
+  const [event] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  manifest = changePackageForEvent(event, {
+    workspace: {
+      id: "foreign-local",
+      sourceRevision: "3".repeat(64),
+      workspaceRevision: event.exportRequest.expectedWorkspaceRevision,
+    },
+  });
+  await assert.rejects(
+    fixture.jobs.acknowledgeChangePackageDelivery(
+      changePackageAcknowledgement(event, manifest),
+    ),
+    (error) => error.code === "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT",
+  );
+
+  manifest = changePackageForEvent(event);
+  const acknowledgement = changePackageAcknowledgement(event, manifest);
+  readerFailure = new Error("package store unavailable");
+  await assert.rejects(
+    fixture.jobs.acknowledgeChangePackageDelivery(acknowledgement),
+    (error) => error.code === "CODE_JOB_CHANGE_PACKAGE_RECEIPT_UNVERIFIED",
+  );
+  assert.equal(
+    (await fixture.jobs.readChangePackageDeliveryBatch()).items.length,
+    1,
+  );
+
+  readerFailure = null;
+  assert.equal(
+    (await fixture.jobs.acknowledgeChangePackageDelivery(acknowledgement)).status,
+    "applied",
+  );
+});
+
+test("an accepted package checkpoint rejects a higher-revision delivery fork", async () => {
+  let manifest = null;
+  const changePackageReader = {
+    async get() {
+      return structuredClone(manifest);
+    },
+  };
+  const fixture = await completedDeliveryFixture({ changePackageReader });
+  const beforeAcknowledgement = structuredClone(fixture.store.value);
+  const [event] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  manifest = changePackageForEvent(event);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(event, manifest),
+  );
+
+  const forkStore = new MemoryStore(beforeAcknowledgement);
+  const fork = await readyStore({ store: forkStore, changePackageReader });
+  const forkGrant = grant({
+    proposalId: "work-intent-proposal-package-fork",
+    contentDigest: "1".repeat(64),
+    requestedBy: { roleId: "tester", workItemId: "work-package-fork" },
+    source: {
+      assignmentId: "assignment-package-fork",
+      eventId: "event-package-fork",
+    },
+  });
+  const forkCreated = await fork.jobs.createApprovedJob(approval({
+    confirmationId: "confirmation-code-job-package-fork",
+    requestId: "approval-request-package-fork",
+    displayedPayloadDigest: "2".repeat(64),
+    approvalBindingDigest: "3".repeat(64),
+    grant: forkGrant,
+  }));
+  await fork.jobs.pause({
+    jobId: forkCreated.job.jobId,
+    expectedRevision: forkCreated.job.revision,
+    reason: "形成更高修订的变更包投递分叉",
+  });
+  fixture.store.value = forkStore.value;
+
+  await assert.rejects(
+    fixture.jobs.createApprovedJob(
+      approval({ requestId: "approval-request-package-fork-retry" }),
+    ),
+    (error) => error.code === "CODE_JOB_CHANGE_PACKAGE_FORKED",
+  );
+});
+
+test("a completed job cannot be archived before its package delivery receipt", async () => {
+  let manifest = null;
+  const fixture = await completedDeliveryFixture({
+    changePackageReader: {
+      async get() {
+        return structuredClone(manifest);
+      },
+    },
+  });
+  const memoryEvents = await fixture.jobs.readMemoryProjectionBatch({ limit: 10 });
+  for (const event of memoryEvents.items) {
+    await fixture.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(event),
+    );
+  }
+  await assert.rejects(
+    fixture.jobs.compactTerminalPrefix(
+      compactionRequest(fixture.store, {
+        compactionId: "package-delivery-pending",
+        targetThroughSequence: fixture.completed.job.sequence,
+      }),
+    ),
+    (error) => error.code === "CODE_JOB_RETENTION_BLOCKED",
+  );
+
+  const [delivery] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  manifest = changePackageForEvent(delivery);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(delivery, manifest),
+  );
+  const compacted = await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "package-delivery-complete",
+      targetThroughSequence: fixture.completed.job.sequence,
+    }),
+  );
+  assert.equal(compacted.status, "applied");
+  assert.equal(compacted.receipt.archived, 1);
+});
+
+test("archived package delivery remains bound to the exact completed job version", async () => {
+  let manifest = null;
+  const changePackageReader = {
+    async get() {
+      return structuredClone(manifest);
+    },
+  };
+  const fixture = await completedDeliveryFixture({ changePackageReader });
+  const memoryEvents = await fixture.jobs.readMemoryProjectionBatch({ limit: 100 });
+  for (const event of memoryEvents.items) {
+    await fixture.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  }
+  const [delivery] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  manifest = changePackageForEvent(delivery);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(delivery, manifest),
+  );
+  await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "package-delivery-archive-binding",
+      targetThroughSequence: fixture.completed.job.sequence,
+    }),
+  );
+  await readyStore({ store: fixture.store, changePackageReader });
+  const durable = structuredClone(fixture.store.value);
+
+  const forgedContent = {
+    schemaVersion: delivery.schemaVersion,
+    sequence: delivery.sequence,
+    previousDigest: delivery.previousDigest,
+    job: delivery.job,
+    proposal: delivery.proposal,
+    grant: delivery.grant,
+    exportRequest: {
+      ...delivery.exportRequest,
+      expectedWorkspaceRevision: "8".repeat(64),
+    },
+  };
+  const forgedDigest = digestValue(forgedContent);
+  const rebound = structuredClone(durable);
+  rebound.changePackageDelivery.delivered[0].receipt.eventId =
+    `code-job-change-package-event-${forgedDigest}`;
+  rebound.changePackageDelivery.delivered[0].receipt.eventDigest = forgedDigest;
+  rebound.changePackageDelivery.checkpointDigest = forgedDigest;
+  const truncated = structuredClone(durable);
+  truncated.changePackageDelivery = {
+    revision: 0,
+    nextSequence: 1,
+    cursor: 0,
+    checkpointDigest: null,
+    pending: [],
+    delivered: [],
+  };
+
+  for (const tampered of [rebound, truncated]) {
+    fixture.store.value = tampered;
+    await assert.rejects(
+      readyStore({ store: fixture.store, changePackageReader }),
+      (error) => error.code === "CODE_JOB_ARCHIVE_CORRUPTED",
+    );
+  }
+});
+
 test("meaningful lifecycle changes append one ordered durable memory event", async () => {
   const fixture = await preparedActionFixture("memory-stream-observation");
   const observed = await fixture.jobs.recordObservation({
@@ -1698,7 +2226,7 @@ test("meaningful lifecycle changes append one ordered durable memory event", asy
   assert.deepEqual(batch.items.map(({ sequence }) => sequence), [1, 2, 3, 4]);
   assert.equal(batch.items[0].previousDigest, null);
   assert.equal(batch.items[1].previousDigest, batch.items[0].eventDigest);
-  assert.equal(fixture.store.value.schemaVersion, 7);
+  assert.equal(fixture.store.value.schemaVersion, 8);
 
   const repeated = await fixture.jobs.recordObservation({
     jobId: fixture.created.job.jobId,
@@ -2021,6 +2549,7 @@ test("schema v5 terminal digest and memory receipt recover without uncertainty",
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 5;
   delete legacy.memoryProjection;
+  delete legacy.changePackageDelivery;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const { recordDigest: _recordDigest, ...projectedContent } = jobValue;
     const receipt = projectedContent.execution.memoryProjection;

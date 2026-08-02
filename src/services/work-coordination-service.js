@@ -65,6 +65,10 @@ async function skipCodeJobs() {
   return { skipped: "not_configured" };
 }
 
+async function skipCodeJobChangePackages() {
+  return { skipped: "not_configured" };
+}
+
 async function skipCodeJobMemory() {
   return { skipped: "not_configured" };
 }
@@ -79,6 +83,7 @@ function stageFailure(stage, error) {
 export class WorkCoordinationService {
   #intake;
   #runCodeJobs;
+  #dispatchCodeJobChangePackages;
   #projectCodeJobMemory;
   #runProposals;
   #reconcileProposals;
@@ -93,6 +98,7 @@ export class WorkCoordinationService {
   constructor({
     ledger,
     codeJobRunner,
+    codeJobChangePackageDispatcher,
     codeJobMemoryProjector,
     proposalRunner,
     proposalResultReconciler,
@@ -113,6 +119,14 @@ export class WorkCoordinationService {
     this.#runCodeJobs = codeJobRunner == null
       ? skipCodeJobs
       : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
+    this.#dispatchCodeJobChangePackages =
+      codeJobChangePackageDispatcher == null
+        ? skipCodeJobChangePackages
+        : requirePort(
+            codeJobChangePackageDispatcher,
+            "runCycle",
+            "codeJobChangePackageDispatcher",
+          );
     this.#projectCodeJobMemory = codeJobMemoryProjector == null
       ? skipCodeJobMemory
       : requirePort(
@@ -185,6 +199,10 @@ export class WorkCoordinationService {
           ...(options.includeWork && options.roleId !== null
             ? { roleId: options.roleId }
             : {}),
+        })],
+      ["code_job_change_packages", () =>
+        this.#dispatchCodeJobChangePackages({
+          limit: this.#defaults.codeJobLimit,
         })],
       ["code_job_memory", () =>
         this.#projectCodeJobMemory({

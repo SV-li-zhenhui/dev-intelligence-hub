@@ -26,6 +26,13 @@ import {
   memoryRecordForCodeJobEvent,
   normalizeCodeJobMemoryEvent,
 } from "../domain/code-job-memory-event.js";
+import {
+  createCodeJobChangePackageEvent,
+  normalizeCodeJobChangePackageEvent,
+} from "../domain/code-job-change-package-event.js";
+import {
+  normalizeChangePackageManifest,
+} from "../domain/change-package-contract.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
 
 export const CODE_JOB_STATE_KEY = "code-job-state";
@@ -36,11 +43,15 @@ const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_ARCHIVED_JOBS = 10_000;
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_PENDING_MEMORY_EVENTS = 256_000;
+const MAX_CHANGE_PACKAGE_DELIVERIES = MAX_JOBS + MAX_ARCHIVED_JOBS;
 const ACTION_COMMIT_HEADROOM_BYTES = 320 * 1024;
 const TERMINAL_HEADROOM_BYTES = 160 * 1024;
 const MEMORY_RECEIPT_HEADROOM_BYTES = 16 * 1024;
 const JOB_ID = /^code-job-[a-f0-9]{55}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const CHANGE_PACKAGE_ID = /^change-package-[a-f0-9]{64}$/;
+const CHANGE_PACKAGE_EVENT_ID =
+  /^code-job-change-package-event-[a-f0-9]{64}$/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const STATUS_SET = new Set(CODE_JOB_STATUSES);
 const RUNNABLE_STATUSES = new Set([
@@ -87,7 +98,7 @@ function capacityExceeded() {
 function retentionBlocked() {
   return storeError(
     "CODE_JOB_RETENTION_BLOCKED",
-    "代码任务归档被未完成的前缀任务或缺失的记忆投影阻塞",
+    "代码任务归档被未完成的前缀任务、记忆投影或变更包投递阻塞",
     409,
   );
 }
@@ -126,6 +137,31 @@ function memoryOrderConflict() {
     "CODE_JOB_MEMORY_ORDER_CONFLICT",
     "代码任务记忆投影确认顺序无效",
     409,
+  );
+}
+
+function changePackageBindingConflict() {
+  return storeError(
+    "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT",
+    "代码任务 change package 投递绑定不匹配",
+    409,
+  );
+}
+
+function changePackageOrderConflict() {
+  return storeError(
+    "CODE_JOB_CHANGE_PACKAGE_ORDER_CONFLICT",
+    "代码任务 change package 投递确认顺序无效",
+    409,
+  );
+}
+
+function changePackageReceiptUnverified(cause) {
+  return storeError(
+    "CODE_JOB_CHANGE_PACKAGE_RECEIPT_UNVERIFIED",
+    "无法验证代码任务的持久 change package",
+    409,
+    cause === undefined ? undefined : { cause },
   );
 }
 
@@ -277,9 +313,20 @@ function sealArchive(value) {
   return { ...content, checkpointDigest: digestValue(content) };
 }
 
+function emptyChangePackageDelivery() {
+  return {
+    revision: 0,
+    nextSequence: 1,
+    cursor: 0,
+    checkpointDigest: null,
+    pending: [],
+    delivered: [],
+  };
+}
+
 function defaultState() {
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
     revision: 0,
     nextJobSequence: 1,
     archive: sealArchive({
@@ -302,6 +349,7 @@ function defaultState() {
       lastAcknowledgement: null,
       pending: [],
     },
+    changePackageDelivery: emptyChangePackageDelivery(),
     jobs: [],
   };
 }
@@ -661,6 +709,276 @@ function assertMemoryProjectionExtension(current, durable) {
   }
 }
 
+function normalizeChangePackageAcknowledgement(value, error, {
+  delivered = false,
+} = {}) {
+  const keys = [
+    "sequence",
+    "eventId",
+    "eventDigest",
+    "jobId",
+    "sourceRecordDigest",
+    "packageId",
+    "packageDigest",
+    ...(delivered ? ["deliveredAt"] : []),
+  ];
+  assertExactKeys(value, keys, error);
+  const eventDigest = normalizeSha256(value.eventDigest, error);
+  const packageDigest = normalizeSha256(value.packageDigest, error);
+  if (
+    typeof value.eventId !== "string" ||
+    !CHANGE_PACKAGE_EVENT_ID.test(value.eventId) ||
+    value.eventId !== `code-job-change-package-event-${eventDigest}` ||
+    typeof value.packageId !== "string" ||
+    !CHANGE_PACKAGE_ID.test(value.packageId) ||
+    value.packageId !== `change-package-${packageDigest}`
+  ) {
+    throw error;
+  }
+  return {
+    sequence: safeInteger(value.sequence, 1, Number.MAX_SAFE_INTEGER, error),
+    eventId: value.eventId,
+    eventDigest,
+    jobId: normalizeJobId(value.jobId, error),
+    sourceRecordDigest: normalizeSha256(value.sourceRecordDigest, error),
+    packageId: value.packageId,
+    packageDigest,
+    ...(delivered
+      ? { deliveredAt: normalizeCodeJobTimestamp(value.deliveredAt, error) }
+      : {}),
+  };
+}
+
+function normalizeDeliveredChangePackage(value, error) {
+  assertExactKeys(value, ["previousDigest", "receipt"], error);
+  const receipt = normalizeChangePackageAcknowledgement(
+    value.receipt,
+    error,
+    { delivered: true },
+  );
+  const previousDigest = value.previousDigest === null
+    ? null
+    : normalizeSha256(value.previousDigest, error);
+  if (
+    (receipt.sequence === 1) !== (previousDigest === null)
+  ) {
+    throw error;
+  }
+  return { previousDigest, receipt };
+}
+
+function normalizeChangePackageDelivery(value, stateRevision, error) {
+  assertExactKeys(
+    value,
+    [
+      "revision",
+      "nextSequence",
+      "cursor",
+      "checkpointDigest",
+      "pending",
+      "delivered",
+    ],
+    error,
+  );
+  const revision = safeInteger(
+    value.revision,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const nextSequence = safeInteger(
+    value.nextSequence,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const cursor = safeInteger(
+    value.cursor,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const checkpointDigest = value.checkpointDigest === null
+    ? null
+    : normalizeSha256(value.checkpointDigest, error);
+  const delivered = denseArray(
+    value.delivered,
+    MAX_CHANGE_PACKAGE_DELIVERIES,
+    error,
+  ).map((entry) => normalizeDeliveredChangePackage(entry, error));
+  const pending = denseArray(
+    value.pending,
+    MAX_CHANGE_PACKAGE_DELIVERIES,
+    error,
+  ).map((entry) => {
+    try {
+      return normalizeCodeJobChangePackageEvent(entry);
+    } catch {
+      throw error;
+    }
+  });
+  if (
+    revision > stateRevision ||
+    cursor !== delivered.length ||
+    nextSequence !== cursor + pending.length + 1 ||
+    (nextSequence === 1) !== (revision === 0) ||
+    (cursor === 0) !== (checkpointDigest === null) ||
+    new Set(
+      [
+        ...delivered.map(({ receipt }) => receipt.jobId),
+        ...pending.map(({ job }) => job.id),
+      ],
+    ).size !== delivered.length + pending.length
+  ) {
+    throw error;
+  }
+  let previousDigest = null;
+  for (let index = 0; index < delivered.length; index += 1) {
+    const entry = delivered[index];
+    if (
+      entry.receipt.sequence !== index + 1 ||
+      entry.previousDigest !== previousDigest
+    ) {
+      throw error;
+    }
+    previousDigest = entry.receipt.eventDigest;
+  }
+  if (previousDigest !== checkpointDigest) throw error;
+  for (let index = 0; index < pending.length; index += 1) {
+    const event = pending[index];
+    if (
+      event.sequence !== cursor + index + 1 ||
+      event.previousDigest !== previousDigest
+    ) {
+      throw error;
+    }
+    previousDigest = event.eventDigest;
+  }
+  return {
+    revision,
+    nextSequence,
+    cursor,
+    checkpointDigest,
+    pending,
+    delivered,
+  };
+}
+
+function appendChangePackageDelivery(delivery, job, revision) {
+  if (
+    delivery.nextSequence >= Number.MAX_SAFE_INTEGER ||
+    delivery.pending.length + delivery.delivered.length >=
+      MAX_CHANGE_PACKAGE_DELIVERIES
+  ) {
+    throw capacityExceeded();
+  }
+  const previousDigest = delivery.pending.at(-1)?.eventDigest ??
+    delivery.checkpointDigest;
+  const event = createCodeJobChangePackageEvent({
+    sequence: delivery.nextSequence,
+    previousDigest,
+    job,
+  });
+  return {
+    ...delivery,
+    revision,
+    nextSequence: delivery.nextSequence + 1,
+    pending: [...delivery.pending, event],
+  };
+}
+
+function hasChangePackageDelivery(state, jobId) {
+  return (
+    state.changePackageDelivery.pending.some(
+      (event) => event.job.id === jobId,
+    ) ||
+    state.changePackageDelivery.delivered.some(
+      ({ receipt }) => receipt.jobId === jobId,
+    )
+  );
+}
+
+function changePackageEventMatchesJob(event, job) {
+  const memory = job.execution.memoryProjection;
+  const sourceMatches =
+    (job.revision === event.job.revision &&
+      job.recordDigest === event.job.recordDigest) ||
+    (memory !== null &&
+      memory.sourceRevision === event.job.revision &&
+      memory.sourceRecordDigest === event.job.recordDigest);
+  const completion = job.execution.observations.at(-1);
+  return (
+    job.status === "completed" &&
+    sourceMatches &&
+    event.job.id === job.jobId &&
+    event.proposal.id === job.proposal.proposalId &&
+    event.proposal.contentDigest === job.proposal.contentDigest &&
+    event.grant.digest === job.grant.grantDigest &&
+    event.exportRequest.sessionId === job.execution.sessionId &&
+    event.exportRequest.completedActionId === completion?.actionId &&
+    event.exportRequest.expectedWorkspaceRevision ===
+      job.execution.workspaceRevision
+  );
+}
+
+function deliveredChangePackageMatchesJob(entry, job) {
+  try {
+    const event = createCodeJobChangePackageEvent({
+      sequence: entry.receipt.sequence,
+      previousDigest: entry.previousDigest,
+      job,
+    });
+    return (
+      changePackageEventMatchesJob(event, job) &&
+      pendingChangePackageAcknowledgement(
+        event,
+        deliveredAcknowledgement(entry.receipt),
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function assertChangePackageDeliveryExtension(current, durable) {
+  const forked = () => storeError(
+    "CODE_JOB_CHANGE_PACKAGE_FORKED",
+    "代码任务 change package 投递链发生回退或分叉",
+    500,
+  );
+  if (
+    durable.cursor < current.cursor ||
+    durable.nextSequence < current.nextSequence ||
+    (durable.cursor === current.cursor &&
+      durable.checkpointDigest !== current.checkpointDigest)
+  ) {
+    throw forked();
+  }
+  for (let index = 0; index < current.delivered.length; index += 1) {
+    if (!sameValue(current.delivered[index], durable.delivered[index])) {
+      throw forked();
+    }
+  }
+  const currentBySequence = new Map(
+    current.pending.map((event) => [event.sequence, event]),
+  );
+  for (const entry of durable.delivered.slice(current.delivered.length)) {
+    const existing = currentBySequence.get(entry.receipt.sequence);
+    if (
+      existing !== undefined &&
+      existing.eventDigest !== entry.receipt.eventDigest
+    ) {
+      throw forked();
+    }
+  }
+  for (const event of durable.pending) {
+    const existing = currentBySequence.get(event.sequence);
+    if (existing !== undefined && existing.eventDigest !== event.eventDigest) {
+      throw forked();
+    }
+  }
+}
+
 function normalizeLegacyState(value, limits, error) {
   assertExactKeys(
     value,
@@ -706,13 +1024,14 @@ function normalizeLegacyState(value, limits, error) {
     }
   }
   const state = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     revision,
     nextJobSequence,
     archive: emptyArchive(),
     archiveIndex: [],
     lastCompaction: null,
     memoryProjection: migrateMemoryProjection(jobs, revision),
+    changePackageDelivery: emptyChangePackageDelivery(),
     jobs,
   };
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
@@ -726,10 +1045,11 @@ function normalizeStateValue(value, limits) {
   if (value?.schemaVersion === 1) {
     return normalizeLegacyState(value, limits, error);
   }
-  if (![2, 3, 4, 5, 6, 7].includes(value.schemaVersion)) throw error;
+  if (![2, 3, 4, 5, 6, 7, 8].includes(value.schemaVersion)) throw error;
   const legacyVersion = value.schemaVersion === 2;
   const manifestVersion = value.schemaVersion === 3;
-  const outboxVersion = value.schemaVersion === 7;
+  const memoryOutboxVersion = value.schemaVersion >= 7;
+  const changePackageVersion = value.schemaVersion >= 8;
   assertExactKeys(
     value,
     legacyVersion
@@ -750,7 +1070,8 @@ function normalizeStateValue(value, limits) {
         "archive",
         "archiveIndex",
         "lastCompaction",
-        ...(outboxVersion ? ["memoryProjection"] : []),
+        ...(memoryOutboxVersion ? ["memoryProjection"] : []),
+        ...(changePackageVersion ? ["changePackageDelivery"] : []),
         "jobs",
       ],
     error,
@@ -777,15 +1098,43 @@ function normalizeStateValue(value, limits) {
     : null;
   const jobs = normalizeJobs(value.jobs, limits, error);
   validateUniqueJobs(jobs, error);
-  const memoryProjection = outboxVersion
+  const memoryProjection = memoryOutboxVersion
     ? normalizeMemoryProjection(value.memoryProjection, revision, error)
     : migrateMemoryProjection(jobs, revision);
+  const changePackageDelivery = changePackageVersion
+    ? normalizeChangePackageDelivery(
+        value.changePackageDelivery,
+        revision,
+        error,
+      )
+    : emptyChangePackageDelivery();
   const knownJobIds = new Set([
     ...jobs.map(({ jobId }) => jobId),
     ...archiveIndex.map(({ jobId }) => jobId),
   ]);
   const acknowledgedEvent =
     memoryProjection.lastAcknowledgement?.event ?? null;
+  const liveJobsById = new Map(jobs.map((job) => [job.jobId, job]));
+  const archivedJobsById = new Map(
+    archiveIndex.map((entry) => [entry.jobId, entry]),
+  );
+  const pendingPackageInvalid = changePackageDelivery.pending.some((event) => {
+    const job = liveJobsById.get(event.job.id);
+    return !job || !changePackageEventMatchesJob(event, job);
+  });
+  const deliveredPackageInvalid = changePackageDelivery.delivered.some(
+    (entry) => {
+      const live = liveJobsById.get(entry.receipt.jobId);
+      if (live) {
+        return !deliveredChangePackageMatchesJob(entry, live);
+      }
+      const archived = archivedJobsById.get(entry.receipt.jobId);
+      return (
+        !archived ||
+        archived.status !== "completed"
+      );
+    },
+  );
   if (
     nextJobSequence !== archive.throughSequence + jobs.length + 1 ||
     archive.jobCount !== archiveIndex.length ||
@@ -798,10 +1147,13 @@ function normalizeStateValue(value, limits) {
     (acknowledgedEvent !== null &&
       (!knownJobIds.has(acknowledgedEvent.jobId) ||
         acknowledgedEvent.jobRevision > revision)) ||
+    pendingPackageInvalid ||
+    deliveredPackageInvalid ||
     jobs.some(({ revision: jobRevision }) => jobRevision > revision) ||
     Math.max(
       archive.revision,
       memoryProjection.revision,
+      changePackageDelivery.revision,
       jobs.reduce(
         (maximum, job) => Math.max(maximum, job.revision),
         0,
@@ -829,13 +1181,14 @@ function normalizeStateValue(value, limits) {
     }
   }
   const state = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     revision,
     nextJobSequence,
     archive,
     archiveIndex,
     lastCompaction,
     memoryProjection,
+    changePackageDelivery,
     jobs: ordered,
   };
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
@@ -1058,6 +1411,29 @@ function memoryAcknowledgementResult(status, memoryProjection) {
   });
 }
 
+function changePackageAcknowledgementResult(status, delivery) {
+  return cloneCodeJobValue({
+    status,
+    cursor: delivery.cursor,
+    highWatermark: delivery.nextSequence - 1,
+  });
+}
+
+function pendingChangePackageAcknowledgement(event, request) {
+  return (
+    request.sequence === event.sequence &&
+    request.eventId === event.eventId &&
+    request.eventDigest === event.eventDigest &&
+    request.jobId === event.job.id &&
+    request.sourceRecordDigest === event.job.recordDigest
+  );
+}
+
+function deliveredAcknowledgement(receipt) {
+  const { deliveredAt: _deliveredAt, ...request } = receipt;
+  return request;
+}
+
 function sameAuthorization(job, request) {
   return (
     job.jobId === codeJobIdForGrant(request.grant) &&
@@ -1101,6 +1477,37 @@ function normalizeMutationBase(value, extraKeys = []) {
       Number.MAX_SAFE_INTEGER,
       error,
     ),
+  };
+}
+
+function normalizeFinishRequest(value, terminalStatus) {
+  if (terminalStatus !== "completed") {
+    return {
+      request: normalizeMutationBase(value, ["result"]),
+      changePackageDelivery: false,
+    };
+  }
+  const error = storeError(
+    "INVALID_CODE_JOB_MUTATION",
+    "代码任务迁移请求无效",
+  );
+  const keys = plainDataKeys(value, error);
+  const hasDelivery = keys.includes("changePackageDelivery");
+  const request = normalizeMutationBase(
+    value,
+    ["result", ...(hasDelivery ? ["changePackageDelivery"] : [])],
+  );
+  if (
+    hasDelivery &&
+    typeof value.changePackageDelivery !== "boolean"
+  ) {
+    throw error;
+  }
+  return {
+    request,
+    changePackageDelivery: hasDelivery
+      ? value.changePackageDelivery
+      : false,
   };
 }
 
@@ -1222,9 +1629,9 @@ function createArchiveTombstone(entry) {
       actionType: job.execution.observations.at(-1).actionType,
       status: job.execution.observations.at(-1).status,
       recordedAt: job.execution.observations.at(-1).recordedAt,
-    };
+  };
   const content = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     previousArchiveDigest: entry.previousArchiveDigest,
     archiveDigest: entry.archiveDigest,
     sequence: job.sequence,
@@ -1246,6 +1653,7 @@ function createArchiveTombstone(entry) {
         recordedAt: job.execution.result.recordedAt,
       },
       memoryProjection: job.execution.memoryProjection,
+      changePackageDelivery: entry.changePackageDelivery,
     },
   };
   if (
@@ -1285,7 +1693,7 @@ function normalizeArchiveTombstone(value) {
     ],
     error,
   );
-  if (value.schemaVersion !== 1) throw error;
+  if (![1, 2].includes(value.schemaVersion)) throw error;
   const previousArchiveDigest = value.previousArchiveDigest === null
     ? null
     : normalizeSha256(value.previousArchiveDigest, error);
@@ -1307,11 +1715,11 @@ function normalizeArchiveTombstone(value) {
   const updatedAt = normalizeCodeJobTimestamp(value.updatedAt, error);
   const outcome = normalizeArchivedOutcome(
     value.outcome,
-    { updatedAt },
+    { schemaVersion: value.schemaVersion, updatedAt },
     error,
   );
   const content = {
-    schemaVersion: 1,
+    schemaVersion: value.schemaVersion,
     previousArchiveDigest,
     archiveDigest,
     sequence: safeInteger(
@@ -1355,6 +1763,11 @@ function normalizeArchiveTombstone(value) {
     outcome.memoryProjection.jobId !== content.jobId ||
     outcome.memoryProjection.sourceRevision >= content.revision ||
     outcome.memoryProjection.projectedAt !== content.updatedAt ||
+    (outcome.changePackageDelivery != null &&
+      (content.status !== "completed" ||
+        outcome.changePackageDelivery.receipt.jobId !== content.jobId ||
+        outcome.changePackageDelivery.receipt.sourceRecordDigest !==
+          outcome.memoryProjection.sourceRecordDigest)) ||
     archiveLinkDigest(previousArchiveDigest, content) !== archiveDigest ||
     tombstoneDigest !== digestValue(content)
   ) {
@@ -1364,6 +1777,7 @@ function normalizeArchiveTombstone(value) {
 }
 
 function normalizeArchivedOutcome(value, tombstone, error) {
+  const packageVersion = tombstone.schemaVersion >= 2;
   assertExactKeys(
     value,
     [
@@ -1372,6 +1786,7 @@ function normalizeArchivedOutcome(value, tombstone, error) {
       "latestObservation",
       "terminalResult",
       "memoryProjection",
+      ...(packageVersion ? ["changePackageDelivery"] : []),
     ],
     error,
   );
@@ -1452,12 +1867,17 @@ function normalizeArchivedOutcome(value, tombstone, error) {
   ) {
     throw error;
   }
+  const changePackageDelivery = !packageVersion ||
+    value.changePackageDelivery === null
+    ? null
+    : normalizeDeliveredChangePackage(value.changePackageDelivery, error);
   return {
     turn,
     observationCount,
     latestObservation,
     terminalResult,
     memoryProjection,
+    ...(packageVersion ? { changePackageDelivery } : {}),
   };
 }
 
@@ -1693,7 +2113,7 @@ function assertTombstoneMatchesManifest(tombstone, manifest) {
   return bindings;
 }
 
-function prepareArchiveEntry(archive, job, revision, limits) {
+function prepareArchiveEntry(state, archive, job, revision, limits) {
   if (
     job.sequence !== archive.throughSequence + 1 ||
     !isRetentionEligibleCodeJob(job)
@@ -1702,10 +2122,15 @@ function prepareArchiveEntry(archive, job, revision, limits) {
   }
   const previousArchiveDigest = archive.digest;
   const archiveDigest = archiveLinkDigest(previousArchiveDigest, job);
+  const changePackageDelivery =
+    state.changePackageDelivery.delivered.find(
+      ({ receipt }) => receipt.jobId === job.jobId,
+    ) ?? null;
   const tombstone = createArchiveTombstone({
     job,
     previousArchiveDigest,
     archiveDigest,
+    changePackageDelivery,
   });
   const bindings = archiveBindingValuesFromTombstone(tombstone);
   const indexes = Object.fromEntries(
@@ -1748,6 +2173,15 @@ function prepareArchiveEntry(archive, job, revision, limits) {
   return { archive: nextArchive, tombstone, indexes, manifest };
 }
 
+function isStateRetentionEligible(state, job) {
+  return (
+    isRetentionEligibleCodeJob(job) &&
+    !state.changePackageDelivery.pending.some(
+      (event) => event.job.id === job.jobId,
+    )
+  );
+}
+
 function archiveTerminalPrefix(
   state,
   {
@@ -1765,12 +2199,18 @@ function archiveTerminalPrefix(
   while (
     jobs.length > 0 &&
     jobs[0].sequence <= targetThroughSequence &&
-    isRetentionEligibleCodeJob(jobs[0]) &&
+    isStateRetentionEligible(state, jobs[0]) &&
     !protectedSequences.has(jobs[0].sequence)
   ) {
     if (!all && archived > 0) break;
     const job = jobs[0];
-    const prepared = prepareArchiveEntry(archive, job, state.revision, limits);
+    const prepared = prepareArchiveEntry(
+      state,
+      archive,
+      job,
+      state.revision,
+      limits,
+    );
     archive = prepared.archive;
     archiveIndex = [...archiveIndex, prepared.manifest];
     archivedEntries.push(prepared);
@@ -1835,6 +2275,7 @@ export class CodeJobStore {
     clock = () => new Date(),
     limits = {},
     memoryReceiptVerifier = null,
+    changePackageReader = null,
   } = {}) {
     validateDependency(store, ["read", "write"], "store");
     validateDependency(exclusiveLease, ["run"], "exclusiveLease");
@@ -1846,12 +2287,19 @@ export class CodeJobStore {
     ) {
       throw new TypeError("memoryReceiptVerifier is invalid");
     }
+    if (
+      changePackageReader !== null &&
+      typeof changePackageReader?.get !== "function"
+    ) {
+      throw new TypeError("changePackageReader is invalid");
+    }
     this.store = store;
     this.exclusiveLease = exclusiveLease;
     this.operationQueue = operationQueue;
     this.clock = clock;
     this.limits = normalizeLimits(limits);
     this.memoryReceiptVerifier = memoryReceiptVerifier;
+    this.changePackageReader = changePackageReader;
     this.state = defaultState();
     this.archiveManifestLookup = createArchiveManifestLookup(this.state);
     this.ready = false;
@@ -2553,6 +3001,80 @@ export class CodeJobStore {
     });
   }
 
+  readChangePackageDeliveryBatch(value = {}) {
+    const { limit } = normalizeMemoryBatchOptions(value);
+    return this.#query(() => cloneCodeJobValue({
+      cursor: this.state.changePackageDelivery.cursor,
+      highWatermark: this.state.changePackageDelivery.nextSequence - 1,
+      items: this.state.changePackageDelivery.pending.slice(0, limit),
+    }));
+  }
+
+  acknowledgeChangePackageDelivery(value) {
+    const error = storeError(
+      "INVALID_CODE_JOB_MUTATION",
+      "代码任务 change package 投递确认无效",
+    );
+    const request = normalizeChangePackageAcknowledgement(value, error);
+    return this.#mutate(async (state) => {
+      const delivery = state.changePackageDelivery;
+      if (request.sequence <= delivery.cursor) {
+        const previous = delivery.delivered[request.sequence - 1];
+        if (
+          previous &&
+          sameValue(request, deliveredAcknowledgement(previous.receipt))
+        ) {
+          return {
+            state,
+            value: changePackageAcknowledgementResult("already", delivery),
+            write: false,
+          };
+        }
+        throw changePackageOrderConflict();
+      }
+      if (request.sequence !== delivery.cursor + 1) {
+        throw changePackageOrderConflict();
+      }
+      const event = delivery.pending[0];
+      if (!event) throw changePackageOrderConflict();
+      if (!pendingChangePackageAcknowledgement(event, request)) {
+        throw changePackageBindingConflict();
+      }
+      const job = state.jobs.find(({ jobId }) => jobId === event.job.id);
+      if (!job || !changePackageEventMatchesJob(event, job)) {
+        throw changePackageBindingConflict();
+      }
+      await this.#verifyChangePackageReceipt(event, request, job);
+      const revision = state.revision + 1;
+      const receipt = {
+        ...request,
+        deliveredAt: this.#now(state),
+      };
+      const nextDelivery = {
+        ...delivery,
+        revision,
+        cursor: request.sequence,
+        checkpointDigest: event.eventDigest,
+        pending: delivery.pending.slice(1),
+        delivered: [
+          ...delivery.delivered,
+          { previousDigest: event.previousDigest, receipt },
+        ],
+      };
+      return {
+        state: {
+          ...state,
+          revision,
+          changePackageDelivery: nextDelivery,
+        },
+        value: changePackageAcknowledgementResult("applied", nextDelivery),
+        write: true,
+        protectedSequences: new Set(),
+        requiredHeadroomBytes: 0,
+      };
+    });
+  }
+
   markMemoryProjected(value) {
     const request = normalizeMutationBase(value, [
       "sourceRecordDigest",
@@ -2846,7 +3368,8 @@ export class CodeJobStore {
   }
 
   #finish(value, terminalStatus) {
-    const request = normalizeMutationBase(value, ["result"]);
+    const normalized = normalizeFinishRequest(value, terminalStatus);
+    const { request, changePackageDelivery } = normalized;
     const detail = createCodeJobDetail(value.result);
     const detailDigest = digestValue(detail);
     return this.#mutate((state) => {
@@ -2854,7 +3377,10 @@ export class CodeJobStore {
       if (isTerminalCodeJobStatus(job.status)) {
         if (
           job.status !== terminalStatus ||
-          job.execution.result.detailDigest !== detailDigest
+          job.execution.result.detailDigest !== detailDigest ||
+          (terminalStatus === "completed" &&
+            hasChangePackageDelivery(state, job.jobId) !==
+              changePackageDelivery)
         ) {
           throw transitionConflict("代码任务已以不同结果结束");
         }
@@ -2894,7 +3420,17 @@ export class CodeJobStore {
           },
         }),
       );
-      return this.#appliedLifecycleChange(changed);
+      const finalState = changePackageDelivery
+        ? {
+            ...changed.state,
+            changePackageDelivery: appendChangePackageDelivery(
+              changed.state.changePackageDelivery,
+              changed.job,
+              changed.state.revision,
+            ),
+          }
+        : changed.state;
+      return this.#appliedLifecycleChange({ ...changed, state: finalState });
     });
   }
 
@@ -2915,6 +3451,36 @@ export class CodeJobStore {
     } catch (cause) {
       if (cause?.code === "CODE_JOB_MEMORY_RECEIPT_UNVERIFIED") throw cause;
       throw memoryReceiptUnverified(cause);
+    }
+  }
+
+  async #verifyChangePackageReceipt(event, request, job) {
+    if (this.changePackageReader === null) {
+      throw changePackageReceiptUnverified();
+    }
+    let manifest;
+    try {
+      manifest = normalizeChangePackageManifest(
+        await this.changePackageReader.get(request.packageId),
+      );
+    } catch (cause) {
+      throw changePackageReceiptUnverified(cause);
+    }
+    const profileBindings = manifest.passedProfiles.map(
+      ({ id, configDigest }) => ({ id, configDigest }),
+    );
+    if (
+      manifest.packageId !== request.packageId ||
+      manifest.packageDigest !== request.packageDigest ||
+      !sameValue(manifest.job, event.job) ||
+      !sameValue(manifest.proposal, event.proposal) ||
+      !sameValue(manifest.grant, event.grant) ||
+      manifest.workspace.id !== job.grant.workspaceId ||
+      manifest.workspace.workspaceRevision !==
+        event.exportRequest.expectedWorkspaceRevision ||
+      !sameValue(profileBindings, job.grant.requiredProfiles)
+    ) {
+      throw changePackageBindingConflict();
     }
   }
 
@@ -3017,7 +3583,7 @@ export class CodeJobStore {
       state,
       value: workerMutationResult("applied", job),
       write: true,
-      protectedSequences: isRetentionEligibleCodeJob(job)
+      protectedSequences: isStateRetentionEligible(state, job)
         ? new Set()
         : new Set([job.sequence]),
       requiredHeadroomBytes,
@@ -3047,6 +3613,13 @@ export class CodeJobStore {
   }
 
   async #validateArchiveArtifacts(state) {
+    const tombstonesByJobId = new Map();
+    const deliveredByJobId = new Map(
+      state.changePackageDelivery.delivered.map((entry) => [
+        entry.receipt.jobId,
+        entry,
+      ]),
+    );
     for (const manifest of state.archiveIndex) {
       const rawTombstone = await this.store.read(
         archiveRecordKey(manifest.jobId),
@@ -3054,6 +3627,14 @@ export class CodeJobStore {
       );
       if (rawTombstone === null) throw corruptedArchive();
       const tombstone = normalizeArchiveTombstone(rawTombstone);
+      tombstonesByJobId.set(tombstone.jobId, tombstone);
+      if (tombstone.schemaVersion >= 2) {
+        const archivedDelivery = tombstone.outcome.changePackageDelivery;
+        const delivered = deliveredByJobId.get(tombstone.jobId) ?? null;
+        if (!sameValue(archivedDelivery, delivered)) {
+          throw corruptedArchive();
+        }
+      }
       const bindings = assertTombstoneMatchesManifest(tombstone, manifest);
       for (const kind of ARCHIVE_BINDING_KINDS) {
         const rawIndex = await this.store.read(
@@ -3068,6 +3649,17 @@ export class CodeJobStore {
         ) {
           throw corruptedArchive();
         }
+      }
+    }
+    const liveJobIds = new Set(state.jobs.map(({ jobId }) => jobId));
+    for (const entry of state.changePackageDelivery.delivered) {
+      if (liveJobIds.has(entry.receipt.jobId)) continue;
+      const tombstone = tombstonesByJobId.get(entry.receipt.jobId);
+      if (
+        tombstone === undefined ||
+        !sameValue(entry, tombstone.outcome.changePackageDelivery)
+      ) {
+        throw corruptedArchive();
       }
     }
   }
@@ -3232,6 +3824,10 @@ export class CodeJobStore {
     assertMemoryProjectionExtension(
       this.state.memoryProjection,
       durable.memoryProjection,
+    );
+    assertChangePackageDeliveryExtension(
+      this.state.changePackageDelivery,
+      durable.changePackageDelivery,
     );
     for (let index = 0; index < this.state.archiveIndex.length; index += 1) {
       if (!sameValue(this.state.archiveIndex[index], durable.archiveIndex[index])) {

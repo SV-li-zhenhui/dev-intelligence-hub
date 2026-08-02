@@ -52,6 +52,7 @@ export class CodeJobWorkerService {
   #queue;
   #maxTurns;
   #observationLimit;
+  #changePackageDeliveryEnabled;
   #runnableCursor;
   #reconcilableCursor;
   #preferReconcilable;
@@ -64,6 +65,7 @@ export class CodeJobWorkerService {
     operationQueue = new OperationQueue(),
     maxTurns = 64,
     observationLimit = 20,
+    changePackageDeliveryEnabled = false,
   } = {}) {
     this.#jobs = requirePort(
       jobStore,
@@ -108,6 +110,9 @@ export class CodeJobWorkerService {
     if (!operationQueue || typeof operationQueue.enqueue !== "function") {
       throw new TypeError("code job worker queue is invalid");
     }
+    if (typeof changePackageDeliveryEnabled !== "boolean") {
+      throw new TypeError("changePackageDeliveryEnabled must be a boolean");
+    }
     this.#queue = operationQueue;
     this.#maxTurns = positiveInteger(maxTurns, "maxTurns", 128);
     this.#observationLimit = positiveInteger(
@@ -115,6 +120,7 @@ export class CodeJobWorkerService {
       "observationLimit",
       100,
     );
+    this.#changePackageDeliveryEnabled = changePackageDeliveryEnabled;
     this.#runnableCursor = 0;
     this.#reconcilableCursor = 0;
     this.#preferReconcilable = true;
@@ -722,16 +728,12 @@ export class CodeJobWorkerService {
           }),
     })).job;
     if (pending.action.type === "complete" && status === "succeeded") {
-      job = (await this.#jobs.complete({
-        jobId: job.jobId,
-        expectedRevision: job.revision,
-        result: terminalResult(
-          job,
-          pending.action,
-          detail,
-          response.session.workspaceRevision,
-        ),
-      })).job;
+      job = await this.#completeJob(
+        job,
+        pending.action,
+        detail,
+        response.session.workspaceRevision,
+      );
       return { jobId: job.jobId, status: "completed", actionType: "complete" };
     }
     return {
@@ -764,17 +766,25 @@ export class CodeJobWorkerService {
 
   async #completeObservedJob(job, observation) {
     trustedObservationAction(observation);
-    job = (await this.#jobs.complete({
+    job = await this.#completeJob(
+      job,
+      observation.action,
+      observation.detail,
+      observation.workspaceRevision,
+    );
+    return { jobId: job.jobId, status: "completed", actionType: "complete" };
+  }
+
+  async #completeJob(job, action, detail, workspaceRevision) {
+    const changed = await this.#jobs.complete({
       jobId: job.jobId,
       expectedRevision: job.revision,
-      result: terminalResult(
-        job,
-        observation.action,
-        observation.detail,
-        observation.workspaceRevision,
-      ),
-    })).job;
-    return { jobId: job.jobId, status: "completed", actionType: "complete" };
+      result: terminalResult(job, action, detail, workspaceRevision),
+      ...(this.#changePackageDeliveryEnabled
+        ? { changePackageDelivery: true }
+        : {}),
+    });
+    return changed.job;
   }
 
   async #finishFailed(job, error) {

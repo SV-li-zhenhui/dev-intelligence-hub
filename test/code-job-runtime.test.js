@@ -9,6 +9,7 @@ import { codeJobConfirmationIdForGrant } from "../src/domain/code-action-proposa
 import { memoryRecordForCodeJobEvent } from "../src/domain/code-job-memory-event.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobRuntime } from "../src/code-job-runtime.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 
@@ -152,6 +153,9 @@ async function runtimeFixture({
   brainDirectory,
   workerFactory,
   memoryReceiptVerifier,
+  completedChangeExporter,
+  changePackageProducer,
+  changePackageReader,
 } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
@@ -168,6 +172,11 @@ async function runtimeFixture({
     ...(memoryReceiptVerifier === undefined
       ? {}
       : { memoryReceiptVerifier }),
+    ...(completedChangeExporter === undefined
+      ? {}
+      : { completedChangeExporter }),
+    ...(changePackageProducer === undefined ? {} : { changePackageProducer }),
+    ...(changePackageReader === undefined ? {} : { changePackageReader }),
   });
   return { runtime, store, guard };
 }
@@ -186,7 +195,9 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal(Object.isFrozen(runtime.control), true);
   assert.equal(Object.isFrozen(runtime.projectionSource), true);
   assert.equal(runtime.worker, null);
+  assert.equal(runtime.changePackageDelivery, null);
   assert.deepEqual(Object.keys(runtime).sort(), [
+    "changePackageDelivery",
     "close",
     "confirmationExecutor",
     "control",
@@ -214,6 +225,205 @@ test("runtime acquires and recovers before exposing local approval and reader po
   assert.equal(JSON.stringify(found).includes("configDigest"), false);
 
   await runtime.close();
+});
+
+async function enqueueCompletedChangePackageDelivery(runtime, jobs) {
+  const creation = await runtime.confirmationExecutor.execute(envelope());
+  const queued = await jobs.getForWorker(creation.receipt.id);
+  const starting = await jobs.claimStarting({
+    jobId: queued.jobId,
+    expectedRevision: queued.revision,
+  });
+  const workspaceRevision = "4".repeat(64);
+  const active = await jobs.activate({
+    jobId: queued.jobId,
+    expectedRevision: starting.job.revision,
+    workspaceRevision,
+  });
+  const actionId = "complete-change-package";
+  const prepared = await jobs.prepareAction({
+    jobId: queued.jobId,
+    expectedRevision: active.job.revision,
+    action: {
+      type: "complete",
+      actionId,
+      expectedWorkspaceRevision: workspaceRevision,
+    },
+  });
+  const detail = { created: [], modified: [], deleted: [] };
+  const observed = await jobs.recordObservation({
+    jobId: queued.jobId,
+    expectedRevision: prepared.job.revision,
+    actionId,
+    status: "succeeded",
+    workspaceRevision,
+    detail,
+  });
+  await jobs.complete({
+    jobId: queued.jobId,
+    expectedRevision: observed.job.revision,
+    result: { summary: "Change package ready", manifest: detail },
+    changePackageDelivery: true,
+  });
+  return { workspaceRevision, actionId };
+}
+
+test("change-package delivery is atomically configured, narrow, and drained on close", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let workerOptions;
+  let manifest;
+  const calls = [];
+  const completedChangeExporter = {
+    marker: "exporter",
+    async export(request) {
+      assert.equal(this.marker, "exporter");
+      calls.push({ kind: "export", request });
+      entered.resolve();
+      await release.promise;
+      return {
+        workspace: {
+          id: "widgets-local",
+          sourceRevision: "3".repeat(64),
+          workspaceRevision: request.expectedWorkspaceRevision,
+        },
+        passedProfiles: [{
+          id: "node-tests",
+          configDigest: "b".repeat(64),
+          workspaceRevision: request.expectedWorkspaceRevision,
+          actionId: "test-change-package",
+          attemptNumber: 1,
+          imageId: `sha256:${"4".repeat(64)}`,
+          artifacts: {
+            output: { path: "proof/output.json", sha256: "5".repeat(64), bytes: 1 },
+            stdout: { path: "proof/stdout.json", sha256: "6".repeat(64), bytes: 1 },
+            stderr: { path: "proof/stderr.json", sha256: "7".repeat(64), bytes: 1 },
+          },
+        }],
+        created: [],
+        modified: [],
+        deleted: [],
+      };
+    },
+  };
+  const changePackageProducer = {
+    marker: "producer",
+    async create(draft) {
+      assert.equal(this.marker, "producer");
+      calls.push({ kind: "create", draft });
+      manifest = createChangePackage(draft).manifest;
+      return manifest;
+    },
+  };
+  const changePackageReader = {
+    marker: "reader",
+    async get(packageId) {
+      assert.equal(this.marker, "reader");
+      calls.push({ kind: "get", packageId });
+      return manifest;
+    },
+  };
+  const { runtime, guard } = await runtimeFixture({
+    executor: {},
+    brainDirectory: {},
+    completedChangeExporter,
+    changePackageProducer,
+    changePackageReader,
+    workerFactory(options) {
+      workerOptions = options;
+      return { async runCycle() { return { selected: 0, outcomes: [] }; } };
+    },
+  });
+
+  assert.equal(workerOptions.changePackageDeliveryEnabled, true);
+  assert.deepEqual(Object.keys(runtime.changePackageDelivery), ["runCycle"]);
+  assert.equal(Object.isFrozen(runtime.changePackageDelivery), true);
+  const expected = await enqueueCompletedChangePackageDelivery(
+    runtime,
+    workerOptions.jobStore,
+  );
+  const cycle = runtime.changePackageDelivery.runCycle({ limit: 1 });
+  await entered.promise;
+  const closing = runtime.close();
+  await Promise.resolve();
+  assert.equal(guard.closeCount, 0);
+
+  release.resolve();
+  assert.deepEqual(await cycle, {
+    observed: 1,
+    created: 1,
+    acknowledged: 1,
+    cursor: 1,
+    highWatermark: 1,
+    pending: 0,
+  });
+  assert.deepEqual(calls.map(({ kind }) => kind), ["export", "create", "get"]);
+  assert.deepEqual(calls[0].request, {
+    sessionId: codeJobIdForGrant(grant()),
+    completedActionId: expected.actionId,
+    expectedWorkspaceRevision: expected.workspaceRevision,
+  });
+  await closing;
+  assert.equal(guard.closeCount, 1);
+  await assert.rejects(
+    runtime.changePackageDelivery.runCycle(),
+    (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
+  );
+});
+
+test("change-package delivery dependencies are all-or-none narrow ports", async () => {
+  const exporter = { async export() {} };
+  const producer = { async create() {} };
+  const reader = { async get() {} };
+  for (const dependencies of [
+    { completedChangeExporter: exporter },
+    { completedChangeExporter: exporter, changePackageProducer: producer },
+    { changePackageProducer: producer, changePackageReader: reader },
+  ]) {
+    let guardCalls = 0;
+    await assert.rejects(
+      createCodeJobRuntime({
+        store: new MemoryStore(),
+        ...dependencies,
+        createGuard() {
+          guardCalls += 1;
+          return new FakeGuard();
+        },
+      }),
+      /configured together/,
+    );
+    assert.equal(guardCalls, 0);
+  }
+
+  for (const dependencies of [
+    { completedChangeExporter: {}, changePackageProducer: producer, changePackageReader: reader },
+    { completedChangeExporter: exporter, changePackageProducer: {}, changePackageReader: reader },
+    { completedChangeExporter: exporter, changePackageProducer: producer, changePackageReader: {} },
+  ]) {
+    await assert.rejects(
+      createCodeJobRuntime({ store: new MemoryStore(), ...dependencies }),
+      /change package/,
+    );
+  }
+
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({}, "export", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return async () => {};
+    },
+  });
+  await assert.rejects(
+    createCodeJobRuntime({
+      store: new MemoryStore(),
+      completedChangeExporter: accessor,
+      changePackageProducer: producer,
+      changePackageReader: reader,
+    }),
+    /change package/,
+  );
+  assert.equal(getterCalls, 0);
 });
 
 test("projection source is private, ordered, and bound to the memory verifier", async () => {

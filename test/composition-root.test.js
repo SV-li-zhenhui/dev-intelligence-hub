@@ -1395,6 +1395,95 @@ test("maintenance mode does not acquire change package write authority", async (
   await application.close();
 });
 
+test("local code and change package composition injects only frozen delivery ports", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = {
+    ...localCodeCoordinationConfig({ githubActions: false }),
+    changePackages: {
+      enabled: true,
+      gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+    },
+  };
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      authority: { workspaces: [] },
+      executor: controlledCodeExecutorPort(),
+      changePackageTargets: [{ workspaceId: "dashboard" }],
+      completedChangeExporter: { async export() {} },
+      async close() {},
+    }),
+    changePackageRuntimeFactory: async () => ({
+      packageProducer: { async create() {} },
+      packageReader: { async get() {}, async readFile() {} },
+      applicationProducer: { async prepareConfirmation() {} },
+      applicationExecutor: { async execute() {}, async reconcile() {} },
+      applicationReader: { async getResult() {} },
+      async close() {},
+    }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "code-action-runner": { async claim() {}, async advance() {} },
+      },
+    }),
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      return {
+        confirmationExecutor: { async execute() {}, async reconcile() {} },
+        reader: { async get() {}, async list() {}, async listNewest() {} },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
+        changePackageDelivery: { async runCycle() {} },
+        async close() {},
+      };
+    },
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() {},
+    }),
+    codeJobGrantFactory: () => ({
+      async create() {},
+      verify(value) { return value; },
+    }),
+    codeJobBrainDirectoryFactory: () => ({ async decide() {} }),
+    codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: (runners) => runners[0],
+  });
+
+  for (const [name, methods] of [
+    ["completedChangeExporter", ["export"]],
+    ["changePackageProducer", ["create"]],
+    ["changePackageReader", ["get"]],
+  ]) {
+    assert.equal(Object.isFrozen(calls.codeJobRuntime[name]), true);
+    assert.deepEqual(Object.keys(calls.codeJobRuntime[name]), methods);
+  }
+  assert.equal(
+    Object.isFrozen(calls.coordination.codeJobChangePackageDispatcher),
+    true,
+  );
+  assert.deepEqual(
+    Object.keys(calls.coordination.codeJobChangePackageDispatcher),
+    ["runCycle"],
+  );
+  for (const privateName of [
+    "completedChangeExporter",
+    "changePackageProducer",
+    "changePackageDelivery",
+    "codeJobChangePackageDispatcher",
+  ]) {
+    assert.equal(privateName in application, false);
+  }
+
+  await application.close();
+});
+
 test("local code execution fails closed when unified memory is disabled", async () => {
   const config = localCodeCoordinationConfig({ githubActions: false });
   config.memory.enabled = false;
@@ -1638,6 +1727,10 @@ test("local code composition binds authority, both proposal runners, and one saf
     "function",
   );
   assert.equal(calls.coordination.codeJobMemoryLimit, 18);
+  assert.equal("completedChangeExporter" in calls.codeJobRuntime, false);
+  assert.equal("changePackageProducer" in calls.codeJobRuntime, false);
+  assert.equal("changePackageReader" in calls.codeJobRuntime, false);
+  assert.equal(calls.coordination.codeJobChangePackageDispatcher, null);
 
   assert.equal(Object.isFrozen(application.codeJobReader), true);
   assert.equal(Object.isFrozen(application.codeJobControl), true);
@@ -1762,6 +1855,10 @@ test("local-only code actions create confirmation while maintenance keeps projec
   assert.equal("executor" in calls.codeJobRuntime, false);
   assert.equal("brainDirectory" in calls.codeJobRuntime, false);
   assert.equal("grantVerifier" in calls.codeJobRuntime, false);
+  assert.equal("completedChangeExporter" in calls.codeJobRuntime, false);
+  assert.equal("changePackageProducer" in calls.codeJobRuntime, false);
+  assert.equal("changePackageReader" in calls.codeJobRuntime, false);
+  assert.equal(calls.coordination.codeJobChangePackageDispatcher, null);
   await maintenance.close();
 });
 
