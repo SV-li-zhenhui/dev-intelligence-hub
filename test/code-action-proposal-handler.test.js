@@ -691,6 +691,14 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     {
       confirmation: {},
       job: queuedJob(grant, {
+        status: "active",
+        pendingActionType: "shell_command",
+        updatedAt: "2026-08-02T03:00:02.000Z",
+      }),
+    },
+    {
+      confirmation: {},
+      job: queuedJob(grant, {
         status: "unknown",
         pendingActionType: "read_text",
         pause: { reason: "伪造暂停", at: CREATED_AT },

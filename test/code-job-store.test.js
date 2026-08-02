@@ -360,6 +360,37 @@ test("get and list return newest browser-safe copies", async () => {
   const found = await jobs.get(first.job.jobId);
   assert.equal(found.jobId, first.job.jobId);
   assert.equal(found.requiredProfiles[0], "node-tests");
+  assert.deepEqual(Object.keys(found), [
+    "jobId",
+    "status",
+    "revision",
+    "proposalId",
+    "proposalContentDigest",
+    "grantDigest",
+    "requestedBy",
+    "subject",
+    "repository",
+    "workspaceId",
+    "operation",
+    "objective",
+    "acceptanceCriteria",
+    "evidence",
+    "summary",
+    "reason",
+    "allowedActions",
+    "writablePaths",
+    "requiredProfiles",
+    "turn",
+    "pendingActionType",
+    "observationCount",
+    "latestObservation",
+    "terminalResult",
+    "memoryProjection",
+    "pause",
+    "uncertainty",
+    "createdAt",
+    "updatedAt",
+  ]);
   assert.equal("approval" in found, false);
   assert.equal("requestId" in found, false);
   assert.equal("recordDigest" in found, false);
@@ -1606,10 +1637,7 @@ test("terminal prefix retention frees capacity and seals archive continuity", as
   const archivedFirst = await jobs.get(first.job.jobId);
   assert.equal(archivedFirst.status, "failed");
   assert.equal(archivedFirst.uncertainty, null);
-  assert.deepEqual(
-    Object.keys(archivedFirst).sort(),
-    Object.keys(liveFirst).sort(),
-  );
+  assert.deepEqual(archivedFirst, liveFirst);
   const archivedRetry = await jobs.createApprovedJob(
     approval({ requestId: "approval-request-archived-retry" }),
   );

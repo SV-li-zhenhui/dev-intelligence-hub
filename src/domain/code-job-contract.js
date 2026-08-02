@@ -3,6 +3,12 @@ import {
   normalizeActionRequest,
 } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
+import {
+  projectNormalizedCodeJobForBrowser,
+} from "./code-job-browser-projection.js";
+import {
+  CODE_JOB_STATUSES as SHARED_CODE_JOB_STATUSES,
+} from "./code-job-vocabulary.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -16,17 +22,7 @@ const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100}
 const CONTROL_CHARACTER = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
-export const CODE_JOB_STATUSES = Object.freeze([
-  "queued",
-  "starting",
-  "active",
-  "pausing",
-  "unknown",
-  "paused",
-  "completed",
-  "failed",
-  "fenced",
-]);
+export const CODE_JOB_STATUSES = SHARED_CODE_JOB_STATUSES;
 const JOB_STATUSES = new Set(CODE_JOB_STATUSES);
 const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "fenced"]);
 const PAUSABLE_JOB_STATUSES = new Set(["queued", "starting", "active"]);
@@ -1450,66 +1446,7 @@ export function isRetentionEligibleCodeJob(value) {
 }
 
 export function projectCodeJobForBrowser(value) {
-  const job = normalizeCodeJob(value);
-  return structuredClone({
-    jobId: job.jobId,
-    status: job.status,
-    revision: job.revision,
-    proposalId: job.proposal.proposalId,
-    proposalContentDigest: job.proposal.contentDigest,
-    grantDigest: job.grant.grantDigest,
-    requestedBy: job.grant.requestedBy,
-    subject: job.grant.subject,
-    repository: job.grant.repository,
-    workspaceId: job.grant.workspaceId,
-    operation: job.grant.operation,
-    objective: job.grant.objective,
-    acceptanceCriteria: job.grant.acceptanceCriteria,
-    evidence: job.grant.evidence,
-    summary: job.grant.summary,
-    reason: job.grant.reason,
-    allowedActions: job.grant.allowedActions,
-    writablePaths: job.grant.writablePaths,
-    requiredProfiles: job.grant.requiredProfiles.map(({ id }) => id),
-    turn: job.execution.turn,
-    pendingActionType: job.execution.pendingAction?.action.type ?? null,
-    observationCount: job.execution.observations.length,
-    latestObservation: job.execution.observations.length === 0
-      ? null
-      : {
-        actionType: job.execution.observations.at(-1).actionType,
-        status: job.execution.observations.at(-1).status,
-        recordedAt: job.execution.observations.at(-1).recordedAt,
-      },
-    terminalResult: job.execution.result === null
-      ? null
-      : {
-        kind: job.execution.result.kind,
-        recordedAt: job.execution.result.recordedAt,
-      },
-    memoryProjection: job.execution.memoryProjection === null
-      ? null
-      : {
-        recordId: job.execution.memoryProjection.memoryRecordId,
-        projectedAt: job.execution.memoryProjection.projectedAt,
-      },
-    pause: job.execution.pause === null
-      ? null
-      : {
-          reason: job.execution.pause.reason,
-          at: job.execution.pause.at,
-        },
-    uncertainty: job.execution.uncertainty === null
-      ? null
-      : {
-          from: job.execution.uncertainty.from,
-          code: job.execution.uncertainty.code,
-          message: job.execution.uncertainty.message,
-          at: job.execution.uncertainty.at,
-        },
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-  });
+  return projectNormalizedCodeJobForBrowser(normalizeCodeJob(value));
 }
 
 export function cloneCodeJobValue(value) {

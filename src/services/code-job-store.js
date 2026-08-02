@@ -14,6 +14,9 @@ import {
   updateCodeJobLifecycle,
 } from "../domain/code-job-contract.js";
 import {
+  projectArchivedCodeJobForBrowser,
+} from "../domain/code-job-browser-projection.js";
+import {
   digestValue,
   normalizeActionRequest,
 } from "../domain/code-executor-contract.js";
@@ -1144,44 +1147,6 @@ function normalizeArchivedOutcome(value, tombstone, error) {
   };
 }
 
-function archivedBrowserOutcome(tombstone) {
-  const grant = tombstone.grant;
-  return cloneCodeJobValue({
-    jobId: tombstone.jobId,
-    status: tombstone.status,
-    revision: tombstone.revision,
-    proposalId: tombstone.proposal.proposalId,
-    proposalContentDigest: tombstone.proposal.contentDigest,
-    grantDigest: grant.grantDigest,
-    requestedBy: grant.requestedBy,
-    subject: grant.subject,
-    repository: grant.repository,
-    workspaceId: grant.workspaceId,
-    operation: grant.operation,
-    objective: grant.objective,
-    acceptanceCriteria: grant.acceptanceCriteria,
-    evidence: grant.evidence,
-    summary: grant.summary,
-    reason: grant.reason,
-    allowedActions: grant.allowedActions,
-    writablePaths: grant.writablePaths,
-    requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
-    turn: tombstone.outcome.turn,
-    pendingActionType: null,
-    observationCount: tombstone.outcome.observationCount,
-    latestObservation: tombstone.outcome.latestObservation,
-    terminalResult: tombstone.outcome.terminalResult,
-    memoryProjection: {
-      recordId: tombstone.outcome.memoryProjection.memoryRecordId,
-      projectedAt: tombstone.outcome.memoryProjection.projectedAt,
-    },
-    pause: null,
-    uncertainty: null,
-    createdAt: tombstone.createdAt,
-    updatedAt: tombstone.updatedAt,
-  });
-}
-
 function sameArchivedAuthorization(tombstone, request) {
   return (
     tombstone.jobId === codeJobIdForGrant(request.grant) &&
@@ -1200,7 +1165,7 @@ function archivedCreationResult(status, tombstone) {
   return cloneCodeJobValue({
     status,
     receipt: { id: tombstone.jobId, createdAt: tombstone.createdAt },
-    job: archivedBrowserOutcome(tombstone),
+    job: projectArchivedCodeJobForBrowser(tombstone),
   });
 }
 
@@ -2250,7 +2215,7 @@ export class CodeJobStore {
           value: cloneCodeJobValue({
             status: "already",
             archived: true,
-            job: archivedBrowserOutcome(archived),
+            job: projectArchivedCodeJobForBrowser(archived),
           }),
           write: false,
         };
@@ -2312,7 +2277,7 @@ export class CodeJobStore {
       const job = this.state.jobs.find((candidate) => candidate.jobId === jobId);
       if (job) return projectCodeJobForBrowser(job);
       const archived = await this.#readArchivedByJobId(this.state, jobId);
-      return archived ? archivedBrowserOutcome(archived) : null;
+      return archived ? projectArchivedCodeJobForBrowser(archived) : null;
     });
   }
 
