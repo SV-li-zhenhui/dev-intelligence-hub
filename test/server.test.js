@@ -1002,6 +1002,58 @@ test("scheduled employees stay behind the confirmation gate when facts are stale
   }
 });
 
+test("scheduled and manual employees wait for refresh without an external queue", async () => {
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const timers = [];
+  const employeeRuns = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [{ id: "requirements-analyst", intervalMinutes: 11 }];
+      },
+      async runSelected(ids, options) {
+        employeeRuns.push({ ids, ...options });
+      },
+    },
+    refreshService: {
+      async refresh() {
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await refreshStarted.promise;
+    const scheduled = timers[1].callback();
+    const manual = backgroundWork.runEmployee("developer");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(employeeRuns, []);
+
+    releaseRefresh.resolve();
+    await Promise.all([backgroundWork.initialRefresh, scheduled, manual]);
+
+    assert.deepEqual(employeeRuns, [
+      { ids: ["pr-reviewer"], trigger: "refresh_completed" },
+      { ids: ["requirements-analyst"], trigger: "scheduled" },
+      { ids: ["developer"], trigger: "manual" },
+    ]);
+  } finally {
+    releaseRefresh.resolve();
+    await backgroundWork.stop();
+  }
+});
+
 test("periodic refresh fences facts but reopens confirmations before slow agency", async () => {
   await exerciseConfirmationRefreshGate("periodic");
 });

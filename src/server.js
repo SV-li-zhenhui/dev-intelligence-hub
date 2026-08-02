@@ -724,9 +724,15 @@ export function createDashboardServer(
         employeeAction?.[2] === "run"
       ) {
         assertTrustedMutation(request, expectedOrigin);
-        await employeeRegistry.run(employeeAction[1], {
-          trigger: "manual",
-        });
+        if (typeof backgroundWork?.runEmployee === "function") {
+          await backgroundWork.runEmployee(employeeAction[1], {
+            trigger: "manual",
+          });
+        } else {
+          await employeeRegistry.run(employeeAction[1], {
+            trigger: "manual",
+          });
+        }
         sendJson(
           response,
           200,
@@ -841,8 +847,7 @@ export function startApplicationBackgroundWork(
   );
   let stopped = false;
   let stopPromise = null;
-  let factTail = Promise.resolve();
-  let agencyTail = Promise.resolve();
+  let backgroundTail = Promise.resolve();
 
   function reportBackgroundError(error) {
     try {
@@ -961,14 +966,13 @@ export function startApplicationBackgroundWork(
 
   function enqueueAgencyCycle(options) {
     const operation = () => performAgencyCycle(options);
-    const result = agencyTail.then(operation, operation);
-    agencyTail = result.catch(() => {});
+    const result = backgroundTail.then(operation, operation);
+    backgroundTail = result.catch(() => {});
     return result;
   }
 
   function enqueueFactCycle(factOperation) {
     const operation = async () => {
-      await agencyTail;
       if (stopped) return undefined;
       await confirmationAccess.closeAndDrain();
       if (stopped) return undefined;
@@ -983,7 +987,7 @@ export function startApplicationBackgroundWork(
       if (stopped) return result;
       confirmationAccess.open();
       try {
-        await enqueueAgencyCycle({
+        await performAgencyCycle({
           trigger: "refresh_completed",
           includeLegacyEmployees: true,
         });
@@ -992,8 +996,8 @@ export function startApplicationBackgroundWork(
       }
       return result;
     };
-    const result = factTail.then(operation, operation);
-    factTail = result.catch(() => {});
+    const result = backgroundTail.then(operation, operation);
+    backgroundTail = result.catch(() => {});
     return result;
   }
 
@@ -1076,6 +1080,15 @@ export function startApplicationBackgroundWork(
     signalAgency: ({ trigger = "signal" } = {}) =>
       runTracked(() =>
         enqueueAgencyCycle({ trigger, includeLegacyEmployees: false }),
+      ),
+    runEmployee: (id, { trigger = "manual" } = {}) =>
+      runTracked(
+        () =>
+          enqueueAgencyCycle({
+            trigger,
+            employeeIds: [id],
+          }),
+        { rethrow: true },
       ),
     runConfirmationOperation: (operation) => confirmationAccess.run(operation),
     confirmationReady: () => confirmationAccess.isReady(),
