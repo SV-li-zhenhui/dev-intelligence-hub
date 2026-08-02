@@ -16,6 +16,10 @@ import {
   boundedLedgerString,
   workLedgerError,
 } from "./work-ledger-values.js";
+import {
+  assertWorkLedgerGraphClaimable,
+  assertWorkLedgerGraphCompletable,
+} from "./work-ledger-graph.js";
 
 const MIN_LEASE_MS = 1_000;
 const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
@@ -87,6 +91,7 @@ export function planWorkItemClaim({ state, input, clock, newLeaseId }) {
       409,
     );
   }
+  assertWorkLedgerGraphClaimable(state, itemId);
   const leaseId = newLeaseId();
   const leaseUntil = new Date(Date.parse(now) + duration).toISOString();
   const itemResult = {
@@ -261,6 +266,7 @@ export function planWorkItemCompletion({ state, input, clock }) {
   const now = clock();
   assertWorkLease(item, input.leaseId, now);
   assertCompleteTransition(item.status);
+  assertWorkLedgerGraphCompletable(state, itemId);
   const itemResult = moveWorkItem(item, {
     status: "completed",
     now,

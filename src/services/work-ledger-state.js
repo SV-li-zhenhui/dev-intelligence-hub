@@ -16,9 +16,13 @@ import {
   WORK_LEDGER_OUTBOX_STATUSES,
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
+import {
+  createDefaultWorkGraphMetadata,
+  normalizeWorkLedgerGraphItems,
+} from "./work-ledger-graph.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 2;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 3;
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
@@ -55,6 +59,7 @@ const ITEM_KEYS = [
   "inputDigest",
   "assignment",
   "event",
+  "graph",
   "currentTarget",
   "activeIntentId",
   "decisionContext",
@@ -304,12 +309,48 @@ function optionalString(value, name, maximumBytes = 256) {
   return value === null ? null : safeString(value, name, maximumBytes);
 }
 
+function denseLedgerArrayValues(value) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) {
+    return null;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) {
+    return null;
+  }
+  const entries = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+    entries.push(descriptor.value);
+  }
+  return entries;
+}
+
+function workItemCapacityView(item) {
+  const baseItem = { ...item };
+  delete baseItem.graph;
+  return baseItem;
+}
+
+function workLedgerCapacityView(state) {
+  // Preserve the legacy ledger budget while the graph contract enforces its
+  // own independent task, structure, delivery, and total-byte hard limits.
+  return {
+    ...state,
+    items: state.items.map(workItemCapacityView),
+  };
+}
+
 function normalizeItem(value, stateRevision, limits) {
   if (!hasExactLedgerKeys(value, ITEM_KEYS)) {
     throw corrupted("员工工作项字段损坏");
   }
   const assignment = canonicalStoredValue(value.assignment, "分派内容损坏");
   const event = canonicalStoredValue(value.event, "分派事件损坏");
+  const graph = canonicalStoredValue(value.graph, "工作图元数据损坏");
   const assignmentId = safeString(value.assignmentId, "assignmentId", 192);
   if (
     assignment.assignmentId !== assignmentId ||
@@ -389,6 +430,7 @@ function normalizeItem(value, stateRevision, limits) {
     inputDigest,
     assignment,
     event,
+    graph,
     currentTarget,
     activeIntentId,
     decisionContext: normalizeDecisionContext(value.decisionContext),
@@ -405,7 +447,8 @@ function normalizeItem(value, stateRevision, limits) {
   };
   if (
     Date.parse(item.updatedAt) < Date.parse(item.createdAt) ||
-    prettySerializedLedgerBytes(item) > limits.itemByteBudget
+    prettySerializedLedgerBytes(workItemCapacityView(item)) >
+      limits.itemByteBudget
   ) {
     throw corrupted("员工工作项超过容量或时间顺序损坏");
   }
@@ -542,7 +585,9 @@ export function assertWorkLedgerCapacity(state, limits) {
     state.timeline.length > limits.timelineLimit ||
     state.outbox.length > limits.outboxLimit ||
     state.items.some(
-      (item) => prettySerializedLedgerBytes(item) > limits.itemByteBudget,
+      (item) =>
+        prettySerializedLedgerBytes(workItemCapacityView(item)) >
+        limits.itemByteBudget,
     ) ||
     state.timeline.some(
       (entry) => prettySerializedLedgerBytes(entry) > limits.timelineByteBudget,
@@ -550,7 +595,8 @@ export function assertWorkLedgerCapacity(state, limits) {
     state.outbox.some(
       (entry) => prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget,
     ) ||
-    prettySerializedLedgerBytes(state) > limits.stateByteBudget
+    prettySerializedLedgerBytes(workLedgerCapacityView(state)) >
+      limits.stateByteBudget
   ) {
     throw workLedgerError(
       "WORK_LEDGER_CAPACITY_EXCEEDED",
@@ -580,13 +626,13 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   ) {
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: 2,
       proposalCursor: 0,
       proposalHighWatermark: 0,
     };
   }
-  if (
-    !hasExactLedgerKeys(value, [
+  const schema2Items =
+    hasExactLedgerKeys(value, [
       "schemaVersion",
       "revision",
       "intakeCursor",
@@ -600,7 +646,52 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       "items",
       "timeline",
       "outbox",
-    ]) ||
+    ]) &&
+    value.schemaVersion === 2
+      ? denseLedgerArrayValues(value.items)
+      : null;
+  if (
+    schema2Items !== null &&
+    schema2Items.every((item) => {
+      const legacyKeys = ITEM_KEYS.filter((key) => key !== "graph");
+      return hasExactLedgerKeys(item, legacyKeys);
+    })
+  ) {
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      items: schema2Items.map((item) => ({
+        ...item,
+        graph: createDefaultWorkGraphMetadata(),
+      })),
+    };
+  }
+  const hasCurrentStateFields = hasExactLedgerKeys(value, [
+    "schemaVersion",
+    "revision",
+    "intakeCursor",
+    "sourceHighWatermark",
+    "attentionCursor",
+    "attentionHighWatermark",
+    "proposalCursor",
+    "proposalHighWatermark",
+    "timelineStartSequence",
+    "nextTimelineSequence",
+    "items",
+    "timeline",
+    "outbox",
+  ]);
+  const itemValues = hasCurrentStateFields
+    ? denseLedgerArrayValues(value.items)
+    : null;
+  const timelineValues = hasCurrentStateFields
+    ? denseLedgerArrayValues(value.timeline)
+    : null;
+  const outboxValues = hasCurrentStateFields
+    ? denseLedgerArrayValues(value.outbox)
+    : null;
+  if (
+    !hasCurrentStateFields ||
     value.schemaVersion !== WORK_LEDGER_STATE_SCHEMA_VERSION ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 0 ||
@@ -620,16 +711,16 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     value.timelineStartSequence < 1 ||
     !Number.isSafeInteger(value.nextTimelineSequence) ||
     value.nextTimelineSequence < value.timelineStartSequence ||
-    !Array.isArray(value.items) ||
-    !Array.isArray(value.timeline) ||
-    !Array.isArray(value.outbox) ||
-    value.items.length > limits.itemLimit ||
-    value.timeline.length > limits.timelineLimit ||
-    value.outbox.length > limits.outboxLimit
+    itemValues === null ||
+    timelineValues === null ||
+    outboxValues === null ||
+    itemValues.length > limits.itemLimit ||
+    timelineValues.length > limits.timelineLimit ||
+    outboxValues.length > limits.outboxLimit
   ) {
     throw corrupted("员工工作台账状态损坏");
   }
-  const state = {
+  let state = {
     schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
     revision: value.revision,
     intakeCursor: value.intakeCursor,
@@ -640,14 +731,22 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     proposalHighWatermark: value.proposalHighWatermark,
     timelineStartSequence: value.timelineStartSequence,
     nextTimelineSequence: value.nextTimelineSequence,
-    items: value.items.map((item) => normalizeItem(item, value.revision, limits)),
-    timeline: value.timeline.map((entry) =>
+    items: itemValues.map((item) => normalizeItem(item, value.revision, limits)),
+    timeline: timelineValues.map((entry) =>
       normalizeTimelineEntry(entry, value.revision, limits),
     ),
-    outbox: value.outbox.map((entry) =>
+    outbox: outboxValues.map((entry) =>
       normalizeOutboxEntry(entry, value.revision, limits),
     ),
   };
+  try {
+    state = {
+      ...state,
+      items: normalizeWorkLedgerGraphItems(state.items, state.revision),
+    };
+  } catch {
+    throw corrupted("员工工作图结构损坏");
+  }
   assertUnique(state.items, "itemId", "员工工作项 ID 重复");
   assertUnique(state.items, "assignmentId", "员工分派 ID 重复");
   assertUnique(

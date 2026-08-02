@@ -9,6 +9,7 @@ import {
   prettySerializedLedgerBytes,
   workLedgerError,
 } from "./work-ledger-values.js";
+import { createDefaultWorkGraphMetadata } from "./work-ledger-graph.js";
 
 export const MAX_WORK_LEDGER_INTAKE_BATCH = 100;
 export const MAX_WORK_LEDGER_QUERY_PAGE = 100;
@@ -280,6 +281,7 @@ function createWorkItem({
     inputDigest,
     assignment,
     event,
+    graph: createDefaultWorkGraphMetadata(),
     currentTarget: assignment.target,
     activeIntentId: null,
     decisionContext: null,

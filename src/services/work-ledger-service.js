@@ -43,6 +43,7 @@ import {
   WORK_LEDGER_OUTBOX_STATUSES,
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
+import { validateWorkLedgerGraphTransition } from "./work-ledger-graph.js";
 
 function queryPage(records, idName, options = {}, allowedStatuses = null) {
   if (!isPlainLedgerObject(options)) {
@@ -533,6 +534,16 @@ export class WorkLedgerService {
         "WORK_LEDGER_STATE_CORRUPTED",
         "拒绝写入不一致的员工工作台账",
         503,
+        { cause: error },
+      );
+    }
+    try {
+      validateWorkLedgerGraphTransition(this.state, normalized);
+    } catch (error) {
+      throw workLedgerError(
+        "WORK_LEDGER_GRAPH_TRANSITION_INVALID",
+        "员工工作图转换与台账修订不一致",
+        409,
         { cause: error },
       );
     }

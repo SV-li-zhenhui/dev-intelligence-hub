@@ -306,6 +306,127 @@ test("claim records a bounded lease, revision, and immutable input digest", asyn
   );
 });
 
+test("graph dependencies and child ownership block work before a lease is issued", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [consumer, prerequisite] = durable.items;
+  consumer.graph.dependsOnItemIds = [prerequisite.itemId];
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  await assert.rejects(
+    recovered.claim({
+      itemId: consumer.itemId,
+      expectedRevision: consumer.revision,
+      workerId: "employee-pr-reviewer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_GRAPH_BLOCKED" && error.statusCode === 409,
+  );
+  assert.equal(fixture.store.stored().revision, durable.revision);
+
+  let gate = await recovered.claim({
+    itemId: prerequisite.itemId,
+    expectedRevision: prerequisite.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  gate = await recovered.complete({
+    itemId: gate.itemId,
+    expectedRevision: gate.revision,
+    leaseId: gate.leaseId,
+    actorId: "employee-pr-reviewer",
+    result: { outcome: "prerequisite-complete" },
+  });
+  assert.equal(gate.status, "completed");
+  const readyConsumer = (await recovered.listItems()).items.find(
+    ({ itemId }) => itemId === consumer.itemId,
+  );
+  const claimed = await recovered.claim({
+    itemId: readyConsumer.itemId,
+    expectedRevision: readyConsumer.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimed.status, "working");
+
+  const parentFixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await parentFixture.service.intake();
+  const parentState = parentFixture.store.stored();
+  const [parent, child] = parentState.items;
+  child.graph.parentItemId = parent.itemId;
+  parentFixture.store.replaceStored(parentState);
+  const parentService = new WorkLedgerService({
+    store: parentFixture.store,
+    assignmentSource: parentFixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: parentFixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await parentService.recover();
+  await assert.rejects(
+    parentService.claim({
+      itemId: parent.itemId,
+      expectedRevision: parent.revision,
+      workerId: "employee-pr-reviewer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_GRAPH_BLOCKED",
+  );
+});
+
+test("completion reports an ordinary graph conflict before corrupt-state handling", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [parent, child] = durable.items;
+  child.graph.parentItemId = parent.itemId;
+  Object.assign(parent, {
+    status: "working",
+    ownerId: "employee-orchestrator",
+    leaseId: "parent-lease",
+    leaseUntil: "2026-08-02T03:00:00.000Z",
+    attempt: 1,
+  });
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  await assert.rejects(
+    recovered.complete({
+      itemId: parent.itemId,
+      expectedRevision: parent.revision,
+      leaseId: parent.leaseId,
+      actorId: "employee-orchestrator",
+      result: { outcome: "premature" },
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_GRAPH_BLOCKED" && error.statusCode === 409,
+  );
+  assert.equal(fixture.store.stored().revision, durable.revision);
+});
+
 test("an expired working lease is recoverable and every claim is auditable", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   await fixture.service.intake();
@@ -2051,6 +2172,7 @@ test("work ledger recovers schema v1 state with an empty proposal checkpoint", a
   legacy.schemaVersion = 1;
   delete legacy.proposalCursor;
   delete legacy.proposalHighWatermark;
+  for (const item of legacy.items) delete item.graph;
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -2065,6 +2187,151 @@ test("work ledger recovers schema v1 state with an empty proposal checkpoint", a
   assert.equal(summary.proposalCursor, 0);
   assert.equal(summary.proposalHighWatermark, 0);
   assert.equal(summary.intakeCursor, 1);
+});
+
+test("schema v2 migration is lazy and preserves an active outbox through its next write", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-reviewer",
+    roleId: "pr-reviewer",
+    intent: reviewIntent(),
+  });
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 2;
+  for (const entry of legacy.items) delete entry.graph;
+  fixture.store.replaceStored(legacy);
+  const writesBeforeRecovery = fixture.store.writes.length;
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+
+  assert.equal(fixture.store.writes.length, writesBeforeRecovery);
+  assert.equal(fixture.store.stored().schemaVersion, 2);
+  const recoveredItem = (await recovered.listItems()).items[0];
+  const recoveredOutbox = (await recovered.listOutbox()).items[0];
+  assert.equal(recoveredItem.itemId, staged.item.itemId);
+  assert.equal(recoveredItem.revision, staged.item.revision);
+  assert.equal(recoveredItem.activeIntentId, staged.outbox.intentId);
+  assert.deepEqual(recoveredItem.graph, {
+    parentItemId: null,
+    dependsOnItemIds: [],
+    acceptanceContracts: [
+      { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+    ],
+    deliveries: [],
+  });
+  assert.equal(recoveredOutbox.intentId, staged.outbox.intentId);
+
+  const claimed = await recovered.claimIntent({
+    intentId: recoveredOutbox.intentId,
+    expectedRevision: recoveredOutbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+
+  assert.equal(claimed.status, "dispatching");
+  assert.equal(fixture.store.stored().schemaVersion, 3);
+  assert.deepEqual(
+    fixture.store.stored().items[0].graph,
+    recoveredItem.graph,
+  );
+});
+
+test("schema v2 keeps its original byte budget while graph metadata stays separately bounded", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 2;
+  for (const item of legacy.items) delete item.graph;
+  const legacyBytes = Buffer.byteLength(
+    `${JSON.stringify(legacy, null, 2)}\n`,
+    "utf8",
+  );
+  const exactStore = new MemoryStore({ [STATE_KEY]: legacy });
+  const recovered = new WorkLedgerService({
+    store: exactStore,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+    limits: { stateByteBudget: legacyBytes },
+  });
+
+  await recovered.recover();
+  assert.equal((await recovered.listItems()).items.length, 1);
+  assert.equal(exactStore.stored().schemaVersion, 2);
+  assert.equal(exactStore.writes.length, 0);
+
+  const undersizedStore = new MemoryStore({ [STATE_KEY]: legacy });
+  const undersized = new WorkLedgerService({
+    store: undersizedStore,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+    limits: { stateByteBudget: legacyBytes - 1 },
+  });
+  await assert.rejects(
+    undersized.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+  assert.deepEqual(undersizedStore.stored(), legacy);
+  assert.equal(undersizedStore.writes.length, 0);
+});
+
+test("schema v2 keeps the original per-item byte budget during migration", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 2;
+  for (const item of legacy.items) delete item.graph;
+  const legacyItemBytes = Buffer.byteLength(
+    `${JSON.stringify(legacy.items[0], null, 2)}\n`,
+    "utf8",
+  );
+  const createRecovered = (itemByteBudget) => {
+    const store = new MemoryStore({ [STATE_KEY]: legacy });
+    const service = new WorkLedgerService({
+      store,
+      assignmentSource: fixture.source,
+      exclusiveLease: new ExclusiveLease(),
+      clock: fixture.time.clock,
+      idFactory: incrementingIds(),
+      limits: { itemByteBudget },
+    });
+    return { service, store };
+  };
+  const exact = createRecovered(legacyItemBytes);
+
+  await exact.service.recover();
+
+  assert.equal((await exact.service.listItems()).items.length, 1);
+  assert.equal(exact.store.writes.length, 0);
+
+  const undersized = createRecovered(legacyItemBytes - 1);
+  await assert.rejects(
+    undersized.service.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+  assert.deepEqual(undersized.store.stored(), legacy);
+  assert.equal(undersized.store.writes.length, 0);
 });
 
 async function prepareWaitingCondition(fixture, condition) {

@@ -120,6 +120,15 @@ test("creates a deterministic schema v1 snapshot without retaining caller data",
   );
 });
 
+test("an empty graph starts at revision zero without aliasing its first write", () => {
+  const empty = createWorkGraphSnapshot(draft([], { revision: 0 }));
+  const first = createWorkGraphSnapshot(draft([task("first")], { revision: 1 }));
+
+  assert.equal(empty.revision, 0);
+  assert.deepEqual(normalizeWorkGraphSnapshot(empty, { expectedRevision: 0 }), empty);
+  assert.deepEqual(validateWorkGraphTransition(empty, first), first);
+});
+
 test("rejects duplicate ids, dangling references, self dependencies, and cycles", () => {
   assert.throws(
     () => createWorkGraphSnapshot(draft([task("same"), task("same")])),
@@ -205,7 +214,7 @@ test("rejects excessive task count, hierarchy depth, fan-out, and dependencies",
   );
 });
 
-test("requires strict option objects and accepts node responsibility targets", () => {
+test("requires strict options and accepts every existing ledger responsibility target", () => {
   const snapshot = createWorkGraphSnapshot(
     draft([task("one", { responsibility: responsibility("triage-node") })]),
   );
@@ -215,6 +224,21 @@ test("requires strict option objects and accepts node responsibility targets", (
   assert.equal(
     createWorkGraphSnapshot(draft([nodeTask])).tasks[0].responsibility.type,
     "node",
+  );
+  for (const id of ["审查员", "alice@example.com", "PR reviewer"]) {
+    assert.equal(
+      createWorkGraphSnapshot(
+        draft([task(`target-${id.length}`, { responsibility: responsibility(id) })]),
+      ).tasks[0].responsibility.id,
+      id,
+    );
+  }
+  assert.throws(
+    () =>
+      createWorkGraphSnapshot(
+        draft([task("long-target", { responsibility: responsibility("x".repeat(129)) })]),
+      ),
+    hasCode("WORK_GRAPH_INVALID"),
   );
 
   assert.throws(
@@ -465,10 +489,20 @@ test("validates one-step CAS transitions and append-only task histories", () => 
     validateWorkGraphTransition(previous, validNewTask),
     validNewTask,
   );
+  const validImportedActiveTask = createWorkGraphSnapshot(
+    draft(
+      [task("implementation"), task("active-task", { status: "in_progress" })],
+      { revision: 8 },
+    ),
+  );
+  assert.deepEqual(
+    validateWorkGraphTransition(previous, validImportedActiveTask),
+    validImportedActiveTask,
+  );
 
   const invalidNewTasks = [
     task("new-task", { revision: 2 }),
-    task("new-task", { status: "in_progress" }),
+    task("new-task", { status: "completed", deliveries: [delivery()] }),
     task("new-task", {
       revision: 2,
       acceptanceContracts: [contract(), contract({ revision: 2 })],
@@ -573,7 +607,7 @@ test("rejects rewritten history and newly appended deliveries for stale contract
   assert.deepEqual(validateWorkGraphTransition(previous, currentAppend), currentAppend);
 });
 
-test("enforces forward-only task status transitions and immutable terminal tasks", () => {
+test("supports non-terminal requeue while keeping terminal tasks immutable", () => {
   const transition = (fromTask, toTask) => {
     const previous = createWorkGraphSnapshot(
       draft([fromTask], { revision: 7 }),
@@ -594,12 +628,11 @@ test("enforces forward-only task status transitions and immutable terminal tasks
       task("one", { revision: 2, status: "failed" }),
     ),
   );
-  assert.throws(
+  assert.doesNotThrow(
     transition(
       task("one", { status: "in_progress" }),
       task("one", { revision: 2, status: "pending" }),
     ),
-    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
   );
 
   for (const terminalStatus of ["completed", "failed", "cancelled"]) {
@@ -654,7 +687,7 @@ test("rejects new tasks below terminal ancestors", () => {
   );
 });
 
-test("binds task revisions to direct child identities and revisions", () => {
+test("binds parent revisions to child identities without copying child revisions", () => {
   const groupingContract = contract({
     acceptanceCriteria: [],
     expectedDeliverables: [],
@@ -671,32 +704,10 @@ test("binds task revisions to direct child identities and revisions", () => {
       { revision: 7 },
     ),
   );
-  const staleParent = createWorkGraphSnapshot(
+  const childProgress = createWorkGraphSnapshot(
     draft(
       [
         task("root", {
-          status: "in_progress",
-          acceptanceContracts: [groupingContract],
-        }),
-        task("child", {
-          revision: 2,
-          parentTaskId: "root",
-          status: "in_progress",
-        }),
-      ],
-      { revision: 8 },
-    ),
-  );
-  assert.throws(
-    () => validateWorkGraphTransition(previous, staleParent),
-    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
-  );
-
-  const currentParent = createWorkGraphSnapshot(
-    draft(
-      [
-        task("root", {
-          revision: 2,
           status: "in_progress",
           acceptanceContracts: [groupingContract],
         }),
@@ -710,8 +721,8 @@ test("binds task revisions to direct child identities and revisions", () => {
     ),
   );
   assert.deepEqual(
-    validateWorkGraphTransition(previous, currentParent),
-    currentParent,
+    validateWorkGraphTransition(previous, childProgress),
+    childProgress,
   );
 
   const pureParentBump = createWorkGraphSnapshot(
@@ -727,13 +738,13 @@ test("binds task revisions to direct child identities and revisions", () => {
       { revision: 8 },
     ),
   );
-  assert.throws(
-    () => validateWorkGraphTransition(previous, pureParentBump),
-    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  assert.deepEqual(
+    validateWorkGraphTransition(previous, pureParentBump),
+    pureParentBump,
   );
 });
 
-test("requires child-set and descendant changes to bump every ancestor once", () => {
+test("a new child bumps its direct parent but not unchanged ancestors", () => {
   const groupingContract = contract({
     acceptanceCriteria: [],
     expectedDeliverables: [],
@@ -754,31 +765,10 @@ test("requires child-set and descendant changes to bump every ancestor once", ()
       { revision: 7 },
     ),
   );
-  const nextTasks = (rootRevision) => [
-    group("root", { revision: rootRevision }),
-    group("branch", { revision: 2, parentTaskId: "root" }),
-    task("leaf", {
-      revision: 2,
-      parentTaskId: "branch",
-      status: "in_progress",
-    }),
-  ];
-  const staleRoot = createWorkGraphSnapshot(
-    draft(nextTasks(1), { revision: 8 }),
-  );
-  assert.throws(
-    () => validateWorkGraphTransition(previous, staleRoot),
-    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
-  );
-  const fullyBound = createWorkGraphSnapshot(
-    draft(nextTasks(2), { revision: 8 }),
-  );
-  assert.deepEqual(validateWorkGraphTransition(previous, fullyBound), fullyBound);
-
   const withNewChild = createWorkGraphSnapshot(
     draft(
       [
-        group("root", { revision: 2 }),
+        group("root"),
         group("branch", { revision: 2, parentTaskId: "root" }),
         task("leaf", { parentTaskId: "branch" }),
         task("new-leaf", { parentTaskId: "branch" }),
@@ -789,6 +779,22 @@ test("requires child-set and descendant changes to bump every ancestor once", ()
   assert.deepEqual(
     validateWorkGraphTransition(previous, withNewChild),
     withNewChild,
+  );
+
+  const staleDirectParent = createWorkGraphSnapshot(
+    draft(
+      [
+        group("root"),
+        group("branch", { parentTaskId: "root" }),
+        task("leaf", { parentTaskId: "branch" }),
+        task("new-leaf", { parentTaskId: "branch" }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, staleDirectParent),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
   );
 });
 
@@ -886,6 +892,9 @@ test("derives parent pending, partial, completed, failed, and cancelled outcomes
     createWorkGraphSnapshot(
       draft([parent, ...children.map((entry) => ({ ...entry, parentTaskId: "root" }))]),
     );
+  const boundOutcome = deriveParentTaskOutcome(graph([task("one")]), "root");
+  assert.equal(boundOutcome.graphRevision, 7);
+  assert.match(boundOutcome.graphContentDigest, /^[a-f0-9]{64}$/);
 
   const pendingParent = { ...parent, status: "pending" };
   assert.equal(

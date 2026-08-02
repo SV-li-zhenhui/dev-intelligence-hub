@@ -190,7 +190,7 @@ function normalizeResponsibility(value) {
   if (!RESPONSIBILITY_TYPES.has(value.type)) throw invalid("责任目标类型无效");
   return {
     type: value.type,
-    id: boundedText(value.id, "responsibility.id", 256, SAFE_ID),
+    id: boundedText(value.id, "responsibility.id", 128),
   };
 }
 
@@ -494,7 +494,9 @@ function normalizeContent(value, limits, deliveryBudget) {
     throw invalid("taskId 重复");
   }
   assertReferencesAndHierarchy(tasks, limits);
-  const revision = safeInteger(value.revision, "graph.revision");
+  const revision = safeInteger(value.revision, "graph.revision", {
+    minimum: 0,
+  });
   if (tasks.some((task) => task.revision > revision)) {
     throw staleRevision("graph.revision 落后于任务修订");
   }
@@ -518,7 +520,9 @@ function assertGraphSize(snapshot, limits) {
 
 function assertExpectedRevision(revision, expectedRevision) {
   if (expectedRevision === undefined) return;
-  const expected = safeInteger(expectedRevision, "expectedRevision");
+  const expected = safeInteger(expectedRevision, "expectedRevision", {
+    minimum: 0,
+  });
   if (revision !== expected) throw staleRevision();
 }
 
@@ -593,13 +597,11 @@ function childrenByParent(tasks) {
   return children;
 }
 
-function revisionBoundTaskContent(task, children, tasksById) {
+function revisionBoundTaskContent(task, children) {
   const { revision, ...ownContent } = task;
   return {
     ...ownContent,
-    directChildren: (children.get(task.taskId) ?? [])
-      .map((taskId) => ({ taskId, revision: tasksById.get(taskId).revision }))
-      .sort((left, right) => compareText(left.taskId, right.taskId)),
+    directChildTaskIds: [...(children.get(task.taskId) ?? [])].sort(compareText),
   };
 }
 
@@ -611,12 +613,6 @@ function assertTaskStatusTransition(previousTask, nextTask) {
     throw graphError(
       "WORK_GRAPH_INVALID_TRANSITION",
       `终态任务 ${previousTask.taskId} 不可改写或复活`,
-    );
-  }
-  if (previousTask.status === "in_progress" && nextTask.status === "pending") {
-    throw graphError(
-      "WORK_GRAPH_INVALID_TRANSITION",
-      `任务 ${previousTask.taskId} 不可从 in_progress 回退到 pending`,
     );
   }
 }
@@ -653,9 +649,6 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
     throw staleRevision("工作图 transition 必须保持 graphId 且修订恰好递增 1");
   }
 
-  const previousById = new Map(
-    previous.tasks.map((task) => [task.taskId, task]),
-  );
   const nextById = new Map(next.tasks.map((task) => [task.taskId, task]));
   const previousChildren = childrenByParent(previous.tasks);
   const nextChildren = childrenByParent(next.tasks);
@@ -675,13 +668,15 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
       revisionBoundTaskContent(
         previousTask,
         previousChildren,
-        previousById,
       ),
-      revisionBoundTaskContent(nextTask, nextChildren, nextById),
+      revisionBoundTaskContent(nextTask, nextChildren),
     );
+    const revisionDelta = nextTask.revision - previousTask.revision;
+    // Integrated stores may advance a task for bounded operational facts that
+    // are intentionally absent from this shared projection.
     if (
-      (changed && nextTask.revision !== previousTask.revision + 1) ||
-      (!changed && nextTask.revision !== previousTask.revision)
+      (changed && revisionDelta !== 1) ||
+      (!changed && ![0, 1].includes(revisionDelta))
     ) {
       throw graphError(
         "WORK_GRAPH_INVALID_TRANSITION",
@@ -713,7 +708,7 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
     if (previousTaskIds.has(nextTask.taskId)) continue;
     if (
       nextTask.revision !== 1 ||
-      nextTask.status !== "pending" ||
+      !["pending", "in_progress"].includes(nextTask.status) ||
       nextTask.acceptanceContracts.length !== 1 ||
       nextTask.acceptanceContracts[0].revision !== 1 ||
       nextTask.deliveries.length !== 0
@@ -857,6 +852,8 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
   }
 
   return deepFreeze({
+    graphRevision: index.snapshot.revision,
+    graphContentDigest: index.snapshot.contentDigest,
     taskId: parent.taskId,
     taskRevision: parent.revision,
     outcome,
