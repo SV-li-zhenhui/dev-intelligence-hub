@@ -1340,6 +1340,73 @@ export class ControlledCodeExecutor {
     }
   }
 
+  async reconcileAction(request) {
+    const normalized = normalizeActionRequest(request);
+    this.#assertReady();
+    this.#assertRuntimeAvailable(normalized.sessionId);
+    const requestDigest = digestValue(normalized.action);
+    const snapshot = await this.stateQueue.enqueue(async () => {
+      const state = await this.#readState();
+      const session = this.#requireSession(state, normalized.sessionId);
+      const action = session.actions.find(
+        (entry) => entry.id === normalized.action.actionId,
+      );
+      if (!action) {
+        return {
+          status: "absent",
+          session: projectSession(session),
+        };
+      }
+      if (action.requestDigest !== requestDigest) {
+        throw executorError(
+          "IDEMPOTENCY_CONFLICT",
+          "actionId 已用于不同的受控操作",
+        );
+      }
+      return {
+        status: action.status === "running" ? "running" : "terminal",
+        session: structuredClone(session),
+        action: structuredClone(action),
+      };
+    });
+    if (snapshot.status === "absent") return snapshot;
+    try {
+      const auditedInput = await this.#readAuditedActionInput(
+        normalized.sessionId,
+        snapshot.action,
+      );
+      if (digestValue(auditedInput) !== requestDigest) {
+        throw executorError(
+          "EXECUTION_AUDIT_INVALID",
+          "动作输入审计产物与对账请求不匹配",
+        );
+      }
+      if (snapshot.status === "running") {
+        return {
+          status: "running",
+          session: projectSession(snapshot.session),
+          action: projectAction(snapshot.action),
+        };
+      }
+      const result = ["succeeded", "failed"].includes(snapshot.action.status)
+        ? await this.#readValidatedActionResult(
+            snapshot.session,
+            snapshot.action,
+          )
+        : { error: snapshot.action.error };
+      return structuredClone({
+        status: "terminal",
+        session: projectSession(snapshot.session),
+        action: projectAction(snapshot.action),
+        result,
+      });
+    } catch (error) {
+      if (error?.code === "IDEMPOTENCY_CONFLICT") throw error;
+      this.runtimeFences.add(normalized.sessionId);
+      throw executorError("EXECUTION_FENCED", "审计产物完整性校验失败");
+    }
+  }
+
   async list() {
     this.#assertReady();
     return this.stateQueue.enqueue(async () => {

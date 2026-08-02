@@ -855,6 +855,41 @@ test("a recovered executor returns validated action result envelopes", async (t)
   assert.equal(reread.result.content, "export const value = 1;\n");
 });
 
+test("action reconciliation is exact, audited, and never creates work", async (t) => {
+  const setup = await fixture(t);
+  const { read } = await createCompletedSessionWithRead(setup);
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const exact = {
+    sessionId: "session-one",
+    action: {
+      type: "read_text",
+      actionId: "read-before-completion",
+      expectedWorkspaceRevision: read.action.workspaceRevisionBefore,
+      path: "src/app.js",
+    },
+  };
+
+  const reconciled = await recovered.executor.reconcileAction(exact);
+  assert.equal(reconciled.status, "terminal");
+  assert.equal(reconciled.action.status, "succeeded");
+  assert.deepEqual(reconciled.result, read.result);
+
+  await assert.rejects(
+    recovered.executor.reconcileAction({
+      ...exact,
+      action: { ...exact.action, path: "src/other.js" },
+    }),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  const absent = await recovered.executor.reconcileAction({
+    ...exact,
+    action: { ...exact.action, actionId: "read-never-started" },
+  });
+  assert.equal(absent.status, "absent");
+  assert.equal(absent.session.status, "completed");
+});
+
 test("action result access is exact, ready-gated, and terminal-only", async (t) => {
   const pending = deferred();
   const sandbox = new FakeSandbox({ results: [() => pending.promise] });
