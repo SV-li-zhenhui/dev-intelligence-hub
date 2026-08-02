@@ -7,7 +7,11 @@ function proposal(overrides = {}) {
   const source = { assignmentId: "assignment-1", eventId: "event-1" };
   const binding = {
     eventId: "event-1",
-    subject: { repository: "acme/repo", number: 42 },
+    subject: {
+      id: "github:pr:acme/repo#42",
+      repository: "acme/repo",
+      number: 42,
+    },
     repository: "acme/repo",
     pullRequestNumber: 42,
     headRefOid: "b".repeat(40),
@@ -113,6 +117,16 @@ test("source event and PR subject bindings must agree", () => {
       (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
     );
   }
+});
+
+test("accepts the exact trusted subject emitted by the work intent policy", () => {
+  const value = proposal();
+  const plan = createGitHubReviewProposalConfirmationPlan(value, {
+    actorAccountId: "review-account",
+  });
+
+  assert.equal(value.binding.subject.id, "github:pr:acme/repo#42");
+  assert.equal(plan.target.resourceId, "acme/repo#42");
 });
 
 test("tampered digests and non-GitHub proposal shapes fail closed", () => {

@@ -145,9 +145,14 @@ export function createGitHubReviewProposalConfirmationPlan(
   }
   const subject = plainRecord(
     binding.subject,
-    ["repository", "number"],
+    Object.hasOwn(binding.subject, "id")
+      ? ["id", "repository", "number"]
+      : ["repository", "number"],
     "binding.subject",
   );
+  if (subject.id !== undefined) {
+    text(subject.id, "binding.subject.id", 512);
+  }
   const subjectRepository = text(
     subject.repository,
     "binding.subject.repository",
