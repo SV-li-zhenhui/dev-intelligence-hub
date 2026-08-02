@@ -18,6 +18,7 @@ import {
   validateExecutionId,
   validateWorkspaceId,
 } from "../domain/code-execution-policy.js";
+import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
 
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
@@ -29,20 +30,6 @@ const DEFAULT_LIMITS = Object.freeze({
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function revisionFromHashes(fileHashes) {
-  const digest = createHash("sha256");
-  const entries = [...fileHashes].sort(([left], [right]) =>
-    left < right ? -1 : left > right ? 1 : 0,
-  );
-  for (const [relativePath, fileHash] of entries) {
-    digest.update(relativePath, "utf8");
-    digest.update("\0");
-    digest.update(fileHash, "utf8");
-    digest.update("\0");
-  }
-  return digest.digest("hex");
 }
 
 function safeError(error, fallbackCode, fallbackMessage) {
@@ -181,7 +168,7 @@ export class CodeWorkspaceBroker {
           throw error;
         }
 
-        const sourceRevision = revisionFromHashes(baseline);
+        const sourceRevision = workspaceRevisionFromFileHashes(baseline);
         this.executions.set(key, {
           workspace,
           root: executionRoot,
@@ -541,7 +528,9 @@ export class CodeWorkspaceBroker {
   }
 
   async #currentWorkspaceRevision(execution) {
-    return revisionFromHashes(await this.#currentFileHashes(execution));
+    return workspaceRevisionFromFileHashes(
+      await this.#currentFileHashes(execution),
+    );
   }
 
   #commitCachedFileHash(execution, relativePath, fileHash) {
@@ -551,7 +540,7 @@ export class CodeWorkspaceBroker {
     } else {
       fileHashes.set(relativePath, fileHash);
     }
-    const revision = revisionFromHashes(fileHashes);
+    const revision = workspaceRevisionFromFileHashes(fileHashes);
     execution.workspaceState = { fileHashes, revision };
     return revision;
   }
@@ -559,7 +548,7 @@ export class CodeWorkspaceBroker {
   async #createWorkspaceSnapshot(execution) {
     const current = await this.#currentFileHashes(execution);
     return {
-      workspaceRevision: revisionFromHashes(current),
+      workspaceRevision: workspaceRevisionFromFileHashes(current),
       manifest: this.#createChangeManifest(execution, current),
     };
   }
