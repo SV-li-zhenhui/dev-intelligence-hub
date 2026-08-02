@@ -113,6 +113,8 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
   ]);
   assert.equal(Object.isFrozen(runtime.changePackageTargets), true);
   assert.equal(Object.isFrozen(runtime.changePackageTargets[0]), true);
+  assert.deepEqual(Object.keys(runtime.completedChangeExporter), ["export"]);
+  assert.equal(Object.isFrozen(runtime.completedChangeExporter), true);
   const session = await runtime.executor.start({
     sessionId: "runtime-session",
     workspaceId: "dashboard",
@@ -130,6 +132,14 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
 
   assert.equal(read.result.content, "export const value = 1;\n");
   assert.equal(read.session.status, "active");
+  await assert.rejects(
+    runtime.completedChangeExporter.export({
+      sessionId: session.id,
+      completedActionId: "complete-runtime-session",
+      expectedWorkspaceRevision: session.workspaceRevision,
+    }),
+    (error) => error.code === "EXECUTOR_SESSION_NOT_COMPLETED",
+  );
 });
 
 test("workspace authority binds source, exclusions, writes, and fixed profiles", async (t) => {

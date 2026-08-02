@@ -282,6 +282,51 @@ async function createCompletedSessionWithRead(setup) {
   return { read, failedCompletion, completed };
 }
 
+async function createCompletedSessionWithChanges(setup) {
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  const session = await first.executor.start(startRequest());
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-before-changes",
+      path: "src/app.js",
+    }),
+  );
+  const modified = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "write-modified",
+      path: "src/app.js",
+      content: "export const value = 2;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  const created = await first.executor.perform(
+    actionRequest(modified.session, {
+      type: "write_text",
+      actionId: "write-created",
+      path: "test/new.js",
+      content: "export const added = true;\n",
+      expectedSha256: null,
+    }),
+  );
+  const checked = await first.executor.perform(
+    actionRequest(created.session, {
+      type: "run_profile",
+      actionId: "test-changes",
+      profileId: "node-tests",
+    }),
+  );
+  const completed = await first.executor.perform(
+    actionRequest(checked.session, {
+      type: "complete",
+      actionId: "complete-changes",
+    }),
+  );
+  return { completed, read };
+}
+
 function cleanupPendingError(message = "cleanup pending") {
   return new DockerSandboxError("SANDBOX_CLEANUP_FAILED", message, {
     details: { cleanupPending: true, containerName: "mydashboard-pending" },
@@ -430,6 +475,198 @@ test("writes, tests, and completion stay bound to an exact workspace revision", 
     await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
     "export const value = 1;\n",
   );
+});
+
+test("completed change export rebuilds exact package material after scratch loss", async (t) => {
+  const setup = await fixture(t);
+  const first = setup.createExecutor();
+  await first.executor.recover();
+  let session = await first.executor.start(startRequest());
+  const sourceRevision = session.sourceRevision;
+  const read = await first.executor.perform(
+    actionRequest(session, {
+      type: "read_text",
+      actionId: "read-for-export",
+      path: "src/app.js",
+    }),
+  );
+  const firstWrite = await first.executor.perform(
+    actionRequest(read.session, {
+      type: "write_text",
+      actionId: "write-export-first",
+      path: "src/app.js",
+      content: "export const value = 2;\n",
+      expectedSha256: read.result.sha256,
+    }),
+  );
+  const finalWrite = await first.executor.perform(
+    actionRequest(firstWrite.session, {
+      type: "write_text",
+      actionId: "write-export-final",
+      path: "src/app.js",
+      content: "export const value = 3;\n",
+      expectedSha256: firstWrite.result.sha256,
+    }),
+  );
+  const created = await first.executor.perform(
+    actionRequest(finalWrite.session, {
+      type: "write_text",
+      actionId: "write-export-created",
+      path: "test/new.js",
+      content: "export const added = true;\n",
+      expectedSha256: null,
+    }),
+  );
+  const checked = await first.executor.perform(
+    actionRequest(created.session, {
+      type: "run_profile",
+      actionId: "test-export",
+      profileId: "node-tests",
+    }),
+  );
+  const completed = await first.executor.perform(
+    actionRequest(checked.session, {
+      type: "complete",
+      actionId: "complete-export",
+    }),
+  );
+  const durable = await setup.innerStore.read("code-executor-state");
+  const proofAction = durable.sessions[session.id].actions.find(
+    ({ id }) => id === "test-export",
+  );
+  await rm(setup.scratchRoot, { recursive: true, force: true });
+
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+  const request = {
+    sessionId: session.id,
+    completedActionId: "complete-export",
+    expectedWorkspaceRevision: completed.session.workspaceRevision,
+  };
+  const exported = await recovered.executor.exportCompletedChangeSet(request);
+
+  assert.deepEqual(exported.workspace, {
+    id: "dashboard",
+    sourceRevision,
+    workspaceRevision: completed.session.workspaceRevision,
+  });
+  assert.deepEqual(exported.modified.map(({ path }) => path), ["src/app.js"]);
+  assert.equal(exported.modified[0].beforeSha256, read.result.sha256);
+  assert.equal(
+    exported.modified[0].content.toString("utf8"),
+    "export const value = 3;\n",
+  );
+  assert.deepEqual(exported.created.map(({ path }) => path), ["test/new.js"]);
+  assert.equal(
+    exported.created[0].content.toString("utf8"),
+    "export const added = true;\n",
+  );
+  assert.deepEqual(exported.deleted, []);
+  assert.deepEqual(exported.passedProfiles, [
+    {
+      id: "node-tests",
+      configDigest: digestValue(profileDefinitions["node-tests"]),
+      workspaceRevision: completed.session.workspaceRevision,
+      actionId: "test-export",
+      attemptNumber: 1,
+      imageId: `sha256:${"a".repeat(64)}`,
+      artifacts: structuredClone(proofAction.outputArtifacts),
+    },
+  ]);
+  assert.equal(JSON.stringify(exported).includes(setup.root), false);
+
+  exported.modified[0].content.fill(0);
+  const repeated = await recovered.executor.exportCompletedChangeSet(request);
+  assert.equal(
+    repeated.modified[0].content.toString("utf8"),
+    "export const value = 3;\n",
+  );
+  await assert.rejects(
+    recovered.executor.exportCompletedChangeSet({
+      ...request,
+      completedActionId: "complete-other",
+    }),
+    hasCode("EXECUTION_BINDING_MISMATCH"),
+  );
+});
+
+test("completed change export fences a manifest without audited content", async (t) => {
+  const setup = await fixture(t);
+  const { completed } = await createCompletedSessionWithRead(setup);
+  const state = await setup.innerStore.read("code-executor-state");
+  const session = state.sessions["session-one"];
+  const completion = session.actions.at(-1);
+  await replaceArtifact(setup, completion.outputArtifacts.manifest, {
+    created: [{ path: "src/ghost.js", sha256: "f".repeat(64) }],
+    modified: [],
+    deleted: [],
+  });
+  await setup.innerStore.write("code-executor-state", state);
+  const recovered = setup.createExecutor({ broker: setup.createBroker() });
+  await recovered.executor.recover();
+
+  await assert.rejects(
+    recovered.executor.exportCompletedChangeSet({
+      sessionId: session.id,
+      completedActionId: completion.id,
+      expectedWorkspaceRevision: completed.session.workspaceRevision,
+    }),
+    hasCode("EXECUTION_FENCED"),
+  );
+});
+
+test("completed change export binds classification, baseline, and full write set", async (t) => {
+  const cases = [
+    {
+      name: "classification",
+      tamper(manifest) {
+        const [modified] = manifest.modified;
+        manifest.created.push({
+          path: modified.path,
+          sha256: modified.afterSha256,
+        });
+        manifest.modified = [];
+      },
+    },
+    {
+      name: "baseline",
+      tamper(manifest) {
+        manifest.modified[0].beforeSha256 = "f".repeat(64);
+      },
+    },
+    {
+      name: "complete set",
+      tamper(manifest) {
+        manifest.created = [];
+      },
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (child) => {
+      const setup = await fixture(child);
+      const { completed } = await createCompletedSessionWithChanges(setup);
+      const state = await setup.innerStore.read("code-executor-state");
+      const session = state.sessions["session-one"];
+      const completion = session.actions.at(-1);
+      const manifest = await setup.journal.readJson(
+        completion.outputArtifacts.manifest,
+      );
+      scenario.tamper(manifest);
+      await replaceArtifact(setup, completion.outputArtifacts.manifest, manifest);
+      await setup.innerStore.write("code-executor-state", state);
+      const recovered = setup.createExecutor({ broker: setup.createBroker() });
+      await recovered.executor.recover();
+
+      await assert.rejects(
+        recovered.executor.exportCompletedChangeSet({
+          sessionId: session.id,
+          completedActionId: completion.id,
+          expectedWorkspaceRevision: completed.session.workspaceRevision,
+        }),
+        hasCode("EXECUTION_FENCED"),
+      );
+    });
+  }
 });
 
 test("action schemas and idempotency reject capability escalation", async (t) => {

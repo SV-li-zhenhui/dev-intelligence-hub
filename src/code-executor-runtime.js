@@ -161,6 +161,12 @@ function createChangePackageTargets(workspaces, authority) {
   );
 }
 
+function createCompletedChangeExporter(executor) {
+  return Object.freeze({
+    export: executor.exportCompletedChangeSet.bind(executor),
+  });
+}
+
 export async function createCodeExecutorRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
   if (!enabledConfig) return null;
@@ -232,6 +238,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     workspaces,
     authority,
   );
+  const completedChangeExporter = createCompletedChangeExporter(executor);
   return Object.freeze({
     broker,
     sandbox,
@@ -239,6 +246,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     executor,
     authority,
     changePackageTargets,
+    completedChangeExporter,
     recovery,
   });
 }

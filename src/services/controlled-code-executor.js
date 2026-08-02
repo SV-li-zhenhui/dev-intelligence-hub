@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   ControlledCodeExecutorError,
   digestValue,
@@ -581,6 +582,61 @@ function normalizeActionResultRequest(value) {
     normalized[key] = descriptor.value;
   }
   return normalized;
+}
+
+function normalizeCompletedChangeExportRequest(value) {
+  if (!isPlainRecord(value)) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  const expectedKeys = [
+    "sessionId",
+    "completedActionId",
+    "expectedWorkspaceRevision",
+  ];
+  const actualKeys = Reflect.ownKeys(value);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some(
+      (key) => typeof key !== "string" || !expectedKeys.includes(key),
+    )
+  ) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  const normalized = {};
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    const valid = key === "expectedWorkspaceRevision" ? SHA256 : SAFE_ID;
+    if (
+      !descriptor?.enumerable ||
+      !("value" in descriptor) ||
+      typeof descriptor.value !== "string" ||
+      !valid.test(descriptor.value)
+    ) {
+      throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+    }
+    normalized[key] = descriptor.value;
+  }
+  return normalized;
+}
+
+function contentSha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function packageArtifact(ref) {
+  return { path: ref.path, sha256: ref.sha256, bytes: ref.bytes };
+}
+
+function compareChangePath(left, right) {
+  return left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+}
+
+function canonicalChangeManifest(value) {
+  return {
+    created: [...value.created].sort(compareChangePath),
+    modified: [...value.modified].sort(compareChangePath),
+    deleted: [...value.deleted].sort(compareChangePath),
+  };
 }
 
 function normalizeLimits(limits = {}) {
@@ -1337,6 +1393,45 @@ export class ControlledCodeExecutor {
     } catch {
       this.runtimeFences.add(sessionId);
       throw executorError("EXECUTION_FENCED", "审计产物完整性校验失败");
+    }
+  }
+
+  async exportCompletedChangeSet(value) {
+    const request = normalizeCompletedChangeExportRequest(value);
+    this.#assertReady();
+    this.#assertRuntimeAvailable(request.sessionId);
+    const session = await this.stateQueue.enqueue(async () => {
+      const state = await this.#readState();
+      return structuredClone(this.#requireSession(state, request.sessionId));
+    });
+    if (session.status !== "completed") {
+      throw executorError(
+        "EXECUTOR_SESSION_NOT_COMPLETED",
+        "代码执行会话尚未完成",
+      );
+    }
+    const completedAction = session.actions.at(-1);
+    if (
+      completedAction?.id !== request.completedActionId ||
+      completedAction.type !== "complete" ||
+      completedAction.status !== "succeeded" ||
+      completedAction.workspaceRevisionAfter !==
+        request.expectedWorkspaceRevision ||
+      session.workspaceRevision !== request.expectedWorkspaceRevision
+    ) {
+      throw executorError(
+        "EXECUTION_BINDING_MISMATCH",
+        "完成会话与 change package 导出请求不匹配",
+      );
+    }
+    try {
+      return await this.#buildCompletedChangeSet(session, completedAction);
+    } catch {
+      this.runtimeFences.add(request.sessionId);
+      throw executorError(
+        "EXECUTION_FENCED",
+        "完成会话无法通过 change package 审计",
+      );
     }
   }
 
@@ -2370,6 +2465,117 @@ export class ControlledCodeExecutor {
         "已完成会话的审计证明缺失或损坏",
       );
     }
+  }
+
+  async #buildCompletedChangeSet(session, completedAction) {
+    await this.#validateCompletedSessionArtifacts(session);
+    const manifest = await this.#readValidatedActionResult(
+      session,
+      completedAction,
+    );
+    if (manifest.deleted.length > 0) {
+      throw executorError(
+        "EXECUTION_AUDIT_INVALID",
+        "当前执行器没有经过审计的删除动作",
+      );
+    }
+
+    const writes = new Map();
+    for (const action of session.actions) {
+      if (action.type !== "write_text" || action.status !== "succeeded") {
+        continue;
+      }
+      const [input, result] = await Promise.all([
+        this.#readAuditedActionInput(session.id, action),
+        this.#readValidatedActionResult(session, action),
+      ]);
+      const content = Buffer.from(input.content, "utf8");
+      const sha256 = contentSha256(content);
+      if (
+        result.path !== input.path ||
+        result.sha256 !== sha256 ||
+        result.bytes !== content.length
+      ) {
+        throw executorError(
+          "EXECUTION_AUDIT_INVALID",
+          "写入动作内容与审计结果不匹配",
+        );
+      }
+      const previous = writes.get(input.path);
+      if (previous && input.expectedSha256 !== previous.sha256) {
+        throw executorError(
+          "EXECUTION_AUDIT_INVALID",
+          "同一文件的写入审计链不连续",
+        );
+      }
+      writes.set(input.path, {
+        beforeSha256: previous
+          ? previous.beforeSha256
+          : input.expectedSha256,
+        content,
+        sha256,
+      });
+    }
+
+    const auditedManifest = { created: [], modified: [], deleted: [] };
+    const created = [];
+    const modified = [];
+    for (const [path, write] of writes) {
+      if (write.beforeSha256 === null) {
+        auditedManifest.created.push({ path, sha256: write.sha256 });
+        created.push({ path, content: Buffer.from(write.content) });
+      } else if (write.beforeSha256 !== write.sha256) {
+        auditedManifest.modified.push({
+          path,
+          beforeSha256: write.beforeSha256,
+          afterSha256: write.sha256,
+        });
+        modified.push({
+          path,
+          beforeSha256: write.beforeSha256,
+          content: Buffer.from(write.content),
+        });
+      }
+    }
+    if (
+      digestValue(canonicalChangeManifest(auditedManifest)) !==
+      digestValue(canonicalChangeManifest(manifest))
+    ) {
+      throw executorError(
+        "EXECUTION_AUDIT_INVALID",
+        "变更清单与完整写入审计链不匹配",
+      );
+    }
+    created.sort(compareChangePath);
+    modified.sort(compareChangePath);
+    const passedProfiles = session.requiredProfiles.map((profile) => {
+      const proof = session.verifiedProfiles[profile.id];
+      const action = session.actions.find(({ id }) => id === proof.actionId);
+      return {
+        id: profile.id,
+        configDigest: profile.configDigest,
+        workspaceRevision: proof.workspaceRevision,
+        actionId: proof.actionId,
+        attemptNumber: proof.attemptNumber,
+        imageId: proof.imageId,
+        artifacts: {
+          output: packageArtifact(action.outputArtifacts.output),
+          stdout: packageArtifact(action.outputArtifacts.stdout),
+          stderr: packageArtifact(action.outputArtifacts.stderr),
+        },
+      };
+    });
+    return {
+      workspace: {
+        id: session.workspaceId,
+        sourceRevision: session.sourceRevision,
+        workspaceRevision: session.workspaceRevision,
+      },
+      passedProfiles,
+      created,
+      modified,
+      deleted: [],
+    };
   }
 
   async #validateRecoveryArtifacts() {
