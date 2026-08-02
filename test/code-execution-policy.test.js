@@ -79,4 +79,18 @@ test("sensitive paths stay excluded and callers cannot widen write access", () =
     () => policy.assertWritable("package.json"),
     (error) => error.code === "WRITE_NOT_ALLOWED",
   );
+
+  if (process.platform === "win32") {
+    assert.throws(
+      () => policy.assertAccessible("SRC/PRIVATE/note.txt"),
+      (error) => error.code === "PATH_EXCLUDED",
+    );
+    assert.equal(policy.assertWritable("SRC/app.js"), "SRC/app.js");
+  } else {
+    assert.equal(policy.assertAccessible("SRC/PRIVATE/note.txt"), "SRC/PRIVATE/note.txt");
+    assert.throws(
+      () => policy.assertWritable("SRC/app.js"),
+      (error) => error.code === "WRITE_NOT_ALLOWED",
+    );
+  }
 });

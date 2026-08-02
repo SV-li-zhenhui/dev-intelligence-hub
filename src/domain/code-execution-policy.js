@@ -68,7 +68,14 @@ export function normalizeWorkspacePath(value, { allowRoot = false } = {}) {
 }
 
 function pathIncludes(parent, candidate) {
-  return candidate === parent || candidate.startsWith(`${parent}/`);
+  const comparableParent =
+    process.platform === "win32" ? parent.toLowerCase() : parent;
+  const comparableCandidate =
+    process.platform === "win32" ? candidate.toLowerCase() : candidate;
+  return (
+    comparableCandidate === comparableParent ||
+    comparableCandidate.startsWith(`${comparableParent}/`)
+  );
 }
 
 function isDefaultExcluded(relativePath) {
