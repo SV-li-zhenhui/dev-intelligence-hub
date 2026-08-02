@@ -1,0 +1,605 @@
+import { normalizeWorkDecision } from "../domain/work-intent.js";
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const DEFAULT_INTAKE_LIMIT = 100;
+const DEFAULT_WORK_LIMIT = 20;
+const MAX_PAGE_COUNT = 100;
+const PAGE_SIZE = 100;
+const ORCHESTRATOR_ROLE_ID = "orchestrator";
+const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
+
+function requirePort(value, methods, name) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    methods.some((method) => typeof value[method] !== "function")
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function boundedString(value, name, maximumBytes = 128) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    CONTROL_CHARACTERS.test(value) ||
+    Buffer.byteLength(value, "utf8") > maximumBytes
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function positiveInteger(value, name, maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function dataEntries(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+  const entries = [];
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !descriptor?.enumerable ||
+      !("value" in descriptor)
+    ) {
+      return null;
+    }
+    entries.push([key, descriptor.value]);
+  }
+  return entries;
+}
+
+function cycleOptions(value = {}) {
+  const entries = dataEntries(value);
+  if (!entries) throw new TypeError("runCycle options are invalid");
+  const input = Object.fromEntries(entries);
+  if (
+    Object.keys(input).some(
+      (key) => !["trigger", "intakeLimit", "workLimit"].includes(key),
+    )
+  ) {
+    throw new TypeError("runCycle options are invalid");
+  }
+  return Object.freeze({
+    trigger:
+      input.trigger === undefined
+        ? "scheduled"
+        : boundedString(input.trigger, "trigger"),
+    intakeLimit:
+      input.intakeLimit === undefined
+        ? DEFAULT_INTAKE_LIMIT
+        : positiveInteger(input.intakeLimit, "intakeLimit", 100),
+    workLimit:
+      input.workLimit === undefined
+        ? DEFAULT_WORK_LIMIT
+        : positiveInteger(input.workLimit, "workLimit", 100),
+  });
+}
+
+function normalizeLoopClock(clock) {
+  let value;
+  try {
+    value = clock();
+  } catch (error) {
+    throw new TypeError("clock failed", { cause: error });
+  }
+  const timestamp = value instanceof Date ? value.toISOString() : value;
+  if (
+    typeof timestamp !== "string" ||
+    !Number.isFinite(Date.parse(timestamp)) ||
+    new Date(Date.parse(timestamp)).toISOString() !== timestamp
+  ) {
+    throw new TypeError("clock is invalid");
+  }
+  return timestamp;
+}
+
+function targetKey(target) {
+  return `${target.type}:${target.id}`;
+}
+
+function isAvailable(item, now) {
+  if (item.status === "queued") return true;
+  if (item.status === "retry_wait") {
+    return Date.parse(item.availableAt) <= Date.parse(now);
+  }
+  return (
+    item.status === "working" &&
+    typeof item.leaseUntil === "string" &&
+    Date.parse(item.leaseUntil) <= Date.parse(now)
+  );
+}
+
+function stableFailureCode(error) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+    const code = descriptor && "value" in descriptor ? descriptor.value : null;
+    if (
+      typeof code === "string" &&
+      /^[A-Z][A-Z0-9_]{0,127}$/.test(code)
+    ) {
+      return code;
+    }
+  } catch {
+    // Errors are untrusted; fall through to one stable local classification.
+  }
+  return "ROLE_DECISION_FAILED";
+}
+
+function timeoutError(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+async function within(operation, durationMs, code) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(timeoutError(code)), durationMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function workerItemDto(item) {
+  const {
+    ownerId: _ownerId,
+    leaseId: _leaseId,
+    leaseUntil: _leaseUntil,
+    ...visible
+  } = item;
+  return structuredClone(visible);
+}
+
+function orchestratorDecision(target) {
+  const targetLabel = `${target.type}:${target.id}`;
+  return {
+    schemaVersion: 1,
+    confidence: 100,
+    summary: "需要用户决定缺失岗位的工作路由",
+    intent: {
+      schemaVersion: 1,
+      type: "ask_user",
+      summary: `目标 ${targetLabel} 当前没有可执行员工`,
+      reason: "系统保留了原始分派，但无法安全替用户选择接手人",
+      question: `工作原计划交给 ${targetLabel}，请决定由谁接手或如何重新路由。`,
+      choices: [
+        {
+          id: "reroute",
+          label: "重新路由",
+          description: "选择另一个岗位或员工处理。",
+        },
+        {
+          id: "take-over",
+          label: "我来接手",
+          description: "将该工作保留给用户亲自处理。",
+        },
+        {
+          id: "keep-waiting",
+          label: "继续等待",
+          description: "保持工作不执行，等待目标岗位可用。",
+        },
+      ],
+    },
+  };
+}
+
+function activeQuestionTargets(items) {
+  return new Set(
+    items
+      .filter((item) =>
+        ["dispatch_pending", "waiting_user"].includes(item.status),
+      )
+      .map((item) => targetKey(item.currentTarget)),
+  );
+}
+
+export class ProactiveWorkLoop {
+  constructor({
+    ledger,
+    roleDirectory,
+    clock = () => new Date(),
+    leaseDurationMs = 2 * 60 * 1000,
+    maxAttempts = 3,
+    retryBaseMs = 30 * 1000,
+    retryMaxMs = 15 * 60 * 1000,
+    resolveTimeoutMs,
+    decideTimeoutMs,
+  } = {}) {
+    this.ledger = requirePort(
+      ledger,
+      [
+        "intake",
+        "listItems",
+        "claim",
+        "stageIntent",
+        "scheduleRetry",
+        "transition",
+      ],
+      "ledger",
+    );
+    this.roleDirectory = requirePort(
+      roleDirectory,
+      ["resolve"],
+      "roleDirectory",
+    );
+    if (typeof clock !== "function") throw new TypeError("clock is invalid");
+    this.clock = clock;
+    this.leaseDurationMs = positiveInteger(
+      leaseDurationMs,
+      "leaseDurationMs",
+      24 * 60 * 60 * 1000,
+    );
+    if (this.leaseDurationMs < 1_000) {
+      throw new TypeError("leaseDurationMs is invalid");
+    }
+    this.maxAttempts = positiveInteger(maxAttempts, "maxAttempts", 100);
+    this.retryBaseMs = positiveInteger(
+      retryBaseMs,
+      "retryBaseMs",
+      24 * 60 * 60 * 1000,
+    );
+    this.retryMaxMs = positiveInteger(
+      retryMaxMs,
+      "retryMaxMs",
+      24 * 60 * 60 * 1000,
+    );
+    if (this.retryMaxMs < this.retryBaseMs) {
+      throw new TypeError("retryMaxMs is invalid");
+    }
+    this.resolveTimeoutMs = positiveInteger(
+      resolveTimeoutMs ?? Math.min(10_000, this.leaseDurationMs - 1),
+      "resolveTimeoutMs",
+      24 * 60 * 60 * 1000,
+    );
+    this.decideTimeoutMs = positiveInteger(
+      decideTimeoutMs ?? Math.min(60_000, this.leaseDurationMs - 1),
+      "decideTimeoutMs",
+      24 * 60 * 60 * 1000,
+    );
+    if (
+      this.resolveTimeoutMs >= this.leaseDurationMs ||
+      this.decideTimeoutMs >= this.leaseDurationMs
+    ) {
+      throw new TypeError("role timeouts must be shorter than leaseDurationMs");
+    }
+    this.inFlight = null;
+  }
+
+  runCycle(input = {}) {
+    if (this.inFlight) return this.inFlight;
+    const options = cycleOptions(input);
+    const execution = Promise.resolve().then(() => this.#executeCycle(options));
+    const tracked = execution.finally(() => {
+      if (this.inFlight === tracked) this.inFlight = null;
+    });
+    this.inFlight = tracked;
+    return tracked;
+  }
+
+  async #executeCycle(options) {
+    const intake = await this.ledger.intake({ limit: options.intakeLimit });
+    const items = await this.#listAllItems();
+    const activeQuestions = activeQuestionTargets(items);
+    const resolutions = new Map();
+    const outcomes = [];
+    let claimedCount = 0;
+    let claimAttempts = 0;
+
+    for (const item of items) {
+      if (claimAttempts >= options.workLimit) break;
+      if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      const key = targetKey(item.currentTarget);
+      let resolution;
+      try {
+        if (!resolutions.has(key)) {
+          try {
+            resolutions.set(key, await this.#resolve(item.currentTarget));
+          } catch (error) {
+            resolutions.set(key, { status: "resolution_failed", error });
+          }
+        }
+        resolution = resolutions.get(key);
+      } catch {
+        outcomes.push({ itemId: item.itemId, status: "resolution_failed" });
+        continue;
+      }
+      if (resolution.status === "resolution_failed") {
+        outcomes.push({ itemId: item.itemId, status: "resolution_failed" });
+        continue;
+      }
+      if (resolution.status === "paused") {
+        outcomes.push({ itemId: item.itemId, status: "paused" });
+        continue;
+      }
+      if (resolution.orchestrator && activeQuestions.has(key)) {
+        outcomes.push({
+          itemId: item.itemId,
+          status: "missing_target_waiting",
+        });
+        continue;
+      }
+
+      claimAttempts += 1;
+      const claim = await this.#claim(item, resolution, options.intakeLimit);
+      if (!claim.item) {
+        outcomes.push({ itemId: item.itemId, status: claim.status });
+        continue;
+      }
+      claimedCount += 1;
+      const outcome = await this.#decideAndStage(
+        claim.item,
+        resolution,
+        options,
+      );
+      outcomes.push({ itemId: item.itemId, ...outcome });
+      if (
+        resolution.orchestrator &&
+        ["staged", "stage_recovered", "stage_uncertain"].includes(
+          outcome.status,
+        )
+      ) {
+        activeQuestions.add(key);
+      }
+    }
+
+    return {
+      trigger: options.trigger,
+      intake,
+      scanned: items.length,
+      claimAttempts,
+      claimed: claimedCount,
+      staged: outcomes.filter(({ status }) => status === "staged").length,
+      recoveredStages: outcomes.filter(
+        ({ status }) => status === "stage_recovered",
+      ).length,
+      retried: outcomes.filter(({ status }) => status === "retry_scheduled")
+        .length,
+      blocked: outcomes.filter(({ status }) => status === "blocked").length,
+      outcomes,
+    };
+  }
+
+  async #resolve(target) {
+    if (target.type !== "role") return this.#orchestrator(target);
+    const candidate = await within(
+      () => this.roleDirectory.resolve({ ...target }),
+      this.resolveTimeoutMs,
+      "ROLE_RESOLUTION_TIMEOUT",
+    );
+    if (candidate === null || candidate === undefined) {
+      return this.#orchestrator(target);
+    }
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      candidate.roleId !== target.id ||
+      typeof candidate.enabled !== "boolean" ||
+      typeof candidate.paused !== "boolean" ||
+      typeof candidate.decide !== "function"
+    ) {
+      throw new TypeError("roleDirectory returned an invalid worker");
+    }
+    const workerId = boundedString(candidate.workerId, "workerId");
+    if (!candidate.enabled || candidate.paused) {
+      return { status: "paused", orchestrator: false, workerId };
+    }
+    return {
+      status: "active",
+      orchestrator: false,
+      roleId: candidate.roleId,
+      workerId,
+      decide: candidate.decide.bind(candidate),
+    };
+  }
+
+  #orchestrator(target) {
+    return {
+      status: "active",
+      orchestrator: true,
+      roleId: ORCHESTRATOR_ROLE_ID,
+      workerId: ORCHESTRATOR_WORKER_ID,
+      decide: async () => orchestratorDecision(target),
+    };
+  }
+
+  async #claim(item, worker, intakeLimit) {
+    try {
+      return {
+        status: "claimed",
+        item: await this.ledger.claim({
+          itemId: item.itemId,
+          expectedRevision: item.revision,
+          workerId: worker.workerId,
+          leaseDurationMs: this.leaseDurationMs,
+        }),
+      };
+    } catch {
+      const observed = await this.#observeItem(item.itemId, intakeLimit);
+      if (
+        observed &&
+        observed.status === "working" &&
+        observed.ownerId === worker.workerId &&
+        observed.revision === item.revision + 1 &&
+        observed.attempt === item.attempt + 1 &&
+        observed.inputDigest === item.inputDigest
+      ) {
+        return { status: "claim_recovered", item: observed };
+      }
+      return {
+        status: observed ? "claim_not_acquired" : "claim_uncertain",
+        item: null,
+      };
+    }
+  }
+
+  async #decideAndStage(item, worker, options) {
+    let decision;
+    try {
+      decision = normalizeWorkDecision(
+        await within(
+          () => worker.decide({
+            item: workerItemDto(item),
+            trigger: options.trigger,
+          }),
+          this.decideTimeoutMs,
+          "ROLE_DECISION_TIMEOUT",
+        ),
+      );
+    } catch (error) {
+      return this.#recordFailure(item, worker.workerId, error, options);
+    }
+
+    try {
+      await this.ledger.stageIntent({
+        itemId: item.itemId,
+        expectedRevision: item.revision,
+        leaseId: item.leaseId,
+        actorId: worker.workerId,
+        roleId: worker.roleId,
+        intent: decision.intent,
+      });
+      return { status: "staged", workerId: worker.workerId };
+    } catch (error) {
+      const observed = await this.#observeItem(
+        item.itemId,
+        options.intakeLimit,
+      );
+      if (
+        ["dispatch_pending", "waiting_user"].includes(observed?.status) &&
+        observed.inputDigest === item.inputDigest &&
+        (observed.status === "waiting_user" ||
+          observed.revision === item.revision + 1)
+      ) {
+        return { status: "stage_recovered", workerId: worker.workerId };
+      }
+      if (
+        observed?.status === "working" &&
+        observed.revision === item.revision &&
+        observed.leaseId === item.leaseId
+      ) {
+        return this.#recordFailure(item, worker.workerId, error, options);
+      }
+      return {
+        status: observed ? "stage_state_changed" : "stage_uncertain",
+        workerId: worker.workerId,
+      };
+    }
+  }
+
+  async #recordFailure(item, actorId, error, options) {
+    const code = stableFailureCode(error);
+    const input = {
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      leaseId: item.leaseId,
+      actorId,
+      reason:
+        item.attempt >= this.maxAttempts
+          ? "decision_attempts_exhausted"
+          : "decision_failed",
+    };
+    try {
+      if (item.attempt >= this.maxAttempts) {
+        await this.ledger.transition({
+          ...input,
+          toStatus: "blocked",
+          details: { code },
+        });
+        return { status: "blocked", workerId: actorId, code };
+      }
+      const exponent = Math.min(item.attempt - 1, 30);
+      const delay = Math.min(
+        this.retryMaxMs,
+        this.retryBaseMs * 2 ** exponent,
+      );
+      await this.ledger.scheduleRetry({
+        ...input,
+        availableAt: new Date(
+          Date.parse(normalizeLoopClock(this.clock)) + delay,
+        ).toISOString(),
+      });
+      return { status: "retry_scheduled", workerId: actorId, code };
+    } catch {
+      const observed = await this.#observeItem(
+        item.itemId,
+        options.intakeLimit,
+      );
+      if (observed?.status === "blocked") {
+        return { status: "blocked", workerId: actorId, code };
+      }
+      if (observed?.status === "retry_wait") {
+        return { status: "retry_scheduled", workerId: actorId, code };
+      }
+      return {
+        status: observed ? "failure_state_unchanged" : "failure_uncertain",
+        workerId: actorId,
+        code,
+      };
+    }
+  }
+
+  async #observeItem(itemId, intakeLimit) {
+    try {
+      await this.ledger.intake({ limit: Math.min(intakeLimit, 1) });
+      return await this.#findItem(itemId);
+    } catch {
+      return null;
+    }
+  }
+
+  async #findItem(itemId) {
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      const result = await this.ledger.listItems({
+        limit: PAGE_SIZE,
+        ...(cursor ? { cursor } : {}),
+      });
+      const found = result.items.find((item) => item.itemId === itemId);
+      if (found) return found;
+      if (!result.nextCursor) return null;
+      if (result.nextCursor === cursor) {
+        throw new TypeError("ledger pagination did not advance");
+      }
+      cursor = result.nextCursor;
+    }
+    throw new TypeError("ledger pagination exceeded its safety bound");
+  }
+
+  async #listAllItems() {
+    const items = [];
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      const result = await this.ledger.listItems({
+        limit: PAGE_SIZE,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!result || !Array.isArray(result.items)) {
+        throw new TypeError("ledger listItems result is invalid");
+      }
+      items.push(...result.items);
+      if (!result.nextCursor) return items;
+      if (result.nextCursor === cursor) {
+        throw new TypeError("ledger pagination did not advance");
+      }
+      cursor = result.nextCursor;
+    }
+    throw new TypeError("ledger pagination exceeded its safety bound");
+  }
+}
