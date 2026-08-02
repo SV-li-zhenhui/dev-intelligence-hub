@@ -329,6 +329,16 @@ export class CodeJobBrainDirectory {
             409,
           );
         }
+        if (
+          decision.action.type === "run_profile" &&
+          context.capabilities.requiredProfilesRemaining === 0
+        ) {
+          throw directoryError(
+            "CODE_BRAIN_CHECKS_ALREADY_PASSED",
+            "Code brain tried to repeat checks that already passed",
+            409,
+          );
+        }
         return decision;
       } catch (error) {
         if (attempt === 1) throw error;

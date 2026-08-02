@@ -146,6 +146,27 @@ test("sealed capabilities reject model escalation and premature completion", asy
   }
 });
 
+test("the host rejects repeated profile runs after all checks pass", async () => {
+  const router = fakeRouter([decision({ type: "run_profile" })]);
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+
+  await assert.rejects(
+    directory.decide(input({
+      capabilities: {
+        ...input().capabilities,
+        requiredProfilesRemaining: 0,
+      },
+    })),
+    (error) =>
+      error instanceof CodeJobBrainDirectoryError &&
+      error.code === "CODE_BRAIN_CHECKS_ALREADY_PASSED",
+  );
+  assert.equal(router.calls.length, 2);
+});
+
 test("remote brains require explicit requirements and code authorization", async () => {
   const providerCalls = [];
   const router = new BrainRouter({
