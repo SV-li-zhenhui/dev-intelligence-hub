@@ -12,6 +12,11 @@ const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
+const SHA256 = /^[a-f0-9]{64}$/;
+const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const RECEIPT_KEYS = ["recordId", "contentDigest", "source"];
+const RECEIPT_SOURCE_KEYS = ["kind", "id"];
 const QUERY_KEYS = [
   "q",
   "roleId",
@@ -60,6 +65,52 @@ function exact(value, allowed, name) {
     throw memoryError("MEMORY_INPUT_INVALID", `${name} 字段无效`);
   }
   return Object.fromEntries(entries);
+}
+
+function receiptUnverified() {
+  return memoryError(
+    "MEMORY_RECEIPT_UNVERIFIED",
+    "无法验证持久记忆凭据",
+    409,
+  );
+}
+
+function receiptReference(value) {
+  const error = receiptUnverified();
+  try {
+    const entries = new Map(dataEntries(value, "memory receipt"));
+    const sourceEntries = new Map(
+      dataEntries(entries.get("source"), "memory receipt source"),
+    );
+    if (
+      entries.size !== RECEIPT_KEYS.length ||
+      RECEIPT_KEYS.some((key) => !entries.has(key)) ||
+      sourceEntries.size !== RECEIPT_SOURCE_KEYS.length ||
+      RECEIPT_SOURCE_KEYS.some((key) => !sourceEntries.has(key))
+    ) {
+      throw error;
+    }
+    const recordId = entries.get("recordId");
+    const contentDigest = entries.get("contentDigest");
+    const kind = sourceEntries.get("kind");
+    const id = sourceEntries.get("id");
+    if (
+      typeof contentDigest !== "string" ||
+      !SHA256.test(contentDigest) ||
+      recordId !== `memory-${contentDigest}` ||
+      typeof kind !== "string" ||
+      !SAFE_SOURCE_KIND.test(kind) ||
+      typeof id !== "string" ||
+      id.trim().length === 0 ||
+      Buffer.byteLength(id, "utf8") > 512 ||
+      INVALID_RECEIPT_CONTROL.test(id)
+    ) {
+      throw error;
+    }
+    return { recordId, contentDigest, source: { kind, id } };
+  } catch {
+    throw error;
+  }
 }
 
 function strictArray(value, maximum, name) {
@@ -533,6 +584,22 @@ export class LocalMemoryJournal {
       totalMatched: matched.length,
       indexHealthy: !this.#lastIndexError,
     };
+  }
+
+  verifyReceipt(value) {
+    this.#assertReady();
+    const expected = receiptReference(value);
+    const record = this.#journal.records.find(
+      ({ recordId }) => recordId === expected.recordId,
+    );
+    if (
+      record?.contentDigest !== expected.contentDigest ||
+      record.source.kind !== expected.source.kind ||
+      record.source.id !== expected.source.id
+    ) {
+      throw receiptUnverified();
+    }
+    return structuredClone({ ...expected, persisted: true });
   }
 
   rebuildIndex() {

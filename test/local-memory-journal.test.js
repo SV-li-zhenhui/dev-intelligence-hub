@@ -27,15 +27,21 @@ function record(index, overrides = {}) {
 
 function memoryStore({ failIndexWrites = false } = {}) {
   const values = new Map();
+  const reads = [];
+  const writes = [];
   return {
     values,
+    reads,
+    writes,
     async read(key, fallback = null) {
+      reads.push(key);
       return structuredClone(values.has(key) ? values.get(key) : fallback);
     },
     async write(key, value) {
       if (failIndexWrites && key === MEMORY_INDEX_KEY) {
         throw new Error("index disk unavailable");
       }
+      writes.push(key);
       values.set(key, structuredClone(value));
     },
   };
@@ -99,6 +105,82 @@ test("local search supports Chinese keywords, filters, newest order, and stable 
   assert.equal(secondPage.nextCursor, null);
   assert.equal(firstPage.totalMatched, 3);
   assert.equal(secondPage.totalMatched, 3);
+});
+
+test("receipt verification is exact, read-only, and never exposes memory content", async () => {
+  const { store, journal } = await fixture();
+  await journal.append(record(1, { content: "private-memory-content" }));
+  const stored = store.values.get(MEMORY_JOURNAL_KEY).records[0];
+  const request = {
+    recordId: stored.recordId,
+    contentDigest: stored.contentDigest,
+    source: structuredClone(stored.source),
+  };
+  const readsBefore = store.reads.length;
+  const writesBefore = store.writes.length;
+
+  const verified = journal.verifyReceipt(request);
+
+  assert.deepEqual(verified, { ...request, persisted: true });
+  assert.deepEqual(Object.keys(verified), [
+    "recordId",
+    "contentDigest",
+    "source",
+    "persisted",
+  ]);
+  assert.equal("content" in verified, false);
+  assert.equal("title" in verified, false);
+  assert.notStrictEqual(verified.source, stored.source);
+  assert.equal(store.reads.length, readsBefore);
+  assert.equal(store.writes.length, writesBefore);
+
+  verified.source.id = "changed-by-caller";
+  assert.deepEqual(journal.verifyReceipt(request), { ...request, persisted: true });
+});
+
+test("receipt verification fails uniformly for malformed, missing, or mismatched bindings", async () => {
+  const { journal } = await fixture();
+  await journal.append(record(1, { content: "private-memory-content" }));
+  const [stored] = journal.search({}).items;
+  const persisted = record(1).source;
+  const valid = {
+    recordId: stored.id,
+    contentDigest: stored.id.slice("memory-".length),
+    source: persisted,
+  };
+  const failures = [
+    { ...valid, recordId: `memory-${"0".repeat(64)}`, contentDigest: "0".repeat(64) },
+    { ...valid, contentDigest: "0".repeat(64) },
+    { ...valid, source: { ...valid.source, id: "another-source" } },
+    { ...valid, debug: true },
+    { recordId: valid.recordId, contentDigest: valid.contentDigest },
+    { ...valid, source: { ...valid.source, debug: true } },
+  ];
+  const fingerprints = failures.map((candidate) => {
+    let error;
+    try {
+      journal.verifyReceipt(candidate);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error);
+    assert.equal(error.cause, undefined);
+    assert.equal(error.message.includes("private-memory-content"), false);
+    return {
+      code: error.code,
+      message: error.message,
+      statusCode: error.statusCode,
+    };
+  });
+
+  assert.deepEqual(
+    fingerprints,
+    failures.map(() => ({
+      code: "MEMORY_RECEIPT_UNVERIFIED",
+      message: "无法验证持久记忆凭据",
+      statusCode: 409,
+    })),
+  );
 });
 
 test("an index write outage never rolls back raw memory and search stays local", async () => {
