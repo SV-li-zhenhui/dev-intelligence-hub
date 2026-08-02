@@ -22,6 +22,53 @@ function applicationConfig(codeExecutor = { enabled: false }) {
   };
 }
 
+function externalActionConfig(codeExecutor = { enabled: false }) {
+  return {
+    ...applicationConfig(codeExecutor),
+    githubActions: {
+      enabled: true,
+      actorAccountId: "review-account",
+    },
+  };
+}
+
+function workCoordinationConfig({ externalActions = true } = {}) {
+  return {
+    ...applicationConfig(),
+    workflowRouting: {
+      schemaVersion: 1,
+      enabled: true,
+      maxHops: 8,
+      rules: [],
+    },
+    githubActions: externalActions
+      ? { enabled: true, actorAccountId: "review-account" }
+      : { enabled: false },
+    workCoordination: {
+      enabled: true,
+      intakeLimit: 11,
+      workLimit: 12,
+      dispatchLimit: 13,
+      attentionLimit: 14,
+      conditionLimit: 15,
+      leaseDurationMs: 16_000,
+      resolveTimeoutMs: 2_000,
+      decisionTimeoutMs: 3_000,
+      maxAttempts: 4,
+      retryBaseMs: 5_000,
+      retryMaxMs: 6_000,
+      factMaximumAgeMs: 7_000,
+      policy: {
+        version: 2,
+        capabilityRoles: { testing: "tester" },
+        githubReviewRoles: ["pr-reviewer"],
+        codeActionRoles: ["developer"],
+        workspaceByRepository: { "acme/repo": "acme-workspace" },
+      },
+    },
+  };
+}
+
 function confirmationQueuePort() {
   return Object.freeze({
     async next() {
@@ -217,23 +264,298 @@ test("application composes the recovered local workflow router", async () => {
   await application.close();
 });
 
-test("application close starts and awaits both workflow and confirmation shutdown", async () => {
-  let releaseWorkflow;
-  let releaseConfirmation;
-  const workflowClosed = new Promise((resolve) => {
-    releaseWorkflow = resolve;
-  });
-  const confirmationClosed = new Promise((resolve) => {
-    releaseConfirmation = resolve;
-  });
+test("enabled work coordination composes private runtimes into frozen application ports", async () => {
+  const store = memoryStore();
+  const runtimeOrder = [];
+  const serviceOrder = [];
   const closeCalls = [];
+  const calls = {};
+  const workers = [{ roleId: "developer" }];
+  const workflowRouting = {
+    async readAssignmentBatch() {},
+    async close() {
+      closeCalls.push("workflow");
+    },
+  };
+  const ledgerRuntime = {
+    async getSummary() {
+      return { source: "ledger" };
+    },
+    async listItems(options) {
+      return { items: [options], nextCursor: null };
+    },
+    async listTimeline(options) {
+      return { items: [options], nextCursor: null };
+    },
+    async close() {
+      closeCalls.push("ledger");
+    },
+  };
+  const attentionProducer = { async create() {} };
+  const attentionConsumer = { async readOutbox() {} };
+  const attentionBrowser = {
+    async next() {
+      return { id: "attention-1" };
+    },
+    async answer(value) {
+      return value;
+    },
+    async reject(value) {
+      return value;
+    },
+    async later(value) {
+      return value;
+    },
+  };
+  const confirmationQueue = confirmationQueuePort();
+  const policy = { async bind() {} };
+  const roleDirectory = { async resolve() {} };
+  const factSource = { async read() {} };
+  const reconciler = { async runCycle() {} };
+  const conditionWaker = { async runCycle() {} };
+  const workLoop = { async runCycle() {} };
+  const dispatcher = { async dispatchPending() {} };
+  const coordinationService = {
+    async intake() {
+      return "intake-result";
+    },
+    async runCycle(value) {
+      return value;
+    },
+  };
+  const coordinator = {
+    async next() {
+      return "coordinated-attention";
+    },
+  };
+
+  const application = await createApplication({
+    config: workCoordinationConfig(),
+    store,
+    workCoordinationDependencies: { workers },
+    codeExecutorRuntimeFactory: async () => {
+      runtimeOrder.push("code-executor");
+      return {
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      };
+    },
+    workflowRoutingRuntimeFactory: async () => {
+      runtimeOrder.push("workflow");
+      return workflowRouting;
+    },
+    workLedgerRuntimeFactory: async (options) => {
+      runtimeOrder.push("ledger");
+      calls.ledger = options;
+      return ledgerRuntime;
+    },
+    attentionInboxRuntimeFactory: async (options) => {
+      runtimeOrder.push("attention");
+      calls.attention = options;
+      return {
+        producer: attentionProducer,
+        browser: attentionBrowser,
+        consumer: attentionConsumer,
+        async close() {
+          closeCalls.push("attention");
+        },
+      };
+    },
+    confirmationRuntimeFactory: async () => {
+      runtimeOrder.push("confirmation");
+      return {
+        queue: confirmationQueue,
+        producerQueue: confirmationProducerPort(),
+        async close() {
+          closeCalls.push("confirmation");
+        },
+      };
+    },
+    workIntentPolicyFactory: (options) => {
+      serviceOrder.push("policy");
+      calls.policy = options;
+      return policy;
+    },
+    roleWorkerDirectoryFactory: (options) => {
+      serviceOrder.push("directory");
+      calls.directory = options;
+      return roleDirectory;
+    },
+    workflowFactSourceFactory: (options) => {
+      serviceOrder.push("facts");
+      calls.facts = options;
+      return factSource;
+    },
+    attentionResultReconcilerFactory: (options) => {
+      serviceOrder.push("reconciler");
+      calls.reconciler = options;
+      return reconciler;
+    },
+    workConditionWakerFactory: (options) => {
+      serviceOrder.push("waker");
+      calls.waker = options;
+      return conditionWaker;
+    },
+    proactiveWorkLoopFactory: (options) => {
+      serviceOrder.push("loop");
+      calls.loop = options;
+      return workLoop;
+    },
+    workIntentDispatcherFactory: (options) => {
+      serviceOrder.push("dispatcher");
+      calls.dispatcher = options;
+      return dispatcher;
+    },
+    workCoordinationFactory: (options) => {
+      serviceOrder.push("coordination");
+      calls.coordination = options;
+      return coordinationService;
+    },
+    attentionCoordinatorFactory: (options) => {
+      serviceOrder.push("attention-coordinator");
+      calls.coordinator = options;
+      return coordinator;
+    },
+  });
+
+  assert.deepEqual(runtimeOrder, [
+    "code-executor",
+    "workflow",
+    "ledger",
+    "attention",
+    "confirmation",
+  ]);
+  assert.deepEqual(serviceOrder, [
+    "policy",
+    "directory",
+    "facts",
+    "reconciler",
+    "waker",
+    "loop",
+    "dispatcher",
+    "coordination",
+    "attention-coordinator",
+  ]);
+  assert.strictEqual(calls.ledger.store, store);
+  assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
+  assert.strictEqual(calls.attention.store, store);
+  assert.notStrictEqual(
+    calls.ledger.operationQueue,
+    calls.attention.operationQueue,
+  );
+  assert.strictEqual(
+    calls.directory.legacyEmployeeRegistry,
+    application.employeeRegistry,
+  );
+  assert.deepEqual(calls.directory.legacyOwnedRoleIds, ["pr-reviewer"]);
+  assert.strictEqual(calls.directory.workers, workers);
+  assert.deepEqual(calls.policy, workCoordinationConfig().workCoordination.policy);
+  assert.equal(calls.facts.maximumAgeMs, 7_000);
+  assert.strictEqual(calls.reconciler.attentionConsumer, attentionConsumer);
+  assert.strictEqual(calls.reconciler.ledger, ledgerRuntime);
+  assert.strictEqual(calls.waker.factSource, factSource);
+  assert.strictEqual(calls.waker.ledger, ledgerRuntime);
+  assert.strictEqual(calls.loop.roleDirectory, roleDirectory);
+  assert.equal(calls.loop.decideTimeoutMs, 3_000);
+  assert.strictEqual(calls.dispatcher.policy, policy);
+  assert.strictEqual(calls.dispatcher.attentionProducer, attentionProducer);
+  assert.strictEqual(calls.coordination.workLoop, workLoop);
+  assert.strictEqual(calls.coordination.dispatcher, dispatcher);
+  assert.equal(calls.coordination.attentionLimit, 14);
+  assert.strictEqual(calls.coordinator.externalQueue, confirmationQueue);
+  assert.strictEqual(calls.coordinator.internalInbox, attentionBrowser);
+
+  assert.deepEqual(Object.keys(application.workLedgerView).sort(), [
+    "getSummary",
+    "listItems",
+    "listTimeline",
+  ]);
+  assert.deepEqual(Object.keys(application.attentionBrowser).sort(), [
+    "answer",
+    "later",
+    "next",
+    "reject",
+  ]);
+  assert.deepEqual(Object.keys(application.attentionCoordinator), ["next"]);
+  assert.deepEqual(Object.keys(application.workCoordination).sort(), [
+    "intake",
+    "runCycle",
+  ]);
+  for (const port of [
+    application.workLedgerView,
+    application.attentionBrowser,
+    application.attentionCoordinator,
+    application.workCoordination,
+  ]) {
+    assert.equal(Object.isFrozen(port), true);
+  }
+  for (const privateName of [
+    "workLedger",
+    "workLedgerRuntime",
+    "attentionInbox",
+    "attentionInboxRuntime",
+    "attentionProducer",
+    "attentionConsumer",
+  ]) {
+    assert.equal(privateName in application, false);
+  }
+  assert.deepEqual(await application.workLedgerView.getSummary(), {
+    source: "ledger",
+  });
+  assert.equal(await application.workCoordination.intake(), "intake-result");
+  assert.equal(
+    await application.attentionCoordinator.next(),
+    "coordinated-attention",
+  );
+
+  await application.close();
+  assert.deepEqual(closeCalls, [
+    "confirmation",
+    "attention",
+    "ledger",
+    "workflow",
+    "code-executor",
+  ]);
+});
+
+test("disabled work coordination does not acquire private runtimes or services", async () => {
+  let workFactoryCalls = 0;
+  const unexpectedFactory = () => {
+    workFactoryCalls += 1;
+    throw new Error("work coordination must stay disabled");
+  };
   const application = await createApplication({
     config: applicationConfig(),
     store: memoryStore(),
+    workLedgerRuntimeFactory: unexpectedFactory,
+    attentionInboxRuntimeFactory: unexpectedFactory,
+    workIntentPolicyFactory: unexpectedFactory,
+    workCoordinationFactory: unexpectedFactory,
+  });
+
+  assert.equal(workFactoryCalls, 0);
+  assert.equal(application.workLedgerView, null);
+  assert.equal(application.attentionBrowser, null);
+  assert.equal(application.attentionCoordinator, null);
+  assert.equal(application.workCoordination, null);
+  await application.close();
+});
+
+test("application close is idempotent and attempts every runtime in reverse order", async () => {
+  const closeCalls = [];
+  const closeFailure = new Error("confirmation close failed");
+  const application = await createApplication({
+    config: externalActionConfig(),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      async close() {
+        closeCalls.push("code-executor");
+      },
+    }),
     workflowRoutingRuntimeFactory: async () => ({
       async close() {
         closeCalls.push("workflow");
-        await workflowClosed;
       },
     }),
     confirmationRuntimeFactory: async () => ({
@@ -241,36 +563,35 @@ test("application close starts and awaits both workflow and confirmation shutdow
       producerQueue: confirmationProducerPort(),
       async close() {
         closeCalls.push("confirmation");
-        await confirmationClosed;
+        throw closeFailure;
       },
     }),
   });
 
-  let completed = false;
-  const closing = application.close().then(() => {
-    completed = true;
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(new Set(closeCalls), new Set(["workflow", "confirmation"]));
-  releaseConfirmation();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(completed, false);
-  releaseWorkflow();
-  await closing;
-  assert.equal(completed, true);
+  const firstClose = application.close();
+  const secondClose = application.close();
+  assert.strictEqual(secondClose, firstClose);
+  await assert.rejects(firstClose, (error) => error === closeFailure);
+  await assert.rejects(secondClose, (error) => error === closeFailure);
+  assert.deepEqual(closeCalls, ["confirmation", "workflow", "code-executor"]);
 });
 
 test("a later startup failure releases the acquired workflow runtime", async () => {
-  let workflowCloses = 0;
+  const closeCalls = [];
   const startupFailure = new Error("confirmation startup failed");
 
   await assert.rejects(
     createApplication({
-      config: applicationConfig(),
+      config: externalActionConfig(),
       store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => ({
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      }),
       workflowRoutingRuntimeFactory: async () => ({
         async close() {
-          workflowCloses += 1;
+          closeCalls.push("workflow");
         },
       }),
       confirmationRuntimeFactory: async () => {
@@ -279,7 +600,67 @@ test("a later startup failure releases the acquired workflow runtime", async () 
     }),
     (error) => error === startupFailure,
   );
-  assert.equal(workflowCloses, 1);
+  assert.deepEqual(closeCalls, ["workflow", "code-executor"]);
+});
+
+test("work coordination startup preserves its error while closing every acquired runtime", async () => {
+  const closeCalls = [];
+  const startupFailure = new Error("attention startup failed");
+  const cleanupFailure = new Error("ledger close failed");
+
+  await assert.rejects(
+    createApplication({
+      config: workCoordinationConfig({ externalActions: false }),
+      store: memoryStore(),
+      codeExecutorRuntimeFactory: async () => ({
+        async close() {
+          closeCalls.push("code-executor");
+        },
+      }),
+      workflowRoutingRuntimeFactory: async () => ({
+        async readAssignmentBatch() {},
+        async close() {
+          closeCalls.push("workflow");
+        },
+      }),
+      workLedgerRuntimeFactory: async () => ({
+        async close() {
+          closeCalls.push("ledger");
+          throw cleanupFailure;
+        },
+      }),
+      attentionInboxRuntimeFactory: async () => {
+        throw startupFailure;
+      },
+    }),
+    (error) => error === startupFailure,
+  );
+  assert.deepEqual(closeCalls, ["ledger", "workflow", "code-executor"]);
+});
+
+test("external confirmation runtime requires both action authorization gates", async () => {
+  let calls = 0;
+  const createConfirmation = async () => {
+    calls += 1;
+    throw new Error("confirmation runtime must stay disabled");
+  };
+  const withoutConfiguredActions = await createApplication({
+    config: applicationConfig(),
+    store: memoryStore(),
+    confirmationRuntimeFactory: createConfirmation,
+  });
+  const withoutProcessAuthorization = await createApplication({
+    config: externalActionConfig(),
+    store: memoryStore(),
+    externalActions: false,
+    confirmationRuntimeFactory: createConfirmation,
+  });
+
+  assert.equal(calls, 0);
+  assert.equal(withoutConfiguredActions.confirmationQueue, null);
+  assert.equal(withoutProcessAuthorization.confirmationQueue, null);
+  await withoutConfiguredActions.close();
+  await withoutProcessAuthorization.close();
 });
 
 test("application awaits recovered executor composition and propagates failure", async () => {
@@ -329,7 +710,7 @@ test("application awaits the private confirmation runtime and exposes only its q
   });
   let completed = false;
   const pending = createApplication({
-    config: applicationConfig(),
+    config: externalActionConfig(),
     store: memoryStore(),
     confirmationRuntimeFactory: () => recoveredRuntime,
   }).then((application) => {
