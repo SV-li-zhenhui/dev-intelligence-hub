@@ -1,6 +1,7 @@
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
+  normalizeCodeJobGrant,
 } from "../domain/code-job-contract.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
@@ -334,24 +335,13 @@ export class CodeJobGrantFactory {
     const proposal = normalizeStoredProposal(value);
     const operation = proposal.payload.operation;
     const roleId = proposal.requestedBy.roleId;
-    const allowedOperations = this.#operationsByRole.get(roleId);
-    const boundWorkspace = this.#workspaceByRepository.get(
-      proposal.binding.repository,
-    );
-    const workspace = this.#workspaces.get(proposal.binding.workspaceId);
-    if (proposal.policyVersion !== this.#policyVersion) {
-      throw invalid("工作提案引用了已失效的策略版本");
-    }
-    if (
-      boundWorkspace === undefined ||
-      boundWorkspace !== proposal.binding.workspaceId
-    ) {
-      throw invalid("工作提案引用了已撤销的仓库工作区绑定");
-    }
-    if (!allowedOperations?.includes(operation)) {
-      throw invalid("岗位无权创建该类型的代码任务");
-    }
-    if (!workspace) throw invalid("工作提案引用了未知代码工作区");
+    const workspace = this.#currentAuthority({
+      policyVersion: proposal.policyVersion,
+      repository: proposal.binding.repository,
+      workspaceId: proposal.binding.workspaceId,
+      roleId,
+      operation,
+    });
     const grant = createCodeJobGrant({
       proposalId: proposal.proposalId,
       contentDigest: proposal.contentDigest,
@@ -377,5 +367,60 @@ export class CodeJobGrantFactory {
       grant,
       allowedOperationsByRole: this.#publicOperations,
     });
+  }
+
+  verify(value) {
+    let grant;
+    try {
+      grant = normalizeCodeJobGrant(value);
+    } catch {
+      throw invalid("代码任务授权封印无效");
+    }
+    const roleId = grant.requestedBy.roleId;
+    const workspace = this.#currentAuthority({
+      policyVersion: grant.policyVersion,
+      repository: grant.repository,
+      workspaceId: grant.workspaceId,
+      roleId,
+      operation: grant.operation,
+    });
+    const expected = {
+      workspaceAuthorityDigest: workspace.authorityDigest,
+      allowedActions: CODE_JOB_ACTIONS_BY_OPERATION[grant.operation],
+      writablePaths:
+        grant.operation === "modify" ? workspace.writablePaths : [],
+      requiredProfiles: workspace.requiredProfiles,
+      brainDigest: this.#brainDigests.get(roleId),
+    };
+    const actual = Object.fromEntries(
+      Object.keys(expected).map((key) => [key, grant[key]]),
+    );
+    if (digestValue(actual) !== digestValue(expected)) {
+      throw invalid("代码任务授权已不符合当前执行配置");
+    }
+    return grant;
+  }
+
+  #currentAuthority({
+    policyVersion,
+    repository,
+    workspaceId,
+    roleId,
+    operation,
+  }) {
+    const allowedOperations = this.#operationsByRole.get(roleId);
+    const boundWorkspace = this.#workspaceByRepository.get(repository);
+    const workspace = this.#workspaces.get(workspaceId);
+    if (policyVersion !== this.#policyVersion) {
+      throw invalid("工作提案引用了已失效的策略版本");
+    }
+    if (boundWorkspace === undefined || boundWorkspace !== workspaceId) {
+      throw invalid("工作提案引用了已撤销的仓库工作区绑定");
+    }
+    if (!allowedOperations?.includes(operation)) {
+      throw invalid("岗位无权创建该类型的代码任务");
+    }
+    if (!workspace) throw invalid("工作提案引用了未知代码工作区");
+    return workspace;
   }
 }

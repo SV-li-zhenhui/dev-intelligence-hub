@@ -196,6 +196,42 @@ test("brain and sandbox changes produce different sealed grants", () => {
   assert.notEqual(first.grantDigest, changedProfile.grantDigest);
 });
 
+test("execution-time verification fences every changed authority surface", () => {
+  const sealed = factory().create(proposal()).grant;
+  assert.deepEqual(factory().verify(sealed), sealed);
+
+  const changed = [
+    factory({ policyVersion: 8 }),
+    factory({ workspaceByRepository: {} }),
+    factory({ codeActionRoles: ["tester"] }),
+    factory({
+      brainProviders: {
+        ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:22434" },
+      },
+    }),
+    factory({
+      executorAuthority: {
+        workspaces: [
+          {
+            id: "acme-workspace",
+            writablePaths: ["src", "test"],
+            requiredProfiles: [
+              { id: "node-tests", configDigest: "b".repeat(64) },
+            ],
+            authorityDigest: "e".repeat(64),
+          },
+        ],
+      },
+    }),
+  ];
+  for (const verifier of changed) {
+    assert.throws(
+      () => verifier.verify(sealed),
+      (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+    );
+  }
+});
+
 test("authority, policy, and brain configuration must be complete", () => {
   assert.throws(
     () => factory({ executorAuthority: { workspaces: [] } }),
