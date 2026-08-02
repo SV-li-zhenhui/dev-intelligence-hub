@@ -82,6 +82,34 @@ test("workforce rejects unknown provider fields and the legacy PR role", () => {
   );
 });
 
+test("provider options are isolated by adapter kind", () => {
+  assert.doesNotThrow(() =>
+    createConfiguredWorkforce({
+      brainProviders: {
+        local: {
+          kind: "ollama",
+          baseUrl: "http://127.0.0.1:11434",
+          apiKeyEnv: "UNUSED_LOCAL_TOKEN",
+        },
+        remote: {
+          kind: "openai-compatible",
+          baseUrl: "https://models.example/v1",
+          apiKeyEnv: "MODEL_TOKEN",
+          contextTokens: 16_384,
+        },
+      },
+      roles: {},
+      store: new MemoryStore(),
+      dependencies: {
+        environment: { MODEL_TOKEN: "token" },
+        fetch: async () => {
+          throw new Error("provider construction must not call fetch");
+        },
+      },
+    }),
+  );
+});
+
 test("remote providers read credentials only from the injected environment", async () => {
   const workforce = createConfiguredWorkforce({
     brainProviders: {

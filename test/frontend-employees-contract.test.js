@@ -101,3 +101,19 @@ test("employee mutations refresh the roster without delaying confirmation refres
     );
   }
 });
+
+test("role mutations bind responses to their request-time dashboard sequence", () => {
+  for (const name of ["handleRoleControl", "handleRoleRun"]) {
+    const source = functionSource(name);
+    const capture = source.indexOf("const sequence = ++requestSequence");
+    const fetchStart = source.indexOf("await fetch(");
+
+    assert.notEqual(capture, -1, `${name} must capture a request sequence`);
+    assert.ok(capture < fetchStart, `${name} must sequence before its request`);
+    assert.match(source, /applyDashboard\(await response\.json\(\), sequence\)/);
+    assert.doesNotMatch(
+      source,
+      /applyDashboard\(await response\.json\(\), \+\+requestSequence\)/,
+    );
+  }
+});

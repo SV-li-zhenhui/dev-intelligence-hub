@@ -348,6 +348,13 @@ function confirmationUnavailable() {
   });
 }
 
+function employeeFactsUnavailable() {
+  return Object.assign(new Error("岗位正在等待最新事实，请稍后重试"), {
+    statusCode: 503,
+    code: "EMPLOYEE_FACTS_NOT_READY",
+  });
+}
+
 function createConfirmationAccessGate(enabled) {
   let ready = !enabled;
   let activeOperations = 0;
@@ -725,9 +732,10 @@ export function createDashboardServer(
       ) {
         assertTrustedMutation(request, expectedOrigin);
         if (typeof backgroundWork?.runEmployee === "function") {
-          await backgroundWork.runEmployee(employeeAction[1], {
+          const result = await backgroundWork.runEmployee(employeeAction[1], {
             trigger: "manual",
           });
+          if (result?.skipped) throw employeeFactsUnavailable();
         } else {
           await employeeRegistry.run(employeeAction[1], {
             trigger: "manual",
@@ -848,6 +856,10 @@ export function startApplicationBackgroundWork(
   let stopped = false;
   let stopPromise = null;
   let backgroundTail = Promise.resolve();
+  let factsReady = false;
+  let pendingFactCycles = 0;
+  const coalescedAgencyCycles = new Map();
+  const coalescedRefreshCycles = new Map();
 
   function reportBackgroundError(error) {
     try {
@@ -907,9 +919,12 @@ export function startApplicationBackgroundWork(
     trigger,
     includeLegacyEmployees = false,
     employeeIds = [],
+    discardWhenFactsPending = false,
   }) {
-    if (stopped || !confirmationAccess.isReady()) {
-      return { skipped: "confirmation_not_ready" };
+    if (stopped) return { skipped: "stopped" };
+    if (!factsReady) return { skipped: "facts_not_ready" };
+    if (discardWhenFactsPending && pendingFactCycles > 0) {
+      return { skipped: "newer_facts_pending" };
     }
     const failures = [];
     if (typeof application.workCoordination?.runCycle === "function") {
@@ -971,30 +986,57 @@ export function startApplicationBackgroundWork(
     return result;
   }
 
+  function coalesceCycle(cycles, key, createCycle) {
+    const existing = cycles.get(key);
+    if (existing) return existing;
+    let tracked;
+    tracked = createCycle().finally(() => {
+      if (cycles.get(key) === tracked) cycles.delete(key);
+    });
+    cycles.set(key, tracked);
+    return tracked;
+  }
+
+  function enqueueCoalescedAgencyCycle(key, options) {
+    return coalesceCycle(coalescedAgencyCycles, key, () =>
+      enqueueAgencyCycle(options),
+    );
+  }
+
   function enqueueFactCycle(factOperation) {
+    pendingFactCycles += 1;
     const operation = async () => {
-      if (stopped) return undefined;
-      await confirmationAccess.closeAndDrain();
-      if (stopped) return undefined;
-      const result = await factOperation();
-      if (stopped) return result;
-      await routeWorkflowSnapshot();
-      if (stopped) return result;
-      await intakeWorkflowAssignments();
-      if (stopped) return result;
-      if (!(await hasFreshPullRequestFacts())) return result;
-      await reconcileExternalConfirmations();
-      if (stopped) return result;
-      confirmationAccess.open();
       try {
-        await performAgencyCycle({
-          trigger: "refresh_completed",
-          includeLegacyEmployees: true,
-        });
-      } catch (error) {
-        reportBackgroundError(error);
+        if (stopped) return undefined;
+        factsReady = false;
+        await confirmationAccess.closeAndDrain();
+        if (stopped) return undefined;
+        const result = await factOperation();
+        if (stopped) return result;
+        await routeWorkflowSnapshot();
+        if (stopped) return result;
+        await intakeWorkflowAssignments();
+        if (stopped) return result;
+        if (!(await hasFreshPullRequestFacts())) return result;
+        await reconcileExternalConfirmations();
+        if (stopped) return result;
+        factsReady = true;
+        if (pendingFactCycles === 1) {
+          confirmationAccess.open();
+          try {
+            await performAgencyCycle({
+              trigger: "refresh_completed",
+              includeLegacyEmployees: true,
+            });
+          } catch (error) {
+            reportBackgroundError(error);
+          }
+        }
+        return result;
+      } finally {
+        pendingFactCycles -= 1;
+        if (stopped) factsReady = false;
       }
-      return result;
     };
     const result = backgroundTail.then(operation, operation);
     backgroundTail = result.catch(() => {});
@@ -1002,8 +1044,9 @@ export function startApplicationBackgroundWork(
   }
 
   function enqueueRefresh({ notify = false } = {}) {
-    return enqueueFactCycle(() =>
-      application.refreshService.refresh({ notify }),
+    const key = notify ? "notify" : "silent";
+    return coalesceCycle(coalescedRefreshCycles, key, () =>
+      enqueueFactCycle(() => application.refreshService.refresh({ notify })),
     );
   }
 
@@ -1031,9 +1074,10 @@ export function startApplicationBackgroundWork(
       setIntervalFn(
         () =>
           runTracked(() =>
-            enqueueAgencyCycle({
+            enqueueCoalescedAgencyCycle("coordination", {
               trigger: "scheduled",
               includeLegacyEmployees: false,
+              discardWhenFactsPending: true,
             }),
           ),
         agencyTickSeconds * 1_000,
@@ -1045,9 +1089,10 @@ export function startApplicationBackgroundWork(
       setIntervalFn(
         () =>
           runTracked(() =>
-            enqueueAgencyCycle({
+            enqueueCoalescedAgencyCycle(`employee:${schedule.id}`, {
               trigger: "scheduled",
               employeeIds: [schedule.id],
+              discardWhenFactsPending: true,
             }),
           ),
         schedule.intervalMinutes * 60_000,
@@ -1059,6 +1104,7 @@ export function startApplicationBackgroundWork(
   function stop() {
     if (stopPromise) return stopPromise;
     stopped = true;
+    factsReady = false;
     for (const timer of timers) clearIntervalFn(timer);
     stopPromise = (async () => {
       await confirmationAccess.closeAndDrain();
@@ -1079,12 +1125,15 @@ export function startApplicationBackgroundWork(
       runTracked(() => enqueueFactCycle(operation), { rethrow: true }),
     signalAgency: ({ trigger = "signal" } = {}) =>
       runTracked(() =>
-        enqueueAgencyCycle({ trigger, includeLegacyEmployees: false }),
+        enqueueCoalescedAgencyCycle("signal", {
+          trigger,
+          includeLegacyEmployees: false,
+        }),
       ),
     runEmployee: (id, { trigger = "manual" } = {}) =>
       runTracked(
         () =>
-          enqueueAgencyCycle({
+          enqueueCoalescedAgencyCycle(`manual-employee:${id}`, {
             trigger,
             employeeIds: [id],
           }),

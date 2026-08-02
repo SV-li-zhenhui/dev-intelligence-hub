@@ -1054,6 +1054,274 @@ test("scheduled and manual employees wait for refresh without an external queue"
   }
 });
 
+test("overlapping scheduled role and refresh ticks are coalesced", async () => {
+  const roleStarted = deferred();
+  const releaseRole = deferred();
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const timers = [];
+  let refreshCount = 0;
+  let roleRunCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [{ id: "requirements-analyst", intervalMinutes: 11 }];
+      },
+      async runSelected(ids) {
+        if (ids[0] !== "requirements-analyst") return;
+        roleRunCount += 1;
+        roleStarted.resolve();
+        await releaseRole.promise;
+      },
+    },
+    refreshService: {
+      async refresh() {
+        refreshCount += 1;
+        if (refreshCount === 1) return;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    const firstRoleTick = timers[1].callback();
+    await roleStarted.promise;
+    const overlappingRoleTick = timers[1].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(roleRunCount, 1);
+    releaseRole.resolve();
+    await Promise.all([firstRoleTick, overlappingRoleTick]);
+    assert.equal(roleRunCount, 1);
+
+    const firstRefreshTick = timers[0].callback();
+    await refreshStarted.promise;
+    const overlappingRefreshTick = timers[0].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refreshCount, 2);
+    releaseRefresh.resolve();
+    await Promise.all([firstRefreshTick, overlappingRefreshTick]);
+    assert.equal(refreshCount, 2);
+  } finally {
+    releaseRole.resolve();
+    releaseRefresh.resolve();
+    await backgroundWork.stop();
+  }
+});
+
+test("a pending refresh skips obsolete queued role ticks", async () => {
+  const firstRoleStarted = deferred();
+  const releaseFirstRole = deferred();
+  const timers = [];
+  const calls = [];
+  let refreshCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [
+          { id: "requirements-analyst", intervalMinutes: 11 },
+          { id: "developer", intervalMinutes: 13 },
+        ];
+      },
+      async runSelected(ids, options) {
+        calls.push({ operation: "run", ids, ...options });
+        if (ids[0] === "requirements-analyst") {
+          firstRoleStarted.resolve();
+          await releaseFirstRole.promise;
+        }
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshCount += 1;
+        calls.push({ operation: "refresh", count: refreshCount, ...options });
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+    const activeRole = timers[1].callback();
+    await firstRoleStarted.promise;
+    const obsoleteRole = timers[2].callback();
+    const refresh = timers[0].callback();
+    releaseFirstRole.resolve();
+    await Promise.all([activeRole, obsoleteRole, refresh]);
+
+    assert.deepEqual(calls, [
+      {
+        operation: "run",
+        ids: ["requirements-analyst"],
+        trigger: "scheduled",
+      },
+      { operation: "refresh", count: 2, notify: false },
+      {
+        operation: "run",
+        ids: ["pr-reviewer"],
+        trigger: "refresh_completed",
+      },
+    ]);
+
+    await timers[2].callback();
+    assert.deepEqual(calls.at(-1), {
+      operation: "run",
+      ids: ["developer"],
+      trigger: "scheduled",
+    });
+  } finally {
+    releaseFirstRole.resolve();
+    await backgroundWork.stop();
+  }
+});
+
+test("a manual role run queued before refresh is never discarded", async () => {
+  const firstManualStarted = deferred();
+  const releaseFirstManual = deferred();
+  const timers = [];
+  const calls = [];
+  let refreshCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [];
+      },
+      async runSelected(ids, options) {
+        calls.push({ operation: "run", ids, ...options });
+        if (ids[0] === "requirements-analyst") {
+          firstManualStarted.resolve();
+          await releaseFirstManual.promise;
+        }
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshCount += 1;
+        calls.push({ operation: "refresh", count: refreshCount, ...options });
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+    const activeManual = backgroundWork.runEmployee("requirements-analyst");
+    await firstManualStarted.promise;
+    const queuedManual = backgroundWork.runEmployee("developer");
+    const refresh = timers[0].callback();
+    releaseFirstManual.resolve();
+    await Promise.all([activeManual, queuedManual, refresh]);
+
+    assert.deepEqual(calls, [
+      {
+        operation: "run",
+        ids: ["requirements-analyst"],
+        trigger: "manual",
+      },
+      { operation: "run", ids: ["developer"], trigger: "manual" },
+      { operation: "refresh", count: 2, notify: false },
+      {
+        operation: "run",
+        ids: ["pr-reviewer"],
+        trigger: "refresh_completed",
+      },
+    ]);
+  } finally {
+    releaseFirstManual.resolve();
+    await backgroundWork.stop();
+  }
+});
+
+test("a manual role run between two fact cycles uses the first fresh snapshot", async () => {
+  const firstRefreshStarted = deferred();
+  const releaseFirstRefresh = deferred();
+  const timers = [];
+  const calls = [];
+  let refreshCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [];
+      },
+      async runSelected(ids, options) {
+        calls.push({ operation: "run", ids, ...options });
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshCount += 1;
+        calls.push({ operation: "refresh", count: refreshCount, ...options });
+        if (refreshCount === 2) {
+          firstRefreshStarted.resolve();
+          await releaseFirstRefresh.promise;
+        }
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+    const firstRefresh = timers[0].callback();
+    await firstRefreshStarted.promise;
+    const manual = backgroundWork.runEmployee("developer");
+    const secondRefresh = backgroundWork.refresh({ notify: true });
+    releaseFirstRefresh.resolve();
+    await Promise.all([firstRefresh, manual, secondRefresh]);
+
+    assert.deepEqual(calls, [
+      { operation: "refresh", count: 2, notify: false },
+      { operation: "run", ids: ["developer"], trigger: "manual" },
+      { operation: "refresh", count: 3, notify: true },
+      {
+        operation: "run",
+        ids: ["pr-reviewer"],
+        trigger: "refresh_completed",
+      },
+    ]);
+  } finally {
+    releaseFirstRefresh.resolve();
+    await backgroundWork.stop();
+  }
+});
+
 test("periodic refresh fences facts but reopens confirmations before slow agency", async () => {
   await exerciseConfirmationRefreshGate("periodic");
 });
@@ -1107,9 +1375,18 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
       },
       body: JSON.stringify(confirmationApprovalRequest()),
     });
+    const manualEmployee = await request(server, {
+      method: "POST",
+      path: "/api/employees/pr-reviewer/run",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+      },
+    });
 
     assert.equal(next.status, 503);
     assert.equal(approve.status, 503);
+    assert.equal(manualEmployee.status, 503);
     assert.deepEqual(queueCalls, []);
   } finally {
     await server.shutdown();

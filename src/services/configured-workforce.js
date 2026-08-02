@@ -13,6 +13,12 @@ const PROVIDER_KEYS = new Set([
   "maxRequestBytes",
   "contextTokens",
 ]);
+const COMMON_PROVIDER_OPTION_KEYS = Object.freeze([
+  "baseUrl",
+  "timeoutMs",
+  "maxResponseBytes",
+  "maxRequestBytes",
+]);
 const ROLE_KEYS = new Set([
   "name",
   "mission",
@@ -56,22 +62,37 @@ function exactConfig(value, allowed, name) {
   return Object.fromEntries(entries);
 }
 
+function selectOptions(config, keys) {
+  return Object.fromEntries(
+    keys
+      .filter((key) => config[key] !== undefined)
+      .map((key) => [key, config[key]]),
+  );
+}
+
 function providerOptions(id, value, dependencies) {
   const config = exactConfig(value, PROVIDER_KEYS, `brainProviders.${id}`);
-  const { kind, ...options } = config;
   const common = {
-    ...options,
+    ...selectOptions(config, COMMON_PROVIDER_OPTION_KEYS),
     id,
     ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
   };
-  if (kind === "ollama") return new OllamaStructuredProvider(common);
-  if (kind === "openai-compatible") {
+  if (config.kind === "ollama") {
+    return new OllamaStructuredProvider({
+      ...common,
+      ...selectOptions(config, ["contextTokens"]),
+    });
+  }
+  if (config.kind === "openai-compatible") {
     return new OpenAiCompatibleProvider({
       ...common,
+      ...selectOptions(config, ["apiKeyEnv"]),
       environment: dependencies.environment ?? process.env,
     });
   }
-  throw new TypeError(`brain provider kind is unsupported: ${String(kind)}`);
+  throw new TypeError(
+    `brain provider kind is unsupported: ${String(config.kind)}`,
+  );
 }
 
 function createProviders(value, dependencies) {

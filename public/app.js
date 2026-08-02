@@ -747,6 +747,7 @@ async function handleRoleControl(event) {
   const button = event.currentTarget;
   const roleId = button.dataset.roleId;
   button.disabled = true;
+  const sequence = ++requestSequence;
   try {
     const response = await fetch(`/api/employees/${encodeURIComponent(roleId)}/control`, {
       method: "POST",
@@ -760,7 +761,7 @@ async function handleRoleControl(event) {
       }),
     });
     if (!response.ok) throw new Error(`岗位控制失败（${response.status}）`);
-    applyDashboard(await response.json(), ++requestSequence);
+    applyDashboard(await response.json(), sequence);
     void loadEmployeeRoles();
   } catch (error) {
     statusBanner.hidden = false;
@@ -774,13 +775,14 @@ async function handleRoleRun(event) {
   const roleId = button.dataset.roleRun;
   button.disabled = true;
   button.textContent = "运行中…";
+  const sequence = ++requestSequence;
   try {
     const response = await fetch(`/api/employees/${encodeURIComponent(roleId)}/run`, {
       method: "POST",
       headers: { "x-mydashboard-action": "1" },
     });
     if (!response.ok) throw new Error(`岗位运行失败（${response.status}）`);
-    applyDashboard(await response.json(), ++requestSequence);
+    applyDashboard(await response.json(), sequence);
     void loadEmployeeRoles();
     await refreshConfirmationQueue({ showConfirmation: false });
     queueMicrotask(showNextConfirmation);
