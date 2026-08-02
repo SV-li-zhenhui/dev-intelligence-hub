@@ -3,7 +3,10 @@ import {
   normalizeCodeJobGrant,
 } from "../domain/code-job-contract.js";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
-import { createCodeActionProposalConfirmationPlan } from "../domain/code-action-proposal-confirmation.js";
+import {
+  codeJobConfirmationIdForProposal,
+  createCodeActionProposalConfirmationPlan,
+} from "../domain/code-action-proposal-confirmation.js";
 import {
   WORK_PROPOSAL_STATUSES,
   assertWorkProposalExactKeys,
@@ -580,11 +583,13 @@ export class CodeActionProposalHandler {
         cloneWorkProposalValue(input.proposal),
       );
     } catch (error) {
-      if (existingItem && AUTHORIZATION_ERROR_CODES.has(error?.code)) {
-        return this.#invalidateChangedAuthorization(
-          existingItem,
-          input.proposal,
-        );
+      if (AUTHORIZATION_ERROR_CODES.has(error?.code)) {
+        const owned =
+          existingItem ??
+          (await this.#findOwnedConfirmation(input.proposal));
+        if (owned) {
+          return this.#invalidateChangedAuthorization(owned, input.proposal);
+        }
       }
       throw error;
     }
@@ -599,7 +604,9 @@ export class CodeActionProposalHandler {
 
     if (
       existingItem !== null &&
-      input.downstreamRef !== confirmationId
+      (input.downstreamRef !== confirmationId ||
+        existingItem.approvalBindingDigest !==
+          expected.approvalBindingDigest)
     ) {
       return this.#invalidateChangedAuthorization(
         existingItem,
@@ -634,8 +641,32 @@ export class CodeActionProposalHandler {
       throw invalidProposal();
     }
     if (input.downstreamRef !== null) throw invalidProposal();
-    const item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
+    let queued;
+    try {
+      queued = await this.#enqueue(plan);
+    } catch (error) {
+      if (error?.code !== "CONFIRMATION_ID_CONFLICT") throw error;
+      const owned = normalizeOwnedConfirmationItem(
+        await this.#getConfirmation(confirmationId),
+        input.proposal,
+        confirmationId,
+      );
+      return this.#invalidateChangedAuthorization(owned, input.proposal);
+    }
+    const item = normalizeConfirmationItem(queued, expected);
     return this.#transitionConfirmation(item, grant);
+  }
+
+  async #findOwnedConfirmation(proposal) {
+    const id = codeJobConfirmationIdForProposal(proposal);
+    let value;
+    try {
+      value = await this.#getConfirmation(id);
+    } catch (error) {
+      if (error?.code === "CONFIRMATION_NOT_FOUND") return null;
+      throw error;
+    }
+    return normalizeOwnedConfirmationItem(value, proposal, id);
   }
 
   async #invalidateChangedAuthorization(item, proposal) {
@@ -668,11 +699,16 @@ export class CodeActionProposalHandler {
     if (current.status === "pending") {
       throw invalidConfirmation("旧代码任务确认未能安全撤销");
     }
+    const revoked =
+      current.status === "stale" &&
+      current.invalidation?.reason === "authorization_changed";
     return terminal(
       "stale",
-      "代码任务授权已变化，旧确认已撤销",
+      revoked
+        ? "代码任务授权已变化，旧确认已撤销"
+        : "代码任务授权已变化，旧确认结果已隔离",
       current,
-      ["authorization_changed"],
+      ["authorization_changed", `old_confirmation_status:${current.status}`],
     );
   }
 

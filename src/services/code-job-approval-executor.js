@@ -124,6 +124,13 @@ function requireStore(value) {
   });
 }
 
+function requireGrantVerifier(value) {
+  if (!value || typeof value.verify !== "function") {
+    throw new TypeError("grantVerifier is invalid");
+  }
+  return value.verify.bind(value);
+}
+
 function unknown(code = "CODE_JOB_OUTCOME_UNKNOWN") {
   return {
     status: "error",
@@ -173,11 +180,13 @@ function normalizeStoreOutcome(value, request) {
 export class CodeJobApprovalExecutor {
   #createApprovedJob;
   #reconcileApprovedJob;
+  #verifyGrant;
 
-  constructor({ codeJobStore } = {}) {
+  constructor({ codeJobStore, grantVerifier } = {}) {
     const store = requireStore(codeJobStore);
     this.#createApprovedJob = store.createApprovedJob;
     this.#reconcileApprovedJob = store.reconcileApprovedJob;
+    this.#verifyGrant = requireGrantVerifier(grantVerifier);
     Object.freeze(this);
   }
 
@@ -188,6 +197,8 @@ export class CodeJobApprovalExecutor {
     } catch {
       return unknown("INVALID_CODE_JOB_APPROVAL");
     }
+    const authorization = await this.#authorization(request);
+    if (authorization !== null) return authorization;
     try {
       return normalizeStoreOutcome(
         await this.#createApprovedJob(request),
@@ -216,12 +227,29 @@ export class CodeJobApprovalExecutor {
       return unknown("INVALID_CODE_JOB_APPROVAL");
     }
     try {
-      return normalizeStoreOutcome(
+      const reconciled = normalizeStoreOutcome(
         await this.#reconcileApprovedJob(request),
         request,
       );
+      if (reconciled.status !== "absent") return reconciled;
+      const authorization = await this.#authorization(request);
+      return authorization ?? reconciled;
     } catch (error) {
       return unknown(stableCode(error));
+    }
+  }
+
+  async #authorization(request) {
+    try {
+      const verified = await this.#verifyGrant(structuredClone(request.grant));
+      if (digestValue(verified) !== digestValue(request.grant)) {
+        return unknown("CODE_JOB_AUTHORITY_PROTOCOL_ERROR");
+      }
+      return null;
+    } catch (error) {
+      return error?.code === "INVALID_CODE_JOB_AUTHORITY"
+        ? { status: "stale" }
+        : unknown("CODE_JOB_AUTHORITY_UNKNOWN");
     }
   }
 }

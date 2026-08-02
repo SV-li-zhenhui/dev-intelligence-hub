@@ -259,16 +259,23 @@ function queuePlan(value) {
   return plan;
 }
 
-export function codeJobConfirmationIdForGrant(value) {
-  const grant = normalizedGrant(value);
+function confirmationId(proposalId, contentDigest) {
   const digest = createHash("sha256")
-    .update(grant.proposalId, "utf8")
+    .update(proposalId, "utf8")
     .update("\0", "utf8")
-    .update(grant.contentDigest, "utf8")
-    .update("\0", "utf8")
-    .update(grant.grantDigest, "utf8")
+    .update(contentDigest, "utf8")
     .digest("hex");
   return `confirmation-code-job-${digest}`;
+}
+
+export function codeJobConfirmationIdForGrant(value) {
+  const grant = normalizedGrant(value);
+  return confirmationId(grant.proposalId, grant.contentDigest);
+}
+
+export function codeJobConfirmationIdForProposal(value) {
+  const proposal = normalizedStoredProposal(value);
+  return confirmationId(proposal.proposalId, proposal.contentDigest);
 }
 
 export function createCodeActionProposalConfirmationPlan(value, optionsValue) {

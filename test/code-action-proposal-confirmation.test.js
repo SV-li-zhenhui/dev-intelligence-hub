@@ -185,7 +185,7 @@ test("a policy-bound code proposal becomes one exact local job creation approval
   assert.match(queued.approvalBindingDigest, /^[a-f0-9]{64}$/);
 });
 
-test("confirmation IDs bind both proposal and grant while remaining stable and bounded", () => {
+test("confirmation IDs form one stable recovery slot per proposal", () => {
   const original = proposal();
   const value = proposalWith(original, {
     proposalId: `p${"a".repeat(190)}b`,
@@ -206,7 +206,11 @@ test("confirmation IDs bind both proposal and grant while remaining stable and b
   );
 
   assert.equal(first.id, repeated.id);
-  assert.notEqual(first.id, changed.id);
+  assert.equal(first.id, changed.id);
+  assert.notEqual(
+    normalizeConfirmationPlan(first).approvalBindingDigest,
+    normalizeConfirmationPlan(changed).approvalBindingDigest,
+  );
   assert.match(first.id, /^confirmation-code-job-[a-f0-9]{64}$/);
   assert.equal(Buffer.byteLength(first.id, "utf8") <= 128, true);
 });

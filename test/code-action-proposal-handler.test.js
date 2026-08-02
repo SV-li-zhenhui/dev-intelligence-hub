@@ -156,8 +156,21 @@ class FakeConfirmationProducer {
   }
 
   async enqueue(plan) {
-    this.plan = structuredClone(plan);
     this.enqueueCalls.push(structuredClone(plan));
+    if (this.plan !== null) {
+      const existing = normalizeConfirmationPlan(this.plan);
+      const incoming = normalizeConfirmationPlan(plan);
+      if (
+        existing.id === incoming.id &&
+        existing.approvalBindingDigest !== incoming.approvalBindingDigest
+      ) {
+        const error = new Error("confirmation conflict");
+        error.code = "CONFIRMATION_ID_CONFLICT";
+        throw error;
+      }
+      return confirmationItem(this.plan, this.status, this.overrides);
+    }
+    this.plan = structuredClone(plan);
     return confirmationItem(plan, this.status, this.overrides);
   }
 
@@ -384,6 +397,78 @@ test("revoked policy invalidates an existing confirmation before it can run", as
   assert.equal(transition.status, "stale");
   assert.equal(producer.invalidateCalls.length, 1);
   assert.equal(producer.invalidateCalls[0][1].reason, "authorization_changed");
+  assert.equal(reader.getCalls.length, 0);
+});
+
+test("a lost proposal advance still finds and revokes its stable confirmation slot", async () => {
+  const firstGrant = grantFor();
+  const { grantDigest: _grantDigest, ...firstGrantContent } = firstGrant;
+  const secondGrant = createCodeJobGrant({
+    ...firstGrantContent,
+    workspaceAuthorityDigest: "8".repeat(64),
+  });
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(firstGrant));
+  let currentGrant = firstGrant;
+  const value = new CodeActionProposalHandler({
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: {
+      async create() {
+        return authority(currentGrant).factory.create(proposal());
+      },
+    },
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    pollIntervalMs: 5_000,
+  });
+
+  await value.handle(handlerInput());
+  currentGrant = secondGrant;
+  const transition = await value.handle(handlerInput());
+
+  assert.equal(transition.status, "stale");
+  assert.equal(producer.enqueueCalls.length, 2);
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.invalidateCalls[0][1].reason, "authorization_changed");
+  assert.equal(reader.getCalls.length, 0);
+});
+
+test("an already completed old confirmation is isolated without claiming revocation", async () => {
+  const firstGrant = grantFor();
+  const { grantDigest: _grantDigest, ...firstGrantContent } = firstGrant;
+  const secondGrant = createCodeJobGrant({
+    ...firstGrantContent,
+    brainDigest: "d".repeat(64),
+  });
+  const producer = new FakeConfirmationProducer();
+  const reader = new FakeCodeJobReader(queuedJob(firstGrant));
+  let currentGrant = firstGrant;
+  const value = new CodeActionProposalHandler({
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: {
+      async create() {
+        return authority(currentGrant).factory.create(proposal());
+      },
+    },
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    pollIntervalMs: 5_000,
+  });
+  const waiting = await value.handle(handlerInput());
+  producer.status = "completed";
+  currentGrant = secondGrant;
+
+  const transition = await value.handle(
+    handlerInput({
+      status: "waiting_confirmation",
+      downstreamRef: waiting.downstreamRef,
+    }),
+  );
+
+  assert.equal(transition.status, "stale");
+  assert.match(transition.summary, /隔离/);
+  assert.doesNotMatch(transition.summary, /已撤销/);
+  assert.equal(producer.invalidateCalls.length, 0);
   assert.equal(reader.getCalls.length, 0);
 });
 

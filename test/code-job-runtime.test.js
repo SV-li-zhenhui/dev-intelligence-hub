@@ -146,6 +146,7 @@ function envelope({ requestId = "approval-request-0001" } = {}) {
 async function runtimeFixture({ store = new MemoryStore(), guard = new FakeGuard() } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
+    grantVerifier: { async verify(value) { return structuredClone(value); } },
     operationQueue: new OperationQueue(),
     clock: () => new Date("2026-08-02T06:00:01.000Z"),
     createGuard({ name }) {

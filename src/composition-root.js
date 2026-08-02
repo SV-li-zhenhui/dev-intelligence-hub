@@ -187,8 +187,9 @@ export async function createApplication({
   let workProposalRuntime = null;
   let memoryRuntime = null;
   let codeJobRuntime = null;
-  let confirmationRuntime = null;
-  let codeJobReader = null;
+    let confirmationRuntime = null;
+    let codeJobReader = null;
+    let grantFactory = null;
   try {
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
@@ -273,11 +274,27 @@ export async function createApplication({
       );
     }
     if (localCodeExecutionEnabled) {
+      grantFactory = codeJobGrantFactory({
+        executorAuthority: codeExecutorRuntime.authority,
+        policyVersion: coordinationConfig.policy?.version ?? 1,
+        workspaceByRepository:
+          coordinationConfig.policy?.workspaceByRepository || {},
+        codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
+        codeOperationsByRole:
+          coordinationConfig.policy?.codeOperationsByRole || {},
+        brainByRole: brainConfigurationsByRole(config.employees?.roles),
+        brainProviders: config.brainProviders || {},
+      });
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
           ...codeJobRuntimeDependencies,
           store,
           operationQueue: new OperationQueue(),
+          grantVerifier: frozenPort(
+            grantFactory,
+            ["verify"],
+            "codeJobGrantFactory",
+          ),
         }),
       );
       if (!codeJobRuntime) {
@@ -334,17 +351,6 @@ export async function createApplication({
       );
     }
     if (localCodeExecutionEnabled) {
-      const grantFactory = codeJobGrantFactory({
-        executorAuthority: codeExecutorRuntime.authority,
-        policyVersion: coordinationConfig.policy?.version ?? 1,
-        workspaceByRepository:
-          coordinationConfig.policy?.workspaceByRepository || {},
-        codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
-        codeOperationsByRole:
-          coordinationConfig.policy?.codeOperationsByRole || {},
-        brainByRole: brainConfigurationsByRole(config.employees?.roles),
-        brainProviders: config.brainProviders || {},
-      });
       proposalRunners.push(
         codeActionProposalRunnerFactory({
           enabled: true,

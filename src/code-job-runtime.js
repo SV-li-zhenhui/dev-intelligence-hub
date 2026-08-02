@@ -80,6 +80,7 @@ function operationAdmission() {
 
 export async function createCodeJobRuntime({
   store,
+  grantVerifier,
   dataDirectory,
   operationQueue = new OperationQueue(),
   clock,
@@ -114,7 +115,10 @@ export async function createCodeJobRuntime({
       ...(limits ? { limits } : {}),
     });
     await jobs.recover();
-    const approvalExecutor = new CodeJobApprovalExecutor({ codeJobStore: jobs });
+    const approvalExecutor = new CodeJobApprovalExecutor({
+      codeJobStore: jobs,
+      grantVerifier,
+    });
     return Object.freeze({
       confirmationExecutor: frozenPort({
         execute: (value) => admission.run(() => approvalExecutor.execute(value)),

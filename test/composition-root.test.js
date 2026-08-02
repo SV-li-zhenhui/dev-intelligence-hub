@@ -1245,7 +1245,7 @@ test("local code composition binds authority, both proposal runners, and one saf
     },
     codeJobGrantFactory: (options) => {
       calls.grantFactory = options;
-      return { async create() {} };
+      return { async create() {}, verify(value) { return value; } };
     },
     githubReviewProposalRunnerFactory: (options) => {
       calls.githubRunner = options;
@@ -1390,7 +1390,10 @@ test("local-only code actions still create confirmation while maintenance acquir
         },
       };
     },
-    codeJobGrantFactory: () => ({ async create() {} }),
+    codeJobGrantFactory: () => ({
+      async create() {},
+      verify(value) { return value; },
+    }),
     codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
     workProposalRunnerGroupFactory: (runners) => runners[0] || null,
   };
@@ -1491,6 +1494,10 @@ test("confirmation startup failure closes the already acquired local code runtim
         async close() {
           closeCalls.push("code-job");
         },
+      }),
+      codeJobGrantFactory: () => ({
+        async create() {},
+        verify(value) { return value; },
       }),
       confirmationRuntimeFactory: async () => {
         throw startupFailure;

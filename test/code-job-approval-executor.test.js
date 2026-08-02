@@ -113,9 +113,21 @@ function store(overrides = {}) {
   };
 }
 
+function grantVerifier(overrides = {}) {
+  return {
+    async verify(value) {
+      return structuredClone(value);
+    },
+    ...overrides,
+  };
+}
+
 test("approval creates only one durable local job and returns its receipt", async () => {
   const fake = store();
-  const executor = new CodeJobApprovalExecutor({ codeJobStore: fake.port });
+  const executor = new CodeJobApprovalExecutor({
+    codeJobStore: fake.port,
+    grantVerifier: grantVerifier(),
+  });
   const input = envelope();
 
   assert.deepEqual(await executor.execute(input), {
@@ -138,7 +150,10 @@ test("approval creates only one durable local job and returns its receipt", asyn
 
 test("invalid or widened envelopes fail before the store is called", async () => {
   const fake = store();
-  const executor = new CodeJobApprovalExecutor({ codeJobStore: fake.port });
+  const executor = new CodeJobApprovalExecutor({
+    codeJobStore: fake.port,
+    grantVerifier: grantVerifier(),
+  });
   const input = envelope();
   const forgedBindingDigest = "f".repeat(64);
   const invalid = [
@@ -181,7 +196,10 @@ test("a lost create acknowledgement reconciles to the exact existing job", async
       };
     },
   });
-  const executor = new CodeJobApprovalExecutor({ codeJobStore: fake.port });
+  const executor = new CodeJobApprovalExecutor({
+    codeJobStore: fake.port,
+    grantVerifier: grantVerifier(),
+  });
 
   assert.equal((await executor.execute(input)).status, "already");
   assert.deepEqual(fake.calls.map(([name]) => name), ["create", "reconcile"]);
@@ -193,7 +211,10 @@ test("confirmed absence is retryable while conflicts remain unknown", async () =
       throw new Error("disk unavailable");
     },
   });
-  const absent = new CodeJobApprovalExecutor({ codeJobStore: absentStore.port });
+  const absent = new CodeJobApprovalExecutor({
+    codeJobStore: absentStore.port,
+    grantVerifier: grantVerifier(),
+  });
   assert.deepEqual(await absent.execute(envelope()), {
     status: "absent",
     code: "CODE_JOB_NOT_CREATED",
@@ -208,9 +229,58 @@ test("confirmed absence is retryable while conflicts remain unknown", async () =
   });
   const conflict = new CodeJobApprovalExecutor({
     codeJobStore: conflictStore.port,
+    grantVerifier: grantVerifier(),
   });
   assert.deepEqual(await conflict.reconcile(envelope()), {
     status: "error",
     error: { trust: "unknown", code: "CODE_JOB_BINDING_CONFLICT" },
   });
+});
+
+test("revoked approval grants become stale before durable job creation", async () => {
+  const fake = store();
+  const executor = new CodeJobApprovalExecutor({
+    codeJobStore: fake.port,
+    grantVerifier: grantVerifier({
+      async verify() {
+        const error = new Error("revoked");
+        error.code = "INVALID_CODE_JOB_AUTHORITY";
+        throw error;
+      },
+    }),
+  });
+
+  assert.deepEqual(await executor.execute(envelope()), { status: "stale" });
+  assert.equal(fake.calls.length, 0);
+  assert.deepEqual(await executor.reconcile(envelope()), { status: "stale" });
+  assert.deepEqual(fake.calls.map(([operation]) => operation), ["reconcile"]);
+});
+
+test("reconciliation acknowledges an existing job before applying revocation", async () => {
+  const input = envelope();
+  const fake = store({
+    async reconcileApprovedJob(value) {
+      fake.calls.push(["reconcile", value]);
+      return {
+        status: "already",
+        receipt: {
+          id: codeJobIdForGrant(value.grant),
+          createdAt: "2026-08-02T03:00:01.000Z",
+        },
+      };
+    },
+  });
+  let verifierCalls = 0;
+  const executor = new CodeJobApprovalExecutor({
+    codeJobStore: fake.port,
+    grantVerifier: grantVerifier({
+      async verify() {
+        verifierCalls += 1;
+        throw new Error("must not be consulted for an existing fact");
+      },
+    }),
+  });
+
+  assert.equal((await executor.reconcile(input)).status, "already");
+  assert.equal(verifierCalls, 0);
 });
