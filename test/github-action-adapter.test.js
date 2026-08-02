@@ -178,6 +178,19 @@ test("the configured actor is checked before target or marker queries", async ()
   ]);
 });
 
+test("work proposal reviews use the same sealed GitHub review protocol", async () => {
+  const runner = new FakeRunner([actor("different-user")]);
+  const result = await createAdapter(runner).reconcile(
+    reviewEnvelope({ kind: "github.work-proposal-review" }),
+  );
+
+  assert.deepEqual(result, {
+    status: "error",
+    error: { trust: "trusted", code: "GITHUB_ACTOR_MISMATCH" },
+  });
+  assert.equal(runner.calls.length, 1);
+});
+
 test("every GitHub call uses one fixed token, absolute executable, and minimal environment", async () => {
   const sourceEnv = {
     GH_TOKEN: "token_from_parent",

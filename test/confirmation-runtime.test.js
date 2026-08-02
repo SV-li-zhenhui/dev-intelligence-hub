@@ -88,6 +88,7 @@ test("disabled GitHub actions construct no confirmation runtime components", asy
         createStore: failIfCalled,
         createOperationQueue: failIfCalled,
         createExecutor: failIfCalled,
+        createExecutorRouter: failIfCalled,
         createGuard: failIfCalled,
         createQueue: failIfCalled,
       },
@@ -110,6 +111,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   const store = { read() {}, write() {} };
   const operationQueue = { enqueue(operation) { return operation(); } };
   const executor = { execute() {}, reconcile() {} };
+  const router = { execute() {}, reconcile() {} };
   const guard = {
     acquire() { events.push("acquire"); },
     run(operation) { return operation(); },
@@ -117,6 +119,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   };
   const rawQueue = queuePort(events);
   let executorOptions;
+  let routerOptions;
   let queueOptions;
 
   const runtime = await createConfirmationRuntime(
@@ -137,6 +140,11 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
         executorOptions = options;
         return executor;
       },
+      createExecutorRouter(options) {
+        events.push("router");
+        routerOptions = options;
+        return router;
+      },
       createGuard(options) {
         events.push("guard");
         assert.deepEqual(options, { name: "mydashboard-confirmation-queue-v1" });
@@ -154,6 +162,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "store",
     "operationQueue",
     "executor",
+    "router",
     "guard",
     "queue",
     "acquire",
@@ -174,10 +183,22 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal("tokenEnv" in executorOptions, false);
   assert.deepEqual(queueOptions, {
     store,
-    executor,
+    executor: router,
     operationQueue,
     exclusiveLease: guard,
   });
+  assert.deepEqual(Object.keys(routerOptions.executors).sort(), [
+    "github.pull-request-review",
+    "github.work-proposal-review",
+  ]);
+  assert.strictEqual(
+    routerOptions.executors["github.pull-request-review"],
+    executor,
+  );
+  assert.strictEqual(
+    routerOptions.executors["github.work-proposal-review"],
+    executor,
+  );
 
   assert.equal(Object.isFrozen(runtime), true);
   assert.deepEqual(Object.keys(runtime), ["queue", "producerQueue", "close"]);
@@ -207,6 +228,41 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(firstClose, secondClose);
   await firstClose;
   assert.deepEqual(events.slice(-1), ["close"]);
+});
+
+test("a local-only runtime starts without reading GitHub credentials", async () => {
+  const localExecutor = { execute() {}, reconcile() {} };
+  let routed;
+  let githubExecutors = 0;
+  const dependencies = runtimeDependencies({
+    localExecutor,
+    createExecutor() {
+      githubExecutors += 1;
+      throw new Error("must not create GitHub executor");
+    },
+    createExecutorRouter({ executors }) {
+      routed = executors;
+      return localExecutor;
+    },
+  });
+  Object.defineProperty(dependencies, "env", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error("must not read GitHub environment");
+    },
+  });
+
+  const runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    dependencies,
+  );
+
+  assert.equal(githubExecutors, 0);
+  assert.deepEqual(Object.keys(routed), ["local.code-job-create"]);
+  assert.strictEqual(routed["local.code-job-create"], localExecutor);
+  assert.ok(runtime);
+  await runtime.close();
 });
 
 test("recover failure closes the guard before rethrowing the same error", async () => {

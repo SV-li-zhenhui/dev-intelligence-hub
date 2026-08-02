@@ -127,7 +127,10 @@ function parseTarget(value) {
 }
 
 function normalizeAction(kind, value) {
-  if (kind === "github.pull-request-review") {
+  if (
+    kind === "github.pull-request-review" ||
+    kind === "github.work-proposal-review"
+  ) {
     exactObject(value, ["type", "reviewEvent", "body"]);
     if (
       value.type !== "pull_request_review" ||

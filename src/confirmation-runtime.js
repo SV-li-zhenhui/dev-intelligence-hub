@@ -4,6 +4,7 @@ import { projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
+import { ConfirmationExecutorRouter } from "./services/confirmation-executor-router.js";
 import { ConfirmationQueue } from "./services/confirmation-queue.js";
 
 const GUARD_NAME = "mydashboard-confirmation-queue-v1";
@@ -170,6 +171,7 @@ function validateDependencies(dependencies) {
   }
   const defaults = {
     createExecutor: createGitHubActionExecutor,
+    createExecutorRouter: (options) => new ConfirmationExecutorRouter(options),
     createGuard: (options) => new ProcessExclusiveGuard(options),
     createOperationQueue: () => new OperationQueue(),
     createQueue: (options) => new ConfirmationQueue(options),
@@ -227,13 +229,34 @@ function closeOnce(guard) {
 
 export async function createConfirmationRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
-  if (!enabledConfig) return null;
+  const configuredLocalExecutor = dataProperty(dependencies, "localExecutor");
+  const localExecutor =
+    configuredLocalExecutor === undefined || configuredLocalExecutor === null
+      ? null
+      : assertPort(
+          configuredLocalExecutor,
+          ["execute", "reconcile"],
+          "localExecutor",
+        );
+  if (!enabledConfig && !localExecutor) return null;
 
   const factories = validateDependencies(dependencies);
-  const configuredEnvironment = dataProperty(dependencies, "env");
-  const environment =
-    configuredEnvironment === undefined ? process.env : configuredEnvironment;
-  const token = configuredToken(environment, enabledConfig.tokenEnv);
+  let githubExecutorOptions = null;
+  if (enabledConfig) {
+    const configuredEnvironment = dataProperty(dependencies, "env");
+    const environment =
+      configuredEnvironment === undefined ? process.env : configuredEnvironment;
+    const token = configuredToken(environment, enabledConfig.tokenEnv);
+    githubExecutorOptions = {
+      ghCommand: enabledConfig.ghCommand,
+      token,
+      env: environment,
+      networkEnv: enabledConfig.networkEnv,
+      ...(enabledConfig.timeoutMs === undefined
+        ? {}
+        : { timeoutMs: enabledConfig.timeoutMs }),
+    };
+  }
   const dataDirectory = runtimeDataDirectory(dependencies);
   const configuredStore = dataProperty(dependencies, "store");
   const store = assertPort(
@@ -248,16 +271,25 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     ["enqueue"],
     "operationQueue",
   );
+  let githubExecutor = null;
+  if (githubExecutorOptions) {
+    githubExecutor = assertPort(
+      factories.createExecutor(githubExecutorOptions),
+      ["execute", "reconcile"],
+      "githubExecutor",
+    );
+  }
+  const executors = {
+    ...(githubExecutor
+      ? {
+          "github.pull-request-review": githubExecutor,
+          "github.work-proposal-review": githubExecutor,
+        }
+      : {}),
+    ...(localExecutor ? { "local.code-job-create": localExecutor } : {}),
+  };
   const executor = assertPort(
-    factories.createExecutor({
-      ghCommand: enabledConfig.ghCommand,
-      token,
-      env: environment,
-      networkEnv: enabledConfig.networkEnv,
-      ...(enabledConfig.timeoutMs === undefined
-        ? {}
-        : { timeoutMs: enabledConfig.timeoutMs }),
-    }),
+    factories.createExecutorRouter({ executors }),
     ["execute", "reconcile"],
     "executor",
   );
