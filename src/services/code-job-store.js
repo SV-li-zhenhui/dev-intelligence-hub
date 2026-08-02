@@ -20,6 +20,13 @@ import {
   digestValue,
   normalizeActionRequest,
 } from "../domain/code-executor-contract.js";
+import {
+  classifyCodeJobMemoryEvent,
+  createCodeJobMemoryEvent,
+  memoryRecordForCodeJobEvent,
+  normalizeCodeJobMemoryEvent,
+} from "../domain/code-job-memory-event.js";
+import { normalizeMemoryRecord } from "../domain/memory-record.js";
 
 export const CODE_JOB_STATE_KEY = "code-job-state";
 const CODE_JOB_TOMBSTONE_PREFIX = "code-job-tombstone";
@@ -28,6 +35,7 @@ const MAX_JOBS = 1_000;
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_ARCHIVED_JOBS = 10_000;
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const MAX_PENDING_MEMORY_EVENTS = 256_000;
 const ACTION_COMMIT_HEADROOM_BYTES = 320 * 1024;
 const TERMINAL_HEADROOM_BYTES = 160 * 1024;
 const MEMORY_RECEIPT_HEADROOM_BYTES = 16 * 1024;
@@ -44,6 +52,11 @@ const RUNNABLE_STATUSES = new Set([
 const RECONCILABLE_STATUSES = new Set(["unknown"]);
 const RESUMED_STATUSES = new Set(["queued", "starting", "active"]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
+const TERMINAL_MEMORY_EVENT_KINDS = new Set([
+  "completed",
+  "failed",
+  "fenced",
+]);
 
 function storeError(code, message, statusCode = 400, options) {
   return codeJobError(code, message, statusCode, options);
@@ -105,6 +118,14 @@ function memoryReceiptUnverified(cause) {
     "无法验证代码任务的持久记忆投影",
     409,
     cause === undefined ? undefined : { cause },
+  );
+}
+
+function memoryOrderConflict() {
+  return storeError(
+    "CODE_JOB_MEMORY_ORDER_CONFLICT",
+    "代码任务记忆投影确认顺序无效",
+    409,
   );
 }
 
@@ -258,7 +279,7 @@ function sealArchive(value) {
 
 function defaultState() {
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     revision: 0,
     nextJobSequence: 1,
     archive: sealArchive({
@@ -273,6 +294,14 @@ function defaultState() {
     }),
     archiveIndex: [],
     lastCompaction: null,
+    memoryProjection: {
+      revision: 0,
+      nextSequence: 1,
+      cursor: 0,
+      checkpointDigest: null,
+      lastAcknowledgement: null,
+      pending: [],
+    },
     jobs: [],
   };
 }
@@ -405,6 +434,233 @@ function validateUniqueJobs(jobs, error) {
   }
 }
 
+function normalizeMemoryEventId(value, error) {
+  if (
+    typeof value !== "string" ||
+    value.length > 192 ||
+    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value)
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+function normalizeMemoryAcknowledgement(value, error) {
+  assertExactKeys(
+    value,
+    [
+      "sequence",
+      "eventId",
+      "eventDigest",
+      "jobId",
+      "sourceRecordDigest",
+      "memoryRecordId",
+      "memoryRecordDigest",
+    ],
+    error,
+  );
+  const memoryRecordDigest = normalizeSha256(
+    value.memoryRecordDigest,
+    error,
+  );
+  const eventDigest = normalizeSha256(value.eventDigest, error);
+  const eventId = normalizeMemoryEventId(value.eventId, error);
+  if (eventId !== `code-job-memory-event-${eventDigest}`) throw error;
+  return {
+    sequence: safeInteger(
+      value.sequence,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      error,
+    ),
+    eventId,
+    eventDigest,
+    jobId: normalizeJobId(value.jobId, error),
+    sourceRecordDigest: normalizeSha256(value.sourceRecordDigest, error),
+    memoryRecordId: normalizeMemoryRecordId(
+      value.memoryRecordId,
+      memoryRecordDigest,
+      error,
+    ),
+    memoryRecordDigest,
+  };
+}
+
+function normalizeLastMemoryAcknowledgement(value, error) {
+  assertExactKeys(value, ["event", "receipt"], error);
+  let event;
+  try {
+    event = normalizeCodeJobMemoryEvent(value.event);
+  } catch {
+    throw error;
+  }
+  const receipt = normalizeMemoryAcknowledgement(value.receipt, error);
+  if (!sameValue(receipt, acknowledgementForMemoryEvent(event))) throw error;
+  return { event, receipt };
+}
+
+function emptyMemoryProjection() {
+  return defaultState().memoryProjection;
+}
+
+function normalizeMemoryProjection(value, stateRevision, error) {
+  assertExactKeys(
+    value,
+    [
+      "revision",
+      "nextSequence",
+      "cursor",
+      "checkpointDigest",
+      "lastAcknowledgement",
+      "pending",
+    ],
+    error,
+  );
+  const revision = safeInteger(
+    value.revision,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const nextSequence = safeInteger(
+    value.nextSequence,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const cursor = safeInteger(
+    value.cursor,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    error,
+  );
+  const checkpointDigest = value.checkpointDigest === null
+    ? null
+    : normalizeSha256(value.checkpointDigest, error);
+  const lastAcknowledgement = value.lastAcknowledgement === null
+    ? null
+    : normalizeLastMemoryAcknowledgement(value.lastAcknowledgement, error);
+  const pending = denseArray(
+    value.pending,
+    MAX_PENDING_MEMORY_EVENTS,
+    error,
+  ).map((entry) => {
+    try {
+      return normalizeCodeJobMemoryEvent(entry);
+    } catch {
+      throw error;
+    }
+  });
+  if (
+    revision > stateRevision ||
+    cursor > Number.MAX_SAFE_INTEGER - pending.length - 1 ||
+    nextSequence !== cursor + pending.length + 1 ||
+    (nextSequence === 1) !== (revision === 0) ||
+    (cursor === 0) !== (checkpointDigest === null) ||
+    (cursor === 0) !== (lastAcknowledgement === null) ||
+    (lastAcknowledgement !== null &&
+      (lastAcknowledgement.event.sequence !== cursor ||
+        lastAcknowledgement.event.eventDigest !== checkpointDigest))
+  ) {
+    throw error;
+  }
+  let previousDigest = checkpointDigest;
+  for (let index = 0; index < pending.length; index += 1) {
+    const event = pending[index];
+    if (
+      event.sequence !== cursor + index + 1 ||
+      event.previousDigest !== previousDigest
+    ) {
+      throw error;
+    }
+    previousDigest = event.eventDigest;
+  }
+  return {
+    revision,
+    nextSequence,
+    cursor,
+    checkpointDigest,
+    lastAcknowledgement,
+    pending,
+  };
+}
+
+function appendMemoryEvent(memoryProjection, job, kind, revision) {
+  if (kind === null) return memoryProjection;
+  assertMemoryEventCapacity(memoryProjection);
+  const previousDigest = memoryProjection.pending.at(-1)?.eventDigest ??
+    memoryProjection.checkpointDigest;
+  const event = createCodeJobMemoryEvent({
+    sequence: memoryProjection.nextSequence,
+    previousDigest,
+    job,
+    kind,
+  });
+  return {
+    ...memoryProjection,
+    revision,
+    nextSequence: memoryProjection.nextSequence + 1,
+    pending: [...memoryProjection.pending, event],
+  };
+}
+
+function assertMemoryEventCapacity(memoryProjection) {
+  if (
+    memoryProjection.nextSequence >= Number.MAX_SAFE_INTEGER ||
+    memoryProjection.pending.length >= MAX_PENDING_MEMORY_EVENTS
+  ) {
+    throw capacityExceeded();
+  }
+}
+
+function migrateMemoryProjection(jobs, revision) {
+  let projection = emptyMemoryProjection();
+  for (const job of [...jobs].sort(
+    (left, right) => left.revision - right.revision || left.sequence - right.sequence,
+  )) {
+    const kind = classifyCodeJobMemoryEvent(null, job);
+    projection = appendMemoryEvent(projection, job, kind, revision);
+  }
+  return projection;
+}
+
+function assertMemoryProjectionExtension(current, durable) {
+  const forked = () => storeError(
+    "CODE_JOB_MEMORY_FORKED",
+    "代码任务记忆投影链发生回退或分叉",
+    500,
+  );
+  if (
+    durable.cursor < current.cursor ||
+    durable.nextSequence < current.nextSequence ||
+    (durable.cursor === current.cursor &&
+      durable.checkpointDigest !== current.checkpointDigest)
+  ) {
+    throw forked();
+  }
+  const currentBySequence = new Map(
+    current.pending.map((event) => [event.sequence, event]),
+  );
+  if (durable.cursor > current.cursor) {
+    const acknowledged = currentBySequence.get(durable.cursor);
+    if (
+      acknowledged !== undefined &&
+      acknowledged.eventDigest !== durable.checkpointDigest
+    ) {
+      throw forked();
+    }
+  }
+  for (const event of durable.pending) {
+    const existing = currentBySequence.get(event.sequence);
+    if (
+      existing !== undefined &&
+      existing.eventDigest !== event.eventDigest
+    ) {
+      throw forked();
+    }
+  }
+}
+
 function normalizeLegacyState(value, limits, error) {
   assertExactKeys(
     value,
@@ -450,12 +706,13 @@ function normalizeLegacyState(value, limits, error) {
     }
   }
   const state = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     revision,
     nextJobSequence,
     archive: emptyArchive(),
     archiveIndex: [],
     lastCompaction: null,
+    memoryProjection: migrateMemoryProjection(jobs, revision),
     jobs,
   };
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
@@ -469,9 +726,10 @@ function normalizeStateValue(value, limits) {
   if (value?.schemaVersion === 1) {
     return normalizeLegacyState(value, limits, error);
   }
-  if (![2, 3, 4, 5, 6].includes(value.schemaVersion)) throw error;
+  if (![2, 3, 4, 5, 6, 7].includes(value.schemaVersion)) throw error;
   const legacyVersion = value.schemaVersion === 2;
   const manifestVersion = value.schemaVersion === 3;
+  const outboxVersion = value.schemaVersion === 7;
   assertExactKeys(
     value,
     legacyVersion
@@ -492,6 +750,7 @@ function normalizeStateValue(value, limits) {
         "archive",
         "archiveIndex",
         "lastCompaction",
+        ...(outboxVersion ? ["memoryProjection"] : []),
         "jobs",
       ],
     error,
@@ -518,14 +777,31 @@ function normalizeStateValue(value, limits) {
     : null;
   const jobs = normalizeJobs(value.jobs, limits, error);
   validateUniqueJobs(jobs, error);
+  const memoryProjection = outboxVersion
+    ? normalizeMemoryProjection(value.memoryProjection, revision, error)
+    : migrateMemoryProjection(jobs, revision);
+  const knownJobIds = new Set([
+    ...jobs.map(({ jobId }) => jobId),
+    ...archiveIndex.map(({ jobId }) => jobId),
+  ]);
+  const acknowledgedEvent =
+    memoryProjection.lastAcknowledgement?.event ?? null;
   if (
     nextJobSequence !== archive.throughSequence + jobs.length + 1 ||
     archive.jobCount !== archiveIndex.length ||
     archive.jobCount > limits.maximumArchivedJobs ||
     archive.storageBytes > limits.maximumArchiveBytes ||
+    memoryProjection.pending.some(
+      ({ jobId, jobRevision }) =>
+        !knownJobIds.has(jobId) || jobRevision > revision,
+    ) ||
+    (acknowledgedEvent !== null &&
+      (!knownJobIds.has(acknowledgedEvent.jobId) ||
+        acknowledgedEvent.jobRevision > revision)) ||
     jobs.some(({ revision: jobRevision }) => jobRevision > revision) ||
     Math.max(
       archive.revision,
+      memoryProjection.revision,
       jobs.reduce(
         (maximum, job) => Math.max(maximum, job.revision),
         0,
@@ -553,12 +829,13 @@ function normalizeStateValue(value, limits) {
     }
   }
   const state = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     revision,
     nextJobSequence,
     archive,
     archiveIndex,
     lastCompaction,
+    memoryProjection,
     jobs: ordered,
   };
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
@@ -576,9 +853,12 @@ function normalizeState(value, limits) {
   }
 }
 
-function normalizeJobId(value) {
+function normalizeJobId(
+  value,
+  error = storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效"),
+) {
   if (typeof value !== "string" || !JOB_ID.test(value)) {
-    throw storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效");
+    throw error;
   }
   return value;
 }
@@ -742,6 +1022,40 @@ function normalizeListOptions(value = {}) {
       value.cursor === undefined ? null : normalizeJobId(value.cursor),
     status,
   };
+}
+
+function normalizeMemoryBatchOptions(value = {}) {
+  const error = storeError("INVALID_CODE_JOB_QUERY", "代码任务查询无效");
+  assertExactKeys(
+    value,
+    Object.hasOwn(value, "limit") ? ["limit"] : [],
+    error,
+  );
+  return {
+    limit: safeInteger(value.limit ?? 50, 1, 100, error),
+  };
+}
+
+function acknowledgementForMemoryEvent(value) {
+  const event = normalizeCodeJobMemoryEvent(value);
+  const record = normalizeMemoryRecord(memoryRecordForCodeJobEvent(event));
+  return {
+    sequence: event.sequence,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    jobId: event.jobId,
+    sourceRecordDigest: event.sourceRecordDigest,
+    memoryRecordId: record.recordId,
+    memoryRecordDigest: record.contentDigest,
+  };
+}
+
+function memoryAcknowledgementResult(status, memoryProjection) {
+  return cloneCodeJobValue({
+    status,
+    cursor: memoryProjection.cursor,
+    highWatermark: memoryProjection.nextSequence - 1,
+  });
 }
 
 function sameAuthorization(job, request) {
@@ -1039,7 +1353,7 @@ function normalizeArchiveTombstone(value) {
     Date.parse(content.updatedAt) < Date.parse(content.createdAt) ||
     outcome.terminalResult.kind !== content.status ||
     outcome.memoryProjection.jobId !== content.jobId ||
-    outcome.memoryProjection.sourceRevision + 1 !== content.revision ||
+    outcome.memoryProjection.sourceRevision >= content.revision ||
     outcome.memoryProjection.projectedAt !== content.updatedAt ||
     archiveLinkDigest(previousArchiveDigest, content) !== archiveDigest ||
     tombstoneDigest !== digestValue(content)
@@ -1838,6 +2152,7 @@ export class CodeJobStore {
       }
       this.#assertJobRevision(job, request.expectedRevision);
       if (job.status !== "active") throw transitionConflict();
+      assertMemoryEventCapacity(state.memoryProjection);
       const epoch = state.revision + 1;
       const changed = this.#updateJob(
         state,
@@ -1853,7 +2168,10 @@ export class CodeJobStore {
           },
         }),
       );
-      return this.#appliedLifecycleChange(changed);
+      return this.#appliedLifecycleChange(
+        changed,
+        ACTION_COMMIT_HEADROOM_BYTES,
+      );
     });
   }
 
@@ -2164,6 +2482,75 @@ export class CodeJobStore {
 
   fence(value) {
     return this.#finish(value, "fenced");
+  }
+
+  readMemoryProjectionBatch(value = {}) {
+    const { limit } = normalizeMemoryBatchOptions(value);
+    return this.#query(() => cloneCodeJobValue({
+      cursor: this.state.memoryProjection.cursor,
+      highWatermark: this.state.memoryProjection.nextSequence - 1,
+      items: this.state.memoryProjection.pending.slice(0, limit),
+    }));
+  }
+
+  acknowledgeMemoryProjection(value) {
+    const error = storeError(
+      "INVALID_CODE_JOB_MUTATION",
+      "代码任务记忆投影确认无效",
+    );
+    const request = normalizeMemoryAcknowledgement(value, error);
+    return this.#mutate(async (state) => {
+      const projection = state.memoryProjection;
+      if (request.sequence <= projection.cursor) {
+        if (
+          request.sequence === projection.cursor &&
+          sameValue(request, projection.lastAcknowledgement.receipt)
+        ) {
+          return {
+            state,
+            value: memoryAcknowledgementResult("already", projection),
+            write: false,
+          };
+        }
+        throw memoryOrderConflict();
+      }
+      if (request.sequence !== projection.cursor + 1) {
+        throw memoryOrderConflict();
+      }
+      const event = projection.pending[0];
+      if (event === undefined) throw memoryOrderConflict();
+      const expected = acknowledgementForMemoryEvent(event);
+      if (!sameValue(request, expected)) throw memoryBindingConflict();
+      const record = normalizeMemoryRecord(memoryRecordForCodeJobEvent(event));
+      await this.#verifyMemoryReceipt(record);
+      const revision = state.revision + 1;
+      const receiptState = await this.#bindTerminalMemoryReceipt(
+        state,
+        event,
+        record,
+        revision,
+      );
+      const nextProjection = {
+        ...projection,
+        revision,
+        cursor: request.sequence,
+        checkpointDigest: event.eventDigest,
+        lastAcknowledgement: { event, receipt: request },
+        pending: projection.pending.slice(1),
+      };
+      const nextState = {
+        ...receiptState,
+        revision,
+        memoryProjection: nextProjection,
+      };
+      return {
+        state: nextState,
+        value: memoryAcknowledgementResult("applied", nextProjection),
+        write: true,
+        protectedSequences: new Set(),
+        requiredHeadroomBytes: 0,
+      };
+    });
   }
 
   markMemoryProjected(value) {
@@ -2511,6 +2898,78 @@ export class CodeJobStore {
     });
   }
 
+  async #verifyMemoryReceipt(record) {
+    if (this.memoryReceiptVerifier === null) {
+      throw memoryReceiptUnverified();
+    }
+    const verificationRequest = Object.freeze({
+      recordId: record.recordId,
+      contentDigest: record.contentDigest,
+      source: Object.freeze(cloneCodeJobValue(record.source)),
+    });
+    try {
+      const verified = await this.memoryReceiptVerifier.verify(
+        cloneCodeJobValue(verificationRequest),
+      );
+      normalizeVerifiedMemoryReceipt(verified, verificationRequest);
+    } catch (cause) {
+      if (cause?.code === "CODE_JOB_MEMORY_RECEIPT_UNVERIFIED") throw cause;
+      throw memoryReceiptUnverified(cause);
+    }
+  }
+
+  async #bindTerminalMemoryReceipt(state, event, record, revision) {
+    if (!TERMINAL_MEMORY_EVENT_KINDS.has(event.kind)) {
+      return { ...state, revision };
+    }
+    const index = state.jobs.findIndex(({ jobId }) => jobId === event.jobId);
+    if (index < 0) {
+      const archived = await this.#readArchivedByJobId(state, event.jobId);
+      if (
+        archived === null ||
+        archived.status !== event.kind ||
+        archived.outcome.memoryProjection.sourceRecordDigest !==
+          event.sourceRecordDigest
+      ) {
+        throw memoryBindingConflict();
+      }
+      return { ...state, revision };
+    }
+    const job = state.jobs[index];
+    if (job.status !== event.kind) throw memoryBindingConflict();
+    const existing = job.execution.memoryProjection;
+    if (existing !== null) {
+      if (existing.sourceRecordDigest !== event.sourceRecordDigest) {
+        throw memoryBindingConflict();
+      }
+      return { ...state, revision };
+    }
+    if (
+      job.revision !== event.jobRevision ||
+      job.updatedAt !== event.occurredAt ||
+      job.recordDigest !== event.sourceRecordDigest
+    ) {
+      throw memoryBindingConflict();
+    }
+    return this.#updateJob(
+      state,
+      index,
+      job.status,
+      (projectedAt) => ({
+        ...job.execution,
+        memoryProjection: {
+          jobId: job.jobId,
+          sourceRecordDigest: event.sourceRecordDigest,
+          sourceRevision: event.jobRevision,
+          sourceUpdatedAt: event.occurredAt,
+          memoryRecordId: record.recordId,
+          memoryRecordDigest: record.contentDigest,
+          projectedAt,
+        },
+      }),
+    ).state;
+  }
+
   #requireJob(state, jobId) {
     const index = state.jobs.findIndex((candidate) => candidate.jobId === jobId);
     if (index < 0) throw jobNotFound();
@@ -2533,8 +2992,19 @@ export class CodeJobStore {
     });
     const jobs = [...state.jobs];
     jobs[index] = job;
+    const kind = classifyCodeJobMemoryEvent(current, job);
     return {
-      state: { ...state, revision, jobs },
+      state: {
+        ...state,
+        revision,
+        memoryProjection: appendMemoryEvent(
+          state.memoryProjection,
+          job,
+          kind,
+          revision,
+        ),
+        jobs,
+      },
       job,
     };
   }
@@ -2759,6 +3229,10 @@ export class CodeJobStore {
         500,
       );
     }
+    assertMemoryProjectionExtension(
+      this.state.memoryProjection,
+      durable.memoryProjection,
+    );
     for (let index = 0; index < this.state.archiveIndex.length; index += 1) {
       if (!sameValue(this.state.archiveIndex[index], durable.archiveIndex[index])) {
         throw storeError(

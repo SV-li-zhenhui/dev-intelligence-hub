@@ -7,6 +7,10 @@ import {
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import {
+  memoryRecordForCodeJobEvent,
+} from "../src/domain/code-job-memory-event.js";
+import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   CODE_JOB_STATE_KEY,
@@ -126,6 +130,20 @@ function memoryProjection(job, digest = "9".repeat(64)) {
     sourceRecordDigest: job.recordDigest,
     memoryRecordId: `memory-${digest}`,
     memoryRecordDigest: digest,
+  };
+}
+
+function memoryAcknowledgement(event, overrides = {}) {
+  const record = normalizeMemoryRecord(memoryRecordForCodeJobEvent(event));
+  return {
+    sequence: event.sequence,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    jobId: event.jobId,
+    sourceRecordDigest: event.sourceRecordDigest,
+    memoryRecordId: record.recordId,
+    memoryRecordDigest: record.contentDigest,
+    ...overrides,
   };
 }
 
@@ -1234,6 +1252,7 @@ test("schema v5 explicit null admission remains prepared but not admitted", asyn
   const fixture = await preparedActionFixture("v5-prepared-action");
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 5;
+  delete legacy.memoryProjection;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const { uncertainty: _uncertainty, ...execution } = jobValue.execution;
     const content = { ...jobValue, execution };
@@ -1252,16 +1271,17 @@ test("schema v5 explicit null admission remains prepared but not admitted", asyn
     expectedRevision: pending.revision,
     reason: "迁移后暂停",
   });
-  assert.equal(store.value.schemaVersion, 6);
+  assert.equal(store.value.schemaVersion, 7);
 });
 
-test("schema v2 and v3 outer states recover and write back as v6", async (t) => {
+test("schema v2 and v3 outer states recover and write back as v7", async (t) => {
   for (const schemaVersion of [2, 3]) {
     await t.test(`schema v${schemaVersion}`, async () => {
       const fixture = await readyStore();
       const created = await fixture.jobs.createApprovedJob(approval());
       const legacy = structuredClone(fixture.store.value);
       legacy.schemaVersion = schemaVersion;
+      delete legacy.memoryProjection;
       delete legacy.lastCompaction;
       if (schemaVersion === 2) delete legacy.archiveIndex;
       legacy.jobs = legacy.jobs.map((jobValue) => {
@@ -1291,17 +1311,222 @@ test("schema v2 and v3 outer states recover and write back as v6", async (t) => 
         reason: `升级 schema v${schemaVersion}`,
       });
 
-      assert.equal(store.value.schemaVersion, 6);
+      assert.equal(store.value.schemaVersion, 7);
       assert.ok(Array.isArray(store.value.archiveIndex));
       assert.equal(Object.hasOwn(store.value, "lastCompaction"), true);
     });
   }
 });
 
+test("schema v6 recovery deterministically seeds current meaningful memory events", async (t) => {
+  const scenarios = [
+    ["observation", async () => {
+      const fixture = await preparedActionFixture("legacy-current-observation");
+      await fixture.jobs.recordObservation({
+        jobId: fixture.created.job.jobId,
+        expectedRevision: fixture.prepared.job.revision,
+        actionId: "legacy-current-observation",
+        status: "succeeded",
+        workspaceRevision: "4".repeat(64),
+        detail: { files: [] },
+      });
+      return fixture;
+    }],
+    ["paused", async () => {
+      const fixture = await readyStore();
+      const created = await fixture.jobs.createApprovedJob(approval());
+      await fixture.jobs.pause({
+        jobId: created.job.jobId,
+        expectedRevision: created.job.revision,
+        reason: "迁移暂停状态",
+      });
+      return fixture;
+    }],
+    ["unknown", async () => {
+      const fixture = await preparedActionFixture("legacy-current-unknown");
+      const pending = fixture.prepared.job.execution.pendingAction;
+      const admitted = await fixture.jobs.admitAction({
+        jobId: fixture.created.job.jobId,
+        expectedRevision: fixture.prepared.job.revision,
+        actionId: pending.actionId,
+        actionDigest: pending.actionDigest,
+      });
+      await fixture.jobs.markActionUnknown({
+        jobId: fixture.created.job.jobId,
+        expectedRevision: admitted.job.revision,
+        actionId: pending.actionId,
+        actionDigest: pending.actionDigest,
+        epoch: admitted.job.execution.actionAdmission.epoch,
+        code: "LEGACY_UNKNOWN",
+        message: "迁移未知状态",
+      });
+      return fixture;
+    }],
+    ["failed", async () => {
+      const fixture = await readyStore();
+      const created = await fixture.jobs.createApprovedJob(approval());
+      await fixture.jobs.fail({
+        jobId: created.job.jobId,
+        expectedRevision: created.job.revision,
+        result: { code: "LEGACY_TERMINAL" },
+      });
+      return fixture;
+    }],
+  ];
+
+  for (const [kind, createFixture] of scenarios) {
+    await t.test(kind, async () => {
+      const fixture = await createFixture();
+      const [original] = (
+        await fixture.jobs.readMemoryProjectionBatch({ limit: 100 })
+      ).items.filter((event) => event.kind === kind);
+      const legacy = structuredClone(fixture.store.value);
+      legacy.schemaVersion = 6;
+      delete legacy.memoryProjection;
+      const store = new MemoryStore(legacy);
+      const recovered = await readyStore({ store });
+      const batch = await recovered.jobs.readMemoryProjectionBatch();
+
+      assert.equal(batch.items.length, 1);
+      assert.equal(batch.items[0].kind, kind);
+      assert.equal(batch.items[0].eventDigest, original.eventDigest);
+      assert.equal(store.value.schemaVersion, 6);
+      if (kind === "failed") {
+        await recovered.jobs.acknowledgeMemoryProjection(
+          memoryAcknowledgement(batch.items[0]),
+        );
+        assert.equal(store.value.schemaVersion, 7);
+      }
+    });
+  }
+});
+
+test("schema v6 does not replay a terminal event that already has a memory receipt", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const failed = await fixture.jobs.fail({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code: "LEGACY_ALREADY_PROJECTED" },
+  });
+  await fixture.jobs.markMemoryProjected(memoryProjection(failed.job));
+  const legacy = structuredClone(fixture.store.value);
+  legacy.schemaVersion = 6;
+  delete legacy.memoryProjection;
+
+  const recovered = await readyStore({ store: new MemoryStore(legacy) });
+  assert.deepEqual(await recovered.jobs.readMemoryProjectionBatch(), {
+    cursor: 0,
+    highWatermark: 0,
+    items: [],
+  });
+});
+
+test("memory projection chain corruption is rejected before queries are served", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  await fixture.jobs.fail({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code: "TAMPER_PROOF" },
+  });
+  const tampered = structuredClone(fixture.store.value);
+  tampered.memoryProjection.pending[0].sourceRecordDigest = "0".repeat(64);
+
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(tampered) }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+  const [ownEvent] = (
+    await fixture.jobs.readMemoryProjectionBatch()
+  ).items;
+  await fixture.jobs.acknowledgeMemoryProjection(
+    memoryAcknowledgement(ownEvent),
+  );
+
+  const foreign = await readyStore();
+  const foreignGrant = grant({
+    proposalId: "work-intent-proposal-foreign-checkpoint",
+    contentDigest: "4".repeat(64),
+    requestedBy: { roleId: "tester", workItemId: "work-foreign-checkpoint" },
+    source: {
+      assignmentId: "assignment-foreign-checkpoint",
+      eventId: "event-foreign-checkpoint",
+    },
+  });
+  const foreignCreated = await foreign.jobs.createApprovedJob(approval({
+    confirmationId: "confirmation-code-job-foreign-checkpoint",
+    requestId: "approval-request-foreign-checkpoint",
+    displayedPayloadDigest: "5".repeat(64),
+    approvalBindingDigest: "6".repeat(64),
+    grant: foreignGrant,
+  }));
+  await foreign.jobs.fail({
+    jobId: foreignCreated.job.jobId,
+    expectedRevision: foreignCreated.job.revision,
+    result: { code: "FOREIGN_CHECKPOINT" },
+  });
+  const [foreignEvent] = (
+    await foreign.jobs.readMemoryProjectionBatch()
+  ).items;
+  const foreignCheckpoint = structuredClone(fixture.store.value);
+  foreignCheckpoint.memoryProjection.checkpointDigest =
+    foreignEvent.eventDigest;
+  foreignCheckpoint.memoryProjection.lastAcknowledgement = {
+    event: foreignEvent,
+    receipt: memoryAcknowledgement(foreignEvent),
+  };
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(foreignCheckpoint) }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+});
+
+test("an accepted memory checkpoint cannot be replaced by a higher-revision fork", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  await fixture.jobs.fail({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code: "CHECKPOINTED" },
+  });
+  const beforeAcknowledgement = structuredClone(fixture.store.value);
+  const [event] = (await fixture.jobs.readMemoryProjectionBatch()).items;
+  await fixture.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+
+  const forkStore = new MemoryStore(beforeAcknowledgement);
+  const fork = await readyStore({ store: forkStore });
+  const forkGrant = grant({
+    proposalId: "work-intent-proposal-fork",
+    contentDigest: "1".repeat(64),
+    requestedBy: { roleId: "tester", workItemId: "work-fork" },
+    source: { assignmentId: "assignment-fork", eventId: "event-fork" },
+  });
+  const forkCreated = await fork.jobs.createApprovedJob(approval({
+    confirmationId: "confirmation-code-job-fork",
+    requestId: "approval-request-fork",
+    displayedPayloadDigest: "2".repeat(64),
+    approvalBindingDigest: "3".repeat(64),
+    grant: forkGrant,
+  }));
+  await fork.jobs.pause({
+    jobId: forkCreated.job.jobId,
+    expectedRevision: forkCreated.job.revision,
+    reason: "形成更高修订的投影分叉",
+  });
+  fixture.store.value = forkStore.value;
+
+  await assert.rejects(
+    fixture.jobs.createApprovedJob(approval({ requestId: "approval-request-retry" })),
+    (error) => error.code === "CODE_JOB_MEMORY_FORKED",
+  );
+});
+
 test("legacy pending actions migrate to explicit admitted uncertainty", async () => {
   const fixture = await preparedActionFixture("legacy-pending-action");
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 4;
+  delete legacy.memoryProjection;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const {
       actionAdmission: _actionAdmission,
@@ -1361,7 +1586,7 @@ test("legacy pending actions migrate to explicit admitted uncertainty", async ()
   assert.equal(paused.job.execution.uncertainty, null);
   assert.equal(paused.job.execution.actionAdmission, null);
   assert.equal(paused.job.execution.pendingAction.actionId, pending.actionId);
-  assert.equal(store.value.schemaVersion, 6);
+  assert.equal(store.value.schemaVersion, 7);
 });
 
 test("terminal transitions are sealed, idempotent, and browser-safe", async () => {
@@ -1436,6 +1661,301 @@ test("terminal transitions are sealed, idempotent, and browser-safe", async () =
   assert.equal(JSON.stringify(browser).includes("Inspection completed"), false);
 });
 
+test("meaningful lifecycle changes append one ordered durable memory event", async () => {
+  const fixture = await preparedActionFixture("memory-stream-observation");
+  const observed = await fixture.jobs.recordObservation({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: fixture.prepared.job.revision,
+    actionId: "memory-stream-observation",
+    status: "succeeded",
+    workspaceRevision: "4".repeat(64),
+    detail: { files: ["src/index.js"] },
+  });
+  const paused = await fixture.jobs.pause({
+    jobId: observed.job.jobId,
+    expectedRevision: observed.job.revision,
+    reason: "等待记忆投影测试",
+  });
+  const resumed = await fixture.jobs.resume({
+    jobId: paused.job.jobId,
+    expectedRevision: paused.job.revision,
+  });
+  await fixture.jobs.fail({
+    jobId: resumed.job.jobId,
+    expectedRevision: resumed.job.revision,
+    result: { code: "MEMORY_STREAM_TEST_DONE" },
+  });
+
+  const batch = await fixture.jobs.readMemoryProjectionBatch({ limit: 10 });
+  assert.equal(batch.cursor, 0);
+  assert.equal(batch.highWatermark, 4);
+  assert.deepEqual(batch.items.map(({ kind }) => kind), [
+    "observation",
+    "paused",
+    "resumed",
+    "failed",
+  ]);
+  assert.deepEqual(batch.items.map(({ sequence }) => sequence), [1, 2, 3, 4]);
+  assert.equal(batch.items[0].previousDigest, null);
+  assert.equal(batch.items[1].previousDigest, batch.items[0].eventDigest);
+  assert.equal(fixture.store.value.schemaVersion, 7);
+
+  const repeated = await fixture.jobs.recordObservation({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: fixture.prepared.job.revision,
+    actionId: "memory-stream-observation",
+    status: "succeeded",
+    workspaceRevision: "4".repeat(64),
+    detail: { files: ["src/index.js"] },
+  });
+  assert.equal(repeated.status, "already");
+  assert.equal(
+    (await fixture.jobs.readMemoryProjectionBatch({ limit: 10 })).highWatermark,
+    4,
+  );
+});
+
+test("unknown action recovery emits one unknown event and one reconciled event", async () => {
+  const fixture = await preparedActionFixture("memory-unknown-action");
+  const pending = fixture.prepared.job.execution.pendingAction;
+  const admitted = await fixture.jobs.admitAction({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: fixture.prepared.job.revision,
+    actionId: pending.actionId,
+    actionDigest: pending.actionDigest,
+  });
+  const epoch = admitted.job.execution.actionAdmission.epoch;
+  const unknown = await fixture.jobs.markActionUnknown({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: admitted.job.revision,
+    actionId: pending.actionId,
+    actionDigest: pending.actionDigest,
+    epoch,
+    code: "RESULT_UNKNOWN",
+    message: "执行结果需要可信对账",
+  });
+  assert.equal(
+    (await fixture.jobs.markActionUnknown({
+      jobId: fixture.created.job.jobId,
+      expectedRevision: admitted.job.revision,
+      actionId: pending.actionId,
+      actionDigest: pending.actionDigest,
+      epoch,
+      code: "RESULT_UNKNOWN",
+      message: "执行结果需要可信对账",
+    })).status,
+    "already",
+  );
+  await fixture.jobs.recordObservation({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: unknown.job.revision,
+    actionId: pending.actionId,
+    actionDigest: pending.actionDigest,
+    epoch,
+    status: "succeeded",
+    workspaceRevision: "4".repeat(64),
+    detail: { files: [] },
+  });
+
+  const batch = await fixture.jobs.readMemoryProjectionBatch();
+  assert.deepEqual(batch.items.map(({ kind }) => kind), [
+    "unknown",
+    "reconciled",
+  ]);
+});
+
+test("memory acknowledgements are receipt-verified, prefix ordered, and terminally atomic", async () => {
+  const fixture = await preparedActionFixture("memory-prefix-observation");
+  const observed = await fixture.jobs.recordObservation({
+    jobId: fixture.created.job.jobId,
+    expectedRevision: fixture.prepared.job.revision,
+    actionId: "memory-prefix-observation",
+    status: "succeeded",
+    workspaceRevision: "4".repeat(64),
+    detail: { files: ["README.md"] },
+  });
+  const paused = await fixture.jobs.pause({
+    jobId: observed.job.jobId,
+    expectedRevision: observed.job.revision,
+    reason: "验证投影前缀",
+  });
+  const resumed = await fixture.jobs.resume({
+    jobId: paused.job.jobId,
+    expectedRevision: paused.job.revision,
+  });
+  const failed = await fixture.jobs.fail({
+    jobId: resumed.job.jobId,
+    expectedRevision: resumed.job.revision,
+    result: { code: "PREFIX_TEST_DONE" },
+  });
+  const { items } = await fixture.jobs.readMemoryProjectionBatch({ limit: 10 });
+
+  await assert.rejects(
+    fixture.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(items[1])),
+    (error) => error.code === "CODE_JOB_MEMORY_ORDER_CONFLICT",
+  );
+  await assert.rejects(
+    fixture.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(items[0], {
+      sourceRecordDigest: "0".repeat(64),
+    })),
+    (error) => error.code === "CODE_JOB_MEMORY_BINDING_CONFLICT",
+  );
+
+  const firstRequest = memoryAcknowledgement(items[0]);
+  const first = await fixture.jobs.acknowledgeMemoryProjection(firstRequest);
+  assert.deepEqual(first, { status: "applied", cursor: 1, highWatermark: 4 });
+  assert.equal(
+    (await fixture.jobs.getForWorker(failed.job.jobId)).execution.memoryProjection,
+    null,
+  );
+  assert.equal(
+    (await fixture.jobs.acknowledgeMemoryProjection(firstRequest)).status,
+    "already",
+  );
+  for (const event of items.slice(1)) {
+    await fixture.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(event),
+    );
+  }
+
+  const projected = await fixture.jobs.getForWorker(failed.job.jobId);
+  const terminalRecord = normalizeMemoryRecord(
+    memoryRecordForCodeJobEvent(items.at(-1)),
+  );
+  assert.equal(projected.execution.memoryProjection.sourceRevision, failed.job.revision);
+  assert.equal(
+    projected.execution.memoryProjection.sourceRecordDigest,
+    failed.job.recordDigest,
+  );
+  assert.equal(
+    projected.execution.memoryProjection.memoryRecordId,
+    terminalRecord.recordId,
+  );
+  assert.ok(projected.revision > failed.job.revision + 1);
+  assert.deepEqual(await fixture.jobs.readMemoryProjectionBatch(), {
+    cursor: 4,
+    highWatermark: 4,
+    items: [],
+  });
+
+  const forged = structuredClone(fixture.store.value);
+  const { recordDigest: _recordDigest, ...forgedContent } = forged.jobs[0];
+  forgedContent.execution.memoryProjection.sourceRecordDigest = "0".repeat(64);
+  forged.jobs[0] = {
+    ...forgedContent,
+    recordDigest: digestValue(forgedContent),
+  };
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(forged) }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+
+  const compacted = await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "memory-revision-gap-compaction",
+      targetThroughSequence: projected.sequence,
+    }),
+  );
+  assert.equal(compacted.status, "applied");
+  const recoveredArchive = await readyStore({ store: fixture.store });
+  assert.equal(
+    (await recoveredArchive.jobs.get(projected.jobId)).status,
+    "failed",
+  );
+});
+
+test("a persisted memory acknowledgement returns already after write acknowledgement loss", async () => {
+  const { jobs, store } = await readyStore();
+  const created = await jobs.createApprovedJob(approval());
+  await jobs.fail({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code: "ACK_LOSS" },
+  });
+  const [event] = (await jobs.readMemoryProjectionBatch()).items;
+  const request = memoryAcknowledgement(event);
+  store.writeThenFailAt = store.writeCount + 1;
+
+  await assert.rejects(
+    jobs.acknowledgeMemoryProjection(request),
+    /disk acknowledgement unavailable/,
+  );
+  const retry = await jobs.acknowledgeMemoryProjection(request);
+  assert.deepEqual(retry, { status: "already", cursor: 1, highWatermark: 1 });
+  assert.equal(store.value.memoryProjection.pending.length, 0);
+  assert.notEqual(store.value.jobs[0].execution.memoryProjection, null);
+
+  const tampered = structuredClone(store.value);
+  tampered.memoryProjection.lastAcknowledgement.receipt.sourceRecordDigest =
+    "0".repeat(64);
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(tampered) }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+});
+
+test("an unverified memory receipt leaves the terminal event pending for retry", async () => {
+  const store = new MemoryStore();
+  const unavailable = await readyStore({
+    store,
+    memoryReceiptVerifier: {
+      verify() {
+        throw new Error("memory journal unavailable");
+      },
+    },
+  });
+  const created = await unavailable.jobs.createApprovedJob(approval());
+  await unavailable.jobs.fail({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code: "MEMORY_UNAVAILABLE" },
+  });
+  const [event] = (await unavailable.jobs.readMemoryProjectionBatch()).items;
+
+  await assert.rejects(
+    unavailable.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event)),
+    (error) => error.code === "CODE_JOB_MEMORY_RECEIPT_UNVERIFIED",
+  );
+  assert.equal(store.value.memoryProjection.cursor, 0);
+  assert.equal(store.value.memoryProjection.pending.length, 1);
+  assert.equal(store.value.jobs[0].execution.memoryProjection, null);
+
+  const recovered = await readyStore({ store });
+  assert.equal(
+    (await recovered.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(event),
+    )).status,
+    "applied",
+  );
+});
+
+test("action admission reserves enough durable space for its later observation event", async () => {
+  const fixture = await preparedActionFixture("memory-headroom-action");
+  const durable = structuredClone(fixture.store.value);
+  const maximumStateBytes =
+    Buffer.byteLength(JSON.stringify(durable), "utf8") + 320 * 1024 - 1;
+  const constrainedStore = new MemoryStore(durable);
+  const constrained = await readyStore({
+    store: constrainedStore,
+    limits: { maximumStateBytes },
+  });
+  const pending = fixture.prepared.job.execution.pendingAction;
+
+  await assert.rejects(
+    constrained.jobs.admitAction({
+      jobId: fixture.created.job.jobId,
+      expectedRevision: fixture.prepared.job.revision,
+      actionId: pending.actionId,
+      actionDigest: pending.actionDigest,
+    }),
+    (error) => error.code === "CODE_JOB_RETENTION_BLOCKED",
+  );
+  assert.equal(
+    constrainedStore.value.jobs[0].execution.actionAdmission,
+    null,
+  );
+});
+
 test("memory projection receipt is exact, CAS-bound, and idempotent after acknowledgement loss", async () => {
   const { jobs, store } = await readyStore();
   const created = await jobs.createApprovedJob(approval());
@@ -1500,6 +2020,7 @@ test("schema v5 terminal digest and memory receipt recover without uncertainty",
 
   const legacy = structuredClone(fixture.store.value);
   legacy.schemaVersion = 5;
+  delete legacy.memoryProjection;
   legacy.jobs = legacy.jobs.map((jobValue) => {
     const { recordDigest: _recordDigest, ...projectedContent } = jobValue;
     const receipt = projectedContent.execution.memoryProjection;

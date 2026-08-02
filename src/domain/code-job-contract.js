@@ -1270,7 +1270,7 @@ function assertMemoryProjectionBinding(content, error) {
   );
   if (
     !TERMINAL_JOB_STATUSES.has(content.status) ||
-    content.revision !== receipt.sourceRevision + 1 ||
+    content.revision <= receipt.sourceRevision ||
     content.updatedAt !== receipt.projectedAt ||
     !sourceDigests.has(receipt.sourceRecordDigest)
   ) {
