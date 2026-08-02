@@ -324,6 +324,15 @@ export class ConfiguredRoleEmployee {
   }
 
   control(command, expectedRevision) {
+    if (this.#controller.running) {
+      return Promise.reject(
+        employeeError(
+          "ROLE_RUN_IN_PROGRESS",
+          "Configured role cannot be controlled while its run is in progress",
+          409,
+        ),
+      );
+    }
     return this.#controller.control(command, expectedRevision);
   }
 
@@ -333,14 +342,29 @@ export class ConfiguredRoleEmployee {
   }
 
   async decide(input) {
-    const role = await this.#controller.roleView();
-    if (!role.enabled) {
+    const before = await this.#controller.roleView();
+    if (!before.enabled) {
       throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
     }
-    if (role.paused) {
+    if (before.paused) {
       throw employeeError("ROLE_PAUSED", "Configured role is paused", 409);
     }
-    return this.#decisionEngine.decide(input);
+    const decision = await this.#decisionEngine.decide(input);
+    const after = await this.#controller.roleView();
+    if (!after.enabled) {
+      throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
+    }
+    if (after.paused) {
+      throw employeeError("ROLE_PAUSED", "Configured role is paused", 409);
+    }
+    if (after.revision !== before.revision) {
+      throw employeeError(
+        "ROLE_STATE_CHANGED",
+        "Configured role state changed while deciding",
+        409,
+      );
+    }
+    return decision;
   }
 
   asRoleWorker() {

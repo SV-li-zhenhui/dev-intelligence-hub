@@ -2,6 +2,18 @@ import { normalizeWorkDecision } from "./work-intent.js";
 
 const DEFAULT_MAXIMUM_BYTES = 128 * 1024;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
+const UTF8_MAXIMUM_BYTES_PER_CHARACTER = 4;
+const SAFE_TOKEN_PATTERN = "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$";
+const ISO_TIMESTAMP_PATTERN =
+  "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$";
+const VALID_TEXT_CHARACTER =
+  "[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]";
+const NON_WHITESPACE_TEXT_CHARACTER =
+  "[^\\s\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]";
+const VALID_TEXT_PATTERN = `^${VALID_TEXT_CHARACTER}*$`;
+const NONEMPTY_TEXT_PATTERN =
+  `^${VALID_TEXT_CHARACTER}*${NON_WHITESPACE_TEXT_CHARACTER}` +
+  `${VALID_TEXT_CHARACTER}*$`;
 
 export class StructuredBrainContractError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -12,8 +24,21 @@ export class StructuredBrainContractError extends Error {
   }
 }
 
-function stringSchema(maxLength, { minimum = 1 } = {}) {
-  return { type: "string", minLength: minimum, maxLength };
+function stringSchema(
+  maximumBytes,
+  { minimum = 1, ascii = false, pattern, format } = {},
+) {
+  const maxLength = ascii
+    ? maximumBytes
+    : Math.floor(maximumBytes / UTF8_MAXIMUM_BYTES_PER_CHARACTER);
+  return {
+    type: "string",
+    minLength: minimum,
+    maxLength,
+    pattern:
+      pattern ?? (minimum === 0 ? VALID_TEXT_PATTERN : NONEMPTY_TEXT_PATTERN),
+    ...(format ? { format } : {}),
+  };
 }
 
 function stringArraySchema(maxItems, maxLength, { minimum = 0 } = {}) {
@@ -53,7 +78,7 @@ const intentVariants = [
         additionalProperties: false,
         required: ["id", "label", "description"],
         properties: {
-          id: stringSchema(64),
+          id: stringSchema(64, { ascii: true, pattern: SAFE_TOKEN_PATTERN }),
           label: stringSchema(256),
           description: stringSchema(1_024, { minimum: 0 }),
         },
@@ -69,7 +94,11 @@ const intentVariants = [
           required: ["kind", "notBefore"],
           properties: {
             kind: { type: "string", const: "time" },
-            notBefore: stringSchema(64),
+            notBefore: stringSchema(64, {
+              ascii: true,
+              pattern: ISO_TIMESTAMP_PATTERN,
+              format: "date-time",
+            }),
           },
         },
         {
@@ -78,8 +107,14 @@ const intentVariants = [
           required: ["kind", "fact", "oneOf"],
           properties: {
             kind: { type: "string", const: "workflow_fact" },
-            fact: stringSchema(64),
-            oneOf: stringArraySchema(16, 256, { minimum: 1 }),
+            fact: stringSchema(64, {
+              ascii: true,
+              pattern: SAFE_TOKEN_PATTERN,
+            }),
+            oneOf: {
+              ...stringArraySchema(16, 256, { minimum: 1 }),
+              uniqueItems: true,
+            },
           },
         },
       ],

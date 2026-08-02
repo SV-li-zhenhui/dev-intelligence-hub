@@ -19,12 +19,16 @@ const MESSAGES = Object.freeze([
 ]);
 
 function textResponse(value, { ok = true, status = 200 } = {}) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
   return {
     ok,
     status,
-    async text() {
-      return typeof value === "string" ? value : JSON.stringify(value);
-    },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(text));
+        controller.close();
+      },
+    }),
   };
 }
 
@@ -182,9 +186,11 @@ test("providers bound response bytes and timeout without exposing response conte
     fetch: async () => ({
       ok: true,
       status: 200,
-      async text() {
-        throw new Error("sensitive body reader failure");
-      },
+      body: new ReadableStream({
+        pull() {
+          throw new Error("sensitive body reader failure");
+        },
+      }),
     }),
   });
   await assert.rejects(
@@ -193,6 +199,23 @@ test("providers bound response bytes and timeout without exposing response conte
       error.code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" &&
       !error.message.includes("sensitive"),
   );
+
+  let unboundedRead = false;
+  const unbounded = new OllamaStructuredProvider({
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      async text() {
+        unboundedRead = true;
+        return "sensitive".repeat(1_000_000);
+      },
+    }),
+  });
+  await assert.rejects(
+    unbounded.generate({ model: "qwen", messages: MESSAGES, schema: SCHEMA }),
+    (error) => error.code === "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+  );
+  assert.equal(unboundedRead, false);
 });
 
 test("BrainRouter requires explicit remoteData authorization per classification", async () => {
@@ -212,6 +235,12 @@ test("BrainRouter requires explicit remoteData authorization per classification"
     model: "smart-model",
     remoteData: remoteData(),
   };
+
+  await assert.rejects(
+    router.generate({ brain, messages: MESSAGES, schema: SCHEMA }),
+    (error) => error.code === "REMOTE_DATA_CLASSIFICATION_REQUIRED",
+  );
+  assert.equal(calls.length, 0);
 
   await assert.rejects(
     router.generate({ brain, messages: MESSAGES, schema: SCHEMA, dataClasses: ["code"] }),

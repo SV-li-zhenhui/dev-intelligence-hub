@@ -156,6 +156,13 @@ export class BrainRouter {
     const provider = this.#provider(brain.provider);
     const classes = normalizeDataClasses(dataClasses);
     if (provider.remote) {
+      if (classes.length === 0) {
+        throw routerError(
+          "REMOTE_DATA_CLASSIFICATION_REQUIRED",
+          "Remote brain requires explicit data classification",
+          403,
+        );
+      }
       const denied = classes.find((name) => brain.remoteData[name] !== true);
       if (denied) {
         throw routerError(

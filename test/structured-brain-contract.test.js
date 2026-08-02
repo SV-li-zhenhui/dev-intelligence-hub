@@ -42,6 +42,28 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     ),
     true,
   );
+
+  const askUser = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(
+    ({ properties }) => properties.type.const === "ask_user",
+  );
+  const waitCondition = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(
+    ({ properties }) => properties.type.const === "wait_condition",
+  );
+  const choiceId = askUser.properties.choices.items.properties.id;
+  const workflowFact = waitCondition.properties.condition.oneOf.find(
+    ({ properties }) => properties.kind.const === "workflow_fact",
+  );
+  const time = waitCondition.properties.condition.oneOf.find(
+    ({ properties }) => properties.kind.const === "time",
+  );
+  assert.equal(new RegExp(choiceId.pattern).test("more_details"), false);
+  assert.equal(new RegExp(choiceId.pattern).test("more-details"), true);
+  assert.equal(workflowFact.properties.oneOf.uniqueItems, true);
+  assert.equal(time.properties.notBefore.format, "date-time");
+  assert.equal(
+    WORK_DECISION_JSON_SCHEMA.properties.summary.maxLength,
+    1_024,
+  );
 });
 
 test("parsing rejects wrappers, extra fields, invalid variants, and oversized text", () => {

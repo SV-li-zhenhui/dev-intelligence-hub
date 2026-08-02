@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
+import { BrainRouter } from "../src/services/brain-router.js";
 import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 
@@ -154,7 +155,7 @@ test("RoleDecisionEngine rejects intents outside the independent role permission
   );
 });
 
-test("the default role context classifies pull requests as code data", async () => {
+test("the default role context separates PR code from minimum requirements data", async () => {
   let routed;
   const engine = new RoleDecisionEngine({
     definition: definition("developer"),
@@ -172,12 +173,67 @@ test("the default role context classifies pull requests as code data", async () 
   });
 
   await engine.decide({
-    item: { event: { eventType: "pull_request.observed" } },
+    item: {
+      itemId: "work-1",
+      ownerId: "internal-owner",
+      assignment: { reason: "review_requested" },
+      event: { eventType: "pull_request.observed" },
+      decisionContext: { value: { answer: "check the boundary" } },
+    },
     trigger: "assigned",
   });
 
-  assert.deepEqual(routed.dataClasses, ["code"]);
-  assert.equal(Object.hasOwn(JSON.parse(routed.messages[1].content), "code"), true);
+  assert.deepEqual(routed.dataClasses, ["requirements", "code"]);
+  assert.deepEqual(JSON.parse(routed.messages[1].content), {
+    requirements: {
+      trigger: "assigned",
+      assignment: { reason: "review_requested" },
+      decisionContext: { value: { answer: "check the boundary" } },
+    },
+    code: { event: { eventType: "pull_request.observed" } },
+  });
+});
+
+test("the default PR context cannot cross a remote requirements denial", async () => {
+  const calls = [];
+  const router = new BrainRouter({
+    providers: [
+      {
+        id: "remote-brain",
+        remote: true,
+        async generate(request) {
+          calls.push(request);
+          return JSON.stringify(completeDecision());
+        },
+      },
+    ],
+  });
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain({
+      provider: "remote-brain",
+      remoteData: { requirements: false, code: true, memory: false },
+    }),
+    brainRouter: router,
+  });
+
+  await assert.rejects(
+    engine.decide({
+      item: {
+        event: { eventType: "pull_request.observed" },
+        decisionContext: {
+          source: "attention",
+          value: { answer: "private requirement" },
+        },
+      },
+      trigger: "assigned",
+    }),
+    (error) =>
+      error.code === "REMOTE_DATA_NOT_AUTHORIZED" &&
+      /requirements/.test(error.message),
+  );
+  assert.equal(calls.length, 0);
 });
 
 test("four configured roles keep definition, permissions, brain, pause, and revision independent", async () => {
@@ -263,6 +319,64 @@ test("the explicit role worker port resolves and decide never deadlocks an onRun
   assert.equal(resolved.paused, false);
   assert.equal(decideCalls.length, 1);
   assert.equal((await employee.view()).runCount, 1);
+});
+
+test("pausing a role invalidates a decision that is already in flight", async () => {
+  const store = new MemoryStore();
+  let entered;
+  let release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("tester"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: {
+      view() {
+        return { brain: { remote: false } };
+      },
+      async decide() {
+        entered();
+        await gate;
+        return completeDecision();
+      },
+    },
+    store,
+  });
+
+  const deciding = employee.decide({ item: { itemId: "work-1" } });
+  await started;
+  await employee.control("pause", 0);
+  release();
+
+  await assert.rejects(deciding, (error) => error.code === "ROLE_PAUSED");
+});
+
+test("onRun self-control fails explicitly instead of deadlocking the role queue", async () => {
+  const store = new MemoryStore();
+  let employee;
+  employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: fakeDecisionEngine("developer"),
+    store,
+    onRun: async () => {
+      const revision = (await employee.roleView()).revision;
+      await employee.control("pause", revision);
+    },
+  });
+
+  await assert.rejects(
+    employee.run({ trigger: "manual" }),
+    (error) => error.code === "ROLE_RUN_IN_PROGRESS",
+  );
+  assert.equal(employee.running, null);
+  assert.equal((await employee.view()).lastErrorCode, "ROLE_RUN_IN_PROGRESS");
 });
 
 test("persisted failures and public state never contain provider secrets", async () => {

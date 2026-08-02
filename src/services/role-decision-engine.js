@@ -195,11 +195,21 @@ function normalizeContext(value) {
 
 function defaultContext({ item, trigger }) {
   const eventType = item?.event?.eventType;
-  const classification =
-    typeof eventType === "string" && eventType.startsWith("pull_request.")
-      ? "code"
-      : "requirements";
-  return { [classification]: { workItem: item, trigger } };
+  const requirements = { trigger };
+  if (item?.assignment !== undefined) {
+    requirements.assignment = item.assignment;
+  }
+  if (item?.decisionContext !== undefined && item.decisionContext !== null) {
+    requirements.decisionContext = item.decisionContext;
+  }
+  if (
+    typeof eventType === "string" &&
+    eventType.startsWith("pull_request.")
+  ) {
+    return { requirements, code: { event: item.event } };
+  }
+  if (item?.event !== undefined) requirements.event = item.event;
+  return { requirements };
 }
 
 function normalizeTrigger(value) {
@@ -281,7 +291,7 @@ export class RoleDecisionEngine {
         { role: "user", content: JSON.stringify(context) },
       ],
       schema: WORK_DECISION_JSON_SCHEMA,
-      dataClasses: Object.keys(context),
+      dataClasses: [...new Set(["requirements", ...Object.keys(context)])],
     });
     const decision = parseStructuredWorkDecision(response);
     if (!this.#permissions.allowedIntents.includes(decision.intent.type)) {

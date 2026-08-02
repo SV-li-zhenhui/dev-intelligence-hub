@@ -201,54 +201,41 @@ function normalizeSchema(value) {
 }
 
 async function boundedResponseText(response, maximumBytes) {
-  if (response.body && typeof response.body.getReader === "function") {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    let bytes = 0;
-    let text = "";
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        bytes += value.byteLength;
-        if (bytes > maximumBytes) {
-          await reader.cancel().catch(() => {});
-          throw providerError(
-            "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
-            "Structured provider response exceeds the configured limit",
-            413,
-          );
-        }
-        text += decoder.decode(value, { stream: true });
-      }
-      return text + decoder.decode();
-    } catch (error) {
-      if (error instanceof OpenAICompatibleProviderError) throw error;
-      throw providerError(
-        "STRUCTURED_PROVIDER_RESPONSE_INVALID",
-        "Structured provider response is invalid",
-        502,
-      );
-    }
-  }
-  let text;
-  try {
-    text = await response.text();
-  } catch {
+  if (!response.body || typeof response.body.getReader !== "function") {
     throw providerError(
       "STRUCTURED_PROVIDER_RESPONSE_INVALID",
       "Structured provider response is invalid",
       502,
     );
   }
-  if (Buffer.byteLength(text, "utf8") > maximumBytes) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maximumBytes) {
+        await reader.cancel().catch(() => {});
+        throw providerError(
+          "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
+          "Structured provider response exceeds the configured limit",
+          413,
+        );
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } catch (error) {
+    if (error instanceof OpenAICompatibleProviderError) throw error;
     throw providerError(
-      "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
-      "Structured provider response exceeds the configured limit",
-      413,
+      "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+      "Structured provider response is invalid",
+      502,
     );
   }
-  return text;
 }
 
 function responseContent(text) {
