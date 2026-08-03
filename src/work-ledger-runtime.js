@@ -105,6 +105,18 @@ export async function createWorkLedgerRuntime({
       }),
       graphPlanner: Object.freeze({
         createChild: (command) => admit(() => graphPlanner.createChild(command)),
+        reviseAcceptanceContract: (command) =>
+          admit(() => graphPlanner.reviseAcceptanceContract(command)),
+        decideDelivery: (command) =>
+          admit(() => graphPlanner.decideDelivery(command)),
+      }),
+      graphMemoryProjectionSource: Object.freeze({
+        readBatch: (options) =>
+          admit(() => service.readGraphMemoryProjectionBatch(options)),
+        ack: (receipt) =>
+          admit(() => service.acknowledgeGraphMemoryProjection(receipt)),
+        ackBatch: (request) =>
+          admit(() => service.acknowledgeGraphMemoryProjectionBatch(request)),
       }),
       close,
     };

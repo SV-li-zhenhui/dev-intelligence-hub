@@ -989,6 +989,16 @@ test("work view reads only newest-first projection endpoints", async () => {
     { items: [{ assignmentId: "newest", status: "queued" }] },
     { items: [{ type: "latest" }] },
     { enabled: true, items: [{ id: "code-job-newest", status: "queued" }] },
+    {
+      schemaVersion: 1,
+      graph: {
+        schemaVersion: 1,
+        graphId: "work-ledger",
+        revision: 0,
+        tasks: [],
+      },
+      taskStates: [],
+    },
   ];
   const view = createWorkView({
     fetchImpl: async (url, options) => {
@@ -1004,6 +1014,7 @@ test("work view reads only newest-first projection endpoints", async () => {
     "/api/work/items?limit=50&order=newest",
     "/api/work/timeline?limit=50&order=newest",
     "/api/code/jobs?limit=50&order=newest",
+    "/api/work/graph",
   ]);
   assert.equal(calls.every(([, options]) => options.cache === "no-store"), true);
   assert.match(view.render(), /newest/);

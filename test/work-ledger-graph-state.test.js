@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { workGraphMemoryRecordReceipt } from "../src/domain/work-graph-memory-event.js";
 import {
   createDefaultWorkGraphMetadata,
   projectWorkLedgerGraphSnapshot,
@@ -12,9 +13,14 @@ import {
 } from "../src/services/work-ledger-records.js";
 import {
   emptyWorkLedgerState,
+  normalizeWorkLedgerLimits,
   normalizeWorkLedgerPersistedState,
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
+import {
+  acknowledgeWorkGraphMemoryProjectionBatch,
+  migrateWorkGraphMemoryProjection,
+} from "../src/services/work-ledger-graph-memory.js";
 
 const CREATED_AT = "2026-08-03T01:00:00.000Z";
 
@@ -48,11 +54,64 @@ function stateWithItems(items) {
     ...items.map(({ sourceSequence }) => sourceSequence),
   );
   state.sourceHighWatermark = state.intakeCursor;
+  state.graphMemoryProjection = migrateWorkGraphMemoryProjection(
+    items,
+    state.revision,
+    normalizeWorkLedgerLimits(),
+  );
   return state;
 }
 
 function corrupted(error) {
   return error.code === "WORK_LEDGER_STATE_CORRUPTED";
+}
+
+function graphDelivery({
+  deliverableId = "review-report",
+  revision = 1,
+  status = "submitted",
+  summary = "Review evidence",
+  contentDigest = "a".repeat(64),
+  recordedAt = CREATED_AT,
+} = {}) {
+  return {
+    deliverableId,
+    revision,
+    contractRevision: 1,
+    status,
+    summary,
+    evidence: [
+      {
+        kind: "artifact",
+        referenceId: `artifact-${deliverableId}`,
+        contentDigest,
+      },
+    ],
+    recordedAt,
+  };
+}
+
+function stateWithDeliveryHistory(deliveries, {
+  status = "queued",
+  statusReason = null,
+} = {}) {
+  const item = createAssignmentWorkItem(assignment(1), CREATED_AT);
+  const deliverableIds = [...new Set(
+    deliveries.map(({ deliverableId }) => deliverableId),
+  )];
+  item.revision = deliveries.length + 1;
+  item.status = status;
+  item.statusReason = statusReason;
+  item.graph.acceptanceContracts[0].expectedDeliverables = deliverableIds.map(
+    (deliverableId) => ({
+      deliverableId,
+      kind: "review-report",
+      description: `Evidence for ${deliverableId}`,
+      required: true,
+    }),
+  );
+  item.graph.deliveries = deliveries;
+  return stateWithItems([item]);
 }
 
 test("new ledger items carry minimal graph metadata and project without a second state source", () => {
@@ -68,8 +127,12 @@ test("new ledger items carry minimal graph metadata and project without a second
 
   assert.equal(snapshot.graphId, "work-ledger");
   assert.equal(snapshot.revision, 1);
-  assert.deepEqual(queued.graph, createDefaultWorkGraphMetadata());
-  assert.deepEqual(blocked.graph, createDefaultWorkGraphMetadata());
+  assert.deepEqual(queued.graph, createDefaultWorkGraphMetadata(CREATED_AT));
+  assert.deepEqual(blocked.graph, createDefaultWorkGraphMetadata(CREATED_AT));
+  assert.equal(
+    Object.hasOwn(byId.get(queued.itemId).acceptanceContracts[0], "recordedAt"),
+    false,
+  );
   assert.equal(byId.get(queued.itemId).status, "pending");
   assert.equal(byId.get(blocked.itemId).status, "in_progress");
   assert.deepEqual(byId.get(queued.itemId).responsibility, queued.currentTarget);
@@ -142,6 +205,7 @@ test("schema v2 composes graph and identity migrations without changing ledger f
   );
   const legacy = structuredClone(current);
   legacy.schemaVersion = 2;
+  delete legacy.graphMemoryProjection;
   for (const item of legacy.items) delete item.graph;
   const callerSnapshot = structuredClone(legacy);
 
@@ -152,12 +216,18 @@ test("schema v2 composes graph and identity migrations without changing ledger f
   assert.deepEqual(legacy, callerSnapshot);
 });
 
-test("schema v3 migrates identically to v4 before graph tasks are admitted", () => {
+test("schema v3 migrates identically to the current schema before graph tasks are admitted", () => {
   const current = normalizeWorkLedgerPersistedState(
     stateWithItems([createAssignmentWorkItem(assignment(1), CREATED_AT)]),
   );
   const legacy = structuredClone(current);
   legacy.schemaVersion = 3;
+  delete legacy.graphMemoryProjection;
+  for (const item of legacy.items) {
+    for (const contract of item.graph.acceptanceContracts) {
+      delete contract.recordedAt;
+    }
+  }
   const callerSnapshot = structuredClone(legacy);
 
   const migrated = normalizeWorkLedgerPersistedState(legacy);
@@ -165,6 +235,166 @@ test("schema v3 migrates identically to v4 before graph tasks are admitted", () 
   assert.equal(migrated.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   assert.deepEqual(migrated, current);
   assert.deepEqual(legacy, callerSnapshot);
+});
+
+test("schema v4 backfills graph history timestamps without mutating the caller", () => {
+  const current = stateWithDeliveryHistory([
+    graphDelivery(),
+    graphDelivery({ revision: 2, status: "accepted" }),
+  ], { statusReason: "delivery_accepted" });
+  current.items[0].updatedAt = "2026-08-03T02:00:00.000Z";
+  const legacy = structuredClone(current);
+  legacy.schemaVersion = 4;
+  delete legacy.graphMemoryProjection;
+  for (const item of legacy.items) {
+    for (const contract of item.graph.acceptanceContracts) {
+      delete contract.recordedAt;
+    }
+    for (const delivery of item.graph.deliveries) {
+      delete delivery.recordedAt;
+    }
+  }
+  const callerSnapshot = structuredClone(legacy);
+
+  const migrated = normalizeWorkLedgerPersistedState(legacy);
+
+  assert.equal(migrated.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  assert.deepEqual(legacy, callerSnapshot);
+  assert.deepEqual(
+    migrated.items[0].graph.acceptanceContracts.map(({ recordedAt }) =>
+      recordedAt
+    ),
+    [CREATED_AT],
+  );
+  assert.deepEqual(
+    migrated.items[0].graph.deliveries.map(({ recordedAt }) => recordedAt),
+    [CREATED_AT, CREATED_AT],
+  );
+});
+
+test("schema v5 seeds a deterministic durable graph memory backlog", () => {
+  const current = normalizeWorkLedgerPersistedState(stateWithDeliveryHistory([
+    graphDelivery(),
+    graphDelivery({ revision: 2, status: "accepted" }),
+  ], { statusReason: "delivery_accepted" }));
+  const legacy = structuredClone(current);
+  legacy.schemaVersion = 5;
+  delete legacy.graphMemoryProjection;
+  const callerSnapshot = structuredClone(legacy);
+
+  const migrated = normalizeWorkLedgerPersistedState(legacy);
+
+  assert.deepEqual(migrated, current);
+  assert.deepEqual(legacy, callerSnapshot);
+  assert.deepEqual(
+    migrated.graphMemoryProjection.pending.map(({ kind }) => kind),
+    ["acceptance_contract", "delivery_submitted", "delivery_accepted"],
+  );
+});
+
+test("schema v5 graph memory migration fails closed when event budget is exhausted", () => {
+  const current = stateWithItems([
+    createAssignmentWorkItem(assignment(1), CREATED_AT),
+  ]);
+  const legacy = structuredClone(current);
+  legacy.schemaVersion = 5;
+  delete legacy.graphMemoryProjection;
+  const callerSnapshot = structuredClone(legacy);
+
+  assert.throws(
+    () => normalizeWorkLedgerPersistedState(legacy, {
+      graphMemoryEventByteBudget: 1,
+    }),
+    corrupted,
+  );
+  assert.deepEqual(legacy, callerSnapshot);
+});
+
+test("schema v6 adds graph source integrity without rewriting its event queue", () => {
+  const seeded = normalizeWorkLedgerPersistedState(stateWithDeliveryHistory([
+    graphDelivery(),
+    graphDelivery({ revision: 2, status: "accepted" }),
+  ], { statusReason: "delivery_accepted" }));
+  const acknowledged = acknowledgeWorkGraphMemoryProjectionBatch(
+    seeded.graphMemoryProjection,
+    {
+      receipts: seeded.graphMemoryProjection.pending
+        .slice(0, 2)
+        .map(workGraphMemoryRecordReceipt),
+    },
+    seeded.revision + 1,
+  );
+  const current = normalizeWorkLedgerPersistedState({
+    ...seeded,
+    revision: seeded.revision + 1,
+    graphMemoryProjection: acknowledged.projection,
+  });
+  const legacy = structuredClone(current);
+  legacy.schemaVersion = 6;
+  delete legacy.graphMemoryProjection.sourceHistoryDigest;
+  const legacyProjection = structuredClone(legacy.graphMemoryProjection);
+
+  const migrated = normalizeWorkLedgerPersistedState(legacy);
+  const { sourceHistoryDigest, ...projection } = migrated.graphMemoryProjection;
+
+  assert.equal(migrated.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  assert.match(sourceHistoryDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(projection, legacyProjection);
+});
+
+test("graph memory projection recovery rejects forged events and checkpoints", () => {
+  const current = normalizeWorkLedgerPersistedState(
+    stateWithItems([createAssignmentWorkItem(assignment(1), CREATED_AT)]),
+  );
+  const forgedEvent = structuredClone(current);
+  forgedEvent.graphMemoryProjection.pending[0].memoryRecord.title = "forged";
+  assert.throws(
+    () => normalizeWorkLedgerPersistedState(forgedEvent),
+    corrupted,
+  );
+
+  const skipped = structuredClone(current);
+  skipped.graphMemoryProjection.cursor = 1;
+  skipped.graphMemoryProjection.pending = [];
+  assert.throws(
+    () => normalizeWorkLedgerPersistedState(skipped),
+    corrupted,
+  );
+
+  const forgedHistoryDigest = structuredClone(current);
+  forgedHistoryDigest.graphMemoryProjection.sourceHistoryDigest = "0".repeat(64);
+  assert.throws(
+    () => normalizeWorkLedgerPersistedState(forgedHistoryDigest),
+    corrupted,
+  );
+});
+
+test("recovery rejects rewrites to older fully acknowledged graph history", () => {
+  const current = normalizeWorkLedgerPersistedState(stateWithDeliveryHistory([
+    graphDelivery(),
+    graphDelivery({ revision: 2, status: "accepted" }),
+  ], { statusReason: "delivery_accepted" }));
+  const acknowledgement = acknowledgeWorkGraphMemoryProjectionBatch(
+    current.graphMemoryProjection,
+    {
+      receipts: current.graphMemoryProjection.pending.map(
+        workGraphMemoryRecordReceipt,
+      ),
+    },
+    current.revision + 1,
+  );
+  const acknowledged = normalizeWorkLedgerPersistedState({
+    ...current,
+    revision: current.revision + 1,
+    graphMemoryProjection: acknowledgement.projection,
+  });
+  const rewritten = structuredClone(acknowledged);
+  rewritten.items[0].graph.deliveries[0].summary = "rewritten history";
+
+  assert.throws(
+    () => normalizeWorkLedgerPersistedState(rewritten),
+    corrupted,
+  );
 });
 
 test("schema v2 preserves responsibility IDs accepted by the existing ledger", () => {
@@ -177,6 +407,7 @@ test("schema v2 preserves responsibility IDs accepted by the existing ledger", (
       createAssignmentWorkItem(assignment(1, target), CREATED_AT),
     ]);
     current.schemaVersion = 2;
+    delete current.graphMemoryProjection;
     for (const item of current.items) delete item.graph;
 
     assert.deepEqual(
@@ -192,11 +423,151 @@ test("schema v1 composes both migrations and initializes both later checkpoints"
   );
   const legacy = structuredClone(current);
   legacy.schemaVersion = 1;
+  delete legacy.graphMemoryProjection;
   delete legacy.proposalCursor;
   delete legacy.proposalHighWatermark;
   for (const item of legacy.items) delete item.graph;
 
   assert.deepEqual(normalizeWorkLedgerPersistedState(legacy), current);
+});
+
+test("delivery recovery accepts only a pending submission or its bound decision", async (t) => {
+  const submitted = graphDelivery();
+
+  await t.test("one pending submission", () => {
+    const state = stateWithDeliveryHistory([submitted], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+
+    assert.doesNotThrow(() => normalizeWorkLedgerPersistedState(state));
+  });
+
+  await t.test("one evidence-bound decision", () => {
+    const accepted = graphDelivery({ revision: 2, status: "accepted" });
+    const state = stateWithDeliveryHistory([submitted, accepted], {
+      statusReason: "delivery_accepted",
+    });
+
+    assert.doesNotThrow(() => normalizeWorkLedgerPersistedState(state));
+  });
+});
+
+test("delivery recovery rejects ambiguous or evidence-rewritten histories", async (t) => {
+  await t.test("two pending submissions", () => {
+    const state = stateWithDeliveryHistory([
+      graphDelivery(),
+      graphDelivery({
+        deliverableId: "test-report",
+        revision: 2,
+      }),
+    ], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("decision evidence differs from its submission", () => {
+    const state = stateWithDeliveryHistory([
+      graphDelivery(),
+      graphDelivery({
+        revision: 2,
+        status: "accepted",
+        contentDigest: "b".repeat(64),
+      }),
+    ], {
+      statusReason: "delivery_accepted",
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("pending submission without the waiting state", () => {
+    const state = stateWithDeliveryHistory([graphDelivery()]);
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("accepted deliverable resubmitted under the same contract", () => {
+    const state = stateWithDeliveryHistory([
+      graphDelivery(),
+      graphDelivery({ revision: 2, status: "accepted" }),
+      graphDelivery({ revision: 3 }),
+      graphDelivery({ revision: 4, status: "rejected" }),
+    ], {
+      statusReason: "delivery_rejected",
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("pending submission bound to an obsolete contract", () => {
+    const state = stateWithDeliveryHistory([graphDelivery()], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+    const firstContract = state.items[0].graph.acceptanceContracts[0];
+    state.items[0].graph.acceptanceContracts.push({
+      ...structuredClone(firstContract),
+      revision: 2,
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+});
+
+test("graph history timestamps are immutable, canonical, and causally ordered", async (t) => {
+  await t.test("missing timestamp", () => {
+    const state = stateWithDeliveryHistory([graphDelivery()], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+    delete state.items[0].graph.deliveries[0].recordedAt;
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("timestamp before its contract", () => {
+    const state = stateWithDeliveryHistory([
+      graphDelivery({ recordedAt: "2026-08-03T00:59:59.000Z" }),
+    ], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("timestamp after item update", () => {
+    const state = stateWithDeliveryHistory([
+      graphDelivery({ recordedAt: "2026-08-03T01:00:01.000Z" }),
+    ], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+
+    assert.throws(() => normalizeWorkLedgerPersistedState(state), corrupted);
+  });
+
+  await t.test("transition rewrites a stored timestamp", () => {
+    const previous = stateWithDeliveryHistory([graphDelivery()], {
+      status: "waiting_external",
+      statusReason: "delivery_submitted",
+    });
+    const next = structuredClone(previous);
+    next.revision += 1;
+    next.items[0].revision += 1;
+    next.items[0].graph.deliveries[0].recordedAt =
+      "2026-08-03T01:00:01.000Z";
+    next.items[0].updatedAt = "2026-08-03T01:00:01.000Z";
+
+    assert.throws(
+      () => validateWorkLedgerGraphTransition(previous, next),
+      (error) => error.code === "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+    );
+  });
 });
 
 test("dangling and cyclic embedded graph relationships make recovery fail closed", async (t) => {

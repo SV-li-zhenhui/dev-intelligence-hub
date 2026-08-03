@@ -769,6 +769,11 @@ export async function createApplication({
           memoryProjectorFactory({
             memoryProducer: memoryRuntime.producer,
             ledgerView: workLedgerRuntime,
+            graphProjectionSource: frozenPort(
+              workLedgerRuntime.graphMemoryProjectionSource,
+              ["readBatch", "ackBatch"],
+              "workLedgerRuntime.graphMemoryProjectionSource",
+            ),
             store,
           }),
           ["runCycle"],

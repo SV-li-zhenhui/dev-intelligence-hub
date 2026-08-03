@@ -10,6 +10,7 @@ import {
   normalizeBoundWorkProposal,
 } from "../src/domain/work-proposal-contract.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
 
 const STATE_KEY = "work-ledger-state";
 
@@ -2445,6 +2446,7 @@ test("work ledger recovers schema v1 state with an empty proposal checkpoint", a
   await fixture.service.intake();
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 1;
+  delete legacy.graphMemoryProjection;
   delete legacy.proposalCursor;
   delete legacy.proposalHighWatermark;
   for (const item of legacy.items) delete item.graph;
@@ -2484,6 +2486,7 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   });
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
+  delete legacy.graphMemoryProjection;
   for (const entry of legacy.items) delete entry.graph;
   fixture.store.replaceStored(legacy);
   const writesBeforeRecovery = fixture.store.writes.length;
@@ -2508,7 +2511,12 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
     parentItemId: null,
     dependsOnItemIds: [],
     acceptanceContracts: [
-      { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+      {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+        recordedAt: recoveredItem.createdAt,
+      },
     ],
     deliveries: [],
   });
@@ -2522,7 +2530,10 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   });
 
   assert.equal(claimed.status, "dispatching");
-  assert.equal(fixture.store.stored().schemaVersion, 4);
+  assert.equal(
+    fixture.store.stored().schemaVersion,
+    WORK_LEDGER_STATE_SCHEMA_VERSION,
+  );
   assert.deepEqual(
     fixture.store.stored().items[0].graph,
     recoveredItem.graph,
@@ -2534,6 +2545,7 @@ test("schema v2 keeps its original byte budget while graph metadata stays separa
   await fixture.service.intake();
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
+  delete legacy.graphMemoryProjection;
   for (const item of legacy.items) delete item.graph;
   const legacyBytes = Buffer.byteLength(
     `${JSON.stringify(legacy, null, 2)}\n`,
@@ -2576,6 +2588,7 @@ test("schema v2 keeps the original per-item byte budget during migration", async
   await fixture.service.intake();
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
+  delete legacy.graphMemoryProjection;
   for (const item of legacy.items) delete item.graph;
   const legacyItemBytes = Buffer.byteLength(
     `${JSON.stringify(legacy.items[0], null, 2)}\n`,

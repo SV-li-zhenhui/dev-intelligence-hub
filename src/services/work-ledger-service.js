@@ -14,6 +14,16 @@ import {
   planWorkGraphChildCreation,
 } from "./work-ledger-graph-commands.js";
 import {
+  planWorkGraphAcceptanceRevision,
+  planWorkGraphDeliveryDecision,
+  planWorkGraphDeliverySubmission,
+} from "./work-ledger-delivery-commands.js";
+import {
+  acknowledgeWorkGraphMemoryProjectionBatch,
+  appendWorkGraphMemoryEvents,
+  readWorkGraphMemoryProjectionBatch,
+} from "./work-ledger-graph-memory.js";
+import {
   planIntentAcknowledgement,
   planIntentClaim,
   planIntentStage,
@@ -199,6 +209,11 @@ export class WorkLedgerService {
       nextTimelineSequence: this.state.nextTimelineSequence,
       itemCounts,
       outboxCounts,
+      graphMemoryProjection: {
+        cursor: this.state.graphMemoryProjection.cursor,
+        highWatermark: this.state.graphMemoryProjection.nextSequence - 1,
+        pending: this.state.graphMemoryProjection.pending.length,
+      },
       outboxDeliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
     });
   }
@@ -226,6 +241,42 @@ export class WorkLedgerService {
   async getGraphSnapshot() {
     this.#assertReady();
     return projectWorkLedgerGraphView(this.state);
+  }
+
+  async readGraphMemoryProjectionBatch(options = {}) {
+    this.#assertReady();
+    return readWorkGraphMemoryProjectionBatch(
+      this.state.graphMemoryProjection,
+      options,
+    );
+  }
+
+  async acknowledgeGraphMemoryProjection(input = {}) {
+    return this.acknowledgeGraphMemoryProjectionBatch({ receipts: [input] });
+  }
+
+  async acknowledgeGraphMemoryProjectionBatch(input = {}) {
+    this.#assertReady();
+    return this.#writeTransaction(async () => {
+      const nextRevision = this.state.revision + 1;
+      const acknowledgement = acknowledgeWorkGraphMemoryProjectionBatch(
+        this.state.graphMemoryProjection,
+        input,
+        nextRevision,
+      );
+      if (!acknowledgement.write) {
+        return cloneLedgerValue(acknowledgement.result);
+      }
+      await this.#persist(
+        {
+          ...this.state,
+          revision: nextRevision,
+          graphMemoryProjection: acknowledgement.projection,
+        },
+        { appendGraphMemory: false },
+      );
+      return cloneLedgerValue(acknowledgement.result);
+    });
   }
 
   async intake({ limit = 100 } = {}) {
@@ -301,6 +352,18 @@ export class WorkLedgerService {
 
   async createGraphChild(input = {}) {
     return this.#executeCommand(planWorkGraphChildCreation, input);
+  }
+
+  async reviseGraphAcceptance(input = {}) {
+    return this.#executeCommand(planWorkGraphAcceptanceRevision, input);
+  }
+
+  async submitGraphDelivery(input = {}) {
+    return this.#executeCommand(planWorkGraphDeliverySubmission, input);
+  }
+
+  async decideGraphDelivery(input = {}) {
+    return this.#executeCommand(planWorkGraphDeliveryDecision, input);
   }
 
   async stageIntent(input = {}) {
@@ -536,12 +599,19 @@ export class WorkLedgerService {
     }
   }
 
-  async #persist(candidate) {
+  async #persist(candidate, { appendGraphMemory = true } = {}) {
     if (candidate.revision !== this.state.revision + 1) {
       throw workLedgerError(
         "WORK_LEDGER_STATE_REVISION_CONFLICT",
         "员工工作台账 revision 冲突",
         409,
+      );
+    }
+    if (appendGraphMemory) {
+      candidate = appendWorkGraphMemoryEvents(
+        this.state,
+        candidate,
+        this.limits,
       );
     }
     assertWorkLedgerCapacity(candidate, this.limits);

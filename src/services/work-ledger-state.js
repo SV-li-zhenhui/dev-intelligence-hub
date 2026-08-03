@@ -22,12 +22,20 @@ import {
   normalizeWorkLedgerGraphItems,
 } from "./work-ledger-graph.js";
 import {
+  MAX_WORK_GRAPH_MEMORY_EVENTS,
+  MAX_WORK_GRAPH_MEMORY_EVENT_BYTES,
+  emptyWorkGraphMemoryProjection,
+  migrateLegacyWorkGraphMemoryProjection,
+  migrateWorkGraphMemoryProjection,
+  normalizeWorkGraphMemoryProjection,
+} from "./work-ledger-graph-memory.js";
+import {
   graphChildAssignmentId,
   graphChildDefinitionDigest,
 } from "./work-ledger-records.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 4;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 7;
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
@@ -35,6 +43,7 @@ export const MAX_WORK_LEDGER_STATE_BYTES = 32 * 1024 * 1024;
 export const MAX_WORK_LEDGER_ITEM_BYTES = 512 * 1024;
 export const MAX_WORK_LEDGER_TIMELINE_BYTES = 64 * 1024;
 export const MAX_WORK_LEDGER_INTENT_BYTES = 64 * 1024;
+export const MAX_WORK_GRAPH_MEMORY_STATE_BYTES = 32 * 1024 * 1024;
 
 export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "assignment_intaken",
@@ -57,6 +66,10 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "cancelled",
   "graph_child_created",
   "graph_parent_revised",
+  "graph_acceptance_revised",
+  "graph_delivery_submitted",
+  "graph_delivery_accepted",
+  "graph_delivery_rejected",
 ]);
 
 const ITEM_KEYS = [
@@ -84,6 +97,19 @@ const ITEM_KEYS = [
 ];
 const GRAPH_CHILD_KEY =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
+const LEGACY_ACCEPTANCE_CONTRACT_KEYS = [
+  "revision",
+  "acceptanceCriteria",
+  "expectedDeliverables",
+];
+const LEGACY_DELIVERY_KEYS = [
+  "deliverableId",
+  "revision",
+  "contractRevision",
+  "status",
+  "summary",
+  "evidence",
+];
 const TIMELINE_KEYS = [
   "timelineId",
   "contentDigest",
@@ -124,10 +150,13 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
     "itemLimit",
     "timelineLimit",
     "outboxLimit",
+    "graphMemoryOutboxLimit",
     "stateByteBudget",
     "itemByteBudget",
     "timelineByteBudget",
     "intentByteBudget",
+    "graphMemoryEventByteBudget",
+    "graphMemoryStateByteBudget",
   ]);
   if (Object.keys(overrides).some((key) => !known.has(key))) {
     throw new TypeError("limits contains an unknown field");
@@ -147,6 +176,11 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
       overrides.outboxLimit ?? MAX_WORK_LEDGER_OUTBOX,
       MAX_WORK_LEDGER_OUTBOX,
       "outboxLimit",
+    ),
+    graphMemoryOutboxLimit: validatePositiveLimit(
+      overrides.graphMemoryOutboxLimit ?? MAX_WORK_GRAPH_MEMORY_EVENTS,
+      MAX_WORK_GRAPH_MEMORY_EVENTS,
+      "graphMemoryOutboxLimit",
     ),
     stateByteBudget: validatePositiveLimit(
       overrides.stateByteBudget ?? MAX_WORK_LEDGER_STATE_BYTES,
@@ -168,6 +202,16 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
       MAX_WORK_LEDGER_INTENT_BYTES,
       "intentByteBudget",
     ),
+    graphMemoryEventByteBudget: validatePositiveLimit(
+      overrides.graphMemoryEventByteBudget ?? MAX_WORK_GRAPH_MEMORY_EVENT_BYTES,
+      MAX_WORK_GRAPH_MEMORY_EVENT_BYTES,
+      "graphMemoryEventByteBudget",
+    ),
+    graphMemoryStateByteBudget: validatePositiveLimit(
+      overrides.graphMemoryStateByteBudget ?? MAX_WORK_GRAPH_MEMORY_STATE_BYTES,
+      MAX_WORK_GRAPH_MEMORY_STATE_BYTES,
+      "graphMemoryStateByteBudget",
+    ),
   });
 }
 
@@ -186,6 +230,7 @@ export function emptyWorkLedgerState() {
     items: [],
     timeline: [],
     outbox: [],
+    graphMemoryProjection: emptyWorkGraphMemoryProjection(),
   };
 }
 
@@ -348,10 +393,59 @@ function workItemCapacityView(item) {
 function workLedgerCapacityView(state) {
   // Preserve the legacy ledger budget while the graph contract enforces its
   // own independent task, structure, delivery, and total-byte hard limits.
+  const { graphMemoryProjection: _graphMemoryProjection, ...ledger } = state;
   return {
-    ...state,
+    ...ledger,
     items: state.items.map(workItemCapacityView),
   };
+}
+
+function assertGraphDeliveryHistory(items) {
+  for (const item of items) {
+    let pending = null;
+    const acceptedDeliverables = new Set();
+    for (const delivery of item.graph.deliveries) {
+      if (delivery.status === "submitted") {
+        if (pending !== null) {
+          throw corrupted("任务存在多个未裁决交付物");
+        }
+        const deliveryKey = `${delivery.contractRevision}:${delivery.deliverableId}`;
+        if (acceptedDeliverables.has(deliveryKey)) {
+          throw corrupted("已验收交付物不能在同一契约下重新提交");
+        }
+        pending = delivery;
+        continue;
+      }
+      if (
+        pending === null ||
+        delivery.revision !== pending.revision + 1 ||
+        delivery.deliverableId !== pending.deliverableId ||
+        delivery.contractRevision !== pending.contractRevision ||
+        JSON.stringify(delivery.evidence) !== JSON.stringify(pending.evidence)
+      ) {
+        throw corrupted("交付审核没有绑定紧邻的提交记录");
+      }
+      if (delivery.status === "accepted") {
+        acceptedDeliverables.add(
+          `${delivery.contractRevision}:${delivery.deliverableId}`,
+        );
+      }
+      pending = null;
+    }
+    if (
+      pending !== null &&
+      pending.contractRevision !== item.graph.acceptanceContracts.at(-1).revision
+    ) {
+      throw corrupted("待审核交付物绑定了过期验收契约");
+    }
+    if (
+      (pending !== null) !==
+        (item.status === "waiting_external" &&
+          item.statusReason === "delivery_submitted")
+    ) {
+      throw corrupted("待审核交付物与任务等待状态不一致");
+    }
+  }
 }
 
 function assertGraphTaskProvenance(
@@ -429,13 +523,18 @@ function assertGraphTaskProvenance(
   }
   let expectedDefinitionDigest;
   try {
+    const initialContract = acceptanceContracts[0];
     expectedDefinitionDigest = graphChildDefinitionDigest({
       parentItemId: parentTaskId,
       childKey,
       work: { title, description },
       target: assignment.target,
       dependsOnItemIds: normalizedInitialDependencies,
-      acceptanceContract: acceptanceContracts[0],
+      acceptanceContract: {
+        revision: initialContract.revision,
+        acceptanceCriteria: initialContract.acceptanceCriteria,
+        expectedDeliverables: initialContract.expectedDeliverables,
+      },
     });
   } catch {
     throw corrupted("图任务定义摘要损坏");
@@ -702,6 +801,8 @@ export function assertWorkLedgerCapacity(state, limits) {
     state.items.length > limits.itemLimit ||
     state.timeline.length > limits.timelineLimit ||
     state.outbox.length > limits.outboxLimit ||
+    state.graphMemoryProjection.pending.length >
+      limits.graphMemoryOutboxLimit ||
     state.items.some(
       (item) =>
         prettySerializedLedgerBytes(workItemCapacityView(item)) >
@@ -713,6 +814,13 @@ export function assertWorkLedgerCapacity(state, limits) {
     state.outbox.some(
       (entry) => prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget,
     ) ||
+    state.graphMemoryProjection.pending.some(
+      (event) =>
+        prettySerializedLedgerBytes(event) >
+        limits.graphMemoryEventByteBudget,
+    ) ||
+    prettySerializedLedgerBytes(state.graphMemoryProjection) >
+      limits.graphMemoryStateByteBudget ||
     prettySerializedLedgerBytes(workLedgerCapacityView(state)) >
       limits.stateByteBudget
   ) {
@@ -722,6 +830,56 @@ export function assertWorkLedgerCapacity(state, limits) {
       409,
     );
   }
+}
+
+function migrateLegacyGraphRecords(value, expectedKeys, recordedAt, label) {
+  const records = denseLedgerArrayValues(value);
+  if (records === null) throw corrupted(`${label}历史损坏`);
+  return records.map((record) => {
+    if (!hasExactLedgerKeys(record, expectedKeys)) {
+      throw corrupted(`${label}历史损坏`);
+    }
+    return {
+      ...canonicalStoredValue(record, `${label}历史损坏`),
+      recordedAt,
+    };
+  });
+}
+
+function migrateLegacyGraphHistory(item) {
+  if (!hasExactLedgerKeys(item, ITEM_KEYS)) {
+    throw corrupted("旧版员工工作项字段损坏");
+  }
+  if (
+    !hasExactLedgerKeys(item.graph, [
+      "parentItemId",
+      "dependsOnItemIds",
+      "acceptanceContracts",
+      "deliveries",
+    ])
+  ) {
+    throw corrupted("旧版工作图元数据损坏");
+  }
+  const recordedAt = timestamp(item.createdAt, "item.createdAt");
+  return {
+    ...item,
+    graph: {
+      parentItemId: item.graph.parentItemId,
+      dependsOnItemIds: item.graph.dependsOnItemIds,
+      acceptanceContracts: migrateLegacyGraphRecords(
+        item.graph.acceptanceContracts,
+        LEGACY_ACCEPTANCE_CONTRACT_KEYS,
+        recordedAt,
+        "验收契约",
+      ),
+      deliveries: migrateLegacyGraphRecords(
+        item.graph.deliveries,
+        LEGACY_DELIVERY_KEYS,
+        recordedAt,
+        "交付",
+      ),
+    },
+  };
 }
 
 export function normalizeWorkLedgerPersistedState(value, limitsInput) {
@@ -777,14 +935,14 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   ) {
     value = {
       ...value,
-      schemaVersion: 3,
+      schemaVersion: 5,
       items: schema2Items.map((item) => ({
         ...item,
-        graph: createDefaultWorkGraphMetadata(),
+        graph: createDefaultWorkGraphMetadata(item.createdAt),
       })),
     };
   }
-  if (
+  const legacyGraphItems =
     hasExactLedgerKeys(value, [
       "schemaVersion",
       "revision",
@@ -800,9 +958,86 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       "timeline",
       "outbox",
     ]) &&
-    value.schemaVersion === 3
-  ) {
-    value = { ...value, schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION };
+    [3, 4].includes(value.schemaVersion)
+      ? denseLedgerArrayValues(value.items)
+      : null;
+  if (legacyGraphItems !== null) {
+    value = {
+      ...value,
+      schemaVersion: 5,
+      items: legacyGraphItems.map(migrateLegacyGraphHistory),
+    };
+  }
+  const schema5Items =
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+    ]) &&
+    value.schemaVersion === 5
+      ? denseLedgerArrayValues(value.items)
+      : null;
+  if (schema5Items !== null) {
+    let graphMemoryProjection;
+    try {
+      graphMemoryProjection = migrateWorkGraphMemoryProjection(
+        schema5Items,
+        value.revision,
+        limits,
+      );
+    } catch {
+      throw corrupted("无法迁移任务图记忆投影");
+    }
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      graphMemoryProjection,
+    };
+  }
+  const schema6Items =
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+      "graphMemoryProjection",
+    ]) && value.schemaVersion === 6
+      ? denseLedgerArrayValues(value.items)
+      : null;
+  if (schema6Items !== null) {
+    let graphMemoryProjection;
+    try {
+      graphMemoryProjection = migrateLegacyWorkGraphMemoryProjection(
+        value.graphMemoryProjection,
+        schema6Items,
+      );
+    } catch {
+      throw corrupted("无法迁移任务图记忆完整性摘要");
+    }
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      graphMemoryProjection,
+    };
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
     "schemaVersion",
@@ -818,6 +1053,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     "items",
     "timeline",
     "outbox",
+    "graphMemoryProjection",
   ]);
   const itemValues = hasCurrentStateFields
     ? denseLedgerArrayValues(value.items)
@@ -885,6 +1121,20 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   } catch {
     throw corrupted("员工工作图结构损坏");
   }
+  try {
+    state = {
+      ...state,
+      graphMemoryProjection: normalizeWorkGraphMemoryProjection(
+        value.graphMemoryProjection,
+        state.revision,
+        state.items,
+        limits,
+      ),
+    };
+  } catch {
+    throw corrupted("任务图记忆投影状态损坏");
+  }
+  assertGraphDeliveryHistory(state.items);
   assertUnique(state.items, "itemId", "员工工作项 ID 重复");
   assertUnique(state.items, "assignmentId", "员工分派 ID 重复");
   assertUnique(

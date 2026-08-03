@@ -178,6 +178,16 @@ function codeJobProjectionSourcePort() {
   };
 }
 
+function graphMemoryProjectionSourcePort() {
+  return {
+    async readBatch() {
+      return { cursor: 0, highWatermark: 0, items: [] };
+    },
+    async ack() {},
+    async ackBatch() {},
+  };
+}
+
 function workProposalRuntimePort(overrides = {}) {
   const runner = { async claim() {}, async advance() {} };
   return {
@@ -198,6 +208,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
   };
   const ledger = {
     graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
+    graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
     async getSummary() {},
     async listItems() { return { items: [], nextCursor: null }; },
     async listTimeline() { return { items: [], nextCursor: null }; },
@@ -487,6 +498,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
         throw new Error("graph planner must remain private");
       },
     },
+    graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
     async getSummary() {
       return { source: "ledger" };
     },
@@ -862,6 +874,7 @@ test("enabled unified memory exposes search only and projects the existing work 
     }),
     workLedgerRuntimeFactory: async () => ({
       graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
+      graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
       async listTimeline() { return { items: [], nextCursor: null }; },
@@ -912,6 +925,11 @@ test("enabled unified memory exposes search only and projects the existing work 
   assert.equal(calls.memory.maximumRecords, 1234);
   assert.equal(calls.memory.maximumStateBytes, 5_000_000);
   assert.strictEqual(calls.projector.memoryProducer, memoryRuntime.producer);
+  assert.equal(Object.isFrozen(calls.projector.graphProjectionSource), true);
+  assert.deepEqual(
+    Object.keys(calls.projector.graphProjectionSource).sort(),
+    ["ackBatch", "readBatch"],
+  );
   assert.equal(Object.isFrozen(application.memorySearch), true);
   assert.deepEqual(Object.keys(application.memorySearch).sort(), [
     "getHealth",

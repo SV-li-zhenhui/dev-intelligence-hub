@@ -350,6 +350,7 @@ async function withServer(
     backgroundWork,
     workflowRouting,
     workLedgerView,
+    workGraphView,
     attentionCoordinator,
     attentionBrowser,
     memorySearch,
@@ -535,6 +536,7 @@ async function withServer(
         : workflowRouting;
   }
   if (workLedgerView) application.workLedgerView = workLedgerView;
+  if (workGraphView) application.workGraphView = workGraphView;
   if (attentionCoordinator) {
     application.attentionCoordinator = attentionCoordinator;
   }
@@ -1835,6 +1837,287 @@ test("work APIs expose only newest-first ledger projections", async () => {
   );
 });
 
+test("work graph API exposes only the read-only graph snapshot", async () => {
+  const calls = [];
+  const snapshot = {
+    schemaVersion: 1,
+    graph: {
+      schemaVersion: 1,
+      graphId: "work-ledger",
+      revision: 4,
+      tasks: [
+        {
+          taskId: "work-1",
+          revision: 2,
+          parentTaskId: null,
+          status: "in_progress",
+          responsibility: { type: "role", id: "orchestrator" },
+          acceptanceContracts: [
+            {
+              revision: 1,
+              acceptanceCriteria: [],
+              expectedDeliverables: [],
+            },
+          ],
+          deliveries: [],
+          dependsOn: [],
+        },
+      ],
+      contentDigest: "a".repeat(64),
+    },
+    taskStates: [
+      {
+        taskId: "work-1",
+        taskRevision: 2,
+        ledgerStatus: "working",
+        ownerId: "employee-orchestrator",
+        leaseUntil: "2026-08-03T04:10:00.000Z",
+        availableAt: null,
+        statusReason: null,
+        updatedAt: "2026-08-03T04:00:00.000Z",
+        work: { title: "Review PR", description: null },
+      },
+    ],
+  };
+  const workGraphView = {
+    async getSnapshot() {
+      calls.push({ operation: "get_graph_snapshot" });
+      return snapshot;
+    },
+    async createChild() {
+      calls.push({ operation: "create_graph_child" });
+      throw new Error("graph writes must remain private");
+    },
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, { path: "/api/work/graph" });
+
+      assert.equal(response.status, 200);
+      const expected = {
+        schemaVersion: 2,
+        totalTaskCount: 1,
+        graph: {
+          schemaVersion: 1,
+          graphId: "work-ledger",
+          revision: 4,
+          tasks: [{
+            taskId: "work-1",
+            revision: 2,
+            parentTaskId: null,
+            responsibility: { type: "role", id: "orchestrator" },
+            acceptanceContract: {
+              revision: 1,
+              acceptanceCriteria: [],
+              expectedDeliverables: [],
+            },
+            latestDeliveries: [],
+            history: { acceptanceContractCount: 1, deliveryCount: 0 },
+            dependsOn: [],
+          }],
+        },
+        taskStates: [{
+          taskId: "work-1",
+          taskRevision: 2,
+          ledgerStatus: "working",
+          ownerId: "employee-orchestrator",
+          statusReason: null,
+          updatedAt: "2026-08-03T04:00:00.000Z",
+          work: { title: "Review PR", description: null },
+        }],
+      };
+      assert.deepEqual(JSON.parse(response.body), expected);
+      assert.deepEqual(calls, [{ operation: "get_graph_snapshot" }]);
+    },
+    { workGraphView },
+  );
+});
+
+test("work graph API returns a newest bounded window with complete references", async () => {
+  const contract = {
+    revision: 1,
+    acceptanceCriteria: [],
+    expectedDeliverables: [],
+  };
+  const tasks = Array.from({ length: 400 }, (_, index) => ({
+    taskId: `task-${String(index).padStart(3, "0")}`,
+    revision: 1,
+    parentTaskId: index === 399 ? "task-000" : null,
+    status: "pending",
+    responsibility: { type: "role", id: "orchestrator" },
+    acceptanceContracts: [structuredClone(contract)],
+    deliveries: [],
+    dependsOn: index === 399 ? ["task-001"] : [],
+  }));
+  tasks[399] = {
+    ...tasks[399],
+    revision: 4,
+    acceptanceContracts: [
+      {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [{
+          deliverableId: "implementation",
+          kind: "change-package",
+          description: "Old implementation",
+          required: true,
+        }],
+      },
+      {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "verified",
+          description: "Current behavior verified",
+        }],
+        expectedDeliverables: [{
+          deliverableId: "implementation",
+          kind: "change-package",
+          description: "Current implementation",
+          required: true,
+        }],
+      },
+    ],
+    deliveries: [
+      {
+        deliverableId: "implementation",
+        revision: 1,
+        contractRevision: 1,
+        status: "accepted",
+        summary: "obsolete delivery must stay private",
+        evidence: [{
+          kind: "artifact",
+          referenceId: "obsolete",
+          contentDigest: "a".repeat(64),
+        }],
+      },
+      {
+        deliverableId: "implementation",
+        revision: 2,
+        contractRevision: 2,
+        status: "submitted",
+        summary: "superseded current delivery",
+        evidence: [{
+          kind: "artifact",
+          referenceId: "submitted",
+          contentDigest: "b".repeat(64),
+        }],
+      },
+      {
+        deliverableId: "implementation",
+        revision: 3,
+        contractRevision: 2,
+        status: "accepted",
+        summary: "latest current delivery",
+        evidence: [{
+          kind: "artifact",
+          referenceId: "accepted",
+          contentDigest: "c".repeat(64),
+        }],
+      },
+    ],
+  };
+  const taskStates = tasks.map((task, index) => ({
+    taskId: task.taskId,
+    taskRevision: task.revision,
+    ledgerStatus: "queued",
+    ownerId: null,
+    statusReason: null,
+    updatedAt: new Date(Date.parse("2026-08-03T00:00:00.000Z") + index * 1_000)
+      .toISOString(),
+    work: { title: `Task ${index}`, description: null },
+  }));
+
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, { path: "/api/work/graph" });
+      const body = JSON.parse(response.body);
+      assert.equal(response.status, 200);
+      assert.equal(body.schemaVersion, 2);
+      assert.equal(body.totalTaskCount, 400);
+      assert.equal(body.graph.tasks.length, 300);
+      assert.equal(body.taskStates.length, 300);
+      const ids = new Set(body.graph.tasks.map(({ taskId }) => taskId));
+      assert.equal(ids.has("task-399"), true);
+      for (const task of body.graph.tasks) {
+        if (task.parentTaskId !== null) assert.equal(ids.has(task.parentTaskId), true);
+        for (const dependencyId of task.dependsOn) {
+          assert.equal(ids.has(dependencyId), true);
+        }
+      }
+      const newest = body.graph.tasks.find(({ taskId }) => taskId === "task-399");
+      assert.equal(newest.acceptanceContract.revision, 2);
+      assert.deepEqual(newest.history, {
+        acceptanceContractCount: 2,
+        deliveryCount: 3,
+      });
+      assert.deepEqual(
+        newest.latestDeliveries.map(({ revision }) => revision),
+        [3],
+      );
+      assert.doesNotMatch(response.body, /obsolete delivery|superseded current/);
+    },
+    {
+      workGraphView: {
+        async getSnapshot() {
+          return {
+            schemaVersion: 1,
+            graph: {
+              schemaVersion: 1,
+              graphId: "work-ledger",
+              revision: 400,
+              tasks,
+            },
+            taskStates,
+          };
+        },
+      },
+    },
+  );
+});
+
+test("work graph HTTP boundary exposes no write route", async () => {
+  const calls = [];
+  const workGraphView = {
+    async getSnapshot() {
+      calls.push({ operation: "get_graph_snapshot" });
+      return {};
+    },
+    async createChild() {
+      calls.push({ operation: "create_graph_child" });
+      throw new Error("graph writes must remain private");
+    },
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const headers = {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      };
+      const responses = await Promise.all([
+        request(server, {
+          method: "POST",
+          path: "/api/work/graph",
+          headers,
+          body: JSON.stringify({ parentTaskId: "work-1" }),
+        }),
+        request(server, {
+          method: "POST",
+          path: "/api/work/graph/children",
+          headers,
+          body: JSON.stringify({ parentTaskId: "work-1" }),
+        }),
+      ]);
+
+      assert.deepEqual(responses.map(({ status }) => status), [404, 404]);
+      assert.deepEqual(calls, []);
+    },
+    { workGraphView },
+  );
+});
+
 test("work HTTP boundary exposes no intake, claim, stage, dispatch, or outbox", async () => {
   await withServer(
     async ({ server, calls }) => {
@@ -1878,6 +2161,24 @@ test("work APIs fail closed when the ledger projection is unavailable", async ()
     ]);
     assert.deepEqual(responses.map(({ status }) => status), [503, 503, 503]);
   });
+});
+
+test("work graph API fails closed when its projection is disabled or invalid", async () => {
+  await withServer(async ({ server }) => {
+    const response = await request(server, { path: "/api/work/graph" });
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(JSON.parse(response.body), { error: "服务器内部错误" });
+  });
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, { path: "/api/work/graph" });
+
+      assert.equal(response.status, 503);
+      assert.deepEqual(JSON.parse(response.body), { error: "服务器内部错误" });
+    },
+    { workGraphView: {} },
+  );
 });
 
 test("code jobs expose only their safe newest-first reader projection", async () => {

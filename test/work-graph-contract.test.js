@@ -443,7 +443,10 @@ test("validates one-step CAS transitions and append-only task histories", () => 
         task("implementation", {
           revision: 2,
           status: "completed",
-          deliveries: [delivery()],
+          deliveries: [
+            delivery({ status: "submitted" }),
+            delivery({ revision: 2 }),
+          ],
         }),
       ],
       { revision: 8 },
@@ -597,7 +600,12 @@ test("rejects rewritten history and newly appended deliveries for stale contract
           acceptanceContracts: contracts,
           deliveries: [
             delivery({ status: "rejected" }),
-            delivery({ revision: 2, contractRevision: 2 }),
+            delivery({
+              revision: 2,
+              contractRevision: 2,
+              status: "submitted",
+            }),
+            delivery({ revision: 3, contractRevision: 2 }),
           ],
         }),
       ],
@@ -605,6 +613,57 @@ test("rejects rewritten history and newly appended deliveries for stale contract
     ),
   );
   assert.deepEqual(validateWorkGraphTransition(previous, currentAppend), currentAppend);
+});
+
+test("new delivery decisions must immediately bind one submitted record", () => {
+  const previous = createWorkGraphSnapshot(
+    draft([task("implementation")], { revision: 7 }),
+  );
+  const directDecision = createWorkGraphSnapshot(
+    draft(
+      [
+        task("implementation", {
+          revision: 2,
+          status: "completed",
+          deliveries: [delivery()],
+        }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, directDecision),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+
+  const mismatchedEvidence = createWorkGraphSnapshot(
+    draft(
+      [
+        task("implementation", {
+          revision: 2,
+          status: "completed",
+          deliveries: [
+            delivery({ status: "submitted" }),
+            delivery({
+              revision: 2,
+              evidence: [
+                {
+                  kind: "change_package",
+                  referenceId: "change-package-1",
+                  contentDigest: "b".repeat(64),
+                },
+              ],
+            }),
+          ],
+        }),
+      ],
+      { revision: 8 },
+    ),
+  );
+  assert.throws(
+    () => validateWorkGraphTransition(previous, mismatchedEvidence),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
 });
 
 test("supports non-terminal requeue while keeping terminal tasks immutable", () => {

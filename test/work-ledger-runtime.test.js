@@ -196,15 +196,30 @@ test("runtime owns one named process guard and exposes least-authority graph por
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
+  assert.equal(Object.isFrozen(runtime.graphMemoryProjectionSource), true);
   assert.deepEqual(Object.keys(runtime.graphReader), ["getSnapshot"]);
-  assert.deepEqual(Object.keys(runtime.graphPlanner), ["createChild"]);
+  assert.deepEqual(Object.keys(runtime.graphPlanner), [
+    "createChild",
+    "reviseAcceptanceContract",
+    "decideDelivery",
+  ]);
+  assert.deepEqual(
+    Object.keys(runtime.graphMemoryProjectionSource),
+    ["readBatch", "ack", "ackBatch"],
+  );
   assert.equal(runtime.getGraphSnapshot, undefined);
   assert.equal(runtime.createGraphChild, undefined);
   assert.equal(runtime.graphStore, undefined);
+  assert.equal(runtime.graphDeliverer, undefined);
+  assert.equal(runtime.deliverer, undefined);
   assert.deepEqual(events.slice(0, 2), ["acquire", "run"]);
 
   const graphSnapshot = await runtime.graphReader.getSnapshot();
   assert.equal(graphSnapshot.graph.revision, 0);
+  assert.deepEqual(
+    await runtime.graphMemoryProjectionSource.readBatch({ limit: 1 }),
+    { cursor: 0, highWatermark: 0, items: [] },
+  );
 
   const intake = await runtime.intake();
   assert.equal(intake.cursor, 0);
@@ -224,11 +239,24 @@ test("runtime owns one named process guard and exposes least-authority graph por
       error.code === "WORK_LEDGER_RUNTIME_CLOSED" && error.statusCode === 503,
   );
   await assert.rejects(
+    runtime.graphMemoryProjectionSource.ackBatch({ receipts: [] }),
+    (error) =>
+      error.code === "WORK_LEDGER_RUNTIME_CLOSED" && error.statusCode === 503,
+  );
+  await assert.rejects(
     runtime.graphReader.getSnapshot(),
     (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
   );
   await assert.rejects(
     runtime.graphPlanner.createChild({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    runtime.graphPlanner.reviseAcceptanceContract({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    runtime.graphPlanner.decideDelivery({}),
     (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
   );
 });

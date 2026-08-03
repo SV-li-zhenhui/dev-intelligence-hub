@@ -765,6 +765,337 @@ h1 {
   min-width: 0;
 }
 
+.work-graph-panel {
+  margin-bottom: 28px;
+}
+
+.work-graph-read-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.work-graph-warning,
+.work-graph-refreshing {
+  margin: 0 0 10px;
+  padding: 9px 11px;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-left: 3px solid var(--amber);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.work-graph-refreshing {
+  color: var(--blue);
+  background: var(--blue-soft);
+  border-left-color: var(--blue);
+}
+
+.work-graph-window-note {
+  margin: 0 0 10px;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.work-graph-tree,
+.work-graph-children {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.work-graph-tree {
+  display: grid;
+  gap: 10px;
+}
+
+.work-graph-children {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0 22px;
+  padding-left: 20px;
+  border-left: 2px solid var(--line-strong);
+}
+
+.work-graph-node {
+  min-width: 0;
+}
+
+.work-graph-card {
+  min-width: 0;
+  padding: 13px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.work-graph-card-heading {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.work-graph-card-heading > div {
+  min-width: 0;
+}
+
+.work-graph-card-heading > div > span,
+.work-graph-card-heading > div > strong {
+  display: block;
+}
+
+.work-graph-card-heading > div > span {
+  margin-bottom: 4px;
+  color: var(--faint);
+  font: 9px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.work-graph-card-heading > div > strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.work-graph-card > p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.work-graph-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 16px;
+  margin-top: 10px;
+}
+
+.work-graph-meta span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.work-graph-meta b {
+  margin-right: 5px;
+  color: var(--faint);
+  font-weight: 600;
+}
+
+.work-graph-meta code,
+.work-graph-dependency code {
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.work-graph-reason {
+  display: block;
+  margin-top: 8px;
+  color: var(--amber);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.work-graph-dependencies {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+}
+
+.work-graph-dependencies > span,
+.work-graph-dependencies > em {
+  color: var(--faint);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.5;
+}
+
+.work-graph-dependencies > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.work-graph-dependency {
+  display: grid;
+  min-width: 150px;
+  padding: 6px 8px;
+  color: var(--muted);
+  background: var(--paper);
+  border-radius: 5px;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.work-graph-dependency strong {
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.work-graph-dependency small {
+  color: var(--faint);
+}
+
+.work-graph-acceptance {
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+}
+
+.work-graph-contract-heading {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.work-graph-contract-heading strong {
+  font-size: 11px;
+}
+
+.work-graph-contract-heading span,
+.work-graph-contract-empty {
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.work-graph-contract-empty {
+  margin: 8px 0 0;
+}
+
+.work-graph-criteria,
+.work-graph-deliverables,
+.work-graph-evidence {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.work-graph-criteria {
+  display: grid;
+  gap: 5px;
+}
+
+.work-graph-criteria li {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.28fr) minmax(0, 1fr);
+  gap: 8px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.work-graph-criteria code {
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  font: inherit;
+}
+
+.work-graph-deliverables {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.work-graph-deliverable {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: var(--paper);
+  border-radius: 5px;
+}
+
+.work-graph-deliverable > div,
+.work-graph-deliverable > div > strong,
+.work-graph-deliverable > div > span {
+  display: block;
+  min-width: 0;
+}
+
+.work-graph-deliverable > div > strong {
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.work-graph-deliverable > div > span,
+.work-graph-deliverable > p {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.work-graph-deliverable > p {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.work-graph-delivery-status {
+  align-self: start;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--faint);
+  background: var(--surface);
+  font-size: 9px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.work-graph-delivery-status.delivery-submitted {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.work-graph-delivery-status.delivery-accepted {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.work-graph-delivery-status.delivery-rejected {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.work-graph-evidence {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 4px;
+}
+
+.work-graph-evidence li {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.work-graph-evidence code,
+.work-graph-evidence small {
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  font: 8px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.work-graph-overflow-note {
+  grid-column: 1 / -1;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .work-list {
   border-top: 1px solid var(--line-strong);
 }
@@ -1616,6 +1947,17 @@ dialog::backdrop {
     text-align: left;
   }
 
+  .work-graph-children {
+    margin-left: 14px;
+    padding-left: 14px;
+  }
+
+  .work-graph-children .work-graph-children {
+    margin-left: 0;
+    padding-left: 0;
+    border-left: 0;
+  }
+
   .employee-summary {
     grid-template-columns: 1fr;
   }
@@ -1694,6 +2036,45 @@ dialog::backdrop {
 
   .work-summary div:nth-child(n + 3) {
     border-top: 1px solid var(--line);
+  }
+
+  .work-graph-panel .section-heading {
+    align-items: flex-start;
+  }
+
+  .work-graph-panel .section-heading span {
+    max-width: 60%;
+    line-height: 1.35;
+    text-align: right;
+  }
+
+  .work-graph-card-heading {
+    display: grid;
+    gap: 8px;
+  }
+
+  .work-graph-card-heading .status-pill {
+    justify-self: start;
+  }
+
+  .work-graph-dependencies {
+    grid-template-columns: 1fr;
+    gap: 5px;
+  }
+
+  .work-graph-dependency {
+    width: 100%;
+  }
+
+  .work-graph-contract-heading,
+  .work-graph-criteria li {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .work-graph-deliverables {
+    grid-template-columns: 1fr;
   }
 
   .code-job-detail {

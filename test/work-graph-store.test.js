@@ -4,6 +4,7 @@ import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
 
 const STATE_KEY = "work-ledger-state";
@@ -233,7 +234,11 @@ test("reader projects one immutable graph with authoritative ledger statuses", a
   assert.equal(Object.isFrozen(snapshot.graph), true);
   assert.equal(Object.isFrozen(snapshot.taskStates), true);
   assert.deepEqual(Object.keys(reader), ["getSnapshot"]);
-  assert.deepEqual(Object.keys(planner), ["createChild"]);
+  assert.deepEqual(Object.keys(planner), [
+    "createChild",
+    "reviseAcceptanceContract",
+    "decideDelivery",
+  ]);
   assert.equal(Object.isFrozen(graph), true);
   assert.equal(Object.isFrozen(reader), true);
   assert.equal(Object.isFrozen(planner), true);
@@ -656,7 +661,10 @@ test("a created child recovers through the same ledger authority", async () => {
   const created = await planner.createChild(
     createCommand({ parent, graphRevision: 1 }),
   );
-  assert.equal(store.values.get(STATE_KEY).schemaVersion, 4);
+  assert.equal(
+    store.values.get(STATE_KEY).schemaVersion,
+    WORK_LEDGER_STATE_SCHEMA_VERSION,
+  );
   const restarted = new WorkLedgerService({
     store,
     assignmentSource: source,

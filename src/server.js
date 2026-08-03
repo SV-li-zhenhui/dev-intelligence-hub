@@ -207,6 +207,149 @@ function requireWorkLedgerView(application) {
   return view;
 }
 
+function requireWorkGraphView(application) {
+  const view = application.workGraphView;
+  if (!view || typeof view.getSnapshot !== "function") {
+    throw httpError(503, "员工工作图尚未启用");
+  }
+  return view;
+}
+
+function projectGraphContract(contract) {
+  return {
+    revision: contract.revision,
+    acceptanceCriteria: contract.acceptanceCriteria.map((criterion) => ({
+      criterionId: criterion.criterionId,
+      description: criterion.description,
+    })),
+    expectedDeliverables: contract.expectedDeliverables.map((deliverable) => ({
+      deliverableId: deliverable.deliverableId,
+      kind: deliverable.kind,
+      description: deliverable.description,
+      required: deliverable.required,
+    })),
+  };
+}
+
+function projectGraphDelivery(delivery) {
+  return {
+    deliverableId: delivery.deliverableId,
+    revision: delivery.revision,
+    contractRevision: delivery.contractRevision,
+    status: delivery.status,
+    summary: delivery.summary,
+    evidence: delivery.evidence.map((entry) => ({
+      kind: entry.kind,
+      referenceId: entry.referenceId,
+      contentDigest: entry.contentDigest,
+    })),
+  };
+}
+
+const MAX_WORK_GRAPH_HTTP_TASKS = 300;
+
+function compareGraphTaskRecency(left, right, stateById) {
+  const leftTime = Date.parse(stateById.get(left.taskId)?.updatedAt || "");
+  const rightTime = Date.parse(stateById.get(right.taskId)?.updatedAt || "");
+  const safeLeft = Number.isFinite(leftTime) ? leftTime : Number.NEGATIVE_INFINITY;
+  const safeRight = Number.isFinite(rightTime) ? rightTime : Number.NEGATIVE_INFINITY;
+  return safeRight - safeLeft || left.taskId.localeCompare(right.taskId, "en");
+}
+
+function graphTaskClosure(taskId, taskById, selected) {
+  const pending = new Set();
+  const stack = [taskId];
+  while (stack.length > 0) {
+    const currentId = stack.pop();
+    if (selected.has(currentId) || pending.has(currentId)) continue;
+    const task = taskById.get(currentId);
+    if (!task) continue;
+    pending.add(currentId);
+    if (task.parentTaskId !== null) stack.push(task.parentTaskId);
+    stack.push(...task.dependsOn);
+  }
+  return pending;
+}
+
+function selectWorkGraphHttpWindow(snapshot) {
+  const taskById = new Map(
+    snapshot.graph.tasks.map((task) => [task.taskId, task]),
+  );
+  const stateById = new Map(
+    snapshot.taskStates.map((state) => [state.taskId, state]),
+  );
+  const selected = new Set();
+  const candidates = [...snapshot.graph.tasks].sort((left, right) =>
+    compareGraphTaskRecency(left, right, stateById)
+  );
+  for (const candidate of candidates) {
+    const closure = graphTaskClosure(candidate.taskId, taskById, selected);
+    if (selected.size + closure.size > MAX_WORK_GRAPH_HTTP_TASKS) continue;
+    for (const taskId of closure) selected.add(taskId);
+    if (selected.size === MAX_WORK_GRAPH_HTTP_TASKS) break;
+  }
+  return {
+    totalTaskCount: snapshot.graph.tasks.length,
+    tasks: snapshot.graph.tasks.filter(({ taskId }) => selected.has(taskId)),
+    taskStates: snapshot.taskStates.filter(({ taskId }) => selected.has(taskId)),
+  };
+}
+
+function projectCurrentGraphTask(task) {
+  const acceptanceContract = task.acceptanceContracts.at(-1);
+  const latestByDeliverable = new Map();
+  for (const delivery of task.deliveries) {
+    if (delivery.contractRevision === acceptanceContract.revision) {
+      latestByDeliverable.set(delivery.deliverableId, delivery);
+    }
+  }
+  return {
+    taskId: task.taskId,
+    revision: task.revision,
+    parentTaskId: task.parentTaskId,
+    responsibility: {
+      type: task.responsibility.type,
+      id: task.responsibility.id,
+    },
+    acceptanceContract: projectGraphContract(acceptanceContract),
+    latestDeliveries: acceptanceContract.expectedDeliverables
+      .map(({ deliverableId }) => latestByDeliverable.get(deliverableId))
+      .filter(Boolean)
+      .map(projectGraphDelivery),
+    history: {
+      acceptanceContractCount: task.acceptanceContracts.length,
+      deliveryCount: task.deliveries.length,
+    },
+    dependsOn: [...task.dependsOn],
+  };
+}
+
+function projectWorkGraphHttpSnapshot(snapshot) {
+  const window = selectWorkGraphHttpWindow(snapshot);
+  return {
+    schemaVersion: 2,
+    totalTaskCount: window.totalTaskCount,
+    graph: {
+      schemaVersion: snapshot.graph.schemaVersion,
+      graphId: snapshot.graph.graphId,
+      revision: snapshot.graph.revision,
+      tasks: window.tasks.map(projectCurrentGraphTask),
+    },
+    taskStates: window.taskStates.map((state) => ({
+      taskId: state.taskId,
+      taskRevision: state.taskRevision,
+      ledgerStatus: state.ledgerStatus,
+      ownerId: state.ownerId,
+      statusReason: state.statusReason,
+      updatedAt: state.updatedAt,
+      work: {
+        title: state.work.title,
+        description: state.work.description,
+      },
+    })),
+  };
+}
+
 function requireAttentionBrowser(application) {
   const browser = application.attentionBrowser;
   if (
@@ -1032,6 +1175,15 @@ export function createDashboardServer(
               application.config.githubActions?.enabled === true,
           },
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/work/graph") {
+        const snapshot = await requireWorkGraphView(application).getSnapshot();
+        sendJson(
+          response,
+          200,
+          projectWorkGraphHttpSnapshot(snapshot),
+        );
         return;
       }
       if (

@@ -25,7 +25,12 @@ import {
   createGraphChildWorkItem,
   graphChildAssignmentId,
 } from "./work-ledger-records.js";
-import { validateWorkLedgerGraphTransition } from "./work-ledger-graph.js";
+import {
+  assertExpectedWorkGraphRevision,
+  assertWorkGraphCommandTransition,
+  assertWorkGraphTasksInScope,
+  normalizeWorkGraphCommandAuthority,
+} from "./work-ledger-graph-command-support.js";
 
 const CANCELLABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
 const ACTIVE_SIDE_EFFECT_STATUSES = new Set([
@@ -105,17 +110,6 @@ function normalizeTaskRevisionBindings(value, requiredTaskIds) {
   return new Map(bindings.map(({ taskId, revision }) => [taskId, revision]));
 }
 
-function normalizeGraphAuthority(value) {
-  if (!hasExactLedgerKeys(value, ["actorId", "scopeRootTaskId"])) {
-    throw graphCommandError("工作图权限上下文无效");
-  }
-  const actorId = normalizeWorkActor(value.actorId);
-  const scopeRootTaskId = value.scopeRootTaskId === null
-    ? null
-    : graphCommandString(value.scopeRootTaskId, "scopeRootTaskId", 192);
-  return { actorId, scopeRootTaskId };
-}
-
 function normalizeChildWork(value) {
   if (!hasExactLedgerKeys(value, ["title", "description"])) {
     throw graphCommandError("子任务工作说明无效");
@@ -147,7 +141,7 @@ function normalizeGraphChildCommand(input) {
   if (!hasExactLedgerKeys(input, ["authority", "command"])) {
     throw graphCommandError("创建子任务请求无效");
   }
-  const authority = normalizeGraphAuthority(input.authority);
+  const authority = normalizeWorkGraphCommandAuthority(input.authority);
   const command = input.command;
   if (
     !hasExactLedgerKeys(command, [
@@ -216,31 +210,6 @@ function normalizeGraphChildCommand(input) {
   };
 }
 
-function assertTasksInScope(state, taskIds, scopeRootTaskId) {
-  if (scopeRootTaskId === null) return;
-  const byId = new Map(state.items.map((item) => [item.itemId, item]));
-  if (!byId.has(scopeRootTaskId)) {
-    throw workLedgerError(
-      "WORK_LEDGER_GRAPH_SCOPE_INVALID",
-      "工作图权限范围不存在",
-      403,
-    );
-  }
-  for (const taskId of taskIds) {
-    let currentTaskId = taskId;
-    while (currentTaskId !== null && currentTaskId !== scopeRootTaskId) {
-      currentTaskId = byId.get(currentTaskId)?.graph.parentItemId ?? null;
-    }
-    if (currentTaskId !== scopeRootTaskId) {
-      throw workLedgerError(
-        "WORK_LEDGER_GRAPH_SCOPE_DENIED",
-        "工作图命令越过了绑定任务范围",
-        403,
-      );
-    }
-  }
-}
-
 function assertTaskRevisionBindings(state, revisions) {
   for (const [taskId, expectedRevision] of revisions) {
     const item = requireWorkLedgerItem(state, taskId);
@@ -257,23 +226,6 @@ function graphChildResult(stateRevision, child, parent, applied) {
     parentTaskId: parent.itemId,
     parentTaskRevision: parent.revision,
   };
-}
-
-function assertGraphCommandTransition(state, items) {
-  try {
-    validateWorkLedgerGraphTransition(state, {
-      ...state,
-      revision: state.revision + 1,
-      items,
-    });
-  } catch (cause) {
-    throw workLedgerError(
-      "WORK_LEDGER_GRAPH_TRANSITION_INVALID",
-      "工作图命令会破坏任务关系或修订约束",
-      409,
-      { cause },
-    );
-  }
 }
 
 export function planWorkGraphChildCreation({ state, input, clock }) {
@@ -303,7 +255,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
   const existing = state.items.find(
     (item) => item.assignmentId === assignmentId,
   );
-  assertTasksInScope(
+  assertWorkGraphTasksInScope(
     state,
     [
       command.parentTaskId,
@@ -342,7 +294,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
     };
   }
 
-  assertExpectedGraphRevision(command.expectedGraphRevision, state);
+  assertExpectedWorkGraphRevision(command.expectedGraphRevision, state);
   assertTaskRevisionBindings(state, command.expectedTaskRevisions);
   if (
     !["assignment", "graph_task"].includes(parent.kind) ||
@@ -379,7 +331,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
     ...replaceWorkLedgerRecord(state.items, "itemId", parentResult),
     child,
   ];
-  assertGraphCommandTransition(state, items);
+  assertWorkGraphCommandTransition(state, items);
   return {
     patch: { items },
     timelineEvents: [
@@ -427,16 +379,6 @@ function normalizeExpectedRevisions(input) {
     throw workLedgerError(
       "WORK_LEDGER_REVISION_INVALID",
       "工作图或工作项 revision 无效",
-    );
-  }
-}
-
-function assertExpectedGraphRevision(value, state) {
-  if (value !== state.revision) {
-    throw workLedgerError(
-      "WORK_LEDGER_STATE_REVISION_CONFLICT",
-      "工作图已被其他员工更新",
-      409,
     );
   }
 }
@@ -530,7 +472,7 @@ export function planWorkGraphCancellation({ state, input, clock }) {
     );
   }
   const root = requireWorkLedgerItem(state, itemId);
-  assertExpectedGraphRevision(input.expectedGraphRevision, state);
+  assertExpectedWorkGraphRevision(input.expectedGraphRevision, state);
   assertItemRevision(root, input.expectedRevision);
   if (root.status === "cancelled") {
     return {

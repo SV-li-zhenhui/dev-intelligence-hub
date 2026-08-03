@@ -1,11 +1,14 @@
 import {
   createWorkGraphSnapshot,
+  normalizeWorkGraphAcceptanceContract,
+  normalizeWorkGraphDelivery,
   validateWorkGraphTransition,
 } from "../domain/work-graph-contract.js";
 import {
   boundedLedgerString,
   cloneLedgerValue,
   ledgerDataEntries,
+  normalizeLedgerTimestamp,
   workLedgerError,
 } from "./work-ledger-values.js";
 
@@ -32,6 +35,22 @@ const DEFAULT_ACCEPTANCE_CONTRACT = Object.freeze({
   expectedDeliverables: Object.freeze([]),
 });
 
+const ACCEPTANCE_RECORD_KEYS = [
+  "revision",
+  "acceptanceCriteria",
+  "expectedDeliverables",
+  "recordedAt",
+];
+const DELIVERY_RECORD_KEYS = [
+  "deliverableId",
+  "revision",
+  "contractRevision",
+  "status",
+  "summary",
+  "evidence",
+  "recordedAt",
+];
+
 const GRAPH_METADATA_KEYS = [
   "parentItemId",
   "dependsOnItemIds",
@@ -39,16 +58,62 @@ const GRAPH_METADATA_KEYS = [
   "deliveries",
 ];
 
-export function createDefaultWorkGraphMetadata() {
+function projectionError(message) {
+  return workLedgerError(
+    "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+    message,
+  );
+}
+
+function graphRecord(value, expectedKeys, label) {
+  const entries = ledgerDataEntries(value);
+  const keys = entries && new Set(entries.map(([key]) => key));
+  if (
+    !entries ||
+    entries.length !== expectedKeys.length ||
+    expectedKeys.some((key) => !keys.has(key))
+  ) {
+    throw projectionError(`${label}字段无效`);
+  }
+  const fields = new Map(entries);
+  const recordedAt = fields.get("recordedAt");
+  if (
+    typeof recordedAt !== "string" ||
+    !Number.isFinite(Date.parse(recordedAt)) ||
+    new Date(Date.parse(recordedAt)).toISOString() !== recordedAt
+  ) {
+    throw projectionError(`${label}记录时间无效`);
+  }
+  return {
+    content: Object.fromEntries(
+      expectedKeys
+        .filter((key) => key !== "recordedAt")
+        .map((key) => [key, fields.get(key)]),
+    ),
+    recordedAt,
+  };
+}
+
+export function createWorkGraphAcceptanceRecord(value, recordedAt) {
+  return {
+    ...normalizeWorkGraphAcceptanceContract(value),
+    recordedAt: normalizeLedgerTimestamp(recordedAt, "contract.recordedAt"),
+  };
+}
+
+export function createWorkGraphDeliveryRecord(value, recordedAt) {
+  return {
+    ...normalizeWorkGraphDelivery(value),
+    recordedAt: normalizeLedgerTimestamp(recordedAt, "delivery.recordedAt"),
+  };
+}
+
+export function createDefaultWorkGraphMetadata(recordedAt) {
   return {
     parentItemId: null,
     dependsOnItemIds: [],
     acceptanceContracts: [
-      {
-        revision: DEFAULT_ACCEPTANCE_CONTRACT.revision,
-        acceptanceCriteria: [],
-        expectedDeliverables: [],
-      },
+      createWorkGraphAcceptanceRecord(DEFAULT_ACCEPTANCE_CONTRACT, recordedAt),
     ],
     deliveries: [],
   };
@@ -65,15 +130,7 @@ export function workLedgerStatusToGraphStatus(status) {
   return graphStatus;
 }
 
-function graphTaskFromItem(item) {
-  const itemEntries = ledgerDataEntries(item);
-  if (!itemEntries) {
-    throw workLedgerError(
-      "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
-      "工作项不是安全的数据对象",
-    );
-  }
-  const fields = new Map(itemEntries);
+function exactGraphMetadata(fields) {
   const graphEntries = ledgerDataEntries(fields.get("graph"));
   const graphKeys = graphEntries && new Set(graphEntries.map(([key]) => key));
   if (
@@ -81,34 +138,121 @@ function graphTaskFromItem(item) {
     graphEntries.length !== GRAPH_METADATA_KEYS.length ||
     GRAPH_METADATA_KEYS.some((key) => !graphKeys.has(key))
   ) {
-    throw workLedgerError(
-      "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
-      "工作项的工作图元数据字段无效",
-    );
+    throw projectionError("工作项的工作图元数据字段无效");
   }
-  const graph = new Map(graphEntries);
+  return new Map(graphEntries);
+}
+
+function normalizeStoredGraphHistory(fields, graph) {
+  const contracts = denseProjectionArray(graph.get("acceptanceContracts"))
+    .map((entry) => graphRecord(entry, ACCEPTANCE_RECORD_KEYS, "验收契约"));
+  const deliveries = denseProjectionArray(graph.get("deliveries"))
+    .map((entry) => graphRecord(entry, DELIVERY_RECORD_KEYS, "交付"));
+  const createdAt = fields.get("createdAt");
+  const updatedAt = fields.get("updatedAt");
+  if (
+    typeof createdAt !== "string" ||
+    typeof updatedAt !== "string" ||
+    !Number.isFinite(Date.parse(createdAt)) ||
+    !Number.isFinite(Date.parse(updatedAt))
+  ) {
+    throw projectionError("工作项时间无效");
+  }
+  const createdTime = Date.parse(createdAt);
+  const updatedTime = Date.parse(updatedAt);
+  let previousContractTime = createdTime;
+  for (const contract of contracts) {
+    const recordedTime = Date.parse(contract.recordedAt);
+    if (recordedTime < previousContractTime || recordedTime > updatedTime) {
+      throw projectionError("验收契约记录时间顺序无效");
+    }
+    previousContractTime = recordedTime;
+  }
+  let previousDeliveryTime = createdTime;
+  const contractByRevision = new Map(
+    contracts.map((entry) => [entry.content.revision, entry]),
+  );
+  for (const delivery of deliveries) {
+    const recordedTime = Date.parse(delivery.recordedAt);
+    const contract = contractByRevision.get(delivery.content.contractRevision);
+    if (
+      recordedTime < previousDeliveryTime ||
+      recordedTime > updatedTime ||
+      !contract ||
+      recordedTime < Date.parse(contract.recordedAt)
+    ) {
+      throw projectionError("交付记录时间顺序无效");
+    }
+    previousDeliveryTime = recordedTime;
+  }
+  for (const contract of contracts) {
+    const earlierDeliveries = deliveries.filter(
+      (delivery) =>
+        delivery.content.contractRevision < contract.content.revision,
+    );
+    if (
+      earlierDeliveries.some(
+        (delivery) =>
+          Date.parse(delivery.recordedAt) > Date.parse(contract.recordedAt),
+      )
+    ) {
+      throw projectionError("验收契约早于已有交付记录");
+    }
+  }
+  return { contracts, deliveries };
+}
+
+function graphTaskFromItem(item) {
+  const itemEntries = ledgerDataEntries(item);
+  if (!itemEntries) {
+    throw projectionError("工作项不是安全的数据对象");
+  }
+  const fields = new Map(itemEntries);
+  const graph = exactGraphMetadata(fields);
+  const history = normalizeStoredGraphHistory(fields, graph);
   return {
     taskId: fields.get("itemId"),
     revision: fields.get("revision"),
     parentTaskId: graph.get("parentItemId"),
     status: workLedgerStatusToGraphStatus(fields.get("status")),
     responsibility: fields.get("currentTarget"),
-    acceptanceContracts: graph.get("acceptanceContracts"),
-    deliveries: graph.get("deliveries"),
+    acceptanceContracts: history.contracts.map(({ content }) => content),
+    deliveries: history.deliveries.map(({ content }) => content),
     dependsOn: graph.get("dependsOnItemIds"),
   };
 }
 
-function metadataFromTask(task) {
+function metadataFromTask(task, item) {
+  const fields = new Map(ledgerDataEntries(item));
+  const graph = exactGraphMetadata(fields);
+  const history = normalizeStoredGraphHistory(fields, graph);
+  const contractTimes = new Map(
+    history.contracts.map(({ content, recordedAt }) => [
+      content.revision,
+      recordedAt,
+    ]),
+  );
+  const deliveryTimes = new Map(
+    history.deliveries.map(({ content, recordedAt }) => [
+      content.revision,
+      recordedAt,
+    ]),
+  );
   return cloneLedgerValue({
     parentItemId: task.parentTaskId,
     dependsOnItemIds: task.dependsOn,
-    acceptanceContracts: task.acceptanceContracts,
-    deliveries: task.deliveries,
+    acceptanceContracts: task.acceptanceContracts.map((contract) => ({
+      ...contract,
+      recordedAt: contractTimes.get(contract.revision),
+    })),
+    deliveries: task.deliveries.map((delivery) => ({
+      ...delivery,
+      recordedAt: deliveryTimes.get(delivery.revision),
+    })),
   });
 }
 
-function denseItems(value) {
+function denseProjectionArray(value) {
   if (
     !Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Array.prototype ||
@@ -191,7 +335,7 @@ export function projectWorkLedgerGraphSnapshot(state, options) {
       "工作台账修订无效",
     );
   }
-  const items = denseItems(fields.get("items"));
+  const items = denseProjectionArray(fields.get("items"));
   return createWorkGraphSnapshot(
     {
       graphId: WORK_LEDGER_GRAPH_ID,
@@ -207,7 +351,7 @@ export function projectWorkLedgerGraphView(state, options) {
   const stateEntries = ledgerDataEntries(state);
   const fields = new Map(stateEntries);
   const itemsById = new Map(
-    denseItems(fields.get("items")).map((item) => {
+    denseProjectionArray(fields.get("items")).map((item) => {
       const entries = ledgerDataEntries(item);
       if (!entries) {
         throw workLedgerError(
@@ -250,7 +394,45 @@ export function projectWorkLedgerGraphView(state, options) {
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const previous = projectWorkLedgerGraphSnapshot(previousState);
   const next = projectWorkLedgerGraphSnapshot(nextState);
-  return validateWorkGraphTransition(previous, next);
+  validateWorkGraphTransition(previous, next);
+  assertStoredHistoryPrefixes(previousState, nextState);
+  return next;
+}
+
+function storedHistoryByItemId(state) {
+  return new Map(
+    denseProjectionArray(state.items).map((item) => {
+      const fields = new Map(ledgerDataEntries(item));
+      const history = normalizeStoredGraphHistory(
+        fields,
+        exactGraphMetadata(fields),
+      );
+      return [fields.get("itemId"), history];
+    }),
+  );
+}
+
+function assertHistoryPrefix(previous, next, name) {
+  if (
+    next.length < previous.length ||
+    previous.some(
+      (entry, index) =>
+        JSON.stringify(entry) !== JSON.stringify(next[index]),
+    )
+  ) {
+    throw projectionError(`${name}历史记录不能改写`);
+  }
+}
+
+function assertStoredHistoryPrefixes(previousState, nextState) {
+  const previousById = storedHistoryByItemId(previousState);
+  const nextById = storedHistoryByItemId(nextState);
+  for (const [itemId, previous] of previousById) {
+    const next = nextById.get(itemId);
+    if (!next) throw projectionError("工作图任务不能丢失");
+    assertHistoryPrefix(previous.contracts, next.contracts, "验收契约");
+    assertHistoryPrefix(previous.deliveries, next.deliveries, "交付");
+  }
 }
 
 function workLedgerGraphTaskContext(state, itemId) {
@@ -326,7 +508,7 @@ export function assertWorkLedgerGraphCompletable(state, itemId) {
 }
 
 export function normalizeWorkLedgerGraphItems(items, stateRevision) {
-  const safeItems = denseItems(items);
+  const safeItems = denseProjectionArray(items);
   const snapshot = projectWorkLedgerGraphSnapshot({
     revision: stateRevision,
     items: safeItems,
@@ -336,6 +518,6 @@ export function normalizeWorkLedgerGraphItems(items, stateRevision) {
   );
   return safeItems.map((item) => ({
     ...item,
-    graph: metadataFromTask(tasksById.get(item.itemId)),
+    graph: metadataFromTask(tasksById.get(item.itemId), item),
   }));
 }

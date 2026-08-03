@@ -1,3 +1,9 @@
+import {
+  normalizeWorkGraphSnapshot,
+  renderWorkGraph,
+} from "./work-graph-view.js";
+import { escapeHtml, relativeTime } from "./view-format.js";
+
 function initialState() {
   return {
     loaded: false,
@@ -9,28 +15,13 @@ function initialState() {
     codeJobsEnabled: false,
     codeJobs: [],
     codeJobsError: "",
+    graphLoading: false,
+    graphSnapshot: null,
+    graphError: "",
   };
 }
 
-export function escapeWorkHtml(value = "") {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function relativeTime(value, now) {
-  if (!value || !Number.isFinite(Date.parse(value))) return "未知时间";
-  const seconds = Math.round((now - Date.parse(value)) / 1_000);
-  if (Math.abs(seconds) < 60) return "刚刚";
-  const minutes = Math.round(seconds / 60);
-  if (Math.abs(minutes) < 60) return `${minutes} 分钟前`;
-  const hours = Math.round(minutes / 60);
-  if (Math.abs(hours) < 24) return `${hours} 小时前`;
-  return `${Math.round(hours / 24)} 天前`;
-}
+export const escapeWorkHtml = escapeHtml;
 
 function statusLabel(status) {
   return {
@@ -680,6 +671,11 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
       <small>模型只生成结构化判断；代码执行和外部写入不能绕过受控执行器与确认队列。</small>
     </div>
+    ${renderWorkGraph({
+      loading: state.graphLoading,
+      error: state.graphError,
+      snapshot: state.graphSnapshot,
+    }, { now })}
     <div class="work-columns">
       <section class="section work-panel">
         <div class="section-heading"><h2>最近工作</h2><span>${state.items.length} ITEMS · 最新在前</span></div>
@@ -727,6 +723,7 @@ export function createWorkView({
   let state = initialState();
   let detailState = null;
   let detailRequestSequence = 0;
+  let loadRequestSequence = 0;
 
   function change(patch) {
     state = { ...state, ...patch };
@@ -765,6 +762,21 @@ export function createWorkView({
       };
     } catch (error) {
       return { enabled: false, items: [], error: errorMessage(error) };
+    }
+  }
+
+  async function readWorkGraph() {
+    const response = await fetchImpl("/api/work/graph", {
+      cache: "no-store",
+    }).catch(() => null);
+    if (!response) {
+      return { snapshot: null, error: "读取共享任务图失败" };
+    }
+    try {
+      const payload = await responseJson(response, "读取共享任务图");
+      return { snapshot: normalizeWorkGraphSnapshot(payload), error: "" };
+    } catch (error) {
+      return { snapshot: null, error: errorMessage(error) };
     }
   }
 
@@ -981,21 +993,29 @@ export function createWorkView({
   }
 
   async function load() {
-    if (state.loading) return;
-    change({ loading: true, error: "" });
+    const sequence = ++loadRequestSequence;
+    change({
+      loading: true,
+      error: "",
+      graphLoading: true,
+      graphError: "",
+    });
+    const responsesPromise = Promise.all([
+      fetchImpl("/api/work/summary", { cache: "no-store" }),
+      fetchImpl("/api/work/items?limit=50&order=newest", { cache: "no-store" }),
+      fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
+    ]);
+    const codeJobsPromise = readCodeJobs();
+    const graphPromise = readWorkGraph();
     try {
-      const responses = await Promise.all([
-        fetchImpl("/api/work/summary", { cache: "no-store" }),
-        fetchImpl("/api/work/items?limit=50&order=newest", { cache: "no-store" }),
-        fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
-      ]);
-      const codeJobsPromise = readCodeJobs();
+      const responses = await responsesPromise;
       const [summary, items, timeline] = await Promise.all([
         responseJson(responses[0], "读取工作摘要"),
         responseJson(responses[1], "读取工作项"),
         responseJson(responses[2], "读取工作时间线"),
       ]);
       const codeJobs = await codeJobsPromise;
+      if (sequence !== loadRequestSequence) return;
       change({
         loaded: true,
         loading: false,
@@ -1008,8 +1028,16 @@ export function createWorkView({
         codeJobsError: codeJobs.error,
       });
     } catch (error) {
+      if (sequence !== loadRequestSequence) return;
       change({ loaded: true, loading: false, error: errorMessage(error) });
     }
+    const graph = await graphPromise;
+    if (sequence !== loadRequestSequence) return;
+    change({
+      graphLoading: false,
+      graphSnapshot: graph.snapshot || state.graphSnapshot,
+      graphError: graph.error,
+    });
   }
 
   return {
@@ -1023,7 +1051,8 @@ export function createWorkView({
     load,
     loadCodeJobChangePackage,
     loadMoreCodeJobObservations,
-    needsLoad: () => !state.loaded || Boolean(state.error),
+    needsLoad: () =>
+      !state.loaded || Boolean(state.error) || Boolean(state.graphError),
     openCodeJob,
     render: () => renderWorkView(state, { now: clock() }),
     requestCodeJobChangePackageApply,

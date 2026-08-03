@@ -293,6 +293,12 @@ function normalizeDelivery(value, limits) {
   };
 }
 
+export function normalizeWorkGraphDelivery(value, optionsValue) {
+  const options = normalizeOptions(optionsValue, ["limits"]);
+  const limitOverrides = Object.hasOwn(options, "limits") ? options.limits : {};
+  return deepFreeze(normalizeDelivery(value, normalizeLimits(limitOverrides)));
+}
+
 function assertSequentialRevisions(values, name) {
   for (let index = 0; index < values.length; index += 1) {
     if (values[index].revision !== index + 1) {
@@ -707,6 +713,20 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
         throw staleRevision(
           `任务 ${previousTask.taskId} 的新交付绑定了过期契约修订`,
         );
+      }
+      if (["accepted", "rejected"].includes(appendedDelivery.status)) {
+        const submitted = nextTask.deliveries[appendedDelivery.revision - 2];
+        if (
+          submitted?.status !== "submitted" ||
+          submitted.deliverableId !== appendedDelivery.deliverableId ||
+          submitted.contractRevision !== appendedDelivery.contractRevision ||
+          !sameValue(submitted.evidence, appendedDelivery.evidence)
+        ) {
+          throw graphError(
+            "WORK_GRAPH_INVALID_TRANSITION",
+            `任务 ${previousTask.taskId} 的交付审核没有紧邻匹配的 submitted 记录`,
+          );
+        }
       }
     }
   }

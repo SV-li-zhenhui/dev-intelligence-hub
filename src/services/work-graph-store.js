@@ -39,6 +39,33 @@ function normalizePlannerAuthority(value) {
   return Object.freeze({ actorId, scopeRootTaskId });
 }
 
+function normalizeDelivererAuthority(value) {
+  if (
+    !hasExactLedgerKeys(value, [
+      "principalId",
+      "scopeRootTaskId",
+      "taskId",
+      "leaseId",
+    ])
+  ) {
+    throw new TypeError("work graph deliverer authority is invalid");
+  }
+  let coordinator;
+  let taskId;
+  let leaseId;
+  try {
+    coordinator = normalizePlannerAuthority({
+      principalId: value.principalId,
+      scopeRootTaskId: value.scopeRootTaskId,
+    });
+    taskId = boundedLedgerString(value.taskId, "taskId", 192);
+    leaseId = boundedLedgerString(value.leaseId, "leaseId", 128);
+  } catch {
+    throw new TypeError("work graph deliverer authority is invalid");
+  }
+  return Object.freeze({ ...coordinator, taskId, leaseId });
+}
+
 function snapshotCommand(value) {
   return canonicalLedgerValue(value, {
     maximumEntries: 20_000,
@@ -47,9 +74,22 @@ function snapshotCommand(value) {
   });
 }
 
+function invokeCommand(method, authority, command) {
+  let snapshot;
+  try {
+    snapshot = snapshotCommand(command);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return method({ authority, command: snapshot });
+}
+
 export class WorkGraphStore {
   #getSnapshot;
   #createChild;
+  #reviseAcceptance;
+  #submitDelivery;
+  #decideDelivery;
 
   constructor(value = {}) {
     if (!hasExactLedgerKeys(value, ["ledger"])) {
@@ -65,6 +105,21 @@ export class WorkGraphStore {
       "createGraphChild",
       "work graph planner port",
     );
+    this.#reviseAcceptance = bindDataMethod(
+      value.ledger,
+      "reviseGraphAcceptance",
+      "work graph planner port",
+    );
+    this.#submitDelivery = bindDataMethod(
+      value.ledger,
+      "submitGraphDelivery",
+      "work graph deliverer port",
+    );
+    this.#decideDelivery = bindDataMethod(
+      value.ledger,
+      "decideGraphDelivery",
+      "work graph planner port",
+    );
     Object.freeze(this);
   }
 
@@ -77,18 +132,20 @@ export class WorkGraphStore {
   planner(authority) {
     const trustedAuthority = normalizePlannerAuthority(authority);
     return Object.freeze({
-      createChild: (command) => {
-        let snapshot;
-        try {
-          snapshot = snapshotCommand(command);
-        } catch (error) {
-          return Promise.reject(error);
-        }
-        return this.#createChild({
-          authority: trustedAuthority,
-          command: snapshot,
-        });
-      },
+      createChild: (command) =>
+        invokeCommand(this.#createChild, trustedAuthority, command),
+      reviseAcceptanceContract: (command) =>
+        invokeCommand(this.#reviseAcceptance, trustedAuthority, command),
+      decideDelivery: (command) =>
+        invokeCommand(this.#decideDelivery, trustedAuthority, command),
+    });
+  }
+
+  deliverer(authority) {
+    const trustedAuthority = normalizeDelivererAuthority(authority);
+    return Object.freeze({
+      submitDelivery: (command) =>
+        invokeCommand(this.#submitDelivery, trustedAuthority, command),
     });
   }
 }
