@@ -427,6 +427,281 @@ test("completion reports an ordinary graph conflict before corrupt-state handlin
   assert.equal(fixture.store.stored().revision, durable.revision);
 });
 
+test("graph cancellation atomically closes a safe subtree and blocks its dependents", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2), assignment(3)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [root, child, dependent] = durable.items;
+  child.graph.parentItemId = root.itemId;
+  dependent.graph.dependsOnItemIds = [child.itemId];
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const request = {
+    itemId: root.itemId,
+    expectedGraphRevision: durable.revision,
+    expectedRevision: root.revision,
+    actorId: "employee-orchestrator",
+    reason: "owner-cancelled-scope",
+  };
+
+  const result = await recovered.cancelGraphTask(request);
+
+  assert.equal(result.root.status, "cancelled");
+  assert.deepEqual(result.cancelledItemIds, [child.itemId, root.itemId].sort());
+  const byId = new Map(
+    (await recovered.listItems({ limit: 10 })).items.map((item) => [
+      item.itemId,
+      item,
+    ]),
+  );
+  assert.equal(byId.get(root.itemId).status, "cancelled");
+  assert.equal(byId.get(child.itemId).status, "cancelled");
+  assert.equal(byId.get(dependent.itemId).status, "queued");
+  const writesAfterCancellation = fixture.store.writes.length;
+  await assert.rejects(
+    recovered.cancelGraphTask(request),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+  );
+  const cancelledRoot = byId.get(root.itemId);
+  const replay = await recovered.cancelGraphTask({
+    ...request,
+    expectedGraphRevision: fixture.store.stored().revision,
+    expectedRevision: cancelledRoot.revision,
+  });
+  assert.equal(replay.root.status, "cancelled");
+  assert.deepEqual(replay.cancelledItemIds, []);
+  assert.equal(fixture.store.writes.length, writesAfterCancellation);
+  await assert.rejects(
+    recovered.claim({
+      itemId: dependent.itemId,
+      expectedRevision: dependent.revision,
+      workerId: "employee-pr-reviewer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_GRAPH_BLOCKED",
+  );
+  const cancelledEvents = (await recovered.listTimeline({ limit: 20 })).items
+    .filter(({ type }) => type === "cancelled");
+  assert.equal(cancelledEvents.length, 2);
+
+  const restarted = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await restarted.recover();
+  assert.equal(
+    (await restarted.listItems({ status: "cancelled" })).items.length,
+    2,
+  );
+});
+
+test("graph cancellation refuses an active descendant and invokes no DTO accessors", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [root, child] = durable.items;
+  child.graph.parentItemId = root.itemId;
+  Object.assign(child, {
+    status: "working",
+    ownerId: "employee-developer",
+    leaseId: "child-lease",
+    leaseUntil: "2026-08-02T03:00:00.000Z",
+    attempt: 1,
+  });
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const request = {
+    itemId: root.itemId,
+    expectedGraphRevision: durable.revision,
+    expectedRevision: root.revision,
+    actorId: "employee-orchestrator",
+    reason: "cancel-tree",
+  };
+
+  await assert.rejects(
+    recovered.cancelGraphTask(request),
+    (error) =>
+      error.code === "WORK_LEDGER_CANCELLATION_UNSAFE" &&
+      error.statusCode === 409,
+  );
+  assert.equal(fixture.store.stored().revision, durable.revision);
+
+  let invoked = false;
+  const hostile = { ...request };
+  Object.defineProperty(hostile, "reason", {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return "hidden";
+    },
+  });
+  await assert.rejects(
+    recovered.cancelGraphTask(hostile),
+    (error) => error.code === "WORK_LEDGER_CANCELLATION_INVALID",
+  );
+  assert.equal(invoked, false);
+});
+
+test("graph cancellation refuses an already active reverse dependency consumer", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [dependency, consumer] = durable.items;
+  consumer.graph.dependsOnItemIds = [dependency.itemId];
+  Object.assign(consumer, {
+    status: "working",
+    ownerId: "employee-developer",
+    leaseId: "consumer-lease",
+    leaseUntil: "2026-08-02T03:00:00.000Z",
+    attempt: 1,
+  });
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  await assert.rejects(
+    recovered.cancelGraphTask({
+      itemId: dependency.itemId,
+      expectedGraphRevision: durable.revision,
+      expectedRevision: dependency.revision,
+      actorId: "employee-orchestrator",
+      reason: "dependency-invalidated",
+    }),
+    (error) => error.code === "WORK_LEDGER_CANCELLATION_UNSAFE",
+  );
+  assert.equal(fixture.store.stored().revision, durable.revision);
+});
+
+test("graph cancellation refuses an active ancestor", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [parent, child] = durable.items;
+  child.graph.parentItemId = parent.itemId;
+  Object.assign(parent, {
+    status: "working",
+    ownerId: "employee-planner",
+    leaseId: "parent-lease",
+    leaseUntil: "2026-08-02T03:00:00.000Z",
+    attempt: 1,
+  });
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  await assert.rejects(
+    recovered.cancelGraphTask({
+      itemId: child.itemId,
+      expectedGraphRevision: durable.revision,
+      expectedRevision: child.revision,
+      actorId: "employee-orchestrator",
+      reason: "child-no-longer-needed",
+    }),
+    (error) => error.code === "WORK_LEDGER_CANCELLATION_UNSAFE",
+  );
+  assert.equal(fixture.store.stored().revision, durable.revision);
+});
+
+test("completed descendants do not create false active-dependent cancellation conflicts", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2), assignment(3)],
+  });
+  await fixture.service.intake();
+  let durable = fixture.store.stored();
+  const [root, child, consumer] = durable.items;
+  child.graph.parentItemId = root.itemId;
+  consumer.graph.dependsOnItemIds = [child.itemId];
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  let completedChild = await recovered.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  completedChild = await recovered.complete({
+    itemId: child.itemId,
+    expectedRevision: completedChild.revision,
+    leaseId: completedChild.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "child-complete" },
+  });
+  const currentConsumer = (await recovered.listItems()).items.find(
+    ({ itemId }) => itemId === consumer.itemId,
+  );
+  const workingConsumer = await recovered.claim({
+    itemId: consumer.itemId,
+    expectedRevision: currentConsumer.revision,
+    workerId: "employee-consumer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(workingConsumer.status, "working");
+
+  durable = fixture.store.stored();
+  const currentRoot = durable.items.find(({ itemId }) => itemId === root.itemId);
+  const result = await recovered.cancelGraphTask({
+    itemId: root.itemId,
+    expectedGraphRevision: durable.revision,
+    expectedRevision: currentRoot.revision,
+    actorId: "employee-orchestrator",
+    reason: "remaining-root-work-cancelled",
+  });
+
+  assert.deepEqual(result.cancelledItemIds, [root.itemId]);
+  assert.equal(result.root.status, "cancelled");
+  assert.equal(
+    (await recovered.listItems()).items.find(
+      ({ itemId }) => itemId === child.itemId,
+    ).status,
+    "completed",
+  );
+});
+
 test("an expired working lease is recoverable and every claim is auditable", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   await fixture.service.intake();

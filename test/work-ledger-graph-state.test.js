@@ -86,6 +86,7 @@ test("every ledger status has an explicit graph projection", () => {
     ["retry_wait", "in_progress"],
     ["completed", "completed"],
     ["blocked", "in_progress"],
+    ["cancelled", "cancelled"],
   ]);
 
   for (const [status, graphStatus] of expected) {

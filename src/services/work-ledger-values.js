@@ -14,6 +14,7 @@ export const WORK_LEDGER_STATUSES = new Set([
   "retry_wait",
   "completed",
   "blocked",
+  "cancelled",
 ]);
 export const WORK_LEDGER_OUTBOX_STATUSES = new Set([
   "pending",

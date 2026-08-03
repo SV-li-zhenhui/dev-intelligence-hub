@@ -23,6 +23,7 @@ const GRAPH_STATUS_BY_LEDGER_STATUS = new Map([
   ["retry_wait", "in_progress"],
   ["completed", "completed"],
   ["blocked", "in_progress"],
+  ["cancelled", "cancelled"],
 ]);
 
 const DEFAULT_ACCEPTANCE_CONTRACT = Object.freeze({

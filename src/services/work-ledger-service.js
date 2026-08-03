@@ -9,6 +9,7 @@ import {
 import { planAttentionBatchApplication } from "./work-ledger-attention-commands.js";
 import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
+import { planWorkGraphCancellation } from "./work-ledger-graph-commands.js";
 import {
   planIntentAcknowledgement,
   planIntentClaim,
@@ -281,6 +282,10 @@ export class WorkLedgerService {
 
   async complete(input = {}) {
     return this.#executeCommand(planWorkItemCompletion, input);
+  }
+
+  async cancelGraphTask(input = {}) {
+    return this.#executeCommand(planWorkGraphCancellation, input);
   }
 
   async stageIntent(input = {}) {

@@ -49,6 +49,7 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "attention_rejection_applied",
   "proposal_result_applied",
   "condition_satisfied",
+  "cancelled",
 ]);
 
 const ITEM_KEYS = [
@@ -412,7 +413,8 @@ function normalizeItem(value, stateRevision, limits) {
   if (
     working !== (ownerId !== null && leaseId !== null && leaseUntil !== null) ||
     (value.status === "retry_wait") !== (availableAt !== null) ||
-    (value.kind === "system_alert" && value.status !== "blocked")
+    (value.kind === "system_alert" &&
+      !["blocked", "cancelled"].includes(value.status))
   ) {
     throw corrupted("员工工作项租约或等待状态损坏");
   }

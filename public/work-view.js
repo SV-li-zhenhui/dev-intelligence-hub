@@ -43,6 +43,7 @@ function statusLabel(status) {
     retry_wait: "等待重试",
     completed: "已完成",
     blocked: "已阻塞",
+    cancelled: "已取消",
   }[status] || status || "未知";
 }
 
@@ -672,6 +673,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       <div><span>等待</span><strong>${waiting}</strong></div>
       <div><span>阻塞</span><strong>${count(summary, "blocked")}</strong></div>
       <div><span>完成</span><strong>${count(summary, "completed")}</strong></div>
+      <div><span>取消</span><strong>${count(summary, "cancelled")}</strong></div>
     </section>
     <div class="work-safeguards" role="note">
       <span class="status-pill ${safeguards.prEmployeePaused ? "status-paused" : "status-working"}">PR 新循环：${safeguards.prEmployeePaused ? "暂停 / 旧员工独占" : "已启用"}</span>
