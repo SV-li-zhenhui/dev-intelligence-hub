@@ -197,6 +197,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     },
   };
   const ledger = {
+    graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
     async getSummary() {},
     async listItems() { return { items: [], nextCursor: null }; },
     async listTimeline() { return { items: [], nextCursor: null }; },
@@ -473,6 +474,19 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     },
   };
   const ledgerRuntime = {
+    graphReader: {
+      async getSnapshot() {
+        return { graphRevision: 7, tasks: [] };
+      },
+      async createChild() {
+        throw new Error("graph writes must remain private");
+      },
+    },
+    graphPlanner: {
+      async createChild() {
+        throw new Error("graph planner must remain private");
+      },
+    },
     async getSummary() {
       return { source: "ledger" };
     },
@@ -726,6 +740,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "listItems",
     "listTimeline",
   ]);
+  assert.deepEqual(Object.keys(application.workGraphView), ["getSnapshot"]);
+  assert.notStrictEqual(application.workGraphView, ledgerRuntime.graphReader);
+  assert.equal("createChild" in application.workGraphView, false);
   assert.deepEqual(Object.keys(application.attentionBrowser).sort(), [
     "answer",
     "later",
@@ -739,6 +756,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   for (const port of [
     application.workLedgerView,
+    application.workGraphView,
     application.attentionBrowser,
     application.attentionCoordinator,
     application.workCoordination,
@@ -748,6 +766,11 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   for (const privateName of [
     "workLedger",
     "workLedgerRuntime",
+    "graphReader",
+    "graphPlanner",
+    "workGraphPlanner",
+    "workGraphStore",
+    "createGraphChild",
     "attentionInbox",
     "attentionInboxRuntime",
     "attentionProducer",
@@ -760,6 +783,10 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   }
   assert.deepEqual(await application.workLedgerView.getSummary(), {
     source: "ledger",
+  });
+  assert.deepEqual(await application.workGraphView.getSnapshot(), {
+    graphRevision: 7,
+    tasks: [],
   });
   assert.equal(await application.workCoordination.intake(), "intake-result");
   assert.equal(
@@ -796,6 +823,7 @@ test("disabled work coordination does not acquire private runtimes or services",
 
   assert.equal(workFactoryCalls, 0);
   assert.equal(application.workLedgerView, null);
+  assert.equal(application.workGraphView, null);
   assert.equal(application.attentionBrowser, null);
   assert.equal(application.attentionCoordinator, null);
   assert.equal(application.workCoordination, null);
@@ -833,6 +861,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       async close() {},
     }),
     workLedgerRuntimeFactory: async () => ({
+      graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
       async listTimeline() { return { items: [], nextCursor: null }; },

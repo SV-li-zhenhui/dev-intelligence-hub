@@ -633,6 +633,40 @@ test("workLimit processes the oldest available items first", async () => {
   assert.equal(ledger.items[2].status, "dispatch_pending");
 });
 
+test("graph-blocked parents do not consume the claim budget before ready children", async () => {
+  const time = controlledClock();
+  const parent = workItem(1);
+  const child = workItem(2);
+  parent.graph = {
+    parentItemId: null,
+    dependsOnItemIds: [],
+    acceptanceContracts: [],
+    deliveries: [],
+  };
+  child.graph = {
+    parentItemId: parent.itemId,
+    dependsOnItemIds: [],
+    acceptanceContracts: [],
+    deliveries: [],
+  };
+  const ledger = new FakeLedger({ source: [parent, child], time });
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ workLimit: 1 });
+
+  assert.equal(result.claimAttempts, 1);
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(
+    ledger.calls.claim.map(({ itemId }) => itemId),
+    [child.itemId],
+  );
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.items[1].status, "dispatch_pending");
+});
+
 test("workLimit bounds claim attempts even when a claim is not acquired", async () => {
   const time = controlledClock();
   const ledger = new FakeLedger({

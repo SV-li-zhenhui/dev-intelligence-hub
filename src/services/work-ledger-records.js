@@ -233,6 +233,68 @@ export function createAssignmentWorkItem(envelope, createdAt) {
   });
 }
 
+export function graphChildAssignmentId(parentItemId, childKey) {
+  return `graph-assignment-${ledgerDigest({ parentItemId, childKey })}`;
+}
+
+export function graphChildDefinitionDigest(definition) {
+  return ledgerDigest({
+    parentItemId: definition.parentItemId,
+    childKey: definition.childKey,
+    work: definition.work,
+    target: definition.target,
+    dependsOnItemIds: definition.dependsOnItemIds,
+    acceptanceContract: definition.acceptanceContract,
+  });
+}
+
+export function createGraphChildWorkItem(definition, createdAt) {
+  const initialDependsOnTaskIds = [...definition.dependsOnItemIds];
+  const definitionDigest = graphChildDefinitionDigest({
+    parentItemId: definition.parentItemId,
+    childKey: definition.childKey,
+    work: definition.work,
+    target: definition.target,
+    dependsOnItemIds: initialDependsOnTaskIds,
+    acceptanceContract: definition.acceptanceContract,
+  });
+  const assignmentId = graphChildAssignmentId(
+    definition.parentItemId,
+    definition.childKey,
+  );
+  const item = createWorkItem({
+    kind: "graph_task",
+    sourceSequence: 0,
+    assignment: {
+      assignmentId,
+      eventId: definition.parentEvent.eventId,
+      target: definition.target,
+      reason: "graph_child_created",
+      graphTask: {
+        parentTaskId: definition.parentItemId,
+        childKey: definition.childKey,
+        initialDependsOnTaskIds,
+        definitionDigest,
+      },
+      work: {
+        title: definition.work.title,
+        description: definition.work.description,
+      },
+    },
+    event: structuredClone(definition.parentEvent),
+    status: "queued",
+    statusReason: null,
+    createdAt,
+  });
+  item.graph = {
+    parentItemId: definition.parentItemId,
+    dependsOnItemIds: [...initialDependsOnTaskIds],
+    acceptanceContracts: [structuredClone(definition.acceptanceContract)],
+    deliveries: [],
+  };
+  return item;
+}
+
 export function createGapAlertWorkItem(gap, createdAt) {
   const gapKey = {
     expectedSequence: gap.expectedSequence,

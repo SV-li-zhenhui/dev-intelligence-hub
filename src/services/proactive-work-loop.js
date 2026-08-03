@@ -133,6 +133,33 @@ function isAvailable(item, now) {
   );
 }
 
+function graphBlockedItemIds(items) {
+  const statusById = new Map(items.map((item) => [item.itemId, item.status]));
+  const childrenByParent = new Map();
+  for (const item of items) {
+    const parentItemId = item.graph?.parentItemId;
+    if (typeof parentItemId !== "string") continue;
+    const childIds = childrenByParent.get(parentItemId) ?? [];
+    childIds.push(item.itemId);
+    childrenByParent.set(parentItemId, childIds);
+  }
+  return new Set(
+    items
+      .filter((item) => {
+        const dependencies = item.graph?.dependsOnItemIds;
+        const blockedByDependency = Array.isArray(dependencies) &&
+          dependencies.some(
+            (dependencyId) => statusById.get(dependencyId) !== "completed",
+          );
+        const blockedByChild = (childrenByParent.get(item.itemId) ?? []).some(
+          (childId) => statusById.get(childId) !== "completed",
+        );
+        return blockedByDependency || blockedByChild;
+      })
+      .map(({ itemId }) => itemId),
+  );
+}
+
 function stableFailureCode(error) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(error, "code");
@@ -312,6 +339,7 @@ export class ProactiveWorkLoop {
   async #executeCycle(options) {
     const intake = await this.ledger.intake({ limit: options.intakeLimit });
     const items = await this.#listAllItems();
+    const graphBlocked = graphBlockedItemIds(items);
     const activeQuestions = activeQuestionTargets(items);
     const resolutions = new Map();
     const outcomes = [];
@@ -320,7 +348,12 @@ export class ProactiveWorkLoop {
 
     for (const item of items) {
       if (claimAttempts >= options.workLimit) break;
-      if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      if (
+        !isAvailable(item, normalizeLoopClock(this.clock)) ||
+        graphBlocked.has(item.itemId)
+      ) {
+        continue;
+      }
       if (
         options.roleId !== null &&
         options.roleId !== ORCHESTRATOR_ROLE_ID &&

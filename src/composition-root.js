@@ -659,6 +659,7 @@ export async function createApplication({
       ...configuredWorkforce.employees,
     ]);
     let workLedgerView = null;
+    let workGraphView = null;
     let attentionBrowser = null;
     let attentionCoordinator = null;
     let memoryProjector = null;
@@ -743,6 +744,11 @@ export async function createApplication({
         ["getSummary", "listItems", "listTimeline"],
         "workLedgerRuntime",
       );
+      workGraphView = frozenPort(
+        workLedgerRuntime.graphReader,
+        ["getSnapshot"],
+        "workLedgerRuntime.graphReader",
+      );
       attentionBrowser = frozenPort(
         attentionInboxRuntime.browser,
         ["next", "answer", "reject", "later"],
@@ -808,6 +814,7 @@ export async function createApplication({
       codeJobControl,
       codeJobEvidenceReader,
       workLedgerView,
+      workGraphView,
       attentionBrowser,
       attentionCoordinator,
       workCoordination,

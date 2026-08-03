@@ -242,6 +242,12 @@ function normalizeContract(value, limits) {
   };
 }
 
+export function normalizeWorkGraphAcceptanceContract(value, optionsValue) {
+  const options = normalizeOptions(optionsValue, ["limits"]);
+  const limitOverrides = Object.hasOwn(options, "limits") ? options.limits : {};
+  return deepFreeze(normalizeContract(value, normalizeLimits(limitOverrides)));
+}
+
 function normalizeEvidence(value) {
   exactObject(value, ["kind", "referenceId", "contentDigest"]);
   return {
@@ -745,18 +751,20 @@ function terminalAncestor(task, byId) {
   return null;
 }
 
-function pendingLeafTasks(index) {
-  return index.snapshot.tasks.filter(
-    (task) =>
-      task.status === "pending" && (index.children.get(task.taskId)?.length ?? 0) === 0,
-  );
+function pendingTasks(index) {
+  return index.snapshot.tasks.filter(({ status }) => status === "pending");
 }
 
-function blockingTaskIds(task, byId) {
+function blockingTaskIds(task, index) {
   const blockers = task.dependsOn.filter(
-    (dependencyId) => byId.get(dependencyId).status !== "completed",
+    (dependencyId) => index.byId.get(dependencyId).status !== "completed",
   );
-  const ancestor = terminalAncestor(task, byId);
+  blockers.push(
+    ...(index.children.get(task.taskId) ?? []).filter(
+      (childId) => index.byId.get(childId).status !== "completed",
+    ),
+  );
+  const ancestor = terminalAncestor(task, index.byId);
   if (ancestor !== null) blockers.push(ancestor);
   return [...new Set(blockers)].sort(compareText);
 }
@@ -764,8 +772,8 @@ function blockingTaskIds(task, byId) {
 export function getReadyWorkGraphTaskIds(snapshot, options) {
   const index = graphIndex(snapshot, options);
   return deepFreeze(
-    pendingLeafTasks(index)
-      .filter((task) => blockingTaskIds(task, index.byId).length === 0)
+    pendingTasks(index)
+      .filter((task) => blockingTaskIds(task, index).length === 0)
       .map(({ taskId }) => taskId)
       .sort(compareText),
   );
@@ -774,10 +782,10 @@ export function getReadyWorkGraphTaskIds(snapshot, options) {
 export function getBlockedWorkGraphTasks(snapshot, options) {
   const index = graphIndex(snapshot, options);
   return deepFreeze(
-    pendingLeafTasks(index)
+    pendingTasks(index)
       .map((task) => ({
         taskId: task.taskId,
-        blockingTaskIds: blockingTaskIds(task, index.byId),
+        blockingTaskIds: blockingTaskIds(task, index),
       }))
       .filter(({ blockingTaskIds: blockers }) => blockers.length > 0)
       .sort((left, right) => compareText(left.taskId, right.taskId)),
@@ -786,8 +794,8 @@ export function getBlockedWorkGraphTasks(snapshot, options) {
 
 export function getParallelReadyWorkGraphTaskIds(snapshot, options) {
   const index = graphIndex(snapshot, options);
-  const ready = pendingLeafTasks(index).filter(
-    (task) => blockingTaskIds(task, index.byId).length === 0,
+  const ready = pendingTasks(index).filter(
+    (task) => blockingTaskIds(task, index).length === 0,
   );
   const counts = new Map();
   for (const task of ready) {

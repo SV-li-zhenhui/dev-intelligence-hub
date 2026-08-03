@@ -2522,7 +2522,7 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   });
 
   assert.equal(claimed.status, "dispatching");
-  assert.equal(fixture.store.stored().schemaVersion, 3);
+  assert.equal(fixture.store.stored().schemaVersion, 4);
   assert.deepEqual(
     fixture.store.stored().items[0].graph,
     recoveredItem.graph,

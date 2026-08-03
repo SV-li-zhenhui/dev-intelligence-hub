@@ -136,13 +136,28 @@ test("ledger graph revisions and recoverable statuses follow the ledger CAS", ()
   }
 });
 
-test("schema v2 migrates to v3 without changing existing ledger facts or its caller", () => {
+test("schema v2 composes graph and identity migrations without changing ledger facts", () => {
   const current = normalizeWorkLedgerPersistedState(
     stateWithItems([createAssignmentWorkItem(assignment(1), CREATED_AT)]),
   );
   const legacy = structuredClone(current);
   legacy.schemaVersion = 2;
   for (const item of legacy.items) delete item.graph;
+  const callerSnapshot = structuredClone(legacy);
+
+  const migrated = normalizeWorkLedgerPersistedState(legacy);
+
+  assert.equal(migrated.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  assert.deepEqual(migrated, current);
+  assert.deepEqual(legacy, callerSnapshot);
+});
+
+test("schema v3 migrates identically to v4 before graph tasks are admitted", () => {
+  const current = normalizeWorkLedgerPersistedState(
+    stateWithItems([createAssignmentWorkItem(assignment(1), CREATED_AT)]),
+  );
+  const legacy = structuredClone(current);
+  legacy.schemaVersion = 3;
   const callerSnapshot = structuredClone(legacy);
 
   const migrated = normalizeWorkLedgerPersistedState(legacy);

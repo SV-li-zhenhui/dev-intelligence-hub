@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
   boundedLedgerString,
   canonicalLedgerValue,
@@ -20,9 +21,13 @@ import {
   createDefaultWorkGraphMetadata,
   normalizeWorkLedgerGraphItems,
 } from "./work-ledger-graph.js";
+import {
+  graphChildAssignmentId,
+  graphChildDefinitionDigest,
+} from "./work-ledger-records.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 3;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 4;
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
@@ -50,6 +55,8 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "proposal_result_applied",
   "condition_satisfied",
   "cancelled",
+  "graph_child_created",
+  "graph_parent_revised",
 ]);
 
 const ITEM_KEYS = [
@@ -75,6 +82,8 @@ const ITEM_KEYS = [
   "createdAt",
   "updatedAt",
 ];
+const GRAPH_CHILD_KEY =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const TIMELINE_KEYS = [
   "timelineId",
   "contentDigest",
@@ -345,6 +354,105 @@ function workLedgerCapacityView(state) {
   };
 }
 
+function assertGraphTaskProvenance(
+  kind,
+  assignmentId,
+  assignment,
+  event,
+  graph,
+) {
+  if (kind !== "graph_task") return;
+  if (
+    assignment.reason !== "graph_child_created" ||
+    !hasExactLedgerKeys(assignment.graphTask, [
+      "parentTaskId",
+      "childKey",
+      "initialDependsOnTaskIds",
+      "definitionDigest",
+    ]) ||
+    !hasExactLedgerKeys(assignment.work, ["title", "description"])
+  ) {
+    throw corrupted("图任务来源字段损坏");
+  }
+  const parentTaskId = safeString(
+    assignment.graphTask.parentTaskId,
+    "graphTask.parentTaskId",
+    192,
+  );
+  const childKey = safeString(
+    assignment.graphTask.childKey,
+    "graphTask.childKey",
+    128,
+  );
+  const title = safeString(assignment.work.title, "graphTask.work.title", 256);
+  const description = safeString(
+    assignment.work.description,
+    "graphTask.work.description",
+    16 * 1024,
+  );
+  const initialDependsOnTaskIds = denseLedgerArrayValues(
+    assignment.graphTask.initialDependsOnTaskIds,
+  );
+  const currentDependsOnTaskIds = denseLedgerArrayValues(
+    graph.dependsOnItemIds,
+  );
+  const acceptanceContracts = denseLedgerArrayValues(graph.acceptanceContracts);
+  if (
+    !GRAPH_CHILD_KEY.test(childKey) ||
+    !SHA256_PATTERN.test(assignment.graphTask.definitionDigest) ||
+    graph.parentItemId !== parentTaskId ||
+    assignmentId !== graphChildAssignmentId(parentTaskId, childKey) ||
+    initialDependsOnTaskIds === null ||
+    initialDependsOnTaskIds.length > 128 ||
+    currentDependsOnTaskIds === null ||
+    acceptanceContracts === null ||
+    acceptanceContracts.length < 1
+  ) {
+    throw corrupted("图任务来源绑定损坏");
+  }
+  const normalizedInitialDependencies = initialDependsOnTaskIds.map(
+    (taskId) => safeString(taskId, "graphTask.initialDependsOnTaskIds", 192),
+  );
+  const sortedInitialDependencies = [...normalizedInitialDependencies].sort();
+  if (
+    new Set(normalizedInitialDependencies).size !==
+      normalizedInitialDependencies.length ||
+    normalizedInitialDependencies.some(
+      (taskId, index) => taskId !== sortedInitialDependencies[index],
+    ) ||
+    currentDependsOnTaskIds.length !== normalizedInitialDependencies.length ||
+    currentDependsOnTaskIds.some(
+      (taskId, index) => taskId !== normalizedInitialDependencies[index],
+    )
+  ) {
+    throw corrupted("图任务初始依赖损坏");
+  }
+  let expectedDefinitionDigest;
+  try {
+    expectedDefinitionDigest = graphChildDefinitionDigest({
+      parentItemId: parentTaskId,
+      childKey,
+      work: { title, description },
+      target: assignment.target,
+      dependsOnItemIds: normalizedInitialDependencies,
+      acceptanceContract: acceptanceContracts[0],
+    });
+  } catch {
+    throw corrupted("图任务定义摘要损坏");
+  }
+  if (assignment.graphTask.definitionDigest !== expectedDefinitionDigest) {
+    throw corrupted("图任务定义摘要损坏");
+  }
+  try {
+    const normalizedEvent = normalizeStoredWorkflowEvent(event);
+    if (assignment.eventId !== normalizedEvent.eventId) {
+      throw new Error("event binding mismatch");
+    }
+  } catch {
+    throw corrupted("图任务来源事件损坏");
+  }
+}
+
 function normalizeItem(value, stateRevision, limits) {
   if (!hasExactLedgerKeys(value, ITEM_KEYS)) {
     throw corrupted("员工工作项字段损坏");
@@ -382,11 +490,12 @@ function normalizeItem(value, stateRevision, limits) {
   if (
     value.inputDigest !== inputDigest ||
     value.itemId !== expectedItemId ||
-    !["assignment", "system_alert"].includes(value.kind) ||
+    !["assignment", "system_alert", "graph_task"].includes(value.kind) ||
     !Number.isSafeInteger(value.sourceSequence) ||
     value.sourceSequence < 0 ||
-    (value.kind === "assignment" && value.sourceSequence < 1) ||
-    (value.kind === "system_alert" && value.sourceSequence !== 0) ||
+    (value.kind === "assignment"
+      ? value.sourceSequence < 1
+      : value.sourceSequence !== 0) ||
     !WORK_LEDGER_STATUSES.has(value.status) ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 1 ||
@@ -396,6 +505,13 @@ function normalizeItem(value, stateRevision, limits) {
   ) {
     throw corrupted("员工工作项状态损坏");
   }
+  assertGraphTaskProvenance(
+    value.kind,
+    assignmentId,
+    assignment,
+    event,
+    graph,
+  );
   const ownerId = optionalString(value.ownerId, "ownerId", 128);
   const leaseId = optionalString(value.leaseId, "leaseId", 128);
   const leaseUntil = value.leaseUntil === null
@@ -661,12 +777,32 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   ) {
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: 3,
       items: schema2Items.map((item) => ({
         ...item,
         graph: createDefaultWorkGraphMetadata(),
       })),
     };
+  }
+  if (
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+    ]) &&
+    value.schemaVersion === 3
+  ) {
+    value = { ...value, schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION };
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
     "schemaVersion",

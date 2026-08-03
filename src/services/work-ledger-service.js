@@ -9,7 +9,10 @@ import {
 import { planAttentionBatchApplication } from "./work-ledger-attention-commands.js";
 import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
-import { planWorkGraphCancellation } from "./work-ledger-graph-commands.js";
+import {
+  planWorkGraphCancellation,
+  planWorkGraphChildCreation,
+} from "./work-ledger-graph-commands.js";
 import {
   planIntentAcknowledgement,
   planIntentClaim,
@@ -44,7 +47,10 @@ import {
   WORK_LEDGER_OUTBOX_STATUSES,
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
-import { validateWorkLedgerGraphTransition } from "./work-ledger-graph.js";
+import {
+  projectWorkLedgerGraphView,
+  validateWorkLedgerGraphTransition,
+} from "./work-ledger-graph.js";
 
 function queryPage(records, idName, options = {}, allowedStatuses = null) {
   if (!isPlainLedgerObject(options)) {
@@ -217,6 +223,11 @@ export class WorkLedgerService {
     );
   }
 
+  async getGraphSnapshot() {
+    this.#assertReady();
+    return projectWorkLedgerGraphView(this.state);
+  }
+
   async intake({ limit = 100 } = {}) {
     this.#assertReady();
     const batchLimit = validatePositiveLimit(
@@ -286,6 +297,10 @@ export class WorkLedgerService {
 
   async cancelGraphTask(input = {}) {
     return this.#executeCommand(planWorkGraphCancellation, input);
+  }
+
+  async createGraphChild(input = {}) {
+    return this.#executeCommand(planWorkGraphChildCreation, input);
   }
 
   async stageIntent(input = {}) {

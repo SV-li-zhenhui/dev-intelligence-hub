@@ -133,6 +133,48 @@ function denseItems(value) {
   return items;
 }
 
+function freezeProjection(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  for (const child of Object.values(value)) freezeProjection(child);
+  return Object.freeze(value);
+}
+
+function projectedItemWork(item) {
+  const assignmentEntries = ledgerDataEntries(item.get("assignment"));
+  const eventEntries = ledgerDataEntries(item.get("event"));
+  if (!assignmentEntries || !eventEntries) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+      "工作项说明不是安全的数据对象",
+    );
+  }
+  const assignment = new Map(assignmentEntries);
+  const event = new Map(eventEntries);
+  const source = item.get("kind") === "graph_task"
+    ? assignment.get("work")
+    : new Map(ledgerDataEntries(event.get("payload")) ?? []);
+  const entries = source instanceof Map ? source : new Map(
+    ledgerDataEntries(source) ?? [],
+  );
+  const title = entries.get("title");
+  const description = entries.get("description");
+  if (
+    item.get("kind") === "graph_task" &&
+    (typeof title !== "string" || typeof description !== "string")
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+      "图任务缺少工作说明",
+    );
+  }
+  return {
+    title: typeof title === "string" ? title : null,
+    description: typeof description === "string" ? description : null,
+  };
+}
+
 export function projectWorkLedgerGraphSnapshot(state, options) {
   const stateEntries = ledgerDataEntries(state);
   if (!stateEntries) {
@@ -158,6 +200,51 @@ export function projectWorkLedgerGraphSnapshot(state, options) {
     },
     options,
   );
+}
+
+export function projectWorkLedgerGraphView(state, options) {
+  const graph = projectWorkLedgerGraphSnapshot(state, options);
+  const stateEntries = ledgerDataEntries(state);
+  const fields = new Map(stateEntries);
+  const itemsById = new Map(
+    denseItems(fields.get("items")).map((item) => {
+      const entries = ledgerDataEntries(item);
+      if (!entries) {
+        throw workLedgerError(
+          "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+          "工作项运行状态不是安全的数据对象",
+        );
+      }
+      const itemFields = new Map(entries);
+      return [itemFields.get("itemId"), itemFields];
+    }),
+  );
+  const taskStates = graph.tasks.map((task) => {
+    const item = itemsById.get(task.taskId);
+    if (!item || item.get("revision") !== task.revision) {
+      throw workLedgerError(
+        "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+        "工作图与台账运行状态修订不一致",
+      );
+    }
+    workLedgerStatusToGraphStatus(item.get("status"));
+    return {
+      taskId: task.taskId,
+      taskRevision: task.revision,
+      ledgerStatus: item.get("status"),
+      ownerId: item.get("ownerId"),
+      leaseUntil: item.get("leaseUntil"),
+      availableAt: item.get("availableAt"),
+      statusReason: item.get("statusReason"),
+      updatedAt: item.get("updatedAt"),
+      work: projectedItemWork(item),
+    };
+  });
+  return freezeProjection({
+    schemaVersion: 1,
+    graph,
+    taskStates,
+  });
 }
 
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
@@ -189,7 +276,10 @@ export function assertWorkLedgerGraphClaimable(state, itemId) {
   const blockedByDependency = task.dependsOn.some(
     (dependencyId) => byId.get(dependencyId).status !== "completed",
   );
-  if (children.length > 0 || blockedByDependency) {
+  const blockedByChild = children.some(
+    ({ status }) => status !== "completed",
+  );
+  if (blockedByChild || blockedByDependency) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_BLOCKED",
       "工作项仍有子任务或未完成依赖，当前不可领取",

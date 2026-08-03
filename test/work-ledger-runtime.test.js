@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 
 class MemoryStore {
@@ -15,6 +16,36 @@ class MemoryStore {
   async write(_name, value) {
     this.value = structuredClone(value);
     this.writes += 1;
+  }
+}
+
+class PausableMemoryStore extends MemoryStore {
+  constructor() {
+    super();
+    this.nextWriteGate = null;
+  }
+
+  pauseNextWrite() {
+    let release;
+    let markStarted;
+    const started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+    const released = new Promise((resolve) => {
+      release = resolve;
+    });
+    this.nextWriteGate = { markStarted, released };
+    return Object.freeze({ started, release });
+  }
+
+  async write(name, value) {
+    const gate = this.nextWriteGate;
+    if (gate) {
+      this.nextWriteGate = null;
+      gate.markStarted();
+      await gate.released;
+    }
+    return super.write(name, value);
   }
 }
 
@@ -65,7 +96,75 @@ function emptySource(events = []) {
   };
 }
 
-test("runtime owns one named process guard and exposes only ledger operations", async () => {
+function oneAssignmentSource() {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "issue.created",
+    occurredAt: "2026-08-02T02:00:00.000Z",
+    source: { provider: "github", scopeId: "test-dashboard" },
+    subject: {
+      id: "issue-runtime-1",
+      repository: "acme/dashboard",
+      number: 1,
+    },
+    payload: { number: 1, title: "Runtime graph integration" },
+  });
+  const record = {
+    sequence: 1,
+    assignment: {
+      assignmentId: "assignment-runtime-1",
+      eventId: event.eventId,
+      target: { type: "role", id: "orchestrator" },
+      reason: "test",
+    },
+    event,
+  };
+  return {
+    async readAssignmentBatch({ afterSequence }) {
+      const items = afterSequence < 1 ? [record] : [];
+      return structuredClone({
+        items,
+        nextSequence: items.length ? 1 : afterSequence,
+        highWatermark: 1,
+        oldestAvailableSequence: 1,
+      });
+    },
+  };
+}
+
+function graphChildCommand(parent, graphRevision) {
+  return {
+    parentTaskId: parent.itemId,
+    childKey: "runtime-child",
+    work: {
+      title: "运行时子任务",
+      description: "验证共享图端口和关闭排空语义。",
+    },
+    target: { type: "role", id: "developer" },
+    dependsOnTaskIds: [],
+    acceptanceContract: {
+      revision: 1,
+      acceptanceCriteria: [
+        { criterionId: "verified", description: "运行时验证通过" },
+      ],
+      expectedDeliverables: [
+        {
+          deliverableId: "test-report",
+          kind: "test-report",
+          description: "测试结果",
+          required: true,
+        },
+      ],
+    },
+    leaseId: null,
+    expectedGraphRevision: graphRevision,
+    expectedTaskRevisions: [
+      { taskId: parent.itemId, revision: parent.revision },
+    ],
+  };
+}
+
+test("runtime owns one named process guard and exposes least-authority graph ports", async () => {
   const events = [];
   const runtime = await createWorkLedgerRuntime({
     store: new MemoryStore(),
@@ -95,7 +194,17 @@ test("runtime owns one named process guard and exposes only ledger operations", 
   ]) {
     assert.equal(typeof runtime[method], "function", method);
   }
+  assert.equal(Object.isFrozen(runtime.graphReader), true);
+  assert.equal(Object.isFrozen(runtime.graphPlanner), true);
+  assert.deepEqual(Object.keys(runtime.graphReader), ["getSnapshot"]);
+  assert.deepEqual(Object.keys(runtime.graphPlanner), ["createChild"]);
+  assert.equal(runtime.getGraphSnapshot, undefined);
+  assert.equal(runtime.createGraphChild, undefined);
+  assert.equal(runtime.graphStore, undefined);
   assert.deepEqual(events.slice(0, 2), ["acquire", "run"]);
+
+  const graphSnapshot = await runtime.graphReader.getSnapshot();
+  assert.equal(graphSnapshot.graph.revision, 0);
 
   const intake = await runtime.intake();
   assert.equal(intake.cursor, 0);
@@ -108,6 +217,51 @@ test("runtime owns one named process guard and exposes only ledger operations", 
   const secondClose = runtime.close();
   assert.strictEqual(firstClose, secondClose);
   await firstClose;
+  assert.equal(events.filter((event) => event === "close").length, 1);
+  await assert.rejects(
+    runtime.getSummary(),
+    (error) =>
+      error.code === "WORK_LEDGER_RUNTIME_CLOSED" && error.statusCode === 503,
+  );
+  await assert.rejects(
+    runtime.graphReader.getSnapshot(),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    runtime.graphPlanner.createChild({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+});
+
+test("runtime drains an accepted graph write before closing its sole guard", async () => {
+  const events = [];
+  const store = new PausableMemoryStore();
+  const runtime = await createWorkLedgerRuntime({
+    store,
+    assignmentSource: oneAssignmentSource(),
+    clock: () => "2026-08-02T02:00:00.000Z",
+    idFactory: () => "lease-runtime-graph-1",
+    createGuard: guardFactory(events),
+  });
+  await runtime.intake();
+  const parent = (await runtime.listItems()).items[0];
+  const graph = await runtime.graphReader.getSnapshot();
+  const gate = store.pauseNextWrite();
+
+  const creation = runtime.graphPlanner.createChild(
+    graphChildCommand(parent, graph.graph.revision),
+  );
+  await gate.started;
+  const closing = runtime.close();
+  await Promise.resolve();
+  assert.equal(events.includes("close"), false);
+
+  gate.release();
+  const result = await creation;
+  await closing;
+
+  assert.equal(result.applied, true);
+  assert.equal(events.at(-1), "close");
   assert.equal(events.filter((event) => event === "close").length, 1);
 });
 

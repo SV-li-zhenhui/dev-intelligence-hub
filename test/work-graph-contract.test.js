@@ -881,6 +881,33 @@ test("computes blocked, ready, and sibling-parallel leaf tasks", () => {
   ]);
 });
 
+test("pending parents are blocked only until every direct child completes", () => {
+  const pendingChild = createWorkGraphSnapshot(
+    draft([
+      task("root"),
+      task("child", { parentTaskId: "root" }),
+    ]),
+  );
+  assert.deepEqual(getReadyWorkGraphTaskIds(pendingChild), ["child"]);
+  assert.deepEqual(getBlockedWorkGraphTasks(pendingChild), [
+    { taskId: "root", blockingTaskIds: ["child"] },
+  ]);
+
+  const completedChild = createWorkGraphSnapshot(
+    draft([
+      task("root"),
+      task("child", {
+        revision: 2,
+        parentTaskId: "root",
+        status: "completed",
+        deliveries: [delivery()],
+      }),
+    ]),
+  );
+  assert.deepEqual(getReadyWorkGraphTaskIds(completedChild), ["root"]);
+  assert.deepEqual(getBlockedWorkGraphTasks(completedChild), []);
+});
+
 test("derives parent pending, partial, completed, failed, and cancelled outcomes", () => {
   const parent = task("root", {
     status: "in_progress",
