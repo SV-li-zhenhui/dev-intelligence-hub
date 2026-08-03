@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  normalizeOrchestrationIntent,
+  normalizeSubmitDeliveryIntent,
+} from "./orchestration-intent.js";
 
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -9,6 +13,8 @@ const INTENT_TYPES = new Set([
   "propose_code_action",
   "handoff",
   "complete",
+  "orchestrate",
+  "submit_delivery",
 ]);
 const REVIEW_VERDICTS = new Set(["approve", "request_changes", "comment"]);
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
@@ -189,6 +195,22 @@ function normalizeEvidence(value) {
   return stringList(value, "evidence", 20, 2_048);
 }
 
+function orchestrationAction(value) {
+  try {
+    return normalizeOrchestrationIntent(value);
+  } catch {
+    invalid("action 无效");
+  }
+}
+
+function specialistDeliveryIntent(value) {
+  try {
+    return normalizeSubmitDeliveryIntent(value);
+  } catch {
+    invalid("submit_delivery intent 无效");
+  }
+}
+
 function normalizeIntentVariant(value) {
   const typeEntries = plainDataEntries(value);
   const type = typeEntries.find(([key]) => key === "type")?.[1];
@@ -319,6 +341,24 @@ function normalizeIntentVariant(value) {
         evidence: normalizeEvidence(entries.get("evidence")),
       };
     }
+    case "orchestrate": {
+      const keys = [
+        "schemaVersion",
+        "type",
+        "summary",
+        "reason",
+        "action",
+      ];
+      const entries = exactObject(value, keys);
+      const normalizedCommon = common(value, keys);
+      const action = orchestrationAction(entries.get("action"));
+      if (normalizedCommon.reason !== action.reason) {
+        invalid("orchestrate reason 必须与 action.reason 一致");
+      }
+      return { ...normalizedCommon, action };
+    }
+    case "submit_delivery":
+      return specialistDeliveryIntent(value);
     default:
       invalid("type 无效");
   }

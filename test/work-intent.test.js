@@ -6,6 +6,10 @@ import {
   normalizeWorkIntent,
   workIntentDigest,
 } from "../src/domain/work-intent.js";
+import {
+  WORK_DECISION_JSON_SCHEMA,
+  parseStructuredWorkDecision,
+} from "../src/domain/structured-brain-contract.js";
 
 function common(type) {
   return {
@@ -22,6 +26,46 @@ function assertInvalid(value) {
     (error) =>
       error instanceof WorkIntentError && error.code === "WORK_INTENT_INVALID",
   );
+}
+
+function orchestrationAction(type = "pause") {
+  return {
+    schemaVersion: 1,
+    type,
+    sourceTaskId: "work-item-root",
+    sourceTaskRevision: 4,
+    expectedGraphRevision: 8,
+    reason: "等待当前依赖恢复",
+  };
+}
+
+function orchestrateIntent(type = "pause") {
+  const action = orchestrationAction(type);
+  return {
+    ...common("orchestrate"),
+    reason: action.reason,
+    action,
+  };
+}
+
+function submitDeliveryIntent() {
+  return {
+    schemaVersion: 1,
+    type: "submit_delivery",
+    taskId: "work-item-development",
+    expectedTaskRevision: 6,
+    expectedGraphRevision: 9,
+    contractRevision: 1,
+    deliverableId: "implementation",
+    summary: "实现和聚焦测试已经完成",
+    reason: "当前证据满足提交条件",
+    evidence: [{
+      kind: "change-package",
+      referenceId: "change-package:development:1",
+      contentDigest: "a".repeat(64),
+    }],
+    artifact: null,
+  };
 }
 
 test("normalizes every bounded employee intent without trusted targets", () => {
@@ -125,6 +169,62 @@ test("a brain decision binds confidence and one exact structured intent", () => 
       checkAfterSeconds: 180,
       summary: decision.intent.summary,
     }),
+  );
+});
+
+test("normalizes orchestration wrappers and direct specialist deliveries", () => {
+  const orchestrate = normalizeWorkIntent(orchestrateIntent());
+  const delivery = normalizeWorkIntent(submitDeliveryIntent());
+
+  assert.equal(orchestrate.type, "orchestrate");
+  assert.equal(orchestrate.reason, orchestrate.action.reason);
+  assert.equal(orchestrate.action.type, "pause");
+  assert.equal(delivery.type, "submit_delivery");
+  assert.equal(delivery.deliverableId, "implementation");
+  assert.match(workIntentDigest(orchestrate), /^[a-f0-9]{64}$/);
+  assert.match(workIntentDigest(delivery), /^[a-f0-9]{64}$/);
+});
+
+test("rejects orchestration reason mismatch and authority fields at either boundary", () => {
+  const actionAuthority = orchestrateIntent();
+  actionAuthority.action = { ...actionAuthority.action, actorId: "owner" };
+  const deliveryAuthority = { ...submitDeliveryIntent(), leaseId: "lease-1" };
+
+  for (const candidate of [
+    { ...orchestrateIntent(), reason: "与 action 不一致" },
+    { ...orchestrateIntent(), scopeRootTaskId: "work-item-root" },
+    actionAuthority,
+    deliveryAuthority,
+  ]) {
+    assertInvalid(candidate);
+  }
+});
+
+test("structured brain parser accepts orchestration and delivery decisions", () => {
+  for (const intent of [orchestrateIntent(), submitDeliveryIntent()]) {
+    const decision = {
+      schemaVersion: 1,
+      confidence: 90,
+      summary: "已形成受约束的下一步",
+      intent,
+    };
+    assert.deepEqual(
+      parseStructuredWorkDecision(JSON.stringify(decision)),
+      normalizeWorkDecision(decision),
+    );
+  }
+
+  const variants = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf;
+  assert.equal(
+    variants.some(({ properties }) =>
+      properties?.type?.const === "orchestrate" &&
+      properties.action?.oneOf?.length === 7),
+    true,
+  );
+  assert.equal(
+    variants.some(({ properties }) =>
+      properties?.type?.const === "submit_delivery"),
+    true,
   );
 });
 

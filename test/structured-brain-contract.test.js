@@ -34,7 +34,20 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     "summary",
     "intent",
   ]);
-  assert.equal(WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.length, 6);
+  const intentVariants = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf;
+  assert.equal(intentVariants.length, 8);
+  assert.equal(
+    intentVariants.find(
+      ({ properties }) => properties?.type?.const === "orchestrate",
+    ).properties.action.oneOf.length,
+    7,
+  );
+  assert.equal(
+    intentVariants.find(
+      ({ properties }) => properties?.type?.const === "submit_delivery",
+    ).oneOf.length,
+    2,
+  );
   assert.equal(Object.isFrozen(WORK_DECISION_JSON_SCHEMA), true);
   assert.equal(
     WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.every(

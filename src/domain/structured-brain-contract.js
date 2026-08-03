@@ -1,4 +1,8 @@
 import { normalizeWorkDecision } from "./work-intent.js";
+import {
+  ORCHESTRATION_INTENT_JSON_SCHEMA,
+  SUBMIT_DELIVERY_INTENT_JSON_SCHEMA,
+} from "./orchestration-intent.js";
 
 const DEFAULT_MAXIMUM_BYTES = 128 * 1024;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
@@ -157,6 +161,10 @@ const intentVariants = [
     outcome: { type: "string", enum: ["done", "no-action"] },
     evidence,
   }),
+  intentSchema("orchestrate", {
+    action: ORCHESTRATION_INTENT_JSON_SCHEMA,
+  }),
+  SUBMIT_DELIVERY_INTENT_JSON_SCHEMA,
 ];
 
 function deepFreeze(value) {

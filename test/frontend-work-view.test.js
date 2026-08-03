@@ -104,6 +104,7 @@ test("work view escapes records and clearly displays safety posture", () => {
     summary: {
       itemCounts: {
         queued: 2,
+        paused: 5,
         working: 1,
         blocked: 3,
         completed: 4,
@@ -113,7 +114,7 @@ test("work view escapes records and clearly displays safety posture", () => {
     },
     items: [{
       assignmentId: "assignment-1",
-      status: "waiting_user",
+      status: "paused",
       currentTarget: { type: "role", id: "requirements-analyst" },
       event: {
         eventType: "issue.updated",
@@ -161,7 +162,9 @@ test("work view escapes records and clearly displays safety posture", () => {
 
   assert.match(html, /PR 新循环：暂停 \/ 旧员工独占/);
   assert.match(html, /GitHub 外部写：关闭/);
+  assert.match(html, /<span>暂停<\/span><strong>5<\/strong>/);
   assert.match(html, /<span>取消<\/span><strong>1<\/strong>/);
+  assert.match(html, /status-paused[^>]*>已暂停/);
   assert.match(html, /requirements-analyst/);
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert/);

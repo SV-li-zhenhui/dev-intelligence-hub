@@ -7,6 +7,7 @@ const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const TASK_STATUSES = new Set([
   "pending",
+  "paused",
   "in_progress",
   "completed",
   "failed",
@@ -451,7 +452,9 @@ function assertReferencesAndHierarchy(tasks, limits) {
     if (
       ["failed", "cancelled"].includes(task.status) &&
       childIds.some((childId) =>
-        ["pending", "in_progress"].includes(byId.get(childId).status),
+        ["pending", "paused", "in_progress"].includes(
+          byId.get(childId).status,
+        ),
       )
     ) {
       throw invalid("终态父任务仍有活动的直接子任务");
@@ -856,7 +859,9 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
   const failedTaskIds = statusIds("failed");
   const cancelledTaskIds = statusIds("cancelled");
   const activeTaskIds = children
-    .filter((task) => ["pending", "in_progress"].includes(task.status))
+    .filter((task) =>
+      ["pending", "paused", "in_progress"].includes(task.status)
+    )
     .map(({ taskId: childId }) => childId)
     .sort(compareText);
 

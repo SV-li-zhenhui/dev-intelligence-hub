@@ -22,6 +22,8 @@ import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
+import { OrchestratorService } from "./services/orchestrator-service.js";
+import { RoleContextAssembler } from "./services/role-context-assembler.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { RefreshService } from "./services/refresh-service.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
@@ -170,6 +172,9 @@ export async function createApplication({
   workProposalRunnerGroupFactory = createWorkProposalRunnerGroup,
   workConditionWakerFactory = (options) => new WorkConditionWaker(options),
   proactiveWorkLoopFactory = (options) => new ProactiveWorkLoop(options),
+  roleContextAssemblerFactory = (options) =>
+    new RoleContextAssembler(options),
+  orchestratorServiceFactory = (options) => new OrchestratorService(options),
   workIntentDispatcherFactory = (options) =>
     new WorkIntentDispatcher(options),
   workCoordinationFactory = (options) =>
@@ -682,6 +687,24 @@ export async function createApplication({
         ...clockOptions,
         maximumAgeMs: coordinationConfig.factMaximumAgeMs,
       });
+      const roleContextAssembler = roleContextAssemblerFactory({
+        graphReader: workLedgerRuntime.graphReader,
+        factSource,
+      });
+      const orchestratorService = orchestratorServiceFactory({
+        contextAssembler: roleContextAssembler,
+        graphReader: workLedgerRuntime.graphReader,
+        scopedGraphPlannerFactory:
+          workLedgerRuntime.scopedGraphPlannerFactory,
+        graphDelivererFactory: workLedgerRuntime.graphDelivererFactory,
+        capabilityRoles: coordinationConfig.policy?.capabilityRoles || {},
+        ...(workCoordinationDependencies.evidenceVerifier
+          ? {
+              evidenceVerifier:
+                workCoordinationDependencies.evidenceVerifier,
+            }
+          : {}),
+      });
       const attentionResultReconciler = attentionResultReconcilerFactory({
         attentionConsumer: attentionInboxRuntime.consumer,
         ledger: workLedgerRuntime,
@@ -699,6 +722,8 @@ export async function createApplication({
       const workLoop = proactiveWorkLoopFactory({
         ledger: workLedgerRuntime,
         roleDirectory,
+        roleContextAssembler,
+        orchestratorService,
         ...clockOptions,
         leaseDurationMs: coordinationConfig.leaseDurationMs,
         maxAttempts: coordinationConfig.maxAttempts,

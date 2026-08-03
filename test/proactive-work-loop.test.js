@@ -46,6 +46,12 @@ function workItem(number, target = { type: "role", id: "pr-reviewer" }) {
       subject: { id: `github:pr:acme/repo#${number}` },
       payload: { number },
     },
+    graph: {
+      parentItemId: null,
+      dependsOnItemIds: [],
+      acceptanceContracts: [],
+      deliveries: [],
+    },
     currentTarget: clone(target),
     activeIntentId: null,
     decisionContext: null,
@@ -769,4 +775,688 @@ test("role timeouts must be strictly shorter than the work lease", () => {
     }),
     /shorter than leaseDurationMs/,
   );
+});
+
+function contextPacket(item, roleId) {
+  return {
+    schemaVersion: 1,
+    binding: { taskId: item.itemId, roleId },
+    context: { requirements: { taskId: item.itemId } },
+    acceptedInputs: [],
+    contextDigest: "a".repeat(64),
+  };
+}
+
+function deliveryDecision(item) {
+  return {
+    schemaVersion: 1,
+    confidence: 91,
+    summary: "交付当前岗位成果",
+    intent: {
+      schemaVersion: 1,
+      type: "submit_delivery",
+      taskId: item.itemId,
+      expectedTaskRevision: item.revision,
+      expectedGraphRevision: 7,
+      contractRevision: 1,
+      deliverableId: "implementation",
+      summary: "实现和验证均已完成",
+      reason: "满足当前交付契约",
+      evidence: [],
+      artifact: null,
+    },
+  };
+}
+
+function orchestrationDecision(item, actionType = "pause") {
+  const reason = "根据共享任务图推进";
+  return {
+    schemaVersion: 1,
+    confidence: 92,
+    summary: "协调直属任务",
+    intent: {
+      schemaVersion: 1,
+      type: "orchestrate",
+      summary: "协调直属任务",
+      reason,
+      action: {
+        schemaVersion: 1,
+        type: actionType,
+        sourceTaskId: item.itemId,
+        sourceTaskRevision: item.revision,
+        expectedGraphRevision: 7,
+        reason,
+      },
+    },
+  };
+}
+
+test("trusted specialist claims, assembles, decides, and submits without staging", async () => {
+  const time = controlledClock();
+  const source = workItem(31, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const order = [];
+  const originalClaim = ledger.claim.bind(ledger);
+  ledger.claim = async (input) => {
+    order.push("claim");
+    return originalClaim(input);
+  };
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      decide: async ({ item, context }) => {
+        order.push("decide");
+        assert.deepEqual(context, { requirements: { taskId: item.itemId } });
+        return deliveryDecision(item);
+      },
+    }),
+  });
+  const assembler = {
+    async assemble({ roleId, item }) {
+      order.push("assemble");
+      return contextPacket(item, roleId);
+    },
+  };
+  const executions = [];
+  const service = {
+    async execute(input) {
+      order.push("execute");
+      executions.push(clone(input));
+      return { applied: true, deliveryRevision: 1 };
+    },
+  };
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: assembler,
+    orchestratorService: service,
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.deepEqual(order, ["claim", "assemble", "decide", "execute"]);
+  assert.equal(cycle.submittedDeliveries, 1);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(executions[0].item.ownerId, "employee-developer");
+  assert.equal(executions[0].contextPacket.binding.roleId, "developer");
+  assert.equal(executions[0].intent.type, "submit_delivery");
+});
+
+test("trusted specialist retries assembler and delivery-service failures", async (t) => {
+  for (const failurePoint of ["assembler", "service"]) {
+    await t.test(failurePoint, async () => {
+      const time = controlledClock();
+      const source = workItem(
+        failurePoint === "assembler" ? 70 : 71,
+        { type: "role", id: "developer" },
+      );
+      const ledger = new FakeLedger({ source: [source], time });
+      let assembleCalls = 0;
+      let decisionCalls = 0;
+      let serviceCalls = 0;
+      let successfulSubmissions = 0;
+      const directory = new FakeRoleDirectory({
+        developer: worker({
+          roleId: "developer",
+          decide: async ({ item }) => {
+            decisionCalls += 1;
+            return deliveryDecision(item);
+          },
+        }),
+      });
+      const loop = createLoop({
+        ledger,
+        directory,
+        time,
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            assembleCalls += 1;
+            if (failurePoint === "assembler" && assembleCalls === 1) {
+              throw new Error("context temporarily unavailable");
+            }
+            return contextPacket(item, roleId);
+          },
+        },
+        orchestratorService: {
+          async execute() {
+            serviceCalls += 1;
+            if (failurePoint === "service" && serviceCalls === 1) {
+              throw new Error("delivery service temporarily unavailable");
+            }
+            successfulSubmissions += 1;
+            return { applied: true, deliveryRevision: 1 };
+          },
+        },
+      });
+
+      const first = await loop.runCycle({ roleId: "developer" });
+
+      assert.equal(first.retried, 1);
+      assert.equal(first.submittedDeliveries, 0);
+      assert.equal(ledger.items[0].status, "retry_wait");
+      assert.equal(ledger.calls.scheduleRetry.length, 1);
+      assert.equal(ledger.calls.stageIntent.length, 0);
+
+      time.advance(1_000);
+      const second = await loop.runCycle({ roleId: "developer" });
+
+      assert.equal(second.submittedDeliveries, 1);
+      assert.equal(successfulSubmissions, 1);
+      assert.equal(ledger.calls.claim.length, 2);
+      assert.equal(ledger.calls.scheduleRetry.length, 1);
+      assert.equal(ledger.calls.stageIntent.length, 0);
+      assert.equal(assembleCalls, 2);
+      assert.equal(
+        decisionCalls,
+        failurePoint === "assembler" ? 1 : 2,
+      );
+      assert.equal(serviceCalls, failurePoint === "assembler" ? 1 : 2);
+    });
+  }
+});
+
+test("trusted specialist generic decisions retain the durable stage path", async () => {
+  const time = controlledClock();
+  const source = workItem(32, { type: "role", id: "tester" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory({
+    tester: worker({ roleId: "tester", decide: async () => completeDecision() }),
+  });
+  let serviceCalls = 0;
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        serviceCalls += 1;
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "tester" });
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(serviceCalls, 0);
+  assert.equal(ledger.calls.stageIntent.length, 1);
+});
+
+test("a child-blocked configured root orchestrates without obtaining a lease", async () => {
+  const time = controlledClock();
+  const root = workItem(40, { type: "role", id: "orchestrator" });
+  const child = workItem(41, { type: "role", id: "developer" });
+  child.graph = { parentItemId: root.itemId, dependsOnItemIds: [] };
+  const ledger = new FakeLedger({ source: [root, child], time });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async ({ item }) => orchestrationDecision(item),
+    }),
+    developer: worker({ roleId: "developer" }),
+  });
+  const executions = [];
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute(input) {
+        executions.push(clone(input));
+        return { applied: true };
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.orchestrated, 1);
+  assert.equal(cycle.claimed, 0);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(executions[0].item.status, "queued");
+});
+
+test("a child-blocked root generic decision stays unclaimed", async () => {
+  const time = controlledClock();
+  const root = workItem(42, { type: "role", id: "orchestrator" });
+  const child = workItem(43, { type: "role", id: "developer" });
+  child.graph = { parentItemId: root.itemId, dependsOnItemIds: [] };
+  const ledger = new FakeLedger({ source: [root, child], time });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async () => completeDecision(),
+    }),
+    developer: worker({ roleId: "developer" }),
+  });
+  let serviceCalls = 0;
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        serviceCalls += 1;
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.outcomes[0].status, "graph_blocked");
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(serviceCalls, 0);
+});
+
+test("a ready root decides before claiming and staging a generic intent", async () => {
+  const time = controlledClock();
+  const root = workItem(44, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [root], time });
+  const order = [];
+  const originalClaim = ledger.claim.bind(ledger);
+  const originalStage = ledger.stageIntent.bind(ledger);
+  ledger.claim = async (input) => {
+    order.push("claim");
+    return originalClaim(input);
+  };
+  ledger.stageIntent = async (input) => {
+    order.push("stage");
+    return originalStage(input);
+  };
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async () => {
+        order.push("decide");
+        return completeDecision();
+      },
+    }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        order.push("assemble");
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.deepEqual(order, ["assemble", "decide", "claim", "stage"]);
+  assert.equal(cycle.staged, 1);
+  assert.equal(cycle.claimed, 1);
+});
+
+test("missing-target fallback never exposes work to trusted role ports", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [workItem(45, { type: "role", id: "missing-role" })],
+    time,
+  });
+  let trustedCalls = 0;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory(),
+    time,
+    roleContextAssembler: {
+      async assemble() {
+        trustedCalls += 1;
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        trustedCalls += 1;
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle();
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(trustedCalls, 0);
+  assert.equal(ledger.outbox[0].intent.type, "ask_user");
+});
+
+test("concurrent scopes create only one question for the same missing target", async () => {
+  const time = controlledClock();
+  const target = { type: "role", id: "missing-specialist" };
+  const ledger = new FakeLedger({
+    source: [workItem(46, target), workItem(47, target)],
+    time,
+  });
+  const firstStageStarted = deferred();
+  const releaseFirstStage = deferred();
+  const secondResolveStarted = deferred();
+  const releaseSecondResolve = deferred();
+  const directory = new FakeRoleDirectory();
+  let resolveCalls = 0;
+  directory.resolve = async (requestedTarget) => {
+    directory.calls.push(clone(requestedTarget));
+    resolveCalls += 1;
+    if (resolveCalls === 2) {
+      secondResolveStarted.resolve();
+      await releaseSecondResolve.promise;
+    }
+    return null;
+  };
+  const originalStage = ledger.stageIntent.bind(ledger);
+  ledger.stageIntent = async (input) => {
+    firstStageStarted.resolve();
+    await releaseFirstStage.promise;
+    return originalStage(input);
+  };
+  const loop = createLoop({ ledger, directory, time });
+
+  const wildcardCycle = loop.runCycle({ workLimit: 1 });
+  await firstStageStarted.promise;
+  const orchestratorCycle = loop.runCycle({
+    roleId: "orchestrator",
+    workLimit: 2,
+  });
+  await secondResolveStarted.promise;
+  releaseFirstStage.resolve();
+  await wildcardCycle;
+  releaseSecondResolve.resolve();
+  const concurrent = await orchestratorCycle;
+
+  assert.equal(ledger.calls.stageIntent.length, 1);
+  assert.equal(ledger.outbox.length, 1);
+  assert.equal(ledger.outbox[0].intent.type, "ask_user");
+  assert.equal(
+    concurrent.outcomes.every(
+      ({ status }) => status === "missing_target_waiting",
+    ),
+    true,
+  );
+});
+
+test("different role cycles overlap while one item is decided only once", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [
+      workItem(50, { type: "role", id: "requirements-analyst" }),
+      workItem(51, { type: "role", id: "developer" }),
+    ],
+    time,
+  });
+  const requirementsStarted = deferred();
+  const developerStarted = deferred();
+  const release = deferred();
+  const directory = new FakeRoleDirectory({
+    "requirements-analyst": worker({
+      roleId: "requirements-analyst",
+      decide: async () => {
+        requirementsStarted.resolve();
+        await release.promise;
+        return completeDecision();
+      },
+    }),
+    developer: worker({
+      roleId: "developer",
+      decide: async () => {
+        developerStarted.resolve();
+        await release.promise;
+        return completeDecision();
+      },
+    }),
+  });
+  const trusted = {
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  };
+  const loop = createLoop({ ledger, directory, time, ...trusted });
+
+  const requirements = loop.runCycle({ roleId: "requirements-analyst" });
+  await requirementsStarted.promise;
+  const developer = loop.runCycle({ roleId: "developer" });
+  await Promise.race([
+    developerStarted.promise,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("different role cycle was serialized")),
+      100,
+    )),
+  ]);
+  release.resolve();
+  await Promise.all([requirements, developer]);
+
+  const wildcard = loop.runCycle();
+  const developerAgain = loop.runCycle({ roleId: "developer" });
+  await Promise.all([wildcard, developerAgain]);
+  assert.deepEqual(
+    ledger.calls.claim.map(({ itemId }) => itemId).sort(),
+    ["work-item-50", "work-item-51"],
+  );
+});
+
+test("root trusted failures use natural cycles without lease-based retry", async (t) => {
+  for (const failurePoint of ["assembler", "service"]) {
+    await t.test(failurePoint, async () => {
+      const time = controlledClock();
+      const root = workItem(
+        failurePoint === "assembler" ? 60 : 61,
+        { type: "role", id: "orchestrator" },
+      );
+      const ledger = new FakeLedger({ source: [root], time });
+      let assembleCalls = 0;
+      let serviceCalls = 0;
+      const directory = new FakeRoleDirectory({
+        orchestrator: worker({
+          roleId: "orchestrator",
+          workerId: "employee-orchestrator",
+          decide: async ({ item }) => orchestrationDecision(item),
+        }),
+      });
+      const loop = createLoop({
+        ledger,
+        directory,
+        time,
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            assembleCalls += 1;
+            if (failurePoint === "assembler" && assembleCalls === 1) {
+              throw new Error("trusted context failed");
+            }
+            return contextPacket(item, roleId);
+          },
+        },
+        orchestratorService: {
+          async execute() {
+            serviceCalls += 1;
+            if (failurePoint === "service" && serviceCalls === 1) {
+              throw new Error("trusted mutation failed");
+            }
+            return { applied: true };
+          },
+        },
+      });
+
+      await assert.rejects(
+        loop.runCycle({ roleId: "orchestrator" }),
+        failurePoint === "assembler"
+          ? /trusted context failed/
+          : /trusted mutation failed/,
+      );
+      assert.equal(ledger.items[0].status, "queued");
+      assert.equal(ledger.calls.claim.length, 0);
+      assert.equal(ledger.calls.scheduleRetry.length, 0);
+      assert.equal(ledger.calls.transition.length, 0);
+
+      const recovered = await loop.runCycle({ roleId: "orchestrator" });
+
+      assert.equal(recovered.orchestrated, 1);
+      assert.equal(ledger.calls.claim.length, 0);
+      assert.equal(ledger.calls.scheduleRetry.length, 0);
+      assert.equal(assembleCalls, 2);
+      assert.equal(serviceCalls, failurePoint === "assembler" ? 1 : 2);
+    });
+  }
+});
+
+test("non-root orchestrator tasks never use the configured-root path", async (t) => {
+  await t.test("graph-blocked child stays unclaimed", async () => {
+    const time = controlledClock();
+    const child = workItem(62, { type: "role", id: "orchestrator" });
+    child.graph = {
+      parentItemId: "work-item-root",
+      dependsOnItemIds: ["work-item-unfinished-dependency"],
+    };
+    const ledger = new FakeLedger({ source: [child], time });
+    let trustedCalls = 0;
+    const loop = createLoop({
+      ledger,
+      directory: new FakeRoleDirectory({
+        orchestrator: worker({
+          roleId: "orchestrator",
+          workerId: "employee-orchestrator",
+        }),
+      }),
+      time,
+      roleContextAssembler: {
+        async assemble() {
+          trustedCalls += 1;
+        },
+      },
+      orchestratorService: {
+        async execute() {
+          trustedCalls += 1;
+        },
+      },
+    });
+
+    const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+    assert.equal(cycle.outcomes[0].status, "graph_blocked");
+    assert.equal(ledger.calls.claim.length, 0);
+    assert.equal(trustedCalls, 0);
+  });
+
+  await t.test("ready child is handled as a specialist", async () => {
+    const time = controlledClock();
+    const child = workItem(63, { type: "role", id: "orchestrator" });
+    child.graph = {
+      parentItemId: "work-item-root",
+      dependsOnItemIds: [],
+    };
+    const ledger = new FakeLedger({ source: [child], time });
+    let serviceCalls = 0;
+    const loop = createLoop({
+      ledger,
+      directory: new FakeRoleDirectory({
+        orchestrator: worker({
+          roleId: "orchestrator",
+          workerId: "employee-orchestrator",
+          decide: async ({ item }) => orchestrationDecision(item),
+        }),
+      }),
+      time,
+      roleContextAssembler: {
+        async assemble({ roleId, item }) {
+          return contextPacket(item, roleId);
+        },
+      },
+      orchestratorService: {
+        async execute() {
+          serviceCalls += 1;
+        },
+      },
+    });
+
+    const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+    assert.equal(cycle.retried, 1);
+    assert.equal(ledger.items[0].status, "retry_wait");
+    assert.equal(ledger.calls.claim.length, 1);
+    assert.equal(ledger.calls.scheduleRetry.length, 1);
+    assert.equal(serviceCalls, 0);
+  });
+});
+
+test("trusted loop ports are configured together and fit inside the lease", () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ time });
+  const directory = new FakeRoleDirectory();
+
+  assert.throws(
+    () => createLoop({
+      ledger,
+      directory,
+      time,
+      roleContextAssembler: { async assemble() {} },
+    }),
+    /configured together/,
+  );
+  assert.throws(
+    () => createLoop({
+      ledger,
+      directory,
+      time,
+      leaseDurationMs: 2_000,
+      resolveTimeoutMs: 1_000,
+      decideTimeoutMs: 1_000,
+      roleContextAssembler: { async assemble() {} },
+      orchestratorService: { async execute() {} },
+    }),
+    /must fit within leaseDurationMs/,
+  );
+});
+
+test("trusted loop constructor rejects accessor ports without invoking them", () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ time });
+  const directory = new FakeRoleDirectory();
+
+  for (const [portName, method] of [
+    ["roleContextAssembler", "assemble"],
+    ["orchestratorService", "execute"],
+  ]) {
+    let getterCalls = 0;
+    const accessorPort = {};
+    Object.defineProperty(accessorPort, method, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return async () => {};
+      },
+    });
+    const ports = {
+      roleContextAssembler: { async assemble() {} },
+      orchestratorService: { async execute() {} },
+      [portName]: accessorPort,
+    };
+
+    assert.throws(
+      () => createLoop({ ledger, directory, time, ...ports }),
+      new RegExp(`${portName} is invalid`),
+    );
+    assert.equal(getterCalls, 0);
+  }
 });

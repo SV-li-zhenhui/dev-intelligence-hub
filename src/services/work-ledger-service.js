@@ -14,6 +14,13 @@ import {
   planWorkGraphChildCreation,
 } from "./work-ledger-graph-commands.js";
 import {
+  planScopedWorkGraphCancellation,
+  planWorkGraphEscalation,
+  planWorkGraphTaskPause,
+  planWorkGraphTaskReassignment,
+  planWorkGraphTaskResume,
+} from "./work-ledger-orchestration-commands.js";
+import {
   planWorkGraphAcceptanceRevision,
   planWorkGraphDeliveryDecision,
   planWorkGraphDeliverySubmission,
@@ -50,6 +57,7 @@ import {
 import {
   boundedLedgerString,
   cloneLedgerValue,
+  hasExactLedgerKeys,
   isPlainLedgerObject,
   normalizeLedgerTimestamp,
   validatePositiveLimit,
@@ -347,7 +355,10 @@ export class WorkLedgerService {
   }
 
   async cancelGraphTask(input = {}) {
-    return this.#executeCommand(planWorkGraphCancellation, input);
+    const planner = hasExactLedgerKeys(input, ["authority", "command"])
+      ? planScopedWorkGraphCancellation
+      : planWorkGraphCancellation;
+    return this.#executeCommand(planner, input);
   }
 
   async createGraphChild(input = {}) {
@@ -364,6 +375,22 @@ export class WorkLedgerService {
 
   async decideGraphDelivery(input = {}) {
     return this.#executeCommand(planWorkGraphDeliveryDecision, input);
+  }
+
+  async reassignGraphTask(input = {}) {
+    return this.#executeCommand(planWorkGraphTaskReassignment, input);
+  }
+
+  async pauseGraphTask(input = {}) {
+    return this.#executeCommand(planWorkGraphTaskPause, input);
+  }
+
+  async resumeGraphTask(input = {}) {
+    return this.#executeCommand(planWorkGraphTaskResume, input);
+  }
+
+  async stageGraphEscalation(input = {}) {
+    return this.#executeCommand(planWorkGraphEscalation, input);
   }
 
   async stageIntent(input = {}) {

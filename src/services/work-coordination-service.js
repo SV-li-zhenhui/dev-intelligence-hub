@@ -194,45 +194,45 @@ export class WorkCoordinationService {
       : "housekeeping";
     const running = this.#inFlightByScope.get(scope);
     if (running) return running;
-    const execution = this.#cycleTail.then(() => this.#performCycle(options));
+    const serialized = options.roleId === null;
+    const execution = serialized
+      ? this.#cycleTail.then(() => this.#performCycle(options))
+      : this.#performCycle(options);
     const tracked = execution.finally(() => {
       if (this.#inFlightByScope.get(scope) === tracked) {
         this.#inFlightByScope.delete(scope);
       }
     });
     this.#inFlightByScope.set(scope, tracked);
-    this.#cycleTail = tracked.catch(() => {});
+    if (serialized) this.#cycleTail = tracked.catch(() => {});
     return tracked;
   }
 
   async #performCycle(options) {
-    const stages = [
-      ["code_jobs", () =>
-        this.#runCodeJobs({
-          limit: this.#defaults.codeJobLimit,
-          ...(options.includeWork && options.roleId !== null
-            ? { roleId: options.roleId }
-            : {}),
-        })],
-      ["code_job_change_packages", () =>
-        this.#dispatchCodeJobChangePackages({
-          limit: this.#defaults.codeJobLimit,
-        })],
-      ["change_package_application_results", () =>
-        this.#reconcileChangePackageApplicationResults()],
-      ["code_job_memory", () =>
-        this.#projectCodeJobMemory({
-          limit: this.#defaults.codeJobMemoryLimit,
-        })],
-      ["proposal_execution", () =>
-        this.#runProposals({ limit: this.#defaults.proposalLimit })],
-      ["proposal_results", () =>
-        this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
-      ["attention_results", () =>
-        this.#reconcileAttention({ limit: this.#defaults.attentionLimit })],
-      ["conditions", () =>
-        this.#wakeConditions({ limit: this.#defaults.conditionLimit })],
-    ];
+    const stages = options.roleId === null
+      ? [
+          ["code_jobs", () =>
+            this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+          ["code_job_change_packages", () =>
+            this.#dispatchCodeJobChangePackages({
+              limit: this.#defaults.codeJobLimit,
+            })],
+          ["change_package_application_results", () =>
+            this.#reconcileChangePackageApplicationResults()],
+          ["code_job_memory", () =>
+            this.#projectCodeJobMemory({
+              limit: this.#defaults.codeJobMemoryLimit,
+            })],
+          ["proposal_execution", () =>
+            this.#runProposals({ limit: this.#defaults.proposalLimit })],
+          ["proposal_results", () =>
+            this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
+          ["attention_results", () =>
+            this.#reconcileAttention({ limit: this.#defaults.attentionLimit })],
+          ["conditions", () =>
+            this.#wakeConditions({ limit: this.#defaults.conditionLimit })],
+        ]
+      : [];
     if (options.includeWork) {
       stages.push([
         "work",

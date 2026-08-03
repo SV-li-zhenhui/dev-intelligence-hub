@@ -197,6 +197,7 @@
             "wait_condition",
             "propose_github_review",
             "handoff",
+            "submit_delivery",
             "complete"
           ]
         },
@@ -212,15 +213,14 @@
       },
       "orchestrator": {
         "name": "主控调度员",
-        "mission": "主动观察全局工作，判断下一步，协调岗位交接；遇到需要所有者决策或授权的事项时提出清晰问题。",
+        "mission": "主动观察共享任务图，按验收契约拆分、分派、验收或退回直属任务；需要所有者决定时使用编排升级动作，所有子任务完成后再结束根任务。",
         "enabled": true,
         "scheduleMinutes": 2,
         "initialPaused": true,
+        "workerId": "employee-orchestrator",
         "permissions": {
           "allowedIntents": [
-            "ask_user",
-            "wait_condition",
-            "handoff",
+            "orchestrate",
             "complete"
           ]
         },
@@ -236,7 +236,7 @@
       },
       "requirements-analyst": {
         "name": "需求分析师",
-        "mission": "主动梳理需求、识别歧义和验收条件；能自行判断的就推进，需要产品决策时把一个明确问题送入确认队列。",
+        "mission": "主动梳理需求、识别歧义和验收条件；围绕当前任务契约形成 requirement-spec 交付，能自行判断的就推进，需要产品决策时把一个明确问题送入确认队列。",
         "enabled": true,
         "scheduleMinutes": 3,
         "initialPaused": true,
@@ -245,6 +245,7 @@
             "ask_user",
             "wait_condition",
             "handoff",
+            "submit_delivery",
             "complete"
           ]
         },
@@ -260,7 +261,7 @@
       },
       "developer": {
         "name": "开发工程师",
-        "mission": "主动分析实现方案和风险，提出受策略约束的代码动作；任何真实代码变更都必须经过受控执行器。",
+        "mission": "主动读取已验收的需求输入，分析实现方案和风险，提出受策略约束的代码动作，并按任务契约提交 change-package；任何真实代码变更都必须经过受控执行器。",
         "enabled": true,
         "scheduleMinutes": 3,
         "initialPaused": true,
@@ -270,6 +271,7 @@
             "wait_condition",
             "propose_code_action",
             "handoff",
+            "submit_delivery",
             "complete"
           ]
         },
@@ -285,7 +287,7 @@
       },
       "tester": {
         "name": "测试工程师",
-        "mission": "主动检查验收标准、设计验证并反馈风险，必要时提出只在受控执行器中运行的测试动作。",
+        "mission": "主动读取已验收实现和验收标准，设计验证并按任务契约提交 test-report，失败时提供可复现证据；必要时提出只在受控执行器中运行的测试动作。",
         "enabled": true,
         "scheduleMinutes": 4,
         "initialPaused": true,
@@ -295,6 +297,7 @@
             "wait_condition",
             "propose_code_action",
             "handoff",
+            "submit_delivery",
             "complete"
           ]
         },

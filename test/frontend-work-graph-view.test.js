@@ -208,6 +208,20 @@ test("a submitted deliverable is labeled as waiting for review", () => {
   assert.match(html, /等待交付审核/);
 });
 
+test("a paused graph task keeps its explicit ledger status presentation", () => {
+  const value = graphSnapshot();
+  value.taskStates[2].ledgerStatus = "paused";
+  value.taskStates[2].ownerId = null;
+  value.taskStates[2].statusReason = "orchestrator-paused";
+
+  const html = renderWorkGraph({
+    snapshot: normalizeWorkGraphSnapshot(value),
+  });
+
+  assert.match(html, /status-paused[^>]*>已暂停/);
+  assert.doesNotMatch(html, /未知状态 · paused/);
+});
+
 test("shared work graph rejects mismatched and cyclic browser projections", () => {
   const legacy = graphSnapshot();
   legacy.schemaVersion = 1;

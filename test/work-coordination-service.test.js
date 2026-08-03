@@ -158,26 +158,14 @@ test("role cycles forward the role scope to the proactive work loop", async () =
     roleId: "developer",
   });
 
-  assert.deepEqual(calls.find(([name]) => name === "work"), [
-    "work",
-    {
+  assert.deepEqual(calls, [
+    ["work", {
       trigger: "employee:developer",
       intakeLimit: 100,
       workLimit: 20,
       roleId: "developer",
-    },
-  ]);
-  assert.deepEqual(calls.find(([name]) => name === "code_jobs"), [
-    "code_jobs",
-    { limit: 10, roleId: "developer" },
-  ]);
-  assert.deepEqual(
-    calls.find(([name]) => name === "code_job_change_packages"),
-    ["code_job_change_packages", { limit: 10 }],
-  );
-  assert.deepEqual(calls.find(([name]) => name === "code_job_memory"), [
-    "code_job_memory",
-    { limit: 50 },
+    }],
+    ["dispatch", { limit: 50 }],
   ]);
   assert.equal(result.roleId, "developer");
 });
@@ -270,9 +258,9 @@ test("all independent stage failures are reported after every stage is attempted
 });
 
 test("same role signals merge while different role cycles stay distinct", async () => {
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const attentionStarted = deferred();
+  const release = deferred();
+  const developerStarted = deferred();
+  const requirementsStarted = deferred();
   let attentionCalls = 0;
   const workScopes = [];
   const service = new WorkCoordinationService({
@@ -281,14 +269,17 @@ test("same role signals merge while different role cycles stay distinct", async 
     attentionResultReconciler: {
       async runCycle() {
         attentionCalls += 1;
-        if (attentionCalls === 1) attentionStarted.resolve();
-        await gate;
       },
     },
     conditionWaker: { async runCycle() {} },
     workLoop: {
       async runCycle(options) {
         workScopes.push(options.roleId);
+        if (options.roleId === "developer") developerStarted.resolve();
+        if (options.roleId === "requirements-analyst") {
+          requirementsStarted.resolve();
+        }
+        await release.promise;
       },
     },
     dispatcher: { async dispatchPending() {} },
@@ -305,9 +296,9 @@ test("same role signals merge while different role cycles stay distinct", async 
   });
   assert.strictEqual(first, second);
   assert.notStrictEqual(first, third);
-  await attentionStarted.promise;
-  assert.equal(attentionCalls, 1);
-  release();
+  await Promise.all([developerStarted.promise, requirementsStarted.promise]);
+  assert.equal(attentionCalls, 0);
+  release.resolve();
   const [result, duplicateResult, thirdResult] = await Promise.all([
     first,
     second,
@@ -316,6 +307,6 @@ test("same role signals merge while different role cycles stay distinct", async 
   assert.equal(result.trigger, "manual");
   assert.deepEqual(duplicateResult, result);
   assert.equal(thirdResult.roleId, "requirements-analyst");
-  assert.equal(attentionCalls, 2);
-  assert.deepEqual(workScopes, ["developer", "requirements-analyst"]);
+  assert.equal(attentionCalls, 0);
+  assert.deepEqual(workScopes.sort(), ["developer", "requirements-analyst"]);
 });

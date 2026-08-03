@@ -2,6 +2,7 @@ import {
   boundedLedgerString,
   canonicalLedgerValue,
   hasExactLedgerKeys,
+  workLedgerError,
 } from "./work-ledger-values.js";
 
 function bindDataMethod(value, methodName, portName) {
@@ -20,6 +21,20 @@ function bindDataMethod(value, methodName, portName) {
     owner = Object.getPrototypeOf(owner);
   }
   throw new TypeError(`${portName} is invalid`);
+}
+
+function bindOptionalDataMethod(value, methodName) {
+  let owner = value;
+  while (owner !== null) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, methodName);
+    if (descriptor) {
+      return "value" in descriptor && typeof descriptor.value === "function"
+        ? descriptor.value.bind(value)
+        : null;
+    }
+    owner = Object.getPrototypeOf(owner);
+  }
+  return null;
 }
 
 function normalizePlannerAuthority(value) {
@@ -81,6 +96,13 @@ function invokeCommand(method, authority, command) {
   } catch (error) {
     return Promise.reject(error);
   }
+  if (method === null) {
+    return Promise.reject(workLedgerError(
+      "WORK_LEDGER_GRAPH_PORT_UNAVAILABLE",
+      "当前工作图适配器不支持此编排命令",
+      503,
+    ));
+  }
   return method({ authority, command: snapshot });
 }
 
@@ -90,6 +112,11 @@ export class WorkGraphStore {
   #reviseAcceptance;
   #submitDelivery;
   #decideDelivery;
+  #reassignTask;
+  #pauseTask;
+  #resumeTask;
+  #cancelTask;
+  #stageEscalation;
 
   constructor(value = {}) {
     if (!hasExactLedgerKeys(value, ["ledger"])) {
@@ -120,6 +147,26 @@ export class WorkGraphStore {
       "decideGraphDelivery",
       "work graph planner port",
     );
+    this.#reassignTask = bindOptionalDataMethod(
+      value.ledger,
+      "reassignGraphTask",
+    );
+    this.#pauseTask = bindOptionalDataMethod(
+      value.ledger,
+      "pauseGraphTask",
+    );
+    this.#resumeTask = bindOptionalDataMethod(
+      value.ledger,
+      "resumeGraphTask",
+    );
+    this.#cancelTask = bindOptionalDataMethod(
+      value.ledger,
+      "cancelGraphTask",
+    );
+    this.#stageEscalation = bindOptionalDataMethod(
+      value.ledger,
+      "stageGraphEscalation",
+    );
     Object.freeze(this);
   }
 
@@ -138,6 +185,16 @@ export class WorkGraphStore {
         invokeCommand(this.#reviseAcceptance, trustedAuthority, command),
       decideDelivery: (command) =>
         invokeCommand(this.#decideDelivery, trustedAuthority, command),
+      reassignTask: (command) =>
+        invokeCommand(this.#reassignTask, trustedAuthority, command),
+      pauseTask: (command) =>
+        invokeCommand(this.#pauseTask, trustedAuthority, command),
+      resumeTask: (command) =>
+        invokeCommand(this.#resumeTask, trustedAuthority, command),
+      cancelTask: (command) =>
+        invokeCommand(this.#cancelTask, trustedAuthority, command),
+      stageEscalation: (command) =>
+        invokeCommand(this.#stageEscalation, trustedAuthority, command),
     });
   }
 

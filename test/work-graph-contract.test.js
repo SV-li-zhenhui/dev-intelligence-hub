@@ -940,6 +940,79 @@ test("computes blocked, ready, and sibling-parallel leaf tasks", () => {
   ]);
 });
 
+test("paused tasks remain active blockers but are never graph-ready", () => {
+  const groupingContract = contract({
+    acceptanceCriteria: [],
+    expectedDeliverables: [],
+  });
+  const snapshot = createWorkGraphSnapshot(
+    draft([
+      task("root", {
+        status: "in_progress",
+        acceptanceContracts: [groupingContract],
+      }),
+      task("paused-child", {
+        parentTaskId: "root",
+        status: "paused",
+      }),
+      task("ready-child", { parentTaskId: "root" }),
+      task("dependent-child", {
+        parentTaskId: "root",
+        dependsOn: ["paused-child"],
+      }),
+    ]),
+  );
+
+  assert.deepEqual(getReadyWorkGraphTaskIds(snapshot), ["ready-child"]);
+  assert.deepEqual(getParallelReadyWorkGraphTaskIds(snapshot), []);
+  assert.deepEqual(getBlockedWorkGraphTasks(snapshot), [
+    {
+      taskId: "dependent-child",
+      blockingTaskIds: ["paused-child"],
+    },
+  ]);
+  assert.deepEqual(
+    deriveParentTaskOutcome(snapshot, "root").activeTaskIds,
+    ["dependent-child", "paused-child", "ready-child"],
+  );
+
+  const resumed = createWorkGraphSnapshot(
+    draft(
+      snapshot.tasks.map((entry) =>
+        entry.taskId === "paused-child"
+          ? { ...entry, revision: 2, status: "pending" }
+          : entry
+      ),
+      { revision: 8 },
+    ),
+  );
+  assert.deepEqual(validateWorkGraphTransition(snapshot, resumed), resumed);
+
+  assert.throws(
+    () =>
+      validateWorkGraphTransition(
+        createWorkGraphSnapshot(draft([], { revision: 0 })),
+        createWorkGraphSnapshot(
+          draft([task("new-paused", { status: "paused" })], { revision: 1 }),
+        ),
+      ),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
+  assert.throws(
+    () =>
+      createWorkGraphSnapshot(
+        draft([
+          task("cancelled-root", { status: "cancelled" }),
+          task("paused-child", {
+            parentTaskId: "cancelled-root",
+            status: "paused",
+          }),
+        ]),
+      ),
+    hasCode("WORK_GRAPH_INVALID"),
+  );
+});
+
 test("pending parents are blocked only until every direct child completes", () => {
   const pendingChild = createWorkGraphSnapshot(
     draft([

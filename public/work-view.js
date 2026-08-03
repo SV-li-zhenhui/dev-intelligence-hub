@@ -26,6 +26,7 @@ export const escapeWorkHtml = escapeHtml;
 function statusLabel(status) {
   return {
     queued: "待领取",
+    paused: "已暂停",
     working: "判断中",
     dispatch_pending: "等待派发",
     waiting_user: "等待你答复",
@@ -660,6 +661,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
   return `
     <section class="work-summary" aria-label="主动工作循环状态">
       <div><span>待领取</span><strong>${count(summary, "queued")}</strong></div>
+      <div><span>暂停</span><strong>${count(summary, "paused")}</strong></div>
       <div><span>处理中</span><strong>${count(summary, "working") + count(summary, "dispatch_pending")}</strong></div>
       <div><span>等待</span><strong>${waiting}</strong></div>
       <div><span>阻塞</span><strong>${count(summary, "blocked")}</strong></div>

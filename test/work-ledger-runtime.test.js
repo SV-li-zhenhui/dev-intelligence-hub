@@ -196,6 +196,8 @@ test("runtime owns one named process guard and exposes least-authority graph por
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
+  assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);
+  assert.equal(Object.isFrozen(runtime.graphDelivererFactory), true);
   assert.equal(Object.isFrozen(runtime.graphMemoryProjectionSource), true);
   assert.deepEqual(Object.keys(runtime.graphReader), ["getSnapshot"]);
   assert.deepEqual(Object.keys(runtime.graphPlanner), [
@@ -203,6 +205,8 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "reviseAcceptanceContract",
     "decideDelivery",
   ]);
+  assert.deepEqual(Object.keys(runtime.scopedGraphPlannerFactory), ["forRoot"]);
+  assert.deepEqual(Object.keys(runtime.graphDelivererFactory), ["forClaim"]);
   assert.deepEqual(
     Object.keys(runtime.graphMemoryProjectionSource),
     ["readBatch", "ack", "ackBatch"],
@@ -257,6 +261,98 @@ test("runtime owns one named process guard and exposes least-authority graph por
   );
   await assert.rejects(
     runtime.graphPlanner.decideDelivery({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+});
+
+test("runtime factories bind scoped orchestrator and exact claim authority", async () => {
+  const runtime = await createWorkLedgerRuntime({
+    store: new MemoryStore(),
+    assignmentSource: oneAssignmentSource(),
+    clock: () => "2026-08-02T02:00:00.000Z",
+    idFactory: (() => {
+      let nextId = 1;
+      return () => `lease-runtime-factory-${nextId++}`;
+    })(),
+    createGuard: guardFactory([]),
+  });
+  await runtime.intake();
+  const parent = (await runtime.listItems()).items[0];
+
+  assert.throws(
+    () => runtime.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: null }),
+    TypeError,
+  );
+  const planner = runtime.scopedGraphPlannerFactory.forRoot({
+    scopeRootTaskId: parent.itemId,
+  });
+  assert.equal(Object.isFrozen(planner), true);
+  assert.deepEqual(Object.keys(planner), [
+    "createChild",
+    "reviseAcceptanceContract",
+    "decideDelivery",
+    "reassignTask",
+    "pauseTask",
+    "resumeTask",
+    "cancelTask",
+    "stageEscalation",
+  ]);
+
+  const graph = await runtime.graphReader.getSnapshot();
+  const created = await planner.createChild(
+    graphChildCommand(parent, graph.graph.revision),
+  );
+  let child = (await runtime.listItems()).items.find(
+    ({ itemId }) => itemId === created.taskId,
+  );
+  child = await runtime.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  const deliverer = runtime.graphDelivererFactory.forClaim({
+    scopeRootTaskId: parent.itemId,
+    taskId: child.itemId,
+    workerId: "employee-developer",
+    leaseId: child.leaseId,
+  });
+  assert.equal(Object.isFrozen(deliverer), true);
+  assert.deepEqual(Object.keys(deliverer), ["submitDelivery"]);
+
+  const graphBeforeDelivery = await runtime.graphReader.getSnapshot();
+  const submitted = await deliverer.submitDelivery({
+    deliveryRevision: 1,
+    contractRevision: 1,
+    deliverableId: "test-report",
+    summary: "运行时工厂绑定的交付",
+    evidence: [
+      {
+        kind: "test-report",
+        referenceId: "runtime-factory-report",
+        contentDigest: "a".repeat(64),
+      },
+    ],
+    expectedGraphRevision: graphBeforeDelivery.graph.revision,
+    expectedTaskRevision: child.revision,
+  });
+  assert.equal(submitted.taskStatus, "waiting_external");
+
+  const closing = runtime.close();
+  await closing;
+  await assert.rejects(
+    planner.pauseTask({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    deliverer.submitDelivery({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  assert.throws(
+    () =>
+      runtime.scopedGraphPlannerFactory.forRoot({
+        scopeRootTaskId: parent.itemId,
+      }),
     (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
   );
 });

@@ -42,6 +42,42 @@ function common(type) {
   };
 }
 
+function orchestrateIntent() {
+  const reason = "等待当前依赖恢复";
+  return {
+    ...common("orchestrate"),
+    reason,
+    action: {
+      schemaVersion: 1,
+      type: "pause",
+      sourceTaskId: context().workItemId,
+      sourceTaskRevision: 4,
+      expectedGraphRevision: 8,
+      reason,
+    },
+  };
+}
+
+function submitDeliveryIntent() {
+  return {
+    schemaVersion: 1,
+    type: "submit_delivery",
+    taskId: context().workItemId,
+    expectedTaskRevision: 6,
+    expectedGraphRevision: 9,
+    contractRevision: 1,
+    deliverableId: "implementation",
+    summary: "实现和聚焦测试已经完成",
+    reason: "当前证据满足提交条件",
+    evidence: [{
+      kind: "change-package",
+      referenceId: "change-package:development:1",
+      contentDigest: "a".repeat(64),
+    }],
+    artifact: null,
+  };
+}
+
 function policy(overrides = {}) {
   return createWorkIntentPolicy({
     version: 3,
@@ -215,6 +251,19 @@ test("completion remains internal and carries no execution capability", () => {
     subject: context().event.subject,
   });
   assert.equal(JSON.stringify(complete).includes("command"), false);
+});
+
+test("orchestration and delivery intents create zero generic policy bindings", () => {
+  const bindings = [];
+  for (const intent of [orchestrateIntent(), submitDeliveryIntent()]) {
+    assert.throws(
+      () => bindings.push(policy().bind({ context: context(), intent })),
+      (error) =>
+        error instanceof WorkIntentPolicyError &&
+        error.code === "WORK_INTENT_POLICY_DENIED",
+    );
+  }
+  assert.deepEqual(bindings, []);
 });
 
 test("denies role escalation, stale PR contexts, and absent trusted mappings", () => {

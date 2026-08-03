@@ -37,6 +37,54 @@ function completeDecision(overrides = {}) {
   };
 }
 
+function orchestrationDecision() {
+  const reason = "等待依赖任务恢复";
+  return {
+    schemaVersion: 1,
+    confidence: 91,
+    summary: "应暂停当前任务",
+    intent: {
+      schemaVersion: 1,
+      type: "orchestrate",
+      summary: "暂停当前任务",
+      reason,
+      action: {
+        schemaVersion: 1,
+        type: "pause",
+        sourceTaskId: "work-item-root",
+        sourceTaskRevision: 4,
+        expectedGraphRevision: 8,
+        reason,
+      },
+    },
+  };
+}
+
+function deliveryDecision() {
+  return {
+    schemaVersion: 1,
+    confidence: 89,
+    summary: "提交岗位交付物",
+    intent: {
+      schemaVersion: 1,
+      type: "submit_delivery",
+      taskId: "work-item-development",
+      expectedTaskRevision: 6,
+      expectedGraphRevision: 9,
+      contractRevision: 1,
+      deliverableId: "implementation",
+      summary: "实现与聚焦测试已经完成",
+      reason: "当前证据满足交付条件",
+      evidence: [{
+        kind: "change-package",
+        referenceId: "change-package:development:1",
+        contentDigest: "a".repeat(64),
+      }],
+      artifact: null,
+    },
+  };
+}
+
 function definition(id, scheduleMinutes = 5) {
   return {
     id,
@@ -122,6 +170,47 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   assert.equal(engine.view().brain.remoteData.memory, false);
 });
 
+test("RoleDecisionEngine uses supplied trusted context without invoking its legacy factory", async () => {
+  let contextFactoryCalls = 0;
+  let request;
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      async generate(value) {
+        request = value;
+        return JSON.stringify(completeDecision());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+    contextFactory: async () => {
+      contextFactoryCalls += 1;
+      return { requirements: { forbidden: true } };
+    },
+  });
+  const context = {
+    requirements: { taskId: "task-1" },
+    code: { acceptedDependencies: [] },
+  };
+
+  await engine.decide({
+    item: { privateLease: "must-not-be-read" },
+    trigger: "employee:developer",
+    context,
+  });
+
+  assert.equal(contextFactoryCalls, 0);
+  assert.deepEqual(JSON.parse(request.messages[1].content), context);
+  assert.deepEqual(request.dataClasses, ["requirements", "code"]);
+  await assert.rejects(
+    engine.decide({ context: { secret: { value: true } } }),
+    /role context is invalid/,
+  );
+});
+
 test("RoleDecisionEngine rejects intents outside the independent role permissions", async () => {
   const forbidden = completeDecision({
     intent: {
@@ -153,6 +242,66 @@ test("RoleDecisionEngine rejects intents outside the independent role permission
     engine.decide({ item: { id: "work-1" }, trigger: "assigned" }),
     (error) => error.code === "ROLE_INTENT_NOT_PERMITTED",
   );
+});
+
+test("RoleDecisionEngine permits configured orchestration and delivery intents", async () => {
+  const responses = [orchestrationDecision(), deliveryDecision()];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"),
+    permissions: permissions("orchestrate", "submit_delivery"),
+    brain: brain(),
+    brainRouter: {
+      async generate() {
+        return JSON.stringify(responses.shift());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+
+  const coordinated = await engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+  });
+  const delivered = await engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+  });
+
+  assert.equal(coordinated.intent.type, "orchestrate");
+  assert.equal(coordinated.intent.action.type, "pause");
+  assert.equal(delivered.intent.type, "submit_delivery");
+  assert.deepEqual(engine.view().permissions.allowedIntents, [
+    "orchestrate",
+    "submit_delivery",
+  ]);
+});
+
+test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {
+  const invalid = orchestrationDecision();
+  invalid.intent.reason = "wrapper reason differs";
+  const responses = [invalid, orchestrationDecision()];
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"),
+    permissions: permissions("orchestrate"),
+    brain: brain(),
+    brainRouter: {
+      async generate(request) {
+        requests.push(request);
+        return JSON.stringify(responses.shift());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+
+  const result = await engine.decide();
+
+  assert.equal(result.intent.action.type, "pause");
+  assert.equal(requests.length, 2);
+  assert.match(requests[0].messages[0].content, /exactly identical/);
+  assert.match(requests[1].messages.at(-1).content, /exactly equal/);
 });
 
 test("RoleDecisionEngine retries one invalid structured response without replaying it", async () => {

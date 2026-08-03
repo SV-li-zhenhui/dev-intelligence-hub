@@ -32,7 +32,12 @@ import {
   normalizeWorkGraphCommandAuthority,
 } from "./work-ledger-graph-command-support.js";
 
-const CANCELLABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
+const CANCELLABLE_STATUSES = new Set([
+  "queued",
+  "paused",
+  "retry_wait",
+  "blocked",
+]);
 const ACTIVE_SIDE_EFFECT_STATUSES = new Set([
   "working",
   "dispatch_pending",

@@ -12,12 +12,39 @@ const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
 function requirePort(value, methods, name) {
   if (
     value === null ||
-    typeof value !== "object" ||
-    methods.some((method) => typeof value[method] !== "function")
+    (typeof value !== "object" && typeof value !== "function")
   ) {
     throw new TypeError(`${name} is invalid`);
   }
-  return value;
+  const port = {};
+  try {
+    for (const method of methods) {
+      let current = value;
+      let found = false;
+      while (current !== null) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, method);
+        if (descriptor) {
+          if (
+            !("value" in descriptor) ||
+            typeof descriptor.value !== "function"
+          ) {
+            throw new TypeError(`${name} is invalid`);
+          }
+          port[method] = descriptor.value.bind(value);
+          found = true;
+          break;
+        }
+        current = Object.getPrototypeOf(current);
+      }
+      if (!found) throw new TypeError(`${name} is invalid`);
+    }
+  } catch (error) {
+    if (error instanceof TypeError && error.message === `${name} is invalid`) {
+      throw error;
+    }
+    throw new TypeError(`${name} is invalid`, { cause: error });
+  }
+  return Object.freeze(port);
 }
 
 function boundedString(value, name, maximumBytes = 128) {
@@ -160,6 +187,16 @@ function graphBlockedItemIds(items) {
   );
 }
 
+function isConfiguredRootItem(item, resolution) {
+  return (
+    resolution.orchestrator === false &&
+    resolution.roleId === ORCHESTRATOR_ROLE_ID &&
+    item.currentTarget.type === "role" &&
+    item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
+    item.graph?.parentItemId === null
+  );
+}
+
 function stableFailureCode(error) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(error, "code");
@@ -258,6 +295,8 @@ export class ProactiveWorkLoop {
     retryMaxMs = 15 * 60 * 1000,
     resolveTimeoutMs,
     decideTimeoutMs,
+    roleContextAssembler,
+    orchestratorService,
   } = {}) {
     this.ledger = requirePort(
       ledger,
@@ -316,8 +355,36 @@ export class ProactiveWorkLoop {
     ) {
       throw new TypeError("role timeouts must be shorter than leaseDurationMs");
     }
+    if ((roleContextAssembler == null) !== (orchestratorService == null)) {
+      throw new TypeError(
+        "roleContextAssembler and orchestratorService must be configured together",
+      );
+    }
+    this.roleContextAssembler = roleContextAssembler == null
+      ? null
+      : requirePort(
+          roleContextAssembler,
+          ["assemble"],
+          "roleContextAssembler",
+        );
+    this.orchestratorService = orchestratorService == null
+      ? null
+      : requirePort(
+          orchestratorService,
+          ["execute"],
+          "orchestratorService",
+        );
+    if (
+      this.roleContextAssembler !== null &&
+      this.resolveTimeoutMs + this.decideTimeoutMs >= this.leaseDurationMs
+    ) {
+      throw new TypeError(
+        "context and decision timeouts must fit within leaseDurationMs",
+      );
+    }
     this.inFlightByScope = new Map();
-    this.cycleTail = Promise.resolve();
+    this.inFlightItemIds = new Set();
+    this.inFlightQuestionTargets = new Set();
   }
 
   runCycle(input = {}) {
@@ -325,14 +392,13 @@ export class ProactiveWorkLoop {
     const scope = options.roleId ?? "*";
     const running = this.inFlightByScope.get(scope);
     if (running) return running;
-    const execution = this.cycleTail.then(() => this.#executeCycle(options));
+    const execution = this.#executeCycle(options);
     const tracked = execution.finally(() => {
       if (this.inFlightByScope.get(scope) === tracked) {
         this.inFlightByScope.delete(scope);
       }
     });
     this.inFlightByScope.set(scope, tracked);
-    this.cycleTail = tracked.catch(() => {});
     return tracked;
   }
 
@@ -345,15 +411,11 @@ export class ProactiveWorkLoop {
     const outcomes = [];
     let claimedCount = 0;
     let claimAttempts = 0;
+    let workAttempts = 0;
 
     for (const item of items) {
-      if (claimAttempts >= options.workLimit) break;
-      if (
-        !isAvailable(item, normalizeLoopClock(this.clock)) ||
-        graphBlocked.has(item.itemId)
-      ) {
-        continue;
-      }
+      if (workAttempts >= options.workLimit) break;
+      if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
       if (
         options.roleId !== null &&
         options.roleId !== ORCHESTRATOR_ROLE_ID &&
@@ -388,6 +450,14 @@ export class ProactiveWorkLoop {
         outcomes.push({ itemId: item.itemId, status: "paused" });
         continue;
       }
+      const isGraphBlocked = graphBlocked.has(item.itemId);
+      const configuredRoot = isConfiguredRootItem(item, resolution);
+      if (
+        (resolution.orchestrator || this.roleContextAssembler === null) &&
+        isGraphBlocked
+      ) {
+        continue;
+      }
       if (resolution.orchestrator && activeQuestions.has(key)) {
         outcomes.push({
           itemId: item.itemId,
@@ -395,27 +465,92 @@ export class ProactiveWorkLoop {
         });
         continue;
       }
-
-      claimAttempts += 1;
-      const claim = await this.#claim(item, resolution, options.intakeLimit);
-      if (!claim.item) {
-        outcomes.push({ itemId: item.itemId, status: claim.status });
+      let reservedQuestionTarget = false;
+      if (resolution.orchestrator) {
+        if (this.inFlightQuestionTargets.has(key)) {
+          outcomes.push({
+            itemId: item.itemId,
+            status: "missing_target_waiting",
+          });
+          continue;
+        }
+        this.inFlightQuestionTargets.add(key);
+        reservedQuestionTarget = true;
+        let questionAlreadyExists;
+        try {
+          questionAlreadyExists = activeQuestionTargets(
+            await this.#listAllItems(),
+          ).has(key);
+        } catch (error) {
+          this.inFlightQuestionTargets.delete(key);
+          throw error;
+        }
+        if (questionAlreadyExists) {
+          this.inFlightQuestionTargets.delete(key);
+          activeQuestions.add(key);
+          outcomes.push({
+            itemId: item.itemId,
+            status: "missing_target_waiting",
+          });
+          continue;
+        }
+      }
+      if (
+        this.roleContextAssembler !== null &&
+        !resolution.orchestrator &&
+        !configuredRoot &&
+        isGraphBlocked
+      ) {
+        if (reservedQuestionTarget) this.inFlightQuestionTargets.delete(key);
+        outcomes.push({ itemId: item.itemId, status: "graph_blocked" });
         continue;
       }
-      claimedCount += 1;
-      const outcome = await this.#decideAndStage(
-        claim.item,
-        resolution,
-        options,
-      );
-      outcomes.push({ itemId: item.itemId, ...outcome });
-      if (
-        resolution.orchestrator &&
-        ["staged", "stage_recovered", "stage_uncertain"].includes(
-          outcome.status,
-        )
-      ) {
-        activeQuestions.add(key);
+      if (this.inFlightItemIds.has(item.itemId)) {
+        if (reservedQuestionTarget) this.inFlightQuestionTargets.delete(key);
+        outcomes.push({ itemId: item.itemId, status: "already_in_flight" });
+        continue;
+      }
+      this.inFlightItemIds.add(item.itemId);
+      try {
+        workAttempts += 1;
+        if (
+          this.roleContextAssembler !== null &&
+          configuredRoot
+        ) {
+          const processed = await this.#processConfiguredOrchestrator({
+            item,
+            worker: resolution,
+            options,
+            graphBlocked: isGraphBlocked,
+          });
+          claimAttempts += processed.claimAttempted ? 1 : 0;
+          claimedCount += processed.claimed ? 1 : 0;
+          outcomes.push({ itemId: item.itemId, ...processed.outcome });
+          continue;
+        }
+
+        claimAttempts += 1;
+        const claim = await this.#claim(item, resolution, options.intakeLimit);
+        if (!claim.item) {
+          outcomes.push({ itemId: item.itemId, status: claim.status });
+          continue;
+        }
+        claimedCount += 1;
+        const outcome = this.roleContextAssembler === null || resolution.orchestrator
+          ? await this.#decideAndStage(claim.item, resolution, options)
+          : await this.#processSpecialist(claim.item, resolution, options);
+        outcomes.push({ itemId: item.itemId, ...outcome });
+        if (
+          resolution.orchestrator &&
+          ["staged", "stage_recovered", "stage_uncertain"].includes(
+            outcome.status,
+          )
+        ) {
+          activeQuestions.add(key);
+        }
+      } finally {
+        this.inFlightItemIds.delete(item.itemId);
+        if (reservedQuestionTarget) this.inFlightQuestionTargets.delete(key);
       }
     }
 
@@ -424,6 +559,7 @@ export class ProactiveWorkLoop {
       roleId: options.roleId,
       intake,
       scanned: items.length,
+      workAttempts,
       claimAttempts,
       claimed: claimedCount,
       staged: outcomes.filter(({ status }) => status === "staged").length,
@@ -433,6 +569,14 @@ export class ProactiveWorkLoop {
       retried: outcomes.filter(({ status }) => status === "retry_scheduled")
         .length,
       blocked: outcomes.filter(({ status }) => status === "blocked").length,
+      orchestrated: outcomes.filter(({ status }) => status === "orchestrated")
+        .length,
+      submittedDeliveries: outcomes.filter(
+        ({ status }) => status === "delivery_submitted",
+      ).length,
+      recoveredDeliveries: outcomes.filter(
+        ({ status }) => status === "delivery_recovered",
+      ).length,
       outcomes,
     };
   }
@@ -515,23 +659,146 @@ export class ProactiveWorkLoop {
     }
   }
 
+  async #assembleContext(item, worker, options) {
+    return within(
+      () => this.roleContextAssembler.assemble({
+        roleId: worker.roleId,
+        item,
+        trigger: options.trigger,
+      }),
+      this.resolveTimeoutMs,
+      "ROLE_CONTEXT_TIMEOUT",
+    );
+  }
+
+  async #decide(item, worker, options, context) {
+    return normalizeWorkDecision(
+      await within(
+        () => worker.decide({
+          item: workerItemDto(item),
+          trigger: options.trigger,
+          ...(context === undefined ? {} : { context }),
+        }),
+        this.decideTimeoutMs,
+        "ROLE_DECISION_TIMEOUT",
+      ),
+    );
+  }
+
+  async #processConfiguredOrchestrator({
+    item,
+    worker,
+    options,
+    graphBlocked,
+  }) {
+    const packet = await this.#assembleContext(item, worker, options);
+    const decision = await this.#decide(
+      item,
+      worker,
+      options,
+      packet.context,
+    );
+    if (decision.intent.type === "orchestrate") {
+      const executed = await this.orchestratorService.execute({
+        worker: { roleId: worker.roleId, workerId: worker.workerId },
+        item,
+        contextPacket: packet,
+        intent: decision.intent,
+      });
+      return {
+        claimAttempted: false,
+        claimed: false,
+        outcome: {
+          status: "orchestrated",
+          workerId: worker.workerId,
+          action: decision.intent.action.type,
+          applied: executed.applied,
+        },
+      };
+    }
+    if (decision.intent.type === "submit_delivery") {
+      throw Object.assign(
+        new Error("The configured root orchestrator cannot submit a delivery"),
+        { code: "ORCHESTRATOR_DELIVERY_NOT_SUPPORTED" },
+      );
+    }
+    if (graphBlocked) {
+      return {
+        claimAttempted: false,
+        claimed: false,
+        outcome: { status: "graph_blocked", workerId: worker.workerId },
+      };
+    }
+    const claim = await this.#claim(item, worker, options.intakeLimit);
+    if (!claim.item) {
+      return {
+        claimAttempted: true,
+        claimed: false,
+        outcome: { status: claim.status },
+      };
+    }
+    return {
+      claimAttempted: true,
+      claimed: true,
+      outcome: await this.#stageDecision(
+        claim.item,
+        worker,
+        options,
+        decision,
+      ),
+    };
+  }
+
+  async #processSpecialist(item, worker, options) {
+    let packet;
+    let decision;
+    try {
+      packet = await this.#assembleContext(item, worker, options);
+      decision = await this.#decide(
+        item,
+        worker,
+        options,
+        packet.context,
+      );
+      if (decision.intent.type === "submit_delivery") {
+        const executed = await this.orchestratorService.execute({
+          worker: { roleId: worker.roleId, workerId: worker.workerId },
+          item,
+          contextPacket: packet,
+          intent: decision.intent,
+        });
+        return {
+          status: executed.recovered
+            ? "delivery_recovered"
+            : "delivery_submitted",
+          workerId: worker.workerId,
+          deliveryRevision: executed.deliveryRevision,
+        };
+      }
+      if (decision.intent.type === "orchestrate") {
+        throw Object.assign(
+          new Error("A specialist cannot execute an orchestration action"),
+          { code: "SPECIALIST_ORCHESTRATION_NOT_PERMITTED" },
+        );
+      }
+    } catch (error) {
+      return this.#recordFailure(item, worker.workerId, error, options);
+    }
+    return this.#stageDecision(item, worker, options, decision);
+  }
+
   async #decideAndStage(item, worker, options) {
     let decision;
     try {
-      decision = normalizeWorkDecision(
-        await within(
-          () => worker.decide({
-            item: workerItemDto(item),
-            trigger: options.trigger,
-          }),
-          this.decideTimeoutMs,
-          "ROLE_DECISION_TIMEOUT",
-        ),
-      );
+      decision = await this.#decide(item, worker, options);
     } catch (error) {
       return this.#recordFailure(item, worker.workerId, error, options);
     }
 
+    return this.#stageDecision(item, worker, options, decision);
+  }
+
+  async #stageDecision(item, worker, options, decision) {
     try {
       await this.ledger.stageIntent({
         itemId: item.itemId,

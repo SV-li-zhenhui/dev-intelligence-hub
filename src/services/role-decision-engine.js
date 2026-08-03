@@ -13,6 +13,8 @@ const INTENT_TYPES = Object.freeze([
   "propose_code_action",
   "handoff",
   "complete",
+  "orchestrate",
+  "submit_delivery",
 ]);
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
 const MAXIMUM_CONTEXT_BYTES = 128 * 1024;
@@ -237,6 +239,7 @@ function systemPrompt(definition, permissions) {
     "Return exactly one JSON object matching the supplied WorkDecision schema.",
     "Do not call tools, perform writes, or claim permissions outside the configured allowed intents.",
     "Every choice id and workflow fact token must use only lowercase letters, digits, and hyphens; never use underscores.",
+    "For an orchestrate intent, intent.reason and intent.action.reason must be exactly identical.",
     `Role definition: ${JSON.stringify(definition)}.`,
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,
     `WorkDecision schema: ${JSON.stringify(WORK_DECISION_JSON_SCHEMA)}.`,
@@ -277,10 +280,15 @@ export class RoleDecisionEngine {
     Object.freeze(this);
   }
 
-  async decide({ item, trigger = "assigned" } = {}) {
+  async decide({ item, trigger = "assigned", context: suppliedContext } = {}) {
     const normalizedTrigger = normalizeTrigger(trigger);
     const context = normalizeContext(
-      await this.#contextFactory({ item: structuredClone(item), trigger: normalizedTrigger }),
+      suppliedContext === undefined
+        ? await this.#contextFactory({
+            item: structuredClone(item),
+            trigger: normalizedTrigger,
+          })
+        : suppliedContext,
     );
     const messages = [
       {
@@ -306,7 +314,7 @@ export class RoleDecisionEngine {
                 {
                   role: "user",
                   content:
-                    "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. Do not include markdown fences or commentary.",
+                    "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. Do not include markdown fences or commentary.",
                 },
               ],
       });

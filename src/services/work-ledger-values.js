@@ -6,6 +6,7 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 export const WORK_LEDGER_TARGET_TYPES = new Set(["role", "person", "node"]);
 export const WORK_LEDGER_STATUSES = new Set([
   "queued",
+  "paused",
   "working",
   "dispatch_pending",
   "waiting_user",

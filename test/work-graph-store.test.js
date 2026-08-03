@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { getReadyWorkGraphTaskIds } from "../src/domain/work-graph-contract.js";
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
@@ -168,6 +169,36 @@ function createCommand({
   };
 }
 
+function scopedTaskCommand(item, graphRevision, overrides = {}) {
+  return {
+    taskId: item.itemId,
+    reason: "orchestrator-coordination",
+    expectedGraphRevision: graphRevision,
+    expectedTaskRevision: item.revision,
+    ...overrides,
+  };
+}
+
+function escalationCommand(item, graphRevision, overrides = {}) {
+  return scopedTaskCommand(item, graphRevision, {
+    summary: "需要所有者确认任务边界",
+    question: "应采用哪个兼容性边界？",
+    choices: [
+      {
+        id: "keep-current",
+        label: "保持当前",
+        description: "不扩大当前任务范围",
+      },
+      {
+        id: "revise-scope",
+        label: "修订范围",
+        description: "由所有者确认新的任务边界",
+      },
+    ],
+    ...overrides,
+  });
+}
+
 function graphPorts(service, principalId, scopeRootTaskId) {
   const graph = new WorkGraphStore({ ledger: service });
   return {
@@ -238,10 +269,355 @@ test("reader projects one immutable graph with authoritative ledger statuses", a
     "createChild",
     "reviseAcceptanceContract",
     "decideDelivery",
+    "reassignTask",
+    "pauseTask",
+    "resumeTask",
+    "cancelTask",
+    "stageEscalation",
   ]);
   assert.equal(Object.isFrozen(graph), true);
   assert.equal(Object.isFrozen(reader), true);
   assert.equal(Object.isFrozen(planner), true);
+});
+
+test("legacy graph adapters keep old ports while unavailable orchestration fails closed", async () => {
+  const calls = [];
+  const graph = new WorkGraphStore({
+    ledger: {
+      async getGraphSnapshot() {
+        return { kind: "legacy-snapshot" };
+      },
+      async createGraphChild(input) {
+        calls.push(["create", input]);
+        return { kind: "legacy-create" };
+      },
+      async reviseGraphAcceptance(input) {
+        calls.push(["revise", input]);
+        return { kind: "legacy-revise" };
+      },
+      async submitGraphDelivery(input) {
+        calls.push(["submit", input]);
+        return { kind: "legacy-submit" };
+      },
+      async decideGraphDelivery(input) {
+        calls.push(["decide", input]);
+        return { kind: "legacy-decide" };
+      },
+    },
+  });
+  const planner = graph.planner({
+    principalId: "employee-orchestrator",
+    scopeRootTaskId: "legacy-root",
+  });
+
+  assert.deepEqual(await graph.reader().getSnapshot(), {
+    kind: "legacy-snapshot",
+  });
+  assert.deepEqual(await planner.createChild({ legacy: true }), {
+    kind: "legacy-create",
+  });
+  await assert.rejects(
+    planner.pauseTask({ legacy: true }),
+    (error) =>
+      error.code === "WORK_LEDGER_GRAPH_PORT_UNAVAILABLE" &&
+      error.statusCode === 503,
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("scoped planner reassigns, pauses, resumes, and safely cancels without crossing roots", async () => {
+  const { service, store } = await fixture(2);
+  let [inside, outside] = (await service.listItems()).items;
+  const { reader, planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    inside.itemId,
+  );
+  const writesBeforeDenied = store.writes.length;
+  const deniedCommands = [
+    ["reassignTask", scopedTaskCommand(outside, 1, {
+      target: { type: "role", id: "testing" },
+    })],
+    ["pauseTask", scopedTaskCommand(outside, 1)],
+    ["resumeTask", scopedTaskCommand(outside, 1)],
+    ["cancelTask", scopedTaskCommand(outside, 1)],
+    ["stageEscalation", escalationCommand(outside, 1)],
+  ];
+  for (const [method, command] of deniedCommands) {
+    await assert.rejects(
+      planner[method](command),
+      (error) =>
+        error.code === "WORK_LEDGER_GRAPH_SCOPE_DENIED" &&
+        error.statusCode === 403,
+      method,
+    );
+  }
+  assert.equal(store.writes.length, writesBeforeDenied);
+
+  let graphRevision = (await reader.getSnapshot()).graph.revision;
+  const reassigned = await planner.reassignTask(
+    scopedTaskCommand(inside, graphRevision, {
+      target: { type: "role", id: "testing" },
+    }),
+  );
+  assert.equal(reassigned.status, "queued");
+  assert.deepEqual(reassigned.currentTarget, { type: "role", id: "testing" });
+  inside = reassigned;
+  graphRevision += 1;
+
+  const writesBeforeStale = store.writes.length;
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(inside, graphRevision - 1)),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesBeforeStale);
+
+  inside = await planner.pauseTask(scopedTaskCommand(inside, graphRevision));
+  graphRevision += 1;
+  assert.equal(inside.status, "paused");
+  assert.equal(inside.ownerId, null);
+  assert.equal(inside.leaseId, null);
+  assert.equal(inside.activeIntentId, null);
+  let snapshot = await reader.getSnapshot();
+  assert.equal(
+    snapshot.graph.tasks.find(({ taskId }) => taskId === inside.itemId).status,
+    "paused",
+  );
+  assert.deepEqual(getReadyWorkGraphTaskIds(snapshot.graph), [outside.itemId]);
+
+  const writesBeforeUnsafe = store.writes.length;
+  await assert.rejects(
+    planner.reassignTask(scopedTaskCommand(inside, graphRevision, {
+      target: { type: "role", id: "developer" },
+    })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesBeforeUnsafe);
+
+  inside = await planner.resumeTask(scopedTaskCommand(inside, graphRevision));
+  graphRevision += 1;
+  assert.equal(inside.status, "queued");
+  inside = await planner.pauseTask(scopedTaskCommand(inside, graphRevision));
+  graphRevision += 1;
+  const cancelled = await planner.cancelTask(
+    scopedTaskCommand(inside, graphRevision),
+  );
+  assert.equal(cancelled.root.status, "cancelled");
+  assert.deepEqual(cancelled.cancelledItemIds, [inside.itemId]);
+
+  snapshot = await reader.getSnapshot();
+  assert.equal(
+    snapshot.graph.tasks.find(({ taskId }) => taskId === inside.itemId).status,
+    "cancelled",
+  );
+  assert.equal(
+    snapshot.graph.tasks.find(({ taskId }) => taskId === outside.itemId).status,
+    "pending",
+  );
+});
+
+test("scoped planner rejects active-task reassign and pause with zero writes", async () => {
+  const { service, store } = await fixture(1);
+  let item = (await service.listItems()).items[0];
+  item = await service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  const graphRevision = (await service.getGraphSnapshot()).graph.revision;
+  const { planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    item.itemId,
+  );
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    planner.reassignTask(scopedTaskCommand(item, graphRevision, {
+      target: { type: "role", id: "testing" },
+    })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(item, graphRevision)),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("scoped pause preserves a future retry backoff without making it ready", async () => {
+  const { service, store } = await fixture(1);
+  let item = (await service.listItems()).items[0];
+  item = await service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  item = await service.scheduleRetry({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-developer",
+    availableAt: "2026-08-03T01:05:00.000Z",
+    reason: "retry-backoff",
+  });
+  const graphRevision = (await service.getGraphSnapshot()).graph.revision;
+  const { reader, planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    item.itemId,
+  );
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(item, graphRevision)),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+
+  const current = (await service.listItems()).items[0];
+  assert.equal(store.writes.length, writesBefore);
+  assert.equal(current.status, "retry_wait");
+  assert.equal(current.availableAt, item.availableAt);
+  assert.deepEqual(
+    getReadyWorkGraphTaskIds((await reader.getSnapshot()).graph),
+    [],
+  );
+});
+
+test("legacy handoff cannot implicitly resume a paused task", async () => {
+  const { service, store } = await fixture(1);
+  let item = (await service.listItems()).items[0];
+  const { planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    item.itemId,
+  );
+  item = await planner.pauseTask(scopedTaskCommand(item, 1));
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    service.handoff({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      leaseId: null,
+      actorId: "employee-orchestrator",
+      target: { type: "role", id: "testing" },
+      reason: "must-use-explicit-resume",
+    }),
+    (error) => error.code === "WORK_LEDGER_TRANSITION_INVALID",
+  );
+
+  const current = (await service.listItems()).items[0];
+  assert.equal(store.writes.length, writesBefore);
+  assert.equal(current.status, "paused");
+  assert.deepEqual(current.currentTarget, item.currentTarget);
+});
+
+test("scoped cancellation cannot mutate a system alert", async () => {
+  const { service, store } = await fixture(0, {
+    records: [assignment(2)],
+  });
+  const alert = (await service.listItems()).items[0];
+  const graphRevision = (await service.getGraphSnapshot()).graph.revision;
+  const { planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    alert.itemId,
+  );
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    planner.cancelTask(scopedTaskCommand(alert, graphRevision)),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+
+  const current = (await service.listItems()).items[0];
+  assert.equal(store.writes.length, writesBefore);
+  assert.equal(current.kind, "system_alert");
+  assert.equal(current.status, "blocked");
+});
+
+test("staging an escalation atomically reuses the standard ask-user outbox", async () => {
+  const { service, store } = await fixture(1);
+  const item = (await service.listItems()).items[0];
+  const { planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    item.itemId,
+  );
+  const command = escalationCommand(item, 1);
+
+  const staged = await planner.stageEscalation(command);
+  assert.equal(staged.applied, true);
+  assert.equal(staged.item.status, "dispatch_pending");
+  assert.equal(staged.item.activeIntentId, staged.outbox.intentId);
+  assert.deepEqual(staged.outbox.requestedBy, {
+    roleId: "orchestrator",
+    workerId: "employee-orchestrator",
+  });
+  assert.deepEqual(staged.outbox.intent, {
+    schemaVersion: 1,
+    type: "ask_user",
+    summary: command.summary,
+    reason: command.reason,
+    question: command.question,
+    choices: command.choices,
+  });
+  assert.equal(staged.outbox.status, "pending");
+  const writesAfterStage = store.writes.length;
+
+  const replay = await planner.stageEscalation(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.outbox.intentId, staged.outbox.intentId);
+  assert.equal(replay.item.revision, staged.item.revision);
+  assert.equal(store.writes.length, writesAfterStage);
+
+  await assert.rejects(
+    planner.stageEscalation({ ...command, question: "另一个问题？" }),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesAfterStage);
+
+  const currentGraphRevision = (await service.getGraphSnapshot()).graph.revision;
+  await assert.rejects(
+    planner.stageEscalation(escalationCommand(staged.item, currentGraphRevision, {
+      question: "另一个问题？",
+    })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesAfterStage);
+
+  const claimed = await service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "attention-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimed.status, "dispatching");
+  await service.ackIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision,
+    outcome: "delivered",
+    nextStatus: "completed",
+    actorId: "attention-dispatcher",
+    details: { downstreamRef: "historical-escalation" },
+  });
+  const writesAfterTerminal = store.writes.length;
+  await assert.rejects(
+    planner.stageEscalation(command),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  assert.equal(store.writes.length, writesAfterTerminal);
+  assert.equal(
+    (await service.listTimeline({ limit: 50 })).items.filter(
+      ({ type, itemId }) => type === "intent_staged" && itemId === item.itemId,
+    ).length,
+    1,
+  );
 });
 
 test("reader does not hide retry state behind the coarse graph status", async () => {

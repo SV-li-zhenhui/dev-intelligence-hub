@@ -261,6 +261,10 @@ export function createWorkIntentPolicy({
     const intent = normalizeWorkIntent(intentValue);
     const commonPayload = { summary: intent.summary, reason: intent.reason };
 
+    if (["orchestrate", "submit_delivery"].includes(intent.type)) {
+      denied("编排和岗位交付意图必须由共享任务图的可信服务处理");
+    }
+
     if (intent.type === "ask_user") {
       return baseBound(
         context,
@@ -353,17 +357,20 @@ export function createWorkIntentPolicy({
         },
       );
     }
-    return baseBound(
-      context,
-      version,
-      "complete",
-      eventBinding(context.event),
-      {
-        outcome: intent.outcome,
-        evidence: intent.evidence,
-        ...commonPayload,
-      },
-    );
+    if (intent.type === "complete") {
+      return baseBound(
+        context,
+        version,
+        "complete",
+        eventBinding(context.event),
+        {
+          outcome: intent.outcome,
+          evidence: intent.evidence,
+          ...commonPayload,
+        },
+      );
+    }
+    denied();
   }
 
   return Object.freeze({ bind });

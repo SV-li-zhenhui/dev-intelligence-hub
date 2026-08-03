@@ -18,6 +18,7 @@ export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 // non-terminal so the ledger can safely requeue them later.
 const GRAPH_STATUS_BY_LEDGER_STATUS = new Map([
   ["queued", "pending"],
+  ["paused", "paused"],
   ["working", "in_progress"],
   ["dispatch_pending", "in_progress"],
   ["waiting_user", "in_progress"],

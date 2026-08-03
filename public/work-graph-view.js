@@ -16,6 +16,7 @@ const MAX_RENDERED_EVIDENCE = 4;
 
 const LEDGER_STATUS_LABELS = Object.freeze({
   queued: "待领取",
+  paused: "已暂停",
   working: "执行中",
   dispatch_pending: "等待派发",
   waiting_user: "等待你答复",

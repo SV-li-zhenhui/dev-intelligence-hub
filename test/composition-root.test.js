@@ -262,6 +262,8 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     workIntentPolicyFactory: () => ({ async bind() {} }),
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
     workflowFactSourceFactory: () => ({ async read() {} }),
+    roleContextAssemblerFactory: () => ({ async assemble() {} }),
+    orchestratorServiceFactory: () => ({ async execute() {} }),
     attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
     workProposalResultReconcilerFactory: (options) => {
       calls.proposalResultReconciler = options;
@@ -534,6 +536,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const policy = { async bind() {} };
   const roleDirectory = { async resolve() {} };
   const factSource = { async read() {} };
+  const roleContextAssembler = { async assemble() {} };
+  const orchestratorService = { async execute() {} };
   const reconciler = { async runCycle() {} };
   const proposalReconciler = { async runCycle() {} };
   const conditionWaker = { async runCycle() {} };
@@ -625,6 +629,16 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       calls.facts = options;
       return factSource;
     },
+    roleContextAssemblerFactory: (options) => {
+      serviceOrder.push("context-assembler");
+      calls.contextAssembler = options;
+      return roleContextAssembler;
+    },
+    orchestratorServiceFactory: (options) => {
+      serviceOrder.push("orchestrator-service");
+      calls.orchestratorService = options;
+      return orchestratorService;
+    },
     attentionResultReconcilerFactory: (options) => {
       serviceOrder.push("reconciler");
       calls.reconciler = options;
@@ -674,6 +688,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "policy",
     "directory",
     "facts",
+    "context-assembler",
+    "orchestrator-service",
     "reconciler",
     "proposal-reconciler",
     "waker",
@@ -724,6 +740,19 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   );
   assert.deepEqual(calls.policy, workCoordinationConfig().workCoordination.policy);
   assert.equal(calls.facts.maximumAgeMs, 7_000);
+  assert.strictEqual(calls.contextAssembler.graphReader, ledgerRuntime.graphReader);
+  assert.strictEqual(calls.contextAssembler.factSource, factSource);
+  assert.strictEqual(
+    calls.orchestratorService.contextAssembler,
+    roleContextAssembler,
+  );
+  assert.strictEqual(
+    calls.orchestratorService.graphReader,
+    ledgerRuntime.graphReader,
+  );
+  assert.deepEqual(calls.orchestratorService.capabilityRoles, {
+    testing: "tester",
+  });
   assert.strictEqual(calls.reconciler.attentionConsumer, attentionConsumer);
   assert.strictEqual(calls.reconciler.ledger, ledgerRuntime);
   assert.strictEqual(calls.proposalReconciler.proposalConsumer, proposalConsumer);
@@ -731,6 +760,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.waker.factSource, factSource);
   assert.strictEqual(calls.waker.ledger, ledgerRuntime);
   assert.strictEqual(calls.loop.roleDirectory, roleDirectory);
+  assert.strictEqual(calls.loop.roleContextAssembler, roleContextAssembler);
+  assert.strictEqual(calls.loop.orchestratorService, orchestratorService);
   assert.equal(calls.loop.decideTimeoutMs, 3_000);
   assert.strictEqual(calls.dispatcher.policy, policy);
   assert.strictEqual(calls.dispatcher.attentionProducer, attentionProducer);
@@ -874,6 +905,8 @@ test("enabled unified memory exposes search only and projects the existing work 
     }),
     workLedgerRuntimeFactory: async () => ({
       graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
+      scopedGraphPlannerFactory: { forRoot() {} },
+      graphDelivererFactory: { forClaim() {} },
       graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
