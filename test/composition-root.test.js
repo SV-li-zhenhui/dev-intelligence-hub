@@ -2432,3 +2432,60 @@ test("local code startup rejects an empty role-policy intersection before acquir
   assert.equal(confirmationCalls, 0);
   assert.deepEqual(closeCalls, ["workflow", "code-executor"]);
 });
+
+test("versioned composition builds every subsystem from the stored active snapshot", async () => {
+  const bootstrap = applicationConfig();
+  const active = { ...applicationConfig(), refreshMinutes: 23 };
+  const calls = [];
+  const port = (methods) =>
+    Object.freeze(
+      Object.fromEntries(methods.map((name) => [name, async () => {}])),
+    );
+  const configurationRuntime = {
+    startupConfiguration: active,
+    status: Object.freeze({
+      safeMode: false,
+      activeVersion: 4,
+      stateRevision: 9,
+      migrationError: null,
+    }),
+    reader: port([
+      "readSnapshot",
+      "readActive",
+      "readVersion",
+      "readDraft",
+      "readProjectionBatch",
+    ]),
+    draftManager: port(["createDraft", "reviseDraft"]),
+    simulator: port(["prepareDraftActivation", "prepareRollback"]),
+    activationExecutor: port(["activateDraft", "activateRollback"]),
+    proposalPort: port(["createDraft", "reviseDraft"]),
+    async close() {
+      calls.push("configuration-close");
+    },
+  };
+
+  const application = await createApplication({
+    config: bootstrap,
+    store: memoryStore(),
+    versionedConfiguration: true,
+    configurationRuntimeFactory: async (candidate, dependencies) => {
+      calls.push({ candidate, dependencies });
+      return configurationRuntime;
+    },
+  });
+
+  assert.deepEqual(calls[0].candidate, bootstrap);
+  assert.equal(calls[0].dependencies.store instanceof Object, true);
+  assert.strictEqual(application.config, active);
+  assert.equal(application.configuration.status.activeVersion, 4);
+  assert.strictEqual(application.configuration.reader, configurationRuntime.reader);
+  assert.strictEqual(
+    application.configuration.proposalPort,
+    configurationRuntime.proposalPort,
+  );
+  assert.equal("activationExecutor" in application.configuration, false);
+
+  await application.close();
+  assert.equal(calls.at(-1), "configuration-close");
+});

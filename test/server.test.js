@@ -574,6 +574,45 @@ async function withServer(
   }
 }
 
+test("configuration safe mode starts no background reads, employees, or confirmations", async () => {
+  let refreshCalls = 0;
+  let operationCalls = 0;
+  const application = startupApplication({
+    async refresh() {
+      refreshCalls += 1;
+      return healthyRefreshResult();
+    },
+  });
+  application.configuration = {
+    status: { safeMode: true, migrationError: { code: "CONFIG_LOCAL_INVALID" } },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn() {
+      throw new Error("safe mode must not schedule work");
+    },
+  });
+
+  assert.deepEqual(await backgroundWork.initialRefresh, {
+    skipped: "configuration_safe_mode",
+  });
+  assert.deepEqual(await backgroundWork.refresh(), {
+    skipped: "configuration_safe_mode",
+  });
+  assert.deepEqual(
+    await backgroundWork.mutateFacts(async () => {
+      operationCalls += 1;
+    }),
+    { skipped: "configuration_safe_mode" },
+  );
+  assert.deepEqual(backgroundWork.timers, []);
+  assert.equal(backgroundWork.confirmationReady(), false);
+  assert.equal(refreshCalls, 0);
+  assert.equal(operationCalls, 0);
+  const firstStop = backgroundWork.stop();
+  assert.strictEqual(backgroundWork.stop(), firstStop);
+  await firstStop;
+});
+
 test("background work runs every registered employee after the initial refresh and on schedule", async () => {
   const calls = [];
   const timers = [];

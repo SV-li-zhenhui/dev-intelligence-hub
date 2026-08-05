@@ -1108,7 +1108,7 @@ export function normalizeConfigurationDocument(value) {
       1_000,
       (entry, entryPath) =>
         text(entry, entryPath, 256, { pattern: SAFE_REPOSITORY }),
-      1,
+      0,
     ),
     prResponsibility: (() => {
       const config = fields(

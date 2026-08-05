@@ -8,7 +8,8 @@ import { createChangePackageRuntime } from "./change-package-runtime.js";
 import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
-import { loadConfig, projectRoot } from "./lib/config.js";
+import { createConfigurationRuntime } from "./configuration-runtime.js";
+import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
@@ -137,6 +138,10 @@ export function createEmployeeRegistry(employees = []) {
 export async function createApplication({
   config: suppliedConfig,
   store: suppliedStore,
+  configurationRuntimeFactory = createConfigurationRuntime,
+  configurationRuntimeDependencies = {},
+  configBootstrapLoader = loadConfigBootstrap,
+  versionedConfiguration = suppliedConfig === undefined,
   codeExecutorRuntimeFactory = createCodeExecutorRuntime,
   codeExecutorDependencies = {},
   changePackageRuntimeFactory = createChangePackageRuntime,
@@ -197,13 +202,17 @@ export async function createApplication({
   workCoordinationDependencies = {},
   externalActions = true,
 } = {}) {
-  const config = suppliedConfig ?? (await loadConfig());
-  const roleConfig = config.employees?.prReviewer || { enabled: false };
-  const github = new GitHubAdapter({
-    maxPatchCharacters: roleConfig.maxPatchCharacters,
-  });
-  const dingtalk = new DingTalkAdapter();
-  const brain = createBrain(config.brain);
+  if (typeof versionedConfiguration !== "boolean") {
+    throw new TypeError("versionedConfiguration must be a boolean");
+  }
+  const bootstrap = suppliedConfig === undefined
+    ? await configBootstrapLoader()
+    : {
+        candidate: suppliedConfig,
+        fallbackConfiguration: suppliedConfig,
+        bootstrapError: null,
+      };
+  let config = bootstrap.candidate ?? bootstrap.fallbackConfiguration;
   const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
   const operationQueue = new OperationQueue();
   const acquiredRuntimes = [];
@@ -213,6 +222,7 @@ export async function createApplication({
     }
     return runtime;
   };
+  let configurationRuntime = null;
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
   let workflowRouting = null;
@@ -236,6 +246,26 @@ export async function createApplication({
   let changePackageApplicationRequester = null;
   let grantFactory = null;
   try {
+    if (versionedConfiguration) {
+      configurationRuntime = trackRuntime(
+        await configurationRuntimeFactory(bootstrap.candidate, {
+          ...configurationRuntimeDependencies,
+          store,
+          fallbackConfiguration: bootstrap.fallbackConfiguration,
+          bootstrapError: bootstrap.bootstrapError,
+        }),
+      );
+      if (!configurationRuntime?.startupConfiguration) {
+        throw new Error("版本化配置运行时没有提供启动配置");
+      }
+      config = configurationRuntime.startupConfiguration;
+    }
+    const roleConfig = config.employees?.prReviewer || { enabled: false };
+    const github = new GitHubAdapter({
+      maxPatchCharacters: roleConfig.maxPatchCharacters,
+    });
+    const dingtalk = new DingTalkAdapter();
+    const brain = createBrain(config.brain);
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
         ...codeExecutorDependencies,
@@ -921,6 +951,15 @@ export async function createApplication({
     };
     return {
       config,
+      configuration: configurationRuntime
+        ? Object.freeze({
+            status: configurationRuntime.status,
+            reader: configurationRuntime.reader,
+            draftManager: configurationRuntime.draftManager,
+            simulator: configurationRuntime.simulator,
+            proposalPort: configurationRuntime.proposalPort,
+          })
+        : null,
       store,
       refreshService,
       employeeRegistry,

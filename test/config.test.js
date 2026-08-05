@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { mergeConfig } from "../src/lib/config.js";
+import {
+  createSafeDisabledConfiguration,
+  mergeConfig,
+} from "../src/lib/config.js";
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
@@ -452,6 +455,19 @@ test("the unified memory master switch preserves but does not activate child cho
   assert.deepEqual(result.memory.imports, {
     localSessions: true,
     git: true,
+  });
+});
+
+test("safe configuration explicitly disables optional memory imports", async () => {
+  const configPath = path.resolve(testDirectory, "../config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  delete config.memory.imports;
+
+  const safe = createSafeDisabledConfiguration(config);
+
+  assert.deepEqual(safe.memory.imports, {
+    localSessions: false,
+    git: false,
   });
 });
 

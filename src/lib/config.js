@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeConfigurationDocument } from "../domain/configuration-contract.js";
 
 export const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -240,15 +241,70 @@ export function mergeConfig(base, local = {}) {
   };
 }
 
-export async function loadConfig() {
-  const base = JSON.parse(
+export function createSafeDisabledConfiguration(value) {
+  const safe = structuredClone(normalizeConfigurationDocument(value));
+  safe.trackedRepositories = [];
+  safe.brain.enabled = false;
+  safe.codeExecutor.enabled = false;
+  safe.changePackages.enabled = false;
+  safe.githubActions.enabled = false;
+  safe.workflowRouting.enabled = false;
+  safe.workCoordination.enabled = false;
+  safe.memory.imports = { localSessions: false, git: false };
+  if (safe.memory.answering) safe.memory.answering.enabled = false;
+  safe.employees.prReviewer.enabled = false;
+  safe.employees.prReviewer.initialPaused = true;
+  for (const role of Object.values(safe.employees.roles)) {
+    role.enabled = false;
+    role.initialPaused = true;
+  }
+  safe.dingtalk.enabled = false;
+  return normalizeConfigurationDocument(safe);
+}
+
+async function readBaseConfig() {
+  return JSON.parse(
     await readFile(path.join(projectRoot, "config.json"), "utf8"),
   );
+}
+
+async function readLocalConfig() {
+  return JSON.parse(
+    await readFile(path.join(projectRoot, "config.local.json"), "utf8"),
+  );
+}
+
+export async function loadConfigBootstrap() {
+  const base = await readBaseConfig();
+  const fallbackConfiguration = createSafeDisabledConfiguration(base);
   try {
-    const local = JSON.parse(
-      await readFile(path.join(projectRoot, "config.local.json"), "utf8"),
-    );
-    return mergeConfig(base, local);
+    return {
+      candidate: mergeConfig(base, await readLocalConfig()),
+      fallbackConfiguration,
+      bootstrapError: null,
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { candidate: base, fallbackConfiguration, bootstrapError: null };
+    }
+    if (error instanceof SyntaxError) {
+      return {
+        candidate: null,
+        fallbackConfiguration,
+        bootstrapError: {
+          code: "CONFIG_LOCAL_INVALID",
+          message: "本地覆盖配置无法解析",
+        },
+      };
+    }
+    throw error;
+  }
+}
+
+export async function loadConfig() {
+  const base = await readBaseConfig();
+  try {
+    return mergeConfig(base, await readLocalConfig());
   } catch (error) {
     if (error.code === "ENOENT") return base;
     throw error;

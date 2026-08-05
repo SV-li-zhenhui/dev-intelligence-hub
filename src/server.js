@@ -1728,6 +1728,26 @@ export function createDashboardServer(
   return attachServerLifecycle(server, application, backgroundWork);
 }
 
+function configurationSafeModeBackgroundWork() {
+  const skipped = Object.freeze({ skipped: "configuration_safe_mode" });
+  const skip = () => Promise.resolve(skipped);
+  let stopPromise = null;
+  return Object.freeze({
+    initialRefresh: Promise.resolve(skipped),
+    timers: Object.freeze([]),
+    stop() {
+      stopPromise ||= Promise.resolve();
+      return stopPromise;
+    },
+    refresh: skip,
+    mutateFacts: skip,
+    signalAgency: skip,
+    runEmployee: skip,
+    runConfirmationOperation: skip,
+    confirmationReady: () => false,
+  });
+}
+
 export function startApplicationBackgroundWork(
   application,
   {
@@ -1736,6 +1756,9 @@ export function startApplicationBackgroundWork(
     reportError = console.error,
   } = {},
 ) {
+  if (application.configuration?.status?.safeMode === true) {
+    return configurationSafeModeBackgroundWork();
+  }
   const employeeRegistry = resolveEmployeeRegistry(application);
   const timers = [];
   const activeTasks = new Set();
