@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { createWorkflowRouter } from "../src/domain/workflow-router.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { WorkflowRoutingService } from "../src/services/workflow-routing-service.js";
 import { MAX_WORKFLOW_STATE_BYTES } from "../src/services/workflow-routing-state.js";
 import { prettySerializedWorkflowBytes } from "../src/services/workflow-routing-values.js";
@@ -11,6 +12,33 @@ const MAX_PAGE_SIZE = 100;
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+    return "activated-v2";
+  });
 }
 
 function canonical(value) {
@@ -253,12 +281,14 @@ async function createFixture({
   stateByteBudget,
   auditByteBudget,
   bundleByteBudget,
+  actionAdmissionGate,
 } = {}) {
   const service = new WorkflowRoutingService({
     store,
     router,
     clock: incrementingClock(),
     exclusiveLease,
+    ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
     ...(recordLimit === undefined ? {} : { recordLimit }),
     ...(configHistoryLimit === undefined ? {} : { configHistoryLimit }),
     ...(stateByteBudget === undefined ? {} : { stateByteBudget }),
@@ -288,6 +318,13 @@ function assertPage(page) {
     true,
   );
 }
+
+test("an explicit invalid workflow admission gate never degrades to direct mode", async () => {
+  await assert.rejects(
+    createFixture({ actionAdmissionGate: null }),
+    /actionAdmissionGate must provide run\(operation\)/,
+  );
+});
 
 test("configuration replacements are versioned, content-addressed, and whole rather than merged", async () => {
   const { service, store } = await createFixture();
@@ -430,6 +467,127 @@ test("ingest is content-idempotent and canonical object key order does not creat
   assert.equal(store.writes.length, 1);
   assert.equal((await service.listAssignments()).items.length, 1);
   assert.equal((await service.listAudit()).items.length, 1);
+});
+
+test("configuration-first admission creates no event or snapshot assignments", async (t) => {
+  for (const kind of ["event", "snapshot"]) {
+    await t.test(kind, async () => {
+      const gate = readyActionAdmissionGate();
+      const { service, store, router } = await createFixture({
+        actionAdmissionGate: gate,
+      });
+      await configure(service);
+      store.clearWrites();
+      router.calls.length = 0;
+      await activateNextConfiguration(gate);
+
+      const ingestion = kind === "event"
+        ? service.ingest({ event: workflowEvent() })
+        : service.ingestSnapshot({
+            snapshot: workflowSnapshot({ items: [pullRequest(42)] }),
+          });
+      await assert.rejects(
+        ingestion,
+        (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+      );
+
+      assert.equal(router.calls.length, 0);
+      assert.equal(store.writes.length, 0);
+      assert.deepEqual(await service.listAssignments(), {
+        items: [],
+        nextCursor: null,
+      });
+      assert.equal(gate.readStatus().mode, "restart_required");
+    });
+  }
+});
+
+test("ingest-first admission releases cutover before old-config routing settles", async () => {
+  const routeEntered = deferred();
+  const releaseRoute = deferred();
+  const gate = readyActionAdmissionGate();
+  const router = new StubRouter(async (input) => {
+    routeEntered.resolve();
+    await releaseRoute.promise;
+    return defaultRoute(input);
+  });
+  const { service } = await createFixture({
+    router,
+    actionAdmissionGate: gate,
+  });
+  const configured = await configure(service);
+
+  const ingestion = service.ingest({ event: workflowEvent() });
+  await routeEntered.promise;
+  assert.equal(
+    await Promise.race([
+      activateNextConfiguration(gate),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
+
+  releaseRoute.resolve();
+  const ingested = await ingestion;
+  assert.equal(ingested.assignments.length, 1);
+  assert.equal(ingested.assignments[0].configVersion, configured.version);
+  assert.equal(ingested.assignments[0].configDigest, configured.digest);
+  assert.equal(gate.readStatus().mode, "restart_required");
+  await assert.rejects(
+    service.ingest({
+      event: workflowEvent({
+        subject: {
+          ...workflowEvent().subject,
+          id: "github:pr:acme/repo#43",
+          number: 43,
+        },
+      }),
+    }),
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+});
+
+test("snapshot-first admission preserves one atomic old-config batch", async () => {
+  const routeEntered = deferred();
+  const releaseRoute = deferred();
+  const gate = readyActionAdmissionGate();
+  const router = new StubRouter(async (input) => {
+    routeEntered.resolve();
+    await releaseRoute.promise;
+    return defaultRoute(input);
+  });
+  const { service } = await createFixture({
+    router,
+    actionAdmissionGate: gate,
+  });
+  const configured = await configure(service);
+
+  const ingestion = service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      items: [pullRequest(42), pullRequest(43)],
+    }),
+  });
+  await routeEntered.promise;
+  assert.equal(
+    await Promise.race([
+      activateNextConfiguration(gate),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
+
+  releaseRoute.resolve();
+  const ingested = await ingestion;
+  assert.equal(ingested.assignments.length, 2);
+  assert.equal(
+    ingested.assignments.every(
+      ({ configVersion, configDigest }) =>
+        configVersion === configured.version &&
+        configDigest === configured.digest,
+    ),
+    true,
+  );
+  assert.equal(gate.readStatus().mode, "restart_required");
 });
 
 test("dryRun explains a candidate definition without writing events, assignments, audit, or config", async () => {

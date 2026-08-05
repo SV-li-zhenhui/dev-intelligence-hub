@@ -249,8 +249,14 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     },
   };
   return {
-    workflowRoutingRuntimeFactory: async () => workflow,
-    workLedgerRuntimeFactory: async () => ledger,
+    workflowRoutingRuntimeFactory: async (_config, options) => {
+      calls.workflowRuntime = options;
+      return workflow;
+    },
+    workLedgerRuntimeFactory: async (options) => {
+      calls.ledgerRuntime = options;
+      return ledger;
+    },
     attentionInboxRuntimeFactory: async () => attention,
     workProposalRuntimeFactory: async (options) => {
       calls.proposalRuntime = options;
@@ -455,6 +461,7 @@ test("application composes the recovered local workflow router", async () => {
 
   assert.strictEqual(application.workflowRouting, workflowRouting);
   assert.strictEqual(calls[0].dependencies.store, store);
+  assert.equal("actionAdmissionGate" in calls[0].dependencies, false);
   assert.equal(calls[0].config.workflowRouting.enabled, false);
   await application.close();
 });
@@ -705,6 +712,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   assert.strictEqual(calls.ledger.store, store);
   assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
+  assert.equal("actionAdmissionGate" in calls.ledger, false);
   assert.strictEqual(calls.attention.store, store);
   assert.notStrictEqual(
     calls.ledger.operationQueue,
@@ -2777,6 +2785,16 @@ test("versioned local code shares one gate and reads Active authority", async ()
     versionedConfiguration: true,
     store: memoryStore(),
     actionAdmissionGateFactory: () => sharedGate,
+    workflowRoutingDependencies: {
+      actionAdmissionGate: {
+        run() { throw new Error("foreign workflow gate"); },
+      },
+    },
+    workLedgerDependencies: {
+      actionAdmissionGate: {
+        run() { throw new Error("foreign ledger gate"); },
+      },
+    },
     configurationRuntimeFactory: async (_candidate, dependencies) => {
       calls.configuration = dependencies;
       return {
@@ -2891,6 +2909,20 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.deepEqual(Object.keys(calls.versionedAuthority.actionAdmissionGate), [
     "run",
   ]);
+  assert.deepEqual(Object.keys(calls.workflowRuntime.actionAdmissionGate), [
+    "run",
+  ]);
+  assert.deepEqual(Object.keys(calls.ledgerRuntime.actionAdmissionGate), [
+    "run",
+  ]);
+  assert.strictEqual(
+    calls.workflowRuntime.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.ledgerRuntime.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
   assert.strictEqual(
     calls.codeJobRuntime.actionAdmissionGate,
     calls.versionedAuthority.actionAdmissionGate,

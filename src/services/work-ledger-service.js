@@ -70,6 +70,20 @@ import {
   validateWorkLedgerGraphTransition,
 } from "./work-ledger-graph.js";
 
+const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
+
+function newWorkAdmissionRun(value) {
+  const gate = value === undefined ? DIRECT_NEW_WORK_ADMISSION : value;
+  if (!gate || typeof gate.run !== "function") {
+    throw new TypeError("actionAdmissionGate must provide run(operation)");
+  }
+  return gate.run.bind(gate);
+}
+
 function queryPage(records, idName, options = {}, allowedStatuses = null) {
   if (!isPlainLedgerObject(options)) {
     throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账查询无效");
@@ -132,6 +146,7 @@ export class WorkLedgerService {
     assignmentSource,
     exclusiveLease,
     operationQueue,
+    actionAdmissionGate,
     clock = () => new Date(),
     idFactory,
     limits,
@@ -162,6 +177,7 @@ export class WorkLedgerService {
     this.assignmentSource = assignmentSource;
     this.exclusiveLease = exclusiveLease;
     this.operationQueue = operationQueue || new OperationQueue();
+    this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
     this.clock = clock;
     this.idFactory = idFactory;
     this.limits = normalizeWorkLedgerLimits(limits);
@@ -246,6 +262,34 @@ export class WorkLedgerService {
     );
   }
 
+  async readItemForReconciliation(input = {}) {
+    this.#assertReady();
+    if (!hasExactLedgerKeys(input, ["itemId"])) {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "工作项恢复查询无效",
+      );
+    }
+    let itemId;
+    try {
+      itemId = boundedLedgerString(input.itemId, "itemId", 192);
+    } catch {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "工作项恢复查询无效",
+      );
+    }
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        const item = this.state.items.find(
+          (candidate) => candidate.itemId === itemId,
+        );
+        return item ? cloneLedgerValue(item) : null;
+      }),
+    );
+  }
+
   async getGraphSnapshot() {
     this.#assertReady();
     return projectWorkLedgerGraphView(this.state);
@@ -294,7 +338,7 @@ export class WorkLedgerService {
       MAX_WORK_LEDGER_INTAKE_BATCH,
       "limit",
     );
-    return this.#writeTransaction(async () => {
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const afterSequence = this.state.intakeCursor;
       let rawBatch;
       try {
@@ -331,11 +375,13 @@ export class WorkLedgerService {
       return gap
         ? this.#recordGap(batch, gap, now)
         : this.#recordBatch(batch, now);
-    });
+    }));
   }
 
   async claim(input = {}) {
-    return this.#executeCommand(planWorkItemClaim, input, true);
+    return this.#admitNewWork(() =>
+      this.#executeCommand(planWorkItemClaim, input, true),
+    );
   }
 
   async transition(input = {}) {
@@ -728,6 +774,15 @@ export class WorkLedgerService {
         return operation();
       }),
     );
+  }
+
+  async #admitNewWork(operation) {
+    const admitted = await this.runNewWorkAdmission(() => ({
+      // The service queue is the admission boundary. Carry its Promise out so
+      // cutover never waits on the assignment source or durable store.
+      operation: operation(),
+    }));
+    return admitted.operation;
   }
 
   #assertReady() {

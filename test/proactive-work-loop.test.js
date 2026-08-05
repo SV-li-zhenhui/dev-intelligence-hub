@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 
 function clone(value) {
@@ -14,6 +15,24 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+  });
 }
 
 function controlledClock() {
@@ -710,6 +729,82 @@ test("a lost claim acknowledgement is recovered before one decision is staged", 
   assert.equal(ledger.calls.claim.length, 1);
   assert.equal(ledger.calls.stageIntent.length, 1);
   assert.equal(ledger.outbox.length, 1);
+});
+
+test("configuration-first claim rejection stops the cycle with its gate error", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(1)], time });
+  ledger.claim = async (input) => {
+    ledger.calls.claim.push(clone(input));
+    throw Object.assign(new Error("configuration changed"), {
+      code: "RUNTIME_RESTART_REQUIRED",
+    });
+  };
+  let decisionCalls = 0;
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker({
+      decide: async () => {
+        decisionCalls += 1;
+        return completeDecision();
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  await assert.rejects(
+    loop.runCycle(),
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  assert.equal(ledger.calls.claim.length, 1);
+  assert.equal(decisionCalls, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+});
+
+test("an admitted lost claim ACK reconciles after cutover without reaching the brain", async () => {
+  const time = controlledClock();
+  const gate = readyActionAdmissionGate();
+  const ledger = new FakeLedger({ source: [workItem(1)], time });
+  ledger.claimFailure = "after_write";
+  const claim = ledger.claim.bind(ledger);
+  ledger.claim = async (input) => {
+    const admitted = await gate.run(() => ({ operation: claim(input) }));
+    try {
+      return await admitted.operation;
+    } catch (error) {
+      await activateNextConfiguration(gate);
+      throw error;
+    }
+  };
+  let reconciliationReads = 0;
+  ledger.readItemForReconciliation = async ({ itemId }) => {
+    reconciliationReads += 1;
+    return clone(
+      ledger.items.find((candidate) => candidate.itemId === itemId) ?? null,
+    );
+  };
+  let providerCalls = 0;
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker({
+      decide: (input) => gate.run(() => {
+        providerCalls += 1;
+        return completeDecision(input.item.itemId);
+      }),
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle();
+
+  assert.equal(result.claimed, 1);
+  assert.equal(result.retried, 1);
+  assert.equal(result.outcomes[0].code, "RUNTIME_RESTART_REQUIRED");
+  assert.equal(reconciliationReads, 1);
+  assert.equal(providerCalls, 0);
+  assert.equal(ledger.calls.intake.length, 1);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.items[0].status, "retry_wait");
+  assert.equal(gate.readStatus().mode, "restart_required");
 });
 
 test("one failed target resolution is cached for the whole cycle", async () => {

@@ -180,6 +180,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "listItems",
     "listTimeline",
     "listOutbox",
+    "readItemForReconciliation",
     "intake",
     "claim",
     "transition",

@@ -38,6 +38,20 @@ import {
   workflowServiceError,
 } from "./workflow-routing-values.js";
 
+const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
+
+function newWorkAdmissionRun(value) {
+  const gate = value === undefined ? DIRECT_NEW_WORK_ADMISSION : value;
+  if (!gate || typeof gate.run !== "function") {
+    throw new TypeError("actionAdmissionGate must provide run(operation)");
+  }
+  return gate.run.bind(gate);
+}
+
 function validateLimit(value, maximum, name) {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new TypeError(`${name} is invalid`);
@@ -52,6 +66,7 @@ export class WorkflowRoutingService {
     clock = () => new Date(),
     operationQueue,
     exclusiveLease,
+    actionAdmissionGate,
     recordLimit = MAX_WORKFLOW_RECORDS,
     configHistoryLimit = MAX_WORKFLOW_CONFIG_HISTORY,
     stateByteBudget = MAX_WORKFLOW_STATE_BYTES,
@@ -77,6 +92,7 @@ export class WorkflowRoutingService {
     this.clock = clock;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
+    this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
     this.limits = Object.freeze({
       recordLimit: validateLimit(
         recordLimit,
@@ -217,7 +233,7 @@ export class WorkflowRoutingService {
   async ingest({ event } = {}) {
     this.#assertReady();
     const normalizedEvent = normalizeWorkflowEvent(event);
-    return this.#writeTransaction(async () => {
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const existing = this.state.events.find(
         (candidate) => candidate.eventId === normalizedEvent.eventId,
       );
@@ -250,13 +266,13 @@ export class WorkflowRoutingService {
         assignments,
         audit,
       });
-    });
+    }));
   }
 
   async ingestSnapshot({ snapshot, sourceScopeId = "github-dashboard" } = {}) {
     this.#assertReady();
     const currentCheckpoint = projectWorkflowSnapshot(snapshot);
-    return this.#writeTransaction(async () => {
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
       if (replay) return replay;
       const config = this.#requireConfig();
@@ -305,7 +321,7 @@ export class WorkflowRoutingService {
         audit,
         checkpointRefreshedAt: nextState.checkpoint.refreshedAt,
       });
-    });
+    }));
   }
 
   async listAssignments(options = {}) {
@@ -555,6 +571,15 @@ export class WorkflowRoutingService {
         return operation();
       }),
     );
+  }
+
+  async #admitNewWork(operation) {
+    const admitted = await this.runNewWorkAdmission(() => ({
+      // Enqueue synchronously, then carry the Promise out so cutover never
+      // waits on local routing or durable storage.
+      operation: operation(),
+    }));
+    return admitted.operation;
   }
 
   #assertReady() {

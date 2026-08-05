@@ -25,6 +25,7 @@ export async function createWorkflowRoutingRuntime(
     router = createWorkflowRouter(),
     clock,
     operationQueue,
+    actionAdmissionGate,
     createGuard = (options) => new ProcessExclusiveGuard(options),
   } = {},
 ) {
@@ -53,6 +54,7 @@ export async function createWorkflowRoutingRuntime(
       store,
       router,
       exclusiveLease: guard,
+      ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),
     });

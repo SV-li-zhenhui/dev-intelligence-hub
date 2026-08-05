@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { normalizeAttentionRequest } from "../src/domain/attention-contract.js";
 import {
   createAttentionItem,
@@ -16,6 +17,33 @@ const STATE_KEY = "work-ledger-state";
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+    return "activated-v2";
+  });
 }
 
 class MemoryStore {
@@ -134,6 +162,7 @@ async function createFixture({
   lease = new ExclusiveLease(),
   time = controlledClock(),
   limits,
+  actionAdmissionGate,
 } = {}) {
   const service = new WorkLedgerService({
     store,
@@ -141,11 +170,19 @@ async function createFixture({
     exclusiveLease: lease,
     clock: time.clock,
     idFactory: incrementingIds(),
+    ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
     ...(limits ? { limits } : {}),
   });
   await service.recover();
   return { service, source, store, lease, time };
 }
+
+test("an explicit invalid ledger admission gate never degrades to direct mode", async () => {
+  await assert.rejects(
+    createFixture({ actionAdmissionGate: null }),
+    /actionAdmissionGate must provide run\(operation\)/,
+  );
+});
 
 test("intake atomically advances its cursor and preserves unresolved targets", async () => {
   const records = [
@@ -265,6 +302,173 @@ test("an internal source sequence gap is blocked as a system alert before partia
   assert.equal(items.length, 1);
   assert.equal(items[0].kind, "system_alert");
   assert.equal(items[0].status, "blocked");
+});
+
+test("configuration-first admission neither intakes nor claims work", async (t) => {
+  await t.test("intake", async () => {
+    const gate = readyActionAdmissionGate();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      actionAdmissionGate: gate,
+    });
+    await activateNextConfiguration(gate);
+
+    await assert.rejects(
+      fixture.service.intake(),
+      (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+    );
+
+    assert.equal(fixture.source.calls.length, 0);
+    assert.equal(fixture.store.writes.length, 0);
+    assert.deepEqual((await fixture.service.listItems()).items, []);
+  });
+
+  await t.test("claim", async () => {
+    const gate = readyActionAdmissionGate();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      actionAdmissionGate: gate,
+    });
+    await fixture.service.intake();
+    const queued = (await fixture.service.listItems()).items[0];
+    await activateNextConfiguration(gate);
+
+    await assert.rejects(
+      fixture.service.claim({
+        itemId: queued.itemId,
+        expectedRevision: queued.revision,
+        workerId: "employee-pr-reviewer",
+        leaseDurationMs: 30_000,
+      }),
+      (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+    );
+
+    const unchanged = (await fixture.service.listItems()).items[0];
+    assert.equal(unchanged.status, "queued");
+    assert.equal(unchanged.revision, queued.revision);
+    assert.equal(fixture.store.writes.length, 1);
+  });
+});
+
+test("intake-first admission releases cutover before its source settles", async () => {
+  const gate = readyActionAdmissionGate();
+  const sourceEntered = deferred();
+  const releaseSource = deferred();
+  const source = new FakeAssignmentSource([assignment(1)]);
+  source.override = async ({ afterSequence, limit }) => {
+    sourceEntered.resolve();
+    await releaseSource.promise;
+    return {
+      items: source.records
+        .filter(({ sequence }) => sequence > afterSequence)
+        .slice(0, limit),
+      nextSequence: 1,
+      highWatermark: 1,
+      oldestAvailableSequence: 1,
+    };
+  };
+  const fixture = await createFixture({
+    source,
+    actionAdmissionGate: gate,
+  });
+
+  const intake = fixture.service.intake();
+  await sourceEntered.promise;
+  assert.equal(
+    await Promise.race([
+      activateNextConfiguration(gate),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
+
+  releaseSource.resolve();
+  assert.equal((await intake).received, 1);
+  assert.equal((await fixture.service.listItems()).items.length, 1);
+  assert.equal(gate.readStatus().mode, "restart_required");
+});
+
+test("claim-first admission releases cutover before its durable write settles", async () => {
+  const gate = readyActionAdmissionGate();
+  const fixture = await createFixture({
+    records: [assignment(1)],
+    actionAdmissionGate: gate,
+  });
+  await fixture.service.intake();
+  const queued = (await fixture.service.listItems()).items[0];
+  const writeEntered = deferred();
+  const releaseWrite = deferred();
+  const write = fixture.store.write.bind(fixture.store);
+  let deferNextWrite = true;
+  fixture.store.write = async (...args) => {
+    if (deferNextWrite) {
+      deferNextWrite = false;
+      writeEntered.resolve();
+      await releaseWrite.promise;
+    }
+    return write(...args);
+  };
+
+  const claim = fixture.service.claim({
+    itemId: queued.itemId,
+    expectedRevision: queued.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  await writeEntered.promise;
+  assert.equal(
+    await Promise.race([
+      activateNextConfiguration(gate),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
+
+  releaseWrite.resolve();
+  const claimed = await claim;
+  assert.equal(claimed.status, "working");
+  assert.equal(claimed.ownerId, "employee-pr-reviewer");
+  assert.equal(gate.readStatus().mode, "restart_required");
+});
+
+test("trusted reconciliation rereads one durable item without new intake", async () => {
+  const gate = readyActionAdmissionGate();
+  const fixture = await createFixture({
+    records: [assignment(1)],
+    actionAdmissionGate: gate,
+  });
+  await fixture.service.intake();
+  const queued = (await fixture.service.listItems()).items[0];
+  const concurrent = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: fixture.lease,
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await concurrent.recover();
+  const claimed = await concurrent.claim({
+    itemId: queued.itemId,
+    expectedRevision: queued.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  await activateNextConfiguration(gate);
+  const sourceCalls = fixture.source.calls.length;
+
+  const reconciled = await fixture.service.readItemForReconciliation({
+    itemId: queued.itemId,
+  });
+
+  assert.equal(reconciled.status, "working");
+  assert.equal(reconciled.revision, claimed.revision);
+  assert.equal(reconciled.leaseId, claimed.leaseId);
+  assert.equal(fixture.source.calls.length, sourceCalls);
+  assert.equal(gate.readStatus().mode, "restart_required");
+  await assert.rejects(
+    fixture.service.readItemForReconciliation({ itemId: queued.itemId, extra: true }),
+    (error) => error?.code === "WORK_LEDGER_QUERY_INVALID",
+  );
 });
 
 test("claim records a bounded lease, revision, and immutable input digest", async () => {

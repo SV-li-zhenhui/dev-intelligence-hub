@@ -368,6 +368,9 @@ export async function createApplication({
       await workflowRoutingRuntimeFactory(config, {
         ...workflowRoutingDependencies,
         store,
+        ...(ordinaryActionAdmissionGate === null
+          ? {}
+          : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       }),
     );
     const coordinationConfig = config.workCoordination || {};
@@ -393,6 +396,9 @@ export async function createApplication({
           store,
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
         }),
       );
       attentionInboxRuntime = trackRuntime(

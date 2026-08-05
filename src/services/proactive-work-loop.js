@@ -8,6 +8,11 @@ const PAGE_SIZE = 100;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
+const RUNTIME_ADMISSION_ERROR_CODES = new Set([
+  "RUNTIME_RESTART_REQUIRED",
+  "RUNTIME_CONFIGURATION_NOT_READY",
+  "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+]);
 
 function requirePort(value, methods, name) {
   if (
@@ -45,6 +50,31 @@ function requirePort(value, methods, name) {
     throw new TypeError(`${name} is invalid`, { cause: error });
   }
   return Object.freeze(port);
+}
+
+function optionalPortMethod(value, method, name) {
+  let current = value;
+  try {
+    while (current !== null && current !== undefined) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, method);
+      if (descriptor) {
+        if (
+          !("value" in descriptor) ||
+          typeof descriptor.value !== "function"
+        ) {
+          throw new TypeError(`${name} is invalid`);
+        }
+        return descriptor.value.bind(value);
+      }
+      current = Object.getPrototypeOf(current);
+    }
+  } catch (error) {
+    if (error instanceof TypeError && error.message === `${name} is invalid`) {
+      throw error;
+    }
+    throw new TypeError(`${name} is invalid`, { cause: error });
+  }
+  return null;
 }
 
 function boundedString(value, name, maximumBytes = 128) {
@@ -309,6 +339,11 @@ export class ProactiveWorkLoop {
         "transition",
       ],
       "ledger",
+    );
+    this.readItemForReconciliation = optionalPortMethod(
+      ledger,
+      "readItemForReconciliation",
+      "ledger.readItemForReconciliation",
     );
     this.roleDirectory = requirePort(
       roleDirectory,
@@ -640,7 +675,10 @@ export class ProactiveWorkLoop {
           leaseDurationMs: this.leaseDurationMs,
         }),
       };
-    } catch {
+    } catch (error) {
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
+        throw error;
+      }
       const observed = await this.#observeItem(item.itemId, intakeLimit);
       if (
         observed &&
@@ -890,6 +928,9 @@ export class ProactiveWorkLoop {
 
   async #observeItem(itemId, intakeLimit) {
     try {
+      if (this.readItemForReconciliation !== null) {
+        return await this.readItemForReconciliation({ itemId });
+      }
       await this.ledger.intake({ limit: Math.min(intakeLimit, 1) });
       return await this.#findItem(itemId);
     } catch {
