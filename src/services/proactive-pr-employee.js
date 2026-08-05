@@ -61,6 +61,65 @@ const WORK_POLICY_BY_ACTION = Object.freeze({
   },
 });
 const DECISIONS = new Set(["accept", "reject"]);
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run: (operation) => operation(),
+});
+const RUNTIME_ADMISSION_FAILURES = new Set([
+  "RUNTIME_RESTART_REQUIRED",
+  "RUNTIME_CONFIGURATION_NOT_READY",
+  "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+]);
+
+function actionAdmissionRun(value) {
+  const gate = value === undefined ? DIRECT_ACTION_ADMISSION : value;
+  if (!gate || typeof gate.run !== "function") {
+    throw new TypeError("actionAdmissionGate must provide run(operation)");
+  }
+  return gate.run.bind(gate);
+}
+
+async function runAdmittedOperation(admitAction, operation) {
+  const admitted = await admitAction(() => {
+    try {
+      return { operation: operation(), synchronousError: null };
+    } catch (error) {
+      return { operation: null, synchronousError: error };
+    }
+  });
+  if (admitted.synchronousError !== null) throw admitted.synchronousError;
+  return admitted.operation;
+}
+
+function stableFailureCode(error) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+    const code = descriptor && "value" in descriptor
+      ? descriptor.value
+      : null;
+    if (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,127}$/.test(code)) {
+      return code;
+    }
+  } catch {
+    // Treat hostile error values as an ordinary job failure.
+  }
+  return "PR_EMPLOYEE_JOB_FAILED";
+}
+
+function isSameRunningClaim(job, claimed) {
+  return Boolean(
+    job &&
+      job.id === claimed.id &&
+      job.status === "running" &&
+      job.fingerprint === claimed.fingerprint &&
+      job.headRefOid === claimed.headRefOid &&
+      job.policyVersion === claimed.policyVersion &&
+      job.attempts === claimed.attempts &&
+      job.startedAt === claimed.startedAt &&
+      job.leaseUntil === claimed.leaseUntil &&
+      job.brain?.provider === claimed.brain?.provider &&
+      job.brain?.model === claimed.brain?.model,
+  );
+}
 
 function serviceError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
@@ -214,6 +273,8 @@ function projectWork(state) {
 }
 
 export class ProactivePrEmployeeService {
+  #admitAction;
+
   constructor({
     store,
     github,
@@ -223,10 +284,12 @@ export class ProactivePrEmployeeService {
     operationQueue = null,
     producerQueue = null,
     githubActions = { enabled: false },
+    actionAdmissionGate,
   }) {
     this.store = store;
     this.github = github;
     this.reviewer = reviewer;
+    this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     this.clock = clock;
     this.config = {
       enabled: true,
@@ -939,6 +1002,10 @@ export class ProactivePrEmployeeService {
       };
     }
 
+    if (jobsChanged) {
+      state = await this.controller.writeState(state);
+    }
+
     const fingerprints = new Set(
       [
         ...state.jobs,
@@ -949,14 +1016,31 @@ export class ProactivePrEmployeeService {
         .filter(Boolean),
     );
     const newJobs = candidates
-      .map((item) => ({ item, fingerprint: jobFingerprint(item, this.config.policyVersion) }))
+      .map((item) => ({
+        item,
+        fingerprint: jobFingerprint(item, this.config.policyVersion),
+      }))
       .filter(({ item }) => !unresolvedSubjects.has(item.id))
       .filter(({ fingerprint }) => !fingerprints.has(fingerprint))
       .map(({ item, fingerprint }) => this.#newJob(item, fingerprint, runAt));
-    state.jobs.push(...newJobs);
-    const beforeTrim = state.jobs.length;
-    state.jobs = trimJobs(state.jobs, this.config.jobLimit);
-    jobsChanged ||= state.jobs.length !== beforeTrim;
+    if (newJobs.length) {
+      const admittedState = {
+        ...state,
+        jobs: trimJobs([...state.jobs, ...newJobs], this.config.jobLimit),
+      };
+      state = await runAdmittedOperation(
+        this.#admitAction,
+        () => this.controller.writeState(admittedState),
+      );
+    }
+    const jobsBeforeTrim = state.jobs.length;
+    if (!newJobs.length) {
+      state = {
+        ...state,
+        jobs: trimJobs(state.jobs, this.config.jobLimit),
+      };
+    }
+    const jobsTrimmed = state.jobs.length !== jobsBeforeTrim;
     state.lastRun = {
       trigger,
       at: runAt,
@@ -974,7 +1058,7 @@ export class ProactivePrEmployeeService {
       state.lastError = "";
     }
     state = await this.controller.writeState(state, {
-      bumpRevision: jobsChanged || newJobs.length > 0,
+      bumpRevision: jobsTrimmed,
     });
 
     const readyToRun = state.jobs
@@ -1030,9 +1114,21 @@ export class ProactivePrEmployeeService {
       updatedAt: startedAt,
       leaseUntil: new Date(Date.parse(startedAt) + 120_000).toISOString(),
       error: "",
+      brain: {
+        provider: this.reviewer?.provider || "",
+        model: this.reviewer?.model || "",
+      },
     };
-    state.jobs[index] = claimed;
-    state = await this.controller.writeState(state);
+    const claimedState = {
+      ...state,
+      jobs: state.jobs.map((job, jobIndex) =>
+        jobIndex === index ? claimed : job,
+      ),
+    };
+    state = await runAdmittedOperation(
+      this.#admitAction,
+      () => this.controller.writeState(claimedState),
+    );
 
     try {
       if (!this.reviewer) throw new Error("岗位大脑未配置");
@@ -1040,7 +1136,9 @@ export class ProactivePrEmployeeService {
       const item = snapshot?.items?.find(
         (candidate) =>
           candidate.id === claimed.subjectId &&
-          candidate.headRefOid === claimed.headRefOid,
+          candidate.headRefOid === claimed.headRefOid &&
+          candidate.nextAction === claimed.nextAction &&
+          candidate.relation === claimed.relation,
       );
       if (!item || !isCandidate(item)) {
         return this.#finishAsSuperseded(state, claimed.id);
@@ -1052,11 +1150,14 @@ export class ProactivePrEmployeeService {
       if (context.headRefOid !== claimed.headRefOid) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
-      const analysis = await this.reviewer.analyze({
-        ...context,
-        workMode: policy.mode,
-        requestedAction: item.nextAction,
-      });
+      const analysis = await runAdmittedOperation(
+        this.#admitAction,
+        () => this.reviewer.analyze({
+          ...context,
+          workMode: policy.mode,
+          requestedAction: item.nextAction,
+        }),
+      );
       const latest = await this.store.read("snapshot");
       const current = latest?.items?.find(
         (candidate) => candidate.id === claimed.subjectId,
@@ -1065,6 +1166,7 @@ export class ProactivePrEmployeeService {
         !current ||
         current.headRefOid !== claimed.headRefOid ||
         current.nextAction !== claimed.nextAction ||
+        current.relation !== claimed.relation ||
         !isCandidate(current)
       ) {
         return this.#finishAsSuperseded(state, claimed.id);
@@ -1085,10 +1187,7 @@ export class ProactivePrEmployeeService {
         reviewBody: policy.mode === "review" ? analysis.reviewBody : "",
         requiresApproval: policy.requiresApproval,
         status: policy.requiresApproval ? "ready_for_human" : "ready",
-        brain: {
-          provider: this.reviewer.provider || "",
-          model: this.reviewer.model || "",
-        },
+        brain: { ...claimed.brain },
         updatedAt: completedAt,
         completedAt,
         leaseUntil: null,
@@ -1115,8 +1214,18 @@ export class ProactivePrEmployeeService {
       }
       return state;
     } catch (error) {
+      if (RUNTIME_ADMISSION_FAILURES.has(stableFailureCode(error))) {
+        throw error;
+      }
+      try {
+        state = await this.controller.readState();
+      } catch {
+        throw error;
+      }
       index = state.jobs.findIndex((job) => job.id === claimed.id);
-      if (index < 0) return state;
+      if (index < 0 || !isSameRunningClaim(state.jobs[index], claimed)) {
+        return state;
+      }
       const failedAt = this.clock().toISOString();
       const attempts = state.jobs[index].attempts || 1;
       const blocked = attempts >= this.config.maxAttempts;

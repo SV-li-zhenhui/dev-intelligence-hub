@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactivePrEmployeeService } from "../src/services/proactive-pr-employee.js";
 
 class MemoryStore {
@@ -13,6 +15,103 @@ class MemoryStore {
 
   async write(name, value) {
     this.values.set(name, structuredClone(value));
+  }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+class BlockingStateStore extends MemoryStore {
+  constructor(entries, blockedWriteNumber) {
+    super(entries);
+    this.blockedWriteNumber = blockedWriteNumber;
+    this.stateWrites = 0;
+    this.writeStarted = deferred();
+    this.writeRelease = deferred();
+  }
+
+  async write(name, value) {
+    if (name === "pr-employee-state") {
+      this.stateWrites += 1;
+      if (this.stateWrites === this.blockedWriteNumber) {
+        this.writeStarted.resolve();
+        await this.writeRelease.promise;
+      }
+    }
+    return super.write(name, value);
+  }
+}
+
+class LostStateWriteAcknowledgementStore extends MemoryStore {
+  constructor(entries, lostWriteNumber) {
+    super(entries);
+    this.lostWriteNumber = lostWriteNumber;
+    this.stateWrites = 0;
+  }
+
+  async write(name, value) {
+    await super.write(name, value);
+    if (name === "pr-employee-state") {
+      this.stateWrites += 1;
+      if (this.stateWrites === this.lostWriteNumber) {
+        throw new Error("state write acknowledgement lost");
+      }
+    }
+  }
+}
+
+class SnapshotChangingOnClaimStore extends MemoryStore {
+  constructor(entries, replacementSnapshot) {
+    super(entries);
+    this.replacementSnapshot = replacementSnapshot;
+    this.stateWrites = 0;
+  }
+
+  async write(name, value) {
+    await super.write(name, value);
+    if (name === "pr-employee-state") {
+      this.stateWrites += 1;
+      if (this.stateWrites === 2) {
+        this.values.set("snapshot", structuredClone(this.replacementSnapshot));
+      }
+    }
+  }
+}
+
+function readyGate(version = 1) {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version,
+    configurationDigest: String(version).repeat(64),
+  });
+  return gate;
+}
+
+function cutoverToVersion(gate, version) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version,
+      configurationDigest: String(version).repeat(64),
+    });
+  });
+}
+
+async function settlesBefore(promise, durationMs = 250) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), durationMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -61,7 +160,54 @@ function reviewResult(overrides = {}) {
   };
 }
 
-function createService({ store, github, reviewer, now, config = {} } = {}) {
+function queuedState(item = pullRequest(), overrides = {}) {
+  const policyVersion = overrides.policyVersion ?? 1;
+  const createdAt = "2026-07-31T10:00:00.000Z";
+  return {
+    revision: 3,
+    paused: false,
+    jobs: [
+      {
+        id: "pr-work-existing",
+        fingerprint: [
+          item.id,
+          item.headRefOid,
+          item.nextAction,
+          policyVersion,
+        ].join("\u0000"),
+        policyVersion,
+        subjectId: item.id,
+        repo: item.repo,
+        number: item.number,
+        title: item.title,
+        url: item.url,
+        relation: item.relation,
+        headRefOid: item.headRefOid,
+        nextAction: item.nextAction,
+        triggerReason: item.actionReasons[0],
+        status: "queued",
+        attempts: 0,
+        createdAt,
+        updatedAt: createdAt,
+        ...overrides,
+      },
+    ],
+    memoryOutbox: [],
+    memoryOutboxError: "",
+    memoryOutboxDropped: 0,
+    lastRun: null,
+    lastError: "",
+  };
+}
+
+function createService({
+  store,
+  github,
+  reviewer,
+  now,
+  config = {},
+  actionAdmissionGate,
+} = {}) {
   return new ProactivePrEmployeeService({
     store,
     github,
@@ -77,8 +223,563 @@ function createService({ store, github, reviewer, now, config = {} } = {}) {
       memoryLimit: 100,
       ...config,
     },
+    actionAdmissionGate,
   });
 }
+
+test("configuration-first admission creates no legacy PR employee job", async () => {
+  const gate = readyGate();
+  await cutoverToVersion(gate, 2);
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  let contextCalls = 0;
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {
+      async loadReviewContext() {
+        contextCalls += 1;
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  await assert.rejects(
+    service.tick(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  assert.equal(await store.read("pr-employee-state", null), null);
+  assert.equal(contextCalls, 0);
+  assert.equal(reviewerCalls, 0);
+});
+
+test("an admitted job write releases cutover before storage settles", async () => {
+  const gate = readyGate();
+  const store = new BlockingStateStore(
+    { snapshot: snapshot([pullRequest()]) },
+    1,
+  );
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {
+      async loadReviewContext(item) {
+        return { ...item, patch: "diff", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const tick = service.tick();
+  await store.writeStarted.promise;
+  const cutover = cutoverToVersion(gate, 2);
+
+  assert.equal(await settlesBefore(cutover), true);
+  store.writeRelease.resolve();
+  await assert.rejects(
+    tick,
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].status, "queued");
+  assert.equal(state.jobs[0].attempts, 0);
+  assert.equal(reviewerCalls, 0);
+});
+
+test("configuration fencing does not block stale-job reconciliation", async () => {
+  const gate = readyGate();
+  await cutoverToVersion(gate, 2);
+  const oldItem = pullRequest({ headRefOid: "head-old" });
+  const store = new MemoryStore({
+    snapshot: snapshot([pullRequest()]),
+    "pr-employee-state": queuedState(oldItem),
+  });
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {},
+    reviewer: { async analyze() { return reviewResult(); } },
+  });
+
+  await assert.rejects(
+    service.tick(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].status, "superseded");
+  assert.equal(state.jobs[0].headRefOid, "head-old");
+});
+
+test("configuration-first running claim leaves queued work and controls available", async () => {
+  const gate = readyGate();
+  await cutoverToVersion(gate, 2);
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item),
+  });
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {},
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  await assert.rejects(
+    service.tick(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  const unchanged = await service.view();
+  const paused = await service.control("pause", unchanged.role.revision);
+
+  assert.equal(unchanged.jobs[0].status, "queued");
+  assert.equal(unchanged.jobs[0].attempts, 0);
+  assert.equal(reviewerCalls, 0);
+  assert.equal(paused.role.paused, true);
+});
+
+test("a running claim releases cutover before the later brain admission", async () => {
+  const gate = readyGate();
+  const item = pullRequest();
+  const store = new BlockingStateStore(
+    {
+      snapshot: snapshot([item]),
+      "pr-employee-state": queuedState(item),
+    },
+    2,
+  );
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      provider: "ollama",
+      model: "sealed-model",
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const tick = service.tick();
+  await store.writeStarted.promise;
+  const cutover = cutoverToVersion(gate, 2);
+
+  assert.equal(await settlesBefore(cutover), true);
+  store.writeRelease.resolve();
+  await assert.rejects(
+    tick,
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "running");
+  assert.equal(state.jobs[0].attempts, 1);
+  assert.deepEqual(state.jobs[0].brain, {
+    provider: "ollama",
+    model: "sealed-model",
+  });
+  assert.equal(reviewerCalls, 0);
+});
+
+test("an admitted brain request finishes after cutover without holding the gate", async () => {
+  const gate = readyGate();
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item),
+  });
+  const analysisStarted = deferred();
+  const analysisRelease = deferred();
+  const service = createService({
+    store,
+    actionAdmissionGate: gate,
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      provider: "ollama",
+      model: "sealed-model",
+      async analyze() {
+        analysisStarted.resolve();
+        await analysisRelease.promise;
+        return reviewResult();
+      },
+    },
+  });
+
+  const tick = service.tick();
+  await analysisStarted.promise;
+  const cutover = cutoverToVersion(gate, 2);
+
+  assert.equal(await settlesBefore(cutover), true);
+  analysisRelease.resolve();
+  const completed = await tick;
+
+  assert.equal(completed.jobs[0].status, "ready_for_human");
+  assert.equal(completed.jobs[0].attempts, 1);
+});
+
+test("service and Ollama brain share one gate without nesting deadlock", async () => {
+  const gate = readyGate();
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item),
+  });
+  const requestStarted = deferred();
+  const responseRelease = deferred();
+  const reviewer = new OllamaPrEmployeeReviewer({
+    actionAdmissionGate: gate,
+    fetch: async () => {
+      requestStarted.resolve();
+      await responseRelease.promise;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            message: { content: JSON.stringify(reviewResult()) },
+          };
+        },
+      };
+    },
+  });
+  const service = createService({
+    store,
+    reviewer,
+    actionAdmissionGate: gate,
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+  });
+
+  const tick = service.tick();
+  await requestStarted.promise;
+  const cutover = cutoverToVersion(gate, 2);
+
+  assert.equal(await settlesBefore(cutover), true);
+  responseRelease.resolve();
+  const completed = await tick;
+
+  assert.equal(completed.jobs[0].status, "ready_for_human");
+});
+
+test("a committed analysis write acknowledgement never reruns the brain", async () => {
+  const item = pullRequest();
+  const store = new LostStateWriteAcknowledgementStore(
+    {
+      snapshot: snapshot([item]),
+      "pr-employee-state": queuedState(item),
+    },
+    3,
+  );
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "ready_for_human");
+  assert.equal(result.jobs[0].attempts, 1);
+  assert.equal(reviewerCalls, 1);
+  assert.equal(
+    (await store.read("pr-employee-state")).jobs[0].status,
+    "ready_for_human",
+  );
+});
+
+test("an expired running lease rebinds to only the restarted brain", async () => {
+  const item = pullRequest();
+  const stored = queuedState(item);
+  stored.jobs[0] = {
+    ...stored.jobs[0],
+    status: "running",
+    attempts: 1,
+    startedAt: "2026-07-31T09:58:00.000Z",
+    leaseUntil: "2026-07-31T10:00:00.000Z",
+    brain: { provider: "ollama", model: "old-model" },
+  };
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": stored,
+  });
+  let newBrainCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: readyGate(2),
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      provider: "ollama",
+      model: "new-model",
+      async analyze() {
+        newBrainCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "ready_for_human");
+  assert.equal(result.jobs[0].attempts, 2);
+  assert.deepEqual(result.jobs[0].brain, {
+    provider: "ollama",
+    model: "new-model",
+  });
+  assert.equal(newBrainCalls, 1);
+});
+
+test("an active running lease never reaches a restarted brain", async () => {
+  const item = pullRequest();
+  const stored = queuedState(item);
+  stored.jobs[0] = {
+    ...stored.jobs[0],
+    status: "running",
+    attempts: 1,
+    startedAt: "2026-07-31T10:00:00.000Z",
+    leaseUntil: "2026-07-31T10:02:00.000Z",
+    brain: { provider: "ollama", model: "old-model" },
+  };
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": stored,
+  });
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    actionAdmissionGate: readyGate(2),
+    github: {},
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "running");
+  assert.equal(result.jobs[0].attempts, 1);
+  assert.equal(reviewerCalls, 0);
+});
+
+test("a lost running-claim acknowledgement waits for one lease recovery", async () => {
+  const item = pullRequest();
+  const store = new LostStateWriteAcknowledgementStore(
+    {
+      snapshot: snapshot([item]),
+      "pr-employee-state": queuedState(item),
+    },
+    2,
+  );
+  let oldBrainCalls = 0;
+  const first = createService({
+    store,
+    actionAdmissionGate: readyGate(),
+    github: {},
+    reviewer: {
+      async analyze() {
+        oldBrainCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  await assert.rejects(first.tick(), /acknowledgement lost/);
+  const uncertain = await store.read("pr-employee-state");
+  assert.equal(uncertain.jobs[0].status, "running");
+  assert.equal(uncertain.jobs[0].attempts, 1);
+  assert.equal(oldBrainCalls, 0);
+
+  let recoveredBrainCalls = 0;
+  const restarted = createService({
+    store,
+    now: "2026-07-31T10:03:00.000Z",
+    actionAdmissionGate: readyGate(2),
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      provider: "ollama",
+      model: "restarted-model",
+      async analyze() {
+        recoveredBrainCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const recovered = await restarted.tick();
+
+  assert.equal(recovered.jobs[0].status, "ready_for_human");
+  assert.equal(recovered.jobs[0].attempts, 2);
+  assert.equal(recovered.jobs[0].brain.model, "restarted-model");
+  assert.equal(recoveredBrainCalls, 1);
+});
+
+test("a same-head action change is superseded before context reaches the brain", async () => {
+  const item = pullRequest();
+  const changed = pullRequest({ nextAction: "complete_review" });
+  const store = new SnapshotChangingOnClaimStore(
+    {
+      snapshot: snapshot([item]),
+      "pr-employee-state": queuedState(item),
+    },
+    snapshot([changed]),
+  );
+  let contextCalls = 0;
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext() {
+        contextCalls += 1;
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "superseded");
+  assert.equal(contextCalls, 0);
+  assert.equal(reviewerCalls, 0);
+});
+
+test("runtime admission failures leave the running claim recoverable", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item),
+  });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext(current) {
+        return {
+          ...current,
+          patch: "diff",
+          patchTruncated: false,
+          files: [],
+        };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        throw Object.assign(new Error("restart required"), {
+          code: "RUNTIME_RESTART_REQUIRED",
+        });
+      },
+    },
+  });
+
+  await assert.rejects(
+    service.tick(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "running");
+  assert.equal(state.jobs[0].attempts, 1);
+  assert.equal(state.jobs[0].error, "");
+});
+
+test("an explicit invalid legacy employee admission gate fails closed", () => {
+  assert.throws(
+    () => createService({
+      store: new MemoryStore(),
+      actionAdmissionGate: null,
+    }),
+    /actionAdmissionGate must provide run/,
+  );
+});
 
 test("a fresh installation can reserve the legacy PR employee in paused state", async () => {
   const store = new MemoryStore();

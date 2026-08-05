@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactivePrEmployeeService } from "../src/services/proactive-pr-employee.js";
 
 const HEAD = "0123456789abcdef0123456789abcdef01234567";
 const NEXT_HEAD = "89abcdef0123456789abcdef0123456789abcdef";
 const BINDING_DIGEST = "b".repeat(64);
+
+function readyGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
 
 function statusError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
@@ -200,6 +210,7 @@ function createService({
     files: [{ path: "checkout.js", additions: 8, deletions: 2 }],
   }),
   config = {},
+  actionAdmissionGate,
 } = {}) {
   return new ProactivePrEmployeeService({
     store,
@@ -222,16 +233,21 @@ function createService({
       memoryLimit: 100,
       ...config,
     },
+    actionAdmissionGate,
   });
 }
 
-async function createLinkedJob({ reviewVerdict = "request_changes" } = {}) {
+async function createLinkedJob({
+  reviewVerdict = "request_changes",
+  actionAdmissionGate,
+} = {}) {
   const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
   const confirmationQueue = new RecordingConfirmationQueue({ store });
   const service = createService({
     store,
     confirmationQueue,
     analyze: async () => reviewResult({ reviewVerdict }),
+    actionAdmissionGate,
   });
   const work = await service.tick({ trigger: "refresh_completed" });
   return {
@@ -242,6 +258,27 @@ async function createLinkedJob({ reviewVerdict = "request_changes" } = {}) {
     job: work.jobs[0],
   };
 }
+
+test("confirmation recovery remains available after configuration cutover", async () => {
+  const gate = readyGate();
+  const { confirmationQueue, service, job } = await createLinkedJob({
+    actionAdmissionGate: gate,
+  });
+  const pending = confirmationQueue.items.get(job.confirmationId);
+  confirmationQueue.items.set(job.confirmationId, {
+    ...pending,
+    status: "completed",
+    receipt: { id: "review-after-cutover" },
+  });
+  await gate.cutover(({ commit }) => {
+    commit({ version: 2, configurationDigest: "2".repeat(64) });
+  });
+
+  const recovered = await service.recoverConfirmations();
+
+  assert.equal(recovered.jobs[0].status, "published");
+  assert.equal(recovered.jobs[0].confirmationStatus, "completed");
+});
 
 test("each review verdict enqueues one exact head-bound confirmation plan", async (t) => {
   const cases = [

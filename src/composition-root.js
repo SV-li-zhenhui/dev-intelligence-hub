@@ -830,6 +830,9 @@ export async function createApplication({
       githubActions: externalActions
         ? config.githubActions || { enabled: false }
         : { enabled: false },
+      ...(ordinaryActionAdmissionGate === null
+        ? {}
+        : { actionAdmissionGate: ordinaryActionAdmissionGate }),
     });
     if (confirmationRuntime) await prEmployee.recoverConfirmations();
     let workCoordination = null;
