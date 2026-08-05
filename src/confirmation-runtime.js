@@ -22,6 +22,7 @@ const NETWORK_ENV_KEYS = new Set([
 ]);
 const USER_QUEUE_METHODS = [
   "next",
+  "nextForAction",
   "get",
   "approve",
   "retry",

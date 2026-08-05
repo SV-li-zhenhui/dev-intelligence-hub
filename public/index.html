@@ -20,7 +20,7 @@
         </div>
 
         <nav class="nav" aria-label="主导航">
-          <button class="nav-item active" data-view="overview">
+          <button class="nav-item active" data-view="overview" aria-current="page">
             <span>总览</span><kbd>1</kbd>
           </button>
           <button class="nav-item" data-view="prs">
@@ -46,6 +46,9 @@
           </button>
           <button class="nav-item" data-view="work">
             <span>工作台账</span><kbd>9</kbd>
+          </button>
+          <button class="nav-item" data-view="configuration">
+            <span>配置中心</span><kbd>0</kbd>
           </button>
         </nav>
 
@@ -75,7 +78,7 @@
           </div>
         </header>
 
-        <div id="status-banner" class="status-banner" hidden></div>
+        <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
         <section id="content" aria-live="polite">
           <div class="skeleton-header"></div>
           <div class="skeleton-row"></div>

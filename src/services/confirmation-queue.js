@@ -21,6 +21,7 @@ const STATE_KEY = "confirmation-queue";
 const MAX_ITEMS = 1_000;
 const APPLICATION_RESULT_KIND = "local.change-package-apply";
 const APPLICATION_SNAPSHOT_REQUEST_ID = "application-snapshot-read";
+const ACTION_SELECTOR = /^[a-z][a-z0-9._-]{0,127}$/;
 
 export class ConfirmationExecutionError extends Error {
   constructor(code, outcome, { cause } = {}) {
@@ -114,6 +115,22 @@ function byCreation(left, right) {
     Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
     left.id.localeCompare(right.id)
   );
+}
+
+function normalizeActionSelector(kind, actionType) {
+  if (
+    typeof kind !== "string" ||
+    typeof actionType !== "string" ||
+    !ACTION_SELECTOR.test(kind) ||
+    !ACTION_SELECTOR.test(actionType)
+  ) {
+    throw queueError(
+      "INVALID_CONFIRMATION_ACTION_QUERY",
+      "确认动作筛选条件无效",
+      400,
+    );
+  }
+  return { kind, actionType };
 }
 
 function exactDataFields(value, expected, error) {
@@ -372,6 +389,13 @@ export class ConfirmationQueue {
     this.#assertReady();
     const { deferred } = normalizeExternalDeferredOptions(options);
     return this.#projectNext(deferred);
+  }
+
+  async nextForAction(kind, actionType, options) {
+    this.#assertReady();
+    const selector = normalizeActionSelector(kind, actionType);
+    const { deferred } = normalizeExternalDeferredOptions(options);
+    return this.#projectNext(deferred, selector);
   }
 
   async get(id) {
@@ -777,14 +801,16 @@ export class ConfirmationQueue {
     }
   }
 
-  #projectNext(deferred = []) {
+  #projectNext(deferred = [], selector = null) {
     const deferredBindings = new Set(
       deferred.map(
         (entry) => `${entry.id}\u0000${entry.approvalBindingDigest}`,
       ),
     );
     const isVisible = (item) =>
-      !deferredBindings.has(`${item.id}\u0000${item.approvalBindingDigest}`);
+      !deferredBindings.has(`${item.id}\u0000${item.approvalBindingDigest}`) &&
+      (selector === null ||
+        (item.kind === selector.kind && item.action.type === selector.actionType));
     const pending = this.state.items
       .filter(
         (item) =>

@@ -7,6 +7,7 @@ import { createApplication } from "./composition-root.js";
 import {
   normalizeUnifiedDeferredOptions,
 } from "./domain/attention-deferred-contract.js";
+import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
 import { projectRoot } from "./lib/config.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 
@@ -34,6 +35,11 @@ const browserSecurityHeaders = {
   "x-frame-options": "DENY",
 };
 const internalServerErrorMessage = "服务器内部错误";
+const configurationRequestMaximumBytes = 2 * 1024 * 1024 + 64 * 1024;
+const configurationInitializationKind = "local.configuration-activate";
+const configurationInitializationAction = "initialize_from_draft";
+const safeConfigurationResourceId =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 
 function sendJson(response, status, value) {
   response.writeHead(status, {
@@ -202,6 +208,65 @@ function requireConfirmationQueue(application) {
     throw httpError(503, "外部动作确认队列未启用");
   }
   return queue;
+}
+
+function isConfigurationSafeMode(application) {
+  return application.configuration?.status?.safeMode === true;
+}
+
+function isInitializationConfirmation(item) {
+  return (
+    item?.kind === configurationInitializationKind &&
+    item?.display?.payload?.action?.type === configurationInitializationAction
+  );
+}
+
+function initializationConfirmationNotFound() {
+  return httpError(404, "找不到可在安全模式处理的配置初始化确认项");
+}
+
+function requireSafeModeConfirmationQueue(application) {
+  const queue = application.confirmationQueue;
+  if (
+    !queue ||
+    !["nextForAction", "get", "approve", "retry", "reject"].every(
+      (method) => typeof queue[method] === "function",
+    )
+  ) {
+    throw httpError(503, "配置初始化确认队列未启用");
+  }
+
+  const operate = async (operation, id, input) => {
+    const item = await queue.get(id);
+    if (!isInitializationConfirmation(item)) {
+      throw initializationConfirmationNotFound();
+    }
+    return queue[operation](id, input);
+  };
+  return Object.freeze({
+    next(options) {
+      return queue.nextForAction(
+        configurationInitializationKind,
+        configurationInitializationAction,
+        options,
+      );
+    },
+    approve(id, input) {
+      return operate("approve", id, input);
+    },
+    retry(id, input) {
+      return operate("retry", id, input);
+    },
+    reject(id, input) {
+      return operate("reject", id, input);
+    },
+  });
+}
+
+function confirmationQueueForHttp(application) {
+  return isConfigurationSafeMode(application)
+    ? requireSafeModeConfirmationQueue(application)
+    : requireConfirmationQueue(application);
 }
 
 function requireWorkflowRouting(application) {
@@ -470,13 +535,16 @@ function unifiedAttentionOptions(url) {
 }
 
 async function readUnifiedAttention(application, options) {
-  if (typeof application.attentionCoordinator?.next === "function") {
+  if (
+    !isConfigurationSafeMode(application) &&
+    typeof application.attentionCoordinator?.next === "function"
+  ) {
     return options === undefined
       ? application.attentionCoordinator.next()
       : application.attentionCoordinator.next(options);
   }
   if (application.confirmationQueue) {
-    const queue = requireConfirmationQueue(application);
+    const queue = confirmationQueueForHttp(application);
     const external = options === undefined
       ? await queue.next()
       : await queue.next({ deferred: options.external });
@@ -577,7 +645,7 @@ function codeJobEvidenceQueryOptions(url) {
 }
 
 function requireApplicationPort(application, property, methods, message) {
-  const port = application[property];
+  const port = application?.[property];
   if (
     !port ||
     !methods.every((method) => typeof port[method] === "function")
@@ -599,11 +667,161 @@ function requireExactJsonFields(value, fields, message) {
   return value;
 }
 
-function requireExpectedRevision(value) {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw httpError(400, "expectedRevision 无效");
+function requireNoQuery(url, message) {
+  if ([...url.searchParams.keys()].length > 0) {
+    throw httpError(400, message);
+  }
+}
+
+function requireNonNegativeRevision(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw httpError(400, `${name} 无效`);
   }
   return value;
+}
+
+function requirePositiveRevision(value, name) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw httpError(400, `${name} 无效`);
+  }
+  return value;
+}
+
+function configurationRevisionQuery(url) {
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.length !== 1 ||
+    keys[0] !== "revision" ||
+    url.searchParams.getAll("revision").length !== 1
+  ) {
+    throw httpError(400, "配置草稿查询必须绑定唯一 revision");
+  }
+  const value = url.searchParams.get("revision");
+  if (!/^[1-9][0-9]*$/.test(value || "")) {
+    throw httpError(400, "revision 无效");
+  }
+  return requirePositiveRevision(Number(value), "revision");
+}
+
+function configurationResourceId(rawValue) {
+  let value;
+  try {
+    value = decodeURIComponent(rawValue);
+  } catch {
+    throw httpError(400, "配置资源 ID 无效");
+  }
+  if (!safeConfigurationResourceId.test(value)) {
+    throw httpError(400, "配置资源 ID 无效");
+  }
+  return value;
+}
+
+function projectConfigurationDraft(draft, { configuration = false } = {}) {
+  return {
+    draftId: draft.draftId,
+    revision: draft.revision,
+    baseVersion: draft.baseVersion,
+    configurationDigest: draft.configurationDigest,
+    createdAt: draft.createdAt,
+    ...(configuration ? { configuration: draft.configuration } : {}),
+  };
+}
+
+function projectConfigurationVersion(version, { configuration = false } = {}) {
+  if (!version) return null;
+  return {
+    version: version.version,
+    configurationDigest: version.configurationDigest,
+    source: version.source,
+    previousVersion: version.previousVersion,
+    draftRevisionId: version.draftRevisionId,
+    rollbackOf: version.rollbackOf,
+    activatedAt: version.activatedAt,
+    impactDigest: version.impactDigest,
+    ...(configuration ? { configuration: version.configuration } : {}),
+  };
+}
+
+function configurationHeadDrafts(snapshot) {
+  const heads = new Map(
+    snapshot.draftHeads.map((head) => [head.draftId, head.draftRevisionId]),
+  );
+  return snapshot.draftRevisions
+    .filter(
+      (draft) => heads.get(draft.draftId) === draft.draftRevisionId,
+    )
+    .reverse();
+}
+
+async function readConfigurationHttpState(application) {
+  const reader = requireApplicationPort(
+    application.configuration,
+    "reader",
+    ["readSnapshot"],
+    "版本化配置读取端口未启用",
+  );
+  const snapshot = await reader.readSnapshot();
+  const headDrafts = configurationHeadDrafts(snapshot);
+  const initializationDraft = headDrafts.find(
+    (draft) => draft.baseVersion === 0,
+  );
+  const editableConfiguration = initializationDraft
+    ? initializationDraft.configuration
+    : application.config;
+  const storedActive = snapshot.activeVersion === null
+    ? null
+    : snapshot.versions.find(
+        (version) => version.version === snapshot.activeVersion,
+      );
+  if (snapshot.activeVersion !== null && !storedActive) {
+    throw httpError(503, "活动配置版本状态不完整");
+  }
+  const runtimeActiveVersion = application.configuration.status.activeVersion ?? null;
+  const runtimeConfigurationDigest = canonicalJsonDigest(application.config);
+  const pendingRestart = Boolean(
+    storedActive &&
+      (storedActive.version !== runtimeActiveVersion ||
+        storedActive.configurationDigest !== runtimeConfigurationDigest),
+  );
+  return {
+    status: {
+      safeMode: isConfigurationSafeMode(application),
+      migrationError: application.configuration.status.migrationError ?? null,
+      stateRevision: snapshot.revision,
+    },
+    storedActive: projectConfigurationVersion(storedActive),
+    runtimeEffective: {
+      activeVersion: runtimeActiveVersion,
+      configurationDigest: runtimeConfigurationDigest,
+    },
+    pendingRestart,
+    drafts: headDrafts.map((draft) => projectConfigurationDraft(draft)),
+    editableConfiguration,
+  };
+}
+
+function assertInitializationMutationAllowed(application, snapshot) {
+  if (!isConfigurationSafeMode(application)) {
+    throw httpError(409, "配置初始化接口仅在安全模式可用");
+  }
+  if (snapshot.activeVersion !== null) {
+    throw httpError(409, "配置已经初始化，请重启服务以载入活动版本");
+  }
+}
+
+function assertInitializationDraft(snapshot, draftId) {
+  const head = snapshot.draftHeads.find((draft) => draft.draftId === draftId);
+  if (!head) return;
+  const draft = snapshot.draftRevisions.find(
+    (candidate) => candidate.draftRevisionId === head.draftRevisionId,
+  );
+  if (!draft || draft.baseVersion !== 0) {
+    throw httpError(409, "该草稿不是安全模式初始化草稿");
+  }
+}
+
+function requireExpectedRevision(value) {
+  return requirePositiveRevision(value, "expectedRevision");
 }
 
 function dataFieldMap(value, required, message, maximumFields = 32) {
@@ -1185,6 +1403,202 @@ export function createDashboardServer(
         );
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/configuration") {
+        requireNoQuery(url, "配置状态查询参数无效");
+        sendJson(response, 200, await readConfigurationHttpState(application));
+        return;
+      }
+      const configurationDraftRead = url.pathname.match(
+        /^\/api\/configuration\/drafts\/([^/]+)$/,
+      );
+      if (request.method === "GET" && configurationDraftRead) {
+        const draftId = configurationResourceId(configurationDraftRead[1]);
+        const revision = configurationRevisionQuery(url);
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readDraft"],
+          "版本化配置读取端口未启用",
+        );
+        const draft = await reader.readDraft({ draftId, revision });
+        sendJson(response, 200, {
+          draft: projectConfigurationDraft(draft, { configuration: true }),
+        });
+        return;
+      }
+      const configurationVersionRead = url.pathname.match(
+        /^\/api\/configuration\/versions\/([^/]+)$/,
+      );
+      if (request.method === "GET" && configurationVersionRead) {
+        requireNoQuery(url, "配置版本查询参数无效");
+        const rawVersion = configurationVersionRead[1];
+        if (!/^[1-9][0-9]*$/.test(rawVersion)) {
+          throw httpError(400, "version 无效");
+        }
+        const version = requirePositiveRevision(Number(rawVersion), "version");
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readVersion"],
+          "版本化配置读取端口未启用",
+        );
+        const stored = await reader.readVersion({ version });
+        sendJson(response, 200, {
+          version: projectConfigurationVersion(stored, { configuration: true }),
+        });
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/configuration/drafts"
+      ) {
+        requireNoQuery(url, "配置草稿创建查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request, configurationRequestMaximumBytes),
+          ["expectedStateRevision", "configuration"],
+          "配置草稿创建请求字段无效",
+        );
+        const expectedStateRevision = requireNonNegativeRevision(
+          input.expectedStateRevision,
+          "expectedStateRevision",
+        );
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readSnapshot"],
+          "版本化配置读取端口未启用",
+        );
+        const snapshot = await reader.readSnapshot();
+        assertInitializationMutationAllowed(application, snapshot);
+        const draftManager = requireApplicationPort(
+          application.configuration,
+          "draftManager",
+          ["createInitializationDraft"],
+          "配置初始化草稿写入端口未启用",
+        );
+        const draft = await draftManager.createInitializationDraft({
+          configuration: input.configuration,
+          expectedStateRevision,
+          proposedBy: "owner:local",
+        });
+        sendJson(response, 201, {
+          draft: projectConfigurationDraft(draft),
+        });
+        return;
+      }
+      const configurationDraftMutation = url.pathname.match(
+        /^\/api\/configuration\/drafts\/([^/]+)$/,
+      );
+      if (request.method === "PUT" && configurationDraftMutation) {
+        requireNoQuery(url, "配置草稿修订查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request, configurationRequestMaximumBytes),
+          [
+            "expectedDraftRevision",
+            "expectedStateRevision",
+            "configuration",
+          ],
+          "配置草稿修订请求字段无效",
+        );
+        const draftId = configurationResourceId(configurationDraftMutation[1]);
+        const expectedDraftRevision = requirePositiveRevision(
+          input.expectedDraftRevision,
+          "expectedDraftRevision",
+        );
+        const expectedStateRevision = requireNonNegativeRevision(
+          input.expectedStateRevision,
+          "expectedStateRevision",
+        );
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readSnapshot"],
+          "版本化配置读取端口未启用",
+        );
+        const snapshot = await reader.readSnapshot();
+        assertInitializationMutationAllowed(application, snapshot);
+        assertInitializationDraft(snapshot, draftId);
+        const draftManager = requireApplicationPort(
+          application.configuration,
+          "draftManager",
+          ["reviseDraft"],
+          "配置初始化草稿写入端口未启用",
+        );
+        const draft = await draftManager.reviseDraft({
+          draftId,
+          expectedDraftRevision,
+          expectedStateRevision,
+          configuration: input.configuration,
+          proposedBy: "owner:local",
+        });
+        sendJson(response, 200, {
+          draft: projectConfigurationDraft(draft),
+        });
+        return;
+      }
+      const configurationInitializationRoute = url.pathname.match(
+        /^\/api\/configuration\/drafts\/([^/]+)\/(preview|request-confirmation)$/,
+      );
+      if (request.method === "POST" && configurationInitializationRoute) {
+        requireNoQuery(url, "配置初始化请求查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request),
+          ["draftRevision", "expectedStateRevision"],
+          "配置初始化请求字段无效",
+        );
+        const draftId = configurationResourceId(
+          configurationInitializationRoute[1],
+        );
+        const draftRevision = requirePositiveRevision(
+          input.draftRevision,
+          "draftRevision",
+        );
+        const expectedStateRevision = requireNonNegativeRevision(
+          input.expectedStateRevision,
+          "expectedStateRevision",
+        );
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readSnapshot"],
+          "版本化配置读取端口未启用",
+        );
+        const snapshot = await reader.readSnapshot();
+        assertInitializationMutationAllowed(application, snapshot);
+        assertInitializationDraft(snapshot, draftId);
+        const requestBinding = {
+          draftId,
+          draftRevision,
+          expectedStateRevision,
+        };
+        if (configurationInitializationRoute[2] === "preview") {
+          const simulator = requireApplicationPort(
+            application.configuration,
+            "simulator",
+            ["prepareInitialization"],
+            "配置初始化预览端口未启用",
+          );
+          sendJson(
+            response,
+            200,
+            await simulator.prepareInitialization(requestBinding),
+          );
+        } else {
+          const requester = requireApplicationPort(
+            application.configuration,
+            "confirmationRequester",
+            ["requestInitialization"],
+            "配置初始化确认请求端口未启用",
+          );
+          sendJson(response, 200, {
+            request: await requester.requestInitialization(requestBinding),
+          });
+        }
+        return;
+      }
       if (request.method === "POST" && url.pathname === "/api/refresh") {
         assertTrustedMutation(request, expectedOrigin);
         const refresh = backgroundWork?.refresh ||
@@ -1513,7 +1927,7 @@ export function createDashboardServer(
           return;
         }
         const next = await runConfirmationOperation(backgroundWork, () =>
-          requireConfirmationQueue(application).next(),
+          confirmationQueueForHttp(application).next(),
         );
         sendJson(response, 200, { available: true, ...next });
         return;
@@ -1525,7 +1939,7 @@ export function createDashboardServer(
         assertTrustedMutation(request, expectedOrigin, { json: true });
         await runConfirmationOperation(backgroundWork, async () => {
           const input = await readJsonBody(request);
-          const queue = requireConfirmationQueue(application);
+          const queue = confirmationQueueForHttp(application);
           const item = await queue[confirmationAction[2]](
             confirmationAction[1],
             input,
@@ -1728,23 +2142,29 @@ export function createDashboardServer(
   return attachServerLifecycle(server, application, backgroundWork);
 }
 
-function configurationSafeModeBackgroundWork() {
+function configurationSafeModeBackgroundWork(application) {
   const skipped = Object.freeze({ skipped: "configuration_safe_mode" });
   const skip = () => Promise.resolve(skipped);
+  const confirmationEnabled = Boolean(application.confirmationQueue);
+  const confirmationAccess = createConfirmationAccessGate(confirmationEnabled);
+  confirmationAccess.open();
   let stopPromise = null;
   return Object.freeze({
     initialRefresh: Promise.resolve(skipped),
     timers: Object.freeze([]),
     stop() {
-      stopPromise ||= Promise.resolve();
+      stopPromise ||= confirmationAccess.closeAndDrain();
       return stopPromise;
     },
     refresh: skip,
     mutateFacts: skip,
     signalAgency: skip,
     runEmployee: skip,
-    runConfirmationOperation: skip,
-    confirmationReady: () => false,
+    runConfirmationOperation(operation) {
+      return confirmationAccess.run(operation);
+    },
+    confirmationReady: () =>
+      confirmationEnabled && confirmationAccess.isReady(),
   });
 }
 
@@ -1757,7 +2177,7 @@ export function startApplicationBackgroundWork(
   } = {},
 ) {
   if (application.configuration?.status?.safeMode === true) {
-    return configurationSafeModeBackgroundWork();
+    return configurationSafeModeBackgroundWork(application);
   }
   const employeeRegistry = resolveEmployeeRegistry(application);
   const timers = [];

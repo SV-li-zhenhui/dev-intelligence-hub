@@ -34,6 +34,9 @@ function queuePort(events = []) {
     next() {
       return "next";
     },
+    nextForAction(...args) {
+      return ["nextForAction", ...args];
+    },
     get(id) {
       return ["get", id];
     },

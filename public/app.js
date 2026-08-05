@@ -1,5 +1,12 @@
+import {
+  configurationImpactCategories,
+  createConfigurationFetch,
+  isCurrentConfigurationRequest,
+} from "./configuration-view-support.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
+
+const configurationFetch = createConfigurationFetch({ timeoutMs: 45_000 });
 
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
@@ -62,6 +69,19 @@ let activeExternalConfirmation = null;
 let activeInternalAttention = null;
 let activeConfirmationKey = "";
 let codeJobDetailFocusIntent = null;
+let configurationState = null;
+let configurationLoadError = "";
+let configurationRequestSequence = 0;
+let lastAppliedConfigurationRequest = 0;
+let configurationAbortController = null;
+let configurationEditorValue = "";
+let configurationEditorDirty = false;
+let configurationEditorBinding = null;
+let configurationEditorError = "";
+let configurationPreview = null;
+let configurationOperationPending = false;
+let configurationNotice = "";
+let configurationAutoSelected = false;
 const MAX_DEFERRED_CONFIRMATIONS = 32;
 const deferredConfirmations = new Set();
 
@@ -102,6 +122,7 @@ const viewTitles = {
   memory: "搜索做过的事情",
   workflow: "工作流指挥",
   work: "主动工作台账",
+  configuration: "配置中心",
 };
 
 const workflowView = createWorkflowView({
@@ -663,8 +684,231 @@ function versionsView() {
   </section>`;
 }
 
+function plainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+}
+
+function hasConfigurationState() {
+  return configurationState !== null;
+}
+
+function configurationStatus(state = configurationState) {
+  return plainRecord(state?.status) || {};
+}
+
+function configurationStateRevision(state = configurationState) {
+  const candidates = [
+    configurationStatus(state).stateRevision,
+    state?.stateRevision,
+  ];
+  return candidates.find(
+    (value) => Number.isSafeInteger(value) && value >= 0,
+  );
+}
+
+function sameConfigurationRevision(left, right) {
+  const leftRevision = configurationStateRevision(left);
+  return (
+    Number.isSafeInteger(leftRevision) &&
+    leftRevision === configurationStateRevision(right)
+  );
+}
+
+function currentConfigurationBinding() {
+  const draft = initializationDraft();
+  return {
+    expectedStateRevision: configurationStateRevision(),
+    draftId: typeof draft?.draftId === "string" ? draft.draftId : null,
+    draftRevision: Number.isSafeInteger(draft?.revision) ? draft.revision : null,
+  };
+}
+
+function sameConfigurationBinding(left, right) {
+  return Boolean(
+    left &&
+      right &&
+      left.expectedStateRevision === right.expectedStateRevision &&
+      left.draftId === right.draftId &&
+      left.draftRevision === right.draftRevision,
+  );
+}
+
+function currentPreviewBinding() {
+  const preview = plainRecord(configurationPreview?.preview) ||
+    plainRecord(configurationPreview);
+  if (!preview) return null;
+  return {
+    expectedStateRevision: preview.expectedStateRevision,
+    draftId: preview.draftId,
+    draftRevision: preview.draftRevision,
+  };
+}
+
+function initializationDraft() {
+  const drafts = Array.isArray(configurationState?.drafts)
+    ? configurationState.drafts.filter(plainRecord)
+    : [];
+  return (
+    drafts.find((draft) => draft.baseVersion === 0) ||
+    drafts.find((draft) => draft.kind === "configuration.initialize") ||
+    drafts[0] ||
+    null
+  );
+}
+
+function storedActiveConfiguration() {
+  return plainRecord(configurationState?.storedActive);
+}
+
+function configurationDocumentCandidate() {
+  const draft = initializationDraft();
+  const runtime = plainRecord(configurationState?.runtimeEffective);
+  const stored = storedActiveConfiguration();
+  const candidates = [
+    draft?.configuration,
+    configurationState?.editableConfiguration,
+    runtime?.configuration,
+    stored?.configuration,
+  ];
+  return candidates.map(plainRecord).find(Boolean) || null;
+}
+
+function configurationActiveVersion() {
+  const candidates = [
+    storedActiveConfiguration()?.version,
+    configurationStatus().activeVersion,
+  ];
+  return candidates.find(
+    (value) => Number.isSafeInteger(value) && value >= 1,
+  ) ?? null;
+}
+
+function configurationRequiresRestart() {
+  return (
+    configurationState?.pendingRestart === true ||
+    plainRecord(configurationState?.pendingRestart) !== null ||
+    (configurationStatus().safeMode === true &&
+      configurationActiveVersion() !== null)
+  );
+}
+
+function configurationErrorText(value) {
+  if (typeof value === "string") return value;
+  const error = plainRecord(value);
+  if (!error) return "";
+  return [error.code, error.message].filter(Boolean).join(" · ");
+}
+
+function configurationImpactMarkup(impact) {
+  const changed = configurationImpactCategories(impact);
+  if (!changed.length) {
+    return '<p class="configuration-help">预览未报告配置路径变化。</p>';
+  }
+  return `<div class="configuration-impact-list">${changed
+    .map(
+      (category) => `<section>
+        <strong>${escapeHtml(category.label)} · ${category.count}</strong>
+        ${listMarkup(category.paths)}
+      </section>`,
+    )
+    .join("")}</div>`;
+}
+
+function configurationPreviewMarkup() {
+  if (!configurationPreview) return "";
+  const preview = plainRecord(configurationPreview.preview) || configurationPreview;
+  const impact = plainRecord(preview.impact) || {};
+  return `<section class="configuration-preview" aria-labelledby="configuration-preview-title">
+    <div class="section-heading">
+      <h2 id="configuration-preview-title">初始化影响预览</h2>
+      <span>只显示路径，不展示敏感配置值</span>
+    </div>
+    ${configurationImpactMarkup(impact)}
+    <dl class="configuration-digests">
+      <div><dt>配置摘要</dt><dd><code>${escapeHtml(preview.documentDigest || "未提供")}</code></dd></div>
+      <div><dt>验证摘要</dt><dd><code>${escapeHtml(preview.validationDigest || "未提供")}</code></dd></div>
+    </dl>
+  </section>`;
+}
+
+function configurationView() {
+  if (!hasConfigurationState()) {
+    return `<section class="configuration-panel">
+      <div class="empty">${escapeHtml(configurationLoadError || "正在读取本地配置状态…")}</div>
+      ${configurationLoadError ? '<button class="secondary-button" data-configuration-reload>重新读取</button>' : ""}
+    </section>`;
+  }
+
+  const status = configurationStatus();
+  const safeMode = status.safeMode === true;
+  const activeVersion = configurationActiveVersion();
+  const stateRevision = configurationStateRevision();
+  const draft = initializationDraft();
+  const draftId = typeof draft?.draftId === "string" ? draft.draftId : null;
+  const draftRevision = Number.isSafeInteger(draft?.revision) ? draft.revision : null;
+  const initializationOpen = safeMode && activeVersion === null;
+  const migrationError = configurationErrorText(status.migrationError);
+  const restartNotice = configurationRequiresRestart()
+    ? "已保存，重启服务后生效"
+    : configurationNotice;
+  const statusLabel = initializationOpen
+    ? "等待初始化"
+    : activeVersion === null
+      ? "未初始化"
+      : `已保存 v${activeVersion}`;
+
+  const editor = initializationOpen
+    ? configurationEditorBinding !== null
+      ? `<form class="configuration-editor" id="configuration-editor-form" novalidate>
+          <label for="configuration-document">初始化配置（JSON）</label>
+          <p id="configuration-document-help" class="configuration-help">先保存本地草稿，再预览影响并加入统一确认队列。页面不会直接激活配置。</p>
+          <textarea id="configuration-document" name="configuration" spellcheck="false" aria-describedby="configuration-document-help${configurationEditorError ? " configuration-document-error" : ""}" aria-invalid="${configurationEditorError ? "true" : "false"}">${escapeHtml(configurationEditorValue)}</textarea>
+          <p id="configuration-document-error" class="configuration-inline-error" role="alert" ${configurationEditorError ? "" : "hidden"}>${escapeHtml(configurationEditorError)}</p>
+          <div class="configuration-actions">
+            <button type="submit" ${configurationOperationPending ? "disabled" : ""}>${draftId ? "保存新修订" : "保存初始化草稿"}</button>
+            <button type="button" class="secondary-button" data-configuration-preview ${configurationOperationPending ? "disabled" : ""}>预览影响</button>
+            <button type="button" class="secondary-button" data-configuration-request ${configurationOperationPending ? "disabled" : ""}>请求确认</button>
+          </div>
+        </form>`
+      : `<div class="configuration-inline-error" role="alert">服务端没有提供可编辑的规范化配置。请重新读取配置状态，不能用空对象初始化。</div>`
+    : `<div class="configuration-locked">
+        <strong>${activeVersion === null ? "当前不可编辑" : `活动配置 v${activeVersion}`}</strong>
+        <p>${safeMode ? "初始化版本已写入本地存储；当前进程仍保持安全模式。" : "在线草稿激活和回滚尚未开放，避免旧运行时继续使用过期权限。"}</p>
+      </div>`;
+
+  return `<div class="configuration-panel">
+    ${restartNotice ? `<div class="configuration-success" role="status"><strong>${escapeHtml(restartNotice)}</strong><span>系统不会自动重启。请在方便时手动重启服务。</span></div>` : ""}
+    ${configurationLoadError ? `<div class="configuration-inline-error" role="alert">${escapeHtml(configurationLoadError)}</div>` : ""}
+    <section class="configuration-status" aria-labelledby="configuration-status-title">
+      <div class="configuration-status-heading">
+        <div>
+          <p class="eyebrow">LOCAL CONFIGURATION / VERSIONED</p>
+          <h2 id="configuration-status-title">${safeMode ? "安全初始化模式" : "版本化配置"}</h2>
+        </div>
+        <span class="status-pill ${initializationOpen ? "status-waiting_user" : "status-active"}">${escapeHtml(statusLabel)}</span>
+      </div>
+      <p>${initializationOpen ? "当前没有 Active 配置。只有你确认的初始化草稿可以写入 v1，员工和外部动作保持关闭。" : "这里展示存储状态与当前进程实际使用状态；普通在线激活暂未开放。"}</p>
+      <dl class="configuration-summary">
+        <div><dt>存储版本</dt><dd>${activeVersion === null ? "尚无 Active" : `v${activeVersion}`}</dd></div>
+        <div><dt>状态修订</dt><dd>${stateRevision ?? "未知"}</dd></div>
+        <div><dt>初始化草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
+        <div><dt>运行时</dt><dd>${safeMode ? "安全禁用配置" : "启动时 Active 配置"}</dd></div>
+      </dl>
+      ${migrationError ? `<p class="configuration-migration-error"><strong>启动配置未导入：</strong>${escapeHtml(migrationError)}</p>` : ""}
+    </section>
+    ${editor}
+    ${configurationPreviewMarkup()}
+  </div>`;
+}
+
 function render() {
-  if (!dashboard) return;
+  if (currentView !== "configuration" && !dashboard) {
+    pageTitle.textContent = viewTitles[currentView];
+    content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
+    return;
+  }
   itemIndex = new Map();
   jobIndex = new Map();
   pageTitle.textContent = viewTitles[currentView];
@@ -692,6 +936,7 @@ function render() {
     memory: memoryView,
     workflow: () => workflowView.render(),
     work: () => workView.render(),
+    configuration: configurationView,
   };
   content.innerHTML = views[currentView]();
   content.querySelectorAll("[data-item-id]").forEach((button) => {
@@ -732,8 +977,234 @@ function render() {
     "click",
     handleMemoryLocalRerun,
   );
+  bindConfigurationView();
   workflowView.bind(content);
   workView.bind(content);
+}
+
+function bindConfigurationView() {
+  const form = content.querySelector("#configuration-editor-form");
+  form?.addEventListener("submit", handleConfigurationSave);
+  form?.querySelector("#configuration-document")?.addEventListener(
+    "input",
+    (event) => {
+      configurationEditorValue = event.currentTarget.value;
+      configurationEditorDirty = true;
+      configurationEditorError = "";
+      configurationPreview = null;
+      event.currentTarget.setAttribute("aria-invalid", "false");
+      event.currentTarget.setAttribute(
+        "aria-describedby",
+        "configuration-document-help",
+      );
+      const error = form.querySelector("#configuration-document-error");
+      if (error) {
+        error.hidden = true;
+        error.textContent = "";
+      }
+    },
+  );
+  content
+    .querySelector("[data-configuration-preview]")
+    ?.addEventListener("click", handleConfigurationPreview);
+  content
+    .querySelector("[data-configuration-request]")
+    ?.addEventListener("click", handleConfigurationRequest);
+  content
+    .querySelector("[data-configuration-reload]")
+    ?.addEventListener("click", () => void loadConfiguration());
+}
+
+function parsedConfigurationDocument() {
+  let parsed;
+  try {
+    parsed = JSON.parse(configurationEditorValue);
+  } catch {
+    throw new Error("配置不是有效的 JSON，请检查逗号、引号和括号。");
+  }
+  if (!plainRecord(parsed)) {
+    throw new Error("配置顶层必须是一个 JSON 对象。");
+  }
+  return parsed;
+}
+
+function requiredConfigurationBinding() {
+  const expectedStateRevision = configurationStateRevision();
+  if (!Number.isSafeInteger(expectedStateRevision)) {
+    throw new Error("配置状态修订不可用，请重新读取后再试。");
+  }
+  return { expectedStateRevision, draft: initializationDraft() };
+}
+
+function requiredConfigurationEditorBinding() {
+  const binding = configurationEditorBinding;
+  if (!binding || !Number.isSafeInteger(binding.expectedStateRevision)) {
+    throw new Error("编辑器没有可靠的配置修订绑定，请刷新页面后再试。");
+  }
+  return binding;
+}
+
+async function configurationResponseError(response, fallback) {
+  const payload = await response.json().catch(() => null);
+  const detail = configurationErrorText(payload?.error);
+  return new Error(detail || `${fallback}（${response.status}）`);
+}
+
+async function runConfigurationOperation(operation) {
+  if (configurationOperationPending) return;
+  configurationOperationPending = true;
+  configurationEditorError = "";
+  if (currentView === "configuration") render();
+  try {
+    await operation();
+  } catch (error) {
+    configurationEditorError = error.message;
+  } finally {
+    configurationOperationPending = false;
+    if (currentView === "configuration") {
+      render();
+      if (configurationEditorError) {
+        content.querySelector("#configuration-document")?.focus();
+      }
+    }
+  }
+}
+
+async function handleConfigurationSave(event) {
+  event.preventDefault();
+  configurationEditorValue = event.currentTarget.elements.configuration.value;
+  configurationEditorDirty = true;
+  await runConfigurationOperation(async () => {
+    const configuration = parsedConfigurationDocument();
+    const {
+      expectedStateRevision,
+      draftId,
+      draftRevision: expectedDraftRevision,
+    } = requiredConfigurationEditorBinding();
+    if (draftId && !Number.isSafeInteger(expectedDraftRevision)) {
+      throw new Error("草稿修订绑定无效，请刷新页面后再试。");
+    }
+    const response = await configurationFetch(
+      draftId
+        ? `/api/configuration/drafts/${encodeURIComponent(draftId)}`
+        : "/api/configuration/drafts",
+      {
+        method: draftId ? "PUT" : "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify(
+          draftId
+            ? { expectedDraftRevision, expectedStateRevision, configuration }
+            : { expectedStateRevision, configuration },
+        ),
+      },
+    );
+    if (response.status === 409) {
+      await loadConfiguration();
+      throw new Error("配置状态已有更新。为避免覆盖他人修改，请复制当前内容并刷新页面后重新核对。");
+    }
+    if (!response.ok) {
+      throw await configurationResponseError(response, "保存配置草稿失败");
+    }
+    await response.json();
+    configurationEditorValue = JSON.stringify(configuration, null, 2);
+    configurationEditorDirty = false;
+    configurationPreview = null;
+    configurationNotice = "初始化草稿已保存";
+    await loadConfiguration();
+  });
+}
+
+async function handleConfigurationPreview() {
+  await runConfigurationOperation(async () => {
+    const { expectedStateRevision, draft } = requiredConfigurationBinding();
+    if (
+      typeof draft?.draftId !== "string" ||
+      !Number.isSafeInteger(draft.revision)
+    ) {
+      throw new Error("请先保存初始化草稿，再预览影响。");
+    }
+    if (configurationEditorDirty) {
+      throw new Error("编辑内容尚未保存。请先保存新修订，再预览影响。");
+    }
+    const response = await configurationFetch(
+      `/api/configuration/drafts/${encodeURIComponent(draft.draftId)}/preview`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify({
+          draftRevision: draft.revision,
+          expectedStateRevision,
+        }),
+      },
+    );
+    if (response.status === 409) {
+      await loadConfiguration();
+      throw new Error("草稿或配置状态已经变化。请根据最新修订重新预览。");
+    }
+    if (!response.ok) {
+      throw await configurationResponseError(response, "预览配置影响失败");
+    }
+    configurationPreview = await response.json();
+    configurationNotice = "影响预览已更新";
+  });
+}
+
+async function handleConfigurationRequest() {
+  await runConfigurationOperation(async () => {
+    const { expectedStateRevision, draft } = requiredConfigurationBinding();
+    if (
+      typeof draft?.draftId !== "string" ||
+      !Number.isSafeInteger(draft.revision)
+    ) {
+      throw new Error("请先保存并预览初始化草稿。");
+    }
+    if (
+      configurationEditorDirty ||
+      !configurationPreview ||
+      !sameConfigurationBinding(
+        currentPreviewBinding(),
+        currentConfigurationBinding(),
+      )
+    ) {
+      throw new Error("请先保存当前编辑内容并查看最新影响预览。");
+    }
+    const response = await configurationFetch(
+      `/api/configuration/drafts/${encodeURIComponent(draft.draftId)}/request-confirmation`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify({
+          draftRevision: draft.revision,
+          expectedStateRevision,
+        }),
+      },
+    );
+    if (response.status === 409) {
+      await loadConfiguration();
+      throw new Error("草稿或配置状态已经变化。请重新预览后再请求确认。");
+    }
+    if (!response.ok) {
+      throw await configurationResponseError(response, "请求配置确认失败");
+    }
+    await response.json();
+    configurationNotice = "初始化配置已加入确认队列";
+    try {
+      await refreshConfirmationQueue({ showConfirmation: false });
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = `${error.message}。请求已经提交，页面会自动重试读取确认队列。`;
+    }
+    queueMicrotask(showNextConfirmation);
+  });
 }
 
 function detailRows(item) {
@@ -1368,18 +1839,22 @@ function pendingConfirmations() {
           },
         ]
       : [];
-  const responsibilities = pullRequestGroups().uncertain.map((item) => ({
-    kind: "responsibility",
-    item,
-    key: confirmationKey("responsibility", item),
-  }));
+  const responsibilities = dashboard
+    ? pullRequestGroups().uncertain.map((item) => ({
+        kind: "responsibility",
+        item,
+        key: confirmationKey("responsibility", item),
+      }))
+    : [];
   const legacyReviewDrafts = confirmationQueueState.externalEnabled
     ? []
-    : (dashboard.employee?.confirmationQueue || []).map((job) => ({
-        kind: "review_draft",
-        job,
-        key: confirmationKey("review", job),
-      }));
+    : dashboard
+      ? (dashboard.employee?.confirmationQueue || []).map((job) => ({
+          kind: "review_draft",
+          job,
+          key: confirmationKey("review", job),
+        }))
+      : [];
   return [
     ...externalActions,
     ...responsibilities,
@@ -1565,6 +2040,50 @@ function showChangePackageApplicationConfirmation(entry, remaining) {
     .addEventListener("click", handleExternalConfirmation);
 }
 
+function showConfigurationActivationConfirmation(entry, remaining) {
+  const item = structuredClone(entry.item);
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
+  const payload = item.display?.payload || {};
+  const action = payload.action || {};
+  const impact = payload.impact || {};
+  const operation = item.retryable ? "retry" : "approve";
+  const actionLabel = item.retryable
+    ? "确认并重试保存初始化配置"
+    : item.display?.actionLabel || "确认并保存初始化配置";
+  confirmationDialog.setAttribute(
+    "aria-labelledby",
+    "configuration-confirmation-title",
+  );
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation configuration-confirmation">
+      <p class="eyebrow">CONFIGURATION INITIALIZATION / ${remaining} LEFT</p>
+      <h2 id="configuration-confirmation-title">${escapeHtml(item.display?.title || "确认初始化版本化配置")}</h2>
+      <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将只把初始化配置保存为本地 v1")}</p>
+      <dl class="detail-grid confirmation-grid">
+        <dt>保存版本</dt><dd>v1</dd>
+        <dt>初始化草稿</dt><dd>${escapeHtml(action.draftId || "未知")} · r${escapeHtml(action.draftRevision ?? "未知")}</dd>
+        <dt>状态修订</dt><dd>${escapeHtml(action.expectedStateRevision ?? "未知")}</dd>
+        <dt>配置摘要</dt><dd><code>${escapeHtml(action.documentDigest || "未知")}</code></dd>
+        <dt>验证摘要</dt><dd><code>${escapeHtml(action.validationDigest || "未知")}</code></dd>
+        <dt>影响摘要</dt><dd><code>${escapeHtml(action.impactDigest || "未知")}</code></dd>
+      </dl>
+      <p class="confirmation-reason"><strong>逐项影响</strong></p>
+      ${configurationImpactMarkup(impact)}
+      <p class="confirmation-reason"><strong>依据</strong></p>
+      ${listMarkup(item.display?.evidence)}
+      <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
+        <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
+        <button class="secondary" data-external-operation="reject">驳回，不保存</button>
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+      <p class="confirmation-note">批准只会保存当前摘要绑定的初始化配置，不会自动重启服务，也不会直接启用员工、代码执行器或 GitHub 动作。</p>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
 function showUnsupportedExternalConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
   activeInternalAttention = null;
@@ -1584,6 +2103,13 @@ function showUnsupportedExternalConfirmation(entry, remaining) {
 }
 
 function showExternalActionConfirmation(entry, remaining) {
+  if (
+    entry.item?.kind === "local.configuration-activate" &&
+    entry.item?.display?.payload?.action?.type === "initialize_from_draft"
+  ) {
+    showConfigurationActivationConfirmation(entry, remaining);
+    return;
+  }
   if (entry.item?.kind === "local.code-job-create") {
     showCodeJobConfirmation(entry, remaining);
     return;
@@ -1769,11 +2295,12 @@ function showReviewDraftConfirmation(entry, remaining) {
 }
 
 function showNextConfirmation() {
-  if (!dashboard || confirmationDialog.open || dialog.open) return;
+  if (confirmationDialog.open || dialog.open) return;
   const pending = pendingConfirmations();
   const [entry] = pending;
   if (!entry) return;
   activeConfirmationKey = entry.key;
+  confirmationDialog.removeAttribute("aria-labelledby");
   if (entry.kind === "external_action") {
     showExternalActionConfirmation(entry, pending.length);
   } else if (entry.kind === "internal_request") {
@@ -1884,6 +2411,9 @@ async function handleExternalConfirmation(event) {
       activeConfirmationKey = "";
       try {
         await refreshConfirmationQueue({ showConfirmation: false });
+        if (item.kind === "local.configuration-activate") {
+          await loadConfiguration();
+        }
         const sequence = ++requestSequence;
         const nextDashboard = await fetchDashboard();
         if (nextDashboard) applyDashboard(nextDashboard, sequence);
@@ -1894,12 +2424,22 @@ async function handleExternalConfirmation(event) {
       return;
     }
     if (!response.ok) throw new Error(`外部动作确认失败（${response.status}）`);
-    await response.json();
+    const confirmationResult = await response.json();
+    const configurationCompleted =
+      item.kind === "local.configuration-activate" &&
+      ["approve", "retry"].includes(operation) &&
+      confirmationResult?.item?.status === "completed";
+    if (configurationCompleted) {
+      configurationNotice = "已保存，重启服务后生效";
+      configurationPreview = null;
+      configurationEditorDirty = false;
+    }
     invalidateConfirmationQueueSnapshot();
     activeConfirmationKey = "";
     activeExternalConfirmation = null;
     confirmationDialog.close();
     await load({ showConfirmation: false });
+    if (configurationCompleted) await loadConfiguration();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
@@ -1987,7 +2527,111 @@ function updateChrome() {
   statusBanner.hidden = errors.length === 0;
   statusBanner.textContent = errors.length
     ? `部分数据未能刷新：${errors.join("；")}`
-    : "";
+      : "";
+}
+
+function updateConfigurationChrome() {
+  if (dashboard || !hasConfigurationState()) return;
+  const status = configurationStatus();
+  const activeVersion = configurationActiveVersion();
+  const stateRevision = configurationStateRevision();
+  lastUpdated.textContent = `配置状态 revision ${stateRevision ?? "未知"}`;
+  sourceHealth.classList.toggle("error", status.safeMode === true);
+  sourceHealth.innerHTML = `
+    <span class="pulse"></span>
+    <div>
+      <strong>${status.safeMode === true ? "安全恢复模式" : "配置中心已连接"}</strong>
+      <span>${activeVersion === null ? "尚无 Active 配置" : `本地已保存 v${activeVersion}`}</span>
+    </div>`;
+}
+
+function applyConfigurationState(nextState, sequence) {
+  if (!plainRecord(nextState) || sequence < lastAppliedConfigurationRequest) {
+    return false;
+  }
+  const hadLoadError = configurationLoadError !== "";
+  const unchanged = sameConfigurationRevision(configurationState, nextState);
+  lastAppliedConfigurationRequest = sequence;
+  configurationLoadError = "";
+  if (unchanged) {
+    updateConfigurationChrome();
+    if (hadLoadError && currentView === "configuration") render();
+    return true;
+  }
+  configurationState = nextState;
+  const editable = configurationDocumentCandidate();
+  const binding = currentConfigurationBinding();
+  if (
+    configurationPreview &&
+    !sameConfigurationBinding(currentPreviewBinding(), binding)
+  ) {
+    configurationPreview = null;
+  }
+  if (editable && !configurationEditorDirty) {
+    configurationEditorValue = JSON.stringify(editable, null, 2);
+    configurationEditorDirty = false;
+    configurationEditorBinding = binding;
+  }
+  updateConfigurationChrome();
+  if (
+    !configurationAutoSelected &&
+    !dashboard &&
+    configurationStatus().safeMode === true
+  ) {
+    configurationAutoSelected = true;
+    activateView("configuration");
+  } else if (currentView === "configuration") {
+    render();
+  }
+  return true;
+}
+
+async function loadConfiguration() {
+  const sequence = ++configurationRequestSequence;
+  configurationAbortController?.abort();
+  const controller = new AbortController();
+  configurationAbortController = controller;
+  try {
+    const response = await configurationFetch("/api/configuration", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw await configurationResponseError(response, "读取配置状态失败");
+    }
+    const nextState = await response.json();
+    if (
+      !isCurrentConfigurationRequest({
+        sequence,
+        currentSequence: configurationRequestSequence,
+        lastAppliedSequence: lastAppliedConfigurationRequest,
+        signal: controller.signal,
+      })
+    ) {
+      return false;
+    }
+    applyConfigurationState(nextState, sequence);
+    return true;
+  } catch (error) {
+    if (error?.name === "AbortError") return false;
+    if (
+      !isCurrentConfigurationRequest({
+        sequence,
+        currentSequence: configurationRequestSequence,
+        lastAppliedSequence: lastAppliedConfigurationRequest,
+        signal: controller.signal,
+      })
+    ) {
+      return false;
+    }
+    configurationLoadError = error.message;
+    if (currentView === "configuration") render();
+    return false;
+  } finally {
+    if (configurationAbortController === controller) {
+      configurationAbortController = null;
+    }
+  }
 }
 
 async function fetchDashboard() {
@@ -2026,20 +2670,23 @@ async function load({ showConfirmation = true } = {}) {
   const sequence = ++requestSequence;
   const confirmationSequence = ++confirmationRequestSequence;
   void loadEmployeeRoles();
+  if (!hasConfigurationState() || currentView === "configuration") {
+    void loadConfiguration();
+  }
   try {
     const [nextDashboard, nextConfirmationQueue] = await Promise.all([
       fetchDashboard(),
       fetchConfirmationQueue(),
     ]);
     applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
+    if (showConfirmation) queueMicrotask(showNextConfirmation);
     if (!nextDashboard) {
-      content.innerHTML = '<div class="empty">正在建立第一次数据快照，请稍候…</div>';
+      render();
       return;
     }
     applyDashboard(nextDashboard, sequence);
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
-    if (showConfirmation) queueMicrotask(showNextConfirmation);
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;
@@ -2049,6 +2696,22 @@ async function load({ showConfirmation = true } = {}) {
 async function refresh() {
   refreshButton.disabled = true;
   refreshButton.classList.add("loading");
+  if (currentView === "configuration") {
+    try {
+      await Promise.all([
+        loadConfiguration(),
+        refreshConfirmationQueue({ showConfirmation: false }),
+      ]);
+      queueMicrotask(showNextConfirmation);
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = error.message;
+    } finally {
+      refreshButton.disabled = false;
+      refreshButton.classList.remove("loading");
+    }
+    return;
+  }
   const sequence = ++requestSequence;
   try {
     const response = await fetch("/api/refresh", {
@@ -2071,24 +2734,37 @@ async function refresh() {
   }
 }
 
+function activateView(view) {
+  if (!Object.hasOwn(viewTitles, view)) return;
+  document.querySelector(".nav-item.active")?.classList.remove("active");
+  document.querySelector(".nav-item[aria-current=page]")?.removeAttribute(
+    "aria-current",
+  );
+  const button = document.querySelector(`.nav-item[data-view="${view}"]`);
+  button?.classList.add("active");
+  button?.setAttribute("aria-current", "page");
+  currentView = view;
+  render();
+  if (currentView === "configuration") {
+    void loadConfiguration();
+  }
+  if (currentView === "memory" && !memoryLoaded) {
+    loadMemories().catch((error) => {
+      statusBanner.hidden = false;
+      statusBanner.textContent = error.message;
+    });
+  }
+  if (currentView === "workflow" && workflowView.needsLoad()) {
+    workflowView.load();
+  }
+  if (currentView === "work" && workView.needsLoad()) {
+    workView.load();
+  }
+}
+
 document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
-    document.querySelector(".nav-item.active")?.classList.remove("active");
-    button.classList.add("active");
-    currentView = button.dataset.view;
-    render();
-    if (currentView === "memory" && !memoryLoaded) {
-      loadMemories().catch((error) => {
-        statusBanner.hidden = false;
-        statusBanner.textContent = error.message;
-      });
-    }
-    if (currentView === "workflow" && workflowView.needsLoad()) {
-      workflowView.load();
-    }
-    if (currentView === "work" && workView.needsLoad()) {
-      workView.load();
-    }
+    activateView(button.dataset.view);
   });
 });
 
@@ -2128,6 +2804,9 @@ document.addEventListener("keydown", (event) => {
   if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
   if (/^[1-9]$/.test(event.key)) {
     document.querySelectorAll(".nav-item")[Number(event.key) - 1]?.click();
+  }
+  if (event.key === "0") {
+    activateView("configuration");
   }
 });
 

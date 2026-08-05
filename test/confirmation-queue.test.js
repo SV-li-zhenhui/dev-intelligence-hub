@@ -90,6 +90,40 @@ function actionPlan(overrides = {}) {
   };
 }
 
+function configurationPlan(type, suffix) {
+  const actor = {
+    provider: "local-configuration",
+    accountId: "owner:local",
+  };
+  const target = {
+    provider: "local-configuration",
+    resourceId: "active-configuration",
+    version: "a".repeat(64),
+  };
+  const action = {
+    type,
+    validationDigest: "a".repeat(64),
+  };
+  return actionPlan({
+    id: `confirmation-configuration-${suffix}`,
+    kind: "local.configuration-activate",
+    requestedBy: {
+      roleId: "configuration-owner",
+      workItemId: `configuration-${suffix}`,
+    },
+    actor,
+    target,
+    action,
+    display: {
+      title: "激活版本化配置",
+      summary: "配置动作必须按不可变动作类型过滤。",
+      actionLabel: "确认并激活配置",
+      evidence: [],
+      payload: { actor, target, action },
+    },
+  });
+}
+
 function applicationPlan({
   packageDigest = "8".repeat(64),
   jobId = "code-job-application-1",
@@ -222,6 +256,24 @@ test("the queue stays closed until durable recovery succeeds", async () => {
     queue.readSnapshot({ afterRevision: 0 }),
     (error) => error.code === "CONFIRMATION_QUEUE_NOT_READY",
   );
+});
+
+test("a kind-and-action query skips unrelated confirmations without exposing them", async () => {
+  const queue = await readyQueue();
+  await queue.enqueue(actionPlan());
+  await queue.enqueue(configurationPlan("activate_rollback", "rollback"));
+  const initialization = await queue.enqueue(
+    configurationPlan("initialize_from_draft", "initialization"),
+  );
+
+  const selected = await queue.nextForAction(
+    "local.configuration-activate",
+    "initialize_from_draft",
+  );
+
+  assert.equal(selected.pendingCount, 1);
+  assert.equal(selected.item.id, initialization.id);
+  assert.equal((await queue.next()).item.kind, "github.pull-request-review");
 });
 
 test("enqueue freezes an exact plan and is idempotent only for the same binding", async () => {

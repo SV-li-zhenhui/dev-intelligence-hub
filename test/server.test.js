@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import test from "node:test";
 import {
@@ -8,6 +9,11 @@ import {
   startDashboardServer,
 } from "../src/server.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
+import { createSafeDisabledConfiguration } from "../src/lib/config.js";
+
+const safeEditableConfiguration = createSafeDisabledConfiguration(
+  JSON.parse(readFileSync(new URL("../config.json", import.meta.url), "utf8")),
+);
 
 function request(server, {
   method = "GET",
@@ -222,6 +228,362 @@ function startupApplication({
       },
     },
     close,
+  };
+}
+
+function safeConfigurationApplication() {
+  const calls = [];
+  const runtimeConfiguration = structuredClone(safeEditableConfiguration);
+  let snapshot = {
+    revision: 0,
+    activeVersion: null,
+    migration: {
+      status: "pending",
+      importedAt: null,
+      importedBy: null,
+      sourceDigest: null,
+    },
+    versions: [],
+    draftRevisions: [],
+    draftHeads: [],
+    audit: [],
+    projectionOutbox: [],
+  };
+
+  const fail = (statusCode, message) => {
+    throw Object.assign(new Error(message), { statusCode });
+  };
+  const copy = (value) => structuredClone(value);
+  const requireDraft = (draftId, revision) => {
+    const draft = snapshot.draftRevisions.find(
+      (candidate) =>
+        candidate.draftId === draftId && candidate.revision === revision,
+    );
+    if (!draft) fail(404, "配置草稿修订不存在");
+    return draft;
+  };
+  const draftRecord = ({
+    draftId,
+    revision,
+    configuration,
+    proposedBy,
+    supersedesRevisionId,
+  }) => ({
+    draftRevisionId: `configuration-draft-revision-${draftId}-${revision}`,
+    contentDigest: `${revision}`.padStart(64, "a").slice(-64),
+    draftId,
+    revision,
+    baseVersion: 0,
+    configurationDigest: `${revision}`.padStart(64, "b").slice(-64),
+    configuration: copy(configuration),
+    proposedBy,
+    createdAt: `2026-08-05T0${revision}:00:00.000Z`,
+    supersedesRevisionId,
+  });
+
+  const draftManager = {
+    async createInitializationDraft(input) {
+      calls.push({ operation: "configuration_create", input: copy(input) });
+      if (snapshot.activeVersion !== null) fail(409, "版本化配置已经完成初始化");
+      const draft = draftRecord({
+        draftId: "initial-draft",
+        revision: 1,
+        configuration: input.configuration,
+        proposedBy: input.proposedBy,
+        supersedesRevisionId: null,
+      });
+      snapshot = {
+        ...snapshot,
+        revision: snapshot.revision + 1,
+        draftRevisions: [...snapshot.draftRevisions, draft],
+        draftHeads: [
+          ...snapshot.draftHeads,
+          {
+            draftId: draft.draftId,
+            revision: draft.revision,
+            draftRevisionId: draft.draftRevisionId,
+          },
+        ],
+      };
+      return copy(draft);
+    },
+    async reviseDraft(input) {
+      calls.push({ operation: "configuration_revise", input: copy(input) });
+      const headIndex = snapshot.draftHeads.findIndex(
+        (candidate) => candidate.draftId === input.draftId,
+      );
+      const head = snapshot.draftHeads[headIndex];
+      if (!head) fail(404, "配置草稿不存在");
+      if (head.revision !== input.expectedDraftRevision) {
+        fail(409, "配置草稿已有新修订");
+      }
+      const previous = requireDraft(head.draftId, head.revision);
+      const draft = draftRecord({
+        draftId: head.draftId,
+        revision: head.revision + 1,
+        configuration: input.configuration,
+        proposedBy: input.proposedBy,
+        supersedesRevisionId: previous.draftRevisionId,
+      });
+      const draftHeads = [...snapshot.draftHeads];
+      draftHeads[headIndex] = {
+        draftId: draft.draftId,
+        revision: draft.revision,
+        draftRevisionId: draft.draftRevisionId,
+      };
+      snapshot = {
+        ...snapshot,
+        revision: snapshot.revision + 1,
+        draftRevisions: [...snapshot.draftRevisions, draft],
+        draftHeads,
+      };
+      return copy(draft);
+    },
+  };
+
+  const initializationItem = {
+    id: "confirmation-configuration-initialization",
+    kind: "local.configuration-activate",
+    status: "pending",
+    queueRevision: 12,
+    itemRevision: 1,
+    requestedBy: {
+      roleId: "configuration-owner",
+      workItemId: "configuration-initial-draft",
+    },
+    actor: { provider: "local-configuration", accountId: "owner:local" },
+    target: {
+      provider: "local-configuration",
+      resourceId: "active-configuration",
+      version: "c".repeat(64),
+    },
+    action: {
+      type: "initialize_from_draft",
+      validationDigest: "d".repeat(64),
+    },
+    display: {
+      title: "初始化版本化配置",
+      summary: "从已保存草稿初始化活动配置。",
+      actionLabel: "确认初始化",
+      evidence: [],
+      payload: {
+        actor: { provider: "local-configuration", accountId: "owner:local" },
+        target: {
+          provider: "local-configuration",
+          resourceId: "active-configuration",
+          version: "c".repeat(64),
+        },
+        action: {
+          type: "initialize_from_draft",
+          validationDigest: "d".repeat(64),
+        },
+      },
+    },
+    displayedPayloadDigest: "e".repeat(64),
+    approvalBindingDigest: "f".repeat(64),
+    retryable: false,
+  };
+  const githubItem = {
+    ...copy(initializationItem),
+    id: "confirmation-unrelated-github",
+    kind: "github.pull-request-review",
+    action: { type: "pull_request_review" },
+  };
+  const rollbackItem = {
+    ...copy(initializationItem),
+    id: "confirmation-configuration-rollback",
+    action: { type: "activate_rollback" },
+    display: {
+      ...copy(initializationItem.display),
+      payload: {
+        ...copy(initializationItem.display.payload),
+        action: { type: "activate_rollback" },
+      },
+    },
+  };
+  const items = new Map(
+    [githubItem, rollbackItem, initializationItem].map((item) => [item.id, item]),
+  );
+  const publicItem = (item) => {
+    if (!item) return null;
+    const projected = copy(item);
+    delete projected.action;
+    return projected;
+  };
+  const nextInitialization = () => {
+    const item = items.get(initializationItem.id);
+    const pending = item.status === "pending" || item.retryable ? [item] : [];
+    return {
+      queueRevision: 12,
+      pendingCount: pending.length,
+      item: publicItem(pending[0] || null),
+    };
+  };
+  const completeInitialization = () => {
+    const head = snapshot.draftHeads[0];
+    const draft = head && requireDraft(head.draftId, head.revision);
+    if (!draft) fail(409, "初始化草稿不存在");
+    const active = {
+      configurationVersionId: "configuration-version-initialized",
+      contentDigest: "1".repeat(64),
+      version: 1,
+      configurationDigest: draft.configurationDigest,
+      configuration: copy(draft.configuration),
+      source: "initialization",
+      previousVersion: null,
+      draftRevisionId: draft.draftRevisionId,
+      rollbackOf: null,
+      activatedBy: "owner:local",
+      activatedAt: "2026-08-05T08:00:00.000Z",
+      impactDigest: "2".repeat(64),
+    };
+    snapshot = {
+      ...snapshot,
+      revision: snapshot.revision + 1,
+      activeVersion: 1,
+      versions: [active],
+    };
+  };
+  const confirmationQueue = {
+    async next() {
+      calls.push({ operation: "unsafe_confirmation_next" });
+      throw new Error("safe mode must use an action-scoped query");
+    },
+    async nextForAction(kind, actionType, options) {
+      calls.push({
+        operation: "configuration_confirmation_next",
+        kind,
+        actionType,
+        options: copy(options),
+      });
+      return copy(nextInitialization());
+    },
+    async get(id) {
+      calls.push({ operation: "configuration_confirmation_get", id });
+      const item = items.get(id);
+      if (!item) fail(404, "确认项不存在");
+      return publicItem(item);
+    },
+    async approve(id, input) {
+      calls.push({ operation: "configuration_confirmation_approve", id, input: copy(input) });
+      const item = items.get(id);
+      item.status = "completed";
+      completeInitialization();
+      return publicItem(item);
+    },
+    async retry(id, input) {
+      calls.push({ operation: "configuration_confirmation_retry", id, input: copy(input) });
+      return publicItem(items.get(id));
+    },
+    async reject(id, input) {
+      calls.push({ operation: "configuration_confirmation_reject", id, input: copy(input) });
+      const item = items.get(id);
+      item.status = "rejected";
+      return publicItem(item);
+    },
+  };
+
+  const reader = {
+    async readSnapshot() {
+      calls.push({ operation: "configuration_snapshot" });
+      return copy(snapshot);
+    },
+    async readActive() {
+      return copy(
+        snapshot.versions.find(({ version }) => version === snapshot.activeVersion) || null,
+      );
+    },
+    async readVersion({ version }) {
+      const entry = snapshot.versions.find((candidate) => candidate.version === version);
+      if (!entry) fail(404, "配置版本不存在");
+      return copy(entry);
+    },
+    async readDraft({ draftId, revision }) {
+      calls.push({ operation: "configuration_draft_read", draftId, revision });
+      return copy(requireDraft(draftId, revision));
+    },
+    async readProjectionBatch() {
+      return { highWatermark: 0, nextSequence: 0, items: [] };
+    },
+  };
+  const simulator = {
+    async prepareInitialization(input) {
+      calls.push({ operation: "configuration_preview", input: copy(input) });
+      return {
+        kind: "configuration.initialize",
+        ...copy(input),
+        expectedActiveVersion: null,
+        activeDigest: null,
+        baselineDigest: "6".repeat(64),
+        draftRevisionId: `configuration-draft-revision-${input.draftId}-${input.draftRevision}`,
+        documentDigest: "3".repeat(64),
+        validationDigest: "4".repeat(64),
+        impactDigest: "5".repeat(64),
+        impact: {
+          changed: true,
+          beforeDigest: "6".repeat(64),
+          afterDigest: "3".repeat(64),
+          security_tightening: [],
+          authority_expansion: ["githubActions.enabled"],
+          benign_claim_change: ["refreshMinutes"],
+          restart_required: ["githubActions.enabled"],
+        },
+      };
+    },
+  };
+  const confirmationRequester = {
+    async requestInitialization(input) {
+      calls.push({
+        operation: "configuration_request_confirmation",
+        input: copy(input),
+      });
+      return publicItem(initializationItem);
+    },
+  };
+  const application = {
+    config: runtimeConfiguration,
+    configuration: {
+      status: {
+        safeMode: true,
+        activeVersion: null,
+        stateRevision: 0,
+        migrationError: { code: "CONFIG_LOCAL_INVALID", message: "测试迁移失败" },
+      },
+      reader,
+      draftManager,
+      simulator,
+      confirmationRequester,
+    },
+    confirmationQueue,
+    store: { async read() { return null; } },
+    refreshService: { running: null, async refresh() { fail(503, "safe mode"); } },
+  };
+  return { application, calls, getSnapshot: () => copy(snapshot), items };
+}
+
+async function withSafeConfigurationServer(run) {
+  const fixture = safeConfigurationApplication();
+  const backgroundWork = startApplicationBackgroundWork(fixture.application);
+  const reportedErrors = [];
+  const server = createDashboardServer(fixture.application, {
+    backgroundWork,
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await run({ ...fixture, server, backgroundWork, reportedErrors });
+  } finally {
+    await server.shutdown();
+  }
+}
+
+function trustedConfigurationHeaders() {
+  return {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
   };
 }
 
@@ -574,7 +936,7 @@ async function withServer(
   }
 }
 
-test("configuration safe mode starts no background reads, employees, or confirmations", async () => {
+test("configuration safe mode starts no background reads or employees but permits confirmation operations", async () => {
   let refreshCalls = 0;
   let operationCalls = 0;
   const application = startupApplication({
@@ -604,13 +966,344 @@ test("configuration safe mode starts no background reads, employees, or confirma
     }),
     { skipped: "configuration_safe_mode" },
   );
+  assert.equal(
+    await backgroundWork.runConfirmationOperation(async () => {
+      operationCalls += 1;
+      return "confirmation-completed";
+    }),
+    "confirmation-completed",
+  );
   assert.deepEqual(backgroundWork.timers, []);
-  assert.equal(backgroundWork.confirmationReady(), false);
+  assert.equal(backgroundWork.confirmationReady(), true);
   assert.equal(refreshCalls, 0);
-  assert.equal(operationCalls, 0);
+  assert.equal(operationCalls, 1);
   const firstStop = backgroundWork.stop();
   assert.strictEqual(backgroundWork.stop(), firstStop);
   await firstStop;
+});
+
+test("configuration safe mode shutdown drains an accepted confirmation operation", async () => {
+  const operationStarted = deferred();
+  const releaseOperation = deferred();
+  const application = startupApplication();
+  application.configuration = {
+    status: { safeMode: true, migrationError: null },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application);
+  const operation = backgroundWork.runConfirmationOperation(async () => {
+    operationStarted.resolve();
+    await releaseOperation.promise;
+    return "completed";
+  });
+  await operationStarted.promise;
+
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  assert.equal(backgroundWork.confirmationReady(), false);
+  await assert.rejects(
+    backgroundWork.runConfirmationOperation(async () => "must-not-run"),
+    (error) => error?.code === "CONFIRMATION_FACTS_NOT_READY",
+  );
+
+  releaseOperation.resolve();
+  assert.equal(await operation, "completed");
+  await stopping;
+  assert.equal(stopped, true);
+});
+
+test("safe-mode configuration API creates, revises, previews, and reloads only initialization drafts", async () => {
+  await withSafeConfigurationServer(async ({ server, calls }) => {
+    const initial = await request(server, { path: "/api/configuration" });
+    assert.equal(initial.status, 200);
+    const initialState = JSON.parse(initial.body);
+    assert.deepEqual(Object.keys(initialState).sort(), [
+      "drafts",
+      "editableConfiguration",
+      "pendingRestart",
+      "runtimeEffective",
+      "status",
+      "storedActive",
+    ]);
+    assert.equal(initialState.status.safeMode, true);
+    assert.equal(initialState.status.stateRevision, 0);
+    assert.equal(initialState.status.migrationError.code, "CONFIG_LOCAL_INVALID");
+    assert.equal(initialState.storedActive, null);
+    assert.equal(initialState.runtimeEffective.activeVersion, null);
+    assert.match(initialState.runtimeEffective.configurationDigest, /^[a-f0-9]{64}$/);
+    assert.equal(initialState.pendingRestart, false);
+    assert.deepEqual(initialState.drafts, []);
+    assert.deepEqual(
+      initialState.editableConfiguration,
+      safeEditableConfiguration,
+    );
+    assert.equal("audit" in initialState, false);
+    assert.equal("projectionOutbox" in initialState, false);
+
+    const firstConfiguration = structuredClone(safeEditableConfiguration);
+    firstConfiguration.refreshMinutes = 20;
+    const created = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 0,
+        configuration: firstConfiguration,
+      }),
+    });
+    assert.equal(created.status, 201, created.body);
+    const createdDraft = JSON.parse(created.body).draft;
+    assert.equal(createdDraft.draftId, "initial-draft");
+    assert.equal(createdDraft.revision, 1);
+    assert.equal(createdDraft.baseVersion, 0);
+    assert.equal("proposedBy" in createdDraft, false);
+    assert.equal("contentDigest" in createdDraft, false);
+    assert.deepEqual(
+      calls.find(({ operation }) => operation === "configuration_create").input,
+      {
+        expectedStateRevision: 0,
+        configuration: firstConfiguration,
+        proposedBy: "owner:local",
+      },
+    );
+
+    const afterCreate = await request(server, { path: "/api/configuration" });
+    assert.equal(afterCreate.status, 200);
+    const createdState = JSON.parse(afterCreate.body);
+    assert.equal(createdState.status.stateRevision, 1);
+    assert.equal(createdState.drafts.length, 1);
+    assert.equal(createdState.drafts[0].draftId, "initial-draft");
+    assert.equal(createdState.drafts[0].baseVersion, 0);
+    assert.equal("configuration" in createdState.drafts[0], false);
+    assert.deepEqual(createdState.editableConfiguration, firstConfiguration);
+    assert.equal(
+      calls.filter(({ operation }) => operation === "configuration_draft_read")
+        .length,
+      0,
+    );
+
+    const draftRead = await request(server, {
+      path: "/api/configuration/drafts/initial-draft?revision=1",
+    });
+    assert.equal(draftRead.status, 200);
+    assert.deepEqual(JSON.parse(draftRead.body).draft.configuration, firstConfiguration);
+    assert.equal(
+      calls.filter(({ operation }) => operation === "configuration_draft_read")
+        .length,
+      1,
+    );
+
+    const secondConfiguration = structuredClone(firstConfiguration);
+    secondConfiguration.refreshMinutes = 25;
+    const revised = await request(server, {
+      method: "PUT",
+      path: "/api/configuration/drafts/initial-draft",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedDraftRevision: 1,
+        expectedStateRevision: 1,
+        configuration: secondConfiguration,
+      }),
+    });
+    assert.equal(revised.status, 200, revised.body);
+    assert.equal(JSON.parse(revised.body).draft.revision, 2);
+    assert.deepEqual(
+      calls.find(({ operation }) => operation === "configuration_revise").input,
+      {
+        draftId: "initial-draft",
+        expectedDraftRevision: 1,
+        expectedStateRevision: 1,
+        configuration: secondConfiguration,
+        proposedBy: "owner:local",
+      },
+    );
+
+    const reloaded = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(reloaded.status.stateRevision, 2);
+    assert.equal(reloaded.drafts[0].revision, 2);
+    assert.deepEqual(reloaded.editableConfiguration, secondConfiguration);
+
+    const binding = { draftRevision: 2, expectedStateRevision: 2 };
+    const preview = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts/initial-draft/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(binding),
+    });
+    assert.equal(preview.status, 200, preview.body);
+    const prepared = JSON.parse(preview.body);
+    assert.equal(prepared.kind, "configuration.initialize");
+    assert.equal(prepared.expectedActiveVersion, null);
+    assert.deepEqual(prepared.impact.restart_required, ["githubActions.enabled"]);
+    assert.deepEqual(
+      calls.find(({ operation }) => operation === "configuration_preview").input,
+      { draftId: "initial-draft", ...binding },
+    );
+
+    const queued = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts/initial-draft/request-confirmation",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(binding),
+    });
+    assert.equal(queued.status, 200, queued.body);
+    assert.equal(
+      JSON.parse(queued.body).request.id,
+      "confirmation-configuration-initialization",
+    );
+    assert.deepEqual(
+      calls.find(
+        ({ operation }) => operation === "configuration_request_confirmation",
+      ).input,
+      { draftId: "initial-draft", ...binding },
+    );
+  });
+});
+
+test("safe-mode configuration mutations reject untrusted, expansive, and direct activation requests", async () => {
+  await withSafeConfigurationServer(async ({ server, calls }) => {
+    const configuration = structuredClone(safeEditableConfiguration);
+    const untrusted = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedStateRevision: 0, configuration }),
+    });
+    const clientActor = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 0,
+        configuration,
+        proposedBy: "attacker",
+      }),
+    });
+    const directPaths = [
+      "/api/configuration/activate",
+      "/api/configuration/rollback",
+      "/api/confirmations/enqueue",
+    ];
+    const direct = await Promise.all(
+      directPaths.map((path) =>
+        request(server, {
+          method: "POST",
+          path,
+          headers: trustedConfigurationHeaders(),
+          body: "{}",
+        }),
+      ),
+    );
+
+    assert.equal(untrusted.status, 403);
+    assert.equal(clientActor.status, 400);
+    assert.deepEqual(direct.map(({ status }) => status), [404, 404, 404]);
+    assert.equal(
+      calls.filter(({ operation }) => operation === "configuration_create").length,
+      0,
+    );
+  });
+});
+
+test("safe mode exposes and operates only initialization confirmations then reports restart drift", async () => {
+  await withSafeConfigurationServer(async ({ server, calls }) => {
+    const configuration = structuredClone(safeEditableConfiguration);
+    const created = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({ expectedStateRevision: 0, configuration }),
+    });
+    assert.equal(created.status, 201);
+
+    const directNext = await request(server, { path: "/api/confirmations/next" });
+    const attentionNext = await request(server, { path: "/api/attention/next" });
+    assert.equal(directNext.status, 200, directNext.body);
+    assert.equal(attentionNext.status, 200, attentionNext.body);
+    assert.equal(
+      JSON.parse(directNext.body).item.id,
+      "confirmation-configuration-initialization",
+    );
+    assert.equal(
+      JSON.parse(attentionNext.body).item.id,
+      "confirmation-configuration-initialization",
+    );
+    const scopedReads = calls.filter(
+      ({ operation }) => operation === "configuration_confirmation_next",
+    );
+    assert.equal(scopedReads.length, 2);
+    for (const read of scopedReads) {
+      assert.equal(read.kind, "local.configuration-activate");
+      assert.equal(read.actionType, "initialize_from_draft");
+    }
+    assert.equal(
+      calls.some(({ operation }) => operation === "unsafe_confirmation_next"),
+      false,
+    );
+
+    const approval = {
+      requestId: "request-configuration-initialization-1",
+      expectedQueueRevision: 12,
+      expectedItemRevision: 1,
+      displayedPayloadDigest: "e".repeat(64),
+      approvalBindingDigest: "f".repeat(64),
+    };
+    for (const id of [
+      "confirmation-unrelated-github",
+      "confirmation-configuration-rollback",
+    ]) {
+      const denied = await request(server, {
+        method: "POST",
+        path: `/api/confirmations/${id}/approve`,
+        headers: trustedConfigurationHeaders(),
+        body: JSON.stringify(approval),
+      });
+      assert.equal(denied.status, 404, `${id}: ${denied.body}`);
+    }
+    assert.equal(
+      calls.filter(
+        ({ operation }) => operation === "configuration_confirmation_approve",
+      ).length,
+      0,
+    );
+
+    const approved = await request(server, {
+      method: "POST",
+      path: "/api/confirmations/confirmation-configuration-initialization/approve",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(approval),
+    });
+    assert.equal(approved.status, 200, approved.body);
+    assert.equal(JSON.parse(approved.body).item.status, "completed");
+
+    const status = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(status.status.safeMode, true);
+    assert.equal(status.storedActive.version, 1);
+    assert.equal(status.runtimeEffective.activeVersion, null);
+    assert.equal(status.pendingRestart, true);
+    assert.deepEqual(status.editableConfiguration, configuration);
+
+    const version = await request(server, {
+      path: "/api/configuration/versions/1",
+    });
+    assert.equal(version.status, 200);
+    assert.deepEqual(JSON.parse(version.body).version.configuration, configuration);
+
+    const createAfterActivation = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({ expectedStateRevision: 2, configuration }),
+    });
+    assert.equal(createAfterActivation.status, 409);
+  });
 });
 
 test("background work runs every registered employee after the initial refresh and on schedule", async () => {
