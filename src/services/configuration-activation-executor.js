@@ -6,6 +6,7 @@ import { digestValue } from "../domain/code-executor-contract.js";
 const TRUSTED_OWNER = "owner:local";
 const CANONICAL_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const CONFIGURATION_DIGEST = /^[a-f0-9]{64}$/;
 
 const ACTIONS = Object.freeze({
   initialize_from_draft: Object.freeze({
@@ -172,6 +173,23 @@ function expectedVersion(action) {
     : action.expectedActiveVersion + 1;
 }
 
+function expectedStoredBinding(action) {
+  return Object.freeze({
+    version: expectedVersion(action),
+    configurationDigest: action.documentDigest,
+  });
+}
+
+function sameConfigurationBinding(left, right) {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left?.version === right?.version &&
+      left?.configurationDigest === right?.configurationDigest)
+  );
+}
+
 function expectedVersionBinding(action) {
   const definition = ACTIONS[action.type];
   return {
@@ -264,20 +282,60 @@ function snapshotFields(value) {
   };
 }
 
-function reconcileSnapshot(snapshot, envelope) {
+function activeSnapshotBinding(state) {
+  if (state.activeVersion === null) {
+    return { known: true, value: null };
+  }
+  const active = state.versions[state.activeVersion - 1];
+  const version = dataField(active, "version");
+  const configurationDigest = dataField(active, "configurationDigest");
+  if (
+    !version.found ||
+    version.value !== state.activeVersion ||
+    !configurationDigest.found ||
+    typeof configurationDigest.value !== "string" ||
+    !CONFIGURATION_DIGEST.test(configurationDigest.value)
+  ) {
+    return { known: false, value: null };
+  }
+  return {
+    known: true,
+    value: Object.freeze({
+      version: version.value,
+      configurationDigest: configurationDigest.value,
+    }),
+  };
+}
+
+function reconciliationOutcome(snapshot, envelope) {
   const state = snapshotFields(snapshot);
-  if (!state) return unknown("CONFIGURATION_STATE_PROTOCOL_ERROR");
+  if (!state) {
+    return {
+      result: unknown("CONFIGURATION_STATE_PROTOCOL_ERROR"),
+      storedActiveKnown: false,
+      storedActive: null,
+    };
+  }
   const action = envelope.action;
+  const storedActive = activeSnapshotBinding(state);
   const resultVersion = expectedVersion(action);
   if (state.versions.length >= resultVersion) {
     const version = matchingVersion(state.versions[resultVersion - 1], action);
-    return version ? completed("already", envelope, version) : stale();
+    return {
+      result: version ? completed("already", envelope, version) : stale(),
+      storedActiveKnown: storedActive.known,
+      storedActive: storedActive.value,
+    };
   }
   if (
     state.revision === action.expectedStateRevision &&
     state.activeVersion === action.expectedActiveVersion
   ) {
-    return absent();
+    return {
+      result: absent(),
+      storedActiveKnown: storedActive.known,
+      storedActive: storedActive.value,
+    };
   }
   if (
     state.revision < action.expectedStateRevision ||
@@ -285,19 +343,70 @@ function reconcileSnapshot(snapshot, envelope) {
       (state.activeVersion === null ||
         state.activeVersion < action.expectedActiveVersion))
   ) {
-    return unknown("CONFIGURATION_STATE_PROTOCOL_ERROR");
+    return {
+      result: unknown("CONFIGURATION_STATE_PROTOCOL_ERROR"),
+      storedActiveKnown: false,
+      storedActive: null,
+    };
   }
-  return stale();
+  return {
+    result: stale(),
+    storedActiveKnown: storedActive.known,
+    storedActive: storedActive.value,
+  };
+}
+
+function settleCutover(control, runtimeEffective, outcome) {
+  if (["applied", "already"].includes(outcome.result.status)) {
+    if (!outcome.storedActiveKnown || outcome.storedActive === null) {
+      control.markUnknown();
+      return;
+    }
+    control.commit(outcome.storedActive);
+    return;
+  }
+  if (outcome.result.status === "absent") {
+    if (
+      outcome.storedActiveKnown &&
+      sameConfigurationBinding(outcome.storedActive, runtimeEffective)
+    ) {
+      control.abort();
+    } else {
+      control.markUnknown();
+    }
+    return;
+  }
+  if (
+    outcome.result.status === "stale" &&
+    outcome.storedActiveKnown &&
+    sameConfigurationBinding(outcome.storedActive, runtimeEffective)
+  ) {
+    control.abort();
+    return;
+  }
+  if (
+    outcome.result.status === "stale" &&
+    outcome.storedActiveKnown &&
+    outcome.storedActive !== null
+  ) {
+    control.commit(outcome.storedActive);
+    return;
+  }
+  control.markUnknown();
 }
 
 export class ConfigurationActivationExecutor {
   #activation;
   #allowedActionTypes;
+  #cutover;
+  #readFenceStatus;
+  #reconcileCutover;
   #readSnapshot;
 
   constructor({
     activationExecutor,
     configurationReader,
+    actionAdmissionGate,
     allowedActionTypes = Object.keys(ACTIONS),
   } = {}) {
     this.#activation = requirePort(
@@ -310,6 +419,14 @@ export class ConfigurationActivationExecutor {
       ["readSnapshot"],
       "configuration reader",
     ).readSnapshot;
+    const cutoverFence = requirePort(
+      actionAdmissionGate,
+      ["cutover", "readStatus", "reconcileCutover"],
+      "configuration action admission gate",
+    );
+    this.#cutover = cutoverFence.cutover;
+    this.#readFenceStatus = cutoverFence.readStatus;
+    this.#reconcileCutover = cutoverFence.reconcileCutover;
     this.#allowedActionTypes = normalizeAllowedActionTypes(allowedActionTypes);
     Object.freeze(this);
   }
@@ -322,19 +439,7 @@ export class ConfigurationActivationExecutor {
       return invalidApproval();
     }
     if (!this.#allowedActionTypes.has(envelope.action.type)) return stale();
-    const definition = ACTIONS[envelope.action.type];
-    try {
-      const result = normalizeActivationResult(
-        await this.#activation[definition.method](
-          activationRequest(envelope.action),
-        ),
-        envelope,
-      );
-      if (result) return result;
-    } catch {
-      // A thrown result can be a lost acknowledgement, so evidence decides.
-    }
-    return this.#reconcileEnvelope(envelope);
+    return this.#runCutover(envelope, { execute: true });
   }
 
   async reconcile(value) {
@@ -346,14 +451,52 @@ export class ConfigurationActivationExecutor {
     }
     // Reconciliation stays policy-independent because an executing item may
     // have crossed the side-effect boundary under an earlier runtime policy.
+    return this.#runCutover(envelope, { execute: false });
+  }
+
+  #runCutover(envelope, { execute }) {
+    const run = execute ? this.#cutover : this.#reconcileCutover;
+    return run(async (control) => {
+      const runtimeEffective = this.#readFenceStatus().runtimeEffective;
+      const outcome = execute
+        ? await this.#executeEnvelope(envelope)
+        : await this.#reconcileEnvelope(envelope);
+      settleCutover(control, runtimeEffective, outcome);
+      return outcome.result;
+    });
+  }
+
+  async #executeEnvelope(envelope) {
+    const definition = ACTIONS[envelope.action.type];
+    try {
+      const result = normalizeActivationResult(
+        await this.#activation[definition.method](
+          activationRequest(envelope.action),
+        ),
+        envelope,
+      );
+      if (result) {
+        return {
+          result,
+          storedActiveKnown: true,
+          storedActive: expectedStoredBinding(envelope.action),
+        };
+      }
+    } catch {
+      // A thrown result can be a lost acknowledgement, so evidence decides.
+    }
     return this.#reconcileEnvelope(envelope);
   }
 
   async #reconcileEnvelope(envelope) {
     try {
-      return reconcileSnapshot(await this.#readSnapshot(), envelope);
+      return reconciliationOutcome(await this.#readSnapshot(), envelope);
     } catch {
-      return unknown();
+      return {
+        result: unknown(),
+        storedActiveKnown: false,
+        storedActive: null,
+      };
     }
   }
 }

@@ -4,6 +4,7 @@ import {
   createConfigurationActivationConfirmationPlan,
 } from "../src/domain/configuration-activation-confirmation.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import {
   ConfigurationActivationExecutor,
 } from "../src/services/configuration-activation-executor.js";
@@ -111,8 +112,19 @@ function versionFor(envelope) {
   };
 }
 
-function fixture({ snapshot, activation, allowedActionTypes } = {}) {
+function activeRecord(version, configurationDigest) {
+  return { version, configurationDigest };
+}
+
+function fixture({
+  snapshot,
+  activation,
+  allowedActionTypes,
+  runtimeEffective = null,
+} = {}) {
   const calls = [];
+  const actionAdmissionGate = new ActionAdmissionGate();
+  actionAdmissionGate.bindEffective(runtimeEffective);
   const activationExecutor = {
     async activateInitialization(value) {
       calls.push({ method: "activateInitialization", value });
@@ -145,8 +157,10 @@ function fixture({ snapshot, activation, allowedActionTypes } = {}) {
     executor: new ConfigurationActivationExecutor({
       activationExecutor,
       configurationReader: reader,
+      actionAdmissionGate,
       ...(allowedActionTypes === undefined ? {} : { allowedActionTypes }),
     }),
+    actionAdmissionGate,
   };
 }
 
@@ -187,6 +201,7 @@ test("execute dispatches draft activation and rollback through their private por
   ]) {
     const envelope = privateEnvelope(kind);
     const context = fixture({
+      runtimeEffective: { version: 3, configurationDigest: A },
       activation: () => ({ applied: true, active: versionFor(envelope) }),
     });
 
@@ -206,6 +221,7 @@ test("execute dispatches draft activation and rollback through their private por
 
 test("runtime policy can fence actions whose live configuration is stale", async () => {
   const context = fixture({
+    runtimeEffective: { version: 3, configurationDigest: A },
     allowedActionTypes: ["initialize_from_draft"],
     activation: () => {
       throw new Error("must not activate a normal draft in this process");
@@ -213,7 +229,7 @@ test("runtime policy can fence actions whose live configuration is stale", async
     snapshot: () => ({
       revision: 4,
       activeVersion: 3,
-      versions: [{}, {}, {}],
+      versions: [{}, {}, activeRecord(3, A)],
     }),
   });
   const envelope = privateEnvelope("configuration.activate");
@@ -231,6 +247,7 @@ test("reconcile is read-only and distinguishes already, absent, stale, and unkno
   const envelope = privateEnvelope("configuration.activate");
   await t.test("already", async () => {
     const context = fixture({
+      runtimeEffective: { version: 3, configurationDigest: A },
       snapshot: () => ({
         revision: 5,
         activeVersion: 4,
@@ -242,18 +259,29 @@ test("reconcile is read-only and distinguishes already, absent, stale, and unkno
   });
   await t.test("absent", async () => {
     const context = fixture({
-      snapshot: () => ({ revision: 4, activeVersion: 3, versions: [{}, {}, {}] }),
+      runtimeEffective: { version: 3, configurationDigest: A },
+      snapshot: () => ({
+        revision: 4,
+        activeVersion: 3,
+        versions: [{}, {}, activeRecord(3, A)],
+      }),
     });
     assert.equal((await context.executor.reconcile(envelope)).status, "absent");
   });
   await t.test("stale", async () => {
     const context = fixture({
-      snapshot: () => ({ revision: 5, activeVersion: 3, versions: [{}, {}, {}] }),
+      runtimeEffective: { version: 3, configurationDigest: A },
+      snapshot: () => ({
+        revision: 5,
+        activeVersion: 3,
+        versions: [{}, {}, activeRecord(3, A)],
+      }),
     });
     assert.equal((await context.executor.reconcile(envelope)).status, "stale");
   });
   await t.test("unknown", async () => {
     const context = fixture({
+      runtimeEffective: { version: 3, configurationDigest: A },
       snapshot: () => {
         throw new Error("reader unavailable");
       },
@@ -265,22 +293,209 @@ test("reconcile is read-only and distinguishes already, absent, stale, and unkno
   });
 });
 
-test("an acknowledgement loss reconciles instead of activating twice", async () => {
-  const envelope = privateEnvelope();
+test("acknowledgement loss reconciles every activation kind without replay", async () => {
+  for (const [kind, method] of [
+    ["configuration.initialize", "activateInitialization"],
+    ["configuration.activate", "activateDraft"],
+    ["configuration.rollback", "activateRollback"],
+  ]) {
+    const envelope = privateEnvelope(kind);
+    const matching = versionFor(envelope);
+    const context = fixture({
+      runtimeEffective: kind === "configuration.initialize"
+        ? null
+        : { version: 3, configurationDigest: A },
+      activation: () => {
+        throw Object.assign(new Error("ack lost"), {
+          code: "CONFIGURATION_STATE_WRITE_FAILED",
+        });
+      },
+      snapshot: () => ({
+        revision: 5,
+        activeVersion: matching.version,
+        versions: matching.version === 1
+          ? [matching]
+          : [{}, {}, activeRecord(3, A), matching],
+      }),
+    });
+
+    assert.equal((await context.executor.execute(envelope)).status, "already");
+    assert.deepEqual(context.calls.map(({ method: name }) => name), [
+      method,
+      "readSnapshot",
+    ]);
+    assert.equal(
+      context.actionAdmissionGate.readStatus().mode,
+      "restart_required",
+    );
+  }
+});
+
+test("a successful activation closes later admission against the old runtime", async () => {
+  const envelope = privateEnvelope("configuration.activate");
+  const context = fixture({
+    runtimeEffective: { version: 3, configurationDigest: A },
+    activation: () => ({ applied: true, active: versionFor(envelope) }),
+  });
+  let laterCalls = 0;
+
+  assert.equal((await context.executor.execute(envelope)).status, "applied");
+  await assert.rejects(
+    context.actionAdmissionGate.run(() => {
+      laterCalls += 1;
+    }),
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(laterCalls, 0);
+  assert.deepEqual(context.actionAdmissionGate.readStatus(), {
+    mode: "restart_required",
+    storedActive: { version: 4, configurationDigest: B },
+    runtimeEffective: { version: 3, configurationDigest: A },
+  });
+});
+
+test("proven absence reopens the runtime but an unknown result keeps it fenced", async () => {
+  const envelope = privateEnvelope("configuration.activate");
+  const runtimeEffective = { version: 3, configurationDigest: A };
+  const absentContext = fixture({
+    runtimeEffective,
+    activation: () => {
+      throw new Error("not written");
+    },
+    snapshot: () => ({
+      revision: 4,
+      activeVersion: 3,
+      versions: [{}, {}, activeRecord(3, A)],
+    }),
+  });
+
+  assert.equal((await absentContext.executor.execute(envelope)).status, "absent");
+  assert.equal(absentContext.actionAdmissionGate.readStatus().mode, "ready");
+  assert.equal(
+    await absentContext.actionAdmissionGate.run(() => "admitted"),
+    "admitted",
+  );
+
+  const unknownContext = fixture({
+    runtimeEffective,
+    activation: () => {
+      throw new Error("write acknowledgement lost");
+    },
+    snapshot: () => {
+      throw new Error("reader unavailable");
+    },
+  });
+  assert.equal(
+    (await unknownContext.executor.execute(envelope)).error.trust,
+    "unknown",
+  );
+  assert.equal(unknownContext.actionAdmissionGate.readStatus().mode, "unknown");
+});
+
+test("same-process reconciliation remains available after activation", async () => {
+  const envelope = privateEnvelope("configuration.activate");
   const matching = versionFor(envelope);
   const context = fixture({
-    activation: () => {
-      throw Object.assign(new Error("ack lost"), {
-        code: "CONFIGURATION_STATE_WRITE_FAILED",
-      });
-    },
-    snapshot: () => ({ revision: 5, activeVersion: 1, versions: [matching] }),
+    runtimeEffective: { version: 3, configurationDigest: A },
+    activation: () => ({ applied: true, active: matching }),
+    snapshot: () => ({
+      revision: 5,
+      activeVersion: 4,
+      versions: [{}, {}, activeRecord(3, A), matching],
+    }),
   });
-  assert.equal((await context.executor.execute(envelope)).status, "already");
-  assert.deepEqual(context.calls.map(({ method }) => method), [
-    "activateInitialization",
-    "readSnapshot",
-  ]);
+
+  assert.equal((await context.executor.execute(envelope)).status, "applied");
+  assert.equal(context.actionAdmissionGate.readStatus().mode, "restart_required");
+  assert.equal((await context.executor.reconcile(envelope)).status, "already");
+  assert.equal(context.actionAdmissionGate.readStatus().mode, "restart_required");
+});
+
+test("corrupt active evidence never reopens admission", async () => {
+  const envelope = privateEnvelope("configuration.activate");
+  for (const active of [
+    {},
+    activeRecord(2, A),
+    activeRecord(3, C),
+  ]) {
+    const context = fixture({
+      runtimeEffective: { version: 3, configurationDigest: A },
+      activation: () => {
+        throw new Error("activation acknowledgement unavailable");
+      },
+      snapshot: () => ({
+        revision: 4,
+        activeVersion: 3,
+        versions: [{}, {}, active],
+      }),
+    });
+
+    assert.equal((await context.executor.execute(envelope)).status, "absent");
+    assert.equal(context.actionAdmissionGate.readStatus().mode, "unknown");
+    await assert.rejects(
+      context.actionAdmissionGate.run(() => "must-not-run"),
+      (error) => error?.code === "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+    );
+  }
+});
+
+test("same-process reconciliation resolves an uncertain activation", async (t) => {
+  const envelope = privateEnvelope("configuration.activate");
+  const runtimeEffective = { version: 3, configurationDigest: A };
+
+  await t.test("proven absent restores ready admission", async () => {
+    let reads = 0;
+    const context = fixture({
+      runtimeEffective,
+      activation: () => {
+        throw new Error("activation acknowledgement unavailable");
+      },
+      snapshot: () => {
+        reads += 1;
+        if (reads === 1) throw new Error("reader unavailable");
+        return {
+          revision: 4,
+          activeVersion: 3,
+          versions: [{}, {}, activeRecord(3, A)],
+        };
+      },
+    });
+
+    assert.equal(
+      (await context.executor.execute(envelope)).error.trust,
+      "unknown",
+    );
+    assert.equal(context.actionAdmissionGate.readStatus().mode, "unknown");
+    assert.equal((await context.executor.reconcile(envelope)).status, "absent");
+    assert.equal(context.actionAdmissionGate.readStatus().mode, "ready");
+  });
+
+  await t.test("proven applied requires restart", async () => {
+    let reads = 0;
+    const matching = versionFor(envelope);
+    const context = fixture({
+      runtimeEffective,
+      activation: () => {
+        throw new Error("activation acknowledgement unavailable");
+      },
+      snapshot: () => {
+        reads += 1;
+        if (reads === 1) throw new Error("reader unavailable");
+        return {
+          revision: 5,
+          activeVersion: 4,
+          versions: [{}, {}, activeRecord(3, A), matching],
+        };
+      },
+    });
+
+    assert.equal(
+      (await context.executor.execute(envelope)).error.trust,
+      "unknown",
+    );
+    assert.equal((await context.executor.reconcile(envelope)).status, "already");
+    assert.equal(context.actionAdmissionGate.readStatus().mode, "restart_required");
+  });
 });
 
 test("forged envelopes fail closed before activation or reads", async () => {
@@ -291,4 +506,20 @@ test("forged envelopes fail closed before activation or reads", async () => {
   assert.equal(result.status, "error");
   assert.equal(result.error.code, "INVALID_CONFIGURATION_ACTIVATION_APPROVAL");
   assert.equal(context.calls.length, 0);
+});
+
+test("executor construction requires the shared cutover fence", () => {
+  const activationExecutor = {
+    async activateInitialization() {},
+    async activateDraft() {},
+    async activateRollback() {},
+  };
+  assert.throws(
+    () =>
+      new ConfigurationActivationExecutor({
+        activationExecutor,
+        configurationReader: { async readSnapshot() {} },
+      }),
+    /action admission gate is invalid/,
+  );
 });

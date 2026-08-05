@@ -5,6 +5,7 @@ import {
   ConfirmationRuntimeError,
   createConfirmationRuntime,
 } from "../src/confirmation-runtime.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 
 const TOKEN_ENV = "MYDASHBOARD_GITHUB_TOKEN";
 const TOKEN = "github-token-from-environment";
@@ -77,6 +78,61 @@ function runtimeDependencies(overrides = {}) {
     }),
     createQueue: () => queuePort(),
     ...overrides,
+  };
+}
+
+function memoryStore() {
+  let value = null;
+  return {
+    async read(_key, fallback = null) {
+      return structuredClone(value ?? fallback);
+    },
+    async write(_key, next) {
+      value = structuredClone(next);
+    },
+  };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function localPlan(id, kind, actionType) {
+  const actor = { provider: "local-test", accountId: "owner:local" };
+  const target = {
+    provider: "local-test",
+    resourceId: id,
+    version: "a".repeat(64),
+  };
+  const action = { type: actionType };
+  return {
+    id,
+    kind,
+    requestedBy: { roleId: "configuration-owner", workItemId: id },
+    actor,
+    target,
+    action,
+    display: {
+      title: "验证确认与配置切换总序",
+      summary: "并发确认必须按一个锁顺序完成。",
+      actionLabel: "确认",
+      evidence: [],
+      payload: { actor, target, action },
+    },
+  };
+}
+
+function approval(item, requestId) {
+  return {
+    requestId,
+    expectedQueueRevision: item.queueRevision,
+    expectedItemRevision: item.itemRevision,
+    displayedPayloadDigest: item.displayedPayloadDigest,
+    approvalBindingDigest: item.approvalBindingDigest,
   };
 }
 
@@ -326,6 +382,180 @@ test("multiple local confirmation kinds share one routed queue", async () => {
     routed["local.configuration-activate"],
     configurationExecutor,
   );
+  await runtime.close();
+});
+
+test("runtime cutover fences new side effects but never blocks reconciliation", async () => {
+  const calls = [];
+  const executor = (name) => ({
+    async execute() {
+      calls.push(`${name}:execute`);
+      return { status: "applied" };
+    },
+    async reconcile() {
+      calls.push(`${name}:reconcile`);
+      return { status: "already" };
+    },
+  });
+  const codeJobExecutor = executor("code");
+  const applicationExecutor = executor("application");
+  const configurationExecutor = executor("configuration");
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  let routed;
+  const runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    runtimeDependencies({
+      actionAdmissionGate: gate,
+      localExecutors: {
+        "local.code-job-create": codeJobExecutor,
+        "local.change-package-apply": applicationExecutor,
+        "local.configuration-activate": configurationExecutor,
+      },
+      createExecutorRouter({ executors }) {
+        routed = executors;
+        return codeJobExecutor;
+      },
+    }),
+  );
+
+  await gate.cutover(({ commit }) => {
+    commit({ version: 2, configurationDigest: "2".repeat(64) });
+  });
+  assert.deepEqual(await runtime.queue.approve("code", {}), [
+    "approve",
+    "code",
+    {},
+  ]);
+  assert.deepEqual(await runtime.queue.retry("application", {}), [
+    "retry",
+    "application",
+    {},
+  ]);
+  assert.equal(
+    (await routed["local.code-job-create"].execute({})).status,
+    "stale",
+  );
+  assert.equal(
+    (await routed["local.change-package-apply"].execute({})).status,
+    "stale",
+  );
+  assert.equal(
+    (await routed["local.code-job-create"].reconcile({})).status,
+    "already",
+  );
+  assert.equal(
+    (await routed["local.change-package-apply"].reconcile({})).status,
+    "already",
+  );
+  assert.equal(
+    (await routed["local.configuration-activate"].execute({})).status,
+    "applied",
+  );
+  assert.deepEqual(calls, [
+    "code:reconcile",
+    "application:reconcile",
+    "configuration:execute",
+  ]);
+
+  await runtime.close();
+});
+
+test("real confirmation queue never inverts its lock order with configuration cutover", async () => {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  const configurationEntered = deferred();
+  const releaseConfiguration = deferred();
+  let ordinaryCalls = 0;
+  const runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    runtimeDependencies({
+      store: memoryStore(),
+      actionAdmissionGate: gate,
+      createExecutorRouter: undefined,
+      createOperationQueue: undefined,
+      createQueue: undefined,
+      localExecutors: {
+        "local.code-job-create": {
+          async execute() {
+            ordinaryCalls += 1;
+            return { status: "applied", receipt: { id: "ordinary-receipt" } };
+          },
+          async reconcile() {
+            return { status: "absent" };
+          },
+        },
+        "local.configuration-activate": {
+          async execute() {
+            configurationEntered.resolve();
+            await releaseConfiguration.promise;
+            return gate.cutover(({ commit }) => {
+              commit({
+                version: 2,
+                configurationDigest: "2".repeat(64),
+              });
+              return {
+                status: "applied",
+                receipt: { id: "configuration-receipt" },
+              };
+            });
+          },
+          async reconcile() {
+            return { status: "absent" };
+          },
+        },
+      },
+    }),
+  );
+  const configuration = await runtime.producerQueue.enqueue(
+    localPlan(
+      "confirmation-lock-configuration",
+      "local.configuration-activate",
+      "initialize_from_draft",
+    ),
+  );
+  const ordinary = await runtime.producerQueue.enqueue(
+    localPlan(
+      "confirmation-lock-ordinary",
+      "local.code-job-create",
+      "create_code_job",
+    ),
+  );
+  const configurationHead = await runtime.queue.get(configuration.id);
+  const ordinaryHead = await runtime.queue.get(ordinary.id);
+  const configurationApproval = runtime.queue.approve(
+    configuration.id,
+    approval(configurationHead, "request-lock-configuration"),
+  );
+  await configurationEntered.promise;
+  const ordinaryApproval = runtime.queue.approve(
+    ordinary.id,
+    approval(ordinaryHead, "request-lock-ordinary"),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseConfiguration.resolve();
+
+  let timeout;
+  const settled = await Promise.race([
+    Promise.allSettled([configurationApproval, ordinaryApproval]),
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("confirmation and cutover lock order deadlocked")),
+        1_000,
+      );
+    }),
+  ]).finally(() => clearTimeout(timeout));
+  assert.equal(settled[0].status, "fulfilled");
+  assert.equal(settled[0].value.status, "completed");
+  assert.equal(settled[1].status, "rejected");
+  assert.equal(ordinaryCalls, 0);
+  assert.equal(gate.readStatus().mode, "restart_required");
   await runtime.close();
 });
 

@@ -38,6 +38,14 @@ const internalServerErrorMessage = "服务器内部错误";
 const configurationRequestMaximumBytes = 2 * 1024 * 1024 + 64 * 1024;
 const configurationInitializationKind = "local.configuration-activate";
 const configurationInitializationAction = "initialize_from_draft";
+const configurationRuntimeModes = new Set([
+  "unbound",
+  "boot_safe",
+  "ready",
+  "cutover",
+  "restart_required",
+  "unknown",
+]);
 const safeConfigurationResourceId =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 
@@ -753,6 +761,123 @@ function configurationHeadDrafts(snapshot) {
     .reverse();
 }
 
+function normalizeConfigurationRuntimeBinding(value) {
+  if (value === null) return null;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== 2
+  ) {
+    throw httpError(503, "配置运行时绑定无效");
+  }
+  const version = Object.getOwnPropertyDescriptor(value, "version");
+  const configurationDigest = Object.getOwnPropertyDescriptor(
+    value,
+    "configurationDigest",
+  );
+  if (
+    !version?.enumerable ||
+    !("value" in version) ||
+    !Number.isSafeInteger(version.value) ||
+    version.value < 1 ||
+    !configurationDigest?.enumerable ||
+    !("value" in configurationDigest) ||
+    typeof configurationDigest.value !== "string" ||
+    !sha256Pattern.test(configurationDigest.value)
+  ) {
+    throw httpError(503, "配置运行时绑定无效");
+  }
+  return {
+    version: version.value,
+    configurationDigest: configurationDigest.value,
+  };
+}
+
+function sameConfigurationRuntimeBinding(left, right) {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.version === right.version &&
+      left.configurationDigest === right.configurationDigest)
+  );
+}
+
+async function readConfigurationRuntimeStatus(application) {
+  if (!application.configuration?.runtimeStatus) return null;
+  const reader = requireApplicationPort(
+    application.configuration,
+    "runtimeStatus",
+    ["readStatus"],
+    "配置运行时状态端口未启用",
+  );
+  const status = await reader.readStatus();
+  if (
+    status === null ||
+    typeof status !== "object" ||
+    Array.isArray(status) ||
+    Object.getPrototypeOf(status) !== Object.prototype ||
+    Reflect.ownKeys(status).length !== 3
+  ) {
+    throw httpError(503, "配置运行时状态无效");
+  }
+  const mode = Object.getOwnPropertyDescriptor(status, "mode");
+  const storedActive = Object.getOwnPropertyDescriptor(status, "storedActive");
+  const runtimeEffective = Object.getOwnPropertyDescriptor(
+    status,
+    "runtimeEffective",
+  );
+  if (
+    !mode?.enumerable ||
+    !("value" in mode) ||
+    !configurationRuntimeModes.has(mode.value) ||
+    !storedActive?.enumerable ||
+    !("value" in storedActive) ||
+    !runtimeEffective?.enumerable ||
+    !("value" in runtimeEffective)
+  ) {
+    throw httpError(503, "配置运行时状态无效");
+  }
+  return {
+    mode: mode.value,
+    storedActive: normalizeConfigurationRuntimeBinding(storedActive.value),
+    runtimeEffective: normalizeConfigurationRuntimeBinding(
+      runtimeEffective.value,
+    ),
+  };
+}
+
+function inferredConfigurationRuntimeMode(storedActive, runtimeEffective) {
+  if (sameConfigurationRuntimeBinding(storedActive, runtimeEffective)) {
+    return storedActive === null ? "boot_safe" : "ready";
+  }
+  return "restart_required";
+}
+
+function effectiveConfigurationRuntimeMode(
+  reported,
+  storedActive,
+  runtimeEffective,
+) {
+  const inferred = inferredConfigurationRuntimeMode(
+    storedActive,
+    runtimeEffective,
+  );
+  if (reported === null) return inferred;
+  if (["cutover", "unknown", "unbound"].includes(reported.mode)) {
+    return reported.mode;
+  }
+  return (
+    sameConfigurationRuntimeBinding(reported.storedActive, storedActive) &&
+    sameConfigurationRuntimeBinding(reported.runtimeEffective, runtimeEffective) &&
+    reported.mode === inferred
+  )
+    ? reported.mode
+    : "unknown";
+}
+
 async function readConfigurationHttpState(application) {
   const reader = requireApplicationPort(
     application.configuration,
@@ -778,15 +903,36 @@ async function readConfigurationHttpState(application) {
   }
   const runtimeActiveVersion = application.configuration.status.activeVersion ?? null;
   const runtimeConfigurationDigest = canonicalJsonDigest(application.config);
-  const pendingRestart = Boolean(
-    storedActive &&
-      (storedActive.version !== runtimeActiveVersion ||
-        storedActive.configurationDigest !== runtimeConfigurationDigest),
+  const storedBinding = storedActive === null
+    ? null
+    : {
+        version: storedActive.version,
+        configurationDigest: storedActive.configurationDigest,
+      };
+  const runtimeBinding = runtimeActiveVersion === null
+    ? null
+    : {
+        version: runtimeActiveVersion,
+        configurationDigest: runtimeConfigurationDigest,
+      };
+  const storedRuntimeMismatch = !sameConfigurationRuntimeBinding(
+    storedBinding,
+    runtimeBinding,
   );
+  const reportedRuntimeStatus = await readConfigurationRuntimeStatus(application);
+  const runtimeMode = effectiveConfigurationRuntimeMode(
+    reportedRuntimeStatus,
+    storedBinding,
+    runtimeBinding,
+  );
+  const pendingRestart =
+    storedRuntimeMismatch ||
+    ["unbound", "restart_required", "unknown"].includes(runtimeMode);
   return {
     status: {
       safeMode: isConfigurationSafeMode(application),
       migrationError: application.configuration.status.migrationError ?? null,
+      runtimeMode,
       stateRevision: snapshot.revision,
     },
     storedActive: projectConfigurationVersion(storedActive),

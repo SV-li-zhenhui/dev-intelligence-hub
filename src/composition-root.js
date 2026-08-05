@@ -235,10 +235,17 @@ export async function createApplication({
   const actionAdmissionGate = versionedConfiguration
     ? frozenPort(
         actionAdmissionGateFactory(),
-        ["run"],
+        ["bindEffective", "cutover", "readStatus", "reconcileCutover", "run"],
         "actionAdmissionGate",
       )
     : null;
+  const ordinaryActionAdmissionGate = actionAdmissionGate === null
+    ? null
+    : frozenPort(
+        actionAdmissionGate,
+        ["run"],
+        "ordinary action admission gate",
+      );
   const bootstrap = suppliedConfig === undefined
     ? await configBootstrapLoader()
     : {
@@ -438,7 +445,7 @@ export async function createApplication({
           startupConfiguration: config,
           brainDependencies:
             workCoordinationDependencies.brainDependencies || {},
-          actionAdmissionGate,
+          actionAdmissionGate: ordinaryActionAdmissionGate,
           grantFactoryFactory: codeJobGrantFactory,
           brainDirectoryFactory: codeJobBrainDirectoryFactory,
         });
@@ -518,7 +525,9 @@ export async function createApplication({
         await codeJobRuntimeFactory({
           ...codeJobRuntimeDependencies,
           store,
-          ...(actionAdmissionGate === null ? {} : { actionAdmissionGate }),
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
           operationQueue: new OperationQueue(),
           memoryReceiptVerifier: frozenPort(
             memoryRuntime.receiptVerifier,
@@ -581,11 +590,12 @@ export async function createApplication({
       }
     }
     const localExecutors = {};
+    const configurationActionRecoveryEnabled =
+      versionedConfiguration && externalActions;
     const configurationInitializationEnabled =
-      versionedConfiguration &&
-      externalActions &&
+      configurationActionRecoveryEnabled &&
       configurationRuntime.status.safeMode === true;
-    if (configurationInitializationEnabled) {
+    if (configurationActionRecoveryEnabled) {
       const configurationActivationExecutor =
         configurationActivationExecutorFactory({
           activationExecutor: frozenPort(
@@ -598,7 +608,16 @@ export async function createApplication({
             ["readSnapshot"],
             "configurationRuntime.reader",
           ),
-          allowedActionTypes: Object.freeze(["initialize_from_draft"]),
+          actionAdmissionGate: frozenPort(
+            actionAdmissionGate,
+            ["cutover", "readStatus", "reconcileCutover"],
+            "configuration action admission gate",
+          ),
+          allowedActionTypes: Object.freeze(
+            configurationInitializationEnabled
+              ? ["initialize_from_draft"]
+              : [],
+          ),
         });
       localExecutors["local.configuration-activate"] = frozenPort(
         configurationActivationExecutor,
@@ -634,6 +653,11 @@ export async function createApplication({
         await confirmationRuntimeFactory(config, {
           ...confirmationRuntimeDependencies,
           store,
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : {
+                actionAdmissionGate: ordinaryActionAdmissionGate,
+              }),
           ...(Object.keys(localExecutors).length === 0
             ? {}
             : { localExecutors: Object.freeze(localExecutors) }),
@@ -649,8 +673,8 @@ export async function createApplication({
     if (changePackageActionsEnabled && !confirmationRuntime) {
       throw new Error("change package 应用需要可用的确认运行时");
     }
-    if (configurationInitializationEnabled && !confirmationRuntime) {
-      throw new Error("版本化配置初始化需要可用的确认运行时");
+    if (configurationActionRecoveryEnabled && !confirmationRuntime) {
+      throw new Error("版本化配置动作恢复需要可用的确认运行时");
     }
     if (configurationInitializationEnabled) {
       configurationConfirmationRequester = frozenPort(
@@ -1061,6 +1085,11 @@ export async function createApplication({
             simulator: configurationRuntime.simulator,
             proposalPort: configurationRuntime.proposalPort,
             confirmationRequester: configurationConfirmationRequester,
+            runtimeStatus: frozenPort(
+              actionAdmissionGate,
+              ["readStatus"],
+              "configuration runtime status",
+            ),
           })
         : null,
       store,

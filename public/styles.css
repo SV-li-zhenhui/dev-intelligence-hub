@@ -1875,19 +1875,43 @@ h1 {
   line-height: 1.55;
 }
 
-.configuration-success {
+.configuration-success,
+.configuration-runtime-warning,
+.configuration-runtime-error {
   padding: 14px 16px;
+  border-left: 3px solid;
+}
+
+.configuration-success {
   color: var(--green);
   background: var(--green-soft);
-  border-left: 3px solid var(--green);
+  border-color: var(--green);
+}
+
+.configuration-runtime-warning {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: var(--amber);
+}
+
+.configuration-runtime-error {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: var(--red);
 }
 
 .configuration-success strong,
-.configuration-success span {
+.configuration-success span,
+.configuration-runtime-warning strong,
+.configuration-runtime-warning span,
+.configuration-runtime-error strong,
+.configuration-runtime-error span {
   display: block;
 }
 
-.configuration-success span {
+.configuration-success span,
+.configuration-runtime-warning span,
+.configuration-runtime-error span {
   margin-top: 4px;
   color: var(--ink);
   font-size: 11px;

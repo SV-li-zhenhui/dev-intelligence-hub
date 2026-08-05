@@ -8,6 +8,7 @@ import {
   createEmployeeRegistry,
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 
 function applicationConfig(codeExecutor = { enabled: false }) {
   return {
@@ -2480,25 +2481,44 @@ test("versioned composition builds every subsystem from the stored active snapsh
       calls.push("configuration-close");
     },
   };
+  let activationOptions;
+  let confirmationDependencies;
 
   const application = await createApplication({
     config: bootstrap,
     store: memoryStore(),
     versionedConfiguration: true,
-    actionAdmissionGateFactory: () => ({
-      async run(operation) {
-        return operation();
-      },
-    }),
+    actionAdmissionGateFactory: () => new ActionAdmissionGate(),
     configurationRuntimeFactory: async (candidate, dependencies) => {
       calls.push({ candidate, dependencies });
+      dependencies.actionAdmissionGate.bindEffective({
+        version: 4,
+        configurationDigest: "4".repeat(64),
+      });
       return configurationRuntime;
+    },
+    configurationActivationExecutorFactory: (options) => {
+      activationOptions = options;
+      return { async execute() {}, async reconcile() {} };
+    },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      confirmationDependencies = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {
+          calls.push("confirmation-close");
+        },
+      };
     },
   });
 
   assert.deepEqual(calls[0].candidate, bootstrap);
   assert.equal(calls[0].dependencies.store instanceof Object, true);
-  assert.equal(typeof calls[0].dependencies.actionAdmissionGate.run, "function");
+  assert.deepEqual(
+    Object.keys(calls[0].dependencies.actionAdmissionGate).sort(),
+    ["bindEffective", "cutover", "readStatus", "reconcileCutover", "run"],
+  );
   assert.equal(
     Object.isFrozen(calls[0].dependencies.actionAdmissionGate),
     true,
@@ -2511,7 +2531,14 @@ test("versioned composition builds every subsystem from the stored active snapsh
     configurationRuntime.proposalPort,
   );
   assert.equal(application.configuration.confirmationRequester, null);
-  assert.equal(application.confirmationQueue, null);
+  assert.deepEqual(Object.keys(application.configuration.runtimeStatus), [
+    "readStatus",
+  ]);
+  assert.deepEqual(activationOptions.allowedActionTypes, []);
+  assert.deepEqual(Object.keys(confirmationDependencies.localExecutors), [
+    "local.configuration-activate",
+  ]);
+  assert.notEqual(application.confirmationQueue, null);
   assert.equal("activationExecutor" in application.configuration, false);
 
   await application.close();
@@ -2600,6 +2627,11 @@ test("safe mode grants only initialization through the shared confirmation queue
   assert.deepEqual(Object.keys(calls.activationOptions.configurationReader), [
     "readSnapshot",
   ]);
+  assert.deepEqual(Object.keys(calls.activationOptions.actionAdmissionGate), [
+    "cutover",
+    "readStatus",
+    "reconcileCutover",
+  ]);
   assert.deepEqual(
     Object.keys(calls.confirmationDependencies.localExecutors),
     ["local.configuration-activate"],
@@ -2607,6 +2639,10 @@ test("safe mode grants only initialization through the shared confirmation queue
   assert.equal(
     Object.isFrozen(calls.confirmationDependencies.localExecutors),
     true,
+  );
+  assert.deepEqual(
+    Object.keys(calls.confirmationDependencies.actionAdmissionGate),
+    ["run"],
   );
   assert.deepEqual(
     Object.keys(application.configuration.confirmationRequester),
@@ -2696,11 +2732,7 @@ test("versioned local code shares one gate and reads Active authority", async ()
   const config = localCodeCoordinationConfig({ githubActions: false });
   const calls = {};
   const closeCalls = [];
-  const sharedGate = {
-    async run(operation) {
-      return operation();
-    },
-  };
+  const sharedGate = new ActionAdmissionGate();
   const configurationReader = {
     async readSnapshot() {},
     async readActive() {},
@@ -2821,11 +2853,21 @@ test("versioned local code shares one gate and reads Active authority", async ()
     },
   });
 
-  assert.strictEqual(
+  assert.notStrictEqual(
     calls.configuration.actionAdmissionGate,
     calls.codeJobRuntime.actionAdmissionGate,
   );
   assert.notStrictEqual(calls.configuration.actionAdmissionGate, sharedGate);
+  assert.deepEqual(Object.keys(calls.codeJobRuntime.actionAdmissionGate), [
+    "run",
+  ]);
+  assert.deepEqual(Object.keys(calls.versionedAuthority.actionAdmissionGate), [
+    "run",
+  ]);
+  assert.strictEqual(
+    calls.codeJobRuntime.actionAdmissionGate,
+    calls.versionedAuthority.actionAdmissionGate,
+  );
   assert.strictEqual(
     calls.versionedAuthority.configurationReader,
     configurationReader,
@@ -2837,6 +2879,10 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.strictEqual(calls.codeRunner.grantFactory, versionedAuthority);
   assert.deepEqual(Object.keys(calls.confirmation.localExecutors).sort(), [
     "local.code-job-create",
+    "local.configuration-activate",
+  ]);
+  assert.deepEqual(Object.keys(calls.confirmation.actionAdmissionGate), [
+    "run",
   ]);
   assert.equal("activationExecutor" in application.configuration, false);
   assert.equal(application.configuration.confirmationRequester, null);

@@ -67,9 +67,9 @@ export async function createConfigurationRuntime(
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
   }
-  const activationGate = port(
+  const actionAdmission = port(
     actionAdmissionGate,
-    ["run"],
+    ["bindEffective", "cutover", "readStatus", "reconcileCutover", "run"],
     "configuration action admission gate",
   );
   const declaredBootstrapError = normalizeBootstrapError(bootstrapError);
@@ -140,6 +140,14 @@ export async function createConfigurationRuntime(
       "createInitializationDraft",
       "reviseDraft",
     ];
+    actionAdmission.bindEffective(
+      active === null
+        ? null
+        : {
+            version: active.version,
+            configurationDigest: active.configurationDigest,
+          },
+    );
     const runtime = {
       status: Object.freeze({
         safeMode,
@@ -159,13 +167,19 @@ export async function createConfigurationRuntime(
         ],
         "configuration simulator",
       ),
-      activationExecutor: Object.freeze({
-        activateInitialization: (value) =>
-          activationGate.run(() => service.activateInitialization(value)),
-        activateDraft: (value) =>
-          activationGate.run(() => service.activateDraft(value)),
-        activateRollback: (value) =>
-          activationGate.run(() => service.activateRollback(value)),
+      activationExecutor: port(
+        service,
+        ["activateInitialization", "activateDraft", "activateRollback"],
+        "configuration activation executor",
+      ),
+      runtimeAdmission: Object.freeze({
+        readStatus: actionAdmission.readStatus,
+        run: actionAdmission.run,
+      }),
+      cutoverFence: Object.freeze({
+        cutover: actionAdmission.cutover,
+        readStatus: actionAdmission.readStatus,
+        reconcileCutover: actionAdmission.reconcileCutover,
       }),
       proposalPort: port(service, draftMethods, "configuration proposal port"),
       close,

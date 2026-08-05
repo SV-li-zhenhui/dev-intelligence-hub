@@ -132,6 +132,12 @@ function fixture({ brainDirectoryFactory, actionAdmissionGate } = {}) {
   let current = active(startup);
   const versions = [current];
   const admissionGate = actionAdmissionGate || new ActionAdmissionGate();
+  if (admissionGate.readStatus().mode === "unbound") {
+    admissionGate.bindEffective({
+      version: current.version,
+      configurationDigest: current.configurationDigest,
+    });
+  }
   const authority = new VersionedCodeJobAuthority({
     configurationReader: {
       async readActive() {

@@ -1,4 +1,3 @@
-import { ActionAdmissionGate } from "../lib/action-admission-gate.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
@@ -24,6 +23,10 @@ import {
   trustedObservationAction,
   workerError,
 } from "./code-job-worker-policy.js";
+
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run: (operation) => operation(),
+});
 
 export { CodeJobWorkerError } from "./code-job-worker-policy.js";
 
@@ -181,7 +184,7 @@ export class CodeJobWorkerService {
     executor,
     brainDirectory,
     grantVerifier,
-    actionAdmissionGate = new ActionAdmissionGate(),
+    actionAdmissionGate = DIRECT_ACTION_ADMISSION,
     operationQueue = new OperationQueue(),
     sessionTransitionLease: suppliedSessionTransitionLease =
       sessionTransitionLease(),

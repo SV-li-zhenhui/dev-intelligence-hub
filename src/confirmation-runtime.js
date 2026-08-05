@@ -1,5 +1,6 @@
 import path from "node:path";
 import { createGitHubActionExecutor } from "./adapters/github-action-adapter.js";
+import { ActionAdmissionGateError } from "./lib/action-admission-gate.js";
 import { projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
@@ -30,6 +31,7 @@ const USER_QUEUE_METHODS = [
 ];
 const PRODUCER_QUEUE_METHODS = ["enqueue", "get", "invalidate"];
 const APPLICATION_RESULT_SOURCE_METHODS = ["readSnapshot"];
+const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
 const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabled",
   "actorAccountId",
@@ -267,6 +269,38 @@ function createQueueFacade(queue, methods) {
   return Object.freeze(facade);
 }
 
+function runtimeAdmissionGate(dependencies) {
+  const configured = dataProperty(dependencies, "actionAdmissionGate");
+  return configured === undefined
+    ? null
+    : assertPort(configured, ["run"], "actionAdmissionGate");
+}
+
+function fenceExecutor(kind, executor, admissionGate) {
+  if (admissionGate === null || kind === CONFIGURATION_ACTIVATION_KIND) {
+    return executor;
+  }
+  const execute = executor.execute.bind(executor);
+  const reconcile = executor.reconcile.bind(executor);
+  return Object.freeze({
+    async execute(value) {
+      let admitted = false;
+      try {
+        return await admissionGate.run(() => {
+          admitted = true;
+          return execute(value);
+        });
+      } catch (error) {
+        if (!admitted && error instanceof ActionAdmissionGateError) {
+          return Object.freeze({ status: "stale" });
+        }
+        throw error;
+      }
+    },
+    reconcile,
+  });
+}
+
 function closeOnce(guard) {
   let result;
   return () => {
@@ -281,6 +315,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   if (!enabledConfig && Object.keys(localExecutors).length === 0) return null;
 
   const factories = validateDependencies(dependencies);
+  const actionAdmissionGate = runtimeAdmissionGate(dependencies);
   let githubExecutorOptions = null;
   if (enabledConfig) {
     const configuredEnvironment = dataProperty(dependencies, "env");
@@ -319,7 +354,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       "githubExecutor",
     );
   }
-  const executors = {
+  const unfencedExecutors = {
     ...(githubExecutor
       ? {
           "github.pull-request-review": githubExecutor,
@@ -328,6 +363,14 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       : {}),
     ...localExecutors,
   };
+  const executors = Object.freeze(
+    Object.fromEntries(
+      Object.entries(unfencedExecutors).map(([kind, candidate]) => [
+        kind,
+        fenceExecutor(kind, candidate, actionAdmissionGate),
+      ]),
+    ),
+  );
   const executor = assertPort(
     factories.createExecutorRouter({ executors }),
     ["execute", "reconcile"],

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { createConfigurationRuntime } from "../src/configuration-runtime.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
@@ -82,12 +83,32 @@ test("runtime imports once and exposes frozen least-authority ports", async () =
     "createInitializationDraft",
     "reviseDraft",
   ]);
+  assert.deepEqual(Object.keys(runtime.runtimeAdmission).sort(), [
+    "readStatus",
+    "run",
+  ]);
+  assert.deepEqual(Object.keys(runtime.cutoverFence).sort(), [
+    "cutover",
+    "readStatus",
+    "reconcileCutover",
+  ]);
   assert.equal("importBootstrap" in runtime, false);
   assert.equal("activateDraft" in runtime.proposalPort, false);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.reader), true);
   assert.equal(runtime.status.safeMode, false);
   assert.equal(runtime.status.activeVersion, 1);
+  assert.deepEqual(runtime.runtimeAdmission.readStatus(), {
+    mode: "ready",
+    storedActive: {
+      version: 1,
+      configurationDigest: store.snapshot().versions[0].configurationDigest,
+    },
+    runtimeEffective: {
+      version: 1,
+      configurationDigest: store.snapshot().versions[0].configurationDigest,
+    },
+  });
   assert.equal(store.snapshot().migration.status, "imported");
 
   const firstClose = runtime.close();
@@ -127,56 +148,34 @@ test("an existing active version ignores later bootstrap content without reading
   await restarted.close();
 });
 
-test("activation runs through the supplied shared action-admission gate", async () => {
-  const events = [];
+test("runtime binds the supplied admission gate to the exact startup version", async () => {
+  const admissionGate = new ActionAdmissionGate();
   const runtime = await createConfigurationRuntime(configuration(), {
     store: memoryStore(),
     fallbackConfiguration: createSafeDisabledConfiguration(configuration()),
-    actionAdmissionGate: {
-      async run(operation) {
-        events.push("gate-enter");
-        const result = await operation();
-        events.push("gate-exit");
-        return result;
-      },
-    },
+    actionAdmissionGate: admissionGate,
     createGuard: () => guard([]),
   });
-  const snapshot = await runtime.reader.readSnapshot();
-  const next = configuration();
-  next.refreshMinutes += 1;
-  const draft = await runtime.draftManager.createDraft({
-    configuration: next,
-    expectedStateRevision: snapshot.revision,
-    proposedBy: "owner:local",
-  });
-  const prepared = await runtime.simulator.prepareDraftActivation({
-    draftId: draft.draftId,
-    draftRevision: draft.revision,
-    expectedStateRevision: snapshot.revision + 1,
-    expectedActiveVersion: snapshot.activeVersion,
-  });
+  const active = await runtime.reader.readActive();
 
-  const activated = await runtime.activationExecutor.activateDraft({
-    draftId: prepared.draftId,
-    draftRevision: prepared.draftRevision,
-    expectedStateRevision: prepared.expectedStateRevision,
-    expectedActiveVersion: prepared.expectedActiveVersion,
-    draftRevisionId: prepared.draftRevisionId,
-    documentDigest: prepared.documentDigest,
-    validationDigest: prepared.validationDigest,
-    impactDigest: prepared.impactDigest,
-    activatedBy: "owner:local",
+  assert.deepEqual(admissionGate.readStatus(), {
+    mode: "ready",
+    storedActive: {
+      version: active.version,
+      configurationDigest: active.configurationDigest,
+    },
+    runtimeEffective: {
+      version: active.version,
+      configurationDigest: active.configurationDigest,
+    },
   });
-
-  assert.equal(activated.active.version, 2);
-  assert.deepEqual(events, ["gate-enter", "gate-exit"]);
+  assert.notStrictEqual(runtime.runtimeAdmission, runtime.cutoverFence);
   await runtime.close();
 });
 
 test("an invalid first import starts from a non-persisted safe fallback", async () => {
   const events = [];
-  const activationEvents = [];
+  const admissionGate = new ActionAdmissionGate();
   const store = memoryStore();
   const invalid = configuration();
   invalid.githubActions.token = "ghp_not-a-real-token";
@@ -185,19 +184,17 @@ test("an invalid first import starts from a non-persisted safe fallback", async 
     store,
     fallbackConfiguration: fallback,
     createGuard: () => guard(events),
-    actionAdmissionGate: {
-      async run(operation) {
-        activationEvents.push("enter");
-        const result = await operation();
-        activationEvents.push("exit");
-        return result;
-      },
-    },
+    actionAdmissionGate: admissionGate,
   });
 
   assert.equal(runtime.status.safeMode, true);
   assert.equal(runtime.status.activeVersion, null);
   assert.equal(runtime.status.migrationError.code, "INVALID_CONFIGURATION_DOCUMENT");
+  assert.deepEqual(admissionGate.readStatus(), {
+    mode: "boot_safe",
+    storedActive: null,
+    runtimeEffective: null,
+  });
   assert.deepEqual(runtime.startupConfiguration, fallback);
   assert.equal(runtime.startupConfiguration.trackedRepositories.length, 0);
   assert.equal(runtime.startupConfiguration.workCoordination.enabled, false);
@@ -226,7 +223,6 @@ test("an invalid first import starts from a non-persisted safe fallback", async 
     activatedBy: "owner:local",
   });
   assert.equal(initialized.active.source, "initialization");
-  assert.deepEqual(activationEvents, ["enter", "exit"]);
   await runtime.close();
 });
 

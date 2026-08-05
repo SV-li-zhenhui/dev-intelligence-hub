@@ -1015,6 +1015,53 @@ test("configuration safe mode shutdown drains an accepted confirmation operation
   assert.equal(stopped, true);
 });
 
+test("configuration API exposes an uncertain runtime fence", async () => {
+  await withSafeConfigurationServer(async ({ application, server }) => {
+    application.configuration.runtimeStatus = {
+      readStatus() {
+        return {
+          mode: "unknown",
+          storedActive: null,
+          runtimeEffective: null,
+        };
+      },
+    };
+
+    const response = await request(server, { path: "/api/configuration" });
+    assert.equal(response.status, 200);
+    const state = JSON.parse(response.body);
+    assert.equal(state.status.runtimeMode, "unknown");
+    assert.equal(state.pendingRestart, true);
+  });
+});
+
+test("configuration API fails closed on contradictory or one-sided bindings", async () => {
+  await withSafeConfigurationServer(async ({ application, server }) => {
+    application.configuration.runtimeStatus = {
+      readStatus() {
+        return {
+          mode: "ready",
+          storedActive: null,
+          runtimeEffective: null,
+        };
+      },
+    };
+    const contradictory = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(contradictory.status.runtimeMode, "unknown");
+    assert.equal(contradictory.pendingRestart, true);
+
+    delete application.configuration.runtimeStatus;
+    application.configuration.status.activeVersion = 1;
+    const runtimeOnly = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(runtimeOnly.status.runtimeMode, "restart_required");
+    assert.equal(runtimeOnly.pendingRestart, true);
+  });
+});
+
 test("safe-mode configuration API creates, revises, previews, and reloads only initialization drafts", async () => {
   await withSafeConfigurationServer(async ({ server, calls }) => {
     const initial = await request(server, { path: "/api/configuration" });
@@ -1029,6 +1076,7 @@ test("safe-mode configuration API creates, revises, previews, and reloads only i
       "storedActive",
     ]);
     assert.equal(initialState.status.safeMode, true);
+    assert.equal(initialState.status.runtimeMode, "boot_safe");
     assert.equal(initialState.status.stateRevision, 0);
     assert.equal(initialState.status.migrationError.code, "CONFIG_LOCAL_INVALID");
     assert.equal(initialState.storedActive, null);
@@ -1285,6 +1333,7 @@ test("safe mode exposes and operates only initialization confirmations then repo
       (await request(server, { path: "/api/configuration" })).body,
     );
     assert.equal(status.status.safeMode, true);
+    assert.equal(status.status.runtimeMode, "restart_required");
     assert.equal(status.storedActive.version, 1);
     assert.equal(status.runtimeEffective.activeVersion, null);
     assert.equal(status.pendingRestart, true);

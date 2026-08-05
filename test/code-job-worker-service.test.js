@@ -852,6 +852,10 @@ test("configuration activation and action admission resolve revocation races", a
 
   await t.test("activation first fences the waiting action", async () => {
     const gate = new ActionAdmissionGate();
+    gate.bindEffective({
+      version: 1,
+      configurationDigest: "1".repeat(64),
+    });
     const activationEntered = deferred();
     const releaseActivation = deferred();
     let activeVersion = 1;
@@ -889,6 +893,10 @@ test("configuration activation and action admission resolve revocation races", a
 
   await t.test("admission first preserves only its immutable action", async () => {
     const gate = new ActionAdmissionGate();
+    gate.bindEffective({
+      version: 1,
+      configurationDigest: "1".repeat(64),
+    });
     let activeVersion = 1;
     const events = [];
     const initial = preparedJob("admission-first-action");

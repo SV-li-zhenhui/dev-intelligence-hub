@@ -794,6 +794,48 @@ function configurationRequiresRestart() {
   );
 }
 
+function configurationRuntimePresentation() {
+  const mode = configurationStatus().runtimeMode;
+  if (mode === "cutover") {
+    return {
+      label: "正在切换配置",
+      notice: "配置切换正在完成，新动作暂不接纳",
+      detail: "请等待当前确认完成，不要重复提交。",
+      tone: "warning",
+    };
+  }
+  if (mode === "unknown" || mode === "unbound") {
+    return {
+      label: "状态无法确认",
+      notice: "运行时配置状态无法确认，请重启服务完成恢复",
+      detail: "在恢复完成前，系统保持封闭，不会接纳新动作。",
+      tone: "error",
+    };
+  }
+  if (mode === "restart_required") {
+    return {
+      label: "等待重启",
+      notice: "已保存，重启服务后生效",
+      detail: "系统不会自动重启。请在方便时手动重启服务。",
+      tone: "warning",
+    };
+  }
+  if (mode === "boot_safe") {
+    return {
+      label: "安全启动",
+      notice: "",
+      detail: "普通员工和外部动作保持关闭。",
+      tone: "normal",
+    };
+  }
+  return {
+    label: mode === "ready" ? "已就绪" : "未知",
+    notice: "",
+    detail: "",
+    tone: "normal",
+  };
+}
+
 function configurationErrorText(value) {
   if (typeof value === "string") return value;
   const error = plainRecord(value);
@@ -850,9 +892,16 @@ function configurationView() {
   const draftRevision = Number.isSafeInteger(draft?.revision) ? draft.revision : null;
   const initializationOpen = safeMode && activeVersion === null;
   const migrationError = configurationErrorText(status.migrationError);
-  const restartNotice = configurationRequiresRestart()
-    ? "已保存，重启服务后生效"
-    : configurationNotice;
+  const runtime = configurationRuntimePresentation();
+  const runtimeNotice = runtime.notice || (
+    configurationRequiresRestart() ? "已保存，重启服务后生效" : ""
+  );
+  const notice = runtimeNotice || configurationNotice;
+  const noticeClass = runtime.tone === "error"
+    ? "configuration-runtime-error"
+    : runtime.tone === "warning"
+      ? "configuration-runtime-warning"
+      : "configuration-success";
   const statusLabel = initializationOpen
     ? "等待初始化"
     : activeVersion === null
@@ -879,7 +928,7 @@ function configurationView() {
       </div>`;
 
   return `<div class="configuration-panel">
-    ${restartNotice ? `<div class="configuration-success" role="status"><strong>${escapeHtml(restartNotice)}</strong><span>系统不会自动重启。请在方便时手动重启服务。</span></div>` : ""}
+    ${notice ? `<div class="${noticeClass}" role="${runtime.tone === "error" ? "alert" : "status"}"><strong>${escapeHtml(notice)}</strong>${runtime.detail ? `<span>${escapeHtml(runtime.detail)}</span>` : ""}</div>` : ""}
     ${configurationLoadError ? `<div class="configuration-inline-error" role="alert">${escapeHtml(configurationLoadError)}</div>` : ""}
     <section class="configuration-status" aria-labelledby="configuration-status-title">
       <div class="configuration-status-heading">
@@ -894,7 +943,7 @@ function configurationView() {
         <div><dt>存储版本</dt><dd>${activeVersion === null ? "尚无 Active" : `v${activeVersion}`}</dd></div>
         <div><dt>状态修订</dt><dd>${stateRevision ?? "未知"}</dd></div>
         <div><dt>初始化草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
-        <div><dt>运行时</dt><dd>${safeMode ? "安全禁用配置" : "启动时 Active 配置"}</dd></div>
+        <div><dt>运行时</dt><dd>${escapeHtml(runtime.label)}</dd></div>
       </dl>
       ${migrationError ? `<p class="configuration-migration-error"><strong>启动配置未导入：</strong>${escapeHtml(migrationError)}</p>` : ""}
     </section>
@@ -2533,15 +2582,17 @@ function updateChrome() {
 function updateConfigurationChrome() {
   if (dashboard || !hasConfigurationState()) return;
   const status = configurationStatus();
+  const runtime = configurationRuntimePresentation();
   const activeVersion = configurationActiveVersion();
   const stateRevision = configurationStateRevision();
   lastUpdated.textContent = `配置状态 revision ${stateRevision ?? "未知"}`;
-  sourceHealth.classList.toggle("error", status.safeMode === true);
+  const runtimeError = ["unknown", "unbound"].includes(status.runtimeMode);
+  sourceHealth.classList.toggle("error", status.safeMode === true || runtimeError);
   sourceHealth.innerHTML = `
     <span class="pulse"></span>
     <div>
-      <strong>${status.safeMode === true ? "安全恢复模式" : "配置中心已连接"}</strong>
-      <span>${activeVersion === null ? "尚无 Active 配置" : `本地已保存 v${activeVersion}`}</span>
+      <strong>${runtimeError ? "配置运行时已封闭" : status.safeMode === true ? "安全恢复模式" : "配置中心已连接"}</strong>
+      <span>${activeVersion === null ? "尚无 Active 配置" : `本地已保存 v${activeVersion}`} · ${escapeHtml(runtime.label)}</span>
     </div>`;
 }
 
@@ -2549,16 +2600,15 @@ function applyConfigurationState(nextState, sequence) {
   if (!plainRecord(nextState) || sequence < lastAppliedConfigurationRequest) {
     return false;
   }
-  const hadLoadError = configurationLoadError !== "";
   const unchanged = sameConfigurationRevision(configurationState, nextState);
   lastAppliedConfigurationRequest = sequence;
   configurationLoadError = "";
+  configurationState = nextState;
   if (unchanged) {
     updateConfigurationChrome();
-    if (hadLoadError && currentView === "configuration") render();
+    if (currentView === "configuration") render();
     return true;
   }
-  configurationState = nextState;
   const editable = configurationDocumentCandidate();
   const binding = currentConfigurationBinding();
   if (
