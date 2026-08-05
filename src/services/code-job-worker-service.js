@@ -751,7 +751,9 @@ export class CodeJobWorkerService {
         }
         let recoveredSession = interrupted.session;
         if (recoveredSession.status === "interrupted") {
-          const resumed = await this.#resumeUnchangedSession(job);
+          const resumed = await this.#resumeUnchangedSession(job, {
+            trustedReconciliation: true,
+          });
           if (resumed.session === null) {
             return currentJobOutcome(job.jobId, resumed.job);
           }
@@ -800,9 +802,14 @@ export class CodeJobWorkerService {
     };
   }
 
-  async #resumeUnchangedSession(job) {
-    return this.#runUnchangedSessionTransition(job, () =>
-      this.#executor.resume({ sessionId: job.jobId }),
+  async #resumeUnchangedSession(
+    job,
+    { trustedReconciliation = false } = {},
+  ) {
+    return this.#runUnchangedSessionTransition(
+      job,
+      () => this.#executor.resume({ sessionId: job.jobId }),
+      { trustedReconciliation },
     );
   }
 
@@ -816,11 +823,18 @@ export class CodeJobWorkerService {
     );
   }
 
-  async #runUnchangedSessionTransition(job, invoke) {
-    const admitted = await this.#sessionTransitions.run(async () => {
+  async #runUnchangedSessionTransition(
+    job,
+    invoke,
+    { trustedReconciliation = false } = {},
+  ) {
+    const enter = () => this.#sessionTransitions.run(async () => {
       const current = await this.#jobs.getForWorker(job.jobId);
       if (!sameSessionTransitionFence(job, current)) {
         return { job: current, operation: null };
+      }
+      if (!trustedReconciliation) {
+        await this.#verifyAuthority(current.grant);
       }
 
       // Invocation must enqueue synchronously. The returned Promise is carried
@@ -828,6 +842,9 @@ export class CodeJobWorkerService {
       const operation = Promise.resolve(invoke());
       return { job: current, operation };
     });
+    const admitted = trustedReconciliation
+      ? await enter()
+      : await this.#actionAdmission(enter);
     if (admitted.operation === null) {
       return { job: admitted.job, session: null };
     }

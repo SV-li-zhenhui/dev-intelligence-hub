@@ -24,6 +24,25 @@ function deferred() {
   return { promise, resolve };
 }
 
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+    return "activated-v2";
+  });
+}
+
 class IntegrationMemoryStore {
   constructor() {
     this.values = new Map();
@@ -736,12 +755,36 @@ test("a queued job is started and one semantic action is durably executed", asyn
   const performed = executor.calls.find(({ method }) => method === "perform").value.action;
   assert.match(performed.actionId, /^action-[a-f0-9]{55}$/);
   assert.equal(performed.expectedWorkspaceRevision, REVISION_A);
-  assert.equal(events[events.indexOf("admit") - 1], "verify");
+  const startIndex = events.indexOf("executor.start");
+  const startAdmissionEnter = events.lastIndexOf(
+    "admission-gate-enter",
+    startIndex,
+  );
+  const startAdmissionExit = events.indexOf(
+    "admission-gate-exit",
+    startIndex,
+  );
   assert.deepEqual(
-    events.slice(
-      events.indexOf("admission-gate-enter"),
-      events.indexOf("admission-gate-exit") + 1,
-    ),
+    events.slice(startAdmissionEnter, startAdmissionExit + 1),
+    [
+      "admission-gate-enter",
+      "verify",
+      "executor.start",
+      "admission-gate-exit",
+    ],
+  );
+  const actionIndex = events.indexOf("admit");
+  const actionAdmissionEnter = events.lastIndexOf(
+    "admission-gate-enter",
+    actionIndex,
+  );
+  const actionAdmissionExit = events.indexOf(
+    "admission-gate-exit",
+    actionIndex,
+  );
+  assert.equal(events[actionIndex - 1], "verify");
+  assert.deepEqual(
+    events.slice(actionAdmissionEnter, actionAdmissionExit + 1),
     ["admission-gate-enter", "verify", "admit", "admission-gate-exit"],
   );
   assert.equal(
@@ -1528,6 +1571,8 @@ test("interrupted recovery converges after a lost resume acknowledgement", async
     error: { code: "RESULT_UNKNOWN", message: "Result unknown" },
   }];
   const resume = executor.resume.bind(executor);
+  const actionAdmissionGate = readyActionAdmissionGate();
+  await activateNextConfiguration(actionAdmissionGate);
   let loseAcknowledgement = true;
   executor.resume = async (value) => {
     const session = await resume(value);
@@ -1544,6 +1589,7 @@ test("interrupted recovery converges after a lost resume acknowledgement", async
     executor,
     brainDirectory: brain([]),
     grantVerifier: verifier([]),
+    actionAdmissionGate,
   });
 
   const lostAckCycle = await worker.runCycle();
@@ -1564,6 +1610,7 @@ test("interrupted recovery converges after a lost resume acknowledgement", async
     executor.calls.some(({ method }) => method === "perform"),
     false,
   );
+  assert.equal(actionAdmissionGate.readStatus().mode, "restart_required");
 });
 
 test("the host selects fixed profiles and completes only after current-attempt proof", async () => {
@@ -2714,6 +2761,74 @@ test("cancel-first transition prevents an admitted session start", async () => {
   assert.ok(events.indexOf("cancel") > events.indexOf("claim"));
 });
 
+test("configuration-first admission starts or resumes no new executor session", async (t) => {
+  await t.test("start", async () => {
+    const initial = job();
+    const gate = readyActionAdmissionGate();
+    await activateNextConfiguration(gate);
+    const store = new FakeJobStore([initial]);
+    const executor = new FakeExecutor(initial);
+    const brainCalls = [];
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([], brainCalls),
+      grantVerifier: verifier([]),
+      actionAdmissionGate: gate,
+    });
+
+    const result = await worker.runCycle();
+
+    assert.equal(result.outcomes[0].status, "restart_required");
+    assert.equal(result.outcomes[0].code, "RUNTIME_RESTART_REQUIRED");
+    assert.equal(executor.calls.some(({ method }) => method === "start"), false);
+    assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+    assert.equal(brainCalls.length, 0);
+    assert.equal((await store.getForWorker(initial.jobId)).status, "starting");
+  });
+
+  await t.test("resume", async () => {
+    const initial = job({
+      status: "starting",
+      revision: 2,
+      execution: {
+        sessionId: job().jobId,
+        workspaceRevision: null,
+        turn: 0,
+        pendingAction: null,
+        actionAdmission: null,
+        observations: [],
+        result: null,
+        pause: null,
+        uncertainty: null,
+      },
+    });
+    const gate = readyActionAdmissionGate();
+    await activateNextConfiguration(gate);
+    const store = new FakeJobStore([initial]);
+    const executor = new FakeExecutor(initial, [], {
+      sessionStatus: "interrupted",
+    });
+    executor.exists = true;
+    const brainCalls = [];
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([], brainCalls),
+      grantVerifier: verifier([]),
+      actionAdmissionGate: gate,
+    });
+
+    const result = await worker.runCycle();
+
+    assert.equal(result.outcomes[0].status, "restart_required");
+    assert.equal(result.outcomes[0].code, "RUNTIME_RESTART_REQUIRED");
+    assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+    assert.equal(brainCalls.length, 0);
+    assert.equal((await store.getForWorker(initial.jobId)).status, "starting");
+  });
+});
+
 test("start-first admission releases the gate before the long start settles", async () => {
   const initial = job();
   const events = [];
@@ -2731,6 +2846,7 @@ test("start-first admission releases the gate before the long start settles", as
   const sessionTransitionLease = {
     run(operation) { return transitionQueue.enqueue(operation); },
   };
+  const actionAdmissionGate = readyActionAdmissionGate();
   const brainCalls = [];
   const worker = new CodeJobWorkerService({
     jobStore: store,
@@ -2738,10 +2854,19 @@ test("start-first admission releases the gate before the long start settles", as
     brainDirectory: brain([], brainCalls),
     grantVerifier: verifier(events),
     sessionTransitionLease,
+    actionAdmissionGate,
   });
 
   const cycle = worker.runCycle();
   await startEntered.promise;
+  const cutover = activateNextConfiguration(actionAdmissionGate);
+  assert.equal(
+    await Promise.race([
+      cutover,
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
   const starting = await store.getForWorker(initial.jobId);
   const cancellation = sessionTransitionLease.run(() => store.cancel({
     jobId: starting.jobId,
@@ -2766,6 +2891,7 @@ test("start-first admission releases the gate before the long start settles", as
   );
   assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
   assert.equal(brainCalls.length, 0);
+  assert.equal(actionAdmissionGate.readStatus().mode, "restart_required");
 });
 
 test("resume-first admission releases the gate before the long resume settles", async () => {
@@ -2802,6 +2928,7 @@ test("resume-first admission releases the gate before the long resume settles", 
   const sessionTransitionLease = {
     run(operation) { return transitionQueue.enqueue(operation); },
   };
+  const actionAdmissionGate = readyActionAdmissionGate();
   const brainCalls = [];
   const worker = new CodeJobWorkerService({
     jobStore: store,
@@ -2809,10 +2936,19 @@ test("resume-first admission releases the gate before the long resume settles", 
     brainDirectory: brain([], brainCalls),
     grantVerifier: verifier(events),
     sessionTransitionLease,
+    actionAdmissionGate,
   });
 
   const cycle = worker.runCycle();
   await resumeEntered.promise;
+  const cutover = activateNextConfiguration(actionAdmissionGate);
+  assert.equal(
+    await Promise.race([
+      cutover,
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]),
+    "activated-v2",
+  );
   const starting = await store.getForWorker(initial.jobId);
   const cancellation = sessionTransitionLease.run(() => store.cancel({
     jobId: starting.jobId,
@@ -2841,6 +2977,7 @@ test("resume-first admission releases the gate before the long resume settles", 
   );
   assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
   assert.equal(brainCalls.length, 0);
+  assert.equal(actionAdmissionGate.readStatus().mode, "restart_required");
 });
 
 test("cancellation committed during starting recovery prevents session resume", async () => {
