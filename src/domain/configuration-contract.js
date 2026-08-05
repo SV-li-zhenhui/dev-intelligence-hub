@@ -1,9 +1,12 @@
-import { createHash } from "node:crypto";
 import {
   normalizeWorkspacePath,
   validateWorkspaceId,
 } from "./code-execution-policy.js";
 import { normalizeWorkflowRoutingConfig } from "./workflow-router.js";
+import {
+  canonicalJsonDigest,
+  canonicalJsonStringify,
+} from "../lib/canonical-json-digest.js";
 
 const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_DEPTH = 32;
@@ -1151,22 +1154,8 @@ export function normalizeConfigurationDocument(value) {
   return deepFreeze(document);
 }
 
-function canonicalValue(value) {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.keys(value)
-        .sort((left, right) => left.localeCompare(right, "en"))
-        .map((key) => [key, canonicalValue(value[key])]),
-    );
-  }
-  return value;
-}
-
 function digestNormalized(document) {
-  return createHash("sha256")
-    .update(JSON.stringify(canonicalValue(document)), "utf8")
-    .digest("hex");
+  return canonicalJsonDigest(document);
 }
 
 export function configurationDocumentDigest(value) {
@@ -1174,7 +1163,7 @@ export function configurationDocumentDigest(value) {
 }
 
 function equalValue(left, right) {
-  return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+  return canonicalJsonStringify(left) === canonicalJsonStringify(right);
 }
 
 function collectChanges(before, after, path = "", changes = []) {
