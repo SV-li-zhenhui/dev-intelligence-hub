@@ -1,3 +1,4 @@
+import { ActionAdmissionGate } from "../lib/action-admission-gate.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
@@ -164,6 +165,7 @@ export class CodeJobWorkerService {
   #executor;
   #brain;
   #verifyGrant;
+  #actionAdmission;
   #queue;
   #sessionTransitions;
   #maxTurns;
@@ -179,6 +181,7 @@ export class CodeJobWorkerService {
     executor,
     brainDirectory,
     grantVerifier,
+    actionAdmissionGate = new ActionAdmissionGate(),
     operationQueue = new OperationQueue(),
     sessionTransitionLease: suppliedSessionTransitionLease =
       sessionTransitionLease(),
@@ -228,6 +231,11 @@ export class CodeJobWorkerService {
       ["verify"],
       "code job grant verifier",
     ).verify;
+    this.#actionAdmission = requirePort(
+      actionAdmissionGate,
+      ["run"],
+      "code job action admission gate",
+    ).run;
     if (!operationQueue || typeof operationQueue.enqueue !== "function") {
       throw new TypeError("code job worker queue is invalid");
     }
@@ -515,6 +523,7 @@ export class CodeJobWorkerService {
       },
       {
         beforeGenerate: () => this.#verifyAuthority(job.grant),
+        brainDigest: job.grant.brainDigest,
       },
     );
     const action = bindTrustedAction(
@@ -875,25 +884,31 @@ export class CodeJobWorkerService {
       response = normalizeActionResponse(pending, current);
       result = current.result;
     } else {
-      const fresh = await this.#jobs.getForWorker(job.jobId);
-      if (
-        fresh?.status !== "active" ||
-        fresh.execution.pendingAction?.actionDigest !== pending.actionDigest
-      ) {
+      const admission = await this.#actionAdmission(async () => {
+        const fresh = await this.#jobs.getForWorker(job.jobId);
+        if (
+          fresh?.status !== "active" ||
+          fresh.execution.pendingAction?.actionDigest !== pending.actionDigest
+        ) {
+          return { admitted: false, job: fresh };
+        }
+        await this.#verifyAuthority(fresh.grant);
+        const changed = await this.#jobs.admitAction({
+          jobId: fresh.jobId,
+          expectedRevision: fresh.revision,
+          actionId: pending.actionId,
+          actionDigest: pending.actionDigest,
+        });
+        return { admitted: true, job: changed.job };
+      });
+      if (!admission.admitted) {
         return {
           jobId: job.jobId,
-          status: fresh?.status ?? "missing",
+          status: admission.job?.status ?? "missing",
           actionType: null,
         };
       }
-      job = fresh;
-      await this.#verifyAuthority(job.grant);
-      job = (await this.#jobs.admitAction({
-        jobId: job.jobId,
-        expectedRevision: job.revision,
-        actionId: pending.actionId,
-        actionDigest: pending.actionDigest,
-      })).job;
+      job = admission.job;
       const controller = new AbortController();
       this.#cancellationControllers.set(job.jobId, controller);
       try {

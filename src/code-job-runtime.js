@@ -182,6 +182,7 @@ export async function createCodeJobRuntime({
   grantVerifier,
   executor,
   brainDirectory,
+  actionAdmissionGate,
   dataDirectory,
   operationQueue = new OperationQueue(),
   workerOperationQueue = new OperationQueue(),
@@ -276,6 +277,9 @@ export async function createCodeJobRuntime({
           executor,
           brainDirectory,
           grantVerifier,
+          ...(actionAdmissionGate === undefined
+            ? {}
+            : { actionAdmissionGate }),
           operationQueue: workerOperationQueue,
           sessionTransitionLease: sessionTransitions,
           ...(changePackageDispatcher === null

@@ -206,6 +206,29 @@ function authorizedOperations(value, authorizedRoles) {
   return result;
 }
 
+export function codeJobBrainDigest({
+  roleId: roleIdValue,
+  brain: rawBrain,
+  brainProviders,
+} = {}) {
+  const roleId = safeRoleId(roleIdValue, "roleId");
+  const providers = plainRecord(brainProviders, "brainProviders");
+  let brain;
+  try {
+    brain = normalizeBrainConfig(rawBrain);
+  } catch (cause) {
+    throw invalid(`岗位 ${roleId} 的大脑配置无效`, { cause });
+  }
+  if (!Object.hasOwn(providers, brain.provider)) {
+    throw invalid(`岗位 ${roleId} 的大脑提供方未配置`);
+  }
+  const provider = plainRecord(
+    providers[brain.provider],
+    `brainProviders.${brain.provider}`,
+  );
+  return digestValue({ schemaVersion: 1, roleId, brain, provider });
+}
+
 function normalizeBrainDigests(brainByRoleValue, providersValue, roleIds) {
   const brainByRole = plainRecord(brainByRoleValue, "brainByRole");
   const providers = plainRecord(providersValue, "brainProviders");
@@ -214,22 +237,13 @@ function normalizeBrainDigests(brainByRoleValue, providersValue, roleIds) {
     if (!Object.hasOwn(brainByRole, roleId)) {
       throw invalid(`岗位 ${roleId} 缺少大脑配置`);
     }
-    let brain;
-    try {
-      brain = normalizeBrainConfig(brainByRole[roleId]);
-    } catch (cause) {
-      throw invalid(`岗位 ${roleId} 的大脑配置无效`, { cause });
-    }
-    if (!Object.hasOwn(providers, brain.provider)) {
-      throw invalid(`岗位 ${roleId} 的大脑提供方未配置`);
-    }
-    const provider = plainRecord(
-      providers[brain.provider],
-      `brainProviders.${brain.provider}`,
-    );
     result.set(
       roleId,
-      digestValue({ schemaVersion: 1, roleId, brain, provider }),
+      codeJobBrainDigest({
+        roleId,
+        brain: brainByRole[roleId],
+        brainProviders: providers,
+      }),
     );
   }
   return result;

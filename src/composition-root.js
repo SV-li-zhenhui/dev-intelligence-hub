@@ -9,6 +9,7 @@ import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
 import { createConfigurationRuntime } from "./configuration-runtime.js";
+import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { StateStore } from "./lib/state-store.js";
@@ -43,6 +44,7 @@ import { createConfiguredCodeJobBrainDirectory } from "./services/code-job-brain
 import { createGitHubReviewProposalRunnerService } from "./services/github-review-proposal-handler.js";
 import { WorkIntentDispatcher } from "./services/work-intent-dispatcher.js";
 import { WorkProposalResultReconciler } from "./services/work-proposal-result-reconciler.js";
+import { VersionedCodeJobAuthority } from "./services/versioned-code-job-authority.js";
 import { createWorkIntentPolicy } from "./services/work-intent-policy.js";
 import { createWorkProposalRunnerGroup } from "./services/work-proposal-runner-group.js";
 import { WorkflowFactSource } from "./services/workflow-fact-source.js";
@@ -140,6 +142,7 @@ export async function createApplication({
   store: suppliedStore,
   configurationRuntimeFactory = createConfigurationRuntime,
   configurationRuntimeDependencies = {},
+  actionAdmissionGateFactory = () => new ActionAdmissionGate(),
   configBootstrapLoader = loadConfigBootstrap,
   versionedConfiguration = suppliedConfig === undefined,
   codeExecutorRuntimeFactory = createCodeExecutorRuntime,
@@ -186,6 +189,8 @@ export async function createApplication({
     createGitHubReviewProposalRunnerService,
   codeJobGrantFactory = (options) => new CodeJobGrantFactory(options),
   codeJobBrainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
+  versionedCodeJobAuthorityFactory = (options) =>
+    new VersionedCodeJobAuthority(options),
   codeActionProposalRunnerFactory =
     createCodeActionProposalRunnerService,
   workProposalRunnerGroupFactory = createWorkProposalRunnerGroup,
@@ -205,6 +210,19 @@ export async function createApplication({
   if (typeof versionedConfiguration !== "boolean") {
     throw new TypeError("versionedConfiguration must be a boolean");
   }
+  if (typeof actionAdmissionGateFactory !== "function") {
+    throw new TypeError("actionAdmissionGateFactory must be a function");
+  }
+  if (typeof versionedCodeJobAuthorityFactory !== "function") {
+    throw new TypeError("versionedCodeJobAuthorityFactory must be a function");
+  }
+  const actionAdmissionGate = versionedConfiguration
+    ? frozenPort(
+        actionAdmissionGateFactory(),
+        ["run"],
+        "actionAdmissionGate",
+      )
+    : null;
   const bootstrap = suppliedConfig === undefined
     ? await configBootstrapLoader()
     : {
@@ -251,6 +269,7 @@ export async function createApplication({
         await configurationRuntimeFactory(bootstrap.candidate, {
           ...configurationRuntimeDependencies,
           store,
+          actionAdmissionGate,
           fallbackConfiguration: bootstrap.fallbackConfiguration,
           bootstrapError: bootstrap.bootstrapError,
         }),
@@ -394,22 +413,37 @@ export async function createApplication({
     }
     let activeCodeJobOptions = null;
     if (localCodeExecutionEnabled) {
-      grantFactory = codeJobGrantFactory({
-        executorAuthority: codeExecutorRuntime.authority,
-        policyVersion: coordinationConfig.policy?.version ?? 1,
-        workspaceByRepository:
-          coordinationConfig.policy?.workspaceByRepository || {},
-        codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
-        codeOperationsByRole:
-          coordinationConfig.policy?.codeOperationsByRole || {},
-        brainByRole: brainConfigurationsByRole(config.employees?.roles),
-        brainProviders: config.brainProviders || {},
-      });
-      const codeJobBrainDirectory = codeJobBrainDirectoryFactory({
-        brainProviders: config.brainProviders || {},
-        roles: config.employees?.roles || {},
-        dependencies: workCoordinationDependencies.brainDependencies || {},
-      });
+      let codeJobBrainDirectory;
+      if (versionedConfiguration) {
+        grantFactory = versionedCodeJobAuthorityFactory({
+          configurationReader: configurationRuntime.reader,
+          executorAuthority: codeExecutorRuntime.authority,
+          startupConfiguration: config,
+          brainDependencies:
+            workCoordinationDependencies.brainDependencies || {},
+          actionAdmissionGate,
+          grantFactoryFactory: codeJobGrantFactory,
+          brainDirectoryFactory: codeJobBrainDirectoryFactory,
+        });
+        codeJobBrainDirectory = grantFactory;
+      } else {
+        grantFactory = codeJobGrantFactory({
+          executorAuthority: codeExecutorRuntime.authority,
+          policyVersion: coordinationConfig.policy?.version ?? 1,
+          workspaceByRepository:
+            coordinationConfig.policy?.workspaceByRepository || {},
+          codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
+          codeOperationsByRole:
+            coordinationConfig.policy?.codeOperationsByRole || {},
+          brainByRole: brainConfigurationsByRole(config.employees?.roles),
+          brainProviders: config.brainProviders || {},
+        });
+        codeJobBrainDirectory = codeJobBrainDirectoryFactory({
+          brainProviders: config.brainProviders || {},
+          roles: config.employees?.roles || {},
+          dependencies: workCoordinationDependencies.brainDependencies || {},
+        });
+      }
       activeCodeJobOptions = {
         grantVerifier: frozenPort(
           grantFactory,
@@ -467,6 +501,7 @@ export async function createApplication({
         await codeJobRuntimeFactory({
           ...codeJobRuntimeDependencies,
           store,
+          ...(actionAdmissionGate === null ? {} : { actionAdmissionGate }),
           operationQueue: new OperationQueue(),
           memoryReceiptVerifier: frozenPort(
             memoryRuntime.receiptVerifier,

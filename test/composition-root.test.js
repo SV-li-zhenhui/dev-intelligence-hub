@@ -2469,6 +2469,11 @@ test("versioned composition builds every subsystem from the stored active snapsh
     config: bootstrap,
     store: memoryStore(),
     versionedConfiguration: true,
+    actionAdmissionGateFactory: () => ({
+      async run(operation) {
+        return operation();
+      },
+    }),
     configurationRuntimeFactory: async (candidate, dependencies) => {
       calls.push({ candidate, dependencies });
       return configurationRuntime;
@@ -2477,6 +2482,11 @@ test("versioned composition builds every subsystem from the stored active snapsh
 
   assert.deepEqual(calls[0].candidate, bootstrap);
   assert.equal(calls[0].dependencies.store instanceof Object, true);
+  assert.equal(typeof calls[0].dependencies.actionAdmissionGate.run, "function");
+  assert.equal(
+    Object.isFrozen(calls[0].dependencies.actionAdmissionGate),
+    true,
+  );
   assert.strictEqual(application.config, active);
   assert.equal(application.configuration.status.activeVersion, 4);
   assert.strictEqual(application.configuration.reader, configurationRuntime.reader);
@@ -2488,4 +2498,144 @@ test("versioned composition builds every subsystem from the stored active snapsh
 
   await application.close();
   assert.equal(calls.at(-1), "configuration-close");
+});
+
+test("versioned local code shares one gate and reads Active authority", async () => {
+  const config = localCodeCoordinationConfig({ githubActions: false });
+  const calls = {};
+  const closeCalls = [];
+  const sharedGate = {
+    async run(operation) {
+      return operation();
+    },
+  };
+  const configurationReader = {
+    async readSnapshot() {},
+    async readActive() {},
+    async readVersion() {},
+    async readDraft() {},
+    async readProjectionBatch() {},
+  };
+  const versionedAuthority = {
+    async create() {},
+    async verify(value) {
+      return value;
+    },
+    async decide() {},
+  };
+  const localExecutor = { async execute() {}, async reconcile() {} };
+
+  const application = await createApplication({
+    config,
+    versionedConfiguration: true,
+    store: memoryStore(),
+    actionAdmissionGateFactory: () => sharedGate,
+    configurationRuntimeFactory: async (_candidate, dependencies) => {
+      calls.configuration = dependencies;
+      return {
+        startupConfiguration: config,
+        status: {
+          safeMode: false,
+          activeVersion: 1,
+          stateRevision: 1,
+          migrationError: null,
+        },
+        reader: configurationReader,
+        draftManager: {
+          async createDraft() {},
+          async reviseDraft() {},
+        },
+        simulator: {
+          async prepareDraftActivation() {},
+          async prepareRollback() {},
+        },
+        activationExecutor: {
+          async activateDraft() {},
+          async activateRollback() {},
+        },
+        proposalPort: {
+          async createDraft() {},
+          async reviseDraft() {},
+        },
+        async close() {
+          closeCalls.push("configuration");
+        },
+      };
+    },
+    codeExecutorRuntimeFactory: async () => ({
+      authority: {
+        workspaces: [
+          {
+            id: "acme-workspace",
+            writablePaths: ["src"],
+            requiredProfiles: [
+              { id: "node-tests", configDigest: "a".repeat(64) },
+            ],
+            authorityDigest: "b".repeat(64),
+          },
+        ],
+      },
+      executor: controlledCodeExecutorPort(),
+      async close() {
+        closeCalls.push("code-executor");
+      },
+    }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "code-action-runner": { async claim() {}, async advance() {} },
+      },
+    }),
+    versionedCodeJobAuthorityFactory: (options) => {
+      calls.versionedAuthority = options;
+      return versionedAuthority;
+    },
+    codeActionProposalRunnerFactory: (options) => {
+      calls.codeRunner = options;
+      return { async runCycle() {} };
+    },
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      return {
+        confirmationExecutor: localExecutor,
+        reader: {
+          async get() {},
+          async getDetail() {},
+          async list() {},
+          async listNewest() {},
+        },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
+        async close() {
+          closeCalls.push("code-job");
+        },
+      };
+    },
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() {
+        closeCalls.push("confirmation");
+      },
+    }),
+  });
+
+  assert.strictEqual(
+    calls.configuration.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.notStrictEqual(calls.configuration.actionAdmissionGate, sharedGate);
+  assert.strictEqual(
+    calls.versionedAuthority.configurationReader,
+    configurationReader,
+  );
+  assert.equal(
+    await calls.codeJobRuntime.grantVerifier.verify("sealed-grant"),
+    "sealed-grant",
+  );
+  assert.strictEqual(calls.codeRunner.grantFactory, versionedAuthority);
+
+  await application.close();
 });

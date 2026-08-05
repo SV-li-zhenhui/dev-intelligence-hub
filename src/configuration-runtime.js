@@ -1,4 +1,5 @@
 import { normalizeConfigurationDocument } from "./domain/configuration-contract.js";
+import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { ConfigurationStore } from "./services/configuration-store.js";
@@ -59,12 +60,18 @@ export async function createConfigurationRuntime(
     idFactory,
     limits,
     operationQueue = new OperationQueue(),
+    actionAdmissionGate = new ActionAdmissionGate(),
     createGuard = (options) => new ProcessExclusiveGuard(options),
   } = {},
 ) {
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
   }
+  const activationGate = port(
+    actionAdmissionGate,
+    ["run"],
+    "configuration action admission gate",
+  );
   const declaredBootstrapError = normalizeBootstrapError(bootstrapError);
   const guard = createGuard({ name: GUARD_NAME });
   if (
@@ -144,11 +151,12 @@ export async function createConfigurationRuntime(
         ["prepareDraftActivation", "prepareRollback"],
         "configuration simulator",
       ),
-      activationExecutor: port(
-        service,
-        ["activateDraft", "activateRollback"],
-        "configuration activation executor",
-      ),
+      activationExecutor: Object.freeze({
+        activateDraft: (value) =>
+          activationGate.run(() => service.activateDraft(value)),
+        activateRollback: (value) =>
+          activationGate.run(() => service.activateRollback(value)),
+      }),
       proposalPort: port(service, draftMethods, "configuration proposal port"),
       close,
     };

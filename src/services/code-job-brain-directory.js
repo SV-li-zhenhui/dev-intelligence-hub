@@ -12,6 +12,7 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const OPERATIONS = new Set(["inspect", "modify", "verify"]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed"]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const SHA256 = /^[a-f0-9]{64}$/;
 
 export class CodeJobBrainDirectoryError extends Error {
   constructor(code, message, statusCode = 400, options = {}) {
@@ -27,17 +28,31 @@ function directoryError(code, message, statusCode, options) {
 }
 
 function requireDecisionAuthorization(value) {
+  const entries = dataEntries(value, "code brain authorization");
+  const authorization = Object.fromEntries(entries);
+  const keys = entries.map(([key]) => key);
   if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== 1 ||
-    typeof value.beforeGenerate !== "function"
+    keys.length < 1 ||
+    keys.length > 3 ||
+    !keys.includes("beforeGenerate") ||
+    keys.some(
+      (key) =>
+        !["beforeGenerate", "brainDigest", "admitGenerate"].includes(key),
+    ) ||
+    typeof authorization.beforeGenerate !== "function" ||
+    (Object.hasOwn(authorization, "brainDigest") &&
+      (typeof authorization.brainDigest !== "string" ||
+        !SHA256.test(authorization.brainDigest))) ||
+    (Object.hasOwn(authorization, "admitGenerate") &&
+      typeof authorization.admitGenerate !== "function")
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
-  return value.beforeGenerate;
+  return {
+    beforeGenerate: authorization.beforeGenerate,
+    admitGenerate:
+      authorization.admitGenerate || ((operation) => operation()),
+  };
 }
 
 function dataEntries(value, name) {
@@ -288,7 +303,8 @@ export class CodeJobBrainDirectory {
 
   async decide(value, authorization) {
     const { roleId, context } = normalizeDecisionInput(value);
-    const beforeGenerate = requireDecisionAuthorization(authorization);
+    const { beforeGenerate, admitGenerate } =
+      requireDecisionAuthorization(authorization);
     const brain = this.#brains.get(roleId);
     if (!brain) {
       throw directoryError(
@@ -302,23 +318,32 @@ export class CodeJobBrainDirectory {
       { role: "user", content: JSON.stringify(context) },
     ];
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await beforeGenerate();
-      const response = await this.#router.generate({
-        brain,
-        schema: CODE_ACTION_DECISION_JSON_SCHEMA,
-        dataClasses: ["requirements", "code"],
-        messages:
-          attempt === 0
-            ? messages
-            : [
-                ...messages,
-                {
-                  role: "user",
-                  content:
-                    "The previous response failed local validation. Return one corrected JSON object only. Use an allowed action and omit every trusted execution field.",
-                },
-              ],
-      });
+      const admitted = exactData(
+        await admitGenerate(async () => {
+          await beforeGenerate();
+          return {
+            response: this.#router.generate({
+              brain,
+              schema: CODE_ACTION_DECISION_JSON_SCHEMA,
+              dataClasses: ["requirements", "code"],
+              messages:
+                attempt === 0
+                  ? messages
+                  : [
+                      ...messages,
+                      {
+                        role: "user",
+                        content:
+                          "The previous response failed local validation. Return one corrected JSON object only. Use an allowed action and omit every trusted execution field.",
+                      },
+                    ],
+            }),
+          };
+        }),
+        ["response"],
+        "admitted code brain response",
+      );
+      const response = await admitted.response;
       try {
         const decision = parseStructuredCodeActionDecision(response);
         if (!context.capabilities.allowedActions.includes(decision.action.type)) {

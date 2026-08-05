@@ -169,6 +169,98 @@ test("generation fails closed without a trusted authorization callback", async (
   assert.equal(router.calls.length, 0);
 });
 
+test("authorization accessors are rejected without executing getters", async () => {
+  for (const accessorName of [
+    "beforeGenerate",
+    "brainDigest",
+    "admitGenerate",
+  ]) {
+    const router = fakeRouter();
+    const directory = new CodeJobBrainDirectory({
+      brainRouter: router.port,
+      roles: roleBrain(),
+    });
+    const authorization = {
+      beforeGenerate: async () => {},
+      brainDigest: "a".repeat(64),
+      admitGenerate: async (operation) => operation(),
+    };
+    let getterReads = 0;
+    Object.defineProperty(authorization, accessorName, {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error(`${accessorName} getter must not run`);
+      },
+    });
+
+    await assert.rejects(
+      directory.decide(input(), authorization),
+      TypeError,
+    );
+    assert.equal(getterReads, 0, accessorName);
+    assert.equal(router.calls.length, 0, accessorName);
+  }
+});
+
+test("admission wraps every provider request without awaiting its response", async () => {
+  const requests = [];
+  let insideAdmission = false;
+  let admissions = 0;
+  let admissionExits = 0;
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: {
+      generate(value) {
+        assert.equal(insideAdmission, true);
+        let resolve;
+        const response = new Promise((resolveResponse) => {
+          resolve = resolveResponse;
+        });
+        requests.push({ value: structuredClone(value), resolve });
+        return response;
+      },
+      describe(brain) {
+        return {
+          provider: brain.provider,
+          model: brain.model,
+          remote: false,
+          remoteData: brain.remoteData,
+        };
+      },
+    },
+    roles: roleBrain(),
+  });
+  const result = directory.decide(input(), {
+    beforeGenerate: async () => {},
+    admitGenerate: async (operation) => {
+      admissions += 1;
+      insideAdmission = true;
+      try {
+        return await operation();
+      } finally {
+        insideAdmission = false;
+        admissionExits += 1;
+      }
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.equal(admissions, 1);
+  assert.equal(admissionExits, 1);
+  assert.equal(insideAdmission, false);
+
+  requests[0].resolve("not json");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.equal(admissions, 2);
+  assert.equal(admissionExits, 2);
+  assert.equal(insideAdmission, false);
+
+  requests[1].resolve(decision({ type: "run_profile" }));
+  assert.equal((await result).action.type, "run_profile");
+});
+
 test("sealed capabilities reject model escalation and premature completion", async () => {
   for (const [response, expectedCode] of [
     [decision({ type: "write_text", path: "src/app.js", content: "x" }), "CODE_BRAIN_ACTION_NOT_PERMITTED"],

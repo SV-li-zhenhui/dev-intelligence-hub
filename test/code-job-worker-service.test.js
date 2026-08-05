@@ -5,6 +5,7 @@ import {
   createCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
@@ -58,6 +59,7 @@ function grant(overrides = {}) {
     ],
     writablePaths: ["src", "test"],
     requiredProfiles: [{ id: "node-tests", configDigest: PROFILE_DIGEST }],
+    brainDigest: "1".repeat(64),
     ...overrides,
   };
 }
@@ -713,6 +715,14 @@ test("a queued job is started and one semantic action is durably executed", asyn
     executor,
     brainDirectory: brain([{ type: "read_text", path: "src/app.js" }], brainCalls),
     grantVerifier: verifier(events),
+    actionAdmissionGate: {
+      async run(operation) {
+        events.push("admission-gate-enter");
+        const result = await operation();
+        events.push("admission-gate-exit");
+        return result;
+      },
+    },
   });
 
   const result = await worker.runCycle({ limit: 1, roleId: "developer" });
@@ -727,7 +737,17 @@ test("a queued job is started and one semantic action is durably executed", asyn
   assert.match(performed.actionId, /^action-[a-f0-9]{55}$/);
   assert.equal(performed.expectedWorkspaceRevision, REVISION_A);
   assert.equal(events[events.indexOf("admit") - 1], "verify");
-  assert.equal(events[events.indexOf("executor.perform") - 1], "admit");
+  assert.deepEqual(
+    events.slice(
+      events.indexOf("admission-gate-enter"),
+      events.indexOf("admission-gate-exit") + 1,
+    ),
+    ["admission-gate-enter", "verify", "admit", "admission-gate-exit"],
+  );
+  assert.equal(
+    events[events.indexOf("executor.perform") - 1],
+    "admission-gate-exit",
+  );
   assert.deepEqual(Object.keys(brainCalls[0]), [
     "roleId",
     "task",
@@ -784,6 +804,140 @@ test("durable admission is the authorization cutover for one immutable action", 
     1,
   );
   assert.equal(brainCalls.length, 1);
+});
+
+test("configuration activation and action admission resolve revocation races", async (t) => {
+  function preparedJob(actionId) {
+    const action = {
+      type: "list_files",
+      actionId,
+      expectedWorkspaceRevision: REVISION_A,
+      path: "",
+    };
+    return job({
+      status: "active",
+      revision: 3,
+      execution: {
+        sessionId: job().jobId,
+        workspaceRevision: REVISION_A,
+        turn: 0,
+        pendingAction: {
+          turn: 1,
+          actionId,
+          actionDigest: digestValue(action),
+          action,
+          preparedAt: "2026-08-01T00:00:01.000Z",
+        },
+        actionAdmission: null,
+        observations: [],
+        result: null,
+        pause: null,
+      },
+    });
+  }
+
+  function activeVerifier(activeVersion, events) {
+    return {
+      async verify(value) {
+        events.push(`verify-v${activeVersion()}`);
+        if (activeVersion() !== 1) {
+          throw Object.assign(new Error("configuration authority changed"), {
+            code: "INVALID_CODE_JOB_AUTHORITY",
+          });
+        }
+        return structuredClone(value);
+      },
+    };
+  }
+
+  await t.test("activation first fences the waiting action", async () => {
+    const gate = new ActionAdmissionGate();
+    const activationEntered = deferred();
+    const releaseActivation = deferred();
+    let activeVersion = 1;
+    const activation = gate.run(async () => {
+      activationEntered.resolve();
+      await releaseActivation.promise;
+      activeVersion = 2;
+    });
+    await activationEntered.promise;
+
+    const events = [];
+    const initial = preparedJob("activation-first-action");
+    const store = new FakeJobStore([initial], events);
+    const executor = new FakeExecutor(initial, events);
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([]),
+      grantVerifier: activeVerifier(() => activeVersion, events),
+      actionAdmissionGate: gate,
+    });
+    const cycle = worker.runCycle();
+
+    await Promise.resolve();
+    assert.equal(events.includes("admit"), false);
+    releaseActivation.resolve();
+    await activation;
+    const result = await cycle;
+
+    assert.equal(result.outcomes[0].status, "fenced");
+    assert.equal(result.outcomes[0].code, "INVALID_CODE_JOB_AUTHORITY");
+    assert.equal(events.includes("admit"), false);
+    assert.equal(events.includes("executor.perform"), false);
+  });
+
+  await t.test("admission first preserves only its immutable action", async () => {
+    const gate = new ActionAdmissionGate();
+    let activeVersion = 1;
+    const events = [];
+    const initial = preparedJob("admission-first-action");
+    const store = new FakeJobStore([initial], events);
+    const executor = new FakeExecutor(initial, events);
+    const admissionPersisted = deferred();
+    const releaseAdmission = deferred();
+    store.afterAdmit = async () => {
+      admissionPersisted.resolve();
+      await releaseAdmission.promise;
+    };
+    const performEntered = deferred();
+    const releasePerform = deferred();
+    const perform = executor.perform.bind(executor);
+    executor.perform = async (...args) => {
+      performEntered.resolve();
+      await releasePerform.promise;
+      return perform(...args);
+    };
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([]),
+      grantVerifier: activeVerifier(() => activeVersion, events),
+      actionAdmissionGate: gate,
+    });
+    const cycle = worker.runCycle();
+    await admissionPersisted.promise;
+    const activation = gate.run(() => {
+      activeVersion = 2;
+    });
+
+    await Promise.resolve();
+    assert.equal(activeVersion, 1);
+    releaseAdmission.resolve();
+    await performEntered.promise;
+    await activation;
+    assert.equal(activeVersion, 2);
+    releasePerform.resolve();
+    const first = await cycle;
+    const second = await worker.runCycle();
+
+    assert.equal(first.outcomes[0].actionType, "list_files");
+    assert.equal(second.outcomes[0].status, "fenced");
+    assert.equal(
+      executor.calls.filter(({ method }) => method === "perform").length,
+      1,
+    );
+  });
 });
 
 test("pause during admitted session start waits for start reconciliation", async () => {

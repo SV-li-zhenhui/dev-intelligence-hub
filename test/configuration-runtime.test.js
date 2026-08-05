@@ -123,6 +123,53 @@ test("an existing active version ignores later bootstrap content without reading
   await restarted.close();
 });
 
+test("activation runs through the supplied shared action-admission gate", async () => {
+  const events = [];
+  const runtime = await createConfigurationRuntime(configuration(), {
+    store: memoryStore(),
+    fallbackConfiguration: createSafeDisabledConfiguration(configuration()),
+    actionAdmissionGate: {
+      async run(operation) {
+        events.push("gate-enter");
+        const result = await operation();
+        events.push("gate-exit");
+        return result;
+      },
+    },
+    createGuard: () => guard([]),
+  });
+  const snapshot = await runtime.reader.readSnapshot();
+  const next = configuration();
+  next.refreshMinutes += 1;
+  const draft = await runtime.draftManager.createDraft({
+    configuration: next,
+    expectedStateRevision: snapshot.revision,
+    proposedBy: "owner:local",
+  });
+  const prepared = await runtime.simulator.prepareDraftActivation({
+    draftId: draft.draftId,
+    draftRevision: draft.revision,
+    expectedStateRevision: snapshot.revision + 1,
+    expectedActiveVersion: snapshot.activeVersion,
+  });
+
+  const activated = await runtime.activationExecutor.activateDraft({
+    draftId: prepared.draftId,
+    draftRevision: prepared.draftRevision,
+    expectedStateRevision: prepared.expectedStateRevision,
+    expectedActiveVersion: prepared.expectedActiveVersion,
+    draftRevisionId: prepared.draftRevisionId,
+    documentDigest: prepared.documentDigest,
+    validationDigest: prepared.validationDigest,
+    impactDigest: prepared.impactDigest,
+    activatedBy: "owner:local",
+  });
+
+  assert.equal(activated.active.version, 2);
+  assert.deepEqual(events, ["gate-enter", "gate-exit"]);
+  await runtime.close();
+});
+
 test("an invalid first import starts from a non-persisted safe fallback", async () => {
   const events = [];
   const store = memoryStore();
