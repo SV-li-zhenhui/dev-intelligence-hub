@@ -69,10 +69,29 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
   const time = waitCondition.properties.condition.oneOf.find(
     ({ properties }) => properties.kind.const === "time",
   );
+  const proposalVariants = intentVariants.filter(({ properties }) =>
+    ["propose_github_review", "propose_code_action"].includes(
+      properties.type.const,
+    ),
+  );
   assert.equal(new RegExp(choiceId.pattern).test("more_details"), false);
   assert.equal(new RegExp(choiceId.pattern).test("more-details"), true);
   assert.equal(workflowFact.properties.oneOf.uniqueItems, true);
   assert.equal(time.properties.notBefore.format, "date-time");
+  for (const proposal of proposalVariants) {
+    assert.equal(proposal.required.includes("deliverableId"), false);
+    assert.equal(
+      new RegExp(proposal.properties.deliverableId.pattern).test(
+        "implementation.secondary",
+      ),
+      true,
+    );
+    assert.match(
+      proposal.properties.deliverableId.description,
+      /multiple compatible expected deliverables/i,
+    );
+    assert.equal(Object.hasOwn(proposal.properties, "dispatchIntentId"), false);
+  }
   assert.equal(
     WORK_DECISION_JSON_SCHEMA.properties.summary.maxLength,
     1_024,

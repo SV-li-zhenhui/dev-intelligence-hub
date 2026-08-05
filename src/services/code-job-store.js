@@ -1390,6 +1390,84 @@ function normalizeListOptions(value = {}) {
   };
 }
 
+function optionalAbortSignal(value, error) {
+  if (value === undefined) return null;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    typeof value.aborted !== "boolean" ||
+    typeof value.addEventListener !== "function" ||
+    typeof value.removeEventListener !== "function" ||
+    typeof value.throwIfAborted !== "function"
+  ) {
+    throw error;
+  }
+  return value;
+}
+
+function normalizeDeliveryEvidenceReadOptions(value) {
+  const error = storeError("INVALID_CODE_JOB_QUERY", "代码任务证据查询无效");
+  assertExactKeys(
+    value,
+    Object.hasOwn(value ?? {}, "signal")
+      ? ["jobId", "signal"]
+      : ["jobId"],
+    error,
+  );
+  return {
+    jobId: normalizeJobId(value.jobId, error),
+    signal: optionalAbortSignal(value.signal, error),
+  };
+}
+
+function checkAbort(signal) {
+  signal?.throwIfAborted();
+}
+
+function abortReason(signal) {
+  try {
+    signal.throwIfAborted();
+  } catch (error) {
+    return error;
+  }
+  return new DOMException("The operation was aborted", "AbortError");
+}
+
+function abortableRead(operation, signal) {
+  if (signal === null) return Promise.resolve(operation);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (handler, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      handler(value);
+    };
+    const onAbort = () => finish(reject, abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
+function readStoreValue(store, key, fallback, signal) {
+  checkAbort(signal);
+  let operation;
+  try {
+    operation = store.read(
+      key,
+      fallback,
+      signal === null ? undefined : { signal },
+    );
+  } catch (error) {
+    operation = Promise.reject(error);
+  }
+  return abortableRead(operation, signal);
+}
+
 function detailCursorStale() {
   return storeError(
     "CODE_JOB_DETAIL_CURSOR_STALE",
@@ -3610,6 +3688,36 @@ export class CodeJobStore {
     });
   }
 
+  async readDeliveryEvidence(value) {
+    const { jobId, signal } = normalizeDeliveryEvidenceReadOptions(value);
+    this.#assertReady();
+    checkAbort(signal);
+    const state = this.state;
+    const archiveManifestLookup = this.archiveManifestLookup;
+    const live = state.jobs.find((candidate) => candidate.jobId === jobId);
+    if (live !== undefined) {
+      const projection = cloneCodeJobValue({
+        job: projectCodeJobForBrowser(live),
+        archived: false,
+        changePackage: liveChangePackageProjection(state, jobId),
+      });
+      checkAbort(signal);
+      return projection;
+    }
+    const archived = await this.#readArchivedByJobId(state, jobId, {
+      signal,
+      archiveManifestLookup,
+    });
+    checkAbort(signal);
+    return archived === null
+      ? null
+      : cloneCodeJobValue({
+          job: projectArchivedCodeJobForBrowser(archived),
+          archived: true,
+          changePackage: archivedChangePackageProjection(archived),
+        });
+  }
+
   get(value) {
     const jobId = normalizeJobId(value);
     return this.#query(async () => {
@@ -4093,8 +4201,8 @@ export class CodeJobStore {
     return found;
   }
 
-  async #readArchivedByJobId(state, jobId) {
-    return this.#readArchivedIndex(state, "job", jobId);
+  async #readArchivedByJobId(state, jobId, options = {}) {
+    return this.#readArchivedIndex(state, "job", jobId, options);
   }
 
   async #validateArchiveArtifacts(state) {
@@ -4149,20 +4257,30 @@ export class CodeJobStore {
     }
   }
 
-  async #readArchivedIndex(state, kind, bindingValue) {
+  async #readArchivedIndex(
+    state,
+    kind,
+    bindingValue,
+    { signal = null, archiveManifestLookup = this.archiveManifestLookup } = {},
+  ) {
     try {
+      checkAbort(signal);
       const bindingDigest = archiveBindingDigest(kind, bindingValue);
-      const manifest = this.archiveManifestLookup[kind].get(bindingDigest);
+      const manifest = archiveManifestLookup[kind].get(bindingDigest);
       if (manifest === undefined) return null;
-      const rawIndex = await this.store.read(
+      const rawIndex = await readStoreValue(
+        this.store,
         archiveIndexKey(kind, bindingValue),
         null,
+        signal,
       );
       if (rawIndex === null) throw corruptedArchive();
       const index = normalizeArchiveIndex(rawIndex, kind, bindingValue);
-      const rawTombstone = await this.store.read(
+      const rawTombstone = await readStoreValue(
+        this.store,
         archiveRecordKey(index.jobId),
         null,
+        signal,
       );
       if (rawTombstone === null) throw corruptedArchive();
       const tombstone = normalizeArchiveTombstone(rawTombstone);
@@ -4177,8 +4295,10 @@ export class CodeJobStore {
       ) {
         throw corruptedArchive();
       }
+      checkAbort(signal);
       return tombstone;
     } catch (error) {
+      if (signal?.aborted) throw error;
       if (error?.code === "CODE_JOB_ARCHIVE_CORRUPTED") {
         this.ready = false;
         throw error;

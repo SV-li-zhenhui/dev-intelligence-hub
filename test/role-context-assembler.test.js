@@ -5,12 +5,23 @@ import {
   RoleContextAssembler,
   RoleContextAssemblerError,
 } from "../src/services/role-context-assembler.js";
+import { deliveryAcceptanceContractDigest } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
 
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
 const DIGEST_C = "c".repeat(64);
 const DIGEST_D = "d".repeat(64);
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function contract(revision, deliverables) {
   return {
@@ -347,6 +358,9 @@ async function assemble(fixture, options = {}) {
   const assembler = new RoleContextAssembler({
     graphReader: reader(fixture.snapshot),
     ...(options.factSource ? { factSource: options.factSource } : {}),
+    ...(options.evidenceCatalog
+      ? { evidenceCatalog: options.evidenceCatalog }
+      : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -579,6 +593,229 @@ test("classifies PR source and fresh facts as code while keeping requirements pr
     ],
   );
   assert.equal(factCalls.every(({ item }) => Object.keys(item).join() === "event"), true);
+});
+
+test("projects bounded authoritative evidence for the exact current role and contract", async () => {
+  const fixture = graphFixture();
+  const currentTask = fixture.snapshot.graph.tasks.find(
+    ({ taskId }) => taskId === "task-current",
+  );
+  const deliverables = [
+    expected("verification", "test-report"),
+    expected("requirements", "requirement-spec"),
+    expected("implementation", "change-package"),
+    expected("secondary-change", "change-package", false),
+  ];
+  currentTask.acceptanceContracts = [
+    contract(1, deliverables),
+    contract(2, deliverables),
+    contract(3, deliverables),
+  ];
+  const currentContract = currentTask.acceptanceContracts.at(-1);
+  const catalogCalls = [];
+  const sourceRecords = [
+    {
+      deliverableId: "verification",
+      evidence: evidence("test-report", "code-job-authoritative", DIGEST_B),
+    },
+    {
+      deliverableId: "implementation",
+      evidence: evidence(
+        "change-package",
+        "change-package-authoritative",
+        DIGEST_A,
+      ),
+    },
+  ];
+
+  const packet = await assemble(fixture, {
+    evidenceCatalog: {
+      async listForTask(value) {
+        catalogCalls.push(structuredClone(value));
+        return sourceRecords;
+      },
+    },
+  });
+
+  assert.deepEqual(catalogCalls, [
+    {
+      taskId: "task-current",
+      roleId: "developer",
+      contractRevision: 3,
+      contractDigest: deliveryAcceptanceContractDigest(currentContract),
+      kinds: ["change-package", "test-report"],
+      limit: 20,
+    },
+  ]);
+  assert.deepEqual(packet.context.code.authoritativeEvidence, sourceRecords);
+  assert.equal(
+    Object.isFrozen(packet.context.code.authoritativeEvidence),
+    true,
+  );
+  assert.equal(
+    packet.context.code.authoritativeEvidence.every(Object.isFrozen),
+    true,
+  );
+
+  sourceRecords[0].evidence.referenceId = "caller-mutated-reference";
+  sourceRecords.push({
+    deliverableId: "verification",
+    evidence: evidence("test-report", "caller-added", DIGEST_C),
+  });
+  assert.deepEqual(packet.context.code.authoritativeEvidence, [
+    {
+      deliverableId: "verification",
+      evidence: evidence("test-report", "code-job-authoritative", DIGEST_B),
+    },
+    {
+      deliverableId: "implementation",
+      evidence: evidence(
+        "change-package",
+        "change-package-authoritative",
+        DIGEST_A,
+      ),
+    },
+  ]);
+});
+
+test("passes the caller abort signal to the authoritative evidence catalog", async () => {
+  const fixture = graphFixture();
+  const controller = new AbortController();
+  let catalogSignal;
+  const assembler = new RoleContextAssembler({
+    graphReader: reader(fixture.snapshot),
+    evidenceCatalog: {
+      async listForTask({ signal }) {
+        catalogSignal = signal;
+        return [];
+      },
+    },
+  });
+
+  await assembler.assemble({
+    roleId: "developer",
+    item: fixture.item,
+    trigger: "employee:developer",
+    signal: controller.signal,
+  });
+
+  assert.equal(catalogSignal, controller.signal);
+  assert.equal(catalogSignal.aborted, false);
+});
+
+test("caller cancellation stops a hanging graph snapshot read", async () => {
+  const fixture = graphFixture();
+  const controller = new AbortController();
+  const started = deferred();
+  let graphSignal;
+  const assembler = new RoleContextAssembler({
+    graphReader: {
+      async getSnapshot({ signal } = {}) {
+        graphSignal = signal;
+        started.resolve();
+        return new Promise((resolve, reject) => {
+          if (signal.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => reject(signal.reason),
+            { once: true },
+          );
+        });
+      },
+    },
+  });
+  const operation = assembler.assemble({
+    roleId: "developer",
+    item: fixture.item,
+    trigger: "employee:developer",
+    signal: controller.signal,
+  });
+  await started.promise;
+  const reason = new DOMException("graph read timed out", "AbortError");
+
+  controller.abort(reason);
+
+  await assert.rejects(operation, (error) => error === reason);
+  assert.equal(graphSignal, controller.signal);
+  assert.equal(graphSignal.aborted, true);
+});
+
+test("caller cancellation stops a hanging fact read", async () => {
+  const fixture = graphFixture();
+  const controller = new AbortController();
+  const started = deferred();
+  let factSignal;
+  const assembler = new RoleContextAssembler({
+    graphReader: reader(fixture.snapshot),
+    factSource: {
+      async read(_request, { signal } = {}) {
+        factSignal = signal;
+        started.resolve();
+        return new Promise((resolve, reject) => {
+          if (signal.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => reject(signal.reason),
+            { once: true },
+          );
+        });
+      },
+    },
+  });
+  const operation = assembler.assemble({
+    roleId: "developer",
+    item: fixture.item,
+    trigger: "employee:developer",
+    signal: controller.signal,
+  });
+  await started.promise;
+  const reason = new DOMException("fact read timed out", "AbortError");
+
+  controller.abort(reason);
+
+  await assert.rejects(operation, (error) => error === reason);
+  assert.equal(factSignal, controller.signal);
+  assert.equal(factSignal.aborted, true);
+});
+
+test("fails closed when authoritative evidence cannot be read or exceeds its bound", async () => {
+  const sourceFailure = new Error("evidence registry unavailable");
+  await assert.rejects(
+    assemble(graphFixture(), {
+      evidenceCatalog: {
+        async listForTask() {
+          throw sourceFailure;
+        },
+      },
+    }),
+    (error) =>
+      error instanceof RoleContextAssemblerError &&
+      error.code === "ROLE_CONTEXT_EVIDENCE_UNAVAILABLE" &&
+      error.statusCode === 503 &&
+      error.cause === sourceFailure,
+  );
+
+  await assert.rejects(
+    assemble(graphFixture(), {
+      evidenceCatalog: {
+        async listForTask() {
+          return Array.from({ length: 21 }, (_, index) =>
+            evidence("change-package", `package-${index}`, DIGEST_A)
+          );
+        },
+      },
+    }),
+    (error) =>
+      error instanceof RoleContextAssemblerError &&
+      error.code === "ROLE_CONTEXT_EVIDENCE_INVALID" &&
+      error.statusCode === 503,
+  );
 });
 
 test("places fresh non-PR facts in requirements and omits an otherwise empty code class", async () => {
@@ -1510,6 +1747,7 @@ test("constructor rejects accessor ports without invoking them", () => {
   for (const [portName, method] of [
     ["graphReader", "getSnapshot"],
     ["factSource", "read"],
+    ["evidenceCatalog", "listForTask"],
   ]) {
     let getterCalls = 0;
     const accessorPort = {};
@@ -1524,6 +1762,9 @@ test("constructor rejects accessor ports without invoking them", () => {
       graphReader: reader(graphFixture().snapshot),
       ...(portName === "factSource" ? { factSource: accessorPort } : {}),
       ...(portName === "graphReader" ? { graphReader: accessorPort } : {}),
+      ...(portName === "evidenceCatalog"
+        ? { evidenceCatalog: accessorPort }
+        : {}),
     };
 
     assert.throws(

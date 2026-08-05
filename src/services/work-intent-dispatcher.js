@@ -4,6 +4,7 @@ import {
   normalizeBoundWorkIntent,
   normalizeWorkIntentDispatchBinding,
 } from "../domain/work-intent-dispatch-binding.js";
+import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 
 const MAX_DISPATCH_BATCH = 100;
@@ -359,6 +360,52 @@ function requestedBy(value) {
     );
   }
   return { roleId, workerId };
+}
+
+function publicAcceptanceContract(contract) {
+  return {
+    revision: contract.revision,
+    acceptanceCriteria: contract.acceptanceCriteria.map(
+      ({ criterionId, description }) => ({ criterionId, description }),
+    ),
+    expectedDeliverables: contract.expectedDeliverables.map(
+      ({ deliverableId, kind, description, required }) => ({
+        deliverableId,
+        kind,
+        description,
+        required,
+      }),
+    ),
+  };
+}
+
+function evidenceTargetFor(item, requester, intent) {
+  if (![
+    "propose_github_review",
+    "propose_code_action",
+  ].includes(intent.type)) {
+    return null;
+  }
+  const contract = item?.graph?.acceptanceContracts?.at(-1);
+  if (
+    contract === undefined ||
+    contract.expectedDeliverables?.length === 0 ||
+    typeof item.graph?.parentItemId !== "string" ||
+    item.currentTarget?.type !== "role" ||
+    item.currentTarget.id !== requester.roleId
+  ) {
+    return null;
+  }
+  const proposal = intent.type === "propose_code_action"
+    ? { kind: "code_action_proposal", operation: intent.operation }
+    : { kind: "github_review_proposal" };
+  return createProposalDeliveryEvidenceTarget({
+    taskId: item.itemId,
+    roleId: requester.roleId,
+    acceptanceContract: publicAcceptanceContract(contract),
+    proposal,
+    deliverableId: intent.deliverableId,
+  });
 }
 
 function validateBoundIntent(bound, item, intent, requester) {
@@ -826,12 +873,18 @@ export class WorkIntentDispatcher {
       const bindingPlan = await this.#admitAction(() => {
         let plannedBound;
         try {
+          const evidenceTarget = evidenceTargetFor(
+            item,
+            requester,
+            claimed.intent,
+          );
           const rawBound = this.#bind({
             context: {
               assignmentId: item.assignmentId,
               workItemId: item.itemId,
               roleId: requester.roleId,
               event: item.event,
+              ...(evidenceTarget === null ? {} : { evidenceTarget }),
             },
             intent: claimed.intent,
           });

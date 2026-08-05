@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 
+import { normalizeDeliveryEvidenceTarget } from "./delivery-evidence-contract.js";
+
 const INVALID_TEXT_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_REFERENCE = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,190}[A-Za-z0-9])?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const RESULT_ID = /^work-proposal-result-[a-f0-9]{64}$/;
+const DISPATCH_INTENT_ID = /^work-dispatch-intent-[a-f0-9]{64}$/;
 const MAX_PROPOSAL_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 16 * 1024;
 const MAX_CANONICAL_ENTRIES = 5_000;
@@ -247,6 +250,41 @@ export function normalizeWorkProposalDigest(value, error = invalid()) {
     pattern: SHA256,
     error,
   });
+}
+
+export function assertWorkProposalAuthorityBinding(
+  proposal,
+  binding,
+  error = invalid("工作提案权威绑定无效"),
+) {
+  const requestedBy = normalizeRequestedBy(proposal?.requestedBy, error);
+  workProposalDataEntries(binding, error);
+  if (Object.hasOwn(binding, "dispatchIntentId")) {
+    boundedWorkProposalText(
+      binding.dispatchIntentId,
+      "binding.dispatchIntentId",
+      {
+        maximumBytes: 128,
+        pattern: DISPATCH_INTENT_ID,
+        error,
+      },
+    );
+  }
+  if (!Object.hasOwn(binding, "evidenceTarget")) return null;
+
+  let target;
+  try {
+    target = normalizeDeliveryEvidenceTarget(binding.evidenceTarget);
+  } catch {
+    throw error;
+  }
+  if (
+    target.taskId !== requestedBy.workItemId ||
+    target.roleId !== requestedBy.roleId
+  ) {
+    throw error;
+  }
+  return target;
 }
 
 export function normalizeWorkProposalTimestamp(value, error = invalid()) {

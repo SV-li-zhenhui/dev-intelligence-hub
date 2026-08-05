@@ -169,16 +169,29 @@ test("runtime owns one guard and exposes only least-authority frozen ports", asy
     },
   });
 
-  assert.deepEqual(Object.keys(runtime).sort(), ["close", "consumer", "producer", "runners"]);
+  assert.deepEqual(Object.keys(runtime).sort(), [
+    "close",
+    "consumer",
+    "evidenceReader",
+    "producer",
+    "runners",
+  ]);
   assert.deepEqual(Object.keys(runtime.producer), ["create"]);
   assert.deepEqual(Object.keys(runtime.runners).sort(), ["code-runner", "github-runner"]);
   assert.deepEqual(Object.keys(runtime.runners["github-runner"]).sort(), ["advance", "claim"]);
   assert.deepEqual(Object.keys(runtime.consumer), ["readResultBatch"]);
+  assert.deepEqual(Object.keys(runtime.evidenceReader).sort(), [
+    "getProposalForEvidence",
+    "getResult",
+    "getResultForProposal",
+    "listEvidenceCandidates",
+  ]);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.producer), true);
   assert.equal(Object.isFrozen(runtime.runners), true);
   assert.equal(Object.isFrozen(runtime.runners["github-runner"]), true);
   assert.equal(Object.isFrozen(runtime.consumer), true);
+  assert.equal(Object.isFrozen(runtime.evidenceReader), true);
   assert.equal(guard.options.name, "mydashboard-work-proposal-v1");
 
   assert.equal((await runtime.producer.create(proposal())).status, "pending_delivery");

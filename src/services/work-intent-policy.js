@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+
+import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
   normalizeStoredWorkflowEvent,
   normalizeWorkflowEvent,
@@ -194,17 +196,57 @@ function stable(value) {
 }
 
 function normalizeContext(value) {
-  const entries = exact(value, ["assignmentId", "workItemId", "roleId", "event"]);
+  const entries = exact(
+    value,
+    Object.hasOwn(value ?? {}, "evidenceTarget")
+      ? ["assignmentId", "workItemId", "roleId", "event", "evidenceTarget"]
+      : ["assignmentId", "workItemId", "roleId", "event"],
+  );
   const suppliedEvent = entries.get("event");
   const event =
     suppliedEvent && typeof suppliedEvent === "object" && Object.hasOwn(suppliedEvent, "eventId")
       ? normalizeStoredWorkflowEvent(suppliedEvent)
       : normalizeWorkflowEvent(suppliedEvent);
-  return {
+  const context = {
     assignmentId: boundedId(entries.get("assignmentId"), "assignmentId"),
     workItemId: boundedId(entries.get("workItemId"), "workItemId"),
     roleId: safeId(entries.get("roleId"), "roleId"),
     event,
+  };
+  if (entries.has("evidenceTarget")) {
+    try {
+      context.evidenceTarget = normalizeDeliveryEvidenceTarget(
+        entries.get("evidenceTarget"),
+      );
+    } catch {
+      contextError("evidenceTarget 无效");
+    }
+  }
+  return context;
+}
+
+function proposalAuthorityBinding(context, intent) {
+  const target = context.evidenceTarget;
+  if (
+    target !== undefined &&
+    (target.taskId !== context.workItemId || target.roleId !== context.roleId)
+  ) {
+    contextError("evidenceTarget 与工作上下文不匹配");
+  }
+  if (
+    target !== undefined &&
+    intent.deliverableId !== undefined &&
+    target.deliverables[0].deliverableId !== intent.deliverableId
+  ) {
+    contextError("evidenceTarget 与 deliverableId 不匹配");
+  }
+  return {
+    ...(target === undefined
+      ? {}
+      : { evidenceTarget: structuredClone(target) }),
+    ...(intent.dispatchIntentId === undefined
+      ? {}
+      : { dispatchIntentId: intent.dispatchIntentId }),
   };
 }
 
@@ -309,6 +351,7 @@ export function createWorkIntentPolicy({
           repository: context.event.subject.repository,
           pullRequestNumber: context.event.subject.number,
           headRefOid,
+          ...proposalAuthorityBinding(context, intent),
         },
         {
           verdict: intent.verdict,
@@ -331,7 +374,12 @@ export function createWorkIntentPolicy({
         context,
         version,
         "code_action_proposal",
-        { ...eventBinding(context.event), repository, workspaceId },
+        {
+          ...eventBinding(context.event),
+          repository,
+          workspaceId,
+          ...proposalAuthorityBinding(context, intent),
+        },
         {
           operation: intent.operation,
           objective: intent.objective,

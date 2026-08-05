@@ -221,12 +221,13 @@ async function readyStore({
     },
   },
   changePackageReader = null,
+  operationQueue = new OperationQueue(),
 } = {}) {
   const exclusiveLease = new ExclusiveLease();
   const jobs = new CodeJobStore({
     store,
     exclusiveLease,
-    operationQueue: new OperationQueue(),
+    operationQueue,
     clock: time.clock,
     memoryReceiptVerifier,
     changePackageReader,
@@ -2829,6 +2830,99 @@ test("job detail reports authoritative pending, ready, and archived package deli
   assert.equal(archived.terminalDetail, null);
   assert.deepEqual(archived.changePackage, ready.changePackage);
   assert.deepEqual(archived.job.evidence, fixture.completed.job.grant.evidence);
+});
+
+test("delivery evidence exact reads survive compaction and abort archive I/O without entering the mutation queue", async () => {
+  const queued = new OperationQueue();
+  const operationQueue = {
+    count: 0,
+    enqueue(operation) {
+      this.count += 1;
+      return queued.enqueue(operation);
+    },
+  };
+  let manifest = null;
+  const changePackageReader = {
+    async get() {
+      return structuredClone(manifest);
+    },
+  };
+  const fixture = await completedDeliveryFixture({
+    operationQueue,
+    changePackageReader,
+  });
+  const [delivery] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })
+  ).items;
+  manifest = changePackageForEvent(delivery);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(delivery, manifest),
+  );
+  const memoryEvents = await fixture.jobs.readMemoryProjectionBatch({ limit: 20 });
+  for (const event of memoryEvents.items) {
+    await fixture.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  }
+
+  const countBeforeLiveRead = operationQueue.count;
+  const live = await fixture.jobs.readDeliveryEvidence({
+    jobId: fixture.completed.job.jobId,
+  });
+  assert.equal(operationQueue.count, countBeforeLiveRead);
+  assert.equal(live.archived, false);
+  assert.equal(live.job.status, "completed");
+  assert.match(live.job.memoryProjection.recordId, /^memory-[a-f0-9]{64}$/);
+  assert.equal(live.changePackage.status, "ready");
+
+  await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "delivery-evidence-exact-archive",
+      targetThroughSequence: fixture.completed.job.sequence,
+    }),
+  );
+  const countBeforeArchiveRead = operationQueue.count;
+  const archived = await fixture.jobs.readDeliveryEvidence({
+    jobId: fixture.completed.job.jobId,
+  });
+  assert.equal(operationQueue.count, countBeforeArchiveRead);
+  assert.equal(archived.archived, true);
+  assert.deepEqual(archived.job, live.job);
+  assert.deepEqual(archived.changePackage, live.changePackage);
+
+  const recovered = await readyStore({
+    store: fixture.store,
+    changePackageReader,
+  });
+  assert.deepEqual(
+    await recovered.jobs.readDeliveryEvidence({
+      jobId: fixture.completed.job.jobId,
+    }),
+    archived,
+  );
+
+  const originalRead = fixture.store.read.bind(fixture.store);
+  let receivedSignal = null;
+  fixture.store.read = async (name, fallback, options) => {
+    if (name.includes("code-job-tombstone-index")) {
+      receivedSignal = options?.signal ?? null;
+      return new Promise(() => {});
+    }
+    return originalRead(name, fallback, options);
+  };
+  const controller = new AbortController();
+  const pending = fixture.jobs.readDeliveryEvidence({
+    jobId: fixture.completed.job.jobId,
+    signal: controller.signal,
+  });
+  controller.abort();
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+  assert.equal(receivedSignal, controller.signal);
+  fixture.store.read = originalRead;
+  assert.deepEqual(
+    await fixture.jobs.readDeliveryEvidence({
+      jobId: fixture.completed.job.jobId,
+    }),
+    archived,
+  );
 });
 
 test("meaningful lifecycle changes append one ordered durable memory event", async () => {

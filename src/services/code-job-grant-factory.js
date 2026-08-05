@@ -6,6 +6,7 @@ import {
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import {
+  assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
   normalizeBoundWorkProposal,
   normalizeWorkProposalDigest,
@@ -280,10 +281,26 @@ function normalizeStoredProposal(value) {
   ) {
     throw invalid("代码工作提案绑定无效");
   }
-  exactRecord(
+  const binding = exactRecord(
     proposal.binding,
-    ["eventId", "subject", "repository", "workspaceId"],
+    [
+      "eventId",
+      "subject",
+      "repository",
+      "workspaceId",
+      ...(Object.hasOwn(proposal.binding, "evidenceTarget")
+        ? ["evidenceTarget"]
+        : []),
+      ...(Object.hasOwn(proposal.binding, "dispatchIntentId")
+        ? ["dispatchIntentId"]
+        : []),
+    ],
     "proposal.binding",
+  );
+  assertWorkProposalAuthorityBinding(
+    proposal,
+    binding,
+    invalid("proposal.binding 权威信息无效"),
   );
   exactRecord(
     proposal.payload,

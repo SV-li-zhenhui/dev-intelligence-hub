@@ -251,6 +251,7 @@ function systemPrompt(definition, permissions) {
     "Do not call tools, perform writes, or claim permissions outside the configured allowed intents.",
     "Every choice id and workflow fact token must use only lowercase letters, digits, and hyphens; never use underscores.",
     "For an orchestrate intent, intent.reason and intent.action.reason must be exactly identical.",
+    "For authoritative proposal delivery, propose_code_action modify produces change-package, verify produces test-report, inspect produces no authoritative evidence, and propose_github_review produces review-report or github-review. Include deliverableId whenever the current task has multiple compatible expected deliverables; omit it only for legacy/direct work or when exactly one compatible deliverable can be selected automatically.",
     `Role definition: ${JSON.stringify(definition)}.`,
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,
     `WorkDecision schema: ${JSON.stringify(WORK_DECISION_JSON_SCHEMA)}.`,

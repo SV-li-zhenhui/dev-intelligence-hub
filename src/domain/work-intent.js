@@ -6,6 +6,8 @@ import {
 
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const SAFE_DELIVERABLE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const DISPATCH_INTENT_ID = /^work-dispatch-intent-[a-f0-9]{64}$/;
 const INTENT_TYPES = new Set([
   "ask_user",
   "wait_condition",
@@ -195,6 +197,53 @@ function normalizeEvidence(value) {
   return stringList(value, "evidence", 20, 2_048);
 }
 
+function proposalKeys(entries, requiredKeys) {
+  const actual = new Set(entries.map(([key]) => key));
+  return [
+    ...requiredKeys,
+    ...["deliverableId", "dispatchIntentId"].filter((key) => actual.has(key)),
+  ];
+}
+
+function proposalAuthority(entries) {
+  return {
+    ...(entries.has("deliverableId")
+      ? {
+          deliverableId: text(
+            entries.get("deliverableId"),
+            "deliverableId",
+            128,
+          ),
+        }
+      : {}),
+    ...(entries.has("dispatchIntentId")
+      ? {
+          dispatchIntentId: text(
+            entries.get("dispatchIntentId"),
+            "dispatchIntentId",
+            128,
+          ),
+        }
+      : {}),
+  };
+}
+
+function assertProposalAuthority(authority) {
+  if (
+    authority.deliverableId !== undefined &&
+    !SAFE_DELIVERABLE_ID.test(authority.deliverableId)
+  ) {
+    invalid("deliverableId 无效");
+  }
+  if (
+    authority.dispatchIntentId !== undefined &&
+    !DISPATCH_INTENT_ID.test(authority.dispatchIntentId)
+  ) {
+    invalid("dispatchIntentId 无效");
+  }
+  return authority;
+}
+
 function orchestrationAction(value) {
   try {
     return normalizeOrchestrationIntent(value);
@@ -256,7 +305,7 @@ function normalizeIntentVariant(value) {
       };
     }
     case "propose_github_review": {
-      const keys = [
+      const keys = proposalKeys(typeEntries, [
         "schemaVersion",
         "type",
         "summary",
@@ -264,19 +313,20 @@ function normalizeIntentVariant(value) {
         "verdict",
         "body",
         "evidence",
-      ];
+      ]);
       const entries = exactObject(value, keys);
       const verdict = entries.get("verdict");
       if (!REVIEW_VERDICTS.has(verdict)) invalid("verdict 无效");
       return {
         ...common(value, keys),
+        ...assertProposalAuthority(proposalAuthority(entries)),
         verdict,
         body: text(entries.get("body"), "body", 16 * 1024),
         evidence: normalizeEvidence(entries.get("evidence")),
       };
     }
     case "propose_code_action": {
-      const keys = [
+      const keys = proposalKeys(typeEntries, [
         "schemaVersion",
         "type",
         "summary",
@@ -285,12 +335,13 @@ function normalizeIntentVariant(value) {
         "objective",
         "acceptanceCriteria",
         "evidence",
-      ];
+      ]);
       const entries = exactObject(value, keys);
       const operation = entries.get("operation");
       if (!CODE_OPERATIONS.has(operation)) invalid("operation 无效");
       return {
         ...common(value, keys),
+        ...assertProposalAuthority(proposalAuthority(entries)),
         operation,
         objective: text(entries.get("objective"), "objective", 4_096),
         acceptanceCriteria: stringList(

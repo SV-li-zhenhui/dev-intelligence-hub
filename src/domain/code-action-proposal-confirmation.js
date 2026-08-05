@@ -3,6 +3,7 @@ import { normalizeCodeJobGrant } from "./code-job-contract.js";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 import { digestValue } from "./code-executor-contract.js";
 import {
+  assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
   boundedWorkProposalText,
   normalizeBoundWorkProposal,
@@ -83,8 +84,24 @@ function normalizeProposalDetails(proposal) {
   }
   const binding = exactRecord(
     proposal.binding,
-    ["eventId", "subject", "repository", "workspaceId"],
+    [
+      "eventId",
+      "subject",
+      "repository",
+      "workspaceId",
+      ...(Object.hasOwn(proposal.binding, "evidenceTarget")
+        ? ["evidenceTarget"]
+        : []),
+      ...(Object.hasOwn(proposal.binding, "dispatchIntentId")
+        ? ["dispatchIntentId"]
+        : []),
+    ],
     "binding",
+  );
+  assertWorkProposalAuthorityBinding(
+    proposal,
+    binding,
+    invalid("binding 权威信息无效"),
   );
   const payload = exactRecord(
     proposal.payload,

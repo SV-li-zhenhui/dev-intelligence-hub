@@ -11,8 +11,17 @@ import {
   normalizeBoundWorkProposal,
   workProposalDigest,
 } from "../src/domain/work-proposal-contract.js";
+import {
+  createDeliveryEvidenceTarget,
+} from "../src/domain/delivery-evidence-contract.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
-import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
+import {
+  normalizeWorkLedgerLimits,
+  WORK_LEDGER_STATE_SCHEMA_VERSION,
+} from "../src/services/work-ledger-state.js";
+import {
+  migrateWorkGraphMemoryProjection,
+} from "../src/services/work-ledger-graph-memory.js";
 
 const STATE_KEY = "work-ledger-state";
 
@@ -1335,6 +1344,22 @@ test("stageIntent persists a complete policy-safe intent before dispatch is clai
   });
   const writesBeforeStage = fixture.store.writes.length;
 
+  await assert.rejects(
+    fixture.service.stageIntent({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      leaseId: item.leaseId,
+      actorId: "employee-pr-reviewer",
+      roleId: "pr-reviewer",
+      intent: {
+        ...reviewIntent(),
+        dispatchIntentId: `work-dispatch-intent-${"f".repeat(64)}`,
+      },
+    }),
+    (error) => error.code === "WORK_LEDGER_INTENT_INVALID",
+  );
+  assert.equal(fixture.store.writes.length, writesBeforeStage);
+
   const staged = await fixture.service.stageIntent({
     itemId: item.itemId,
     expectedRevision: item.revision,
@@ -1353,7 +1378,14 @@ test("stageIntent persists a complete policy-safe intent before dispatch is clai
     roleId: "pr-reviewer",
     workerId: "employee-pr-reviewer",
   });
-  assert.deepEqual(staged.outbox.intent, reviewIntent());
+  assert.deepEqual(staged.outbox.intent, {
+    ...reviewIntent(),
+    dispatchIntentId: staged.outbox.intent.dispatchIntentId,
+  });
+  assert.match(
+    staged.outbox.intent.dispatchIntentId,
+    /^work-dispatch-intent-[a-f0-9]{64}$/,
+  );
   assert.equal(staged.deliverySemantics, "at-least-once-idempotent");
   assert.equal(fixture.store.stored().outbox.length, 1);
   assert.equal(
@@ -2172,6 +2204,7 @@ test("a failed intent can be restaged with the same idempotency key", async () =
     roleId: "pr-reviewer",
     intent: reviewIntent(),
   });
+  const dispatchIntentId = staged.outbox.intent.dispatchIntentId;
   let dispatch = await fixture.service.claimIntent({
     intentId: staged.outbox.intentId,
     expectedRevision: staged.outbox.revision,
@@ -2214,6 +2247,7 @@ test("a failed intent can be restaged with the same idempotency key", async () =
   });
 
   assert.equal(staged.outbox.intentId, dispatch.intentId);
+  assert.equal(staged.outbox.intent.dispatchIntentId, dispatchIntentId);
   assert.equal(staged.outbox.status, "pending");
   assert.equal(staged.outbox.dispatchBinding, null);
   assert.equal(staged.outbox.attempt, 1);
@@ -2596,6 +2630,8 @@ async function prepareProposalResult(
     kind = "github_review_proposal",
     downstreamRef,
     proposalDigest,
+    authoritativeEvidence = false,
+    intentOverrides = {},
   } = {},
 ) {
   await fixture.service.intake();
@@ -2603,6 +2639,53 @@ async function prepareProposalResult(
   const codeProposal = kind === "code_action_proposal";
   const roleId = codeProposal ? "developer" : "pr-reviewer";
   const workerId = `employee-${roleId}`;
+  let evidenceTarget;
+  if (authoritativeEvidence) {
+    const acceptanceContract = {
+      revision: 1,
+      acceptanceCriteria: [],
+      expectedDeliverables: [
+        {
+          deliverableId: codeProposal ? "change-package" : "review-report",
+          kind: codeProposal ? "change-package" : "review-report",
+          description: codeProposal
+            ? "可追溯的代码变更包"
+            : "可追溯的 PR 审查报告",
+          required: true,
+        },
+      ],
+    };
+    const durable = fixture.store.stored();
+    const durableItem = durable.items.find(
+      ({ itemId }) => itemId === item.itemId,
+    );
+    durableItem.graph.acceptanceContracts = [
+      {
+        ...acceptanceContract,
+        recordedAt: durableItem.graph.acceptanceContracts[0].recordedAt,
+      },
+    ];
+    durable.graphMemoryProjection = migrateWorkGraphMemoryProjection(
+      durable.items,
+      durable.revision,
+      normalizeWorkLedgerLimits(),
+    );
+    fixture.store.replaceStored(durable);
+    fixture.service = new WorkLedgerService({
+      store: fixture.store,
+      assignmentSource: fixture.source,
+      exclusiveLease: fixture.lease,
+      clock: fixture.time.clock,
+      idFactory: incrementingIds(),
+    });
+    await fixture.service.recover();
+    item = (await fixture.service.listItems()).items[0];
+    evidenceTarget = createDeliveryEvidenceTarget({
+      taskId: item.itemId,
+      roleId,
+      acceptanceContract,
+    });
+  }
   item = await fixture.service.claim({
     itemId: item.itemId,
     expectedRevision: item.revision,
@@ -2615,10 +2698,11 @@ async function prepareProposalResult(
     leaseId: item.leaseId,
     actorId: workerId,
     roleId,
-    intent: codeProposal ? codeActionIntent() : reviewIntent(),
+    intent: codeProposal
+      ? codeActionIntent(intentOverrides)
+      : reviewIntent(intentOverrides),
   });
-  const proposal = normalizeBoundWorkProposal({
-    proposalId: `work-intent-${codeProposal ? "c".repeat(64) : "b".repeat(64)}`,
+  const proposalContent = {
     policyVersion: 1,
     kind,
     requestedBy: {
@@ -2630,8 +2714,16 @@ async function prepareProposalResult(
       eventId: staged.item.event.eventId,
     },
     binding: codeProposal
-      ? { repository: "acme/repo", workspaceId: "dashboard" }
-      : { repository: "acme/repo", pullRequestNumber: 1 },
+      ? {
+          repository: "acme/repo",
+          workspaceId: "dashboard",
+          ...(evidenceTarget === undefined ? {} : { evidenceTarget }),
+        }
+      : {
+          repository: "acme/repo",
+          pullRequestNumber: 1,
+          ...(evidenceTarget === undefined ? {} : { evidenceTarget }),
+        },
     payload: codeProposal
       ? {
           operation: "modify",
@@ -2639,13 +2731,32 @@ async function prepareProposalResult(
           acceptanceCriteria: ["回归测试通过"],
         }
       : { verdict: "approve", body: "本地审查通过。" },
+  };
+  const proposal = normalizeBoundWorkProposal({
+    proposalId: authoritativeEvidence
+      ? `work-intent-${workProposalDigest(proposalContent)}`
+      : `work-intent-${codeProposal ? "c".repeat(64) : "b".repeat(64)}`,
+    ...proposalContent,
   });
-  const claimed = await fixture.service.claimIntent({
+  let claimed = await fixture.service.claimIntent({
     intentId: staged.outbox.intentId,
     expectedRevision: staged.outbox.revision,
     dispatcherId: "work-intent-dispatcher",
     leaseDurationMs: 30_000,
   });
+  if (evidenceTarget !== undefined) {
+    claimed = await fixture.service.bindIntent({
+      intentId: claimed.intentId,
+      expectedRevision: claimed.revision,
+      itemExpectedRevision: staged.item.revision,
+      dispatcherId: "work-intent-dispatcher",
+      dispatchLeaseId: claimed.dispatchLeaseId,
+      boundIntent: {
+        intentId: proposal.proposalId,
+        ...proposalContent,
+      },
+    });
+  }
   await fixture.service.ackIntent({
     intentId: claimed.intentId,
     expectedRevision: claimed.revision,
@@ -2679,6 +2790,7 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
     fixture.store.stored().outbox[0].intentId,
     result.proposalId,
   );
+  assert.equal(fixture.store.stored().outbox[0].dispatchBinding, null);
   const batch = {
     items: [result],
     nextSequence: 1,
@@ -2709,6 +2821,146 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
   assert.equal(replayed.applied, 0);
   assert.equal(replayed.deduplicated, 1);
   assert.equal(fixture.store.writes.length, writesBeforeReplay);
+});
+
+test("authoritative proposal evidence requeues graph work with trusted result context", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture, {
+    authoritativeEvidence: true,
+  });
+  const firstOutbox = fixture.store.stored().outbox[0];
+  const waiting = (await fixture.service.listItems()).items[0];
+  const boundTarget = fixture.store.stored().outbox[0].dispatchBinding
+    .boundIntent.binding.evidenceTarget;
+  assert.deepEqual(
+    boundTarget,
+    createDeliveryEvidenceTarget({
+      taskId: waiting.itemId,
+      roleId: "pr-reviewer",
+      acceptanceContract: waiting.graph.acceptanceContracts.at(-1),
+    }),
+  );
+
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const queued = (await fixture.service.listItems()).items[0];
+
+  assert.equal(applied.applied, 1);
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.statusReason, "proposal_evidence_ready");
+  assert.equal(queued.activeIntentId, null);
+  assert.deepEqual(
+    {
+      source: queued.decisionContext.source,
+      referenceId: queued.decisionContext.referenceId,
+      outcome: queued.decisionContext.outcome,
+      value: queued.decisionContext.value,
+      observedAt: queued.decisionContext.observedAt,
+    },
+    {
+      source: "proposal",
+      referenceId: result.proposalId,
+      outcome: "succeeded",
+      value: {
+        kind: result.kind,
+        resultId: result.resultId,
+        resultDigest: result.contentDigest,
+        summary: result.summary,
+        downstreamRef: result.downstreamRef,
+      },
+      observedAt: result.at,
+    },
+  );
+  assert.match(queued.decisionContext.contentDigest, /^[a-f0-9]{64}$/);
+
+  const nextTurn = await fixture.service.claim({
+    itemId: queued.itemId,
+    expectedRevision: queued.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  assert.deepEqual(nextTurn.decisionContext, queued.decisionContext);
+  const continued = await fixture.service.stageIntent({
+    itemId: nextTurn.itemId,
+    expectedRevision: nextTurn.revision,
+    leaseId: nextTurn.leaseId,
+    actorId: "employee-pr-reviewer",
+    roleId: "pr-reviewer",
+    intent: reviewIntent(),
+  });
+  assert.notEqual(continued.outbox.intentId, firstOutbox.intentId);
+  assert.notEqual(
+    continued.outbox.intent.dispatchIntentId,
+    firstOutbox.intent.dispatchIntentId,
+  );
+});
+
+test("a successful intervening proposal starts a new retry identity", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const { staged, claimed } = await prepareClaimedReviewIntent(fixture);
+  const failedDispatchIntentId = staged.outbox.intent.dispatchIntentId;
+  const bound = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item),
+  });
+  await fixture.service.ackIntent({
+    intentId: bound.intentId,
+    expectedRevision: bound.revision,
+    dispatchLeaseId: bound.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision,
+    outcome: "failed",
+    nextStatus: "retry_wait",
+    availableAt: "2026-08-02T02:01:00.000Z",
+    actorId: "work-intent-dispatcher",
+    details: { code: "temporary-unavailable" },
+  });
+  fixture.time.advance(60_000);
+
+  const result = await prepareProposalResult(fixture, {
+    authoritativeEvidence: true,
+    intentOverrides: {
+      summary: "先提交另一份审查",
+      body: "另一份独立审查。",
+    },
+  });
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  const continued = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-reviewer",
+    roleId: "pr-reviewer",
+    intent: reviewIntent(),
+  });
+
+  assert.notEqual(
+    continued.outbox.intent.dispatchIntentId,
+    failedDispatchIntentId,
+  );
+  const historicalFailure = (await fixture.service.listOutbox()).items.find(
+    ({ intent }) => intent.dispatchIntentId === failedDispatchIntentId,
+  );
+  assert.equal(historicalFailure.status, "failed");
 });
 
 test("a bound code proposal id distinct from its staged intent completes work", async () => {

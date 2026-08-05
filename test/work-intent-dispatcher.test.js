@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
 
@@ -117,22 +119,24 @@ function waitIntent() {
   };
 }
 
-function reviewIntent() {
+function reviewIntent(overrides = {}) {
   return {
     ...common("propose_github_review"),
     verdict: "comment",
     body: "建议补一条并发回归测试。",
     evidence: ["状态更新可能丢失"],
+    ...overrides,
   };
 }
 
-function codeIntent() {
+function codeIntent(overrides = {}) {
   return {
     ...common("propose_code_action"),
     operation: "modify",
     objective: "修复并发覆盖",
     acceptanceCriteria: ["回归测试通过"],
     evidence: ["revision 未校验"],
+    ...overrides,
   };
 }
 
@@ -493,6 +497,21 @@ function fixture(pairs, options = {}) {
   return { dispatcher, ledger, attention, proposals, time };
 }
 
+function attachChildContract(pair, acceptanceContract) {
+  pair.item.graph = {
+    parentItemId: "work-item-orchestrator-root",
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      ...acceptanceContract,
+      expectedDeliverables: acceptanceContract.expectedDeliverables.map(
+        (deliverable) => ({ ...deliverable, dataClass: "code" }),
+      ),
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+}
+
 test("ask_user is content-addressed in the internal inbox before waiting_user acknowledgement", async () => {
   const pair = workPair(1, askUserIntent({ reason: "依据".repeat(600) }));
   const { dispatcher, ledger, attention } = fixture([pair]);
@@ -570,6 +589,396 @@ test("internal outcomes and durable proposals map to explicit ledger states", as
       assert.equal(Object.hasOwn(ledger.ackCalls[0], "accountId"), false);
     });
   }
+});
+
+test("proposal evidence authority is derived from the trusted graph contract", async () => {
+  const pair = workPair(6, codeIntent(), {
+    target: { type: "role", id: "developer" },
+  });
+  const acceptanceContract = {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "变更包由可信执行器生成" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "受控代码变更包",
+        required: true,
+      },
+    ],
+  };
+  pair.item.graph = {
+    parentItemId: "work-item-orchestrator-root",
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      ...acceptanceContract,
+      expectedDeliverables: acceptanceContract.expectedDeliverables.map(
+        (deliverable) => ({ ...deliverable, dataClass: "code" }),
+      ),
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  const expected = createDeliveryEvidenceTarget({
+    taskId: pair.item.itemId,
+    roleId: "developer",
+    acceptanceContract,
+  });
+  assert.deepEqual(proposals.calls[0].binding.evidenceTarget, expected);
+  assert.deepEqual(
+    ledger.bindCalls[0].boundIntent.binding.evidenceTarget,
+    expected,
+  );
+});
+
+test("proposal authority auto-selects the sole action-compatible deliverable", async () => {
+  const pair = workPair(6, codeIntent({ operation: "verify" }), {
+    target: { type: "role", id: "developer" },
+  });
+  attachChildContract(pair, {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "变更和验证均有权威证据" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "受控代码变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "受控测试报告",
+        required: true,
+      },
+    ],
+  });
+  const { dispatcher, proposals } = fixture([pair]);
+
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.deepEqual(proposals.calls[0].binding.evidenceTarget.deliverables, [
+    { deliverableId: "verification", kind: "test-report" },
+  ]);
+});
+
+test("a structured role decision reaches dispatcher action-compatible selection", async () => {
+  const acceptanceContract = {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "变更和验证均有权威证据" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "受控代码变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "受控测试报告",
+        required: true,
+      },
+    ],
+  };
+  const response = {
+    schemaVersion: 1,
+    confidence: 91,
+    summary: "运行交付验证",
+    intent: codeIntent({ operation: "verify" }),
+  };
+  const engine = new RoleDecisionEngine({
+    definition: {
+      id: "developer",
+      name: "Developer",
+      mission: "Produce verified changes",
+      enabled: true,
+    },
+    permissions: { allowedIntents: ["propose_code_action"] },
+    brain: {
+      provider: "local-brain",
+      model: "role-model",
+      remoteData: { requirements: false, code: false, memory: false },
+    },
+    brainRouter: {
+      async generate() {
+        return JSON.stringify(response);
+      },
+      describe() {
+        return {
+          provider: "local-brain",
+          model: "role-model",
+          remote: false,
+          remoteData: { requirements: false, code: false, memory: false },
+        };
+      },
+    },
+  });
+  const decision = await engine.decide({
+    context: {
+      requirements: { acceptanceContract },
+      code: { authoritativeEvidence: [] },
+    },
+  });
+  assert.equal(Object.hasOwn(decision.intent, "deliverableId"), false);
+  const pair = workPair(6, decision.intent, {
+    target: { type: "role", id: "developer" },
+  });
+  attachChildContract(pair, acceptanceContract);
+  const { dispatcher, proposals } = fixture([pair]);
+
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.deepEqual(proposals.calls[0].binding.evidenceTarget.deliverables, [
+    { deliverableId: "verification", kind: "test-report" },
+  ]);
+});
+
+test("proposal enqueue rejects action-incompatible authoritative delivery", async (t) => {
+  const acceptanceContract = {
+    revision: 4,
+    acceptanceCriteria: [
+      { criterionId: "bound", description: "动作必须生成所选交付物" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "受控代码变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "受控测试报告",
+        required: true,
+      },
+      {
+        deliverableId: "review",
+        kind: "review-report",
+        description: "已发布评审",
+        required: true,
+      },
+    ],
+  };
+  const cases = [
+    {
+      name: "modify cannot target test-report",
+      roleId: "developer",
+      intent: codeIntent({ deliverableId: "verification" }),
+    },
+    {
+      name: "verify cannot target change-package",
+      roleId: "developer",
+      intent: codeIntent({
+        operation: "verify",
+        deliverableId: "implementation",
+      }),
+    },
+    {
+      name: "review cannot target change-package",
+      roleId: "pr-reviewer",
+      intent: reviewIntent({ deliverableId: "implementation" }),
+    },
+    {
+      name: "inspect cannot create authoritative evidence",
+      roleId: "developer",
+      intent: codeIntent({ operation: "inspect" }),
+    },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.name, async () => {
+      const pair = workPair(6 + index, entry.intent, {
+        target: { type: "role", id: entry.roleId },
+      });
+      attachChildContract(pair, acceptanceContract);
+      const { dispatcher, ledger, proposals } = fixture([pair]);
+
+      const result = await dispatcher.dispatchPending();
+
+      assert.equal(result.blocked, 1);
+      assert.equal(result.items[0].code, "policy-binding-invalid");
+      assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
+      assert.equal(proposals.calls.length, 0);
+    });
+  }
+});
+
+test("duplicate-kind deliverables bind only the explicitly selected authority", async () => {
+  const dispatchIntentId = `work-dispatch-intent-${"a".repeat(64)}`;
+  const pair = workPair(
+    7,
+    codeIntent({ deliverableId: "verification", dispatchIntentId }),
+    { target: { type: "role", id: "developer" } },
+  );
+  const acceptanceContract = {
+    revision: 5,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "两个交付物均来自受控执行器" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "实现变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "change-package",
+        description: "验证变更包",
+        required: true,
+      },
+    ],
+  };
+  pair.item.graph = {
+    parentItemId: "work-item-orchestrator-root",
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      ...acceptanceContract,
+      expectedDeliverables: acceptanceContract.expectedDeliverables.map(
+        (deliverable) => ({ ...deliverable, dataClass: "code" }),
+      ),
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.deepEqual(proposals.calls[0].binding.evidenceTarget.deliverables, [
+    { deliverableId: "verification", kind: "change-package" },
+  ]);
+  assert.equal(
+    proposals.calls[0].binding.dispatchIntentId,
+    dispatchIntentId,
+  );
+  assert.equal(
+    ledger.bindCalls[0].boundIntent.binding.dispatchIntentId,
+    dispatchIntentId,
+  );
+});
+
+test("multi-deliverable authority without a selector blocks before proposal creation", async () => {
+  const pair = workPair(8, codeIntent(), {
+    target: { type: "role", id: "developer" },
+  });
+  pair.item.graph = {
+    parentItemId: "work-item-orchestrator-root",
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      revision: 2,
+      acceptanceCriteria: [
+        { criterionId: "verified", description: "交付物可独立验证" },
+      ],
+      expectedDeliverables: [
+        {
+          deliverableId: "implementation",
+          kind: "change-package",
+          description: "实现变更包",
+          required: true,
+          dataClass: "code",
+        },
+        {
+          deliverableId: "verification",
+          kind: "change-package",
+          description: "验证变更包",
+          required: true,
+          dataClass: "code",
+        },
+      ],
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.blocked, 1);
+  assert.equal(result.items[0].code, "policy-binding-invalid");
+  assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("an unknown explicit deliverable blocks authoritative proposal binding", async () => {
+  const pair = workPair(9, reviewIntent({ deliverableId: "missing-review" }), {
+    target: { type: "role", id: "pr-reviewer" },
+  });
+  pair.item.graph = {
+    parentItemId: "work-item-orchestrator-root",
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      revision: 1,
+      acceptanceCriteria: [
+        { criterionId: "reviewed", description: "Review 可复核" },
+      ],
+      expectedDeliverables: [{
+        deliverableId: "review",
+        kind: "review-report",
+        description: "Review 报告",
+        required: true,
+        dataClass: "code",
+      }],
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.blocked, 1);
+  assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("a direct-root proposal remains non-authoritative without an acceptance path", async () => {
+  const dispatchIntentId = `work-dispatch-intent-${"b".repeat(64)}`;
+  const pair = workPair(7, codeIntent({
+    deliverableId: "implementation",
+    dispatchIntentId,
+  }), {
+    target: { type: "role", id: "developer" },
+  });
+  pair.item.graph = {
+    parentItemId: null,
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      revision: 1,
+      acceptanceCriteria: [
+        { criterionId: "verified", description: "变更包已验证" },
+      ],
+      expectedDeliverables: [{
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "代码变更包",
+        required: true,
+        dataClass: "code",
+      }],
+      recordedAt: pair.item.createdAt,
+    }],
+    deliveries: [],
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(proposals.calls.length, 1);
+  assert.equal(
+    Object.hasOwn(proposals.calls[0].binding, "evidenceTarget"),
+    false,
+  );
+  assert.equal(proposals.calls[0].binding.dispatchIntentId, dispatchIntentId);
+  assert.equal(ledger.items[0].status, "waiting_external");
 });
 
 test("active dispatcher leases are skipped while an exactly expired lease is reclaimed", async () => {

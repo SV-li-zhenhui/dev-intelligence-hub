@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertWorkProposalAuthorityBinding,
   normalizeBoundWorkProposal,
   normalizeWorkProposalAdvanceRequest,
 } from "../src/domain/work-proposal-contract.js";
@@ -24,6 +25,34 @@ function boundProposal(overrides = {}) {
     ...overrides,
   };
 }
+
+test("proposal authority binding has one task, role, and dispatch validator", () => {
+  const proposal = normalizeBoundWorkProposal(boundProposal());
+  const evidenceTarget = {
+    schemaVersion: 1,
+    taskId: proposal.requestedBy.workItemId,
+    roleId: proposal.requestedBy.roleId,
+    contractRevision: 2,
+    contractDigest: "c".repeat(64),
+    deliverables: [{ deliverableId: "review", kind: "review-report" }],
+  };
+  assert.doesNotThrow(() =>
+    assertWorkProposalAuthorityBinding(proposal, {
+      evidenceTarget,
+      dispatchIntentId: `work-dispatch-intent-${"d".repeat(64)}`,
+    }),
+  );
+
+  for (const binding of [
+    { evidenceTarget: { ...evidenceTarget, roleId: "developer" } },
+    { dispatchIntentId: "work-dispatch-intent-invalid" },
+  ]) {
+    assert.throws(
+      () => assertWorkProposalAuthorityBinding(proposal, binding),
+      (error) => error.code === "INVALID_WORK_PROPOSAL",
+    );
+  }
+});
 
 test("bound proposals are canonical pure data with a stable content digest", () => {
   const first = normalizeBoundWorkProposal(boundProposal());

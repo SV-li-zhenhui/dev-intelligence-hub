@@ -22,6 +22,7 @@ import {
   workProposalError,
 } from "../domain/work-proposal-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { WorkProposalEvidenceReader } from "./work-proposal-evidence-reader.js";
 
 export const WORK_PROPOSAL_STATE_KEY = "work-proposal-state";
 
@@ -514,6 +515,8 @@ function normalizeIdFactory(value) {
 }
 
 export class WorkProposalStore {
+  #evidenceReader;
+
   constructor({
     store,
     exclusiveLease,
@@ -534,6 +537,12 @@ export class WorkProposalStore {
     this.limits = normalizeLimits(limits);
     this.state = defaultState();
     this.ready = false;
+    this.#evidenceReader = new WorkProposalEvidenceReader({
+      readState: () => {
+        this.#assertReady();
+        return this.state;
+      },
+    });
   }
 
   recover() {
@@ -810,6 +819,22 @@ export class WorkProposalStore {
         oldestAvailableSequence: this.state.results[0]?.sequence ?? null,
       };
     });
+  }
+
+  getResult(value) {
+    return this.#evidenceReader.getResult(value);
+  }
+
+  getProposalForEvidence(value) {
+    return this.#evidenceReader.getProposalForEvidence(value);
+  }
+
+  getResultForProposal(value) {
+    return this.#evidenceReader.getResultForProposal(value);
+  }
+
+  listEvidenceCandidates(value) {
+    return this.#evidenceReader.listEvidenceCandidates(value);
   }
 
   #validateTransition(item, transition, now) {

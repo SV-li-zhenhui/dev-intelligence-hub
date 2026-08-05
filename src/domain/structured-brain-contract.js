@@ -8,6 +8,13 @@ const DEFAULT_MAXIMUM_BYTES = 128 * 1024;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
 const UTF8_MAXIMUM_BYTES_PER_CHARACTER = 4;
 const SAFE_TOKEN_PATTERN = "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$";
+const SAFE_DELIVERABLE_ID_PATTERN =
+  "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$";
+const PROPOSAL_DELIVERABLE_DESCRIPTION =
+  "Select the expected deliverable this proposal will produce. " +
+  "It is required when the current task has multiple compatible expected " +
+  "deliverables; omit it only for legacy/direct work or when exactly " +
+  "one compatible deliverable can be selected automatically.";
 const ISO_TIMESTAMP_PATTERN =
   "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$";
 const VALID_TEXT_CHARACTER =
@@ -30,7 +37,7 @@ export class StructuredBrainContractError extends Error {
 
 function stringSchema(
   maximumBytes,
-  { minimum = 1, ascii = false, pattern, format } = {},
+  { minimum = 1, ascii = false, pattern, format, description } = {},
 ) {
   const maxLength = ascii
     ? maximumBytes
@@ -42,6 +49,7 @@ function stringSchema(
     pattern:
       pattern ?? (minimum === 0 ? VALID_TEXT_PATTERN : NONEMPTY_TEXT_PATTERN),
     ...(format ? { format } : {}),
+    ...(description ? { description } : {}),
   };
 }
 
@@ -54,7 +62,7 @@ function stringArraySchema(maxItems, maxLength, { minimum = 0 } = {}) {
   };
 }
 
-function intentSchema(type, fields) {
+function intentSchema(type, fields, { optional = [] } = {}) {
   const properties = {
     schemaVersion: { type: "integer", const: 1 },
     type: { type: "string", const: type },
@@ -65,7 +73,7 @@ function intentSchema(type, fields) {
   return {
     type: "object",
     additionalProperties: false,
-    required: Object.keys(properties),
+    required: Object.keys(properties).filter((key) => !optional.includes(key)),
     properties,
   };
 }
@@ -130,19 +138,29 @@ const intentVariants = [
     },
   }),
   intentSchema("propose_github_review", {
+    deliverableId: stringSchema(128, {
+      ascii: true,
+      pattern: SAFE_DELIVERABLE_ID_PATTERN,
+      description: PROPOSAL_DELIVERABLE_DESCRIPTION,
+    }),
     verdict: {
       type: "string",
       enum: ["approve", "request_changes", "comment"],
     },
     body: stringSchema(16 * 1_024),
     evidence,
-  }),
+  }, { optional: ["deliverableId"] }),
   intentSchema("propose_code_action", {
+    deliverableId: stringSchema(128, {
+      ascii: true,
+      pattern: SAFE_DELIVERABLE_ID_PATTERN,
+      description: PROPOSAL_DELIVERABLE_DESCRIPTION,
+    }),
     operation: { type: "string", enum: ["inspect", "modify", "verify"] },
     objective: stringSchema(4_096),
     acceptanceCriteria: stringArraySchema(20, 2_048, { minimum: 1 }),
     evidence,
-  }),
+  }, { optional: ["deliverableId"] }),
   intentSchema("handoff", {
     capability: {
       type: "string",

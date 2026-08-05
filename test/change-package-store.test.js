@@ -116,6 +116,13 @@ test("producer and reader ports stay separate across restart", async (t) => {
   const created = await producer.create(draft());
   assert.equal("root" in created, false);
   assert.deepEqual(await reader.get(created.packageId), created);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    reader.get(created.packageId, { signal: controller.signal }),
+    (error) => error?.name === "AbortError",
+  );
+  assert.deepEqual(await reader.get(created.packageId), created);
   assert.equal(
     (await reader.readFile({ packageId: created.packageId, path: "src/answer.js" })).toString(),
     "export const answer = 42;\n",

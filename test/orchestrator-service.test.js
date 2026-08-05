@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createRequirementSpec } from "../src/domain/requirement-spec-contract.js";
+import { deliveryAcceptanceContractDigest } from
+  "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
 import {
   OrchestratorService,
@@ -13,6 +15,14 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 const INPUT_DIGEST = "a".repeat(64);
 const CONTEXT_DIGEST = "b".repeat(64);
 const EXTERNAL_DIGEST = "c".repeat(64);
+
+function deliverableEvidence(kind = "change-package", suffix = "1") {
+  return {
+    kind,
+    referenceId: `artifact:${kind}:${suffix}`,
+    contentDigest: EXTERNAL_DIGEST,
+  };
+}
 
 function deferred() {
   let resolve;
@@ -318,7 +328,10 @@ function serviceFrom(
   });
 }
 
-function rootFixture({ submitted = false } = {}) {
+function rootFixture({
+  submitted = false,
+  externalEvidence = [deliverableEvidence()],
+} = {}) {
   const root = task({ taskId: "root", revision: 3 });
   const child = task({
     taskId: "root/child",
@@ -334,10 +347,13 @@ function rootFixture({ submitted = false } = {}) {
             contractRevision: 1,
             status: "submitted",
             summary: "实现说明",
-            evidence: [workInputEvidence({
-              taskId: "root/child",
-              responsibility: { type: "role", id: "developer" },
-            })],
+            evidence: [
+              ...externalEvidence,
+              workInputEvidence({
+                taskId: "root/child",
+                responsibility: { type: "role", id: "developer" },
+              }),
+            ],
           },
         ]
       : [],
@@ -357,6 +373,25 @@ function rootFixture({ submitted = false } = {}) {
     directChildren: [child, dependency],
   });
   return { root, child, dependency, view, item, packet };
+}
+
+function executeDeliveryDecision(fakes, fixture, type) {
+  return serviceFrom(fakes).execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: fixture.item,
+    contextPacket: fixture.packet,
+    intent: orchestrate({
+      ...commonAction(type, fixture.child, fixture.view),
+      submittedDeliveryRevision: 1,
+    }),
+  });
+}
+
+function assertNoTrustedMutation(calls) {
+  assert.equal(calls.plannerFactory.length, 0);
+  assert.equal(calls.delivererFactory.length, 0);
+  assert.equal(calls.planner.length, 0);
+  assert.equal(calls.delivery.length, 0);
 }
 
 test("maps all seven orchestration actions to the least-authority planner commands", async (t) => {
@@ -494,6 +529,7 @@ test("maps all seven orchestration actions to the least-authority planner comman
       const fakes = fakePorts({
         packet: fixture.packet,
         views: fixture.view,
+        verifier: () => true,
         plannerResult: (method, command) => ({
           applied: true,
           taskId: method === "createChild" ? "root/new-child" : command.taskId,
@@ -664,6 +700,203 @@ test("rejects stale context and unauthorized orchestration before either factory
   });
 });
 
+test("classifies context reassembly failures without hiding availability", async (t) => {
+  await t.test("preserves the service-owned context timeout", async () => {
+    const fixture = rootFixture();
+    let contextSignal;
+    const fakes = fakePorts({
+      packet(input) {
+        contextSignal = input.signal;
+        return new Promise(() => {});
+      },
+      views: fixture.view,
+    });
+    const service = new OrchestratorService({
+      ...fakes.ports,
+      evidenceVerificationTimeoutMs: 1,
+    });
+
+    await assert.rejects(
+      service.execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE" &&
+        error.statusCode === 503,
+    );
+
+    assert.equal(contextSignal instanceof AbortSignal, true);
+    assert.equal(contextSignal.aborted, true);
+    assert.equal(fakes.calls.graphReads, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+
+  await t.test("maps a producer 5xx to context unavailable", async () => {
+    const fixture = rootFixture();
+    const outage = Object.assign(new Error("evidence catalog unavailable"), {
+      code: "ROLE_CONTEXT_EVIDENCE_UNAVAILABLE",
+      statusCode: 503,
+    });
+    const fakes = fakePorts({
+      packet() {
+        throw outage;
+      },
+      views: fixture.view,
+    });
+
+    await assert.rejects(
+      serviceFrom(fakes).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_CONTEXT_UNAVAILABLE" &&
+        error.statusCode === 503 &&
+        error.cause === outage,
+    );
+
+    assert.equal(fakes.calls.graphReads, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+
+  await t.test("maps a producer binding mismatch to stale", async () => {
+    const fixture = rootFixture();
+    const mismatch = Object.assign(new Error("task revision changed"), {
+      code: "ROLE_CONTEXT_STALE",
+      statusCode: 409,
+    });
+    const fakes = fakePorts({
+      packet() {
+        throw mismatch;
+      },
+      views: fixture.view,
+    });
+
+    await assert.rejects(
+      serviceFrom(fakes).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_CONTEXT_STALE" &&
+        error.statusCode === 409 &&
+        error.cause === mismatch,
+    );
+
+    assert.equal(fakes.calls.graphReads, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+});
+
+test("an expired root lease does not constrain orchestration evidence reads", async () => {
+  const fixture = rootFixture();
+  const now = Date.parse("2026-08-03T08:00:00.000Z");
+  fixture.item.status = "working";
+  fixture.item.ownerId = "previous-orchestrator";
+  fixture.item.leaseId = "expired-root-lease";
+  fixture.item.leaseUntil = new Date(now - 1_000).toISOString();
+  const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+  const service = new OrchestratorService({
+    ...fakes.ports,
+    clock: () => new Date(now),
+  });
+
+  const result = await service.execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: fixture.item,
+    contextPacket: fixture.packet,
+    intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+  });
+
+  assert.equal(result.applied, true);
+  assert.equal(fakes.calls.assemble.length, 1);
+  assert.equal(fakes.calls.planner.length, 1);
+});
+
+test("rejects locally unbound submissions before applying lease deadlines", async (t) => {
+  const now = Date.parse("2026-08-03T08:00:00.000Z");
+
+  await t.test("root orchestrator", async () => {
+    const fixture = rootFixture();
+    fixture.item.status = "working";
+    fixture.item.ownerId = "employee-orchestrator";
+    fixture.item.leaseId = "expired-root-lease";
+    fixture.item.leaseUntil = new Date(now - 1_000).toISOString();
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+    const service = new OrchestratorService({
+      ...fakes.ports,
+      clock: () => new Date(now),
+    });
+
+    await assert.rejects(
+      service.execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: {
+          schemaVersion: 1,
+          type: "submit_delivery",
+          taskId: fixture.root.taskId,
+          expectedTaskRevision: fixture.root.revision,
+          expectedGraphRevision: fixture.view.graph.revision,
+          contractRevision: 1,
+          deliverableId: "implementation",
+          summary: "不允许的根任务交付",
+          reason: "根编排者不能提交岗位交付",
+          evidence: [],
+          artifact: null,
+        },
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_AUTHORITY_DENIED" &&
+        error.statusCode === 403,
+    );
+
+    assert.equal(fakes.calls.assemble.length, 0);
+    assert.equal(fakes.calls.graphReads, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+
+  await t.test("wrong lease owner", async () => {
+    const fixture = specialistFixture();
+    fixture.item.ownerId = "another-developer";
+    fixture.item.leaseUntil = new Date(now - 1_000).toISOString();
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+    const service = new OrchestratorService({
+      ...fakes.ports,
+      clock: () => new Date(now),
+    });
+
+    await assert.rejects(
+      service.execute({
+        worker: { roleId: "developer", workerId: "employee-developer" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: submitIntent(fixture),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_AUTHORITY_DENIED" &&
+        error.statusCode === 403,
+    );
+
+    assert.equal(fakes.calls.assemble.length, 0);
+    assert.equal(fakes.calls.graphReads, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+});
+
 function specialistFixture({
   deliverableId = "implementation",
   kind = "change-package",
@@ -707,7 +940,7 @@ function submitIntent(fixture, {
   };
 }
 
-test("submits ordinary and requirement-spec deliveries with trusted evidence and no caller verifier", async (t) => {
+test("submits ordinary and requirement-spec deliveries with trusted evidence", async (t) => {
   await t.test("ordinary delivery", async () => {
     const fixture = specialistFixture();
     const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
@@ -772,6 +1005,58 @@ test("submits ordinary and requirement-spec deliveries with trusted evidence and
     ]);
     assert.equal(command.evidence[0].contentDigest, spec.contentDigest);
   });
+});
+
+test("requires requirement-spec deliverable id and kind in both directions", async (t) => {
+  const mismatches = [
+    {
+      name: "reserved id with a non-requirement kind",
+      deliverableId: "requirement-spec",
+      kind: "change-package",
+      artifact: {
+        title: "需求规格",
+        problem: "需要验证保留交付物绑定",
+        requirements: ["交付物 ID 与 kind 必须一致"],
+        acceptanceCriteria: ["不一致绑定在执行前被拒绝"],
+        openQuestions: [],
+      },
+    },
+    {
+      name: "reserved kind with a non-requirement id",
+      deliverableId: "implementation",
+      kind: "requirement-spec",
+    },
+  ];
+
+  for (const mismatch of mismatches) {
+    await t.test(mismatch.name, async () => {
+      const fixture = specialistFixture(mismatch);
+      const fakes = fakePorts({
+        packet: fixture.packet,
+        views: fixture.view,
+        verifier: () => true,
+      });
+
+      await assert.rejects(
+        serviceFrom(fakes).execute({
+          worker: { roleId: "developer", workerId: "employee-developer" },
+          item: fixture.item,
+          contextPacket: fixture.packet,
+          intent: submitIntent(fixture, {
+            deliverableId: mismatch.deliverableId,
+            artifact: mismatch.artifact ?? null,
+          }),
+        }),
+        (error) =>
+          error instanceof OrchestratorServiceError &&
+          error.code === "ORCHESTRATOR_EVIDENCE_REJECTED" &&
+          error.statusCode === 409,
+      );
+
+      assert.equal(fakes.calls.verify.length, 0);
+      assertNoTrustedMutation(fakes.calls);
+    });
+  }
 });
 
 test("configuration-first admission performs no trusted graph mutation", async (t) => {
@@ -854,10 +1139,193 @@ test("mutation-first admission releases cutover before graph storage settles", a
   assert.equal(result.applied, true);
 });
 
+test("requires matching authoritative evidence before accepting non-requirement deliveries", async (t) => {
+  await t.test("legacy evidence-free submission cannot be accepted", async () => {
+    const fixture = rootFixture({
+      submitted: true,
+      externalEvidence: [],
+    });
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier: () => true,
+    });
+
+    await assert.rejects(
+      executeDeliveryDecision(fakes, fixture, "accept_delivery"),
+      (error) => error.code === "ORCHESTRATOR_EVIDENCE_REJECTED",
+    );
+    assert.equal(fakes.calls.verify.length, 0);
+    assert.equal(fakes.calls.plannerFactory.length, 0);
+  });
+
+  await t.test("supporting evidence cannot replace the contract evidence kind", async () => {
+    const fixture = rootFixture({
+      submitted: true,
+      externalEvidence: [deliverableEvidence("test-report")],
+    });
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier: () => true,
+    });
+
+    await assert.rejects(
+      executeDeliveryDecision(fakes, fixture, "accept_delivery"),
+      (error) => error.code === "ORCHESTRATOR_EVIDENCE_REJECTED",
+    );
+    assert.equal(fakes.calls.verify.length, 0);
+    assert.equal(fakes.calls.plannerFactory.length, 0);
+  });
+
+  await t.test("matching evidence still requires a configured verifier", async () => {
+    const fixture = rootFixture({ submitted: true });
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+
+    await assert.rejects(
+      executeDeliveryDecision(fakes, fixture, "accept_delivery"),
+      (error) =>
+        error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE",
+    );
+    assert.equal(fakes.calls.plannerFactory.length, 0);
+  });
+
+  await t.test("verified primary and supporting evidence can be accepted", async () => {
+    const primary = deliverableEvidence();
+    const supporting = deliverableEvidence("test-report");
+    const fixture = rootFixture({
+      submitted: true,
+      externalEvidence: [supporting, primary],
+    });
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier: () => true,
+    });
+
+    await executeDeliveryDecision(fakes, fixture, "accept_delivery");
+
+    assert.deepEqual(
+      fakes.calls.verify.map(({ evidence }) => evidence.kind),
+      ["change-package", "test-report"],
+    );
+    assert.equal(fakes.calls.planner.length, 1);
+  });
+
+  await t.test("returning incomplete evidence remains allowed", async () => {
+    const fixture = rootFixture({
+      submitted: true,
+      externalEvidence: [],
+    });
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+
+    const result = await executeDeliveryDecision(
+      fakes,
+      fixture,
+      "return_delivery",
+    );
+
+    assert.equal(result.action, "return_delivery");
+    assert.equal(fakes.calls.verify.length, 0);
+    assert.equal(fakes.calls.planner.length, 1);
+  });
+});
+
+test("rejects a delivery bound to a superseded acceptance contract", async () => {
+  const base = rootFixture({ submitted: true });
+  const child = {
+    ...base.child,
+    acceptanceContracts: [
+      ...base.child.acceptanceContracts,
+      { ...contract(), revision: 2 },
+    ],
+  };
+  const view = graphView(
+    [base.root, child, base.dependency],
+    base.view.graph.revision,
+  );
+  const fixture = {
+    ...base,
+    child,
+    view,
+    packet: packetFor(view, base.root, {
+      roleId: "orchestrator",
+      directChildren: [child, base.dependency],
+    }),
+  };
+  const fakes = fakePorts({
+    packet: fixture.packet,
+    views: fixture.view,
+    verifier: () => true,
+  });
+
+  await assert.rejects(
+    executeDeliveryDecision(fakes, fixture, "accept_delivery"),
+    (error) =>
+      error instanceof OrchestratorServiceError &&
+      error.code === "ORCHESTRATOR_CONTEXT_STALE" &&
+      error.statusCode === 409,
+  );
+
+  assert.equal(fakes.calls.verify.length, 0);
+  assertNoTrustedMutation(fakes.calls);
+});
+
+test("rechecks graph authority after successful evidence verification", async (t) => {
+  const changes = [
+    {
+      name: "graph revision changed",
+      currentView(fixture) {
+        return graphView(
+          [fixture.root, fixture.child, fixture.dependency],
+          fixture.view.graph.revision + 1,
+        );
+      },
+    },
+    {
+      name: "graph content digest changed",
+      currentView(fixture) {
+        return graphView(
+          [
+            { ...fixture.root, status: "in_progress" },
+            fixture.child,
+            fixture.dependency,
+          ],
+          fixture.view.graph.revision,
+        );
+      },
+    },
+  ];
+
+  for (const change of changes) {
+    await t.test(change.name, async () => {
+      const fixture = rootFixture({ submitted: true });
+      const changedView = change.currentView(fixture);
+      const fakes = fakePorts({
+        packet: fixture.packet,
+        views: [fixture.view, changedView],
+        verifier: () => true,
+      });
+
+      await assert.rejects(
+        executeDeliveryDecision(fakes, fixture, "accept_delivery"),
+        (error) =>
+          error instanceof OrchestratorServiceError &&
+          error.code === "ORCHESTRATOR_CONTEXT_STALE" &&
+          error.statusCode === 409,
+      );
+
+      assert.equal(fakes.calls.verify.length, 1);
+      assert.equal(fakes.calls.graphReads, 2);
+      assertNoTrustedMutation(fakes.calls);
+    });
+  }
+});
+
 test("fails closed on unverifiable caller evidence before obtaining a deliverer", async (t) => {
   const evidence = {
-    kind: "test-report",
-    referenceId: "artifact:test-report:1",
+    kind: "change-package",
+    referenceId: "artifact:change-package:1",
     contentDigest: EXTERNAL_DIGEST,
   };
 
@@ -891,10 +1359,133 @@ test("fails closed on unverifiable caller evidence before obtaining a deliverer"
         contextPacket: fixture.packet,
         intent: submitIntent(fixture, { evidence: [evidence] }),
       }),
-      (error) => error.code === "ORCHESTRATOR_EVIDENCE_REJECTED",
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_EVIDENCE_REJECTED" &&
+        error.statusCode === 409,
     );
     assert.equal(fakes.calls.verify.length, 1);
-    assert.equal(fakes.calls.delivererFactory.length, 0);
+    assertNoTrustedMutation(fakes.calls);
+  });
+
+  await t.test("transient verifier failure is retryable and mutation-free", async () => {
+    const fixture = specialistFixture();
+    const outage = new Error("evidence registry unavailable");
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier() {
+        throw outage;
+      },
+    });
+
+    await assert.rejects(
+      serviceFrom(fakes).execute({
+        worker: { roleId: "developer", workerId: "employee-developer" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: submitIntent(fixture, { evidence: [evidence] }),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE" &&
+        error.statusCode === 503 &&
+        error.cause === outage,
+    );
+
+    assert.equal(fakes.calls.verify.length, 1);
+    assertNoTrustedMutation(fakes.calls);
+  });
+
+  await t.test("timed-out verification cannot mutate late and can be retried", async () => {
+    const fixture = specialistFixture();
+    const lateVerification = deferred();
+    let verificationAttempts = 0;
+    let timedOutSignal;
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier(input) {
+        verificationAttempts += 1;
+        if (verificationAttempts === 1) {
+          timedOutSignal = input.signal;
+          return lateVerification.promise;
+        }
+        return true;
+      },
+    });
+    const service = new OrchestratorService({
+      ...fakes.ports,
+      evidenceVerificationTimeoutMs: 1,
+    });
+    const execute = () => service.execute({
+      worker: { roleId: "developer", workerId: "employee-developer" },
+      item: fixture.item,
+      contextPacket: fixture.packet,
+      intent: submitIntent(fixture, { evidence: [evidence] }),
+    });
+
+    await assert.rejects(
+      execute(),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE" &&
+        error.statusCode === 503,
+    );
+    assert.equal(timedOutSignal instanceof AbortSignal, true);
+    assert.equal(timedOutSignal.aborted, true);
+    assert.equal(fakes.calls.verify.length, 1);
+    assertNoTrustedMutation(fakes.calls);
+
+    lateVerification.resolve(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    assertNoTrustedMutation(fakes.calls);
+
+    const result = await execute();
+
+    assert.equal(result.applied, true);
+    assert.equal(verificationAttempts, 2);
+    assert.equal(fakes.calls.verify.length, 2);
+    assert.equal(fakes.calls.delivererFactory.length, 1);
+    assert.equal(fakes.calls.delivery.length, 1);
+  });
+
+  await t.test("verification timeout preserves a mutation margin inside the work lease", async () => {
+    const fixture = specialistFixture();
+    const now = Date.parse("2026-08-03T08:00:00.000Z");
+    fixture.item.leaseUntil = new Date(now + 1_010).toISOString();
+    let verificationSignal;
+    const fakes = fakePorts({
+      packet: fixture.packet,
+      views: fixture.view,
+      verifier(input) {
+        verificationSignal = input.signal;
+        return new Promise(() => {});
+      },
+    });
+    const service = new OrchestratorService({
+      ...fakes.ports,
+      evidenceVerificationTimeoutMs: 10_000,
+      evidenceMutationMarginMs: 1_000,
+      clock: () => new Date(now),
+    });
+
+    await assert.rejects(
+      service.execute({
+        worker: { roleId: "developer", workerId: "employee-developer" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: submitIntent(fixture, { evidence: [evidence] }),
+      }),
+      (error) =>
+        error instanceof OrchestratorServiceError &&
+        error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE",
+    );
+
+    assert.equal(verificationSignal instanceof AbortSignal, true);
+    assert.equal(verificationSignal.aborted, true);
+    assertNoTrustedMutation(fakes.calls);
   });
 
   await t.test("verifier authorizes the exact evidence binding", async () => {
@@ -910,11 +1501,20 @@ test("fails closed on unverifiable caller evidence before obtaining a deliverer"
       contextPacket: fixture.packet,
       intent: submitIntent(fixture, { evidence: [evidence] }),
     });
-    assert.deepEqual(fakes.calls.verify, [{
+    assert.equal(fakes.calls.verify.length, 1);
+    const [{ signal, ...authority }] = fakes.calls.verify;
+    assert.deepEqual(authority, {
       taskId: fixture.specialist.taskId,
+      roleId: "developer",
+      contractRevision: 1,
+      contractDigest: deliveryAcceptanceContractDigest(
+        fixture.specialist.acceptanceContracts.at(-1),
+      ),
       deliverableId: "implementation",
       evidence,
-    }]);
+    });
+    assert.equal(signal instanceof AbortSignal, true);
+    assert.equal(signal.aborted, false);
     assert.equal(fakes.calls.delivery.length, 1);
   });
 });
@@ -1147,6 +1747,7 @@ test("reconciles an exact uncertain delivery decision without deciding twice", a
     packet: fixture.packet,
     views: [
       fixture.view,
+      fixture.view,
       () => {
         const command = fakes.calls.planner[0].command;
         const submitted = fixture.child.deliveries[0];
@@ -1170,6 +1771,7 @@ test("reconciles an exact uncertain delivery decision without deciding twice", a
       },
     ],
     plannerResult: uncertain,
+    verifier: () => true,
   });
   const result = await serviceFrom(fakes).execute({
     worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
@@ -1192,7 +1794,7 @@ test("reconciles an exact uncertain delivery decision without deciding twice", a
   });
   assert.equal(fakes.calls.planner.length, 1);
   assert.equal(fakes.calls.plannerFactory.length, 1);
-  assert.equal(fakes.calls.graphReads, 2);
+  assert.equal(fakes.calls.graphReads, 3);
 });
 
 test("rejects stale graph bindings and hidden child actions before planner creation", async (t) => {

@@ -7,10 +7,13 @@ export class StateStore {
     this.dataDirectory = dataDirectory;
   }
 
-  async read(name, fallback = null) {
+  async read(name, fallback = null, { signal } = {}) {
     try {
       return JSON.parse(
-        await readFile(path.join(this.dataDirectory, `${name}.json`), "utf8"),
+        await readFile(path.join(this.dataDirectory, `${name}.json`), {
+          encoding: "utf8",
+          ...(signal === undefined ? {} : { signal }),
+        }),
       );
     } catch (error) {
       if (error.code === "ENOENT") return fallback;

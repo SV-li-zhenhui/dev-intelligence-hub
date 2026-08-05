@@ -45,6 +45,18 @@ function proposal(overrides = {}) {
   });
 }
 
+function evidenceTarget(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    taskId: "work-item-1",
+    roleId: "pr-reviewer",
+    contractRevision: 2,
+    contractDigest: "c".repeat(64),
+    deliverables: [{ deliverableId: "review", kind: "review-report" }],
+    ...overrides,
+  };
+}
+
 test("a trusted GitHub proposal becomes the exact user-visible action", () => {
   const value = proposal();
   const plan = createGitHubReviewProposalConfirmationPlan(value, {
@@ -74,6 +86,31 @@ test("a trusted GitHub proposal becomes the exact user-visible action", () => {
   });
   assert.equal("displayedPayloadDigest" in plan, false);
   assert.equal("approvalBindingDigest" in plan, false);
+});
+
+test("review confirmation accepts exact proposal authority and rejects foreign targets", () => {
+  const dispatchIntentId = `work-dispatch-intent-${"d".repeat(64)}`;
+  const authorized = proposal({
+    binding: { evidenceTarget: evidenceTarget(), dispatchIntentId },
+  });
+  assert.doesNotThrow(() =>
+    createGitHubReviewProposalConfirmationPlan(authorized, {
+      actorAccountId: "review-account",
+    }),
+  );
+
+  const foreign = proposal({
+    binding: {
+      evidenceTarget: evidenceTarget({ taskId: "work-item-foreign" }),
+    },
+  });
+  assert.throws(
+    () =>
+      createGitHubReviewProposalConfirmationPlan(foreign, {
+        actorAccountId: "review-account",
+      }),
+    (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
+  );
 });
 
 test("confirmation IDs remain stable and bounded for maximum-length proposal IDs", () => {

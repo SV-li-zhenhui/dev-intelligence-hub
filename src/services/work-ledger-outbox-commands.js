@@ -23,9 +23,15 @@ import {
 } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  ledgerDigest,
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
+
+const PROPOSAL_INTENT_TYPES = new Set([
+  "propose_github_review",
+  "propose_code_action",
+]);
 
 function requireIntent(state, intentId) {
   const intent = state.outbox.find(
@@ -108,9 +114,71 @@ function normalizeRequestedBy(input, item, intent) {
   return requestedBy;
 }
 
+function sameProposalRetry(candidate, item, intent, requestedBy) {
+  if (
+    candidate.status !== "failed" ||
+    candidate.itemId !== item.itemId ||
+    candidate.inputDigest !== item.inputDigest ||
+    ledgerDigest(candidate.requestedBy) !== ledgerDigest(requestedBy) ||
+    candidate.intent?.type !== intent.type
+  ) {
+    return false;
+  }
+  const {
+    dispatchIntentId: _trustedDispatchIntentId,
+    ...previousIntent
+  } = candidate.intent;
+  return ledgerDigest(previousIntent) === ledgerDigest(intent);
+}
+
+function latestStagedIntentForItem(state, itemId) {
+  // New intent identities are appended, while an exact failed retry replaces
+  // its existing record in place. Reverse insertion order therefore preserves
+  // the retry-chain boundary even when an older identity is retried.
+  for (let index = state.outbox.length - 1; index >= 0; index -= 1) {
+    if (state.outbox[index].itemId === itemId) return state.outbox[index];
+  }
+  return undefined;
+}
+
+function bindProposalDispatchIntent(state, item, intent, requestedBy) {
+  if (!PROPOSAL_INTENT_TYPES.has(intent.type)) return intent;
+  if (intent.dispatchIntentId !== undefined) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_INVALID",
+      "dispatchIntentId 只能由工作台账生成",
+    );
+  }
+  const latestAttempt = latestStagedIntentForItem(state, item.itemId);
+  const failedRetry = latestAttempt !== undefined &&
+      sameProposalRetry(latestAttempt, item, intent, requestedBy)
+    ? latestAttempt
+    : undefined;
+  if (failedRetry !== undefined) {
+    return failedRetry.intent.dispatchIntentId === undefined
+      ? intent
+      : {
+          ...intent,
+          dispatchIntentId: failedRetry.intent.dispatchIntentId,
+        };
+  }
+  const dispatchIntentDigest = ledgerDigest({
+    domain: "mydashboard-work-proposal-dispatch-intent/v1",
+    itemId: item.itemId,
+    itemRevision: item.revision,
+    inputDigest: item.inputDigest,
+    requestedBy,
+    intent,
+  });
+  return {
+    ...intent,
+    dispatchIntentId: `work-dispatch-intent-${dispatchIntentDigest}`,
+  };
+}
+
 export function planIntentStage({ state, input, clock }) {
   const itemId = boundedLedgerString(input.itemId, "itemId", 192);
-  const intent = normalizeLedgerWorkIntent(input.intent);
+  const suppliedIntent = normalizeLedgerWorkIntent(input.intent);
   const item = requireWorkLedgerItem(state, itemId);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();
@@ -122,7 +190,13 @@ export function planIntentStage({ state, input, clock }) {
       409,
     );
   }
-  const requestedBy = normalizeRequestedBy(input, item, intent);
+  const requestedBy = normalizeRequestedBy(input, item, suppliedIntent);
+  const intent = bindProposalDispatchIntent(
+    state,
+    item,
+    suppliedIntent,
+    requestedBy,
+  );
   const actorId = requestedBy.workerId;
   const candidate = createWorkIntentRecord(item, intent, requestedBy, now);
   const existing = state.outbox.find(

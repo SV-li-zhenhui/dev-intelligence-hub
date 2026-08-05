@@ -95,6 +95,31 @@ function factory(overrides = {}) {
   });
 }
 
+function proposalWithAuthority(value, authority) {
+  return normalizeBoundWorkProposal({
+    proposalId: value.proposalId,
+    policyVersion: value.policyVersion,
+    kind: value.kind,
+    requestedBy: value.requestedBy,
+    source: value.source,
+    binding: { ...value.binding, ...authority },
+    payload: value.payload,
+  });
+}
+
+function evidenceTargetFor(value, deliverables = [
+  { deliverableId: "implementation", kind: "change-package" },
+]) {
+  return {
+    schemaVersion: 1,
+    taskId: value.requestedBy.workItemId,
+    roleId: value.requestedBy.roleId,
+    contractRevision: 3,
+    contractDigest: "c".repeat(64),
+    deliverables,
+  };
+}
+
 test("trusted authority seals workspace, operation, profile, and brain bindings", () => {
   const options = factory().create(proposal());
 
@@ -115,6 +140,27 @@ test("trusted authority seals workspace, operation, profile, and brain bindings"
   assert.match(options.grant.brainDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(options.allowedOperationsByRole.tester, ["inspect", "verify"]);
   assert.equal(Object.isFrozen(options.allowedOperationsByRole), true);
+});
+
+test("grant creation preserves exact proposal authority boundaries", () => {
+  const base = proposal();
+  const authorized = proposalWithAuthority(base, {
+    evidenceTarget: evidenceTargetFor(base),
+    dispatchIntentId: `work-dispatch-intent-${"e".repeat(64)}`,
+  });
+
+  assert.doesNotThrow(() => factory().create(authorized));
+
+  const ambiguous = proposalWithAuthority(base, {
+    evidenceTarget: evidenceTargetFor(base, [
+      { deliverableId: "implementation", kind: "change-package" },
+      { deliverableId: "verification", kind: "change-package" },
+    ]),
+  });
+  assert.throws(
+    () => factory().create(ambiguous),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
 });
 
 test("read-only operations never inherit workspace write paths", () => {

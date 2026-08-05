@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { normalizeWorkCoordinationTiming } from "./work-coordination-timing.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const DEFAULT_INTAKE_LIMIT = 100;
@@ -261,6 +262,31 @@ async function within(operation, durationMs, code) {
   }
 }
 
+function waitForAbortable(operation, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(operation).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+async function withinAbortable(operation, durationMs, code) {
+  const controller = new AbortController();
+  const deadline = timeoutError(code);
+  const timer = setTimeout(() => controller.abort(deadline), durationMs);
+  try {
+    return await waitForAbortable(
+      Promise.resolve().then(() => operation(controller.signal)),
+      controller.signal,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function workerItemDto(item) {
   const {
     ownerId: _ownerId,
@@ -319,7 +345,7 @@ export class ProactiveWorkLoop {
     ledger,
     roleDirectory,
     clock = () => new Date(),
-    leaseDurationMs = 2 * 60 * 1000,
+    leaseDurationMs,
     maxAttempts = 3,
     retryBaseMs = 30 * 1000,
     retryMaxMs = 15 * 60 * 1000,
@@ -352,14 +378,20 @@ export class ProactiveWorkLoop {
     );
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.clock = clock;
-    this.leaseDurationMs = positiveInteger(
-      leaseDurationMs,
-      "leaseDurationMs",
-      24 * 60 * 60 * 1000,
+    const timing = normalizeWorkCoordinationTiming(
+      {
+        leaseDurationMs,
+        resolveTimeoutMs,
+        decisionTimeoutMs: decideTimeoutMs,
+      },
+      {
+        roleContextEnabled:
+          roleContextAssembler != null && orchestratorService != null,
+      },
     );
-    if (this.leaseDurationMs < 1_000) {
-      throw new TypeError("leaseDurationMs is invalid");
-    }
+    this.leaseDurationMs = timing.leaseDurationMs;
+    this.resolveTimeoutMs = timing.resolveTimeoutMs;
+    this.decideTimeoutMs = timing.decisionTimeoutMs;
     this.maxAttempts = positiveInteger(maxAttempts, "maxAttempts", 100);
     this.retryBaseMs = positiveInteger(
       retryBaseMs,
@@ -373,22 +405,6 @@ export class ProactiveWorkLoop {
     );
     if (this.retryMaxMs < this.retryBaseMs) {
       throw new TypeError("retryMaxMs is invalid");
-    }
-    this.resolveTimeoutMs = positiveInteger(
-      resolveTimeoutMs ?? Math.min(10_000, this.leaseDurationMs - 1),
-      "resolveTimeoutMs",
-      24 * 60 * 60 * 1000,
-    );
-    this.decideTimeoutMs = positiveInteger(
-      decideTimeoutMs ?? Math.min(60_000, this.leaseDurationMs - 1),
-      "decideTimeoutMs",
-      24 * 60 * 60 * 1000,
-    );
-    if (
-      this.resolveTimeoutMs >= this.leaseDurationMs ||
-      this.decideTimeoutMs >= this.leaseDurationMs
-    ) {
-      throw new TypeError("role timeouts must be shorter than leaseDurationMs");
     }
     if ((roleContextAssembler == null) !== (orchestratorService == null)) {
       throw new TypeError(
@@ -409,14 +425,6 @@ export class ProactiveWorkLoop {
           ["execute"],
           "orchestratorService",
         );
-    if (
-      this.roleContextAssembler !== null &&
-      this.resolveTimeoutMs + this.decideTimeoutMs >= this.leaseDurationMs
-    ) {
-      throw new TypeError(
-        "context and decision timeouts must fit within leaseDurationMs",
-      );
-    }
     this.inFlightByScope = new Map();
     this.inFlightItemIds = new Set();
     this.inFlightQuestionTargets = new Set();
@@ -698,11 +706,12 @@ export class ProactiveWorkLoop {
   }
 
   async #assembleContext(item, worker, options) {
-    return within(
-      () => this.roleContextAssembler.assemble({
+    return withinAbortable(
+      (signal) => this.roleContextAssembler.assemble({
         roleId: worker.roleId,
         item,
         trigger: options.trigger,
+        signal,
       }),
       this.resolveTimeoutMs,
       "ROLE_CONTEXT_TIMEOUT",

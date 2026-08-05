@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import {
   WorkIntentPolicyError,
@@ -96,6 +97,29 @@ function policy(overrides = {}) {
     workspaceByRepository: { "acme/repo": "acme-workspace" },
     ...overrides,
   });
+}
+
+function acceptanceContract() {
+  return {
+    revision: 4,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "受控执行结果可复核" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "主实现变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "change-package",
+        description: "验证变更包",
+        required: true,
+      },
+    ],
+  };
 }
 
 test("binds user questions and waits to the trusted work item and event", () => {
@@ -207,6 +231,92 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(handoff.kind, "handoff");
   assert.equal(handoff.binding.targetRoleId, "tester");
   assert.equal(handoff.payload.capability, "testing");
+});
+
+test("proposal authority binds one selected delivery and the durable dispatch identity", () => {
+  const trustedContext = context({ roleId: "developer" });
+  const evidenceTarget = createDeliveryEvidenceTarget({
+    taskId: trustedContext.workItemId,
+    roleId: trustedContext.roleId,
+    acceptanceContract: acceptanceContract(),
+    deliverableId: "verification",
+  });
+  const dispatchIntentId = `work-dispatch-intent-${"e".repeat(64)}`;
+  const intent = {
+    ...common("propose_code_action"),
+    deliverableId: "verification",
+    dispatchIntentId,
+    operation: "verify",
+    objective: "验证指定交付物",
+    acceptanceCriteria: ["聚焦测试通过"],
+    evidence: [],
+  };
+
+  const bound = policy().bind({
+    context: { ...trustedContext, evidenceTarget },
+    intent,
+  });
+
+  assert.deepEqual(bound.binding.evidenceTarget, evidenceTarget);
+  assert.equal(bound.binding.evidenceTarget.deliverables.length, 1);
+  assert.equal(
+    bound.binding.evidenceTarget.deliverables[0].deliverableId,
+    "verification",
+  );
+  assert.equal(bound.binding.dispatchIntentId, dispatchIntentId);
+
+  const nonAuthoritative = policy().bind({
+    context: trustedContext,
+    intent,
+  });
+  assert.equal(
+    Object.hasOwn(nonAuthoritative.binding, "evidenceTarget"),
+    false,
+  );
+  assert.equal(nonAuthoritative.binding.dispatchIntentId, dispatchIntentId);
+
+  const continued = policy().bind({
+    context: { ...trustedContext, evidenceTarget },
+    intent: {
+      ...intent,
+      dispatchIntentId: `work-dispatch-intent-${"f".repeat(64)}`,
+    },
+  });
+  assert.notEqual(continued.intentId, bound.intentId);
+  assert.notEqual(continued.binding.dispatchIntentId, dispatchIntentId);
+});
+
+test("proposal policy rejects foreign or differently selected evidence authority", () => {
+  const trustedContext = context({ roleId: "developer" });
+  const target = createDeliveryEvidenceTarget({
+    taskId: trustedContext.workItemId,
+    roleId: trustedContext.roleId,
+    acceptanceContract: acceptanceContract(),
+    deliverableId: "verification",
+  });
+  const baseIntent = {
+    ...common("propose_code_action"),
+    operation: "modify",
+    objective: "修改主实现",
+    acceptanceCriteria: ["测试通过"],
+    evidence: [],
+  };
+  const foreignTask = { ...target, taskId: `work-item-${"f".repeat(64)}` };
+
+  for (const [evidenceTarget, deliverableId] of [
+    [target, "implementation"],
+    [foreignTask, "verification"],
+  ]) {
+    assert.throws(
+      () => policy().bind({
+        context: { ...trustedContext, evidenceTarget },
+        intent: { ...baseIntent, deliverableId },
+      }),
+      (error) =>
+        error instanceof WorkIntentPolicyError &&
+        error.code === "WORK_INTENT_CONTEXT_INVALID",
+    );
+  }
 });
 
 test("code operations are configurable per trusted role", () => {

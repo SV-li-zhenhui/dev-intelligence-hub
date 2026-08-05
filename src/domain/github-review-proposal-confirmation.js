@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 import {
+  assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
   normalizeBoundWorkProposal,
   normalizeWorkProposalDigest,
@@ -126,8 +127,19 @@ export function createGitHubReviewProposalConfirmationPlan(
       "repository",
       "pullRequestNumber",
       "headRefOid",
+      ...(Object.hasOwn(proposal.binding, "evidenceTarget")
+        ? ["evidenceTarget"]
+        : []),
+      ...(Object.hasOwn(proposal.binding, "dispatchIntentId")
+        ? ["dispatchIntentId"]
+        : []),
     ],
     "binding",
+  );
+  assertWorkProposalAuthorityBinding(
+    proposal,
+    binding,
+    invalid("binding 权威信息无效"),
   );
   const payload = plainRecord(
     proposal.payload,

@@ -85,6 +85,38 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function optionalReadSignal(value) {
+  if (value === undefined) return null;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+    Reflect.ownKeys(value).length !== 1
+  ) {
+    throw storeError(
+      "INVALID_CHANGE_PACKAGE_REQUEST",
+      "change package 读取请求无效",
+    );
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, "signal");
+  const signal = descriptor?.enumerable && "value" in descriptor
+    ? descriptor.value
+    : null;
+  if (
+    signal === null ||
+    typeof signal !== "object" ||
+    typeof signal.aborted !== "boolean" ||
+    typeof signal.throwIfAborted !== "function"
+  ) {
+    throw storeError(
+      "INVALID_CHANGE_PACKAGE_REQUEST",
+      "change package 读取请求无效",
+    );
+  }
+  return signal;
+}
+
 function exactReadRequest(value) {
   if (
     value === null ||
@@ -218,8 +250,10 @@ export class ChangePackageStore {
     });
   }
 
-  async get(packageIdValue) {
+  async get(packageIdValue, options) {
     this.#assertReady();
+    const signal = optionalReadSignal(options);
+    signal?.throwIfAborted();
     let packageId;
     try {
       packageId = normalizeChangePackageId(packageIdValue);
@@ -232,7 +266,11 @@ export class ChangePackageStore {
     if (manifest === undefined) {
       throw storeError("CHANGE_PACKAGE_NOT_FOUND", "change package 不存在");
     }
-    return normalizeChangePackageManifest(manifest, { limits: this.#limits });
+    const projection = normalizeChangePackageManifest(manifest, {
+      limits: this.#limits,
+    });
+    signal?.throwIfAborted();
+    return projection;
   }
 
   async readFile(value) {

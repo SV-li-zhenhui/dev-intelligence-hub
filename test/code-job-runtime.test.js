@@ -32,6 +32,35 @@ class MemoryStore {
   }
 }
 
+class KeyedMemoryStore {
+  constructor() {
+    this.values = new Map();
+    this.blockArchiveRead = null;
+    this.archiveReadEntered = null;
+    this.receivedSignal = null;
+  }
+
+  get value() {
+    return this.values.get("code-job-state") ?? null;
+  }
+
+  async read(name, fallback, options) {
+    if (
+      this.blockArchiveRead !== null &&
+      name.includes("code-job-tombstone-index")
+    ) {
+      this.receivedSignal = options?.signal ?? null;
+      this.archiveReadEntered?.resolve();
+      return this.blockArchiveRead.promise;
+    }
+    return structuredClone(this.values.get(name) ?? fallback);
+  }
+
+  async write(name, value) {
+    this.values.set(name, structuredClone(value));
+  }
+}
+
 class FakeGuard {
   constructor({ events = [], acquireError = null, closeError = null } = {}) {
     this.events = events;
@@ -611,6 +640,78 @@ test("worker cycles stay private and close drains the complete admitted cycle", 
     runtime.worker.runCycle({ limit: 1 }),
     (error) => error.code === "CODE_JOB_RUNTIME_CLOSED",
   );
+});
+
+test("aborting an archived evidence read releases runtime close and a recovered runtime can retry", async () => {
+  const store = new KeyedMemoryStore();
+  let jobStore;
+  const { runtime, guard } = await runtimeFixture({
+    store,
+    executor: {},
+    brainDirectory: {},
+    memoryReceiptVerifier: {
+      async verify(value) {
+        return { ...structuredClone(value), persisted: true };
+      },
+    },
+    workerFactory(options) {
+      jobStore = options.jobStore;
+      return {
+        async runCycle() { return { selected: 0, outcomes: [] }; },
+        requestCancellation() { return false; },
+      };
+    },
+  });
+  const created = await runtime.confirmationExecutor.execute(envelope());
+  const queued = await jobStore.getForWorker(created.receipt.id);
+  const failed = await jobStore.fail({
+    jobId: queued.jobId,
+    expectedRevision: queued.revision,
+    result: { code: "EVIDENCE_ARCHIVE_FIXTURE" },
+  });
+  const memoryDigest = "9".repeat(64);
+  await jobStore.markMemoryProjected({
+    jobId: failed.job.jobId,
+    expectedRevision: failed.job.revision,
+    sourceRecordDigest: failed.job.recordDigest,
+    memoryRecordId: `memory-${memoryDigest}`,
+    memoryRecordDigest: memoryDigest,
+  });
+  await jobStore.compactTerminalPrefix({
+    compactionId: "runtime-evidence-archive",
+    expectedRevision: store.value.revision,
+    targetThroughSequence: failed.job.sequence,
+    preArchiveDigest: store.value.archive.digest,
+  });
+
+  store.blockArchiveRead = deferred();
+  store.archiveReadEntered = deferred();
+  const controller = new AbortController();
+  const evidenceRead = runtime.reader.readDeliveryEvidence({
+    jobId: failed.job.jobId,
+    signal: controller.signal,
+  });
+  await store.archiveReadEntered.promise;
+  const closing = runtime.close();
+  await Promise.resolve();
+  assert.equal(guard.closeCount, 0);
+
+  controller.abort();
+  await assert.rejects(evidenceRead, (error) => error?.name === "AbortError");
+  assert.equal(store.receivedSignal, controller.signal);
+  await closing;
+  assert.equal(guard.closeCount, 1);
+
+  store.blockArchiveRead = null;
+  store.archiveReadEntered = null;
+  const recovered = await runtimeFixture({ store });
+  const retry = await recovered.runtime.reader.readDeliveryEvidence({
+    jobId: failed.job.jobId,
+  });
+  assert.equal(retry.archived, true);
+  assert.equal(retry.job.jobId, failed.job.jobId);
+  assert.equal(retry.job.memoryProjection.recordId, `memory-${memoryDigest}`);
+  await recovered.runtime.close();
 });
 
 test("pause control is admitted while a worker cycle is still running", async () => {

@@ -9,6 +9,10 @@ import {
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import {
+  createWorkProposalResult,
+  normalizeBoundWorkProposal,
+} from "../src/domain/work-proposal-contract.js";
 
 function applicationConfig(codeExecutor = { enabled: false }) {
   return {
@@ -287,7 +291,10 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       calls.waker = options;
       return { async runCycle() {} };
     },
-    proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
+    proactiveWorkLoopFactory: (options) => {
+      calls.loop = options;
+      return { async runCycle() {} };
+    },
     workIntentDispatcherFactory: (options) => {
       calls.dispatcher = options;
       return { async dispatchPending() {} };
@@ -871,6 +878,234 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "ledger",
     "workflow",
   ]);
+});
+
+test("work coordination normalizes omitted timing before composing the loop and orchestrator", async () => {
+  const cases = [
+    {
+      omitted: [
+        "leaseDurationMs",
+        "resolveTimeoutMs",
+        "decisionTimeoutMs",
+      ],
+      expected: {
+        leaseDurationMs: 120_000,
+        resolveTimeoutMs: 10_000,
+        decideTimeoutMs: 60_000,
+        evidenceVerificationTimeoutMs: 49_000,
+      },
+    },
+    {
+      omitted: ["decisionTimeoutMs"],
+      expected: {
+        leaseDurationMs: 16_000,
+        resolveTimeoutMs: 2_000,
+        decideTimeoutMs: 3_000,
+        evidenceVerificationTimeoutMs: 10_000,
+      },
+    },
+  ];
+
+  for (const { omitted, expected } of cases) {
+    const config = structuredClone(
+      workCoordinationConfig({ externalActions: false }),
+    );
+    for (const field of omitted) delete config.workCoordination[field];
+    const calls = {};
+    const closeCalls = [];
+    const application = await createApplication({
+      config,
+      store: memoryStore(),
+      externalActions: false,
+      ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+    });
+
+    assert.equal(calls.loop.leaseDurationMs, expected.leaseDurationMs);
+    assert.equal(calls.loop.resolveTimeoutMs, expected.resolveTimeoutMs);
+    assert.equal(calls.loop.decideTimeoutMs, expected.decideTimeoutMs);
+    assert.equal(
+      calls.orchestratorService.evidenceVerificationTimeoutMs,
+      expected.evidenceVerificationTimeoutMs,
+    );
+    assert.equal(
+      calls.orchestratorService.evidenceMutationMarginMs,
+      1_000,
+    );
+    assert.equal(
+      calls.loop.resolveTimeoutMs +
+        calls.loop.decideTimeoutMs +
+        calls.orchestratorService.evidenceMutationMarginMs +
+        calls.orchestratorService.evidenceVerificationTimeoutMs,
+      calls.loop.leaseDurationMs,
+    );
+
+    await application.close();
+  }
+});
+
+test("work coordination rejects optional timing below the role-context budget", async () => {
+  const config = workCoordinationConfig({ externalActions: false });
+  config.workCoordination.leaseDurationMs = 12_999;
+  delete config.workCoordination.resolveTimeoutMs;
+  delete config.workCoordination.decisionTimeoutMs;
+  const calls = {};
+  const closeCalls = [];
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      externalActions: false,
+      ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+    }),
+    /must preserve at least 1000ms.*10000ms for evidence verification/,
+  );
+  assert.equal(calls.loop, undefined);
+  assert.deepEqual(closeCalls, ["workflow"]);
+});
+
+test("default delivery evidence service is shared, least-authority, and verifies trusted results", async () => {
+  const config = workCoordinationConfig({ externalActions: false });
+  const calls = {};
+  const closeCalls = [];
+  const taskId = "task-review";
+  const roleId = "pr-reviewer";
+  const proposalId = "proposal-review-1";
+  const contractDigest = "b".repeat(64);
+  const evidenceTarget = {
+    schemaVersion: 1,
+    taskId,
+    roleId,
+    contractRevision: 4,
+    contractDigest,
+    deliverables: [
+      { deliverableId: "review", kind: "review-report" },
+    ],
+  };
+  const proposal = normalizeBoundWorkProposal({
+    proposalId,
+    policyVersion: 1,
+    kind: "github_review_proposal",
+    requestedBy: { roleId, workItemId: taskId },
+    source: { assignmentId: "assignment-review", eventId: "event-review" },
+    binding: { evidenceTarget },
+    payload: { verdict: "comment", body: "Review completed" },
+  });
+  const result = createWorkProposalResult({
+    proposal,
+    sequence: 1,
+    transition: {
+      status: "succeeded",
+      summary: "Review published",
+      evidence: ["github-review:published"],
+    },
+    downstreamRef: "github-review-1",
+    at: "2026-08-06T01:00:00.000Z",
+  });
+  const resultId = result.resultId;
+  const resultDigest = result.contentDigest;
+  const authoritativeEvidence = {
+    kind: "review-report",
+    referenceId: resultId,
+    contentDigest: resultDigest,
+  };
+  const evidenceReaderCalls = [];
+  const proposalRuntime = workProposalRuntimePort({
+    runners: {},
+    evidenceReader: {
+      async getResult({ resultId: requestedResultId }) {
+        evidenceReaderCalls.push(["getResult", requestedResultId]);
+        return requestedResultId === resultId ? structuredClone(result) : null;
+      },
+      async getResultForProposal() {
+        throw new Error("review verification uses its exact result id");
+      },
+      async getProposalForEvidence({ proposalId: requestedProposalId }) {
+        evidenceReaderCalls.push([
+          "getProposalForEvidence",
+          requestedProposalId,
+        ]);
+        return requestedProposalId === proposalId
+          ? structuredClone(proposal)
+          : null;
+      },
+      async listEvidenceCandidates() {
+        throw new Error("verification must use exact result authority");
+      },
+    },
+  });
+  const compositionStubs = localCoordinationStubs({
+    calls,
+    closeCalls,
+    runners: {},
+  });
+
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...compositionStubs,
+    workProposalRuntimeFactory: async (options) => {
+      calls.proposalRuntime = options;
+      return proposalRuntime;
+    },
+    roleContextAssemblerFactory: (options) => {
+      calls.contextAssembler = options;
+      return { async assemble() {} };
+    },
+  });
+
+  assert.strictEqual(
+    calls.contextAssembler.evidenceCatalog,
+    application.deliveryEvidence,
+  );
+  assert.strictEqual(
+    calls.orchestratorService.evidenceVerifier,
+    application.deliveryEvidence,
+  );
+  assert.deepEqual(Object.keys(application.deliveryEvidence), [
+    "listForTask",
+    "verify",
+  ]);
+  assert.equal(Object.isFrozen(application.deliveryEvidence), true);
+  assert.equal("getResult" in application.deliveryEvidence, false);
+  assert.equal("getProposalForEvidence" in application.deliveryEvidence, false);
+
+  const coordination = config.workCoordination;
+  const evidenceBudget =
+    coordination.leaseDurationMs -
+    coordination.resolveTimeoutMs -
+    coordination.decisionTimeoutMs -
+    1_000;
+  assert.equal(
+    calls.orchestratorService.evidenceVerificationTimeoutMs,
+    evidenceBudget,
+  );
+  assert.equal(
+    calls.orchestratorService.evidenceVerificationTimeoutMs +
+      calls.orchestratorService.evidenceMutationMarginMs +
+      coordination.resolveTimeoutMs +
+      coordination.decisionTimeoutMs <=
+      coordination.leaseDurationMs,
+    true,
+  );
+
+  assert.deepEqual(
+    await application.deliveryEvidence.verify({
+      taskId,
+      roleId,
+      contractRevision: evidenceTarget.contractRevision,
+      contractDigest,
+      deliverableId: "review",
+      evidence: authoritativeEvidence,
+    }),
+    authoritativeEvidence,
+  );
+  assert.deepEqual(evidenceReaderCalls, [
+    ["getResult", resultId],
+    ["getProposalForEvidence", proposalId],
+  ]);
+
+  await application.close();
 });
 
 test("disabled work coordination does not acquire private runtimes or services", async () => {

@@ -97,12 +97,14 @@ test("normalizes every bounded employee intent without trusted targets", () => {
     },
     {
       ...common("propose_github_review"),
+      deliverableId: "review.primary",
       verdict: "request_changes",
       body: "空值分支会错误地发布旧状态，请先修复。",
       evidence: ["src/service.js:42"],
     },
     {
       ...common("propose_code_action"),
+      deliverableId: "implementation_main",
       operation: "modify",
       objective: "修复空值分支并保持接口兼容",
       acceptanceCriteria: ["现有测试通过", "新增回归测试"],
@@ -137,6 +139,33 @@ test("normalizes every bounded employee intent without trusted targets", () => {
     ]) {
       assert.equal(serialized.includes(`\"${forbidden}\"`), false);
     }
+  }
+});
+
+test("proposal intents preserve one optional delivery selector and durable dispatch identity", () => {
+  const dispatchIntentId = `work-dispatch-intent-${"d".repeat(64)}`;
+  for (const intent of [
+    {
+      ...common("propose_github_review"),
+      deliverableId: "review.secondary",
+      dispatchIntentId,
+      verdict: "comment",
+      body: "建议补充边界测试。",
+      evidence: [],
+    },
+    {
+      ...common("propose_code_action"),
+      deliverableId: "implementation_secondary",
+      dispatchIntentId,
+      operation: "verify",
+      objective: "验证第二个交付物",
+      acceptanceCriteria: ["聚焦测试通过"],
+      evidence: [],
+    },
+  ]) {
+    const normalized = normalizeWorkIntent(intent);
+    assert.equal(normalized.deliverableId, intent.deliverableId);
+    assert.equal(normalized.dispatchIntentId, dispatchIntentId);
   }
 });
 
@@ -276,7 +305,10 @@ test("rejects unknown schemas, malformed variants, and oversized text", () => {
     { ...common("wait_condition"), condition: { kind: "time", notBefore: "2026-08-03T01:02:03.000Z" }, checkAfterSeconds: 1 },
     { ...common("propose_github_review"), verdict: "merge", body: "merge", evidence: [] },
     { ...common("propose_github_review"), verdict: "comment", body: "x".repeat(16 * 1024 + 1), evidence: [] },
+    { ...common("propose_github_review"), deliverableId: "Review", verdict: "comment", body: "review", evidence: [] },
     { ...common("propose_code_action"), operation: "shell", objective: "run", acceptanceCriteria: [], evidence: [] },
+    { ...common("propose_code_action"), deliverableId: "x".repeat(129), operation: "inspect", objective: "run", acceptanceCriteria: ["done"], evidence: [] },
+    { ...common("propose_code_action"), dispatchIntentId: `work-dispatch-intent-${"g".repeat(64)}`, operation: "inspect", objective: "run", acceptanceCriteria: ["done"], evidence: [] },
     { ...common("complete"), outcome: "blocked", evidence: [] },
   ]) {
     assertInvalid(candidate);

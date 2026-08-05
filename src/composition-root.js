@@ -18,6 +18,7 @@ import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
 import { ConfigurationActivationExecutor } from "./services/configuration-activation-executor.js";
 import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
+import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js";
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import {
@@ -39,6 +40,7 @@ import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js"
 import { RefreshService } from "./services/refresh-service.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
+import { normalizeWorkCoordinationTiming } from "./services/work-coordination-timing.js";
 import { WorkCoordinationService } from "./services/work-coordination-service.js";
 import { createCodeActionProposalRunnerService } from "./services/code-action-proposal-handler.js";
 import { CodeJobGrantFactory } from "./services/code-job-grant-factory.js";
@@ -211,6 +213,8 @@ export async function createApplication({
   roleContextAssemblerFactory = (options) =>
     new RoleContextAssembler(options),
   orchestratorServiceFactory = (options) => new OrchestratorService(options),
+  deliveryEvidenceServiceFactory = (options) =>
+    new DeliveryEvidenceService(options),
   workIntentDispatcherFactory = (options) =>
     new WorkIntentDispatcher(options),
   workCoordinationFactory = (options) =>
@@ -281,6 +285,7 @@ export async function createApplication({
   let codeJobRuntime = null;
   let confirmationRuntime = null;
   let codeJobReader = null;
+  let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
   let codeJobWorker = null;
   let codeJobMemoryProjector = null;
@@ -375,6 +380,16 @@ export async function createApplication({
     );
     const coordinationConfig = config.workCoordination || {};
     const coordinationEnabled = coordinationConfig.enabled === true;
+    const coordinationTiming = coordinationEnabled
+      ? normalizeWorkCoordinationTiming(
+          {
+            leaseDurationMs: coordinationConfig.leaseDurationMs,
+            resolveTimeoutMs: coordinationConfig.resolveTimeoutMs,
+            decisionTimeoutMs: coordinationConfig.decisionTimeoutMs,
+          },
+          { roleContextEnabled: true },
+        )
+      : null;
     const githubProposalExecutionEnabled =
       coordinationEnabled &&
       externalActions &&
@@ -565,6 +580,15 @@ export async function createApplication({
         ["get", "getDetail", "list", "listNewest"],
         "codeJobRuntime.reader",
       );
+      if (
+        typeof codeJobRuntime.reader.readDeliveryEvidence === "function"
+      ) {
+        codeJobDeliveryEvidenceReader = frozenPort(
+          codeJobRuntime.reader,
+          ["readDeliveryEvidence"],
+          "codeJobRuntime.deliveryEvidenceReader",
+        );
+      }
       codeJobControl = frozenPort(
         codeJobRuntime.control,
         ["pause", "resume", "cancel"],
@@ -871,6 +895,7 @@ export async function createApplication({
     let attentionBrowser = null;
     let attentionCoordinator = null;
     let memoryProjector = null;
+    let deliveryEvidence = null;
     if (coordinationEnabled) {
       const clockOptions = workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
@@ -890,9 +915,34 @@ export async function createApplication({
         ...clockOptions,
         maximumAgeMs: coordinationConfig.factMaximumAgeMs,
       });
+      const proposalResultReader = workProposalRuntime.evidenceReader
+        ? frozenPort(
+            workProposalRuntime.evidenceReader,
+            [
+              "getResult",
+              "getResultForProposal",
+              "getProposalForEvidence",
+              "listEvidenceCandidates",
+            ],
+            "workProposalRuntime.evidenceReader",
+          )
+        : null;
+      const deliveryEvidenceService = deliveryEvidenceServiceFactory({
+        ...(changePackageReader === null ? {} : { changePackageReader }),
+        ...(codeJobDeliveryEvidenceReader === null
+          ? {}
+          : { codeJobReader: codeJobDeliveryEvidenceReader }),
+        ...(proposalResultReader === null ? {} : { proposalResultReader }),
+      });
+      deliveryEvidence = frozenPort(
+        deliveryEvidenceService,
+        ["listForTask", "verify"],
+        "deliveryEvidenceService",
+      );
       const roleContextAssembler = roleContextAssemblerFactory({
         graphReader: workLedgerRuntime.graphReader,
         factSource,
+        evidenceCatalog: deliveryEvidence,
       });
       const orchestratorService = orchestratorServiceFactory({
         contextAssembler: roleContextAssembler,
@@ -901,15 +951,16 @@ export async function createApplication({
           workLedgerRuntime.scopedGraphPlannerFactory,
         graphDelivererFactory: workLedgerRuntime.graphDelivererFactory,
         capabilityRoles: coordinationConfig.policy?.capabilityRoles || {},
+        evidenceVerificationTimeoutMs:
+          coordinationTiming.evidenceVerificationTimeoutMs,
+        evidenceMutationMarginMs:
+          coordinationTiming.evidenceMutationMarginMs,
+        ...clockOptions,
         ...(ordinaryActionAdmissionGate === null
           ? {}
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
-        ...(workCoordinationDependencies.evidenceVerifier
-          ? {
-              evidenceVerifier:
-                workCoordinationDependencies.evidenceVerifier,
-            }
-          : {}),
+        evidenceVerifier:
+          workCoordinationDependencies.evidenceVerifier ?? deliveryEvidence,
       });
       const attentionResultReconciler = attentionResultReconcilerFactory({
         attentionConsumer: attentionInboxRuntime.consumer,
@@ -934,12 +985,12 @@ export async function createApplication({
         roleContextAssembler,
         orchestratorService,
         ...clockOptions,
-        leaseDurationMs: coordinationConfig.leaseDurationMs,
+        leaseDurationMs: coordinationTiming.leaseDurationMs,
         maxAttempts: coordinationConfig.maxAttempts,
         retryBaseMs: coordinationConfig.retryBaseMs,
         retryMaxMs: coordinationConfig.retryMaxMs,
-        resolveTimeoutMs: coordinationConfig.resolveTimeoutMs,
-        decideTimeoutMs: coordinationConfig.decisionTimeoutMs,
+        resolveTimeoutMs: coordinationTiming.resolveTimeoutMs,
+        decideTimeoutMs: coordinationTiming.decisionTimeoutMs,
       });
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,
@@ -1154,6 +1205,7 @@ export async function createApplication({
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      deliveryEvidence,
       memorySearch,
       memoryAnswer,
       memoryImports,

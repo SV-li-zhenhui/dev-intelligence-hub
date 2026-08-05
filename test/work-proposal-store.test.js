@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   WORK_PROPOSAL_STATE_KEY,
@@ -69,13 +70,14 @@ async function readyStore({
   store = new MemoryStore(),
   time = manualClock(),
   limits,
+  operationQueue = new OperationQueue(),
 } = {}) {
   let id = 0;
   const exclusiveLease = new ExclusiveLease();
   const proposals = new WorkProposalStore({
     store,
     exclusiveLease,
-    operationQueue: new OperationQueue(),
+    operationQueue,
     clock: time.clock,
     idFactory: () => `lease-${++id}`,
     ...(limits ? { limits } : {}),
@@ -415,4 +417,216 @@ test("capacity failures preserve prior state and corrupt recovery fails closed",
     broken.recover(),
     (error) => error.code === "WORK_PROPOSAL_STATE_CORRUPTED",
   );
+});
+
+test("authority-filtered evidence snapshots apply filters before limit without entering the mutation queue", async () => {
+  const operationQueue = {
+    count: 0,
+    enqueue(operation) {
+      this.count += 1;
+      return Promise.resolve().then(operation);
+    },
+  };
+  const { proposals } = await readyStore({ operationQueue });
+  const contract = {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "tested", description: "测试通过" },
+    ],
+    expectedDeliverables: [{
+      deliverableId: "verification",
+      kind: "test-report",
+      description: "测试报告",
+      required: true,
+    }],
+  };
+  const currentTarget = createDeliveryEvidenceTarget({
+    taskId: "work-1",
+    roleId: "developer",
+    acceptanceContract: contract,
+    deliverableId: "verification",
+  });
+  const staleTarget = createDeliveryEvidenceTarget({
+    taskId: "work-1",
+    roleId: "developer",
+    acceptanceContract: { ...contract, revision: 2 },
+    deliverableId: "verification",
+  });
+  const complete = async (
+    proposalId,
+    evidenceTarget,
+    outcome = "succeeded",
+  ) => {
+    await proposals.create(proposal({
+      proposalId,
+      binding: {
+        repository: "acme/widgets",
+        workspaceId: "widgets-local",
+        evidenceTarget,
+      },
+      payload: { operation: "verify", objective: "Run delivery tests" },
+    }));
+    const claim = await claimAs(proposals, {
+      runnerId: "code-runner",
+      leaseDurationMs: 30_000,
+    });
+    await advanceAs(
+      proposals,
+      advanceRequest(claim, {
+        status: outcome,
+        summary: `${proposalId} terminal`,
+        evidence: [],
+      }),
+    );
+  };
+  await complete("current-proposal", currentTarget);
+  for (let index = 0; index < 5; index += 1) {
+    await complete(`stale-proposal-${index}`, staleTarget);
+  }
+  await complete("failed-current-proposal", currentTarget, "failed");
+  const queueCountBeforeReads = operationQueue.count;
+
+  const page = proposals.listEvidenceCandidates({
+    taskId: currentTarget.taskId,
+    roleId: currentTarget.roleId,
+    contractRevision: currentTarget.contractRevision,
+    contractDigest: currentTarget.contractDigest,
+    kinds: ["test-report"],
+    limit: 1,
+  });
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0].proposal.proposalId, "current-proposal");
+  assert.equal(page.nextBeforeSequence, null);
+  const result = proposals.getResultForProposal({
+    proposalId: "current-proposal",
+  });
+  assert.equal(result.proposalId, "current-proposal");
+  assert.deepEqual(
+    proposals.getResult({ resultId: result.resultId }),
+    result,
+  );
+  assert.equal(
+    proposals.getProposalForEvidence({ proposalId: "current-proposal" })
+      .proposalId,
+    "current-proposal",
+  );
+  assert.equal(operationQueue.count, queueCountBeforeReads);
+
+  await complete("newer-current-proposal", currentTarget);
+  const newestPage = proposals.listEvidenceCandidates({
+    taskId: currentTarget.taskId,
+    roleId: currentTarget.roleId,
+    contractRevision: currentTarget.contractRevision,
+    contractDigest: currentTarget.contractDigest,
+    kinds: ["test-report"],
+    limit: 1,
+  });
+  assert.equal(
+    newestPage.items[0].proposal.proposalId,
+    "newer-current-proposal",
+  );
+  assert.equal(
+    newestPage.nextBeforeSequence,
+    newestPage.items[0].result.sequence,
+  );
+  const olderPage = proposals.listEvidenceCandidates({
+    taskId: currentTarget.taskId,
+    roleId: currentTarget.roleId,
+    contractRevision: currentTarget.contractRevision,
+    contractDigest: currentTarget.contractDigest,
+    kinds: ["test-report"],
+    limit: 1,
+    beforeSequence: newestPage.nextBeforeSequence,
+  });
+  assert.equal(olderPage.items[0].proposal.proposalId, "current-proposal");
+  assert.equal(olderPage.nextBeforeSequence, null);
+
+  const controller = new AbortController();
+  controller.abort();
+  assert.throws(
+    () => proposals.listEvidenceCandidates({
+      taskId: currentTarget.taskId,
+      roleId: currentTarget.roleId,
+      contractRevision: currentTarget.contractRevision,
+      contractDigest: currentTarget.contractDigest,
+      kinds: ["test-report"],
+      limit: 1,
+      signal: controller.signal,
+    }),
+    (error) => error?.name === "AbortError",
+  );
+});
+
+test("evidence candidates exclude action-incompatible code deliverables", async () => {
+  const { proposals } = await readyStore();
+  const contract = {
+    revision: 5,
+    acceptanceCriteria: [
+      { criterionId: "delivered", description: "动作生成匹配的交付物" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "代码变更包",
+        required: true,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "测试报告",
+        required: true,
+      },
+    ],
+  };
+  const targetFor = (deliverableId) => createDeliveryEvidenceTarget({
+    taskId: "work-1",
+    roleId: "developer",
+    acceptanceContract: contract,
+    deliverableId,
+  });
+  const complete = async (proposalId, operation, evidenceTarget) => {
+    await proposals.create(proposal({
+      proposalId,
+      binding: {
+        repository: "acme/widgets",
+        workspaceId: "widgets-local",
+        evidenceTarget,
+      },
+      payload: { operation, objective: "Produce authoritative evidence" },
+    }));
+    const claim = await claimAs(proposals, {
+      runnerId: "code-runner",
+      leaseDurationMs: 30_000,
+    });
+    await advanceAs(
+      proposals,
+      advanceRequest(claim, {
+        status: "succeeded",
+        summary: `${proposalId} terminal`,
+        evidence: [],
+      }),
+    );
+  };
+  const changeTarget = targetFor("implementation");
+  const testTarget = targetFor("verification");
+  await complete("valid-modify", "modify", changeTarget);
+  await complete("invalid-modify-test", "modify", testTarget);
+  await complete("valid-verify", "verify", testTarget);
+  await complete("invalid-verify-change", "verify", changeTarget);
+
+  const page = proposals.listEvidenceCandidates({
+    taskId: changeTarget.taskId,
+    roleId: changeTarget.roleId,
+    contractRevision: changeTarget.contractRevision,
+    contractDigest: changeTarget.contractDigest,
+    kinds: ["change-package", "test-report"],
+    limit: 10,
+  });
+
+  assert.deepEqual(
+    page.items.map(({ proposal: candidate }) => candidate.proposalId),
+    ["valid-verify", "valid-modify"],
+  );
+  assert.equal(page.nextBeforeSequence, null);
 });

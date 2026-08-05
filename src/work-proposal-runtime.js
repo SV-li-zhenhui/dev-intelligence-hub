@@ -190,6 +190,15 @@ export async function createWorkProposalRuntime({
       consumer: frozenPort({
         readResultBatch: (value) => admit(() => proposals.readResultBatch(value)),
       }),
+      evidenceReader: frozenPort({
+        getResult: (value) => admit(() => proposals.getResult(value)),
+        getProposalForEvidence: (value) =>
+          admit(() => proposals.getProposalForEvidence(value)),
+        getResultForProposal: (value) =>
+          admit(() => proposals.getResultForProposal(value)),
+        listEvidenceCandidates: (value) =>
+          admit(() => proposals.listEvidenceCandidates(value)),
+      }),
       close,
     });
   } catch (error) {

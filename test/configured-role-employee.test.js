@@ -172,6 +172,14 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   assert.deepEqual(calls[0].dataClasses, ["requirements", "code"]);
   assert.match(calls[0].messages[0].content, /developer/);
   assert.match(calls[0].messages[0].content, /untrusted|不可信/i);
+  assert.match(
+    calls[0].messages[0].content,
+    /modify produces change-package.*verify produces test-report/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
+    /multiple compatible expected deliverables.*deliverableId|deliverableId.*multiple compatible expected deliverables/i,
+  );
   assert.deepEqual(JSON.parse(calls[0].messages[1].content), {
     requirements: { trigger: "assigned", title: "修复登录" },
     code: { files: ["src/app.js"] },

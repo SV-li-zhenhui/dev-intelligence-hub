@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
+import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
+import {
+  RoleContextAssemblerError,
+  roleContextError,
+} from "./role-context-error.js";
+
+export { RoleContextAssemblerError };
 
 const MAX_CONTEXT_BYTES = 128 * 1024;
 const MAX_CANONICAL_DEPTH = 16;
@@ -32,16 +39,8 @@ const DATA_CLASS_BY_DELIVERABLE_KIND = new Map([
   ["github-review", "code"],
 ]);
 
-export class RoleContextAssemblerError extends Error {
-  constructor(code, message, statusCode = 400, options) {
-    super(message, options);
-    this.name = "RoleContextAssemblerError";
-    this.code = code;
-    this.statusCode = statusCode;
-  }
-}
 function contextError(code, message, statusCode, options) {
-  return new RoleContextAssemblerError(code, message, statusCode, options);
+  return roleContextError(code, message, statusCode, options);
 }
 
 function invalid(message = "Role context input is invalid", options) {
@@ -840,17 +839,23 @@ function normalizeFactObservation(value, name) {
   return { name, value: valueText, observedAt };
 }
 
-async function readFacts(factSource, event) {
+async function readFacts(factSource, event, signal) {
+  signal?.throwIfAborted();
   if (!factSource) return [];
   const facts = [];
   for (const name of FACT_NAMES) {
+    signal?.throwIfAborted();
     let observation;
     try {
-      observation = await factSource.read({
-        item: { event: structuredClone(event) },
-        fact: name,
-      });
+      observation = await factSource.read(
+        {
+          item: { event: structuredClone(event) },
+          fact: name,
+        },
+        signal === undefined ? undefined : { signal },
+      );
     } catch (cause) {
+      signal?.throwIfAborted();
       throw contextError(
         "ROLE_CONTEXT_FACT_UNAVAILABLE",
         `Unable to read current fact ${name}`,
@@ -858,6 +863,7 @@ async function readFacts(factSource, event) {
         { cause },
       );
     }
+    signal?.throwIfAborted();
     const normalized = normalizeFactObservation(observation, name);
     if (normalized) facts.push(normalized);
   }
@@ -877,24 +883,54 @@ function assertPacketSize(value) {
 export class RoleContextAssembler {
   #graphReader;
   #factSource;
+  #evidenceCatalogAdapter;
 
-  constructor({ graphReader, factSource } = {}) {
+  constructor({ graphReader, factSource, evidenceCatalog } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
+    this.#evidenceCatalogAdapter =
+      createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
     Object.freeze(this);
   }
 
   async assemble(value) {
-    const input = exactData(value, ["roleId", "item", "trigger"], "assemble input");
+    const input = ownData(value, "assemble input");
+    const assembleKeys = input.has("signal")
+      ? ["roleId", "item", "trigger", "signal"]
+      : ["roleId", "item", "trigger"];
+    if (
+      input.size !== assembleKeys.length ||
+      assembleKeys.some((key) => !input.has(key))
+    ) {
+      throw invalid("assemble input is invalid");
+    }
     const roleId = text(input.get("roleId"), "roleId", 128);
     if (!SAFE_ROLE_ID.test(roleId)) throw invalid("roleId is invalid");
     const trigger = text(input.get("trigger"), "trigger", 128);
     const item = normalizeItem(input.get("item"));
+    const signal = input.get("signal");
+    if (
+      signal !== undefined &&
+      (
+        signal === null ||
+        typeof signal !== "object" ||
+        typeof signal.aborted !== "boolean" ||
+        typeof signal.addEventListener !== "function" ||
+        typeof signal.removeEventListener !== "function" ||
+        typeof signal.throwIfAborted !== "function"
+      )
+    ) {
+      throw invalid("signal is invalid");
+    }
+    signal?.throwIfAborted();
 
     let snapshotValue;
     try {
-      snapshotValue = await this.#graphReader.getSnapshot();
+      snapshotValue = await this.#graphReader.getSnapshot(
+        signal === undefined ? undefined : { signal },
+      );
     } catch (cause) {
+      signal?.throwIfAborted();
       throw contextError(
         "ROLE_CONTEXT_GRAPH_UNAVAILABLE",
         "Unable to read the work graph",
@@ -902,7 +938,9 @@ export class RoleContextAssembler {
         { cause },
       );
     }
+    signal?.throwIfAborted();
     const snapshot = normalizeSnapshot(snapshotValue);
+    signal?.throwIfAborted();
     const currentTask = snapshot.tasksById.get(item.taskId);
     const taskState = snapshot.statesById.get(item.taskId);
     if (!currentTask || !taskState) {
@@ -916,6 +954,7 @@ export class RoleContextAssembler {
 
     const deliveryState = currentDeliveryState(currentTask);
     const { currentContract } = deliveryState;
+    const currentAcceptanceContract = publicContract(currentContract);
     const dependencies = projectDependencies(currentTask, snapshot);
     const coordination = projectRootCoordination(roleId, currentTask, snapshot);
     const currentTaskRejection = projectCurrentTaskRejection(
@@ -923,7 +962,16 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
-    const facts = await readFacts(this.#factSource, item.event);
+    const [facts, authoritativeEvidence] = await Promise.all([
+      readFacts(this.#factSource, item.event, signal),
+      this.#evidenceCatalogAdapter.read({
+        roleId,
+        taskId: currentTask.taskId,
+        acceptanceContract: currentAcceptanceContract,
+        signal,
+      }),
+    ]);
+    signal?.throwIfAborted();
     const isPullRequest = item.eventType.startsWith("pull_request.");
 
     const binding = {
@@ -958,7 +1006,7 @@ export class RoleContextAssembler {
         parentTaskId: currentTask.parentTaskId,
         responsibility: { ...currentTask.responsibility },
         work: { ...taskState.work },
-        acceptanceContract: publicContract(currentContract),
+        acceptanceContract: currentAcceptanceContract,
       },
       source: {
         assignmentId: item.assignmentId,
@@ -986,7 +1034,8 @@ export class RoleContextAssembler {
       dependencies.code.length > 0 ||
       coordination?.code.length > 0 ||
       currentTaskRejection?.dataClass === "code" ||
-      proposalDecisionContext !== null
+      proposalDecisionContext !== null ||
+      authoritativeEvidence.length > 0
     ) {
       context.code = {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
@@ -1000,6 +1049,9 @@ export class RoleContextAssembler {
           : {}),
         ...(coordination?.code.length > 0
           ? { childDeliveries: coordination.code }
+          : {}),
+        ...(authoritativeEvidence.length > 0
+          ? { authoritativeEvidence }
           : {}),
       };
     }
@@ -1019,6 +1071,7 @@ export class RoleContextAssembler {
       contextDigest,
     };
     assertPacketSize(packet);
+    signal?.throwIfAborted();
     return deepFreeze(packet);
   }
 }

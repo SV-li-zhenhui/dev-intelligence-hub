@@ -334,6 +334,8 @@ export async function createCodeJobRuntime({
         getDetail: (value) => admission.run(() => jobs.getDetail(value)),
         list: (value) => admission.run(() => jobs.list(value)),
         listNewest: (value) => admission.run(() => jobs.listNewest(value)),
+        readDeliveryEvidence: (value) =>
+          admission.run(() => jobs.readDeliveryEvidence(value)),
       }),
       control: frozenPort({
         pause: (value) => controlMutation("pause", value),

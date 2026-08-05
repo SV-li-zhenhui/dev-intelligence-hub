@@ -141,6 +141,20 @@ function options(grant, allowedOperationsByRole = {}) {
   };
 }
 
+function evidenceTargetFor(value, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    taskId: value.requestedBy.workItemId,
+    roleId: value.requestedBy.roleId,
+    contractRevision: 3,
+    contractDigest: "c".repeat(64),
+    deliverables: [
+      { deliverableId: "implementation", kind: "change-package" },
+    ],
+    ...overrides,
+  };
+}
+
 function assertInvalid(operation) {
   assert.throws(
     operation,
@@ -183,6 +197,41 @@ test("a policy-bound code proposal becomes one exact local job creation approval
   const queued = normalizeConfirmationPlan(plan);
   assert.match(queued.displayedPayloadDigest, /^[a-f0-9]{64}$/);
   assert.match(queued.approvalBindingDigest, /^[a-f0-9]{64}$/);
+});
+
+test("confirmation accepts exact proposal authority and rejects ambiguous targets", () => {
+  const base = proposal();
+  const dispatchIntentId = `work-dispatch-intent-${"e".repeat(64)}`;
+  const authorized = proposalWith(base, {
+    binding: {
+      evidenceTarget: evidenceTargetFor(base),
+      dispatchIntentId,
+    },
+  });
+
+  assert.doesNotThrow(() =>
+    createCodeActionProposalConfirmationPlan(
+      authorized,
+      options(grantFor(authorized)),
+    ),
+  );
+
+  const ambiguous = proposalWith(base, {
+    binding: {
+      evidenceTarget: evidenceTargetFor(base, {
+        deliverables: [
+          { deliverableId: "implementation", kind: "change-package" },
+          { deliverableId: "verification", kind: "change-package" },
+        ],
+      }),
+    },
+  });
+  assertInvalid(() =>
+    createCodeActionProposalConfirmationPlan(
+      ambiguous,
+      options(grantFor(ambiguous)),
+    ),
+  );
 });
 
 test("confirmation IDs form one stable recovery slot per proposal", () => {

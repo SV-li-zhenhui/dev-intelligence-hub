@@ -1,4 +1,5 @@
 import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js";
+import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
@@ -147,7 +148,31 @@ function requireBoundProposal(state, result) {
       409,
     );
   }
-  return item;
+  let evidenceTarget = null;
+  const rawTarget = outbox.dispatchBinding?.boundIntent?.binding?.evidenceTarget;
+  if (rawTarget !== undefined) {
+    try {
+      evidenceTarget = normalizeDeliveryEvidenceTarget(rawTarget);
+    } catch (cause) {
+      throw workLedgerError(
+        "WORK_LEDGER_PROPOSAL_BINDING_CONFLICT",
+        "工作提案证据目标绑定无效",
+        409,
+        { cause },
+      );
+    }
+    if (
+      evidenceTarget.taskId !== item.itemId ||
+      evidenceTarget.roleId !== result.requestedBy.roleId
+    ) {
+      throw workLedgerError(
+        "WORK_LEDGER_PROPOSAL_BINDING_CONFLICT",
+        "工作提案证据目标不属于当前任务",
+        409,
+      );
+    }
+  }
+  return { item, evidenceTarget };
 }
 
 export function planProposalBatchApplication({ state, input, clock }) {
@@ -171,7 +196,7 @@ export function planProposalBatchApplication({ state, input, clock }) {
   const appliedItemIds = [];
   for (const result of batch.pending) {
     const workingState = { ...state, items };
-    const item = requireBoundProposal(workingState, result);
+    const { item, evidenceTarget } = requireBoundProposal(workingState, result);
     if (Date.parse(result.at) > Date.parse(now)) {
       throw invalid("工作提案结果时间晚于台账时钟");
     }
@@ -189,10 +214,17 @@ export function planProposalBatchApplication({ state, input, clock }) {
       },
       observedAt: result.at,
     });
+    const continueForEvidence = succeeded && evidenceTarget !== null;
+    let nextStatus = "blocked";
+    if (succeeded) {
+      nextStatus = continueForEvidence ? "queued" : "completed";
+    }
     const itemResult = moveWorkItem(item, {
-      status: succeeded ? "completed" : "blocked",
+      status: nextStatus,
       now,
-      reason: `proposal_${result.outcome}`,
+      reason: continueForEvidence
+        ? "proposal_evidence_ready"
+        : `proposal_${result.outcome}`,
       activeIntentId: null,
       decisionContext,
     });

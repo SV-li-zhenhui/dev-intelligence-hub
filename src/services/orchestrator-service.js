@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
 import {
   assertRequirementSpecAcceptedInputsBudget,
   createRequirementSpec,
@@ -7,6 +8,10 @@ import {
 } from "../domain/requirement-spec-contract.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import {
+  WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
+  WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
+} from "./work-coordination-timing.js";
 
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
@@ -55,6 +60,24 @@ function evidenceRejected(message, options) {
     "ORCHESTRATOR_EVIDENCE_REJECTED",
     message,
     409,
+    options,
+  );
+}
+
+function evidenceVerifierUnavailable(message, options) {
+  return serviceError(
+    "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE",
+    message,
+    503,
+    options,
+  );
+}
+
+function contextUnavailable(message, options) {
+  return serviceError(
+    "ORCHESTRATOR_CONTEXT_UNAVAILABLE",
+    message,
+    503,
     options,
   );
 }
@@ -207,6 +230,18 @@ function positiveRevision(value, name) {
   return value;
 }
 
+function timeoutMilliseconds(value, name) {
+  if (
+    !Number.isSafeInteger(value) ||
+    Object.is(value, -0) ||
+    value < 1 ||
+    value > 24 * 60 * 60 * 1000
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return value;
+}
+
 function requirePort(value, method, name) {
   if (
     value === null ||
@@ -310,8 +345,19 @@ function normalizeItem(value) {
   }
   const ownerId = fields.get("ownerId");
   const leaseId = fields.get("leaseId");
+  const rawLeaseUntil = fields.get("leaseUntil");
   if (ownerId !== null) boundedText(ownerId, "item.ownerId", 128);
   if (leaseId !== null) boundedText(leaseId, "item.leaseId", 128);
+  if (
+    rawLeaseUntil !== undefined &&
+    rawLeaseUntil !== null &&
+    (
+      typeof rawLeaseUntil !== "string" ||
+      !Number.isFinite(Date.parse(rawLeaseUntil))
+    )
+  ) {
+    throw invalid("item.leaseUntil is invalid");
+  }
   return {
     value: item,
     itemId: boundedText(fields.get("itemId"), "item.itemId", 192),
@@ -320,6 +366,7 @@ function normalizeItem(value) {
     status: boundedText(fields.get("status"), "item.status", 64),
     ownerId,
     leaseId,
+    leaseUntil: rawLeaseUntil ?? null,
     currentTarget: normalizeTarget(fields.get("currentTarget"), "item.currentTarget"),
   };
 }
@@ -415,6 +462,23 @@ function assertCurrentItem({ item, packet, worker, tasksById }) {
     throw stale("The employee claim no longer matches its task binding");
   }
   return task;
+}
+
+function assertLocalSubmissionClaim({ worker, item, intent }) {
+  if (worker.roleId === ORCHESTRATOR_ROLE_ID) {
+    throw denied("The root orchestrator cannot submit a specialist delivery");
+  }
+  if (
+    item.status !== "working" ||
+    item.ownerId !== worker.workerId ||
+    !item.leaseId ||
+    item.currentTarget.type !== "role" ||
+    item.currentTarget.id !== worker.roleId ||
+    intent.taskId !== item.itemId ||
+    intent.expectedTaskRevision !== item.revision
+  ) {
+    throw denied("The specialist delivery is not bound to the active claim");
+  }
 }
 
 function directChildIds(packet) {
@@ -573,38 +637,110 @@ function workInputsEvidence({ taskId, roleId: employeeRoleId, contextDigest, acc
   };
 }
 
-async function verifyExternalEvidence(verifier, evidence, authority) {
+function waitForVerification(operation, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(operation).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+async function verifyExternalEvidence(
+  verifier,
+  evidence,
+  authority,
+  timeoutMs,
+) {
   if (evidence.length === 0) return;
   if (!verifier) {
-    throw serviceError(
-      "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE",
+    throw evidenceVerifierUnavailable(
       "External evidence cannot be accepted without a configured verifier",
-      503,
     );
   }
-  for (const record of evidence) {
-    let verified;
-    try {
-      verified = await verifier.verify({
-        taskId: authority.taskId,
-        deliverableId: authority.deliverableId,
-        evidence: structuredClone(record),
-      });
-    } catch (cause) {
-      throw evidenceRejected("External evidence verification failed", { cause });
+  const controller = new AbortController();
+  const deadline = evidenceVerifierUnavailable(
+    "External evidence verification timed out",
+  );
+  const timer = setTimeout(() => controller.abort(deadline), timeoutMs);
+  try {
+    for (const record of evidence) {
+      let verified;
+      try {
+        verified = await waitForVerification(
+          verifier.verify({
+            taskId: authority.taskId,
+            roleId: authority.roleId,
+            contractRevision: authority.contractRevision,
+            contractDigest: authority.contractDigest,
+            deliverableId: authority.deliverableId,
+            evidence: structuredClone(record),
+            signal: controller.signal,
+          }),
+          controller.signal,
+        );
+      } catch (cause) {
+        if (cause === deadline) throw deadline;
+        throw evidenceVerifierUnavailable(
+          "External evidence authority is temporarily unavailable",
+          { cause },
+        );
+      }
+      if (verified === true) continue;
+      let normalized;
+      try {
+        normalized = checkedClone(verified);
+      } catch (cause) {
+        throw evidenceRejected(
+          "External evidence verifier returned invalid data",
+          { cause },
+        );
+      }
+      if (!sameValue(normalized, record)) {
+        throw evidenceRejected(
+          "External evidence verifier changed or rejected evidence",
+        );
+      }
     }
-    if (verified === true) continue;
-    let normalized;
-    try {
-      normalized = checkedClone(verified);
-    } catch (cause) {
-      throw evidenceRejected("External evidence verifier returned invalid data", {
-        cause,
-      });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function assembleCurrentContext(assembler, input, timeoutMs) {
+  const controller = new AbortController();
+  const deadline = evidenceVerifierUnavailable(
+    "Authoritative evidence catalog read timed out",
+  );
+  const timer = setTimeout(() => controller.abort(deadline), timeoutMs);
+  try {
+    return await waitForVerification(
+      Promise.resolve().then(() => assembler.assemble({
+        ...input,
+        signal: controller.signal,
+      })),
+      controller.signal,
+    );
+  } catch (cause) {
+    if (cause === deadline) throw cause;
+    if (cause?.code === "ROLE_CONTEXT_STALE" && cause?.statusCode === 409) {
+      throw stale("Unable to reassemble a current role context", { cause });
     }
-    if (!sameValue(normalized, record)) {
-      throw evidenceRejected("External evidence verifier changed or rejected evidence");
+    if (
+      Number.isInteger(cause?.statusCode) &&
+      cause.statusCode >= 500 &&
+      cause.statusCode <= 599
+    ) {
+      throw contextUnavailable(
+        "Unable to reassemble a current role context",
+        { cause },
+      );
     }
+    throw cause;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -614,6 +750,40 @@ function evidenceOfKind(evidence, kind) {
 
 function nonReservedEvidence(evidence) {
   return evidence.filter(({ kind }) => !RESERVED_EVIDENCE_KINDS.has(kind));
+}
+
+function currentExpectedDeliverable(task, deliverableId, contractRevision) {
+  const contract = latestContract(task);
+  const expected = contract.expectedDeliverables.find(
+    (candidate) => candidate.deliverableId === deliverableId,
+  );
+  if (!expected || contractRevision !== contract.revision) {
+    throw stale("The submitted delivery no longer matches its acceptance contract");
+  }
+  if (
+    (deliverableId === "requirement-spec") !==
+    (expected.kind === "requirement-spec")
+  ) {
+    throw evidenceRejected(
+      "Requirement deliverable id and kind do not match",
+    );
+  }
+  return { contract, expected };
+}
+
+function assertAcceptanceEvidence(task, submitted, externalEvidence) {
+  const binding = currentExpectedDeliverable(
+    task,
+    submitted.deliverableId,
+    submitted.contractRevision,
+  );
+  if (binding.expected.kind === "requirement-spec") return binding;
+  if (!externalEvidence.some(({ kind }) => kind === binding.expected.kind)) {
+    throw evidenceRejected(
+      `Delivery ${submitted.deliverableId} lacks authoritative ${binding.expected.kind} evidence`,
+    );
+  }
+  return binding;
 }
 
 function parseWorkInputsEvidence(task, evidence, acceptedInputs) {
@@ -903,6 +1073,7 @@ async function planDeliveryDecision({
   graph,
   tasksById,
   evidenceVerifier,
+  evidenceVerificationTimeoutMs,
   graphReader,
 }) {
   if (!children.has(source.taskId)) {
@@ -918,18 +1089,30 @@ async function planDeliveryDecision({
     throw denied("The submitted delivery is outside the current review window");
   }
   const submitted = latestSubmitted(source, action.submittedDeliveryRevision);
+  let verifiedEvidence = false;
   if (action.type === "accept_delivery") {
     const acceptedInputs = deriveAcceptedInputs(source, tasksById);
+    const externalEvidence = nonReservedEvidence(submitted.evidence);
     parseWorkInputsEvidence(source, submitted.evidence, acceptedInputs);
+    const { contract } = assertAcceptanceEvidence(
+      source,
+      submitted,
+      externalEvidence,
+    );
     parseRequirementSpec(source, submitted, acceptedInputs, graph.revision);
     await verifyExternalEvidence(
       evidenceVerifier,
-      nonReservedEvidence(submitted.evidence),
+      externalEvidence,
       {
         taskId: source.taskId,
+        roleId: source.responsibility.id,
+        contractRevision: contract.revision,
+        contractDigest: deliveryAcceptanceContractDigest(contract),
         deliverableId: submitted.deliverableId,
       },
+      evidenceVerificationTimeoutMs,
     );
+    verifiedEvidence = externalEvidence.length > 0;
   }
   const expectedStatus =
     action.type === "accept_delivery" ? "accepted" : "rejected";
@@ -946,6 +1129,7 @@ async function planDeliveryDecision({
     command,
     recover: () =>
       recoverDeliveryDecision(graphReader, command, rootId, expectedStatus),
+    verifiedEvidence,
     result: projectActionResult(action.type, rootId, source.taskId, {
       deliveryDecision: true,
     }),
@@ -1002,12 +1186,35 @@ async function createOrchestrationPlan(options) {
   }
 }
 
+async function assertGraphStillCurrent(graphReader, expected) {
+  let current;
+  try {
+    current = normalizeGraphView(await graphReader.getSnapshot());
+  } catch (cause) {
+    throw serviceError(
+      "ORCHESTRATOR_GRAPH_UNAVAILABLE",
+      "Unable to recheck the work graph after evidence verification",
+      503,
+      { cause },
+    );
+  }
+  if (
+    current.revision !== expected.revision ||
+    current.contentDigest !== expected.contentDigest
+  ) {
+    throw stale("The work graph changed during evidence verification");
+  }
+}
+
 export class OrchestratorService {
   #contextAssembler;
   #graphReader;
   #plannerFactory;
   #delivererFactory;
   #evidenceVerifier;
+  #evidenceVerificationTimeoutMs;
+  #evidenceMutationMarginMs;
+  #clock;
   #capabilityRoles;
   #admitAction;
 
@@ -1017,6 +1224,11 @@ export class OrchestratorService {
     scopedGraphPlannerFactory,
     graphDelivererFactory,
     evidenceVerifier,
+    evidenceVerificationTimeoutMs =
+      WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
+    evidenceMutationMarginMs =
+      WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
+    clock = () => new Date(),
     capabilityRoles = {},
     actionAdmissionGate,
   } = {}) {
@@ -1037,6 +1249,16 @@ export class OrchestratorService {
       "graphDelivererFactory",
     );
     this.#evidenceVerifier = optionalEvidenceVerifier(evidenceVerifier);
+    this.#evidenceVerificationTimeoutMs = timeoutMilliseconds(
+      evidenceVerificationTimeoutMs,
+      "evidenceVerificationTimeoutMs",
+    );
+    this.#evidenceMutationMarginMs = timeoutMilliseconds(
+      evidenceMutationMarginMs,
+      "evidenceMutationMarginMs",
+    );
+    if (typeof clock !== "function") throw new TypeError("clock is invalid");
+    this.#clock = clock;
     this.#capabilityRoles = normalizeCapabilityRoles(capabilityRoles);
     this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     Object.freeze(this);
@@ -1054,17 +1276,21 @@ export class OrchestratorService {
       fields.get("contextPacket"),
     );
     const intent = normalizeWorkIntent(checkedClone(fields.get("intent")));
+    let evidenceDeadlineAt = null;
+    if (intent.type === "submit_delivery") {
+      assertLocalSubmissionClaim({ worker, item, intent });
+      evidenceDeadlineAt = this.#evidenceDeadline(item);
+    }
 
-    let freshPacket;
-    try {
-      freshPacket = await this.#contextAssembler.assemble({
+    const freshPacket = await assembleCurrentContext(
+      this.#contextAssembler,
+      {
         roleId: worker.roleId,
         item: item.value,
         trigger,
-      });
-    } catch (cause) {
-      throw stale("Unable to reassemble a current role context", { cause });
-    }
+      },
+      this.#remainingEvidenceBudget(evidenceDeadlineAt),
+    );
     const packet = assertPacketIsFresh(originalPacket, freshPacket);
 
     let graph;
@@ -1106,9 +1332,35 @@ export class OrchestratorService {
         graph,
         tasksById,
         bindingTask,
+        evidenceDeadlineAt,
       });
     }
     throw invalid("OrchestratorService only accepts trusted graph intents");
+  }
+
+  #evidenceDeadline(item) {
+    if (item.leaseUntil === null) return null;
+    const now = this.#clock();
+    const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+    if (!Number.isFinite(nowMs)) {
+      throw new TypeError("clock returned an invalid value");
+    }
+    return Date.now() + Date.parse(item.leaseUntil) - nowMs;
+  }
+
+  #remainingEvidenceBudget(evidenceDeadlineAt) {
+    if (evidenceDeadlineAt === null) {
+      return this.#evidenceVerificationTimeoutMs;
+    }
+    const availableMs = Math.floor(
+      evidenceDeadlineAt - Date.now() - this.#evidenceMutationMarginMs,
+    );
+    if (availableMs < 1) {
+      throw evidenceVerifierUnavailable(
+        "The active work lease has no remaining evidence budget",
+      );
+    }
+    return Math.min(this.#evidenceVerificationTimeoutMs, availableMs);
   }
 
   async #executeOrchestration({
@@ -1141,8 +1393,12 @@ export class OrchestratorService {
       summary: intent.summary,
       capabilityRoles: this.#capabilityRoles,
       evidenceVerifier: this.#evidenceVerifier,
+      evidenceVerificationTimeoutMs: this.#evidenceVerificationTimeoutMs,
       graphReader: this.#graphReader,
     });
+    if (plan.verifiedEvidence) {
+      await assertGraphStillCurrent(this.#graphReader, graph);
+    }
     const planner = this.#plannerFactory.forRoot({ scopeRootTaskId: rootId });
     let operation;
     try {
@@ -1186,41 +1442,40 @@ export class OrchestratorService {
     graph,
     tasksById,
     bindingTask,
+    evidenceDeadlineAt,
   }) {
-    if (worker.roleId === ORCHESTRATOR_ROLE_ID) {
-      throw denied("The root orchestrator cannot submit a specialist delivery");
-    }
+    assertLocalSubmissionClaim({ worker, item, intent });
     if (
-      item.status !== "working" ||
-      item.ownerId !== worker.workerId ||
-      !item.leaseId ||
-      item.currentTarget.type !== "role" ||
-      item.currentTarget.id !== worker.roleId ||
       bindingTask.responsibility.type !== "role" ||
       bindingTask.responsibility.id !== worker.roleId ||
-      intent.taskId !== item.itemId ||
-      intent.expectedTaskRevision !== item.revision ||
       intent.expectedGraphRevision !== graph.revision
     ) {
       throw denied("The specialist delivery is not bound to the active claim");
     }
-    const contract = latestContract(bindingTask);
-    if (
-      intent.contractRevision !== contract.revision ||
-      !contract.expectedDeliverables.some(
-        ({ deliverableId }) => deliverableId === intent.deliverableId,
-      )
-    ) {
-      throw stale("The specialist delivery no longer matches its acceptance contract");
-    }
+    const { contract } = currentExpectedDeliverable(
+      bindingTask,
+      intent.deliverableId,
+      intent.contractRevision,
+    );
     const acceptedInputs = deriveAcceptedInputs(bindingTask, tasksById);
     if (!sameValue(packet.acceptedInputs, acceptedInputs)) {
       throw stale("The specialist inputs changed before delivery submission");
     }
-    await verifyExternalEvidence(this.#evidenceVerifier, intent.evidence, {
-      taskId: item.itemId,
-      deliverableId: intent.deliverableId,
-    });
+    await verifyExternalEvidence(
+      this.#evidenceVerifier,
+      intent.evidence,
+      {
+        taskId: item.itemId,
+        roleId: worker.roleId,
+        contractRevision: contract.revision,
+        contractDigest: deliveryAcceptanceContractDigest(contract),
+        deliverableId: intent.deliverableId,
+      },
+      this.#remainingEvidenceBudget(evidenceDeadlineAt),
+    );
+    if (intent.evidence.length > 0) {
+      await assertGraphStillCurrent(this.#graphReader, graph);
+    }
 
     const deliveryRevision = bindingTask.deliveries.length + 1;
     const trustedEvidence = [

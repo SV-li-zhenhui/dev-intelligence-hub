@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -854,6 +855,55 @@ test("a bounded decision timeout schedules a safe retry before the lease expires
   assert.equal(ledger.items[0].status, "retry_wait");
 });
 
+test("a bounded context timeout aborts a hanging graph read before retrying", async () => {
+  const time = controlledClock();
+  const sourceItem = workItem(69, { type: "role", id: "developer" });
+  sourceItem.inputDigest = "a".repeat(64);
+  const ledger = new FakeLedger({
+    source: [sourceItem],
+    time,
+  });
+  let graphSignal;
+  const directory = new FakeRoleDirectory({
+    developer: worker({ roleId: "developer" }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    leaseDurationMs: 13_000,
+    resolveTimeoutMs: 1_000,
+    decideTimeoutMs: 1_000,
+    roleContextAssembler: new RoleContextAssembler({
+      graphReader: {
+        async getSnapshot({ signal } = {}) {
+          graphSignal = signal;
+          return new Promise((resolve, reject) => {
+            if (signal.aborted) {
+              reject(signal.reason);
+              return;
+            }
+            signal.addEventListener(
+              "abort",
+              () => reject(signal.reason),
+              { once: true },
+            );
+          });
+        },
+      },
+    }),
+    orchestratorService: { async execute() {} },
+  });
+
+  const result = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(result.retried, 1);
+  assert.equal(graphSignal instanceof AbortSignal, true);
+  assert.equal(graphSignal.aborted, true);
+  assert.equal(graphSignal.reason.code, "ROLE_CONTEXT_TIMEOUT");
+  assert.equal(ledger.items[0].status, "retry_wait");
+});
+
 test("role timeouts must be strictly shorter than the work lease", () => {
   const time = controlledClock();
   const ledger = new FakeLedger({ time });
@@ -1176,6 +1226,52 @@ test("a child-blocked configured root orchestrates without obtaining a lease", a
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);
   assert.equal(executions[0].item.status, "queued");
+});
+
+test("an expired configured root orchestrates without reclaiming its lease", async () => {
+  const time = controlledClock();
+  const root = workItem(70, { type: "role", id: "orchestrator" });
+  root.status = "working";
+  root.ownerId = "previous-orchestrator";
+  root.leaseId = "expired-root-lease";
+  root.leaseUntil = new Date(
+    Date.parse(time.clock()) - 1_000,
+  ).toISOString();
+  root.attempt = 1;
+  const ledger = new FakeLedger({ source: [root], time });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async ({ item }) => orchestrationDecision(item),
+    }),
+  });
+  const executions = [];
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute(input) {
+        executions.push(clone(input));
+        return { applied: true };
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.orchestrated, 1);
+  assert.equal(cycle.claimed, 0);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(executions.length, 1);
+  assert.equal(executions[0].item.status, "working");
+  assert.equal(executions[0].item.leaseId, "expired-root-lease");
 });
 
 test("runtime cutover leaves configured root orchestration queued", async () => {
