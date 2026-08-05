@@ -434,6 +434,9 @@ export async function createApplication({
                 ]
               : []),
           ],
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
         }),
       );
     }
@@ -935,6 +938,9 @@ export async function createApplication({
         attentionProducer: attentionInboxRuntime.producer,
         proposalProducer: workProposalRuntime.producer,
         ...clockOptions,
+        ...(ordinaryActionAdmissionGate === null
+          ? {}
+          : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       });
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,

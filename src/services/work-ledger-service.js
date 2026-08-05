@@ -32,6 +32,7 @@ import {
 } from "./work-ledger-graph-memory.js";
 import {
   planIntentAcknowledgement,
+  planIntentBinding,
   planIntentClaim,
   planIntentStage,
 } from "./work-ledger-outbox-commands.js";
@@ -445,6 +446,10 @@ export class WorkLedgerService {
 
   async claimIntent(input = {}) {
     return this.#executeCommand(planIntentClaim, input, true);
+  }
+
+  async bindIntent(input = {}) {
+    return this.#executeCommand(planIntentBinding, input);
   }
 
   async ackIntent(input = {}) {

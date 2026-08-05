@@ -9,6 +9,7 @@ import {
 import {
   createWorkProposalResult,
   normalizeBoundWorkProposal,
+  workProposalDigest,
 } from "../src/domain/work-proposal-contract.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
@@ -1215,6 +1216,61 @@ function reviewIntent(overrides = {}) {
   };
 }
 
+function boundReviewIntent(item, overrides = {}) {
+  const content = {
+    policyVersion: 4,
+    kind: "github_review_proposal",
+    requestedBy: {
+      roleId: "pr-reviewer",
+      workItemId: item.itemId,
+    },
+    source: {
+      assignmentId: item.assignmentId,
+      eventId: item.event.eventId,
+    },
+    binding: {
+      repository: "acme/repo",
+      pullRequestNumber: 41,
+    },
+    payload: {
+      verdict: "approve",
+      body: "本地审查未发现阻塞问题。",
+      evidence: ["tests:passed"],
+    },
+    ...overrides,
+  };
+  return {
+    intentId: `work-intent-${workProposalDigest(content)}`,
+    ...content,
+  };
+}
+
+async function prepareClaimedReviewIntent(fixture, leaseDurationMs = 30_000) {
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-reviewer",
+    roleId: "pr-reviewer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs,
+  });
+  return { item, staged, claimed };
+}
+
 function codeActionIntent(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -1562,6 +1618,176 @@ test("outbox dispatch uses expiring leases and acknowledgement fences stale work
     (await fixture.service.listTimeline({ limit: 50 })).items.at(-1).type,
     "intent_acknowledged",
   );
+});
+
+test("intent policy binding is durable, idempotent, and fenced by its live lease", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const { staged, claimed } = await prepareClaimedReviewIntent(fixture, 1_000);
+  const boundIntent = boundReviewIntent(staged.item);
+  const input = {
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent,
+  };
+  const writesBeforeBinding = fixture.store.writes.length;
+
+  const sealed = await fixture.service.bindIntent(input);
+
+  assert.equal(sealed.revision, claimed.revision + 1);
+  assert.deepEqual(sealed.dispatchBinding.boundIntent, boundIntent);
+  assert.match(sealed.dispatchBinding.bindingDigest, /^[a-f0-9]{64}$/);
+  assert.equal(fixture.store.writes.length, writesBeforeBinding + 1);
+  assert.equal(
+    (await fixture.service.listTimeline({ limit: 50 })).items.at(-1).type,
+    "intent_bound",
+  );
+
+  const replay = await fixture.service.bindIntent(input);
+  assert.deepEqual(replay.dispatchBinding, sealed.dispatchBinding);
+  assert.equal(fixture.store.writes.length, writesBeforeBinding + 1);
+
+  fixture.time.advance(1_000);
+  await assert.rejects(
+    fixture.service.bindIntent(input),
+    (error) => error.code === "WORK_LEDGER_INTENT_LEASE_EXPIRED",
+  );
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  assert.deepEqual(
+    (await recovered.listOutbox()).items[0].dispatchBinding,
+    sealed.dispatchBinding,
+  );
+});
+
+test("a failed binding write leaves the claimed intent exactly retryable", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const { staged, claimed } = await prepareClaimedReviewIntent(fixture);
+  const input = {
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item),
+  };
+  fixture.store.failNextWrite();
+
+  await assert.rejects(
+    fixture.service.bindIntent(input),
+    (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
+  );
+  assert.equal((await fixture.service.listOutbox()).items[0].dispatchBinding, null);
+  assert.equal(fixture.store.stored().outbox[0].dispatchBinding, null);
+
+  const retried = await fixture.service.bindIntent(input);
+  assert.deepEqual(retried.dispatchBinding.boundIntent, input.boundIntent);
+});
+
+test("intent binding rejects stale items and semantically changed plans without writing", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const { staged, claimed } = await prepareClaimedReviewIntent(fixture);
+  const base = {
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+  };
+  const writesBefore = fixture.store.writes.length;
+
+  await assert.rejects(
+    fixture.service.bindIntent({
+      ...base,
+      itemExpectedRevision: staged.item.revision + 1,
+      boundIntent: boundReviewIntent(staged.item),
+    }),
+    (error) => error.code === "WORK_LEDGER_REVISION_CONFLICT",
+  );
+  const changedSource = boundReviewIntent(staged.item, {
+    source: {
+      assignmentId: "workflow-assignment-forged",
+      eventId: staged.item.event.eventId,
+    },
+  });
+  await assert.rejects(
+    fixture.service.bindIntent({ ...base, boundIntent: changedSource }),
+    (error) => error.code === "WORK_LEDGER_INTENT_BINDING_INVALID",
+  );
+  assert.equal(fixture.store.writes.length, writesBefore);
+  assert.equal((await fixture.service.listOutbox()).items[0].dispatchBinding, null);
+});
+
+test("recovery rejects a tampered durable intent binding", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const { staged, claimed } = await prepareClaimedReviewIntent(fixture);
+  await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item),
+  });
+  const tampered = fixture.store.stored();
+  tampered.outbox[0].dispatchBinding.boundIntent.payload.body = "篡改后的动作";
+  fixture.store.replaceStored(tampered);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+});
+
+test("schema v7 quarantines an in-flight intent whose old policy binding is unknowable", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await prepareClaimedReviewIntent(fixture, 1_000);
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 7;
+  for (const entry of legacy.outbox) delete entry.dispatchBinding;
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+  assert.deepEqual(
+    (await recovered.listOutbox()).items[0].dispatchBinding,
+    { status: "legacy_unknown" },
+  );
+  const quarantined = (await recovered.listOutbox()).items[0];
+  const writesBeforeClaim = fixture.store.writes.length;
+  await assert.rejects(
+    recovered.claimIntent({
+      intentId: quarantined.intentId,
+      expectedRevision: quarantined.revision,
+      dispatcherId: "recovery-dispatcher",
+      leaseDurationMs: 1_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_INTENT_BINDING_UNKNOWN",
+  );
+  assert.equal(fixture.store.writes.length, writesBeforeClaim);
+  assert.equal(fixture.store.stored().schemaVersion, 7);
 });
 
 test("a delivered handoff atomically acknowledges the outbox and queues the trusted role", async () => {
@@ -1952,6 +2178,14 @@ test("a failed intent can be restaged with the same idempotency key", async () =
     dispatcherId: "confirmation-bridge",
     leaseDurationMs: 30_000,
   });
+  dispatch = await fixture.service.bindIntent({
+    intentId: dispatch.intentId,
+    expectedRevision: dispatch.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "confirmation-bridge",
+    dispatchLeaseId: dispatch.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item),
+  });
   const failed = await fixture.service.ackIntent({
     intentId: dispatch.intentId,
     expectedRevision: dispatch.revision,
@@ -1981,6 +2215,7 @@ test("a failed intent can be restaged with the same idempotency key", async () =
 
   assert.equal(staged.outbox.intentId, dispatch.intentId);
   assert.equal(staged.outbox.status, "pending");
+  assert.equal(staged.outbox.dispatchBinding, null);
   assert.equal(staged.outbox.attempt, 1);
   assert.equal((await fixture.service.listOutbox()).items.length, 1);
   assert.equal(
@@ -2692,6 +2927,7 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   legacy.schemaVersion = 2;
   delete legacy.graphMemoryProjection;
   for (const entry of legacy.items) delete entry.graph;
+  for (const entry of legacy.outbox) delete entry.dispatchBinding;
   fixture.store.replaceStored(legacy);
   const writesBeforeRecovery = fixture.store.writes.length;
   const recovered = new WorkLedgerService({

@@ -190,6 +190,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "cancelGraphTask",
     "stageIntent",
     "claimIntent",
+    "bindIntent",
     "ackIntent",
     "close",
   ]) {

@@ -12,6 +12,9 @@ import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { WorkProposalStore } from "./services/work-proposal-store.js";
 
 const GUARD_NAME = "mydashboard-work-proposal-v1";
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run: (operation) => operation(),
+});
 
 function validateGuard(value) {
   if (
@@ -27,6 +30,26 @@ function validateGuard(value) {
 
 function frozenPort(methods) {
   return Object.freeze(methods);
+}
+
+function actionAdmissionRun(value) {
+  const gate = value === undefined ? DIRECT_ACTION_ADMISSION : value;
+  if (!gate || typeof gate.run !== "function") {
+    throw new TypeError("actionAdmissionGate must provide run(operation)");
+  }
+  return gate.run.bind(gate);
+}
+
+async function runAdmittedOperation(admitAction, operation) {
+  const admitted = await admitAction(() => {
+    try {
+      return { operation: operation(), synchronousError: null };
+    } catch (error) {
+      return { operation: null, synchronousError: error };
+    }
+  });
+  if (admitted.synchronousError !== null) throw admitted.synchronousError;
+  return admitted.operation;
 }
 
 function invalidRunnerRequest() {
@@ -97,6 +120,7 @@ export async function createWorkProposalRuntime({
   idFactory = randomUUID,
   limits,
   runnerScopes = [],
+  actionAdmissionGate,
   operationQueue = new OperationQueue(),
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
@@ -104,6 +128,7 @@ export async function createWorkProposalRuntime({
     throw new TypeError("createGuard must be a function");
   }
   const scopes = normalizeRunnerScopes(runnerScopes);
+  const admitAction = actionAdmissionRun(actionAdmissionGate);
   const guard = validateGuard(createGuard({ name: GUARD_NAME }));
   let closePromise = null;
   let accepting = true;
@@ -144,8 +169,13 @@ export async function createWorkProposalRuntime({
         scopes.map((scope) => [
           scope.runnerId,
           frozenPort({
-            claim: (value) =>
-              admit(() => proposals.claim(bindClaimRequest(value, scope), scope)),
+            claim: (value) => admit(() => {
+              const request = bindClaimRequest(value, scope);
+              return runAdmittedOperation(
+                admitAction,
+                () => proposals.claim(request, scope),
+              );
+            }),
             advance: (value) =>
               admit(() => proposals.advance(bindAdvanceRequest(value, scope), scope)),
           }),

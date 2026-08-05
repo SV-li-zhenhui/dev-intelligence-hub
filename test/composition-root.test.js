@@ -282,7 +282,10 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     },
     workConditionWakerFactory: () => ({ async runCycle() {} }),
     proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
-    workIntentDispatcherFactory: () => ({ async dispatchPending() {} }),
+    workIntentDispatcherFactory: (options) => {
+      calls.dispatcher = options;
+      return { async dispatchPending() {} };
+    },
     workCoordinationFactory: (options) => {
       calls.coordination = options;
       return { async intake() {}, async runCycle() {} };
@@ -713,6 +716,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.ledger.store, store);
   assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
   assert.equal("actionAdmissionGate" in calls.ledger, false);
+  assert.equal("actionAdmissionGate" in calls.proposals, false);
+  assert.equal("actionAdmissionGate" in calls.dispatcher, false);
   assert.strictEqual(calls.attention.store, store);
   assert.notStrictEqual(
     calls.ledger.operationQueue,
@@ -2795,6 +2800,11 @@ test("versioned local code shares one gate and reads Active authority", async ()
         run() { throw new Error("foreign ledger gate"); },
       },
     },
+    workProposalDependencies: {
+      actionAdmissionGate: {
+        run() { throw new Error("foreign proposal gate"); },
+      },
+    },
     configurationRuntimeFactory: async (_candidate, dependencies) => {
       calls.configuration = dependencies;
       return {
@@ -2915,12 +2925,26 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.deepEqual(Object.keys(calls.ledgerRuntime.actionAdmissionGate), [
     "run",
   ]);
+  assert.deepEqual(Object.keys(calls.proposalRuntime.actionAdmissionGate), [
+    "run",
+  ]);
+  assert.deepEqual(Object.keys(calls.dispatcher.actionAdmissionGate), [
+    "run",
+  ]);
   assert.strictEqual(
     calls.workflowRuntime.actionAdmissionGate,
     calls.codeJobRuntime.actionAdmissionGate,
   );
   assert.strictEqual(
     calls.ledgerRuntime.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.proposalRuntime.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.dispatcher.actionAdmissionGate,
     calls.codeJobRuntime.actionAdmissionGate,
   );
   assert.strictEqual(

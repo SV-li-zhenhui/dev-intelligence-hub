@@ -1,3 +1,9 @@
+import {
+  createWorkIntentDispatchBinding,
+  LEGACY_UNKNOWN_WORK_INTENT_BINDING,
+  normalizeBoundWorkIntent,
+  normalizeWorkIntentDispatchBinding,
+} from "../domain/work-intent-dispatch-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 
 const MAX_DISPATCH_BATCH = 100;
@@ -9,15 +15,9 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const WORK_INTENT_ID = /^work-intent-[a-f0-9]{64}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const INVALID_CONTEXT_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
-
-const EXPECTED_BOUND_KIND = new Map([
-  ["ask_user", "attention_request"],
-  ["wait_condition", "wait_condition"],
-  ["propose_github_review", "github_review_proposal"],
-  ["propose_code_action", "code_action_proposal"],
-  ["handoff", "handoff"],
-  ["complete", "complete"],
-]);
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run: (operation) => operation(),
+});
 
 const CLAIM_CONTENTION_CODES = new Set([
   "WORK_LEDGER_INTENT_LEASE_ACTIVE",
@@ -114,6 +114,19 @@ function validateDependency(value, methods, name) {
   return Object.fromEntries(
     methods.map((method) => [method, value[method].bind(value)]),
   );
+}
+
+function actionAdmissionRun(value) {
+  const gate = value === undefined ? DIRECT_ACTION_ADMISSION : value;
+  return validateDependency(gate, ["run"], "actionAdmissionGate").run;
+}
+
+function deepFreeze(value) {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function validateDuration(value, name) {
@@ -349,62 +362,83 @@ function requestedBy(value) {
 }
 
 function validateBoundIntent(bound, item, intent, requester) {
-  const entries = exactDataMap(bound, [
-    "intentId",
-    "policyVersion",
-    "kind",
-    "requestedBy",
-    "source",
-    "binding",
-    "payload",
-  ]);
-  const requestedBy = exactDataMap(entries?.get("requestedBy"), [
-    "roleId",
-    "workItemId",
-  ]);
-  const source = exactDataMap(entries?.get("source"), [
-    "assignmentId",
-    "eventId",
-  ]);
   const event = dataMap(item.event);
-  const expectedKind = EXPECTED_BOUND_KIND.get(intent.type);
-  if (
-    !entries ||
-    !requestedBy ||
-    !source ||
-    !WORK_INTENT_ID.test(entries.get("intentId")) ||
-    !Number.isSafeInteger(entries.get("policyVersion")) ||
-    entries.get("policyVersion") < 1 ||
-    entries.get("kind") !== expectedKind ||
-    requestedBy.get("roleId") !== requester.roleId ||
-    requestedBy.get("workItemId") !== item.itemId ||
-    source.get("assignmentId") !== item.assignmentId ||
-    source.get("eventId") !== event?.get("eventId") ||
-    !dataMap(entries.get("binding")) ||
-    !dataMap(entries.get("payload"))
-  ) {
+  const error = dispatcherError(
+    "WORK_INTENT_BINDING_INVALID",
+    "策略没有返回与可信工作项一致的绑定",
+    409,
+  );
+  return deepFreeze(
+    normalizeBoundWorkIntent(
+      bound,
+      {
+        intentType: intent.type,
+        roleId: requester.roleId,
+        workItemId: item.itemId,
+        assignmentId: item.assignmentId,
+        eventId: event?.get("eventId"),
+      },
+      error,
+    ),
+  );
+}
+
+function persistedBoundIntent(value, item, requester) {
+  const record = dataMap(value);
+  if (!record || !record.has("dispatchBinding")) {
     throw dispatcherError(
-      "WORK_INTENT_BINDING_INVALID",
-      "策略没有返回与可信工作项一致的绑定",
+      "WORK_INTENT_LEDGER_QUERY_INVALID",
+      "员工工作意图缺少持久策略绑定字段",
+      503,
+    );
+  }
+  const rawBinding = record.get("dispatchBinding");
+  if (rawBinding === null) return null;
+  const legacy = exactDataMap(rawBinding, ["status"]);
+  if (legacy?.get("status") === LEGACY_UNKNOWN_WORK_INTENT_BINDING) {
+    throw dispatcherError(
+      "WORK_INTENT_LEGACY_BINDING_UNKNOWN",
+      "历史工作意图可能已经产生下游动作，必须人工核对后恢复",
       409,
     );
   }
+  const invalid = dispatcherError(
+    "WORK_INTENT_LEDGER_QUERY_INVALID",
+    "员工工作意图持久策略绑定损坏",
+    503,
+  );
+  try {
+    const envelope = normalizeWorkIntentDispatchBinding(rawBinding, invalid);
+    return {
+      envelope,
+      bound: validateBoundIntent(
+        envelope.boundIntent,
+        item,
+        record.get("intent"),
+        requester,
+      ),
+    };
+  } catch {
+    throw invalid;
+  }
+}
+
+function bindingUncertain(
+  intentId,
+  code = "binding-result-uncertain",
+  claimed = true,
+) {
   return {
-    intentId: entries.get("intentId"),
-    policyVersion: entries.get("policyVersion"),
-    kind: entries.get("kind"),
-    requestedBy: {
-      roleId: requestedBy.get("roleId"),
-      workItemId: requestedBy.get("workItemId"),
-    },
-    source: {
-      assignmentId: source.get("assignmentId"),
-      eventId: source.get("eventId"),
-    },
-    binding: entries.get("binding"),
-    payload: entries.get("payload"),
-    roleId: requester.roleId,
+    claimed,
+    counter: "uncertain",
+    result: { intentId, status: "uncertain", code },
   };
+}
+
+function hasLegacyUnknownBinding(value) {
+  const binding = dataMap(value)?.get("dispatchBinding");
+  const legacy = exactDataMap(binding, ["status"]);
+  return legacy?.get("status") === LEGACY_UNKNOWN_WORK_INTENT_BINDING;
 }
 
 function proposalInput(bound) {
@@ -468,7 +502,7 @@ function attentionRequest(claimed, item, bound) {
   return {
     requestKey: claimed.intentId,
     type: "ask_user",
-    producer: { roleId: bound.roleId, workItemId: item.itemId },
+    producer: { roleId: bound.requestedBy.roleId, workItemId: item.itemId },
     question: payload.get("question"),
     context: [
       { label: "工作摘要", value: safeContextText(payload.get("summary")) },
@@ -508,6 +542,7 @@ function emptyResult(scanned) {
 export class WorkIntentDispatcher {
   #ledger;
   #bind;
+  #admitAction;
   #createAttention;
   #createProposal;
   #clock;
@@ -520,6 +555,7 @@ export class WorkIntentDispatcher {
     policy,
     attentionProducer,
     proposalProducer,
+    actionAdmissionGate,
     clock = () => new Date(),
     dispatcherId = "work-intent-dispatcher",
     leaseDurationMs = DEFAULT_LEASE_MS,
@@ -527,10 +563,11 @@ export class WorkIntentDispatcher {
   } = {}) {
     this.#ledger = validateDependency(
       ledger,
-      ["listOutbox", "listItems", "claimIntent", "ackIntent"],
+      ["listOutbox", "listItems", "claimIntent", "bindIntent", "ackIntent"],
       "ledger",
     );
     this.#bind = validateDependency(policy, ["bind"], "policy").bind;
+    this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     this.#createAttention = validateDependency(
       attentionProducer,
       ["create"],
@@ -552,8 +589,17 @@ export class WorkIntentDispatcher {
   async dispatchPending(options = {}) {
     const limit = dispatchLimit(options);
     const now = this.#now();
-    const candidates = await this.#eligibleOutbox(now, limit);
-    const result = emptyResult(candidates.length);
+    const { candidates, quarantined } = await this.#eligibleOutbox(now, limit);
+    const result = emptyResult(candidates.length + quarantined.length);
+    for (const candidate of quarantined) {
+      const isolated = bindingUncertain(
+        candidate.intentId,
+        "legacy-binding-unknown",
+        false,
+      );
+      result.items.push(isolated.result);
+      result[isolated.counter] += 1;
+    }
     if (!candidates.length) return result;
     const items = await this.#itemsById(
       new Set(candidates.map(({ itemId }) => itemId)),
@@ -603,12 +649,21 @@ export class WorkIntentDispatcher {
       }
       unique.set(entry.intentId, entry);
     }
-    return [...unique.values()]
-      .sort((left, right) =>
+    const ordered = [...unique.values()].sort(
+      (left, right) =>
         String(left.createdAt).localeCompare(String(right.createdAt), "en") ||
         left.intentId.localeCompare(right.intentId, "en"),
-      )
-      .slice(0, limit);
+    );
+    const candidates = [];
+    const quarantined = [];
+    for (const entry of ordered) {
+      if (hasLegacyUnknownBinding(entry)) {
+        if (quarantined.length < limit) quarantined.push(entry);
+      } else if (candidates.length < limit) {
+        candidates.push(entry);
+      }
+    }
+    return { candidates, quarantined };
   }
 
   async #itemsById(requiredIds) {
@@ -682,14 +737,27 @@ export class WorkIntentDispatcher {
   }
 
   async #dispatch(candidate, item) {
+    const claimAdmission = await this.#admitAction(() => {
+      try {
+        return {
+          operation: this.#ledger.claimIntent({
+            intentId: candidate.intentId,
+            expectedRevision: candidate.revision,
+            dispatcherId: this.#dispatcherId,
+            leaseDurationMs: this.#leaseDurationMs,
+          }),
+          synchronousError: null,
+        };
+      } catch (error) {
+        return { operation: null, synchronousError: error };
+      }
+    });
     let claimed;
     try {
-      claimed = await this.#ledger.claimIntent({
-        intentId: candidate.intentId,
-        expectedRevision: candidate.revision,
-        dispatcherId: this.#dispatcherId,
-        leaseDurationMs: this.#leaseDurationMs,
-      });
+      if (claimAdmission.synchronousError !== null) {
+        throw claimAdmission.synchronousError;
+      }
+      claimed = await claimAdmission.operation;
     } catch (error) {
       const code = ownErrorCode(error);
       return {
@@ -739,24 +807,115 @@ export class WorkIntentDispatcher {
       });
     }
 
-    let bound;
+    let persisted;
     try {
-      const rawBound = await this.#bind({
-        context: {
-          assignmentId: item.assignmentId,
-          workItemId: item.itemId,
-          roleId: requester.roleId,
-          event: item.event,
-        },
-        intent: claimed.intent,
-      });
-      bound = validateBoundIntent(rawBound, item, claimed.intent, requester);
+      persisted = persistedBoundIntent(claimed, item, requester);
     } catch (error) {
-      const code = ownErrorCode(error);
-      return this.#ackFailure(claimed, item, {
-        nextStatus: "blocked",
-        code: POLICY_BLOCK_CODES.has(code) ? "policy-denied" : "policy-binding-invalid",
+      return bindingUncertain(
+        claimed.intentId,
+        ownErrorCode(error) === "WORK_INTENT_LEGACY_BINDING_UNKNOWN"
+          ? "legacy-binding-unknown"
+          : "ledger-binding-invalid",
+      );
+    }
+
+    let bound;
+    if (persisted !== null) {
+      bound = persisted.bound;
+    } else {
+      const bindingPlan = await this.#admitAction(() => {
+        let plannedBound;
+        try {
+          const rawBound = this.#bind({
+            context: {
+              assignmentId: item.assignmentId,
+              workItemId: item.itemId,
+              roleId: requester.roleId,
+              event: item.event,
+            },
+            intent: claimed.intent,
+          });
+          if (rawBound instanceof Promise) {
+            void rawBound.catch(() => {});
+            throw dispatcherError(
+              "WORK_INTENT_BINDING_INVALID",
+              "工作意图策略必须同步返回完整绑定",
+              409,
+            );
+          }
+          plannedBound = validateBoundIntent(
+            rawBound,
+            item,
+            claimed.intent,
+            requester,
+          );
+        } catch (error) {
+          const code = ownErrorCode(error);
+          return {
+            status: "failed",
+            code: POLICY_BLOCK_CODES.has(code)
+              ? "policy-denied"
+              : "policy-binding-invalid",
+          };
+        }
+        try {
+          return {
+            status: "persisting",
+            bound: plannedBound,
+            operation: this.#ledger.bindIntent({
+              intentId: claimed.intentId,
+              expectedRevision: claimed.revision,
+              itemExpectedRevision: item.revision,
+              dispatcherId: this.#dispatcherId,
+              dispatchLeaseId: claimed.dispatchLeaseId,
+              boundIntent: plannedBound,
+            }),
+            synchronousError: null,
+          };
+        } catch (error) {
+          return {
+            status: "persisting",
+            bound: plannedBound,
+            operation: null,
+            synchronousError: error,
+          };
+        }
       });
+      if (bindingPlan.status === "failed") {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "blocked",
+          code: bindingPlan.code,
+        });
+      }
+      let bindingReceipt;
+      try {
+        if (bindingPlan.synchronousError !== null) {
+          throw bindingPlan.synchronousError;
+        }
+        bindingReceipt = await bindingPlan.operation;
+      } catch {
+        return bindingUncertain(claimed.intentId);
+      }
+      try {
+        const receiptEntries = dataMap(bindingReceipt);
+        const expectedEnvelope = createWorkIntentDispatchBinding(bindingPlan.bound);
+        persisted = persistedBoundIntent(bindingReceipt, item, requester);
+        if (
+          !receiptEntries ||
+          receiptEntries.get("intentId") !== claimed.intentId ||
+          receiptEntries.get("status") !== "dispatching" ||
+          receiptEntries.get("revision") !== claimed.revision + 1 ||
+          receiptEntries.get("dispatchLeaseId") !== claimed.dispatchLeaseId ||
+          persisted === null ||
+          persisted.envelope.bindingDigest !== expectedEnvelope.bindingDigest
+        ) {
+          throw new Error("binding receipt does not match the admitted plan");
+        }
+      } catch {
+        return bindingUncertain(claimed.intentId, "binding-receipt-invalid");
+      }
+      claimed = bindingReceipt;
+      bound = persisted.bound;
     }
 
     if (bound.kind === "attention_request") {

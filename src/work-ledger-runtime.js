@@ -25,6 +25,7 @@ const RUNTIME_METHODS = Object.freeze([
   "cancelGraphTask",
   "stageIntent",
   "claimIntent",
+  "bindIntent",
   "ackIntent",
   "applyAttentionBatch",
   "applyProposalBatch",

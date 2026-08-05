@@ -1,4 +1,9 @@
 import {
+  createWorkIntentDispatchBinding,
+  LEGACY_UNKNOWN_WORK_INTENT_BINDING,
+  normalizeBoundWorkIntent,
+} from "../domain/work-intent-dispatch-binding.js";
+import {
   createWorkIntentRecord,
   normalizeLedgerWorkIntent,
   WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
@@ -68,6 +73,7 @@ function pendingIntent(existing, item, intent, requestedBy, now) {
     dispatcherId: null,
     dispatchLeaseId: null,
     dispatchLeaseUntil: null,
+    dispatchBinding: null,
     outcome: null,
     updatedAt: now,
   };
@@ -171,6 +177,16 @@ export function planIntentClaim({ state, input, clock, newLeaseId }) {
   const duration = normalizeWorkLeaseDuration(input.leaseDurationMs);
   const outbox = requireIntent(state, intentId);
   assertIntentRevision(outbox, input.expectedRevision);
+  if (
+    outbox.dispatchBinding?.status ===
+      LEGACY_UNKNOWN_WORK_INTENT_BINDING
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_BINDING_UNKNOWN",
+      "历史工作意图的策略绑定无法证明，必须人工核对后恢复",
+      409,
+    );
+  }
   const now = clock();
   const expiredLease =
     outbox.status === "dispatching" &&
@@ -238,6 +254,135 @@ export function planIntentClaim({ state, input, clock, newLeaseId }) {
       ),
     },
     timelineEvents,
+    result: {
+      ...outboxResult,
+      deliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
+    },
+  };
+}
+
+export function planIntentBinding({ state, input, clock }) {
+  const intentId = boundedLedgerString(input.intentId, "intentId", 192);
+  const dispatcherId = boundedLedgerString(
+    input.dispatcherId,
+    "dispatcherId",
+    128,
+  );
+  const dispatchLeaseId = boundedLedgerString(
+    input.dispatchLeaseId,
+    "dispatchLeaseId",
+    128,
+  );
+  if (
+    !Number.isSafeInteger(input.expectedRevision) ||
+    input.expectedRevision < 1
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_REVISION_INVALID",
+      "outbox revision 无效",
+    );
+  }
+  const outbox = requireIntent(state, intentId);
+  const item = requireWorkLedgerItem(state, outbox.itemId);
+  assertItemRevision(item, input.itemExpectedRevision);
+  if (
+    item.status !== "dispatch_pending" ||
+    item.activeIntentId !== outbox.intentId ||
+    item.inputDigest !== outbox.inputDigest
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_BINDING_CONFLICT",
+      "工作意图与当前工作项不再一致",
+      409,
+    );
+  }
+  let dispatchBinding;
+  try {
+    const boundIntent = normalizeBoundWorkIntent(input.boundIntent, {
+      intentType: outbox.intent.type,
+      roleId: outbox.requestedBy.roleId,
+      workItemId: item.itemId,
+      assignmentId: item.assignmentId,
+      eventId: item.event.eventId,
+    });
+    dispatchBinding = createWorkIntentDispatchBinding(boundIntent);
+  } catch (cause) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_BINDING_INVALID",
+      "工作意图策略绑定无效",
+      400,
+      { cause },
+    );
+  }
+  const sameLease =
+    outbox.status === "dispatching" &&
+    outbox.dispatcherId === dispatcherId &&
+    outbox.dispatchLeaseId === dispatchLeaseId;
+  const now = clock();
+  if (sameLease && Date.parse(outbox.dispatchLeaseUntil) <= Date.parse(now)) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_LEASE_EXPIRED",
+      "outbox dispatcher 租约已过期",
+      409,
+    );
+  }
+  if (
+    sameLease &&
+    outbox.revision === input.expectedRevision + 1 &&
+    outbox.dispatchBinding?.bindingDigest === dispatchBinding.bindingDigest &&
+    JSON.stringify(outbox.dispatchBinding.boundIntent) ===
+      JSON.stringify(dispatchBinding.boundIntent)
+  ) {
+    return {
+      write: false,
+      result: {
+        ...outbox,
+        deliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
+      },
+    };
+  }
+  assertIntentRevision(outbox, input.expectedRevision);
+  if (!sameLease) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_LEASE_CONFLICT",
+      "outbox dispatcher 租约已变化",
+      409,
+    );
+  }
+  if (outbox.dispatchBinding !== null) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_BINDING_CONFLICT",
+      "工作意图已经绑定了不同策略结果",
+      409,
+    );
+  }
+  const outboxResult = {
+    ...outbox,
+    dispatchBinding,
+    revision: outbox.revision + 1,
+    updatedAt: now,
+  };
+  return {
+    patch: {
+      outbox: replaceWorkLedgerRecord(
+        state.outbox,
+        "intentId",
+        outboxResult,
+      ),
+    },
+    timelineEvents: [
+      {
+        itemId: outbox.itemId,
+        type: "intent_bound",
+        at: now,
+        actorId: dispatcherId,
+        details: {
+          intentId: outbox.intentId,
+          bindingDigest: dispatchBinding.bindingDigest,
+          dispatchLeaseId,
+        },
+      },
+    ],
     result: {
       ...outboxResult,
       deliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,

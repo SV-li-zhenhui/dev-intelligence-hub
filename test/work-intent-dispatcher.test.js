@@ -1,13 +1,56 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
 
 function clone(value) {
   return structuredClone(value);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function configurationBinding(version) {
+  return {
+    version,
+    configurationDigest: String(version).repeat(64),
+  };
+}
+
+function readyGate(version = 1) {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective(configurationBinding(version));
+  return gate;
+}
+
+function cutoverToVersion(gate, version) {
+  return gate.cutover((control) => {
+    control.commit(configurationBinding(version));
+  });
+}
+
+async function settlesBefore(promise, durationMs = 250) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), durationMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function controlledClock(initial = "2026-08-02T04:00:00.000Z") {
@@ -155,6 +198,7 @@ function workPair(index, intent, {
         : "employee-orchestrator",
     },
     intent: clone(intent),
+    dispatchBinding: null,
     status,
     revision: status === "dispatching" ? 2 : 1,
     attempt: status === "dispatching" ? 1 : 0,
@@ -174,10 +218,12 @@ class FakeLedger {
     this.outbox = pairs.map(({ outbox }) => clone(outbox));
     this.clock = clock;
     this.claimCalls = [];
+    this.bindCalls = [];
     this.ackCalls = [];
     this.nextLease = 1;
     this.failAckBeforeOnce = false;
     this.failAckAfterOnce = false;
+    this.failBindAfterOnce = false;
   }
 
   async listOutbox(options) {
@@ -222,6 +268,30 @@ class FakeLedger {
       this.clock.now() + input.leaseDurationMs,
     ).toISOString();
     entry.updatedAt = this.clock.clock();
+    return clone(entry);
+  }
+
+  async bindIntent(input) {
+    this.bindCalls.push(clone(input));
+    const entry = this.outbox.find(({ intentId }) => intentId === input.intentId);
+    if (
+      !entry ||
+      entry.status !== "dispatching" ||
+      entry.revision !== input.expectedRevision ||
+      entry.dispatcherId !== input.dispatcherId ||
+      entry.dispatchLeaseId !== input.dispatchLeaseId
+    ) {
+      throw Object.assign(new Error("binding fenced"), {
+        code: "WORK_LEDGER_INTENT_LEASE_CONFLICT",
+      });
+    }
+    entry.dispatchBinding = createWorkIntentDispatchBinding(input.boundIntent);
+    entry.revision += 1;
+    entry.updatedAt = this.clock.clock();
+    if (this.failBindAfterOnce) {
+      this.failBindAfterOnce = false;
+      throw new Error("binding response lost");
+    }
     return clone(entry);
   }
 
@@ -276,6 +346,34 @@ class FakeLedger {
   }
 }
 
+class BlockingClaimLedger extends FakeLedger {
+  constructor(pairs, clock) {
+    super(pairs, clock);
+    this.claimStarted = deferred();
+    this.claimRelease = deferred();
+  }
+
+  async claimIntent(input) {
+    this.claimStarted.resolve();
+    await this.claimRelease.promise;
+    return super.claimIntent(input);
+  }
+}
+
+class BlockingBindLedger extends FakeLedger {
+  constructor(pairs, clock) {
+    super(pairs, clock);
+    this.bindStarted = deferred();
+    this.bindRelease = deferred();
+  }
+
+  async bindIntent(input) {
+    this.bindStarted.resolve();
+    await this.bindRelease.promise;
+    return super.bindIntent(input);
+  }
+}
+
 class FakeAttentionProducer {
   constructor() {
     this.calls = [];
@@ -308,6 +406,20 @@ class FakeAttentionProducer {
       throw new Error("attention response lost");
     }
     return clone(receipt);
+  }
+}
+
+class BlockingAttentionProducer extends FakeAttentionProducer {
+  constructor() {
+    super();
+    this.createStarted = deferred();
+    this.createRelease = deferred();
+  }
+
+  async create(request) {
+    this.createStarted.resolve();
+    await this.createRelease.promise;
+    return super.create(request);
   }
 }
 
@@ -373,6 +485,7 @@ function fixture(pairs, options = {}) {
     policy: options.policy ?? policy(),
     attentionProducer: attention,
     proposalProducer: proposals,
+    actionAdmissionGate: options.actionAdmissionGate,
     clock: time.clock,
     leaseDurationMs: options.leaseDurationMs ?? 1_000,
     retryDelayMs: options.retryDelayMs ?? 60_000,
@@ -547,6 +660,152 @@ test("an idempotent proposal survives a lost response and is acknowledged after 
   assert.match(ledger.ackCalls[0].details.proposalDigest, /^[a-f0-9]{64}$/);
 });
 
+test("a restarted dispatcher replays the old sealed proposal instead of rebinding with new policy", async () => {
+  const pair = workPair(11, codeIntent(), {
+    target: { type: "role", id: "developer" },
+  });
+  const proposals = new FakeProposalProducer();
+  proposals.failAfterCreateOnce = true;
+  const oldGate = readyGate(1);
+  let oldPolicyCalls = 0;
+  const oldPolicy = policy({ version: 4 });
+  const firstRuntime = fixture([pair], {
+    proposals,
+    actionAdmissionGate: oldGate,
+    policy: {
+      bind(input) {
+        oldPolicyCalls += 1;
+        return oldPolicy.bind(input);
+      },
+    },
+  });
+
+  const uncertain = await firstRuntime.dispatcher.dispatchPending();
+  assert.equal(uncertain.uncertain, 1);
+  assert.equal(oldPolicyCalls, 1);
+  assert.equal(firstRuntime.ledger.bindCalls.length, 1);
+  assert.equal(proposals.records.size, 1);
+  assert.equal(firstRuntime.ledger.outbox[0].dispatchBinding.boundIntent.policyVersion, 4);
+
+  await cutoverToVersion(oldGate, 2);
+  firstRuntime.time.advance(1_000);
+  let newPolicyCalls = 0;
+  const newPolicy = policy({ version: 5 });
+  const restarted = fixture([pair], {
+    time: firstRuntime.time,
+    ledger: firstRuntime.ledger,
+    proposals,
+    actionAdmissionGate: readyGate(2),
+    policy: {
+      bind(input) {
+        newPolicyCalls += 1;
+        return newPolicy.bind(input);
+      },
+    },
+  });
+
+  const recovered = await restarted.dispatcher.dispatchPending();
+
+  assert.equal(recovered.delivered, 1);
+  assert.equal(newPolicyCalls, 0);
+  assert.equal(proposals.calls.length, 2);
+  assert.deepEqual(proposals.calls[1], proposals.calls[0]);
+  assert.equal(proposals.records.size, 1);
+  assert.equal(firstRuntime.ledger.outbox[0].status, "delivered");
+});
+
+test("a lost binding receipt produces no downstream action until durable recovery", async () => {
+  const pair = workPair(12, askUserIntent());
+  const gate = readyGate();
+  const firstRuntime = fixture([pair], { actionAdmissionGate: gate });
+  firstRuntime.ledger.failBindAfterOnce = true;
+
+  const uncertain = await firstRuntime.dispatcher.dispatchPending();
+
+  assert.equal(uncertain.uncertain, 1);
+  assert.equal(uncertain.items[0].code, "binding-result-uncertain");
+  assert.equal(firstRuntime.attention.calls.length, 0);
+  assert.notEqual(firstRuntime.ledger.outbox[0].dispatchBinding, null);
+
+  await cutoverToVersion(gate, 2);
+  firstRuntime.time.advance(1_000);
+  let newPolicyCalls = 0;
+  const restarted = fixture([pair], {
+    time: firstRuntime.time,
+    ledger: firstRuntime.ledger,
+    attention: firstRuntime.attention,
+    actionAdmissionGate: readyGate(2),
+    policy: {
+      bind(input) {
+        newPolicyCalls += 1;
+        return policy({ version: 5 }).bind(input);
+      },
+    },
+  });
+
+  const recovered = await restarted.dispatcher.dispatchPending();
+
+  assert.equal(recovered.delivered, 1);
+  assert.equal(newPolicyCalls, 0);
+  assert.equal(firstRuntime.attention.calls.length, 1);
+});
+
+test("legacy in-flight intents with unknowable bindings never call policy or downstream", async () => {
+  const time = controlledClock();
+  const pair = workPair(13, askUserIntent(), {
+    status: "dispatching",
+    leaseUntil: new Date(time.now()).toISOString(),
+  });
+  pair.outbox.dispatchBinding = { status: "legacy_unknown" };
+  let policyCalls = 0;
+  const trustedPolicy = policy();
+  const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+    time,
+    policy: {
+      bind(input) {
+        policyCalls += 1;
+        return trustedPolicy.bind(input);
+      },
+    },
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.uncertain, 1);
+  assert.equal(result.items[0].code, "legacy-binding-unknown");
+  assert.equal(policyCalls, 0);
+  assert.equal(ledger.claimCalls.length, 0);
+  assert.equal(ledger.bindCalls.length, 0);
+  assert.equal(ledger.ackCalls.length, 0);
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("legacy binding quarantine does not consume the actionable dispatch limit", async () => {
+  const time = controlledClock();
+  const legacy = workPair(13, askUserIntent(), {
+    status: "dispatching",
+    leaseUntil: new Date(time.now()).toISOString(),
+  });
+  legacy.outbox.dispatchBinding = { status: "legacy_unknown" };
+  const actionable = workPair(14, askUserIntent());
+  const { dispatcher, ledger, attention } = fixture([legacy, actionable], {
+    time,
+  });
+
+  const result = await dispatcher.dispatchPending({ limit: 1 });
+
+  assert.equal(result.scanned, 2);
+  assert.equal(result.uncertain, 1);
+  assert.equal(result.delivered, 1);
+  assert.deepEqual(
+    ledger.claimCalls.map(({ intentId }) => intentId),
+    [actionable.outbox.intentId],
+  );
+  assert.equal(ledger.outbox[0].revision, legacy.outbox.revision);
+  assert.equal(attention.calls.length, 1);
+});
+
 test("policy rejection blocks safely and attention conflicts split blocked from retry_wait", async (t) => {
   await t.test("policy", async () => {
     const pair = workPair(1, reviewIntent(), {
@@ -641,6 +900,7 @@ test("constructor and dispatch options reject incomplete ports and unsafe batch 
           listOutbox() {},
           listItems() {},
           claimIntent() {},
+          bindIntent() {},
           ackIntent() {},
         },
         policy: { bind() {} },
@@ -649,6 +909,14 @@ test("constructor and dispatch options reject incomplete ports and unsafe batch 
     /proposalProducer/,
   );
   const pair = workPair(1, waitIntent());
+  assert.throws(
+    () => fixture([pair], { actionAdmissionGate: null }),
+    /actionAdmissionGate/,
+  );
+  assert.throws(
+    () => fixture([pair], { actionAdmissionGate: {} }),
+    /actionAdmissionGate/,
+  );
   const { dispatcher } = fixture([pair]);
   await assert.rejects(dispatcher.dispatchPending({ limit: 101 }), /limit/);
   await assert.rejects(dispatcher.dispatchPending({ limit: 1, extra: true }), /options/);
@@ -661,7 +929,7 @@ test("dispatcher binds policy and attention producer only from durable requested
   const contexts = [];
   const trustedPolicy = policy();
   const capturingPolicy = {
-    async bind(input) {
+    bind(input) {
       contexts.push(clone(input.context));
       return trustedPolicy.bind(input);
     },
@@ -676,6 +944,151 @@ test("dispatcher binds policy and attention producer only from durable requested
     roleId: "orchestrator",
     workItemId: pair.item.itemId,
   });
+});
+
+test("configuration-first intent admission rejects without claiming or dispatching", async () => {
+  const gate = readyGate();
+  await cutoverToVersion(gate, 2);
+  const pair = workPair(1, askUserIntent());
+  let policyCalls = 0;
+  const trustedPolicy = policy();
+  const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+    actionAdmissionGate: gate,
+    policy: {
+      bind(input) {
+        policyCalls += 1;
+        return trustedPolicy.bind(input);
+      },
+    },
+  });
+  const before = clone({ items: ledger.items, outbox: ledger.outbox });
+
+  await assert.rejects(
+    dispatcher.dispatchPending(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  assert.equal(ledger.claimCalls.length, 0);
+  assert.equal(ledger.ackCalls.length, 0);
+  assert.equal(policyCalls, 0);
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+  assert.deepEqual({ items: ledger.items, outbox: ledger.outbox }, before);
+});
+
+test("cutover between intent claim and policy binding leaves only a recoverable lease", async () => {
+  const gate = readyGate();
+  const pair = workPair(2, askUserIntent());
+  const time = controlledClock();
+  const ledger = new BlockingClaimLedger([pair], time);
+  let policyCalls = 0;
+  const trustedPolicy = policy();
+  const { dispatcher, attention, proposals } = fixture([pair], {
+    time,
+    ledger,
+    actionAdmissionGate: gate,
+    policy: {
+      bind(input) {
+        policyCalls += 1;
+        return trustedPolicy.bind(input);
+      },
+    },
+  });
+
+  const dispatch = dispatcher.dispatchPending();
+  await ledger.claimStarted.promise;
+  await cutoverToVersion(gate, 2);
+  ledger.claimRelease.resolve();
+
+  await assert.rejects(
+    dispatch,
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(ledger.claimCalls.length, 1);
+  assert.equal(ledger.outbox[0].status, "dispatching");
+  assert.equal(policyCalls, 0);
+  assert.equal(ledger.ackCalls.length, 0);
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("an admitted intent binding write releases cutover before durable settlement", async () => {
+  const gate = readyGate();
+  const pair = workPair(3, askUserIntent());
+  const time = controlledClock();
+  const ledger = new BlockingBindLedger([pair], time);
+  const { dispatcher, attention } = fixture([pair], {
+    time,
+    ledger,
+    actionAdmissionGate: gate,
+  });
+
+  const dispatch = dispatcher.dispatchPending();
+  await ledger.bindStarted.promise;
+  const cutover = cutoverToVersion(gate, 2);
+  const cutoverFinishedBeforeBinding = await settlesBefore(cutover);
+  ledger.bindRelease.resolve();
+  const result = await dispatch;
+  await cutover;
+
+  assert.equal(cutoverFinishedBeforeBinding, true);
+  assert.equal(result.delivered, 1);
+  assert.equal(ledger.bindCalls.length, 1);
+  assert.equal(attention.calls.length, 1);
+});
+
+test("an admitted intent policy plan finishes downstream work after cutover", async () => {
+  const gate = readyGate();
+  const pair = workPair(3, askUserIntent());
+  const nextPair = workPair(4, askUserIntent());
+  const attention = new BlockingAttentionProducer();
+  const trustedPolicy = policy();
+  let mutableBound;
+  const { dispatcher, ledger } = fixture([pair, nextPair], {
+    attention,
+    actionAdmissionGate: gate,
+    policy: {
+      bind(input) {
+        mutableBound = clone(trustedPolicy.bind(input));
+        return mutableBound;
+      },
+    },
+  });
+
+  const dispatch = dispatcher.dispatchPending({ limit: 1 });
+  await attention.createStarted.promise;
+  await cutoverToVersion(gate, 2);
+  mutableBound.payload.question = "不可信的切换后修改";
+  attention.createRelease.resolve();
+  const result = await dispatch;
+
+  assert.equal(result.delivered, 1);
+  assert.equal(ledger.ackCalls.length, 1);
+  assert.equal(attention.calls[0].question, "是否接受新的验收口径？");
+  await assert.rejects(
+    dispatcher.dispatchPending(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+});
+
+test("asynchronous intent policy binding fails closed without downstream effects", async () => {
+  const pair = workPair(4, askUserIntent());
+  const trustedPolicy = policy();
+  const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+    policy: {
+      async bind(input) {
+        return trustedPolicy.bind(input);
+      },
+    },
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.blocked, 1);
+  assert.equal(ledger.claimCalls.length, 1);
+  assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
 });
 
 test("dispatcher rejects accessor and sparse ledger pages without invoking getters", async (t) => {
@@ -732,6 +1145,9 @@ test("dispatcher rejects accessor and sparse ledger pages without invoking gette
         listItems: async () => ({ items: [], nextCursor: null }),
         claimIntent: async () => {
           throw new Error("must not claim");
+        },
+        bindIntent: async () => {
+          throw new Error("must not bind");
         },
         ackIntent: async () => {
           throw new Error("must not acknowledge");

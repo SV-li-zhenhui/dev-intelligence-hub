@@ -211,6 +211,33 @@ test("claim and advance acknowledgement loss are retried with the exact request"
   assert.deepEqual(runner.advanceCalls[1], runner.advanceCalls[0]);
 });
 
+test("runtime admission failures stop proposal claims without lost-ack retries", async (t) => {
+  for (const code of [
+    "RUNTIME_RESTART_REQUIRED",
+    "RUNTIME_CONFIGURATION_NOT_READY",
+    "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+  ]) {
+    await t.test(code, async () => {
+      const failure = Object.assign(new Error("runtime admission rejected"), { code });
+      const runner = new FakeRunner([failure, claim(1)]);
+      let handlerCalls = 0;
+      const service = new WorkProposalRunnerService({
+        runner,
+        handler: {
+          async handle() {
+            handlerCalls += 1;
+          },
+        },
+      });
+
+      await assert.rejects(service.runCycle({ limit: 1 }), (error) => error === failure);
+      assert.equal(runner.claimCalls.length, 1);
+      assert.equal(runner.advanceCalls.length, 0);
+      assert.equal(handlerCalls, 0);
+    });
+  }
+});
+
 test("runner construction and cycle limits fail closed", () => {
   const runner = new FakeRunner();
   const handler = { async handle() {} };

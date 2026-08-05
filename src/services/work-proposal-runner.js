@@ -17,6 +17,11 @@ const MAX_DURATION_MS = 24 * 60 * 60 * 1_000;
 const NONTERMINAL_STATUSES = new Set(
   WORK_PROPOSAL_STATUSES.filter((status) => !isTerminalWorkProposalStatus(status)),
 );
+const RUNTIME_ADMISSION_FAILURES = new Set([
+  "RUNTIME_RESTART_REQUIRED",
+  "RUNTIME_CONFIGURATION_NOT_READY",
+  "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+]);
 
 function requirePort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -299,7 +304,8 @@ export class WorkProposalRunnerService {
     const request = { leaseDurationMs: this.#leaseDurationMs };
     try {
       return await this.#claim(request);
-    } catch {
+    } catch (error) {
+      if (RUNTIME_ADMISSION_FAILURES.has(stableFailureCode(error))) throw error;
       return this.#claim(request);
     }
   }

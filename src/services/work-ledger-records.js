@@ -414,6 +414,7 @@ export function createWorkIntentRecord(item, intent, requestedBy, createdAt) {
     inputDigest: item.inputDigest,
     requestedBy,
     intent,
+    dispatchBinding: null,
     status: "pending",
     revision: 1,
     attempt: 0,

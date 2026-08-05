@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import {
+  LEGACY_UNKNOWN_WORK_INTENT_BINDING,
+  normalizeBoundWorkIntent,
+  normalizeWorkIntentDispatchBinding,
+} from "../domain/work-intent-dispatch-binding.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
   boundedLedgerString,
@@ -35,7 +40,8 @@ import {
 } from "./work-ledger-records.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 7;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 8;
+const PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION = 7;
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
@@ -57,6 +63,7 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "completed",
   "intent_staged",
   "intent_claimed",
+  "intent_bound",
   "intent_lease_expired",
   "intent_acknowledged",
   "attention_answer_applied",
@@ -127,6 +134,7 @@ const OUTBOX_KEYS = [
   "inputDigest",
   "requestedBy",
   "intent",
+  "dispatchBinding",
   "status",
   "revision",
   "attempt",
@@ -137,6 +145,9 @@ const OUTBOX_KEYS = [
   "createdAt",
   "updatedAt",
 ];
+const LEGACY_OUTBOX_KEYS = OUTBOX_KEYS.filter(
+  (key) => key !== "dispatchBinding",
+);
 
 export function normalizeWorkLedgerLimits(overrides = {}) {
   if (
@@ -730,6 +741,26 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
   }
   const intent = normalizeIntent(value.intent);
   const requestedBy = normalizeRequestedBy(value.requestedBy);
+  let dispatchBinding = null;
+  if (value.dispatchBinding !== null) {
+    if (
+      hasExactLedgerKeys(value.dispatchBinding, ["status"]) &&
+      value.dispatchBinding.status === LEGACY_UNKNOWN_WORK_INTENT_BINDING
+    ) {
+      if (value.status !== "dispatching") {
+        throw corrupted("历史员工工作意图策略绑定状态损坏");
+      }
+      dispatchBinding = { status: "legacy_unknown" };
+    } else {
+      try {
+        dispatchBinding = normalizeWorkIntentDispatchBinding(
+          value.dispatchBinding,
+        );
+      } catch {
+        throw corrupted("员工工作意图策略绑定损坏");
+      }
+    }
+  }
   const itemId = safeString(value.itemId, "outbox.itemId", 192);
   const inputDigest = value.inputDigest;
   const intentDigest = ledgerDigest({ itemId, inputDigest, requestedBy, intent });
@@ -773,6 +804,7 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     inputDigest,
     requestedBy,
     intent,
+    dispatchBinding,
     status: value.status,
     revision: value.revision,
     attempt: value.attempt,
@@ -787,6 +819,14 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
   };
   if (prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget) {
     throw corrupted("员工工作意图超过容量");
+  }
+  if (
+    dispatchBinding !== null &&
+    Object.hasOwn(dispatchBinding, "boundIntent") &&
+    prettySerializedLedgerBytes(dispatchBinding.boundIntent) >
+      limits.intentByteBudget
+  ) {
+    throw corrupted("员工工作意图策略绑定超过容量");
   }
   return entry;
 }
@@ -812,7 +852,12 @@ export function assertWorkLedgerCapacity(state, limits) {
       (entry) => prettySerializedLedgerBytes(entry) > limits.timelineByteBudget,
     ) ||
     state.outbox.some(
-      (entry) => prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget,
+      (entry) =>
+        prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget ||
+        (entry.dispatchBinding !== null &&
+          Object.hasOwn(entry.dispatchBinding, "boundIntent") &&
+          prettySerializedLedgerBytes(entry.dispatchBinding.boundIntent) >
+            limits.intentByteBudget),
     ) ||
     state.graphMemoryProjection.pending.some(
       (event) =>
@@ -1000,7 +1045,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     }
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION,
       graphMemoryProjection,
     };
   }
@@ -1035,8 +1080,42 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     }
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION,
       graphMemoryProjection,
+    };
+  }
+  const schema7Outbox =
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+      "graphMemoryProjection",
+    ]) && value.schemaVersion === PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION
+      ? denseLedgerArrayValues(value.outbox)
+      : null;
+  if (
+    schema7Outbox !== null &&
+    schema7Outbox.every((entry) => hasExactLedgerKeys(entry, LEGACY_OUTBOX_KEYS))
+  ) {
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      outbox: schema7Outbox.map((entry) => ({
+        ...entry,
+        dispatchBinding: entry.status === "dispatching"
+          ? { status: LEGACY_UNKNOWN_WORK_INTENT_BINDING }
+          : null,
+      })),
     };
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
@@ -1155,6 +1234,25 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     const item = itemIndex.get(entry.itemId);
     if (!item || item.inputDigest !== entry.inputDigest) {
       throw corrupted("员工工作 outbox 引用不存在或已变化的工作项");
+    }
+    if (entry.status === "pending" && entry.dispatchBinding !== null) {
+      throw corrupted("待分发工作意图不能复用旧策略绑定");
+    }
+    if (entry.dispatchBinding?.boundIntent) {
+      if (entry.attempt < 1) {
+        throw corrupted("未领取工作意图不能包含策略绑定");
+      }
+      try {
+        normalizeBoundWorkIntent(entry.dispatchBinding.boundIntent, {
+          intentType: entry.intent.type,
+          roleId: entry.requestedBy.roleId,
+          workItemId: item.itemId,
+          assignmentId: item.assignmentId,
+          eventId: item.event.eventId,
+        });
+      } catch {
+        throw corrupted("员工工作意图策略绑定与工作项不一致");
+      }
     }
   }
   const outboxById = new Map(

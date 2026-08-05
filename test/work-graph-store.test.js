@@ -620,6 +620,64 @@ test("staging an escalation atomically reuses the standard ask-user outbox", asy
   );
 });
 
+test("a failed sealed escalation clears its policy binding before restaging", async () => {
+  const { service } = await fixture(1);
+  const item = (await service.listItems()).items[0];
+  const { planner } = graphPorts(
+    service,
+    "employee-orchestrator",
+    item.itemId,
+  );
+  const staged = await planner.stageEscalation(escalationCommand(item, 1));
+  const claimed = await service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "attention-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const boundIntent = createWorkIntentPolicy().bind({
+    context: {
+      assignmentId: staged.item.assignmentId,
+      workItemId: staged.item.itemId,
+      roleId: "orchestrator",
+      event: staged.item.event,
+    },
+    intent: claimed.intent,
+  });
+  const sealed = await service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "attention-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent,
+  });
+  const failed = await service.ackIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    dispatchLeaseId: sealed.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision,
+    outcome: "failed",
+    nextStatus: "blocked",
+    actorId: "attention-dispatcher",
+    details: { code: "downstream-rejected" },
+  });
+  const graphRevision = (await service.getGraphSnapshot()).graph.revision;
+
+  const restaged = await planner.stageEscalation(
+    escalationCommand(failed.item, graphRevision),
+  );
+
+  assert.equal(restaged.applied, true);
+  assert.equal(restaged.outbox.intentId, staged.outbox.intentId);
+  assert.equal(restaged.outbox.status, "pending");
+  assert.equal(restaged.outbox.dispatchBinding, null);
+  assert.equal(
+    (await service.listOutbox()).items[0].dispatchBinding,
+    null,
+  );
+});
+
 test("reader does not hide retry state behind the coarse graph status", async () => {
   const { service } = await fixture(1);
   let item = (await service.listItems()).items[0];

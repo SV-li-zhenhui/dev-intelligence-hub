@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 
 class MemoryStore {
@@ -24,6 +25,39 @@ function deferred() {
   return { promise, resolve };
 }
 
+function configurationBinding(version) {
+  return {
+    version,
+    configurationDigest: String(version).repeat(64),
+  };
+}
+
+function readyGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective(configurationBinding(1));
+  return gate;
+}
+
+function cutoverToVersion(gate, version) {
+  return gate.cutover((control) => {
+    control.commit(configurationBinding(version));
+  });
+}
+
+async function settlesBefore(promise, durationMs = 250) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), durationMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 class BlockingStore extends MemoryStore {
   constructor() {
     super();
@@ -35,6 +69,28 @@ class BlockingStore extends MemoryStore {
   async write(name, value) {
     this.writeCount += 1;
     if (this.writeCount === 1) {
+      this.started.resolve();
+      await this.release.promise;
+    }
+    await super.write(name, value);
+  }
+}
+
+class SelectiveBlockingStore extends MemoryStore {
+  constructor() {
+    super();
+    this.started = deferred();
+    this.release = deferred();
+    this.blocking = false;
+  }
+
+  blockNextWrite() {
+    this.blocking = true;
+  }
+
+  async write(name, value) {
+    if (this.blocking) {
+      this.blocking = false;
       this.started.resolve();
       await this.release.promise;
     }
@@ -187,6 +243,93 @@ test("runtime drains every accepted proposal operation before closing its guard"
 
   assert.equal(guard.closed, true);
   assert.equal(store.value.proposals.length, 2);
+});
+
+test("configuration-first proposal admission rejects a claim without mutation", async () => {
+  const store = new MemoryStore();
+  const gate = readyGate();
+  let leaseIds = 0;
+  const runtime = await createWorkProposalRuntime({
+    store,
+    runnerScopes: runnerScopes(),
+    actionAdmissionGate: gate,
+    idFactory() {
+      leaseIds += 1;
+      return `lease-${leaseIds}`;
+    },
+    createGuard: (options) => new Guard(options),
+  });
+  await runtime.producer.create(proposal());
+  const before = structuredClone(store.value);
+  await cutoverToVersion(gate, 2);
+
+  await assert.rejects(
+    runtime.runners["github-runner"].claim({ leaseDurationMs: 30_000 }),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  assert.equal(leaseIds, 0);
+  assert.deepEqual(store.value, before);
+  await runtime.close();
+});
+
+test("an admitted proposal claim releases cutover and can advance after restart is required", async () => {
+  const store = new SelectiveBlockingStore();
+  const gate = readyGate();
+  const runtime = await createWorkProposalRuntime({
+    store,
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    idFactory: () => "lease-admitted-before-cutover",
+    runnerScopes: runnerScopes(),
+    actionAdmissionGate: gate,
+    createGuard: (options) => new Guard(options),
+  });
+  await runtime.producer.create(proposal());
+  store.blockNextWrite();
+
+  const claimPromise = runtime.runners["github-runner"].claim({
+    leaseDurationMs: 30_000,
+  });
+  await store.started.promise;
+  const cutover = cutoverToVersion(gate, 2);
+  const cutoverFinishedBeforeClaim = await settlesBefore(cutover);
+  store.release.resolve();
+  const claim = await claimPromise;
+  await cutover;
+
+  assert.equal(cutoverFinishedBeforeClaim, true);
+  assert.equal(claim.proposal.proposalId, proposal().proposalId);
+  const advanced = await runtime.runners["github-runner"].advance(
+    scopedAdvanceRequest(claim, {
+      status: "failed",
+      summary: "已安全收尾",
+      evidence: [],
+    }),
+  );
+  assert.equal(advanced.status, "failed");
+  await runtime.producer.create({
+    ...proposal(),
+    proposalId: "work-intent-proposal-after-cutover",
+    requestedBy: { roleId: "pr-reviewer", workItemId: "work-after-cutover" },
+  });
+  await assert.rejects(
+    runtime.runners["github-runner"].claim({ leaseDurationMs: 30_000 }),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  await runtime.close();
+});
+
+test("runtime rejects an explicitly invalid action admission gate", async () => {
+  for (const actionAdmissionGate of [null, {}]) {
+    await assert.rejects(
+      createWorkProposalRuntime({
+        store: new MemoryStore(),
+        actionAdmissionGate,
+        createGuard: (options) => new Guard(options),
+      }),
+      /actionAdmissionGate/,
+    );
+  }
 });
 
 test("runtime closes its guard when durable recovery is corrupt", async () => {

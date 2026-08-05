@@ -390,6 +390,7 @@ function pendingEscalation(existing, candidate, now) {
     dispatcherId: null,
     dispatchLeaseId: null,
     dispatchLeaseUntil: null,
+    dispatchBinding: null,
     outcome: null,
     updatedAt: now,
   };
