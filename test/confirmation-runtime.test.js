@@ -292,6 +292,7 @@ test("a local-only runtime starts without reading GitHub credentials", async () 
 test("multiple local confirmation kinds share one routed queue", async () => {
   const codeJobExecutor = { execute() {}, reconcile() {} };
   const applicationExecutor = { execute() {}, reconcile() {} };
+  const configurationExecutor = { execute() {}, reconcile() {} };
   let routed;
   const runtime = await createConfirmationRuntime(
     { githubActions: { enabled: false } },
@@ -299,6 +300,7 @@ test("multiple local confirmation kinds share one routed queue", async () => {
       localExecutors: {
         "local.code-job-create": codeJobExecutor,
         "local.change-package-apply": applicationExecutor,
+        "local.configuration-activate": configurationExecutor,
       },
       createExecutorRouter({ executors }) {
         routed = executors;
@@ -310,11 +312,16 @@ test("multiple local confirmation kinds share one routed queue", async () => {
   assert.deepEqual(Object.keys(routed).sort(), [
     "local.change-package-apply",
     "local.code-job-create",
+    "local.configuration-activate",
   ]);
   assert.strictEqual(routed["local.code-job-create"], codeJobExecutor);
   assert.strictEqual(
     routed["local.change-package-apply"],
     applicationExecutor,
+  );
+  assert.strictEqual(
+    routed["local.configuration-activate"],
+    configurationExecutor,
   );
   await runtime.close();
 });

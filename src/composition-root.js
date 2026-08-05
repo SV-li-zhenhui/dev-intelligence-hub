@@ -16,6 +16,8 @@ import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
+import { ConfigurationActivationExecutor } from "./services/configuration-activation-executor.js";
+import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import {
@@ -142,6 +144,10 @@ export async function createApplication({
   store: suppliedStore,
   configurationRuntimeFactory = createConfigurationRuntime,
   configurationRuntimeDependencies = {},
+  configurationActivationExecutorFactory = (options) =>
+    new ConfigurationActivationExecutor(options),
+  configurationConfirmationRequesterFactory = (options) =>
+    new ConfigurationConfirmationRequester(options),
   actionAdmissionGateFactory = () => new ActionAdmissionGate(),
   configBootstrapLoader = loadConfigBootstrap,
   versionedConfiguration = suppliedConfig === undefined,
@@ -216,6 +222,16 @@ export async function createApplication({
   if (typeof versionedCodeJobAuthorityFactory !== "function") {
     throw new TypeError("versionedCodeJobAuthorityFactory must be a function");
   }
+  if (typeof configurationActivationExecutorFactory !== "function") {
+    throw new TypeError(
+      "configurationActivationExecutorFactory must be a function",
+    );
+  }
+  if (typeof configurationConfirmationRequesterFactory !== "function") {
+    throw new TypeError(
+      "configurationConfirmationRequesterFactory must be a function",
+    );
+  }
   const actionAdmissionGate = versionedConfiguration
     ? frozenPort(
         actionAdmissionGateFactory(),
@@ -241,6 +257,7 @@ export async function createApplication({
     return runtime;
   };
   let configurationRuntime = null;
+  let configurationConfirmationRequester = null;
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
   let workflowRouting = null;
@@ -564,6 +581,31 @@ export async function createApplication({
       }
     }
     const localExecutors = {};
+    const configurationInitializationEnabled =
+      versionedConfiguration &&
+      externalActions &&
+      configurationRuntime.status.safeMode === true;
+    if (configurationInitializationEnabled) {
+      const configurationActivationExecutor =
+        configurationActivationExecutorFactory({
+          activationExecutor: frozenPort(
+            configurationRuntime.activationExecutor,
+            ["activateInitialization", "activateDraft", "activateRollback"],
+            "configurationRuntime.activationExecutor",
+          ),
+          configurationReader: frozenPort(
+            configurationRuntime.reader,
+            ["readSnapshot"],
+            "configurationRuntime.reader",
+          ),
+          allowedActionTypes: Object.freeze(["initialize_from_draft"]),
+        });
+      localExecutors["local.configuration-activate"] = frozenPort(
+        configurationActivationExecutor,
+        ["execute", "reconcile"],
+        "configurationActivationExecutor",
+      );
+    }
     if (localCodeExecutionEnabled) {
       localExecutors["local.code-job-create"] = frozenPort(
         codeJobRuntime.confirmationExecutor,
@@ -606,6 +648,31 @@ export async function createApplication({
     }
     if (changePackageActionsEnabled && !confirmationRuntime) {
       throw new Error("change package 应用需要可用的确认运行时");
+    }
+    if (configurationInitializationEnabled && !confirmationRuntime) {
+      throw new Error("版本化配置初始化需要可用的确认运行时");
+    }
+    if (configurationInitializationEnabled) {
+      configurationConfirmationRequester = frozenPort(
+        configurationConfirmationRequesterFactory({
+          simulator: frozenPort(
+            configurationRuntime.simulator,
+            [
+              "prepareInitialization",
+              "prepareDraftActivation",
+              "prepareRollback",
+            ],
+            "configurationRuntime.simulator",
+          ),
+          confirmationProducer: frozenPort(
+            confirmationRuntime.producerQueue,
+            ["enqueue"],
+            "confirmationRuntime.producerQueue",
+          ),
+        }),
+        ["requestInitialization"],
+        "configurationConfirmationRequester",
+      );
     }
     if (changePackageActionsEnabled) {
       const applicationProducer = frozenPort(
@@ -993,6 +1060,7 @@ export async function createApplication({
             draftManager: configurationRuntime.draftManager,
             simulator: configurationRuntime.simulator,
             proposalPort: configurationRuntime.proposalPort,
+            confirmationRequester: configurationConfirmationRequester,
           })
         : null,
       store,

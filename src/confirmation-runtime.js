@@ -40,6 +40,7 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
 const LOCAL_EXECUTOR_KINDS = new Set([
   "local.code-job-create",
   "local.change-package-apply",
+  "local.configuration-activate",
 ]);
 
 export class ConfirmationRuntimeError extends Error {

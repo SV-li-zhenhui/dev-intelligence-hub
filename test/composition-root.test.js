@@ -2456,10 +2456,26 @@ test("versioned composition builds every subsystem from the stored active snapsh
       "readDraft",
       "readProjectionBatch",
     ]),
-    draftManager: port(["createDraft", "reviseDraft"]),
-    simulator: port(["prepareDraftActivation", "prepareRollback"]),
-    activationExecutor: port(["activateDraft", "activateRollback"]),
-    proposalPort: port(["createDraft", "reviseDraft"]),
+    draftManager: port([
+      "createDraft",
+      "createInitializationDraft",
+      "reviseDraft",
+    ]),
+    simulator: port([
+      "prepareInitialization",
+      "prepareDraftActivation",
+      "prepareRollback",
+    ]),
+    activationExecutor: port([
+      "activateInitialization",
+      "activateDraft",
+      "activateRollback",
+    ]),
+    proposalPort: port([
+      "createDraft",
+      "createInitializationDraft",
+      "reviseDraft",
+    ]),
     async close() {
       calls.push("configuration-close");
     },
@@ -2494,10 +2510,186 @@ test("versioned composition builds every subsystem from the stored active snapsh
     application.configuration.proposalPort,
     configurationRuntime.proposalPort,
   );
+  assert.equal(application.configuration.confirmationRequester, null);
+  assert.equal(application.confirmationQueue, null);
   assert.equal("activationExecutor" in application.configuration, false);
 
   await application.close();
   assert.equal(calls.at(-1), "configuration-close");
+});
+
+test("safe mode grants only initialization through the shared confirmation queue", async () => {
+  const config = applicationConfig();
+  const calls = {};
+  const port = (methods) =>
+    Object.freeze(
+      Object.fromEntries(methods.map((name) => [name, async () => {}])),
+    );
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    versionedConfiguration: true,
+    configurationRuntimeFactory: async () => ({
+      startupConfiguration: config,
+      status: {
+        safeMode: true,
+        activeVersion: null,
+        stateRevision: 1,
+        migrationError: null,
+      },
+      reader: port([
+        "readSnapshot",
+        "readActive",
+        "readVersion",
+        "readDraft",
+        "readProjectionBatch",
+      ]),
+      draftManager: port([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      simulator: port([
+        "prepareInitialization",
+        "prepareDraftActivation",
+        "prepareRollback",
+      ]),
+      activationExecutor: port([
+        "activateInitialization",
+        "activateDraft",
+        "activateRollback",
+      ]),
+      proposalPort: port([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      async close() {},
+    }),
+    configurationActivationExecutorFactory: (options) => {
+      calls.activationOptions = options;
+      return { async execute() {}, async reconcile() {} };
+    },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.confirmationDependencies = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {},
+      };
+    },
+    configurationConfirmationRequesterFactory: (options) => {
+      calls.requesterOptions = options;
+      return {
+        async requestInitialization() {},
+        async requestDraftActivation() {},
+        async requestRollback() {},
+      };
+    },
+  });
+
+  assert.deepEqual(calls.activationOptions.allowedActionTypes, [
+    "initialize_from_draft",
+  ]);
+  assert.equal(Object.isFrozen(calls.activationOptions.allowedActionTypes), true);
+  assert.deepEqual(Object.keys(calls.activationOptions.activationExecutor), [
+    "activateInitialization",
+    "activateDraft",
+    "activateRollback",
+  ]);
+  assert.deepEqual(Object.keys(calls.activationOptions.configurationReader), [
+    "readSnapshot",
+  ]);
+  assert.deepEqual(
+    Object.keys(calls.confirmationDependencies.localExecutors),
+    ["local.configuration-activate"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.confirmationDependencies.localExecutors),
+    true,
+  );
+  assert.deepEqual(
+    Object.keys(application.configuration.confirmationRequester),
+    ["requestInitialization"],
+  );
+  assert.deepEqual(Object.keys(calls.requesterOptions.simulator), [
+    "prepareInitialization",
+    "prepareDraftActivation",
+    "prepareRollback",
+  ]);
+  assert.deepEqual(Object.keys(calls.requesterOptions.confirmationProducer), [
+    "enqueue",
+  ]);
+  assert.equal("activationExecutor" in application.configuration, false);
+  await application.close();
+});
+
+test("versioned maintenance mode does not construct configuration action authority", async () => {
+  const config = applicationConfig();
+  const port = (methods) =>
+    Object.freeze(
+      Object.fromEntries(methods.map((name) => [name, async () => {}])),
+    );
+  let activationExecutorCalls = 0;
+  let confirmationRuntimeCalls = 0;
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    versionedConfiguration: true,
+    externalActions: false,
+    configurationRuntimeFactory: async () => ({
+      startupConfiguration: config,
+      status: {
+        safeMode: false,
+        activeVersion: 1,
+        stateRevision: 1,
+        migrationError: null,
+      },
+      reader: port([
+        "readSnapshot",
+        "readActive",
+        "readVersion",
+        "readDraft",
+        "readProjectionBatch",
+      ]),
+      draftManager: port([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      simulator: port([
+        "prepareInitialization",
+        "prepareDraftActivation",
+        "prepareRollback",
+      ]),
+      activationExecutor: port([
+        "activateInitialization",
+        "activateDraft",
+        "activateRollback",
+      ]),
+      proposalPort: port([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      async close() {},
+    }),
+    configurationActivationExecutorFactory: () => {
+      activationExecutorCalls += 1;
+      throw new Error("must not construct configuration action authority");
+    },
+    confirmationRuntimeFactory: async () => {
+      confirmationRuntimeCalls += 1;
+      throw new Error("must not construct confirmation runtime");
+    },
+  });
+
+  assert.equal(activationExecutorCalls, 0);
+  assert.equal(confirmationRuntimeCalls, 0);
+  assert.equal(application.configuration.confirmationRequester, null);
+  assert.equal(application.confirmationQueue, null);
+  assert.equal("activationExecutor" in application.configuration, false);
+  await application.close();
 });
 
 test("versioned local code shares one gate and reads Active authority", async () => {
@@ -2543,18 +2735,22 @@ test("versioned local code shares one gate and reads Active authority", async ()
         reader: configurationReader,
         draftManager: {
           async createDraft() {},
+          async createInitializationDraft() {},
           async reviseDraft() {},
         },
         simulator: {
+          async prepareInitialization() {},
           async prepareDraftActivation() {},
           async prepareRollback() {},
         },
         activationExecutor: {
+          async activateInitialization() {},
           async activateDraft() {},
           async activateRollback() {},
         },
         proposalPort: {
           async createDraft() {},
+          async createInitializationDraft() {},
           async reviseDraft() {},
         },
         async close() {
@@ -2613,13 +2809,16 @@ test("versioned local code shares one gate and reads Active authority", async ()
         },
       };
     },
-    confirmationRuntimeFactory: async () => ({
-      queue: confirmationQueuePort(),
-      producerQueue: confirmationProducerPort(),
-      async close() {
-        closeCalls.push("confirmation");
-      },
-    }),
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {
+          closeCalls.push("confirmation");
+        },
+      };
+    },
   });
 
   assert.strictEqual(
@@ -2636,6 +2835,11 @@ test("versioned local code shares one gate and reads Active authority", async ()
     "sealed-grant",
   );
   assert.strictEqual(calls.codeRunner.grantFactory, versionedAuthority);
+  assert.deepEqual(Object.keys(calls.confirmation.localExecutors).sort(), [
+    "local.code-job-create",
+  ]);
+  assert.equal("activationExecutor" in application.configuration, false);
+  assert.equal(application.configuration.confirmationRequester, null);
 
   await application.close();
 });
