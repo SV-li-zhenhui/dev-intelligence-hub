@@ -1,6 +1,11 @@
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
 const MAX_CYCLE = 100;
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
 
 function bindPort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -9,6 +14,17 @@ function bindPort(value, methods, name) {
   return Object.fromEntries(
     methods.map((method) => [method, value[method].bind(value)]),
   );
+}
+
+function carryOperation(invoke) {
+  try {
+    return Object.freeze({
+      status: "started",
+      operation: Promise.resolve(invoke()),
+    });
+  } catch (error) {
+    return Object.freeze({ status: "failed", error });
+  }
 }
 
 function normalizedClock(clock) {
@@ -103,9 +119,15 @@ export class WorkConditionWaker {
   #ledger;
   #readFact;
   #clock;
+  #admitWake;
   #inFlight = null;
 
-  constructor({ ledger, factSource, clock = () => new Date() } = {}) {
+  constructor({
+    ledger,
+    factSource,
+    actionAdmissionGate,
+    clock = () => new Date(),
+  } = {}) {
     this.#ledger = bindPort(
       ledger,
       ["listItems", "listOutbox", "wakeCondition"],
@@ -114,6 +136,13 @@ export class WorkConditionWaker {
     this.#readFact = factSource === undefined
       ? null
       : bindPort(factSource, ["read"], "factSource").read;
+    this.#admitWake = bindPort(
+      actionAdmissionGate === undefined
+        ? DIRECT_ACTION_ADMISSION
+        : actionAdmissionGate,
+      ["run"],
+      "actionAdmissionGate",
+    ).run;
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.#clock = clock;
   }
@@ -152,14 +181,27 @@ export class WorkConditionWaker {
         outcomes.push({ itemId: item.itemId, status: "waiting" });
         continue;
       }
+      const command = {
+        itemId: item.itemId,
+        expectedRevision: item.revision,
+        intentId: outbox.intentId,
+        actorId: "work-condition-waker",
+        observation,
+      };
+      let admitted;
       try {
-        await this.#ledger.wakeCondition({
-          itemId: item.itemId,
-          expectedRevision: item.revision,
-          intentId: outbox.intentId,
-          actorId: "work-condition-waker",
-          observation,
-        });
+        admitted = await this.#admitWake(() => carryOperation(() => {
+          // Wake exactly this durable condition while admission is current,
+          // but do not hold configuration cutover on the storage result.
+          return this.#ledger.wakeCondition(command);
+        }));
+      } catch (error) {
+        // Admission rejection is a runtime boundary, not an uncertain wake.
+        throw error;
+      }
+      try {
+        if (admitted.status === "failed") throw admitted.error;
+        await admitted.operation;
         outcomes.push({ itemId: item.itemId, status: "woken" });
       } catch {
         outcomes.push({ itemId: item.itemId, status: "wake_uncertain" });

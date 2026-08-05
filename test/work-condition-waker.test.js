@@ -1,6 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { WorkConditionWaker } from "../src/services/work-condition-waker.js";
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+    return "activated-v2";
+  });
+}
 
 function clone(value) {
   return structuredClone(value);
@@ -183,4 +211,101 @@ test("invalid fact observations and missing fact sources keep work waiting", asy
   });
   assert.equal((await withoutSource.runCycle()).waiting, 1);
   assert.equal(ledger.wakeCalls.length, 0);
+});
+
+test("configuration-first admission leaves a due condition waiting", async () => {
+  const pair = waitingPair({
+    kind: "time",
+    notBefore: "2026-08-02T02:00:00.000Z",
+  });
+  const ledger = new FakeLedger([pair]);
+  const gate = readyActionAdmissionGate();
+  await activateNextConfiguration(gate);
+  const waker = new WorkConditionWaker({
+    ledger,
+    actionAdmissionGate: gate,
+    clock: () => "2026-08-02T02:00:00.000Z",
+  });
+
+  await assert.rejects(
+    waker.runCycle(),
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+
+  assert.equal(ledger.wakeCalls.length, 0);
+  assert.equal(ledger.items[0].status, "waiting_condition");
+});
+
+test("wake-first admission releases cutover before durable storage settles", async () => {
+  const pair = waitingPair({
+    kind: "time",
+    notBefore: "2026-08-02T02:00:00.000Z",
+  });
+  const ledger = new FakeLedger([pair]);
+  const wakeCondition = ledger.wakeCondition.bind(ledger);
+  const wakeEntered = deferred();
+  const releaseWake = deferred();
+  ledger.wakeCondition = async (input) => {
+    wakeEntered.resolve();
+    await releaseWake.promise;
+    return wakeCondition(input);
+  };
+  const gate = readyActionAdmissionGate();
+  const waker = new WorkConditionWaker({
+    ledger,
+    actionAdmissionGate: gate,
+    clock: () => "2026-08-02T02:00:00.000Z",
+  });
+
+  const cycle = waker.runCycle();
+  await wakeEntered.promise;
+  const cutover = activateNextConfiguration(gate);
+  const cutoverFinishedFirst = await Promise.race([
+    cutover.then(() => true),
+    new Promise((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  releaseWake.resolve();
+  await cutover;
+  const result = await cycle;
+
+  assert.equal(cutoverFinishedFirst, true);
+  assert.equal(result.woken, 1);
+  assert.equal(ledger.wakeCalls.length, 1);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(gate.readStatus().mode, "restart_required");
+});
+
+test("a synchronous wake failure retains direct-mode uncertain semantics", async () => {
+  const pair = waitingPair({
+    kind: "time",
+    notBefore: "2026-08-02T02:00:00.000Z",
+  });
+  const ledger = new FakeLedger([pair]);
+  ledger.wakeCondition = () => {
+    throw new Error("synchronous storage failure");
+  };
+  const waker = new WorkConditionWaker({
+    ledger,
+    clock: () => "2026-08-02T02:00:00.000Z",
+  });
+
+  const result = await waker.runCycle();
+
+  assert.equal(result.uncertain, 1);
+  assert.equal(result.outcomes[0].status, "wake_uncertain");
+  assert.equal(ledger.items[0].status, "waiting_condition");
+});
+
+test("rejects an explicit invalid action admission gate", () => {
+  const pair = waitingPair({
+    kind: "time",
+    notBefore: "2026-08-02T02:00:00.000Z",
+  });
+  assert.throws(
+    () => new WorkConditionWaker({
+      ledger: new FakeLedger([pair]),
+      actionAdmissionGate: null,
+    }),
+    /actionAdmissionGate is invalid/,
+  );
 });

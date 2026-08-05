@@ -820,6 +820,11 @@ export class ProactiveWorkLoop {
         );
       }
     } catch (error) {
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
+        // Configuration cutover is not an employee failure. Keep the durable
+        // claim intact so the item can be recomputed after restart.
+        throw error;
+      }
       return this.#recordFailure(item, worker.workerId, error, options);
     }
     return this.#stageDecision(item, worker, options, decision);

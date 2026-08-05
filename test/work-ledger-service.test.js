@@ -3150,6 +3150,45 @@ test("condition wake is atomically bound, durable, and idempotent", async () => 
   );
 });
 
+test("graph recovery reads a condition wake that lost its durable acknowledgement", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const waiting = await prepareWaitingCondition(fixture, {
+    kind: "workflow_fact",
+    fact: "ci-status",
+    oneOf: ["success"],
+  });
+  const before = await fixture.service.getGraphSnapshot();
+  const durableWrite = fixture.store.write.bind(fixture.store);
+  let loseAcknowledgement = true;
+  fixture.store.write = async (...args) => {
+    await durableWrite(...args);
+    if (loseAcknowledgement) {
+      loseAcknowledgement = false;
+      throw new Error("durable acknowledgement lost");
+    }
+  };
+
+  await assert.rejects(
+    fixture.service.wakeCondition({
+      itemId: waiting.item.itemId,
+      expectedRevision: waiting.item.revision,
+      intentId: waiting.intentId,
+      actorId: "work-condition-waker",
+      observation: {
+        kind: "workflow_fact",
+        fact: "ci-status",
+        value: "success",
+        observedAt: "2026-08-02T02:00:00.000Z",
+      },
+    }),
+    (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
+  );
+
+  const recovered = await fixture.service.getGraphSnapshot();
+  assert.equal(recovered.graph.revision, before.graph.revision + 1);
+  assert.equal(recovered.graph.tasks[0].revision, waiting.item.revision + 1);
+});
+
 test("an unmatched condition observation writes nothing", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   const waiting = await prepareWaitingCondition(fixture, {

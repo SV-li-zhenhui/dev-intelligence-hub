@@ -341,10 +341,15 @@ export class CodeJobWorkerService {
     }
 
     if (job.status === "queued") {
-      job = (await this.#jobs.claimStarting({
-        jobId,
-        expectedRevision: job.revision,
-      })).job;
+      const admitted = await this.#actionAdmission(() => ({
+        // Claim the exact queued job while configuration authority is current,
+        // then carry the durable write out so cutover never waits on storage.
+        operation: this.#jobs.claimStarting({
+          jobId,
+          expectedRevision: job.revision,
+        }),
+      }));
+      job = (await admitted.operation).job;
     }
 
     if (job.status === "starting") {

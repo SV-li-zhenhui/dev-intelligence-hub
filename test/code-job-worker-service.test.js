@@ -2761,12 +2761,13 @@ test("cancel-first transition prevents an admitted session start", async () => {
   assert.ok(events.indexOf("cancel") > events.indexOf("claim"));
 });
 
-test("configuration-first admission starts or resumes no new executor session", async (t) => {
+test("configuration-first admission claims no new work and starts or resumes no session", async (t) => {
   await t.test("start", async () => {
     const initial = job();
     const gate = readyActionAdmissionGate();
     await activateNextConfiguration(gate);
-    const store = new FakeJobStore([initial]);
+    const events = [];
+    const store = new FakeJobStore([initial], events);
     const executor = new FakeExecutor(initial);
     const brainCalls = [];
     const worker = new CodeJobWorkerService({
@@ -2784,7 +2785,8 @@ test("configuration-first admission starts or resumes no new executor session", 
     assert.equal(executor.calls.some(({ method }) => method === "start"), false);
     assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
     assert.equal(brainCalls.length, 0);
-    assert.equal((await store.getForWorker(initial.jobId)).status, "starting");
+    assert.equal(events.includes("claim"), false);
+    assert.equal((await store.getForWorker(initial.jobId)).status, "queued");
   });
 
   await t.test("resume", async () => {
@@ -2827,6 +2829,51 @@ test("configuration-first admission starts or resumes no new executor session", 
     assert.equal(brainCalls.length, 0);
     assert.equal((await store.getForWorker(initial.jobId)).status, "starting");
   });
+});
+
+test("claim-first admission releases cutover before durable storage settles", async () => {
+  const initial = job();
+  const events = [];
+  const store = new FakeJobStore([initial], events);
+  const claimStarting = store.claimStarting.bind(store);
+  const claimEntered = deferred();
+  const releaseClaim = deferred();
+  store.claimStarting = async (input) => {
+    claimEntered.resolve();
+    await releaseClaim.promise;
+    return claimStarting(input);
+  };
+  const executor = new FakeExecutor(initial, events);
+  const gate = readyActionAdmissionGate();
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([], brainCalls),
+    grantVerifier: verifier(events),
+    actionAdmissionGate: gate,
+  });
+
+  const cycle = worker.runCycle();
+  await claimEntered.promise;
+  const cutover = activateNextConfiguration(gate);
+  const cutoverFinishedFirst = await Promise.race([
+    cutover.then(() => true),
+    new Promise((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  releaseClaim.resolve();
+  await cutover;
+  const result = await cycle;
+  const stored = await store.getForWorker(initial.jobId);
+
+  assert.equal(cutoverFinishedFirst, true);
+  assert.equal(result.outcomes[0].status, "restart_required");
+  assert.equal(result.outcomes[0].code, "RUNTIME_RESTART_REQUIRED");
+  assert.equal(stored.status, "starting");
+  assert.equal(events.filter((event) => event === "claim").length, 1);
+  assert.equal(executor.calls.some(({ method }) => method === "start"), false);
+  assert.equal(executor.calls.some(({ method }) => method === "resume"), false);
+  assert.equal(brainCalls.length, 0);
 });
 
 test("start-first admission releases the gate before the long start settles", async () => {

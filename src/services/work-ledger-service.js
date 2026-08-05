@@ -293,7 +293,15 @@ export class WorkLedgerService {
 
   async getGraphSnapshot() {
     this.#assertReady();
-    return projectWorkLedgerGraphView(this.state);
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        // Graph reads are also used to reconcile uncertain writes. Refresh
+        // from durable state so an applied write with a lost ACK is visible in
+        // the same recovery cycle rather than only after another mutation.
+        this.state = await this.#readDurableState();
+        return projectWorkLedgerGraphView(this.state);
+      }),
+    );
   }
 
   async readGraphMemoryProjectionBatch(options = {}) {

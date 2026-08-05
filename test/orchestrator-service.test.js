@@ -8,10 +8,40 @@ import {
   OrchestratorService,
   OrchestratorServiceError,
 } from "../src/services/orchestrator-service.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 
 const INPUT_DIGEST = "a".repeat(64);
 const CONTEXT_DIGEST = "b".repeat(64);
 const EXTERNAL_DIGEST = "c".repeat(64);
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({
+    version: 1,
+    configurationDigest: "1".repeat(64),
+  });
+  return gate;
+}
+
+function activateNextConfiguration(gate) {
+  return gate.cutover(({ commit }) => {
+    commit({
+      version: 2,
+      configurationDigest: "2".repeat(64),
+    });
+    return "activated-v2";
+  });
+}
 
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
@@ -273,11 +303,19 @@ function fakePorts({ packet, views, plannerResult, deliveryResult, verifier } = 
   return { calls, ports };
 }
 
-function serviceFrom(fakes, capabilityRoles = {
-  development: "developer",
-  testing: "tester",
-}) {
-  return new OrchestratorService({ ...fakes.ports, capabilityRoles });
+function serviceFrom(
+  fakes,
+  capabilityRoles = {
+    development: "developer",
+    testing: "tester",
+  },
+  actionAdmissionGate,
+) {
+  return new OrchestratorService({
+    ...fakes.ports,
+    capabilityRoles,
+    ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
+  });
 }
 
 function rootFixture({ submitted = false } = {}) {
@@ -465,7 +503,13 @@ test("maps all seven orchestration actions to the least-authority planner comman
           evidence: [{ private: true }],
         }),
       });
-      const result = await serviceFrom(fakes).execute({
+      const admissions = [];
+      const result = await serviceFrom(fakes, undefined, {
+        run(operation) {
+          admissions.push(scenario.name);
+          return operation();
+        },
+      }).execute({
         worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
         item: fixture.item,
         contextPacket: fixture.packet,
@@ -480,6 +524,8 @@ test("maps all seven orchestration actions to the least-authority planner comman
       ]);
       assert.equal(result.action, scenario.name);
       assert.equal(result.applied, true);
+      assert.deepEqual(admissions, [scenario.name]);
+      assert.equal(Object.isFrozen(fakes.calls.planner[0].command), true);
       assert.equal(Object.isFrozen(result), true);
       assert.doesNotMatch(JSON.stringify(result), /private-owner|private-lease|evidence/);
     });
@@ -665,7 +711,13 @@ test("submits ordinary and requirement-spec deliveries with trusted evidence and
   await t.test("ordinary delivery", async () => {
     const fixture = specialistFixture();
     const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
-    const result = await serviceFrom(fakes).execute({
+    let admissions = 0;
+    const result = await serviceFrom(fakes, undefined, {
+      run(operation) {
+        admissions += 1;
+        return operation();
+      },
+    }).execute({
       worker: { roleId: "developer", workerId: "employee-developer" },
       item: fixture.item,
       contextPacket: fixture.packet,
@@ -678,6 +730,8 @@ test("submits ordinary and requirement-spec deliveries with trusted evidence and
       leaseId: "lease-secret",
     }]);
     assert.equal(fakes.calls.delivery.length, 1);
+    assert.equal(admissions, 1);
+    assert.equal(Object.isFrozen(fakes.calls.delivery[0]), true);
     assert.deepEqual(fakes.calls.delivery[0].evidence, [
       workInputEvidence(fixture.specialist),
     ]);
@@ -718,6 +772,86 @@ test("submits ordinary and requirement-spec deliveries with trusted evidence and
     ]);
     assert.equal(command.evidence[0].contentDigest, spec.contentDigest);
   });
+});
+
+test("configuration-first admission performs no trusted graph mutation", async (t) => {
+  await t.test("orchestration", async () => {
+    const fixture = rootFixture();
+    const gate = readyActionAdmissionGate();
+    await activateNextConfiguration(gate);
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+
+    await assert.rejects(
+      serviceFrom(fakes, undefined, gate).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+      }),
+      (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+    );
+
+    assert.equal(fakes.calls.planner.length, 0);
+    assert.equal(fakes.calls.delivery.length, 0);
+  });
+
+  await t.test("delivery submission", async () => {
+    const fixture = specialistFixture();
+    const gate = readyActionAdmissionGate();
+    await activateNextConfiguration(gate);
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+
+    await assert.rejects(
+      serviceFrom(fakes, undefined, gate).execute({
+        worker: { roleId: "developer", workerId: "employee-developer" },
+        item: fixture.item,
+        contextPacket: fixture.packet,
+        intent: submitIntent(fixture),
+      }),
+      (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+    );
+
+    assert.equal(fakes.calls.planner.length, 0);
+    assert.equal(fakes.calls.delivery.length, 0);
+  });
+});
+
+test("mutation-first admission releases cutover before graph storage settles", async () => {
+  const fixture = rootFixture();
+  const gate = readyActionAdmissionGate();
+  const mutationEntered = deferred();
+  const mutationResult = deferred();
+  const fakes = fakePorts({
+    packet: fixture.packet,
+    views: fixture.view,
+    plannerResult(method, command) {
+      mutationEntered.resolve({ method, command });
+      return mutationResult.promise;
+    },
+  });
+  const execution = serviceFrom(fakes, undefined, gate).execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: fixture.item,
+    contextPacket: fixture.packet,
+    intent: orchestrate(commonAction("pause", fixture.child, fixture.view)),
+  });
+  const admitted = await mutationEntered.promise;
+  const cutover = activateNextConfiguration(gate);
+  const cutoverFinishedFirst = await Promise.race([
+    cutover.then(() => true),
+    new Promise((resolve) => setImmediate(() => resolve(false))),
+  ]);
+
+  mutationResult.resolve({ applied: true, taskId: fixture.child.taskId });
+  await cutover;
+  const result = await execution;
+
+  assert.equal(cutoverFinishedFirst, true);
+  assert.equal(gate.readStatus().mode, "restart_required");
+  assert.equal(admitted.method, "pauseTask");
+  assert.equal(Object.isFrozen(admitted.command), true);
+  assert.equal(fakes.calls.planner.length, 1);
+  assert.equal(result.applied, true);
 });
 
 test("fails closed on unverifiable caller evidence before obtaining a deliverer", async (t) => {
@@ -877,7 +1011,7 @@ test("validates trusted work-input and requirement-spec evidence before acceptan
   });
 });
 
-test("does not retry a failed CAS command", async () => {
+test("does not retry a synchronously failed CAS command", async () => {
   const fixture = rootFixture();
   const conflict = Object.assign(new Error("CAS conflict"), {
     code: "WORK_LEDGER_STALE_REVISION",
@@ -885,8 +1019,16 @@ test("does not retry a failed CAS command", async () => {
   const fakes = fakePorts({
     packet: fixture.packet,
     views: fixture.view,
-    plannerResult: conflict,
   });
+  fakes.ports.scopedGraphPlannerFactory.forRoot = (request) => {
+    fakes.calls.plannerFactory.push(request);
+    return {
+      pauseTask(command) {
+        fakes.calls.planner.push({ method: "pauseTask", command });
+        throw conflict;
+      },
+    };
+  };
   await assert.rejects(
     serviceFrom(fakes).execute({
       worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
@@ -946,6 +1088,54 @@ test("reconciles an exact uncertain delivery submission without issuing it twice
   });
   assert.equal(fakes.calls.delivery.length, 1);
   assert.equal(fakes.calls.delivererFactory.length, 1);
+  assert.equal(fakes.calls.graphReads, 2);
+});
+
+test("a synchronous delivery-port failure still enters exact recovery", async () => {
+  const fixture = specialistFixture();
+  const uncertain = new Error("synchronous write result unknown");
+  let fakes;
+  fakes = fakePorts({
+    packet: fixture.packet,
+    views: [
+      fixture.view,
+      () => {
+        const command = fakes.calls.delivery[0];
+        const submitted = {
+          ...fixture.specialist,
+          revision: 2,
+          deliveries: [{
+            deliverableId: command.deliverableId,
+            revision: command.deliveryRevision,
+            contractRevision: command.contractRevision,
+            status: "submitted",
+            summary: command.summary,
+            evidence: command.evidence,
+          }],
+        };
+        return graphView([fixture.root, submitted], 3);
+      },
+    ],
+  });
+  fakes.ports.graphDelivererFactory.forClaim = (request) => {
+    fakes.calls.delivererFactory.push(request);
+    return {
+      submitDelivery(command) {
+        fakes.calls.delivery.push(command);
+        throw uncertain;
+      },
+    };
+  };
+
+  const result = await serviceFrom(fakes).execute({
+    worker: { roleId: "developer", workerId: "employee-developer" },
+    item: fixture.item,
+    contextPacket: fixture.packet,
+    intent: submitIntent(fixture),
+  });
+
+  assert.equal(result.recovered, true);
+  assert.equal(fakes.calls.delivery.length, 1);
   assert.equal(fakes.calls.graphReads, 2);
 });
 
@@ -1154,4 +1344,13 @@ test("does not invoke accessor properties while validating constructor ports", (
     TypeError,
   );
   assert.equal(getterCalls, 0);
+});
+
+test("rejects an explicit invalid action admission gate", () => {
+  const fixture = rootFixture();
+  const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+  assert.throws(
+    () => serviceFrom(fakes, undefined, null),
+    /actionAdmissionGate is invalid/,
+  );
 });

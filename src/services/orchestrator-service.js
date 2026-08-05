@@ -19,6 +19,11 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const MAX_SAFE_DEPTH = 24;
 const MAX_SAFE_ENTRIES = 500_000;
 const MAX_SAFE_BYTES = 20 * 1024 * 1024;
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
 
 export class OrchestratorServiceError extends Error {
   constructor(code, message, statusCode = 400, options) {
@@ -233,6 +238,24 @@ function requirePort(value, method, name) {
 function optionalEvidenceVerifier(value) {
   if (value === undefined || value === null) return null;
   return requirePort(value, "verify", "evidenceVerifier");
+}
+
+function actionAdmissionRun(value) {
+  const gate = value === undefined
+    ? DIRECT_ACTION_ADMISSION
+    : requirePort(value, "run", "actionAdmissionGate");
+  return gate.run.bind(gate);
+}
+
+function carryOperation(invoke) {
+  try {
+    return Object.freeze({
+      status: "started",
+      operation: Promise.resolve(invoke()),
+    });
+  } catch (error) {
+    return Object.freeze({ status: "failed", error });
+  }
 }
 
 function normalizeCapabilityRoles(value) {
@@ -986,6 +1009,7 @@ export class OrchestratorService {
   #delivererFactory;
   #evidenceVerifier;
   #capabilityRoles;
+  #admitAction;
 
   constructor({
     contextAssembler,
@@ -994,6 +1018,7 @@ export class OrchestratorService {
     graphDelivererFactory,
     evidenceVerifier,
     capabilityRoles = {},
+    actionAdmissionGate,
   } = {}) {
     this.#contextAssembler = requirePort(
       contextAssembler,
@@ -1013,6 +1038,7 @@ export class OrchestratorService {
     );
     this.#evidenceVerifier = optionalEvidenceVerifier(evidenceVerifier);
     this.#capabilityRoles = normalizeCapabilityRoles(capabilityRoles);
+    this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     Object.freeze(this);
   }
 
@@ -1133,9 +1159,17 @@ export class OrchestratorService {
         { cause },
       );
     }
+    const command = deepFreeze(checkedClone(plan.command));
+    const admitted = await this.#admitAction(() => carryOperation(() => {
+      // The exact graph operation is started while authority is current, but
+      // its Promise is carried out so configuration cutover never waits on
+      // graph persistence or recovery reads.
+      return operation(command);
+    }));
     let mutation;
     try {
-      mutation = await operation(plan.command);
+      if (admitted.status === "failed") throw admitted.error;
+      mutation = await admitted.operation;
     } catch (cause) {
       const recovered = plan.recover ? await plan.recover() : null;
       if (recovered) return recovered;
@@ -1254,13 +1288,19 @@ export class OrchestratorService {
         { cause },
       );
     }
+    const sealedCommand = deepFreeze(checkedClone(command));
+    const admitted = await this.#admitAction(() => carryOperation(() => {
+      // Keep only the synchronous mutation admission inside the shared gate.
+      return submitDelivery(sealedCommand);
+    }));
     let mutation;
     try {
-      mutation = await submitDelivery(command);
+      if (admitted.status === "failed") throw admitted.error;
+      mutation = await admitted.operation;
     } catch (cause) {
       const recovered = await recoverDeliverySubmission(
         this.#graphReader,
-        command,
+        sealedCommand,
         item.itemId,
         rootId,
       );

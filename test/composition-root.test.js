@@ -274,13 +274,19 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
     workflowFactSourceFactory: () => ({ async read() {} }),
     roleContextAssemblerFactory: () => ({ async assemble() {} }),
-    orchestratorServiceFactory: () => ({ async execute() {} }),
+    orchestratorServiceFactory: (options) => {
+      calls.orchestratorService = options;
+      return { async execute() {} };
+    },
     attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
     workProposalResultReconcilerFactory: (options) => {
       calls.proposalResultReconciler = options;
       return { async runCycle() {} };
     },
-    workConditionWakerFactory: () => ({ async runCycle() {} }),
+    workConditionWakerFactory: (options) => {
+      calls.waker = options;
+      return { async runCycle() {} };
+    },
     proactiveWorkLoopFactory: () => ({ async runCycle() {} }),
     workIntentDispatcherFactory: (options) => {
       calls.dispatcher = options;
@@ -718,6 +724,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.equal("actionAdmissionGate" in calls.ledger, false);
   assert.equal("actionAdmissionGate" in calls.proposals, false);
   assert.equal("actionAdmissionGate" in calls.dispatcher, false);
+  assert.equal("actionAdmissionGate" in calls.orchestratorService, false);
+  assert.equal("actionAdmissionGate" in calls.waker, false);
   assert.strictEqual(calls.attention.store, store);
   assert.notStrictEqual(
     calls.ledger.operationQueue,
@@ -2931,6 +2939,11 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.deepEqual(Object.keys(calls.dispatcher.actionAdmissionGate), [
     "run",
   ]);
+  assert.deepEqual(
+    Object.keys(calls.orchestratorService.actionAdmissionGate),
+    ["run"],
+  );
+  assert.deepEqual(Object.keys(calls.waker.actionAdmissionGate), ["run"]);
   assert.strictEqual(
     calls.workflowRuntime.actionAdmissionGate,
     calls.codeJobRuntime.actionAdmissionGate,
@@ -2945,6 +2958,14 @@ test("versioned local code shares one gate and reads Active authority", async ()
   );
   assert.strictEqual(
     calls.dispatcher.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.orchestratorService.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.waker.actionAdmissionGate,
     calls.codeJobRuntime.actionAdmissionGate,
   );
   assert.strictEqual(

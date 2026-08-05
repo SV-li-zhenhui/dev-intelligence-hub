@@ -978,6 +978,61 @@ test("trusted specialist claims, assembles, decides, and submits without staging
   assert.equal(executions[0].intent.type, "submit_delivery");
 });
 
+test("runtime cutover is never recorded as a specialist failure", async (t) => {
+  for (const failurePoint of ["brain", "final-mutation"]) {
+    await t.test(failurePoint, async () => {
+      const time = controlledClock();
+      const source = workItem(
+        failurePoint === "brain" ? 61 : 62,
+        { type: "role", id: "developer" },
+      );
+      const ledger = new FakeLedger({ source: [source], time });
+      const admissionError = Object.assign(new Error("configuration changed"), {
+        code: "RUNTIME_RESTART_REQUIRED",
+      });
+      let serviceCalls = 0;
+      const directory = new FakeRoleDirectory({
+        developer: worker({
+          roleId: "developer",
+          decide: async ({ item }) => {
+            if (failurePoint === "brain") throw admissionError;
+            return deliveryDecision(item);
+          },
+        }),
+      });
+      const loop = createLoop({
+        ledger,
+        directory,
+        time,
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            return contextPacket(item, roleId);
+          },
+        },
+        orchestratorService: {
+          async execute() {
+            serviceCalls += 1;
+            throw admissionError;
+          },
+        },
+      });
+
+      await assert.rejects(
+        loop.runCycle({ roleId: "developer" }),
+        (error) => error === admissionError,
+      );
+
+      assert.equal(ledger.items[0].status, "working");
+      assert.equal(ledger.items[0].ownerId, "employee-developer");
+      assert.equal(ledger.items[0].leaseId, "lease-1");
+      assert.equal(ledger.calls.scheduleRetry.length, 0);
+      assert.equal(ledger.calls.transition.length, 0);
+      assert.equal(ledger.calls.stageIntent.length, 0);
+      assert.equal(serviceCalls, failurePoint === "brain" ? 0 : 1);
+    });
+  }
+});
+
 test("trusted specialist retries assembler and delivery-service failures", async (t) => {
   for (const failurePoint of ["assembler", "service"]) {
     await t.test(failurePoint, async () => {
@@ -1121,6 +1176,48 @@ test("a child-blocked configured root orchestrates without obtaining a lease", a
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);
   assert.equal(executions[0].item.status, "queued");
+});
+
+test("runtime cutover leaves configured root orchestration queued", async () => {
+  const time = controlledClock();
+  const root = workItem(63, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [root], time });
+  const admissionError = Object.assign(new Error("configuration changed"), {
+    code: "RUNTIME_RESTART_REQUIRED",
+  });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async ({ item }) => orchestrationDecision(item),
+    }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        throw admissionError;
+      },
+    },
+  });
+
+  await assert.rejects(
+    loop.runCycle({ roleId: "orchestrator" }),
+    (error) => error === admissionError,
+  );
+
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.equal(ledger.calls.transition.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
 });
 
 test("a child-blocked root generic decision stays unclaimed", async () => {

@@ -901,6 +901,9 @@ export async function createApplication({
           workLedgerRuntime.scopedGraphPlannerFactory,
         graphDelivererFactory: workLedgerRuntime.graphDelivererFactory,
         capabilityRoles: coordinationConfig.policy?.capabilityRoles || {},
+        ...(ordinaryActionAdmissionGate === null
+          ? {}
+          : { actionAdmissionGate: ordinaryActionAdmissionGate }),
         ...(workCoordinationDependencies.evidenceVerifier
           ? {
               evidenceVerifier:
@@ -921,6 +924,9 @@ export async function createApplication({
         ledger: workLedgerRuntime,
         factSource,
         ...clockOptions,
+        ...(ordinaryActionAdmissionGate === null
+          ? {}
+          : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       });
       const workLoop = proactiveWorkLoopFactory({
         ledger: workLedgerRuntime,
