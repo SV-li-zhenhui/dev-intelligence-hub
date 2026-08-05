@@ -146,7 +146,35 @@
   "memory": {
     "enabled": true,
     "maximumRecords": 20000,
-    "maximumStateBytes": 67108864
+    "maximumStateBytes": 67108864,
+    "imports": {
+      "localSessions": false,
+      "git": false
+    },
+    "answering": {
+      "enabled": true,
+      "maximumRecords": 12,
+      "maximumContextBytes": 114688,
+      "maximumConcurrent": 1,
+      "brain": {
+        "provider": "ollama",
+        "model": "qwen3.5:9b",
+        "remoteData": {
+          "requirements": false,
+          "code": false,
+          "memory": false
+        }
+      },
+      "localBrain": {
+        "provider": "ollama",
+        "model": "qwen3.5:9b",
+        "remoteData": {
+          "requirements": false,
+          "code": false,
+          "memory": false
+        }
+      }
+    }
   },
   "brain": {
     "enabled": true,
@@ -161,6 +189,7 @@
     "ollama": {
       "kind": "ollama",
       "baseUrl": "http://127.0.0.1:11434",
+      "remote": false,
       "contextTokens": 8192,
       "timeoutMs": 120000,
       "maxResponseBytes": 131072,

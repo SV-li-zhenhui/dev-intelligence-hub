@@ -1,6 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createConfiguredWorkforce } from "../src/services/configured-workforce.js";
+import {
+  createConfiguredBrainRouter,
+  createConfiguredWorkforce,
+} from "../src/services/configured-workforce.js";
+
+const SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["ok"],
+  properties: { ok: { type: "boolean" } },
+});
+const MESSAGES = Object.freeze([
+  Object.freeze({ role: "system", content: "Return JSON." }),
+  Object.freeze({ role: "user", content: "{}" }),
+]);
+
+function textResponse(value) {
+  return {
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+        controller.close();
+      },
+    }),
+  };
+}
 
 class MemoryStore {
   constructor() {
@@ -107,6 +134,124 @@ test("provider options are isolated by adapter kind", () => {
         },
       },
     }),
+  );
+});
+
+test("a loopback gateway declared remote enforces memory authorization before fetch", async () => {
+  const calls = [];
+  const router = createConfiguredBrainRouter({
+    brainProviders: {
+      gateway: {
+        kind: "ollama",
+        baseUrl: "http://127.0.0.1:11434",
+        remote: true,
+      },
+    },
+    dependencies: {
+      fetch: async (url, options) => {
+        calls.push({ url, options });
+        return textResponse({ message: { content: '{"ok":true}' } });
+      },
+    },
+  });
+  const deniedBrain = {
+    provider: "gateway",
+    model: "local-gateway-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+
+  await assert.rejects(
+    router.generate({
+      brain: deniedBrain,
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["memory"],
+    }),
+    (error) => error.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.equal(calls.length, 0);
+  assert.deepEqual(router.describe(deniedBrain), {
+    provider: "gateway",
+    model: "local-gateway-model",
+    remote: true,
+    remoteData: { requirements: false, code: false, memory: false },
+  });
+
+  assert.equal(
+    await router.generate({
+      brain: {
+        ...deniedBrain,
+        remoteData: { requirements: false, code: false, memory: true },
+      },
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["memory"],
+    }),
+    '{"ok":true}',
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("a non-loopback provider cannot be downgraded by remote false", async () => {
+  let fetchCalls = 0;
+  const router = createConfiguredBrainRouter({
+    brainProviders: {
+      hosted: {
+        kind: "ollama",
+        baseUrl: "https://models.example/v1",
+        remote: false,
+      },
+    },
+    dependencies: {
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("denied data must not reach fetch");
+      },
+    },
+  });
+  const brain = {
+    provider: "hosted",
+    model: "hosted-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+
+  assert.equal(router.describe(brain).remote, true);
+  await assert.rejects(
+    router.generate({
+      brain,
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["memory"],
+    }),
+    (error) => error.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test("provider remote declarations are optional booleans only", () => {
+  assert.equal(
+    createConfiguredBrainRouter({
+      brainProviders: {
+        local: {
+          kind: "ollama",
+          baseUrl: "http://127.0.0.1:11434",
+        },
+      },
+    }).describe({
+      provider: "local",
+      model: "local-model",
+      remoteData: { requirements: false, code: false, memory: false },
+    }).remote,
+    false,
+  );
+  assert.throws(
+    () =>
+      createConfiguredBrainRouter({
+        brainProviders: {
+          invalid: { kind: "ollama", remote: "yes" },
+        },
+      }),
+    /brainProviders\.invalid\.remote is invalid/,
   );
 });
 

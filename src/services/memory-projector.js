@@ -242,7 +242,7 @@ function legacyRecord(raw) {
       brain: plainData(memory.brain),
     }),
     evidence: stringList(memory.evidence, 20),
-    tags: ["legacy", "pr-reviewer"],
+    tags: ["legacy", "pr-reviewer", "derived"],
     sourceUrl,
     subjectNumber: number,
   };

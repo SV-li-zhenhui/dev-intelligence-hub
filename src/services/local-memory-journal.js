@@ -7,12 +7,14 @@ import {
 
 export const MEMORY_JOURNAL_KEY = "unified-memory-records";
 export const MEMORY_INDEX_KEY = "unified-memory-index";
-const MAX_BATCH = 100;
+const MAX_BATCH = 160;
+const MAX_READ_RECORDS = 20;
 const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
 const SHA256 = /^[a-f0-9]{64}$/;
+const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/;
 const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const RECEIPT_KEYS = ["recordId", "contentDigest", "source"];
@@ -422,6 +424,51 @@ function queryOptions(value) {
   };
 }
 
+function readRecordIds(value) {
+  const input = exact(value, ["recordIds"], "memory record query");
+  if (!Object.hasOwn(input, "recordIds")) {
+    throw memoryError("MEMORY_INPUT_INVALID", "recordIds 不能为空");
+  }
+  const recordIds = strictArray(
+    input.recordIds,
+    MAX_READ_RECORDS,
+    "recordIds",
+  );
+  if (
+    recordIds.length === 0 ||
+    recordIds.some(
+      (recordId) =>
+        typeof recordId !== "string" || !MEMORY_RECORD_ID.test(recordId),
+    ) ||
+    new Set(recordIds).size !== recordIds.length
+  ) {
+    throw memoryError("MEMORY_INPUT_INVALID", "recordIds 无效");
+  }
+  return recordIds;
+}
+
+function supersededRecordIds(records) {
+  const result = new Set();
+  for (const { evidence } of records) {
+    for (const item of evidence) {
+      if (!item.startsWith("supersedes:")) continue;
+      const recordId = item.slice("supersedes:".length);
+      if (MEMORY_RECORD_ID.test(recordId)) result.add(recordId);
+    }
+  }
+  return result;
+}
+
+function recordLabels(record, supersededIds) {
+  return {
+    authority: record.tags.includes("derived") ? "derived" : "raw",
+    lifecycle:
+      record.tags.includes("obsolete") || supersededIds.has(record.recordId)
+        ? "obsolete"
+        : "current",
+  };
+}
+
 function newestFirst(left, right) {
   return (
     right.occurredAt.localeCompare(left.occurredAt, "en") ||
@@ -450,6 +497,8 @@ export class LocalMemoryJournal {
   #operationQueue;
   #limits;
   #journal = emptyJournal();
+  #recordsById = new Map();
+  #supersededIds = new Set();
   #index = new Map();
   #indexComplete = true;
   #ready = false;
@@ -498,6 +547,10 @@ export class LocalMemoryJournal {
         const built = buildIndex(journal.records, journal.revision);
         const storedIndex = await this.#store.read(MEMORY_INDEX_KEY, null);
         this.#journal = journal;
+        this.#recordsById = new Map(
+          journal.records.map((record) => [record.recordId, record]),
+        );
+        this.#supersededIds = supersededRecordIds(journal.records);
         this.#index = built.tokenMap;
         this.#indexComplete = built.complete;
         this.#lastIndexError = "";
@@ -586,12 +639,32 @@ export class LocalMemoryJournal {
     };
   }
 
+  readRecords(value) {
+    this.#assertReady();
+    const recordIds = readRecordIds(value);
+    if (recordIds.some((recordId) => !this.#recordsById.has(recordId))) {
+      throw memoryError(
+        "MEMORY_RECORD_NOT_FOUND",
+        "指定的统一记忆记录不存在",
+        404,
+      );
+    }
+    return structuredClone({
+      journalRevision: this.#journal.revision,
+      items: recordIds.map((recordId) => {
+        const record = this.#recordsById.get(recordId);
+        return {
+          record,
+          labels: recordLabels(record, this.#supersededIds),
+        };
+      }),
+    });
+  }
+
   verifyReceipt(value) {
     this.#assertReady();
     const expected = receiptReference(value);
-    const record = this.#journal.records.find(
-      ({ recordId }) => recordId === expected.recordId,
-    );
+    const record = this.#recordsById.get(expected.recordId);
     if (
       record?.contentDigest !== expected.contentDigest ||
       record.source.kind !== expected.source.kind ||
@@ -621,7 +694,7 @@ export class LocalMemoryJournal {
 
   async #append(records) {
     this.#assertReady();
-    const byId = new Map(this.#journal.records.map((record) => [record.recordId, record]));
+    const byId = new Map(this.#recordsById);
     const receipts = [];
     let added = 0;
     for (const record of records) {
@@ -657,6 +730,10 @@ export class LocalMemoryJournal {
     }
     await this.#store.write(MEMORY_JOURNAL_KEY, candidate);
     this.#journal = candidate;
+    this.#recordsById = byId;
+    for (const recordId of supersededRecordIds(records)) {
+      this.#supersededIds.add(recordId);
+    }
     const built = buildIndex(candidate.records, candidate.revision);
     this.#index = built.tokenMap;
     this.#indexComplete = built.complete;

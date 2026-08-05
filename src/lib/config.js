@@ -67,6 +67,21 @@ function mergeNamedConfigs(base = {}, local = {}, mergeValue) {
   return merged;
 }
 
+function mergeBrainConfig(base = {}, local = {}) {
+  return {
+    ...base,
+    ...local,
+    ...(base.remoteData !== undefined || local.remoteData !== undefined
+      ? {
+          remoteData: {
+            ...(base.remoteData || {}),
+            ...(local.remoteData || {}),
+          },
+        }
+      : {}),
+  };
+}
+
 function mergeRoleConfig(base = {}, local = {}) {
   const baseBrain = base.brain || {};
   const localBrain = local.brain || {};
@@ -78,18 +93,49 @@ function mergeRoleConfig(base = {}, local = {}) {
       : {}),
     ...(base.brain !== undefined || local.brain !== undefined
       ? {
-          brain: {
-            ...baseBrain,
-            ...localBrain,
-            ...(baseBrain.remoteData !== undefined ||
-            localBrain.remoteData !== undefined
+          brain: mergeBrainConfig(baseBrain, localBrain),
+        }
+      : {}),
+  };
+}
+
+function mergeMemoryConfig(base = {}, local = {}) {
+  const baseAnswering = base.answering || {};
+  const localAnswering = local.answering || {};
+  return {
+    ...base,
+    ...local,
+    ...(base.answering !== undefined || local.answering !== undefined
+      ? {
+          answering: {
+            ...baseAnswering,
+            ...localAnswering,
+            ...(baseAnswering.brain !== undefined ||
+            localAnswering.brain !== undefined
               ? {
-                  remoteData: {
-                    ...(baseBrain.remoteData || {}),
-                    ...(localBrain.remoteData || {}),
-                  },
+                  brain: mergeBrainConfig(
+                    baseAnswering.brain,
+                    localAnswering.brain,
+                  ),
                 }
               : {}),
+            ...(baseAnswering.localBrain !== undefined ||
+            localAnswering.localBrain !== undefined
+              ? {
+                  localBrain: mergeBrainConfig(
+                    baseAnswering.localBrain,
+                    localAnswering.localBrain,
+                  ),
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(base.imports !== undefined || local.imports !== undefined
+      ? {
+          imports: {
+            ...(base.imports || {}),
+            ...(local.imports || {}),
           },
         }
       : {}),
@@ -188,10 +234,7 @@ export function mergeConfig(base, local = {}) {
       : {}),
     ...(base.memory !== undefined || local.memory !== undefined
       ? {
-          memory: {
-            ...(base.memory || {}),
-            ...(local.memory || {}),
-          },
+          memory: mergeMemoryConfig(base.memory, local.memory),
         }
       : {}),
   };

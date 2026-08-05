@@ -16,11 +16,18 @@ import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
-import { createConfiguredWorkforce } from "./services/configured-workforce.js";
+import {
+  createConfiguredBrainRouter,
+  createConfiguredWorkforce,
+} from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
+import { MemoryAnswerService } from "./services/memory-answer-service.js";
+import { MemoryContextRetriever } from "./services/memory-context-retriever.js";
+import { LocalSessionImporter } from "./services/local-session-importer.js";
+import { GitActivityImporter } from "./services/git-activity-importer.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
@@ -149,6 +156,13 @@ export async function createApplication({
   memoryRuntimeFactory = createMemoryRuntime,
   memoryRuntimeDependencies = {},
   memoryProjectorFactory = (options) => new MemoryProjector(options),
+  memoryContextRetrieverFactory = (options) =>
+    new MemoryContextRetriever(options),
+  memoryAnswerServiceFactory = (options) => new MemoryAnswerService(options),
+  memoryBrainRouterFactory = createConfiguredBrainRouter,
+  memoryAnswerDependencies = {},
+  localSessionImporterFactory = (options) => new LocalSessionImporter(options),
+  gitActivityImporterFactory = (options) => new GitActivityImporter(options),
   codeJobMemoryProjectorFactory = (options) =>
     new CodeJobMemoryProjector(options),
   codeJobEvidenceReaderFactory = (options) =>
@@ -333,7 +347,8 @@ export async function createApplication({
         }),
       );
     }
-    if (config.memory?.enabled === true) {
+    const memoryEnabled = config.memory?.enabled === true;
+    if (memoryEnabled) {
       memoryRuntime = trackRuntime(
         await memoryRuntimeFactory({
           ...memoryRuntimeDependencies,
@@ -813,6 +828,82 @@ export async function createApplication({
           "memoryRuntime.search",
         )
       : null;
+    let memoryAnswer = null;
+    let memoryImports = null;
+    const memoryAnswerConfig = config.memory?.answering;
+    if (memoryEnabled && memoryAnswerConfig?.enabled === true) {
+      if (!memoryRuntime) {
+        throw new Error("记忆问答需要启用统一记忆运行时");
+      }
+      const memoryBrainRouter = memoryBrainRouterFactory({
+        brainProviders: config.brainProviders || {},
+        dependencies: memoryAnswerDependencies.brainDependencies || {},
+      });
+      const contextRetriever = memoryContextRetrieverFactory({
+        memorySearch: frozenPort(
+          memoryRuntime.search,
+          ["search"],
+          "memoryRuntime.search",
+        ),
+        contextReader: frozenPort(
+          memoryRuntime.contextReader,
+          ["readRecords"],
+          "memoryRuntime.contextReader",
+        ),
+        maximumRecords: memoryAnswerConfig.maximumRecords,
+        maximumContextBytes: memoryAnswerConfig.maximumContextBytes,
+      });
+      memoryAnswer = frozenPort(
+        memoryAnswerServiceFactory({
+          contextRetriever,
+          brainRouter: memoryBrainRouter,
+          configuredBrain: memoryAnswerConfig.brain,
+          localBrain: memoryAnswerConfig.localBrain,
+          maximumConcurrent: memoryAnswerConfig.maximumConcurrent,
+          ...(memoryAnswerDependencies.beforeGenerate
+            ? { beforeGenerate: memoryAnswerDependencies.beforeGenerate }
+            : {}),
+        }),
+        ["answer"],
+        "memoryAnswerService",
+      );
+    }
+    const memoryImportConfig = config.memory?.imports || {};
+    const localSessionImportEnabled =
+      memoryEnabled && memoryImportConfig.localSessions === true;
+    const gitImportEnabled = memoryEnabled && memoryImportConfig.git === true;
+    if (localSessionImportEnabled || gitImportEnabled) {
+      if (!memoryRuntime) {
+        throw new Error("记忆导入需要启用统一记忆运行时");
+      }
+      const memoryProducer = frozenPort(
+        memoryRuntime.producer,
+        ["appendBatch"],
+        "memoryRuntime.producer",
+      );
+      const imports = {};
+      if (localSessionImportEnabled) {
+        const importer = localSessionImporterFactory({
+          memoryProducer,
+        });
+        imports.session = frozenPort(
+          importer,
+          ["importSession"],
+          "localSessionImporter",
+        );
+      }
+      if (gitImportEnabled) {
+        const importer = gitActivityImporterFactory({
+          memoryProducer,
+        });
+        imports.git = frozenPort(
+          importer,
+          ["importCommits"],
+          "gitActivityImporter",
+        );
+      }
+      memoryImports = Object.freeze(imports);
+    }
     const notifier = new NotificationService(dingtalk, config.dingtalk);
     const refreshService = new RefreshService({
       github,
@@ -849,6 +940,8 @@ export async function createApplication({
       attentionCoordinator,
       workCoordination,
       memorySearch,
+      memoryAnswer,
+      memoryImports,
       memoryProjector,
       close,
     };

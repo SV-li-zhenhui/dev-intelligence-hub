@@ -1,3 +1,5 @@
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
@@ -151,10 +153,24 @@ export class BrainRouter {
     Object.freeze(this);
   }
 
-  async generate({ brain: brainValue, messages, schema, dataClasses = [] } = {}) {
+  async generate({
+    brain: brainValue,
+    messages,
+    schema,
+    dataClasses = [],
+    signal = null,
+  } = {}) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
     const classes = normalizeDataClasses(dataClasses);
+    const requestSignal = normalizeAbortSignal(signal);
+    if (requestSignal?.aborted) {
+      throw routerError(
+        "BRAIN_REQUEST_CANCELLED",
+        "Brain request was cancelled",
+        499,
+      );
+    }
     if (provider.remote) {
       if (classes.length === 0) {
         throw routerError(
@@ -172,7 +188,12 @@ export class BrainRouter {
         );
       }
     }
-    return provider.generate({ model: brain.model, messages, schema });
+    return provider.generate({
+      model: brain.model,
+      messages,
+      schema,
+      ...(requestSignal ? { signal: requestSignal } : {}),
+    });
   }
 
   describe(brainValue) {

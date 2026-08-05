@@ -176,6 +176,7 @@ test("memory projector imports work items, timeline, and legacy PR memory idempo
   assert.equal(batches[0][2].eventType, "timeline.assignment_intaken");
   assert.equal(batches[0][3].eventType, "analysis_ready");
   assert.equal(batches[0][3].roleId, "pr-reviewer");
+  assert.deepEqual(batches[0][3].tags, ["legacy", "pr-reviewer", "derived"]);
 });
 
 test("graph contracts and deliveries remain searchable without retained timeline events", async () => {

@@ -650,6 +650,305 @@ h1 {
   text-decoration: none;
 }
 
+.memory-question {
+  margin: 18px 0;
+  padding: 16px;
+  background: color-mix(in srgb, var(--green) 5%, var(--surface));
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+
+.memory-question > label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.memory-question-primary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.memory-question input {
+  min-width: 0;
+  width: 100%;
+  padding: 9px 11px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.memory-question > p {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.memory-answer-panel {
+  min-width: 0;
+  margin: 20px 0 8px;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--green);
+  border-radius: 8px;
+}
+
+.memory-answer-heading,
+.memory-context-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.memory-answer-heading > *,
+.memory-context-heading > * {
+  min-width: 0;
+}
+
+.memory-answer-heading h3 {
+  margin: 2px 0 0;
+  font-size: 17px;
+}
+
+.memory-answer-heading > span,
+.memory-context-heading span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.memory-answer-summary {
+  margin: 16px 0;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--paper);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.memory-answer-empty {
+  margin: 16px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.memory-claims {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0 20px;
+  padding-left: 22px;
+}
+
+.memory-claims li {
+  min-width: 0;
+  padding-left: 4px;
+}
+
+.memory-claim {
+  min-width: 0;
+}
+
+.memory-claim > summary {
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.memory-claim-citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  margin-bottom: 0;
+}
+
+.memory-claim > summary:focus-visible,
+.memory-context-record > summary:focus-visible,
+.memory-citation-link:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+.memory-claim p {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.memory-citation-link {
+  max-width: 100%;
+  padding: 4px 7px;
+  overflow-wrap: anywhere;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--green) 24%, var(--line));
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  text-decoration: none;
+}
+
+.memory-derived-label,
+.memory-cited-label {
+  display: inline-block;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
+
+.memory-context-heading {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.memory-context-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.memory-context-heading code,
+.memory-record-meta code,
+.memory-record-section code {
+  overflow-wrap: anywhere;
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.memory-context-records {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.memory-context-record {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.memory-context-record[data-cited="true"] {
+  border-color: color-mix(in srgb, var(--green) 40%, var(--line));
+}
+
+.memory-context-record > summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 11px 12px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.memory-context-record > summary > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.memory-context-record > summary strong,
+.memory-context-record > summary small {
+  overflow-wrap: anywhere;
+}
+
+.memory-context-record > summary small {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 400;
+}
+
+.memory-record-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  margin: 0;
+  padding: 0 12px;
+  border-top: 1px solid var(--line);
+}
+
+.memory-record-meta div {
+  min-width: 0;
+  padding: 9px 8px 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.memory-record-meta dt {
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.memory-record-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.memory-record-section {
+  min-width: 0;
+  padding: 11px 12px 0;
+}
+
+.memory-record-section > strong {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.memory-record-section p,
+.memory-record-section pre {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.memory-record-section pre {
+  max-height: 320px;
+  overflow: auto;
+  padding: 9px;
+  background: var(--paper);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.memory-record-section ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.memory-record-empty {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.memory-record-source {
+  display: inline-block;
+  margin: 12px;
+  color: var(--green);
+  font-size: 10px;
+  text-decoration: none;
+}
+
 .workflow-summary {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -2015,6 +2314,37 @@ dialog::backdrop {
   }
 
   .memory-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-question-primary {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-question-primary button {
+    width: 100%;
+  }
+
+  .memory-answer-panel {
+    padding: 14px;
+  }
+
+  .memory-answer-heading,
+  .memory-context-heading {
+    display: grid;
+    gap: 9px;
+  }
+
+  .memory-answer-heading > span,
+  .memory-context-heading span {
+    text-align: left;
+  }
+
+  .memory-context-heading .secondary-button {
+    width: 100%;
+  }
+
+  .memory-record-meta {
     grid-template-columns: 1fr;
   }
 

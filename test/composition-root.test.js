@@ -978,6 +978,225 @@ test("enabled unified memory exposes search only and projects the existing work 
   await application.close();
 });
 
+test("cited memory answering wires only trusted retrieval and configured brain ports", async () => {
+  const configuredBrain = {
+    provider: "ollama",
+    model: "configured-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+  const localBrain = {
+    provider: "ollama",
+    model: "local-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+  const config = {
+    ...applicationConfig(),
+    memory: {
+      enabled: true,
+      answering: {
+        enabled: true,
+        maximumRecords: 7,
+        maximumContextBytes: 110_000,
+        maximumConcurrent: 2,
+        brain: configuredBrain,
+        localBrain,
+      },
+    },
+    brainProviders: { ollama: { kind: "ollama" } },
+  };
+  const calls = {};
+  const memoryRuntime = {
+    producer: { async append() {}, async appendBatch() {} },
+    search: {
+      async search() { return { items: [], nextCursor: null }; },
+      async getHealth() { return { ready: true }; },
+    },
+    contextReader: { async readRecords() {} },
+    receiptVerifier: { async verify() {} },
+    maintenance: { async rebuildIndex() {} },
+    async close() {},
+  };
+  const router = { async generate() {}, describe() {} };
+  const retriever = { async retrieve() {} };
+  const answerService = {
+    async answer(value) { return { value }; },
+    async hiddenWrite() {},
+  };
+
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    memoryRuntimeFactory: async () => memoryRuntime,
+    memoryBrainRouterFactory: (options) => {
+      calls.router = options;
+      return router;
+    },
+    memoryContextRetrieverFactory: (options) => {
+      calls.retriever = options;
+      return retriever;
+    },
+    memoryAnswerServiceFactory: (options) => {
+      calls.answer = options;
+      return answerService;
+    },
+    memoryAnswerDependencies: {
+      brainDependencies: { fetch: "injected-fetch" },
+      beforeGenerate: async () => {},
+    },
+  });
+
+  assert.deepEqual(calls.router, {
+    brainProviders: config.brainProviders,
+    dependencies: { fetch: "injected-fetch" },
+  });
+  assert.equal(Object.isFrozen(calls.retriever.memorySearch), true);
+  assert.deepEqual(Object.keys(calls.retriever.memorySearch), ["search"]);
+  assert.equal(Object.isFrozen(calls.retriever.contextReader), true);
+  assert.deepEqual(Object.keys(calls.retriever.contextReader), ["readRecords"]);
+  assert.equal(calls.retriever.maximumRecords, 7);
+  assert.equal(calls.retriever.maximumContextBytes, 110_000);
+  assert.strictEqual(calls.answer.contextRetriever, retriever);
+  assert.strictEqual(calls.answer.brainRouter, router);
+  assert.deepEqual(calls.answer.configuredBrain, configuredBrain);
+  assert.deepEqual(calls.answer.localBrain, localBrain);
+  assert.equal(calls.answer.maximumConcurrent, 2);
+  assert.equal(typeof calls.answer.beforeGenerate, "function");
+  assert.equal(Object.isFrozen(application.memoryAnswer), true);
+  assert.deepEqual(Object.keys(application.memoryAnswer), ["answer"]);
+  assert.equal("contextReader" in application, false);
+  assert.equal("hiddenWrite" in application.memoryAnswer, false);
+  assert.deepEqual(await application.memoryAnswer.answer({ safe: true }), {
+    value: { safe: true },
+  });
+  await application.close();
+});
+
+test("memory imports are explicit opt-in ports with append-only authority", async () => {
+  const config = {
+    ...applicationConfig(),
+    memory: {
+      enabled: true,
+      imports: { localSessions: true, git: true },
+    },
+  };
+  const calls = {};
+  const producer = {
+    async append() {},
+    async appendBatch(value) { return value; },
+    async hiddenErase() {},
+  };
+  const memoryRuntime = {
+    producer,
+    search: { async search() {}, async getHealth() {} },
+    contextReader: { async readRecords() {} },
+    receiptVerifier: { async verify() {} },
+    maintenance: { async rebuildIndex() {} },
+    async close() {},
+  };
+  const sessionImporter = {
+    async importSession(value) { return { kind: "session", value }; },
+    async hiddenImport() {},
+  };
+  const gitImporter = {
+    async importCommits(value) { return { kind: "git", value }; },
+    async hiddenImport() {},
+  };
+
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    memoryRuntimeFactory: async () => memoryRuntime,
+    localSessionImporterFactory: (options) => {
+      calls.session = options;
+      return sessionImporter;
+    },
+    gitActivityImporterFactory: (options) => {
+      calls.git = options;
+      return gitImporter;
+    },
+  });
+
+  for (const options of [calls.session, calls.git]) {
+    assert.equal(Object.isFrozen(options.memoryProducer), true);
+    assert.deepEqual(Object.keys(options.memoryProducer), ["appendBatch"]);
+    assert.equal("hiddenErase" in options.memoryProducer, false);
+  }
+  assert.equal(Object.isFrozen(application.memoryImports), true);
+  assert.deepEqual(Object.keys(application.memoryImports), ["session", "git"]);
+  assert.deepEqual(Object.keys(application.memoryImports.session), ["importSession"]);
+  assert.deepEqual(Object.keys(application.memoryImports.git), ["importCommits"]);
+  assert.equal("hiddenImport" in application.memoryImports.session, false);
+  assert.deepEqual(
+    await application.memoryImports.session.importSession({ id: "s1" }),
+    { kind: "session", value: { id: "s1" } },
+  );
+  assert.deepEqual(
+    await application.memoryImports.git.importCommits({ id: "g1" }),
+    { kind: "git", value: { id: "g1" } },
+  );
+  await application.close();
+});
+
+test("disabling unified memory also disables answering and import children", async () => {
+  const calls = { runtime: 0, answer: 0, sessionImport: 0, gitImport: 0 };
+  const application = await createApplication({
+    config: {
+      ...applicationConfig(),
+      memory: {
+        enabled: false,
+        answering: { enabled: true },
+        imports: { localSessions: true, git: true },
+      },
+    },
+    store: memoryStore(),
+    memoryRuntimeFactory: async () => {
+      calls.runtime += 1;
+      return null;
+    },
+    memoryAnswerServiceFactory: () => {
+      calls.answer += 1;
+      return { async answer() {} };
+    },
+    localSessionImporterFactory: () => {
+      calls.sessionImport += 1;
+      return { async importSession() {} };
+    },
+    gitActivityImporterFactory: () => {
+      calls.gitImport += 1;
+      return { async importCommits() {} };
+    },
+  });
+
+  assert.equal(application.memorySearch, null);
+  assert.equal(application.memoryAnswer, null);
+  assert.equal(application.memoryImports, null);
+  assert.deepEqual(calls, {
+    runtime: 0,
+    answer: 0,
+    sessionImport: 0,
+    gitImport: 0,
+  });
+  await application.close();
+});
+
+test("enabled memory children fail closed when the runtime factory is unavailable", async () => {
+  await assert.rejects(
+    createApplication({
+      config: {
+        ...applicationConfig(),
+        memory: {
+          enabled: true,
+          answering: { enabled: true },
+          imports: { localSessions: true, git: true },
+        },
+      },
+      store: memoryStore(),
+      memoryRuntimeFactory: async () => null,
+    }),
+    /记忆问答需要启用统一记忆运行时/,
+  );
+});
+
 test("application close is idempotent and attempts every runtime in reverse order", async () => {
   const closeCalls = [];
   const closeFailure = new Error("confirmation close failed");

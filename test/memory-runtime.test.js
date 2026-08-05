@@ -58,16 +58,28 @@ test("memory runtime exposes least-authority frozen ports and closes once", asyn
 
   assert.deepEqual(Object.keys(runtime.producer).sort(), ["append", "appendBatch"]);
   assert.deepEqual(Object.keys(runtime.search).sort(), ["getHealth", "search"]);
+  assert.deepEqual(Object.keys(runtime.contextReader), ["readRecords"]);
   assert.deepEqual(Object.keys(runtime.receiptVerifier), ["verify"]);
   assert.deepEqual(Object.keys(runtime.maintenance), ["rebuildIndex"]);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.producer), true);
+  assert.equal(Object.isFrozen(runtime.contextReader), true);
   assert.equal(Object.isFrozen(runtime.receiptVerifier), true);
   assert.equal("journal" in runtime, false);
 
   const value = memoryRecord();
   const expected = normalizeMemoryRecord(value);
   await runtime.producer.append(value);
+  const context = await runtime.contextReader.readRecords({
+    recordIds: [expected.recordId],
+  });
+  assert.equal(context.journalRevision, 1);
+  assert.deepEqual(context.items, [
+    {
+      record: structuredClone(expected),
+      labels: { authority: "raw", lifecycle: "current" },
+    },
+  ]);
   assert.deepEqual(
     await runtime.receiptVerifier.verify({
       recordId: expected.recordId,
@@ -83,6 +95,10 @@ test("memory runtime exposes least-authority frozen ports and closes once", asyn
   );
   assert.equal("append" in runtime.receiptVerifier, false);
   assert.equal("search" in runtime.receiptVerifier, false);
+  assert.equal("append" in runtime.contextReader, false);
+  assert.equal("search" in runtime.contextReader, false);
+  assert.equal("verify" in runtime.contextReader, false);
+  assert.equal("rebuildIndex" in runtime.contextReader, false);
   const first = runtime.close();
   assert.strictEqual(runtime.close(), first);
   await first;

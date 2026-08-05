@@ -354,6 +354,8 @@ async function withServer(
     attentionCoordinator,
     attentionBrowser,
     memorySearch,
+    memoryAnswer,
+    memoryImports,
     codeJobReader,
     codeJobControl,
     changePackageReader,
@@ -542,6 +544,8 @@ async function withServer(
   }
   if (attentionBrowser) application.attentionBrowser = attentionBrowser;
   if (memorySearch) application.memorySearch = memorySearch;
+  if (memoryAnswer) application.memoryAnswer = memoryAnswer;
+  if (memoryImports) application.memoryImports = memoryImports;
   if (codeJobReader) application.codeJobReader = codeJobReader;
   if (codeJobControl) application.codeJobControl = codeJobControl;
   if (changePackageReader) application.changePackageReader = changePackageReader;
@@ -4013,4 +4017,346 @@ test("unified memory query fails closed when the local journal is unavailable", 
 
     assert.equal(response.status, 503);
   });
+});
+
+test("cited memory answering is an explicit same-origin bounded operation", async () => {
+  const calls = [];
+  const input = {
+    schemaVersion: 1,
+    question: "测试为什么失败？",
+    mode: "configured",
+    retrieval: {
+      kind: "query",
+      filters: { query: "测试失败", repository: "acme/repo" },
+    },
+  };
+  const result = {
+    schemaVersion: 1,
+    status: "insufficient_evidence",
+    answer: "证据不足",
+    derived: false,
+    claims: [],
+    citations: [],
+    context: {
+      contextDigest: "a".repeat(64),
+      recordIds: [],
+      records: [],
+    },
+    brain: {
+      mode: "configured",
+      provider: "ollama",
+      model: "qwen",
+      remote: false,
+    },
+    localRerunAvailable: true,
+  };
+  await withServer(
+    async ({ server }) => {
+      const body = JSON.stringify(input);
+      const accepted = await request(server, {
+        method: "POST",
+        path: "/api/memory/answer",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json; charset=utf-8",
+        },
+        body,
+      });
+      const crossOrigin = await request(server, {
+        method: "POST",
+        path: "/api/memory/answer",
+        headers: {
+          origin: "https://attacker.example",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body,
+      });
+      const wrongType = await request(server, {
+        method: "POST",
+        path: "/api/memory/answer",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "text/plain",
+        },
+        body,
+      });
+
+      assert.equal(accepted.status, 200);
+      assert.deepEqual(JSON.parse(accepted.body), result);
+      assert.equal(crossOrigin.status, 403);
+      assert.equal(wrongType.status, 415);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].value, input);
+      assert.equal(calls[0].signal?.aborted, false);
+    },
+    {
+      memoryAnswer: {
+        async answer(value, { signal } = {}) {
+          calls.push({ value: structuredClone(value), signal });
+          return structuredClone(result);
+        },
+      },
+    },
+  );
+});
+
+test("disconnecting a memory answer client cancels server work and frees the next slot", async () => {
+  const started = deferred();
+  const cancelled = deferred();
+  let inFlight = 0;
+  let observedSignal = null;
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const body = JSON.stringify({ slow: true });
+      let outgoing;
+      const abandoned = new Promise((resolve) => {
+        outgoing = http.request({
+          host: "127.0.0.1",
+          port: server.address().port,
+          method: "POST",
+          path: "/api/memory/answer",
+          headers: {
+            host: "127.0.0.1:4173",
+            origin: "http://127.0.0.1:4173",
+            "x-mydashboard-action": "1",
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(body),
+          },
+        });
+        outgoing.on("response", (response) => {
+          response.resume();
+          response.on("end", resolve);
+        });
+        outgoing.on("error", resolve);
+        outgoing.end(body);
+      });
+
+      await started.promise;
+      outgoing.destroy();
+      await cancelled.promise;
+      await abandoned;
+
+      const next = await request(server, {
+        method: "POST",
+        path: "/api/memory/answer",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ slow: false }),
+      });
+
+      assert.equal(observedSignal.aborted, true);
+      assert.equal(next.status, 200);
+      assert.deepEqual(JSON.parse(next.body), { status: "answered" });
+      assert.deepEqual(reportedErrors, []);
+    },
+    {
+      memoryAnswer: {
+        async answer(value, { signal }) {
+          if (inFlight >= 1) {
+            throw Object.assign(new Error("busy"), { statusCode: 429 });
+          }
+          inFlight += 1;
+          try {
+            if (!value.slow) return { status: "answered" };
+            observedSignal = signal;
+            started.resolve();
+            await new Promise((_, reject) => {
+              signal.addEventListener("abort", () => {
+                cancelled.resolve();
+                reject(Object.assign(new Error("cancelled"), {
+                  code: "MEMORY_ANSWER_CANCELLED",
+                  statusCode: 499,
+                }));
+              }, { once: true });
+            });
+          } finally {
+            inFlight -= 1;
+          }
+        },
+      },
+    },
+  );
+});
+
+test("memory answer availability and provider failures remain safely classified", async () => {
+  await withServer(async ({ server }) => {
+    const unavailable = await request(server, {
+      method: "POST",
+      path: "/api/memory/answer",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ safe: true }),
+    });
+    assert.equal(unavailable.status, 503);
+    assert.deepEqual(JSON.parse(unavailable.body), { error: "服务器内部错误" });
+  });
+
+  const failure = Object.assign(new Error("private provider response"), {
+    code: "STRUCTURED_PROVIDER_REQUEST_FAILED",
+    statusCode: 502,
+  });
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: "/api/memory/answer",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ safe: true }),
+      });
+      assert.equal(response.status, 502);
+      assert.deepEqual(JSON.parse(response.body), { error: "服务器内部错误" });
+      assert.deepEqual(reportedErrors, [failure]);
+      assert.equal(response.body.includes("private provider response"), false);
+    },
+    {
+      memoryAnswer: {
+        async answer() { throw failure; },
+      },
+    },
+  );
+});
+
+test("memory session and Git imports require explicit same-origin opt-in ports", async () => {
+  const calls = [];
+  const session = {
+    schemaVersion: 1,
+    provider: "codex",
+    sessionId: "session-1",
+    occurredAt: "2026-08-05T01:00:00.000Z",
+    title: "Memory work",
+    entries: [{
+      role: "user",
+      occurredAt: "2026-08-05T01:00:01.000Z",
+      content: "Continue the command center.",
+    }],
+  };
+  const git = {
+    schemaVersion: 1,
+    repository: "acme/repo",
+    commits: [{
+      oid: "a".repeat(40),
+      occurredAt: "2026-08-05T01:02:00.000Z",
+      author: "Ada",
+      subject: "Add memory import",
+      body: "",
+    }],
+  };
+  const trustedHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const sessionResponse = await request(server, {
+        method: "POST",
+        path: "/api/memory/import/session",
+        headers: trustedHeaders,
+        body: JSON.stringify(session),
+      });
+      const gitResponse = await request(server, {
+        method: "POST",
+        path: "/api/memory/import/git",
+        headers: trustedHeaders,
+        body: JSON.stringify(git),
+      });
+      const untrusted = await request(server, {
+        method: "POST",
+        path: "/api/memory/import/session",
+        headers: {
+          ...trustedHeaders,
+          origin: "https://attacker.example",
+        },
+        body: JSON.stringify(session),
+      });
+
+      assert.equal(sessionResponse.status, 200);
+      assert.deepEqual(JSON.parse(sessionResponse.body), {
+        schemaVersion: 1,
+        kind: "session",
+        added: 1,
+      });
+      assert.equal(gitResponse.status, 200);
+      assert.deepEqual(JSON.parse(gitResponse.body), {
+        schemaVersion: 1,
+        kind: "git",
+        added: 1,
+      });
+      assert.equal(untrusted.status, 403);
+      assert.deepEqual(calls, [
+        { kind: "session", value: session },
+        { kind: "git", value: git },
+      ]);
+    },
+    {
+      memoryImports: {
+        session: {
+          async importSession(value) {
+            calls.push({ kind: "session", value: structuredClone(value) });
+            return { schemaVersion: 1, kind: "session", added: 1 };
+          },
+        },
+        git: {
+          async importCommits(value) {
+            calls.push({ kind: "git", value: structuredClone(value) });
+            return { schemaVersion: 1, kind: "git", added: 1 };
+          },
+        },
+      },
+    },
+  );
+});
+
+test("disabled and oversized memory imports fail before invoking an importer", async () => {
+  const trustedHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+  await withServer(async ({ server }) => {
+    const unavailable = await request(server, {
+      method: "POST",
+      path: "/api/memory/import/session",
+      headers: trustedHeaders,
+      body: JSON.stringify({ schemaVersion: 1 }),
+    });
+    assert.equal(unavailable.status, 503);
+  });
+
+  let calls = 0;
+  await withServer(
+    async ({ server }) => {
+      const oversized = await request(server, {
+        method: "POST",
+        path: "/api/memory/import/git",
+        headers: trustedHeaders,
+        body: "x".repeat(3 * 1024 * 1024 + 1),
+      });
+      assert.equal(oversized.status, 413);
+      assert.equal(calls, 0);
+    },
+    {
+      memoryImports: {
+        git: {
+          async importCommits() {
+            calls += 1;
+          },
+        },
+      },
+    },
+  );
 });

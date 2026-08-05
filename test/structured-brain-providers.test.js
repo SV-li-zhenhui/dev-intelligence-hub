@@ -241,6 +241,90 @@ test("providers bound response bytes and timeout without exposing response conte
   assert.equal(unboundedRead, false);
 });
 
+test("structured providers propagate external cancellation without misreporting a timeout", async () => {
+  const factories = [
+    (fetch) => new OllamaStructuredProvider({ fetch, timeoutMs: 100 }),
+    (fetch) => new OpenAiCompatibleProvider({
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch,
+      timeoutMs: 100,
+    }),
+  ];
+
+  for (const createProvider of factories) {
+    let observedSignal = null;
+    let markStarted;
+    const started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+    const provider = createProvider(async (_url, { signal }) => {
+      observedSignal = signal;
+      markStarted();
+      return new Promise((_, reject) => {
+        signal.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }, { once: true });
+      });
+    });
+    const controller = new AbortController();
+    const pending = provider.generate({
+      model: "model",
+      messages: MESSAGES,
+      schema: SCHEMA,
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort();
+
+    await assert.rejects(
+      pending,
+      (error) =>
+        error.code === "STRUCTURED_PROVIDER_CANCELLED" &&
+        error.statusCode === 499,
+    );
+    assert.equal(observedSignal.aborted, true);
+  }
+});
+
+test("structured providers do not start fetch after immediate cancellation", async () => {
+  const factories = [
+    (fetch) => new OllamaStructuredProvider({ fetch, timeoutMs: 100 }),
+    (fetch) => new OpenAiCompatibleProvider({
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch,
+      timeoutMs: 100,
+    }),
+  ];
+
+  for (const createProvider of factories) {
+    let fetchCalls = 0;
+    const provider = createProvider(async () => {
+      fetchCalls += 1;
+      throw new Error("fetch must not start");
+    });
+    const controller = new AbortController();
+    const pending = provider.generate({
+      model: "model",
+      messages: MESSAGES,
+      schema: SCHEMA,
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    await assert.rejects(
+      pending,
+      (error) =>
+        error.code === "STRUCTURED_PROVIDER_CANCELLED" &&
+        error.statusCode === 499,
+    );
+    assert.equal(fetchCalls, 0);
+  }
+});
+
 test("BrainRouter requires explicit remoteData authorization per classification", async () => {
   const calls = [];
   const remoteProvider = {
@@ -276,9 +360,11 @@ test("BrainRouter requires explicit remoteData authorization per classification"
     messages: MESSAGES,
     schema: SCHEMA,
     dataClasses: ["code"],
+    signal: new AbortController().signal,
   });
   assert.equal(output, '{"ok":true}');
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].signal.aborted, false);
   assert.deepEqual(router.describe(brain), {
     provider: "remote-brain",
     model: "smart-model",
@@ -286,4 +372,35 @@ test("BrainRouter requires explicit remoteData authorization per classification"
     remoteData: remoteData(),
   });
   assert.equal(Object.isFrozen(router.describe(brain)), true);
+});
+
+test("BrainRouter rejects a pre-cancelled request before provider admission", async () => {
+  let providerCalls = 0;
+  const router = new BrainRouter({
+    providers: [{
+      id: "local",
+      remote: false,
+      async generate() {
+        providerCalls += 1;
+        return '{"ok":true}';
+      },
+    }],
+  });
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    router.generate({
+      brain: {
+        provider: "local",
+        model: "qwen",
+        remoteData: remoteData(),
+      },
+      messages: MESSAGES,
+      schema: SCHEMA,
+      signal: controller.signal,
+    }),
+    (error) => error.code === "BRAIN_REQUEST_CANCELLED" && error.statusCode === 499,
+  );
+  assert.equal(providerCalls, 0);
 });

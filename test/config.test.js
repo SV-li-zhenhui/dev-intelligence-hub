@@ -386,6 +386,75 @@ test("memory overrides preserve local capacity defaults", () => {
   });
 });
 
+test("memory answer and import overrides preserve independent safe defaults", () => {
+  const result = mergeConfig(
+    {
+      memory: {
+        enabled: true,
+        imports: { localSessions: false, git: false },
+        answering: {
+          enabled: true,
+          maximumRecords: 12,
+          brain: {
+            provider: "ollama",
+            model: "base-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+          localBrain: {
+            provider: "ollama",
+            model: "local-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+        },
+      },
+    },
+    {
+      memory: {
+        imports: { git: true },
+        answering: {
+          brain: { model: "remote-model", remoteData: { memory: true } },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(result.memory.imports, {
+    localSessions: false,
+    git: true,
+  });
+  assert.deepEqual(result.memory.answering.brain, {
+    provider: "ollama",
+    model: "remote-model",
+    remoteData: { requirements: false, code: false, memory: true },
+  });
+  assert.deepEqual(result.memory.answering.localBrain, {
+    provider: "ollama",
+    model: "local-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  });
+  assert.equal(result.memory.answering.maximumRecords, 12);
+});
+
+test("the unified memory master switch preserves but does not activate child choices", () => {
+  const result = mergeConfig(
+    {
+      memory: {
+        enabled: true,
+        answering: { enabled: true },
+        imports: { localSessions: true, git: true },
+      },
+    },
+    { memory: { enabled: false } },
+  );
+
+  assert.equal(result.memory.enabled, false);
+  assert.equal(result.memory.answering.enabled, true);
+  assert.deepEqual(result.memory.imports, {
+    localSessions: true,
+    git: true,
+  });
+});
+
 test("committed privileged capabilities are disabled and secret-free", async () => {
   const configPath = path.resolve(testDirectory, "../config.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
@@ -394,6 +463,10 @@ test("committed privileged capabilities are disabled and secret-free", async () 
   assert.deepEqual(config.changePackages, { enabled: false });
   assert.deepEqual(config.githubActions, { enabled: false });
   assert.equal(config.memory.enabled, true);
+  assert.deepEqual(config.memory.imports, {
+    localSessions: false,
+    git: false,
+  });
   const absolutePaths = Object.values(config.codeExecutor).filter(
     (value) =>
       typeof value === "string" &&

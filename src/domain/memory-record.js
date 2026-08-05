@@ -4,7 +4,8 @@ const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_ROLE = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-const MAX_RECORD_BYTES = 64 * 1024;
+export const MAX_MEMORY_RECORD_CONTENT_BYTES = 32 * 1024;
+export const MAX_MEMORY_RECORD_BYTES = 64 * 1024;
 
 export class MemoryRecordError extends Error {
   constructor(message = "统一记忆记录无效") {
@@ -195,9 +196,14 @@ export function normalizeMemoryRecord(value) {
     eventType,
     title: text(entries.get("title"), "title", 1_024),
     summary: text(entries.get("summary"), "summary", 8_192, { empty: true }),
-    content: text(entries.get("content"), "content", 32 * 1_024, {
-      empty: true,
-    }),
+    content: text(
+      entries.get("content"),
+      "content",
+      MAX_MEMORY_RECORD_CONTENT_BYTES,
+      {
+        empty: true,
+      },
+    ),
     evidence: strictStrings(entries.get("evidence"), "evidence", 20, 2_048),
     tags: strictStrings(entries.get("tags"), "tags", 20, 128).map((tag) => {
       if (!SAFE_TOKEN.test(tag)) invalid("tags 无效");
@@ -209,7 +215,10 @@ export function normalizeMemoryRecord(value) {
   if (new Set(normalized.tags).size !== normalized.tags.length) {
     invalid("tags 重复");
   }
-  if (Buffer.byteLength(JSON.stringify(normalized), "utf8") > MAX_RECORD_BYTES) {
+  if (
+    Buffer.byteLength(JSON.stringify(normalized), "utf8") >
+    MAX_MEMORY_RECORD_BYTES
+  ) {
     invalid("统一记忆记录过大");
   }
   const digest = memoryRecordDigest(normalized);

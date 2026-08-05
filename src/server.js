@@ -104,6 +104,32 @@ async function readJsonBody(request, maxBytes = 8 * 1024) {
   return value;
 }
 
+async function withClientAbortSignal(request, response, operation) {
+  const controller = new AbortController();
+  const abortIncompleteRequest = () => {
+    if (!request.complete) controller.abort();
+  };
+  const abortIncompleteResponse = () => {
+    if (!response.writableFinished) controller.abort();
+  };
+  request.once("aborted", abortIncompleteRequest);
+  request.once("close", abortIncompleteRequest);
+  response.once("close", abortIncompleteResponse);
+  if (
+    (request.destroyed && !request.complete) ||
+    (response.destroyed && !response.writableFinished)
+  ) {
+    controller.abort();
+  }
+  try {
+    return await operation(controller.signal);
+  } finally {
+    request.off("aborted", abortIncompleteRequest);
+    request.off("close", abortIncompleteRequest);
+    response.off("close", abortIncompleteResponse);
+  }
+}
+
 function serveStatic(response, requestPath) {
   const publicDirectory = path.join(projectRoot, "public");
   const relativePath = requestPath === "/" ? "index.html" : requestPath.slice(1);
@@ -374,6 +400,24 @@ function requireMemorySearch(application) {
     throw httpError(503, "统一记忆尚未启用");
   }
   return search;
+}
+
+function requireMemoryAnswer(application) {
+  const service = application.memoryAnswer;
+  if (!service || typeof service.answer !== "function") {
+    throw httpError(503, "记忆问答尚未启用");
+  }
+  return service;
+}
+
+function requireMemoryImport(application, kind) {
+  const imports = application.memoryImports;
+  const service = imports?.[kind];
+  const method = kind === "session" ? "importSession" : "importCommits";
+  if (!service || typeof service[method] !== "function") {
+    throw httpError(503, "该记忆导入能力尚未启用");
+  }
+  return service[method].bind(service);
 }
 
 function memoryQueryOptions(url) {
@@ -1567,6 +1611,50 @@ export function createDashboardServer(
         return;
       }
       if (
+        request.method === "POST" &&
+        url.pathname === "/api/memory/answer"
+      ) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        await withClientAbortSignal(request, response, async (signal) => {
+          const result = await requireMemoryAnswer(application).answer(
+            await readJsonBody(request, 12 * 1024),
+            { signal },
+          );
+          if (!signal.aborted && !response.destroyed) {
+            sendJson(response, 200, result);
+          }
+        });
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/memory/import/session"
+      ) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        sendJson(
+          response,
+          200,
+          await requireMemoryImport(application, "session")(
+            await readJsonBody(request, 5 * 1024 * 1024),
+          ),
+        );
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/memory/import/git"
+      ) {
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        sendJson(
+          response,
+          200,
+          await requireMemoryImport(application, "git")(
+            await readJsonBody(request, 3 * 1024 * 1024),
+          ),
+        );
+        return;
+      }
+      if (
         request.method === "GET" &&
         url.pathname === "/api/memory/search"
       ) {
@@ -1621,6 +1709,7 @@ export function createDashboardServer(
       }
       await serveStatic(response, url.pathname);
     } catch (error) {
+      if (response.destroyed || response.writableEnded) return;
       const status = Number.isInteger(error.statusCode)
         ? error.statusCode
         : 500;

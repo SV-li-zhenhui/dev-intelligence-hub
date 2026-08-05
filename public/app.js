@@ -36,6 +36,15 @@ let memoryNextCursor = null;
 let memoryTotalMatched = 0;
 let memoryIndexHealthy = true;
 let memoryLoaded = false;
+let memorySearchRequestSequence = 0;
+let lastAppliedMemorySearchRequest = 0;
+let memorySearchAbortController = null;
+let memoryQuestion = "";
+let memoryAnswerResult = null;
+let memoryAnswerPending = false;
+let memoryAnswerRequestSequence = 0;
+let lastAppliedMemoryAnswerRequest = 0;
+let memoryAnswerAbortController = null;
 let requestSequence = 0;
 let lastAppliedRequest = 0;
 let confirmationRequestSequence = 0;
@@ -409,6 +418,151 @@ function employeesView() {
     ${employeePanel({ expanded: true })}`;
 }
 
+function memoryString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function memoryStringArray(value) {
+  return Array.isArray(value)
+    ? value.filter((entry) => typeof entry === "string")
+    : [];
+}
+
+function memoryContextRecords(result = memoryAnswerResult) {
+  return Array.isArray(result?.context?.records)
+    ? result.context.records.filter(
+        (record) => record && typeof record === "object" && !Array.isArray(record),
+      )
+    : [];
+}
+
+const MEMORY_AUTHORITY_LABELS = Object.freeze({
+  raw: "原始记录",
+  derived: "派生记录",
+});
+const MEMORY_LIFECYCLE_LABELS = Object.freeze({
+  current: "当前有效",
+  obsolete: "已被新事实替代",
+});
+
+function memoryRecordLabel(record) {
+  const authority =
+    MEMORY_AUTHORITY_LABELS[record?.labels?.authority] || "未分类记录";
+  const lifecycle =
+    MEMORY_LIFECYCLE_LABELS[record?.labels?.lifecycle] || "状态未知";
+  return `${authority} · ${lifecycle}`;
+}
+
+function memoryCitationLinks(citationIds, recordsById, numberById) {
+  return memoryStringArray(citationIds)
+    .map((recordId) => {
+      const record = recordsById.get(recordId);
+      const number = numberById.get(recordId) || "?";
+      const title = memoryString(record?.title) || recordId;
+      return `<a class="memory-citation-link" data-memory-citation="${escapeHtml(recordId)}" href="#memory-context-${escapeHtml(recordId)}" aria-label="查看引用 ${escapeHtml(number)}：${escapeHtml(title)}">[${escapeHtml(number)}] ${escapeHtml(title)}</a>`;
+    })
+    .join("");
+}
+
+function memoryClaimRows(result, recordsById, numberById) {
+  const claims = Array.isArray(result?.claims) ? result.claims : [];
+  if (!claims.length) {
+    return '<p class="memory-answer-empty">当前上下文不足以形成可验证的回答，请调整搜索条件后重试。</p>';
+  }
+  return `<ol class="memory-claims">${claims
+    .map(
+      (claim) => `<li><details class="memory-claim" open>
+        <summary>${escapeHtml(memoryString(claim?.statement))}</summary>
+        <div class="memory-claim-citations">${memoryCitationLinks(claim?.citationIds, recordsById, numberById)}</div>
+        ${claim?.derived === true ? '<span class="memory-derived-label">派生结论</span>' : ""}
+      </details></li>`,
+    )
+    .join("")}</ol>`;
+}
+
+function memoryEvidenceMarkup(record) {
+  const evidence = memoryStringArray(record?.evidence);
+  if (!evidence.length) return '<span class="memory-record-empty">无记录内证据</span>';
+  return `<ul>${evidence.map((entry) => `<li><code>${escapeHtml(entry)}</code></li>`).join("")}</ul>`;
+}
+
+function memoryContextRecordMarkup(record, index, citedIds) {
+  const recordId = memoryString(record?.recordId);
+  const sourceKind = memoryString(record?.source?.kind) || "unknown";
+  const sourceId = memoryString(record?.source?.id) || "unknown";
+  const labels = memoryRecordLabel(record);
+  const cited = citedIds.has(recordId);
+  return `<details class="memory-context-record" id="memory-context-${escapeHtml(recordId)}" ${cited ? "data-cited=true" : ""}>
+    <summary>
+      <span><strong>[${index + 1}] ${escapeHtml(memoryString(record?.title) || "未命名记录")}</strong><small>${escapeHtml(labels)}</small></span>
+      ${cited ? '<span class="memory-cited-label">回答已引用</span>' : ""}
+    </summary>
+    <dl class="memory-record-meta">
+      <div><dt>recordId</dt><dd><code>${escapeHtml(recordId)}</code></dd></div>
+      <div><dt>contentDigest</dt><dd><code>${escapeHtml(memoryString(record?.contentDigest))}</code></dd></div>
+      <div><dt>labels</dt><dd><code>${escapeHtml(memoryString(record?.labels?.authority))} / ${escapeHtml(memoryString(record?.labels?.lifecycle))}</code></dd></div>
+      <div><dt>source</dt><dd><code>${escapeHtml(sourceKind)}:${escapeHtml(sourceId)}</code></dd></div>
+      <div><dt>event</dt><dd>${escapeHtml(memoryString(record?.eventType) || "unknown")}</dd></div>
+      <div><dt>time</dt><dd>${escapeHtml(memoryString(record?.occurredAt) || "unknown")}</dd></div>
+      <div><dt>role / repository</dt><dd>${escapeHtml(memoryString(record?.roleId) || "未标注岗位")} / ${escapeHtml(memoryString(record?.repository) || "未标注仓库")}</dd></div>
+    </dl>
+    <div class="memory-record-section"><strong>summary</strong><p>${escapeHtml(memoryString(record?.summary))}</p></div>
+    <div class="memory-record-section"><strong>content</strong><pre>${escapeHtml(memoryString(record?.content))}</pre></div>
+    <div class="memory-record-section"><strong>evidence</strong>${memoryEvidenceMarkup(record)}</div>
+    ${record?.sourceUrl ? `<a class="memory-record-source" href="${escapeHtml(record.sourceUrl)}" target="_blank" rel="noreferrer">打开原始来源 →</a>` : ""}
+  </details>`;
+}
+
+function memoryAnswerView() {
+  if (memoryAnswerPending) {
+    return '<section class="memory-answer-panel" id="memory-answer-panel" aria-live="polite" aria-busy="true"><div class="empty">正在从可引用的本地记录中形成回答…</div></section>';
+  }
+  if (!memoryAnswerResult) return "";
+  const records = memoryContextRecords();
+  const recordsById = new Map(
+    records.map((record) => [memoryString(record.recordId), record]),
+  );
+  const numberById = new Map(
+    records.map((record, index) => [memoryString(record.recordId), index + 1]),
+  );
+  const claims = Array.isArray(memoryAnswerResult.claims)
+    ? memoryAnswerResult.claims
+    : [];
+  const citedIds = new Set(
+    claims.flatMap((claim) => memoryStringArray(claim?.citationIds)),
+  );
+  const brain = memoryAnswerResult.brain || {};
+  const providerLocation = brain.remote === true ? "远程模型" : "本地模型";
+  const provider = [memoryString(brain.provider), memoryString(brain.model)]
+    .filter(Boolean)
+    .join(" / ") || "未标注模型";
+  const mode = brain.mode === "local" ? "本地重新运行" : "配置模型";
+  const contextDigest = memoryString(memoryAnswerResult.context?.contextDigest);
+  const contextRecordIds = memoryStringArray(
+    memoryAnswerResult.context?.recordIds,
+  );
+  const canRerunLocally =
+    memoryAnswerResult.localRerunAvailable === true &&
+    /^[a-f0-9]{64}$/.test(contextDigest) &&
+    contextRecordIds.length > 0 &&
+    memoryString(memoryAnswerResult.context?.question).length > 0;
+  return `<section class="memory-answer-panel" id="memory-answer-panel" aria-live="polite" aria-busy="false">
+    <div class="memory-answer-heading">
+      <div><p class="eyebrow">CITED MEMORY ANSWER</p><h3>${memoryAnswerResult.status === "answered" ? "有依据的回答" : "证据不足"}</h3></div>
+      <span>${memoryAnswerResult.derived === true ? "派生回答" : "检索结论"} · ${escapeHtml(providerLocation)} · ${escapeHtml(provider)} · ${escapeHtml(mode)}</span>
+    </div>
+    ${memoryAnswerResult.answer ? `<p class="memory-answer-summary">${escapeHtml(memoryString(memoryAnswerResult.answer))}</p>` : ""}
+    ${memoryClaimRows(memoryAnswerResult, recordsById, numberById)}
+    <div class="memory-context-heading">
+      <div><strong>可复现回答上下文</strong><span>${records.length} RECORDS · digest <code>${escapeHtml(contextDigest || "unavailable")}</code></span></div>
+      ${canRerunLocally ? '<button class="secondary-button" id="memory-rerun-local" type="button">本地模型重新运行</button>' : ""}
+    </div>
+    <div class="memory-context-records">${records
+      .map((record, index) => memoryContextRecordMarkup(record, index, citedIds))
+      .join("")}</div>
+  </section>`;
+}
+
 function memoryRows() {
   if (!memoryLoaded) return '<div class="empty">正在读取本地记忆…</div>';
   if (!memoryResults.length) {
@@ -444,6 +598,12 @@ function memoryView() {
         <label>结束日期<input name="to" type="date" value="${escapeHtml(memoryFilters.to)}" /></label>
       </div>
     </form>
+    <form class="memory-question" id="memory-question-form">
+      <label for="memory-question">向本地记忆提问</label>
+      <div class="memory-question-primary"><input id="memory-question" name="question" maxlength="4096" value="${escapeHtml(memoryQuestion)}" placeholder="例如：上次结算 PR 为什么没有合入？" autocomplete="off" /><button class="refresh-button" type="submit" ${memoryAnswerPending ? "disabled" : ""}>${memoryAnswerPending ? "回答中…" : "询问记忆"}</button></div>
+      <p>回答只使用当前筛选条件检索到的记录；每条结论都必须带有可检查的本地引用。</p>
+    </form>
+    ${memoryAnswerView()}
     ${memoryRows()}
     ${memoryNextCursor ? '<button class="secondary-button memory-more" id="memory-load-more" type="button">加载更早记录</button>' : ""}
   </section>`;
@@ -560,9 +720,17 @@ function render() {
     "submit",
     handleMemorySearch,
   );
+  content.querySelector("#memory-question-form")?.addEventListener(
+    "submit",
+    handleMemoryQuestion,
+  );
   content.querySelector("#memory-load-more")?.addEventListener(
     "click",
     handleMemoryLoadMore,
+  );
+  content.querySelector("#memory-rerun-local")?.addEventListener(
+    "click",
+    handleMemoryLocalRerun,
   );
   workflowView.bind(content);
   workView.bind(content);
@@ -842,25 +1010,161 @@ function memoryQueryUrl(filters, cursor = null) {
   return `/api/memory/query?${params}`;
 }
 
-async function loadMemories(filters = memoryFilters, { append = false } = {}) {
-  const normalized = Object.fromEntries(
-    Object.keys(memoryFilters).map((key) => [key, String(filters[key] || "").trim()]),
+function normalizedMemoryFilters(filters = {}) {
+  return Object.fromEntries(
+    Object.keys(memoryFilters).map((key) => [
+      key,
+      String(filters[key] || "").trim(),
+    ]),
   );
+}
+
+function memoryFiltersEqual(left, right) {
+  return Object.keys(memoryFilters).every((key) => left[key] === right[key]);
+}
+
+function memoryFiltersFromForm(form) {
+  return normalizedMemoryFilters(
+    form ? Object.fromEntries(new FormData(form)) : memoryFilters,
+  );
+}
+
+function memoryAnswerFilters(filters) {
+  return {
+    query: filters.query,
+    roleId: filters.roleId,
+    repository: filters.repository,
+    eventType: filters.eventType,
+    from: memoryTimestamp(filters.from),
+    to: memoryTimestamp(filters.to, true),
+  };
+}
+
+function isAbortedRequest(error, controller) {
+  return controller.signal.aborted || error?.name === "AbortError";
+}
+
+function cancelMemoryAnswerRequest() {
+  memoryAnswerRequestSequence += 1;
+  memoryAnswerAbortController?.abort();
+  memoryAnswerAbortController = null;
+  memoryAnswerPending = false;
+}
+
+async function loadMemories(
+  filters = memoryFilters,
+  { append = false, resetAnswer = false } = {},
+) {
+  const normalized = normalizedMemoryFilters(filters);
   const cursor = append ? memoryNextCursor : null;
-  const response = await fetch(memoryQueryUrl(normalized, cursor), {
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error(`记忆搜索失败（${response.status}）`);
-  const result = await response.json();
-  memoryFilters = normalized;
-  memoryResults = append
-    ? [...memoryResults, ...(result.items || [])]
-    : result.items || [];
-  memoryNextCursor = result.nextCursor || null;
-  memoryTotalMatched = Number(result.totalMatched) || 0;
-  memoryIndexHealthy = result.indexHealthy !== false;
-  memoryLoaded = true;
+  const sequence = ++memorySearchRequestSequence;
+  memorySearchAbortController?.abort();
+  const controller = new AbortController();
+  memorySearchAbortController = controller;
+  try {
+    const response = await fetch(memoryQueryUrl(normalized, cursor), {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`记忆搜索失败（${response.status}）`);
+    const result = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== memorySearchRequestSequence ||
+      sequence < lastAppliedMemorySearchRequest
+    ) {
+      return false;
+    }
+    lastAppliedMemorySearchRequest = sequence;
+    memoryFilters = normalized;
+    memoryResults = append
+      ? [...memoryResults, ...(result.items || [])]
+      : result.items || [];
+    memoryNextCursor = result.nextCursor || null;
+    memoryTotalMatched = Number(result.totalMatched) || 0;
+    memoryIndexHealthy = result.indexHealthy !== false;
+    memoryLoaded = true;
+    if (resetAnswer) {
+      memoryAnswerResult = null;
+      memoryAnswerPending = false;
+    }
+    if (currentView === "memory") render();
+    return true;
+  } catch (error) {
+    if (isAbortedRequest(error, controller)) return false;
+    throw error;
+  } finally {
+    if (memorySearchAbortController === controller) {
+      memorySearchAbortController = null;
+    }
+  }
+}
+
+function memoryAnswerRequest({ question, mode, filters, context }) {
+  const retrieval = mode === "local"
+    ? {
+        kind: "context",
+        contextDigest: memoryString(context?.contextDigest),
+        recordIds: memoryStringArray(context?.recordIds),
+      }
+    : {
+        kind: "query",
+        filters: memoryAnswerFilters(filters),
+      };
+  return {
+    schemaVersion: 1,
+    question,
+    mode,
+    retrieval,
+  };
+}
+
+async function loadMemoryAnswer(request) {
+  const sequence = ++memoryAnswerRequestSequence;
+  memoryAnswerAbortController?.abort();
+  const controller = new AbortController();
+  memoryAnswerAbortController = controller;
+  memoryQuestion = request.question;
+  memoryAnswerPending = true;
+  if (request.retrieval.kind === "query") memoryAnswerResult = null;
+  statusBanner.hidden = true;
   if (currentView === "memory") render();
+  try {
+    const response = await fetch("/api/memory/answer", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-mydashboard-action": "1",
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`记忆问答失败（${response.status}）`);
+    const result = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== memoryAnswerRequestSequence ||
+      sequence < lastAppliedMemoryAnswerRequest
+    ) {
+      return false;
+    }
+    lastAppliedMemoryAnswerRequest = sequence;
+    memoryAnswerResult = result;
+    memoryAnswerPending = false;
+    if (currentView === "memory") render();
+    return true;
+  } catch (error) {
+    if (isAbortedRequest(error, controller)) return false;
+    if (sequence === memoryAnswerRequestSequence) {
+      memoryAnswerPending = false;
+      if (currentView === "memory") render();
+    }
+    throw error;
+  } finally {
+    if (memoryAnswerAbortController === controller) {
+      memoryAnswerAbortController = null;
+    }
+  }
 }
 
 async function handleMemorySearch(event) {
@@ -868,12 +1172,60 @@ async function handleMemorySearch(event) {
   const form = event.currentTarget;
   const submit = form.querySelector("button[type=submit]");
   submit.disabled = true;
+  cancelMemoryAnswerRequest();
   try {
-    await loadMemories(Object.fromEntries(new FormData(form)));
+    await loadMemories(memoryFiltersFromForm(form), { resetAnswer: true });
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
+    if (currentView === "memory") render();
     submit.disabled = false;
+  }
+}
+
+async function handleMemoryQuestion(event) {
+  event.preventDefault();
+  const question = String(new FormData(event.currentTarget).get("question") || "").trim();
+  if (!question) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = "请输入要向本地记忆提出的问题";
+    return;
+  }
+  memoryQuestion = question;
+  const filters = memoryFiltersFromForm(
+    content.querySelector("#memory-search-form"),
+  );
+  cancelMemoryAnswerRequest();
+  try {
+    const searchNeedsSynchronization =
+      memorySearchAbortController !== null ||
+      !memoryFiltersEqual(filters, memoryFilters);
+    if (
+      searchNeedsSynchronization &&
+      !(await loadMemories(filters, { resetAnswer: true }))
+    ) {
+      return;
+    }
+    await loadMemoryAnswer(
+      memoryAnswerRequest({ question, mode: "configured", filters }),
+    );
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+  }
+}
+
+async function handleMemoryLocalRerun() {
+  const context = memoryAnswerResult?.context;
+  const question = memoryString(context?.question);
+  if (!question) return;
+  try {
+    await loadMemoryAnswer(
+      memoryAnswerRequest({ question, mode: "local", context }),
+    );
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
   }
 }
 

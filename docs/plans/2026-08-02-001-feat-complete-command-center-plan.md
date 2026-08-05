@@ -354,7 +354,7 @@ flowchart TB
 - **Goal:** Expand authoritative memory sources and add optional local or authorized remote answering that cites retrieved records.
 - **Requirements:** R3, R7, R17–R18, R20, AE5; F5; KTD1–KTD3.
 - **Dependencies:** U5–U6.
-- **Files:** `src/domain/memory-answer-contract.js`, `src/services/memory-answer-service.js`, `src/services/memory-context-retriever.js`, `src/services/memory-projector.js`, `src/services/local-session-importer.js`, `src/server.js`, `public/app.js`, `test/memory-answer-service.test.js`, `test/memory-projector.test.js`, `test/server.test.js`, `test/frontend-memory-contract.test.js`.
+- **Files:** `src/domain/memory-answer-contract.js`, `src/services/memory-answer-service.js`, `src/services/memory-context-retriever.js`, `src/services/memory-projector.js`, `src/services/local-session-importer.js`, `src/services/git-activity-importer.js`, `src/server.js`, `public/app.js`, `test/memory-answer-service.test.js`, `test/memory-projector.test.js`, `test/local-session-importer.test.js`, `test/git-activity-importer.test.js`, `test/server.test.js`, `test/frontend-memory-contract.test.js`.
 - **Approach:** Keep lexical/filter retrieval as the availability layer. Add bounded retrieval packets, structured answers with record IDs, derived/obsolete labels, and explicit data classes. Import Git and optional local session history through opt-in adapters that retain source provenance and do not enable `claude-mem`.
 - **Execution note:** Build citation and leakage tests before connecting any provider.
 - **Patterns to follow:** `src/services/local-memory-journal.js`, `src/domain/memory-record.js`, and `src/services/brain-router.js`.

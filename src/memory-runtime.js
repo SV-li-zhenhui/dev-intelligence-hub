@@ -53,6 +53,7 @@ export async function createMemoryRuntime({
     return Object.freeze({
       producer: frozenPort(journal, ["append", "appendBatch"]),
       search: frozenPort(journal, ["search", "getHealth"]),
+      contextReader: frozenPort(journal, ["readRecords"]),
       receiptVerifier: Object.freeze({
         verify: journal.verifyReceipt.bind(journal),
       }),

@@ -1,3 +1,8 @@
+import {
+  normalizeAbortSignal,
+  runStructuredProviderRequest,
+} from "../lib/structured-provider-request.js";
+
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
 const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
@@ -30,25 +35,20 @@ function providerError(code, message, statusCode) {
   return new OpenAICompatibleProviderError(code, message, statusCode);
 }
 
-async function withinTimeout(controller, durationMs, operation) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(
-        providerError(
-          "STRUCTURED_PROVIDER_TIMEOUT",
-          "Structured provider request timed out",
-          504,
-        ),
-      );
-    }, durationMs);
-  });
-  try {
-    return await Promise.race([Promise.resolve().then(operation), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
+function cancellationError() {
+  return providerError(
+    "STRUCTURED_PROVIDER_CANCELLED",
+    "Structured provider request was cancelled",
+    499,
+  );
+}
+
+function timeoutError() {
+  return providerError(
+    "STRUCTURED_PROVIDER_TIMEOUT",
+    "Structured provider request timed out",
+    504,
+  );
 }
 
 function optionsObject(value) {
@@ -309,7 +309,9 @@ export class OpenAICompatibleProvider {
     Object.freeze(this);
   }
 
-  async generate({ model, messages, schema } = {}) {
+  async generate({ model, messages, schema, signal = null } = {}) {
+    const externalSignal = normalizeAbortSignal(signal);
+    if (externalSignal?.aborted) throw cancellationError();
     const body = JSON.stringify({
       model: safeText(model, "model", 256),
       messages: normalizeMessages(messages),
@@ -331,8 +333,13 @@ export class OpenAICompatibleProvider {
       );
     }
     const controller = new AbortController();
-    return withinTimeout(controller, this.#timeoutMs, async () => {
-      try {
+    return runStructuredProviderRequest({
+      controller,
+      timeoutMs: this.#timeoutMs,
+      signal: externalSignal,
+      cancellationError,
+      timeoutError,
+      operation: async () => {
         let response;
         try {
           response = await this.#fetch(this.#requestUrl, {
@@ -346,13 +353,6 @@ export class OpenAICompatibleProvider {
             signal: controller.signal,
           });
         } catch {
-          if (controller.signal.aborted) {
-            throw providerError(
-              "STRUCTURED_PROVIDER_TIMEOUT",
-              "Structured provider request timed out",
-              504,
-            );
-          }
           throw providerError(
             "STRUCTURED_PROVIDER_REQUEST_FAILED",
             "Structured provider request failed",
@@ -369,19 +369,7 @@ export class OpenAICompatibleProvider {
         return responseContent(
           await boundedResponseText(response, this.#maxResponseBytes),
         );
-      } catch (error) {
-        if (
-          controller.signal.aborted &&
-          error?.code !== "STRUCTURED_PROVIDER_TIMEOUT"
-        ) {
-          throw providerError(
-            "STRUCTURED_PROVIDER_TIMEOUT",
-            "Structured provider request timed out",
-            504,
-          );
-        }
-        throw error;
-      }
+      },
     });
   }
 }

@@ -12,6 +12,7 @@ const PROVIDER_KEYS = new Set([
   "maxResponseBytes",
   "maxRequestBytes",
   "contextTokens",
+  "remote",
 ]);
 const COMMON_PROVIDER_OPTION_KEYS = Object.freeze([
   "baseUrl",
@@ -70,25 +71,48 @@ function selectOptions(config, keys) {
   );
 }
 
+function declaredRemote(config, name) {
+  if (config.remote !== undefined && typeof config.remote !== "boolean") {
+    throw new TypeError(`${name}.remote is invalid`);
+  }
+  return config.remote === true;
+}
+
+function providerWithBoundary(provider, remote) {
+  return Object.freeze({
+    id: provider.id,
+    remote: provider.remote || remote,
+    generate: provider.generate.bind(provider),
+  });
+}
+
 function providerOptions(id, value, dependencies) {
-  const config = exactConfig(value, PROVIDER_KEYS, `brainProviders.${id}`);
+  const name = `brainProviders.${id}`;
+  const config = exactConfig(value, PROVIDER_KEYS, name);
+  const remote = declaredRemote(config, name);
   const common = {
     ...selectOptions(config, COMMON_PROVIDER_OPTION_KEYS),
     id,
     ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
   };
   if (config.kind === "ollama") {
-    return new OllamaStructuredProvider({
-      ...common,
-      ...selectOptions(config, ["contextTokens"]),
-    });
+    return providerWithBoundary(
+      new OllamaStructuredProvider({
+        ...common,
+        ...selectOptions(config, ["contextTokens"]),
+      }),
+      remote,
+    );
   }
   if (config.kind === "openai-compatible") {
-    return new OpenAiCompatibleProvider({
-      ...common,
-      ...selectOptions(config, ["apiKeyEnv"]),
-      environment: dependencies.environment ?? process.env,
-    });
+    return providerWithBoundary(
+      new OpenAiCompatibleProvider({
+        ...common,
+        ...selectOptions(config, ["apiKeyEnv"]),
+        environment: dependencies.environment ?? process.env,
+      }),
+      remote,
+    );
   }
   throw new TypeError(
     `brain provider kind is unsupported: ${String(config.kind)}`,
