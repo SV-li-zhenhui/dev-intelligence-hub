@@ -1154,6 +1154,27 @@ export function normalizeConfigurationDocument(value) {
   return deepFreeze(document);
 }
 
+export function createSafeDisabledConfiguration(value) {
+  const safe = structuredClone(normalizeConfigurationDocument(value));
+  safe.trackedRepositories = [];
+  safe.brain.enabled = false;
+  safe.codeExecutor.enabled = false;
+  safe.changePackages.enabled = false;
+  safe.githubActions.enabled = false;
+  safe.workflowRouting.enabled = false;
+  safe.workCoordination.enabled = false;
+  safe.memory.imports = { localSessions: false, git: false };
+  if (safe.memory.answering) safe.memory.answering.enabled = false;
+  safe.employees.prReviewer.enabled = false;
+  safe.employees.prReviewer.initialPaused = true;
+  for (const role of Object.values(safe.employees.roles)) {
+    role.enabled = false;
+    role.initialPaused = true;
+  }
+  safe.dingtalk.enabled = false;
+  return normalizeConfigurationDocument(safe);
+}
+
 function digestNormalized(document) {
   return canonicalJsonDigest(document);
 }

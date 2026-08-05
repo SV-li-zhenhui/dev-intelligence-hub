@@ -64,18 +64,22 @@ test("runtime imports once and exposes frozen least-authority ports", async () =
   ]);
   assert.deepEqual(Object.keys(runtime.draftManager).sort(), [
     "createDraft",
+    "createInitializationDraft",
     "reviseDraft",
   ]);
   assert.deepEqual(Object.keys(runtime.simulator).sort(), [
     "prepareDraftActivation",
+    "prepareInitialization",
     "prepareRollback",
   ]);
   assert.deepEqual(Object.keys(runtime.activationExecutor).sort(), [
     "activateDraft",
+    "activateInitialization",
     "activateRollback",
   ]);
   assert.deepEqual(Object.keys(runtime.proposalPort).sort(), [
     "createDraft",
+    "createInitializationDraft",
     "reviseDraft",
   ]);
   assert.equal("importBootstrap" in runtime, false);
@@ -172,6 +176,7 @@ test("activation runs through the supplied shared action-admission gate", async 
 
 test("an invalid first import starts from a non-persisted safe fallback", async () => {
   const events = [];
+  const activationEvents = [];
   const store = memoryStore();
   const invalid = configuration();
   invalid.githubActions.token = "ghp_not-a-real-token";
@@ -180,6 +185,14 @@ test("an invalid first import starts from a non-persisted safe fallback", async 
     store,
     fallbackConfiguration: fallback,
     createGuard: () => guard(events),
+    actionAdmissionGate: {
+      async run(operation) {
+        activationEvents.push("enter");
+        const result = await operation();
+        activationEvents.push("exit");
+        return result;
+      },
+    },
   });
 
   assert.equal(runtime.status.safeMode, true);
@@ -197,14 +210,23 @@ test("an invalid first import starts from a non-persisted safe fallback", async 
   );
   assert.equal(store.snapshot(), null);
   assert.equal((await runtime.reader.readSnapshot()).migration.status, "pending");
-  await assert.rejects(
-    runtime.proposalPort.createDraft({
-      configuration: fallback,
-      expectedStateRevision: 0,
-      proposedBy: "employee:orchestrator",
-    }),
-    (error) => error.code === "CONFIGURATION_BOOTSTRAP_REQUIRED",
-  );
+  const draft = await runtime.proposalPort.createInitializationDraft({
+    configuration: fallback,
+    expectedStateRevision: 0,
+    proposedBy: "owner:local",
+  });
+  const prepared = await runtime.simulator.prepareInitialization({
+    draftId: draft.draftId,
+    draftRevision: draft.revision,
+    expectedStateRevision: 1,
+  });
+  assert.equal(prepared.expectedActiveVersion, null);
+  const initialized = await runtime.activationExecutor.activateInitialization({
+    ...prepared,
+    activatedBy: "owner:local",
+  });
+  assert.equal(initialized.active.source, "initialization");
+  assert.deepEqual(activationEvents, ["enter", "exit"]);
   await runtime.close();
 });
 

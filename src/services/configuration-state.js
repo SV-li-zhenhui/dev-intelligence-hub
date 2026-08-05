@@ -1,5 +1,6 @@
 import {
   configurationDocumentImpact,
+  createSafeDisabledConfiguration,
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
@@ -28,11 +29,17 @@ const DIGEST = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
-const VERSION_SOURCES = new Set(["bootstrap", "draft", "rollback"]);
+const VERSION_SOURCES = new Set([
+  "bootstrap",
+  "initialization",
+  "draft",
+  "rollback",
+]);
 const AUDIT_KINDS = new Set([
   "bootstrap_imported",
   "draft_created",
   "draft_revised",
+  "configuration_initialized",
   "configuration_activated",
   "configuration_rolled_back",
 ]);
@@ -217,6 +224,8 @@ const VERSION_CONTENT = Object.freeze({
     );
     if (
       (source === "bootstrap" && (draftRevisionId !== null || rollbackOf !== null)) ||
+      (source === "initialization" &&
+        (draftRevisionId === null || rollbackOf !== null)) ||
       (source === "draft" && (draftRevisionId === null || rollbackOf !== null)) ||
       (source === "rollback" && (draftRevisionId !== null || rollbackOf === null))
     ) {
@@ -260,7 +269,7 @@ const DRAFT_CONTENT = Object.freeze({
     return {
       draftId: text(fields.get("draftId"), `${path}.draftId`, 256, SAFE_ID),
       revision: integer(fields.get("revision"), `${path}.revision`, 1),
-      baseVersion: integer(fields.get("baseVersion"), `${path}.baseVersion`, 1),
+      baseVersion: integer(fields.get("baseVersion"), `${path}.baseVersion`),
       configurationDigest,
       configuration,
       proposedBy: text(fields.get("proposedBy"), `${path}.proposedBy`, 128),
@@ -495,25 +504,43 @@ function assertVersionConsistency(state) {
       ? null
       : state.versions[version.rollbackOf - 1];
     const expectedImpactDigest = previous === null
-      ? configurationContentDigest({
-          kind: "bootstrap",
-          documentDigest: version.configurationDigest,
-        })
+      ? version.source === "bootstrap"
+        ? configurationContentDigest({
+            kind: "bootstrap",
+            documentDigest: version.configurationDigest,
+          })
+        : configurationImpactDigest(
+            configurationDocumentImpact(
+              createSafeDisabledConfiguration(version.configuration),
+              version.configuration,
+            ),
+          )
       : configurationImpactDigest(
           configurationDocumentImpact(
             previous.configuration,
             version.configuration,
           ),
         );
+    const validInitialSource =
+      expectedVersion !== 1 ||
+      ["bootstrap", "initialization"].includes(version.source);
+    const validLaterSource =
+      expectedVersion === 1 ||
+      !["bootstrap", "initialization"].includes(version.source);
+    const validDraftSource =
+      !["initialization", "draft"].includes(version.source) ||
+      (sourceDraft &&
+        sourceDraft.configurationDigest === version.configurationDigest &&
+        (version.source === "initialization"
+          ? sourceDraft.baseVersion === 0
+          : sourceDraft.baseVersion >= 1));
     if (
       version.version !== expectedVersion ||
       version.previousVersion !== (expectedVersion === 1 ? null : expectedVersion - 1) ||
       version.impactDigest !== expectedImpactDigest ||
-      (expectedVersion === 1 && version.source !== "bootstrap") ||
-      (expectedVersion > 1 && version.source === "bootstrap") ||
-      (version.source === "draft" &&
-        (!sourceDraft ||
-          sourceDraft.configurationDigest !== version.configurationDigest)) ||
+      !validInitialSource ||
+      !validLaterSource ||
+      !validDraftSource ||
       (version.source === "rollback" &&
         (!rollbackTarget ||
           rollbackTarget.version >= version.version ||
@@ -532,7 +559,13 @@ function assertDraftConsistency(state) {
   const byDraft = new Map();
   const ids = new Set();
   for (const [index, draft] of state.draftRevisions.entries()) {
-    if (ids.has(draft.draftRevisionId) || draft.baseVersion > state.versions.length) {
+    if (
+      ids.has(draft.draftRevisionId) ||
+      draft.baseVersion > state.versions.length ||
+      (draft.baseVersion === 0 &&
+        state.versions.length > 0 &&
+        state.versions[0].source !== "initialization")
+    ) {
       throw corrupted(`configurationState.draftRevisions[${index}]`, "引用重复或悬空");
     }
     ids.add(draft.draftRevisionId);
@@ -576,6 +609,9 @@ function assertAuditConsistency(state) {
   );
   const auditedVersions = new Set();
   const auditedDrafts = new Set();
+  const initializationSequence = state.audit.find(
+    (entry) => entry.kind === "configuration_initialized",
+  )?.sequence;
   for (const [index, entry] of state.audit.entries()) {
     const expected = index + 1;
     const version = entry.configurationVersion === null
@@ -621,11 +657,35 @@ function assertAuditConsistency(state) {
         entry.targetVersion !== null ||
         entry.impactDigest !== null ||
         entry.actor !== draft.proposedBy ||
-        entry.occurredAt !== draft.createdAt
+        entry.occurredAt !== draft.createdAt ||
+        (draft.baseVersion === 0 &&
+          initializationSequence !== undefined &&
+          entry.sequence >= initializationSequence)
       ) {
         throw corrupted(`configurationState.audit[${index}]`, "草稿审计语义不一致");
       }
       auditedDrafts.add(draft.draftRevisionId);
+      continue;
+    }
+    if (entry.kind === "configuration_initialized") {
+      if (
+        !draft ||
+        version?.version !== 1 ||
+        version.source !== "initialization" ||
+        version.draftRevisionId !== draft.draftRevisionId ||
+        draft.baseVersion !== 0 ||
+        entry.draftId !== draft.draftId ||
+        entry.targetVersion !== null ||
+        entry.impactDigest !== version.impactDigest ||
+        entry.actor !== version.activatedBy ||
+        entry.occurredAt !== version.activatedAt
+      ) {
+        throw corrupted(
+          `configurationState.audit[${index}]`,
+          "初始化审计语义不一致",
+        );
+      }
+      auditedVersions.add(version.version);
       continue;
     }
     if (entry.kind === "configuration_activated") {
@@ -798,7 +858,7 @@ export function normalizeConfigurationState(value, limits) {
         state.migration.sourceDigest !== state.versions[0].configurationDigest ||
         state.migration.importedAt !== state.versions[0].activatedAt ||
         state.migration.importedBy !== state.versions[0].activatedBy ||
-        state.versions[0].source !== "bootstrap"))
+        !["bootstrap", "initialization"].includes(state.versions[0].source)))
   ) {
     throw corrupted("configurationState.migration", "与版本历史不一致");
   }

@@ -135,7 +135,11 @@ export async function createConfigurationRuntime(
       ],
       "configuration reader",
     );
-    const draftMethods = ["createDraft", "reviseDraft"];
+    const draftMethods = [
+      "createDraft",
+      "createInitializationDraft",
+      "reviseDraft",
+    ];
     const runtime = {
       status: Object.freeze({
         safeMode,
@@ -148,10 +152,16 @@ export async function createConfigurationRuntime(
       draftManager: port(service, draftMethods, "configuration draft manager"),
       simulator: port(
         service,
-        ["prepareDraftActivation", "prepareRollback"],
+        [
+          "prepareInitialization",
+          "prepareDraftActivation",
+          "prepareRollback",
+        ],
         "configuration simulator",
       ),
       activationExecutor: Object.freeze({
+        activateInitialization: (value) =>
+          activationGate.run(() => service.activateInitialization(value)),
         activateDraft: (value) =>
           activationGate.run(() => service.activateDraft(value)),
         activateRollback: (value) =>

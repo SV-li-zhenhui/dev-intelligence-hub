@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   configurationDocumentImpact,
+  createSafeDisabledConfiguration,
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
@@ -111,6 +112,7 @@ function validationDigest(binding) {
     stateRevision: binding.expectedStateRevision,
     activeVersion: binding.expectedActiveVersion,
     activeDigest: binding.activeDigest,
+    baselineDigest: binding.baselineDigest ?? null,
     documentDigest: binding.documentDigest,
     draftRevisionId: binding.draftRevisionId ?? null,
     targetVersion: binding.targetVersion ?? null,
@@ -241,6 +243,9 @@ export class ConfigurationStore {
       if (active) {
         return cloneFrozenConfigurationValue({ applied: false, active });
       }
+      if (this.state.draftRevisions.length > 0) {
+        return cloneFrozenConfigurationValue({ applied: false, active: null });
+      }
       const document = normalizeConfigurationDocument(configuration);
       const occurredAt = normalizedTimestamp(this.clock);
       const configurationDigest = configurationContentDigest(document);
@@ -301,12 +306,49 @@ export class ConfigurationStore {
   }
 
   async createDraft({ configuration, expectedStateRevision, proposedBy } = {}) {
+    return this.#createDraft({
+      configuration,
+      expectedStateRevision,
+      proposedBy,
+      initialization: false,
+    });
+  }
+
+  async createInitializationDraft({
+    configuration,
+    expectedStateRevision,
+    proposedBy,
+  } = {}) {
+    return this.#createDraft({
+      configuration,
+      expectedStateRevision,
+      proposedBy,
+      initialization: true,
+    });
+  }
+
+  async #createDraft({
+    configuration,
+    expectedStateRevision,
+    proposedBy,
+    initialization,
+  }) {
     const document = normalizeConfigurationDocument(configuration);
     const expected = integer(expectedStateRevision, "expectedStateRevision");
     const actor = boundedText(proposedBy, "proposedBy", 128);
     return this.#writeTransaction(async () => {
       this.#assertStateRevision(expected);
-      const active = this.#requireActive();
+      const active = this.#activeVersion();
+      if (initialization && active !== null) {
+        throw invalid(
+          "CONFIGURATION_INITIALIZATION_STALE",
+          "版本化配置已经完成初始化",
+          409,
+        );
+      }
+      if (!initialization && active === null) {
+        this.#requireActive();
+      }
       const draftId = boundedText(this.idFactory(), "draftId", 256, SAFE_ID);
       if (this.state.draftHeads.some((head) => head.draftId === draftId)) {
         throw invalid("CONFIGURATION_DRAFT_ID_CONFLICT", "配置草稿 ID 已存在", 409);
@@ -315,7 +357,7 @@ export class ConfigurationStore {
       const draft = identifiedDraftRevision({
         draftId,
         revision: 1,
-        baseVersion: active.version,
+        baseVersion: active?.version ?? 0,
         configurationDigest: configurationContentDigest(document),
         configuration: document,
         proposedBy: actor,
@@ -378,6 +420,13 @@ export class ConfigurationStore {
       const previous = this.state.draftRevisions.find(
         (entry) => entry.draftRevisionId === head.draftRevisionId,
       );
+      if (previous.baseVersion === 0 && this.#activeVersion() !== null) {
+        throw invalid(
+          "CONFIGURATION_INITIALIZATION_STALE",
+          "初始化草稿已被活动配置取代",
+          409,
+        );
+      }
       const occurredAt = normalizedTimestamp(this.clock);
       const draft = identifiedDraftRevision({
         draftId: id,
@@ -424,6 +473,66 @@ export class ConfigurationStore {
     return cloneFrozenConfigurationValue(
       this.#prepareDraftActivation(this.state, request),
     );
+  }
+
+  async prepareInitialization(request = {}) {
+    this.#assertReady();
+    return cloneFrozenConfigurationValue(
+      this.#prepareInitialization(this.state, request),
+    );
+  }
+
+  async activateInitialization(request = {}) {
+    const activatedBy = boundedText(request.activatedBy, "activatedBy", 128);
+    this.#validateInitializationRequest(request);
+    return this.#writeTransaction(async () => {
+      const active = this.#activeVersion();
+      if (
+        active?.source === "initialization" &&
+        sameActivationBinding(active, request)
+      ) {
+        return cloneFrozenConfigurationValue({ applied: false, active });
+      }
+      if (active) {
+        throw invalid(
+          "CONFIGURATION_INITIALIZATION_STALE",
+          "版本化配置已经完成初始化",
+          409,
+        );
+      }
+      let prepared;
+      try {
+        prepared = this.#prepareInitialization(this.state, request);
+      } catch (error) {
+        if (error?.statusCode === 409) {
+          throw invalid(
+            "CONFIGURATION_INITIALIZATION_STALE",
+            "配置初始化绑定已过期",
+            409,
+          );
+        }
+        throw error;
+      }
+      this.#assertPreparedBinding(prepared, request, [
+        "kind",
+        "expectedActiveVersion",
+        "activeDigest",
+        "baselineDigest",
+        "draftRevisionId",
+        "documentDigest",
+        "validationDigest",
+        "impactDigest",
+      ]);
+      const version = await this.#appendInitializationVersion({
+        configuration:
+          this.#draftByRevisionId(prepared.draftRevisionId).configuration,
+        draftId: prepared.draftId,
+        draftRevisionId: prepared.draftRevisionId,
+        activatedBy,
+        impactDigest: prepared.impactDigest,
+      });
+      return cloneFrozenConfigurationValue({ applied: true, active: version });
+    });
   }
 
   async activateDraft(request = {}) {
@@ -528,6 +637,58 @@ export class ConfigurationStore {
       nextSequence: items.at(-1)?.sequence ?? cursor,
       items,
     });
+  }
+
+  #prepareInitialization(state, request) {
+    const draftId = boundedText(request.draftId, "draftId", 256, SAFE_ID);
+    const draftRevision = integer(request.draftRevision, "draftRevision", 1);
+    const expectedStateRevision = integer(
+      request.expectedStateRevision,
+      "expectedStateRevision",
+    );
+    this.#assertExpectedAuthority(state, expectedStateRevision, null);
+    const head = state.draftHeads.find((entry) => entry.draftId === draftId);
+    if (!head) {
+      throw invalid("CONFIGURATION_DRAFT_NOT_FOUND", "配置草稿不存在", 404);
+    }
+    if (head.revision !== draftRevision) {
+      throw invalid(
+        "CONFIGURATION_DRAFT_REVISION_CONFLICT",
+        "只能使用初始化草稿的最新修订",
+        409,
+      );
+    }
+    const draft = state.draftRevisions.find(
+      (entry) => entry.draftRevisionId === head.draftRevisionId,
+    );
+    if (draft.baseVersion !== 0) {
+      throw invalid(
+        "CONFIGURATION_INITIALIZATION_STALE",
+        "草稿不是初始化草稿",
+        409,
+      );
+    }
+    const impact = configurationDocumentImpact(
+      createSafeDisabledConfiguration(draft.configuration),
+      draft.configuration,
+    );
+    const binding = {
+      kind: "configuration.initialize",
+      expectedStateRevision,
+      expectedActiveVersion: null,
+      activeDigest: null,
+      baselineDigest: impact.beforeDigest,
+      draftId,
+      draftRevision,
+      draftRevisionId: draft.draftRevisionId,
+      documentDigest: draft.configurationDigest,
+    };
+    return {
+      ...binding,
+      validationDigest: validationDigest(binding),
+      impactDigest: configurationImpactDigest(impact),
+      impact,
+    };
   }
 
   #prepareDraftActivation(state, request) {
@@ -677,6 +838,93 @@ export class ConfigurationStore {
     };
     await this.#persist(candidate);
     return version;
+  }
+
+  async #appendInitializationVersion({
+    configuration,
+    draftId,
+    draftRevisionId,
+    activatedBy,
+    impactDigest,
+  }) {
+    if (this.state.activeVersion !== null || this.state.versions.length !== 0) {
+      throw invalid(
+        "CONFIGURATION_INITIALIZATION_STALE",
+        "版本化配置已经完成初始化",
+        409,
+      );
+    }
+    const occurredAt = normalizedTimestamp(this.clock);
+    const configurationDigest = configurationContentDigest(configuration);
+    const version = identifiedVersion({
+      version: 1,
+      configurationDigest,
+      configuration,
+      source: "initialization",
+      previousVersion: null,
+      draftRevisionId,
+      rollbackOf: null,
+      activatedBy,
+      activatedAt: occurredAt,
+      impactDigest,
+    });
+    const audit = identifiedAudit(
+      auditContent(
+        this.state,
+        {
+          kind: "configuration_initialized",
+          draftId,
+          draftRevisionId,
+          configurationVersion: 1,
+          configurationDigest,
+          impactDigest,
+        },
+        activatedBy,
+        occurredAt,
+      ),
+    );
+    const outbox = identifiedOutbox({
+      sequence: 1,
+      configurationVersion: 1,
+      configurationDigest,
+      previousVersion: null,
+      impactDigest,
+      createdAt: occurredAt,
+    });
+    const candidate = {
+      ...this.state,
+      revision: this.state.revision + 1,
+      migration: {
+        status: "imported",
+        importedAt: occurredAt,
+        importedBy: activatedBy,
+        sourceDigest: configurationDigest,
+      },
+      activeVersion: 1,
+      versions: [version],
+      audit: [...this.state.audit, audit],
+      projectionOutbox: [outbox],
+    };
+    await this.#persist(candidate);
+    return version;
+  }
+
+  #validateInitializationRequest(request) {
+    if (
+      request.kind !== "configuration.initialize" ||
+      request.expectedActiveVersion !== null ||
+      request.activeDigest !== null
+    ) {
+      throw new TypeError("configuration initialization binding is invalid");
+    }
+    boundedText(request.draftId, "draftId", 256, SAFE_ID);
+    integer(request.draftRevision, "draftRevision", 1);
+    integer(request.expectedStateRevision, "expectedStateRevision");
+    boundedText(request.draftRevisionId, "draftRevisionId", 160);
+    exactDigest(request.documentDigest, "documentDigest");
+    exactDigest(request.baselineDigest, "baselineDigest");
+    exactDigest(request.validationDigest, "validationDigest");
+    exactDigest(request.impactDigest, "impactDigest");
   }
 
   #validateDraftActivationRequest(request) {

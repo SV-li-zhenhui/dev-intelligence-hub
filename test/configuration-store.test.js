@@ -198,6 +198,175 @@ test("bootstrap imports once and later file changes cannot replace active author
   assert.equal(Object.isFrozen(active), true);
 });
 
+test("an owner initialization draft creates one audited v1 after safe mode", async () => {
+  const { configurations, store } = await readyStore();
+  const draft = await configurations.createInitializationDraft({
+    configuration: changedConfiguration(),
+    expectedStateRevision: 0,
+    proposedBy: "owner:local",
+  });
+  assert.equal(draft.baseVersion, 0);
+  assert.equal(draft.revision, 1);
+
+  const revisedConfiguration = changedConfiguration();
+  revisedConfiguration.employees.roles.developer.brain.model = "qwen3.5:small";
+  const revised = await configurations.reviseDraft({
+    draftId: draft.draftId,
+    expectedDraftRevision: 1,
+    expectedStateRevision: 1,
+    configuration: revisedConfiguration,
+    proposedBy: "owner:local",
+  });
+  assert.equal(revised.baseVersion, 0);
+  const writeCount = store.writes.length;
+  const prepared = await configurations.prepareInitialization({
+    draftId: draft.draftId,
+    draftRevision: revised.revision,
+    expectedStateRevision: 2,
+  });
+  assert.equal(prepared.kind, "configuration.initialize");
+  assert.equal(prepared.expectedActiveVersion, null);
+  assert.equal(prepared.activeDigest, null);
+  assert.match(prepared.baselineDigest, /^[a-f0-9]{64}$/);
+  assert.equal(prepared.baselineDigest, prepared.impact.beforeDigest);
+  assert.equal(prepared.documentDigest, revised.configurationDigest);
+  assert.equal(prepared.impact.changed, true);
+  assert.match(prepared.validationDigest, /^[a-f0-9]{64}$/);
+  assert.match(prepared.impactDigest, /^[a-f0-9]{64}$/);
+  assert.equal(store.writes.length, writeCount);
+
+  const initialized = await configurations.activateInitialization({
+    ...prepared,
+    activatedBy: "owner:local",
+  });
+  assert.equal(initialized.applied, true);
+  assert.equal(initialized.active.version, 1);
+  assert.equal(initialized.active.previousVersion, null);
+  assert.equal(initialized.active.source, "initialization");
+  assert.equal(initialized.active.draftRevisionId, revised.draftRevisionId);
+
+  const snapshot = await configurations.readSnapshot();
+  assert.equal(snapshot.revision, 3);
+  assert.equal(snapshot.activeVersion, 1);
+  assert.equal(snapshot.migration.status, "imported");
+  assert.equal(snapshot.audit.at(-1).kind, "configuration_initialized");
+  assert.equal(snapshot.projectionOutbox.length, 1);
+  const repeated = await configurations.activateInitialization({
+    ...prepared,
+    activatedBy: "owner:local",
+  });
+  assert.equal(repeated.applied, false);
+  assert.deepEqual(repeated.active, initialized.active);
+
+  const restarted = await readyStore({ store });
+  assert.deepEqual(await restarted.configurations.readActive(), initialized.active);
+});
+
+test("initialization remains explicit, latest-only, and cannot race bootstrap", async () => {
+  const { configurations } = await readyStore();
+  await assert.rejects(
+    configurations.createDraft({
+      configuration: configuration(),
+      expectedStateRevision: 0,
+      proposedBy: "owner:local",
+    }),
+    assertCode("CONFIGURATION_BOOTSTRAP_REQUIRED", 409),
+  );
+  const draft = await configurations.createInitializationDraft({
+    configuration: configuration(),
+    expectedStateRevision: 0,
+    proposedBy: "owner:local",
+  });
+  const revised = await configurations.reviseDraft({
+    draftId: draft.draftId,
+    expectedDraftRevision: 1,
+    expectedStateRevision: 1,
+    configuration: changedConfiguration(),
+    proposedBy: "owner:local",
+  });
+  await assert.rejects(
+    configurations.prepareInitialization({
+      draftId: draft.draftId,
+      draftRevision: 1,
+      expectedStateRevision: 2,
+    }),
+    assertCode("CONFIGURATION_DRAFT_REVISION_CONFLICT", 409),
+  );
+  const ignoredBootstrap = await configurations.importBootstrap({
+    configuration: configuration(),
+    importedBy: "bootstrap-file",
+  });
+  assert.deepEqual(ignoredBootstrap, { applied: false, active: null });
+  const prepared = await configurations.prepareInitialization({
+    draftId: draft.draftId,
+    draftRevision: revised.revision,
+    expectedStateRevision: 2,
+  });
+  await configurations.activateInitialization({
+    ...prepared,
+    activatedBy: "owner:local",
+  });
+  await assert.rejects(
+    configurations.reviseDraft({
+      draftId: draft.draftId,
+      expectedDraftRevision: 2,
+      expectedStateRevision: 3,
+      configuration: configuration(),
+      proposedBy: "owner:local",
+    }),
+    assertCode("CONFIGURATION_INITIALIZATION_STALE", 409),
+  );
+});
+
+test("initialization write uncertainty is reconciled without creating a second v1", async (t) => {
+  async function preparedFixture() {
+    const fixture = await readyStore();
+    const draft = await fixture.configurations.createInitializationDraft({
+      configuration: changedConfiguration(),
+      expectedStateRevision: 0,
+      proposedBy: "owner:local",
+    });
+    const prepared = await fixture.configurations.prepareInitialization({
+      draftId: draft.draftId,
+      draftRevision: draft.revision,
+      expectedStateRevision: 1,
+    });
+    return { ...fixture, prepared };
+  }
+
+  await t.test("write rejected before persistence", async () => {
+    const { configurations, store, prepared } = await preparedFixture();
+    store.failNextWrite("before");
+    await assert.rejects(
+      configurations.activateInitialization({
+        ...prepared,
+        activatedBy: "owner:local",
+      }),
+      assertCode("CONFIGURATION_STATE_WRITE_FAILED", 503),
+    );
+    const snapshot = await configurations.readSnapshot();
+    assert.equal(snapshot.activeVersion, null);
+    assert.equal(snapshot.versions.length, 0);
+    assert.equal(snapshot.projectionOutbox.length, 0);
+  });
+
+  await t.test("write committed before acknowledgement loss", async () => {
+    const { configurations, store, prepared } = await preparedFixture();
+    store.failNextWrite("after");
+    const initialized = await configurations.activateInitialization({
+      ...prepared,
+      activatedBy: "owner:local",
+    });
+    assert.equal(initialized.active.version, 1);
+    const repeated = await configurations.activateInitialization({
+      ...prepared,
+      activatedBy: "owner:local",
+    });
+    assert.equal(repeated.applied, false);
+    assert.equal((await configurations.readSnapshot()).versions.length, 1);
+  });
+});
+
 test("draft edits append immutable revisions and validation never writes", async () => {
   const { configurations, store } = await importedFixture();
   const created = await configurations.createDraft({
