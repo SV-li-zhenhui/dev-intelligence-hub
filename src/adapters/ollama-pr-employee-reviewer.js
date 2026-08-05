@@ -2,6 +2,11 @@ const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
 const WORK_TYPES = ["review_draft", "owner_plan"];
 const REVIEW_VERDICTS = ["approve", "comment", "request_changes", "none"];
 
@@ -49,6 +54,32 @@ const RESULT_SCHEMA = {
 const RESULT_FIELDS = Object.freeze(Object.keys(RESULT_SCHEMA.properties));
 
 class InvalidEmployeeResultError extends Error {}
+
+function actionAdmissionRun(value) {
+  if (!value || typeof value.run !== "function") {
+    throw new TypeError(
+      "OllamaPrEmployeeReviewer requires an action admission gate",
+    );
+  }
+  return value.run.bind(value);
+}
+
+function admittedResponse(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== 1
+  ) {
+    throw new TypeError("admitted PR employee response is invalid");
+  }
+  const response = Object.getOwnPropertyDescriptor(value, "response");
+  if (!response?.enumerable || !("value" in response)) {
+    throw new TypeError("admitted PR employee response is invalid");
+  }
+  return response.value;
+}
 
 function positiveNumber(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -239,11 +270,13 @@ export class OllamaPrEmployeeReviewer {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     contextTokens = DEFAULT_CONTEXT_TOKENS,
     allowRemoteCodeContext = false,
+    actionAdmissionGate = DIRECT_ACTION_ADMISSION,
   } = {}) {
     if (typeof fetchImpl !== "function") {
       throw new TypeError("OllamaPrEmployeeReviewer requires fetch");
     }
     this.fetch = fetchImpl;
+    this.admitRequest = actionAdmissionRun(actionAdmissionGate);
     this.provider = "ollama";
     this.model = model;
     const endpoint = normalizeBaseUrl(baseUrl, allowRemoteCodeContext);
@@ -275,26 +308,29 @@ export class OllamaPrEmployeeReviewer {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await this.fetch(`${this.baseUrl}/api/chat`, {
-        method: "POST",
-        redirect: "error",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: this.model,
-          stream: false,
-          think: false,
-          format: RESULT_SCHEMA,
-          options: { temperature: 0, num_ctx: this.contextTokens },
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt(context.workMode, isRetry),
-            },
-            { role: "user", content: JSON.stringify(context) },
-          ],
+      const admitted = await this.admitRequest(() => ({
+        response: this.fetch(`${this.baseUrl}/api/chat`, {
+          method: "POST",
+          redirect: "error",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: this.model,
+            stream: false,
+            think: false,
+            format: RESULT_SCHEMA,
+            options: { temperature: 0, num_ctx: this.contextTokens },
+            messages: [
+              {
+                role: "system",
+                content: systemPrompt(context.workMode, isRetry),
+              },
+              { role: "user", content: JSON.stringify(context) },
+            ],
+          }),
+          signal: controller.signal,
         }),
-        signal: controller.signal,
-      });
+      }));
+      const response = await admittedResponse(admitted);
       if (!response.ok) {
         const detail = (await response.text().catch(() => "")).trim().slice(0, 500);
         throw new Error(

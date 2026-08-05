@@ -59,6 +59,30 @@ function requirePort(value, methods, name) {
   );
 }
 
+function optionalActionAdmission(value) {
+  if (value === undefined) {
+    return (operation) => Promise.resolve().then(operation);
+  }
+  return requirePort(value, ["run"], "actionAdmissionGate").run;
+}
+
+function admittedProviderResponse(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== 1
+  ) {
+    throw new TypeError("admitted memory brain response is invalid");
+  }
+  const response = Object.getOwnPropertyDescriptor(value, "providerResponse");
+  if (!response?.enumerable || !("value" in response)) {
+    throw new TypeError("admitted memory brain response is invalid");
+  }
+  return response.value;
+}
+
 function dataEntries(value, name) {
   if (
     value === null ||
@@ -285,6 +309,7 @@ function insufficientResult({ request, packet, description }) {
 export class MemoryAnswerService {
   #retrieve;
   #generate;
+  #admitAction;
   #configuredBrain;
   #localBrain;
   #configuredDescription;
@@ -300,6 +325,7 @@ export class MemoryAnswerService {
     localBrain: localBrainValue,
     beforeGenerate = async () => {},
     maximumConcurrent = DEFAULT_MAXIMUM_CONCURRENT,
+    actionAdmissionGate,
   } = {}) {
     this.#retrieve = requirePort(
       contextRetriever,
@@ -324,6 +350,7 @@ export class MemoryAnswerService {
     this.#beforeGenerate = beforeGenerate;
     this.#maximumConcurrent = maximumConcurrent;
     this.#generate = router.generate;
+    this.#admitAction = optionalActionAdmission(actionAdmissionGate);
     this.#configuredBrain = normalizeBrainConfig(configuredBrainValue);
     this.#localBrain = normalizeBrainConfig(localBrainValue);
     this.#configuredDescription = brainDescription(
@@ -383,27 +410,19 @@ export class MemoryAnswerService {
     ];
     let validationFailure = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await runAbortable(signal, () =>
-        this.#beforeGenerate(Object.freeze({
-          attempt: attempt + 1,
-          mode: request.mode,
-          contextDigest: packet.contextDigest,
-          dataClasses: Object.freeze([...packet.dataClasses]),
-          brain: description,
-        }))
-      );
-      const response = await runAbortable(signal, () =>
-        this.#generate({
+      const admission = await runAbortable(signal, () =>
+        this.#admitGenerate({
+          attempt,
           brain,
-          schema: MEMORY_ANSWER_JSON_SCHEMA,
-          dataClasses: [...packet.dataClasses],
-          messages:
-            attempt === 0
-              ? messages
-              : [...messages, { role: "user", content: CORRECTION_MESSAGE }],
-          ...(signal ? { signal } : {}),
+          description,
+          messages,
+          packet,
+          request,
+          signal,
         })
       );
+      const providerResponse = admittedProviderResponse(admission);
+      const response = await runAbortable(signal, () => providerResponse);
       try {
         const decision = validateClaims(
           parseStructuredMemoryAnswer(response),
@@ -421,5 +440,42 @@ export class MemoryAnswerService {
       502,
       validationFailure,
     );
+  }
+
+  #admitGenerate({
+    attempt,
+    brain,
+    description,
+    messages,
+    packet,
+    request,
+    signal,
+  }) {
+    return this.#admitAction(async () => {
+      throwIfCancelled(signal);
+      await this.#beforeGenerate(Object.freeze({
+        attempt: attempt + 1,
+        mode: request.mode,
+        contextDigest: packet.contextDigest,
+        dataClasses: Object.freeze([...packet.dataClasses]),
+        brain: description,
+      }));
+      throwIfCancelled(signal);
+
+      // Carry the provider promise as data so configuration cutover waits for
+      // request admission, not for an unbounded network response.
+      return Object.freeze({
+        providerResponse: this.#generate({
+          brain,
+          schema: MEMORY_ANSWER_JSON_SCHEMA,
+          dataClasses: [...packet.dataClasses],
+          messages:
+            attempt === 0
+              ? messages
+              : [...messages, { role: "user", content: CORRECTION_MESSAGE }],
+          ...(signal ? { signal } : {}),
+        }),
+      });
+    });
   }
 }

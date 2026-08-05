@@ -202,6 +202,7 @@ export class ConfiguredRoleEmployee {
     permissions: permissionsValue,
     brain: brainValue,
     brainRouter,
+    actionAdmissionGate,
     contextFactory,
     decisionEngine: suppliedDecisionEngine,
     store,
@@ -230,6 +231,9 @@ export class ConfiguredRoleEmployee {
           permissions,
           brain,
           brainRouter,
+          ...(actionAdmissionGate === undefined
+            ? {}
+            : { actionAdmissionGate }),
           ...(contextFactory ? { contextFactory } : {}),
         }),
     );

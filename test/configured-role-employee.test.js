@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
@@ -122,6 +123,14 @@ function fakeDecisionEngine(id, calls = []) {
       };
     },
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
 }
 
 test("RoleDecisionEngine classifies context, routes the configured brain, and normalizes output", async () => {
@@ -339,6 +348,61 @@ test("RoleDecisionEngine retries one invalid structured response without replayi
   assert.equal(calls.length, 2);
   assert.equal(JSON.stringify(calls[1]).includes(invalidResponse), false);
   assert.match(calls[1].messages.at(-1).content, /corrected JSON object/);
+});
+
+test("RoleDecisionEngine admits each provider request without holding the gate for network time", async () => {
+  const digest = (value) => value.repeat(64);
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({ version: 1, configurationDigest: digest("a") });
+  const responses = [deferred(), deferred()];
+  const bothEntered = deferred();
+  let generateCalls = 0;
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    actionAdmissionGate: Object.freeze({ run: gate.run.bind(gate) }),
+    brainRouter: {
+      generate() {
+        const response = responses[generateCalls];
+        generateCalls += 1;
+        if (generateCalls === responses.length) bothEntered.resolve();
+        return response.promise;
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+
+  const validDecision = engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+  });
+  const invalidDecision = engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+  });
+  await bothEntered.promise;
+
+  const cutover = gate.cutover(({ commit }) => {
+    commit({ version: 2, configurationDigest: digest("b") });
+    return "stored-v2";
+  });
+  assert.equal(await cutover, "stored-v2");
+  assert.equal(gate.readStatus().mode, "restart_required");
+
+  responses[0].resolve(JSON.stringify(completeDecision()));
+  responses[1].resolve("invalid response");
+
+  assert.equal((await validDecision).intent.type, "complete");
+  await assert.rejects(
+    invalidDecision,
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  await assert.rejects(
+    engine.decide({ item: { event: { eventType: "issue.updated" } } }),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(generateCalls, 2);
 });
 
 test("the default role context separates PR code from minimum requirements data", async () => {

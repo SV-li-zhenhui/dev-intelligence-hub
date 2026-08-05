@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import {
   MemoryAnswerService,
@@ -89,7 +90,49 @@ function fakeRouter(responses, calls) {
   };
 }
 
-function serviceFixture({ context = packet(), responses = [] } = {}) {
+function configurationBinding(version, digestCharacter) {
+  return {
+    version,
+    configurationDigest: digestCharacter.repeat(64),
+  };
+}
+
+function readyActionAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective(configurationBinding(1, "a"));
+  return gate;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function within(promise, durationMs = 1_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("operation did not finish outside provider wait")),
+          durationMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function serviceFixture({
+  actionAdmissionGate,
+  context = packet(),
+  responses = [],
+} = {}) {
   const generateCalls = [];
   const authorizationCalls = [];
   let retrieveCalls = 0;
@@ -104,6 +147,7 @@ function serviceFixture({ context = packet(), responses = [] } = {}) {
     configuredBrain: brain(),
     localBrain: brain(),
     beforeGenerate: async (input) => authorizationCalls.push(structuredClone(input)),
+    ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
   });
   return {
     service,
@@ -112,6 +156,145 @@ function serviceFixture({ context = packet(), responses = [] } = {}) {
     retrieveCalls: () => retrieveCalls,
   };
 }
+
+test("configuration cutover modes reject memory brain admission before provider invocation", async (t) => {
+  const cases = [
+    {
+      name: "restart required",
+      code: "RUNTIME_RESTART_REQUIRED",
+      transition: ({ commit }) => commit(configurationBinding(2, "b")),
+    },
+    {
+      name: "unknown",
+      code: "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+      transition: ({ markUnknown }) => markUnknown(),
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const gate = readyActionAdmissionGate();
+      await gate.cutover((control) => {
+        scenario.transition(control);
+        return null;
+      });
+      const setup = serviceFixture({
+        actionAdmissionGate: gate,
+        responses: [JSON.stringify({
+          schemaVersion: 1,
+          status: "answered",
+          claims: [{ statement: "不应执行", citationIds: [RECORD_ID] }],
+        })],
+      });
+
+      await assert.rejects(
+        setup.service.answer(request()),
+        (error) => error.code === scenario.code,
+      );
+      assert.equal(setup.authorizationCalls.length, 0);
+      assert.equal(setup.generateCalls.length, 0);
+    });
+  }
+});
+
+test("an admitted memory provider request does not hold the cutover gate while awaiting the network", async () => {
+  const gate = readyActionAdmissionGate();
+  const providerStarted = deferred();
+  const providerResponse = deferred();
+  let generateCalls = 0;
+  const service = new MemoryAnswerService({
+    contextRetriever: { async retrieve() { return packet(); } },
+    brainRouter: {
+      describe(value) {
+        return {
+          provider: value.provider,
+          model: value.model,
+          remote: false,
+          remoteData: structuredClone(value.remoteData),
+        };
+      },
+      async generate() {
+        generateCalls += 1;
+        providerStarted.resolve();
+        return providerResponse.promise;
+      },
+    },
+    configuredBrain: brain(),
+    localBrain: brain(),
+    actionAdmissionGate: gate,
+  });
+
+  const answer = service.answer(request());
+  await providerStarted.promise;
+  const cutover = gate.cutover(({ commit }) => {
+    commit(configurationBinding(2, "b"));
+    return "activated";
+  });
+  try {
+    assert.equal(await within(cutover), "activated");
+  } finally {
+    providerResponse.resolve(JSON.stringify({
+      schemaVersion: 1,
+      status: "answered",
+      claims: [{ statement: "已入场请求完成", citationIds: [RECORD_ID] }],
+    }));
+  }
+
+  assert.equal((await answer).answer, "已入场请求完成");
+  assert.equal(generateCalls, 1);
+  assert.equal(gate.readStatus().mode, "restart_required");
+});
+
+test("a cutover after the first provider admission blocks its correction retry", async () => {
+  const gate = readyActionAdmissionGate();
+  const providerStarted = deferred();
+  const firstResponse = deferred();
+  const calls = [];
+  let authorizationCalls = 0;
+  const service = new MemoryAnswerService({
+    contextRetriever: { async retrieve() { return packet(); } },
+    brainRouter: {
+      describe(value) {
+        return {
+          provider: value.provider,
+          model: value.model,
+          remote: false,
+          remoteData: structuredClone(value.remoteData),
+        };
+      },
+      async generate(input) {
+        calls.push(structuredClone(input));
+        providerStarted.resolve();
+        return firstResponse.promise;
+      },
+    },
+    configuredBrain: brain(),
+    localBrain: brain(),
+    actionAdmissionGate: gate,
+    beforeGenerate: async () => {
+      authorizationCalls += 1;
+    },
+  });
+
+  const answer = service.answer(request());
+  await providerStarted.promise;
+  await within(gate.cutover(({ commit }) => {
+    commit(configurationBinding(2, "b"));
+    return null;
+  }));
+  firstResponse.resolve(JSON.stringify({
+    schemaVersion: 1,
+    status: "answered",
+    claims: [{ statement: "无效引用", citationIds: [OTHER_ID] }],
+  }));
+
+  await assert.rejects(
+    answer,
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(authorizationCalls, 1);
+});
 
 test("no current raw evidence returns deterministic insufficiency without a brain call", async () => {
   const setup = serviceFixture({

@@ -151,6 +151,7 @@ export function createConfiguredWorkforce({
   store,
   onRun = async () => {},
   clock,
+  actionAdmissionGate,
   dependencies = {},
 } = {}) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
@@ -173,6 +174,9 @@ export function createConfiguredWorkforce({
       permissions: config.permissions,
       brain: config.brain,
       brainRouter,
+      ...(actionAdmissionGate === undefined
+        ? {}
+        : { actionAdmissionGate }),
       store,
       initialPaused: config.initialPaused,
       ...(config.workerId ? { workerId: config.workerId } : {}),

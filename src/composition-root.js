@@ -112,6 +112,9 @@ export function createBrain(config = {}, dependencies = {}) {
     return new OllamaBrain({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+      ...(dependencies.actionAdmissionGate === undefined
+        ? {}
+        : { actionAdmissionGate: dependencies.actionAdmissionGate }),
     });
   }
   throw new Error(`Unsupported brain provider: ${config.provider || "(empty)"}`);
@@ -128,6 +131,9 @@ export function createPrEmployeeReviewer(
     return new OllamaPrEmployeeReviewer({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+      ...(dependencies.actionAdmissionGate === undefined
+        ? {}
+        : { actionAdmissionGate: dependencies.actionAdmissionGate }),
     });
   }
   throw new Error(
@@ -308,7 +314,12 @@ export async function createApplication({
       maxPatchCharacters: roleConfig.maxPatchCharacters,
     });
     const dingtalk = new DingTalkAdapter();
-    const brain = createBrain(config.brain);
+    const brain = createBrain(
+      config.brain,
+      ordinaryActionAdmissionGate === null
+        ? {}
+        : { actionAdmissionGate: ordinaryActionAdmissionGate },
+    );
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
         ...codeExecutorDependencies,
@@ -792,10 +803,16 @@ export async function createApplication({
     const prEmployee = new ProactivePrEmployeeService({
       github,
       reviewer: roleConfig.enabled
-        ? createPrEmployeeReviewer(config.brain, {
-            ...roleConfig.brain,
-            allowRemoteCodeContext: roleConfig.allowRemoteCodeContext,
-          })
+        ? createPrEmployeeReviewer(
+            config.brain,
+            {
+              ...roleConfig.brain,
+              allowRemoteCodeContext: roleConfig.allowRemoteCodeContext,
+            },
+            ordinaryActionAdmissionGate === null
+              ? {}
+              : { actionAdmissionGate: ordinaryActionAdmissionGate },
+          )
         : null,
       store,
       config: roleConfig,
@@ -816,6 +833,9 @@ export async function createApplication({
             ? { clock: workCoordinationDependencies.clock }
             : {}),
           dependencies: workCoordinationDependencies.brainDependencies || {},
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
           onRun: ({ roleId }) => {
             if (!workCoordination) {
               const error = new Error("员工主动循环尚未就绪");
@@ -1016,6 +1036,9 @@ export async function createApplication({
           configuredBrain: memoryAnswerConfig.brain,
           localBrain: memoryAnswerConfig.localBrain,
           maximumConcurrent: memoryAnswerConfig.maximumConcurrent,
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
           ...(memoryAnswerDependencies.beforeGenerate
             ? { beforeGenerate: memoryAnswerDependencies.beforeGenerate }
             : {}),

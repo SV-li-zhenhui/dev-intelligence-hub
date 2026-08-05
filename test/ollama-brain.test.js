@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+
+const CONFIGURATION_V1 = Object.freeze({
+  version: 1,
+  configurationDigest: "1".repeat(64),
+});
+const CONFIGURATION_V2 = Object.freeze({
+  version: 2,
+  configurationDigest: "2".repeat(64),
+});
 
 const validAssessment = {
   classification: "action_now",
@@ -60,6 +70,23 @@ function uncertainPullRequest(overrides = {}) {
     actionState: "uncertain",
     actionReasons: ["review_facts_unavailable"],
     ...overrides,
+  };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function readyAdmissionGate() {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective(CONFIGURATION_V1);
+  return {
+    gate,
+    port: Object.freeze({ run: gate.run.bind(gate) }),
   };
 }
 
@@ -205,4 +232,49 @@ test("reports request timeouts clearly", async () => {
     brain.assessPullRequest(uncertainPullRequest()),
     /Ollama request timed out after 10 ms/i,
   );
+});
+
+test("configuration cutover blocks an old PR assessment before any context leaves", async () => {
+  const { gate, port } = readyAdmissionGate();
+  await gate.cutover(async (control) => control.commit(CONFIGURATION_V2));
+  let calls = 0;
+  const brain = new OllamaBrain({
+    actionAdmissionGate: port,
+    fetch: async () => {
+      calls += 1;
+      return ollamaResponse();
+    },
+  });
+
+  await assert.rejects(
+    brain.assessPullRequest(uncertainPullRequest()),
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(calls, 0);
+});
+
+test("an admitted assessment releases the cutover fence but a later retry is blocked", async () => {
+  const { gate, port } = readyAdmissionGate();
+  const firstResponse = deferred();
+  const invoked = deferred();
+  let calls = 0;
+  const brain = new OllamaBrain({
+    actionAdmissionGate: port,
+    fetch: () => {
+      calls += 1;
+      invoked.resolve();
+      return firstResponse.promise;
+    },
+  });
+
+  const assessment = brain.assessPullRequest(uncertainPullRequest());
+  await invoked.promise;
+  await gate.cutover(async (control) => control.commit(CONFIGURATION_V2));
+  firstResponse.resolve(jsonResponse({ message: { content: "not-json" } }));
+
+  await assert.rejects(
+    assessment,
+    (error) => error?.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(calls, 1);
 });

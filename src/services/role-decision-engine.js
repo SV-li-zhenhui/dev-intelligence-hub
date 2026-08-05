@@ -18,6 +18,9 @@ const INTENT_TYPES = Object.freeze([
 ]);
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
 const MAXIMUM_CONTEXT_BYTES = 128 * 1024;
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run: (operation) => operation(),
+});
 
 export class RoleDecisionEngineError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -232,6 +235,14 @@ function requireRouter(value) {
   });
 }
 
+function requireActionAdmissionGate(value) {
+  const gate = value === undefined ? DIRECT_ACTION_ADMISSION : value;
+  if (!gate || typeof gate.run !== "function") {
+    throw new TypeError("actionAdmissionGate is invalid");
+  }
+  return Object.freeze({ run: gate.run.bind(gate) });
+}
+
 function systemPrompt(definition, permissions) {
   return [
     "You are a configured employee reasoning brain.",
@@ -251,6 +262,7 @@ export class RoleDecisionEngine {
   #permissions;
   #brain;
   #router;
+  #admitGenerate;
   #contextFactory;
   #view;
 
@@ -259,6 +271,7 @@ export class RoleDecisionEngine {
     permissions,
     brain,
     brainRouter,
+    actionAdmissionGate,
     contextFactory = defaultContext,
   } = {}) {
     if (typeof contextFactory !== "function") {
@@ -268,6 +281,7 @@ export class RoleDecisionEngine {
     this.#permissions = normalizeRolePermissions(permissions);
     this.#brain = normalizeBrainConfig(brain);
     this.#router = requireRouter(brainRouter);
+    this.#admitGenerate = requireActionAdmissionGate(actionAdmissionGate).run;
     this.#contextFactory = contextFactory;
     const brainView = canonicalContextValue(this.#router.describe(this.#brain));
     this.#view = deepFreeze({
@@ -304,20 +318,27 @@ export class RoleDecisionEngine {
     };
     let decision;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await this.#router.generate({
-        ...request,
-        messages:
-          attempt === 0
-            ? messages
-            : [
-                ...messages,
-                {
-                  role: "user",
-                  content:
-                    "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. Do not include markdown fences or commentary.",
-                },
-              ],
-      });
+      const admitted = exactData(
+        await this.#admitGenerate(() => ({
+          response: this.#router.generate({
+            ...request,
+            messages:
+              attempt === 0
+                ? messages
+                : [
+                    ...messages,
+                    {
+                      role: "user",
+                      content:
+                        "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. Do not include markdown fences or commentary.",
+                    },
+                  ],
+          }),
+        })),
+        ["response"],
+        "admitted role brain response",
+      );
+      const response = await admitted.response;
       try {
         decision = parseStructuredWorkDecision(response);
         break;

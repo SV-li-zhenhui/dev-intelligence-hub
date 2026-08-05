@@ -88,6 +88,46 @@ test("workforce builds independently controlled roles over one local provider", 
   assert.equal(Object.isFrozen(workforce.workers), true);
 });
 
+test("workforce forwards one run-only admission gate to every role brain", async () => {
+  const blocked = Object.assign(new Error("runtime cutover"), {
+    code: "RUNTIME_RESTART_REQUIRED",
+  });
+  let admissions = 0;
+  let fetchCalls = 0;
+  const workforce = createConfiguredWorkforce({
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+    },
+    roles: {
+      orchestrator: role("qwen3.5:9b"),
+      developer: role("code-model"),
+    },
+    store: new MemoryStore(),
+    actionAdmissionGate: {
+      run() {
+        admissions += 1;
+        throw blocked;
+      },
+    },
+    dependencies: {
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("blocked requests must not reach the provider");
+      },
+    },
+  });
+
+  for (const worker of workforce.workers) {
+    await assert.rejects(
+      worker.decide({ item: { event: { eventType: "issue.updated" } } }),
+      (error) => error === blocked,
+    );
+  }
+
+  assert.equal(admissions, 2);
+  assert.equal(fetchCalls, 0);
+});
+
 test("workforce rejects unknown provider fields and the legacy PR role", () => {
   assert.throws(
     () =>

@@ -1,7 +1,14 @@
+import { ActionAdmissionGateError } from "../lib/action-admission-gate.js";
+
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
+const DIRECT_ACTION_ADMISSION = Object.freeze({
+  run(operation) {
+    return operation();
+  },
+});
 const CLASSIFICATIONS = [
   "action_now",
   "waiting_other",
@@ -37,6 +44,30 @@ const ASSESSMENT_SCHEMA = {
 const ASSESSMENT_FIELDS = Object.freeze(Object.keys(ASSESSMENT_SCHEMA.properties));
 
 class InvalidAssessmentError extends Error {}
+
+function actionAdmissionRun(value) {
+  if (!value || typeof value.run !== "function") {
+    throw new TypeError("OllamaBrain requires an action admission gate");
+  }
+  return value.run.bind(value);
+}
+
+function admittedResponse(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Reflect.ownKeys(value).length !== 1
+  ) {
+    throw new TypeError("admitted Ollama response is invalid");
+  }
+  const response = Object.getOwnPropertyDescriptor(value, "response");
+  if (!response?.enumerable || !("value" in response)) {
+    throw new TypeError("admitted Ollama response is invalid");
+  }
+  return response.value;
+}
 
 function finiteNumberOrDefault(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -178,11 +209,13 @@ export class OllamaBrain {
     numCtx,
     contextTokens = DEFAULT_CONTEXT_TOKENS,
     maxAssessmentsPerRefresh = 3,
+    actionAdmissionGate = DIRECT_ACTION_ADMISSION,
   } = {}) {
     if (typeof fetchImpl !== "function") {
       throw new TypeError("OllamaBrain requires a fetch implementation");
     }
     this.fetch = fetchImpl;
+    this.admitRequest = actionAdmissionRun(actionAdmissionGate);
     this.provider = "ollama";
     this.model = model;
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -235,12 +268,15 @@ export class OllamaBrain {
     };
 
     try {
-      const response = await this.fetch(`${this.baseUrl}/api/chat`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(request),
-        signal: controller.signal,
-      });
+      const admitted = await this.admitRequest(() => ({
+        response: this.fetch(`${this.baseUrl}/api/chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(request),
+          signal: controller.signal,
+        }),
+      }));
+      const response = await admittedResponse(admitted);
       if (!response.ok) {
         const responseText = await response.text().catch(() => "");
         const detail = responseText.trim().slice(0, 500);
@@ -263,6 +299,7 @@ export class OllamaBrain {
         );
       }
       if (
+        error instanceof ActionAdmissionGateError ||
         error instanceof InvalidAssessmentError ||
         error.message?.startsWith("Ollama request failed with HTTP")
       ) {

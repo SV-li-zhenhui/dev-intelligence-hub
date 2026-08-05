@@ -239,6 +239,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
   const memory = {
     producer: { async append() {}, async appendBatch() {} },
     search: { async search() {}, async getHealth() {} },
+    contextReader: { async readRecords() {} },
     receiptVerifier: {
       async verify(value) { return { ...value, persisted: true }; },
     },
@@ -259,7 +260,10 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       calls.memoryRuntime = options;
       return memory;
     },
-    configuredWorkforceFactory: () => ({ employees: [], workers: [] }),
+    configuredWorkforceFactory: (options) => {
+      calls.workforce = options;
+      return { employees: [], workers: [] };
+    },
     workIntentPolicyFactory: () => ({ async bind() {} }),
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
     workflowFactSourceFactory: () => ({ async read() {} }),
@@ -2729,7 +2733,26 @@ test("versioned maintenance mode does not construct configuration action authori
 });
 
 test("versioned local code shares one gate and reads Active authority", async () => {
-  const config = localCodeCoordinationConfig({ githubActions: false });
+  const baseConfig = localCodeCoordinationConfig({ githubActions: false });
+  const answerBrain = {
+    provider: "ollama",
+    model: "memory-model",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+  const config = {
+    ...baseConfig,
+    memory: {
+      ...baseConfig.memory,
+      answering: {
+        enabled: true,
+        maximumRecords: 10,
+        maximumContextBytes: 100_000,
+        maximumConcurrent: 1,
+        brain: answerBrain,
+        localBrain: answerBrain,
+      },
+    },
+  };
   const calls = {};
   const closeCalls = [];
   const sharedGate = new ActionAdmissionGate();
@@ -2841,6 +2864,10 @@ test("versioned local code shares one gate and reads Active authority", async ()
         },
       };
     },
+    memoryAnswerServiceFactory: (options) => {
+      calls.memoryAnswer = options;
+      return { async answer() {} };
+    },
     confirmationRuntimeFactory: async (_config, dependencies) => {
       calls.confirmation = dependencies;
       return {
@@ -2867,6 +2894,14 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.strictEqual(
     calls.codeJobRuntime.actionAdmissionGate,
     calls.versionedAuthority.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.workforce.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
+  );
+  assert.strictEqual(
+    calls.memoryAnswer.actionAdmissionGate,
+    calls.codeJobRuntime.actionAdmissionGate,
   );
   assert.strictEqual(
     calls.versionedAuthority.configurationReader,
