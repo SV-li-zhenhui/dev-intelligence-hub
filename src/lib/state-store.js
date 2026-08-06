@@ -1,31 +1,109 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
+import { OperationQueue } from "./operation-queue.js";
+
+const RENAME_RETRY_DELAYS_MS = Object.freeze([5, 10, 20, 40, 80]);
+const RETRYABLE_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+const DEFAULT_FILE_SYSTEM = Object.freeze({ mkdir, readFile, rename, rm, writeFile });
+
+function assertDependencies(fileSystem, delay) {
+  if (
+    !fileSystem ||
+    !["mkdir", "readFile", "rename", "rm", "writeFile"].every(
+      (name) => typeof fileSystem[name] === "function",
+    ) ||
+    typeof delay !== "function"
+  ) {
+    throw new TypeError("StateStore dependencies are invalid");
+  }
+}
+
+async function replaceFile(fileSystem, delay, temporary, target) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fileSystem.rename(temporary, target);
+      return;
+    } catch (error) {
+      const retryDelay = RENAME_RETRY_DELAYS_MS[attempt];
+      if (
+        retryDelay === undefined ||
+        !RETRYABLE_RENAME_CODES.has(error?.code)
+      ) {
+        throw error;
+      }
+      // Windows may briefly deny replacing a target held by a reader or scanner.
+      await delay(retryDelay);
+    }
+  }
+}
+
+async function discardTemporary(fileSystem, temporary) {
+  try {
+    await fileSystem.rm(temporary, { force: true });
+  } catch {
+    // Preserve the write failure; an abandoned unique temp file is non-authoritative.
+  }
+}
 
 export class StateStore {
-  constructor(dataDirectory) {
+  constructor(
+    dataDirectory,
+    { fileSystem = DEFAULT_FILE_SYSTEM, wait: delay = wait } = {},
+  ) {
+    assertDependencies(fileSystem, delay);
     this.dataDirectory = dataDirectory;
+    this.fileSystem = fileSystem;
+    this.wait = delay;
+    this.operationQueues = new Map();
   }
 
   async read(name, fallback = null, { signal } = {}) {
-    try {
-      return JSON.parse(
-        await readFile(path.join(this.dataDirectory, `${name}.json`), {
-          encoding: "utf8",
-          ...(signal === undefined ? {} : { signal }),
-        }),
-      );
-    } catch (error) {
-      if (error.code === "ENOENT") return fallback;
-      throw error;
-    }
+    return this.#queueFor(name).enqueue(async () => {
+      try {
+        return JSON.parse(
+          await this.fileSystem.readFile(
+            path.join(this.dataDirectory, `${name}.json`),
+            {
+              encoding: "utf8",
+              ...(signal === undefined ? {} : { signal }),
+            },
+          ),
+        );
+      } catch (error) {
+        if (error.code === "ENOENT") return fallback;
+        throw error;
+      }
+    });
   }
 
   async write(name, value) {
-    await mkdir(this.dataDirectory, { recursive: true });
-    const target = path.join(this.dataDirectory, `${name}.json`);
-    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await rename(temporary, target);
+    return this.#queueFor(name).enqueue(async () => {
+      await this.fileSystem.mkdir(this.dataDirectory, { recursive: true });
+      const target = path.join(this.dataDirectory, `${name}.json`);
+      const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+      let committed = false;
+      try {
+        await this.fileSystem.writeFile(
+          temporary,
+          `${JSON.stringify(value, null, 2)}\n`,
+          "utf8",
+        );
+        await replaceFile(this.fileSystem, this.wait, temporary, target);
+        committed = true;
+      } finally {
+        if (!committed) await discardTemporary(this.fileSystem, temporary);
+      }
+    });
+  }
+
+  #queueFor(name) {
+    let queue = this.operationQueues.get(name);
+    if (!queue) {
+      queue = new OperationQueue();
+      this.operationQueues.set(name, queue);
+    }
+    return queue;
   }
 }
