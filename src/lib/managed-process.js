@@ -185,6 +185,7 @@ export class ManagedProcess {
       await this.terminateTreeWithinLimit();
     } catch (error) {
       this.killDirectly();
+      await this.waitForExit();
       if (error instanceof ManagedProcessError) throw error;
       throw new ManagedProcessError(
         "PROCESS_STOP_FAILED",
@@ -194,6 +195,7 @@ export class ManagedProcess {
     }
     if (!(await this.waitForExit())) {
       this.killDirectly();
+      await this.waitForExit();
       throw new ManagedProcessError(
         "PROCESS_STOP_FAILED",
         "Process did not exit after tree termination",

@@ -207,8 +207,54 @@ test("managed runners fail with stable timeout and output-limit errors", async (
   }
 });
 
-test("managed runners do not hang when tree termination fails", async () => {
+test("managed runners wait for delayed close after direct kill fallback", async () => {
   const child = new FakeChild();
+  let directKills = 0;
+  let closed = false;
+  child.once("close", () => {
+    closed = true;
+  });
+  child.kill = () => {
+    directKills += 1;
+    setTimeout(() => child.emit("close", 137, "SIGKILL"), 10);
+    return true;
+  };
+  const runner = new ManagedProcessRunner({
+    managedProcessFactory: () =>
+      new ManagedProcess({
+        spawnImpl: () => child,
+        terminationTimeoutMs: 50,
+        treeTerminator: async () => {
+          throw new Error("taskkill failed");
+        },
+      }),
+  });
+
+  await assert.rejects(
+    withDeadline(
+      runner.run({
+        command: "C:\\Tools\\docker.exe",
+        args: [],
+        env: {},
+        timeoutMs: 1,
+      }),
+      200,
+    ),
+    (error) =>
+      error instanceof ManagedProcessError &&
+      error.code === "PROCESS_STOP_FAILED",
+  );
+  assert.equal(directKills, 1);
+  assert.equal(closed, true);
+});
+
+test("managed runners bound waiting when direct kill never closes the process", async () => {
+  const child = new FakeChild();
+  let directKills = 0;
+  child.kill = () => {
+    directKills += 1;
+    return true;
+  };
   const runner = new ManagedProcessRunner({
     managedProcessFactory: () =>
       new ManagedProcess({
@@ -226,13 +272,53 @@ test("managed runners do not hang when tree termination fails", async () => {
         command: "C:\\Tools\\docker.exe",
         args: [],
         env: {},
-        timeoutMs: 5,
+        timeoutMs: 1,
       }),
     ),
     (error) =>
       error instanceof ManagedProcessError &&
       error.code === "PROCESS_STOP_FAILED",
   );
+  assert.equal(directKills, 1);
+});
+
+test("managed runners wait for direct kill after a successful tree request stalls", async () => {
+  const child = new FakeChild();
+  let directKills = 0;
+  let closed = false;
+  child.once("close", () => {
+    closed = true;
+  });
+  child.kill = () => {
+    directKills += 1;
+    setTimeout(() => child.emit("close", 137, "SIGKILL"), 10);
+    return true;
+  };
+  const runner = new ManagedProcessRunner({
+    managedProcessFactory: () =>
+      new ManagedProcess({
+        spawnImpl: () => child,
+        terminationTimeoutMs: 20,
+        treeTerminator: async () => {},
+      }),
+  });
+
+  await assert.rejects(
+    withDeadline(
+      runner.run({
+        command: "C:\\Tools\\docker.exe",
+        args: [],
+        env: {},
+        timeoutMs: 1,
+      }),
+      100,
+    ),
+    (error) =>
+      error instanceof ManagedProcessError &&
+      error.code === "PROCESS_STOP_FAILED",
+  );
+  assert.equal(directKills, 1);
+  assert.equal(closed, true);
 });
 
 test("managed runners bound a tree terminator that never settles", async () => {
