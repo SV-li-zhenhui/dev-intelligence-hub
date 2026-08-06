@@ -95,6 +95,23 @@ function sourceKey(item) {
   return null;
 }
 
+function pullRequestHead(item) {
+  const itemEntries = ownData(item);
+  const eventEntries = ownData(itemEntries?.get("event"));
+  const eventType = eventEntries?.get("eventType");
+  if (
+    typeof eventType !== "string" ||
+    !eventType.startsWith("pull_request.")
+  ) {
+    return null;
+  }
+  const payloadEntries = ownData(eventEntries.get("payload"));
+  const headRefOid = payloadEntries?.get("headRefOid");
+  return typeof headRefOid === "string" && headRefOid.length <= 256
+    ? headRefOid
+    : "";
+}
+
 function normalizedFactValue(value) {
   if (typeof value === "string") return value;
   if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
@@ -176,6 +193,13 @@ export class WorkflowFactSource {
         matched = entry;
         break;
       }
+    }
+    const expectedHead = pullRequestHead(item);
+    if (
+      expectedSource === "githubPullRequests" &&
+      (!expectedHead || matched?.get("headRefOid") !== expectedHead)
+    ) {
+      return result({ healthy, fresh: false, observedAt });
     }
     const field = FACT_FIELDS.get(fact);
     return result({

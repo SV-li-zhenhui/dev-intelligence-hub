@@ -4,11 +4,14 @@ import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
 
 const NOW = "2026-08-02T04:00:00.000Z";
 
-function item(eventType = "pull_request.updated") {
+function item(eventType = "pull_request.updated", headRefOid = "HEAD-A") {
   return {
     event: {
       eventType,
       subject: { id: "github:pr:acme/repo#42" },
+      ...(eventType.startsWith("pull_request.")
+        ? { payload: { headRefOid } }
+        : {}),
     },
   };
 }
@@ -29,6 +32,7 @@ function snapshot(overrides = {}) {
         reviewDecision: "APPROVED",
         nextAction: "wait_merge",
         actionState: "waiting_other",
+        headRefOid: "HEAD-A",
       },
     ],
     ...overrides,
@@ -106,6 +110,63 @@ test("source health is selected from the work event kind", async () => {
   assert.equal(result.fresh, false);
 });
 
+test("pull request facts are bound to the exact event Head", async () => {
+  const value = snapshot();
+  value.items[0].headRefOid = "HEAD-B";
+  const facts = source(value);
+
+  for (const fact of [
+    "ci-status",
+    "review-decision",
+    "next-action",
+    "state",
+  ]) {
+    assert.deepEqual(await facts.read({ item: item(), fact }), {
+      healthy: true,
+      fresh: false,
+      value: null,
+      observedAt: "2026-08-02T03:59:00.000Z",
+    });
+  }
+});
+
+test("pull request facts fail closed when either Head is missing", async () => {
+  const missingExpectedHead = item();
+  missingExpectedHead.event.payload = {};
+  assert.equal(
+    (await source(snapshot()).read({
+      item: missingExpectedHead,
+      fact: "ci-status",
+    })).fresh,
+    false,
+  );
+
+  const missingObservedHead = snapshot();
+  delete missingObservedHead.items[0].headRefOid;
+  assert.equal(
+    (await source(missingObservedHead).read({
+      item: item(),
+      fact: "ci-status",
+    })).fresh,
+    false,
+  );
+});
+
+test("issue facts remain readable without a Head binding", async () => {
+  const value = snapshot({
+    items: [{ id: "github:issue:acme/repo#42", state: "open" }],
+  });
+  const issue = item("issue.updated");
+  issue.event.subject.id = "github:issue:acme/repo#42";
+
+  assert.deepEqual(await source(value).read({ item: issue, fact: "state" }), {
+    healthy: true,
+    fresh: true,
+    value: "open",
+    observedAt: "2026-08-02T03:59:00.000Z",
+  });
+});
+
 test("malformed arrays and accessor-bearing inputs fail closed without execution", async () => {
   let getterCalls = 0;
   const malicious = snapshot();
@@ -143,5 +204,24 @@ test("malformed arrays and accessor-bearing inputs fail closed without execution
     },
   });
   await assert.rejects(facts.read(request), /request is invalid/);
+  assert.equal(getterCalls, 0);
+
+  const maliciousItem = item();
+  Object.defineProperty(maliciousItem.event.payload, "headRefOid", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "HEAD-A";
+    },
+  });
+  assert.deepEqual(
+    await source(snapshot()).read({ item: maliciousItem, fact: "state" }),
+    {
+      healthy: true,
+      fresh: false,
+      value: null,
+      observedAt: "2026-08-02T03:59:00.000Z",
+    },
+  );
   assert.equal(getterCalls, 0);
 });
