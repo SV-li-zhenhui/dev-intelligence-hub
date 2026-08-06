@@ -686,6 +686,15 @@ test("forged unknown edit paths, kinds, raw values, and duplicate paths are reje
 
   assert.throws(
     () =>
+      setConfigurationFormField(initial, {
+        path: ["brainProviders", "ollama", "kind"],
+        kind: "text",
+        rawValue: "openai-compatible",
+      }),
+    /read-only/i,
+  );
+  assert.throws(
+    () =>
       configurationDocumentFromForm(
         editState({ path: ["unknownField"], kind: "text", rawValue: "value" }),
       ),
@@ -1182,6 +1191,60 @@ test("provider, role, workspace and profile support add, replace and remove", ()
   assert.equal(state.dirty, true);
 });
 
+test("the Responses provider variant materializes as a closed structured configuration", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  const template = configurationStructureTemplate(
+    ["brainProviders"],
+    "openai-responses",
+  );
+  const state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["brainProviders"],
+    key: template.key,
+    value: template.value,
+  });
+  const result = configurationDocumentFromForm(state);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration.brainProviders[template.key], template.value);
+  assert.doesNotThrow(() => normalizeConfigurationDocument(result.configuration));
+
+  const invalidState = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["brainProviders"],
+    key: "unsafe-responses",
+    value: { ...template.value, maxRequestBytes: 1024 * 1024 + 1 },
+  });
+  const invalidResult = configurationDocumentFromForm(invalidState);
+  assert.equal(invalidResult.ok, false);
+  assert.match(JSON.stringify(invalidResult.issues), /1048576|整数/i);
+});
+
+test("provider forms preserve legacy limits when protocol is omitted", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  Object.assign(configuration.brainProviders["remote-openai"], {
+    timeoutMs: 180_000,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxRequestBytes: 1,
+  });
+
+  const result = configurationDocumentFromForm(
+    createConfigurationFormState(configuration),
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.configuration.brainProviders["remote-openai"],
+    configuration.brainProviders["remote-openai"],
+  );
+  assert.doesNotThrow(() => normalizeConfigurationDocument(result.configuration));
+
+  configuration.brainProviders["remote-openai"].protocol = "chat-completions";
+  assert.throws(
+    () => createConfigurationFormState(configuration),
+    /authoritative configuration constraint/i,
+  );
+});
+
 test("every primitive field can round-trip through its declarative edit kind", () => {
   const configuration = representativeConfiguration();
   let state = createConfigurationFormState(configuration);
@@ -1189,6 +1252,7 @@ test("every primitive field can round-trip through its declarative edit kind", (
   function visit(value, path) {
     if (value === null || typeof value !== "object") {
       const descriptor = configurationFieldDescriptor(path, value);
+      if (descriptor.readOnly) return;
       const rawValue =
         descriptor.kind === "boolean"
           ? value

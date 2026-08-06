@@ -59,6 +59,7 @@ function providerAuthority(configuration, providerId) {
     kind: provider.kind,
     baseUrl: provider.baseUrl,
     apiKeyEnv: provider.apiKeyEnv ?? null,
+    ...(provider.protocol === undefined ? {} : { protocol: provider.protocol }),
     remote: provider.remote ?? null,
   };
 }

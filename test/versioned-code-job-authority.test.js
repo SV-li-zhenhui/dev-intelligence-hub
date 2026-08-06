@@ -548,6 +548,30 @@ test("the assigned provider authority invalidates its sealed grants", async () =
   );
 });
 
+test("an assigned provider protocol change invalidates its sealed grants", async () => {
+  const context = fixture();
+  const configured = structuredClone(context.startup);
+  configured.brainProviders.codex = {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "chat-completions",
+    remote: true,
+  };
+  configured.employees.roles.developer.brain.provider = "codex";
+  configured.employees.roles.developer.brain.remoteData.code = true;
+  context.activate(configured);
+  const sealed = (await context.authority.create(proposal(configured))).grant;
+  const replaced = structuredClone(configured);
+  replaced.brainProviders.codex.protocol = "responses";
+  context.activate(replaced);
+
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
 test("a revoked authority cannot resurrect an old grant after exact restoration", async () => {
   const context = fixture();
   const oldGrant = (await context.authority.create(proposal(context.startup))).grant;

@@ -268,6 +268,75 @@ test("a non-loopback provider cannot be downgraded by remote false", async () =>
   assert.equal(fetchCalls, 0);
 });
 
+test("a dotted Responses provider is remote and denied data never starts fetch", async () => {
+  let fetchCalls = 0;
+  const router = createConfiguredBrainRouter({
+    brainProviders: {
+      "company.codex_api": {
+        kind: "openai-compatible",
+        baseUrl: "https://api.openai.com/v1",
+        apiKeyEnv: "OPENAI_API_KEY",
+        protocol: "responses",
+        remote: false,
+      },
+    },
+    dependencies: {
+      fetch: async (url, options) => {
+        fetchCalls += 1;
+        assert.equal(url, "https://api.openai.com/v1/responses");
+        const body = JSON.parse(options.body);
+        assert.deepEqual(body.tools, []);
+        assert.equal(body.tool_choice, "none");
+        return textResponse({
+          object: "response",
+          status: "completed",
+          error: null,
+          incomplete_details: null,
+          output: [{
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: '{"ok":true}' }],
+          }],
+        });
+      },
+      environment: {
+        OPENAI_API_KEY: "fixture-key",
+      },
+    },
+  });
+  const brain = {
+    provider: "company.codex_api",
+    model: "gpt-5.2-codex",
+    remoteData: { requirements: true, code: false, memory: false },
+  };
+
+  assert.equal(router.describe(brain).remote, true);
+  await assert.rejects(
+    router.generate({
+      brain,
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["requirements", "code"],
+    }),
+    (error) => error.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.equal(fetchCalls, 0);
+  assert.equal(
+    await router.generate({
+      brain: {
+        ...brain,
+        remoteData: { requirements: true, code: true, memory: false },
+      },
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["requirements", "code"],
+    }),
+    '{"ok":true}',
+  );
+  assert.equal(fetchCalls, 1);
+});
+
 test("provider remote declarations are optional booleans only", () => {
   assert.equal(
     createConfiguredBrainRouter({

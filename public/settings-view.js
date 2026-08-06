@@ -123,7 +123,8 @@ function inputControl(path, descriptor, value, attributes) {
     descriptor.control === "env-reference"
       ? ' autocomplete="off" spellcheck="false" data-configuration-value-kind="env-reference" data-configuration-edit-kind="text"'
       : ` data-configuration-value-kind="${escapeHtml(descriptor.kind)}" data-configuration-edit-kind="${escapeHtml(descriptor.kind)}"`;
-  return `<input type="${type}" value="${escapeHtml(value)}" data-configuration-field="${pathAttribute(path)}" id="configuration-field-${pathDomId(path)}" name="${pathAttribute(path)}"${range}${environment}${attributes}>`;
+  const readOnly = descriptor.readOnly ? ' readonly aria-readonly="true"' : "";
+  return `<input type="${type}" value="${escapeHtml(value)}" data-configuration-field="${pathAttribute(path)}" id="configuration-field-${pathDomId(path)}" name="${pathAttribute(path)}"${range}${environment}${readOnly}${attributes}>`;
 }
 
 function templateScalarControl(path, descriptor, value) {
@@ -168,7 +169,8 @@ function renderField(path, value, context, { template = false } = {}) {
       return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><select data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(descriptor.kind)}">${options}</select></label>`;
     }
     const editKind = descriptor.control === "env-reference" ? "text" : descriptor.kind;
-    return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="${type}" value="${escapeHtml(value ?? "")}" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(editKind)}"></label>`;
+    const readOnly = descriptor.readOnly ? ' readonly aria-readonly="true"' : "";
+    return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="${type}" value="${escapeHtml(value ?? "")}" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(editKind)}"${readOnly}></label>`;
   }
   const issue = context.issues.get(pathText(path));
   const accessibility = fieldAccessibility(path, issue, context);
@@ -210,17 +212,21 @@ function renderTemplateValue(value, path, context) {
     .join("");
 }
 
-function addTemplate(path, descriptor, context) {
-  const template = configurationStructureTemplate(path);
+function addTemplate(path, descriptor, context, variant = null) {
+  const template = configurationStructureTemplate(path, variant?.id ?? null);
   const valueRoot = descriptor.kind === "map"
     ? [...path, template.key]
     : [...path, 0];
+  const templateVariant = variant
+    ? ` data-configuration-template-variant="${escapeHtml(variant.id)}"`
+    : "";
+  const label = variant?.label ?? descriptor.label;
   const keyField =
     descriptor.kind === "map"
       ? `<label class="configuration-structured-field"><span>新条目标识</span><input type="text" value="${escapeHtml(template.key)}" data-configuration-template-key></label>`
       : "";
-  return `<details class="configuration-structure-template" data-configuration-structure-template="${pathAttribute(path)}" data-configuration-template-value-root="${pathAttribute(valueRoot)}">
-    <summary>新增${escapeHtml(descriptor.label)}</summary>
+  return `<details class="configuration-structure-template" data-configuration-structure-template="${pathAttribute(path)}" data-configuration-template-value-root="${pathAttribute(valueRoot)}"${templateVariant}>
+    <summary>新增${escapeHtml(label)}</summary>
     <div class="configuration-structure-template-fields">
       ${keyField}
       ${renderTemplateValue(
@@ -228,9 +234,23 @@ function addTemplate(path, descriptor, context) {
         valueRoot,
         context,
       )}
-      ${operationButton("add", path, `新增${descriptor.label}`)}
+      ${operationButton(
+        "add",
+        path,
+        `新增${label}`,
+        variant ? { "template-variant": variant.id } : {},
+      )}
     </div>
   </details>`;
+}
+
+function addTemplates(path, descriptor, context) {
+  return [
+    addTemplate(path, descriptor, context),
+    ...(descriptor.additionalTemplates ?? []).map((variant) =>
+      addTemplate(path, descriptor, context, variant),
+    ),
+  ].join("");
 }
 
 function entryActions(path, identity, label) {
@@ -271,7 +291,7 @@ function renderCollection(path, value, descriptor, context) {
   return `<section class="configuration-structured-collection" data-configuration-collection="${pathAttribute(path)}" data-configuration-node="${pathAttribute(path)}">
     <header><strong>${escapeHtml(descriptor.label)}</strong></header>
     ${items || `<p class="configuration-help">尚未配置${escapeHtml(descriptor.label)}。</p>`}
-    ${addTemplate(path, descriptor, context)}
+    ${addTemplates(path, descriptor, context)}
   </section>`;
 }
 

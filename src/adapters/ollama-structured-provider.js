@@ -8,7 +8,7 @@ const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
 const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
-const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const OPTION_KEYS = new Set([
   "id",

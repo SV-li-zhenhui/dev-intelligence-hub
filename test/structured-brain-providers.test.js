@@ -36,6 +36,26 @@ function remoteData(overrides = {}) {
   return { requirements: false, code: false, memory: false, ...overrides };
 }
 
+function responsesEnvelope(text = '{"ok":true}', overrides = {}) {
+  return {
+    object: "response",
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    output: [
+      { type: "reasoning", id: "reasoning-1", summary: [] },
+      {
+        type: "message",
+        id: "message-1",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text, annotations: [] }],
+      },
+    ],
+    ...overrides,
+  };
+}
+
 test("Ollama defaults to loopback and sends a bounded schema request without redirects", async () => {
   const calls = [];
   const provider = new OllamaStructuredProvider({
@@ -129,6 +149,7 @@ test("OpenAI-compatible credentials come only from the injected environment and 
 
   assert.equal(output, '{"ok":true}');
   assert.equal(OpenAICompatibleProvider, OpenAiCompatibleProvider);
+  assert.equal(provider.protocol, "chat-completions");
   assert.equal(calls[0].url, "https://models.example/v1/chat/completions");
   assert.equal(calls[0].options.headers.authorization, `Bearer ${secret}`);
   assert.equal(calls[0].options.redirect, "error");
@@ -182,6 +203,265 @@ test("OpenAI-compatible credentials come only from the injected environment and 
   });
   assert.throws(() => new OpenAiCompatibleProvider(unsafeOptions));
   assert.equal(getterCalls, 0);
+});
+
+test("OpenAI-compatible Responses sends an explicitly tool-free schema request", async () => {
+  const calls = [];
+  const localContextSentinel = "PRIVATE_WINDOWS_CONTEXT_MUST_NOT_BE_SENT";
+  const provider = new OpenAICompatibleProvider({
+    protocol: "responses",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: {
+      MODEL_TOKEN: "token",
+      USERPROFILE: localContextSentinel,
+      CODEX_HOME: localContextSentinel,
+    },
+    fetch: async (url, options) => {
+      calls.push({ url, options, body: JSON.parse(options.body) });
+      return textResponse(responsesEnvelope());
+    },
+  });
+
+  const output = await provider.generate({
+    model: "smart-model",
+    messages: MESSAGES,
+    schema: SCHEMA,
+  });
+
+  assert.equal(output, '{"ok":true}');
+  assert.equal(provider.protocol, "responses");
+  assert.equal(calls[0].url, "https://models.example/v1/responses");
+  assert.equal(calls[0].options.redirect, "error");
+  assert.deepEqual(calls[0].body, {
+    model: "smart-model",
+    input: MESSAGES,
+    tools: [],
+    tool_choice: "none",
+    parallel_tool_calls: false,
+    store: false,
+    background: false,
+    stream: false,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "work_decision",
+        strict: true,
+        schema: SCHEMA,
+      },
+    },
+  });
+  assert.equal(JSON.stringify(calls[0].body).includes(localContextSentinel), false);
+  assert.equal(Object.hasOwn(calls[0].body, "instructions"), false);
+  assert.equal(Object.hasOwn(calls[0].body, "metadata"), false);
+});
+
+test("OpenAI-compatible Responses rejects unsafe or ambiguous output items", async () => {
+  const validMessage = responsesEnvelope().output[1];
+  const invalidResponses = [
+    responsesEnvelope('{"ok":true}', { status: "incomplete" }),
+    responsesEnvelope('{"ok":true}', { object: "not-a-response" }),
+    responsesEnvelope('{"ok":true}', {
+      output: [
+        { type: "function_call", name: "view_image", arguments: "{}" },
+        validMessage,
+      ],
+    }),
+    responsesEnvelope('{"ok":true}', {
+      output: [{
+        ...validMessage,
+        content: [{ type: "refusal", refusal: "no" }],
+      }],
+    }),
+    responsesEnvelope('{"ok":true}', {
+      output: [{
+        ...validMessage,
+        content: [
+          { type: "output_text", text: '{"ok":true}' },
+          { type: "output_text", text: '{"ok":false}' },
+        ],
+      }],
+    }),
+    responsesEnvelope('{"ok":true}', {
+      output: [validMessage, structuredClone(validMessage)],
+    }),
+    responsesEnvelope('{"ok":true}', {
+      output: [{ ...validMessage, status: "in_progress" }],
+    }),
+    responsesEnvelope('{"ok":true}', { error: { message: "failed" } }),
+  ];
+
+  for (const envelope of invalidResponses) {
+    const provider = new OpenAICompatibleProvider({
+      protocol: "responses",
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch: async () => textResponse(envelope),
+    });
+    await assert.rejects(
+      provider.generate({ model: "smart-model", messages: MESSAGES, schema: SCHEMA }),
+      (error) => error.code === "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+    );
+  }
+});
+
+test("OpenAI-compatible Responses keeps request, response, and timeout limits bounded", async () => {
+  const baseOptions = {
+    protocol: "responses",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+    fetch: async () => textResponse(responsesEnvelope()),
+  };
+  assert.throws(
+    () => new OpenAICompatibleProvider({ ...baseOptions, protocol: "unknown" }),
+    /protocol is invalid/i,
+  );
+  let protocolCoercions = 0;
+  const hostileProtocol = {
+    [Symbol.toPrimitive]() {
+      protocolCoercions += 1;
+      return "responses";
+    },
+  };
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...baseOptions,
+      protocol: hostileProtocol,
+    }),
+    /protocol is invalid/i,
+  );
+  assert.equal(protocolCoercions, 0);
+  for (const timeoutMs of [999, 3_600_001]) {
+    assert.throws(
+      () => new OpenAICompatibleProvider({ ...baseOptions, timeoutMs }),
+      /timeoutMs is outside/i,
+    );
+  }
+  for (const [name, value] of [
+    ["maxResponseBytes", 1024 * 1024 + 1],
+    ["maxRequestBytes", 1024 * 1024 + 1],
+  ]) {
+    assert.throws(
+      () => new OpenAICompatibleProvider({ ...baseOptions, [name]: value }),
+      new RegExp(`${name} is outside`, "i"),
+    );
+  }
+  assert.doesNotThrow(
+    () => new OpenAICompatibleProvider({
+      ...baseOptions,
+      timeoutMs: 3_600_000,
+      maxResponseBytes: 1024 * 1024,
+      maxRequestBytes: 1024 * 1024,
+    }),
+  );
+
+  let fetchCalls = 0;
+  const requestBounded = new OpenAICompatibleProvider({
+    ...baseOptions,
+    maxRequestBytes: 1_024,
+    fetch: async () => {
+      fetchCalls += 1;
+      return textResponse(responsesEnvelope());
+    },
+  });
+  await assert.rejects(
+    requestBounded.generate({
+      model: "smart-model",
+      messages: [{ role: "user", content: "x".repeat(2_000) }],
+      schema: SCHEMA,
+    }),
+    (error) => error.code === "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE",
+  );
+  assert.equal(fetchCalls, 0);
+
+  const responseBounded = new OpenAICompatibleProvider({
+    ...baseOptions,
+    maxResponseBytes: 1_024,
+    fetch: async () => textResponse(responsesEnvelope("x".repeat(2_000))),
+  });
+  await assert.rejects(
+    responseBounded.generate({ model: "smart-model", messages: MESSAGES, schema: SCHEMA }),
+    (error) => error.code === "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
+  );
+
+  const chatOptions = {
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+    fetch: async () => textResponse({
+      choices: [{ message: { content: '{"ok":true}' } }],
+    }),
+  };
+  assert.doesNotThrow(
+    () => new OpenAICompatibleProvider({
+      ...chatOptions,
+      timeoutMs: 10,
+      maxResponseBytes: 1024 * 1024,
+      maxRequestBytes: 2 * 1024 * 1024,
+    }),
+  );
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...chatOptions,
+      timeoutMs: 120_001,
+    }),
+    /timeoutMs is outside/i,
+  );
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...chatOptions,
+      maxRequestBytes: 2 * 1024 * 1024 + 1,
+    }),
+    /maxRequestBytes is outside/i,
+  );
+});
+
+test("OpenAI-compatible Responses rejects accessors and branching schemas before fetch", async () => {
+  let fetchCalls = 0;
+  const provider = new OpenAICompatibleProvider({
+    protocol: "responses",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+    fetch: async () => {
+      fetchCalls += 1;
+      return textResponse(responsesEnvelope());
+    },
+  });
+  let getterCalls = 0;
+  const hostileMessage = { role: "user" };
+  Object.defineProperty(hostileMessage, "content", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "must not be read";
+    },
+  });
+  await assert.rejects(
+    provider.generate({
+      model: "smart-model",
+      messages: [hostileMessage],
+      schema: SCHEMA,
+    }),
+    /messages are invalid/i,
+  );
+  assert.equal(getterCalls, 0);
+
+  let shared = { const: true };
+  for (let depth = 0; depth < 7; depth += 1) {
+    shared = { anyOf: [shared, shared, shared, shared] };
+  }
+  await assert.rejects(
+    provider.generate({
+      model: "smart-model",
+      messages: MESSAGES,
+      schema: shared,
+    }),
+    /schema is invalid/i,
+  );
+  assert.equal(fetchCalls, 0);
 });
 
 test("providers bound response bytes and timeout without exposing response content", async () => {
@@ -251,6 +531,14 @@ test("structured providers propagate external cancellation without misreporting 
       fetch,
       timeoutMs: 100,
     }),
+    (fetch) => new OpenAiCompatibleProvider({
+      protocol: "responses",
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch,
+      timeoutMs: 1_000,
+    }),
   ];
 
   for (const createProvider of factories) {
@@ -297,6 +585,14 @@ test("structured providers do not start fetch after immediate cancellation", asy
       env: { MODEL_TOKEN: "token" },
       fetch,
       timeoutMs: 100,
+    }),
+    (fetch) => new OpenAiCompatibleProvider({
+      protocol: "responses",
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch,
+      timeoutMs: 1_000,
     }),
   ];
 

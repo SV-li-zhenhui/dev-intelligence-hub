@@ -3651,6 +3651,7 @@ function configurationTemplateIdentity(template) {
       : "add",
     structurePath,
     valueRoot,
+    template.dataset.configurationTemplateVariant ?? "",
   ]);
 }
 

@@ -297,19 +297,28 @@ function assertProvider(value, path) {
       "kind",
       "baseUrl",
       "apiKeyEnv",
+      "protocol",
       "timeoutMs",
       "maxResponseBytes",
       "maxRequestBytes",
       "contextTokens",
       "remote",
     ],
-    ["kind", "baseUrl"],
+    ["kind"],
   );
   if (!["ollama", "openai-compatible"].includes(value.kind)) {
     throw formError(
       "UNSUPPORTED_CONFIGURATION_SCHEMA",
       `unsupported brain provider kind ${value.kind}`,
       `${path}.kind`,
+    );
+  }
+  const required = ["baseUrl"];
+  if (required.some((name) => !Object.hasOwn(value, name))) {
+    throw formError(
+      "UNSUPPORTED_CONFIGURATION_SCHEMA",
+      `unsupported configuration schema: incomplete provider ${path}`,
+      path,
     );
   }
 }
@@ -1054,12 +1063,50 @@ function providerConfigurationIssues(configuration) {
   for (const [id, provider] of Object.entries(configuration.brainProviders)) {
     const path = ["brainProviders", id];
     const hasCredentialReference = Object.hasOwn(provider, "apiKeyEnv");
+    const hasProtocol = Object.hasOwn(provider, "protocol");
     if (
       (provider.kind === "openai-compatible" && !hasCredentialReference) ||
       (provider.kind === "ollama" && hasCredentialReference) ||
-      (provider.kind === "openai-compatible" && Object.hasOwn(provider, "contextTokens"))
+      (provider.kind === "openai-compatible" && Object.hasOwn(provider, "contextTokens")) ||
+      (provider.kind === "ollama" && hasProtocol) ||
+      (hasProtocol && !["chat-completions", "responses"].includes(provider.protocol))
     ) {
       issues.push(issue(path, "INVALID_PROVIDER_CONFIGURATION", "Provider 字段组合无效。"));
+    }
+    const limits = !hasProtocol
+      ? {
+          timeoutMs: [1, 2 * 1024 * 1024],
+          maxResponseBytes: [1, 2 * 1024 * 1024],
+          maxRequestBytes: [1, 2 * 1024 * 1024],
+        }
+      : provider.protocol === "responses"
+        ? {
+            timeoutMs: [1_000, 3_600_000],
+            maxResponseBytes: [1_024, 1024 * 1024],
+            maxRequestBytes: [1_024, 1024 * 1024],
+          }
+        : {
+            timeoutMs: [10, 120_000],
+            maxResponseBytes: [1_024, 1024 * 1024],
+            maxRequestBytes: [1_024, 2 * 1024 * 1024],
+          };
+    for (const [name, [minimum, maximum]] of Object.entries(limits)) {
+      if (
+        Object.hasOwn(provider, name) &&
+        (
+          !Number.isSafeInteger(provider[name]) ||
+          provider[name] < minimum ||
+          provider[name] > maximum
+        )
+      ) {
+        issues.push(
+          issue(
+            [...path, name],
+            "INVALID_PROVIDER_CONFIGURATION",
+            `请输入 ${minimum} 到 ${maximum} 之间的整数。`,
+          ),
+        );
+      }
     }
     if (provider.remote === false) {
       try {
@@ -1419,6 +1466,13 @@ function normalizeFormEdit(value, editDocument, seenPaths, index, fallbackDocume
     );
   }
   const current = currentField.value;
+  if (configurationFieldDescriptor(normalizedPath, current).readOnly) {
+    throw formError(
+      "INVALID_FORM_EDIT",
+      `${displayPath} is read-only`,
+      displayPath,
+    );
+  }
   assertKindMatchesValue(value.kind, current, displayPath);
   if (value.kind === "boolean") {
     if (typeof value.rawValue !== "boolean") {
@@ -1868,6 +1922,13 @@ export function setConfigurationFormField(state, input) {
     );
   }
   const current = currentField.value;
+  if (configurationFieldDescriptor(normalizedPath, current).readOnly) {
+    throw formError(
+      "INVALID_FORM_EDIT",
+      `${displayPath} is read-only`,
+      displayPath,
+    );
+  }
   assertKindMatchesValue(kind, current, displayPath);
   if (kind === "boolean") {
     if (typeof rawValue !== "boolean") {

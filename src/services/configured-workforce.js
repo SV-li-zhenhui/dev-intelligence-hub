@@ -8,14 +8,14 @@ const PROVIDER_KEYS = new Set([
   "kind",
   "baseUrl",
   "apiKeyEnv",
+  "protocol",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
   "contextTokens",
   "remote",
 ]);
-const COMMON_PROVIDER_OPTION_KEYS = Object.freeze([
-  "baseUrl",
+const PROVIDER_LIMIT_KEYS = Object.freeze([
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -91,15 +91,15 @@ function providerOptions(id, value, dependencies) {
   const config = exactConfig(value, PROVIDER_KEYS, name);
   const remote = declaredRemote(config, name);
   const common = {
-    ...selectOptions(config, COMMON_PROVIDER_OPTION_KEYS),
+    ...selectOptions(config, PROVIDER_LIMIT_KEYS),
     id,
-    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
   };
   if (config.kind === "ollama") {
     return providerWithBoundary(
       new OllamaStructuredProvider({
         ...common,
-        ...selectOptions(config, ["contextTokens"]),
+        ...selectOptions(config, ["baseUrl", "contextTokens"]),
+        ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       }),
       remote,
     );
@@ -108,8 +108,9 @@ function providerOptions(id, value, dependencies) {
     return providerWithBoundary(
       new OpenAiCompatibleProvider({
         ...common,
-        ...selectOptions(config, ["apiKeyEnv"]),
+        ...selectOptions(config, ["baseUrl", "apiKeyEnv", "protocol"]),
         environment: dependencies.environment ?? process.env,
+        ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       }),
       remote,
     );

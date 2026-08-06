@@ -6,10 +6,31 @@ import {
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
 const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
-const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const CHAT_COMPLETIONS_PROTOCOL = "chat-completions";
+const RESPONSES_PROTOCOL = "responses";
+const PROTOCOL_LIMITS = Object.freeze({
+  [CHAT_COMPLETIONS_PROTOCOL]: Object.freeze({
+    minimumTimeoutMs: 10,
+    maximumTimeoutMs: 120_000,
+    maximumResponseBytes: 1024 * 1024,
+    maximumRequestBytes: 2 * 1024 * 1024,
+  }),
+  [RESPONSES_PROTOCOL]: Object.freeze({
+    minimumTimeoutMs: 1_000,
+    maximumTimeoutMs: 3_600_000,
+    maximumResponseBytes: 1024 * 1024,
+    maximumRequestBytes: 1024 * 1024,
+  }),
+});
+const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const API_KEY = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
+const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const MAX_SCHEMA_DEPTH = 32;
+const MAX_SCHEMA_NODES = 20_000;
+const MAX_SCHEMA_KEYS = 20_000;
+const MAX_SCHEMA_STRING_BYTES = 1024 * 1024;
 const OPTION_KEYS = new Set([
   "id",
   "fetch",
@@ -20,6 +41,7 @@ const OPTION_KEYS = new Set([
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
+  "protocol",
 ]);
 
 export class OpenAICompatibleProviderError extends Error {
@@ -86,6 +108,13 @@ function boundedInteger(value, name, minimum, maximum) {
   return value;
 }
 
+function safeProtocol(value) {
+  if (typeof value !== "string" || !Object.hasOwn(PROTOCOL_LIMITS, value)) {
+    throw new TypeError("OpenAI-compatible protocol is invalid");
+  }
+  return value;
+}
+
 function isLoopback(hostname) {
   const host = hostname.toLowerCase();
   return (
@@ -96,7 +125,7 @@ function isLoopback(hostname) {
   );
 }
 
-function endpoint(value) {
+function endpoint(value, protocol) {
   let url;
   try {
     url = new URL(value);
@@ -120,7 +149,9 @@ function endpoint(value) {
   }
   return {
     remote,
-    requestUrl: `${url.toString().replace(/\/+$/, "")}/chat/completions`,
+    requestUrl: `${url.toString().replace(/\/+$/, "")}/${
+      protocol === RESPONSES_PROTOCOL ? "responses" : "chat/completions"
+    }`,
   };
 }
 
@@ -164,7 +195,16 @@ function normalizeMessages(value) {
   ) {
     throw new TypeError("messages are invalid");
   }
-  return value.map((message) => {
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) {
+    throw new TypeError("messages are invalid");
+  }
+  return value.map((_message, index) => {
+    const entry = Object.getOwnPropertyDescriptor(value, `${index}`);
+    if (!entry?.enumerable || !("value" in entry)) {
+      throw new TypeError("messages are invalid");
+    }
+    const message = entry.value;
     if (
       message === null ||
       typeof message !== "object" ||
@@ -177,6 +217,12 @@ function normalizeMessages(value) {
     ) {
       throw new TypeError("messages are invalid");
     }
+    for (const key of ["role", "content"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(message, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        throw new TypeError("messages are invalid");
+      }
+    }
     return {
       role: message.role,
       content: safeText(message.content, "message.content", 128 * 1024),
@@ -184,20 +230,94 @@ function normalizeMessages(value) {
   });
 }
 
+function schemaBudget() {
+  return {
+    nodes: MAX_SCHEMA_NODES,
+    keys: MAX_SCHEMA_KEYS,
+    stringBytes: MAX_SCHEMA_STRING_BYTES,
+  };
+}
+
+function consumeSchemaBudget(budget, { keys = 0, stringBytes = 0 } = {}) {
+  budget.nodes -= 1;
+  budget.keys -= keys;
+  budget.stringBytes -= stringBytes;
+  if (budget.nodes < 0 || budget.keys < 0 || budget.stringBytes < 0) {
+    throw new TypeError("schema is invalid");
+  }
+}
+
+function cloneSchemaData(value, depth = 0, budget = schemaBudget()) {
+  if (depth > MAX_SCHEMA_DEPTH) throw new TypeError("schema is invalid");
+  if (value === null || typeof value === "boolean") {
+    consumeSchemaBudget(budget);
+    return value;
+  }
+  if (typeof value === "string") {
+    consumeSchemaBudget(budget, { stringBytes: Buffer.byteLength(value, "utf8") });
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("schema is invalid");
+    consumeSchemaBudget(budget);
+    return value;
+  }
+  if (typeof value !== "object") throw new TypeError("schema is invalid");
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 4_096) {
+      throw new TypeError("schema is invalid");
+    }
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== value.length + 1 || !keys.includes("length")) {
+      throw new TypeError("schema is invalid");
+    }
+    consumeSchemaBudget(budget, { keys: value.length });
+    return value.map((_entry, index) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, `${index}`);
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        throw new TypeError("schema is invalid");
+      }
+      return cloneSchemaData(descriptor.value, depth + 1, budget);
+    });
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError("schema is invalid");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > 4_096) throw new TypeError("schema is invalid");
+  let keyBytes = 0;
+  for (const key of keys) {
+    if (typeof key !== "string" || DANGEROUS_KEYS.has(key)) {
+      throw new TypeError("schema is invalid");
+    }
+    keyBytes += Buffer.byteLength(key, "utf8");
+    if (keyBytes > MAX_SCHEMA_STRING_BYTES) throw new TypeError("schema is invalid");
+  }
+  consumeSchemaBudget(budget, { keys: keys.length, stringBytes: keyBytes });
+  const entries = [];
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new TypeError("schema is invalid");
+    }
+    entries.push([
+      key,
+      cloneSchemaData(descriptor.value, depth + 1, budget),
+    ]);
+  }
+  return Object.fromEntries(entries);
+}
+
 function normalizeSchema(value) {
+  const normalized = cloneSchemaData(value);
   if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
+    normalized === null ||
+    typeof normalized !== "object" ||
+    Array.isArray(normalized)
   ) {
     throw new TypeError("schema is invalid");
   }
-  try {
-    return structuredClone(value);
-  } catch {
-    throw new TypeError("schema is invalid");
-  }
+  return normalized;
 }
 
 async function boundedResponseText(response, maximumBytes) {
@@ -238,7 +358,7 @@ async function boundedResponseText(response, maximumBytes) {
   }
 }
 
-function responseContent(text) {
+function responseEnvelope(text) {
   let envelope;
   try {
     envelope = JSON.parse(text);
@@ -249,21 +369,132 @@ function responseContent(text) {
       502,
     );
   }
+  return envelope;
+}
+
+function invalidResponse() {
+  return providerError(
+    "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+    "Structured provider response is invalid",
+    502,
+  );
+}
+
+function chatCompletionContent(envelope) {
   const content = envelope?.choices?.[0]?.message?.content;
   if (typeof content !== "string") {
-    throw providerError(
-      "STRUCTURED_PROVIDER_RESPONSE_INVALID",
-      "Structured provider response is invalid",
-      502,
-    );
+    throw invalidResponse();
   }
   return content;
+}
+
+function dataObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function responsesContent(envelope) {
+  if (
+    !dataObject(envelope) ||
+    envelope.object !== "response" ||
+    envelope.status !== "completed" ||
+    !Array.isArray(envelope.output) ||
+    envelope.output.length < 1 ||
+    (Object.hasOwn(envelope, "error") && envelope.error !== null) ||
+    (Object.hasOwn(envelope, "incomplete_details") &&
+      envelope.incomplete_details !== null)
+  ) {
+    throw invalidResponse();
+  }
+
+  let message = null;
+  let reasoningItems = 0;
+  for (const item of envelope.output) {
+    if (!dataObject(item)) throw invalidResponse();
+    if (item.type === "reasoning") {
+      reasoningItems += 1;
+      if (reasoningItems > 1 || message !== null) throw invalidResponse();
+      continue;
+    }
+    if (item.type !== "message" || message !== null) throw invalidResponse();
+    message = item;
+  }
+
+  if (
+    message === null ||
+    message.status !== "completed" ||
+    message.role !== "assistant" ||
+    !Array.isArray(message.content) ||
+    message.content.length !== 1
+  ) {
+    throw invalidResponse();
+  }
+  const content = message.content[0];
+  if (
+    !dataObject(content) ||
+    content.type !== "output_text" ||
+    typeof content.text !== "string" ||
+    !content.text.trim()
+  ) {
+    throw invalidResponse();
+  }
+  return content.text;
+}
+
+function responseContent(text, protocol) {
+  const envelope = responseEnvelope(text);
+  return protocol === RESPONSES_PROTOCOL
+    ? responsesContent(envelope)
+    : chatCompletionContent(envelope);
+}
+
+function chatCompletionsBody({ model, messages, schema }) {
+  return {
+    model,
+    messages,
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "work_decision",
+        strict: true,
+        schema,
+      },
+    },
+  };
+}
+
+function responsesBody({ model, messages, schema }) {
+  return {
+    model,
+    input: messages,
+    tools: [],
+    tool_choice: "none",
+    parallel_tool_calls: false,
+    store: false,
+    background: false,
+    stream: false,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "work_decision",
+        strict: true,
+        schema,
+      },
+    },
+  };
+}
+
+function requestBody(protocol, request) {
+  return protocol === RESPONSES_PROTOCOL
+    ? responsesBody(request)
+    : chatCompletionsBody(request);
 }
 
 export class OpenAICompatibleProvider {
   #fetch;
   #requestUrl;
   #apiKey;
+  #protocol;
   #timeoutMs;
   #maxResponseBytes;
   #maxRequestBytes;
@@ -273,10 +504,14 @@ export class OpenAICompatibleProvider {
     if (options.fetch !== undefined && typeof options.fetch !== "function") {
       throw new TypeError("OpenAI-compatible provider requires fetch");
     }
-    const target = endpoint(options.baseUrl);
+    const protocol = safeProtocol(options.protocol ?? CHAT_COMPLETIONS_PROTOCOL);
+    const target = endpoint(options.baseUrl, protocol);
+    const limits = PROTOCOL_LIMITS[protocol];
     this.id = safeId(options.id ?? "openai-compatible");
     this.kind = "openai-compatible";
+    this.protocol = protocol;
     this.remote = target.remote;
+    this.#protocol = protocol;
     this.#fetch = options.fetch ?? globalThis.fetch;
     if (typeof this.#fetch !== "function") {
       throw new TypeError("OpenAI-compatible provider requires fetch");
@@ -291,20 +526,20 @@ export class OpenAICompatibleProvider {
     this.#timeoutMs = boundedInteger(
       options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       "timeoutMs",
-      10,
-      120_000,
+      limits.minimumTimeoutMs,
+      limits.maximumTimeoutMs,
     );
     this.#maxResponseBytes = boundedInteger(
       options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
       "maxResponseBytes",
       1_024,
-      1024 * 1024,
+      limits.maximumResponseBytes,
     );
     this.#maxRequestBytes = boundedInteger(
       options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES,
       "maxRequestBytes",
       1_024,
-      2 * 1024 * 1024,
+      limits.maximumRequestBytes,
     );
     Object.freeze(this);
   }
@@ -312,19 +547,11 @@ export class OpenAICompatibleProvider {
   async generate({ model, messages, schema, signal = null } = {}) {
     const externalSignal = normalizeAbortSignal(signal);
     if (externalSignal?.aborted) throw cancellationError();
-    const body = JSON.stringify({
+    const body = JSON.stringify(requestBody(this.#protocol, {
       model: safeText(model, "model", 256),
       messages: normalizeMessages(messages),
-      temperature: 0,
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "work_decision",
-          strict: true,
-          schema: normalizeSchema(schema),
-        },
-      },
-    });
+      schema: normalizeSchema(schema),
+    }));
     if (Buffer.byteLength(body, "utf8") > this.#maxRequestBytes) {
       throw providerError(
         "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE",
@@ -368,6 +595,7 @@ export class OpenAICompatibleProvider {
         }
         return responseContent(
           await boundedResponseText(response, this.#maxResponseBytes),
+          this.#protocol,
         );
       },
     });

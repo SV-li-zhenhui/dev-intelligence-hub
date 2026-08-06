@@ -59,6 +59,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "kind",
   "baseUrl",
   "apiKeyEnv",
+  "protocol",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -377,10 +378,13 @@ function normalizeAssignedBrain(value, path) {
 
 function normalizeProvider(value, path, id) {
   safeId(id, path);
-  const config = fields(value, path, PROVIDER_FIELDS, ["kind", "baseUrl"]);
+  const config = fields(value, path, PROVIDER_FIELDS, ["kind"]);
   const kind = text(config.kind, `${path}.kind`, 64);
   if (!new Set(["ollama", "openai-compatible"]).has(kind)) {
     throw invalid(`${path}.kind`);
+  }
+  if (!Object.hasOwn(config, "baseUrl")) {
+    throw invalid(`${path}.baseUrl`, "缺少必需字段");
   }
   const target = endpoint(config.baseUrl, `${path}.baseUrl`);
   if (config.remote === false && target.remote) {
@@ -392,18 +396,48 @@ function normalizeProvider(value, path, id) {
   if (kind === "ollama" && Object.hasOwn(config, "apiKeyEnv")) {
     throw invalid(`${path}.apiKeyEnv`);
   }
+  if (kind === "ollama" && Object.hasOwn(config, "protocol")) {
+    throw invalid(`${path}.protocol`);
+  }
+  const protocol = Object.hasOwn(config, "protocol")
+    ? text(config.protocol, `${path}.protocol`, 64)
+    : null;
+  if (
+    protocol !== null &&
+    !new Set(["chat-completions", "responses"]).has(protocol)
+  ) {
+    throw invalid(`${path}.protocol`);
+  }
   const normalized = {
     kind,
     baseUrl: target.value,
     ...optional(config, "apiKeyEnv", (entry) =>
       envReference(entry, `${path}.apiKeyEnv`),
     ),
+    ...(protocol === null ? {} : { protocol }),
   };
-  for (const name of ["timeoutMs", "maxResponseBytes", "maxRequestBytes"]) {
+  const limits = protocol === null
+    ? {
+        timeoutMs: [1, 2 * 1024 * 1024],
+        maxResponseBytes: [1, 2 * 1024 * 1024],
+        maxRequestBytes: [1, 2 * 1024 * 1024],
+      }
+    : protocol === "responses"
+      ? {
+          timeoutMs: [1_000, 3_600_000],
+          maxResponseBytes: [1_024, 1024 * 1024],
+          maxRequestBytes: [1_024, 1024 * 1024],
+        }
+      : {
+          timeoutMs: [10, 120_000],
+          maxResponseBytes: [1_024, 1024 * 1024],
+          maxRequestBytes: [1_024, 2 * 1024 * 1024],
+        };
+  for (const [name, [minimum, maximum]] of Object.entries(limits)) {
     Object.assign(
       normalized,
       optional(config, name, (entry) =>
-        integer(entry, `${path}.${name}`, 1, 2 * 1024 * 1024),
+        integer(entry, `${path}.${name}`, minimum, maximum),
       ),
     );
   }
@@ -1227,6 +1261,21 @@ function setDirection(before, after) {
 
 function authorityDirection(change) {
   const { path, before, after } = change;
+  const providerIdentity =
+    path.startsWith("brainProviders.") &&
+    (
+      /\.(?:kind|baseUrl|apiKeyEnv|protocol|remote)$/.test(
+        path,
+      ) ||
+      before?.kind !== undefined ||
+      after?.kind !== undefined
+    );
+  if (providerIdentity) {
+    return {
+      tightening: before !== undefined,
+      expansion: after !== undefined,
+    };
+  }
   if (
     path === "brain.provider" ||
     /\.(?:brain|localBrain)\.provider$/.test(path)
@@ -1284,6 +1333,7 @@ function requiresRestart(path) {
   return (
     path === "port" ||
     path === "githubLogin" ||
+    path.startsWith("brainProviders.") ||
     path.startsWith("codeExecutor.") ||
     path.startsWith("changePackages.") ||
     path === "githubActions.enabled" ||

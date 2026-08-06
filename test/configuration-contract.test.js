@@ -214,6 +214,100 @@ test("legacy brains stay on Ollama while routed role and memory brains accept re
   assert.equal(normalized.memory.answering.brain.provider, "remote-smart");
 });
 
+test("Responses providers use explicit credential references and stricter request limits", () => {
+  const value = document();
+  value.brainProviders["company.codex_api"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "responses",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  value.employees.roles.developer.brain.provider = "company.codex_api";
+  const normalized = normalizeConfigurationDocument(value);
+
+  assert.deepEqual(
+    normalized.brainProviders["company.codex_api"],
+    value.brainProviders["company.codex_api"],
+  );
+  assert.equal(
+    normalized.employees.roles.developer.brain.provider,
+    "company.codex_api",
+  );
+
+  for (const mutate of [
+    (provider) => { provider.remote = false; },
+    (provider) => { delete provider.apiKeyEnv; },
+    (provider) => { provider.protocol = "agents"; },
+    (provider) => { provider.maxRequestBytes = 1024 * 1024 + 1; },
+    (provider) => { provider.contextTokens = 16_384; },
+  ]) {
+    const invalid = structuredClone(value);
+    mutate(invalid.brainProviders["company.codex_api"]);
+    assertInvalid(invalid);
+  }
+
+  const ollamaProtocol = document();
+  ollamaProtocol.brainProviders.ollama.protocol = "responses";
+  assertInvalid(ollamaProtocol);
+});
+
+test("providers without protocol preserve legacy numeric configuration ranges", () => {
+  const value = document();
+  value.brainProviders["legacy.remote"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://legacy.example/v1",
+    apiKeyEnv: "LEGACY_MODEL_TOKEN",
+    remote: true,
+    timeoutMs: 180_000,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxRequestBytes: 1,
+  };
+
+  const normalized = normalizeConfigurationDocument(value);
+  assert.deepEqual(
+    normalized.brainProviders["legacy.remote"],
+    value.brainProviders["legacy.remote"],
+  );
+
+  const explicitChat = structuredClone(value);
+  explicitChat.brainProviders["legacy.remote"].protocol = "chat-completions";
+  assertInvalid(explicitChat);
+});
+
+test("provider protocol changes require new authority and restart", () => {
+  const before = document();
+  before.brainProviders["company.codex_api"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "chat-completions",
+    remote: true,
+    timeoutMs: 120_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  before.employees.roles.developer.brain.provider = "company.codex_api";
+  const after = structuredClone(before);
+  after.brainProviders["company.codex_api"].protocol = "responses";
+
+  const impact = configurationDocumentImpact(before, after);
+
+  assert.deepEqual(impact.security_tightening, [
+    "brainProviders.company.codex_api.protocol",
+  ]);
+  assert.deepEqual(impact.authority_expansion, [
+    "brainProviders.company.codex_api.protocol",
+  ]);
+  assert.deepEqual(impact.benign_claim_change, []);
+  assert.deepEqual(impact.restart_required, [
+    "brainProviders.company.codex_api.protocol",
+  ]);
+});
+
 test("impact classifies security tightening and authority expansion directionally", () => {
   const permitted = document();
   permitted.employees.roles.developer.brain.remoteData.code = true;
@@ -256,12 +350,15 @@ test("impact treats provider identity and repository scope changes as authority 
     "employees.roles.developer.brain.provider",
   ]);
   assert.deepEqual(expanded.authority_expansion, [
+    "brainProviders.remote-smart",
     "employees.roles.developer.brain.provider",
     "trackedRepositories",
   ]);
+  assert.deepEqual(expanded.restart_required, ["brainProviders.remote-smart"]);
 
   const tightened = configurationDocumentImpact(expandedDocument, document());
   assert.deepEqual(tightened.security_tightening, [
+    "brainProviders.remote-smart",
     "employees.roles.developer.brain.provider",
     "trackedRepositories",
   ]);

@@ -1,6 +1,6 @@
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
-const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
 

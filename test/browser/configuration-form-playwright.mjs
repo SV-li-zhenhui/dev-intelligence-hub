@@ -536,6 +536,62 @@ try {
     /已替换/,
   );
 
+  const responsesTemplate = await openDetailsBySummary(
+    page,
+    "新增Responses / Codex API 大脑",
+  );
+  const responsesTemplateKey = responsesTemplate.locator(
+    "[data-configuration-template-key]",
+  );
+  await responsesTemplateKey.fill("codex.fixture");
+  assert.equal(
+    await templateField(
+      responsesTemplate,
+      ["brainProviders", "codex-api", "baseUrl"],
+    ).inputValue(),
+    "https://api.openai.com/v1",
+  );
+  assert.equal(
+    await templateField(
+      responsesTemplate,
+      ["brainProviders", "codex-api", "protocol"],
+    ).inputValue(),
+    "responses",
+  );
+  await responsesTemplate
+    .getByRole("button", { name: "新增Responses / Codex API 大脑" })
+    .click();
+  const responsesProviderCard = attributeLocator(
+    page,
+    "data-configuration-entry",
+    ["brainProviders", "codex.fixture"],
+  );
+  assert.equal(
+    await field(page, ["brainProviders", "codex.fixture", "kind"]).inputValue(),
+    "openai-compatible",
+  );
+  assert.equal(
+    await field(page, ["brainProviders", "codex.fixture", "kind"]).getAttribute(
+      "readonly",
+    ),
+    "",
+  );
+  assert.equal(
+    await field(page, ["brainProviders", "codex.fixture", "protocol"])
+      .inputValue(),
+    "responses",
+  );
+  assert.equal(
+    await responsesProviderCard.locator(
+      `[data-configuration-field='${JSON.stringify([
+        "brainProviders",
+        "codex.fixture",
+        "contextTokens",
+      ])}']`,
+    ).count(),
+    0,
+  );
+
   await field(page, ["employees", "roles", "developer", "brain", "provider"])
     .selectOption("remote.fixture");
   await field(page, ["memory", "answering", "brain", "provider"])
@@ -688,6 +744,16 @@ try {
     apiKeyEnv: "MYDASHBOARD_MODEL_API_KEY",
     remote: true,
     timeoutMs: 120_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  expectedConfiguration.brainProviders["codex.fixture"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "responses",
+    remote: true,
+    timeoutMs: 300_000,
     maxResponseBytes: 131_072,
     maxRequestBytes: 262_144,
   };

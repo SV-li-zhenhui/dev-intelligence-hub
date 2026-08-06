@@ -240,9 +240,9 @@ const INTEGER_FIELDS = deepFreeze([
   { pattern: ["memory", "answering", "maximumContextBytes"], minimum: 1_024, maximum: 128 * 1_024 },
   { pattern: ["memory", "answering", "maximumConcurrent"], minimum: 1, maximum: 16 },
   { pattern: ["brainProviders", "*", "contextTokens"], minimum: 1_024, maximum: 128 * 1_024 },
-  { pattern: ["brainProviders", "*", "timeoutMs"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
-  { pattern: ["brainProviders", "*", "maxResponseBytes"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
-  { pattern: ["brainProviders", "*", "maxRequestBytes"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
+  { pattern: ["brainProviders", "*", "timeoutMs"], minimum: 1, maximum: 3_600_000 },
+  { pattern: ["brainProviders", "*", "maxResponseBytes"], minimum: 1, maximum: 2 * 1024 * 1024 },
+  { pattern: ["brainProviders", "*", "maxRequestBytes"], minimum: 1, maximum: 2 * 1024 * 1024 },
   ...["timeoutMs", "numCtx", "contextTokens", "maxAssessmentsPerRefresh"].map(
     (name) => ({ pattern: ["brain", name], minimum: 1, maximum: 2 ** 31 - 1 }),
   ),
@@ -279,7 +279,8 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["**", "remoteData", "memory"], control: "checkbox", kind: "boolean" },
   { pattern: ["brainProviders", "*", "apiKeyEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
   { pattern: ["githubActions", "tokenEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
-  { pattern: ["brainProviders", "*", "kind"], control: "select", kind: "text", options: ["ollama", "openai-compatible"] },
+  { pattern: ["brainProviders", "*", "kind"], control: "text", kind: "text", readOnly: true },
+  { pattern: ["brainProviders", "*", "protocol"], control: "select", kind: "text", options: ["chat-completions", "responses"] },
   { pattern: ["codeExecutor", "profiles", "*", "kind"], control: "select", kind: "text", options: ["node-test"] },
   { pattern: ["workflowRouting", "rules", "#", "targets", "#", "type"], control: "select", kind: "text", options: ["role", "person", "node"] },
   { pattern: ["workflowRouting", "rules", "#", "onMatch"], control: "select", kind: "text", options: ["stop", "continue"] },
@@ -344,7 +345,29 @@ const FIELD_RULES = deepFreeze([
 
 const COLLECTIONS = deepFreeze([
   { pattern: ["trackedRepositories"], kind: "array", label: "跟踪仓库", template: "repository", maximum: 1_000, uniqueBy: "value" },
-  { pattern: ["brainProviders"], kind: "map", label: "大脑 Provider", template: "provider", keyTemplate: "new-provider", maximum: 100, keyFormat: "safe-id" },
+  {
+    pattern: ["brainProviders"],
+    kind: "map",
+    label: "大脑 Provider",
+    template: "provider",
+    keyTemplate: "new-provider",
+    additionalTemplates: [
+      {
+        id: "openai-responses",
+        label: "Responses / Codex API 大脑",
+        template: "provider-openai-responses",
+        keyTemplate: "codex-api",
+      },
+      {
+        id: "ollama",
+        label: "Ollama 大脑",
+        template: "provider-ollama",
+        keyTemplate: "new-ollama",
+      },
+    ],
+    maximum: 100,
+    keyFormat: "safe-id",
+  },
   { pattern: ["employees", "roles"], kind: "map", label: "岗位", template: "role", keyTemplate: "new-role", maximum: 256, keyFormat: "role-id" },
   { pattern: ["employees", "roles", "*", "permissions", "allowedIntents"], kind: "array", label: "允许意图", template: "intent", minimum: 1, maximum: 8, uniqueBy: "value" },
   { pattern: ["employees", "prReviewer", "retryMinutes"], kind: "array", label: "重试间隔", template: "retry-minute", minimum: 1, maximum: 32, uniqueBy: "value" },
@@ -383,6 +406,25 @@ const TEMPLATES = deepFreeze({
     timeoutMs: 120_000,
     maxResponseBytes: 131_072,
     maxRequestBytes: 262_144,
+  },
+  "provider-openai-responses": {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "responses",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  },
+  "provider-ollama": {
+    kind: "ollama",
+    baseUrl: "http://127.0.0.1:11434",
+    remote: false,
+    timeoutMs: 120_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+    contextTokens: 8_192,
   },
   role: {
     name: "新岗位",
@@ -580,17 +622,26 @@ function cloneTemplate(value) {
   );
 }
 
-export function configurationStructureTemplate(path) {
+export function configurationStructureTemplate(path, variant = null) {
   const normalized = normalizePath(path);
   const descriptor =
     matchingRule(COLLECTIONS, normalized) || matchingRule(SLOTS, normalized);
   if (!descriptor) {
     throw new TypeError("configuration path is not in the structure operation allowlist");
   }
+  if (variant !== null && typeof variant !== "string") {
+    throw new TypeError("configuration template variant is invalid");
+  }
+  const selected = variant === null
+    ? descriptor
+    : descriptor.additionalTemplates?.find((entry) => entry.id === variant);
+  if (!selected) {
+    throw new TypeError("configuration template variant is unavailable");
+  }
   return deepFreeze({
     kind: descriptor.kind || "slot",
-    ...(descriptor.keyTemplate ? { key: descriptor.keyTemplate } : {}),
-    value: cloneTemplate(TEMPLATES[descriptor.template]),
+    ...(selected.keyTemplate ? { key: selected.keyTemplate } : {}),
+    value: cloneTemplate(TEMPLATES[selected.template]),
   });
 }
 

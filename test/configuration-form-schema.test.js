@@ -118,11 +118,13 @@ test("every supported array and mapping exposes add, remove, replace and a safe 
 });
 
 test("schema identifies enum, numeric, boolean and environment-reference controls centrally", () => {
-  assert.deepEqual(
-    configurationFieldDescriptor(["brainProviders", "ollama", "kind"], "ollama")
-      .options,
-    ["ollama", "openai-compatible"],
+  const providerKind = configurationFieldDescriptor(
+    ["brainProviders", "ollama", "kind"],
+    "ollama",
   );
+  assert.equal(providerKind.control, "text");
+  assert.equal(providerKind.readOnly, true);
+  assert.equal(Object.hasOwn(providerKind, "options"), false);
   assert.deepEqual(
     configurationFieldDescriptor(
       ["workflowRouting", "rules", 0, "targets", 0, "type"],
@@ -137,6 +139,18 @@ test("schema identifies enum, numeric, boolean and environment-reference control
   );
   assert.equal(configurationFieldDescriptor(["port"], 4173).minimum, 1);
   assert.equal(configurationFieldDescriptor(["port"], 4173).maximum, 65_535);
+  const providerTimeout = configurationFieldDescriptor(
+    ["brainProviders", "legacy", "timeoutMs"],
+    180_000,
+  );
+  assert.equal(providerTimeout.minimum, 1);
+  assert.equal(providerTimeout.maximum, 3_600_000);
+  const providerResponseLimit = configurationFieldDescriptor(
+    ["brainProviders", "legacy", "maxResponseBytes"],
+    2 * 1024 * 1024,
+  );
+  assert.equal(providerResponseLimit.minimum, 1);
+  assert.equal(providerResponseLimit.maximum, 2 * 1024 * 1024);
   assert.equal(
     configurationFieldDescriptor(["memory", "enabled"], true).control,
     "checkbox",
@@ -171,6 +185,46 @@ test("new provider template is a complete openai-compatible provider", () => {
   assert.equal(template.apiKeyEnv, "MYDASHBOARD_MODEL_API_KEY");
   assert.equal(template.remote, true);
   assert.equal(Object.hasOwn(template, "contextTokens"), false);
+});
+
+test("provider variants expose complete Responses and Ollama forms without stale fields", () => {
+  assert.equal(
+    configurationFieldDescriptor(["brainProviders", "codex", "kind"], "openai-compatible")
+      .readOnly,
+    true,
+  );
+  const responses = configurationStructureTemplate(
+    ["brainProviders"],
+    "openai-responses",
+  );
+  assert.equal(responses.key, "codex-api");
+  assert.deepEqual(responses.value, {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "responses",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  });
+  assert.equal(Object.hasOwn(responses.value, "contextTokens"), false);
+  assert.deepEqual(
+    configurationFieldDescriptor(
+      ["brainProviders", "codex", "protocol"],
+      "responses",
+    ).options,
+    ["chat-completions", "responses"],
+  );
+
+  const ollama = configurationStructureTemplate(["brainProviders"], "ollama");
+  assert.equal(ollama.value.kind, "ollama");
+  assert.equal(ollama.value.baseUrl, "http://127.0.0.1:11434");
+  assert.equal(Object.hasOwn(ollama.value, "executable"), false);
+  assert.throws(
+    () => configurationStructureTemplate(["brainProviders"], "missing"),
+    /variant is unavailable/i,
+  );
 });
 
 test("schema public path boundary rejects accessors, prototypes and oversized paths", () => {

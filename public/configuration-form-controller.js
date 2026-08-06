@@ -242,7 +242,10 @@ function templateFields(container) {
 
 function templateSeed(state, button, path) {
   if (button.dataset.configurationOperation !== "replace") {
-    return configurationStructureTemplate(path).value;
+    return configurationStructureTemplate(
+      path,
+      button.dataset.configurationTemplateVariant ?? null,
+    ).value;
   }
   if (button.dataset.configurationKey !== undefined) {
     return valueAtPath(materializedConfiguration(state), [

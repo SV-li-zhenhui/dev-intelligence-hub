@@ -27,6 +27,21 @@ function configurationWithCredentialReferences() {
   return configuration;
 }
 
+function configurationWithResponsesProvider() {
+  const configuration = configurationWithCredentialReferences();
+  configuration.brainProviders.codex = {
+    kind: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENAI_API_KEY",
+    protocol: "responses",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  return configuration;
+}
+
 function configurationWithScalarConditions() {
   const configuration = configurationWithCredentialReferences();
   configuration.workflowRouting.rules[0].fallback = false;
@@ -244,6 +259,45 @@ test("every rendered collection has named add, remove and replace controls", () 
   assert.doesNotMatch(markup, /aria-label=""/);
 });
 
+test("provider creation offers a complete Responses form instead of raw JSON", () => {
+  const markup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(configurationWithCredentialReferences()),
+  });
+  const responsesTemplate = markup.match(
+    /<details[^>]+data-configuration-template-variant="openai-responses"[\s\S]*?<\/details>/,
+  )?.[0];
+
+  assert.ok(responsesTemplate);
+  assert.match(responsesTemplate, /<summary>新增Responses \/ Codex API 大脑<\/summary>/);
+  assert.match(responsesTemplate, /value="codex-api" data-configuration-template-key/);
+  for (const field of [
+    "kind",
+    "baseUrl",
+    "apiKeyEnv",
+    "protocol",
+    "remote",
+    "timeoutMs",
+    "maxResponseBytes",
+    "maxRequestBytes",
+  ]) {
+    assert.match(
+      responsesTemplate,
+      new RegExp(`data-configuration-template-field="[^\"]*${field}[^\"]*"`),
+      field,
+    );
+  }
+  assert.doesNotMatch(responsesTemplate, /contextTokens/);
+  assert.match(responsesTemplate, /data-configuration-template-variant="openai-responses"/);
+  const kindControl = templateControlForPath(responsesTemplate, [
+    "brainProviders",
+    "codex-api",
+    "kind",
+  ]);
+  assert.match(kindControl, / readonly(?:\s|>)/);
+  assert.match(kindControl, / aria-readonly="true"/);
+  assert.match(responsesTemplate, /<option value="responses" selected>/);
+});
+
 test("invalid fields expose inline accessible errors while submit and status remain available", () => {
   let state = createConfigurationFormState(configurationWithCredentialReferences());
   state = setConfigurationFormField(state, {
@@ -261,19 +315,32 @@ test("invalid fields expose inline accessible errors while submit and status rem
   assert.match(markup, /请输入整数/);
 });
 
-test("invalid select edits remain visible instead of bouncing to the persisted option", () => {
-  let state = createConfigurationFormState(configurationWithCredentialReferences());
-  state = setConfigurationFormField(state, {
-    path: ["brainProviders", "ollama", "kind"],
-    kind: "text",
-    rawValue: "future-provider",
-  });
+test("existing provider identity controls are readonly in markup and form edits", () => {
+  const state = createConfigurationFormState(configurationWithResponsesProvider());
   const markup = renderConfigurationSettingsSkeleton({ state });
+  const readonlyPaths = [
+    ["brainProviders", "ollama", "kind"],
+    ["brainProviders", "codex", "kind"],
+  ];
 
-  assert.match(
-    markup,
-    /<option value="future-provider" selected data-configuration-invalid-option>无效：future-provider<\/option>/,
-  );
+  for (const path of readonlyPaths) {
+    const control = controlForPath(markup, path);
+    assert.match(control, / readonly(?:\s|>)/, path.join("."));
+    assert.match(control, / aria-readonly="true"/, path.join("."));
+    assert.throws(
+      () =>
+        setConfigurationFormField(state, {
+          path,
+          kind: "text",
+          rawValue: "attempted-change",
+        }),
+      (error) => {
+        assert.equal(error.code, "INVALID_FORM_EDIT");
+        assert.equal(error.path, path.join("."));
+        return true;
+      },
+    );
+  }
 });
 
 test("scalar condition controls declare lossless controller edit kinds", () => {
@@ -387,6 +454,15 @@ function controlForPath(markup, path) {
     new RegExp(`<(?:input|select)[^>]*data-configuration-field="${encoded}"[^>]*>`),
   );
   assert.ok(match, `missing control for ${path.join(".")}`);
+  return match[0];
+}
+
+function templateControlForPath(markup, path) {
+  const encoded = escapeRegExp(configurationFormPathAttribute(path.map(String)));
+  const match = markup.match(
+    new RegExp(`<input[^>]*data-configuration-template-field="${encoded}"[^>]*>`),
+  );
+  assert.ok(match, `missing template control for ${path.join(".")}`);
   return match[0];
 }
 
