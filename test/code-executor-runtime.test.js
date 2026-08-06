@@ -86,6 +86,7 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
     workspaces: [
       {
         id: "dashboard",
+        capabilities: ["directory_snapshot"],
         writablePaths: ["src"],
         requiredProfiles: [
           {

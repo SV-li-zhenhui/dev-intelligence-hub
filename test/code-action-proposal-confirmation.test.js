@@ -12,6 +12,8 @@ import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 
 const PROFILE_DIGEST = "a".repeat(64);
 const BRAIN_DIGEST = "b".repeat(64);
+const HEAD_REF_OID = "1".repeat(40);
+const INPUT_DIGEST = "e".repeat(64);
 
 function event(overrides = {}) {
   return normalizeWorkflowEvent({
@@ -26,7 +28,7 @@ function event(overrides = {}) {
     },
     payload: {
       title: "Fix race",
-      headRefOid: "abc123",
+      headRefOid: HEAD_REF_OID,
       state: "open",
       changedFields: ["headRefOid"],
     },
@@ -34,8 +36,26 @@ function event(overrides = {}) {
   });
 }
 
+function inputBindingFor(trustedEvent, rootItemId) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: trustedEvent.subject.repository,
+    pullRequestNumber: trustedEvent.subject.number,
+    rootItemId,
+    workKey: `pull-request-${"f".repeat(64)}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: trustedEvent.payload.headRefOid,
+    eventId: trustedEvent.eventId,
+    eventDigest: trustedEvent.contentDigest,
+    inputDigest: INPUT_DIGEST,
+  };
+}
+
 function proposal(operation = "modify", { roleId = "developer" } = {}) {
   const trustedEvent = event();
+  const workItemId = `work-item-${"d".repeat(64)}`;
   const bound = createWorkIntentPolicy({
     version: 7,
     codeActionRoles: ["developer", "tester"],
@@ -43,9 +63,10 @@ function proposal(operation = "modify", { roleId = "developer" } = {}) {
   }).bind({
     context: {
       assignmentId: `workflow-assignment-${"c".repeat(64)}`,
-      workItemId: `work-item-${"d".repeat(64)}`,
+      workItemId,
       roleId,
       event: trustedEvent,
+      inputBinding: inputBindingFor(trustedEvent, workItemId),
     },
     intent: {
       schemaVersion: 1,
@@ -98,7 +119,16 @@ function grantFor(value, overrides = {}) {
     ...value.binding.subject,
     ...(overrides.subject ?? {}),
   };
+  const source = { ...value.source, ...(overrides.source ?? {}) };
+  const inputBinding = {
+    ...value.binding.inputBinding,
+    repository,
+    pullRequestNumber: subject.number,
+    eventId: source.eventId,
+    ...(overrides.inputBinding ?? {}),
+  };
   return createCodeJobGrant({
+    schemaVersion: 2,
     proposalId: overrides.proposalId ?? value.proposalId,
     contentDigest: overrides.contentDigest ?? value.contentDigest,
     policyVersion: overrides.policyVersion ?? value.policyVersion,
@@ -106,10 +136,11 @@ function grantFor(value, overrides = {}) {
       ...value.requestedBy,
       ...(overrides.requestedBy ?? {}),
     },
-    source: { ...value.source, ...(overrides.source ?? {}) },
+    source,
     subject,
     repository,
     workspaceId: overrides.workspaceId ?? value.binding.workspaceId,
+    inputBinding,
     workspaceAuthorityDigest:
       overrides.workspaceAuthorityDigest ?? "9".repeat(64),
     operation,
@@ -184,6 +215,12 @@ test("a policy-bound code proposal becomes one exact local job creation approval
     version: value.contentDigest,
   });
   assert.deepEqual(plan.action, { type: "create_code_job", grant });
+  assert.equal(plan.action.grant.schemaVersion, 2);
+  assert.equal(plan.action.grant.inputBinding.headRefOid, HEAD_REF_OID);
+  assert.deepEqual(
+    plan.action.grant.inputBinding,
+    value.binding.inputBinding,
+  );
   assert.deepEqual(plan.display.payload, {
     actor: plan.actor,
     target: plan.target,
@@ -370,6 +407,9 @@ test("proposal and grant must agree on every execution-relevant field", () => {
     grantFor(value, {
       repository: "other/repo",
       subject: { repository: "other/repo" },
+    }),
+    grantFor(value, {
+      inputBinding: { headRefOid: "2".repeat(40) },
     }),
     grantFor(value, { workspaceId: "other-workspace" }),
     grantFor(value, { operation: "inspect" }),

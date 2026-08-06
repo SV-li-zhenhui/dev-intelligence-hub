@@ -5,6 +5,7 @@ import {
 import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeMemoryRecord } from "./memory-record.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_JOB_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -337,8 +338,9 @@ function terminalSummary(job) {
 }
 
 function safeSnapshot(job, kind) {
+  const currentGrant = Object.hasOwn(job.grant, "inputBinding");
   return {
-    schemaVersion: 1,
+    schemaVersion: currentGrant ? 2 : 1,
     jobId: job.jobId,
     jobRevision: job.revision,
     sourceRecordDigest: job.recordDigest,
@@ -347,6 +349,7 @@ function safeSnapshot(job, kind) {
     roleId: job.grant.requestedBy.roleId,
     repository: job.grant.repository,
     subjectNumber: job.grant.subject.number,
+    ...(currentGrant ? { inputBinding: job.grant.inputBinding } : {}),
     operation: job.grant.operation,
     turn: job.execution.turn,
     workspaceRevision: job.execution.workspaceRevision,
@@ -372,6 +375,9 @@ const TITLES = Object.freeze({
 
 function memoryEvidence(snapshot) {
   const values = [`source-record:${snapshot.sourceRecordDigest}`];
+  if (snapshot.inputBinding !== undefined && snapshot.inputBinding !== null) {
+    values.push(`pr-head:${snapshot.inputBinding.headRefOid}`);
+  }
   if (snapshot.latestObservation !== null) {
     values.push(`observation-detail:${snapshot.latestObservation.detailDigest}`);
   }
@@ -599,6 +605,9 @@ function normalizeTerminalSummary(value) {
 }
 
 function normalizeSnapshot(value) {
+  const rawFields = dataFieldsOrNull(value);
+  const schemaVersion = rawFields?.get("schemaVersion");
+  const current = schemaVersion === 2;
   const fields = exact(
     value,
     [
@@ -611,6 +620,7 @@ function normalizeSnapshot(value) {
       "roleId",
       "repository",
       "subjectNumber",
+      ...(current ? ["inputBinding"] : []),
       "operation",
       "turn",
       "workspaceRevision",
@@ -621,7 +631,7 @@ function normalizeSnapshot(value) {
     ],
     "memoryRecord.content",
   );
-  if (fields.get("schemaVersion") !== 1) {
+  if (![1, 2].includes(fields.get("schemaVersion"))) {
     throw invalid("memoryRecord.content.schemaVersion 无效");
   }
   const kind = fields.get("kind");
@@ -636,8 +646,22 @@ function normalizeSnapshot(value) {
   if ((TERMINAL_KINDS.has(status) && terminal?.kind !== status) || (!TERMINAL_KINDS.has(status) && terminal !== null)) {
     throw invalid("memoryRecord.content.terminal 与状态不一致");
   }
-  return {
-    schemaVersion: 1,
+  let inputBinding;
+  if (current) {
+    if (fields.get("inputBinding") === null) {
+      inputBinding = null;
+    } else {
+      try {
+        inputBinding = normalizePullRequestExecutionBinding(
+          fields.get("inputBinding"),
+        );
+      } catch {
+        throw invalid("memoryRecord.content.inputBinding 无效");
+      }
+    }
+  }
+  const normalized = {
+    schemaVersion: current ? 2 : 1,
     jobId: text(fields.get("jobId"), "memoryRecord.content.jobId", 64, SAFE_JOB_ID),
     jobRevision: integer(fields.get("jobRevision"), "memoryRecord.content.jobRevision", 1),
     sourceRecordDigest: digest(fields.get("sourceRecordDigest"), "memoryRecord.content.sourceRecordDigest"),
@@ -646,6 +670,7 @@ function normalizeSnapshot(value) {
     roleId: text(fields.get("roleId"), "memoryRecord.content.roleId", 128, SAFE_TOKEN),
     repository: text(fields.get("repository"), "memoryRecord.content.repository", 256),
     subjectNumber: integer(fields.get("subjectNumber"), "memoryRecord.content.subjectNumber", 1),
+    ...(current ? { inputBinding } : {}),
     operation,
     turn: integer(fields.get("turn"), "memoryRecord.content.turn"),
     workspaceRevision: optionalDigest(fields.get("workspaceRevision"), "memoryRecord.content.workspaceRevision"),
@@ -654,6 +679,15 @@ function normalizeSnapshot(value) {
     uncertainty: normalizeUncertaintySummary(fields.get("uncertainty")),
     terminal,
   };
+  if (
+    inputBinding !== undefined &&
+    inputBinding !== null &&
+    (inputBinding.repository !== normalized.repository ||
+      inputBinding.pullRequestNumber !== normalized.subjectNumber)
+  ) {
+    throw invalid("memoryRecord.content.inputBinding 与任务不匹配");
+  }
+  return normalized;
 }
 
 function snapshotFromRecord(record) {

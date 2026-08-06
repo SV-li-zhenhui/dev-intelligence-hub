@@ -596,6 +596,7 @@ export function renderCodeJobDetail(state, { now = Date.now() } = {}) {
       <dt>请求岗位</dt><dd>${escapeWorkHtml(requester.roleId || "未知")}</dd>
       <dt>关联工作项</dt><dd>${escapeWorkHtml(requester.workItemId || "未绑定")}</dd>
       <dt>工作区</dt><dd>${escapeWorkHtml(job.workspaceId || "未知")}</dd>
+      ${job.inputBinding ? `<dt>PR 输入</dt><dd>${escapeWorkHtml(job.inputBinding.repository)} #${escapeWorkHtml(job.inputBinding.pullRequestNumber)}</dd><dt>精确 Head</dt><dd><code>${escapeWorkHtml(job.inputBinding.headRefOid)}</code></dd>` : ""}
       <dt>操作</dt><dd>${escapeWorkHtml(job.operation || "未知")}</dd>
       <dt>更新时间</dt><dd>${escapeWorkHtml(job.updatedAt ? new Date(job.updatedAt).toLocaleString("zh-CN") : "未知")}</dd>
     </dl>

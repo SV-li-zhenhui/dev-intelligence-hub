@@ -6,6 +6,10 @@ import {
   configurationDocumentDigest,
   normalizeConfigurationDocument,
 } from "../src/domain/configuration-contract.js";
+import {
+  createCodeJobGrant,
+  normalizeCodeJobGrant,
+} from "../src/domain/code-job-contract.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
@@ -88,6 +92,7 @@ function executorAuthority() {
     workspaces: [
       {
         id: "dashboard",
+        capabilities: ["git_head_snapshot"],
         writablePaths: ["src", "test"],
         requiredProfiles: [
           { id: "node-tests", configDigest: "a".repeat(64) },
@@ -96,6 +101,7 @@ function executorAuthority() {
       },
       {
         id: "auxiliary",
+        capabilities: ["git_head_snapshot"],
         writablePaths: ["src"],
         requiredProfiles: [
           { id: "auxiliary-tests", configDigest: "b".repeat(64) },
@@ -193,8 +199,14 @@ function legacyGrant(configurations) {
       ]),
     ),
     brainProviders: current.brainProviders,
+    inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
   });
-  return factory.create(proposal(current)).grant;
+  const currentGrant = factory.create(proposal(current)).grant;
+  const legacyContent = structuredClone(currentGrant);
+  delete legacyContent.schemaVersion;
+  delete legacyContent.inputBinding;
+  delete legacyContent.grantDigest;
+  return createCodeJobGrant(legacyContent);
 }
 
 function proposal(config) {
@@ -208,9 +220,28 @@ function proposal(config) {
       repository: "acme/repo",
       number: 42,
     },
-    payload: { title: "Fix race", headRefOid: "abc123", state: "open" },
+    payload: {
+      title: "Fix race",
+      headRefOid: "a".repeat(40),
+      state: "open",
+    },
   });
   const policy = config.workCoordination.policy;
+  const workItemId = `work-item-${"d".repeat(64)}`;
+  const inputBinding = {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: event.subject.repository,
+    pullRequestNumber: event.subject.number,
+    rootItemId: workItemId,
+    workKey: `pr-work-${"b".repeat(64)}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: event.payload.headRefOid,
+    eventId: event.eventId,
+    eventDigest: event.contentDigest,
+    inputDigest: "c".repeat(64),
+  };
   const bound = createWorkIntentPolicy({
     version: policy.version,
     codeActionRoles: policy.codeActionRoles,
@@ -219,9 +250,10 @@ function proposal(config) {
   }).bind({
     context: {
       assignmentId: `workflow-assignment-${"c".repeat(64)}`,
-      workItemId: `work-item-${"d".repeat(64)}`,
+      workItemId,
       roleId: "developer",
       event,
+      inputBinding,
     },
     intent: {
       schemaVersion: 1,
@@ -245,10 +277,19 @@ function proposal(config) {
   });
 }
 
+function acceptingInputAuthorityVerifier() {
+  return {
+    verify(binding) {
+      return structuredClone(binding);
+    },
+  };
+}
+
 function fixture({
   brainDirectoryFactory,
   actionAdmissionGate,
   grantFactoryFactory,
+  inputAuthorityVerifier = acceptingInputAuthorityVerifier(),
 } = {}) {
   const startup = configuration();
   let current = active(startup);
@@ -274,6 +315,7 @@ function fixture({
     executorAuthority: executorAuthority(),
     startupConfiguration: startup,
     actionAdmissionGate: admissionGate,
+    inputAuthorityVerifier,
     ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
     ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
   });
@@ -306,6 +348,7 @@ function fixture({
         executorAuthority: executorAuthority(),
         startupConfiguration: current.configuration,
         actionAdmissionGate: restartGate,
+        inputAuthorityVerifier,
         ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
         ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
       });
@@ -347,7 +390,7 @@ test("malformed grants fail before reading or constructing authority history", a
   assert.equal(factoryCreations, 0);
 });
 
-test("a legacy global-digest grant remains valid after a same-config upgrade", async () => {
+test("a legacy global-digest grant remains readable but cannot authorize execution", async () => {
   const beforeUpgrade = configuration();
   const sealed = legacyGrant([beforeUpgrade]);
   let providerCalls = 0;
@@ -361,21 +404,33 @@ test("a legacy global-digest grant remains valid after a same-config upgrade", a
     }),
   });
 
-  assert.deepEqual(await context.authority.verify(sealed), sealed);
-  await context.authority.decide(
-    { roleId: "developer" },
-    {
-      beforeGenerate: () => context.authority.verify(sealed),
-      brainDigest: sealed.brainDigest,
-    },
+  assert.deepEqual(normalizeCodeJobGrant(sealed), sealed);
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
   );
-  assert.equal(providerCalls, 1);
+  await assert.rejects(
+    context.authority.decide(
+      { roleId: "developer" },
+      {
+        beforeGenerate: () => context.authority.verify(sealed),
+        brainDigest: sealed.brainDigest,
+      },
+    ),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(providerCalls, 0);
 });
 
-test("a legacy grant keeps conservative global invalidation semantics", async () => {
+test("legacy grants remain readable across history but never regain execution authority", async () => {
   const beforeUpgrade = configuration();
   const sealed = legacyGrant([beforeUpgrade]);
   const context = fixture();
+  assert.deepEqual(normalizeCodeJobGrant(sealed), sealed);
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
   const changed = structuredClone(context.startup);
   changed.employees.roles.tester.permissions.allowedIntents.push(
     "propose_github_review",
@@ -393,21 +448,13 @@ test("a legacy grant keeps conservative global invalidation semantics", async ()
   );
 });
 
-test("legacy verification scans a long benign history once", async () => {
+test("legacy rejection scans a long benign history once", async () => {
   let factoryCreations = 0;
-  let providerCalls = 0;
   const context = fixture({
     grantFactoryFactory: (options) => {
       factoryCreations += 1;
       return new CodeJobGrantFactory(options);
     },
-    brainDirectoryFactory: () => ({
-      async decide(_value, authorization) {
-        await authorization.beforeGenerate();
-        providerCalls += 1;
-        return { action: { type: "complete" } };
-      },
-    }),
   });
   const sealed = legacyGrant([context.startup]);
   activateHistory(context, 256, (configurationValue) => {
@@ -416,19 +463,19 @@ test("legacy verification scans a long benign history once", async () => {
   });
 
   const readsBefore = context.snapshotReads;
-  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  assert.deepEqual(normalizeCodeJobGrant(sealed), sealed);
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
   assert.equal(context.snapshotReads - readsBefore, 1);
   assert.ok(factoryCreations <= 2, `created ${factoryCreations} grant factories`);
-  await context.authority.decide(
-    { roleId: "developer" },
-    {
-      beforeGenerate: () => context.authority.verify(sealed),
-      brainDigest: sealed.brainDigest,
-    },
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
   );
   assert.equal(context.snapshotReads - readsBefore, 1);
   assert.ok(factoryCreations <= 4, `created ${factoryCreations} grant factories`);
-  assert.equal(providerCalls, 1);
 });
 
 test("a global executor limit expansion invalidates a scoped grant after restart", async () => {
@@ -464,7 +511,10 @@ test("an unrelated executor workspace change preserves a scoped grant after rest
 
 test("current Active creates grants and security expansion invalidates old grants", async () => {
   const context = fixture();
-  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const currentProposal = proposal(context.startup);
+  const sealed = (await context.authority.create(currentProposal)).grant;
+  assert.equal(sealed.schemaVersion, 2);
+  assert.deepEqual(sealed.inputBinding, currentProposal.binding.inputBinding);
   assert.deepEqual(await context.authority.verify(sealed), sealed);
 
   const expanded = structuredClone(context.startup);

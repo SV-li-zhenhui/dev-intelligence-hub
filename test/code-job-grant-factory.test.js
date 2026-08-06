@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  createCodeJobGrant,
+  normalizeCodeJobGrant,
+} from "../src/domain/code-job-contract.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
@@ -16,7 +20,77 @@ function proposal(operation = "modify", roleId = "developer") {
       repository: "acme/repo",
       number: 42,
     },
-    payload: { title: "Fix race", headRefOid: "abc123", state: "open" },
+    payload: {
+      title: "Fix race",
+      headRefOid: "a".repeat(40),
+      state: "open",
+    },
+  });
+  const workItemId = `work-item-${"d".repeat(64)}`;
+  const inputBinding = {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: event.subject.repository,
+    pullRequestNumber: event.subject.number,
+    rootItemId: workItemId,
+    workKey: `pr-work-${"b".repeat(64)}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: event.payload.headRefOid,
+    eventId: event.eventId,
+    eventDigest: event.contentDigest,
+    inputDigest: "c".repeat(64),
+  };
+  const bound = createWorkIntentPolicy({
+    version: 7,
+    codeActionRoles: ["developer", "tester"],
+    workspaceByRepository: { "acme/repo": "acme-workspace" },
+    codeOperationsByRole: {
+      developer: ["inspect", "modify", "verify"],
+      tester: ["inspect", "verify"],
+    },
+  }).bind({
+    context: {
+      assignmentId: `workflow-assignment-${"c".repeat(64)}`,
+      workItemId,
+      roleId,
+      event,
+      inputBinding,
+    },
+    intent: {
+      schemaVersion: 1,
+      type: "propose_code_action",
+      operation,
+      objective: "修复并发覆盖",
+      acceptanceCriteria: ["回归测试通过"],
+      evidence: ["revision 未校验"],
+      summary: "创建受控代码任务",
+      reason: "需要在隔离副本中验证修复",
+    },
+  });
+  return normalizeBoundWorkProposal({
+    proposalId: bound.intentId,
+    policyVersion: bound.policyVersion,
+    kind: bound.kind,
+    requestedBy: bound.requestedBy,
+    source: bound.source,
+    binding: bound.binding,
+    payload: bound.payload,
+  });
+}
+
+function issueProposal(operation = "modify", roleId = "developer") {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "issue.created",
+    occurredAt: "2026-08-02T01:02:03.000Z",
+    source: { provider: "github", scopeId: "dashboard" },
+    subject: {
+      id: "github:issue:acme/repo#42",
+      repository: "acme/repo",
+      number: 42,
+    },
+    payload: { number: 42, title: "Fix race" },
   });
   const bound = createWorkIntentPolicy({
     version: 7,
@@ -32,6 +106,7 @@ function proposal(operation = "modify", roleId = "developer") {
       workItemId: `work-item-${"d".repeat(64)}`,
       roleId,
       event,
+      inputBinding: null,
     },
     intent: {
       schemaVersion: 1,
@@ -61,6 +136,7 @@ function factory(overrides = {}) {
       workspaces: [
         {
           id: "acme-workspace",
+          capabilities: ["git_head_snapshot"],
           writablePaths: ["src", "test"],
           requiredProfiles: [
             { id: "node-tests", configDigest: "a".repeat(64) },
@@ -90,6 +166,9 @@ function factory(overrides = {}) {
     },
     brainProviders: {
       ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+    },
+    inputAuthorityVerifier: {
+      verify: (binding) => structuredClone(binding),
     },
     ...overrides,
   });
@@ -123,6 +202,8 @@ function evidenceTargetFor(value, deliverables = [
 test("trusted authority seals workspace, operation, profile, and brain bindings", () => {
   const options = factory().create(proposal());
 
+  assert.equal(options.grant.schemaVersion, 2);
+  assert.equal(options.grant.inputBinding.headRefOid, "a".repeat(40));
   assert.equal(options.grant.operation, "modify");
   assert.deepEqual(options.grant.allowedActions, [
     "list_files",
@@ -227,6 +308,7 @@ test("brain and sandbox changes produce different sealed grants", () => {
       workspaces: [
         {
           id: "acme-workspace",
+          capabilities: ["git_head_snapshot"],
           writablePaths: ["src", "test"],
           requiredProfiles: [
             { id: "node-tests", configDigest: "b".repeat(64) },
@@ -260,6 +342,7 @@ test("execution-time verification fences every changed authority surface", () =>
         workspaces: [
           {
             id: "acme-workspace",
+            capabilities: ["git_head_snapshot"],
             writablePaths: ["src", "test"],
             requiredProfiles: [
               { id: "node-tests", configDigest: "b".repeat(64) },
@@ -298,5 +381,148 @@ test("authority, policy, and brain configuration must be complete", () => {
   assert.throws(
     () => factory({ brainByRole: { developer: undefined } }),
     (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("PR grants require an exact Git Head workspace and a live input verifier", () => {
+  const withoutSnapshotCapability = {
+    workspaces: [
+      {
+        id: "acme-workspace",
+        capabilities: ["directory_snapshot"],
+        writablePaths: ["src", "test"],
+        requiredProfiles: [
+          { id: "node-tests", configDigest: "a".repeat(64) },
+        ],
+        authorityDigest: "d".repeat(64),
+      },
+    ],
+  };
+  assert.throws(
+    () => factory({ executorAuthority: withoutSnapshotCapability }).create(proposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.throws(
+    () => factory({ inputAuthorityVerifier: undefined }).create(proposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+
+  const trusted = proposal();
+  const invalidHead = normalizeBoundWorkProposal({
+    proposalId: trusted.proposalId,
+    policyVersion: trusted.policyVersion,
+    kind: trusted.kind,
+    requestedBy: trusted.requestedBy,
+    source: trusted.source,
+    binding: {
+      ...trusted.binding,
+      inputBinding: {
+        ...trusted.binding.inputBinding,
+        headRefOid: "not-a-git-object-id",
+      },
+    },
+    payload: trusted.payload,
+  });
+  assert.throws(
+    () => factory().create(invalidHead),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+
+  const pullRequest = proposal();
+  const nullBoundPullRequest = normalizeBoundWorkProposal({
+    proposalId: pullRequest.proposalId,
+    policyVersion: pullRequest.policyVersion,
+    kind: pullRequest.kind,
+    requestedBy: pullRequest.requestedBy,
+    source: pullRequest.source,
+    binding: { ...pullRequest.binding, inputBinding: null },
+    payload: pullRequest.payload,
+  });
+  assert.throws(
+    () => factory({ executorAuthority: withoutSnapshotCapability }).create(nullBoundPullRequest),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  const { grantDigest: _grantDigest, ...pullRequestGrantContent } =
+    factory().create(pullRequest).grant;
+  const nullBoundPullRequestGrant = createCodeJobGrant({
+    ...pullRequestGrantContent,
+    inputBinding: null,
+  });
+  assert.throws(
+    () => factory().verify(nullBoundPullRequestGrant),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+
+  const issue = factory({
+    executorAuthority: withoutSnapshotCapability,
+    inputAuthorityVerifier: undefined,
+  }).create(issueProposal());
+  assert.equal(issue.grant.inputBinding, null);
+  assert.equal(issue.grant.subject.id, "github:issue:acme/repo#42");
+});
+
+test("changed, rejected, or mismatched current Head authority fails closed", async () => {
+  for (const verify of [
+    () => {
+      throw new Error("source Head changed");
+    },
+    (binding) => ({ ...binding, inputRevision: binding.inputRevision + 1 }),
+  ]) {
+    assert.throws(
+      () => factory({ inputAuthorityVerifier: { verify } }).create(proposal()),
+      (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+    );
+  }
+
+  await assert.rejects(
+    factory({
+      inputAuthorityVerifier: {
+        verify: async () => {
+          throw new Error("source Head changed");
+        },
+      },
+    }).create(proposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  const asynchronouslyAuthorized = await factory({
+    inputAuthorityVerifier: {
+      verify: async (binding) => structuredClone(binding),
+    },
+  }).create(proposal());
+  assert.equal(asynchronouslyAuthorized.grant.inputBinding.headRefOid, "a".repeat(40));
+
+  let current = true;
+  const liveFactory = factory({
+    inputAuthorityVerifier: {
+      verify(binding) {
+        if (!current) throw new Error("source Head changed");
+        return structuredClone(binding);
+      },
+    },
+  });
+  const sealed = liveFactory.create(proposal()).grant;
+  current = false;
+  assert.throws(
+    () => liveFactory.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("legacy grants remain readable but cannot authorize a new execution", () => {
+  const current = factory().create(proposal()).grant;
+  const {
+    schemaVersion: _schemaVersion,
+    inputBinding: _inputBinding,
+    grantDigest: _grantDigest,
+    ...legacyContent
+  } = current;
+  const legacy = createCodeJobGrant(legacyContent);
+
+  assert.deepEqual(normalizeCodeJobGrant(legacy), legacy);
+  assert.throws(
+    () => factory().verify(legacy),
+    (error) =>
+      error?.code === "INVALID_CODE_JOB_AUTHORITY" &&
+      error.message.includes("旧版"),
   );
 });

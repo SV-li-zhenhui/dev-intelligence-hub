@@ -51,6 +51,7 @@ import {
 import {
   activatePendingPullRequestWorkSource,
   appendPullRequestWorkSource,
+  verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
   validatePullRequestSourceTransition,
 } from "./work-ledger-pr-source.js";
 import {
@@ -304,6 +305,18 @@ export class WorkLedgerService {
           (candidate) => candidate.itemId === itemId,
         );
         return item ? cloneLedgerValue(item) : null;
+      }),
+    );
+  }
+
+  async verifyPullRequestExecutionBinding(input = {}) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        return cloneLedgerValue(
+          verifyPullRequestExecutionAuthority(this.state, input),
+        );
       }),
     );
   }

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import {
   activatePendingPullRequestWorkSource,
   appendPullRequestWorkSource,
   createPullRequestWorkSource,
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
+  verifyPullRequestExecutionBinding,
   validatePullRequestSourceTransition,
 } from "../src/services/work-ledger-pr-source.js";
 
@@ -58,7 +62,18 @@ function initialSource() {
 }
 
 function sourceItem(source) {
-  return { itemId: "work-item-pr-42", source };
+  return {
+    itemId: "work-item-pr-42",
+    source,
+    sourceQuarantine: null,
+  };
+}
+
+function executionBinding(item) {
+  return createPullRequestExecutionBinding({
+    sourceBinding: currentWorkItemInputBinding(item),
+    event: currentWorkItemEvent(item),
+  });
 }
 
 test("deferred A to B keeps A active and records B as pending", () => {
@@ -185,5 +200,72 @@ test("source transitions accept pointer progress and reject history rewrites", (
         [sourceItem(rewritten)],
       ),
     (error) => error.code === "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",
+  );
+});
+
+test("execution authority keeps same-Head facts valid but rejects pending or changed Heads", () => {
+  const itemA = sourceItem(initialSource());
+  const bindingA = executionBinding(itemA);
+  assert.deepEqual(
+    verifyPullRequestExecutionBinding({ items: [itemA] }, bindingA),
+    bindingA,
+  );
+
+  const sameHead = sourceItem(
+    appendPullRequestWorkSource(
+      itemA.source,
+      pullRequestEnvelope(2, HEAD_A),
+    ).source,
+  );
+  assert.deepEqual(
+    verifyPullRequestExecutionBinding({ items: [sameHead] }, bindingA),
+    bindingA,
+  );
+
+  const pendingB = sourceItem(
+    appendPullRequestWorkSource(
+      sameHead.source,
+      pullRequestEnvelope(3, HEAD_B, { previousHeadRefOid: HEAD_A }),
+      { activate: false },
+    ).source,
+  );
+  assert.throws(
+    () => verifyPullRequestExecutionBinding({ items: [pendingB] }, bindingA),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  const activeB = sourceItem(
+    activatePendingPullRequestWorkSource(pendingB.source).source,
+  );
+  const bindingB = executionBinding(activeB);
+  assert.throws(
+    () => verifyPullRequestExecutionBinding({ items: [activeB] }, bindingA),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    verifyPullRequestExecutionBinding({ items: [activeB] }, bindingB),
+    bindingB,
+  );
+});
+
+test("execution authority rejects forged identity, provenance, and quarantined roots", () => {
+  const item = sourceItem(initialSource());
+  const binding = executionBinding(item);
+  for (const forged of [
+    { ...binding, repository: "other/repo" },
+    { ...binding, inputDigest: "f".repeat(64) },
+    { ...binding, eventDigest: "e".repeat(64) },
+  ]) {
+    assert.throws(
+      () => verifyPullRequestExecutionBinding({ items: [item] }, forged),
+      (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    );
+  }
+  assert.throws(
+    () => verifyPullRequestExecutionBinding(
+      { items: [{ ...item, sourceQuarantine: { kind: "legacy" } }] },
+      binding,
+    ),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
   );
 });

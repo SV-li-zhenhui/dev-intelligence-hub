@@ -16,6 +16,9 @@ import {
 } from "../src/domain/delivery-evidence-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
+import {
+  createPullRequestExecutionBinding,
+} from "../src/domain/pull-request-execution-binding.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import {
   emptyWorkLedgerState,
@@ -27,6 +30,8 @@ import {
 } from "../src/services/work-ledger-graph-memory.js";
 import {
   appendPullRequestWorkSource,
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "../src/services/work-ledger-pr-source.js";
@@ -242,6 +247,13 @@ function prGraphChildCommand(parent, graphRevision, childKey = "resolve-conflict
   };
 }
 
+function prExecutionBinding(item) {
+  return createPullRequestExecutionBinding({
+    sourceBinding: currentWorkItemInputBinding(item),
+    event: currentWorkItemEvent(item),
+  });
+}
+
 function controlledClock(initial = "2026-08-02T02:00:00.000Z") {
   let now = Date.parse(initial);
   return {
@@ -448,6 +460,44 @@ test("a new PR Head advances the epoch without creating another task", async () 
   assert.equal(items[0].source.inputRevision, 2);
   assert.equal(items[0].source.headRevision, 2);
   assert.equal(items[0].source.current.headRefOid, PR_HEAD_B);
+});
+
+test("PR execution verification rereads shared durable state before every decision", async () => {
+  const store = new MemoryStore();
+  const lease = new ExclusiveLease();
+  const source = new FakeAssignmentSource([prAssignment(1)]);
+  const first = await createFixture({ store, lease, source });
+  await first.service.intake();
+  const headAItem = (await first.service.listItems()).items[0];
+  const headABinding = prExecutionBinding(headAItem);
+
+  assert.deepEqual(
+    await first.service.verifyPullRequestExecutionBinding(headABinding),
+    headABinding,
+  );
+
+  source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  source.highWatermark = 2;
+  const second = await createFixture({ store, lease, source });
+  await second.service.intake();
+  const headBItem = (await second.service.listItems()).items[0];
+  const headBBinding = prExecutionBinding(headBItem);
+
+  await assert.rejects(
+    first.service.verifyPullRequestExecutionBinding(headABinding),
+    (error) => error?.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await first.service.verifyPullRequestExecutionBinding(headBBinding),
+    headBBinding,
+  );
 });
 
 test("a new PR Head clears an answered old-Head decision while same-Head facts preserve it", async () => {
@@ -3159,6 +3209,69 @@ async function prepareClaimedReviewIntent(fixture, leaseDurationMs = 30_000) {
   return { item, staged, claimed };
 }
 
+async function prepareClaimedPullRequestReviewIntent(
+  fixture,
+  leaseDurationMs = 30_000,
+) {
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs,
+  });
+  return { staged, claimed };
+}
+
+function pullRequestReviewProposalBinding(item) {
+  const event = currentWorkItemEvent(item);
+  return {
+    eventId: event.eventId,
+    subject: event.subject,
+    repository: event.subject.repository,
+    pullRequestNumber: event.subject.number,
+    headRefOid: event.payload.headRefOid,
+    inputBinding: prExecutionBinding(item),
+  };
+}
+
+function boundPullRequestReviewIntent(item, binding) {
+  const event = currentWorkItemEvent(item);
+  return boundReviewIntent(item, {
+    requestedBy: {
+      roleId: "pr-engineer",
+      workItemId: item.itemId,
+    },
+    source: {
+      assignmentId: item.assignmentId,
+      eventId: event.eventId,
+    },
+    binding,
+    payload: {
+      verdict: "approve",
+      body: "本地审查未发现阻塞问题。",
+      evidence: ["tests:passed"],
+      summary: "建议批准 PR",
+      reason: "检查通过",
+    },
+  });
+}
+
 function codeActionIntent(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -3706,6 +3819,89 @@ test("schema v7 quarantines an in-flight intent whose old policy binding is unkn
   );
   assert.equal(fixture.store.writes.length, writesBeforeClaim);
   assert.equal(fixture.store.stored().schemaVersion, 7);
+});
+
+test("schema v9 quarantines a sealed PR proposal without an input binding", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const { staged, claimed } = await prepareClaimedPullRequestReviewIntent(
+    fixture,
+    1_000,
+  );
+  const legacyBinding = pullRequestReviewProposalBinding(staged.item);
+  delete legacyBinding.inputBinding;
+  await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundPullRequestReviewIntent(staged.item, legacyBinding),
+  });
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 9;
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+
+  const quarantined = (await recovered.listOutbox()).items[0];
+  assert.deepEqual(quarantined.dispatchBinding, { status: "legacy_unknown" });
+  const writesBeforeClaims = fixture.store.writes.length;
+  for (const dispatcherId of ["recovery-dispatcher-1", "recovery-dispatcher-2"]) {
+    await assert.rejects(
+      recovered.claimIntent({
+        intentId: quarantined.intentId,
+        expectedRevision: quarantined.revision,
+        dispatcherId,
+        leaseDurationMs: 1_000,
+      }),
+      (error) => error.code === "WORK_LEDGER_INTENT_BINDING_UNKNOWN",
+    );
+  }
+  assert.equal(fixture.store.writes.length, writesBeforeClaims);
+});
+
+test("schema v9 preserves a sealed PR proposal with an input binding", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const { staged, claimed } = await prepareClaimedPullRequestReviewIntent(
+    fixture,
+  );
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundPullRequestReviewIntent(
+      staged.item,
+      pullRequestReviewProposalBinding(staged.item),
+    ),
+  });
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 9;
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+
+  const migrated = (await recovered.listOutbox()).items[0];
+  assert.deepEqual(migrated.dispatchBinding, sealed.dispatchBinding);
+  assert.deepEqual(
+    migrated.dispatchBinding.boundIntent.binding.inputBinding,
+    prExecutionBinding(staged.item),
+  );
 });
 
 test("a delivered handoff atomically acknowledges the outbox and queues the trusted role", async () => {

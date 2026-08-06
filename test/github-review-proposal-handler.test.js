@@ -8,6 +8,25 @@ import {
 } from "../src/services/github-review-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 
+const HEAD_REF_OID = "b".repeat(40);
+
+function inputBindingFor(number) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/repo",
+    pullRequestNumber: number,
+    rootItemId: `work-${number}`,
+    workKey: `github:dashboard:acme-repo:${number}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: HEAD_REF_OID,
+    eventId: `event-${number}`,
+    eventDigest: `${"c".repeat(63)}${number % 10}`,
+    inputDigest: `${"d".repeat(63)}${number % 10}`,
+  };
+}
+
 function proposal(number = 42) {
   return normalizeBoundWorkProposal({
     proposalId: `work-intent-${"a".repeat(63)}${number % 10}`,
@@ -20,7 +39,8 @@ function proposal(number = 42) {
       subject: { repository: "acme/repo", number },
       repository: "acme/repo",
       pullRequestNumber: number,
-      headRefOid: "b".repeat(40),
+      headRefOid: HEAD_REF_OID,
+      inputBinding: inputBindingFor(number),
     },
     payload: {
       verdict: "request_changes",
@@ -101,6 +121,10 @@ test("a pending proposal is idempotently enqueued and waits on its exact confirm
   assert.match(
     producer.enqueueCalls[0].id,
     /^confirmation-github-review-[a-f0-9]{64}$/,
+  );
+  assert.deepEqual(
+    producer.enqueueCalls[0].display.payload.inputBinding,
+    handlerInput().proposal.binding.inputBinding,
   );
   assert.deepEqual(transition, {
     status: "waiting_confirmation",

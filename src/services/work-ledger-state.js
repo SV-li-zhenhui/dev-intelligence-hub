@@ -51,9 +51,10 @@ import {
 } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 9;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 10;
 const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
 const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
+const PR_INPUT_BINDING_STATE_SCHEMA_VERSION = 9;
 const LEGACY_PR_SOURCE_UNSTARTED_INTENT_REASON =
   "pr_source_legacy_cutover_before_dispatch";
 const LEGACY_PR_SOURCE_IDLE_STATUSES = new Set([
@@ -497,6 +498,10 @@ function workLedgerCapacityView(state) {
   const { graphMemoryProjection: _graphMemoryProjection, ...ledger } = state;
   return {
     ...ledger,
+    // Schema growth is migration metadata, not user capacity. Keep its
+    // serialized width stable so a version bump cannot strand an exact-limit
+    // legacy state before it has a chance to compact or advance.
+    schemaVersion: 1,
     items: state.items
       .filter(({ kind }) => kind !== "source_root")
       .map(workItemCapacityView),
@@ -1441,6 +1446,34 @@ function migrateDispatchBindingState(value, limits) {
   return migrated;
 }
 
+function quarantineLegacyProposalBinding(entry) {
+  if (
+    entry.status !== "dispatching" ||
+    entry.dispatchBinding === null ||
+    (hasExactLedgerKeys(entry.dispatchBinding, ["status"]) &&
+      entry.dispatchBinding.status === LEGACY_UNKNOWN_WORK_INTENT_BINDING)
+  ) {
+    return entry;
+  }
+  let dispatchBinding;
+  try {
+    dispatchBinding = normalizeWorkIntentDispatchBinding(entry.dispatchBinding);
+  } catch {
+    return entry;
+  }
+  const bound = dispatchBinding.boundIntent;
+  if (
+    !["github_review_proposal", "code_action_proposal"].includes(bound.kind) ||
+    Object.hasOwn(bound.binding, "inputBinding")
+  ) {
+    return entry;
+  }
+  return {
+    ...entry,
+    dispatchBinding: { status: LEGACY_UNKNOWN_WORK_INTENT_BINDING },
+  };
+}
+
 export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   const limits = normalizeWorkLedgerLimits(limitsInput);
   if (
@@ -1652,6 +1685,37 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     value.schemaVersion === DISPATCH_BINDING_STATE_SCHEMA_VERSION
   ) {
     value = migrateDispatchBindingState(value, limits);
+  }
+  const schema9Outbox =
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+      "graphMemoryProjection",
+    ]) && value.schemaVersion === PR_INPUT_BINDING_STATE_SCHEMA_VERSION
+      ? denseLedgerArrayValues(value.outbox)
+      : null;
+  if (schema9Outbox !== null) {
+    if (
+      schema9Outbox.some((entry) => !hasExactLedgerKeys(entry, OUTBOX_KEYS))
+    ) {
+      throw corrupted("旧版员工工作 outbox 字段损坏");
+    }
+    value = {
+      ...value,
+      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      outbox: schema9Outbox.map(quarantineLegacyProposalBinding),
+    };
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
     "schemaVersion",

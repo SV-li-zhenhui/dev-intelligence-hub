@@ -5,8 +5,16 @@ import {
   normalizeWorkIntentDispatchBinding,
 } from "../domain/work-intent-dispatch-binding.js";
 import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
+import {
+  createPullRequestExecutionBinding,
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
-import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import {
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
+} from "./work-ledger-pr-source.js";
 
 const MAX_DISPATCH_BATCH = 100;
 const QUERY_PAGE_SIZE = 100;
@@ -409,6 +417,36 @@ function evidenceTargetFor(item, requester, intent) {
   });
 }
 
+function proposalInputBindingFor(item) {
+  const sourceBinding = currentWorkItemInputBinding(item);
+  if (sourceBinding === null) return null;
+  return createPullRequestExecutionBinding({
+    sourceBinding,
+    event: currentWorkItemEvent(item),
+  });
+}
+
+function assertProposalInputBinding(bound, item, error) {
+  if (
+    !["github_review_proposal", "code_action_proposal"].includes(bound.kind)
+  ) {
+    return;
+  }
+  if (!Object.hasOwn(bound.binding, "inputBinding")) throw error;
+  const expected = proposalInputBindingFor(item);
+  if (expected === null) {
+    if (bound.binding.inputBinding !== null) throw error;
+    return;
+  }
+  let actual;
+  try {
+    actual = normalizePullRequestExecutionBinding(bound.binding.inputBinding);
+  } catch {
+    throw error;
+  }
+  if (!samePullRequestExecutionBinding(actual, expected)) throw error;
+}
+
 function validateBoundIntent(bound, item, intent, requester) {
   const event = dataMap(currentWorkItemEvent(item));
   const error = dispatcherError(
@@ -416,8 +454,7 @@ function validateBoundIntent(bound, item, intent, requester) {
     "策略没有返回与可信工作项一致的绑定",
     409,
   );
-  return deepFreeze(
-    normalizeBoundWorkIntent(
+  const normalized = normalizeBoundWorkIntent(
       bound,
       {
         intentType: intent.type,
@@ -427,8 +464,9 @@ function validateBoundIntent(bound, item, intent, requester) {
         eventId: event?.get("eventId"),
       },
       error,
-    ),
-  );
+    );
+  assertProposalInputBinding(normalized, item, error);
+  return deepFreeze(normalized);
 }
 
 function persistedBoundIntent(value, item, requester) {
@@ -885,6 +923,7 @@ export class WorkIntentDispatcher {
               workItemId: item.itemId,
               roleId: requester.roleId,
               event: currentWorkItemEvent(item),
+              inputBinding: proposalInputBindingFor(item),
               ...(evidenceTarget === null ? {} : { evidenceTarget }),
             },
             intent: claimed.intent,

@@ -127,11 +127,13 @@ function createWorkspaceAuthority(workspaces, requiredProfiles, sandbox) {
         );
         return Object.freeze({
           id: workspace.id,
+          capabilities: Object.freeze(["directory_snapshot"]),
           writablePaths: Object.freeze([...workspace.writablePaths]),
           requiredProfiles: Object.freeze(profiles),
           authorityDigest: digestValue({
-            schemaVersion: 1,
+            schemaVersion: 2,
             workspaceId: workspace.id,
+            capabilities: ["directory_snapshot"],
             sourceRoot: workspace.sourceRoot,
             writablePaths: workspace.writablePaths,
             excludePaths: workspace.excludePaths,

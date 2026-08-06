@@ -43,8 +43,29 @@ function grant() {
   });
 }
 
-function envelope() {
-  const sealedGrant = grant();
+function pullRequestGrant() {
+  const { grantDigest: _grantDigest, ...legacyContent } = grant();
+  return createCodeJobGrant({
+    schemaVersion: 2,
+    ...legacyContent,
+    inputBinding: {
+      schemaVersion: 1,
+      kind: "pull_request",
+      repository: "acme/widgets",
+      pullRequestNumber: 17,
+      rootItemId: "work-root-17",
+      workKey: `pr-work-${"1".repeat(64)}`,
+      inputRevision: 1,
+      headRevision: 1,
+      headRefOid: "a".repeat(40),
+      eventId: "event-1",
+      eventDigest: "2".repeat(64),
+      inputDigest: "3".repeat(64),
+    },
+  });
+}
+
+function envelope(sealedGrant = grant()) {
   const actor = {
     provider: "local-code",
     accountId: "controlled-code-executor",
@@ -237,22 +258,29 @@ test("confirmed absence is retryable while conflicts remain unknown", async () =
   });
 });
 
-test("revoked approval grants become stale before durable job creation", async () => {
+test("a changed PR Head becomes stale before durable job creation", async () => {
+  const sealedGrant = pullRequestGrant();
+  let currentHead = sealedGrant.inputBinding.headRefOid;
+  const input = envelope(sealedGrant);
+  currentHead = "b".repeat(40);
   const fake = store();
   const executor = new CodeJobApprovalExecutor({
     codeJobStore: fake.port,
     grantVerifier: grantVerifier({
-      async verify() {
-        const error = new Error("revoked");
-        error.code = "INVALID_CODE_JOB_AUTHORITY";
-        throw error;
+      async verify(value) {
+        if (value.inputBinding.headRefOid !== currentHead) {
+          const error = new Error("PR Head changed after confirmation");
+          error.code = "INVALID_CODE_JOB_AUTHORITY";
+          throw error;
+        }
+        return structuredClone(value);
       },
     }),
   });
 
-  assert.deepEqual(await executor.execute(envelope()), { status: "stale" });
+  assert.deepEqual(await executor.execute(input), { status: "stale" });
   assert.equal(fake.calls.length, 0);
-  assert.deepEqual(await executor.reconcile(envelope()), { status: "stale" });
+  assert.deepEqual(await executor.reconcile(input), { status: "stale" });
   assert.deepEqual(fake.calls.map(([operation]) => operation), ["reconcile"]);
 });
 

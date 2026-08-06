@@ -16,6 +16,7 @@ const RUNTIME_METHODS = Object.freeze([
   "listTimeline",
   "listOutbox",
   "readItemForReconciliation",
+  "verifyPullRequestExecutionBinding",
   "intake",
   "reconcilePullRequestSource",
   "claim",

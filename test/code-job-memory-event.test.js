@@ -19,9 +19,27 @@ import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 const WORKSPACE_REVISION = "4".repeat(64);
 const FILE_BEFORE = "5".repeat(64);
 const FILE_AFTER = "6".repeat(64);
+const HEAD_REF_OID = "1".repeat(40);
 
-function grant() {
-  return createCodeJobGrant({
+function inputBinding() {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/widgets",
+    pullRequestNumber: 17,
+    rootItemId: "github:acme/widgets:pull-request:17",
+    workKey: "github:acme/widgets:pull-request:17",
+    inputRevision: 3,
+    headRevision: 2,
+    headRefOid: HEAD_REF_OID,
+    eventId: "event-1",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+  };
+}
+
+function grant(binding) {
+  const content = {
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
@@ -47,17 +65,22 @@ function grant() {
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
     brainDigest: "c".repeat(64),
-  });
+  };
+  return createCodeJobGrant(
+    binding === undefined
+      ? content
+      : { schemaVersion: 2, ...content, inputBinding: binding },
+  );
 }
 
-function queuedJob() {
+function queuedJob(binding) {
   return createQueuedCodeJob(
     {
       confirmationId: "confirmation-code-job-approval-1",
       requestId: "approval-request-0001",
       displayedPayloadDigest: "d".repeat(64),
       approvalBindingDigest: "e".repeat(64),
-      grant: grant(),
+      grant: grant(binding),
     },
     {
       sequence: 1,
@@ -67,8 +90,8 @@ function queuedJob() {
   );
 }
 
-function observedJob() {
-  const queued = queuedJob();
+function observedJob(binding) {
+  const queued = queuedJob(binding);
   const action = {
     type: "complete",
     actionId: "complete-action-1",
@@ -120,8 +143,8 @@ function observedJob() {
   });
 }
 
-function completedJob() {
-  const active = observedJob();
+function completedJob(binding) {
+  const active = observedJob(binding);
   const detail = {
     schemaVersion: 1,
     outcome: "fixed",
@@ -436,6 +459,65 @@ test("normalization rejects extra fields, accessors, cycles, and digest tamperin
     }),
     (error) => error?.code === "INVALID_CODE_JOB_MEMORY_EVENT",
   );
+});
+
+test("v2 memory events preserve exact PR Head evidence and reject binding tampering", () => {
+  const event = createCodeJobMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob(inputBinding()),
+    kind: "completed",
+  });
+  const record = memoryRecordForCodeJobEvent(event);
+  const snapshot = JSON.parse(record.content);
+
+  assert.equal(snapshot.schemaVersion, 2);
+  assert.equal(snapshot.repository, "acme/widgets");
+  assert.equal(snapshot.subjectNumber, 17);
+  assert.deepEqual(snapshot.inputBinding, inputBinding());
+  assert.equal(snapshot.inputBinding.headRefOid, HEAD_REF_OID);
+  assert.equal(record.evidence.includes(`pr-head:${HEAD_REF_OID}`), true);
+  assert.deepEqual(normalizeCodeJobMemoryEvent(event), event);
+
+  const headTampered = structuredClone(event);
+  const headSnapshot = JSON.parse(headTampered.memoryRecord.content);
+  headSnapshot.inputBinding.headRefOid = "7".repeat(40);
+  headTampered.memoryRecord.content = JSON.stringify(headSnapshot);
+
+  const repositoryMismatch = structuredClone(event);
+  const repositorySnapshot = JSON.parse(repositoryMismatch.memoryRecord.content);
+  repositorySnapshot.inputBinding.repository = "acme/other";
+  repositoryMismatch.memoryRecord.content = JSON.stringify(repositorySnapshot);
+
+  const pullRequestMismatch = structuredClone(event);
+  const pullRequestSnapshot = JSON.parse(pullRequestMismatch.memoryRecord.content);
+  pullRequestSnapshot.inputBinding.pullRequestNumber = 18;
+  pullRequestMismatch.memoryRecord.content = JSON.stringify(pullRequestSnapshot);
+
+  for (const candidate of [
+    headTampered,
+    repositoryMismatch,
+    pullRequestMismatch,
+  ]) {
+    assert.throws(
+      () => normalizeCodeJobMemoryEvent(candidate),
+      (error) => error?.code === "INVALID_CODE_JOB_MEMORY_EVENT",
+    );
+  }
+});
+
+test("legacy memory events remain readable without an input binding", () => {
+  const event = createCodeJobMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob(),
+    kind: "completed",
+  });
+  const snapshot = JSON.parse(memoryRecordForCodeJobEvent(event).content);
+
+  assert.equal(snapshot.schemaVersion, 1);
+  assert.equal(Object.hasOwn(snapshot, "inputBinding"), false);
+  assert.deepEqual(normalizeCodeJobMemoryEvent(event), event);
 });
 
 test("classifies significant lifecycle changes without looping on projection ack", () => {

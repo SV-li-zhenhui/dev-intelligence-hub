@@ -1,6 +1,7 @@
 import { CODE_JOB_STATUSES } from "./code-job-vocabulary.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
 import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -74,6 +75,14 @@ const PROJECTION_KEYS_WITHOUT_UNCERTAINTY = Object.freeze([
 const PROJECTION_KEYS = Object.freeze([
   ...PROJECTION_KEYS_WITHOUT_UNCERTAINTY,
   "uncertainty",
+]);
+const BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY = Object.freeze([
+  ...PROJECTION_KEYS_WITHOUT_UNCERTAINTY,
+  "inputBinding",
+]);
+const BOUND_PROJECTION_KEYS = Object.freeze([
+  ...PROJECTION_KEYS,
+  "inputBinding",
 ]);
 const PROGRESS_KEYS = new Set([
   "turn",
@@ -465,6 +474,12 @@ function normalizeOptionalRecord(value, keys, error) {
 
 function projectionShape(suppliedKeys) {
   if (hasExactKeys(suppliedKeys, LEGACY_PROJECTION_KEYS)) return "legacy";
+  if (hasExactKeys(suppliedKeys, BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY)) {
+    return "boundWithoutUncertainty";
+  }
+  if (hasExactKeys(suppliedKeys, BOUND_PROJECTION_KEYS)) {
+    return "boundCurrent";
+  }
   if (hasExactKeys(suppliedKeys, PROJECTION_KEYS_WITHOUT_UNCERTAINTY)) {
     return "withoutUncertainty";
   }
@@ -476,6 +491,10 @@ function expectedProjectionKeys(shape) {
   if (shape === "withoutUncertainty") {
     return PROJECTION_KEYS_WITHOUT_UNCERTAINTY;
   }
+  if (shape === "boundWithoutUncertainty") {
+    return BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY;
+  }
+  if (shape === "boundCurrent") return BOUND_PROJECTION_KEYS;
   return PROJECTION_KEYS;
 }
 
@@ -493,7 +512,7 @@ function withLegacyProgress(value, shape, error) {
       uncertainty: null,
     };
   }
-  if (shape === "withoutUncertainty") {
+  if (["withoutUncertainty", "boundWithoutUncertainty"].includes(shape)) {
     return {
       ...cloneProjectionValue(value, error),
       uncertainty: value.status === "unknown"
@@ -713,6 +732,23 @@ export function normalizeCodeJobBrowserProjection(
   const shape = projectionShape(suppliedKeys);
   assertExactKeys(value, expectedProjectionKeys(shape), error);
   const projection = withLegacyProgress(value, shape, error);
+  if (shape.startsWith("bound") && projection.inputBinding !== null) {
+    let inputBinding;
+    try {
+      inputBinding = normalizePullRequestExecutionBinding(
+        projection.inputBinding,
+        error,
+      );
+    } catch {
+      throw error;
+    }
+    if (
+      inputBinding.repository !== projection.repository ||
+      inputBinding.pullRequestNumber !== projection.subject?.number
+    ) {
+      throw error;
+    }
+  }
   const progress = normalizeProgress(projection, error);
   assertProjectionLifecycle(projection, progress, error);
   return projection;
@@ -735,6 +771,9 @@ function projectBrowserFields(source, progress) {
     subject: grant.subject,
     repository: grant.repository,
     workspaceId: grant.workspaceId,
+    ...(Object.hasOwn(grant, "inputBinding")
+      ? { inputBinding: grant.inputBinding }
+      : {}),
     operation: grant.operation,
     objective: grant.objective,
     acceptanceCriteria: grant.acceptanceCriteria,

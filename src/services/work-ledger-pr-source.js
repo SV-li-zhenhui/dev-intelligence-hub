@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
   SHA256_PATTERN,
@@ -749,6 +750,66 @@ export function pullRequestHeadAdmission(state, item) {
     headRevision: binding.headRevision,
     currentHeadRevision: current?.headRevision ?? null,
   });
+}
+
+export function verifyPullRequestExecutionBinding(state, value) {
+  let binding;
+  try {
+    binding = normalizePullRequestExecutionBinding(value);
+  } catch {
+    throw invalid(
+      "PR 执行输入绑定无效",
+      "WORK_LEDGER_PR_EXECUTION_BINDING_INVALID",
+    );
+  }
+  const root = state?.items?.find(
+    (candidate) => candidate.itemId === binding.rootItemId,
+  );
+  if (
+    !root ||
+    root.source?.kind !== "pull_request" ||
+    root.sourceQuarantine !== null
+  ) {
+    throw invalid(
+      "PR 执行输入来源已不可用",
+      "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    );
+  }
+  const source = normalizePullRequestWorkSource(root.source);
+  const admission = pullRequestHeadAdmission(state, root);
+  const current = currentWorkItemInputBinding(root);
+  const revision = source.revisions.find(
+    (candidate) => candidate.revision === binding.inputRevision,
+  );
+  const sourceBinding = source.bindings.find(
+    (candidate) =>
+      candidate.inputRevision === binding.inputRevision &&
+      candidate.eventId === binding.eventId,
+  );
+  if (
+    source.workKey !== binding.workKey ||
+    source.identity.repository !== binding.repository ||
+    source.identity.pullRequestNumber !== binding.pullRequestNumber ||
+    revision?.disposition !== "accepted" ||
+    revision.eventId !== binding.eventId ||
+    revision.eventDigest !== binding.eventDigest ||
+    revision.inputDigest !== binding.inputDigest ||
+    revision.headRevision !== binding.headRevision ||
+    revision.headRefOid !== binding.headRefOid ||
+    sourceBinding === undefined ||
+    current === null ||
+    current.workKey !== binding.workKey ||
+    current.headRevision !== binding.headRevision ||
+    current.headRefOid !== binding.headRefOid ||
+    admission.current !== true ||
+    admission.pending !== false
+  ) {
+    throw invalid(
+      "PR 执行输入已不再对应当前 Head",
+      "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    );
+  }
+  return Object.freeze(binding);
 }
 
 export function activatePendingPullRequestWorkSource(value) {

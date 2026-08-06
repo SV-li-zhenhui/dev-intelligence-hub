@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 import {
   assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
@@ -127,6 +128,7 @@ export function createGitHubReviewProposalConfirmationPlan(
       "repository",
       "pullRequestNumber",
       "headRefOid",
+      "inputBinding",
       ...(Object.hasOwn(proposal.binding, "evidenceTarget")
         ? ["evidenceTarget"]
         : []),
@@ -179,6 +181,23 @@ export function createGitHubReviewProposalConfirmationPlan(
     throw invalid("binding.subject 与 PR 绑定不一致");
   }
   const headRefOid = text(binding.headRefOid, "binding.headRefOid", 64, HEAD_OID);
+  let inputBinding;
+  try {
+    inputBinding = normalizePullRequestExecutionBinding(
+      binding.inputBinding,
+      invalid("binding.inputBinding 无效"),
+    );
+  } catch {
+    throw invalid("binding.inputBinding 无效");
+  }
+  if (
+    inputBinding.repository !== repository ||
+    inputBinding.pullRequestNumber !== number ||
+    inputBinding.headRefOid !== headRefOid ||
+    inputBinding.eventId !== eventId
+  ) {
+    throw invalid("binding.inputBinding 与 Review 目标不匹配");
+  }
   const reviewEvent = REVIEW_EVENTS[payload.verdict];
   if (!reviewEvent) throw invalid("payload.verdict 无效");
   const body = text(payload.body, "payload.body", 16 * 1_024);
@@ -210,7 +229,7 @@ export function createGitHubReviewProposalConfirmationPlan(
       summary,
       actionLabel: "确认并发布到 GitHub",
       evidence: reasons,
-      payload: { actor, target, action },
+      payload: { actor, target, action, inputBinding },
     },
   });
 }

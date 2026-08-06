@@ -312,6 +312,11 @@ test("code job detail renders safe evidence, history, controls, and package meta
         status: "active",
         requestedBy: { roleId: "developer", workItemId: "work-1" },
         repository: "acme/repo",
+        inputBinding: {
+          repository: "acme/repo",
+          pullRequestNumber: 42,
+          headRefOid: "a".repeat(40),
+        },
         workspaceId: "acme-workspace",
         operation: "modify",
         objective: "修复 <unsafe> 分支",
@@ -405,6 +410,8 @@ test("code job detail renders safe evidence, history, controls, and package meta
 
   for (const visible of [
     "任务目标",
+    "PR 输入",
+    "精确 Head",
     "验收条件",
     "授权依据",
     "安全观察历史",
@@ -421,6 +428,8 @@ test("code job detail renders safe evidence, history, controls, and package meta
     assert.equal(html.includes(visible), true, visible);
   }
   assert.match(html, /修复 &lt;unsafe&gt; 分支/);
+  assert.match(html, /acme\/repo #42/);
+  assert.match(html, new RegExp("a{40}"));
   assert.match(html, /读取 &lt;src\/app\.js&gt;/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(html, new RegExp(`变更前 <code>${"1".repeat(64)}</code> → 变更后 <code>${"2".repeat(64)}</code>`));

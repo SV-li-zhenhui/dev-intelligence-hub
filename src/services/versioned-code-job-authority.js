@@ -507,6 +507,7 @@ export class VersionedCodeJobAuthority {
   #grantFactoryFactory;
   #brainDirectoryFactory;
   #actionAdmission;
+  #inputAuthorityVerifier;
   #cache;
   #contexts;
 
@@ -516,6 +517,7 @@ export class VersionedCodeJobAuthority {
     startupConfiguration,
     brainDependencies = {},
     actionAdmissionGate,
+    inputAuthorityVerifier,
     grantFactoryFactory = (options) => new CodeJobGrantFactory(options),
     brainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
   } = {}) {
@@ -534,6 +536,20 @@ export class VersionedCodeJobAuthority {
       "run",
       "actionAdmissionGate",
     );
+    if (
+      inputAuthorityVerifier !== undefined &&
+      (!inputAuthorityVerifier ||
+        typeof inputAuthorityVerifier.verify !== "function")
+    ) {
+      throw new TypeError("inputAuthorityVerifier must provide verify(binding)");
+    }
+    this.#inputAuthorityVerifier = Object.freeze({
+      verify: inputAuthorityVerifier === undefined
+        ? () => {
+            throw invalid("PR 当前 Head 授权校验器未配置");
+          }
+        : inputAuthorityVerifier.verify.bind(inputAuthorityVerifier),
+    });
     if (typeof grantFactoryFactory !== "function") {
       throw new TypeError("grantFactoryFactory must be a function");
     }
@@ -742,6 +758,7 @@ export class VersionedCodeJobAuthority {
       brainByRole: roleBrains(configuration.employees.roles, roleIds),
       brainProviders: configuration.brainProviders,
       scopeAuthorityDigest,
+      inputAuthorityVerifier: this.#inputAuthorityVerifier,
     });
     method(grants, "create", "versioned code job grant factory");
     method(grants, "verify", "versioned code job grant factory");
@@ -808,6 +825,7 @@ export class VersionedCodeJobAuthority {
       codeOperationsByRole: roleOperations(policy, roleIds),
       brainByRole: roleBrains(configuration.employees.roles, roleIds),
       brainProviders: configuration.brainProviders,
+      inputAuthorityVerifier: this.#inputAuthorityVerifier,
     });
     method(grants, "verify", "legacy code job grant factory");
     return { authority, grants };

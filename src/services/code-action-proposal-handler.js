@@ -392,6 +392,7 @@ function normalizeOwnedConfirmationItem(value, proposal, confirmationId) {
     subject: proposal.binding.subject,
     repository: proposal.binding.repository,
     workspaceId: proposal.binding.workspaceId,
+    inputBinding: proposal.binding.inputBinding,
     operation: proposal.payload.operation,
     objective: proposal.payload.objective,
     acceptanceCriteria: proposal.payload.acceptanceCriteria,
@@ -451,6 +452,9 @@ function normalizeCodeJobProjection(value, grant, receipt) {
   const expected = {
     requestedBy: grant.requestedBy,
     subject: grant.subject,
+    ...(Object.hasOwn(grant, "inputBinding")
+      ? { inputBinding: grant.inputBinding }
+      : {}),
     acceptanceCriteria: grant.acceptanceCriteria,
     evidence: grant.evidence,
     allowedActions: grant.allowedActions,

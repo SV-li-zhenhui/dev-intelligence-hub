@@ -151,6 +151,8 @@ test("code authorization uses local-only wording and an exact kind branch", asyn
   for (const visibleLabel of [
     "请求岗位",
     "可信工作区",
+    "PR 输入",
+    "精确 Head",
     "代码操作",
     "任务目标",
     "验收条件",
@@ -162,6 +164,14 @@ test("code authorization uses local-only wording and an exact kind branch", asyn
   ]) {
     assert.equal(app.includes(visibleLabel), true, visibleLabel);
   }
+  const start = app.indexOf("function showCodeJobConfirmation");
+  const end = app.indexOf("\nfunction showChangePackageApplicationConfirmation", start);
+  const renderer = app.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(renderer, /grant\.inputBinding/);
+  assert.match(renderer, /inputBinding\.repository/);
+  assert.match(renderer, /inputBinding\.pullRequestNumber/);
+  assert.match(renderer, /inputBinding\.headRefOid/);
 });
 
 test("change package application uses an exact immutable confirmation branch", async () => {

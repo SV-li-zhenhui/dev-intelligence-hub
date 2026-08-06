@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { normalizeCodeJobGrant } from "./code-job-contract.js";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 import { digestValue } from "./code-executor-contract.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 import {
   assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
@@ -89,6 +90,7 @@ function normalizeProposalDetails(proposal) {
       "subject",
       "repository",
       "workspaceId",
+      "inputBinding",
       ...(Object.hasOwn(proposal.binding, "evidenceTarget")
         ? ["evidenceTarget"]
         : []),
@@ -153,6 +155,24 @@ function normalizeProposalDetails(proposal) {
       error: invalid("binding.subject.number 无效"),
     }),
   };
+  let inputBinding = null;
+  if (binding.inputBinding !== null) {
+    try {
+      inputBinding = normalizePullRequestExecutionBinding(
+        binding.inputBinding,
+        invalid("binding.inputBinding 无效"),
+      );
+    } catch {
+      throw invalid("binding.inputBinding 无效");
+    }
+    if (
+      inputBinding.repository !== repository ||
+      inputBinding.pullRequestNumber !== normalizedSubject.number ||
+      inputBinding.eventId !== eventId
+    ) {
+      throw invalid("binding.inputBinding 与提案来源不匹配");
+    }
+  }
   if (!OPERATIONS.has(payload.operation)) {
     throw invalid("payload.operation 无效");
   }
@@ -168,6 +188,7 @@ function normalizeProposalDetails(proposal) {
     subject: normalizedSubject,
     repository,
     workspaceId,
+    inputBinding,
     operation: payload.operation,
     objective: text(payload.objective, "payload.objective", 4_096),
     acceptanceCriteria,
@@ -237,6 +258,7 @@ function assertGrantMatchesProposal(proposal, details, grant) {
     subject: details.subject,
     repository: details.repository,
     workspaceId: details.workspaceId,
+    inputBinding: details.inputBinding,
     operation: details.operation,
     objective: details.objective,
     acceptanceCriteria: details.acceptanceCriteria,

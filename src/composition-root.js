@@ -470,6 +470,15 @@ export async function createApplication({
     if (localCodeExecutionEnabled && !memoryRuntime) {
       throw new Error("本地代码工作提案需要启用统一记忆运行时");
     }
+    if (localCodeExecutionEnabled && !workLedgerRuntime) {
+      throw new Error("本地代码工作提案需要启用共享工作台账");
+    }
+    const inputAuthorityVerifier = workLedgerRuntime === null
+      ? null
+      : Object.freeze({
+          verify: (binding) =>
+            workLedgerRuntime.verifyPullRequestExecutionBinding(binding),
+        });
     let activeCodeJobOptions = null;
     if (localCodeExecutionEnabled) {
       let codeJobBrainDirectory;
@@ -481,6 +490,7 @@ export async function createApplication({
           brainDependencies:
             workCoordinationDependencies.brainDependencies || {},
           actionAdmissionGate: ordinaryActionAdmissionGate,
+          inputAuthorityVerifier,
           grantFactoryFactory: codeJobGrantFactory,
           brainDirectoryFactory: codeJobBrainDirectoryFactory,
         });
@@ -496,6 +506,7 @@ export async function createApplication({
             coordinationConfig.policy?.codeOperationsByRole || {},
           brainByRole: brainConfigurationsByRole(config.employees?.roles),
           brainProviders: config.brainProviders || {},
+          inputAuthorityVerifier,
         });
         codeJobBrainDirectory = codeJobBrainDirectoryFactory({
           brainProviders: config.brainProviders || {},

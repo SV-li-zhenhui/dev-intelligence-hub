@@ -22,6 +22,11 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_WORKSPACE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const EXECUTOR_CAPABILITIES = new Set([
+  "directory_snapshot",
+  "git_head_snapshot",
+]);
 const PREPARED_CODE_JOB_GRANTS = new WeakSet();
 
 function invalid(message = "代码任务授权配置无效") {
@@ -127,9 +132,16 @@ function normalizeAuthority(value) {
   }
   const result = new Map();
   for (const workspaceValue of workspaces) {
+    const hasCapabilities = Object.hasOwn(workspaceValue, "capabilities");
     const workspace = exactRecord(
       workspaceValue,
-      ["id", "writablePaths", "requiredProfiles", "authorityDigest"],
+      [
+        "id",
+        "writablePaths",
+        "requiredProfiles",
+        "authorityDigest",
+        ...(hasCapabilities ? ["capabilities"] : []),
+      ],
       "executorAuthority.workspace",
     );
     const id = safeWorkspaceId(workspace.id, "executorAuthority.workspace.id");
@@ -175,10 +187,21 @@ function normalizeAuthority(value) {
     if (new Set(requiredProfiles.map(({ id: profileId }) => profileId)).size !== requiredProfiles.length) {
       throw invalid("executorAuthority.workspace.requiredProfiles 重复");
     }
+    const capabilities = hasCapabilities
+      ? normalizeStringArray(
+          workspace.capabilities,
+          EXECUTOR_CAPABILITIES.size,
+          "executorAuthority.workspace.capabilities",
+        ).sort()
+      : [];
+    if (capabilities.some((capability) => !EXECUTOR_CAPABILITIES.has(capability))) {
+      throw invalid("executorAuthority.workspace.capabilities 无效");
+    }
     result.set(id, {
       id,
       writablePaths,
       requiredProfiles,
+      capabilities,
       authorityDigest: sha256(
         workspace.authorityDigest,
         "executorAuthority.workspace.authorityDigest",
@@ -309,6 +332,7 @@ function normalizeStoredProposal(value) {
       "subject",
       "repository",
       "workspaceId",
+      "inputBinding",
       ...(Object.hasOwn(proposal.binding, "evidenceTarget")
         ? ["evidenceTarget"]
         : []),
@@ -335,7 +359,21 @@ function normalizeStoredProposal(value) {
     ],
     "proposal.payload",
   );
+  assertExecutionInputKind(proposal.binding);
   return proposal;
+}
+
+function assertExecutionInputKind(binding) {
+  const subject = binding.subject;
+  const expectedKind = binding.inputBinding === null ? "issue" : "pr";
+  const expectedId = `github:${expectedKind}:${binding.repository}#${subject.number}`;
+  if (subject.id !== expectedId) {
+    throw invalid(
+      binding.inputBinding === null
+        ? "只有可信 Issue 输入可以创建无 Head 绑定的代码任务"
+        : "PR 代码任务的输入身份与 Head 绑定不一致",
+    );
+  }
 }
 
 function publicRoleOperations(operationsByRole) {
@@ -356,6 +394,7 @@ export class CodeJobGrantFactory {
   #brainDigests;
   #publicOperations;
   #scopeAuthorityDigest;
+  #verifyInputAuthority;
 
   constructor({
     executorAuthority,
@@ -366,6 +405,7 @@ export class CodeJobGrantFactory {
     brainByRole,
     brainProviders,
     scopeAuthorityDigest,
+    inputAuthorityVerifier,
   } = {}) {
     if (
       scopeAuthorityDigest !== undefined &&
@@ -389,6 +429,16 @@ export class CodeJobGrantFactory {
     );
     this.#publicOperations = publicRoleOperations(this.#operationsByRole);
     this.#scopeAuthorityDigest = scopeAuthorityDigest ?? null;
+    if (
+      inputAuthorityVerifier !== undefined &&
+      (!inputAuthorityVerifier ||
+        typeof inputAuthorityVerifier.verify !== "function")
+    ) {
+      throw new TypeError("inputAuthorityVerifier must provide verify(binding)");
+    }
+    this.#verifyInputAuthority = inputAuthorityVerifier?.verify.bind(
+      inputAuthorityVerifier,
+    ) ?? null;
     Object.freeze(this);
   }
 
@@ -403,7 +453,8 @@ export class CodeJobGrantFactory {
       roleId,
       operation,
     });
-    const grant = createCodeJobGrant({
+    const createGrant = () => createCodeJobGrant({
+      schemaVersion: 2,
       proposalId: proposal.proposalId,
       contentDigest: proposal.contentDigest,
       policyVersion: proposal.policyVersion,
@@ -412,6 +463,7 @@ export class CodeJobGrantFactory {
       subject: proposal.binding.subject,
       repository: proposal.binding.repository,
       workspaceId: proposal.binding.workspaceId,
+      inputBinding: proposal.binding.inputBinding,
       workspaceAuthorityDigest: workspace.authorityDigest,
       operation,
       objective: proposal.payload.objective,
@@ -424,16 +476,28 @@ export class CodeJobGrantFactory {
       requiredProfiles: workspace.requiredProfiles,
       brainDigest: this.#brainDigests.get(roleId),
     });
-    return Object.freeze({
-      grant,
+    const authorized = this.#verifyInputBinding(
+      proposal.binding.inputBinding,
+      workspace,
+    );
+    const result = () => Object.freeze({
+      grant: createGrant(),
       allowedOperationsByRole: this.#publicOperations,
     });
+    return authorized instanceof Promise ? authorized.then(result) : result();
   }
 
   verify(value) {
     const grant = PREPARED_CODE_JOB_GRANTS.has(value)
       ? value
       : prepareCodeJobGrantVerification(value);
+    if (
+      grant.schemaVersion !== 2 ||
+      !Object.hasOwn(grant, "inputBinding")
+    ) {
+      throw invalid("旧版代码任务授权只能恢复查看，不能接纳新的执行动作");
+    }
+    assertExecutionInputKind(grant);
     const roleId = grant.requestedBy.roleId;
     const workspace = this.#currentAuthority({
       policyVersion: grant.policyVersion,
@@ -456,7 +520,40 @@ export class CodeJobGrantFactory {
     if (digestValue(actual) !== digestValue(expected)) {
       throw invalid("代码任务授权已不符合当前执行配置");
     }
-    return grant;
+    const authorized = this.#verifyInputBinding(grant.inputBinding, workspace);
+    return authorized instanceof Promise
+      ? authorized.then(() => grant)
+      : grant;
+  }
+
+  #verifyInputBinding(inputBinding, workspace) {
+    if (inputBinding === null) return null;
+    if (!GIT_OID.test(inputBinding.headRefOid)) {
+      throw invalid("PR 代码任务没有绑定有效的 Git Head OID");
+    }
+    if (!workspace.capabilities.includes("git_head_snapshot")) {
+      throw invalid("代码工作区不具备固定 Git Head 快照能力");
+    }
+    if (this.#verifyInputAuthority === null) {
+      throw invalid("PR 代码任务缺少当前 Head 授权校验器");
+    }
+    const assertVerified = (verified) => {
+      if (digestValue(verified) !== digestValue(inputBinding)) {
+        throw invalid("PR 当前 Head 授权校验器返回了不一致结果");
+      }
+      return verified;
+    };
+    let verified;
+    try {
+      verified = this.#verifyInputAuthority(structuredClone(inputBinding));
+    } catch {
+      throw invalid("PR 代码任务绑定的 Head 已失效");
+    }
+    return verified instanceof Promise
+      ? verified.then(assertVerified, () => {
+          throw invalid("PR 代码任务绑定的 Head 已失效");
+        })
+      : assertVerified(verified);
   }
 
   #currentAuthority({

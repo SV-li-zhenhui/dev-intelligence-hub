@@ -194,6 +194,13 @@ function workPair(index, intent, {
     createdAt: "2026-08-02T03:00:00.000Z",
     updatedAt: "2026-08-02T03:01:00.000Z",
   };
+  item.source = createPullRequestWorkSource(
+    prSourceEnvelope(
+      index,
+      item.event,
+      item.assignmentId,
+    ),
+  ).source;
   const outbox = {
     intentId,
     intentDigest: intentId.slice("work-intent-".length),
@@ -220,13 +227,18 @@ function workPair(index, intent, {
   return { item, outbox };
 }
 
-function prSourceEnvelope(sequence, event, assignmentId) {
+function prSourceEnvelope(
+  sequence,
+  event,
+  assignmentId,
+  targetRoleId = "pr-engineer",
+) {
   return {
     sequence,
     assignment: {
       assignmentId,
       eventId: event.eventId,
-      target: { type: "role", id: "pr-engineer" },
+      target: { type: "role", id: targetRoleId },
     },
     event,
   };

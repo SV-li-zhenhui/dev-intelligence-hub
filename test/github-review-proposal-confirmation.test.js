@@ -3,6 +3,31 @@ import test from "node:test";
 import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 
+const HEAD_REF_OID = "b".repeat(40);
+
+function inputBindingFor({
+  eventId = "event-1",
+  workItemId = "work-item-1",
+  repository = "acme/repo",
+  pullRequestNumber = 42,
+  headRefOid = HEAD_REF_OID,
+} = {}) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository,
+    pullRequestNumber,
+    rootItemId: workItemId,
+    workKey: "github:dashboard:acme-repo:42",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid,
+    eventId,
+    eventDigest: "c".repeat(64),
+    inputDigest: "d".repeat(64),
+  };
+}
+
 function proposal(overrides = {}) {
   const source = { assignmentId: "assignment-1", eventId: "event-1" };
   const binding = {
@@ -14,7 +39,8 @@ function proposal(overrides = {}) {
     },
     repository: "acme/repo",
     pullRequestNumber: 42,
-    headRefOid: "b".repeat(40),
+    headRefOid: HEAD_REF_OID,
+    inputBinding: inputBindingFor(),
   };
   const payload = {
     verdict: "request_changes",
@@ -40,6 +66,10 @@ function proposal(overrides = {}) {
       ...binding,
       ...overrides.binding,
       subject: { ...binding.subject, ...overrides.binding?.subject },
+      inputBinding: {
+        ...binding.inputBinding,
+        ...overrides.binding?.inputBinding,
+      },
     },
     payload: { ...payload, ...overrides.payload },
   });
@@ -72,7 +102,7 @@ test("a trusted GitHub proposal becomes the exact user-visible action", () => {
   assert.deepEqual(plan.target, {
     provider: "github",
     resourceId: "acme/repo#42",
-    version: "b".repeat(40),
+    version: HEAD_REF_OID,
   });
   assert.deepEqual(plan.action, {
     type: "pull_request_review",
@@ -83,6 +113,7 @@ test("a trusted GitHub proposal becomes the exact user-visible action", () => {
     actor: plan.actor,
     target: plan.target,
     action: plan.action,
+    inputBinding: value.binding.inputBinding,
   });
   assert.equal("displayedPayloadDigest" in plan, false);
   assert.equal("approvalBindingDigest" in plan, false);
@@ -146,6 +177,33 @@ test("source event and PR subject bindings must agree", () => {
   });
 
   for (const value of [mismatchedEvent, mismatchedSubject]) {
+    assert.throws(
+      () =>
+        createGitHubReviewProposalConfirmationPlan(value, {
+          actorAccountId: "review-account",
+        }),
+      (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
+    );
+  }
+});
+
+test("the canonical PR input binding must match the exact Review target", () => {
+  const mismatchedBindings = [
+    proposal({
+      binding: { inputBinding: { repository: "other/repo" } },
+    }),
+    proposal({
+      binding: { inputBinding: { pullRequestNumber: 43 } },
+    }),
+    proposal({
+      binding: { inputBinding: { headRefOid: "e".repeat(40) } },
+    }),
+    proposal({
+      binding: { inputBinding: { eventId: "event-foreign" } },
+    }),
+  ];
+
+  for (const value of mismatchedBindings) {
     assert.throws(
       () =>
         createGitHubReviewProposalConfirmationPlan(value, {

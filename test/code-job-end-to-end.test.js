@@ -131,27 +131,24 @@ function fixedDeveloperWorker() {
 function workflowEvent(occurredAt) {
   return {
     schemaVersion: 1,
-    eventType: "pull_request.created",
+    eventType: "issue.created",
     occurredAt,
     source: { provider: "github", scopeId: "acme/repo" },
     subject: {
-      id: "github:pr:acme/repo#17",
+      id: "github:issue:acme/repo#17",
       repository: "acme/repo",
       number: 17,
     },
     payload: {
       number: 17,
-      author: "octocat",
       title: "Use the corrected exported value",
-      headRefOid: "fixture-head",
-      state: "open",
     },
   };
 }
 
 function workflowRule() {
   return {
-    id: "u4-pr-to-developer",
+    id: "u4-issue-to-developer",
     source: "root",
     enabled: true,
     priority: 100,
@@ -159,7 +156,7 @@ function workflowRule() {
     condition: {
       op: "equals",
       path: "eventType",
-      value: "pull_request.created",
+      value: "issue.created",
     },
     targets: [{ type: "role", id: "developer" }],
     onMatch: "stop",

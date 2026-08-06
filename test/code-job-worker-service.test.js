@@ -1661,20 +1661,42 @@ test("the host selects fixed profiles and completes only after current-attempt p
   assert.equal(store.completionRequests[0].changePackageDelivery, true);
 });
 
-test("revoked authority fences the job before brain or executor access", async () => {
-  const initial = job();
+test("a changed PR Head fences the job before brain or executor access", async () => {
+  const inputBinding = {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/dashboard",
+    pullRequestNumber: 17,
+    rootItemId: "work-root-17",
+    workKey: `pr-work-${"2".repeat(64)}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "a".repeat(40),
+    eventId: "event-17",
+    eventDigest: "3".repeat(64),
+    inputDigest: "4".repeat(64),
+  };
+  const initial = job({ grant: grant({ inputBinding }) });
   const events = [];
   const store = new FakeJobStore([initial], events);
   const executor = new FakeExecutor(initial, events);
   const brainCalls = [];
-  const error = Object.assign(new Error("revoked"), {
-    code: "INVALID_CODE_JOB_AUTHORITY",
-  });
+  const currentHead = "b".repeat(40);
   const worker = new CodeJobWorkerService({
     jobStore: store,
     executor,
     brainDirectory: brain([], brainCalls),
-    grantVerifier: verifier(events, error),
+    grantVerifier: {
+      async verify(value) {
+        events.push("verify");
+        if (value.inputBinding.headRefOid !== currentHead) {
+          throw Object.assign(new Error("PR Head changed"), {
+            code: "INVALID_CODE_JOB_AUTHORITY",
+          });
+        }
+        return structuredClone(value);
+      },
+    },
   });
 
   const result = await worker.runCycle();

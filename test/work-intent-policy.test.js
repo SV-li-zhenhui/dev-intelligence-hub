@@ -24,14 +24,36 @@ function event(overrides = {}) {
   });
 }
 
-function context(overrides = {}) {
+function inputBinding(trustedEvent, rootItemId) {
   return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: trustedEvent.subject.repository,
+    pullRequestNumber: trustedEvent.subject.number,
+    rootItemId,
+    workKey: "github:dashboard:acme-repo:42",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: trustedEvent.payload.headRefOid,
+    eventId: trustedEvent.eventId,
+    eventDigest: trustedEvent.contentDigest,
+    inputDigest: "d".repeat(64),
+  };
+}
+
+function context(overrides = {}) {
+  const trustedEvent = overrides.event ?? event();
+  const result = {
     assignmentId: `workflow-assignment-${"a".repeat(64)}`,
     workItemId: `work-item-${"b".repeat(64)}`,
     roleId: "pr-reviewer",
-    event: event(),
+    event: trustedEvent,
     ...overrides,
   };
+  if (!Object.hasOwn(overrides, "inputBinding")) {
+    result.inputBinding = inputBinding(trustedEvent, result.workItemId);
+  }
+  return result;
 }
 
 function common(type) {
@@ -179,6 +201,7 @@ test("derives a GitHub review target only from the trusted event", () => {
     repository: "acme/repo",
     pullRequestNumber: 42,
     headRefOid: "abc123",
+    inputBinding: context().inputBinding,
   });
   assert.equal(Object.hasOwn(bound.binding, "accountId"), false);
   assert.equal(Object.hasOwn(bound.payload, "command"), false);
@@ -210,6 +233,7 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(code.kind, "code_action_proposal");
   assert.equal(code.binding.workspaceId, "acme-workspace");
   assert.equal(code.binding.repository, "acme/repo");
+  assert.deepEqual(code.binding.inputBinding, context().inputBinding);
   assert.deepEqual(Object.keys(code.payload), [
     "operation",
     "objective",

@@ -6,6 +6,7 @@ import { normalizeWorkspacePath } from "./code-execution-policy.js";
 import {
   projectNormalizedCodeJobForBrowser,
 } from "./code-job-browser-projection.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 import {
   CODE_JOB_STATUSES as SHARED_CODE_JOB_STATUSES,
 } from "./code-job-vocabulary.js";
@@ -328,7 +329,7 @@ function normalizeWritablePaths(value, operation, error) {
   return paths;
 }
 
-const GRANT_KEYS = Object.freeze([
+const LEGACY_GRANT_KEYS = Object.freeze([
   "proposalId",
   "contentDigest",
   "policyVersion",
@@ -349,15 +350,56 @@ const GRANT_KEYS = Object.freeze([
   "requiredProfiles",
   "brainDigest",
 ]);
+const GRANT_KEYS = Object.freeze([
+  "schemaVersion",
+  ...LEGACY_GRANT_KEYS,
+  "inputBinding",
+]);
+
+function grantKeys(value, error, { digest = false } = {}) {
+  const actual = plainDataEntries(value, error).map(([key]) => key);
+  const legacy = [
+    ...LEGACY_GRANT_KEYS,
+    ...(digest ? ["grantDigest"] : []),
+  ];
+  const current = [...GRANT_KEYS, ...(digest ? ["grantDigest"] : [])];
+  if (
+    actual.length === legacy.length &&
+    legacy.every((key) => actual.includes(key))
+  ) {
+    return LEGACY_GRANT_KEYS;
+  }
+  if (
+    actual.length === current.length &&
+    current.every((key) => actual.includes(key))
+  ) {
+    return GRANT_KEYS;
+  }
+  throw error;
+}
+
+function normalizeInputBinding(value, error) {
+  if (value === null) return null;
+  try {
+    return normalizePullRequestExecutionBinding(value, error);
+  } catch {
+    throw error;
+  }
+}
 
 function normalizeGrantContent(value, error) {
-  const entries = exactObject(value, GRANT_KEYS, error);
+  const keys = grantKeys(value, error);
+  const entries = exactObject(value, keys, error);
+  if (keys === GRANT_KEYS && entries.get("schemaVersion") !== 2) {
+    throw error;
+  }
   const operation = entries.get("operation");
   if (!CODE_OPERATIONS.has(operation)) throw error;
   const repository = normalizedRepository(entries.get("repository"), error);
   const subject = normalizeSubject(entries.get("subject"), error);
   if (subject.repository !== repository) throw error;
-  return {
+  const content = {
+    ...(keys === GRANT_KEYS ? { schemaVersion: 2 } : {}),
     proposalId: safeReference(
       entries.get("proposalId"),
       "proposalId",
@@ -418,6 +460,22 @@ function normalizeGrantContent(value, error) {
     ),
     brainDigest: sha256(entries.get("brainDigest"), "brainDigest", error),
   };
+  if (keys === GRANT_KEYS) {
+    const inputBinding = normalizeInputBinding(
+      entries.get("inputBinding"),
+      error,
+    );
+    if (
+      inputBinding !== null &&
+      (inputBinding.repository !== content.repository ||
+        inputBinding.pullRequestNumber !== content.subject.number ||
+        inputBinding.eventId !== content.source.eventId)
+    ) {
+      throw error;
+    }
+    content.inputBinding = inputBinding;
+  }
+  return content;
 }
 
 export function createCodeJobGrant(value) {
@@ -427,9 +485,10 @@ export function createCodeJobGrant(value) {
 
 export function normalizeCodeJobGrant(value) {
   const error = invalidGrant();
-  const entries = exactObject(value, [...GRANT_KEYS, "grantDigest"], error);
+  const keys = grantKeys(value, error, { digest: true });
+  const entries = exactObject(value, [...keys, "grantDigest"], error);
   const content = normalizeGrantContent(
-    Object.fromEntries(GRANT_KEYS.map((key) => [key, entries.get(key)])),
+    Object.fromEntries(keys.map((key) => [key, entries.get(key)])),
     error,
   );
   const grantDigest = sha256(entries.get("grantDigest"), "grantDigest", error);

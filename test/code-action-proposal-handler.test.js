@@ -18,6 +18,24 @@ import {
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 
 const CREATED_AT = "2026-08-02T03:00:01.000Z";
+const HEAD_REF_OID = "1".repeat(40);
+
+function inputBindingFor(number) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/repo",
+    pullRequestNumber: number,
+    rootItemId: `work-${number}`,
+    workKey: `pull-request-acme-repo-${number}`,
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: HEAD_REF_OID,
+    eventId: `event-${number}`,
+    eventDigest: `${"d".repeat(63)}${number % 10}`,
+    inputDigest: `${"e".repeat(63)}${number % 10}`,
+  };
+}
 
 function proposal(number = 42) {
   return normalizeBoundWorkProposal({
@@ -35,6 +53,7 @@ function proposal(number = 42) {
       },
       repository: "acme/repo",
       workspaceId: "acme-workspace",
+      inputBinding: inputBindingFor(number),
     },
     payload: {
       operation: "modify",
@@ -49,6 +68,7 @@ function proposal(number = 42) {
 
 function grantFor(value = proposal()) {
   return createCodeJobGrant({
+    schemaVersion: 2,
     proposalId: value.proposalId,
     contentDigest: value.contentDigest,
     policyVersion: value.policyVersion,
@@ -57,6 +77,7 @@ function grantFor(value = proposal()) {
     subject: value.binding.subject,
     repository: value.binding.repository,
     workspaceId: value.binding.workspaceId,
+    inputBinding: value.binding.inputBinding,
     workspaceAuthorityDigest: "9".repeat(64),
     operation: value.payload.operation,
     objective: value.payload.objective,
@@ -204,6 +225,7 @@ function queuedJob(grant, overrides = {}) {
     subject: grant.subject,
     repository: grant.repository,
     workspaceId: grant.workspaceId,
+    inputBinding: grant.inputBinding,
     operation: grant.operation,
     objective: grant.objective,
     acceptanceCriteria: grant.acceptanceCriteria,
@@ -266,6 +288,13 @@ test("a proposal is enqueued once and waits on the exact code confirmation", asy
   assert.equal(producer.getCalls.length, 0);
   assert.equal(reader.getCalls.length, 0);
   assert.equal(instance.trusted.calls.length, 1);
+  const enqueued = normalizeConfirmationPlan(producer.plan);
+  assert.equal(enqueued.action.grant.schemaVersion, 2);
+  assert.equal(enqueued.action.grant.inputBinding.headRefOid, HEAD_REF_OID);
+  assert.deepEqual(
+    enqueued.action.grant.inputBinding,
+    handlerInput().proposal.binding.inputBinding,
+  );
   assert.deepEqual(transition, {
     status: "waiting_confirmation",
     downstreamRef: producer.plan.id,
@@ -397,18 +426,7 @@ test("a cancelling job stays active and a projected cancellation becomes rejecte
 test("a legacy queued reader projection remains compatible during local upgrade", async () => {
   const grant = grantFor();
   const legacy = queuedJob(grant);
-  for (const key of [
-    "turn",
-    "pendingActionType",
-    "observationCount",
-    "latestObservation",
-    "terminalResult",
-    "memoryProjection",
-    "pause",
-    "uncertainty",
-  ]) {
-    delete legacy[key];
-  }
+  delete legacy.uncertainty;
   const producer = new FakeConfirmationProducer();
   const reader = new FakeCodeJobReader(legacy);
   const instance = handler(producer, reader, grant);
@@ -775,6 +793,15 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
         receipt: { id: jobId, createdAt: "2026-08-02T03:00:02.000Z" },
       },
       job: queuedJob(grant),
+    },
+    {
+      confirmation: {},
+      job: queuedJob(grant, {
+        inputBinding: {
+          ...grant.inputBinding,
+          headRefOid: "2".repeat(40),
+        },
+      }),
     },
     {
       confirmation: {},

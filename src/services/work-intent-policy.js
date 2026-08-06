@@ -6,6 +6,7 @@ import {
   normalizeWorkflowEvent,
 } from "../domain/workflow-events.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -196,12 +197,16 @@ function stable(value) {
 }
 
 function normalizeContext(value) {
-  const entries = exact(
-    value,
-    Object.hasOwn(value ?? {}, "evidenceTarget")
-      ? ["assignmentId", "workItemId", "roleId", "event", "evidenceTarget"]
-      : ["assignmentId", "workItemId", "roleId", "event"],
+  const optionalKeys = ["inputBinding", "evidenceTarget"].filter((key) =>
+    Object.hasOwn(value ?? {}, key),
   );
+  const entries = exact(value, [
+    "assignmentId",
+    "workItemId",
+    "roleId",
+    "event",
+    ...optionalKeys,
+  ]);
   const suppliedEvent = entries.get("event");
   const event =
     suppliedEvent && typeof suppliedEvent === "object" && Object.hasOwn(suppliedEvent, "eventId")
@@ -222,7 +227,54 @@ function normalizeContext(value) {
       contextError("evidenceTarget 无效");
     }
   }
+  if (entries.has("inputBinding")) {
+    if (entries.get("inputBinding") === null) {
+      context.inputBinding = null;
+    } else {
+      try {
+        context.inputBinding = normalizePullRequestExecutionBinding(
+          entries.get("inputBinding"),
+        );
+      } catch {
+        contextError("inputBinding 无效");
+      }
+    }
+  }
+  if (context.inputBinding !== undefined && context.inputBinding !== null) {
+    const binding = context.inputBinding;
+    if (
+      !context.event.eventType.startsWith("pull_request.") ||
+      binding.repository !== context.event.subject.repository ||
+      binding.pullRequestNumber !== context.event.subject.number ||
+      binding.eventId !== context.event.eventId ||
+      binding.eventDigest !== context.event.contentDigest ||
+      binding.headRefOid !== context.event.payload?.headRefOid
+    ) {
+      contextError("inputBinding 与工作事件不匹配");
+    }
+  }
   return context;
+}
+
+function proposalInputBinding(context) {
+  if (!Object.hasOwn(context, "inputBinding")) {
+    denied("代码或 Review 提案缺少可信输入绑定");
+  }
+  if (
+    context.event.eventType.startsWith("pull_request.") &&
+    context.inputBinding === null
+  ) {
+    denied("PR 提案缺少可信输入绑定");
+  }
+  if (
+    !context.event.eventType.startsWith("pull_request.") &&
+    context.inputBinding !== null
+  ) {
+    contextError("非 PR 工作不能携带 PR 输入绑定");
+  }
+  return context.inputBinding === null
+    ? null
+    : structuredClone(context.inputBinding);
 }
 
 function proposalAuthorityBinding(context, intent) {
@@ -351,6 +403,7 @@ export function createWorkIntentPolicy({
           repository: context.event.subject.repository,
           pullRequestNumber: context.event.subject.number,
           headRefOid,
+          inputBinding: proposalInputBinding(context),
           ...proposalAuthorityBinding(context, intent),
         },
         {
@@ -378,6 +431,7 @@ export function createWorkIntentPolicy({
           ...eventBinding(context.event),
           repository,
           workspaceId,
+          inputBinding: proposalInputBinding(context),
           ...proposalAuthorityBinding(context, intent),
         },
         {
