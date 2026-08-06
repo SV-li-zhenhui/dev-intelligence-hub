@@ -1,0 +1,815 @@
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import http from "node:http";
+import path from "node:path";
+import { chromium } from "playwright";
+
+const publicDirectory = path.resolve("public");
+const baseConfiguration = JSON.parse(await readFile("config.json", "utf8"));
+const ACTIVE_DIGEST = "a".repeat(64);
+const DOCUMENT_DIGEST = "b".repeat(64);
+const VALIDATION_DIGEST = "c".repeat(64);
+const IMPACT_DIGEST = "d".repeat(64);
+
+let serverConfiguration = structuredClone(baseConfiguration);
+let stateRevision = 1;
+let draftRevision = 0;
+let draftExists = false;
+let staleNextWrite = false;
+let attentionAvailable = false;
+let failNextConfigurationRead = false;
+const draftWrites = [];
+const staleWrites = [];
+const previewRequests = [];
+const confirmationRequests = [];
+const apiRequests = [];
+
+function json(response, status, value) {
+  response.writeHead(status, {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+  });
+  response.end(JSON.stringify(value));
+}
+
+async function requestJson(request) {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of request) {
+    length += chunk.length;
+    if (length > 2 * 1024 * 1024) throw new Error("fixture request is too large");
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function dashboardFixture() {
+  return {
+    meta: {
+      refreshedAt: "2026-08-06T01:00:00.000Z",
+      durationMs: 1,
+      sources: { github: 0, dingtalk: 0 },
+      errors: [],
+      brain: { enabled: false, errors: [] },
+    },
+    counts: {
+      actionNow: 0,
+      waitingOther: 0,
+      uncertainPullRequests: 0,
+      issues: 0,
+    },
+    groups: {
+      actionNow: [],
+      waitingOther: [],
+      uncertainPullRequests: [],
+      historicalPullRequests: [],
+      reviewRequested: [],
+      myPullRequests: [],
+      myIssues: [],
+      versions: [],
+      dingtalk: [],
+    },
+    employee: null,
+  };
+}
+
+function draftFixture() {
+  return {
+    draftId: "draft-1",
+    revision: draftRevision,
+    baseVersion: 1,
+    configurationDigest: DOCUMENT_DIGEST,
+    createdAt: "2026-08-06T01:01:00.000Z",
+    configuration: structuredClone(serverConfiguration),
+  };
+}
+
+function configurationFixture() {
+  return {
+    status: {
+      safeMode: false,
+      runtimeMode: "ready",
+      stateRevision,
+      activeVersion: 1,
+      migrationError: null,
+    },
+    storedActive: { version: 1, configurationDigest: ACTIVE_DIGEST },
+    runtimeEffective: {
+      activeVersion: 1,
+      configurationDigest: ACTIVE_DIGEST,
+    },
+    pendingRestart: false,
+    editableConfiguration: structuredClone(serverConfiguration),
+    drafts: draftExists ? [draftFixture()] : [],
+    versions: [
+      {
+        version: 1,
+        source: "bootstrap",
+        configurationDigest: ACTIVE_DIGEST,
+        activatedAt: "2026-08-06T01:00:00.000Z",
+      },
+    ],
+    audit: [],
+    history: {
+      totalVersions: 1,
+      totalAuditEntries: 0,
+      versionsTruncated: false,
+      auditTruncated: false,
+    },
+  };
+}
+
+function previewFixture() {
+  return {
+    kind: "configuration.activate",
+    expectedStateRevision: stateRevision,
+    expectedActiveVersion: 1,
+    draftId: "draft-1",
+    draftRevision,
+    documentDigest: DOCUMENT_DIGEST,
+    validationDigest: VALIDATION_DIGEST,
+    impactDigest: IMPACT_DIGEST,
+    impact: { benign_claim_change: ["refreshMinutes"] },
+  };
+}
+
+function confirmationFixture() {
+  return {
+    id: "configuration-confirmation-1",
+    kind: "local.configuration-activate",
+    queueRevision: 4,
+    itemRevision: 1,
+    displayedPayloadDigest: "e".repeat(64),
+    approvalBindingDigest: "f".repeat(64),
+    retryable: false,
+    requestedBy: {
+      roleId: "configuration-owner",
+      workItemId: "configuration-draft-1",
+    },
+    display: {
+      title: "确认配置草稿",
+      summary: "确认后保存当前摘要绑定的配置版本",
+      actionLabel: "确认并激活配置",
+      evidence: ["结构化配置浏览器测试"],
+      payload: {
+        actor: { accountId: "owner:local" },
+        target: { resourceId: "configuration", version: `${stateRevision}` },
+        action: {
+          type: "activate_draft",
+          expectedStateRevision: stateRevision,
+          expectedActiveVersion: 1,
+          draftId: "draft-1",
+          draftRevision,
+          documentDigest: DOCUMENT_DIGEST,
+          validationDigest: VALIDATION_DIGEST,
+          impactDigest: IMPACT_DIGEST,
+        },
+        impact: { benign_claim_change: ["refreshMinutes"] },
+      },
+    },
+  };
+}
+
+function safeStaticPath(pathname) {
+  const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
+  const resolved = path.resolve(publicDirectory, relative);
+  if (
+    resolved !== path.join(publicDirectory, "index.html") &&
+    !resolved.startsWith(`${publicDirectory}${path.sep}`)
+  ) {
+    return null;
+  }
+  return resolved;
+}
+
+function contentType(file) {
+  return {
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+  }[path.extname(file)] || "application/octet-stream";
+}
+
+function createFixtureServer() {
+  return http.createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url, "http://127.0.0.1");
+      if (url.pathname.startsWith("/api/")) {
+        apiRequests.push({ method: request.method, path: url.pathname });
+      }
+      if (request.method === "GET" && url.pathname === "/api/dashboard") {
+        json(response, 200, dashboardFixture());
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/employees") {
+        json(response, 200, { items: [] });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/attention/next") {
+        if (attentionAvailable) {
+          attentionAvailable = false;
+          json(response, 200, {
+            available: true,
+            source: "external_confirmation",
+            pendingCount: 1,
+            externalEnabled: true,
+            externalQueueRevision: 4,
+            item: confirmationFixture(),
+          });
+        } else {
+          json(response, 200, {
+            available: false,
+            source: null,
+            pendingCount: 0,
+            externalEnabled: true,
+            externalQueueRevision: 4,
+            item: null,
+          });
+        }
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/configuration") {
+        if (failNextConfigurationRead) {
+          failNextConfigurationRead = false;
+          response.writeHead(200, {
+            "cache-control": "no-store",
+            "content-type": "application/json; charset=utf-8",
+            "x-fixture-invalid-json": "1",
+          });
+          response.end("{");
+          return;
+        }
+        json(response, 200, configurationFixture());
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/configuration/drafts") {
+        const body = await requestJson(request);
+        draftWrites.push({ body, actionHeader: request.headers["x-mydashboard-action"] });
+        serverConfiguration = structuredClone(body.configuration);
+        stateRevision += 1;
+        draftRevision = 1;
+        draftExists = true;
+        json(response, 201, { draft: draftFixture() });
+        return;
+      }
+      if (request.method === "PUT" && url.pathname === "/api/configuration/drafts/draft-1") {
+        const body = await requestJson(request);
+        if (staleNextWrite) {
+          staleNextWrite = false;
+          staleWrites.push({ body, actionHeader: request.headers["x-mydashboard-action"] });
+          serverConfiguration = {
+            ...serverConfiguration,
+            refreshMinutes: 99,
+          };
+          stateRevision += 1;
+          draftRevision += 1;
+          json(response, 409, { error: "fixture configuration changed" });
+          return;
+        }
+        draftWrites.push({ body, actionHeader: request.headers["x-mydashboard-action"] });
+        serverConfiguration = structuredClone(body.configuration);
+        stateRevision += 1;
+        draftRevision += 1;
+        json(response, 200, { draft: draftFixture() });
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/configuration/drafts/draft-1/preview"
+      ) {
+        previewRequests.push({
+          body: await requestJson(request),
+          actionHeader: request.headers["x-mydashboard-action"],
+        });
+        json(response, 200, previewFixture());
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/configuration/drafts/draft-1/request-confirmation"
+      ) {
+        confirmationRequests.push({
+          body: await requestJson(request),
+          actionHeader: request.headers["x-mydashboard-action"],
+        });
+        attentionAvailable = true;
+        json(response, 201, { request: { id: "configuration-request-1" } });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/fixture/stale-next-write") {
+        staleNextWrite = true;
+        json(response, 200, { ok: true });
+        return;
+      }
+      if (url.pathname === "/favicon.ico") {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      if (url.pathname.startsWith("/api/")) {
+        json(response, 404, { error: "fixture route unavailable" });
+        return;
+      }
+      const file = safeStaticPath(url.pathname);
+      if (!file) {
+        response.writeHead(403);
+        response.end();
+        return;
+      }
+      response.writeHead(200, { "content-type": contentType(file) });
+      response.end(await readFile(file));
+    } catch (error) {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end(String(error));
+    }
+  });
+}
+
+async function launchBrowser() {
+  if (process.platform === "win32") {
+    return chromium.launch({ channel: "msedge", headless: true });
+  }
+  if (existsSync(chromium.executablePath())) {
+    return chromium.launch({ headless: true });
+  }
+  throw new Error("Install a Playwright Chromium browser before running this fixture");
+}
+
+function attributeLocator(page, attribute, pathValue) {
+  return page.locator(`[${attribute}='${JSON.stringify(pathValue)}']`);
+}
+
+function field(page, pathValue) {
+  return attributeLocator(page, "data-configuration-field", pathValue);
+}
+
+function templateField(container, pathValue) {
+  return container.locator(
+    `[data-configuration-template-field='${JSON.stringify(pathValue)}']`,
+  );
+}
+
+async function openDetailsBySummary(page, name) {
+  const summary = page.locator("summary").filter({ hasText: name });
+  await summary.click();
+  return summary.locator("xpath=..");
+}
+
+function captureBrowserErrors(page) {
+  const messages = [];
+  page.on("pageerror", (error) => messages.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") messages.push(`console: ${message.text()}`);
+  });
+  return messages;
+}
+
+const server = createFixtureServer();
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+const address = server.address();
+const origin = `http://127.0.0.1:${address.port}`;
+const browser = await launchBrowser();
+try {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  const browserErrors = captureBrowserErrors(page);
+  await page.goto(origin, { waitUntil: "networkidle" });
+  await page.locator('[data-view="configuration"]').click();
+  await page.locator("[data-configuration-structured-form]").waitFor();
+
+  assert.equal(await page.locator(".configuration-editor textarea").count(), 0);
+
+  const providerCollection = attributeLocator(
+    page,
+    "data-configuration-collection",
+    ["brainProviders"],
+  );
+  const ollamaCard = attributeLocator(
+    providerCollection,
+    "data-configuration-entry",
+    ["brainProviders", "ollama"],
+  );
+  await ollamaCard.getByRole("button", { name: "删除ollama" }).click();
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /无法删除.*brain\.provider/s,
+  );
+  assert.equal(await ollamaCard.count(), 1);
+
+  const refreshField = field(page, ["refreshMinutes"]);
+  await refreshField.fill("");
+  await page.locator("[data-configuration-submit]").click();
+  assert.equal(await refreshField.inputValue(), "");
+  assert.equal(await refreshField.getAttribute("aria-invalid"), "true");
+  assert.match(await refreshField.getAttribute("aria-describedby"), /^configuration-error-/);
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify(["refreshMinutes"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /1 个配置问题/,
+  );
+  await refreshField.fill("17");
+  assert.equal(await refreshField.getAttribute("aria-invalid"), null);
+  assert.equal(await refreshField.getAttribute("aria-describedby"), null);
+  assert.equal(await page.locator("#configuration-form-status").textContent(), "");
+
+  const providerTemplate = await openDetailsBySummary(page, "新增大脑 Provider");
+  const providerTemplateKey = providerTemplate.locator(
+    "[data-configuration-template-key]",
+  );
+  const providerBaseUrl = templateField(
+    providerTemplate,
+    ["brainProviders", "new-provider", "baseUrl"],
+  );
+  await providerTemplateKey.fill("remote.in-progress");
+  await providerBaseUrl.fill("https://draft.example.invalid/v1");
+  await providerBaseUrl.focus();
+  await providerBaseUrl.evaluate((control) => control.setSelectionRange(8, 13));
+  failNextConfigurationRead = true;
+  const failedBackgroundConfigurationRead = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/configuration" &&
+      response.headers()["x-fixture-invalid-json"] === "1",
+  );
+  await page.evaluate(() => document.querySelector("#refresh-button").click());
+  await failedBackgroundConfigurationRead;
+  await page.waitForFunction(
+    () => document.querySelector("#refresh-button")?.disabled === false,
+  );
+  assert.equal(await providerTemplate.evaluate((details) => details.open), true);
+  assert.equal(await providerTemplateKey.inputValue(), "remote.in-progress");
+  assert.equal(
+    await providerBaseUrl.inputValue(),
+    "https://draft.example.invalid/v1",
+  );
+  assert.deepEqual(
+    await page.evaluate(() => ({
+      path: document.activeElement?.dataset?.configurationTemplateField,
+      start: document.activeElement?.selectionStart,
+      end: document.activeElement?.selectionEnd,
+    })),
+    {
+      path: JSON.stringify(["brainProviders", "new-provider", "baseUrl"]),
+      start: 8,
+      end: 13,
+    },
+  );
+  const recoveredBackgroundConfigurationRead = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/configuration" &&
+      response.status() === 200,
+  );
+  await page.evaluate(() => document.querySelector("#refresh-button").click());
+  await recoveredBackgroundConfigurationRead;
+  await page.waitForFunction(
+    () => document.querySelector("#refresh-button")?.disabled === false,
+  );
+  assert.equal(await providerTemplate.evaluate((details) => details.open), true);
+  assert.equal(await providerTemplateKey.inputValue(), "remote.in-progress");
+  assert.equal(
+    await providerBaseUrl.inputValue(),
+    "https://draft.example.invalid/v1",
+  );
+  assert.equal(
+    await page.evaluate(
+      () => document.activeElement?.dataset?.configurationTemplateField,
+    ),
+    JSON.stringify(["brainProviders", "new-provider", "baseUrl"]),
+  );
+  await providerTemplateKey.fill("remote.fixture");
+  await providerBaseUrl.fill("https://models.example.invalid/v1");
+  assert.equal(
+    await templateField(
+      providerTemplate,
+      ["brainProviders", "new-provider", "apiKeyEnv"],
+    ).count(),
+    1,
+  );
+  assert.equal(
+    await templateField(
+      providerTemplate,
+      ["brainProviders", "new-provider", "contextTokens"],
+    ).count(),
+    0,
+  );
+  await providerTemplate.getByRole("button", { name: "新增大脑 Provider" }).click();
+  assert.equal(
+    await page.evaluate(() =>
+      document.activeElement
+        ?.closest("[data-configuration-entry]")
+        ?.dataset?.configurationEntry),
+    JSON.stringify(["brainProviders", "remote.fixture"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已新增/,
+  );
+  assert.equal(
+    await page.locator("#configuration-form-status").evaluate(
+      (status) => status.classList.contains("configuration-success"),
+    ),
+    true,
+  );
+  const remoteProviderCard = attributeLocator(
+    page,
+    "data-configuration-entry",
+    ["brainProviders", "remote.fixture"],
+  );
+  const remoteProviderReplacement = await openDetailsBySummary(
+    remoteProviderCard,
+    "替换remote.fixture",
+  );
+  await remoteProviderReplacement
+    .getByRole("button", { name: "替换remote.fixture" })
+    .click();
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify(["brainProviders", "remote.fixture", "kind"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已替换/,
+  );
+
+  await field(page, ["employees", "roles", "developer", "brain", "provider"])
+    .selectOption("remote.fixture");
+  await field(page, ["memory", "answering", "brain", "provider"])
+    .selectOption("remote.fixture");
+  const legacyProvider = field(page, ["brain", "provider"]);
+  assert.equal(await legacyProvider.locator('option[value="remote.fixture"]').count(), 0);
+  assert.deepEqual(await legacyProvider.locator("option").allTextContents(), ["ollama"]);
+
+  let repositoryTemplate = await openDetailsBySummary(page, "新增跟踪仓库");
+  await templateField(repositoryTemplate, ["trackedRepositories", "0"])
+    .fill("fixture/repository");
+  await repositoryTemplate.getByRole("button", { name: "新增跟踪仓库" }).click();
+  assert.equal(await field(page, ["trackedRepositories", "2"]).inputValue(), "fixture/repository");
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify(["trackedRepositories", "2"]),
+  );
+  const addedRepository = attributeLocator(
+    page,
+    "data-configuration-entry",
+    ["trackedRepositories", "2"],
+  );
+  const repositoryReplacement = await openDetailsBySummary(
+    addedRepository,
+    "替换第 3 项",
+  );
+  await templateField(repositoryReplacement, ["trackedRepositories", "2"])
+    .fill("fixture/repository-replaced");
+  await repositoryReplacement
+    .getByRole("button", { name: "替换第 3 项" })
+    .click();
+  assert.equal(
+    await field(page, ["trackedRepositories", "2"]).inputValue(),
+    "fixture/repository-replaced",
+  );
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify(["trackedRepositories", "2"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已替换/,
+  );
+  await addedRepository.getByRole("button", { name: "删除第 3 项" }).click();
+  assert.equal(await field(page, ["trackedRepositories", "2"]).count(), 0);
+  assert.deepEqual(
+    await page.evaluate(() => ({
+      collection: document.activeElement
+        ?.closest("[data-configuration-collection]")
+        ?.dataset?.configurationCollection,
+      tagName: document.activeElement?.tagName,
+      text: document.activeElement?.textContent?.trim(),
+    })),
+    {
+      collection: JSON.stringify(["trackedRepositories"]),
+      tagName: "SUMMARY",
+      text: "新增跟踪仓库",
+    },
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已删除/,
+  );
+
+  repositoryTemplate = await openDetailsBySummary(page, "新增跟踪仓库");
+  await templateField(repositoryTemplate, ["trackedRepositories", "0"])
+    .fill("fixture/repository");
+  await repositoryTemplate.getByRole("button", { name: "新增跟踪仓库" }).click();
+
+  const fallbackRule = attributeLocator(
+    page,
+    "data-configuration-entry",
+    ["workflowRouting", "rules", "2"],
+  );
+  const conditionPath = ["workflowRouting", "rules", "2", "condition"];
+  let conditionTemplate = await openDetailsBySummary(
+    fallbackRule,
+    "新增匹配条件",
+  );
+  await conditionTemplate
+    .getByRole("button", { name: "新增匹配条件" })
+    .click();
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify([...conditionPath, "op"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已新增/,
+  );
+  let conditionNode = attributeLocator(
+    fallbackRule,
+    "data-configuration-node",
+    conditionPath,
+  );
+  conditionTemplate = await openDetailsBySummary(
+    conditionNode,
+    "替换匹配条件",
+  );
+  await conditionTemplate
+    .getByRole("button", { name: "替换匹配条件" })
+    .click();
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.dataset?.configurationField),
+    JSON.stringify([...conditionPath, "op"]),
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已替换/,
+  );
+  conditionNode = attributeLocator(
+    fallbackRule,
+    "data-configuration-node",
+    conditionPath,
+  );
+  await conditionNode.getByRole("button", { name: "删除匹配条件" }).click();
+  assert.deepEqual(
+    await page.evaluate((pathValue) => ({
+      path: document.activeElement
+        ?.closest("[data-configuration-template-value-root]")
+        ?.dataset?.configurationTemplateValueRoot,
+      tagName: document.activeElement?.tagName,
+      text: document.activeElement?.textContent?.trim(),
+    }), conditionPath),
+    {
+      path: JSON.stringify(conditionPath),
+      tagName: "SUMMARY",
+      text: "新增匹配条件",
+    },
+  );
+  assert.match(
+    await page.locator("#configuration-form-status").textContent(),
+    /已删除/,
+  );
+
+  const saveResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/configuration/drafts",
+  );
+  await page.locator("[data-configuration-submit]").click();
+  assert.equal((await saveResponse).status(), 201);
+  await page.getByRole("button", { name: "保存新修订" }).waitFor();
+
+  const expectedConfiguration = structuredClone(baseConfiguration);
+  expectedConfiguration.refreshMinutes = 17;
+  expectedConfiguration.brainProviders["remote.fixture"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://models.example.invalid/v1",
+    apiKeyEnv: "MYDASHBOARD_MODEL_API_KEY",
+    remote: true,
+    timeoutMs: 120_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  expectedConfiguration.employees.roles.developer.brain.provider = "remote.fixture";
+  expectedConfiguration.memory.answering.brain.provider = "remote.fixture";
+  expectedConfiguration.trackedRepositories.push("fixture/repository");
+  assert.deepEqual(draftWrites, [
+    {
+      actionHeader: "1",
+      body: {
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration: expectedConfiguration,
+      },
+    },
+  ]);
+
+  assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
+  assert.equal(confirmationRequests.length, 0);
+  const previewResponse = page.waitForResponse(
+    (response) => new URL(response.url()).pathname.endsWith("/draft-1/preview"),
+  );
+  await page.locator("[data-configuration-preview]").click();
+  assert.equal((await previewResponse).status(), 200);
+  await page.locator(".configuration-preview").waitFor();
+  assert.deepEqual(previewRequests, [
+    {
+      actionHeader: "1",
+      body: {
+        draftRevision: 1,
+        expectedStateRevision: 2,
+        expectedActiveVersion: 1,
+      },
+    },
+  ]);
+  assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
+  assert.equal(confirmationRequests.length, 0);
+
+  const requestResponse = page.waitForResponse(
+    (response) => new URL(response.url()).pathname.endsWith("/request-confirmation"),
+  );
+  await page.locator("[data-configuration-request]").click();
+  assert.equal((await requestResponse).status(), 201);
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  assert.deepEqual(confirmationRequests, [
+    {
+      actionHeader: "1",
+      body: {
+        draftRevision: 1,
+        expectedStateRevision: 2,
+        expectedActiveVersion: 1,
+      },
+    },
+  ]);
+  assert.match(
+    await page.locator("#confirmation-dialog").textContent(),
+    /确认配置草稿.*确认并激活配置/s,
+  );
+  await page.locator(".confirmation-close").click();
+  await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
+
+  const refreshedField = field(page, ["refreshMinutes"]);
+  await refreshedField.fill("23");
+  await page.evaluate(() => fetch("/fixture/stale-next-write", { method: "POST" }));
+  const staleResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === "/api/configuration/drafts/draft-1",
+  );
+  await page.locator("[data-configuration-submit]").click();
+  assert.equal((await staleResponse).status(), 409);
+  await page.locator("[data-configuration-reset]").waitFor();
+  assert.equal(await field(page, ["refreshMinutes"]).inputValue(), "23");
+  assert.equal(await page.locator("[data-configuration-submit]").isDisabled(), true);
+  assert.equal(await page.locator("[data-configuration-preview]").isDisabled(), true);
+  assert.match(await page.locator("#configuration-form-status").textContent(), /本地内容已保留/);
+  assert.equal(staleWrites.length, 1);
+  assert.equal(staleWrites[0].body.configuration.refreshMinutes, 23);
+  assert.equal(staleWrites[0].actionHeader, "1");
+
+  await page.locator("[data-configuration-reset]").click();
+  await page.waitForFunction(() => {
+    const control = document.querySelector('[data-configuration-field="[\\"refreshMinutes\\"]"]');
+    return control?.value === "99";
+  });
+  assert.equal(await page.locator("[data-configuration-reset]").count(), 0);
+  const unexpectedBrowserErrors = browserErrors.filter(
+    (message) => !/status of 409 \(Conflict\)/.test(message),
+  );
+  assert.equal(unexpectedBrowserErrors.length, 0, unexpectedBrowserErrors.join("\n"));
+
+  const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const mobileErrors = captureBrowserErrors(mobile);
+  await mobile.goto(origin, { waitUntil: "networkidle" });
+  await mobile.locator('[data-view="configuration"]').click();
+  await mobile.locator("[data-configuration-structured-form]").waitFor();
+  await openDetailsBySummary(mobile, "新增大脑 Provider");
+  const overflow = await mobile.evaluate(() => ({
+    document: document.documentElement.scrollWidth - window.innerWidth,
+    form: document.querySelector("[data-configuration-structured-form]").scrollWidth -
+      document.querySelector("[data-configuration-structured-form]").clientWidth,
+  }));
+  assert.ok(overflow.document <= 0, `mobile document overflowed by ${overflow.document}px`);
+  assert.ok(overflow.form <= 0, `mobile form overflowed by ${overflow.form}px`);
+  assert.equal(await mobile.locator(".configuration-editor textarea").count(), 0);
+  assert.equal(mobileErrors.length, 0, mobileErrors.join("\n"));
+  await mobile.close();
+
+  assert.equal(
+    apiRequests.some(
+      ({ method, path: requestPath }) =>
+        method !== "GET" &&
+        (/^\/api\/configuration\/(?:activate|restart)(?:\/|$)/.test(requestPath) ||
+          /^\/api\/configuration\/versions\/\d+\/rollback$/.test(requestPath)),
+    ),
+    false,
+    "the UI must not call direct activate, restart or rollback execution routes",
+  );
+} finally {
+  await browser.close();
+  await new Promise((resolve) => server.close(resolve));
+}
+
+console.log("configuration form Edge Playwright fixture passed");

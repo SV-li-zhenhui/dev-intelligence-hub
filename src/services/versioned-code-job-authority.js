@@ -7,6 +7,7 @@ import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-director
 import {
   codeJobBrainDigest,
   CodeJobGrantFactory,
+  prepareCodeJobGrantVerification,
 } from "./code-job-grant-factory.js";
 
 function invalid(message = "代码任务授权已不符合当前活动配置") {
@@ -51,8 +52,131 @@ function activeConfiguration(value) {
   };
 }
 
-function configurationAuthorityDigest(configuration) {
-  const roleAuthority = Object.fromEntries(
+function providerAuthority(configuration, providerId) {
+  const provider = configuration.brainProviders[providerId];
+  if (!provider) return null;
+  return {
+    kind: provider.kind,
+    baseUrl: provider.baseUrl,
+    apiKeyEnv: provider.apiKeyEnv ?? null,
+    remote: provider.remote ?? null,
+  };
+}
+
+function roleAuthority(configuration, roleId) {
+  const role = configuration.employees.roles[roleId];
+  const policy = configuration.workCoordination.policy;
+  return {
+    prerequisites: {
+      executor: globalExecutorAuthority(configuration),
+      workCoordinationEnabled: configuration.workCoordination.enabled,
+      memoryEnabled: configuration.memory.enabled,
+    },
+    role: role
+      ? {
+          enabled: role.enabled,
+          allowedIntents: [...role.permissions.allowedIntents].sort(),
+          brain: {
+            provider: role.brain.provider,
+            remoteData: role.brain.remoteData,
+          },
+          provider: providerAuthority(configuration, role.brain.provider),
+        }
+      : null,
+    codePolicy: {
+      admitted: policy.codeActionRoles.includes(roleId),
+      operations: [...(policy.codeOperationsByRole[roleId] ?? [])].sort(),
+    },
+  };
+}
+
+function workspaceAuthority(configuration, workspaceId) {
+  const executor = configuration.codeExecutor;
+  const workspace = executor.workspaces?.find(
+    (entry) => entry.id === workspaceId,
+  );
+  const requiredProfileIds = [
+    ...(executor.requiredProfilesByWorkspace?.[workspaceId] ?? []),
+  ].sort();
+  return {
+    workspace: workspace ?? null,
+    requiredProfiles: requiredProfileIds.map((profileId) => ({
+      id: profileId,
+      configuration: executor.profiles?.[profileId] ?? null,
+    })),
+  };
+}
+
+function globalExecutorAuthority(configuration) {
+  const executor = configuration.codeExecutor;
+  return {
+    enabled: executor.enabled,
+    docker: executor.docker ?? null,
+    brokerLimits: executor.brokerLimits ?? {},
+    executorLimits: executor.executorLimits ?? {},
+    maxArtifactBytes: executor.maxArtifactBytes ?? null,
+  };
+}
+
+function grantAuthority(configuration, { repository, workspaceId, roleId }) {
+  return {
+    policyVersion: configuration.workCoordination.policy.version,
+    role: roleAuthority(configuration, roleId),
+    repository: {
+      tracked: configuration.trackedRepositories.includes(repository),
+      workspaceId:
+        configuration.workCoordination.policy.workspaceByRepository[
+          repository
+        ] ?? null,
+    },
+    executor: workspaceAuthority(configuration, workspaceId),
+  };
+}
+
+function advanceAuthority(previous, fingerprint) {
+  return {
+    epoch: previous.epoch + (previous.fingerprint === fingerprint ? 0 : 1),
+    fingerprint,
+  };
+}
+
+function roleAuthorityDigest(authority) {
+  return canonicalJsonDigest({
+    schemaVersion: 1,
+    ...authority,
+  });
+}
+
+function grantAuthorityDigest(authority, scope) {
+  return canonicalJsonDigest({
+    schemaVersion: 1,
+    executorAuthorityDigest: scope.executorAuthorityDigest,
+    scope: {
+      repository: scope.repository,
+      workspaceId: scope.workspaceId,
+      roleId: scope.roleId,
+      operation: scope.operation,
+      policyVersion: scope.policyVersion,
+    },
+    authorization: authority,
+  });
+}
+
+function executorWorkspaceAuthorityDigest(value, workspaceId) {
+  const workspace = value?.workspaces?.find((entry) => entry.id === workspaceId);
+  if (
+    !workspace ||
+    typeof workspace.authorityDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(workspace.authorityDigest)
+  ) {
+    throw invalid("代码执行器工作区授权无效");
+  }
+  return workspace.authorityDigest;
+}
+
+function legacyConfigurationAuthorityDigest(configuration) {
+  // This exact projection is the persisted pre-scope digest algorithm.
+  const roles = Object.fromEntries(
     Object.entries(configuration.employees.roles).map(([roleId, role]) => [
       roleId,
       {
@@ -65,16 +189,18 @@ function configurationAuthorityDigest(configuration) {
       },
     ]),
   );
-  const providerAuthority = Object.fromEntries(
-    Object.entries(configuration.brainProviders).map(([providerId, provider]) => [
-      providerId,
-      {
-        kind: provider.kind,
-        baseUrl: provider.baseUrl,
-        apiKeyEnv: provider.apiKeyEnv ?? null,
-        remote: provider.remote ?? null,
-      },
-    ]),
+  const providers = Object.fromEntries(
+    Object.entries(configuration.brainProviders).map(
+      ([providerId, provider]) => [
+        providerId,
+        {
+          kind: provider.kind,
+          baseUrl: provider.baseUrl,
+          apiKeyEnv: provider.apiKeyEnv ?? null,
+          remote: provider.remote ?? null,
+        },
+      ],
+    ),
   );
   return canonicalJsonDigest({
     trackedRepositories: configuration.trackedRepositories,
@@ -84,12 +210,125 @@ function configurationAuthorityDigest(configuration) {
       policy: configuration.workCoordination.policy,
     },
     memoryEnabled: configuration.memory.enabled,
-    roles: roleAuthority,
-    brainProviders: providerAuthority,
+    roles,
+    brainProviders: providers,
   });
 }
 
-function scopedExecutorAuthority(value, authorityDigest, authorityEpoch) {
+function legacyWorkspaceAuthorityDigest(value, authority, workspaceId) {
+  return canonicalJsonDigest({
+    executorAuthorityDigest: executorWorkspaceAuthorityDigest(value, workspaceId),
+    configurationAuthorityDigest: authority.digest,
+    configurationAuthorityEpoch: authority.epoch,
+  });
+}
+
+class AuthorityHistory {
+  #versions;
+  #executorAuthority;
+  #scopeTimelines;
+  #roleTimelines;
+  #legacyStates;
+
+  constructor(versions, executorAuthority) {
+    this.#versions = versions;
+    this.#executorAuthority = executorAuthority;
+    this.#scopeTimelines = new Map();
+    this.#roleTimelines = new Map();
+    this.#legacyStates = null;
+  }
+
+  versionAt(index) {
+    return this.#versions[index];
+  }
+
+  verificationTimeline(grant) {
+    const scope = {
+      executorAuthorityDigest: executorWorkspaceAuthorityDigest(
+        this.#executorAuthority,
+        grant.workspaceId,
+      ),
+      policyVersion: grant.policyVersion,
+      repository: grant.repository,
+      workspaceId: grant.workspaceId,
+      roleId: grant.requestedBy.roleId,
+      operation: grant.operation,
+    };
+    const scopedDigests = this.#scopeTimeline(scope);
+    let legacyStates = this.#legacyStates;
+    if (!legacyStates) {
+      let legacyAuthority = { digest: null, epoch: 0 };
+      legacyStates = this.#versions.map(({ configuration }) => {
+        const digest = legacyConfigurationAuthorityDigest(configuration);
+        legacyAuthority = {
+          digest,
+          epoch:
+            legacyAuthority.epoch +
+            (legacyAuthority.digest === digest ? 0 : 1),
+        };
+        return legacyAuthority;
+      });
+      this.#legacyStates = legacyStates;
+    }
+    const legacyDigests = legacyStates.map((authority) =>
+      legacyWorkspaceAuthorityDigest(
+        this.#executorAuthority,
+        authority,
+        grant.workspaceId,
+      ),
+    );
+    return {
+      scopedDigests,
+      legacyStates,
+      legacyDigests,
+    };
+  }
+
+  scopeAuthorityDigestAt(index, scope) {
+    return this.#scopeTimeline(scope)[index];
+  }
+
+  roleAuthorityDigestAt(index, roleId) {
+    let timeline = this.#roleTimelines.get(roleId);
+    if (!timeline) {
+      let authority = { epoch: 0, fingerprint: null };
+      timeline = this.#versions.map(({ configuration }) => {
+        authority = advanceAuthority(
+          authority,
+          canonicalJsonDigest(roleAuthority(configuration, roleId)),
+        );
+        return roleAuthorityDigest(authority);
+      });
+      this.#roleTimelines.set(roleId, timeline);
+    }
+    return timeline[index];
+  }
+
+  #scopeTimeline(scope) {
+    const key = canonicalJsonDigest(scope);
+    let timeline = this.#scopeTimelines.get(key);
+    if (timeline) return timeline;
+    let authority = { epoch: 0, fingerprint: null };
+    timeline = this.#versions.map(({ configuration }) => {
+      authority = advanceAuthority(
+        authority,
+        canonicalJsonDigest(
+          grantAuthority(configuration, {
+            repository: scope.repository,
+            workspaceId: scope.workspaceId,
+            roleId: scope.roleId,
+          }),
+        ),
+      );
+      return grantAuthorityDigest(authority, scope);
+    });
+    this.#scopeTimelines.set(key, timeline);
+    return timeline;
+  }
+
+}
+
+function legacyExecutorAuthority(value, authority) {
   if (!value || !Array.isArray(value.workspaces)) {
     throw invalid("代码执行器授权无效");
   }
@@ -98,8 +337,8 @@ function scopedExecutorAuthority(value, authorityDigest, authorityEpoch) {
       ...workspace,
       authorityDigest: canonicalJsonDigest({
         executorAuthorityDigest: workspace.authorityDigest,
-        configurationAuthorityDigest: authorityDigest,
-        configurationAuthorityEpoch: authorityEpoch,
+        configurationAuthorityDigest: authority.digest,
+        configurationAuthorityEpoch: authority.epoch,
       }),
     })),
   };
@@ -185,6 +424,54 @@ function roleBrainDigest(configuration, roleId) {
   });
 }
 
+function executableConfiguration(configuration) {
+  return (
+    configuration.codeExecutor.enabled === true &&
+    configuration.workCoordination.enabled === true &&
+    configuration.memory.enabled === true
+  );
+}
+
+function configurationAdmitsRole(configuration, roleId) {
+  const role = configuration.employees.roles[roleId];
+  return (
+    executableConfiguration(configuration) &&
+    role?.enabled === true &&
+    role.permissions.allowedIntents.includes("propose_code_action") &&
+    configuration.workCoordination.policy.codeActionRoles.includes(roleId)
+  );
+}
+
+function configurationAdmitsGrant(configuration, grant, executorAuthority) {
+  const roleId = grant.requestedBy.roleId;
+  const policy = configuration.workCoordination.policy;
+  const workspace = executorAuthority?.workspaces?.find(
+    ({ id }) => id === grant.workspaceId,
+  );
+  if (
+    !configurationAdmitsRole(configuration, roleId) ||
+    policy.version !== grant.policyVersion ||
+    policy.workspaceByRepository[grant.repository] !== grant.workspaceId ||
+    !policy.codeOperationsByRole[roleId]?.includes(grant.operation) ||
+    !configuration.trackedRepositories.includes(grant.repository) ||
+    !workspace ||
+    roleBrainDigest(configuration, roleId) !== grant.brainDigest
+  ) {
+    return false;
+  }
+  return (
+    canonicalJsonDigest({
+      writablePaths: grant.writablePaths,
+      requiredProfiles: grant.requiredProfiles,
+    }) ===
+    canonicalJsonDigest({
+      writablePaths:
+        grant.operation === "modify" ? workspace.writablePaths : [],
+      requiredProfiles: workspace.requiredProfiles,
+    })
+  );
+}
+
 function configurationHistory(value, current) {
   if (!value || !Array.isArray(value.versions)) {
     throw invalid("配置历史不可用");
@@ -208,20 +495,6 @@ function configurationHistory(value, current) {
     throw invalid("配置历史与当前活动版本不一致");
   }
   return versions;
-}
-
-function currentAuthority(versions) {
-  let previousDigest = null;
-  let epoch = 0;
-  let digest = null;
-  for (const version of versions) {
-    digest = configurationAuthorityDigest(version.configuration);
-    if (digest !== previousDigest) {
-      epoch += 1;
-      previousDigest = digest;
-    }
-  }
-  return { digest, epoch };
 }
 
 export class VersionedCodeJobAuthority {
@@ -289,26 +562,102 @@ export class VersionedCodeJobAuthority {
   }
 
   async verify(value) {
+    const grant = prepareCodeJobGrantVerification(value);
     const current = await this.#current();
+    requireTrackedRepository(current.configuration, grant.repository);
+    const timeline = current.history.verificationTimeline(grant);
+    const currentIndex = current.historyIndex;
     let currentError;
     try {
-      return await this.#verifyWithContext(value, current, current.configuration);
+      return await this.#verifyWithContext(grant, current, current);
     } catch (error) {
       if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
       currentError = error;
     }
-    for await (const context of this.#historicalContexts(current)) {
-      try {
-        return await this.#verifyWithContext(
-          value,
-          context,
-          current.configuration,
+
+    if (
+      timeline.scopedDigests[currentIndex] ===
+      grant.workspaceAuthorityDigest
+    ) {
+      const candidateIndex = this.#grantCandidateIndex(
+        current,
+        grant,
+        timeline.scopedDigests,
+        currentIndex - 1,
+      );
+      if (candidateIndex !== null) {
+        const context = this.#context(
+          current.history.versionAt(candidateIndex),
+          current.history,
+          candidateIndex,
         );
+        try {
+          return await this.#verifyWithContext(grant, context, current);
+        } catch (error) {
+          if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
+        }
+      }
+    }
+
+    if (
+      timeline.legacyDigests[currentIndex] ===
+      grant.workspaceAuthorityDigest
+    ) {
+      const candidateIndex = this.#grantCandidateIndex(
+        current,
+        grant,
+        timeline.legacyDigests,
+        currentIndex,
+      );
+      if (candidateIndex !== null) {
+        const context = {
+          ...this.#legacyContext(
+            current.history.versionAt(candidateIndex),
+            timeline.legacyStates[candidateIndex],
+          ),
+          currentAuthority: timeline.legacyStates[currentIndex],
+        };
+        try {
+          return await this.#verifyLegacy(grant, context, current);
+        } catch (error) {
+          if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
+        }
+      }
+    }
+    throw currentError;
+  }
+
+  #grantCandidateIndex(current, grant, authorityDigests, maximumIndex) {
+    for (let index = maximumIndex; index >= 0; index -= 1) {
+      if (
+        authorityDigests[index] === grant.workspaceAuthorityDigest &&
+        configurationAdmitsGrant(
+          current.history.versionAt(index).configuration,
+          grant,
+          this.#executorAuthority,
+        )
+      ) {
+        return index;
+      }
+    }
+    return null;
+  }
+
+  #brainCandidateContext(current, roleId, brainDigest) {
+    for (let index = current.historyIndex - 1; index >= 0; index -= 1) {
+      const version = current.history.versionAt(index);
+      try {
+        if (
+          configurationAdmitsRole(version.configuration, roleId) &&
+          roleBrainDigest(version.configuration, roleId) === brainDigest
+        ) {
+          return this.#context(version, current.history, index);
+        }
       } catch (error) {
         if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
       }
     }
-    throw currentError;
+    return null;
   }
 
   async decide(value, authorization) {
@@ -319,12 +668,7 @@ export class VersionedCodeJobAuthority {
       ? current
       : null;
     if (context === null) {
-      for await (const candidate of this.#historicalContexts(current)) {
-        if (candidate.brainDigests.get(roleId) === brainDigest) {
-          context = candidate;
-          break;
-        }
-      }
+      context = this.#brainCandidateContext(current, roleId, brainDigest);
     }
     if (!context) {
       throw invalid("岗位大脑封印已不受当前活动配置授权");
@@ -335,8 +679,8 @@ export class VersionedCodeJobAuthority {
         await beforeGenerate();
         const latest = await this.#current();
         if (
-          latest.authorityDigest !== context.authorityDigest ||
-          latest.authorityEpoch !== context.authorityEpoch
+          latest.roleAuthorityDigest(roleId) !==
+          context.roleAuthorityDigest(roleId)
         ) {
           throw invalid("岗位大脑配置在调用前已变化");
         }
@@ -355,22 +699,29 @@ export class VersionedCodeJobAuthority {
       return this.#cache;
     }
     const versions = configurationHistory(await this.#readSnapshot(), active);
-    const authority = currentAuthority(versions);
-    this.#cache = this.#context(active, authority);
+    const history = new AuthorityHistory(versions, this.#executorAuthority);
+    this.#contexts.clear();
+    this.#cache = this.#context(active, history, versions.length - 1, {
+      requireStartupBoundary: true,
+    });
     return this.#cache;
   }
 
-  #context(active, authority) {
-    const contextKey = `${active.version}:${active.digest}:${authority.epoch}`;
+  #context(
+    active,
+    history,
+    historyIndex,
+    { requireStartupBoundary = false } = {},
+  ) {
+    const contextKey = `${active.version}:${active.digest}`;
     const cached = this.#contexts.get(contextKey);
     if (cached) return cached;
     const configuration = active.configuration;
     if (
-      configuration.codeExecutor.enabled !== true ||
-      configuration.workCoordination.enabled !== true ||
-      configuration.memory.enabled !== true ||
-      canonicalJsonDigest(configuration.codeExecutor) !==
-        this.#startupCodeExecutorDigest
+      !executableConfiguration(configuration) ||
+      (requireStartupBoundary &&
+        canonicalJsonDigest(configuration.codeExecutor) !==
+          this.#startupCodeExecutorDigest)
     ) {
       throw invalid("代码执行边界已变化，需要重启后才能接纳新动作");
     }
@@ -379,35 +730,50 @@ export class VersionedCodeJobAuthority {
     if (roleIds.length === 0) {
       throw invalid("活动配置没有可执行代码动作的岗位");
     }
+    const scopeAuthorityDigest = (scope) =>
+      history.scopeAuthorityDigestAt(historyIndex, scope);
     const grants = this.#grantFactoryFactory({
-      executorAuthority: scopedExecutorAuthority(
-        this.#executorAuthority,
-        authority.digest,
-        authority.epoch,
-      ),
+      executorAuthority: this.#executorAuthority,
       policyVersion: policy.version,
       workspaceByRepository: policy.workspaceByRepository,
       codeActionRoles: roleIds,
       codeOperationsByRole: roleOperations(policy, roleIds),
       brainByRole: roleBrains(configuration.employees.roles, roleIds),
       brainProviders: configuration.brainProviders,
+      scopeAuthorityDigest,
     });
     method(grants, "create", "versioned code job grant factory");
     method(grants, "verify", "versioned code job grant factory");
     const context = {
       version: active.version,
       digest: active.digest,
-      authorityDigest: authority.digest,
-      authorityEpoch: authority.epoch,
       configuration,
+      roleAuthorityDigest: (roleId) =>
+        roleIds.includes(roleId)
+          ? history.roleAuthorityDigestAt(historyIndex, roleId)
+          : undefined,
       brainDigests: new Map(
         roleIds.map((roleId) => [
           roleId,
           roleBrainDigest(configuration, roleId),
         ]),
       ),
+      grantAuthorityDigest: (grant) =>
+        history.scopeAuthorityDigestAt(historyIndex, {
+          executorAuthorityDigest: executorWorkspaceAuthorityDigest(
+            this.#executorAuthority,
+            grant.workspaceId,
+          ),
+          repository: grant.repository,
+          workspaceId: grant.workspaceId,
+          roleId: grant.requestedBy.roleId,
+          operation: grant.operation,
+          policyVersion: grant.policyVersion,
+        }),
       grants,
       directory: null,
+      history,
+      historyIndex,
     };
     this.#contexts.set(contextKey, context);
     if (this.#contexts.size > 32) {
@@ -416,29 +782,62 @@ export class VersionedCodeJobAuthority {
     return context;
   }
 
-  async *#historicalContexts(current) {
-    const versions = configurationHistory(await this.#readSnapshot(), current);
-    for (let index = versions.length - 2; index >= 0; index -= 1) {
-      const version = versions[index];
-      const digest = configurationAuthorityDigest(version.configuration);
-      if (digest !== current.authorityDigest) break;
-      try {
-        yield this.#context(version, {
-          digest,
-          epoch: current.authorityEpoch,
-        });
-      } catch (error) {
-        if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
-      }
+  #legacyContext(active, authority) {
+    const configuration = active.configuration;
+    if (
+      configuration.codeExecutor.enabled !== true ||
+      configuration.workCoordination.enabled !== true ||
+      configuration.memory.enabled !== true
+    ) {
+      throw invalid("旧版代码任务授权上下文已不可用");
     }
+    const policy = configuration.workCoordination.policy;
+    const roleIds = enabledCodeRoles(configuration);
+    if (roleIds.length === 0) {
+      throw invalid("旧版配置没有可执行代码动作的岗位");
+    }
+    const grants = this.#grantFactoryFactory({
+      executorAuthority: legacyExecutorAuthority(
+        this.#executorAuthority,
+        authority,
+      ),
+      policyVersion: policy.version,
+      workspaceByRepository: policy.workspaceByRepository,
+      codeActionRoles: roleIds,
+      codeOperationsByRole: roleOperations(policy, roleIds),
+      brainByRole: roleBrains(configuration.employees.roles, roleIds),
+      brainProviders: configuration.brainProviders,
+    });
+    method(grants, "verify", "legacy code job grant factory");
+    return { authority, grants };
   }
 
-  async #verifyWithContext(value, context, activeConfigurationValue) {
+  async #verifyWithContext(value, context, current) {
     const grant = await context.grants.verify(value);
     if (!grant || typeof grant.repository !== "string") {
       throw invalid("代码任务授权校验器返回了无效结果");
     }
-    requireTrackedRepository(activeConfigurationValue, grant.repository);
+    requireTrackedRepository(current.configuration, grant.repository);
+    if (
+      current.grantAuthorityDigest(grant) !== grant.workspaceAuthorityDigest
+    ) {
+      throw invalid("代码任务授权已被相关活动配置失效");
+    }
+    return grant;
+  }
+
+  async #verifyLegacy(value, context, current) {
+    const grant = await context.grants.verify(value);
+    if (!grant || typeof grant.repository !== "string") {
+      throw invalid("旧版代码任务授权校验器返回了无效结果");
+    }
+    requireTrackedRepository(current.configuration, grant.repository);
+    if (
+      context.authority.digest !== context.currentAuthority.digest ||
+      context.authority.epoch !== context.currentAuthority.epoch
+    ) {
+      throw invalid("旧版代码任务授权已被全局配置失效");
+    }
     return grant;
   }
 

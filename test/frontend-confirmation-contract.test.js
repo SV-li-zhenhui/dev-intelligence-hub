@@ -24,6 +24,106 @@ test("the dashboard keeps one confirmation dialog for local and external decisio
   );
 });
 
+test("the employee view separates the next pending decision from read-only history", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function confirmationCenterView");
+  const end = app.indexOf("\nfunction memoryString", start);
+  const confirmationCenter = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(confirmationCenter, /id="confirmation-pending-panel"/);
+  assert.match(confirmationCenter, /待你逐项确认/);
+  assert.match(confirmationCenter, /逐条弹框确认/);
+  assert.match(confirmationCenter, /id="confirmation-history-panel"/);
+  assert.match(confirmationCenter, /只读确认历史/);
+  assert.match(confirmationCenter, /id="confirmation-history-filter"/);
+  assert.match(confirmationCenter, /id="confirmation-history-apply"/);
+  assert.match(confirmationCenter, /id="confirmation-history-error"/);
+  assert.match(confirmationCenter, /id="confirmation-history-results"/);
+  assert.match(confirmationCenter, /id="confirmation-history-pagination"/);
+  assert.match(confirmationCenter, /<select[^>]+name="status"/);
+  assert.match(confirmationCenter, /<select[^>]+name="kind"/);
+  assert.match(confirmationCenter, /<select[^>]+name="roleId"/);
+  assert.doesNotMatch(confirmationCenter, /type="checkbox"/);
+  assert.doesNotMatch(confirmationCenter, /批量/);
+  assert.doesNotMatch(confirmationCenter, /data-external-operation/);
+  assert.doesNotMatch(confirmationCenter, /data-confirmation-id/);
+});
+
+test("confirmation history uses only the paged GET reader and never an approval endpoint", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("async function loadConfirmationHistory");
+  const end = app.indexOf("\nasync function loadMemories", start);
+  const loader = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(loader, /new URLSearchParams/);
+  assert.match(loader, /\/api\/confirmations\/history/);
+  assert.match(loader, /method: "GET"/);
+  assert.match(loader, /confirmationHistoryNextCursor/);
+  assert.match(
+    loader,
+    /const cursor = append \? confirmationHistoryNextCursor : null/,
+  );
+  assert.match(loader, /if \(append && !cursor\) return false/);
+  assert.match(loader, /confirmationHistoryAbortController\?\.abort\(\)/);
+  assert.match(loader, /sequence !== confirmationHistoryRequestSequence/);
+  assert.match(loader, /sequence < lastAppliedConfirmationHistoryRequest/);
+  assert.match(
+    loader,
+    /if \(!append && filtersChanged\) \{[\s\S]*confirmationHistoryItems = \[\];[\s\S]*confirmationHistoryNextCursor = null;[\s\S]*confirmationHistoryLoaded = false;/,
+  );
+  const failure = loader.slice(loader.indexOf("  } catch (error)"));
+  assert.doesNotMatch(failure, /confirmationHistoryItems = \[\]/);
+  assert.doesNotMatch(failure, /confirmationHistoryNextCursor = null/);
+  assert.doesNotMatch(loader, /\brender\(\)/);
+  assert.match(loader, /updateConfirmationHistoryView/);
+  assert.doesNotMatch(loader, /\/approve|\/retry|\/reject/);
+});
+
+test("confirmation history keeps stable controls and a stable live region for local updates", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function updateConfirmationHistoryView");
+  const end = app.indexOf("\nasync function loadConfirmationHistory", start);
+  const updater = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(updater, /#confirmation-history-filter/);
+  assert.match(updater, /#confirmation-history-results/);
+  assert.match(updater, /#confirmation-history-load-more/);
+  assert.match(updater, /replaceChildren|\.innerHTML/);
+  assert.doesNotMatch(updater, /content\.innerHTML|\brender\(\)/);
+});
+
+test("confirmation center layout stays bounded on tablet and mobile widths", async () => {
+  const styles = await readFile(path.join(root, "public", "styles.css"), "utf8");
+  const baseStart = styles.indexOf(".confirmation-center-grid");
+  const tabletStart = styles.indexOf("@media (max-width: 820px)");
+  const mobileStart = styles.indexOf("@media (max-width: 540px)");
+  const base = styles.slice(baseStart, tabletStart);
+  const tablet = styles.slice(tabletStart, mobileStart);
+  const mobile = styles.slice(mobileStart);
+
+  assert.ok(baseStart >= 0 && tabletStart > baseStart && mobileStart > tabletStart);
+  assert.match(base, /\.confirmation-center-panel \{[\s\S]*min-width: 0/);
+  assert.match(
+    base,
+    /\.confirmation-history-filter \{[\s\S]*repeat\(3, minmax\(0, 1fr\)\)/,
+  );
+  assert.match(
+    base,
+    /\.confirmation-history-filter select \{[\s\S]*width: 100%;[\s\S]*min-width: 0/,
+  );
+  assert.match(
+    tablet,
+    /\.confirmation-center-grid \{\s*grid-template-columns: 1fr;/,
+  );
+  assert.match(
+    mobile,
+    /\.confirmation-history-filter \{\s*grid-template-columns: 1fr;/,
+  );
+});
+
 test("external confirmation renders the exact authorization context", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
 

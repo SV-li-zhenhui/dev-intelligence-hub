@@ -12,6 +12,11 @@ import { projectRoot } from "./lib/config.js";
 import {
   CONFIGURATION_CONTROL_PLANE_LIMITS,
 } from "./services/configuration-store.js";
+import {
+  CONFIRMATION_HISTORY_KINDS,
+  CONFIRMATION_HISTORY_MAX_LIMIT,
+  CONFIRMATION_HISTORY_STATUSES,
+} from "./services/confirmation-queue.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 
 const mimeTypes = {
@@ -51,6 +56,12 @@ const configurationRuntimeModes = new Set([
 ]);
 const safeConfigurationResourceId =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
+const confirmationHistoryStatuses = new Set(CONFIRMATION_HISTORY_STATUSES);
+const confirmationHistoryKinds = new Set(CONFIRMATION_HISTORY_KINDS);
+const confirmationHistoryRoleId =
+  /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const confirmationHistoryCursor = /^[A-Za-z0-9_-]{16,512}$/;
+const defaultConfirmationHistoryLimit = 25;
 
 function sendJson(response, status, value) {
   response.writeHead(status, {
@@ -219,6 +230,14 @@ function requireConfirmationQueue(application) {
     throw httpError(503, "外部动作确认队列未启用");
   }
   return queue;
+}
+
+function requireConfirmationHistoryReader(application) {
+  const reader = application.confirmationQueue?.historyReader;
+  if (!reader || typeof reader.list !== "function") {
+    throw httpError(503, "确认历史读取端口未启用");
+  }
+  return reader;
 }
 
 function isConfigurationSafeMode(application) {
@@ -519,6 +538,72 @@ function memoryQueryOptions(url) {
       .filter((key) => url.searchParams.has(key))
       .map((key) => [key, url.searchParams.get(key)]),
   );
+}
+
+function confirmationHistoryQueryOptions(url) {
+  const allowed = new Set(["status", "kind", "roleId", "limit", "cursor"]);
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.some(
+      (key) =>
+        !allowed.has(key) || url.searchParams.getAll(key).length !== 1,
+    )
+  ) {
+    throw httpError(400, "确认历史查询参数无效");
+  }
+
+  const options = {};
+  if (url.searchParams.has("status")) {
+    const status = url.searchParams.get("status");
+    if (!confirmationHistoryStatuses.has(status)) {
+      throw httpError(400, "确认历史 status 筛选无效");
+    }
+    options.status = status;
+  }
+  if (url.searchParams.has("kind")) {
+    const kind = url.searchParams.get("kind");
+    if (!confirmationHistoryKinds.has(kind)) {
+      throw httpError(400, "确认历史 kind 筛选无效");
+    }
+    options.kind = kind;
+  }
+  if (url.searchParams.has("roleId")) {
+    const roleId = url.searchParams.get("roleId");
+    if (!confirmationHistoryRoleId.test(roleId || "")) {
+      throw httpError(400, "确认历史 roleId 筛选无效");
+    }
+    options.roleId = roleId;
+  }
+  if (url.searchParams.has("limit")) {
+    const limit = url.searchParams.get("limit");
+    if (!/^[1-9][0-9]*$/.test(limit || "")) {
+      throw httpError(400, "确认历史 limit 无效");
+    }
+    const parsed = Number(limit);
+    if (
+      !Number.isSafeInteger(parsed) ||
+      parsed > CONFIRMATION_HISTORY_MAX_LIMIT
+    ) {
+      throw httpError(400, "确认历史 limit 无效");
+    }
+    options.limit = parsed;
+  }
+  if (url.searchParams.has("cursor")) {
+    const cursor = url.searchParams.get("cursor");
+    if (!confirmationHistoryCursor.test(cursor || "")) {
+      throw httpError(400, "确认历史 cursor 无效");
+    }
+    options.cursor = cursor;
+  }
+  return options;
+}
+
+function confirmationHistoryFilters(options) {
+  return {
+    ...(options.status ? { status: options.status } : {}),
+    ...(options.kind ? { kind: options.kind } : {}),
+    ...(options.roleId ? { roleId: options.roleId } : {}),
+  };
 }
 
 function unifiedAttentionOptions(url) {
@@ -2260,6 +2345,29 @@ export function createDashboardServer(
           );
         }
         sendJson(response, 200, { item });
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/confirmations/history"
+      ) {
+        const options = confirmationHistoryQueryOptions(url);
+        if (!application.confirmationQueue) {
+          sendJson(response, 200, {
+            available: false,
+            queueRevision: 0,
+            filters: confirmationHistoryFilters(options),
+            limit: options.limit || defaultConfirmationHistoryLimit,
+            roleIdFacets: [],
+            items: [],
+            nextCursor: null,
+          });
+          return;
+        }
+        const history = await requireConfirmationHistoryReader(
+          application,
+        ).list(options);
+        sendJson(response, 200, { available: true, ...history });
         return;
       }
       if (

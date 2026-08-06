@@ -6,6 +6,12 @@ import {
   sameConfigurationBinding,
 } from "./configuration-view-support.js";
 import { createConfirmationDialogOwnership } from "./confirmation-dialog-support.js";
+import { bindConfigurationFormController } from "./configuration-form-controller.js";
+import {
+  configurationDocumentFromForm,
+  createConfigurationFormState,
+} from "./configuration-form-support.js";
+import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 
@@ -92,6 +98,35 @@ let confirmationQueueState = {
   item: null,
 };
 let confirmationQueueLoaded = false;
+const CONFIRMATION_HISTORY_PAGE_SIZE = 20;
+const CONFIRMATION_HISTORY_ROLE_FACET_LIMIT = 64;
+const confirmationHistoryStatuses = Object.freeze([
+  ["", "全部状态"],
+  ["completed", "已完成"],
+  ["failed", "执行失败"],
+  ["rejected", "已拒绝"],
+  ["stale", "已失效"],
+]);
+const confirmationHistoryKinds = Object.freeze([
+  ["", "全部类型"],
+  ["github.pull-request-review", "GitHub PR Review"],
+  ["github.work-proposal-review", "GitHub 工作提案"],
+  ["local.code-job-create", "本地代码任务"],
+  ["local.change-package-apply", "本地变更包应用"],
+  ["local.configuration-activate", "本地配置切换"],
+]);
+let confirmationHistoryFilters = { status: "", kind: "", roleId: "" };
+let confirmationHistoryItems = [];
+let confirmationHistoryRoleIdFacets = [];
+let confirmationHistoryNextCursor = null;
+let confirmationHistoryAvailable = false;
+let confirmationHistoryLoaded = false;
+let confirmationHistoryLoading = false;
+let confirmationHistoryError = "";
+let confirmationHistoryQueueRevision = null;
+let confirmationHistoryRequestSequence = 0;
+let lastAppliedConfirmationHistoryRequest = 0;
+let confirmationHistoryAbortController = null;
 let activeExternalConfirmation = null;
 let activeInternalAttention = null;
 let activeConfirmationKey = "";
@@ -101,7 +136,7 @@ let configurationLoadError = "";
 let configurationRequestSequence = 0;
 let lastAppliedConfigurationRequest = 0;
 let configurationAbortController = null;
-let configurationEditorValue = "";
+let configurationFormState = null;
 let configurationEditorDirty = false;
 let configurationEditorStale = false;
 let configurationEditorBinding = null;
@@ -448,6 +483,184 @@ function employeeRoleCard(role) {
   </article>`;
 }
 
+function confirmationHistoryStatusLabel(status) {
+  return new Map(confirmationHistoryStatuses).get(status) || status || "未知";
+}
+
+function confirmationHistoryKindLabel(kind) {
+  return new Map(confirmationHistoryKinds).get(kind) || kind || "未知类型";
+}
+
+function confirmationHistoryOption(value, label, selected) {
+  return `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function validConfirmationHistoryRoleId(value) {
+  return (
+    typeof value === "string" &&
+    /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/.test(value)
+  );
+}
+
+function compareConfirmationHistoryRoleIds(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function confirmationHistoryRoleIds() {
+  const roleIds = new Set(
+    employeeRoles
+      .map((role) => role?.id)
+      .filter((roleId) => typeof roleId === "string" && roleId),
+  );
+  for (const roleId of confirmationHistoryRoleIdFacets) roleIds.add(roleId);
+  for (const item of confirmationHistoryItems) {
+    const roleId = item?.requestedBy?.roleId;
+    if (typeof roleId === "string" && roleId) roleIds.add(roleId);
+  }
+  if (confirmationHistoryFilters.roleId) {
+    roleIds.add(confirmationHistoryFilters.roleId);
+  }
+  return [...roleIds].sort(compareConfirmationHistoryRoleIds);
+}
+
+function confirmationPendingMarkup() {
+  if (!confirmationQueueLoaded) {
+    return '<div class="empty">正在读取下一项确认…</div>';
+  }
+  if (!confirmationQueueState.available || !confirmationQueueState.item) {
+    return '<div class="empty">当前没有需要你处理的确认。</div>';
+  }
+  const item = confirmationQueueState.item;
+  const title = item.display?.title || item.title || "待确认事项";
+  const summary = item.display?.summary || item.summary || "等待你逐项判断";
+  const roleId = item.requestedBy?.roleId || item.producer?.roleId || "未标注岗位";
+  const source = confirmationQueueState.source === "internal_request"
+    ? "员工咨询"
+    : "动作授权";
+  return `<article class="confirmation-pending-item">
+    <div class="confirmation-history-row-heading">
+      <strong>${escapeHtml(title)}</strong>
+      <span class="status-pill status-waiting_user">下一项</span>
+    </div>
+    <p>${escapeHtml(summary)}</p>
+    <small>${escapeHtml(source)} · ${escapeHtml(roleId)}</small>
+  </article>`;
+}
+
+function confirmationHistoryItemMarkup(item) {
+  const roleId = item.requestedBy?.roleId || "未标注岗位";
+  const workItemId = item.requestedBy?.workItemId || "未标注工作项";
+  return `<article class="confirmation-history-item">
+    <div class="confirmation-history-row-heading">
+      <strong>${escapeHtml(item.title || "未命名确认")}</strong>
+      <span class="status-pill status-${escapeHtml(item.status)}">${escapeHtml(confirmationHistoryStatusLabel(item.status))}</span>
+    </div>
+    <p>${escapeHtml(item.summary || "")}</p>
+    <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
+  </article>`;
+}
+
+function confirmationHistoryMarkup() {
+  if (!confirmationHistoryLoaded && confirmationHistoryLoading) {
+    return '<div class="empty">正在读取确认历史…</div>';
+  }
+  if (!confirmationHistoryLoaded) {
+    return '<div class="empty">确认历史尚未读取。</div>';
+  }
+  if (confirmationHistoryError && !confirmationHistoryItems.length) {
+    return '<div class="empty">本次未能读取匹配的确认历史，请稍后重试。</div>';
+  }
+  if (!confirmationHistoryAvailable) {
+    return '<div class="empty">确认历史读取能力未启用。</div>';
+  }
+  if (!confirmationHistoryItems.length) {
+    return '<div class="empty">当前筛选条件下没有确认历史。</div>';
+  }
+  return `<div class="confirmation-history-list">${confirmationHistoryItems
+    .map(confirmationHistoryItemMarkup)
+    .join("")}</div>`;
+}
+
+function confirmationHistoryRoleOptionsMarkup() {
+  return [
+    confirmationHistoryOption("", "全部岗位", confirmationHistoryFilters.roleId),
+    ...confirmationHistoryRoleIds().map((roleId) =>
+      confirmationHistoryOption(
+        roleId,
+        roleId,
+        confirmationHistoryFilters.roleId,
+      ),
+    ),
+  ].join("");
+}
+
+function confirmationHistoryMetaText() {
+  return confirmationHistoryLoaded
+    ? `${confirmationHistoryItems.length} RECORDS · 最新创建在前`
+    : "READ ONLY";
+}
+
+function confirmationHistoryPaginationVisible() {
+  return Boolean(confirmationHistoryNextCursor) ||
+    confirmationHistoryItems.length > CONFIRMATION_HISTORY_PAGE_SIZE;
+}
+
+function confirmationHistoryPaginationLabel() {
+  if (confirmationHistoryLoading) return "正在加载更早记录…";
+  return confirmationHistoryNextCursor ? "加载更早记录" : "已加载全部记录";
+}
+
+function confirmationCenterView() {
+  const statusOptions = confirmationHistoryStatuses
+    .map(([value, label]) =>
+      confirmationHistoryOption(value, label, confirmationHistoryFilters.status),
+    )
+    .join("");
+  const kindOptions = confirmationHistoryKinds
+    .map(([value, label]) =>
+      confirmationHistoryOption(value, label, confirmationHistoryFilters.kind),
+    )
+    .join("");
+  const roleOptions = confirmationHistoryRoleOptionsMarkup();
+  const historyMeta = confirmationHistoryMetaText();
+  const paginationVisible = confirmationHistoryPaginationVisible();
+  return `<section class="section confirmation-center" aria-labelledby="confirmation-center-title">
+    <div class="section-heading">
+      <h2 id="confirmation-center-title">确认中心</h2>
+      <span>授权与咨询始终逐项处理</span>
+    </div>
+    <div class="confirmation-center-grid">
+      <section class="confirmation-center-panel" id="confirmation-pending-panel" aria-labelledby="confirmation-pending-title">
+        <div class="confirmation-center-panel-heading">
+          <div><p class="eyebrow">PENDING</p><h3 id="confirmation-pending-title">待你逐项确认</h3></div>
+          <span>${confirmationQueueState.pendingCount || 0} ITEMS</span>
+        </div>
+        ${confirmationPendingMarkup()}
+        <p class="confirmation-center-note">系统仍按现有优先级逐条弹框确认；此处只显示下一项，不在列表中授权。</p>
+      </section>
+      <section class="confirmation-center-panel" id="confirmation-history-panel" aria-labelledby="confirmation-history-title" aria-busy="${confirmationHistoryLoading}">
+        <div class="confirmation-center-panel-heading">
+          <div><p class="eyebrow">HISTORY</p><h3 id="confirmation-history-title">只读确认历史</h3></div>
+          <span id="confirmation-history-meta">${escapeHtml(historyMeta)}</span>
+        </div>
+        <form class="confirmation-history-filter" id="confirmation-history-filter">
+          <label for="confirmation-history-status">状态<select id="confirmation-history-status" name="status">${statusOptions}</select></label>
+          <label for="confirmation-history-kind">类型<select id="confirmation-history-kind" name="kind">${kindOptions}</select></label>
+          <label for="confirmation-history-role">岗位<select id="confirmation-history-role" name="roleId">${roleOptions}</select></label>
+          <button class="secondary-button" id="confirmation-history-apply" type="submit">应用筛选</button>
+        </form>
+        <p class="employee-error" id="confirmation-history-error" role="status" ${confirmationHistoryError ? "" : "hidden"}>${escapeHtml(confirmationHistoryError)}</p>
+        <div id="confirmation-history-results" aria-live="polite">${confirmationHistoryMarkup()}</div>
+        <div id="confirmation-history-pagination">
+          <button class="secondary-button confirmation-history-more" id="confirmation-history-load-more" type="button" aria-disabled="${confirmationHistoryLoading || !confirmationHistoryNextCursor}" ${paginationVisible ? "" : "hidden"}>${escapeHtml(confirmationHistoryPaginationLabel())}</button>
+        </div>
+      </section>
+    </div>
+  </section>`;
+}
+
 function employeesView() {
   if (!employeeRolesLoaded) {
     return '<section class="section"><div class="empty">正在读取岗位编制…</div></section>';
@@ -460,7 +673,8 @@ function employeesView() {
     : employeeRolesError
       ? '<div class="empty">暂时无法显示岗位编制。</div>'
       : '<div class="empty">尚未配置数字员工。</div>';
-  return `<section class="section">
+  return `${confirmationCenterView()}
+    <section class="section">
       <div class="section-heading"><h2>岗位编制</h2><span>${employeeRoles.length} ROLES · 每个岗位可独立配置大脑与权限</span></div>
       ${loadError}
       ${roster}
@@ -1027,21 +1241,22 @@ function configurationView() {
       currentPreviewBinding(),
       currentConfigurationBinding(),
     );
+  const structuredForm = configurationFormState
+    ? renderConfigurationSettingsSkeleton({ state: configurationFormState })
+    : "";
 
   const editor = editingOpen
-    ? configurationEditorBinding !== null
-      ? `<form class="configuration-editor" id="configuration-editor-form" novalidate>
-          <label for="configuration-document">${initializationOpen ? "初始化配置" : `基于 v${activeVersion} 的下一版本配置`}（JSON）</label>
-          <p id="configuration-document-help" class="configuration-help">先保存本地草稿，再预览逐项影响并加入统一确认队列。页面不会直接激活或回滚配置。</p>
-          <textarea id="configuration-document" name="configuration" spellcheck="false" aria-describedby="configuration-document-help${configurationEditorError ? " configuration-document-error" : ""}" aria-invalid="${configurationEditorError ? "true" : "false"}">${escapeHtml(configurationEditorValue)}</textarea>
-          <p id="configuration-document-error" class="configuration-inline-error" role="alert" ${configurationEditorError ? "" : "hidden"}>${escapeHtml(configurationEditorError)}</p>
+    ? configurationEditorBinding !== null && configurationFormState !== null
+      ? `<section class="configuration-editor" aria-labelledby="configuration-editor-title">
+          <h2 id="configuration-editor-title">${initializationOpen ? "初始化配置" : `基于 v${activeVersion} 的下一版本配置`}</h2>
+          <p id="configuration-editor-help" class="configuration-help">使用结构化字段保存本地草稿，再预览逐项影响并加入统一确认队列。页面不会直接激活或回滚配置。</p>
+          ${structuredForm}
           <div class="configuration-actions">
-            <button type="submit" ${configurationOperationPending || configurationEditorStale ? "disabled" : ""}>${draftId ? "保存新修订" : initializationOpen ? "保存初始化草稿" : "保存下一版本草稿"}</button>
             <button type="button" class="secondary-button" data-configuration-preview ${configurationOperationPending || configurationEditorStale ? "disabled" : ""}>预览影响</button>
             <button type="button" class="secondary-button" data-configuration-request ${configurationOperationPending || configurationEditorStale || !activationPreviewReady ? "disabled" : ""}>请求激活确认</button>
             ${configurationEditorStale ? '<button type="button" class="secondary-button" data-configuration-reset>放弃本地编辑并载入最新配置</button>' : ""}
           </div>
-        </form>`
+        </section>`
       : `<div class="configuration-inline-error" role="alert">服务端没有提供可编辑的规范化配置。请重新读取配置状态，不能用空对象创建草稿。</div>`
     : `<div class="configuration-locked">
         <strong>${activeVersion === null ? "当前不可编辑" : `活动配置 v${activeVersion}`}</strong>
@@ -1073,6 +1288,41 @@ function configurationView() {
     ${configurationPreviewMarkup()}
     ${configurationVersionsMarkup(activeVersion, activeEditingOpen)}
   </div>`;
+}
+
+function preserveConfirmationHistoryPanel() {
+  if (currentView !== "employees") return null;
+  const panel = content.querySelector("#confirmation-history-panel");
+  if (!panel) return null;
+
+  const focusedElement = document.activeElement;
+  const restoreFocus = panel.contains(focusedElement) ? focusedElement : null;
+  const placeholder = document.createComment("confirmation-history-panel");
+  panel.replaceWith(placeholder);
+  return { panel, restoreFocus };
+}
+
+function restoreConfirmationHistoryPanel(preservedPanel) {
+  if (!preservedPanel) return;
+  const replacement = content.querySelector("#confirmation-history-panel");
+  if (!replacement) return;
+  replacement.replaceWith(preservedPanel.panel);
+  if (preservedPanel.restoreFocus?.isConnected) {
+    preservedPanel.restoreFocus.focus({ preventScroll: true });
+  }
+}
+
+function bindConfirmationHistoryView() {
+  const filter = content.querySelector("#confirmation-history-filter");
+  if (filter && !filter.dataset.confirmationHistoryBound) {
+    filter.dataset.confirmationHistoryBound = "true";
+    filter.addEventListener("submit", applyConfirmationHistoryFilters);
+  }
+  const loadMore = content.querySelector("#confirmation-history-load-more");
+  if (loadMore && !loadMore.dataset.confirmationHistoryBound) {
+    loadMore.dataset.confirmationHistoryBound = "true";
+    loadMore.addEventListener("click", loadMoreConfirmationHistory);
+  }
 }
 
 function render() {
@@ -1110,7 +1360,9 @@ function render() {
     work: () => workView.render(),
     configuration: configurationView,
   };
+  const preservedHistoryPanel = preserveConfirmationHistoryPanel();
   content.innerHTML = views[currentView]();
+  restoreConfirmationHistoryPanel(preservedHistoryPanel);
   content.querySelectorAll("[data-item-id]").forEach((button) => {
       button.addEventListener("click", () => showDetail(itemIndex.get(button.dataset.itemId)));
   });
@@ -1133,6 +1385,7 @@ function render() {
   content.querySelectorAll("[data-role-run]").forEach((button) => {
     button.addEventListener("click", handleRoleRun);
   });
+  bindConfirmationHistoryView();
   content.querySelector("#memory-search-form")?.addEventListener(
     "submit",
     handleMemorySearch,
@@ -1155,12 +1408,43 @@ function render() {
 }
 
 function bindConfigurationView() {
-  const form = content.querySelector("#configuration-editor-form");
+  const form = content.querySelector("[data-configuration-structured-form]");
   form?.addEventListener("submit", handleConfigurationSave);
-  form?.querySelector("#configuration-document")?.addEventListener(
-    "input",
-    handleConfigurationEditorInput,
-  );
+  if (form && configurationFormState) {
+    bindConfigurationFormController({
+      root: form,
+      getState: () => configurationFormState,
+      onStateChange: handleConfigurationFormStateChange,
+      onInvalidate: handleConfigurationFormInvalidate,
+      onError: handleConfigurationFormError,
+    });
+    const submit = form.querySelector("[data-configuration-submit]");
+    if (submit) {
+      const draft = configurationDraft();
+      const initializationOpen =
+        configurationStatus().safeMode === true &&
+        configurationActiveVersion() === null;
+      submit.textContent = draft?.draftId
+        ? "保存新修订"
+        : initializationOpen
+          ? "保存初始化草稿"
+          : "保存下一版本草稿";
+      submit.disabled = configurationOperationPending || configurationEditorStale;
+    }
+    form.setAttribute("aria-busy", `${configurationOperationPending}`);
+    if (configurationOperationPending) {
+      form.querySelectorAll("input, select, button").forEach((control) => {
+        control.disabled = true;
+      });
+    } else if (configurationEditorStale) {
+      form
+        .querySelectorAll("[data-configuration-operation]")
+        .forEach((button) => {
+          button.disabled = true;
+        });
+    }
+    updateConfigurationFormStatus();
+  }
   content
     .querySelector("[data-configuration-preview]")
     ?.addEventListener("click", handleConfigurationPreview);
@@ -1185,22 +1469,135 @@ function bindConfigurationView() {
     );
 }
 
-function handleConfigurationEditorInput(event) {
-  configurationEditorValue = event.currentTarget.value;
-  configurationEditorDirty = true;
+function updateConfigurationFormStatus({ focus = false } = {}) {
+  const status = content.querySelector("#configuration-form-status");
+  if (!status) return;
+  status.textContent = configurationEditorError;
+  status.classList.remove("configuration-success");
+  status.classList.toggle("configuration-inline-error", Boolean(configurationEditorError));
+  if (focus && configurationEditorError) status.focus({ preventScroll: true });
+}
+
+function handleConfigurationFormInvalidate() {
   configurationEditorError = "";
   configurationOperationError = "";
   invalidateConfigurationPreviewUi();
-  event.currentTarget.setAttribute("aria-invalid", "false");
-  event.currentTarget.setAttribute(
-    "aria-describedby",
-    "configuration-document-help",
-  );
-  const error = content.querySelector("#configuration-document-error");
-  if (error) {
-    error.hidden = true;
-    error.textContent = "";
+  updateConfigurationFormStatus();
+}
+
+function handleConfigurationFormStateChange(
+  nextState,
+  {
+    render: renderView = false,
+    focusTarget = null,
+    announcement = "",
+  } = {},
+) {
+  configurationFormState = nextState;
+  configurationEditorDirty = nextState.dirty;
+  configurationEditorError = "";
+  configurationOperationError = "";
+  if (renderView && currentView === "configuration") {
+    render();
+    restoreConfigurationStructureFocus(focusTarget);
+    announceConfigurationStructureChange(announcement);
   }
+}
+
+function configurationPathElement(selector, datasetKey, path) {
+  if (!Array.isArray(path)) return null;
+  const expected = JSON.stringify(path.map((segment) => `${segment}`));
+  return [...content.querySelectorAll(selector)].find(
+    (element) => element.dataset?.[datasetKey] === expected,
+  ) ?? null;
+}
+
+function firstFocusableConfigurationControl(container) {
+  if (!container) return null;
+  if (container.matches("input, select, button, summary")) return container;
+  return container.querySelector("[data-configuration-field]") ??
+    container.querySelector("summary") ??
+    container.querySelector("[data-configuration-operation]") ??
+    container.querySelector("button");
+}
+
+function restoreConfigurationStructureFocus(target) {
+  if (!target || !Array.isArray(target.path)) return;
+  let focusable = null;
+  if (target.scope === "entry") {
+    focusable = firstFocusableConfigurationControl(
+      configurationPathElement(
+        "[data-configuration-entry]",
+        "configurationEntry",
+        target.path,
+      ),
+    );
+  } else if (target.scope === "collection") {
+    const collection = configurationPathElement(
+      "[data-configuration-collection]",
+      "configurationCollection",
+      target.path,
+    );
+    focusable = collection?.querySelector(
+      ":scope > [data-configuration-structure-template] > summary",
+    ) ?? firstFocusableConfigurationControl(collection);
+  } else if (target.scope === "slot") {
+    focusable = configurationPathElement(
+      "[data-configuration-field]",
+      "configurationField",
+      target.path,
+    );
+    if (!focusable) {
+      focusable = firstFocusableConfigurationControl(
+        configurationPathElement(
+          "[data-configuration-node]",
+          "configurationNode",
+          target.path,
+        ),
+      );
+    }
+    if (!focusable) {
+      const template = configurationPathElement(
+        "[data-configuration-template-value-root]",
+        "configurationTemplateValueRoot",
+        target.path,
+      );
+      focusable = firstFocusableConfigurationControl(template);
+    }
+  } else if (target.scope === "slot-template") {
+    const template = configurationPathElement(
+      "[data-configuration-template-value-root]",
+      "configurationTemplateValueRoot",
+      target.path,
+    );
+    focusable = firstFocusableConfigurationControl(template) ??
+      configurationPathElement(
+        "[data-configuration-field]",
+        "configurationField",
+        target.path,
+      );
+  }
+  focusable?.focus({ preventScroll: true });
+}
+
+function announceConfigurationStructureChange(message) {
+  if (!message) return;
+  const status = content.querySelector("#configuration-form-status");
+  if (!status) return;
+  status.textContent = "";
+  status.classList.remove("configuration-inline-error");
+  status.classList.add("configuration-success");
+  queueMicrotask(() => {
+    if (status.isConnected && currentView === "configuration") {
+      status.textContent = message;
+    }
+  });
+}
+
+function handleConfigurationFormError(message) {
+  configurationEditorError = message;
+  configurationOperationError = "";
+  updateConfigurationFormStatus();
 }
 
 function invalidateConfigurationPreviewUi() {
@@ -1216,19 +1613,6 @@ function invalidateConfigurationPreviewUi() {
     .forEach((button) => {
       button.disabled = true;
     });
-}
-
-function parsedConfigurationDocument() {
-  let parsed;
-  try {
-    parsed = JSON.parse(configurationEditorValue);
-  } catch {
-    throw new Error("配置不是有效的 JSON，请检查逗号、引号和括号。");
-  }
-  if (!plainRecord(parsed)) {
-    throw new Error("配置顶层必须是一个 JSON 对象。");
-  }
-  return parsed;
 }
 
 function requiredConfigurationBinding() {
@@ -1259,16 +1643,25 @@ function resetConfigurationEditor() {
     render();
     return;
   }
-  configurationEditorValue = JSON.stringify(editable, null, 2);
+  const binding = currentConfigurationBinding();
+  try {
+    configurationFormState = createConfigurationFormState(editable, binding);
+  } catch (error) {
+    configurationFormState = null;
+    configurationEditorBinding = null;
+    configurationEditorError = error.message;
+    render();
+    return;
+  }
   configurationEditorDirty = false;
   configurationEditorStale = false;
-  configurationEditorBinding = currentConfigurationBinding();
+  configurationEditorBinding = binding;
   configurationEditorError = "";
   configurationOperationError = "";
   configurationPreview = null;
   configurationNotice = "已载入最新配置，请重新核对后保存";
   render();
-  content.querySelector("#configuration-document")?.focus();
+  content.querySelector("[data-configuration-field]")?.focus();
 }
 
 async function configurationResponseError(response, fallback) {
@@ -1299,7 +1692,9 @@ async function runConfigurationOperation(
     if (currentView === "configuration") {
       render();
       if (configurationEditorError) {
-        content.querySelector("#configuration-document")?.focus();
+        const invalid = content.querySelector("[data-configuration-first-invalid]");
+        if (invalid) invalid.focus({ preventScroll: true });
+        else updateConfigurationFormStatus({ focus: true });
       } else if (configurationOperationError && focusSelector) {
         content.querySelector(focusSelector)?.focus();
       }
@@ -1309,10 +1704,24 @@ async function runConfigurationOperation(
 
 async function handleConfigurationSave(event) {
   event.preventDefault();
-  configurationEditorValue = event.currentTarget.elements.configuration.value;
+  if (!configurationFormState) {
+    configurationEditorError = "结构化配置表单尚未就绪，请重新读取配置状态。";
+    render();
+    updateConfigurationFormStatus({ focus: true });
+    return;
+  }
+  const materialized = configurationDocumentFromForm(configurationFormState);
+  if (!materialized.ok) {
+    configurationEditorError = `有 ${materialized.issues.length} 个配置问题，请从第一个标记字段开始修正。`;
+    render();
+    const firstInvalid = content.querySelector("[data-configuration-first-invalid]");
+    if (firstInvalid) firstInvalid.focus({ preventScroll: true });
+    else updateConfigurationFormStatus({ focus: true });
+    return;
+  }
   configurationEditorDirty = true;
   await runConfigurationOperation(async () => {
-    const configuration = parsedConfigurationDocument();
+    const configuration = materialized.configuration;
     const editorBinding = requiredConfigurationEditorBinding();
     const {
       expectedStateRevision,
@@ -1358,7 +1767,6 @@ async function handleConfigurationSave(event) {
       throw await configurationResponseError(response, "保存配置草稿失败");
     }
     await response.json();
-    configurationEditorValue = JSON.stringify(configuration, null, 2);
     configurationEditorDirty = false;
     configurationEditorStale = false;
     configurationPreview = null;
@@ -1870,6 +2278,248 @@ function cancelMemoryAnswerRequest() {
   memoryAnswerAbortController?.abort();
   memoryAnswerAbortController = null;
   memoryAnswerPending = false;
+}
+
+function normalizedConfirmationHistoryFilters(filters = {}) {
+  const status = String(filters.status || "").trim();
+  const kind = String(filters.kind || "").trim();
+  const roleId = String(filters.roleId || "").trim();
+  const allowedStatuses = new Set(
+    confirmationHistoryStatuses.map(([value]) => value),
+  );
+  const allowedKinds = new Set(
+    confirmationHistoryKinds.map(([value]) => value),
+  );
+  return {
+    status: allowedStatuses.has(status) ? status : "",
+    kind: allowedKinds.has(kind) ? kind : "",
+    roleId: validConfirmationHistoryRoleId(roleId) ? roleId : "",
+  };
+}
+
+function normalizedConfirmationHistoryRoleIdFacets(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter(validConfirmationHistoryRoleId))]
+    .sort(compareConfirmationHistoryRoleIds)
+    .slice(0, CONFIRMATION_HISTORY_ROLE_FACET_LIMIT);
+}
+
+function confirmationHistoryFiltersFromForm(form) {
+  return normalizedConfirmationHistoryFilters(
+    form
+      ? Object.fromEntries(new FormData(form))
+      : confirmationHistoryFilters,
+  );
+}
+
+function sameConfirmationHistoryFilters(left, right) {
+  return ["status", "kind", "roleId"].every(
+    (key) => left[key] === right[key],
+  );
+}
+
+function normalizedConfirmationHistoryItems(value) {
+  if (!Array.isArray(value)) return [];
+  const allowedStatuses = new Set(
+    confirmationHistoryStatuses.map(([status]) => status).filter(Boolean),
+  );
+  const allowedKinds = new Set(
+    confirmationHistoryKinds.map(([kind]) => kind).filter(Boolean),
+  );
+  return value.slice(0, 50).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const requestedBy = item.requestedBy;
+    if (
+      typeof item.id !== "string" ||
+      !allowedStatuses.has(item.status) ||
+      !allowedKinds.has(item.kind) ||
+      !requestedBy ||
+      typeof requestedBy !== "object" ||
+      typeof requestedBy.roleId !== "string" ||
+      typeof requestedBy.workItemId !== "string" ||
+      typeof item.createdAt !== "string" ||
+      typeof item.updatedAt !== "string"
+    ) {
+      return [];
+    }
+    return [{
+      id: item.id.slice(0, 128),
+      kind: item.kind,
+      status: item.status,
+      requestedBy: {
+        roleId: requestedBy.roleId.slice(0, 128),
+        workItemId: requestedBy.workItemId.slice(0, 128),
+      },
+      title: typeof item.title === "string" ? item.title.slice(0, 1_024) : "",
+      summary:
+        typeof item.summary === "string" ? item.summary.slice(0, 4_096) : "",
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      retryable: item.retryable === true,
+    }];
+  });
+}
+
+function updateConfirmationHistoryView({ syncFilters = false } = {}) {
+  const panel = content.querySelector("#confirmation-history-panel");
+  if (!panel) return false;
+
+  panel.setAttribute("aria-busy", String(confirmationHistoryLoading));
+  const meta = panel.querySelector("#confirmation-history-meta");
+  if (meta) meta.textContent = confirmationHistoryMetaText();
+
+  const form = panel.querySelector("#confirmation-history-filter");
+  const status = form?.querySelector("#confirmation-history-status");
+  const kind = form?.querySelector("#confirmation-history-kind");
+  const role = form?.querySelector("#confirmation-history-role");
+  if (syncFilters && status) status.value = confirmationHistoryFilters.status;
+  if (syncFilters && kind) kind.value = confirmationHistoryFilters.kind;
+  if (role) {
+    const options = confirmationHistoryRoleOptionsMarkup();
+    if (role.innerHTML !== options) role.innerHTML = options;
+    if (syncFilters) role.value = confirmationHistoryFilters.roleId;
+  }
+
+  const error = panel.querySelector("#confirmation-history-error");
+  if (error) {
+    error.textContent = confirmationHistoryError;
+    error.hidden = !confirmationHistoryError;
+  }
+
+  const results = panel.querySelector("#confirmation-history-results");
+  if (results) {
+    const markup = confirmationHistoryMarkup();
+    if (results.innerHTML !== markup) results.innerHTML = markup;
+  }
+
+  const loadMore = panel.querySelector("#confirmation-history-load-more");
+  if (loadMore) {
+    loadMore.hidden = !confirmationHistoryPaginationVisible();
+    loadMore.setAttribute(
+      "aria-disabled",
+      String(confirmationHistoryLoading || !confirmationHistoryNextCursor),
+    );
+    loadMore.textContent = confirmationHistoryPaginationLabel();
+  }
+  return true;
+}
+
+async function loadConfirmationHistory(
+  filters = confirmationHistoryFilters,
+  { append = false } = {},
+) {
+  const normalized = normalizedConfirmationHistoryFilters(filters);
+  const cursor = append ? confirmationHistoryNextCursor : null;
+  if (append && !cursor) return false;
+  const filtersChanged = !sameConfirmationHistoryFilters(
+    normalized,
+    confirmationHistoryFilters,
+  );
+  const sequence = ++confirmationHistoryRequestSequence;
+  confirmationHistoryAbortController?.abort();
+  const controller = new AbortController();
+  confirmationHistoryAbortController = controller;
+  confirmationHistoryFilters = normalized;
+  if (!append && filtersChanged) {
+    confirmationHistoryItems = [];
+    confirmationHistoryNextCursor = null;
+    confirmationHistoryLoaded = false;
+  }
+  confirmationHistoryLoading = true;
+  confirmationHistoryError = "";
+  updateConfirmationHistoryView();
+  try {
+    const params = new URLSearchParams({
+      limit: String(CONFIRMATION_HISTORY_PAGE_SIZE),
+    });
+    for (const [key, value] of Object.entries(normalized)) {
+      if (value) params.set(key, value);
+    }
+    if (cursor) params.set("cursor", cursor);
+    const response = await fetch(`/api/confirmations/history?${params}`, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`读取确认历史失败（${response.status}）`);
+    }
+    const result = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== confirmationHistoryRequestSequence ||
+      sequence < lastAppliedConfirmationHistoryRequest
+    ) {
+      return false;
+    }
+    lastAppliedConfirmationHistoryRequest = sequence;
+    const pageItems = normalizedConfirmationHistoryItems(result.items);
+    confirmationHistoryRoleIdFacets = normalizedConfirmationHistoryRoleIdFacets(
+      result.roleIdFacets,
+    );
+    confirmationHistoryItems = append
+      ? [
+          ...new Map(
+            [...confirmationHistoryItems, ...pageItems].map((item) => [
+              item.id,
+              item,
+            ]),
+          ).values(),
+        ]
+      : pageItems;
+    confirmationHistoryNextCursor =
+      typeof result.nextCursor === "string" &&
+      /^[A-Za-z0-9_-]{16,512}$/.test(result.nextCursor)
+        ? result.nextCursor
+        : null;
+    confirmationHistoryQueueRevision =
+      Number.isSafeInteger(result.queueRevision) && result.queueRevision >= 0
+        ? result.queueRevision
+        : null;
+    confirmationHistoryAvailable = result.available !== false;
+    confirmationHistoryLoaded = true;
+    confirmationHistoryLoading = false;
+    confirmationHistoryError = "";
+    updateConfirmationHistoryView();
+    return true;
+  } catch (error) {
+    if (isAbortedRequest(error, controller)) return false;
+    if (sequence === confirmationHistoryRequestSequence) {
+      confirmationHistoryLoaded = true;
+      confirmationHistoryLoading = false;
+      confirmationHistoryError = error.message || "读取确认历史失败";
+      updateConfirmationHistoryView();
+    }
+    throw error;
+  } finally {
+    if (confirmationHistoryAbortController === controller) {
+      confirmationHistoryAbortController = null;
+    }
+  }
+}
+
+async function applyConfirmationHistoryFilters(event) {
+  event.preventDefault();
+  try {
+    await loadConfirmationHistory(
+      confirmationHistoryFiltersFromForm(event.currentTarget),
+    );
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+  }
+}
+
+async function loadMoreConfirmationHistory() {
+  if (confirmationHistoryLoading || !confirmationHistoryNextCursor) return;
+  try {
+    await loadConfirmationHistory(confirmationHistoryFilters, {
+      append: true,
+    });
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+  }
 }
 
 async function loadMemories(
@@ -2986,26 +3636,181 @@ function updateConfigurationChrome() {
     </div>`;
 }
 
-function renderConfigurationPreservingEditorFocus() {
-  const editor = content.querySelector("#configuration-document");
-  const selection = document.activeElement === editor
+function configurationTemplateIdentity(template) {
+  if (!template?.matches?.("[data-configuration-structure-template]")) {
+    return null;
+  }
+  const structurePath = template.dataset.configurationStructureTemplate;
+  const valueRoot = template.dataset.configurationTemplateValueRoot;
+  if (typeof structurePath !== "string" || typeof valueRoot !== "string") {
+    return null;
+  }
+  return JSON.stringify([
+    template.hasAttribute("data-configuration-replace-template")
+      ? "replace"
+      : "add",
+    structurePath,
+    valueRoot,
+  ]);
+}
+
+function configurationTemplateControlIdentity(control) {
+  const template = control?.closest?.("[data-configuration-structure-template]");
+  const templateIdentity = configurationTemplateIdentity(template);
+  if (!templateIdentity) return null;
+  if (control.matches("summary")) {
+    return JSON.stringify([templateIdentity, "summary"]);
+  }
+  if (control.dataset.configurationTemplateKey !== undefined) {
+    return JSON.stringify([templateIdentity, "key"]);
+  }
+  if (control.dataset.configurationTemplateField !== undefined) {
+    return JSON.stringify([
+      templateIdentity,
+      "field",
+      control.dataset.configurationTemplateField,
+    ]);
+  }
+  if (control.dataset.configurationTemplateScalarType !== undefined) {
+    const valueControl = control
+      .closest("[data-configuration-template-scalar]")
+      ?.querySelector("[data-configuration-template-field]");
+    if (!valueControl) return null;
+    return JSON.stringify([
+      templateIdentity,
+      "scalar-type",
+      valueControl.dataset.configurationTemplateField,
+    ]);
+  }
+  if (control.dataset.configurationOperation !== undefined) {
+    return JSON.stringify([templateIdentity, "operation"]);
+  }
+  return null;
+}
+
+function configurationTemplateControls() {
+  return [...content.querySelectorAll(
+    "[data-configuration-structure-template] summary, " +
+      "[data-configuration-template-key], " +
+      "[data-configuration-template-field], " +
+      "[data-configuration-template-scalar-type], " +
+      "[data-configuration-structure-template] [data-configuration-operation]",
+  )];
+}
+
+function configurationTemplateDomSnapshot(active) {
+  const templates = [...content.querySelectorAll(
+    "[data-configuration-structure-template]",
+  )].flatMap((template) => {
+    const identity = configurationTemplateIdentity(template);
+    return identity ? [{ identity, open: template.open === true }] : [];
+  });
+  const controls = configurationTemplateControls().flatMap((control) => {
+    const identity = configurationTemplateControlIdentity(control);
+    if (!identity) return [];
+    return [{
+      identity,
+      value: typeof control.value === "string" ? control.value : null,
+      checked: typeof control.checked === "boolean" ? control.checked : null,
+      inputType: control.tagName === "INPUT" ? control.type : null,
+      readOnly: control.tagName === "INPUT" ? control.readOnly : null,
+      editKind:
+        typeof control.dataset.configurationEditKind === "string"
+          ? control.dataset.configurationEditKind
+          : null,
+    }];
+  });
+  const activeIdentity = configurationTemplateControlIdentity(active);
+  const selection = activeIdentity && typeof active.selectionStart === "number"
     ? {
-        start: editor.selectionStart,
-        end: editor.selectionEnd,
-        direction: editor.selectionDirection,
+        start: active.selectionStart,
+        end: active.selectionEnd,
+        direction: active.selectionDirection,
       }
     : null;
-  render();
-  if (!selection) return;
-  const nextEditor = content.querySelector("#configuration-document");
-  if (!nextEditor) return;
-  const maximum = nextEditor.value.length;
-  nextEditor.focus();
-  nextEditor.setSelectionRange(
-    Math.min(selection.start, maximum),
-    Math.min(selection.end, maximum),
-    selection.direction || undefined,
+  return { templates, controls, activeIdentity, selection };
+}
+
+function restoreConfigurationTemplateDom(snapshot) {
+  const templates = new Map(
+    [...content.querySelectorAll("[data-configuration-structure-template]")]
+      .flatMap((template) => {
+        const identity = configurationTemplateIdentity(template);
+        return identity ? [[identity, template]] : [];
+      }),
   );
+  for (const retained of snapshot.templates) {
+    const template = templates.get(retained.identity);
+    if (template) template.open = retained.open;
+  }
+
+  const controls = new Map(
+    configurationTemplateControls().flatMap((control) => {
+      const identity = configurationTemplateControlIdentity(control);
+      return identity ? [[identity, control]] : [];
+    }),
+  );
+  for (const retained of snapshot.controls) {
+    const control = controls.get(retained.identity);
+    if (!control) continue;
+    if (control.tagName === "INPUT" && retained.inputType) {
+      control.type = retained.inputType;
+      control.readOnly = retained.readOnly === true;
+    }
+    if (retained.editKind === null) {
+      delete control.dataset.configurationEditKind;
+    } else {
+      control.dataset.configurationEditKind = retained.editKind;
+    }
+    if (retained.value !== null) control.value = retained.value;
+    if (retained.checked !== null) control.checked = retained.checked;
+  }
+
+  const activeControl = snapshot.activeIdentity
+    ? controls.get(snapshot.activeIdentity)
+    : null;
+  activeControl?.focus({ preventScroll: true });
+  if (
+    activeControl &&
+    snapshot.selection &&
+    typeof activeControl.setSelectionRange === "function"
+  ) {
+    const maximum = activeControl.value.length;
+    activeControl.setSelectionRange(
+      Math.min(snapshot.selection.start, maximum),
+      Math.min(snapshot.selection.end, maximum),
+      snapshot.selection.direction || undefined,
+    );
+  }
+}
+
+function renderConfigurationPreservingEditorFocus() {
+  const active = document.activeElement;
+  const fieldPath = active?.dataset?.configurationField;
+  const selection = fieldPath && typeof active.selectionStart === "number"
+    ? {
+        start: active.selectionStart,
+        end: active.selectionEnd,
+        direction: active.selectionDirection,
+      }
+    : null;
+  const templateSnapshot = configurationTemplateDomSnapshot(active);
+  render();
+  restoreConfigurationTemplateDom(templateSnapshot);
+  if (fieldPath) {
+    const nextField = [...content.querySelectorAll("[data-configuration-field]")]
+      .find((control) => control.dataset.configurationField === fieldPath);
+    if (!nextField) return;
+    nextField.focus({ preventScroll: true });
+    if (selection && typeof nextField.setSelectionRange === "function") {
+      const maximum = nextField.value.length;
+      nextField.setSelectionRange(
+        Math.min(selection.start, maximum),
+        Math.min(selection.end, maximum),
+        selection.direction || undefined,
+      );
+    }
+  }
 }
 
 function applyConfigurationState(
@@ -3045,10 +3850,17 @@ function applyConfigurationState(
     configurationPreview = null;
   }
   if (editable && !configurationEditorDirty) {
-    configurationEditorValue = JSON.stringify(editable, null, 2);
-    configurationEditorDirty = false;
-    configurationEditorStale = false;
-    configurationEditorBinding = binding;
+    try {
+      configurationFormState = createConfigurationFormState(editable, binding);
+      configurationEditorDirty = false;
+      configurationEditorStale = false;
+      configurationEditorBinding = binding;
+      configurationEditorError = "";
+    } catch (error) {
+      configurationFormState = null;
+      configurationEditorBinding = null;
+      configurationEditorError = error.message;
+    }
   }
   updateConfigurationChrome();
   if (
@@ -3130,6 +3942,30 @@ async function fetchConfirmationQueue() {
   return response.json();
 }
 
+function refreshLoadedConfirmationHistory(
+  queueRevision = confirmationQueueState.queueRevision,
+) {
+  if (
+    currentView !== "employees" ||
+    !confirmationHistoryLoaded ||
+    confirmationHistoryLoading
+  ) {
+    return;
+  }
+  if (
+    !confirmationHistoryError &&
+    Number.isSafeInteger(queueRevision) &&
+    queueRevision >= 0 &&
+    confirmationHistoryQueueRevision === queueRevision
+  ) {
+    return;
+  }
+  void loadConfirmationHistory().catch((error) => {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+  });
+}
+
 async function refreshConfirmationQueue({
   showConfirmation = true,
   renderView = true,
@@ -3138,6 +3974,7 @@ async function refreshConfirmationQueue({
   const nextState = await fetchConfirmationQueue();
   const applied = applyConfirmationQueue(nextState, sequence);
   if (applied && dashboard && renderView) render();
+  if (applied) refreshLoadedConfirmationHistory();
   if (showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
 }
@@ -3168,6 +4005,7 @@ async function load({ showConfirmation = true } = {}) {
     if (showConfirmation) queueMicrotask(showNextConfirmation);
     if (!nextDashboard) {
       if (currentView !== "configuration") render();
+      refreshLoadedConfirmationHistory();
       return;
     }
     applyDashboard(nextDashboard, sequence, {
@@ -3175,6 +4013,7 @@ async function load({ showConfirmation = true } = {}) {
     });
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
+    refreshLoadedConfirmationHistory();
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;
@@ -3241,6 +4080,16 @@ function activateView(view) {
   }
   if (currentView === "memory" && !memoryLoaded) {
     loadMemories().catch((error) => {
+      statusBanner.hidden = false;
+      statusBanner.textContent = error.message;
+    });
+  }
+  if (
+    currentView === "employees" &&
+    !confirmationHistoryLoaded &&
+    !confirmationHistoryLoading
+  ) {
+    loadConfirmationHistory().catch((error) => {
       statusBanner.hidden = false;
       statusBanner.textContent = error.message;
     });

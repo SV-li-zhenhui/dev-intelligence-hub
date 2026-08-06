@@ -180,6 +180,40 @@ test("role brains, routing targets, and trusted policies must reference declared
   assertInvalid(untrustedCodeRole);
 });
 
+test("legacy brains stay on Ollama while routed role and memory brains accept remote providers", () => {
+  for (const mutate of [
+    (value) => {
+      value.brain.provider = "remote-smart";
+    },
+    (value) => {
+      value.employees.prReviewer.brain.provider = "remote-smart";
+    },
+  ]) {
+    const legacy = document();
+    legacy.brainProviders["remote-smart"] = {
+      kind: "openai-compatible",
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MYDASHBOARD_MODEL_TOKEN",
+      remote: true,
+    };
+    mutate(legacy);
+    assertInvalid(legacy);
+  }
+
+  const routed = document();
+  routed.brainProviders["remote-smart"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MYDASHBOARD_MODEL_TOKEN",
+    remote: true,
+  };
+  routed.employees.roles.developer.brain.provider = "remote-smart";
+  routed.memory.answering.brain.provider = "remote-smart";
+  const normalized = normalizeConfigurationDocument(routed);
+  assert.equal(normalized.employees.roles.developer.brain.provider, "remote-smart");
+  assert.equal(normalized.memory.answering.brain.provider, "remote-smart");
+});
+
 test("impact classifies security tightening and authority expansion directionally", () => {
   const permitted = document();
   permitted.employees.roles.developer.brain.remoteData.code = true;

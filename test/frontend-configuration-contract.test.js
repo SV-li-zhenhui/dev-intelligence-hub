@@ -23,15 +23,19 @@ function functionSource(name) {
   assert.fail(`${name} must have a complete body`);
 }
 
-test("configuration center is a first-class view with an accessible editor", () => {
+test("configuration center is a first-class view with an accessible structured form", () => {
   assert.match(html, /data-view="configuration"/);
   assert.match(html, />配置中心</);
   assert.equal((html.match(/id="confirmation-dialog"/g) || []).length, 1);
   assert.match(app, /configuration: "配置中心"/);
-  assert.match(app, /id="configuration-editor-form"/);
-  assert.match(app, /<label for="configuration-document">/);
-  assert.match(app, /aria-invalid=/);
-  assert.match(styles, /\.configuration-editor textarea:focus-visible/);
+  assert.match(app, /renderConfigurationSettingsSkeleton/);
+  assert.match(app, /createConfigurationFormState/);
+  assert.match(app, /configurationDocumentFromForm/);
+  assert.match(app, /bindConfigurationFormController/);
+  assert.doesNotMatch(app, /<textarea[^>]+configuration-document/);
+  assert.doesNotMatch(app, /configurationEditorValue|parsedConfigurationDocument/);
+  assert.match(styles, /\.configuration-structured-field/);
+  assert.match(styles, /\[data-configuration-field\]:focus-visible/);
   assert.match(styles, /\.configuration-actions button:focus-visible/);
 });
 
@@ -162,7 +166,7 @@ test("active configuration view exposes version history and staged rollback cont
 
 test("configuration interactions invalidate stale previews and preserve active editing", () => {
   const view = functionSource("configurationView");
-  const input = functionSource("handleConfigurationEditorInput");
+  const input = functionSource("handleConfigurationFormInvalidate");
   const invalidate = functionSource("invalidateConfigurationPreviewUi");
   const applyConfiguration = functionSource("applyConfigurationState");
   const preserveFocus = functionSource(
@@ -188,8 +192,8 @@ test("configuration interactions invalidate stale previews and preserve active e
     applyConfiguration,
     /renderConfigurationPreservingEditorFocus\(\)/,
   );
-  assert.match(preserveFocus, /editor\.selectionStart/);
-  assert.match(preserveFocus, /nextEditor\.setSelectionRange/);
+  assert.match(preserveFocus, /data-configuration-field/);
+  assert.match(preserveFocus, /\.focus\(/);
   assert.match(operation, /\{ editorError = true, focusSelector = null \}/);
   assert.match(operation, /configurationOperationError = error\.message/);
   assert.match(versions, /aria-label="预览回滚到 v\$\{versionNumber\}"/);
@@ -199,7 +203,7 @@ test("configuration interactions invalidate stale previews and preserve active e
   );
 });
 
-test("a stale draft save keeps local text behind an explicit reset", () => {
+test("a stale draft save keeps local typed form state behind an explicit reset", () => {
   const view = functionSource("configurationView");
   const save = functionSource("handleConfigurationSave");
   const reset = functionSource("resetConfigurationEditor");
@@ -208,7 +212,21 @@ test("a stale draft save keeps local text behind an explicit reset", () => {
   assert.match(view, /放弃本地编辑并载入最新配置/);
   assert.match(view, /configurationEditorStale \? "disabled" : ""/);
   assert.match(reset, /configurationEditorStale = false/);
-  assert.match(reset, /configurationEditorBinding = currentConfigurationBinding\(\)/);
+  assert.match(reset, /const binding = currentConfigurationBinding\(\)/);
+  assert.match(reset, /configurationEditorBinding = binding/);
+  assert.match(reset, /createConfigurationFormState/);
+});
+
+test("configuration save materializes the bounded form and preserves 409 state", () => {
+  const save = functionSource("handleConfigurationSave");
+  const applyConfiguration = functionSource("applyConfigurationState");
+
+  assert.match(save, /configurationDocumentFromForm/);
+  assert.match(save, /materialized\.configuration/);
+  assert.match(save, /configurationEditorStale = true/);
+  assert.match(applyConfiguration, /!configurationEditorDirty/);
+  assert.doesNotMatch(save, /JSON\.parse/);
+  assert.doesNotMatch(app, /configuration-document/);
 });
 
 test("completed v1 reports a manual restart boundary without a restart endpoint", () => {

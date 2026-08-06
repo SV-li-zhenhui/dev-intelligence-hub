@@ -29,6 +29,7 @@ const USER_QUEUE_METHODS = [
   "retry",
   "reject",
 ];
+const HISTORY_READER_METHODS = ["list"];
 const PRODUCER_QUEUE_METHODS = ["enqueue", "get", "invalidate"];
 const APPLICATION_RESULT_SOURCE_METHODS = ["readSnapshot"];
 const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
@@ -395,6 +396,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
         "recover",
         ...new Set([
           ...USER_QUEUE_METHODS,
+          ...HISTORY_READER_METHODS,
           ...PRODUCER_QUEUE_METHODS,
           ...APPLICATION_RESULT_SOURCE_METHODS,
         ]),
@@ -403,8 +405,13 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     );
     await guard.acquire();
     await queue.recover();
+    const historyReader = createQueueFacade(queue, HISTORY_READER_METHODS);
     return Object.freeze({
-      queue: createQueueFacade(queue, USER_QUEUE_METHODS),
+      queue: Object.freeze({
+        ...createQueueFacade(queue, USER_QUEUE_METHODS),
+        historyReader,
+      }),
+      historyReader,
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),
       applicationResultSource: createQueueFacade(
         queue,

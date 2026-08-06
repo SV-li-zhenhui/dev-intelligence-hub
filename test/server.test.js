@@ -1020,6 +1020,38 @@ async function withServer(
       retryable: false,
     };
     application.confirmationQueue = {
+      historyReader: Object.freeze({
+        async list(options) {
+          calls.push({ operation: "confirmation_history_list", options });
+          return {
+            queueRevision: 8,
+            filters: {
+              ...(options.status ? { status: options.status } : {}),
+              ...(options.kind ? { kind: options.kind } : {}),
+              ...(options.roleId ? { roleId: options.roleId } : {}),
+            },
+            limit: options.limit || 25,
+            roleIdFacets: ["former-reviewer", "pr-reviewer"],
+            items: [
+              {
+                id: "confirmation-pr-work-completed",
+                kind: "github.pull-request-review",
+                status: "completed",
+                requestedBy: {
+                  roleId: "pr-reviewer",
+                  workItemId: "pr-work-completed",
+                },
+                title: "acme/repo #7 · Checkout",
+                summary: "Review 已完成",
+                createdAt: "2026-08-05T01:00:00.000Z",
+                updatedAt: "2026-08-05T01:01:00.000Z",
+                retryable: false,
+              },
+            ],
+            nextCursor: options.cursor ? null : "next-history-cursor",
+          };
+        },
+      }),
       async next() {
         calls.push({ operation: "confirmation_next" });
         return {
@@ -4607,6 +4639,78 @@ test("the confirmation API exposes only the next immutable projection", async ()
   });
 });
 
+test("confirmation history is a GET-only, filtered, read-only projection", async () => {
+  await withServer(async ({ server, calls }) => {
+    const response = await request(server, {
+      path: `/api/confirmations/history?status=completed&kind=github.pull-request-review&roleId=pr-reviewer&limit=20&cursor=${"a".repeat(32)}`,
+    });
+
+    assert.equal(response.status, 200);
+    const body = JSON.parse(response.body);
+    assert.equal(body.available, true);
+    assert.equal(body.items.length, 1);
+    assert.deepEqual(body.roleIdFacets, ["former-reviewer", "pr-reviewer"]);
+    assert.deepEqual(Object.keys(body.items[0]).sort(), [
+      "createdAt",
+      "id",
+      "kind",
+      "requestedBy",
+      "retryable",
+      "status",
+      "summary",
+      "title",
+      "updatedAt",
+    ]);
+    assert.deepEqual(calls, [
+      {
+        operation: "confirmation_history_list",
+        options: {
+          status: "completed",
+          kind: "github.pull-request-review",
+          roleId: "pr-reviewer",
+          limit: 20,
+          cursor: "a".repeat(32),
+        },
+      },
+    ]);
+
+    const post = await request(server, {
+      method: "POST",
+      path: "/api/confirmations/history",
+    });
+    assert.equal(post.status, 404);
+    assert.equal(
+      calls.filter(({ operation }) => operation === "confirmation_history_list")
+        .length,
+      1,
+    );
+  });
+});
+
+test("confirmation history rejects every non-whitelisted or duplicate filter before reading", async () => {
+  await withServer(async ({ server, calls }) => {
+    const paths = [
+      "/api/confirmations/history?unknown=value",
+      "/api/confirmations/history?status=completed&status=rejected",
+      "/api/confirmations/history?status=pending",
+      "/api/confirmations/history?kind=github.unknown-action",
+      "/api/confirmations/history?roleId=PR%20Admin",
+      "/api/confirmations/history?limit=0",
+      "/api/confirmations/history?limit=51",
+      "/api/confirmations/history?limit=01",
+      "/api/confirmations/history?cursor=short",
+    ];
+    for (const path of paths) {
+      const response = await request(server, { path });
+      assert.equal(response.status, 400, path);
+    }
+    assert.equal(
+      calls.some(({ operation }) => operation === "confirmation_history_list"),
+      false,
+    );
+  });
+});
+
 test("confirmation mutations forward only bound requests and sync the employee", async () => {
   const signals = [];
   const backgroundWork = {
@@ -4713,6 +4817,9 @@ test("disabled external actions expose an empty read view and reject writes", as
   await withServer(
     async ({ server }) => {
       const next = await request(server, { path: "/api/confirmations/next" });
+      const history = await request(server, {
+        path: "/api/confirmations/history",
+      });
       const approve = await request(server, {
         method: "POST",
         path: "/api/confirmations/confirmation-pr-work-1/approve",
@@ -4729,6 +4836,15 @@ test("disabled external actions expose an empty read view and reject writes", as
         queueRevision: 0,
         pendingCount: 0,
         item: null,
+      });
+      assert.deepEqual(JSON.parse(history.body), {
+        available: false,
+        queueRevision: 0,
+        filters: {},
+        limit: 25,
+        roleIdFacets: [],
+        items: [],
+        nextCursor: null,
       });
       assert.equal(approve.status, 503);
     },

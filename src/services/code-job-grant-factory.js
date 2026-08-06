@@ -22,9 +22,30 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_WORKSPACE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const PREPARED_CODE_JOB_GRANTS = new WeakSet();
 
 function invalid(message = "代码任务授权配置无效") {
   return workProposalError("INVALID_CODE_JOB_AUTHORITY", message);
+}
+
+function freezePreparedGrant(value) {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) freezePreparedGrant(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+export function prepareCodeJobGrantVerification(value) {
+  let grant;
+  try {
+    grant = normalizeCodeJobGrant(value);
+  } catch {
+    throw invalid("代码任务授权封印无效");
+  }
+  freezePreparedGrant(grant);
+  PREPARED_CODE_JOB_GRANTS.add(grant);
+  return grant;
 }
 
 function plainRecord(value, name) {
@@ -334,6 +355,7 @@ export class CodeJobGrantFactory {
   #operationsByRole;
   #brainDigests;
   #publicOperations;
+  #scopeAuthorityDigest;
 
   constructor({
     executorAuthority,
@@ -343,7 +365,14 @@ export class CodeJobGrantFactory {
     codeOperationsByRole,
     brainByRole,
     brainProviders,
+    scopeAuthorityDigest,
   } = {}) {
+    if (
+      scopeAuthorityDigest !== undefined &&
+      typeof scopeAuthorityDigest !== "function"
+    ) {
+      throw new TypeError("scopeAuthorityDigest must be a function");
+    }
     this.#workspaces = normalizeAuthority(executorAuthority);
     this.#policyVersion = positiveInteger(policyVersion, "policyVersion");
     this.#workspaceByRepository = normalizeWorkspaceBindings(
@@ -359,6 +388,7 @@ export class CodeJobGrantFactory {
       this.#operationsByRole.keys(),
     );
     this.#publicOperations = publicRoleOperations(this.#operationsByRole);
+    this.#scopeAuthorityDigest = scopeAuthorityDigest ?? null;
     Object.freeze(this);
   }
 
@@ -401,12 +431,9 @@ export class CodeJobGrantFactory {
   }
 
   verify(value) {
-    let grant;
-    try {
-      grant = normalizeCodeJobGrant(value);
-    } catch {
-      throw invalid("代码任务授权封印无效");
-    }
+    const grant = PREPARED_CODE_JOB_GRANTS.has(value)
+      ? value
+      : prepareCodeJobGrantVerification(value);
     const roleId = grant.requestedBy.roleId;
     const workspace = this.#currentAuthority({
       policyVersion: grant.policyVersion,
@@ -452,6 +479,20 @@ export class CodeJobGrantFactory {
       throw invalid("岗位无权创建该类型的代码任务");
     }
     if (!workspace) throw invalid("工作提案引用了未知代码工作区");
-    return workspace;
+    if (this.#scopeAuthorityDigest === null) return workspace;
+    return {
+      ...workspace,
+      authorityDigest: sha256(
+        this.#scopeAuthorityDigest({
+          executorAuthorityDigest: workspace.authorityDigest,
+          policyVersion,
+          repository,
+          workspaceId,
+          roleId,
+          operation,
+        }),
+        "scopeAuthorityDigest result",
+      ),
+    };
   }
 }

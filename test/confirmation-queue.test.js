@@ -4,6 +4,7 @@ import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.j
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
+  CONFIRMATION_HISTORY_MAX_ROLE_FACETS,
   ConfirmationExecutionError,
   ConfirmationQueue,
 } from "../src/services/confirmation-queue.js";
@@ -203,19 +204,20 @@ async function readyQueue({
   store = new MemoryStore(),
   actionExecutor = executor(),
   exclusiveLease = new ExclusiveLease(),
+  clock = createClock(
+    "2026-08-02T01:00:00.000Z",
+    "2026-08-02T01:00:01.000Z",
+    "2026-08-02T01:00:02.000Z",
+    "2026-08-02T01:00:03.000Z",
+    "2026-08-02T01:00:04.000Z",
+  ),
 } = {}) {
   const queue = new ConfirmationQueue({
     store,
     executor: actionExecutor,
     operationQueue: new OperationQueue(),
     exclusiveLease,
-    clock: createClock(
-      "2026-08-02T01:00:00.000Z",
-      "2026-08-02T01:00:01.000Z",
-      "2026-08-02T01:00:02.000Z",
-      "2026-08-02T01:00:03.000Z",
-      "2026-08-02T01:00:04.000Z",
-    ),
+    clock,
   });
   await queue.recover();
   return queue;
@@ -256,6 +258,10 @@ test("the queue stays closed until durable recovery succeeds", async () => {
     queue.readSnapshot({ afterRevision: 0 }),
     (error) => error.code === "CONFIRMATION_QUEUE_NOT_READY",
   );
+  await assert.rejects(
+    queue.list(),
+    (error) => error.code === "CONFIRMATION_QUEUE_NOT_READY",
+  );
 });
 
 test("a kind-and-action query skips unrelated confirmations without exposing them", async () => {
@@ -289,6 +295,334 @@ test("enqueue freezes an exact plan and is idempotent only for the same binding"
     queue.enqueue(actionPlan({ action: { type: "pull_request_review", reviewEvent: "COMMENT", body: "changed" } })),
     (error) => error.code === "CONFIRMATION_ID_CONFLICT" && error.statusCode === 409,
   );
+});
+
+test("history listing is read-only, newest-first, cursor paged, filtered, and safely projected", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({
+    store,
+    clock: createClock(
+      "2026-08-02T01:00:00.000Z",
+      "2026-08-02T01:00:01.000Z",
+      "2026-08-02T01:00:02.000Z",
+      "2026-08-02T01:00:03.000Z",
+      "2026-08-02T01:00:04.000Z",
+      "2026-08-02T01:00:05.000Z",
+      "2026-08-02T01:00:06.000Z",
+      "2026-08-02T01:00:07.000Z",
+    ),
+  });
+
+  await queue.enqueue(actionPlan());
+  let next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next));
+
+  await queue.enqueue(configurationPlan("activate_rollback", "rejected"));
+  next = await queue.next();
+  await queue.reject(next.item.id, {
+    ...approvalRequest(next, "request-reject-history"),
+    reason: "private rejection detail must not be projected",
+  });
+
+  const stale = await queue.enqueue(
+    actionPlan({
+      id: "confirmation-review-44",
+      requestedBy: { roleId: "developer", workItemId: "work-private-44" },
+    }),
+  );
+  await queue.invalidate(stale.id, producerInvalidation(stale));
+  await queue.enqueue(actionPlan({ id: "confirmation-review-99" }));
+  const unsupported = await queue.enqueue(
+    actionPlan({
+      id: "confirmation-unsupported-history",
+      kind: "custom.unsupported-action",
+      requestedBy: {
+        roleId: "unsupported-history-role",
+        workItemId: "unsupported-history-work",
+      },
+    }),
+  );
+  await queue.invalidate(unsupported.id, producerInvalidation(unsupported));
+  const writesBeforeRead = store.writeCount;
+
+  const first = await queue.list({ limit: 2 });
+
+  assert.equal(first.queueRevision, store.value.revision);
+  assert.equal(first.items.length, 2);
+  assert.deepEqual(
+    first.items.map(({ id }) => id),
+    ["confirmation-review-44", "confirmation-configuration-rejected"],
+  );
+  assert.match(first.nextCursor, /^[A-Za-z0-9_-]{16,512}$/);
+  assert.equal(first.limit, 2);
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.items), true);
+  assert.equal(Object.isFrozen(first.items[0]), true);
+  assert.equal(Object.isFrozen(first.items[0].requestedBy), true);
+  assert.equal(Object.isFrozen(first.roleIdFacets), true);
+  assert.deepEqual(first.roleIdFacets, [
+    "configuration-owner",
+    "developer",
+    "pr-reviewer",
+  ]);
+  assert.equal(
+    first.items.some(
+      ({ requestedBy }) => requestedBy.roleId === "pr-reviewer",
+    ),
+    false,
+  );
+  assert.deepEqual(Object.keys(first.items[0]).sort(), [
+    "createdAt",
+    "id",
+    "kind",
+    "requestedBy",
+    "retryable",
+    "status",
+    "summary",
+    "title",
+    "updatedAt",
+  ]);
+  for (const item of first.items) {
+    for (const forbidden of [
+      "action",
+      "actor",
+      "target",
+      "display",
+      "displayedPayloadDigest",
+      "approvalBindingDigest",
+      "receipt",
+      "failure",
+      "rejection",
+      "invalidation",
+    ]) {
+      assert.equal(Object.hasOwn(item, forbidden), false, forbidden);
+    }
+  }
+  const second = await queue.list({ limit: 2, cursor: first.nextCursor });
+  assert.deepEqual(
+    second.items.map(({ id }) => id),
+    ["confirmation-review-42"],
+  );
+  assert.equal(second.nextCursor, null);
+  assert.equal(store.writeCount, writesBeforeRead);
+  const serialized = JSON.stringify([first, second]);
+  for (const secret of [
+    "review-account",
+    "The reviewed paths are covered.",
+    "CI 已通过",
+    "private rejection detail",
+    "work_item_superseded",
+    "0123456789abcdef",
+  ]) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+
+  const filtered = await queue.list({
+    status: "completed",
+    kind: "github.pull-request-review",
+    roleId: "pr-reviewer",
+    limit: 10,
+  });
+  assert.deepEqual(filtered.items.map(({ id }) => id), [
+    "confirmation-review-42",
+  ]);
+  assert.deepEqual(filtered.filters, {
+    status: "completed",
+    kind: "github.pull-request-review",
+    roleId: "pr-reviewer",
+  });
+  assert.equal(
+    first.items.some(({ id }) => id === "confirmation-review-99"),
+    false,
+  );
+  assert.equal(
+    [...first.items, ...second.items].some(
+      ({ id }) => id === "confirmation-unsupported-history",
+    ),
+    false,
+  );
+  assert.equal(first.roleIdFacets.includes("unsupported-history-role"), false);
+});
+
+test("history projects completed and retryable failed actions", async () => {
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      if (envelope.requestedBy.workItemId === "history-failed-work") {
+        throw new ConfirmationExecutionError("GITHUB_REJECTED", "absent");
+      }
+      return { status: "applied", receipt: { id: "review-history-success" } };
+    },
+  });
+  const queue = await readyQueue({ actionExecutor });
+
+  await queue.enqueue(
+    actionPlan({
+      id: "confirmation-history-success",
+      requestedBy: { roleId: "pr-reviewer", workItemId: "history-success-work" },
+    }),
+  );
+  let next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next, "history-success-request"));
+
+  await queue.enqueue(
+    actionPlan({
+      id: "confirmation-history-failed",
+      requestedBy: { roleId: "pr-reviewer", workItemId: "history-failed-work" },
+    }),
+  );
+  next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next, "history-failed-request"));
+
+  const history = await queue.list({ limit: 10 });
+
+  assert.deepEqual(
+    history.items.map(({ id, status, retryable }) => ({ id, status, retryable })),
+    [
+      {
+        id: "confirmation-history-failed",
+        status: "failed",
+        retryable: true,
+      },
+      {
+        id: "confirmation-history-success",
+        status: "completed",
+        retryable: false,
+      },
+    ],
+  );
+});
+
+test("history reads the persisted executing snapshot without waiting for executor work", async () => {
+  let releaseExecution;
+  let signalExecutionStarted;
+  const executionGate = new Promise((resolve) => {
+    releaseExecution = resolve;
+  });
+  const executionStarted = new Promise((resolve) => {
+    signalExecutionStarted = resolve;
+  });
+  const store = new MemoryStore();
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      signalExecutionStarted();
+      await executionGate;
+      return { status: "applied", receipt: { id: "review-executing-history" } };
+    },
+  });
+  const queue = await readyQueue({ store, actionExecutor });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  const approval = queue.approve(next.item.id, approvalRequest(next));
+  await executionStarted;
+
+  const historyPromise = queue.list();
+  const history = await Promise.race([
+    historyPromise,
+    new Promise((resolve) => setImmediate(() => resolve(null))),
+  ]);
+
+  assert.notEqual(history, null);
+  assert.equal(store.value.items[0].status, "executing");
+  assert.equal(history.queueRevision, store.value.revision);
+  assert.deepEqual(history.items, []);
+  assert.deepEqual(history.roleIdFacets, []);
+
+  releaseExecution();
+  await approval;
+  await historyPromise;
+});
+
+test("history role facets are deterministically sorted and explicitly bounded", async () => {
+  assert.equal(CONFIRMATION_HISTORY_MAX_ROLE_FACETS, 64);
+  const queue = await readyQueue();
+  for (let index = CONFIRMATION_HISTORY_MAX_ROLE_FACETS; index >= 0; index -= 1) {
+    const suffix = String(index).padStart(3, "0");
+    const item = await queue.enqueue(
+      actionPlan({
+        id: `confirmation-role-facet-${suffix}`,
+        requestedBy: {
+          roleId: `role-${suffix}`,
+          workItemId: `work-role-facet-${suffix}`,
+        },
+      }),
+    );
+    await queue.invalidate(item.id, producerInvalidation(item));
+  }
+
+  const history = await queue.list({ limit: 1 });
+
+  assert.equal(history.roleIdFacets.length, CONFIRMATION_HISTORY_MAX_ROLE_FACETS);
+  assert.deepEqual(
+    history.roleIdFacets,
+    Array.from(
+      { length: CONFIRMATION_HISTORY_MAX_ROLE_FACETS },
+      (_, index) => `role-${String(index).padStart(3, "0")}`,
+    ),
+  );
+  assert.equal(history.roleIdFacets.includes("role-064"), false);
+});
+
+test("history listing rejects non-whitelisted filters, oversized pages, and mismatched cursors", async () => {
+  const queue = await readyQueue();
+  const first = await queue.enqueue(actionPlan());
+  await queue.invalidate(first.id, producerInvalidation(first));
+  const second = await queue.enqueue(
+    configurationPlan("activate_rollback", "stale"),
+  );
+  await queue.invalidate(second.id, producerInvalidation(second));
+  const page = await queue.list({ limit: 1 });
+  assert.ok(page.nextCursor);
+
+  let getterCalls = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "status", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "completed";
+    },
+  });
+  for (const input of [
+    null,
+    [],
+    { extra: true },
+    { status: "pending" },
+    { status: "executing" },
+    { kind: "github.unknown-action" },
+    { roleId: "Developer Admin" },
+    { limit: 0 },
+    { limit: 51 },
+    { limit: "10" },
+    accessor,
+  ]) {
+    await assert.rejects(
+      queue.list(input),
+      (error) =>
+        error.code === "INVALID_CONFIRMATION_HISTORY_QUERY" &&
+        error.statusCode === 400,
+    );
+  }
+  assert.equal(getterCalls, 0);
+  await assert.rejects(
+    queue.list({ cursor: "not-a-valid-cursor" }),
+    (error) => error.code === "INVALID_CONFIRMATION_HISTORY_CURSOR",
+  );
+  for (const changedFilter of [
+    { status: "completed" },
+    { kind: "local.configuration-activate" },
+    { roleId: "configuration-owner" },
+  ]) {
+    await assert.rejects(
+      queue.list({
+        ...changedFilter,
+        limit: 1,
+        cursor: page.nextCursor,
+      }),
+      (error) => error.code === "INVALID_CONFIRMATION_HISTORY_CURSOR",
+    );
+  }
 });
 
 test("application result snapshots expose only immutable minimal projections", async () => {

@@ -22,6 +22,29 @@ const MAX_ITEMS = 1_000;
 const APPLICATION_RESULT_KIND = "local.change-package-apply";
 const APPLICATION_SNAPSHOT_REQUEST_ID = "application-snapshot-read";
 const ACTION_SELECTOR = /^[a-z][a-z0-9._-]{0,127}$/;
+const HISTORY_ROLE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const HISTORY_CURSOR = /^[A-Za-z0-9_-]{16,512}$/;
+const HISTORY_ITEM_ID =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
+const HISTORY_CURSOR_DIGEST = /^[a-f0-9]{64}$/;
+const DEFAULT_HISTORY_LIMIT = 25;
+export const CONFIRMATION_HISTORY_MAX_LIMIT = 50;
+export const CONFIRMATION_HISTORY_MAX_ROLE_FACETS = 64;
+export const CONFIRMATION_HISTORY_STATUSES = Object.freeze([
+  "completed",
+  "failed",
+  "stale",
+  "rejected",
+]);
+export const CONFIRMATION_HISTORY_KINDS = Object.freeze([
+  "github.pull-request-review",
+  "github.work-proposal-review",
+  "local.code-job-create",
+  "local.change-package-apply",
+  "local.configuration-activate",
+]);
+const HISTORY_STATUS_SET = new Set(CONFIRMATION_HISTORY_STATUSES);
+const HISTORY_KIND_SET = new Set(CONFIRMATION_HISTORY_KINDS);
 
 export class ConfirmationExecutionError extends Error {
   constructor(code, outcome, { cause } = {}) {
@@ -117,6 +140,26 @@ function byCreation(left, right) {
   );
 }
 
+function byNewestCreation(left, right) {
+  return byCreation(right, left);
+}
+
+function compareAscii(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function isProjectableHistoryItem(item) {
+  return HISTORY_STATUS_SET.has(item.status) && HISTORY_KIND_SET.has(item.kind);
+}
+
+function historyRoleIdFacets(items) {
+  return [...new Set(items.map((item) => item.requestedBy.roleId))]
+    .sort(compareAscii)
+    .slice(0, CONFIRMATION_HISTORY_MAX_ROLE_FACETS);
+}
+
 function normalizeActionSelector(kind, actionType) {
   if (
     typeof kind !== "string" ||
@@ -157,6 +200,150 @@ function exactDataFields(value, expected, error) {
     fields.set(key, descriptor.value);
   }
   return fields;
+}
+
+function optionalDataFields(value, allowed, error) {
+  if (value === undefined) return new Map();
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw error;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.some(
+      (key) => typeof key !== "string" || !allowed.includes(key),
+    )
+  ) {
+    throw error;
+  }
+  const fields = new Map();
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw error;
+    fields.set(key, descriptor.value);
+  }
+  return fields;
+}
+
+function canonicalTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function historyFilterDigest(filters) {
+  return digestValue({
+    status: filters.status ?? null,
+    kind: filters.kind ?? null,
+    roleId: filters.roleId ?? null,
+  });
+}
+
+function historyCursorError() {
+  return queueError(
+    "INVALID_CONFIRMATION_HISTORY_CURSOR",
+    "确认历史游标无效",
+    400,
+  );
+}
+
+function encodeHistoryCursor(item, filters) {
+  return Buffer.from(
+    [item.createdAt, item.id, historyFilterDigest(filters)].join("\u0000"),
+    "utf8",
+  ).toString("base64url");
+}
+
+function decodeHistoryCursor(value, filters) {
+  if (typeof value !== "string" || !HISTORY_CURSOR.test(value)) {
+    throw historyCursorError();
+  }
+  let decoded;
+  try {
+    decoded = Buffer.from(value, "base64url").toString("utf8");
+  } catch {
+    throw historyCursorError();
+  }
+  if (Buffer.from(decoded, "utf8").toString("base64url") !== value) {
+    throw historyCursorError();
+  }
+  const parts = decoded.split("\u0000");
+  if (
+    parts.length !== 3 ||
+    !canonicalTimestamp(parts[0]) ||
+    !HISTORY_ITEM_ID.test(parts[1]) ||
+    !HISTORY_CURSOR_DIGEST.test(parts[2]) ||
+    parts[2] !== historyFilterDigest(filters)
+  ) {
+    throw historyCursorError();
+  }
+  return { createdAt: parts[0], id: parts[1] };
+}
+
+function normalizeHistoryQuery(value) {
+  const error = queueError(
+    "INVALID_CONFIRMATION_HISTORY_QUERY",
+    "确认历史筛选条件无效",
+    400,
+  );
+  const fields = optionalDataFields(
+    value,
+    ["status", "kind", "roleId", "limit", "cursor"],
+    error,
+  );
+  const filters = {};
+  if (fields.has("status")) {
+    const status = fields.get("status");
+    if (!HISTORY_STATUS_SET.has(status)) throw error;
+    filters.status = status;
+  }
+  if (fields.has("kind")) {
+    const kind = fields.get("kind");
+    if (!HISTORY_KIND_SET.has(kind)) throw error;
+    filters.kind = kind;
+  }
+  if (fields.has("roleId")) {
+    const roleId = fields.get("roleId");
+    if (typeof roleId !== "string" || !HISTORY_ROLE_ID.test(roleId)) {
+      throw error;
+    }
+    filters.roleId = roleId;
+  }
+  const limit = fields.has("limit")
+    ? fields.get("limit")
+    : DEFAULT_HISTORY_LIMIT;
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > CONFIRMATION_HISTORY_MAX_LIMIT
+  ) {
+    throw error;
+  }
+  const cursor = fields.has("cursor")
+    ? decodeHistoryCursor(fields.get("cursor"), filters)
+    : null;
+  return { filters, limit, cursor };
+}
+
+function projectHistoryItem(item) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    status: item.status,
+    requestedBy: {
+      roleId: item.requestedBy.roleId,
+      workItemId: item.requestedBy.workItemId,
+    },
+    title: item.display.title,
+    summary: item.display.summary,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    retryable: Boolean(item.failure?.retryable),
+  };
 }
 
 function normalizeSnapshotRequest(value) {
@@ -402,6 +589,15 @@ export class ConfirmationQueue {
     this.#assertReady();
     const item = this.#requireItem(id);
     return this.#projectItem(item);
+  }
+
+  async list(options) {
+    this.#assertReady();
+    const query = normalizeHistoryQuery(options);
+    const state = normalizeConfirmationState(
+      await this.store.read(STATE_KEY, defaultConfirmationState()),
+    );
+    return this.#projectHistory(state, query);
   }
 
   async readSnapshot(input) {
@@ -854,6 +1050,33 @@ export class ConfirmationQueue {
       ...(item.failure ? { failure: item.failure } : {}),
       ...(item.rejection ? { rejection: item.rejection } : {}),
       ...(item.invalidation ? { invalidation: item.invalidation } : {}),
+    });
+  }
+
+  #projectHistory(state, { filters, limit, cursor }) {
+    const projectable = state.items.filter(isProjectableHistoryItem);
+    const matches = projectable
+      .filter(
+        (item) =>
+          (!filters.status || item.status === filters.status) &&
+          (!filters.kind || item.kind === filters.kind) &&
+          (!filters.roleId || item.requestedBy.roleId === filters.roleId),
+      )
+      .sort(byNewestCreation);
+    const afterCursor = cursor
+      ? matches.filter((item) => byNewestCreation(item, cursor) > 0)
+      : matches;
+    const page = afterCursor.slice(0, limit);
+    return deepFreeze({
+      queueRevision: state.revision,
+      filters: { ...filters },
+      limit,
+      roleIdFacets: historyRoleIdFacets(projectable),
+      items: page.map(projectHistoryItem),
+      nextCursor:
+        afterCursor.length > limit
+          ? encodeHistoryCursor(page.at(-1), filters)
+          : null,
     });
   }
 

@@ -38,6 +38,9 @@ function queuePort(events = []) {
     nextForAction(...args) {
       return ["nextForAction", ...args];
     },
+    list(input) {
+      return ["list", input];
+    },
     get(id) {
       return ["get", id];
     },
@@ -265,14 +268,17 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(Object.isFrozen(runtime), true);
   assert.deepEqual(Object.keys(runtime), [
     "queue",
+    "historyReader",
     "producerQueue",
     "applicationResultSource",
     "close",
   ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
+  assert.equal(Object.isFrozen(runtime.historyReader), true);
   assert.equal(Object.isFrozen(runtime.producerQueue), true);
   assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
   assert.notEqual(runtime.queue, rawQueue);
+  assert.notEqual(runtime.historyReader, rawQueue);
   assert.notEqual(runtime.producerQueue, rawQueue);
   assert.notEqual(runtime.applicationResultSource, rawQueue);
   assert.equal("recover" in runtime.queue, false);
@@ -280,6 +286,8 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal("invalidate" in runtime.queue, false);
   assert.equal("executor" in runtime.queue, false);
   assert.equal("exclusiveLease" in runtime.queue, false);
+  assert.equal("list" in runtime.queue, false);
+  assert.strictEqual(runtime.queue.historyReader, runtime.historyReader);
   assert.equal(runtime.queue.next(), "next");
   const detachedNext = runtime.queue.next;
   assert.equal(detachedNext(), "next");
@@ -287,6 +295,24 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal("approve" in runtime.producerQueue, false);
   assert.equal("readSnapshot" in runtime.queue, false);
   assert.equal("readSnapshot" in runtime.producerQueue, false);
+  assert.deepEqual(Object.keys(runtime.historyReader), ["list"]);
+  assert.equal("next" in runtime.historyReader, false);
+  assert.equal("get" in runtime.historyReader, false);
+  assert.equal("approve" in runtime.historyReader, false);
+  assert.equal("retry" in runtime.historyReader, false);
+  assert.equal("reject" in runtime.historyReader, false);
+  assert.equal("enqueue" in runtime.historyReader, false);
+  assert.equal("invalidate" in runtime.historyReader, false);
+  assert.equal("readSnapshot" in runtime.historyReader, false);
+  assert.deepEqual(runtime.historyReader.list({ limit: 7 }), [
+    "list",
+    { limit: 7 },
+  ]);
+  const detachedHistoryList = runtime.historyReader.list;
+  assert.deepEqual(detachedHistoryList({ status: "completed" }), [
+    "list",
+    { status: "completed" },
+  ]);
   assert.deepEqual(Object.keys(runtime.applicationResultSource), [
     "readSnapshot",
   ]);

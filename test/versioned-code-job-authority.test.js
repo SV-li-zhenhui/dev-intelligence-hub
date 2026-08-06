@@ -9,6 +9,8 @@ import {
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
+import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { VersionedCodeJobAuthority } from "../src/services/versioned-code-job-authority.js";
 
@@ -35,11 +37,28 @@ function configuration() {
         writablePaths: ["src", "test"],
         excludePaths: [],
       },
+      {
+        id: "auxiliary",
+        sourceRoot: "fixtures/auxiliary",
+        writablePaths: ["src"],
+        excludePaths: [],
+      },
     ],
     profiles: {
       "node-tests": { kind: "node-test", image: IMAGE, timeoutMs: 30_000 },
+      "auxiliary-tests": {
+        kind: "node-test",
+        image: IMAGE,
+        timeoutMs: 30_000,
+      },
     },
-    requiredProfilesByWorkspace: { dashboard: ["node-tests"] },
+    requiredProfilesByWorkspace: {
+      dashboard: ["node-tests"],
+      auxiliary: ["auxiliary-tests"],
+    },
+    brokerLimits: { maxFiles: 1_000, maxWriteBytes: 1_000_000 },
+    executorLimits: { maxSessions: 4, maxActionsPerSession: 100 },
+    maxArtifactBytes: 16_777_216,
   };
   value.workCoordination.enabled = true;
   value.workCoordination.policy = {
@@ -75,8 +94,107 @@ function executorAuthority() {
         ],
         authorityDigest: "d".repeat(64),
       },
+      {
+        id: "auxiliary",
+        writablePaths: ["src"],
+        requiredProfiles: [
+          { id: "auxiliary-tests", configDigest: "b".repeat(64) },
+        ],
+        authorityDigest: "e".repeat(64),
+      },
     ],
   };
+}
+
+function legacyConfigurationAuthority(configurationValue) {
+  const roles = Object.fromEntries(
+    Object.entries(configurationValue.employees.roles).map(([roleId, role]) => [
+      roleId,
+      {
+        enabled: role.enabled,
+        allowedIntents: role.permissions.allowedIntents,
+        brain: {
+          provider: role.brain.provider,
+          remoteData: role.brain.remoteData,
+        },
+      },
+    ]),
+  );
+  const providers = Object.fromEntries(
+    Object.entries(configurationValue.brainProviders).map(
+      ([providerId, provider]) => [
+        providerId,
+        {
+          kind: provider.kind,
+          baseUrl: provider.baseUrl,
+          apiKeyEnv: provider.apiKeyEnv ?? null,
+          remote: provider.remote ?? null,
+        },
+      ],
+    ),
+  );
+  return canonicalJsonDigest({
+    trackedRepositories: configurationValue.trackedRepositories,
+    codeExecutor: configurationValue.codeExecutor,
+    workCoordination: {
+      enabled: configurationValue.workCoordination.enabled,
+      policy: configurationValue.workCoordination.policy,
+    },
+    memoryEnabled: configurationValue.memory.enabled,
+    roles,
+    brainProviders: providers,
+  });
+}
+
+function legacyGrant(configurations) {
+  const current = configurations.at(-1);
+  let previousDigest = null;
+  let authorityDigest = null;
+  let authorityEpoch = 0;
+  for (const configurationValue of configurations) {
+    authorityDigest = legacyConfigurationAuthority(configurationValue);
+    if (authorityDigest !== previousDigest) {
+      authorityEpoch += 1;
+      previousDigest = authorityDigest;
+    }
+  }
+  const policy = current.workCoordination.policy;
+  const roleIds = policy.codeActionRoles.filter((roleId) => {
+    const role = current.employees.roles[roleId];
+    return (
+      role?.enabled === true &&
+      role.permissions.allowedIntents.includes("propose_code_action")
+    );
+  });
+  const factory = new CodeJobGrantFactory({
+    executorAuthority: {
+      workspaces: executorAuthority().workspaces.map((workspace) => ({
+        ...workspace,
+        authorityDigest: canonicalJsonDigest({
+          executorAuthorityDigest: workspace.authorityDigest,
+          configurationAuthorityDigest: authorityDigest,
+          configurationAuthorityEpoch: authorityEpoch,
+        }),
+      })),
+    },
+    policyVersion: policy.version,
+    workspaceByRepository: policy.workspaceByRepository,
+    codeActionRoles: roleIds,
+    codeOperationsByRole: Object.fromEntries(
+      roleIds.map((roleId) => [
+        roleId,
+        policy.codeOperationsByRole[roleId],
+      ]),
+    ),
+    brainByRole: Object.fromEntries(
+      roleIds.map((roleId) => [
+        roleId,
+        current.employees.roles[roleId].brain,
+      ]),
+    ),
+    brainProviders: current.brainProviders,
+  });
+  return factory.create(proposal(current)).grant;
 }
 
 function proposal(config) {
@@ -127,10 +245,15 @@ function proposal(config) {
   });
 }
 
-function fixture({ brainDirectoryFactory, actionAdmissionGate } = {}) {
+function fixture({
+  brainDirectoryFactory,
+  actionAdmissionGate,
+  grantFactoryFactory,
+} = {}) {
   const startup = configuration();
   let current = active(startup);
   const versions = [current];
+  let snapshotReads = 0;
   const admissionGate = actionAdmissionGate || new ActionAdmissionGate();
   if (admissionGate.readStatus().mode === "unbound") {
     admissionGate.bindEffective({
@@ -144,6 +267,7 @@ function fixture({ brainDirectoryFactory, actionAdmissionGate } = {}) {
         return structuredClone(current);
       },
       async readSnapshot() {
+        snapshotReads += 1;
         return { versions: structuredClone(versions) };
       },
     },
@@ -151,14 +275,40 @@ function fixture({ brainDirectoryFactory, actionAdmissionGate } = {}) {
     startupConfiguration: startup,
     actionAdmissionGate: admissionGate,
     ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
+    ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
   });
   return {
     authority,
     actionAdmissionGate: admissionGate,
     startup,
+    get snapshotReads() {
+      return snapshotReads;
+    },
     activate(value, version = current.version + 1) {
       current = active(normalizeConfigurationDocument(value), version);
       versions.push(current);
+    },
+    restart() {
+      const restartGate = new ActionAdmissionGate();
+      restartGate.bindEffective({
+        version: current.version,
+        configurationDigest: current.configurationDigest,
+      });
+      return new VersionedCodeJobAuthority({
+        configurationReader: {
+          async readActive() {
+            return structuredClone(current);
+          },
+          async readSnapshot() {
+            return { versions: structuredClone(versions) };
+          },
+        },
+        executorAuthority: executorAuthority(),
+        startupConfiguration: current.configuration,
+        actionAdmissionGate: restartGate,
+        ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
+        ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
+      });
     },
   };
 }
@@ -171,6 +321,147 @@ function deferred() {
   return { promise, resolve };
 }
 
+function activateHistory(context, targetVersion, change) {
+  for (let version = 2; version <= targetVersion; version += 1) {
+    const configurationValue = structuredClone(context.startup);
+    configurationValue.browserPollSeconds = version;
+    change(configurationValue, version);
+    context.activate(configurationValue);
+  }
+}
+
+test("malformed grants fail before reading or constructing authority history", async () => {
+  let factoryCreations = 0;
+  const context = fixture({
+    grantFactoryFactory: (options) => {
+      factoryCreations += 1;
+      return new CodeJobGrantFactory(options);
+    },
+  });
+
+  await assert.rejects(
+    context.authority.verify({}),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(context.snapshotReads, 0);
+  assert.equal(factoryCreations, 0);
+});
+
+test("a legacy global-digest grant remains valid after a same-config upgrade", async () => {
+  const beforeUpgrade = configuration();
+  const sealed = legacyGrant([beforeUpgrade]);
+  let providerCalls = 0;
+  const context = fixture({
+    brainDirectoryFactory: () => ({
+      async decide(_value, authorization) {
+        await authorization.beforeGenerate();
+        providerCalls += 1;
+        return { action: { type: "complete" } };
+      },
+    }),
+  });
+
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  await context.authority.decide(
+    { roleId: "developer" },
+    {
+      beforeGenerate: () => context.authority.verify(sealed),
+      brainDigest: sealed.brainDigest,
+    },
+  );
+  assert.equal(providerCalls, 1);
+});
+
+test("a legacy grant keeps conservative global invalidation semantics", async () => {
+  const beforeUpgrade = configuration();
+  const sealed = legacyGrant([beforeUpgrade]);
+  const context = fixture();
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.tester.permissions.allowedIntents.push(
+    "propose_github_review",
+  );
+  context.activate(changed);
+
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  context.activate(structuredClone(context.startup));
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("legacy verification scans a long benign history once", async () => {
+  let factoryCreations = 0;
+  let providerCalls = 0;
+  const context = fixture({
+    grantFactoryFactory: (options) => {
+      factoryCreations += 1;
+      return new CodeJobGrantFactory(options);
+    },
+    brainDirectoryFactory: () => ({
+      async decide(_value, authorization) {
+        await authorization.beforeGenerate();
+        providerCalls += 1;
+        return { action: { type: "complete" } };
+      },
+    }),
+  });
+  const sealed = legacyGrant([context.startup]);
+  activateHistory(context, 256, (configurationValue) => {
+    configurationValue.employees.roles.developer.brain.model =
+      "replacement-local-model";
+  });
+
+  const readsBefore = context.snapshotReads;
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  assert.equal(context.snapshotReads - readsBefore, 1);
+  assert.ok(factoryCreations <= 2, `created ${factoryCreations} grant factories`);
+  await context.authority.decide(
+    { roleId: "developer" },
+    {
+      beforeGenerate: () => context.authority.verify(sealed),
+      brainDigest: sealed.brainDigest,
+    },
+  );
+  assert.equal(context.snapshotReads - readsBefore, 1);
+  assert.ok(factoryCreations <= 4, `created ${factoryCreations} grant factories`);
+  assert.equal(providerCalls, 1);
+});
+
+test("a global executor limit expansion invalidates a scoped grant after restart", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const expanded = structuredClone(context.startup);
+  expanded.codeExecutor.brokerLimits.maxFiles = 2_000;
+  context.activate(expanded);
+
+  await assert.rejects(
+    context.restart().verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  context.activate(structuredClone(context.startup));
+  await assert.rejects(
+    context.restart().verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("an unrelated executor workspace change preserves a scoped grant after restart", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.codeExecutor.workspaces.find(
+    ({ id }) => id === "auxiliary",
+  ).writablePaths = ["test"];
+  changed.codeExecutor.profiles["auxiliary-tests"].timeoutMs = 45_000;
+  context.activate(changed);
+
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+});
+
 test("current Active creates grants and security expansion invalidates old grants", async () => {
   const context = fixture();
   const sealed = (await context.authority.create(proposal(context.startup))).grant;
@@ -181,6 +472,75 @@ test("current Active creates grants and security expansion invalidates old grant
     "propose_github_review",
   );
   context.activate(expanded);
+
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("unrelated role, provider, and repository changes keep sealed work valid", async () => {
+  let providerCalls = 0;
+  const context = fixture({
+    brainDirectoryFactory: () => ({
+      async decide(_value, authorization) {
+        await authorization.beforeGenerate();
+        providerCalls += 1;
+        return { action: { type: "complete" } };
+      },
+    }),
+  });
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.tester.permissions.allowedIntents.push(
+    "propose_github_review",
+  );
+  changed.brainProviders["unused-remote"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://models.invalid/v1",
+    apiKeyEnv: "UNUSED_MODEL_TOKEN",
+    remote: true,
+  };
+  changed.trackedRepositories.push("acme/other");
+  changed.workCoordination.policy.workspaceByRepository["acme/other"] =
+    "dashboard";
+  context.activate(changed);
+
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  await context.authority.decide(
+    { roleId: "developer" },
+    {
+      beforeGenerate: () => context.authority.verify(sealed),
+      brainDigest: sealed.brainDigest,
+    },
+  );
+  assert.equal(providerCalls, 1);
+});
+
+test("the grant repository binding invalidates without affecting history fallback", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  delete changed.workCoordination.policy.workspaceByRepository["acme/repo"];
+  context.activate(changed);
+
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  context.activate(structuredClone(context.startup));
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("the assigned provider authority invalidates its sealed grants", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.brainProviders.ollama.baseUrl = "http://127.0.0.1:11435";
+  context.activate(changed);
 
   await assert.rejects(
     context.authority.verify(sealed),
@@ -209,6 +569,55 @@ test("a revoked authority cannot resurrect an old grant after exact restoration"
     await context.authority.create(proposal(context.startup))
   ).grant;
   assert.deepEqual(await context.authority.verify(newGrant), newGrant);
+});
+
+test("policy versions participate in the non-resurrecting scoped epoch", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const upgraded = structuredClone(context.startup);
+  upgraded.workCoordination.policy.version += 1;
+  context.activate(upgraded);
+
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  context.activate(structuredClone(context.startup));
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("a revoked scoped grant is rejected with bounded history replay", async () => {
+  let factoryCreations = 0;
+  const context = fixture({
+    grantFactoryFactory: (options) => {
+      factoryCreations += 1;
+      return new CodeJobGrantFactory(options);
+    },
+  });
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  activateHistory(context, 256, (configurationValue, version) => {
+    if (version === 2) {
+      configurationValue.workCoordination.policy.codeOperationsByRole.developer = [
+        "inspect",
+        "verify",
+      ];
+    }
+  });
+
+  const factoriesBefore = factoryCreations;
+  const readsBefore = context.snapshotReads;
+  await assert.rejects(
+    context.authority.verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(context.snapshotReads - readsBefore, 1);
+  assert.ok(
+    factoryCreations - factoriesBefore <= 1,
+    `created ${factoryCreations - factoriesBefore} grant factories`,
+  );
 });
 
 test("a changed executor boundary blocks new authority until restart", async () => {

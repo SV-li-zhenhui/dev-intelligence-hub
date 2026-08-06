@@ -552,6 +552,135 @@ h1 {
   font-size: 12px;
 }
 
+.confirmation-center-grid {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.8fr) minmax(0, 1.4fr);
+  gap: 14px;
+}
+
+.confirmation-center-panel {
+  min-width: 0;
+  padding: 17px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+
+.confirmation-center-panel-heading,
+.confirmation-history-row-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.confirmation-center-panel-heading h3,
+.confirmation-center-panel-heading p,
+.confirmation-history-row-heading strong,
+.confirmation-pending-item p,
+.confirmation-history-item p,
+.confirmation-center-note {
+  margin: 0;
+}
+
+.confirmation-center-panel-heading h3 {
+  font: 500 18px/1.3 Georgia, "Noto Serif SC", serif;
+}
+
+.confirmation-center-panel-heading > span,
+.confirmation-pending-item small,
+.confirmation-history-item small {
+  color: var(--faint);
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.confirmation-pending-item,
+.confirmation-history-item {
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.confirmation-pending-item {
+  margin-top: 11px;
+  border-top: 1px solid var(--line);
+}
+
+.confirmation-history-row-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.confirmation-pending-item p,
+.confirmation-history-item p {
+  margin: 7px 0 5px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.confirmation-center-note {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.confirmation-history-filter {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  gap: 8px;
+  align-items: end;
+  margin-top: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.confirmation-history-filter label {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.confirmation-history-filter select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin-top: 5px;
+  padding: 8px 9px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 11px;
+}
+
+.confirmation-history-filter button {
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+.confirmation-history-filter select:focus-visible,
+.confirmation-history-filter button:focus-visible,
+.confirmation-history-more:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.confirmation-history-more {
+  margin-top: 13px;
+}
+
+.confirmation-history-more[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .review-preview {
   margin: 16px 0;
   padding: 13px;
@@ -1918,31 +2047,197 @@ h1 {
   font-size: 11px;
 }
 
-.configuration-editor > label {
-  display: block;
-  font-size: 12px;
-  font-weight: 700;
+.configuration-editor > h2 {
+  margin: 0;
+  font: 500 20px/1.35 Georgia, "Noto Serif SC", serif;
 }
 
 .configuration-editor .configuration-help {
   margin: 6px 0 10px;
 }
 
-.configuration-editor textarea {
+.configuration-structured-form,
+.configuration-structured-form fieldset,
+.configuration-structured-node,
+.configuration-structured-collection,
+.configuration-structured-card,
+.configuration-structure-template-fields {
+  min-width: 0;
+}
+
+.configuration-structured-form {
+  display: grid;
+  gap: 16px;
+}
+
+.configuration-structured-form > fieldset {
+  margin: 0;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.configuration-structured-form > fieldset > legend {
+  padding: 0 7px;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.configuration-structured-grid,
+.configuration-structure-template-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 11px;
+  min-width: 0;
+}
+
+.configuration-structured-node,
+.configuration-structured-collection {
+  grid-column: 1 / -1;
+}
+
+.configuration-structured-node > h3,
+.configuration-structured-collection > header {
+  margin: 10px 0 8px;
+  font-size: 12px;
+}
+
+.configuration-structured-field {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.configuration-structured-field input:not([type="checkbox"]),
+.configuration-structured-field select,
+[data-configuration-template-key] {
   width: 100%;
-  min-height: 430px;
-  padding: 12px;
-  resize: vertical;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 10px;
   color: var(--ink);
   background: #fbfaf6;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
-  tab-size: 2;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
-.configuration-editor textarea[aria-invalid="true"] {
+.configuration-structured-field input[type="checkbox"] {
+  width: 20px;
+  height: 20px;
+  margin: 4px 0;
+}
+
+.configuration-structured-field [aria-invalid="true"] {
   border-color: var(--red);
+}
+
+.configuration-field-error {
+  color: var(--red);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+#configuration-form-status:not(:empty) {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 3px solid;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+#configuration-form-status.configuration-inline-error:not(:empty) {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: var(--red);
+}
+
+#configuration-form-status.configuration-success:not(:empty) {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: var(--green);
+}
+
+.configuration-structured-collection {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.configuration-structured-card {
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.configuration-structured-card > header,
+.configuration-structure-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.configuration-structure-template {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.configuration-structure-template > summary {
+  min-height: 40px;
+  padding: 11px 0;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.configuration-structure-template-fields {
+  padding: 10px 0 4px;
+}
+
+.configuration-structure-template-fields > button,
+.configuration-structure-actions button,
+.configuration-structured-form > button[type="submit"] {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.configuration-structure-template-fields > button,
+.configuration-structured-form > button[type="submit"] {
+  align-self: end;
+  color: white;
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.configuration-structure-actions button {
+  color: var(--muted);
+  background: transparent;
+}
+
+.configuration-structured-form button:disabled,
+.configuration-structured-form input:disabled,
+.configuration-structured-form select:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .configuration-actions {
@@ -2104,7 +2399,11 @@ h1 {
 }
 
 .configuration-actions button:focus-visible,
-.configuration-editor textarea:focus-visible,
+.configuration-structured-form [data-configuration-field]:focus-visible,
+.configuration-structured-form [data-configuration-template-field]:focus-visible,
+.configuration-structured-form [data-configuration-template-key]:focus-visible,
+.configuration-structured-form button:focus-visible,
+.configuration-structure-template summary:focus-visible,
 .configuration-version-actions button:focus-visible,
 .configuration-audit summary:focus-visible,
 .configuration-panel [data-configuration-reload]:focus-visible,
@@ -2614,6 +2913,10 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .confirmation-center-grid {
+    grid-template-columns: 1fr;
+  }
+
   .memory-filters {
     grid-template-columns: 1fr 1fr;
   }
@@ -2666,6 +2969,14 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .confirmation-history-filter {
+    grid-template-columns: 1fr;
+  }
+
+  .confirmation-history-filter button {
+    width: 100%;
+  }
+
   .memory-question-primary {
     grid-template-columns: 1fr;
   }
@@ -2708,9 +3019,31 @@ dialog::backdrop {
     width: 100%;
   }
 
-  .configuration-editor textarea {
-    min-height: 360px;
+  .configuration-editor,
+  .configuration-structured-form > fieldset,
+  .configuration-structured-card {
+    padding: 12px;
+  }
+
+  .configuration-structured-grid,
+  .configuration-structure-template-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .configuration-structured-field input:not([type="checkbox"]),
+  .configuration-structured-field select,
+  [data-configuration-template-key] {
     font-size: 16px;
+  }
+
+  .configuration-structure-actions,
+  .configuration-structure-template-fields > button,
+  .configuration-structured-form > button[type="submit"] {
+    width: 100%;
+  }
+
+  .configuration-structure-actions button {
+    flex: 1 1 140px;
   }
 
   .memory-answer-panel {

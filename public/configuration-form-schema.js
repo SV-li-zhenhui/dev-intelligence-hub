@@ -1,0 +1,599 @@
+const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const STRUCTURE_OPERATIONS = Object.freeze(["add", "remove", "replace"]);
+
+export function deepFreeze(value) {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+export const CONFIGURATION_FORM_GROUPS = deepFreeze([
+  {
+    id: "general",
+    label: "基础与 PR 范围",
+    description: "服务刷新、GitHub 身份和需要跟踪的仓库。",
+    roots: ["port", "refreshMinutes", "browserPollSeconds", "githubLogin", "trackedRepositories", "prResponsibility"],
+  },
+  {
+    id: "brains",
+    label: "大脑 Provider",
+    description: "本地或经授权的远程模型端点及凭据引用。",
+    roots: ["brain", "brainProviders"],
+  },
+  {
+    id: "employees",
+    label: "员工与岗位",
+    description: "每个岗位的使命、调度、大脑和允许提出的动作。",
+    roots: ["employees"],
+  },
+  {
+    id: "routing",
+    label: "工作流路由",
+    description: "按事件事实把工作分派给岗位、人员或后续节点。",
+    roots: ["workflowRouting"],
+  },
+  {
+    id: "execution",
+    label: "代码执行与工作区",
+    description: "受控工作区、容器和固定验证 Profile。",
+    roots: ["codeExecutor"],
+  },
+  {
+    id: "delivery",
+    label: "变更包与 GitHub 动作",
+    description: "本地变更包和需要逐项确认的外部 GitHub 动作。",
+    roots: ["changePackages", "githubActions"],
+  },
+  {
+    id: "coordination",
+    label: "协作与授权策略",
+    description: "角色能力、代码操作、仓库工作区和运行限额。",
+    roots: ["workCoordination"],
+  },
+  {
+    id: "memory",
+    label: "记忆",
+    description: "本地记录、可选导入以及有引用依据的回答大脑。",
+    roots: ["memory"],
+  },
+  {
+    id: "notifications",
+    label: "外部通知",
+    description: "钉钉通知范围和每轮发送上限。",
+    roots: ["dingtalk"],
+  },
+]);
+
+const LABELS = deepFreeze({
+  port: "服务端口",
+  refreshMinutes: "数据刷新（分钟）",
+  browserPollSeconds: "浏览器轮询（秒）",
+  githubLogin: "GitHub 登录名",
+  trackedRepositories: "跟踪仓库",
+  prResponsibility: "PR 责任范围",
+  historicalAfterDays: "历史 PR 天数",
+  codeExecutor: "代码执行器",
+  enabled: "启用",
+  docker: "Docker",
+  executable: "可执行命令",
+  host: "本地端点",
+  workspaces: "受控工作区",
+  profiles: "验证 Profile",
+  requiredProfilesByWorkspace: "工作区 Profile 绑定",
+  brokerLimits: "文件代理限额",
+  executorLimits: "执行器限额",
+  maxArtifactBytes: "最大产物字节数",
+  id: "标识",
+  sourceRoot: "源码根目录",
+  writablePaths: "可写路径",
+  excludePaths: "排除路径",
+  kind: "类型",
+  image: "固定镜像",
+  timeoutMs: "超时（毫秒）",
+  maxFiles: "最大文件数",
+  maxFileBytes: "单文件最大字节数",
+  maxTotalBytes: "总读取最大字节数",
+  maxSearchMatches: "最大搜索结果数",
+  maxWriteBytes: "最大写入字节数",
+  maxSessions: "最大会话数",
+  maxActionsPerSession: "单会话最大动作数",
+  changePackages: "变更包",
+  gitCommand: "固定 Git 命令",
+  gitTimeoutMs: "Git 超时（毫秒）",
+  githubActions: "GitHub 动作",
+  actorAccountId: "GitHub 操作账号",
+  tokenEnv: "GitHub Token 环境变量",
+  ghCommand: "固定 GitHub CLI 命令",
+  networkEnv: "网络环境映射",
+  workflowRouting: "工作流路由",
+  schemaVersion: "Schema 版本",
+  maxHops: "最大跳数",
+  rules: "路由规则",
+  source: "来源节点",
+  priority: "优先级",
+  fallback: "兜底规则",
+  condition: "匹配条件",
+  conditions: "子条件",
+  op: "操作符",
+  path: "事实路径",
+  value: "比较值",
+  values: "候选值",
+  patterns: "Glob 模式",
+  targets: "分派目标",
+  type: "目标类型",
+  onMatch: "命中后行为",
+  workCoordination: "协作与授权",
+  tickSeconds: "调度周期（秒）",
+  intakeLimit: "接收上限",
+  workLimit: "工作上限",
+  dispatchLimit: "分派上限",
+  attentionLimit: "关注上限",
+  proposalLimit: "提案上限",
+  conditionLimit: "条件上限",
+  codeJobLimit: "代码任务上限",
+  codeJobMemoryLimit: "代码任务记忆上限",
+  leaseDurationMs: "租约时长（毫秒）",
+  resolveTimeoutMs: "解析超时（毫秒）",
+  decisionTimeoutMs: "决策超时（毫秒）",
+  maxAttempts: "最大尝试次数",
+  retryBaseMs: "重试基础间隔（毫秒）",
+  retryMaxMs: "最大重试间隔（毫秒）",
+  factMaximumAgeMs: "事实最大时效（毫秒）",
+  codeJobMaximumTurns: "代码任务最大轮数",
+  codeJobObservationLimit: "代码任务观察上限",
+  policy: "策略",
+  version: "策略版本",
+  capabilityRoles: "能力岗位映射",
+  githubReviewRoles: "GitHub Review 岗位",
+  codeActionRoles: "代码动作岗位",
+  codeOperationsByRole: "岗位代码操作映射",
+  workspaceByRepository: "仓库工作区映射",
+  memory: "记忆",
+  maximumRecords: "最大记录数",
+  maximumStateBytes: "最大状态字节数",
+  imports: "导入来源",
+  localSessions: "本地会话",
+  git: "Git 历史",
+  answering: "记忆回答",
+  maximumContextBytes: "最大上下文字节数",
+  maximumConcurrent: "最大并发数",
+  brain: "大脑",
+  localBrain: "本地大脑",
+  provider: "Provider",
+  model: "模型",
+  remoteData: "远程数据授权",
+  requirements: "需求数据",
+  code: "代码数据",
+  remote: "远程端点",
+  baseUrl: "服务地址",
+  apiKeyEnv: "API 凭据环境变量",
+  maxResponseBytes: "最大响应字节数",
+  maxRequestBytes: "最大请求字节数",
+  contextTokens: "上下文 Token",
+  numCtx: "上下文窗口",
+  maxAssessmentsPerRefresh: "每轮最大评估数",
+  employees: "员工",
+  prReviewer: "PR 推进员工",
+  roles: "岗位",
+  name: "名称",
+  initialPaused: "初始暂停",
+  policyVersion: "策略版本",
+  tickMinutes: "巡检周期（分钟）",
+  maxJobsPerTick: "每轮最大任务数",
+  retryMinutes: "重试间隔（分钟）",
+  maxPatchCharacters: "补丁最大字符数",
+  memoryLimit: "记忆上限",
+  memoryOutboxLimit: "记忆发件箱上限",
+  jobLimit: "任务上限",
+  allowRemoteCodeContext: "允许远程代码上下文",
+  mission: "岗位使命",
+  scheduleMinutes: "调度周期（分钟）",
+  workerId: "员工标识",
+  permissions: "权限",
+  allowedIntents: "允许意图",
+  dingtalk: "钉钉通知",
+  selfUserId: "钉钉本人 ID",
+  notifyMinimumScore: "最低通知分数",
+  maxNotificationsPerRun: "每轮通知上限",
+});
+
+const INTEGER_FIELDS = deepFreeze([
+  { pattern: ["port"], minimum: 1, maximum: 65_535 },
+  { pattern: ["refreshMinutes"], minimum: 1, maximum: 1_440 },
+  { pattern: ["browserPollSeconds"], minimum: 1, maximum: 86_400 },
+  { pattern: ["prResponsibility", "historicalAfterDays"], minimum: 0, maximum: 10_000 },
+  { pattern: ["workflowRouting", "schemaVersion"], minimum: 1, maximum: 1, options: [1] },
+  { pattern: ["workflowRouting", "maxHops"], minimum: 1, maximum: 32 },
+  { pattern: ["workflowRouting", "rules", "#", "priority"], minimum: -10_000, maximum: 10_000 },
+  { pattern: ["codeExecutor", "profiles", "*", "timeoutMs"], minimum: 1_000, maximum: 600_000 },
+  { pattern: ["codeExecutor", "brokerLimits", "*"], minimum: 1, maximum: 2 ** 31 - 1 },
+  { pattern: ["codeExecutor", "executorLimits", "*"], minimum: 1, maximum: 2 ** 31 - 1 },
+  { pattern: ["codeExecutor", "maxArtifactBytes"], minimum: 1, maximum: 2 ** 31 - 1 },
+  { pattern: ["changePackages", "gitTimeoutMs"], minimum: 1, maximum: 60_000 },
+  { pattern: ["githubActions", "timeoutMs"], minimum: 1, maximum: 600_000 },
+  { pattern: ["workCoordination", "policy", "version"], minimum: 1, maximum: 1_000_000 },
+  ...[
+    "tickSeconds",
+    "intakeLimit",
+    "workLimit",
+    "dispatchLimit",
+    "attentionLimit",
+    "proposalLimit",
+    "conditionLimit",
+    "codeJobLimit",
+    "codeJobMemoryLimit",
+    "leaseDurationMs",
+    "resolveTimeoutMs",
+    "decisionTimeoutMs",
+    "maxAttempts",
+    "retryBaseMs",
+    "retryMaxMs",
+    "factMaximumAgeMs",
+    "codeJobMaximumTurns",
+    "codeJobObservationLimit",
+  ].map((name) => ({ pattern: ["workCoordination", name], minimum: 1, maximum: 2 ** 31 - 1 })),
+  { pattern: ["memory", "maximumRecords"], minimum: 1, maximum: 10_000_000 },
+  { pattern: ["memory", "maximumStateBytes"], minimum: 1_024, maximum: 2 ** 31 - 1 },
+  { pattern: ["memory", "answering", "maximumRecords"], minimum: 1, maximum: 1_000 },
+  { pattern: ["memory", "answering", "maximumContextBytes"], minimum: 1_024, maximum: 128 * 1_024 },
+  { pattern: ["memory", "answering", "maximumConcurrent"], minimum: 1, maximum: 16 },
+  { pattern: ["brainProviders", "*", "contextTokens"], minimum: 1_024, maximum: 128 * 1_024 },
+  { pattern: ["brainProviders", "*", "timeoutMs"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
+  { pattern: ["brainProviders", "*", "maxResponseBytes"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
+  { pattern: ["brainProviders", "*", "maxRequestBytes"], minimum: 1, maximum: 2 * 1_024 * 1_024 },
+  ...["timeoutMs", "numCtx", "contextTokens", "maxAssessmentsPerRefresh"].map(
+    (name) => ({ pattern: ["brain", name], minimum: 1, maximum: 2 ** 31 - 1 }),
+  ),
+  { pattern: ["employees", "prReviewer", "policyVersion"], minimum: 1, maximum: 1_000_000 },
+  { pattern: ["employees", "prReviewer", "tickMinutes"], minimum: 1, maximum: 1_440 },
+  { pattern: ["employees", "prReviewer", "maxJobsPerTick"], minimum: 1, maximum: 1_000 },
+  { pattern: ["employees", "prReviewer", "maxAttempts"], minimum: 1, maximum: 100 },
+  { pattern: ["employees", "prReviewer", "retryMinutes", "#"], minimum: 1, maximum: 43_200 },
+  { pattern: ["employees", "prReviewer", "maxPatchCharacters"], minimum: 1, maximum: 10_000_000 },
+  { pattern: ["employees", "prReviewer", "memoryLimit"], minimum: 1, maximum: 1_000_000 },
+  { pattern: ["employees", "prReviewer", "memoryOutboxLimit"], minimum: 1, maximum: 100_000 },
+  { pattern: ["employees", "prReviewer", "jobLimit"], minimum: 1, maximum: 1_000_000 },
+  ...["timeoutMs", "numCtx", "contextTokens", "maxAssessmentsPerRefresh"].map(
+    (name) => ({
+      pattern: ["employees", "prReviewer", "brain", name],
+      minimum: 1,
+      maximum: 2 ** 31 - 1,
+    }),
+  ),
+  { pattern: ["employees", "roles", "*", "scheduleMinutes"], minimum: 0, maximum: 1_440 },
+  { pattern: ["dingtalk", "notifyMinimumScore"], minimum: 0, maximum: 100 },
+  { pattern: ["dingtalk", "maxNotificationsPerRun"], minimum: 1, maximum: 1_000 },
+]);
+
+const FIELD_RULES = deepFreeze([
+  { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
+  { pattern: ["**", "initialPaused"], control: "checkbox", kind: "boolean" },
+  { pattern: ["employees", "prReviewer", "allowRemoteCodeContext"], control: "checkbox", kind: "boolean" },
+  { pattern: ["brainProviders", "*", "remote"], control: "checkbox", kind: "boolean" },
+  { pattern: ["workflowRouting", "rules", "#", "fallback"], control: "checkbox", kind: "boolean" },
+  { pattern: ["memory", "imports", "*"], control: "checkbox", kind: "boolean" },
+  { pattern: ["**", "remoteData", "requirements"], control: "checkbox", kind: "boolean" },
+  { pattern: ["**", "remoteData", "code"], control: "checkbox", kind: "boolean" },
+  { pattern: ["**", "remoteData", "memory"], control: "checkbox", kind: "boolean" },
+  { pattern: ["brainProviders", "*", "apiKeyEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
+  { pattern: ["githubActions", "tokenEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
+  { pattern: ["brainProviders", "*", "kind"], control: "select", kind: "text", options: ["ollama", "openai-compatible"] },
+  { pattern: ["codeExecutor", "profiles", "*", "kind"], control: "select", kind: "text", options: ["node-test"] },
+  { pattern: ["workflowRouting", "rules", "#", "targets", "#", "type"], control: "select", kind: "text", options: ["role", "person", "node"] },
+  { pattern: ["workflowRouting", "rules", "#", "onMatch"], control: "select", kind: "text", options: ["stop", "continue"] },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "op"], control: "select", kind: "text", options: ["all", "any", "not", "equals", "oneOf", "hasAny", "hasAll", "globAny", "globAll", "atLeast"] },
+  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents", "#"], control: "select", kind: "text", options: ["ask_user", "wait_condition", "propose_github_review", "propose_code_action", "handoff", "complete", "orchestrate", "submit_delivery"] },
+  { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*", "#"], control: "select", kind: "text", options: ["inspect", "modify", "verify"] },
+  { pattern: ["brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
+  { pattern: ["employees", "prReviewer", "brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
+  ...[
+    ["employees", "roles", "*", "brain", "provider"],
+    ["memory", "answering", "brain", "provider"],
+    ["memory", "answering", "localBrain", "provider"],
+  ].map((pattern) => ({
+    pattern,
+    control: "select",
+    kind: "text",
+    format: "safe-id",
+    maximumBytes: 128,
+    optionsFrom: "brainProviders",
+  })),
+  { pattern: ["githubLogin"], kind: "text", format: "github-login", maximumBytes: 40 },
+  { pattern: ["githubActions", "actorAccountId"], kind: "text", format: "github-login", maximumBytes: 40 },
+  { pattern: ["githubActions", "ghCommand"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["githubActions", "networkEnv", "*"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["changePackages", "gitCommand"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["trackedRepositories", "#"], kind: "text", format: "repository", maximumBytes: 256 },
+  { pattern: ["workCoordination", "policy", "capabilityRoles", "*"], kind: "text", format: "role-id", maximumBytes: 128 },
+  { pattern: ["workCoordination", "policy", "githubReviewRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
+  { pattern: ["workCoordination", "policy", "codeActionRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
+  { pattern: ["workCoordination", "policy", "workspaceByRepository", "*"], kind: "text", format: "workspace-id", maximumBytes: 64 },
+  { pattern: ["codeExecutor", "profiles", "*", "image"], kind: "text", format: "pinned-image", maximumBytes: 1_024 },
+  { pattern: ["codeExecutor", "workspaces", "#", "id"], kind: "text", format: "workspace-id", maximumBytes: 64 },
+  { pattern: ["codeExecutor", "workspaces", "#", "sourceRoot"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "workspaces", "#", "writablePaths", "#"], kind: "text", format: "workspace-path", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "workspaces", "#", "excludePaths", "#"], kind: "text", format: "workspace-path", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "requiredProfilesByWorkspace", "*", "#"], kind: "text", format: "safe-id", maximumBytes: 128 },
+  { pattern: ["codeExecutor", "docker", "executable"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "docker", "host"], kind: "text", format: "docker-host", maximumBytes: 2_048 },
+  { pattern: ["brainProviders", "*", "baseUrl"], kind: "text", format: "endpoint", maximumBytes: 2_048 },
+  { pattern: ["brainProviders", "*", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["brain", "baseUrl"], kind: "text", format: "endpoint", maximumBytes: 2_048 },
+  { pattern: ["brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "prReviewer", "name"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "prReviewer", "brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "prReviewer", "brain", "baseUrl"], kind: "text", format: "endpoint", maximumBytes: 2_048 },
+  { pattern: ["employees", "roles", "*", "name"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "roles", "*", "mission"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["employees", "roles", "*", "workerId"], kind: "text", format: "role-id", maximumBytes: 128 },
+  { pattern: ["employees", "roles", "*", "brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["memory", "answering", "brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["memory", "answering", "localBrain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["workflowRouting", "rules", "#", "id"], kind: "text", format: "safe-id-insensitive", maximumBytes: 128 },
+  { pattern: ["workflowRouting", "rules", "#", "source"], kind: "text", format: "safe-id-insensitive", maximumBytes: 128 },
+  { pattern: ["workflowRouting", "rules", "#", "targets", "#", "id"], kind: "text", format: "safe-id-insensitive", maximumBytes: 128 },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "path"], kind: "text", format: "condition-path", maximumBytes: 512 },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "value"], control: "scalar", kind: "scalar", maximumBytes: 512 },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "values", "#"], control: "scalar", kind: "scalar", maximumBytes: 512 },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "patterns", "#"], kind: "text", maximumBytes: 256 },
+  { pattern: ["dingtalk", "selfUserId"], kind: "text", maximumBytes: 128 },
+  { pattern: ["workflowRouting", "rules", "#", "condition"], control: "select", kind: "scalar", options: [null] },
+]);
+
+const COLLECTIONS = deepFreeze([
+  { pattern: ["trackedRepositories"], kind: "array", label: "跟踪仓库", template: "repository", maximum: 1_000, uniqueBy: "value" },
+  { pattern: ["brainProviders"], kind: "map", label: "大脑 Provider", template: "provider", keyTemplate: "new-provider", maximum: 100, keyFormat: "safe-id" },
+  { pattern: ["employees", "roles"], kind: "map", label: "岗位", template: "role", keyTemplate: "new-role", maximum: 256, keyFormat: "role-id" },
+  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents"], kind: "array", label: "允许意图", template: "intent", minimum: 1, maximum: 8, uniqueBy: "value" },
+  { pattern: ["employees", "prReviewer", "retryMinutes"], kind: "array", label: "重试间隔", template: "retry-minute", minimum: 1, maximum: 32, uniqueBy: "value" },
+  { pattern: ["codeExecutor", "workspaces"], kind: "array", label: "受控工作区", template: "workspace", maximum: 100, uniqueBy: "id", optional: true },
+  { pattern: ["codeExecutor", "workspaces", "#", "writablePaths"], kind: "array", label: "可写路径", template: "workspace-path", maximum: 256, uniqueBy: "value" },
+  { pattern: ["codeExecutor", "workspaces", "#", "excludePaths"], kind: "array", label: "排除路径", template: "workspace-path", maximum: 256, uniqueBy: "value" },
+  { pattern: ["codeExecutor", "profiles"], kind: "map", label: "验证 Profile", template: "profile", keyTemplate: "new-profile", maximum: 100, keyFormat: "safe-id", optional: true },
+  { pattern: ["codeExecutor", "requiredProfilesByWorkspace"], kind: "map", label: "工作区 Profile 绑定", template: "profile-binding", keyTemplate: "workspace-id", maximum: 256, keyFormat: "workspace-id", optional: true },
+  { pattern: ["codeExecutor", "requiredProfilesByWorkspace", "*"], kind: "array", label: "所需 Profile", template: "profile-id", minimum: 1, maximum: 100, uniqueBy: "value" },
+  { pattern: ["githubActions", "networkEnv"], kind: "map", label: "网络环境映射", template: "network-env", keyTemplate: "HTTPS_PROXY", maximum: 6, keyOptions: ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR"], optional: true },
+  { pattern: ["workflowRouting", "rules"], kind: "array", label: "路由规则", template: "routing-rule", maximum: 200, uniqueBy: "id" },
+  { pattern: ["workflowRouting", "rules", "#", "targets"], kind: "array", label: "分派目标", template: "routing-target", minimum: 1, maximum: 20, uniqueBy: "type-id" },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "conditions"], kind: "array", label: "子条件", template: "condition", minimum: 1, maximum: 128 },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "values"], kind: "array", label: "候选值", template: "condition-value", minimum: 1, maximum: 50, uniqueBy: "typed-value" },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "patterns"], kind: "array", label: "Glob 模式", template: "glob-pattern", minimum: 1, maximum: 50, uniqueBy: "value" },
+  { pattern: ["workCoordination", "policy", "capabilityRoles"], kind: "map", label: "能力岗位映射", template: "role-id", keyTemplate: "coordination", maximum: 5, keyOptions: ["coordination", "requirements", "pr-review", "development", "testing"] },
+  { pattern: ["workCoordination", "policy", "githubReviewRoles"], kind: "array", label: "GitHub Review 岗位", template: "role-id", maximum: 100, uniqueBy: "value" },
+  { pattern: ["workCoordination", "policy", "codeActionRoles"], kind: "array", label: "代码动作岗位", template: "role-id", maximum: 100, uniqueBy: "value" },
+  { pattern: ["workCoordination", "policy", "codeOperationsByRole"], kind: "map", label: "岗位代码操作映射", template: "code-operations", keyTemplate: "role-id", maximum: 256, keyFormat: "role-id" },
+  { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*"], kind: "array", label: "允许代码操作", template: "code-operation", minimum: 1, maximum: 3, uniqueBy: "value" },
+  { pattern: ["workCoordination", "policy", "workspaceByRepository"], kind: "map", label: "仓库工作区映射", template: "workspace-id", keyTemplate: "owner/repository", maximum: 256, keyFormat: "repository" },
+]);
+
+const SLOTS = deepFreeze([
+  { pattern: ["workflowRouting", "rules", "#", "condition"], label: "匹配条件", template: "condition", nullable: true, operations: ["add", "remove", "replace"] },
+  { pattern: ["workflowRouting", "rules", "#", "condition", "**", "condition"], label: "子条件", template: "condition", nullable: false, operations: ["replace"] },
+]);
+
+const TEMPLATES = deepFreeze({
+  repository: "owner/repository",
+  provider: {
+    kind: "openai-compatible",
+    baseUrl: "https://models.example.invalid/v1",
+    apiKeyEnv: "MYDASHBOARD_MODEL_API_KEY",
+    remote: true,
+    timeoutMs: 120_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  },
+  role: {
+    name: "新岗位",
+    mission: "描述该岗位的职责、边界和完成标准。",
+    enabled: false,
+    scheduleMinutes: 5,
+    initialPaused: true,
+    permissions: { allowedIntents: ["ask_user"] },
+    brain: {
+      provider: "ollama",
+      model: "qwen3.5:9b",
+      remoteData: { requirements: false, code: false, memory: false },
+    },
+  },
+  intent: "ask_user",
+  "retry-minute": 5,
+  workspace: { id: "workspace-id", sourceRoot: ".", writablePaths: [], excludePaths: [] },
+  "workspace-path": "src",
+  profile: { kind: "node-test", image: `node:22-alpine@sha256:${"0".repeat(64)}`, timeoutMs: 120_000 },
+  "profile-binding": ["profile-id"],
+  "profile-id": "profile-id",
+  "network-env": "http://127.0.0.1:7890",
+  "routing-rule": {
+    id: "new-rule",
+    source: "root",
+    enabled: false,
+    priority: 0,
+    fallback: true,
+    condition: null,
+    targets: [{ type: "person", id: "owner" }],
+    onMatch: "stop",
+  },
+  "routing-target": { type: "person", id: "owner" },
+  condition: { op: "equals", path: "eventType", value: "event.type" },
+  "condition-value": "value",
+  "glob-pattern": "**/*",
+  "role-id": "role-id",
+  "code-operations": ["inspect"],
+  "code-operation": "inspect",
+  "workspace-id": "workspace-id",
+});
+
+export const CONFIGURATION_FORM_SCHEMA = deepFreeze({
+  version: 1,
+  groups: CONFIGURATION_FORM_GROUPS,
+  fields: [...INTEGER_FIELDS, ...FIELD_RULES],
+  collections: COLLECTIONS,
+  slots: SLOTS,
+  structureOperations: STRUCTURE_OPERATIONS,
+});
+
+function normalizePath(path) {
+  if (!Array.isArray(path) || Object.getPrototypeOf(path) !== Array.prototype) {
+    throw new TypeError("configuration schema path must be an array");
+  }
+  if (path.length === 0 || path.length > 32) {
+    throw new RangeError("configuration schema path exceeds limit");
+  }
+  const keys = Reflect.ownKeys(path);
+  const expected = Array.from({ length: path.length }, (_, index) => `${index}`);
+  if (
+    keys.length !== expected.length + 1 ||
+    !keys.includes("length") ||
+    expected.some((key) => !keys.includes(key))
+  ) {
+    throw new TypeError("configuration schema path must be a dense data array");
+  }
+  return expected.map((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(path, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new TypeError("configuration schema path must contain data properties");
+    }
+    const segment = descriptor.value;
+    if (
+      !(typeof segment === "string" || Number.isSafeInteger(segment)) ||
+      `${segment}`.length === 0 ||
+      DANGEROUS_KEYS.has(`${segment}`)
+    ) {
+      throw new TypeError("configuration schema path contains an unsafe segment");
+    }
+    return `${segment}`;
+  });
+}
+
+function matches(pattern, path, patternIndex = 0, pathIndex = 0) {
+  if (patternIndex === pattern.length) return pathIndex === path.length;
+  const expected = pattern[patternIndex];
+  if (expected === "**") {
+    for (let offset = pathIndex; offset <= path.length; offset += 1) {
+      if (matches(pattern, path, patternIndex + 1, offset)) return true;
+    }
+    return false;
+  }
+  if (pathIndex >= path.length) return false;
+  if (
+    expected !== "*" &&
+    !(expected === "#" && /^\d+$/.test(path[pathIndex])) &&
+    expected !== path[pathIndex]
+  ) {
+    return false;
+  }
+  return matches(pattern, path, patternIndex + 1, pathIndex + 1);
+}
+
+function matchingRule(rules, path) {
+  return rules.find(({ pattern }) => matches(pattern, path));
+}
+
+function labelFor(path) {
+  const segment = path.at(-1);
+  if (/^\d+$/.test(segment)) return `第 ${Number(segment) + 1} 项`;
+  return LABELS[segment] || segment.replaceAll(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+function defaultField(value) {
+  if (value === null) return { control: "scalar", kind: "scalar" };
+  if (typeof value === "boolean") return { control: "checkbox", kind: "boolean" };
+  if (typeof value === "number") {
+    return {
+      control: "number",
+      kind: Number.isSafeInteger(value) ? "integer" : "number",
+    };
+  }
+  if (typeof value === "string") return { control: "text", kind: "text" };
+  throw new TypeError("configuration field value must be primitive");
+}
+
+export function configurationFieldDescriptor(path, value) {
+  const normalized = normalizePath(path);
+  const integerRule = matchingRule(INTEGER_FIELDS, normalized);
+  const fieldRule = matchingRule(FIELD_RULES, normalized);
+  return deepFreeze({
+    label: labelFor(normalized),
+    ...defaultField(value),
+    ...(integerRule
+      ? { control: integerRule.options ? "select" : "number", kind: "integer", ...integerRule }
+      : {}),
+    ...(fieldRule || {}),
+    path: normalized,
+  });
+}
+
+export function configurationCollectionDescriptor(path, value) {
+  const normalized = normalizePath(path);
+  const descriptor = matchingRule(COLLECTIONS, normalized);
+  if (!descriptor) return null;
+  if (value !== undefined) {
+    const valid =
+      descriptor.kind === "array"
+        ? Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype
+        : value !== null &&
+          typeof value === "object" &&
+          !Array.isArray(value) &&
+          Object.getPrototypeOf(value) === Object.prototype;
+    if (!valid) throw new TypeError(`${descriptor.label} must be a ${descriptor.kind}`);
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > (descriptor.kind === "array" ? 4_097 : 4_096)) {
+      throw new RangeError(`${descriptor.label} exceeds the collection limit`);
+    }
+    const dataKeys = descriptor.kind === "array"
+      ? Array.from({ length: value.length }, (_, index) => `${index}`)
+      : keys;
+    if (
+      descriptor.kind === "array" &&
+      (keys.length !== value.length + 1 || !keys.includes("length"))
+    ) {
+      throw new TypeError(`${descriptor.label} must be a dense data array`);
+    }
+    for (const key of dataKeys) {
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        typeof key !== "string" ||
+        DANGEROUS_KEYS.has(key) ||
+        !property?.enumerable ||
+        !("value" in property)
+      ) {
+        throw new TypeError(`${descriptor.label} must contain safe data properties`);
+      }
+    }
+  }
+  return deepFreeze({ ...descriptor, path: normalized, operations: STRUCTURE_OPERATIONS });
+}
+
+export function configurationSlotDescriptor(path) {
+  const normalized = normalizePath(path);
+  const descriptor = matchingRule(SLOTS, normalized);
+  return descriptor ? deepFreeze({ ...descriptor, path: normalized }) : null;
+}
+
+function cloneTemplate(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(cloneTemplate);
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, cloneTemplate(child)]),
+  );
+}
+
+export function configurationStructureTemplate(path) {
+  const normalized = normalizePath(path);
+  const descriptor =
+    matchingRule(COLLECTIONS, normalized) || matchingRule(SLOTS, normalized);
+  if (!descriptor) {
+    throw new TypeError("configuration path is not in the structure operation allowlist");
+  }
+  return deepFreeze({
+    kind: descriptor.kind || "slot",
+    ...(descriptor.keyTemplate ? { key: descriptor.keyTemplate } : {}),
+    value: cloneTemplate(TEMPLATES[descriptor.template]),
+  });
+}
+
+export function configurationNodeLabel(path) {
+  return labelFor(normalizePath(path));
+}
