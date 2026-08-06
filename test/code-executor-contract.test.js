@@ -10,6 +10,25 @@ import {
 } from "../src/domain/code-executor-contract.js";
 
 const REVISION = "a".repeat(64);
+const HEAD_REF_OID = "b".repeat(40);
+
+function inputBinding(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/repo",
+    pullRequestNumber: 42,
+    rootItemId: "work-item-pr-42",
+    workKey: "github:dashboard:acme-repo:42",
+    inputRevision: 3,
+    headRevision: 2,
+    headRefOid: HEAD_REF_OID,
+    eventId: "event-pr-42",
+    eventDigest: "c".repeat(64),
+    inputDigest: "d".repeat(64),
+    ...overrides,
+  };
+}
 
 function assertInvalid(operation) {
   assert.throws(
@@ -21,37 +40,44 @@ function assertInvalid(operation) {
 }
 
 test("start and resume requests normalize exact plain DTOs", () => {
+  const binding = inputBinding();
   const start = normalizeStartRequest({
     workspaceId: "dashboard",
     requestedBy: { workItemId: "PR-42", roleId: "pr-engineer" },
     sessionId: "session-1",
+    inputBinding: binding,
   });
 
   assert.deepEqual(start, {
     sessionId: "session-1",
     workspaceId: "dashboard",
     requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+    inputBinding: binding,
   });
   assert.equal(
     normalizeStartRequest({
       sessionId: "session-long-role",
       workspaceId: "dashboard",
       requestedBy: { roleId: "r".repeat(65), workItemId: "PR-43" },
+      inputBinding: null,
     }).requestedBy.roleId.length,
     65,
   );
-  assert.deepEqual(normalizeResumeRequest({ sessionId: "session-1" }), {
-    sessionId: "session-1",
-  });
-  assert.deepEqual(normalizeResumeRequest({ sessionId: "a".repeat(64) }), {
-    sessionId: "a".repeat(64),
-  });
+  assert.deepEqual(
+    normalizeResumeRequest({ sessionId: "session-1", inputBinding: binding }),
+    { sessionId: "session-1", inputBinding: binding },
+  );
+  assert.deepEqual(
+    normalizeResumeRequest({ sessionId: "a".repeat(64), inputBinding: null }),
+    { sessionId: "a".repeat(64), inputBinding: null },
+  );
 
   assertInvalid(() =>
     normalizeStartRequest({
       sessionId: "session-1",
       workspaceId: "dashboard",
       requestedBy: { roleId: "pr-engineer", workItemId: null },
+      inputBinding: null,
       command: "npm test",
     }),
   );
@@ -60,6 +86,7 @@ test("start and resume requests normalize exact plain DTOs", () => {
       sessionId: "Session-1",
       workspaceId: "dashboard",
       requestedBy: { roleId: "pr-engineer", workItemId: null },
+      inputBinding: null,
     }),
   );
   assertInvalid(() =>
@@ -67,6 +94,7 @@ test("start and resume requests normalize exact plain DTOs", () => {
       sessionId: "session-1",
       workspaceId: "dashboard",
       requestedBy: { roleId: "pr-engineer", workItemId: "bad\u0000item" },
+      inputBinding: null,
     }),
   );
   assertInvalid(() =>
@@ -77,12 +105,121 @@ test("start and resume requests normalize exact plain DTOs", () => {
         roleId: "pr-engineer",
         workItemId: null,
       }),
+      inputBinding: null,
     }),
   );
   assertInvalid(() =>
-    normalizeResumeRequest({ sessionId: "session-1", workspaceId: "dashboard" }),
+    normalizeStartRequest({
+      sessionId: "session-1",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "pr-engineer", workItemId: null },
+    }),
   );
-  assertInvalid(() => normalizeResumeRequest({ sessionId: "a".repeat(65) }));
+  assertInvalid(() => normalizeResumeRequest({ sessionId: "session-1" }));
+  assertInvalid(() =>
+    normalizeResumeRequest({
+      sessionId: "session-1",
+      inputBinding: null,
+      workspaceId: "dashboard",
+    }),
+  );
+  assertInvalid(() =>
+    normalizeResumeRequest({
+      sessionId: "a".repeat(65),
+      inputBinding: null,
+    }),
+  );
+});
+
+test("start and resume bind a detached canonical pull request Head", () => {
+  const supplied = inputBinding();
+  const start = normalizeStartRequest({
+    sessionId: "session-1",
+    workspaceId: "dashboard",
+    requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+    inputBinding: supplied,
+  });
+  const resume = normalizeResumeRequest({
+    sessionId: "session-1",
+    inputBinding: supplied,
+  });
+
+  assert.deepEqual(start.inputBinding, inputBinding());
+  assert.deepEqual(resume.inputBinding, inputBinding());
+  assert.notStrictEqual(start.inputBinding, supplied);
+  assert.notStrictEqual(resume.inputBinding, supplied);
+  assert.notStrictEqual(start.inputBinding, resume.inputBinding);
+  assert.deepEqual(Object.keys(start.inputBinding), [
+    "schemaVersion",
+    "kind",
+    "repository",
+    "pullRequestNumber",
+    "rootItemId",
+    "workKey",
+    "inputRevision",
+    "headRevision",
+    "headRefOid",
+    "eventId",
+    "eventDigest",
+    "inputDigest",
+  ]);
+
+  supplied.headRefOid = "e".repeat(40);
+  start.inputBinding.repository = "other/repo";
+  assert.equal(start.inputBinding.headRefOid, HEAD_REF_OID);
+  assert.equal(resume.inputBinding.repository, "acme/repo");
+  assert.equal(supplied.repository, "acme/repo");
+
+  assert.equal(
+    normalizeResumeRequest({
+      sessionId: "session-1",
+      inputBinding: inputBinding({ headRefOid: "f".repeat(64) }),
+    }).inputBinding.headRefOid.length,
+    64,
+  );
+});
+
+test("execution input bindings reject malformed, forged, and accessor-backed DTOs", () => {
+  let getterInvoked = false;
+  const accessor = inputBinding();
+  Object.defineProperty(accessor, "repository", {
+    enumerable: true,
+    get() {
+      getterInvoked = true;
+      return "acme/repo";
+    },
+  });
+  const customPrototype = Object.assign(
+    Object.create({ inherited: true }),
+    inputBinding(),
+  );
+  const invalidBindings = [
+    inputBinding({ headRefOid: "B".repeat(40) }),
+    inputBinding({ headRefOid: "b".repeat(39) }),
+    inputBinding({ headRefOid: "b".repeat(65) }),
+    inputBinding({ eventDigest: "not-a-digest" }),
+    { ...inputBinding(), extra: true },
+    customPrototype,
+    accessor,
+  ];
+
+  for (const candidate of invalidBindings) {
+    assertInvalid(() =>
+      normalizeStartRequest({
+        sessionId: "session-1",
+        workspaceId: "dashboard",
+        requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+        inputBinding: candidate,
+      }),
+    );
+    assertInvalid(() =>
+      normalizeResumeRequest({
+        sessionId: "session-1",
+        inputBinding: candidate,
+      }),
+    );
+  }
+  assert.equal(getterInvoked, false);
 });
 
 test("each semantic action has an exact, ordered normalized schema", () => {
@@ -213,20 +350,26 @@ test("action requests reject capabilities and malformed fields outside the contr
 test("DTO validation rejects arrays, custom prototypes, inherited and accessor fields", () => {
   assertInvalid(() => normalizeResumeRequest(["session-1"]));
   assertInvalid(() =>
-    normalizeResumeRequest(Object.assign(Object.create(null), { sessionId: "session-1" })),
+    normalizeResumeRequest(Object.assign(Object.create(null), {
+      sessionId: "session-1",
+      inputBinding: null,
+    })),
   );
   assertInvalid(() =>
-    normalizeResumeRequest(Object.create({ sessionId: "session-1" })),
+    normalizeResumeRequest(Object.create({
+      sessionId: "session-1",
+      inputBinding: null,
+    })),
   );
 
-  const accessor = {};
+  const accessor = { inputBinding: null };
   Object.defineProperty(accessor, "sessionId", {
     enumerable: true,
     get: () => "session-1",
   });
   assertInvalid(() => normalizeResumeRequest(accessor));
 
-  const symbolKey = { sessionId: "session-1" };
+  const symbolKey = { sessionId: "session-1", inputBinding: null };
   symbolKey[Symbol("extra")] = true;
   assertInvalid(() => normalizeResumeRequest(symbolKey));
 });

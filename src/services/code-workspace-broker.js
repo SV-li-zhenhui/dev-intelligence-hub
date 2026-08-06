@@ -18,15 +18,20 @@ import {
   validateExecutionId,
   validateWorkspaceId,
 } from "../domain/code-execution-policy.js";
+import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
 
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
+  maxDirectories: 5_000,
   maxFileBytes: 1_000_000,
   maxTotalBytes: 50_000_000,
   maxSearchMatches: 200,
   maxWriteBytes: 1_000_000,
 });
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const MAX_GIT_EXECUTABLE_BYTES = 256 * 1024 * 1024;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -78,11 +83,147 @@ function assertExpectedSha256(value) {
   }
 }
 
+function bindGitSnapshotter(value) {
+  if (value === null || value === undefined) return null;
+  let current = value;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, "materialize");
+    if (descriptor) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "function") {
+        break;
+      }
+      return Object.freeze({
+        materialize: descriptor.value.bind(value),
+      });
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  throw new CodeExecutionError(
+    "INVALID_WORKSPACE_CONFIG",
+    "Git Head snapshot 端口无效",
+  );
+}
+
+function normalizeInputBinding(value) {
+  if (value === undefined || value === null) return null;
+  const error = new CodeExecutionError(
+    "INVALID_EXECUTION_INPUT_BINDING",
+    "代码执行输入绑定无效",
+  );
+  const binding = normalizePullRequestExecutionBinding(value, error);
+  if (!GIT_OID.test(binding.headRefOid)) throw error;
+  return binding;
+}
+
+function exactDataResult(value, keys) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return false;
+  }
+  const actual = Reflect.ownKeys(value);
+  return (
+    actual.length === keys.length &&
+    actual.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return (
+        typeof key === "string" &&
+        keys.includes(key) &&
+        descriptor?.enumerable &&
+        "value" in descriptor
+      );
+    })
+  );
+}
+
+function normalizeGitSnapshotReceipt(value, { workspace, inputBinding, limits }) {
+  if (
+    !exactDataResult(value, [
+      "headOid",
+      "baseline",
+      "modes",
+      "fileCount",
+      "totalBytes",
+    ]) ||
+    value.headOid !== inputBinding.headRefOid ||
+    Object.getPrototypeOf(value.baseline) !== Map.prototype ||
+    Object.getPrototypeOf(value.modes) !== Map.prototype ||
+    !Number.isSafeInteger(value.fileCount) ||
+    value.fileCount < 0 ||
+    value.fileCount > limits.maxFiles ||
+    value.fileCount !== value.baseline.size ||
+    value.fileCount !== value.modes.size ||
+    !Number.isSafeInteger(value.totalBytes) ||
+    value.totalBytes < 0 ||
+    value.totalBytes > limits.maxTotalBytes
+  ) {
+    throw new CodeExecutionError(
+      "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+      "Git Head snapshot 结果无效",
+    );
+  }
+  const baseline = new Map();
+  const modes = new Map();
+  let previousPath = null;
+  for (const [relativePath, digest] of value.baseline) {
+    let normalizedPath;
+    try {
+      normalizedPath = workspace.policy.assertAccessible(relativePath);
+    } catch {
+      throw new CodeExecutionError(
+        "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+        "Git Head snapshot 结果无效",
+      );
+    }
+    if (
+      normalizedPath !== relativePath ||
+      !SHA256.test(digest) ||
+      !["100644", "100755"].includes(value.modes.get(relativePath)) ||
+      (previousPath !== null &&
+        previousPath.localeCompare(relativePath) >= 0)
+    ) {
+      throw new CodeExecutionError(
+        "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+        "Git Head snapshot 结果无效",
+      );
+    }
+    baseline.set(relativePath, digest);
+    modes.set(relativePath, value.modes.get(relativePath));
+    previousPath = relativePath;
+  }
+  return {
+    baseline,
+    modes,
+    fileCount: value.fileCount,
+    totalBytes: value.totalBytes,
+  };
+}
+
+function gitSnapshotFailure(error) {
+  if (error instanceof CodeExecutionError) return error;
+  const limitCodes = new Set([
+    "FILE_COUNT_LIMIT",
+    "FILE_SIZE_LIMIT",
+    "TOTAL_SIZE_LIMIT",
+  ]);
+  const code = limitCodes.has(error?.code)
+    ? error.code
+    : typeof error?.code === "string" && error.code.startsWith("GIT_")
+      ? error.code
+      : "GIT_HEAD_SNAPSHOT_FAILED";
+  return new CodeExecutionError(code, "无法从指定 Git Head 创建代码快照");
+}
+
 export class CodeWorkspaceBroker {
   constructor({
     workspaces = [],
     scratchRoot = path.join(tmpdir(), "my-dashboard-code-executions"),
     limits = {},
+    gitSnapshotter = null,
+    removeDirectory = rm,
   } = {}) {
     if (typeof scratchRoot !== "string" || !path.isAbsolute(scratchRoot)) {
       throw new CodeExecutionError(
@@ -92,13 +233,28 @@ export class CodeWorkspaceBroker {
     }
     this.scratchRoot = path.resolve(scratchRoot);
     this.limits = validateLimits(limits);
+    this.gitSnapshotter = bindGitSnapshotter(gitSnapshotter);
+    if (typeof removeDirectory !== "function") {
+      throw new CodeExecutionError(
+        "INVALID_WORKSPACE_CONFIG",
+        "工作区清理端口无效",
+      );
+    }
+    this.removeDirectory = removeDirectory;
     this.workspaces = new Map();
     this.executions = new Map();
     this.executionLifecycles = new Map();
     for (const workspace of workspaces) this.#registerWorkspace(workspace);
   }
 
-  #registerWorkspace({ id, sourceRoot, writablePaths = [], excludePaths = [] }) {
+  #registerWorkspace({
+    id,
+    sourceRoot,
+    writablePaths = [],
+    excludePaths = [],
+    gitBoundaryDigest = null,
+    gitExecutableIdentity = null,
+  }) {
     validateWorkspaceId(id);
     if (this.workspaces.has(id)) {
       throw new CodeExecutionError(
@@ -112,19 +268,74 @@ export class CodeWorkspaceBroker {
         "可信工作区配置无效",
       );
     }
+    if (
+      (gitBoundaryDigest === null) !== (gitExecutableIdentity === null) ||
+      (gitBoundaryDigest !== null &&
+        (!SHA256.test(gitBoundaryDigest) ||
+          this.gitSnapshotter === null ||
+          !exactDataResult(gitExecutableIdentity, [
+            "gitCommand",
+            "gitExecutableSha256",
+            "gitExecutableBytes",
+            "gitExecutableMode",
+            "gitExecutableUid",
+            "gitExecutableGid",
+          ]) ||
+          typeof gitExecutableIdentity.gitCommand !== "string" ||
+          !path.isAbsolute(gitExecutableIdentity.gitCommand) ||
+          gitExecutableIdentity.gitCommand.includes("\0") ||
+          !SHA256.test(gitExecutableIdentity.gitExecutableSha256) ||
+          !Number.isSafeInteger(gitExecutableIdentity.gitExecutableBytes) ||
+          gitExecutableIdentity.gitExecutableBytes < 1 ||
+          gitExecutableIdentity.gitExecutableBytes >
+            MAX_GIT_EXECUTABLE_BYTES ||
+          !Number.isSafeInteger(gitExecutableIdentity.gitExecutableMode) ||
+          gitExecutableIdentity.gitExecutableMode < 0 ||
+          gitExecutableIdentity.gitExecutableMode > 0o7777 ||
+          !Number.isSafeInteger(gitExecutableIdentity.gitExecutableUid) ||
+          gitExecutableIdentity.gitExecutableUid < 0 ||
+          !Number.isSafeInteger(gitExecutableIdentity.gitExecutableGid) ||
+          gitExecutableIdentity.gitExecutableGid < 0))
+    ) {
+      throw new CodeExecutionError(
+        "INVALID_WORKSPACE_CONFIG",
+        "Git Head snapshot 工作区配置无效",
+      );
+    }
+    const resolvedSourceRoot = path.resolve(sourceRoot);
+    if (this.#pathsOverlap(this.scratchRoot, resolvedSourceRoot)) {
+      throw new CodeExecutionError(
+        "INVALID_WORKSPACE_CONFIG",
+        "临时工作区不得与可信工作区重叠",
+      );
+    }
     this.workspaces.set(id, {
       id,
-      sourceRoot: path.resolve(sourceRoot),
+      sourceRoot: resolvedSourceRoot,
       policy: new CodeExecutionPolicy({ writablePaths, excludePaths }),
+      gitBoundaryDigest,
+      gitExecutableIdentity: gitExecutableIdentity === null
+        ? null
+        : Object.freeze({
+            gitCommand: path.resolve(gitExecutableIdentity.gitCommand),
+            gitExecutableSha256:
+              gitExecutableIdentity.gitExecutableSha256,
+            gitExecutableBytes: gitExecutableIdentity.gitExecutableBytes,
+            gitExecutableMode: gitExecutableIdentity.gitExecutableMode,
+            gitExecutableUid: gitExecutableIdentity.gitExecutableUid,
+            gitExecutableGid: gitExecutableIdentity.gitExecutableGid,
+          }),
     });
   }
 
-  async createExecution({
-    workspaceId,
-    executionId = `run-${randomUUID()}`,
-  }) {
+  async createExecution(request) {
     return guarded(
       async () => {
+        const {
+          workspaceId,
+          executionId = `run-${randomUUID()}`,
+        } = request;
+        const inputBinding = normalizeInputBinding(request.inputBinding);
         const workspace = this.#workspace(workspaceId);
         validateExecutionId(executionId);
         const key = this.#executionKey(workspaceId, executionId);
@@ -165,18 +376,79 @@ export class CodeWorkspaceBroker {
           const baseline = new Map();
           const copyState = { fileCount: 0, totalBytes: 0 };
           try {
-            await this.#copySanitizedDirectory({
-              workspace,
-              sourceDirectory: workspace.sourceRoot,
-              targetDirectory: executionRoot,
-              relativeDirectory: "",
-              baseline,
-              copyState,
-            });
+            if (inputBinding === null) {
+              await this.#copySanitizedDirectory({
+                workspace,
+                sourceDirectory: workspace.sourceRoot,
+                targetDirectory: executionRoot,
+                relativeDirectory: "",
+                baseline,
+                copyState,
+              });
+            } else {
+              if (
+                workspace.gitBoundaryDigest === null ||
+                this.gitSnapshotter === null
+              ) {
+                throw new CodeExecutionError(
+                  "GIT_HEAD_SNAPSHOT_UNAVAILABLE",
+                  "该工作区没有启用固定 Git Head 快照",
+                );
+              }
+              let snapshot;
+              try {
+                snapshot = await this.gitSnapshotter.materialize({
+                  sourceRoot: workspace.sourceRoot,
+                  targetRoot: executionRoot,
+                  headOid: inputBinding.headRefOid,
+                  excludePaths: [...workspace.policy.excludePaths],
+                  expectedBoundaryDigest: workspace.gitBoundaryDigest,
+                  expectedGitCommand:
+                    workspace.gitExecutableIdentity.gitCommand,
+                  expectedGitExecutableSha256:
+                    workspace.gitExecutableIdentity.gitExecutableSha256,
+                  expectedGitExecutableBytes:
+                    workspace.gitExecutableIdentity.gitExecutableBytes,
+                  expectedGitExecutableMode:
+                    workspace.gitExecutableIdentity.gitExecutableMode,
+                  expectedGitExecutableUid:
+                    workspace.gitExecutableIdentity.gitExecutableUid,
+                  expectedGitExecutableGid:
+                    workspace.gitExecutableIdentity.gitExecutableGid,
+                });
+              } catch (error) {
+                throw gitSnapshotFailure(error);
+              }
+              const receipt = normalizeGitSnapshotReceipt(
+                snapshot,
+                { workspace, inputBinding, limits: this.limits },
+              );
+              const materializedBaseline =
+                await this.#verifyGitSnapshotMaterialization({
+                  workspace,
+                  executionRoot,
+                  receipt,
+                });
+              for (const [relativePath, digest] of materializedBaseline) {
+                baseline.set(relativePath, digest);
+              }
+            }
           } catch (error) {
-            await rm(executionRoot, { recursive: true, force: true }).catch(
-              () => {},
-            );
+            try {
+              await this.#discardExecutionDirectory(workspaceId, executionId);
+            } catch (cleanupError) {
+              const failure = new CodeExecutionError(
+                "EXECUTION_STORAGE_UNAVAILABLE",
+                "代码执行副本创建失败且残留目录未能确认清理",
+              );
+              Object.defineProperty(failure, "cause", {
+                configurable: false,
+                enumerable: false,
+                value: cleanupError,
+                writable: false,
+              });
+              throw failure;
+            }
             throw error;
           }
 
@@ -196,6 +468,7 @@ export class CodeWorkspaceBroker {
           return {
             workspaceId,
             executionId,
+            inputBinding: structuredClone(inputBinding),
             sourceRevision,
             workspaceRevision: sourceRevision,
           };
@@ -538,6 +811,18 @@ export class CodeWorkspaceBroker {
       : normalizedLeft === normalizedRight;
   }
 
+  #pathsOverlap(left, right) {
+    if (this.#samePath(left, right)) return true;
+    const leftToRight = path.relative(path.resolve(left), path.resolve(right));
+    const rightToLeft = path.relative(path.resolve(right), path.resolve(left));
+    const isDescendant = (relative) =>
+      relative !== "" &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative);
+    return isDescendant(leftToRight) || isDescendant(rightToLeft);
+  }
+
   #enqueueExecutionLifecycle(key, operation) {
     const previous = this.executionLifecycles.get(key) ?? Promise.resolve();
     const result = previous.then(operation, operation);
@@ -567,7 +852,10 @@ export class CodeWorkspaceBroker {
     await this.#assertCanonicalChild(this.scratchRoot, workspaceRoot);
     if (!(await this.#assertOptionalManagedDirectory(executionRoot))) return;
     await this.#assertCanonicalChild(workspaceRoot, executionRoot);
-    await rm(executionRoot, { recursive: true, force: true });
+    await this.removeDirectory(executionRoot, {
+      recursive: true,
+      force: true,
+    });
     if (await this.#lstatIfExists(executionRoot)) {
       throw new CodeExecutionError(
         "EXECUTION_STORAGE_UNAVAILABLE",
@@ -731,6 +1019,97 @@ export class CodeWorkspaceBroker {
     if (!stats.isDirectory()) {
       throw new CodeExecutionError(errorCode, "工作区目录不可用");
     }
+  }
+
+  async #verifyGitSnapshotMaterialization({
+    workspace,
+    executionRoot,
+    receipt,
+  }) {
+    const invalid = () => new CodeExecutionError(
+      "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+      "Git Head snapshot 落盘结果与回执不一致",
+    );
+    await this.#assertDirectory(
+      executionRoot,
+      "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+    );
+    await this.#assertCanonicalChild(path.dirname(executionRoot), executionRoot);
+    const actual = new Map();
+    const directories = new Set();
+    let totalBytes = 0;
+    let directoryCount = 0;
+    const visit = async (directory, relativeDirectory) => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const relativePath = relativeDirectory
+          ? `${relativeDirectory}/${entry.name}`
+          : entry.name;
+        const target = path.join(directory, entry.name);
+        const stats = await lstat(target);
+        if (stats.isSymbolicLink()) throw invalid();
+        if (stats.isDirectory()) {
+          directoryCount += 1;
+          if (directoryCount > this.limits.maxDirectories) throw invalid();
+          directories.add(relativePath);
+          await visit(target, relativePath);
+          continue;
+        }
+        if (!stats.isFile() || stats.nlink > 1) throw invalid();
+        if (process.platform !== "win32") {
+          const expectedMode = receipt.modes.get(relativePath);
+          const actualMode = stats.mode & 0o777;
+          if (
+            expectedMode === undefined ||
+            actualMode !== (expectedMode === "100755" ? 0o755 : 0o644)
+          ) {
+            throw invalid();
+          }
+        }
+        if (
+          actual.size >= this.limits.maxFiles ||
+          stats.size > this.limits.maxFileBytes
+        ) {
+          throw invalid();
+        }
+        const value = await readFile(target);
+        totalBytes += value.length;
+        if (
+          !Number.isSafeInteger(totalBytes) ||
+          value.length > this.limits.maxFileBytes ||
+          totalBytes > this.limits.maxTotalBytes
+        ) {
+          throw invalid();
+        }
+        actual.set(relativePath, sha256(value));
+      }
+    };
+    await visit(executionRoot, "");
+    const nonEmptyDirectories = new Set();
+    for (const relativePath of actual.keys()) {
+      const segments = relativePath.split("/").slice(0, -1);
+      for (let index = 1; index <= segments.length; index += 1) {
+        nonEmptyDirectories.add(segments.slice(0, index).join("/"));
+      }
+    }
+    if (
+      actual.size !== receipt.fileCount ||
+      totalBytes !== receipt.totalBytes ||
+      actual.size !== receipt.baseline.size ||
+      [...directories].some((directory) => !nonEmptyDirectories.has(directory))
+    ) {
+      throw invalid();
+    }
+    for (const [relativePath, digest] of receipt.baseline) {
+      if (
+        workspace.policy.isExcluded(relativePath) ||
+        actual.get(relativePath) !== digest
+      ) {
+        throw invalid();
+      }
+    }
+    return actual;
   }
 
   async #copySanitizedDirectory({

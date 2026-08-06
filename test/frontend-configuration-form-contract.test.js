@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  applyConfigurationStructureOperation,
   CONFIGURATION_FORM_GROUPS,
   configurationDocumentFromForm,
   createConfigurationFormState,
@@ -24,6 +25,19 @@ function configurationWithCredentialReferences() {
     remote: true,
   };
   configuration.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
+  return configuration;
+}
+
+function configurationWithLegacyCodeWorkspace() {
+  const configuration = configurationWithCredentialReferences();
+  configuration.codeExecutor.workspaces = [
+    {
+      id: "dashboard",
+      sourceRoot: "D:/claude/MyDashboard",
+      writablePaths: ["src", "public", "test"],
+      excludePaths: [".git", "node_modules"],
+    },
+  ];
   return configuration;
 }
 
@@ -142,6 +156,61 @@ test("settings skeleton is structured and never falls back to a JSON editor", ()
       `missing encoded collection path ${expected.join(".")}`,
     );
   }
+});
+
+test("old code workspaces expose structured Git Head setup and native controls", () => {
+  let state = createConfigurationFormState(configurationWithLegacyCodeWorkspace());
+  let markup = renderConfigurationSettingsSkeleton({ state });
+  const templatePaths = machinePaths(markup, "data-configuration-template-field");
+  for (const expected of [
+    ["codeExecutor", "gitCommand"],
+    ["codeExecutor", "gitTimeoutMs"],
+    ["codeExecutor", "workspaces", "0", "gitHeadSnapshot"],
+  ]) {
+    assert.equal(
+      templatePaths.some(
+        (path) => JSON.stringify(path) === JSON.stringify(expected),
+      ),
+      true,
+      `missing structured add control for ${expected.join(".")}`,
+    );
+  }
+  assert.doesNotMatch(markup, /<textarea/i);
+
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "gitCommand"],
+    value: "C:/Program Files/Git/mingw64/bin/git.exe",
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "gitTimeoutMs"],
+    value: 30_000,
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "workspaces", 0, "gitHeadSnapshot"],
+    value: true,
+  });
+  markup = renderConfigurationSettingsSkeleton({ state });
+
+  const command = controlForPath(markup, ["codeExecutor", "gitCommand"]);
+  assert.match(command, /type="text"/);
+  assert.match(command, /data-configuration-edit-kind="text"/);
+  const timeout = controlForPath(markup, ["codeExecutor", "gitTimeoutMs"]);
+  assert.match(timeout, /type="number"/);
+  assert.match(timeout, / min="1"/);
+  assert.match(timeout, / max="60000"/);
+  assert.match(timeout, / step="1"/);
+  const snapshot = controlForPath(markup, [
+    "codeExecutor",
+    "workspaces",
+    0,
+    "gitHeadSnapshot",
+  ]);
+  assert.match(snapshot, /type="checkbox"/);
+  assert.match(snapshot, / checked(?:\s|>)/);
+  assert.doesNotMatch(markup, /<textarea/i);
 });
 
 test("settings skeleton overlays valid edits and preserves invalid raw input", () => {

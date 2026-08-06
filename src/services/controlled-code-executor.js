@@ -8,14 +8,20 @@ import {
   normalizeStartRequest,
 } from "../domain/code-executor-contract.js";
 import { CodeExecutionError } from "../domain/code-execution-policy.js";
+import {
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
 import { DockerSandboxError } from "../adapters/docker-test-sandbox.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { CodeExecutionJournalError } from "./code-execution-journal.js";
 
 export { ControlledCodeExecutorError };
 
-const SCHEMA_VERSION = 1;
+const LEGACY_SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -72,6 +78,32 @@ const ERROR_DETAIL_KEYS = new Set([
   "cleanupPending",
   "containerName",
 ]);
+const SESSION_STATE_KEYS = Object.freeze([
+  "id",
+  "workspaceId",
+  "requestedBy",
+  "inputBinding",
+  "requestDigest",
+  "status",
+  "revision",
+  "sourceRevision",
+  "workspaceRevision",
+  "requiredProfiles",
+  "verifiedProfiles",
+  "actions",
+  "attempts",
+  "events",
+  "nextSequence",
+  "cleanupFence",
+  "cancellation",
+  "createdAt",
+  "updatedAt",
+  "completedAt",
+  "error",
+]);
+const LEGACY_SESSION_STATE_KEYS = Object.freeze(
+  SESSION_STATE_KEYS.filter((key) => key !== "inputBinding"),
+);
 
 function executorError(code, message) {
   return new ControlledCodeExecutorError(code, message);
@@ -101,6 +133,56 @@ function hasOnlyKeys(value, allowedKeys) {
     isPlainRecord(value) &&
     Object.keys(value).every((key) => allowedKeys.has(key))
   );
+}
+
+function isInputBinding(value) {
+  if (value === null) return true;
+  try {
+    const normalized = normalizePullRequestExecutionBinding(value);
+    return GIT_OID.test(normalized.headRefOid);
+  } catch {
+    return false;
+  }
+}
+
+function sameInputBinding(left, right) {
+  if (left === null || right === null) return left === right;
+  try {
+    return samePullRequestExecutionBinding(left, right);
+  } catch {
+    return false;
+  }
+}
+
+function sessionRequestDigest({
+  workspaceId,
+  requestedBy,
+  inputBinding,
+  requiredProfiles,
+}) {
+  return digestValue({
+    workspaceId,
+    requestedBy,
+    inputBinding,
+    requiredProfiles,
+  });
+}
+
+function legacySessionRequestDigest({
+  workspaceId,
+  requestedBy,
+  requiredProfiles,
+}) {
+  return digestValue({ workspaceId, requestedBy, requiredProfiles });
+}
+
+function assertSessionInputBinding(session, inputBinding) {
+  if (!sameInputBinding(session.inputBinding, inputBinding)) {
+    throw executorError(
+      "IDEMPOTENCY_CONFLICT",
+      "代码执行会话已绑定到不同的输入",
+    );
+  }
 }
 
 function emptyState() {
@@ -312,28 +394,7 @@ function validateProfileState(session) {
 function validateSession(sessionId, session) {
   if (
     !SAFE_ID.test(sessionId) ||
-    !hasExactKeys(session, [
-      "id",
-      "workspaceId",
-      "requestedBy",
-      "requestDigest",
-      "status",
-      "revision",
-      "sourceRevision",
-      "workspaceRevision",
-      "requiredProfiles",
-      "verifiedProfiles",
-      "actions",
-      "attempts",
-      "events",
-      "nextSequence",
-      "cleanupFence",
-      "cancellation",
-      "createdAt",
-      "updatedAt",
-      "completedAt",
-      "error",
-    ]) ||
+    !hasExactKeys(session, SESSION_STATE_KEYS) ||
     session.id !== sessionId ||
     !SAFE_ID.test(session.workspaceId) ||
     !hasExactKeys(session.requestedBy, ["roleId", "workItemId"]) ||
@@ -345,6 +406,7 @@ function validateSession(sessionId, session) {
         session.requestedBy.workItemId.length <= 256 &&
         !CONTROL_CHARACTER.test(session.requestedBy.workItemId))
     ) ||
+    !isInputBinding(session.inputBinding) ||
     typeof session.requestDigest !== "string" ||
     !SHA256.test(session.requestDigest) ||
     !SESSION_STATUSES.has(session.status) ||
@@ -372,6 +434,7 @@ function validateSession(sessionId, session) {
     invalidState();
   }
   validateProfileState(session);
+  if (session.requestDigest !== sessionRequestDigest(session)) invalidState();
   const actionIds = new Set();
   for (const action of session.actions) {
     validateAction(sessionId, action, session.attempts.length);
@@ -572,16 +635,32 @@ function validateSession(sessionId, session) {
 function upgradeLegacyState(value) {
   if (
     !isPlainRecord(value) ||
-    value.schemaVersion !== SCHEMA_VERSION ||
+    value.schemaVersion !== LEGACY_SCHEMA_VERSION ||
     !isPlainRecord(value.sessions)
   ) {
     return value;
   }
   for (const session of Object.values(value.sessions)) {
-    if (isPlainRecord(session) && !Object.hasOwn(session, "cancellation")) {
+    if (!isPlainRecord(session)) return value;
+    if (!Object.hasOwn(session, "cancellation")) {
       session.cancellation = null;
     }
+    if (
+      !hasExactKeys(session, LEGACY_SESSION_STATE_KEYS) ||
+      typeof session.requestDigest !== "string" ||
+      !SHA256.test(session.requestDigest) ||
+      session.requestDigest !== legacySessionRequestDigest(session)
+    ) {
+      return value;
+    }
+    session.inputBinding = null;
+    try {
+      session.requestDigest = sessionRequestDigest(session);
+    } catch {
+      return value;
+    }
   }
+  value.schemaVersion = SCHEMA_VERSION;
   return value;
 }
 
@@ -606,6 +685,25 @@ function validateDependency(value, methods, label) {
     throw executorError("INVALID_EXECUTOR_CONFIG", `${label} 配置无效`);
   }
   return value;
+}
+
+function normalizeViewRequest(value) {
+  if (!isPlainRecord(value)) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  const keys = Reflect.ownKeys(value);
+  const descriptor = Object.getOwnPropertyDescriptor(value, "sessionId");
+  if (
+    keys.length !== 1 ||
+    keys[0] !== "sessionId" ||
+    !descriptor?.enumerable ||
+    !("value" in descriptor) ||
+    typeof descriptor.value !== "string" ||
+    !SAFE_ID.test(descriptor.value)
+  ) {
+    throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+  }
+  return { sessionId: descriptor.value };
 }
 
 function normalizeActionResultRequest(value) {
@@ -679,6 +777,7 @@ function normalizeCancellationRequest(value) {
   }
   const expectedKeys = [
     "sessionId",
+    "inputBinding",
     "cancellationDigest",
     "expectedWorkspaceRevision",
     "expectedAction",
@@ -689,6 +788,7 @@ function normalizeCancellationRequest(value) {
   if (
     typeof value.sessionId !== "string" ||
     !SAFE_ID.test(value.sessionId) ||
+    !isInputBinding(value.inputBinding) ||
     !isRevision(value.cancellationDigest) ||
     !isRevision(value.expectedWorkspaceRevision, { nullable: true })
   ) {
@@ -711,6 +811,9 @@ function normalizeCancellationRequest(value) {
   }
   return {
     sessionId: value.sessionId,
+    inputBinding: value.inputBinding === null
+      ? null
+      : normalizePullRequestExecutionBinding(value.inputBinding),
     cancellationDigest: value.cancellationDigest,
     expectedWorkspaceRevision: value.expectedWorkspaceRevision,
     expectedAction,
@@ -1010,19 +1113,29 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
   return value;
 }
 
-function validateExecutionCreation(value, { workspaceId, executionId }) {
+function validateExecutionCreation(
+  value,
+  { workspaceId, executionId, inputBinding },
+) {
+  const echoesBinding =
+    isPlainRecord(value) && Object.hasOwn(value, "inputBinding");
+  const expectedKeys = [
+    "workspaceId",
+    "executionId",
+    "sourceRevision",
+    "workspaceRevision",
+    ...(echoesBinding ? ["inputBinding"] : []),
+  ];
   if (
-    !hasExactKeys(value, [
-      "workspaceId",
-      "executionId",
-      "sourceRevision",
-      "workspaceRevision",
-    ]) ||
+    !hasExactKeys(value, expectedKeys) ||
     value.workspaceId !== workspaceId ||
     value.executionId !== executionId ||
     !isRevision(value.sourceRevision) ||
     !isRevision(value.workspaceRevision) ||
-    value.sourceRevision !== value.workspaceRevision
+    value.sourceRevision !== value.workspaceRevision ||
+    (inputBinding === null
+      ? echoesBinding && value.inputBinding !== null
+      : !echoesBinding || !sameInputBinding(value.inputBinding, inputBinding))
   ) {
     throw executorError(
       "EXECUTION_RESULT_INVALID",
@@ -1384,6 +1497,7 @@ function projectSession(session) {
       roleId: session.requestedBy.roleId,
       workItemId: session.requestedBy.workItemId,
     },
+    inputBinding: structuredClone(session.inputBinding),
     status: session.status,
     revision: session.revision,
     sourceRevision: session.sourceRevision,
@@ -1540,7 +1654,7 @@ export class ControlledCodeExecutor {
   }
 
   async view(request) {
-    const { sessionId } = normalizeResumeRequest(request);
+    const { sessionId } = normalizeViewRequest(request);
     this.#assertReady();
     return this.#readProjectedSession(sessionId);
   }
@@ -1717,7 +1831,7 @@ export class ControlledCodeExecutor {
       return Promise.reject(error);
     }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
-      this.#resume(normalized.sessionId),
+      this.#resume(normalized),
     );
   }
 
@@ -1769,7 +1883,7 @@ export class ControlledCodeExecutor {
     return value;
   }
 
-  async #readState() {
+  async #readState({ persistLegacyUpgrade = false } = {}) {
     let stored;
     try {
       stored = await this.store.read(this.stateKey, MISSING_STATE);
@@ -1777,7 +1891,11 @@ export class ControlledCodeExecutor {
       throw executorError("STATE_READ_FAILED", "无法读取代码执行状态");
     }
     if (stored === MISSING_STATE) return emptyState();
-    return validateState(upgradeLegacyState(stored));
+    const legacy = isPlainRecord(stored) &&
+      stored.schemaVersion === LEGACY_SCHEMA_VERSION;
+    const state = validateState(upgradeLegacyState(stored));
+    if (legacy && persistLegacyUpgrade) await this.#writeState(state);
+    return state;
   }
 
   async #writeState(state) {
@@ -1822,9 +1940,10 @@ export class ControlledCodeExecutor {
         "工作区未配置可信测试方案",
       );
     }
-    const requestDigest = digestValue({
+    const requestDigest = sessionRequestDigest({
       workspaceId: request.workspaceId,
       requestedBy: request.requestedBy,
+      inputBinding: request.inputBinding,
       requiredProfiles,
     });
     const claimed = await this.#mutateState((state) => {
@@ -1849,6 +1968,7 @@ export class ControlledCodeExecutor {
         id: request.sessionId,
         workspaceId: request.workspaceId,
         requestedBy: request.requestedBy,
+        inputBinding: structuredClone(request.inputBinding),
         requestDigest,
         status: "preparing",
         revision: 0,
@@ -1890,6 +2010,7 @@ export class ControlledCodeExecutor {
       const reference = {
         workspaceId: request.workspaceId,
         executionId: claimed.executionId,
+        inputBinding: structuredClone(request.inputBinding),
       };
       created = validateExecutionCreation(
         await this.broker.createExecution(reference),
@@ -2882,6 +3003,7 @@ export class ControlledCodeExecutor {
     }
     const claimed = await this.#mutateState((state) => {
       const session = this.#requireSession(state, request.sessionId);
+      assertSessionInputBinding(session, request.inputBinding);
       if (session.cancellation !== null) {
         if (!sameCancellationRequest(session.cancellation, request)) {
           throw executorError(
@@ -3050,6 +3172,9 @@ export class ControlledCodeExecutor {
   }
 
   async #recover() {
+    await this.stateQueue.enqueue(() =>
+      this.#readState({ persistLegacyUpgrade: true }),
+    );
     await this.#validateRecoveryArtifacts();
     const fences = await this.#mutateState((state) => {
       let changed = false;
@@ -3156,12 +3281,14 @@ export class ControlledCodeExecutor {
     return { recovered: true, cleanupPending };
   }
 
-  async #resume(sessionId) {
-    this.#assertRuntimeAvailable(sessionId);
+  async #resume({ sessionId, inputBinding }) {
     let fence = await this.stateQueue.enqueue(async () => {
       const state = await this.#readState();
-      return this.#requireSession(state, sessionId).cleanupFence;
+      const session = this.#requireSession(state, sessionId);
+      assertSessionInputBinding(session, inputBinding);
+      return structuredClone(session.cleanupFence);
     });
+    this.#assertRuntimeAvailable(sessionId);
     if (fence) {
       try {
         await this.sandbox.cleanup({
@@ -3197,6 +3324,7 @@ export class ControlledCodeExecutor {
 
     const prepared = await this.#mutateState((state) => {
       const session = this.#requireSession(state, sessionId);
+      assertSessionInputBinding(session, inputBinding);
       if (session.status !== "interrupted") {
         throw executorError("SESSION_NOT_INTERRUPTED", "只有中断会话可以恢复");
       }
@@ -3253,6 +3381,7 @@ export class ControlledCodeExecutor {
         value: {
           workspaceId: session.workspaceId,
           executionId,
+          inputBinding: structuredClone(session.inputBinding),
           number,
           sourceRevision: session.sourceRevision,
           targetWorkspaceRevision: session.workspaceRevision,
@@ -3266,6 +3395,7 @@ export class ControlledCodeExecutor {
       const reference = {
         workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
+        inputBinding: structuredClone(prepared.inputBinding),
       };
       created = validateExecutionCreation(
         await this.broker.createExecution(reference),

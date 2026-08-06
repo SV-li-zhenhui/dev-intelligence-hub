@@ -150,10 +150,13 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
       "executable": "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
       "host": "npipe:////./pipe/dockerDesktopLinuxEngine"
     },
+    "gitCommand": "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    "gitTimeoutMs": 30000,
     "workspaces": [
       {
         "id": "my-dashboard",
         "sourceRoot": ".",
+        "gitHeadSnapshot": true,
         "writablePaths": ["src", "test"]
       }
     ],
@@ -172,6 +175,8 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
 ```
 
 临时工作副本和不可变审计产物保存在被 Git 忽略的 `data/code-executor/`。源仓库保持只读；员工只能提交固定语义动作，不能传入任意 shell 命令。
+
+PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对象生成执行副本，不读取当前 checkout 的脏文件，也不会运行 hook、filter 或网络拉取。Windows 必须把 `gitCommand` 直接指向 Git for Windows 的实际实现（通常是 `mingw64\bin\git.exe`），不能使用 `cmd\git.exe` 或安装目录下的分发包装器；程序路径、内容摘要和大小都会随工作区权限一起封存。该能力只接受本地普通仓库的真实 `.git` 目录，不接受 UNC、linked worktree、alternate/partial object store 或对象链接。
 
 ## 本地安全边界
 

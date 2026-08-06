@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -18,6 +20,11 @@ async function fixture(t, {
   files = { "src/app.js": "export const value = 1;\n" },
   writablePaths = ["src", "test", "docs", "README.md"],
   limits = {},
+  excludePaths = [],
+  gitSnapshotter = null,
+  gitBoundaryDigest = null,
+  gitExecutableIdentity = undefined,
+  removeDirectory = undefined,
 } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "code-workspace-broker-"));
   const sourceRoot = path.join(root, "source");
@@ -29,6 +36,18 @@ async function fixture(t, {
     await writeFile(target, content);
   }
   t.after(() => rm(root, { recursive: true, force: true }));
+  const sealedGitExecutableIdentity = gitExecutableIdentity === undefined
+    ? gitBoundaryDigest === null
+      ? null
+      : {
+          gitCommand: path.join(root, "git.exe"),
+          gitExecutableSha256: "e".repeat(64),
+          gitExecutableBytes: 1,
+          gitExecutableMode: 0o755,
+          gitExecutableUid: 0,
+          gitExecutableGid: 0,
+        }
+    : gitExecutableIdentity;
   return {
     root,
     sourceRoot,
@@ -36,12 +55,75 @@ async function fixture(t, {
     broker: new CodeWorkspaceBroker({
       scratchRoot,
       limits,
+      gitSnapshotter,
+      ...(removeDirectory === undefined ? {} : { removeDirectory }),
       workspaces: [{
         id: "dashboard",
         sourceRoot,
         writablePaths,
+        excludePaths,
+        gitBoundaryDigest,
+        gitExecutableIdentity: sealedGitExecutableIdentity,
       }],
     }),
+  };
+}
+
+function pullRequestBinding(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/dashboard",
+    pullRequestNumber: 42,
+    rootItemId: "github:pr:acme/dashboard#42",
+    workKey: "pr:acme/dashboard#42",
+    inputRevision: 3,
+    headRevision: 2,
+    headRefOid: "1".repeat(40),
+    eventId: "github-event-pr-42",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+    ...overrides,
+  };
+}
+
+function digest(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function fixedSnapshotter(files, { headOid = "1".repeat(40), failure = null } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async materialize(request) {
+      calls.push(structuredClone(request));
+      const entries = Object.entries(files).sort(([left], [right]) =>
+        left.localeCompare(right),
+      );
+      const baseline = new Map();
+      const modes = new Map();
+      let totalBytes = 0;
+      for (const [relativePath, content] of entries) {
+        const value = Buffer.from(content);
+        const target = path.join(
+          request.targetRoot,
+          ...relativePath.split("/"),
+        );
+        await mkdir(path.dirname(target), { recursive: true });
+        await writeFile(target, value);
+        baseline.set(relativePath, digest(value));
+        modes.set(relativePath, "100644");
+        totalBytes += value.length;
+        if (failure) throw Object.assign(new Error("snapshot failed"), failure);
+      }
+      return {
+        headOid,
+        baseline,
+        modes,
+        fileCount: baseline.size,
+        totalBytes,
+      };
+    },
   };
 }
 
@@ -51,6 +133,53 @@ test("unknown workspaces are rejected with a stable error code", async () => {
   await assert.rejects(
     broker.createExecution({ workspaceId: "missing" }),
     (error) => error.code === "WORKSPACE_NOT_FOUND",
+  );
+});
+
+test("workspace storage cannot overlap a trusted source in either direction", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-workspace-overlap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceRoot = path.join(root, "source");
+  await mkdir(sourceRoot);
+
+  assert.throws(
+    () => new CodeWorkspaceBroker({
+      scratchRoot: path.join(sourceRoot, "scratch"),
+      workspaces: [{ id: "dashboard", sourceRoot }],
+    }),
+    { code: "INVALID_WORKSPACE_CONFIG" },
+  );
+
+  const scratchRoot = path.join(root, "scratch");
+  const nestedSource = path.join(scratchRoot, "source");
+  await mkdir(nestedSource, { recursive: true });
+  assert.throws(
+    () => new CodeWorkspaceBroker({
+      scratchRoot,
+      workspaces: [{ id: "nested", sourceRoot: nestedSource }],
+    }),
+    { code: "INVALID_WORKSPACE_CONFIG" },
+  );
+});
+
+test("a Git boundary digest cannot be registered without its sealed executable identity", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-workspace-git-identity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceRoot = path.join(root, "source");
+  await mkdir(sourceRoot);
+  const gitSnapshotter = fixedSnapshotter({});
+
+  assert.throws(
+    () => new CodeWorkspaceBroker({
+      scratchRoot: path.join(root, "scratch"),
+      gitSnapshotter,
+      workspaces: [{
+        id: "dashboard",
+        sourceRoot,
+        gitBoundaryDigest: "a".repeat(64),
+      }],
+    }),
+    { code: "INVALID_WORKSPACE_CONFIG" },
   );
 });
 
@@ -74,6 +203,7 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
 
   assert.equal(execution.workspaceId, "dashboard");
   assert.equal(execution.executionId, "run-one");
+  assert.equal(execution.inputBinding, null);
   assert.match(execution.sourceRevision, /^[a-f0-9]{64}$/);
   assert.equal(execution.workspaceRevision, execution.sourceRevision);
   assert.equal(
@@ -121,6 +251,375 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
   assert.equal(await readFile(path.join(sourceRoot, "test", "app.test.js"), "utf8"), "test('old', () => {});\n");
   await assert.rejects(access(path.join(sourceRoot, "docs", "notes.md")));
 });
+
+test("a PR-bound execution materializes only its sealed Git Head and echoes a detached binding", async (t) => {
+  const boundaryDigest = "f".repeat(64);
+  const snapshotter = fixedSnapshotter({
+    "README.md": "fixed Head\n",
+    "src/app.js": "export const value = 'fixed-head';\n",
+  });
+  const { broker, sourceRoot } = await fixture(t, {
+    files: {
+      "src/app.js": "export const value = 'dirty-checkout';\n",
+      "untracked.txt": "must not be copied\n",
+    },
+    excludePaths: ["private"],
+    gitSnapshotter: snapshotter,
+    gitBoundaryDigest: boundaryDigest,
+  });
+  const inputBinding = pullRequestBinding();
+
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "git-head-run",
+    inputBinding,
+  });
+
+  assert.deepEqual(execution.inputBinding, inputBinding);
+  assert.notStrictEqual(execution.inputBinding, inputBinding);
+  inputBinding.repository = "acme/changed";
+  assert.equal(execution.inputBinding.repository, "acme/dashboard");
+  assert.equal(
+    (await broker.readFile({ ...execution, path: "src/app.js" })).content,
+    "export const value = 'fixed-head';\n",
+  );
+  assert.deepEqual(await broker.listFiles(execution), [
+    "README.md",
+    "src/app.js",
+  ]);
+  await assert.rejects(
+    broker.readFile({ ...execution, path: "untracked.txt" }),
+    (error) => error.code === "FILE_NOT_FOUND",
+  );
+  assert.equal(
+    await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"),
+    "export const value = 'dirty-checkout';\n",
+  );
+  assert.deepEqual(snapshotter.calls, [
+    {
+      sourceRoot: path.resolve(sourceRoot),
+      targetRoot: await broker.getSandboxWorkspacePath(execution),
+      headOid: "1".repeat(40),
+      excludePaths: ["private"],
+      expectedBoundaryDigest: boundaryDigest,
+      expectedGitCommand: path.join(path.dirname(sourceRoot), "git.exe"),
+      expectedGitExecutableSha256: "e".repeat(64),
+      expectedGitExecutableBytes: 1,
+      expectedGitExecutableMode: 0o755,
+      expectedGitExecutableUid: 0,
+      expectedGitExecutableGid: 0,
+    },
+  ]);
+});
+
+test("PR bindings fail before source copy when Git Head snapshot is unavailable", async (t) => {
+  const { broker, scratchRoot } = await fixture(t, {
+    files: { "src/app.js": "directory fallback must not run\n" },
+  });
+
+  await assert.rejects(
+    broker.createExecution({
+      workspaceId: "dashboard",
+      executionId: "git-unavailable-run",
+      inputBinding: pullRequestBinding(),
+    }),
+    (error) => error.code === "GIT_HEAD_SNAPSHOT_UNAVAILABLE",
+  );
+  await assert.rejects(
+    access(path.join(scratchRoot, "dashboard", "git-unavailable-run")),
+    (error) => error.code === "ENOENT",
+  );
+});
+
+test("Git snapshot errors and invalid receipts clean partial output without directory fallback", async (t) => {
+  const boundaryDigest = "e".repeat(64);
+  const scenarios = [
+    {
+      name: "materialization-failure",
+      snapshotter: fixedSnapshotter(
+        { "partial.txt": "partial\n" },
+        { failure: { code: "GIT_SNAPSHOT_OBJECT_MISMATCH" } },
+      ),
+      code: "GIT_SNAPSHOT_OBJECT_MISMATCH",
+    },
+    {
+      name: "Head-mismatch",
+      snapshotter: fixedSnapshotter(
+        { "src/app.js": "wrong Head\n" },
+        { headOid: "4".repeat(40) },
+      ),
+      code: "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const current = await fixture(t, {
+      files: { "src/app.js": "directory fallback must not run\n" },
+      gitSnapshotter: scenario.snapshotter,
+      gitBoundaryDigest: boundaryDigest,
+    });
+    await assert.rejects(
+      current.broker.createExecution({
+        workspaceId: "dashboard",
+        executionId: `${scenario.name}-run`.toLowerCase(),
+        inputBinding: pullRequestBinding(),
+      }),
+      (error) => error.code === scenario.code,
+    );
+    await assert.rejects(
+      access(
+        path.join(
+          current.scratchRoot,
+          "dashboard",
+          `${scenario.name}-run`.toLowerCase(),
+        ),
+      ),
+      (error) => error.code === "ENOENT",
+    );
+  }
+});
+
+test("broker rejects malformed PR bindings and Git snapshot receipts without invoking accessors", async (t) => {
+  const snapshotter = fixedSnapshotter({ "src/app.js": "fixed\n" });
+  const { broker } = await fixture(t, {
+    gitSnapshotter: snapshotter,
+    gitBoundaryDigest: "d".repeat(64),
+  });
+  let getterCalls = 0;
+  const accessor = pullRequestBinding();
+  Object.defineProperty(accessor, "headRefOid", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "1".repeat(40);
+    },
+  });
+
+  for (const inputBinding of [
+    accessor,
+    pullRequestBinding({ headRefOid: "A".repeat(40) }),
+    { ...pullRequestBinding(), extra: true },
+  ]) {
+    await assert.rejects(
+      broker.createExecution({
+        workspaceId: "dashboard",
+        executionId: `invalid-binding-${snapshotter.calls.length}`,
+        inputBinding,
+      }),
+      (error) => error.code === "INVALID_EXECUTION_INPUT_BINDING",
+    );
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(snapshotter.calls.length, 0);
+
+  const badReceiptSnapshotter = {
+    async materialize(request) {
+      await writeFile(path.join(request.targetRoot, "file.txt"), "content");
+      return {
+        headOid: request.headOid,
+        baseline: new Map([["file.txt", "0".repeat(64)]]),
+        modes: new Map([["file.txt", "100644"]]),
+        fileCount: 2,
+        totalBytes: 7,
+      };
+    },
+  };
+  const invalidReceipt = await fixture(t, {
+    gitSnapshotter: badReceiptSnapshotter,
+    gitBoundaryDigest: "c".repeat(64),
+  });
+  await assert.rejects(
+    invalidReceipt.broker.createExecution({
+      workspaceId: "dashboard",
+      executionId: "invalid-receipt-run",
+      inputBinding: pullRequestBinding(),
+    }),
+    (error) => error.code === "GIT_HEAD_SNAPSHOT_RESULT_INVALID",
+  );
+});
+
+test("broker independently audits every Git snapshot file against its receipt", async (t) => {
+  const sealed = Buffer.from("sealed Head\n");
+  const dirty = Buffer.from("different bytes\n");
+  const cases = [
+    {
+      name: "extra-file",
+      files: [["src/extra.js", sealed]],
+      baseline: new Map(),
+      fileCount: 0,
+      totalBytes: 0,
+    },
+    {
+      name: "wrong-content",
+      files: [["src/app.js", dirty]],
+      baseline: new Map([["src/app.js", digest(sealed)]]),
+      fileCount: 1,
+      totalBytes: dirty.length,
+    },
+    {
+      name: "wrong-total",
+      files: [["src/app.js", sealed]],
+      baseline: new Map([["src/app.js", digest(sealed)]]),
+      fileCount: 1,
+      totalBytes: sealed.length + 1,
+    },
+    {
+      name: "excluded-extra",
+      files: [["private/secret.txt", sealed]],
+      baseline: new Map(),
+      fileCount: 0,
+      totalBytes: 0,
+      excludePaths: ["private"],
+    },
+    {
+      name: "extra-empty-directory",
+      files: [],
+      directories: ["empty/generated"],
+      baseline: new Map(),
+      fileCount: 0,
+      totalBytes: 0,
+    },
+  ];
+
+  for (const current of cases) {
+    const snapshotter = {
+      async materialize(request) {
+        for (const relativePath of current.directories ?? []) {
+          await mkdir(
+            path.join(request.targetRoot, ...relativePath.split("/")),
+            { recursive: true },
+          );
+        }
+        for (const [relativePath, value] of current.files) {
+          const target = path.join(
+            request.targetRoot,
+            ...relativePath.split("/"),
+          );
+          await mkdir(path.dirname(target), { recursive: true });
+          await writeFile(target, value);
+        }
+        return {
+          headOid: request.headOid,
+          baseline: new Map(current.baseline),
+          modes: new Map(
+            [...current.baseline.keys()].map((relativePath) => [
+              relativePath,
+              "100644",
+            ]),
+          ),
+          fileCount: current.fileCount,
+          totalBytes: current.totalBytes,
+        };
+      },
+    };
+    const setup = await fixture(t, {
+      gitSnapshotter: snapshotter,
+      gitBoundaryDigest: "9".repeat(64),
+      excludePaths: current.excludePaths ?? [],
+    });
+    const executionId = `audit-${current.name}`;
+
+    await assert.rejects(
+      setup.broker.createExecution({
+        workspaceId: "dashboard",
+        executionId,
+        inputBinding: pullRequestBinding(),
+      }),
+      { code: "GIT_HEAD_SNAPSHOT_RESULT_INVALID" },
+    );
+    await assert.rejects(
+      access(path.join(setup.scratchRoot, "dashboard", executionId)),
+      { code: "ENOENT" },
+    );
+  }
+});
+
+test(
+  "broker rejects a Git executable-mode receipt that differs from the POSIX materialization",
+  { skip: process.platform === "win32" ? "NTFS does not represent Git executable bits" : false },
+  async (t) => {
+    const content = Buffer.from("#!/bin/sh\nexit 0\n");
+    const snapshotter = {
+      async materialize(request) {
+        const target = path.join(request.targetRoot, "script.sh");
+        await writeFile(target, content);
+        await chmod(target, 0o644);
+        return {
+          headOid: request.headOid,
+          baseline: new Map([["script.sh", digest(content)]]),
+          modes: new Map([["script.sh", "100755"]]),
+          fileCount: 1,
+          totalBytes: content.length,
+        };
+      },
+    };
+    const setup = await fixture(t, {
+      gitSnapshotter: snapshotter,
+      gitBoundaryDigest: "8".repeat(64),
+    });
+
+    await assert.rejects(
+      setup.broker.createExecution({
+        workspaceId: "dashboard",
+        executionId: "mode-mismatch",
+        inputBinding: pullRequestBinding(),
+      }),
+      { code: "GIT_HEAD_SNAPSHOT_RESULT_INVALID" },
+    );
+  },
+);
+
+test(
+  "a failed cleanup is explicit and the orphan remains safely discardable",
+  async (t) => {
+    let cleanupLocked = true;
+    const removeDirectory = async (target, options) => {
+      if (cleanupLocked) {
+        throw Object.assign(new Error("directory is locked"), {
+          code: "EBUSY",
+        });
+      }
+      return rm(target, options);
+    };
+    const snapshotter = {
+      async materialize(request) {
+        await writeFile(path.join(request.targetRoot, "partial.txt"), "partial");
+        throw Object.assign(new Error("materialization failed"), {
+          code: "GIT_SNAPSHOT_FAILED",
+        });
+      },
+    };
+    const setup = await fixture(t, {
+      gitSnapshotter: snapshotter,
+      gitBoundaryDigest: "7".repeat(64),
+      removeDirectory,
+    });
+    const executionId = "locked-cleanup";
+    const executionRoot = path.join(
+      setup.scratchRoot,
+      "dashboard",
+      executionId,
+    );
+    await assert.rejects(
+      setup.broker.createExecution({
+        workspaceId: "dashboard",
+        executionId,
+        inputBinding: pullRequestBinding(),
+      }),
+      (error) =>
+        error.code === "EXECUTION_STORAGE_UNAVAILABLE" &&
+        error.cause?.code === "EBUSY",
+    );
+    await access(executionRoot);
+
+    cleanupLocked = false;
+    await setup.broker.discardExecution({
+      workspaceId: "dashboard",
+      executionId,
+    });
+    await assert.rejects(access(executionRoot), { code: "ENOENT" });
+  },
+);
 
 test("discard waits for queued work and removes only the requested execution", async (t) => {
   const { broker, scratchRoot, sourceRoot } = await fixture(t);

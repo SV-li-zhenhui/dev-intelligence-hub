@@ -25,6 +25,8 @@ const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SECRET_VALUE =
   /(?:^|\s)(?:bearer\s+|gh[opusr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/i;
 const URL_USERINFO = /:\/\/[^/@\s:]+:[^/@\s]+@/;
+const WINDOWS_GIT_WRAPPER = /\/(?:cmd|bin)\/git\.exe$/i;
+const WINDOWS_GIT_IMPLEMENTATION = /\/mingw(?:32|64)\/bin\/git\.exe$/i;
 const EDIT_KINDS = new Set(["text", "integer", "number", "boolean", "scalar"]);
 const ENTITY_KINDS = new Set(["provider", "role", "workspace", "profile"]);
 const STRUCTURE_OPERATIONS = new Set(["add", "remove", "replace"]);
@@ -408,6 +410,8 @@ function assertCodeExecutor(value, path) {
     "brokerLimits",
     "executorLimits",
     "maxArtifactBytes",
+    "gitCommand",
+    "gitTimeoutMs",
   ], ["enabled"]);
   if (value.docker) {
     assertFields(value.docker, `${path}.docker`, ["executable", "host"], [
@@ -421,7 +425,7 @@ function assertCodeExecutor(value, path) {
       assertFields(
         workspace,
         `${path}.workspaces[${index}]`,
-        ["id", "sourceRoot", "writablePaths", "excludePaths"],
+        ["id", "sourceRoot", "gitHeadSnapshot", "writablePaths", "excludePaths"],
         ["id", "sourceRoot"],
       ),
     );
@@ -1251,6 +1255,48 @@ function configurationRelationshipIssues(configuration) {
   ) {
     issues.push(issue(["codeExecutor", "requiredProfilesByWorkspace"], "INCOMPLETE_CONFIGURATION", "每个工作区都需要 Profile 绑定。"));
   }
+  if (
+    (configuration.codeExecutor.workspaces || []).some(
+      (workspace) => workspace.gitHeadSnapshot === true,
+    ) &&
+    !configuration.codeExecutor.gitCommand
+  ) {
+    issues.push(issue(["codeExecutor", "gitCommand"], "INCOMPLETE_CONFIGURATION", "启用 Git Head 固定快照前需要配置固定 Git 命令。"));
+  }
+  const gitCommand = configuration.codeExecutor.gitCommand;
+  const normalizedGitCommand = typeof gitCommand === "string"
+    ? gitCommand.replaceAll("\\", "/")
+    : "";
+  const gitCommandIsAbsolute =
+    /^[A-Za-z]:\//u.test(normalizedGitCommand) ||
+    (normalizedGitCommand.startsWith("/") &&
+      !normalizedGitCommand.startsWith("//"));
+  if (
+    (configuration.codeExecutor.workspaces || []).some(
+      (workspace) => workspace.gitHeadSnapshot === true,
+    ) &&
+    normalizedGitCommand &&
+    !gitCommandIsAbsolute
+  ) {
+    issues.push(issue(
+      ["codeExecutor", "gitCommand"],
+      "RELATIVE_GIT_COMMAND",
+      "Git Head 固定快照命令必须填写本机绝对路径。",
+    ));
+  }
+  if (
+    (configuration.codeExecutor.workspaces || []).some(
+      (workspace) => workspace.gitHeadSnapshot === true,
+    ) &&
+    WINDOWS_GIT_WRAPPER.test(normalizedGitCommand) &&
+    !WINDOWS_GIT_IMPLEMENTATION.test(normalizedGitCommand)
+  ) {
+    issues.push(issue(
+      ["codeExecutor", "gitCommand"],
+      "UNSAFE_GIT_WRAPPER",
+      "Windows 固定 Head 快照需直接选择 mingw64/bin/git.exe，不能使用 cmd/bin 包装器。",
+    ));
+  }
   if (configuration.changePackages.enabled && !configuration.changePackages.gitCommand) {
     issues.push(issue(["changePackages", "gitCommand"], "INCOMPLETE_CONFIGURATION", "启用后需要固定 Git 命令。"));
   }
@@ -1647,7 +1693,7 @@ function normalizeStructureOperation(value, seenOperations, index) {
     (hasKey ||
       hasIndex ||
       !slot.operations.includes(value.operation) ||
-      (value.operation === "add" && !slot.nullable))
+      (value.operation === "add" && !slot.nullable && !slot.optional))
   ) {
     throw formError(
       "INVALID_ENTITY_OPERATION",
@@ -1699,6 +1745,13 @@ function descriptorAtPath(document, path) {
   return { value: current };
 }
 
+function pathHasPrefix(path, prefix) {
+  return (
+    path.length >= prefix.length &&
+    prefix.every((segment, index) => path[index] === segment)
+  );
+}
+
 function structureTarget(document, operation) {
   const descriptor = configurationCollectionDescriptor(operation.path);
   if (!descriptor) return null;
@@ -1745,11 +1798,33 @@ function applyStructureOperation(document, operation) {
         pathText(operation.path),
       );
     }
-    const current = valueAtPath(document, operation.path);
-    if (operation.operation === "add" && current !== null) {
-      throw formError("INVALID_ENTITY_OPERATION", "configuration slot already exists", pathText(operation.path));
+    const existing = descriptorAtPath(document, operation.path);
+    if (operation.operation === "add") {
+      if (existing && (!slot.nullable || existing.value !== null)) {
+        throw formError("INVALID_ENTITY_OPERATION", "configuration slot already exists", pathText(operation.path));
+      }
+      if (!existing) {
+        if (!slot.optional) {
+          throw formError("INVALID_ENTITY_OPERATION", "configuration slot does not exist", pathText(operation.path));
+        }
+        const parent = valueAtPath(document, operation.path.slice(0, -1));
+        Object.defineProperty(parent, operation.path.at(-1), {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: cloneSafeData(operation.value, "operation.value", cloneContext(), 0),
+        });
+        return;
+      }
+    } else if (!existing) {
+      throw formError("INVALID_ENTITY_OPERATION", "configuration slot does not exist", pathText(operation.path));
     }
     if (operation.operation === "remove") {
+      if (slot.optional) {
+        const parent = valueAtPath(document, operation.path.slice(0, -1));
+        delete parent[operation.path.at(-1)];
+        return;
+      }
       if (!slot.nullable) {
         throw formError("INVALID_ENTITY_OPERATION", "configuration slot is required", pathText(operation.path));
       }
@@ -1991,10 +2066,15 @@ export function applyConfigurationStructureOperation(state, input) {
   );
   applyStructureOperation(document, operation);
   cloneConfiguration(document);
+  const resetsSlot =
+    ["remove", "replace"].includes(operation.operation) &&
+    !Object.hasOwn(operation, "key") &&
+    !Object.hasOwn(operation, "index");
   const edits = snapshot.edits.filter(
     (edit) =>
-      descriptorAtPath(document, edit.path) ||
-      descriptorAtPath(snapshot.baseDocument, edit.path),
+      !(resetsSlot && pathHasPrefix(edit.path, operation.path)) &&
+      (descriptorAtPath(document, edit.path) ||
+        descriptorAtPath(snapshot.baseDocument, edit.path)),
   );
   return buildFormState({
     baseDocument: snapshot.baseDocument,

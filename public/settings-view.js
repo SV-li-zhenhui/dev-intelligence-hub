@@ -317,6 +317,33 @@ function optionalCollections(path, value, context) {
     .join("");
 }
 
+function optionalSlots(path, value, context) {
+  return CONFIGURATION_FORM_SCHEMA.slots
+    .filter((descriptor) => {
+      const field = descriptor.pattern.at(-1);
+      if (
+        !descriptor.optional ||
+        descriptor.pattern.length !== path.length + 1 ||
+        typeof field !== "string" ||
+        ["*", "#", "**"].includes(field) ||
+        Object.hasOwn(value, field)
+      ) {
+        return false;
+      }
+      return configurationSlotDescriptor([...path, field]) !== null;
+    })
+    .map((descriptor) => {
+      const childPath = [...path, descriptor.pattern.at(-1)];
+      return renderSlotTemplate(
+        childPath,
+        configurationSlotDescriptor(childPath),
+        "add",
+        context,
+      );
+    })
+    .join("");
+}
+
 function slotActions(path, value, context) {
   const slot = configurationSlotDescriptor(path);
   if (!slot) return "";
@@ -360,7 +387,7 @@ function renderNode(value, path, context) {
   return `<section class="configuration-structured-node" data-configuration-node="${pathAttribute(path)}">
     ${path.length > 0 ? `<h3>${escapeHtml(label)}</h3>` : ""}
     ${slotActions(path, value, context)}
-    <div class="configuration-structured-grid">${children}${optionalCollections(path, value, context)}</div>
+    <div class="configuration-structured-grid">${children}${optionalCollections(path, value, context)}${optionalSlots(path, value, context)}</div>
   </section>`;
 }
 

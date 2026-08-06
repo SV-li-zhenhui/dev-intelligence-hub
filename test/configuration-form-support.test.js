@@ -304,6 +304,16 @@ function representativeConfiguration() {
   });
 }
 
+function configurationWithGitHeadSnapshot() {
+  const configuration = structuredClone(representativeConfiguration());
+  configuration.codeExecutor.gitCommand =
+    "C:/Program Files/Git/mingw64/bin/git.exe";
+  configuration.codeExecutor.gitTimeoutMs = 30_000;
+  configuration.codeExecutor.workspaces[0].gitHeadSnapshot = true;
+  configuration.codeExecutor.workspaces[1].gitHeadSnapshot = false;
+  return configuration;
+}
+
 function assertDeepFrozen(value) {
   if (value === null || typeof value !== "object") return;
   assert.equal(Object.isFrozen(value), true);
@@ -326,6 +336,223 @@ test("a complete supported configuration round-trips without losing fields", () 
   assert.notStrictEqual(result.configuration, configuration);
   assertDeepFrozen(state);
   assertDeepFrozen(result);
+});
+
+test("Git Head snapshot scalar fields round-trip and remain directly editable", () => {
+  const configuration = configurationWithGitHeadSnapshot();
+  let state = createConfigurationFormState(configuration);
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "gitCommand"],
+    kind: "text",
+    rawValue: "D:/Tools/Git/mingw64/bin/git.exe",
+  });
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "gitTimeoutMs"],
+    kind: "integer",
+    rawValue: "45000",
+  });
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "workspaces", 1, "gitHeadSnapshot"],
+    kind: "boolean",
+    rawValue: true,
+  });
+
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.configuration.codeExecutor.gitCommand,
+    "D:/Tools/Git/mingw64/bin/git.exe",
+  );
+  assert.equal(result.configuration.codeExecutor.gitTimeoutMs, 45_000);
+  assert.equal(
+    result.configuration.codeExecutor.workspaces[1].gitHeadSnapshot,
+    true,
+  );
+  assert.deepEqual(
+    normalizeConfigurationDocument(result.configuration),
+    result.configuration,
+  );
+});
+
+test("old configurations can add and remove Git Head snapshot fields without JSON", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  let state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["codeExecutor", "gitCommand"],
+    value: configurationStructureTemplate(["codeExecutor", "gitCommand"]).value,
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "gitTimeoutMs"],
+    value: configurationStructureTemplate(["codeExecutor", "gitTimeoutMs"]).value,
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "workspaces", 0, "gitHeadSnapshot"],
+    value: configurationStructureTemplate([
+      "codeExecutor",
+      "workspaces",
+      0,
+      "gitHeadSnapshot",
+    ]).value,
+  });
+
+  let result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.configuration.codeExecutor.gitCommand,
+    "C:/Program Files/Git/mingw64/bin/git.exe",
+  );
+  assert.equal(result.configuration.codeExecutor.gitTimeoutMs, 30_000);
+  assert.equal(
+    result.configuration.codeExecutor.workspaces[0].gitHeadSnapshot,
+    true,
+  );
+  assert.equal(Object.hasOwn(initial.baseDocument.codeExecutor, "gitCommand"), false);
+
+  state = applyConfigurationStructureOperation(state, {
+    operation: "remove",
+    path: ["codeExecutor", "gitCommand"],
+  });
+  result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.issues.some(
+      ({ path, code }) =>
+        path === "codeExecutor.gitCommand" && code === "INCOMPLETE_CONFIGURATION",
+    ),
+    true,
+  );
+
+  state = applyConfigurationStructureOperation(state, {
+    operation: "remove",
+    path: ["codeExecutor", "workspaces", 0, "gitHeadSnapshot"],
+  });
+  result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.equal(Object.hasOwn(result.configuration.codeExecutor, "gitCommand"), false);
+  assert.equal(
+    Object.hasOwn(
+      result.configuration.codeExecutor.workspaces[0],
+      "gitHeadSnapshot",
+    ),
+    false,
+  );
+});
+
+test("Git Head snapshot structure operations keep exact paths and scalar types", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  assert.throws(
+    () =>
+      applyConfigurationStructureOperation(initial, {
+        operation: "add",
+        path: ["codeExecutor", "workspaces", 0, "futureSnapshot"],
+        value: true,
+      }),
+    /allowlist|editable collection/i,
+  );
+
+  const withCommand = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["codeExecutor", "gitCommand"],
+    value: "C:/Program Files/Git/mingw64/bin/git.exe",
+  });
+  assert.throws(
+    () =>
+      applyConfigurationStructureOperation(withCommand, {
+        operation: "add",
+        path: ["codeExecutor", "gitCommand"],
+        value: "D:/Git/bin/git.exe",
+      }),
+    /already exists/i,
+  );
+
+  const wrongType = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["codeExecutor", "workspaces", 0, "gitHeadSnapshot"],
+    value: "true",
+  });
+  const invalid = configurationDocumentFromForm(wrongType);
+  assert.equal(invalid.ok, false);
+  assert.equal(
+    invalid.issues.some(
+      ({ path }) =>
+        path === "codeExecutor.workspaces.0.gitHeadSnapshot",
+    ),
+    true,
+  );
+
+  let edited = createConfigurationFormState(configurationWithGitHeadSnapshot());
+  edited = setConfigurationFormField(edited, {
+    path: ["codeExecutor", "gitCommand"],
+    kind: "text",
+    rawValue: "D:/Edited/Git/mingw64/bin/git.exe",
+  });
+  edited = applyConfigurationStructureOperation(edited, {
+    operation: "remove",
+    path: ["codeExecutor", "gitCommand"],
+  });
+  assert.equal(edited.edits.length, 0);
+  edited = applyConfigurationStructureOperation(edited, {
+    operation: "add",
+    path: ["codeExecutor", "gitCommand"],
+    value: "D:/Readded/Git/mingw64/bin/git.exe",
+  });
+  assert.equal(
+    configurationDocumentFromForm(edited).configuration.codeExecutor.gitCommand,
+    "D:/Readded/Git/mingw64/bin/git.exe",
+  );
+
+  let replaced = createConfigurationFormState(configurationWithGitHeadSnapshot());
+  replaced = setConfigurationFormField(replaced, {
+    path: ["codeExecutor", "gitCommand"],
+    kind: "text",
+    rawValue: "D:/Edited/Git/mingw64/bin/git.exe",
+  });
+  replaced = applyConfigurationStructureOperation(replaced, {
+    operation: "replace",
+    path: ["codeExecutor", "gitCommand"],
+    value: "D:/Replaced/Git/mingw64/bin/git.exe",
+  });
+  assert.equal(replaced.edits.length, 0);
+  assert.equal(
+    configurationDocumentFromForm(replaced).configuration.codeExecutor.gitCommand,
+    "D:/Replaced/Git/mingw64/bin/git.exe",
+  );
+});
+
+test("Git Head snapshot form rejects the Git for Windows wrapper path", () => {
+  let state = createConfigurationFormState(configurationWithGitHeadSnapshot());
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "gitCommand"],
+    kind: "text",
+    rawValue: "C:/Program Files/Git/cmd/git.exe",
+  });
+
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.issues.some(
+      ({ path, code }) =>
+        path === "codeExecutor.gitCommand" && code === "UNSAFE_GIT_WRAPPER",
+    ),
+    true,
+  );
+
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "gitCommand"],
+    kind: "text",
+    rawValue: "tools/mingw64/bin/git.exe",
+  });
+  const relative = configurationDocumentFromForm(state);
+  assert.equal(relative.ok, false);
+  assert.equal(
+    relative.issues.some(
+      ({ path, code }) =>
+        path === "codeExecutor.gitCommand" && code === "RELATIVE_GIT_COMMAND",
+    ),
+    true,
+  );
 });
 
 test("form saves reject remote legacy brains but accept remote role and memory brains", () => {

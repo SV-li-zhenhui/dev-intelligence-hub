@@ -4,7 +4,10 @@ import {
   removeConfigurationEntity,
   setConfigurationFormField,
 } from "./configuration-form-support.js";
-import { configurationStructureTemplate } from "./configuration-form-schema.js";
+import {
+  configurationCollectionDescriptor,
+  configurationStructureTemplate,
+} from "./configuration-form-schema.js";
 
 const EDIT_KINDS = new Set(["text", "integer", "number", "boolean", "scalar"]);
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -341,8 +344,17 @@ function structureFocusTarget(state, operation) {
     });
   }
   if (operation.operation === "add") {
-    const collection = valueAtPath(materializedConfiguration(state), path);
-    if (Array.isArray(collection)) {
+    const collectionDescriptor = configurationCollectionDescriptor(path);
+    if (collectionDescriptor?.kind === "array") {
+      const configuration = materializedConfiguration(state);
+      const parent = valueAtPath(configuration, path.slice(0, -1));
+      const field = path.at(-1);
+      let collection = [];
+      if (Object.hasOwn(parent, field)) {
+        collection = parent[field];
+      } else if (!collectionDescriptor.optional) {
+        collection = valueAtPath(configuration, path);
+      }
       return Object.freeze({
         scope: "entry",
         path: Object.freeze([...path, `${collection.length}`]),

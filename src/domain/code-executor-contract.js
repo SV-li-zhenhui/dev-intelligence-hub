@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const CONTROL_CHARACTER = /\p{Cc}/u;
 
 const ACTION_KEYS = Object.freeze({
@@ -139,13 +141,34 @@ function normalizeRequestedBy(value) {
   };
 }
 
+function normalizeInputBinding(value) {
+  if (value === null) return null;
+  let binding;
+  try {
+    binding = normalizePullRequestExecutionBinding(
+      value,
+      invalidRequest(),
+    );
+  } catch {
+    throw invalidRequest();
+  }
+  if (!GIT_OID.test(binding.headRefOid)) throw invalidRequest();
+  return binding;
+}
+
 export function normalizeStartRequest(value) {
   return normalize(() => {
-    assertExactKeys(value, ["sessionId", "workspaceId", "requestedBy"]);
+    assertExactKeys(value, [
+      "sessionId",
+      "workspaceId",
+      "requestedBy",
+      "inputBinding",
+    ]);
     return {
       sessionId: assertSafeId(value.sessionId),
       workspaceId: assertSafeId(value.workspaceId),
       requestedBy: normalizeRequestedBy(value.requestedBy),
+      inputBinding: normalizeInputBinding(value.inputBinding),
     };
   });
 }
@@ -230,8 +253,11 @@ export function normalizeRuntimeOptions(value = {}) {
 
 export function normalizeResumeRequest(value) {
   return normalize(() => {
-    assertExactKeys(value, ["sessionId"]);
-    return { sessionId: assertSafeId(value.sessionId) };
+    assertExactKeys(value, ["sessionId", "inputBinding"]);
+    return {
+      sessionId: assertSafeId(value.sessionId),
+      inputBinding: normalizeInputBinding(value.inputBinding),
+    };
   });
 }
 

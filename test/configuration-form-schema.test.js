@@ -18,6 +18,8 @@ function extendedConfiguration() {
   const configuration = JSON.parse(configurationText);
   configuration.codeExecutor = {
     enabled: false,
+    gitCommand: "C:/Program Files/Git/mingw64/bin/git.exe",
+    gitTimeoutMs: 30_000,
     docker: {
       executable: "docker",
       host: "npipe:////./pipe/docker_engine",
@@ -26,6 +28,7 @@ function extendedConfiguration() {
       {
         id: "dashboard",
         sourceRoot: "D:/claude/MyDashboard",
+        gitHeadSnapshot: true,
         writablePaths: ["public"],
         excludePaths: ["node_modules"],
       },
@@ -154,6 +157,60 @@ test("schema identifies enum, numeric, boolean and environment-reference control
   assert.equal(
     configurationFieldDescriptor(["memory", "enabled"], true).control,
     "checkbox",
+  );
+  const gitCommand = configurationFieldDescriptor(
+    ["codeExecutor", "gitCommand"],
+    "C:/Program Files/Git/mingw64/bin/git.exe",
+  );
+  assert.equal(gitCommand.control, "text");
+  assert.equal(gitCommand.kind, "text");
+  assert.equal(gitCommand.maximumBytes, 4_096);
+  const gitTimeout = configurationFieldDescriptor(
+    ["codeExecutor", "gitTimeoutMs"],
+    30_000,
+  );
+  assert.equal(gitTimeout.control, "number");
+  assert.equal(gitTimeout.kind, "integer");
+  assert.equal(gitTimeout.minimum, 1);
+  assert.equal(gitTimeout.maximum, 60_000);
+  const gitHeadSnapshot = configurationFieldDescriptor(
+    ["codeExecutor", "workspaces", 0, "gitHeadSnapshot"],
+    true,
+  );
+  assert.equal(gitHeadSnapshot.control, "checkbox");
+  assert.equal(gitHeadSnapshot.kind, "boolean");
+});
+
+test("Git Head snapshot fields expose safe scalar templates for old configurations", () => {
+  assert.deepEqual(
+    configurationStructureTemplate(["codeExecutor", "gitCommand"]),
+    {
+      kind: "slot",
+      value: "C:/Program Files/Git/mingw64/bin/git.exe",
+    },
+  );
+  assert.deepEqual(
+    configurationStructureTemplate(["codeExecutor", "gitTimeoutMs"]),
+    { kind: "slot", value: 30_000 },
+  );
+  assert.deepEqual(
+    configurationStructureTemplate([
+      "codeExecutor",
+      "workspaces",
+      0,
+      "gitHeadSnapshot",
+    ]),
+    { kind: "slot", value: true },
+  );
+  assert.deepEqual(
+    configurationStructureTemplate(["codeExecutor", "workspaces"]).value,
+    {
+      id: "workspace-id",
+      sourceRoot: ".",
+      gitHeadSnapshot: false,
+      writablePaths: [],
+      excludePaths: [],
+    },
   );
 });
 

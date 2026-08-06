@@ -1,5 +1,16 @@
 # Validation notes
 
+## 2026-08-06 — U9 fixed-Head execution foundation
+
+- Complete regression: `npm test` passed 1925/1929 with zero failures; four skips are platform- or opt-in-specific. The focused fixed-Head suite passed 235/237 with two platform skips, and the real Windows Git integration passed.
+- Exact-source binding: PR code proposals, confirmations, capability grants, Code Jobs, executor recovery and cancellation now carry the same canonical repository, PR number and 40/64-character Head OID. Any mismatch fails before a workspace side effect.
+- Safe materialization: the executor reads the approved commit directly from a local Git object database into an isolated workspace. It does not checkout the user's working tree, run hooks or filters, fetch from a network, follow alternate object stores, or accept a Windows Git wrapper in place of the pinned implementation binary.
+- Independent boundary checks: the workspace broker revalidates executable identity, repository/object-directory boundaries, every materialized path, hash, size, Git mode, file count and total bytes before exposing the workspace to the executor.
+- Real integration result: a synthetic repository proved that the materialized source remains the sealed older Head after both the branch Head and dirty working tree change; executable files retain logical Git mode and hostile hooks/filters are not invoked.
+- Review result: three independent reviews found no P0/P1 in this foundation. One U10 residual remains: a Windows file lock can leave a failed workspace that is explicitly detectable and manually discardable, but automatic persistent orphan reconciliation is not implemented yet. Object-database scan deadline/receipt reuse is also retained as a scale optimization.
+- Scope boundary: this foundation does not yet implement trusted base-commit capture, merge/conflict inspection, conflict-resolution semantics, commit creation, remote update or GitHub write. Real PR #23178 was deliberately not submitted to the system and was not inspected or modified manually.
+- Delivery policy: all changes and commits remain local. No GitHub push, PR creation, branch update, merge, Review or comment was performed.
+
 ## 2026-08-03 — Stage 7 controlled code delivery loop
 
 - Complete regression: `npm test` passed 1112/1114 with zero failures; the two skips are host-unavailable Windows symbolic-link cases. Focused ledger, end-to-end, and restart recovery checks passed 51/51 after the final review fix.

@@ -1,3 +1,5 @@
+import nodePath from "node:path";
+
 import {
   normalizeWorkspacePath,
   validateWorkspaceId,
@@ -25,6 +27,15 @@ const SECRET_REFERENCE = /(?:Env|Ref)$/;
 const SECRET_VALUE =
   /(?:^|\s)(?:bearer\s+|gh[opusr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/i;
 const URL_USERINFO = /:\/\/[^/@\s:]+:[^/@\s]+@/;
+
+function isTrustedWindowsGitImplementation(value) {
+  if (process.platform !== "win32") return true;
+  const normalized = value.replaceAll("\\", "/").toLowerCase();
+  return (
+    /^[a-z]:\//u.test(normalized) &&
+    /\/mingw(?:32|64)\/bin\/git\.exe$/u.test(normalized)
+  );
+}
 
 const TOP_LEVEL_FIELDS = Object.freeze([
   "port",
@@ -594,6 +605,8 @@ function normalizeCodeExecutor(value) {
     [
       "enabled",
       "docker",
+      "gitCommand",
+      "gitTimeoutMs",
       "workspaces",
       "profiles",
       "requiredProfilesByWorkspace",
@@ -612,7 +625,15 @@ function normalizeCodeExecutor(value) {
   ) {
     throw invalid(path, "启用后缺少执行器边界配置");
   }
-  const normalized = { enabled };
+  const normalized = {
+    enabled,
+    ...optional(config, "gitCommand", (entry) =>
+      text(entry, `${path}.gitCommand`, 4_096),
+    ),
+    ...optional(config, "gitTimeoutMs", (entry) =>
+      integer(entry, `${path}.gitTimeoutMs`, 1, 60_000),
+    ),
+  };
   if (Object.hasOwn(config, "docker")) {
     const docker = fields(
       config.docker,
@@ -639,7 +660,13 @@ function normalizeCodeExecutor(value) {
       const item = fields(
         workspace,
         itemPath,
-        ["id", "sourceRoot", "writablePaths", "excludePaths"],
+        [
+          "id",
+          "sourceRoot",
+          "writablePaths",
+          "excludePaths",
+          "gitHeadSnapshot",
+        ],
         ["id", "sourceRoot"],
       );
       let id;
@@ -668,10 +695,31 @@ function normalizeCodeExecutor(value) {
         sourceRoot: text(item.sourceRoot, `${itemPath}.sourceRoot`, 4_096),
         ...optional(item, "writablePaths", () => normalizePaths("writablePaths")),
         ...optional(item, "excludePaths", () => normalizePaths("excludePaths")),
+        ...optional(item, "gitHeadSnapshot", (entry) =>
+          boolean(entry, `${itemPath}.gitHeadSnapshot`),
+        ),
       };
     });
     if (enabled && normalized.workspaces.length === 0) {
       throw invalid(`${path}.workspaces`, "启用后不能为空");
+    }
+    const usesGitHeadSnapshot = normalized.workspaces.some(
+      (workspace) => workspace.gitHeadSnapshot,
+    );
+    if (usesGitHeadSnapshot && !Object.hasOwn(normalized, "gitCommand")) {
+      throw invalid(`${path}.gitCommand`, "Git Head 快照启用后不能为空");
+    }
+    if (usesGitHeadSnapshot && !nodePath.isAbsolute(normalized.gitCommand)) {
+      throw invalid(`${path}.gitCommand`, "Git Head 快照命令必须是绝对路径");
+    }
+    if (
+      usesGitHeadSnapshot &&
+      !isTrustedWindowsGitImplementation(normalized.gitCommand)
+    ) {
+      throw invalid(
+        `${path}.gitCommand`,
+        "Windows Git Head 快照必须直接使用 mingw64/bin/git.exe 实现",
+      );
     }
   }
   const profileIds = new Set();
@@ -745,6 +793,7 @@ function normalizeCodeExecutor(value) {
     optional(config, "brokerLimits", () =>
       normalizeLimits("brokerLimits", [
         "maxFiles",
+        "maxDirectories",
         "maxFileBytes",
         "maxTotalBytes",
         "maxSearchMatches",

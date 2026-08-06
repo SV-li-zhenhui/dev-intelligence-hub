@@ -380,6 +380,43 @@ try {
 
   assert.equal(await page.locator(".configuration-editor textarea").count(), 0);
 
+  let gitCommandTemplate = await openDetailsBySummary(
+    page,
+    "新增固定 Git 命令",
+  );
+  await templateField(
+    gitCommandTemplate,
+    ["codeExecutor", "gitCommand"],
+  ).fill("C:/Program Files/Git/mingw64/bin/git.exe");
+  await gitCommandTemplate
+    .getByRole("button", { name: "新增固定 Git 命令" })
+    .click();
+  assert.equal(
+    await field(page, ["codeExecutor", "gitCommand"]).inputValue(),
+    "C:/Program Files/Git/mingw64/bin/git.exe",
+  );
+  assert.equal(
+    await page.evaluate(
+      () => document.activeElement?.dataset?.configurationField,
+    ),
+    JSON.stringify(["codeExecutor", "gitCommand"]),
+  );
+  await page.getByRole("button", { name: "删除固定 Git 命令" }).click();
+  assert.equal(await field(page, ["codeExecutor", "gitCommand"]).count(), 0);
+  gitCommandTemplate = page
+    .locator("summary")
+    .filter({ hasText: "新增固定 Git 命令" });
+  assert.equal(await gitCommandTemplate.count(), 1);
+  assert.equal(
+    await page.evaluate(
+      () =>
+        document.activeElement
+          ?.closest("[data-configuration-template-value-root]")
+          ?.dataset?.configurationTemplateValueRoot,
+    ),
+    JSON.stringify(["codeExecutor", "gitCommand"]),
+  );
+
   const providerCollection = attributeLocator(
     page,
     "data-configuration-collection",

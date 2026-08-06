@@ -81,6 +81,149 @@ test("unknown and dangerous fields are rejected even below a disabled feature", 
   assertInvalid(dangerous);
 });
 
+test("Git Head snapshot configuration is opt-in and preserves legacy workspaces", () => {
+  const legacy = document();
+  legacy.codeExecutor = {
+    enabled: false,
+    workspaces: [{ id: "dashboard", sourceRoot: "dashboard" }],
+  };
+  assert.deepEqual(normalizeConfigurationDocument(legacy).codeExecutor, {
+    enabled: false,
+    workspaces: [{ id: "dashboard", sourceRoot: "dashboard" }],
+  });
+
+  const optedIn = structuredClone(legacy);
+  optedIn.codeExecutor.gitCommand =
+    "C:\\Program Files\\Git\\mingw64\\bin\\git.exe";
+  optedIn.codeExecutor.gitTimeoutMs = 30_000;
+  optedIn.codeExecutor.workspaces[0].gitHeadSnapshot = true;
+
+  assert.deepEqual(normalizeConfigurationDocument(optedIn).codeExecutor, {
+    enabled: false,
+    gitCommand: "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    gitTimeoutMs: 30_000,
+    workspaces: [
+      {
+        id: "dashboard",
+        sourceRoot: "dashboard",
+        gitHeadSnapshot: true,
+      },
+    ],
+  });
+});
+
+test("Git Head snapshot workspaces require a bounded Git configuration", () => {
+  const missingCommand = document();
+  missingCommand.codeExecutor = {
+    enabled: false,
+    workspaces: [
+      {
+        id: "dashboard",
+        sourceRoot: "dashboard",
+        gitHeadSnapshot: true,
+      },
+    ],
+  };
+  assertInvalid(missingCommand);
+
+  for (const timeout of [1, 60_000]) {
+    const boundary = document();
+    boundary.codeExecutor.gitTimeoutMs = timeout;
+    assert.equal(
+      normalizeConfigurationDocument(boundary).codeExecutor.gitTimeoutMs,
+      timeout,
+    );
+  }
+
+  for (const timeout of [0, 60_001, 1.5]) {
+    const invalidTimeout = document();
+    invalidTimeout.codeExecutor.gitTimeoutMs = timeout;
+    assertInvalid(invalidTimeout);
+  }
+
+  const blankCommand = document();
+  blankCommand.codeExecutor.gitCommand = "   ";
+  assertInvalid(blankCommand);
+
+  const invalidFlag = structuredClone(missingCommand);
+  invalidFlag.codeExecutor.gitCommand = "git";
+  invalidFlag.codeExecutor.workspaces[0].gitHeadSnapshot = "true";
+  assertInvalid(invalidFlag);
+
+  const relativeCommand = structuredClone(missingCommand);
+  relativeCommand.codeExecutor.gitCommand = "tools/mingw64/bin/git.exe";
+  assertInvalid(relativeCommand);
+});
+
+test("Windows Git Head snapshots reject wrapper executables before activation", () => {
+  if (process.platform !== "win32") return;
+  const wrapper = document();
+  wrapper.codeExecutor = {
+    enabled: false,
+    gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe",
+    workspaces: [{
+      id: "dashboard",
+      sourceRoot: "dashboard",
+      gitHeadSnapshot: true,
+    }],
+  };
+  assert.throws(
+    () => normalizeConfigurationDocument(wrapper),
+    (error) =>
+      error instanceof ConfigurationContractError &&
+      error.code === "INVALID_CONFIGURATION_DOCUMENT" &&
+      error.message.startsWith("codeExecutor.gitCommand "),
+  );
+
+});
+
+test("Git Head snapshot fields retain strict data-only boundaries", () => {
+  const extra = document();
+  extra.codeExecutor = {
+    enabled: false,
+    gitCommand: "git",
+    workspaces: [
+      {
+        id: "dashboard",
+        sourceRoot: "dashboard",
+        gitHeadSnapshot: true,
+        gitRevision: "HEAD",
+      },
+    ],
+  };
+  assertInvalid(extra);
+
+  for (const accessorPath of ["gitCommand", "gitHeadSnapshot"]) {
+    const accessor = document();
+    accessor.codeExecutor = {
+      enabled: false,
+      gitCommand: "git",
+      workspaces: [
+        {
+          id: "dashboard",
+          sourceRoot: "dashboard",
+          gitHeadSnapshot: true,
+        },
+      ],
+    };
+    const target =
+      accessorPath === "gitCommand"
+        ? accessor.codeExecutor
+        : accessor.codeExecutor.workspaces[0];
+    let getterCalls = 0;
+    Object.defineProperty(target, accessorPath, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return accessorPath === "gitCommand" ? "git" : true;
+      },
+    });
+
+    assertInvalid(accessor);
+    assert.equal(getterCalls, 0);
+  }
+});
+
 test("accessors, symbols, and abnormal prototypes are rejected without invoking them", () => {
   const accessor = document();
   let getterCalls = 0;

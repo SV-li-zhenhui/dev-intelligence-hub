@@ -87,6 +87,7 @@ const LABELS = deepFreeze({
   maxArtifactBytes: "最大产物字节数",
   id: "标识",
   sourceRoot: "源码根目录",
+  gitHeadSnapshot: "Git Head 固定快照",
   writablePaths: "可写路径",
   excludePaths: "排除路径",
   kind: "类型",
@@ -208,6 +209,7 @@ const INTEGER_FIELDS = deepFreeze([
   { pattern: ["workflowRouting", "maxHops"], minimum: 1, maximum: 32 },
   { pattern: ["workflowRouting", "rules", "#", "priority"], minimum: -10_000, maximum: 10_000 },
   { pattern: ["codeExecutor", "profiles", "*", "timeoutMs"], minimum: 1_000, maximum: 600_000 },
+  { pattern: ["codeExecutor", "gitTimeoutMs"], minimum: 1, maximum: 60_000 },
   { pattern: ["codeExecutor", "brokerLimits", "*"], minimum: 1, maximum: 2 ** 31 - 1 },
   { pattern: ["codeExecutor", "executorLimits", "*"], minimum: 1, maximum: 2 ** 31 - 1 },
   { pattern: ["codeExecutor", "maxArtifactBytes"], minimum: 1, maximum: 2 ** 31 - 1 },
@@ -269,6 +271,7 @@ const INTEGER_FIELDS = deepFreeze([
 
 const FIELD_RULES = deepFreeze([
   { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
+  { pattern: ["codeExecutor", "workspaces", "#", "gitHeadSnapshot"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "initialPaused"], control: "checkbox", kind: "boolean" },
   { pattern: ["employees", "prReviewer", "allowRemoteCodeContext"], control: "checkbox", kind: "boolean" },
   { pattern: ["brainProviders", "*", "remote"], control: "checkbox", kind: "boolean" },
@@ -306,6 +309,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["githubActions", "ghCommand"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["githubActions", "networkEnv", "*"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["changePackages", "gitCommand"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "gitCommand"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["trackedRepositories", "#"], kind: "text", format: "repository", maximumBytes: 256 },
   { pattern: ["workCoordination", "policy", "capabilityRoles", "*"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "githubReviewRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
@@ -392,6 +396,27 @@ const COLLECTIONS = deepFreeze([
 ]);
 
 const SLOTS = deepFreeze([
+  {
+    pattern: ["codeExecutor", "gitCommand"],
+    label: "固定 Git 命令",
+    template: "code-executor-git-command",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
+    pattern: ["codeExecutor", "gitTimeoutMs"],
+    label: "Git 超时（毫秒）",
+    template: "code-executor-git-timeout",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
+    pattern: ["codeExecutor", "workspaces", "#", "gitHeadSnapshot"],
+    label: "Git Head 固定快照",
+    template: "workspace-git-head-snapshot",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
   { pattern: ["workflowRouting", "rules", "#", "condition"], label: "匹配条件", template: "condition", nullable: true, operations: ["add", "remove", "replace"] },
   { pattern: ["workflowRouting", "rules", "#", "condition", "**", "condition"], label: "子条件", template: "condition", nullable: false, operations: ["replace"] },
 ]);
@@ -441,7 +466,16 @@ const TEMPLATES = deepFreeze({
   },
   intent: "ask_user",
   "retry-minute": 5,
-  workspace: { id: "workspace-id", sourceRoot: ".", writablePaths: [], excludePaths: [] },
+  workspace: {
+    id: "workspace-id",
+    sourceRoot: ".",
+    gitHeadSnapshot: false,
+    writablePaths: [],
+    excludePaths: [],
+  },
+  "code-executor-git-command": "C:/Program Files/Git/mingw64/bin/git.exe",
+  "code-executor-git-timeout": 30_000,
+  "workspace-git-head-snapshot": true,
   "workspace-path": "src",
   profile: { kind: "node-test", image: `node:22-alpine@sha256:${"0".repeat(64)}`, timeoutMs: 120_000 },
   "profile-binding": ["profile-id"],

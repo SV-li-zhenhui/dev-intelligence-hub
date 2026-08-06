@@ -16,6 +16,24 @@ const REVISION_B = "b".repeat(64);
 const FILE_SHA = "c".repeat(64);
 const PROFILE_DIGEST = "d".repeat(64);
 
+function pullRequestInputBinding(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/dashboard",
+    pullRequestNumber: 42,
+    rootItemId: "github:acme/dashboard:pull-request:42",
+    workKey: "pr-work-42",
+    inputRevision: 3,
+    headRevision: 2,
+    headRefOid: "1".repeat(40),
+    eventId: "pull-request-event-42",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+    ...overrides,
+  };
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise((settle) => {
@@ -467,6 +485,9 @@ class FakeExecutor {
       id: jobValue.jobId,
       workspaceId: jobValue.grant.workspaceId,
       requestedBy: structuredClone(jobValue.grant.requestedBy),
+      inputBinding: Object.hasOwn(jobValue.grant, "inputBinding")
+        ? structuredClone(jobValue.grant.inputBinding)
+        : null,
       status: sessionStatus,
       workspaceRevision: REVISION_A,
       requiredProfiles: jobValue.grant.requiredProfiles.map(({ id }) => id),
@@ -756,6 +777,15 @@ test("a queued job is started and one semantic action is durably executed", asyn
   assert.match(performed.actionId, /^action-[a-f0-9]{55}$/);
   assert.equal(performed.expectedWorkspaceRevision, REVISION_A);
   const startIndex = events.indexOf("executor.start");
+  assert.deepEqual(
+    executor.calls.find(({ method }) => method === "start").value,
+    {
+      sessionId: initial.jobId,
+      workspaceId: initial.grant.workspaceId,
+      requestedBy: initial.grant.requestedBy,
+      inputBinding: null,
+    },
+  );
   const startAdmissionEnter = events.lastIndexOf(
     "admission-gate-enter",
     startIndex,
@@ -799,6 +829,281 @@ test("a queued job is started and one semantic action is durably executed", asyn
     "observations",
   ]);
   assert.equal(JSON.stringify(brainCalls[0]).includes("workspaceRevision"), false);
+});
+
+test("worker forwards an exact PR input binding when starting a session", async () => {
+  const inputBinding = pullRequestInputBinding();
+  const initial = job({ grant: grant({ inputBinding }) });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "read_text", path: "src/app.js" }]),
+    grantVerifier: verifier([]),
+  });
+
+  await worker.runCycle({ limit: 1, roleId: "developer" });
+
+  assert.deepEqual(
+    executor.calls.find(({ method }) => method === "start").value.inputBinding,
+    inputBinding,
+  );
+});
+
+test("session input binding tampering fences before brain or executor actions", async (t) => {
+  const cases = [
+    ["missing", (session) => delete session.inputBinding],
+    ["repository", (session) => {
+      session.inputBinding.repository = "acme/other";
+    }],
+    ["pull request", (session) => {
+      session.inputBinding.pullRequestNumber += 1;
+    }],
+    ["Head", (session) => {
+      session.inputBinding.headRefOid = "4".repeat(40);
+    }],
+    ["event", (session) => {
+      session.inputBinding.eventId = "pull-request-event-foreign";
+    }],
+  ];
+
+  for (const [name, tamper] of cases) {
+    await t.test(name, async () => {
+      const inputBinding = pullRequestInputBinding();
+      const initial = job({
+        grant: grant({ inputBinding }),
+        status: "active",
+        revision: 3,
+        execution: {
+          sessionId: job().jobId,
+          workspaceRevision: REVISION_A,
+          turn: 0,
+          pendingAction: null,
+          actionAdmission: null,
+          observations: [],
+          result: null,
+          pause: null,
+          uncertainty: null,
+        },
+      });
+      const store = new FakeJobStore([initial]);
+      const executor = new FakeExecutor(initial);
+      tamper(executor.session);
+      const brainCalls = [];
+      const worker = new CodeJobWorkerService({
+        jobStore: store,
+        executor,
+        brainDirectory: brain(
+          [{ type: "read_text", path: "src/app.js" }],
+          brainCalls,
+        ),
+        grantVerifier: verifier([]),
+      });
+
+      const result = await worker.runCycle({ limit: 1, roleId: "developer" });
+
+      assert.equal(result.outcomes[0].status, "fenced");
+      assert.equal(
+        result.outcomes[0].code,
+        "CODE_JOB_SESSION_BINDING_INVALID",
+      );
+      assert.equal(brainCalls.length, 0);
+      assert.equal(
+        executor.calls.some(({ method }) => method === "perform"),
+        false,
+      );
+    });
+  }
+});
+
+test("failed, running, and absent executor results cannot bypass the PR Head fence", async (t) => {
+  const inputBinding = pullRequestInputBinding();
+
+  await t.test("failed session", async () => {
+    const initial = job({
+      grant: grant({ inputBinding }),
+      status: "active",
+      revision: 3,
+      execution: {
+        ...job().execution,
+        sessionId: job().jobId,
+        workspaceRevision: REVISION_A,
+      },
+    });
+    const store = new FakeJobStore([initial]);
+    const executor = new FakeExecutor(initial, [], { sessionStatus: "failed" });
+    executor.session.inputBinding.headRefOid = "4".repeat(40);
+    executor.session.error = { code: "FAILED", message: "wrong Head" };
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([]),
+      grantVerifier: verifier([]),
+    });
+
+    const result = await worker.runCycle();
+
+    assert.equal(result.outcomes[0].status, "fenced");
+    assert.equal(result.outcomes[0].code, "CODE_JOB_SESSION_BINDING_INVALID");
+  });
+
+  for (const status of ["running", "absent"]) {
+    await t.test(`${status} reconciliation`, async () => {
+      const action = {
+        type: "read_text",
+        actionId: `head-fence-${status}`,
+        expectedWorkspaceRevision: REVISION_A,
+        path: "src/app.js",
+      };
+      const actionDigest = digestValue(action);
+      const initial = job({
+        grant: grant({ inputBinding }),
+        status: "unknown",
+        revision: 7,
+        execution: {
+          ...job().execution,
+          sessionId: job().jobId,
+          workspaceRevision: REVISION_A,
+          pendingAction: {
+            turn: 1,
+            actionId: action.actionId,
+            actionDigest,
+            action,
+            preparedAt: "2026-08-01T00:00:01.000Z",
+          },
+          actionAdmission: {
+            actionId: action.actionId,
+            actionDigest,
+            epoch: 6,
+            admittedAt: "2026-08-01T00:00:01.500Z",
+          },
+          uncertainty: {
+            from: "active",
+            code: "AUDIT_BACKEND_UNAVAILABLE",
+            at: "2026-08-01T00:00:02.000Z",
+          },
+        },
+      });
+      const store = new FakeJobStore([initial]);
+      const executor = new FakeExecutor(initial);
+      executor.session.inputBinding.headRefOid = "5".repeat(40);
+      if (status === "running") {
+        executor.session.actions.push({
+          id: action.actionId,
+          type: action.type,
+          status: "running",
+          attemptNumber: 1,
+          workspaceRevisionBefore: REVISION_A,
+          workspaceRevisionAfter: null,
+          error: null,
+        });
+      }
+      const worker = new CodeJobWorkerService({
+        jobStore: store,
+        executor,
+        brainDirectory: brain([]),
+        grantVerifier: verifier([]),
+      });
+
+      const result = await worker.runCycle();
+
+      assert.equal(result.outcomes[0].status, "unknown");
+      assert.equal(
+        result.outcomes[0].code,
+        "CODE_JOB_SESSION_BINDING_INVALID",
+      );
+      assert.notEqual(
+        (await store.getForWorker(initial.jobId)).execution.actionAdmission,
+        null,
+      );
+      assert.equal(
+        executor.calls.some(({ method }) => method === "perform"),
+        false,
+      );
+    });
+  }
+});
+
+test("start and resume responses cannot change the sealed input binding", async (t) => {
+  const inputBinding = pullRequestInputBinding();
+
+  await t.test("start omits binding", async () => {
+    const initial = job({ grant: grant({ inputBinding }) });
+    const store = new FakeJobStore([initial]);
+    const executor = new FakeExecutor(initial);
+    delete executor.session.inputBinding;
+    const brainCalls = [];
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([], brainCalls),
+      grantVerifier: verifier([]),
+    });
+
+    const result = await worker.runCycle();
+
+    assert.equal(result.outcomes[0].status, "fenced");
+    assert.equal(
+      result.outcomes[0].code,
+      "CODE_JOB_SESSION_BINDING_INVALID",
+    );
+    assert.equal(brainCalls.length, 0);
+    assert.equal(
+      executor.calls.some(({ method }) => method === "perform"),
+      false,
+    );
+  });
+
+  await t.test("resume changes Head", async () => {
+    const initial = job({
+      grant: grant({ inputBinding }),
+      status: "starting",
+      revision: 2,
+      execution: {
+        sessionId: job().jobId,
+        workspaceRevision: null,
+        turn: 0,
+        pendingAction: null,
+        actionAdmission: null,
+        observations: [],
+        result: null,
+        pause: null,
+        uncertainty: null,
+      },
+    });
+    const store = new FakeJobStore([initial]);
+    const executor = new FakeExecutor(initial, [], {
+      sessionStatus: "interrupted",
+    });
+    executor.exists = true;
+    const resume = executor.resume.bind(executor);
+    executor.resume = async (value) => {
+      const session = await resume(value);
+      session.inputBinding.headRefOid = "5".repeat(40);
+      return session;
+    };
+    const brainCalls = [];
+    const worker = new CodeJobWorkerService({
+      jobStore: store,
+      executor,
+      brainDirectory: brain([], brainCalls),
+      grantVerifier: verifier([]),
+    });
+
+    const result = await worker.runCycle();
+
+    assert.equal(result.outcomes[0].status, "fenced");
+    assert.equal(
+      result.outcomes[0].code,
+      "CODE_JOB_SESSION_BINDING_INVALID",
+    );
+    assert.equal(brainCalls.length, 0);
+    assert.equal(
+      executor.calls.some(({ method }) => method === "perform"),
+      false,
+    );
+  });
 });
 
 test("durable admission is the authorization cutover for one immutable action", async () => {
@@ -1414,7 +1719,9 @@ test("interrupted action results retain admission until trusted reconciliation",
     await t.test(
       pauseDuringAction ? "pausing origin" : "active origin",
       async () => {
+        const inputBinding = pullRequestInputBinding();
         const initial = job({
+          grant: grant({ inputBinding }),
           status: "active",
           revision: 3,
           execution: {
@@ -1512,6 +1819,10 @@ test("interrupted action results retain admission until trusted reconciliation",
           executor.calls.filter(({ method }) => method === "resume").length,
           1,
         );
+        assert.deepEqual(
+          executor.calls.find(({ method }) => method === "resume").value,
+          { sessionId: initial.jobId, inputBinding },
+        );
         assert.equal(brainCalls.length, 1);
       },
     );
@@ -1605,6 +1916,10 @@ test("interrupted recovery converges after a lost resume acknowledgement", async
   assert.equal(
     executor.calls.filter(({ method }) => method === "resume").length,
     1,
+  );
+  assert.deepEqual(
+    executor.calls.find(({ method }) => method === "resume").value,
+    { sessionId: initial.jobId, inputBinding: null },
   );
   assert.equal(
     executor.calls.some(({ method }) => method === "perform"),
@@ -1985,6 +2300,7 @@ test("change package delivery defaults off and requires a strict boolean", async
 });
 
 test("resuming an interrupted session invalidates prior-attempt profile proof", async () => {
+  const inputBinding = pullRequestInputBinding();
   const oldProfileAction = {
     type: "run_profile",
     actionId: "profile-old-attempt",
@@ -1992,6 +2308,7 @@ test("resuming an interrupted session invalidates prior-attempt profile proof", 
     profileId: "node-tests",
   };
   const initial = job({
+    grant: grant({ inputBinding }),
     status: "active",
     revision: 5,
     execution: {
@@ -2023,7 +2340,10 @@ test("resuming an interrupted session invalidates prior-attempt profile proof", 
   assert.equal(brainCalls[0].capabilities.requiredProfilesRemaining, 1);
   const action = executor.calls.find(({ method }) => method === "perform").value.action;
   assert.equal(action.profileId, "node-tests");
-  assert.equal(executor.calls.some(({ method }) => method === "resume"), true);
+  assert.deepEqual(
+    executor.calls.find(({ method }) => method === "resume").value,
+    { sessionId: initial.jobId, inputBinding },
+  );
 });
 
 test("an uncertain audited result enters durable unknown and reconciles without replay", async () => {
@@ -2477,6 +2797,44 @@ test("a cancelled admitted action is reconciled without entering the executor", 
     executor.calls.some(({ method }) => method === "perform"),
     false,
   );
+});
+
+test("cancellation carries the sealed PR Head and rejects a mismatched settlement", async () => {
+  const inputBinding = pullRequestInputBinding();
+  const initial = job({
+    grant: grant({ inputBinding }),
+    status: "active",
+    revision: 3,
+    execution: {
+      ...job().execution,
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  await store.cancel({
+    jobId: initial.jobId,
+    expectedRevision: initial.revision,
+    reason: "cancel exact PR Head",
+  });
+  const executor = new FakeExecutor(initial);
+  executor.session.inputBinding.headRefOid = "6".repeat(40);
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([]),
+    grantVerifier: verifier([]),
+  });
+
+  const result = await worker.runCycle();
+  const request = executor.calls.find(
+    ({ method }) => method === "reconcileCancellation",
+  ).value;
+
+  assert.deepEqual(request.inputBinding, inputBinding);
+  assert.equal(result.outcomes[0].status, "cancelling");
+  assert.equal(result.outcomes[0].code, "CODE_JOB_SESSION_BINDING_INVALID");
+  assert.equal((await store.getForWorker(initial.jobId)).status, "cancelling");
 });
 
 test("durable cancellation aborts an in-flight action only as a best effort", async () => {

@@ -219,6 +219,29 @@ function startRequest(overrides = {}) {
     sessionId: "session-one",
     workspaceId: "dashboard",
     requestedBy: { roleId: "pr-reviewer", workItemId: "repo#1" },
+    inputBinding: null,
+    ...overrides,
+  };
+}
+
+function sessionRequest(sessionId, inputBinding = null) {
+  return { sessionId, inputBinding };
+}
+
+function pullRequestBinding(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "Example/Repository",
+    pullRequestNumber: 17,
+    rootItemId: "github:pr:Example/Repository#17",
+    workKey: "pr:Example/Repository#17",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "a".repeat(40),
+    eventId: "github-event-pr-17",
+    eventDigest: "b".repeat(64),
+    inputDigest: "c".repeat(64),
     ...overrides,
   };
 }
@@ -236,6 +259,7 @@ function actionRequest(session, action) {
 function cancellationRequest(session, overrides = {}) {
   return {
     sessionId: session.id,
+    inputBinding: structuredClone(session.inputBinding),
     cancellationDigest: digestValue({
       kind: "cancel-code-session",
       sessionId: session.id,
@@ -248,6 +272,10 @@ function cancellationRequest(session, overrides = {}) {
 
 function attemptExecutionIdFor(sessionId, number) {
   return `attempt-${digestValue({ number, sessionId }).slice(0, 24)}`;
+}
+
+function createDirectoryExecution(broker, request) {
+  return broker.createExecution({ ...request, inputBinding: null });
 }
 
 function attemptFile(setup, sessionId, number, relativePath = "src/app.js") {
@@ -386,6 +414,281 @@ test("startup recovery gates creation and create is idempotent", async (t) => {
       }),
     ),
     hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+});
+
+test("start persists the exact PR input binding and requires the broker to echo it", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const creationRequests = [];
+  const broker = overrideBroker(baseBroker, {
+    createExecution: async (request) => {
+      creationRequests.push(structuredClone(request));
+      const created = await createDirectoryExecution(baseBroker, request);
+      return {
+        ...created,
+        inputBinding: structuredClone(request.inputBinding),
+      };
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  const inputBinding = pullRequestBinding();
+  await executor.recover();
+
+  const created = await executor.start(startRequest({ inputBinding }));
+
+  assert.deepEqual(created.inputBinding, inputBinding);
+  assert.deepEqual(creationRequests, [
+    {
+      workspaceId: "dashboard",
+      executionId: attemptExecutionIdFor("session-one", 1),
+      inputBinding,
+    },
+  ]);
+  const stored = await setup.innerStore.read("code-executor-state");
+  assert.equal(stored.schemaVersion, 2);
+  assert.deepEqual(stored.sessions[created.id].inputBinding, inputBinding);
+  assert.equal(
+    stored.sessions[created.id].requestDigest,
+    digestValue({
+      workspaceId: "dashboard",
+      requestedBy: startRequest().requestedBy,
+      inputBinding,
+      requiredProfiles: stored.sessions[created.id].requiredProfiles,
+    }),
+  );
+  assert.deepEqual(await executor.view({ sessionId: created.id }), created);
+  await assert.rejects(
+    executor.view(sessionRequest(created.id, inputBinding)),
+    hasCode("INVALID_EXECUTION_REQUEST"),
+  );
+  assert.deepEqual(await executor.start(startRequest({ inputBinding })), created);
+  await assert.rejects(
+    executor.start(
+      startRequest({
+        inputBinding: pullRequestBinding({
+          headRevision: 2,
+          headRefOid: "d".repeat(40),
+        }),
+      }),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.equal(creationRequests.length, 1);
+});
+
+test("non-null PR input bindings fail closed when the broker omits its echo", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const broker = overrideBroker(baseBroker, {
+    createExecution: (request) => createDirectoryExecution(baseBroker, request),
+  });
+  const { executor } = setup.createExecutor({ broker });
+  await executor.recover();
+
+  await assert.rejects(
+    executor.start(startRequest({ inputBinding: pullRequestBinding() })),
+    hasCode("START_FAILED"),
+  );
+  const stored = await setup.innerStore.read("code-executor-state");
+  assert.equal(stored.sessions["session-one"].status, "failed");
+  assert.deepEqual(
+    stored.sessions["session-one"].inputBinding,
+    pullRequestBinding(),
+  );
+});
+
+test("persisted PR input bindings remain sealed by the session request digest", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const initial = setup.createExecutor({
+    broker: overrideBroker(baseBroker, {
+      createExecution: async (request) => ({
+        ...(await createDirectoryExecution(baseBroker, request)),
+        inputBinding: structuredClone(request.inputBinding),
+      }),
+    }),
+  });
+  await initial.executor.recover();
+  const active = await initial.executor.start(
+    startRequest({ inputBinding: pullRequestBinding() }),
+  );
+  const tampered = await setup.innerStore.read("code-executor-state");
+  tampered.sessions[active.id].inputBinding = pullRequestBinding({
+    headRevision: 2,
+    headRefOid: "d".repeat(40),
+  });
+  await setup.innerStore.write("code-executor-state", tampered);
+
+  const recovered = setup.createExecutor();
+  await assert.rejects(
+    recovered.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
+  );
+});
+
+test("resume rejects a changed PR binding before effects and forwards the persisted binding", async (t) => {
+  const setup = await fixture(t);
+  const inputBinding = pullRequestBinding();
+  const initialBroker = setup.createBroker();
+  const initial = setup.createExecutor({
+    broker: overrideBroker(initialBroker, {
+      createExecution: async (request) => ({
+        ...(await createDirectoryExecution(initialBroker, request)),
+        inputBinding: structuredClone(request.inputBinding),
+      }),
+    }),
+  });
+  await initial.executor.recover();
+  const active = await initial.executor.start(startRequest({ inputBinding }));
+
+  const recoverySandbox = new FakeSandbox();
+  const resumeRequests = [];
+  const resumeBaseBroker = setup.createBroker();
+  const recovered = setup.createExecutor({
+    nextSandbox: recoverySandbox,
+    broker: overrideBroker(resumeBaseBroker, {
+      createExecution: async (request) => {
+        resumeRequests.push(structuredClone(request));
+        return {
+          ...(await createDirectoryExecution(resumeBaseBroker, request)),
+          inputBinding: structuredClone(request.inputBinding),
+        };
+      },
+    }),
+  });
+  await recovered.executor.recover();
+  const cleanupCallsBeforeMismatch = recoverySandbox.cleanupCalls.length;
+
+  await assert.rejects(
+    recovered.executor.resume(
+      sessionRequest(
+        active.id,
+        pullRequestBinding({ headRevision: 2, headRefOid: "d".repeat(40) }),
+      ),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.equal(resumeRequests.length, 0);
+  assert.equal(recoverySandbox.cleanupCalls.length, cleanupCallsBeforeMismatch);
+
+  const resumed = await recovered.executor.resume(
+    sessionRequest(active.id, inputBinding),
+  );
+  assert.deepEqual(resumed.inputBinding, inputBinding);
+  assert.deepEqual(resumeRequests, [
+    {
+      workspaceId: "dashboard",
+      executionId: attemptExecutionIdFor(active.id, 2),
+      inputBinding,
+    },
+  ]);
+});
+
+test("schema v1 sessions migrate to null binding and cannot be claimed by a PR", async (t) => {
+  const setup = await fixture(t);
+  const initial = setup.createExecutor();
+  await initial.executor.recover();
+  const active = await initial.executor.start(startRequest());
+  const legacy = await setup.innerStore.read("code-executor-state");
+  const legacySession = legacy.sessions[active.id];
+  legacy.schemaVersion = 1;
+  delete legacySession.inputBinding;
+  delete legacySession.cancellation;
+  legacySession.requestDigest = digestValue({
+    workspaceId: legacySession.workspaceId,
+    requestedBy: legacySession.requestedBy,
+    requiredProfiles: legacySession.requiredProfiles,
+  });
+  await setup.innerStore.write("code-executor-state", legacy);
+
+  const creationRequests = [];
+  const baseBroker = setup.createBroker();
+  const recovered = setup.createExecutor({
+    broker: overrideBroker(baseBroker, {
+      createExecution: async (request) => {
+        creationRequests.push(structuredClone(request));
+        return baseBroker.createExecution(request);
+      },
+    }),
+  });
+  await recovered.executor.recover();
+
+  const migrated = await recovered.executor.view({ sessionId: active.id });
+  assert.equal(migrated.status, "interrupted");
+  assert.equal(migrated.inputBinding, null);
+  const migratedState = await setup.innerStore.read("code-executor-state");
+  assert.equal(migratedState.schemaVersion, 2);
+  assert.equal(migratedState.sessions[active.id].inputBinding, null);
+  assert.equal(
+    migratedState.sessions[active.id].requestDigest,
+    digestValue({
+      workspaceId: legacySession.workspaceId,
+      requestedBy: legacySession.requestedBy,
+      inputBinding: null,
+      requiredProfiles: legacySession.requiredProfiles,
+    }),
+  );
+  assert.deepEqual(await recovered.executor.start(startRequest()), migrated);
+  await assert.rejects(
+    recovered.executor.start(
+      startRequest({ inputBinding: pullRequestBinding() }),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  await assert.rejects(
+    recovered.executor.resume(
+      sessionRequest(active.id, pullRequestBinding()),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.equal(creationRequests.length, 0);
+
+  const resumed = await recovered.executor.resume(sessionRequest(active.id));
+  assert.equal(resumed.status, "active");
+  assert.equal(resumed.inputBinding, null);
+  assert.equal(creationRequests.length, 1);
+  assert.equal(creationRequests[0].inputBinding, null);
+});
+
+test("schema v1 migration is durably persisted even without recovery mutations", async (t) => {
+  const setup = await fixture(t);
+  await setup.innerStore.write("code-executor-state", {
+    schemaVersion: 1,
+    revision: 7,
+    sessions: {},
+  });
+  const recovered = setup.createExecutor();
+
+  await recovered.executor.recover();
+
+  const stored = await setup.innerStore.read("code-executor-state");
+  assert.equal(stored.schemaVersion, 2);
+  assert.equal(stored.revision, 8);
+  assert.deepEqual(stored.sessions, {});
+});
+
+test("schema v1 migration rejects a legacy identity whose digest no longer matches", async (t) => {
+  const setup = await fixture(t);
+  const initial = setup.createExecutor();
+  await initial.executor.recover();
+  const active = await initial.executor.start(startRequest());
+  const legacy = await setup.innerStore.read("code-executor-state");
+  const legacySession = legacy.sessions[active.id];
+  legacy.schemaVersion = 1;
+  delete legacySession.inputBinding;
+  legacySession.requestDigest = digestValue({
+    workspaceId: legacySession.workspaceId,
+    requestedBy: legacySession.requestedBy,
+    requiredProfiles: legacySession.requiredProfiles,
+  });
+  legacySession.requestedBy.workItemId = "repo#tampered";
+  await setup.innerStore.write("code-executor-state", legacy);
+  const recovered = setup.createExecutor();
+
+  await assert.rejects(
+    recovered.executor.recover(),
+    hasCode("EXECUTOR_STATE_INVALID"),
   );
 });
 
@@ -843,7 +1146,7 @@ test("recovery interrupts unknown work and resumes confirmed writes", async (t) 
   assert.equal(recoverySandbox.calls.length, 0);
   assert.equal(recoverySandbox.cleanupCalls.length, 1);
 
-  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  const resumed = await recovered.executor.resume(sessionRequest(session.id));
   assert.equal(resumed.status, "active");
   assert.equal(resumed.attempt.number, 2);
   assert.equal(resumed.workspaceRevision, session.workspaceRevision);
@@ -911,8 +1214,19 @@ test("cleanup uncertainty fences resume", async (t) => {
   await recovered.executor.recover();
   const interrupted = await recovered.executor.view({ sessionId: "session-one" });
   assert.equal(interrupted.cleanupPending, true);
+  const cleanupCallsBeforeMismatch = recoverySandbox.cleanupCalls.length;
   await assert.rejects(
-    recovered.executor.resume({ sessionId: "session-one" }),
+    recovered.executor.resume(
+      sessionRequest("session-one", pullRequestBinding()),
+    ),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.equal(
+    recoverySandbox.cleanupCalls.length,
+    cleanupCallsBeforeMismatch,
+  );
+  await assert.rejects(
+    recovered.executor.resume(sessionRequest("session-one")),
     hasCode("CLEANUP_PENDING"),
   );
   assert.equal(recoverySandbox.cleanupCalls.length, 2);
@@ -1309,7 +1623,7 @@ test("a crash after workspace creation can resume as first materialization", asy
 
   const recovered = setup.createExecutor({ broker: setup.createBroker() });
   await recovered.executor.recover();
-  const resumed = await recovered.executor.resume({ sessionId: "session-one" });
+  const resumed = await recovered.executor.resume(sessionRequest("session-one"));
   assert.equal(resumed.status, "active");
   assert.equal(resumed.attempt.number, 2);
   assert.match(resumed.sourceRevision, /^[a-f0-9]{64}$/);
@@ -1352,7 +1666,7 @@ test("an uncertain write interrupts the session and is never replayed", async (t
 
   const recovered = setup.createExecutor({ broker: setup.createBroker() });
   await recovered.executor.recover();
-  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  const resumed = await recovered.executor.resume(sessionRequest(session.id));
   const reread = await recovered.executor.perform(
     actionRequest(resumed, {
       type: "read_text",
@@ -1440,7 +1754,7 @@ test("artifact persistence failure after a write requires restart recovery", asy
   await recovered.executor.recover();
   const interrupted = await recovered.executor.view({ sessionId: session.id });
   assert.equal(interrupted.actions.at(-1).status, "interrupted");
-  const resumed = await recovered.executor.resume({ sessionId: session.id });
+  const resumed = await recovered.executor.resume(sessionRequest(session.id));
   const reread = await recovered.executor.perform(
     actionRequest(resumed, {
       type: "read_text",
@@ -1472,7 +1786,7 @@ test("resume rejects a changed trusted profile configuration", async (t) => {
   });
   await recovered.executor.recover();
   await assert.rejects(
-    recovered.executor.resume({ sessionId: "session-one" }),
+    recovered.executor.resume(sessionRequest("session-one")),
     hasCode("PROFILE_CONFIG_CHANGED"),
   );
 });
@@ -1903,7 +2217,7 @@ test("active cancellation discards its workspace and returns one stable proof", 
     hasCode("SESSION_NOT_ACTIVE"),
   );
   await assert.rejects(
-    executor.resume({ sessionId: session.id }),
+    executor.resume(sessionRequest(session.id)),
     hasCode("SESSION_NOT_INTERRUPTED"),
   );
   await assert.rejects(
@@ -1914,6 +2228,44 @@ test("active cancellation discards its workspace and returns one stable proof", 
     }),
     hasCode("EXECUTOR_SESSION_NOT_COMPLETED"),
   );
+});
+
+test("cancellation rejects a changed PR Head before discarding its workspace", async (t) => {
+  const setup = await fixture(t);
+  const inputBinding = pullRequestBinding();
+  const baseBroker = setup.createBroker();
+  let discardCalls = 0;
+  const broker = overrideBroker(baseBroker, {
+    createExecution: async (request) => ({
+      ...(await createDirectoryExecution(baseBroker, request)),
+      inputBinding: structuredClone(request.inputBinding),
+    }),
+    discardExecution: async (request) => {
+      discardCalls += 1;
+      return baseBroker.discardExecution(request);
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  await executor.recover();
+  const session = await executor.start(startRequest({ inputBinding }));
+  const request = cancellationRequest(session, {
+    inputBinding: pullRequestBinding({
+      headRevision: 2,
+      headRefOid: "d".repeat(40),
+    }),
+  });
+
+  await assert.rejects(
+    executor.reconcileCancellation(request),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+
+  assert.equal(discardCalls, 0);
+  assert.equal(
+    await readFile(attemptFile(setup, session.id, 1), "utf8"),
+    "export const value = 1;\n",
+  );
+  assert.equal((await executor.view({ sessionId: session.id })).status, "active");
 });
 
 test("cancelling an unknown write never resumes or replays it", async (t) => {
@@ -2080,7 +2432,7 @@ test("cancellation discards every workspace from a resumed session", async (t) =
     }),
   );
   assert.equal(interrupted.session.status, "interrupted");
-  const resumed = await executor.resume({ sessionId: session.id });
+  const resumed = await executor.resume(sessionRequest(session.id));
   assert.equal(resumed.status, "active");
   assert.equal(resumed.attempt.number, 2);
   assert.equal(

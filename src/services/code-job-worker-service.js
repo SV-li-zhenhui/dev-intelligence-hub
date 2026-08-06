@@ -71,6 +71,38 @@ function sameSessionTransitionFence(expected, current) {
     );
 }
 
+function inputBindingForJob(job) {
+  return Object.hasOwn(job.grant, "inputBinding")
+    ? job.grant.inputBinding
+    : null;
+}
+
+function assertJobSessionInputBinding(job, session) {
+  const expectedProfiles = job.grant.requiredProfiles.map(({ id }) => id).sort();
+  const actualProfiles = Array.isArray(session?.requiredProfiles)
+    ? [...session.requiredProfiles].sort()
+    : [];
+  if (
+    session?.id !== job.jobId ||
+    session.workspaceId !== job.grant.workspaceId ||
+    !sameValue(session.requestedBy, job.grant.requestedBy) ||
+    !sameValue(actualProfiles, expectedProfiles) ||
+    !Object.hasOwn(session, "inputBinding") ||
+    !sameValue(session.inputBinding, inputBindingForJob(job))
+  ) {
+    throw workerError(
+      "CODE_JOB_SESSION_BINDING_INVALID",
+      "Controlled executor session input does not match the sealed code job",
+    );
+  }
+  return session;
+}
+
+function assertJobSessionBinding(job, session) {
+  assertJobSessionInputBinding(job, session);
+  return assertSessionBinding(job, session);
+}
+
 function currentJobOutcome(jobId, current) {
   return {
     jobId,
@@ -96,6 +128,9 @@ function cancellationSettlement(job, response) {
     );
   }
   const { proofDigest, ...proofContent } = proof;
+  if (response.session !== null && response.session !== undefined) {
+    assertJobSessionInputBinding(job, response.session);
+  }
   const pending = job.execution.pendingAction;
   const resolution = proof.actionResolution;
   const commonInvalid =
@@ -391,6 +426,7 @@ export class CodeJobWorkerService {
         };
       }
       job = current;
+      assertJobSessionInputBinding(job, session);
       if (session.status === "interrupted") {
         await this.#verifyAuthority(job.grant);
         const resumed = await this.#resumeUnchangedSession(job);
@@ -399,6 +435,7 @@ export class CodeJobWorkerService {
         }
         job = resumed.job;
         session = resumed.session;
+        assertJobSessionInputBinding(job, session);
       }
       current = await this.#jobs.getForWorker(job.jobId);
       if (
@@ -427,7 +464,7 @@ export class CodeJobWorkerService {
           "Controlled executor did not activate the claimed session",
         );
       }
-      assertSessionBinding(job, session);
+      assertJobSessionBinding(job, session);
       job = (await this.#jobs.activate({
         jobId,
         expectedRevision: job.revision,
@@ -464,6 +501,7 @@ export class CodeJobWorkerService {
 
     await this.#verifyAuthority(job.grant);
     let session = await this.#executor.view({ sessionId: job.jobId });
+    assertJobSessionInputBinding(job, session);
     if (session.status === "failed") {
       return this.#finishFailed(job, session.error);
     }
@@ -478,6 +516,7 @@ export class CodeJobWorkerService {
       }
       job = resumed.job;
       session = resumed.session;
+      assertJobSessionInputBinding(job, session);
     }
     if (session.status !== "active") {
       throw workerError(
@@ -485,7 +524,7 @@ export class CodeJobWorkerService {
         "Controlled executor session is not ready for another action",
       );
     }
-    assertSessionBinding(job, session);
+    assertJobSessionBinding(job, session);
     if (job.execution.workspaceRevision !== session.workspaceRevision) {
       throw workerError(
         "CODE_JOB_WORKSPACE_DIVERGED",
@@ -563,6 +602,7 @@ export class CodeJobWorkerService {
         actionType: null,
       };
     }
+    assertJobSessionInputBinding(job, session);
     if (session.status === "failed") {
       return this.#finishFailed(job, session.error);
     }
@@ -572,7 +612,7 @@ export class CodeJobWorkerService {
         "Admitted session start is still being reconciled",
       );
     }
-    assertSessionBinding(job, session);
+    assertJobSessionBinding(job, session);
     const changed = await this.#jobs.acknowledgeStartedSession({
       jobId: job.jobId,
       expectedRevision: job.revision,
@@ -589,6 +629,7 @@ export class CodeJobWorkerService {
     const pending = job.execution.pendingAction;
     const response = await this.#executor.reconcileCancellation({
       sessionId: job.jobId,
+      inputBinding: structuredClone(inputBindingForJob(job)),
       cancellationDigest: job.execution.result.detailDigest,
       expectedWorkspaceRevision: job.execution.workspaceRevision,
       expectedAction: pending === null
@@ -653,6 +694,7 @@ export class CodeJobWorkerService {
       }
       throw error;
     }
+    assertJobSessionInputBinding(job, reconciled.session);
 
     if (reconciled.status === "running") {
       throw workerError(
@@ -716,7 +758,7 @@ export class CodeJobWorkerService {
         "Controlled executor session is not ready for a prepared action",
       );
     }
-    assertSessionBinding(job, session);
+    assertJobSessionBinding(job, session);
     return this.#performPending(job, session);
   }
 
@@ -733,6 +775,7 @@ export class CodeJobWorkerService {
       sessionId: job.jobId,
       action: pending.action,
     });
+    assertJobSessionInputBinding(job, reconciled.session);
     if (reconciled.status === "running") {
       return {
         jobId: job.jobId,
@@ -743,7 +786,7 @@ export class CodeJobWorkerService {
     if (reconciled.status === "terminal") {
       if (reconciled.action?.status === "interrupted") {
         const interrupted = normalizeActionResponse(pending, reconciled);
-        assertSessionBinding(job, interrupted.session);
+        assertJobSessionBinding(job, interrupted.session);
         if (
           interrupted.action.workspaceRevisionAfter !== null ||
           interrupted.session.workspaceRevision !==
@@ -764,7 +807,7 @@ export class CodeJobWorkerService {
           }
           job = resumed.job;
           recoveredSession = resumed.session;
-          assertSessionBinding(job, recoveredSession);
+          assertJobSessionBinding(job, recoveredSession);
         }
         if (
           recoveredSession.status !== "active" ||
@@ -813,17 +856,21 @@ export class CodeJobWorkerService {
   ) {
     return this.#runUnchangedSessionTransition(
       job,
-      () => this.#executor.resume({ sessionId: job.jobId }),
+      (current) => this.#executor.resume({
+        sessionId: current.jobId,
+        inputBinding: structuredClone(inputBindingForJob(current)),
+      }),
       { trustedReconciliation },
     );
   }
 
   async #startUnchangedSession(job) {
-    return this.#runUnchangedSessionTransition(job, () =>
+    return this.#runUnchangedSessionTransition(job, (current) =>
       this.#executor.start({
-        sessionId: job.jobId,
-        workspaceId: job.grant.workspaceId,
-        requestedBy: job.grant.requestedBy,
+        sessionId: current.jobId,
+        workspaceId: current.grant.workspaceId,
+        requestedBy: current.grant.requestedBy,
+        inputBinding: structuredClone(inputBindingForJob(current)),
       }),
     );
   }
@@ -844,7 +891,7 @@ export class CodeJobWorkerService {
 
       // Invocation must enqueue synchronously. The returned Promise is carried
       // as data so this narrow lease never waits for the executor operation.
-      const operation = Promise.resolve(invoke());
+      const operation = Promise.resolve(invoke(current));
       return { job: current, operation };
     });
     const admitted = trustedReconciliation
@@ -859,6 +906,7 @@ export class CodeJobWorkerService {
     if (!sameSessionTransitionFence(admitted.job, current)) {
       return { job: current, session: null };
     }
+    assertJobSessionInputBinding(current, session);
     return { job: current, session };
   }
 
@@ -894,6 +942,7 @@ export class CodeJobWorkerService {
         sessionId: job.jobId,
         action: pending.action,
       });
+      assertJobSessionInputBinding(job, current.session);
       if (current.status === "absent") {
         throw workerError(
           "CODE_JOB_SESSION_DIVERGED",
@@ -972,7 +1021,7 @@ export class CodeJobWorkerService {
         }
       }
     }
-    assertSessionBinding(job, response.session);
+    assertJobSessionBinding(job, response.session);
     if (
       !reconcileExisting &&
       ["succeeded", "failed"].includes(response.action.status)
@@ -1078,7 +1127,7 @@ export class CodeJobWorkerService {
   }
 
   async #recoverCompleted(job, session) {
-    assertSessionBinding(job, session);
+    assertJobSessionBinding(job, session);
     if (job.execution.pendingAction !== null) {
       throw workerError(
         "CODE_JOB_SESSION_DIVERGED",
