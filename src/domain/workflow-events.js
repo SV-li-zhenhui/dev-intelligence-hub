@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
 
 const SCHEMA_VERSION = 1;
 const SUBJECT_KINDS = Object.freeze(["pull_request", "issue"]);
@@ -57,6 +58,8 @@ const PAYLOAD_FIELDS = new Set([
   "draft",
   "evidence",
   "files",
+  "gitTarget",
+  "gitTargetAvailable",
   "headRefOid",
   "inactiveDays",
   "isDraft",
@@ -120,6 +123,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
 ]);
 const BOOLEAN_PAYLOAD_FIELDS = new Set([
   "draft",
+  "gitTargetAvailable",
   "isDraft",
   "requiresConfirmation",
   "reviewFactsAvailable",
@@ -428,11 +432,21 @@ function assertPayloadShape(value) {
 
 function normalizePayload(value) {
   assertPayloadShape(value);
-  return clonePayloadValue(
+  const normalized = clonePayloadValue(
     value,
     { depth: 0, budget: { entries: 0 }, ancestors: new Set() },
     "payload",
   );
+  if (Object.hasOwn(normalized, "gitTarget")) {
+    try {
+      normalized.gitTarget = structuredClone(
+        normalizePullRequestGitTarget(normalized.gitTarget),
+      );
+    } catch {
+      throw invalid("payload.gitTarget");
+    }
+  }
+  return normalized;
 }
 
 function normalizeContent(value) {
@@ -452,6 +466,37 @@ function normalizeContent(value) {
     subject: normalizeSubject(value.subject),
     payload: normalizePayload(value.payload),
   };
+  const hasGitTarget = Object.hasOwn(content.payload, "gitTarget");
+  const hasGitTargetAvailability = Object.hasOwn(
+    content.payload,
+    "gitTargetAvailable",
+  );
+  if (
+    hasGitTargetAvailability &&
+    (content.payload.gitTargetAvailable !== hasGitTarget ||
+      !content.eventType.startsWith("pull_request."))
+  ) {
+    throw invalid("payload.gitTargetAvailable");
+  }
+  if (
+    hasGitTarget &&
+    (
+      content.payload.gitTargetAvailable !== true ||
+      !content.eventType.startsWith("pull_request.") ||
+      content.payload.gitTarget.baseRepository !== content.subject.repository ||
+      content.payload.gitTarget.headRefOid !== content.payload.headRefOid ||
+      [
+        "githubAccount",
+        "baseRepository",
+        "baseRefName",
+        "baseRefOid",
+        "headRepository",
+        "headRefName",
+      ].some((field) => Object.hasOwn(content.payload, field))
+    )
+  ) {
+    throw invalid("payload.gitTarget");
+  }
   if (Buffer.byteLength(JSON.stringify(content), "utf8") > MAX_EVENT_BYTES) {
     throw invalid("event 过大");
   }

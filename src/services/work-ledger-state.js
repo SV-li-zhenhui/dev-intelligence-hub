@@ -29,11 +29,11 @@ import {
 import {
   MAX_WORK_GRAPH_MEMORY_EVENTS,
   MAX_WORK_GRAPH_MEMORY_EVENT_BYTES,
-  appendWorkGraphMemoryEvents,
   emptyWorkGraphMemoryProjection,
   migrateLegacyWorkGraphMemoryProjection,
   migrateWorkGraphMemoryProjection,
   normalizeWorkGraphMemoryProjection,
+  reconcileMigratedWorkGraphMemoryAuthority,
 } from "./work-ledger-graph-memory.js";
 import {
   graphChildAssignmentId,
@@ -43,6 +43,7 @@ import {
 import {
   appendPullRequestWorkSource,
   currentWorkItemEvent,
+  currentWorkItemInputBinding,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
   normalizePullRequestInputBinding,
@@ -1063,13 +1064,28 @@ export function assertWorkLedgerCapacity(state, limits) {
     ({ kind }) => kind === "source_root",
   ).length;
   const operationalItemCount = state.items.length - sourceRootCount;
+  const graphMigrationAllowance = Math.max(
+    1,
+    state.items.filter(
+      (item) => currentWorkItemInputBinding(item) !== null,
+    ).length,
+  );
+  const graphPending = state.graphMemoryProjection.pending;
+  const graphPendingWithinCapacity =
+    graphPending.length <= limits.graphMemoryOutboxLimit ||
+    (graphPending.length <=
+        limits.graphMemoryOutboxLimit + graphMigrationAllowance &&
+      graphPending.slice(limits.graphMemoryOutboxLimit).every(
+        (event) =>
+          event.schemaVersion === 2 &&
+          ["authority_invalidated", "authority_observed"].includes(event.kind),
+      ));
   if (
     operationalItemCount > limits.itemLimit ||
     sourceRootCount > limits.sourceRootLimit ||
     state.timeline.length > limits.timelineLimit ||
     state.outbox.length > limits.outboxLimit ||
-    state.graphMemoryProjection.pending.length >
-      limits.graphMemoryOutboxLimit ||
+    !graphPendingWithinCapacity ||
     state.items.some(
       (item) =>
         prettySerializedLedgerBytes(workItemCapacityView(item)) >
@@ -1434,11 +1450,14 @@ function migrateDispatchBindingState(value, limits) {
   };
   if (roots.length > 0) {
     try {
-      migrated = appendWorkGraphMemoryEvents(
-        { ...value, items },
-        migrated,
-        limits,
-      );
+      migrated = {
+        ...migrated,
+        graphMemoryProjection: reconcileMigratedWorkGraphMemoryAuthority(
+          migrated.graphMemoryProjection,
+          migrated,
+          limits,
+        ),
+      };
     } catch {
       throw corrupted("无法迁移 PR 来源根的任务图记忆");
     }
@@ -1800,10 +1819,28 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     throw corrupted("员工工作图结构损坏");
   }
   try {
+    const legacyAuthorityEpochMigrated = itemValues.some(
+      (item) =>
+        item?.source?.kind === "pull_request" &&
+        Array.isArray(item.source.revisions) &&
+        item.source.revisions.some(
+          (revision) =>
+            !Object.hasOwn(revision, "causalHeadRefOid") ||
+            !Object.hasOwn(revision, "authorityEpochChanged") ||
+            !Object.hasOwn(revision, "authorityEpochCutover"),
+        ),
+    );
+    const graphMemoryProjection = legacyAuthorityEpochMigrated
+      ? reconcileMigratedWorkGraphMemoryAuthority(
+          value.graphMemoryProjection,
+          state,
+          limits,
+        )
+      : value.graphMemoryProjection;
     state = {
       ...state,
       graphMemoryProjection: normalizeWorkGraphMemoryProjection(
-        value.graphMemoryProjection,
+        graphMemoryProjection,
         state.revision,
         state.items,
         limits,

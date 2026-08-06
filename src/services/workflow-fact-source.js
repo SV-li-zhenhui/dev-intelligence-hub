@@ -1,6 +1,15 @@
+import { types as utilTypes } from "node:util";
+import {
+  normalizePullRequestGitTarget,
+  pullRequestGitTargetFromEvent,
+  samePullRequestGitTarget,
+} from "../domain/git-tool-contract.js";
+
 const FACT_FIELDS = new Map([
   ["action-state", "actionState"],
+  ["base-oid", "baseRefOid"],
   ["ci-status", "ciStatus"],
+  ["head-oid", "headRefOid"],
   ["merge-state", "mergeStateStatus"],
   ["next-action", "nextAction"],
   ["review-decision", "reviewDecision"],
@@ -8,6 +17,18 @@ const FACT_FIELDS = new Map([
 ]);
 const SAFE_FACT = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const DEFAULT_MAXIMUM_AGE_MS = 15 * 60 * 1_000;
+const FLAT_GIT_TARGET_FIELDS = Object.freeze([
+  ["sourceAccountId", "githubAccount"],
+  ["baseRepository", "baseRepository"],
+  ["baseRefName", "baseRefName"],
+  ["baseRefOid", "baseRefOid"],
+  ["headRepository", "headRepository"],
+  ["headRefName", "headRefName"],
+  ["headRefOid", "headRefOid"],
+]);
+const OPTIONAL_REPEATED_GIT_TARGET_FIELDS = Object.freeze(
+  FLAT_GIT_TARGET_FIELDS.filter(([, field]) => field !== "headRefOid"),
+);
 
 function invalid(message) {
   return new TypeError(message);
@@ -18,6 +39,7 @@ function ownData(value) {
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
     Object.getPrototypeOf(value) !== Object.prototype
   ) {
     return null;
@@ -112,6 +134,71 @@ function pullRequestHead(item) {
     : "";
 }
 
+function expectedGitTarget(item) {
+  const itemEntries = ownData(item);
+  const eventEntries = ownData(itemEntries?.get("event"));
+  if (!eventEntries) return { valid: false, target: null };
+  const event = Object.fromEntries(eventEntries);
+  try {
+    return { valid: true, target: pullRequestGitTargetFromEvent(event) };
+  } catch {
+    return { valid: false, target: null };
+  }
+}
+
+function flatGitTarget(matched) {
+  return normalizePullRequestGitTarget({
+    schemaVersion: 1,
+    provider: "github",
+    ...Object.fromEntries(
+      FLAT_GIT_TARGET_FIELDS.map(([targetField, snapshotField]) => [
+        targetField,
+        matched.get(snapshotField),
+      ]),
+    ),
+  });
+}
+
+function observedGitTarget(matched) {
+  try {
+    const hasAvailability = matched.has("gitTargetAvailable");
+    const hasTarget = matched.has("gitTarget");
+    if (hasAvailability) {
+      if (matched.get("gitTargetAvailable") !== true || !hasTarget) {
+        return null;
+      }
+      const target = normalizePullRequestGitTarget(matched.get("gitTarget"));
+      if (target.headRefOid !== matched.get("headRefOid")) return null;
+      const repeatedFields = OPTIONAL_REPEATED_GIT_TARGET_FIELDS.filter(
+        ([, field]) => matched.has(field),
+      );
+      if (
+        repeatedFields.length !== 0 &&
+        (repeatedFields.length !== OPTIONAL_REPEATED_GIT_TARGET_FIELDS.length ||
+          !samePullRequestGitTarget(target, flatGitTarget(matched)))
+      ) {
+        return null;
+      }
+      return target;
+    }
+    if (hasTarget) return null;
+    return flatGitTarget(matched);
+  } catch {
+    return null;
+  }
+}
+
+function selectedFactValue(matched, field) {
+  if (field === "baseRefOid" && matched?.has("gitTarget")) {
+    try {
+      return normalizePullRequestGitTarget(matched.get("gitTarget")).baseRefOid;
+    } catch {
+      return null;
+    }
+  }
+  return field && matched ? normalizedFactValue(matched.get(field)) : null;
+}
+
 function normalizedFactValue(value) {
   if (typeof value === "string") return value;
   if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
@@ -178,8 +265,12 @@ export class WorkflowFactSource {
     }
 
     const items = snapshotEntries.get("items");
-    if (!Array.isArray(items) || Object.getPrototypeOf(items) !== Array.prototype) {
-      return result({ healthy, fresh, observedAt });
+    if (
+      !Array.isArray(items) ||
+      utilTypes.isProxy(items) ||
+      Object.getPrototypeOf(items) !== Array.prototype
+    ) {
+      return result({ healthy: false, fresh: false, observedAt });
     }
     let matched = null;
     for (let index = 0; index < items.length; index += 1) {
@@ -201,11 +292,32 @@ export class WorkflowFactSource {
     ) {
       return result({ healthy, fresh: false, observedAt });
     }
+    if (expectedSource === "githubPullRequests") {
+      const expected = expectedGitTarget(item);
+      if (!expected.valid) {
+        return result({ healthy, fresh: false, observedAt });
+      }
+      if (
+        expected.target === null &&
+        (matched?.has("gitTarget") || matched?.has("gitTargetAvailable"))
+      ) {
+        return result({ healthy, fresh: false, observedAt });
+      }
+      if (expected.target !== null) {
+        const observed = matched === null ? null : observedGitTarget(matched);
+        if (
+          observed === null ||
+          !samePullRequestGitTarget(expected.target, observed)
+        ) {
+          return result({ healthy, fresh: false, observedAt });
+        }
+      }
+    }
     const field = FACT_FIELDS.get(fact);
     return result({
       healthy,
       fresh,
-      value: field && matched ? normalizedFactValue(matched.get(field)) : null,
+      value: selectedFactValue(matched, field),
       observedAt,
     });
   }

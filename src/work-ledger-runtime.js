@@ -204,6 +204,11 @@ export async function createWorkLedgerRuntime({
         ackBatch: (request) =>
           admit(() => service.acknowledgeGraphMemoryProjectionBatch(request)),
       }),
+      memoryAuthoritySource: Object.freeze({
+        readSnapshot: (options) =>
+          admit(() => service.readMemoryAuthoritySnapshot(options)),
+        readStatus: () => admit(() => service.readMemoryAuthorityStatus()),
+      }),
       close,
     };
     for (const method of RUNTIME_METHODS) {

@@ -94,7 +94,8 @@ function readerFor(prepared) {
   const blobs = new Map(
     prepared.blobs.map((blob) => [blob.sha256, Buffer.from(blob.content)]),
   );
-  return {
+  const reader = {
+    readFileCalls: [],
     async get(packageId) {
       if (packageId !== prepared.manifest.packageId) {
         throw Object.assign(new Error("not found"), {
@@ -104,6 +105,7 @@ function readerFor(prepared) {
       return clone(prepared.manifest);
     },
     async readFile({ packageId, path: relativePath }) {
+      reader.readFileCalls.push({ packageId, path: relativePath });
       assert.equal(packageId, prepared.manifest.packageId);
       const entry = [
         ...prepared.manifest.changes.created,
@@ -112,6 +114,7 @@ function readerFor(prepared) {
       return Buffer.from(blobs.get(entry.blob.sha256));
     },
   };
+  return reader;
 }
 
 async function fixture(t) {
@@ -183,6 +186,13 @@ async function fixture(t) {
     writablePaths: ["src"],
     excludePaths: [],
   };
+  const authorityCalls = [];
+  const applicationAuthorityVerifier = {
+    async verify(manifest) {
+      authorityCalls.push(clone(manifest));
+      return true;
+    },
+  };
   const createService = (overrides = {}) =>
     new ChangePackageApplicationService({
       packageReader,
@@ -190,6 +200,7 @@ async function fixture(t) {
       gitInspector,
       store,
       exclusiveLease: { run: (operation) => operation() },
+      applicationAuthorityVerifier,
       clock: () => new Date("2026-08-02T03:00:00.000Z"),
       ...overrides,
     });
@@ -202,6 +213,7 @@ async function fixture(t) {
     gitInspector,
     store,
     target,
+    authorityCalls,
     createService,
     requestedBy,
     beforeApp,
@@ -270,10 +282,12 @@ test("persists intent before applying a package and recovers one stable receipt"
   assert.equal(await fileValue(setup.root, "src/old.js"), null);
   assert.equal(await fileValue(setup.root, "src/new.js"), "new\n");
 
+  const readsBeforeRetry = setup.packageReader.readFileCalls.length;
   assert.deepEqual(await service.execute(envelope), {
     status: "already",
     receipt: applied.receipt,
   });
+  assert.equal(setup.packageReader.readFileCalls.length, readsBeforeRetry);
   const restarted = setup.createService();
   await restarted.recover();
   assert.deepEqual(await restarted.reconcile(envelope), {
@@ -287,6 +301,39 @@ test("persists intent before applying a package and recovers one stable receipt"
     workspaceId: "workspace-1",
     receipt: applied.receipt,
   });
+});
+
+test("stale source authority blocks confirmation and execution before intent", async (t) => {
+  const setup = await fixture(t);
+  const producer = setup.createService();
+  await producer.recover();
+  const plan = await producer.prepareConfirmation({
+    packageId: setup.prepared.manifest.packageId,
+    requestedBy: setup.requestedBy,
+  });
+  const authorityCalls = [];
+  const stale = setup.createService({
+    applicationAuthorityVerifier: {
+      async verify(manifest) {
+        authorityCalls.push(clone(manifest));
+        throw new Error("legacy PR source authority");
+      },
+    },
+  });
+  await stale.recover();
+
+  await assert.rejects(
+    stale.prepareConfirmation({
+      packageId: setup.prepared.manifest.packageId,
+      requestedBy: setup.requestedBy,
+    }),
+    (error) => error?.code === "CHANGE_PACKAGE_APPLICATION_STALE",
+  );
+  const writesBeforeExecute = setup.store.writes.length;
+  assert.deepEqual(await stale.execute(queueEnvelope(plan)), { status: "stale" });
+  assert.equal(setup.store.writes.length, writesBeforeExecute);
+  assert.equal(await fileValue(setup.root, "src/app.js"), "before\n");
+  assert.equal(authorityCalls.length, 2);
 });
 
 test("exposes separate least-authority producer, executor, and result ports", async (t) => {
@@ -472,10 +519,19 @@ test("an applied-state write failure reconciles without a second apply", async (
   });
   assert.equal(await fileValue(setup.root, "src/app.js"), "after\n");
 
-  const restarted = setup.createService();
+  let authorityCalls = 0;
+  const restarted = setup.createService({
+    applicationAuthorityVerifier: {
+      async verify() {
+        authorityCalls += 1;
+        throw new Error("legacy PR source authority");
+      },
+    },
+  });
   await restarted.recover();
   const reconciled = await restarted.reconcile(envelope);
   assert.equal(reconciled.status, "already");
+  assert.equal(authorityCalls, 0);
   assert.equal(await fileValue(setup.root, "src/app.js"), "after\n");
 });
 
@@ -561,6 +617,10 @@ test("a mixed checkout is permanently fenced and never completed blindly", async
   assert.equal(await fileValue(setup.root, "src/old.js"), "old\n");
   assert.equal(await fileValue(setup.root, "src/new.js"), null);
   assert.equal((await restarted.getResult(envelope.id)).status, "unknown");
+
+  const readsBeforeRetry = setup.packageReader.readFileCalls.length;
+  assert.equal((await restarted.execute(envelope)).status, "error");
+  assert.equal(setup.packageReader.readFileCalls.length, readsBeforeRetry);
 
   await unlink(path.join(setup.root, "src", "old.js"));
   await writeFile(path.join(setup.root, "src", "new.js"), "new\n");

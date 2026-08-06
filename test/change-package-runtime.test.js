@@ -171,6 +171,18 @@ test("runtime recovers packages before the application and exposes only narrow p
   assert.equal(Object.isFrozen(applicationOptions.packageReader), true);
   assert.deepEqual(Object.keys(applicationOptions.gitInspector), ["inspect"]);
   assert.equal(Object.isFrozen(applicationOptions.gitInspector), true);
+  assert.deepEqual(
+    Object.keys(applicationOptions.applicationAuthorityVerifier),
+    ["verify"],
+  );
+  assert.equal(
+    Object.isFrozen(applicationOptions.applicationAuthorityVerifier),
+    true,
+  );
+  assert.throws(
+    () => applicationOptions.applicationAuthorityVerifier.verify({}),
+    /source authority is unavailable/,
+  );
   assert.deepEqual(Object.keys(applicationOptions.store).sort(), ["read", "write"]);
   assert.deepEqual(
     Object.keys(applicationOptions.exclusiveLease),

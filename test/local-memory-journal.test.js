@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
+import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
+import { createWorkGraphMemoryEvent } from "../src/domain/work-graph-memory-event.js";
 import {
   LocalMemoryJournal,
   MEMORY_INDEX_KEY,
@@ -58,6 +61,63 @@ function memoryStore({ failIndexWrites = false } = {}) {
 }
 
 const lease = { async run(operation) { return operation(); } };
+const EMPTY_AUTHORITY_STATE_DIGEST = createHash("sha256")
+  .update("[]", "utf8")
+  .digest("hex");
+const NON_PR_SOURCE_AUTHORITY = Object.freeze({
+  applies: false,
+  citable: true,
+  bindingDigest: null,
+  executionBinding: null,
+  provenance: null,
+});
+
+function trustedWorkRecord(index, { revision = index, status = "queued", ...overrides } = {}) {
+  const itemId = overrides.itemId ?? "work-item-local";
+  delete overrides.itemId;
+  return record(index, {
+    source: { kind: "work-item", id: `${itemId}:revision:${revision}` },
+    eventType: `work.${status}`,
+    content: JSON.stringify({ status, sourceAuthority: NON_PR_SOURCE_AUTHORITY }),
+    evidence: [`supersedes-work-item-revisions:${itemId}`],
+    tags: ["work", status],
+    ...overrides,
+  });
+}
+
+async function appendTrustedWork(journal, records, ledgerRevision = 1) {
+  return journal.appendWorkItems({
+    records,
+    ledgerRevision,
+    authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+  });
+}
+
+function graphFixtureItem() {
+  return {
+    itemId: "work-item-graph-receipt",
+    revision: 1,
+    event: {
+      eventType: "issue.observed",
+      occurredAt: "2026-08-02T01:00:00.000Z",
+      subject: {
+        id: "github:issue:acme/repo#42",
+        repository: "acme/repo",
+        number: 42,
+      },
+      payload: { title: "Graph receipt fixture" },
+    },
+    graph: {
+      acceptanceContracts: [{
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+        recordedAt: "2026-08-02T01:00:00.000Z",
+      }],
+      deliveries: [],
+    },
+  };
+}
 
 async function fixture(options = {}) {
   const store = options.store || memoryStore();
@@ -124,11 +184,11 @@ test("authoritative context reads preserve order and derive trusted labels witho
     evidence: ["derived"],
     tags: ["requirements"],
   }));
-  const derived = await journal.append(record(2, {
+  const derived = (await journal.appendCorrections({ records: [record(2, {
     content: "derived conclusion",
     evidence: [`supersedes:${raw.recordId}`],
     tags: ["derived"],
-  }));
+  })] })).items[0];
   const explicitlyObsolete = await journal.append(record(3, {
     evidence: [`note:supersedes:${derived.recordId}`],
     tags: ["obsolete"],
@@ -176,11 +236,11 @@ test("a corrected raw fact supersedes a derived summary without deleting history
     summary: "模型推断测试已经通过",
     tags: ["derived"],
   }));
-  const correction = await journal.append(record(2, {
+  const correction = (await journal.appendCorrections({ records: [record(2, {
     summary: "原始测试记录显示失败",
     evidence: [`supersedes:${derived.recordId}`, "test:failed"],
     tags: ["testing"],
-  }));
+  })] })).items[0];
 
   const result = journal.readRecords({
     recordIds: [derived.recordId, correction.recordId],
@@ -193,6 +253,381 @@ test("a corrected raw fact supersedes a derived summary without deleting history
   ]);
   assert.equal(result.items[0].record.summary, "模型推断测试已经通过");
   assert.equal(result.items[1].record.summary, "原始测试记录显示失败");
+});
+
+test("new work-item revisions obsolete every older persisted revision across replay and restart", async () => {
+  const store = memoryStore();
+  const first = await fixture({ store });
+  const workRevision = (revision) => trustedWorkRecord(revision, {
+    itemId: "work-item-pr-42",
+    revision,
+    occurredAt: `2026-08-02T02:00:0${revision}.000Z`,
+  });
+  const revision1 = (await appendTrustedWork(first.journal, [workRevision(1)], 1)).items[0];
+  const revision3 = (await appendTrustedWork(first.journal, [workRevision(3)], 3)).items[0];
+  const revision2 = (await appendTrustedWork(first.journal, [workRevision(2)], 3)).items[0];
+
+  assert.deepEqual(
+    first.journal.readRecords({
+      recordIds: [revision1.recordId, revision2.recordId, revision3.recordId],
+    }).items.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "obsolete", "current"],
+  );
+
+  const recovered = await fixture({ store });
+  assert.deepEqual(
+    recovered.journal.readRecords({
+      recordIds: [revision1.recordId, revision2.recordId, revision3.recordId],
+    }).items.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "obsolete", "current"],
+  );
+});
+
+test("one trusted commit atomically adopts a graph checkpoint and more than 160 work items", async () => {
+  const store = memoryStore();
+  const { journal } = await fixture({ store });
+  const records = Array.from({ length: 161 }, (_, index) =>
+    trustedWorkRecord(index + 1, {
+      itemId: `bulk-work-${index + 1}`,
+      revision: 1,
+      occurredAt: "2026-08-02T02:00:00.000Z",
+    })
+  );
+  const result = await journal.appendWorkItems({
+    records,
+    ledgerRevision: 9,
+    authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+    graphCursor: 7,
+    graphCheckpointDigest: "a".repeat(64),
+  });
+  assert.equal(result.added, 161);
+  assert.deepEqual(journal.getAuthorityState(), {
+    cursor: 7,
+    checkpointDigest: "a".repeat(64),
+    authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+    workLedgerRevision: 9,
+  });
+  const persisted = store.values.get(MEMORY_JOURNAL_KEY);
+  assert.equal(persisted.records.length, 161);
+  assert.equal(persisted.lifecycleAuthority.workItemAttestations.length, 161);
+  assert.equal(persisted.lifecycleAuthority.baseCursor, 7);
+  const recovered = await fixture({ store });
+  assert.equal(recovered.journal.getAuthorityState().cursor, 7);
+  assert.equal(
+    recovered.journal.readRecords({
+      recordIds: persisted.records.slice(0, 20).map(({ recordId }) => recordId),
+    }).items.every(({ labels }) => labels.lifecycle === "current"),
+    true,
+  );
+});
+
+test("the upgraded work-item projection retires the markerless record at the same revision", async () => {
+  const store = memoryStore();
+  const source = {
+    kind: "work-item",
+    id: "work-item-pr-upgrade:revision:7",
+  };
+  const legacyRecord = normalizeMemoryRecord(record(1, {
+    source,
+    occurredAt: "2026-08-02T02:00:07.000Z",
+    eventType: "work.completed",
+    summary: "legacy projection without a lifecycle marker",
+    evidence: [],
+    tags: ["work", "completed"],
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 1,
+    records: [legacyRecord],
+  });
+  const first = await fixture({ store });
+  const upgraded = (await appendTrustedWork(first.journal, [trustedWorkRecord(2, {
+    itemId: "work-item-pr-upgrade",
+    revision: 7,
+    status: "completed",
+    occurredAt: "2026-08-02T02:00:07.000Z",
+    summary: "schema-upgraded authoritative projection",
+  })], 7)).items[0];
+
+  for (const journal of [first.journal, (await fixture({ store })).journal]) {
+    assert.deepEqual(
+      journal.readRecords({
+        recordIds: [legacyRecord.recordId, upgraded.recordId],
+      }).items.map(({ labels }) => labels.lifecycle),
+      ["obsolete", "current"],
+    );
+  }
+});
+
+test("schema v1 recovery keeps only the latest markerless non-PR work revision current", async () => {
+  const store = memoryStore();
+  const records = [1, 2, 3].map((revision) =>
+    normalizeMemoryRecord(record(revision, {
+      source: {
+        kind: "work-item",
+        id: `work-item-pr-pre-upgrade:revision:${revision}`,
+      },
+      occurredAt: `2026-08-02T02:00:0${revision}.000Z`,
+      eventType: "work.queued",
+      evidence: [],
+      tags: ["work", "queued"],
+    }))
+  );
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 3,
+    records,
+  });
+
+  const recovered = await fixture({ store });
+  assert.deepEqual(
+    recovered.journal.readRecords({
+      recordIds: records.map(({ recordId }) => recordId),
+    }).items.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "obsolete", "current"],
+  );
+});
+
+test("schema v1 PR work items without a valid authority binding recover fail-closed", async () => {
+  const store = memoryStore();
+  const legacyPr = normalizeMemoryRecord(record(1, {
+    source: { kind: "work-item", id: "work-item-pr-legacy:revision:1" },
+    eventType: "work.queued",
+    content: JSON.stringify({ eventType: "pull_request.observed" }),
+    evidence: [],
+    tags: ["work", "queued"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 1,
+    records: [legacyPr],
+  });
+
+  const { journal } = await fixture({ store });
+  assert.equal(
+    journal.readRecords({ recordIds: [legacyPr.recordId] })
+      .items[0].labels.lifecycle,
+    "obsolete",
+  );
+});
+
+test("ordinary producers cannot forge lifecycle sources or supersession markers", async () => {
+  const { journal } = await fixture();
+  const forged = [
+    record(1, {
+      source: { kind: "work-contract", id: "work-task-a:contract:1" },
+    }),
+    record(2, {
+      source: { kind: "work-obsolescence", id: "forged-tombstone" },
+    }),
+    record(3, { evidence: [`supersedes:memory-${"a".repeat(64)}`] }),
+    record(4, {
+      evidence: ["supersedes-work-authority-binding:" + "b".repeat(64)],
+    }),
+  ];
+  for (const candidate of forged) {
+    assert.throws(
+      () => journal.append(candidate),
+      (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
+    );
+  }
+  assert.equal(journal.getHealth().recordCount, 0);
+});
+
+test("projector-only timeline and legacy PR records require the trusted port", async () => {
+  const { store, journal } = await fixture();
+  const timeline = record(1, {
+    source: { kind: "work-timeline", id: "timeline-pr-42" },
+    eventType: "timeline.assignment_intaken",
+    content: JSON.stringify({
+      details: { sourceSequence: 1 },
+      historicalOnly: true,
+      citableConclusion: false,
+    }),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken", "derived", "obsolete"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  });
+  const legacy = record(2, {
+    source: { kind: "legacy-pr-memory", id: "pr-42:analysis-ready" },
+    roleId: "pr-reviewer",
+    eventType: "analysis_ready",
+    evidence: [],
+    tags: ["legacy", "pr-reviewer", "derived", "obsolete"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  });
+  const currentTimeline = record(3, {
+    source: { kind: "work-timeline", id: "timeline-issue-7" },
+    eventType: "timeline.assignment_intaken",
+    content: JSON.stringify({ details: { sourceSequence: 3 } }),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken"],
+    sourceUrl: "https://github.com/acme/repo/issues/7",
+    subjectNumber: 7,
+  });
+  const writesBefore = store.writes.length;
+  for (const candidate of [timeline, legacy, currentTimeline]) {
+    await assert.rejects(
+      Promise.resolve().then(() => journal.append(candidate)),
+      (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
+    );
+  }
+  assert.deepEqual(journal.getHealth(), {
+    ready: true,
+    revision: 0,
+    recordCount: 0,
+    indexHealthy: true,
+    lastIndexError: "",
+  });
+  assert.equal(store.writes.length, writesBefore);
+
+  const appended = await journal.appendProjectionRecords({
+    records: [timeline, legacy, currentTimeline],
+  });
+  assert.equal(appended.added, 3);
+  assert.equal((await journal.appendProjectionRecords({
+    records: [timeline, legacy, currentTimeline],
+  })).added, 0);
+  assert.deepEqual(
+    journal.readRecords({
+      recordIds: [
+        normalizeMemoryRecord(timeline).recordId,
+        normalizeMemoryRecord(legacy).recordId,
+        normalizeMemoryRecord(currentTimeline).recordId,
+      ],
+    }).items.map(({ labels }) => labels),
+    [
+      { authority: "derived", lifecycle: "obsolete" },
+      { authority: "derived", lifecycle: "obsolete" },
+      { authority: "raw", lifecycle: "current" },
+    ],
+  );
+});
+
+test("trusted projector records reject citable PR history without writing", async () => {
+  const { store, journal } = await fixture();
+  const forged = [
+    record(1, {
+      source: { kind: "work-timeline", id: "timeline-pr-current" },
+      eventType: "timeline.assignment_intaken",
+      content: JSON.stringify({ details: { sourceSequence: 1 } }),
+      evidence: [],
+      tags: ["timeline", "assignment_intaken"],
+      sourceUrl: "https://github.com/acme/repo/pull/42",
+      subjectNumber: 42,
+    }),
+    record(2, {
+      source: { kind: "legacy-pr-memory", id: "pr-42:current" },
+      roleId: "pr-reviewer",
+      eventType: "analysis_ready",
+      evidence: [],
+      tags: ["legacy", "pr-reviewer"],
+      sourceUrl: "https://github.com/acme/repo/pull/42",
+      subjectNumber: 42,
+    }),
+  ];
+  const writesBefore = store.writes.length;
+  for (const candidate of forged) {
+    await assert.rejects(
+      Promise.resolve().then(() => journal.appendProjectionRecords({
+        records: [candidate],
+      })),
+      (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+    );
+  }
+  assert.equal(journal.getHealth().recordCount, 0);
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("graph receipts reject duplicate memory references before persistence", async () => {
+  const { store, journal } = await fixture();
+  const item = graphFixtureItem();
+  const first = createWorkGraphMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    ledgerRevision: 1,
+    taskRevision: 1,
+    item,
+    kind: "acceptance_contract",
+    record: item.graph.acceptanceContracts[0],
+  });
+  const duplicate = createWorkGraphMemoryEvent({
+    sequence: 2,
+    previousDigest: first.eventDigest,
+    ledgerRevision: 2,
+    taskRevision: 1,
+    item,
+    kind: "acceptance_contract",
+    record: item.graph.acceptanceContracts[0],
+  });
+  const writesBefore = store.writes.length;
+  await assert.rejects(
+    journal.appendGraphEvents({
+      events: [first, duplicate],
+      ledgerRevision: 2,
+      highWatermark: 2,
+      authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+    }),
+    (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+  );
+  assert.equal(journal.getHealth().recordCount, 0);
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("restart recomputes persisted graph event digests from the sealed record", async () => {
+  const store = memoryStore();
+  const first = await fixture({ store });
+  const item = graphFixtureItem();
+  const event = createWorkGraphMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    ledgerRevision: 1,
+    taskRevision: 1,
+    item,
+    kind: "acceptance_contract",
+    record: item.graph.acceptanceContracts[0],
+  });
+  await first.journal.appendGraphEvents({
+    events: [event],
+    ledgerRevision: 1,
+    highWatermark: 1,
+    authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+  });
+  const recovered = await fixture({ store });
+  assert.equal(recovered.journal.getAuthorityState().cursor, 1);
+
+  const tampered = store.values.get(MEMORY_JOURNAL_KEY);
+  tampered.lifecycleAuthority.graphReceipts[0].taskRevision += 1;
+  store.values.set(MEMORY_JOURNAL_KEY, tampered);
+  await assert.rejects(
+    fixture({ store }),
+    (error) => error.code === "MEMORY_JOURNAL_CORRUPTED",
+  );
+});
+
+test("retired legacy PR memory is obsolete even when persisted before lifecycle tags", async () => {
+  const store = memoryStore();
+  const legacy = normalizeMemoryRecord(record(1, {
+    source: { kind: "legacy-pr-memory", id: "pr-work-old:analysis_ready" },
+    roleId: "pr-reviewer",
+    eventType: "analysis_ready",
+    tags: ["legacy", "pr-reviewer", "derived"],
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 1,
+    records: [legacy],
+  });
+  const { journal } = await fixture({ store });
+
+  assert.deepEqual(
+    journal.readRecords({ recordIds: [legacy.recordId] }).items[0].labels,
+    { authority: "derived", lifecycle: "obsolete" },
+  );
 });
 
 test("authoritative context reads reject malformed, missing, and accessor-backed ids", async () => {

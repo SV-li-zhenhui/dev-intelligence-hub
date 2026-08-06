@@ -11,9 +11,10 @@ function inputBindingFor({
   repository = "acme/repo",
   pullRequestNumber = 42,
   headRefOid = HEAD_REF_OID,
+  sourceAccountId = "review-account",
 } = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository,
     pullRequestNumber,
@@ -25,6 +26,17 @@ function inputBindingFor({
     eventId,
     eventDigest: "c".repeat(64),
     inputDigest: "d".repeat(64),
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId,
+      baseRepository: repository,
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/review",
+      headRefOid,
+    },
   };
 }
 
@@ -66,10 +78,13 @@ function proposal(overrides = {}) {
       ...binding,
       ...overrides.binding,
       subject: { ...binding.subject, ...overrides.binding?.subject },
-      inputBinding: {
-        ...binding.inputBinding,
-        ...overrides.binding?.inputBinding,
-      },
+      inputBinding:
+        overrides.binding?.inputBinding?.schemaVersion === 1
+          ? overrides.binding.inputBinding
+          : {
+              ...binding.inputBinding,
+              ...overrides.binding?.inputBinding,
+            },
     },
     payload: { ...payload, ...overrides.payload },
   });
@@ -108,12 +123,12 @@ test("a trusted GitHub proposal becomes the exact user-visible action", () => {
     type: "pull_request_review",
     reviewEvent: "REQUEST_CHANGES",
     body: "请先补充失败分支测试。",
+    inputBinding: value.binding.inputBinding,
   });
   assert.deepEqual(plan.display.payload, {
     actor: plan.actor,
     target: plan.target,
     action: plan.action,
-    inputBinding: value.binding.inputBinding,
   });
   assert.equal("displayedPayloadDigest" in plan, false);
   assert.equal("approvalBindingDigest" in plan, false);
@@ -212,6 +227,55 @@ test("the canonical PR input binding must match the exact Review target", () => 
       (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
     );
   }
+});
+
+test("legacy work-proposal reviews are recovery-only and only v2 binds the execution account", () => {
+  const legacy = proposal({
+    binding: {
+      inputBinding: {
+        schemaVersion: 1,
+        kind: "pull_request",
+        repository: "acme/repo",
+        pullRequestNumber: 42,
+        rootItemId: "work-item-1",
+        workKey: "github:dashboard:acme-repo:42",
+        inputRevision: 1,
+        headRevision: 1,
+        headRefOid: HEAD_REF_OID,
+        eventId: "event-1",
+        eventDigest: "c".repeat(64),
+        inputDigest: "d".repeat(64),
+      },
+    },
+  });
+  const foreignAccount = proposal({
+    binding: {
+      inputBinding: inputBindingFor({ sourceAccountId: "other-account" }),
+    },
+  });
+
+  assert.throws(
+    () => createGitHubReviewProposalConfirmationPlan(legacy, {
+      actorAccountId: "review-account",
+    }),
+    (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
+  );
+  const legacyPlan = createGitHubReviewProposalConfirmationPlan(legacy, {
+    actorAccountId: "review-account",
+    legacyRecovery: true,
+  });
+  assert.equal(Object.hasOwn(legacyPlan.action, "inputBinding"), false);
+  assert.deepEqual(
+    legacyPlan.display.payload.inputBinding,
+    legacy.binding.inputBinding,
+  );
+  assert.throws(
+    () =>
+      createGitHubReviewProposalConfirmationPlan(foreignAccount, {
+        actorAccountId: "review-account",
+      }),
+    (error) => error.code === "INVALID_GITHUB_REVIEW_PROPOSAL",
+  );
 });
 
 test("accepts the exact trusted subject emitted by the work intent policy", () => {

@@ -1,4 +1,5 @@
 import { normalizeWorkflowEvent } from "./workflow-events.js";
+import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
 
 const SOURCE_DEFINITIONS = Object.freeze([
   {
@@ -21,6 +22,8 @@ const FACT_FIELDS = Object.freeze([
   "milestone",
   "relation",
   "assignmentSource",
+  "gitTarget",
+  "gitTargetAvailable",
   "actionState",
   "nextActor",
   "nextAction",
@@ -116,10 +119,18 @@ function requireSourceScopeId(value) {
 }
 
 function sourceIsHealthy(snapshot, statusName) {
-  return snapshot.sourceStatus?.[statusName]?.ok === true;
+  const status = snapshot.sourceStatus?.[statusName];
+  return status?.ok === true && status.stale !== true;
 }
 
 function normalizedFactValue(value, field) {
+  if (field === "gitTarget") {
+    try {
+      return structuredClone(normalizePullRequestGitTarget(value));
+    } catch {
+      throw new TypeError("gitTarget must be a valid PR Git target");
+    }
+  }
   if (Array.isArray(value)) {
     if (value.some((entry) => typeof entry !== "string")) {
       throw new TypeError(`${field} must contain only strings`);

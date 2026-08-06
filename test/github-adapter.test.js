@@ -153,6 +153,57 @@ test("check summaries never treat cancelled, pending, or unknown states as succe
   );
 });
 
+test("every GitHub command is pinned to github.com through an explicit environment", async () => {
+  const calls = [];
+  const sourceEnvironment = {
+    GH_HOST: "enterprise.example.com",
+    PATH: process.env.PATH || "",
+  };
+  const run = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "api") return { login: "runtime-user" };
+    if (args[0] === "search") return [];
+    if (args[0] === "pr") {
+      return { headRefOid: "head-42", files: [] };
+    }
+    throw new Error(`Unexpected call: ${args.join(" ")}`);
+  };
+  const runText = async (command, args, options) => {
+    calls.push({ command, args, options });
+    return "diff";
+  };
+  const adapter = new GitHubAdapter({
+    run,
+    runText,
+    env: sourceEnvironment,
+  });
+
+  await adapter.searchRelevantPullRequests();
+  await adapter.searchIssues();
+  await adapter.loadReviewContext({
+    id: "github:pr:acme/repo#42",
+    repo: "acme/repo",
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    headRefOid: "head-42",
+  });
+
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.command === "gh"));
+  assert.ok(
+    calls.every((call) => call.options.env.GH_HOST === "github.com"),
+  );
+  assert.ok(
+    calls.every((call) => call.options.env.PATH === sourceEnvironment.PATH),
+  );
+  assert.equal(sourceEnvironment.GH_HOST, "enterprise.example.com");
+  assert.equal(
+    calls.find((call) => call.args[0] === "pr" && call.args[1] === "diff")
+      .options.timeoutMs,
+    60_000,
+  );
+});
+
 test("relevant PR search uses the active account, returns every result, and fetches detail once", async () => {
   const calls = [];
   const own = {
@@ -179,8 +230,15 @@ test("relevant PR search uses the active account, returns every result, and fetc
     }
     if (args[0] === "search" && args.includes("--author=@me")) return [own];
     if (args[0] === "pr") {
+      const suffix = args[2].endsWith("/7") ? "7" : "8";
       return {
-        headRefOid: `head-${args[2].endsWith("/7") ? "7" : "8"}`,
+        number: Number(suffix),
+        url: `https://github.com/acme/repo/pull/${suffix}`,
+        baseRefName: "main",
+        baseRefOid: "a".repeat(40),
+        headRefName: `feature-${suffix}`,
+        headRefOid: suffix.repeat(40),
+        headRepository: { nameWithOwner: "acme/repo" },
         reviews: [],
         assignees: [],
         labels: [],
@@ -193,6 +251,13 @@ test("relevant PR search uses the active account, returns every result, and fetc
   const items = await new GitHubAdapter({ run }).searchRelevantPullRequests();
 
   assert.equal(items.length, 2);
+  assert.deepEqual(
+    calls.filter((args) => args[0] === "api"),
+    [
+      ["api", "--hostname", "github.com", "user"],
+      ["api", "--hostname", "github.com", "user"],
+    ],
+  );
   assert.equal(calls.filter((args) => args[0] === "pr").length, 2);
   assert.ok(
     calls
@@ -200,6 +265,16 @@ test("relevant PR search uses the active account, returns every result, and fetc
       .every((args) => args.includes("1000")),
   );
   assert.ok(items.every((item) => item.currentUser === "runtime-user"));
+  assert.ok(items.every((item) => item.githubAccount === "runtime-user"));
+  assert.ok(items.every((item) => item.baseRepository === "acme/repo"));
+  assert.ok(items.every((item) => item.baseRefName === "main"));
+  assert.ok(items.every((item) => item.headRepository === "acme/repo"));
+  assert.ok(items.every((item) => item.gitTarget?.provider === "github"));
+  assert.ok(
+    items.every(
+      (item) => item.gitTarget.headRefOid === item.headRefOid,
+    ),
+  );
   assert.ok(items.every((item) => item.reviewFactsAvailable));
 });
 
@@ -228,6 +303,66 @@ test("a partial PR detail failure makes the source stale instead of returning mi
     adapter.searchRelevantPullRequests(),
     /detail unavailable/,
   );
+});
+
+test("an incomplete live Git target is explicit and cannot masquerade as legacy facts", async () => {
+  const record = {
+    number: 8,
+    title: "Deleted fork PR",
+    url: "https://github.com/acme/repo/pull/8",
+    repository: { nameWithOwner: "acme/repo" },
+    author: { login: "someone-else" },
+    state: "open",
+  };
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      if (args[0] === "search" && args.includes("--assignee=@me")) {
+        return [record];
+      }
+      if (args[0] === "search") return [];
+      return {
+        number: 8,
+        url: "https://github.com/acme/repo/pull/8",
+        baseRefName: "main",
+        baseRefOid: "a".repeat(40),
+        headRefName: "fix/conflict",
+        headRefOid: "b".repeat(40),
+        headRepository: null,
+        reviews: [],
+        assignees: [],
+        labels: [],
+        statusCheckRollup: [],
+      };
+    },
+  });
+
+  const [item] = await adapter.searchRelevantPullRequests();
+
+  assert.equal(item.gitTargetAvailable, false);
+  assert.equal(Object.hasOwn(item, "gitTarget"), false);
+  assert.equal(Object.hasOwn(item, "headRepository"), false);
+  assert.equal(item.headRefOid, "b".repeat(40));
+});
+
+test("an account switch during discovery invalidates the entire PR batch", async () => {
+  let accountCalls = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") {
+        accountCalls += 1;
+        return { login: accountCalls === 1 ? "runtime-user" : "other-user" };
+      }
+      if (args[0] === "search") return [];
+      throw new Error(`Unexpected call: ${args.join(" ")}`);
+    },
+  });
+
+  await assert.rejects(
+    adapter.searchRelevantPullRequests(),
+    /account changed during PR refresh/,
+  );
+  assert.equal(accountCalls, 2);
 });
 
 test("review context is head-pinned and truncates oversized patches", async () => {
@@ -281,7 +416,8 @@ test("review context is head-pinned and truncates oversized patches", async () =
 test("review context reports a head change instead of returning mixed evidence", async () => {
   let viewCount = 0;
   const adapter = new GitHubAdapter({
-    run: async () => {
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
       viewCount += 1;
       return viewCount === 1
         ? { headRefOid: "head-42", files: [] }
@@ -299,6 +435,287 @@ test("review context reports a head change instead of returning mixed evidence",
   assert.equal(result.headRefOid, "head-43");
   assert.equal(result.patch, "");
   assert.equal(result.patchTruncated, false);
+});
+
+test("review context drops a patch when the base target changes under the same Head", async () => {
+  const headRefOid = "b".repeat(40);
+  let viewCount = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      viewCount += 1;
+      return viewCount === 1
+        ? {
+            number: 42,
+            url: "https://github.com/acme/repo/pull/42",
+            baseRefName: "main",
+            baseRefOid: "a".repeat(40),
+            headRefName: "fix/conflict",
+            headRefOid,
+            headRepository: { nameWithOwner: "contributor/repo" },
+            files: [],
+          }
+        : {
+            number: 42,
+            url: "https://github.com/acme/repo/pull/42",
+            baseRefName: "main",
+            baseRefOid: "c".repeat(40),
+            headRefName: "fix/conflict",
+            headRefOid,
+            headRepository: { nameWithOwner: "contributor/repo" },
+          };
+    },
+    runText: async () => "diff that is now stale",
+  });
+
+  const request = {
+    id: "github:pr:acme/repo#42",
+    repo: "acme/repo",
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/conflict",
+      headRefOid,
+    },
+  };
+
+  await assert.rejects(
+    adapter.loadReviewContext(request),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
+});
+
+test("review context drops a patch when the observing GitHub account changes", async () => {
+  const headRefOid = "b".repeat(40);
+  let accountCalls = 0;
+  const metadata = {
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRefName: "fix/conflict",
+    headRefOid,
+    headRepository: { nameWithOwner: "contributor/repo" },
+    files: [],
+  };
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") {
+        accountCalls += 1;
+        return { login: accountCalls === 1 ? "runtime-user" : "other-user" };
+      }
+      return metadata;
+    },
+    runText: async () => "diff read before the account switched",
+  });
+
+  const request = {
+    id: "github:pr:acme/repo#42",
+    repo: "acme/repo",
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    headRefOid,
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/conflict",
+      headRefOid,
+    },
+  };
+
+  await assert.rejects(
+    adapter.loadReviewContext(request),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
+  assert.equal(accountCalls, 2);
+});
+
+test("target-aware review context reads an immutable compare by the sealed OIDs", async () => {
+  const baseRefOid = "a".repeat(40);
+  const headRefOid = "b".repeat(40);
+  const target = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid,
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid,
+  };
+  const textCalls = [];
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      return {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        title: "Resolve conflict",
+        baseRefName: "main",
+        baseRefOid,
+        headRefName: "fix/conflict",
+        headRefOid,
+        headRepository: { nameWithOwner: "contributor/repo" },
+        files: [],
+      };
+    },
+    runText: async (_command, args) => {
+      textCalls.push(args);
+      return "sealed diff";
+    },
+  });
+
+  const result = await adapter.loadReviewContext({
+    id: "github:pr:acme/repo#42",
+    repo: "acme/repo",
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    gitTargetAvailable: true,
+    gitTarget: target,
+  });
+
+  assert.equal(result.patch, "sealed diff");
+  assert.deepEqual(textCalls[0], [
+    "api",
+    "--hostname",
+    "github.com",
+    `repos/acme/repo/compare/${baseRefOid}...${headRefOid}`,
+    "--header",
+    "Accept: application/vnd.github.patch",
+  ]);
+});
+
+test("an explicitly unavailable live target cannot fall back to legacy patch review", async () => {
+  const adapter = new GitHubAdapter({
+    run: async () => assert.fail("unavailable target must fail before I/O"),
+    runText: async () => assert.fail("unavailable target must not read a patch"),
+  });
+
+  await assert.rejects(
+    adapter.loadReviewContext({
+      id: "github:pr:acme/repo#42",
+      repo: "acme/repo",
+      number: 42,
+      url: "https://github.com/acme/repo/pull/42",
+      headRefOid: "b".repeat(40),
+      gitTargetAvailable: false,
+    }),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
+});
+
+test("target-aware no-patch context verifies the target and account twice", async () => {
+  const baseRefOid = "a".repeat(40);
+  const headRefOid = "b".repeat(40);
+  let accountCalls = 0;
+  let viewCalls = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") {
+        accountCalls += 1;
+        return { login: "runtime-user" };
+      }
+      viewCalls += 1;
+      return {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        title: "Fix CI",
+        baseRefName: "main",
+        baseRefOid,
+        headRefName: "fix/ci",
+        headRefOid,
+        headRepository: { nameWithOwner: "acme/repo" },
+        files: [],
+      };
+    },
+    runText: async () => assert.fail("patch must not be read"),
+  });
+
+  const result = await adapter.loadReviewContext(
+    {
+      id: "github:pr:acme/repo#42",
+      repo: "acme/repo",
+      number: 42,
+      url: "https://github.com/acme/repo/pull/42",
+      headRefOid,
+      gitTargetAvailable: true,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid,
+        headRepository: "acme/repo",
+        headRefName: "fix/ci",
+        headRefOid,
+      },
+    },
+    { includePatch: false },
+  );
+
+  assert.equal(result.patch, "");
+  assert.equal(accountCalls, 2);
+  assert.equal(viewCalls, 2);
+});
+
+test("a canonical base repository change invalidates target-aware context", async () => {
+  const baseRefOid = "a".repeat(40);
+  const headRefOid = "b".repeat(40);
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      return {
+        number: 42,
+        url: "https://github.com/acme/renamed/pull/42",
+        baseRefName: "main",
+        baseRefOid,
+        headRefName: "fix/conflict",
+        headRefOid,
+        headRepository: { nameWithOwner: "contributor/repo" },
+        files: [],
+      };
+    },
+    runText: async () => assert.fail("stale target must not read a patch"),
+  });
+
+  await assert.rejects(
+    adapter.loadReviewContext({
+      id: "github:pr:acme/repo#42",
+      repo: "acme/repo",
+      number: 42,
+      url: "https://github.com/acme/repo/pull/42",
+      headRefOid,
+      gitTargetAvailable: true,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid,
+        headRepository: "contributor/repo",
+        headRefName: "fix/conflict",
+        headRefOid,
+      },
+    }),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
 });
 
 test("owner work can load structured PR context without downloading the patch", async () => {

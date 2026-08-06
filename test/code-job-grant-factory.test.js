@@ -23,12 +23,24 @@ function proposal(operation = "modify", roleId = "developer") {
     payload: {
       title: "Fix race",
       headRefOid: "a".repeat(40),
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/race",
+        headRefOid: "a".repeat(40),
+      },
+      gitTargetAvailable: true,
       state: "open",
     },
   });
   const workItemId = `work-item-${"d".repeat(64)}`;
   const inputBinding = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository: event.subject.repository,
     pullRequestNumber: event.subject.number,
@@ -40,6 +52,7 @@ function proposal(operation = "modify", roleId = "developer") {
     eventId: event.eventId,
     eventDigest: event.contentDigest,
     inputDigest: "c".repeat(64),
+    gitTarget: structuredClone(event.payload.gitTarget),
   };
   const bound = createWorkIntentPolicy({
     version: 7,
@@ -76,6 +89,24 @@ function proposal(operation = "modify", roleId = "developer") {
     source: bound.source,
     binding: bound.binding,
     payload: bound.payload,
+  });
+}
+
+function legacyProposal() {
+  const current = proposal();
+  const { gitTarget: _gitTarget, ...legacyBinding } =
+    current.binding.inputBinding;
+  return normalizeBoundWorkProposal({
+    proposalId: current.proposalId,
+    policyVersion: current.policyVersion,
+    kind: current.kind,
+    requestedBy: current.requestedBy,
+    source: current.source,
+    binding: {
+      ...current.binding,
+      inputBinding: { ...legacyBinding, schemaVersion: 1 },
+    },
+    payload: current.payload,
   });
 }
 
@@ -221,6 +252,29 @@ test("trusted authority seals workspace, operation, profile, and brain bindings"
   assert.match(options.grant.brainDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(options.allowedOperationsByRole.tester, ["inspect", "verify"]);
   assert.equal(Object.isFrozen(options.allowedOperationsByRole), true);
+});
+
+test("legacy PR bindings cannot create or authorize new code jobs", () => {
+  const legacy = legacyProposal();
+  assert.throws(
+    () => factory().create(legacy),
+    (error) =>
+      error?.code === "INVALID_CODE_JOB_AUTHORITY" &&
+      error.message.includes("旧版"),
+  );
+  const { grantDigest: _grantDigest, ...currentGrant } =
+    factory().create(proposal()).grant;
+  const legacyBoundGrant = createCodeJobGrant({
+    ...currentGrant,
+    inputBinding: legacy.binding.inputBinding,
+  });
+  assert.deepEqual(normalizeCodeJobGrant(legacyBoundGrant), legacyBoundGrant);
+  assert.throws(
+    () => factory().verify(legacyBoundGrant),
+    (error) =>
+      error?.code === "INVALID_CODE_JOB_AUTHORITY" &&
+      error.message.includes("旧版"),
+  );
 });
 
 test("grant creation preserves exact proposal authority boundaries", () => {

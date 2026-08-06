@@ -55,6 +55,7 @@ import { WorkflowFactSource } from "./services/workflow-fact-source.js";
 import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
+import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
 const CODE_ACTION_PROPOSAL_RUNNER_ID = "code-action-runner";
@@ -106,6 +107,51 @@ function brainConfigurationsByRole(roles) {
   return Object.fromEntries(
     Object.entries(configured).map(([roleId, role]) => [roleId, role?.brain]),
   );
+}
+
+function staleChangePackageAuthority(message, { cause } = {}) {
+  const error = new Error(message, cause === undefined ? {} : { cause });
+  error.code = "CHANGE_PACKAGE_APPLICATION_STALE";
+  return error;
+}
+
+async function verifyChangePackageApplicationAuthority({
+  manifest,
+  codeJobReader,
+  inputAuthorityVerifier,
+}) {
+  if (codeJobReader === null) {
+    throw staleChangePackageAuthority("变更包缺少可核验的来源代码任务");
+  }
+  const job = await codeJobReader.get(manifest.job.id);
+  if (
+    job === null ||
+    job.jobId !== manifest.job.id ||
+    job.status !== "completed" ||
+    job.proposalId !== manifest.proposal.id ||
+    job.proposalContentDigest !== manifest.proposal.contentDigest ||
+    job.grantDigest !== manifest.grant.digest ||
+    job.workspaceId !== manifest.workspace.id ||
+    !Object.hasOwn(job, "inputBinding")
+  ) {
+    throw staleChangePackageAuthority("变更包来源代码任务绑定不匹配");
+  }
+  if (job.inputBinding === null) return true;
+  if (job.inputBinding.schemaVersion !== 2 || inputAuthorityVerifier === null) {
+    throw staleChangePackageAuthority("旧版 PR 变更包只能恢复已有结果");
+  }
+  let verified;
+  try {
+    verified = await inputAuthorityVerifier.verify(
+      structuredClone(job.inputBinding),
+    );
+  } catch (cause) {
+    throw staleChangePackageAuthority("PR 变更包来源授权已失效", { cause });
+  }
+  if (!samePullRequestExecutionBinding(verified, job.inputBinding)) {
+    throw staleChangePackageAuthority("PR 变更包来源授权已变化");
+  }
+  return true;
 }
 
 export function createBrain(config = {}, dependencies = {}) {
@@ -285,6 +331,7 @@ export async function createApplication({
   let codeJobRuntime = null;
   let confirmationRuntime = null;
   let codeJobReader = null;
+  let inputAuthorityVerifier = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
   let codeJobWorker = null;
@@ -298,6 +345,13 @@ export async function createApplication({
   let changePackageApplicationResultBarrier = null;
   let changePackageApplicationRequester = null;
   let grantFactory = null;
+  const applicationAuthorityVerifier = Object.freeze({
+    verify: (manifest) => verifyChangePackageApplicationAuthority({
+      manifest,
+      codeJobReader,
+      inputAuthorityVerifier,
+    }),
+  });
   try {
     if (versionedConfiguration) {
       configurationRuntime = trackRuntime(
@@ -348,6 +402,7 @@ export async function createApplication({
           ...changePackageRuntimeDependencies,
           store,
           trustedTargets: codeExecutorRuntime.changePackageTargets,
+          applicationAuthorityVerifier,
         }),
       );
       if (!changePackageRuntime) {
@@ -464,6 +519,15 @@ export async function createApplication({
           operationQueue: new OperationQueue(),
           maximumRecords: config.memory.maximumRecords,
           maximumStateBytes: config.memory.maximumStateBytes,
+          ...(workLedgerRuntime === null
+            ? {}
+            : {
+                authoritySource: frozenPort(
+                  workLedgerRuntime.memoryAuthoritySource,
+                  ["readStatus"],
+                  "workLedgerRuntime.memoryAuthoritySource",
+                ),
+              }),
         }),
       );
     }
@@ -473,7 +537,7 @@ export async function createApplication({
     if (localCodeExecutionEnabled && !workLedgerRuntime) {
       throw new Error("本地代码工作提案需要启用共享工作台账");
     }
-    const inputAuthorityVerifier = workLedgerRuntime === null
+    inputAuthorityVerifier = workLedgerRuntime === null
       ? null
       : Object.freeze({
           verify: (binding) =>
@@ -708,6 +772,9 @@ export async function createApplication({
         await confirmationRuntimeFactory(config, {
           ...confirmationRuntimeDependencies,
           store,
+          ...(inputAuthorityVerifier === null
+            ? {}
+            : { inputAuthorityVerifier }),
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : {
@@ -811,6 +878,7 @@ export async function createApplication({
           runner:
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
+          inputAuthorityVerifier,
           actorAccountId: config.githubActions.actorAccountId,
           leaseDurationMs: coordinationConfig.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,
@@ -863,10 +931,14 @@ export async function createApplication({
       store,
       config: roleConfig,
       operationQueue,
-      producerQueue: confirmationRuntime?.producerQueue || null,
-      githubActions: externalActions
-        ? config.githubActions || { enabled: false }
-        : { enabled: false },
+      producerQueue: confirmationRuntime
+        ? frozenPort(
+            confirmationRuntime.producerQueue,
+            ["get", "invalidate"],
+            "confirmationRuntime.legacyRecoveryQueue",
+          )
+        : null,
+      githubActions: { enabled: false },
       ...(ordinaryActionAdmissionGate === null
         ? {}
         : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -1068,11 +1140,23 @@ export async function createApplication({
       if (memoryRuntime) {
         memoryProjector = frozenPort(
           memoryProjectorFactory({
-            memoryProducer: memoryRuntime.producer,
-            ledgerView: workLedgerRuntime,
+            memoryLifecycleProducer: frozenPort(
+              memoryRuntime.lifecycleProducer,
+              [
+                "appendWorkItems",
+                "appendGraphEvents",
+                "appendProjectionRecords",
+              ],
+              "memoryRuntime.lifecycleProducer",
+            ),
+            memoryAuthoritySource: frozenPort(
+              workLedgerRuntime.memoryAuthoritySource,
+              ["readSnapshot"],
+              "workLedgerRuntime.memoryAuthoritySource",
+            ),
             graphProjectionSource: frozenPort(
               workLedgerRuntime.graphMemoryProjectionSource,
-              ["readBatch", "ackBatch"],
+              ["ackBatch"],
               "workLedgerRuntime.graphMemoryProjectionSource",
             ),
             store,

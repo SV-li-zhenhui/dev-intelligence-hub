@@ -32,6 +32,7 @@ import {
 import {
   createCodeJobChangePackageEvent,
   normalizeCodeJobChangePackageEvent,
+  reconstructCodeJobChangePackageEventForRecovery,
 } from "../domain/code-job-change-package-event.js";
 import {
   normalizeChangePackageManifest,
@@ -936,7 +937,7 @@ function changePackageEventMatchesJob(event, job) {
 
 function deliveredChangePackageMatchesJob(entry, job) {
   try {
-    const event = createCodeJobChangePackageEvent({
+    const event = reconstructCodeJobChangePackageEventForRecovery({
       sequence: entry.receipt.sequence,
       previousDigest: entry.previousDigest,
       job,

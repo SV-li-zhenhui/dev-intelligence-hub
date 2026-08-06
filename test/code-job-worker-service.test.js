@@ -1939,6 +1939,7 @@ test("the host selects fixed profiles and completes only after current-attempt p
     result: { exitCode: 0, stdout: "ok", stderr: "" },
   });
   const initial = job({
+    grant: grant({ schemaVersion: 2, inputBinding: null }),
     status: "active",
     revision: 5,
     execution: {
@@ -2212,6 +2213,7 @@ test("a durable complete observation finishes locally after authority revocation
     expectedWorkspaceRevision: REVISION_A,
   };
   const initial = job({
+    grant: grant({ schemaVersion: 2, inputBinding: null }),
     status: "active",
     revision: 8,
     execution: {
@@ -2253,6 +2255,48 @@ test("a durable complete observation finishes locally after authority revocation
   assert.equal((await store.getForWorker(initial.jobId)).status, "completed");
   assert.equal(store.completionRequests.length, 1);
   assert.equal(store.completionRequests[0].changePackageDelivery, true);
+});
+
+test("a durable legacy PR completion recovers locally without opening a new package", async () => {
+  const completeAction = {
+    type: "complete",
+    actionId: "legacy-complete-observed-before-upgrade",
+    expectedWorkspaceRevision: REVISION_A,
+  };
+  const initial = job({
+    grant: grant({
+      schemaVersion: 2,
+      inputBinding: pullRequestInputBinding(),
+    }),
+    status: "active",
+    revision: 8,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 1,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [observation(completeAction)],
+      result: null,
+      pause: null,
+    },
+  });
+  const events = [];
+  const store = new FakeJobStore([initial], events);
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor: new FakeExecutor(initial, events),
+    brainDirectory: brain([]),
+    grantVerifier: verifier(events, new Error("must not verify recovery")),
+    changePackageDeliveryEnabled: true,
+  });
+
+  const result = await worker.runCycle();
+
+  assert.equal(result.outcomes[0].status, "completed");
+  assert.equal(events.includes("verify"), false);
+  assert.equal(store.completionRequests.length, 1);
+  assert.equal("changePackageDelivery" in store.completionRequests[0], false);
 });
 
 test("change package delivery defaults off and requires a strict boolean", async () => {

@@ -1,3 +1,5 @@
+import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
+
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
@@ -85,6 +87,14 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function safeGitTarget(value) {
+  try {
+    return normalizePullRequestGitTarget(value);
+  } catch {
+    return null;
+  }
+}
+
 function normalizeBaseUrl(value, allowRemoteCodeContext) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol)) {
@@ -107,6 +117,7 @@ function normalizeBaseUrl(value, allowRemoteCodeContext) {
 }
 
 function selectContext(context) {
+  const gitTarget = safeGitTarget(context.gitTarget);
   return {
     id: context.id || "",
     repository: context.repo || "",
@@ -114,7 +125,18 @@ function selectContext(context) {
     title: String(context.title || "").slice(0, 500),
     description: String(context.description || "").slice(0, 4_000),
     relation: context.relation || "",
-    headRefOid: context.headRefOid || "",
+    gitTargetAvailable:
+      context.gitTargetAvailable === true && gitTarget !== null,
+    githubAccount:
+      gitTarget?.sourceAccountId || context.githubAccount || context.currentUser || "",
+    baseRepository:
+      gitTarget?.baseRepository || context.baseRepository || context.repo || "",
+    baseRefName: gitTarget?.baseRefName || context.baseRefName || "",
+    baseRefOid: gitTarget?.baseRefOid || context.baseRefOid || "",
+    headRepository:
+      gitTarget?.headRepository || context.headRepository || context.repo || "",
+    headRefName: gitTarget?.headRefName || context.headRefName || "",
+    headRefOid: gitTarget?.headRefOid || context.headRefOid || "",
     ciStatus: context.ciStatus || "",
     mergeStateStatus: context.mergeStateStatus || "",
     requestedAction: context.requestedAction || "",

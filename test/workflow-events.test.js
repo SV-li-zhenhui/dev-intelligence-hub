@@ -127,6 +127,67 @@ test("event identity binds timestamp, type, subject, source, and payload", () =>
   }
 });
 
+test("PR events carry one atomic Git target bound to the subject and legacy Head", () => {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "SVisions/OCT-Software",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/OCT-Software",
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+  };
+  const normalized = normalizeWorkflowEvent(event({
+    payload: {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget,
+      gitTargetAvailable: true,
+    },
+  }));
+
+  assert.deepEqual(normalized.payload.gitTarget, gitTarget);
+  assert.ok(Object.isFrozen(normalized.payload.gitTarget));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    payload: {
+      headRefOid: "c".repeat(40),
+      gitTarget,
+      gitTargetAvailable: true,
+    },
+  })));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    payload: {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget,
+      gitTargetAvailable: true,
+      baseRefOid: gitTarget.baseRefOid,
+    },
+  })));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    eventType: "issue.updated",
+    payload: {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget,
+      gitTargetAvailable: true,
+    },
+  })));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    payload: { headRefOid: gitTarget.headRefOid, gitTargetAvailable: true },
+  })));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    payload: {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget,
+      gitTargetAvailable: false,
+    },
+  })));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    eventType: "issue.updated",
+    payload: { gitTargetAvailable: false },
+  })));
+});
+
 test("stored events are re-normalized and their identity is verified", () => {
   const stored = normalizeWorkflowEvent(event());
   assert.deepEqual(normalizeStoredWorkflowEvent(stored), stored);

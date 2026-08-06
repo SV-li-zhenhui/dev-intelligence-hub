@@ -1,6 +1,11 @@
 import path from "node:path";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
+import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import {
   ManagedProcess,
   ManagedProcessError,
   ManagedProcessRunner,
@@ -126,11 +131,8 @@ function parseTarget(value) {
   };
 }
 
-function normalizeAction(kind, value) {
-  if (
-    kind === "github.pull-request-review" ||
-    kind === "github.work-proposal-review"
-  ) {
+function normalizeAction(kind, value, { allowLegacyWorkProposal = false } = {}) {
+  if (kind === "github.pull-request-review") {
     exactObject(value, ["type", "reviewEvent", "body"]);
     if (
       value.type !== "pull_request_review" ||
@@ -144,10 +146,51 @@ function normalizeAction(kind, value) {
       body: actionBody(value.body),
     };
   }
+  if (kind === "github.work-proposal-review") {
+    if (allowLegacyWorkProposal && !Object.hasOwn(value, "inputBinding")) {
+      exactObject(value, ["type", "reviewEvent", "body"]);
+      if (
+        value.type !== "pull_request_review" ||
+        !REVIEW_EVENTS.has(value.reviewEvent)
+      ) {
+        throw actionError("INVALID_GITHUB_ACTION", "trusted");
+      }
+      return {
+        type: "pull_request_review",
+        reviewEvent: value.reviewEvent,
+        body: actionBody(value.body),
+      };
+    }
+    exactObject(value, ["type", "reviewEvent", "body", "inputBinding"]);
+    if (
+      value.type !== "pull_request_review" ||
+      !REVIEW_EVENTS.has(value.reviewEvent)
+    ) {
+      throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    }
+    let inputBinding;
+    try {
+      inputBinding = normalizePullRequestExecutionBinding(
+        value.inputBinding,
+        actionError("INVALID_GITHUB_ACTION", "trusted"),
+      );
+    } catch {
+      throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    }
+    if (inputBinding.schemaVersion !== 2) {
+      throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    }
+    return {
+      type: "pull_request_review",
+      reviewEvent: value.reviewEvent,
+      body: actionBody(value.body),
+      inputBinding,
+    };
+  }
   throw actionError("INVALID_GITHUB_ACTION", "trusted");
 }
 
-function normalizeEnvelope(value) {
+function normalizeEnvelope(value, { allowLegacyWorkProposal = false } = {}) {
   exactObject(value, [
     "schemaVersion",
     "id",
@@ -180,7 +223,19 @@ function normalizeEnvelope(value) {
     accountId: exactString(value.actor.accountId, GITHUB_LOGIN, 39),
   };
   const target = parseTarget(value.target);
-  const action = normalizeAction(kind, value.action);
+  const action = normalizeAction(kind, value.action, {
+    allowLegacyWorkProposal,
+  });
+  if (
+    action.inputBinding &&
+    (action.inputBinding.repository !== target.repo ||
+      action.inputBinding.pullRequestNumber !== target.number ||
+      action.inputBinding.headRefOid !== target.version ||
+      action.inputBinding.gitTarget.sourceAccountId.toLowerCase() !==
+        actor.accountId.toLowerCase())
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
   const displayedPayloadDigest = exactString(
     value.displayedPayloadDigest,
     SHA256,
@@ -317,6 +372,7 @@ class GitHubActionAdapter {
   #command;
   #env;
   #timeoutMs;
+  #verifyInputAuthority;
 
   constructor({
     runner = new ManagedProcessRunner({
@@ -331,6 +387,7 @@ class GitHubActionAdapter {
     token = env?.GH_TOKEN || env?.GITHUB_TOKEN,
     ghCommand,
     timeoutMs = 60_000,
+    inputAuthorityVerifier,
   } = {}) {
     if (!runner || typeof runner.run !== "function") {
       throw new TypeError("runner must provide run");
@@ -381,12 +438,22 @@ class GitHubActionAdapter {
     }
     this.#env = Object.freeze(childEnv);
     this.#timeoutMs = timeoutMs;
+    if (
+      inputAuthorityVerifier !== undefined &&
+      (!inputAuthorityVerifier ||
+        typeof inputAuthorityVerifier.verify !== "function")
+    ) {
+      throw new TypeError("inputAuthorityVerifier must provide verify(binding)");
+    }
+    this.#verifyInputAuthority = inputAuthorityVerifier?.verify.bind(
+      inputAuthorityVerifier,
+    ) ?? null;
   }
 
   async reconcile(input) {
     let envelope;
     try {
-      envelope = normalizeEnvelope(input);
+      envelope = normalizeEnvelope(input, { allowLegacyWorkProposal: true });
     } catch (error) {
       return errorResult(error);
     }
@@ -394,12 +461,21 @@ class GitHubActionAdapter {
       await this.#assertActor(envelope.actor.accountId);
       const matched = await this.#findMarker(envelope);
       if (matched) return { status: "already", receipt: matched };
-      const currentHead = await this.#currentHead(envelope);
-      if (currentHead !== envelope.target.version) {
+      if (
+        envelope.kind === "github.work-proposal-review" &&
+        !envelope.action.inputBinding
+      ) {
+        return { status: "stale" };
+      }
+      if (!(await this.#inputAuthorityCurrent(envelope))) {
+        return { status: "stale" };
+      }
+      const currentTarget = await this.#currentTarget(envelope);
+      if (!currentTarget.matches) {
         return {
           status: "stale",
           expectedVersion: envelope.target.version,
-          actualVersion: currentHead,
+          actualVersion: currentTarget.actualVersion,
         };
       }
       return { status: "absent", code: "GITHUB_MARKER_ABSENT" };
@@ -417,25 +493,31 @@ class GitHubActionAdapter {
       return errorResult(error);
     }
     try {
+      if (!(await this.#inputAuthorityCurrent(envelope))) {
+        return { status: "stale" };
+      }
       await this.#assertActor(envelope.actor.accountId);
       const matched = await this.#findMarker(envelope);
       if (matched) return { status: "already", receipt: matched };
-      const observedHead = await this.#currentHead(envelope);
-      if (observedHead !== envelope.target.version) {
+      const observedTarget = await this.#currentTarget(envelope);
+      if (!observedTarget.matches) {
         return {
           status: "stale",
           expectedVersion: envelope.target.version,
-          actualVersion: observedHead,
+          actualVersion: observedTarget.actualVersion,
         };
       }
       await this.#assertActor(envelope.actor.accountId);
-      const finalHead = await this.#currentHead(envelope);
-      if (finalHead !== envelope.target.version) {
+      const finalTarget = await this.#currentTarget(envelope);
+      if (!finalTarget.matches) {
         return {
           status: "stale",
           expectedVersion: envelope.target.version,
-          actualVersion: finalHead,
+          actualVersion: finalTarget.actualVersion,
         };
+      }
+      if (!(await this.#inputAuthorityCurrent(envelope))) {
+        return { status: "stale" };
       }
       postStarted = true;
       return {
@@ -459,18 +541,75 @@ class GitHubActionAdapter {
     }
   }
 
-  async #currentHead(envelope) {
+  async #inputAuthorityCurrent(envelope) {
+    const binding = envelope.action.inputBinding;
+    if (!binding) {
+      return envelope.kind !== "github.work-proposal-review";
+    }
+    if (this.#verifyInputAuthority === null) return false;
+    try {
+      const verified = await this.#verifyInputAuthority(
+        structuredClone(binding),
+      );
+      return samePullRequestExecutionBinding(verified, binding);
+    } catch {
+      return false;
+    }
+  }
+
+  async #currentTarget(envelope) {
+    const targetAware = Boolean(envelope.action.inputBinding);
     const value = await this.#runJson([
       "pr",
       "view",
       `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
       "--json",
-      "headRefOid",
+      targetAware
+        ? "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+        : "headRefOid",
     ]);
-    if (!isPlainObject(value) || typeof value.headRefOid !== "string") {
+    if (
+      !isPlainObject(value) ||
+      typeof value.headRefOid !== "string" ||
+      !SHA.test(value.headRefOid)
+    ) {
       throw actionError("GITHUB_PROTOCOL");
     }
-    return value.headRefOid;
+    if (!targetAware) {
+      return {
+        matches: value.headRefOid === envelope.target.version,
+        actualVersion: value.headRefOid,
+      };
+    }
+    const expected = envelope.action.inputBinding.gitTarget;
+    const expectedUrl =
+      `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`;
+    if (
+      value.number !== envelope.target.number ||
+      typeof value.url !== "string" ||
+      value.url.toLowerCase() !== expectedUrl.toLowerCase() ||
+      typeof value.baseRefName !== "string" ||
+      typeof value.baseRefOid !== "string" ||
+      typeof value.headRefName !== "string" ||
+      typeof value.headRepository?.nameWithOwner !== "string"
+    ) {
+      return { matches: false, actualVersion: value.headRefOid };
+    }
+    const observed = {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: envelope.actor.accountId,
+      baseRepository: envelope.target.repo,
+      baseRefName: value.baseRefName,
+      baseRefOid: value.baseRefOid,
+      headRepository: value.headRepository.nameWithOwner,
+      headRefName: value.headRefName,
+      headRefOid: value.headRefOid,
+    };
+    return {
+      matches: samePullRequestGitTarget(expected, observed),
+      actualVersion: value.headRefOid,
+    };
   }
 
   async #findMarker(envelope) {
@@ -578,7 +717,9 @@ class GitHubActionAdapter {
 }
 
 export function markerForGitHubAction(input) {
-  return markerForEnvelope(normalizeEnvelope(input));
+  return markerForEnvelope(
+    normalizeEnvelope(input, { allowLegacyWorkProposal: true }),
+  );
 }
 
 export function createGitHubActionExecutor(options) {

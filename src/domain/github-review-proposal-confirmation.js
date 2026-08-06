@@ -114,7 +114,7 @@ function confirmationId(proposal) {
 
 export function createGitHubReviewProposalConfirmationPlan(
   value,
-  { actorAccountId } = {},
+  { actorAccountId, legacyRecovery = false } = {},
 ) {
   const proposal = normalizedStoredProposal(value);
   if (proposal.kind !== "github_review_proposal") {
@@ -190,6 +190,9 @@ export function createGitHubReviewProposalConfirmationPlan(
   } catch {
     throw invalid("binding.inputBinding 无效");
   }
+  if (inputBinding.schemaVersion === 1 && legacyRecovery !== true) {
+    throw invalid("旧版 Review 提案只允许恢复，不得新建确认");
+  }
   if (
     inputBinding.repository !== repository ||
     inputBinding.pullRequestNumber !== number ||
@@ -209,13 +212,27 @@ export function createGitHubReviewProposalConfirmationPlan(
     39,
     GITHUB_LOGIN,
   );
+  if (
+    inputBinding.schemaVersion === 2 &&
+    inputBinding.gitTarget.sourceAccountId.toLowerCase() !==
+    accountId.toLowerCase()
+  ) {
+    throw invalid("GitHub 执行账号与 PR 观察账号不一致");
+  }
   const actor = { provider: "github", accountId };
   const target = {
     provider: "github",
     resourceId: `${repository}#${number}`,
     version: headRefOid,
   };
-  const action = { type: "pull_request_review", reviewEvent, body };
+  const action = inputBinding.schemaVersion === 2
+    ? {
+        type: "pull_request_review",
+        reviewEvent,
+        body,
+        inputBinding,
+      }
+    : { type: "pull_request_review", reviewEvent, body };
 
   return queuePlan({
     id: confirmationId(proposal),
@@ -229,7 +246,9 @@ export function createGitHubReviewProposalConfirmationPlan(
       summary,
       actionLabel: "确认并发布到 GitHub",
       evidence: reasons,
-      payload: { actor, target, action, inputBinding },
+      payload: inputBinding.schemaVersion === 2
+        ? { actor, target, action }
+        : { actor, target, action, inputBinding },
     },
   });
 }

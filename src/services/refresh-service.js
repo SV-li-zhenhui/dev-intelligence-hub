@@ -16,6 +16,18 @@ function serviceError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
 }
 
+function clockMilliseconds(clock) {
+  const value = clock();
+  let milliseconds = Number.NaN;
+  if (value instanceof Date) milliseconds = value.getTime();
+  else if (typeof value === "number") milliseconds = value;
+  else if (typeof value === "string") milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) {
+    throw new TypeError("RefreshService clock returned an invalid time");
+  }
+  return milliseconds;
+}
+
 function confirmedAssessment(actionState) {
   if (actionState === ACTION_STATES.ACTION_NOW) {
     return {
@@ -74,6 +86,14 @@ function brainAssessmentFingerprint(item, brainConfig) {
     assignmentSource: item.assignmentSource || "",
     author: item.author || "",
     currentUser: item.currentUser || "",
+    gitTarget: item.gitTarget || null,
+    gitTargetAvailable: item.gitTargetAvailable,
+    githubAccount: item.githubAccount || "",
+    baseRepository: item.baseRepository || "",
+    baseRefName: item.baseRefName || "",
+    baseRefOid: item.baseRefOid || "",
+    headRepository: item.headRepository || "",
+    headRefName: item.headRefName || "",
     state: item.state || "",
     isDraft: Boolean(item.isDraft),
     reviewFactsAvailable: item.reviewFactsAvailable === true,
@@ -100,6 +120,7 @@ export class RefreshService {
     config,
     brain = null,
     operationQueue = null,
+    clock = () => new Date(),
   }) {
     this.github = github;
     this.brain = brain;
@@ -107,6 +128,10 @@ export class RefreshService {
     this.store = store;
     this.notifier = notifier;
     this.config = config;
+    if (typeof clock !== "function") {
+      throw new TypeError("RefreshService clock must be a function");
+    }
+    this.clock = clock;
     this.running = null;
     this.operationQueue = operationQueue;
     this.operations = Promise.resolve();
@@ -241,7 +266,8 @@ export class RefreshService {
   }
 
   async #performRefresh({ notify = false } = {}) {
-    const startedAt = Date.now();
+    const startedAt = clockMilliseconds(this.clock);
+    const observationLowerBound = new Date(startedAt).toISOString();
     const [previous, notificationBaseline, responsibilityOverrides] =
       await Promise.all([
         this.store.read("snapshot"),
@@ -339,7 +365,7 @@ export class RefreshService {
     errors.push(...dingtalkResult.errors);
 
     const snapshot = {
-      refreshedAt: new Date().toISOString(),
+      refreshedAt: observationLowerBound,
       sources: {
         github:
           assessedPullRequests.items.length + githubValues[1].length,
@@ -372,7 +398,10 @@ export class RefreshService {
       ]),
       versions: githubValues[2],
     };
-    snapshot.durationMs = Date.now() - startedAt;
+    snapshot.durationMs = Math.max(
+      0,
+      clockMilliseconds(this.clock) - startedAt,
+    );
     const diff = diffSnapshots(previous, snapshot);
     const dashboard = buildDashboard(snapshot, previous);
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RefreshService } from "../src/services/refresh-service.js";
+import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
 
 class MemoryStore {
   constructor(entries = {}) {
@@ -228,4 +229,90 @@ test("a failed source retains its last known data instead of reporting completio
     ok: false,
     stale: true,
   });
+});
+
+test("a slow refresh cannot renew the freshness age of earlier PR facts", async () => {
+  const startedAt = Date.parse("2026-08-02T03:00:00.000Z");
+  let now = startedAt;
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+  };
+  const store = new MemoryStore();
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() {
+        now = Date.parse("2026-08-02T03:20:00.000Z");
+        return [
+          pullRequest({
+            id: "github:pr:acme/repo#42",
+            repo: "acme/repo",
+            number: 42,
+            currentUser: "runtime-user",
+            githubAccount: "runtime-user",
+            baseRepository: gitTarget.baseRepository,
+            baseRefName: gitTarget.baseRefName,
+            baseRefOid: gitTarget.baseRefOid,
+            headRepository: gitTarget.headRepository,
+            headRefName: gitTarget.headRefName,
+            headRefOid: gitTarget.headRefOid,
+            gitTargetAvailable: true,
+            gitTarget,
+            ciStatus: "SUCCESS",
+          }),
+        ];
+      },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: null,
+    dingtalk: {},
+    store,
+    notifier: {},
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: false },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date(now),
+  });
+
+  await service.refresh();
+  const snapshot = await store.read("snapshot");
+  assert.equal(snapshot.refreshedAt, "2026-08-02T03:00:00.000Z");
+  assert.equal(snapshot.durationMs, 20 * 60 * 1_000);
+
+  const facts = new WorkflowFactSource({
+    store,
+    clock: () => new Date("2026-08-02T03:34:00.000Z"),
+  });
+  const observed = await facts.read({
+    item: {
+      event: {
+        eventType: "pull_request.updated",
+        subject: {
+          id: "github:pr:acme/repo#42",
+          repository: "acme/repo",
+          number: 42,
+        },
+        payload: {
+          headRefOid: gitTarget.headRefOid,
+          gitTargetAvailable: true,
+          gitTarget,
+        },
+      },
+    },
+    fact: "ci-status",
+  });
+  assert.equal(observed.healthy, true);
+  assert.equal(observed.fresh, false);
+  assert.equal(observed.value, null);
 });

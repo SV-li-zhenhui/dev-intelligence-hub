@@ -202,6 +202,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
   assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);
   assert.equal(Object.isFrozen(runtime.graphDelivererFactory), true);
   assert.equal(Object.isFrozen(runtime.graphMemoryProjectionSource), true);
+  assert.equal(Object.isFrozen(runtime.memoryAuthoritySource), true);
   assert.deepEqual(Object.keys(runtime.graphReader), ["getSnapshot"]);
   assert.deepEqual(Object.keys(runtime.graphPlanner), [
     "createChild",
@@ -214,6 +215,10 @@ test("runtime owns one named process guard and exposes least-authority graph por
     Object.keys(runtime.graphMemoryProjectionSource),
     ["readBatch", "ack", "ackBatch"],
   );
+  assert.deepEqual(Object.keys(runtime.memoryAuthoritySource), [
+    "readSnapshot",
+    "readStatus",
+  ]);
   assert.equal(runtime.getGraphSnapshot, undefined);
   assert.equal(runtime.createGraphChild, undefined);
   assert.equal(runtime.graphStore, undefined);
@@ -225,8 +230,23 @@ test("runtime owns one named process guard and exposes least-authority graph por
   assert.equal(graphSnapshot.graph.revision, 0);
   assert.deepEqual(
     await runtime.graphMemoryProjectionSource.readBatch({ limit: 1 }),
-    { cursor: 0, highWatermark: 0, items: [] },
+    {
+      cursor: 0,
+      highWatermark: 0,
+      checkpointDigest: null,
+      highWatermarkDigest: null,
+      authorityStateDigest:
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      items: [],
+    },
   );
+  const authoritySnapshot = await runtime.memoryAuthoritySource.readSnapshot({
+    limit: 1,
+  });
+  assert.equal(authoritySnapshot.ledgerRevision, 0);
+  assert.deepEqual(authoritySnapshot.items, []);
+  assert.deepEqual(authoritySnapshot.timeline, []);
+  assert.deepEqual(authoritySnapshot.graph.items, []);
 
   const intake = await runtime.intake();
   assert.equal(intake.cursor, 0);

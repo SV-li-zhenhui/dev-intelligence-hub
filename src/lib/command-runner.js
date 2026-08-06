@@ -8,14 +8,18 @@ export class CommandError extends Error {
   }
 }
 
-export function runCommand(command, args, { timeoutMs = 60_000 } = {}) {
+export function runCommand(
+  command,
+  args,
+  { timeoutMs = 60_000, env = process.env } = {},
+) {
   return new Promise((resolve, reject) => {
     const invocation =
       process.platform === "win32" && command === "dws"
         ? {
             command: "C:\\Program Files\\nodejs\\node.exe",
             args: [
-              `${process.env.APPDATA}\\npm\\node_modules\\dingtalk-workspace-cli\\bin\\dws.js`,
+              `${env.APPDATA}\\npm\\node_modules\\dingtalk-workspace-cli\\bin\\dws.js`,
               ...args,
             ],
           }
@@ -23,7 +27,7 @@ export function runCommand(command, args, { timeoutMs = 60_000 } = {}) {
     const child = spawn(invocation.command, invocation.args, {
       shell: false,
       windowsHide: true,
-      env: process.env,
+      env,
     });
     let stdout = "";
     let stderr = "";

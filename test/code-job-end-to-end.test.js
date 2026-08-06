@@ -419,9 +419,13 @@ test("code action confirmation reaches memory and an exactly-once package applic
   );
   assert.equal(detail.changePackage.status, "ready");
   const packageId = detail.changePackage.receipt.packageId;
+  await application.memoryProjector.runCycle();
   const memory = await application.memorySearch.search({ q: "代码任务已完成" });
-  assert.equal(memory.items.length, 1);
-  assert.equal(memory.items[0].repository, "acme/repo");
+  const completedMemory = memory.items.find(
+    ({ source }) => source.kind === "code_job",
+  );
+  assert.notEqual(completedMemory, undefined);
+  assert.equal(completedMemory.repository, "acme/repo");
   const proposalResults = await proposalRuntime.consumer.readResultBatch();
   assert.equal(proposalResults.items.length, 1);
   assert.equal(proposalResults.items[0].outcome, "succeeded");

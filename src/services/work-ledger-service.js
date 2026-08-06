@@ -51,13 +51,21 @@ import {
 import {
   activatePendingPullRequestWorkSource,
   appendPullRequestWorkSource,
+  pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
   validatePullRequestSourceTransition,
 } from "./work-ledger-pr-source.js";
 import {
   applyReadyPullRequestSourceCutover,
+  crossRootPullRequestCutoverCandidate,
+  crossRootPullRequestCutoverActivation,
+  crossRootPullRequestCutoverBlockerReason,
+  crossRootPullRequestCutoverPendingId,
+  crossRootPullRequestCutoverPendingReason,
+  crossRootPullRequestCutoverPredecessorId,
   inspectPullRequestSourceCutover,
   planPullRequestSourceReconciliation,
+  retireCrossRootPullRequestPredecessor,
 } from "./work-ledger-pr-cutover-commands.js";
 import {
   assertWorkLedgerCapacity,
@@ -90,10 +98,71 @@ const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
 });
 
 const PR_SOURCE_REQUEUE_STATUSES = new Set([
+  "blocked",
   "working",
   "retry_wait",
   "completed",
 ]);
+const CROSS_ROOT_REPLACED_REASON =
+  "pr_source_cross_root_cutover_replaced";
+const PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS = new Set([
+  "ignored_authority_fence",
+  "ignored_legacy_downgrade",
+  "ignored_unproven_head",
+]);
+
+function canRequeueAdvancedPullRequestRoot(root) {
+  return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
+    (root.kind === "source_root" &&
+      root.source?.kind === "pull_request" &&
+      root.status === "superseded" &&
+      root.statusReason === CROSS_ROOT_REPLACED_REASON);
+}
+
+function samePullRequestSubject(left, right) {
+  return Boolean(
+    left?.source?.kind === "pull_request" &&
+      right?.source?.kind === "pull_request" &&
+      left.source.identity.subjectId === right.source.identity.subjectId &&
+      left.source.identity.repository === right.source.identity.repository &&
+      left.source.identity.pullRequestNumber ===
+        right.source.identity.pullRequestNumber,
+  );
+}
+
+function operationalPullRequestPredecessor(itemsById, root, authority) {
+  const canonicalItemId = authority?.canonicalRootItemId ??
+    authority?.lastTrustedRootItemId ?? null;
+  if (canonicalItemId === null || canonicalItemId === root.itemId) return null;
+  let candidate = itemsById.get(canonicalItemId) ?? null;
+  if (
+    candidate?.kind !== "source_root" ||
+    !samePullRequestSubject(candidate, root)
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+      "跨来源 PR cutover 当前来源绑定无效",
+      409,
+    );
+  }
+  const pendingPredecessorItemId =
+    crossRootPullRequestCutoverPredecessorId(candidate);
+  if (pendingPredecessorItemId !== null) {
+    candidate = itemsById.get(pendingPredecessorItemId) ?? null;
+  }
+  if (candidate?.itemId === root.itemId) return null;
+  if (
+    candidate?.kind !== "source_root" ||
+    !samePullRequestSubject(candidate, root)
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+      "跨来源 PR cutover 前驱绑定无效",
+      409,
+    );
+  }
+  return candidate;
+}
 
 function newWorkAdmissionRun(value) {
   const gate = value === undefined ? DIRECT_NEW_WORK_ADMISSION : value;
@@ -339,6 +408,45 @@ export class WorkLedgerService {
     return readWorkGraphMemoryProjectionBatch(
       this.state.graphMemoryProjection,
       options,
+    );
+  }
+
+  async readMemoryAuthoritySnapshot({ limit = 100 } = {}) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        return cloneLedgerValue({
+          ledgerRevision: this.state.revision,
+          items: this.state.items,
+          timeline: this.state.timeline,
+          graph: readWorkGraphMemoryProjectionBatch(
+            this.state.graphMemoryProjection,
+            { limit },
+          ),
+        });
+      }),
+    );
+  }
+
+  async readMemoryAuthorityStatus() {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        const graph = this.state.graphMemoryProjection;
+        return cloneLedgerValue({
+          ledgerRevision: this.state.revision,
+          graph: {
+            cursor: graph.cursor,
+            highWatermark: graph.nextSequence - 1,
+            checkpointDigest: graph.checkpointDigest,
+            highWatermarkDigest:
+              graph.pending.at(-1)?.eventDigest ?? graph.checkpointDigest,
+            authorityStateDigest: graph.authorityStateDigest,
+          },
+        });
+      }),
     );
   }
 
@@ -691,6 +799,114 @@ export class WorkLedgerService {
       let disposition = "accepted";
       let headAdvanced = false;
       if (!root) {
+        const pendingCrossRoot = [...itemsById.values()].find(
+          (item) =>
+            item.itemId !== rootCandidate.itemId &&
+            samePullRequestSubject(item, rootCandidate) &&
+            crossRootPullRequestCutoverPredecessorId(item) !== null,
+        );
+        const priorAuthority = pullRequestTrustedPredecessor(
+          { items: [...itemsById.values()] },
+          rootCandidate,
+        );
+        const predecessorItemId = pendingCrossRoot === undefined
+          ? priorAuthority?.canonicalRootItemId ??
+            priorAuthority?.lastTrustedRootItemId ?? null
+          : crossRootPullRequestCutoverPredecessorId(pendingCrossRoot);
+        const predecessor = predecessorItemId === null
+          ? null
+          : itemsById.get(predecessorItemId) ?? null;
+        const candidateAuthority = pullRequestTrustedPredecessor(
+          { items: [...itemsById.values(), rootCandidate] },
+          rootCandidate,
+        );
+        const candidateIsAuthoritative =
+          candidateAuthority?.canonicalRootItemId === rootCandidate.itemId;
+        const candidateFencesAuthority =
+          candidateAuthority?.canonicalRootItemId === null &&
+          candidateAuthority.authorityFenced === true &&
+          candidateAuthority.lastTrustedRootItemId === predecessor?.itemId;
+        if (
+          predecessor !== null &&
+          samePullRequestSubject(predecessor, rootCandidate) &&
+          (candidateIsAuthoritative || candidateFencesAuthority)
+        ) {
+          const activation = inspectPullRequestSourceCutover(
+            predecessor,
+            [...itemsById.values()],
+            outboxById,
+            { forceHeadChanged: true },
+          );
+          if (activation.blockers.length > 0) {
+            rootCandidate.status = "blocked";
+            rootCandidate.statusReason =
+              crossRootPullRequestCutoverPendingReason(predecessor.itemId);
+            for (const blocker of activation.blockers) {
+              const marked = {
+                ...blocker,
+                revision:
+                  initialItemIds.has(blocker.itemId) &&
+                    !revisedItemIds.has(blocker.itemId)
+                    ? blocker.revision + 1
+                    : blocker.revision,
+                statusReason: crossRootPullRequestCutoverBlockerReason(
+                  rootCandidate.itemId,
+                ),
+                updatedAt: now,
+              };
+              if (initialItemIds.has(marked.itemId)) {
+                revisedItemIds.add(marked.itemId);
+              }
+              itemsById.set(marked.itemId, marked);
+              if (marked.source?.kind === "pull_request") {
+                rootByWorkKey.set(marked.source.workKey, marked);
+              }
+            }
+          } else if (candidateIsAuthoritative) {
+            const locallySettled = applyReadyPullRequestSourceCutover({
+              root: predecessor,
+              activation: crossRootPullRequestCutoverActivation(
+                predecessor,
+                activation,
+              ),
+              itemsById,
+              outboxById,
+              nextInputRevision: rootCandidate.source.activeRevision,
+              nextHeadRevision: rootCandidate.source.headRevision,
+              now,
+              timelineEvents,
+            });
+            const retired = retireCrossRootPullRequestPredecessor(
+              locallySettled,
+              now,
+            );
+            const settled = initialItemIds.has(predecessor.itemId)
+              ? retired
+              : {
+                  ...retired,
+                  status: "blocked",
+                  revision: predecessor.revision,
+                };
+            if (
+              initialItemIds.has(settled.itemId) &&
+              settled.revision !== predecessor.revision
+            ) {
+              revisedItemIds.add(settled.itemId);
+            }
+            itemsById.set(settled.itemId, settled);
+            rootByWorkKey.set(settled.source.workKey, settled);
+          }
+        } else if (
+          predecessorItemId !== null &&
+          (predecessor === null ||
+            !samePullRequestSubject(predecessor, rootCandidate))
+        ) {
+          throw workLedgerError(
+            "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+            "跨来源 PR cutover 前驱绑定无效",
+            409,
+          );
+        }
         root = rootCandidate;
         rootByWorkKey.set(root.source.workKey, root);
         itemsById.set(root.itemId, root);
@@ -708,41 +924,262 @@ export class WorkLedgerService {
           },
         });
       } else {
+        const predecessor = pullRequestTrustedPredecessor(
+          { items: [...itemsById.values()] },
+          root,
+        );
+        const crossRootPredecessor = operationalPullRequestPredecessor(
+          itemsById,
+          root,
+          predecessor,
+        );
         let appended = appendPullRequestWorkSource(
           root.source,
           envelope,
-          { activate: false },
+          {
+            activate: false,
+            ...(predecessor === null
+              ? {}
+              : { causalHeadRefOid: predecessor.headRefOid }),
+            authorityEpochChanged:
+              predecessor?.canonicalRootItemId !== root.itemId,
+            authorityFenceRecovery:
+              predecessor?.authorityFenced === true &&
+              predecessor.trustedSourceRootItemId === root.itemId,
+          },
         );
-        if (appended.disposition === "accepted") {
-          const pendingRoot = { ...root, source: appended.source };
+        if (
+          PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS.has(
+            appended.disposition,
+          ) &&
+          crossRootPredecessor !== null
+        ) {
+          const currentPredecessor = itemsById.get(
+            crossRootPredecessor.itemId,
+          );
           const activation = inspectPullRequestSourceCutover(
-            pendingRoot,
+            currentPredecessor,
             [...itemsById.values()],
             outboxById,
+            { forceHeadChanged: true },
           );
-          if (activation.blockers.length === 0) {
+          if (activation.blockers.length > 0) {
+            root = {
+              ...root,
+              source: appended.source,
+              status: "blocked",
+              ownerId: null,
+              leaseId: null,
+              leaseUntil: null,
+              activeIntentId: null,
+              decisionContext: null,
+              availableAt: null,
+              statusReason: crossRootPullRequestCutoverPendingReason(
+                currentPredecessor.itemId,
+              ),
+            };
+            for (const blocker of activation.blockers) {
+              const marked = {
+                ...blocker,
+                revision:
+                  initialItemIds.has(blocker.itemId) &&
+                    !revisedItemIds.has(blocker.itemId)
+                    ? blocker.revision + 1
+                    : blocker.revision,
+                statusReason: crossRootPullRequestCutoverBlockerReason(
+                  root.itemId,
+                ),
+                updatedAt: now,
+              };
+              if (initialItemIds.has(marked.itemId)) {
+                revisedItemIds.add(marked.itemId);
+              }
+              itemsById.set(marked.itemId, marked);
+              if (marked.source?.kind === "pull_request") {
+                rootByWorkKey.set(marked.source.workKey, marked);
+              }
+            }
+          }
+        }
+        if (appended.disposition === "accepted") {
+          const obsoletePendingRoots = [...itemsById.values()].filter(
+            (candidate) =>
+              candidate.itemId !== root.itemId &&
+              samePullRequestSubject(candidate, root) &&
+              crossRootPullRequestCutoverPredecessorId(candidate) !== null &&
+              crossRootPullRequestCutoverCandidate(candidate).sourceSequence <
+                envelope.sequence,
+          );
+          for (const obsolete of obsoletePendingRoots) {
+            const persisted = initialItemIds.has(obsolete.itemId);
+            const replaced = {
+              ...obsolete,
+              status: persisted ? "superseded" : "blocked",
+              revision:
+                persisted && !revisedItemIds.has(obsolete.itemId)
+                  ? obsolete.revision + 1
+                  : obsolete.revision,
+              ownerId: null,
+              leaseId: null,
+              leaseUntil: null,
+              activeIntentId: null,
+              availableAt: null,
+              statusReason: "pr_source_cross_root_cutover_replaced",
+              updatedAt: now,
+            };
+            if (persisted) revisedItemIds.add(replaced.itemId);
+            itemsById.set(replaced.itemId, replaced);
+            rootByWorkKey.set(replaced.source.workKey, replaced);
+            for (const participant of itemsById.values()) {
+              if (
+                crossRootPullRequestCutoverPendingId(participant) !==
+                  obsolete.itemId
+              ) {
+                continue;
+              }
+              const participantPersisted = initialItemIds.has(
+                participant.itemId,
+              );
+              const cleared = {
+                ...participant,
+                revision:
+                  participantPersisted &&
+                    !revisedItemIds.has(participant.itemId)
+                    ? participant.revision + 1
+                    : participant.revision,
+                statusReason: "pr_source_revised",
+                updatedAt: now,
+              };
+              if (participantPersisted) revisedItemIds.add(cleared.itemId);
+              itemsById.set(cleared.itemId, cleared);
+              if (cleared.source?.kind === "pull_request") {
+                rootByWorkKey.set(cleared.source.workKey, cleared);
+              }
+              if (cleared.itemId === root.itemId) root = cleared;
+            }
+          }
+          const pendingRoot = { ...root, source: appended.source };
+          if (crossRootPredecessor !== null) {
             const pendingRevision = appended.source.pendingRevision;
             const pendingHeadRevision = appended.source.revisions[
               pendingRevision - 1
             ].headRevision;
-            root = applyReadyPullRequestSourceCutover({
-              root,
-              activation,
-              itemsById,
-              outboxById,
-              nextInputRevision: pendingRevision,
-              nextHeadRevision: pendingHeadRevision,
-              now,
-              timelineEvents,
-            });
-            const activated = activatePendingPullRequestWorkSource(
-              appended.source,
+            const currentPredecessor = itemsById.get(
+              crossRootPredecessor.itemId,
             );
-            appended = {
-              ...appended,
-              source: activated.source,
-              activeAdvanced: true,
-            };
+            const activation = inspectPullRequestSourceCutover(
+              currentPredecessor,
+              [...itemsById.values()],
+              outboxById,
+              { forceHeadChanged: true },
+            );
+            if (activation.blockers.length > 0) {
+              root = {
+                ...pendingRoot,
+                status: "blocked",
+                ownerId: null,
+                leaseId: null,
+                leaseUntil: null,
+                activeIntentId: null,
+                decisionContext: null,
+                availableAt: null,
+                statusReason: crossRootPullRequestCutoverPendingReason(
+                  currentPredecessor.itemId,
+                ),
+              };
+              for (const blocker of activation.blockers) {
+                const marked = {
+                  ...blocker,
+                  revision:
+                    initialItemIds.has(blocker.itemId) &&
+                      !revisedItemIds.has(blocker.itemId)
+                      ? blocker.revision + 1
+                      : blocker.revision,
+                  statusReason: crossRootPullRequestCutoverBlockerReason(
+                    root.itemId,
+                  ),
+                  updatedAt: now,
+                };
+                if (initialItemIds.has(marked.itemId)) {
+                  revisedItemIds.add(marked.itemId);
+                }
+                itemsById.set(marked.itemId, marked);
+                if (marked.source?.kind === "pull_request") {
+                  rootByWorkKey.set(marked.source.workKey, marked);
+                }
+              }
+            } else {
+              const locallySettled = applyReadyPullRequestSourceCutover({
+                root: currentPredecessor,
+                activation: crossRootPullRequestCutoverActivation(
+                  currentPredecessor,
+                  activation,
+                ),
+                itemsById,
+                outboxById,
+                nextInputRevision: pendingRevision,
+                nextHeadRevision: pendingHeadRevision,
+                now,
+                timelineEvents,
+              });
+              const retired = retireCrossRootPullRequestPredecessor(
+                locallySettled,
+                now,
+              );
+              const settled = initialItemIds.has(currentPredecessor.itemId)
+                ? retired
+                : {
+                    ...retired,
+                    status: "blocked",
+                    revision: currentPredecessor.revision,
+                  };
+              if (
+                initialItemIds.has(settled.itemId) &&
+                settled.revision !== currentPredecessor.revision
+              ) {
+                revisedItemIds.add(settled.itemId);
+              }
+              itemsById.set(settled.itemId, settled);
+              rootByWorkKey.set(settled.source.workKey, settled);
+              const activated = activatePendingPullRequestWorkSource(
+                appended.source,
+              );
+              appended = {
+                ...appended,
+                source: activated.source,
+                activeAdvanced: true,
+              };
+            }
+          } else {
+            const activation = inspectPullRequestSourceCutover(
+              pendingRoot,
+              [...itemsById.values()],
+              outboxById,
+            );
+            if (activation.blockers.length === 0) {
+              const pendingRevision = appended.source.pendingRevision;
+              const pendingHeadRevision = appended.source.revisions[
+                pendingRevision - 1
+              ].headRevision;
+              root = applyReadyPullRequestSourceCutover({
+                root,
+                activation,
+                itemsById,
+                outboxById,
+                nextInputRevision: pendingRevision,
+                nextHeadRevision: pendingHeadRevision,
+                now,
+                timelineEvents,
+              });
+              const activated = activatePendingPullRequestWorkSource(
+                appended.source,
+              );
+              appended = {
+                ...appended,
+                source: activated.source,
+                activeAdvanced: true,
+              };
+            }
           }
         }
         disposition = appended.disposition;
@@ -756,7 +1193,7 @@ export class WorkLedgerService {
           ...(firstRevisionInBatch
             ? { revision: root.revision + 1 }
             : {}),
-          ...(appended.activeAdvanced && PR_SOURCE_REQUEUE_STATUSES.has(root.status)
+          ...(appended.activeAdvanced && canRequeueAdvancedPullRequestRoot(root)
             ? {
                 status: "queued",
                 ownerId: null,

@@ -82,18 +82,20 @@ function manualClock(initial = "2026-08-02T06:00:00.000Z") {
 
 function grantInput(overrides = {}) {
   return {
+    schemaVersion: 2,
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
     requestedBy: { roleId: "developer", workItemId: "work-1" },
     source: { assignmentId: "assignment-1", eventId: "event-1" },
     subject: {
-      id: "github:acme/widgets:pull-request:17",
+      id: "github:issue:acme/widgets#17",
       repository: "acme/widgets",
       number: 17,
     },
     repository: "acme/widgets",
     workspaceId: "widgets-local",
+    inputBinding: null,
     workspaceAuthorityDigest: "9".repeat(64),
     operation: "inspect",
     objective: "Find the retry race without changing source files.",
@@ -108,6 +110,23 @@ function grantInput(overrides = {}) {
     ],
     brainDigest: "c".repeat(64),
     ...overrides,
+  };
+}
+
+function legacyPullRequestInputBinding() {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/widgets",
+    pullRequestNumber: 17,
+    rootItemId: "work-1",
+    workKey: "pull-request-acme-widgets-17",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "1".repeat(40),
+    eventId: "event-1",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
   };
 }
 
@@ -238,8 +257,13 @@ async function readyStore({
 }
 
 async function completedDeliveryFixture(options = {}) {
-  const fixture = await readyStore(options);
-  const created = await fixture.jobs.createApprovedJob(approval());
+  const {
+    jobApproval = approval(),
+    changePackageDelivery = true,
+    ...storeOptions
+  } = options;
+  const fixture = await readyStore(storeOptions);
+  const created = await fixture.jobs.createApprovedJob(jobApproval);
   const starting = await fixture.jobs.claimStarting({
     jobId: created.job.jobId,
     expectedRevision: created.job.revision,
@@ -274,7 +298,7 @@ async function completedDeliveryFixture(options = {}) {
     jobId: created.job.jobId,
     expectedRevision: observed.job.revision,
     result,
-    changePackageDelivery: true,
+    ...(changePackageDelivery ? { changePackageDelivery: true } : {}),
   });
   return {
     ...fixture,
@@ -368,6 +392,42 @@ function changePackageAcknowledgement(event, manifest, overrides = {}) {
     packageId: manifest.packageId,
     packageDigest: manifest.packageDigest,
     ...overrides,
+  };
+}
+
+function persistedLegacyChangePackageEvent(job) {
+  const source = job.execution.memoryProjection ?? {
+    sourceRevision: job.revision,
+    sourceRecordDigest: job.recordDigest,
+  };
+  const completion = job.execution.observations.findLast(
+    ({ actionType, status }) => actionType === "complete" && status === "succeeded",
+  );
+  const content = {
+    schemaVersion: 1,
+    sequence: 1,
+    previousDigest: null,
+    job: {
+      id: job.jobId,
+      revision: source.sourceRevision,
+      recordDigest: source.sourceRecordDigest,
+    },
+    proposal: {
+      id: job.proposal.proposalId,
+      contentDigest: job.proposal.contentDigest,
+    },
+    grant: { digest: job.grant.grantDigest },
+    exportRequest: {
+      sessionId: job.execution.sessionId,
+      completedActionId: completion.actionId,
+      expectedWorkspaceRevision: job.execution.workspaceRevision,
+    },
+  };
+  const eventDigest = digestValue(content);
+  return {
+    ...content,
+    eventId: `code-job-change-package-event-${eventDigest}`,
+    eventDigest,
   };
 }
 
@@ -719,6 +779,7 @@ test("get and list return newest browser-safe copies", async () => {
     "subject",
     "repository",
     "workspaceId",
+    "inputBinding",
     "operation",
     "objective",
     "acceptanceCriteria",
@@ -2057,6 +2118,113 @@ test("schema v8 jobs without cancellation settlement retain durable outbox bindi
         .execution.memoryProjection.sourceRecordDigest,
       legacy.memoryEvent.sourceRecordDigest,
     );
+  });
+});
+
+test("schema v8 legacy PR package deliveries survive pending and delivered restarts", async (t) => {
+  async function legacyDeliveryState({ delivered }) {
+    const jobApproval = approval({
+      grant: grant({
+        subject: {
+          id: "github:pr:acme/widgets#17",
+          repository: "acme/widgets",
+          number: 17,
+        },
+        inputBinding: legacyPullRequestInputBinding(),
+      }),
+    });
+    const fixture = await completedDeliveryFixture({
+      jobApproval,
+      changePackageDelivery: false,
+    });
+    assert.deepEqual(await fixture.jobs.readChangePackageDeliveryBatch(), {
+      cursor: 0,
+      highWatermark: 0,
+      items: [],
+    });
+
+    const event = persistedLegacyChangePackageEvent(fixture.completed.job);
+    const manifest = changePackageForEvent(event);
+    const acknowledgement = changePackageAcknowledgement(event, manifest);
+    const state = structuredClone(fixture.store.value);
+    state.changePackageDelivery = {
+      revision: state.revision,
+      nextSequence: 2,
+      cursor: delivered ? 1 : 0,
+      checkpointDigest: delivered ? event.eventDigest : null,
+      pending: delivered ? [] : [event],
+      delivered: delivered
+        ? [{
+            previousDigest: event.previousDigest,
+            receipt: {
+              ...acknowledgement,
+              deliveredAt: fixture.completed.job.updatedAt,
+            },
+          }]
+        : [],
+    };
+    return {
+      state,
+      event,
+      acknowledgement,
+      changePackageReader: {
+        async get(packageId) {
+          assert.equal(packageId, manifest.packageId);
+          return structuredClone(manifest);
+        },
+      },
+    };
+  }
+
+  await t.test("pending event resumes its existing delivery", async () => {
+    const legacy = await legacyDeliveryState({ delivered: false });
+    const store = new MemoryStore(legacy.state);
+    const recovered = await readyStore({
+      store,
+      changePackageReader: legacy.changePackageReader,
+    });
+
+    assert.deepEqual(
+      (await recovered.jobs.readChangePackageDeliveryBatch()).items,
+      [legacy.event],
+    );
+    assert.equal(
+      (await recovered.jobs.acknowledgeChangePackageDelivery(
+        legacy.acknowledgement,
+      )).status,
+      "applied",
+    );
+    const restarted = await readyStore({ store });
+    assert.deepEqual(await restarted.jobs.readChangePackageDeliveryBatch(), {
+      cursor: 1,
+      highWatermark: 1,
+      items: [],
+    });
+    assert.equal(
+      (await restarted.jobs.acknowledgeChangePackageDelivery(
+        legacy.acknowledgement,
+      )).status,
+      "already",
+    );
+  });
+
+  await t.test("delivered receipt remains idempotent after restart", async () => {
+    const legacy = await legacyDeliveryState({ delivered: true });
+    const store = new MemoryStore(legacy.state);
+    const recovered = await readyStore({ store });
+
+    assert.equal(
+      (await recovered.jobs.acknowledgeChangePackageDelivery(
+        legacy.acknowledgement,
+      )).status,
+      "already",
+    );
+    const restarted = await readyStore({ store });
+    assert.deepEqual(await restarted.jobs.readChangePackageDeliveryBatch(), {
+      cursor: 1,
+      highWatermark: 1,
+      items: [],
+    });
   });
 });
 

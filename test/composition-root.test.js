@@ -193,6 +193,39 @@ function graphMemoryProjectionSourcePort() {
   };
 }
 
+function memoryAuthoritySourcePort() {
+  const authorityStateDigest = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+  return {
+    async readSnapshot() {
+      return {
+        ledgerRevision: 0,
+        items: [],
+        timeline: [],
+        graph: {
+          cursor: 0,
+          highWatermark: 0,
+          checkpointDigest: null,
+          highWatermarkDigest: null,
+          authorityStateDigest,
+          items: [],
+        },
+      };
+    },
+    async readStatus() {
+      return {
+        ledgerRevision: 0,
+        graph: {
+          cursor: 0,
+          highWatermark: 0,
+          checkpointDigest: null,
+          highWatermarkDigest: null,
+          authorityStateDigest,
+        },
+      };
+    },
+  };
+}
+
 function workProposalRuntimePort(overrides = {}) {
   const runner = { async claim() {}, async advance() {} };
   return {
@@ -214,9 +247,13 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
   const ledger = {
     graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
     graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
+    memoryAuthoritySource: memoryAuthoritySourcePort(),
     async getSummary() {},
     async listItems() { return { items: [], nextCursor: null }; },
     async listTimeline() { return { items: [], nextCursor: null }; },
+    verifyPullRequestExecutionBinding(binding) {
+      return structuredClone(binding);
+    },
     async close() {
       closeCalls.push("ledger");
     },
@@ -242,6 +279,12 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
   });
   const memory = {
     producer: { async append() {}, async appendBatch() {} },
+    lifecycleProducer: {
+      async appendWorkItems() {},
+      async appendGraphEvents() {},
+      async appendProjectionRecords() {},
+      async adoptGraphCheckpoint() {},
+    },
     search: { async search() {}, async getHealth() {} },
     contextReader: { async readRecords() {} },
     receiptVerifier: {
@@ -1146,6 +1189,12 @@ test("enabled unified memory exposes search only and projects the existing work 
   const calls = {};
   const memoryRuntime = {
     producer: { async appendBatch() {} },
+    lifecycleProducer: {
+      async appendWorkItems() {},
+      async appendGraphEvents() {},
+      async appendProjectionRecords() {},
+      async adoptGraphCheckpoint() {},
+    },
     search: {
       async search(value) { return { items: [value], nextCursor: null }; },
       async getHealth() { return { ready: true }; },
@@ -1169,6 +1218,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       scopedGraphPlannerFactory: { forRoot() {} },
       graphDelivererFactory: { forClaim() {} },
       graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
+      memoryAuthoritySource: memoryAuthoritySourcePort(),
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
       async listTimeline() { return { items: [], nextCursor: null }; },
@@ -1218,11 +1268,20 @@ test("enabled unified memory exposes search only and projects the existing work 
 
   assert.equal(calls.memory.maximumRecords, 1234);
   assert.equal(calls.memory.maximumStateBytes, 5_000_000);
-  assert.strictEqual(calls.projector.memoryProducer, memoryRuntime.producer);
+  assert.equal("memoryProducer" in calls.projector, false);
+  assert.equal(Object.isFrozen(calls.projector.memoryLifecycleProducer), true);
+  assert.deepEqual(
+    Object.keys(calls.projector.memoryLifecycleProducer).sort(),
+    ["appendGraphEvents", "appendProjectionRecords", "appendWorkItems"],
+  );
+  assert.equal(Object.isFrozen(calls.projector.memoryAuthoritySource), true);
+  assert.deepEqual(Object.keys(calls.projector.memoryAuthoritySource), [
+    "readSnapshot",
+  ]);
   assert.equal(Object.isFrozen(calls.projector.graphProjectionSource), true);
   assert.deepEqual(
     Object.keys(calls.projector.graphProjectionSource).sort(),
-    ["ackBatch", "readBatch"],
+    ["ackBatch"],
   );
   assert.equal(Object.isFrozen(application.memorySearch), true);
   assert.deepEqual(Object.keys(application.memorySearch).sort(), [
@@ -1887,6 +1946,18 @@ test("change package composition derives trusted targets and shares the confirma
   assert.strictEqual(calls.runtimeConfig, config.changePackages);
   assert.strictEqual(calls.runtimeDependencies.trustedTargets, trustedTargets);
   assert.strictEqual(calls.runtimeDependencies.store, application.store);
+  assert.deepEqual(
+    Object.keys(calls.runtimeDependencies.applicationAuthorityVerifier),
+    ["verify"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.runtimeDependencies.applicationAuthorityVerifier),
+    true,
+  );
+  await assert.rejects(
+    calls.runtimeDependencies.applicationAuthorityVerifier.verify({}),
+    (error) => error?.code === "CHANGE_PACKAGE_APPLICATION_STALE",
+  );
   assert.deepEqual(Object.keys(calls.confirmation.localExecutors), [
     "local.change-package-apply",
   ]);
@@ -2002,29 +2073,32 @@ test("local code and change package composition injects only frozen delivery por
       },
       async close() {},
     }),
-    changePackageRuntimeFactory: async () => ({
-      packageProducer: { async create() {} },
-      packageReader: { async get() {}, async readFile() {} },
-      applicationProducer: {
-        async prepareConfirmation(value) {
-          applicationRequestOrder.push("prepare");
-          calls.applicationRequest = value;
-          return { id: "confirmation-change-package-1" };
+    changePackageRuntimeFactory: async (_runtimeConfig, dependencies) => {
+      calls.changePackageRuntime = dependencies;
+      return {
+        packageProducer: { async create() {} },
+        packageReader: { async get() {}, async readFile() {} },
+        applicationProducer: {
+          async prepareConfirmation(value) {
+            applicationRequestOrder.push("prepare");
+            calls.applicationRequest = value;
+            return { id: "confirmation-change-package-1" };
+          },
         },
-      },
-      applicationExecutor: { async execute() {}, async reconcile() {} },
-      applicationReader: { async getResult() {} },
-      applicationProjectionReader: {
-        async getForJob() {}, async getForPackage() {}, async getSummary() {},
-      },
-      applicationProjectionWriter: {
-        async getCheckpoint() {
-          return { sourceRevision: 0, sourceSnapshotDigest: "0".repeat(64) };
+        applicationExecutor: { async execute() {}, async reconcile() {} },
+        applicationReader: { async getResult() {} },
+        applicationProjectionReader: {
+          async getForJob() {}, async getForPackage() {}, async getSummary() {},
         },
-        async applySnapshot() {},
-      },
-      async close() {},
-    }),
+        applicationProjectionWriter: {
+          async getCheckpoint() {
+            return { sourceRevision: 0, sourceSnapshotDigest: "0".repeat(64) };
+          },
+          async applySnapshot() {},
+        },
+        async close() {},
+      };
+    },
     ...localCoordinationStubs({
       calls,
       closeCalls,
@@ -2037,7 +2111,8 @@ test("local code and change package composition injects only frozen delivery por
       return {
         confirmationExecutor: { async execute() {}, async reconcile() {} },
         reader: {
-          async get() {}, async getDetail() {}, async list() {}, async listNewest() {},
+          async get() { return calls.authorityJob ?? null; },
+          async getDetail() {}, async list() {}, async listNewest() {},
         },
         control: codeJobControlPort(),
         worker: codeJobWorkerPort(),
@@ -2084,6 +2159,64 @@ test("local code and change package composition injects only frozen delivery por
     codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
     workProposalRunnerGroupFactory: (runners) => runners[0],
   });
+
+  calls.authorityJob = {
+    jobId: "code-job-1",
+    status: "completed",
+    proposalId: "proposal-1",
+    proposalContentDigest: "b".repeat(64),
+    grantDigest: "c".repeat(64),
+    workspaceId: "dashboard",
+    inputBinding: null,
+  };
+  const sourceManifest = {
+    job: { id: "code-job-1" },
+    proposal: { id: "proposal-1", contentDigest: "b".repeat(64) },
+    grant: { digest: "c".repeat(64) },
+    workspace: { id: "dashboard" },
+  };
+  assert.equal(
+    await calls.changePackageRuntime.applicationAuthorityVerifier.verify(
+      sourceManifest,
+    ),
+    true,
+  );
+  calls.authorityJob.inputBinding = { schemaVersion: 1 };
+  await assert.rejects(
+    calls.changePackageRuntime.applicationAuthorityVerifier.verify(sourceManifest),
+    (error) => error?.code === "CHANGE_PACKAGE_APPLICATION_STALE",
+  );
+  calls.authorityJob.inputBinding = {
+    schemaVersion: 2,
+    kind: "pull_request",
+    repository: "acme/repo",
+    pullRequestNumber: 42,
+    rootItemId: "work-42",
+    workKey: "pull-request-acme-repo-42",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "1".repeat(40),
+    eventId: "event-42",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "4".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/race",
+      headRefOid: "1".repeat(40),
+    },
+  };
+  assert.equal(
+    await calls.changePackageRuntime.applicationAuthorityVerifier.verify(
+      sourceManifest,
+    ),
+    true,
+  );
 
   for (const [name, methods] of [
     ["completedChangeExporter", ["export"]],

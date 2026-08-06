@@ -56,6 +56,42 @@ function context(overrides = {}) {
   return result;
 }
 
+function gitContext(overrides = {}) {
+  const headRefOid = "a".repeat(40);
+  const trustedEvent = event({
+    payload: {
+      title: "Resolve conflict",
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/conflict",
+        headRefOid,
+      },
+      gitTargetAvailable: true,
+      headRefOid,
+      state: "open",
+      changedFields: ["baseRefOid"],
+    },
+  });
+  const rootItemId = `work-item-${"b".repeat(64)}`;
+  const legacy = inputBinding(trustedEvent, rootItemId);
+  return context({
+    event: trustedEvent,
+    roleId: "developer",
+    inputBinding: {
+      ...legacy,
+      schemaVersion: 2,
+      gitTarget: structuredClone(trustedEvent.payload.gitTarget),
+    },
+    ...overrides,
+  });
+}
+
 function common(type) {
   return {
     schemaVersion: 1,
@@ -221,7 +257,7 @@ test("derives a GitHub review target only from the trusted event", () => {
 
 test("maps code workspaces and handoff roles from policy rather than model output", () => {
   const code = policy().bind({
-    context: context({ roleId: "developer" }),
+    context: gitContext(),
     intent: {
       ...common("propose_code_action"),
       operation: "modify",
@@ -233,7 +269,7 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(code.kind, "code_action_proposal");
   assert.equal(code.binding.workspaceId, "acme-workspace");
   assert.equal(code.binding.repository, "acme/repo");
-  assert.deepEqual(code.binding.inputBinding, context().inputBinding);
+  assert.deepEqual(code.binding.inputBinding, gitContext().inputBinding);
   assert.deepEqual(Object.keys(code.payload), [
     "operation",
     "objective",
@@ -257,8 +293,61 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(handoff.payload.capability, "testing");
 });
 
+test("legacy PR bindings are recovery-only and cannot create code proposals", () => {
+  assert.throws(
+    () => policy().bind({
+      context: context({ roleId: "developer" }),
+      intent: {
+        ...common("propose_code_action"),
+        operation: "modify",
+        objective: "修改旧版 PR 输入",
+        acceptanceCriteria: ["回归测试通过"],
+        evidence: [],
+      },
+    }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
+});
+
+test("code proposals preserve the complete trusted Git target and reject same-Head base drift", () => {
+  const trustedContext = gitContext();
+  const intent = {
+    ...common("propose_code_action"),
+    operation: "modify",
+    objective: "解决固定 base/head 的冲突",
+    acceptanceCriteria: ["冲突验证通过"],
+    evidence: ["merge state is dirty"],
+  };
+  const bound = policy().bind({ context: trustedContext, intent });
+
+  assert.equal(bound.binding.inputBinding.schemaVersion, 2);
+  assert.deepEqual(
+    bound.binding.inputBinding.gitTarget,
+    trustedContext.inputBinding.gitTarget,
+  );
+
+  const changedEvent = event({
+    payload: {
+      ...trustedContext.event.payload,
+      gitTarget: {
+        ...trustedContext.event.payload.gitTarget,
+        baseRefOid: "c".repeat(40),
+      },
+    },
+  });
+  assert.throws(
+    () => policy().bind({
+      context: { ...trustedContext, event: changedEvent },
+      intent,
+    }),
+    (error) => error.code === "WORK_INTENT_CONTEXT_INVALID",
+  );
+});
+
 test("proposal authority binds one selected delivery and the durable dispatch identity", () => {
-  const trustedContext = context({ roleId: "developer" });
+  const trustedContext = gitContext();
   const evidenceTarget = createDeliveryEvidenceTarget({
     taskId: trustedContext.workItemId,
     roleId: trustedContext.roleId,
@@ -311,7 +400,7 @@ test("proposal authority binds one selected delivery and the durable dispatch id
 });
 
 test("proposal policy rejects foreign or differently selected evidence authority", () => {
-  const trustedContext = context({ roleId: "developer" });
+  const trustedContext = gitContext();
   const target = createDeliveryEvidenceTarget({
     taskId: trustedContext.workItemId,
     roleId: trustedContext.roleId,
@@ -355,7 +444,7 @@ test("code operations are configurable per trusted role", () => {
   assert.throws(
     () =>
       configured.bind({
-        context: context({ roleId: "tester" }),
+        context: gitContext({ roleId: "tester" }),
         intent: {
           ...common("propose_code_action"),
           operation: "modify",
@@ -429,7 +518,7 @@ test("denies role escalation, stale PR contexts, and absent trusted mappings", (
       intent: githubIntent,
     }),
     () => policy({ workspaceByRepository: {} }).bind({
-      context: context({ roleId: "developer" }),
+      context: gitContext(),
       intent: codeIntent,
     }),
     () => policy({ capabilityRoles: {} }).bind({

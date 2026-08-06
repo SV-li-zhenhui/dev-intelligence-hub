@@ -39,6 +39,61 @@ function snapshot(overrides = {}) {
   };
 }
 
+function gitTargetFacts(overrides = {}) {
+  const facts = {
+    githubAccount: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+    ...overrides,
+  };
+  return {
+    headRefOid: facts.headRefOid,
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: facts.githubAccount,
+      baseRepository: facts.baseRepository,
+      baseRefName: facts.baseRefName,
+      baseRefOid: facts.baseRefOid,
+      headRepository: facts.headRepository,
+      headRefName: facts.headRefName,
+      headRefOid: facts.headRefOid,
+    },
+  };
+}
+
+function gitTargetItem(overrides = {}) {
+  const target = gitTargetFacts(overrides);
+  return {
+    event: {
+      eventType: "pull_request.updated",
+      subject: {
+        id: "github:pr:acme/repo#42",
+        repository: "acme/repo",
+        number: 42,
+      },
+      payload: { ...target },
+    },
+  };
+}
+
+function flatGitTargetFacts(target = gitTargetFacts().gitTarget) {
+  return {
+    githubAccount: target.sourceAccountId,
+    baseRepository: target.baseRepository,
+    baseRefName: target.baseRefName,
+    baseRefOid: target.baseRefOid,
+    headRepository: target.headRepository,
+    headRefName: target.headRefName,
+    headRefOid: target.headRefOid,
+  };
+}
+
 function source(value, options = {}) {
   return new WorkflowFactSource({
     store: {
@@ -152,6 +207,103 @@ test("pull request facts fail closed when either Head is missing", async () => {
   );
 });
 
+test("v2 PR facts are fresh only for the same account, base, branches, repositories, and Head", async () => {
+  const value = snapshot();
+  value.items[0] = {
+    ...value.items[0],
+    ...gitTargetFacts(),
+  };
+  const facts = source(value);
+
+  assert.equal(
+    (await facts.read({ item: gitTargetItem(), fact: "base-oid" })).value,
+    "a".repeat(40),
+  );
+  for (const change of [
+    { githubAccount: "other-user" },
+    { baseRefOid: "c".repeat(40) },
+    { baseRefName: "release/next" },
+    { headRepository: "other/repo" },
+    { headRefName: "other-branch" },
+  ]) {
+    const result = await facts.read({
+      item: gitTargetItem(change),
+      fact: "ci-status",
+    });
+    assert.equal(result.fresh, false);
+    assert.equal(result.value, null);
+  }
+});
+
+test("contradictory Git target availability markers and duplicate facts fail closed", async (t) => {
+  const targetFacts = gitTargetFacts();
+  const cases = [
+    {
+      name: "unavailable marker with a nested target",
+      item: { ...targetFacts, gitTargetAvailable: false },
+    },
+    {
+      name: "available marker with only legacy flat facts",
+      item: {
+        ...flatGitTargetFacts(targetFacts.gitTarget),
+        gitTargetAvailable: true,
+      },
+    },
+    {
+      name: "nested target conflicts with repeated flat facts",
+      item: {
+        ...targetFacts,
+        ...flatGitTargetFacts(targetFacts.gitTarget),
+        githubAccount: "other-user",
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const value = snapshot();
+      value.items[0] = { ...value.items[0], ...entry.item };
+      const observed = await source(value).read({
+        item: gitTargetItem(),
+        fact: "ci-status",
+      });
+      assert.equal(observed.healthy, true);
+      assert.equal(observed.fresh, false);
+      assert.equal(observed.value, null);
+    });
+  }
+});
+
+test("a marker-free legacy flat target remains readable only when complete", async () => {
+  const value = snapshot();
+  value.items[0] = {
+    ...value.items[0],
+    ...flatGitTargetFacts(),
+  };
+
+  const observed = await source(value).read({
+    item: gitTargetItem(),
+    fact: "ci-status",
+  });
+
+  assert.equal(observed.fresh, true);
+  assert.equal(observed.value, "SUCCESS");
+});
+
+test("legacy Head-only work cannot treat a new target-aware snapshot as fresh", async () => {
+  const value = snapshot();
+  value.items[0] = { ...value.items[0], ...gitTargetFacts() };
+
+  const result = await source(value).read({
+    item: item("pull_request.updated", "b".repeat(40)),
+    fact: "ci-status",
+  });
+
+  assert.equal(result.healthy, true);
+  assert.equal(result.fresh, false);
+  assert.equal(result.value, null);
+});
+
 test("issue facts remain readable without a Head binding", async () => {
   const value = snapshot({
     items: [{ id: "github:issue:acme/repo#42", state: "open" }],
@@ -188,6 +340,33 @@ test("malformed arrays and accessor-bearing inputs fail closed without execution
   const facts = new WorkflowFactSource({ store, clock: () => NOW });
 
   assert.deepEqual(await facts.read({ item: item(), fact: "state" }), {
+    healthy: false,
+    fresh: false,
+    value: null,
+    observedAt: "2026-08-02T03:59:00.000Z",
+  });
+  assert.equal(getterCalls, 0);
+
+  const proxiedItems = new Proxy([snapshot().items[0]], {
+    getPrototypeOf() {
+      getterCalls += 1;
+      throw new Error("array prototype trap must not run");
+    },
+    getOwnPropertyDescriptor() {
+      getterCalls += 1;
+      throw new Error("array descriptor trap must not run");
+    },
+    get() {
+      getterCalls += 1;
+      throw new Error("array get trap must not run");
+    },
+  });
+  const proxiedSnapshot = snapshot({ items: proxiedItems });
+  const proxiedFacts = new WorkflowFactSource({
+    store: { async read() { return proxiedSnapshot; } },
+    clock: () => NOW,
+  });
+  assert.deepEqual(await proxiedFacts.read({ item: item(), fact: "state" }), {
     healthy: false,
     fresh: false,
     value: null,

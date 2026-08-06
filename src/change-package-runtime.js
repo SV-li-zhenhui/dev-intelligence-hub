@@ -230,8 +230,21 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
   );
   const configuredStore = dataProperty(dependencies, "store");
   const configuredTargets = dataProperty(dependencies, "trustedTargets");
+  const configuredApplicationAuthorityVerifier = dataProperty(
+    dependencies,
+    "applicationAuthorityVerifier",
+  );
   const trustedTargets =
     configuredTargets === undefined ? [] : configuredTargets;
+  const applicationAuthorityVerifier = bindPort(
+    configuredApplicationAuthorityVerifier ?? {
+      verify() {
+        throw new Error("change package source authority is unavailable");
+      },
+    },
+    ["verify"],
+    "applicationAuthorityVerifier",
+  );
   const processRunner = dataProperty(dependencies, "processRunner");
   const clock = dataProperty(dependencies, "clock");
   const store = bindPort(
@@ -306,6 +319,7 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
       packageReader,
       trustedTargets,
       gitInspector,
+      applicationAuthorityVerifier,
       store,
       exclusiveLease: guard,
       operationQueue,

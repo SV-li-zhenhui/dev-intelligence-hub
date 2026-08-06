@@ -19,6 +19,15 @@ import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispa
 import {
   createPullRequestExecutionBinding,
 } from "../src/domain/pull-request-execution-binding.js";
+import {
+  createLegacyWorkGraphMemoryEvent,
+  workGraphMemoryRecordReceipt,
+} from "../src/domain/work-graph-memory-event.js";
+import { createMemoryRuntime } from "../src/memory-runtime.js";
+import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
+import { MemoryAnswerService } from "../src/services/memory-answer-service.js";
+import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
+import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import {
   emptyWorkLedgerState,
@@ -35,6 +44,9 @@ import {
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "../src/services/work-ledger-pr-source.js";
+import {
+  crossRootPullRequestCutoverCandidate,
+} from "../src/services/work-ledger-pr-cutover-commands.js";
 import {
   createAssignmentWorkItem,
   createGraphChildWorkItem,
@@ -171,6 +183,25 @@ function assignment(sequence, target = { type: "role", id: "pr-reviewer" }) {
 
 const PR_HEAD_A = "a".repeat(40);
 const PR_HEAD_B = "b".repeat(40);
+const PR_HEAD_C = "c".repeat(40);
+
+function prGitFacts(headRefOid, overrides = {}) {
+  return {
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "d".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/conflict",
+      headRefOid,
+      ...overrides,
+    },
+  };
+}
 
 function prAssignment(
   sequence,
@@ -184,13 +215,15 @@ function prAssignment(
     title = "PR 42",
     repository = "acme/repo",
     pullRequestNumber = 42,
+    sourceScopeId = "github-dashboard",
+    gitFacts = {},
   } = {},
 ) {
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType,
     occurredAt,
-    source: { provider: "github", scopeId: "github-dashboard" },
+    source: { provider: "github", scopeId: sourceScopeId },
     subject: {
       id: `github:pr:${repository}#${pullRequestNumber}`,
       repository,
@@ -201,6 +234,7 @@ function prAssignment(
       headRefOid,
       ciStatus,
       changedFields,
+      ...gitFacts,
       ...(previousHeadRefOid === undefined ? {} : { previousHeadRefOid }),
     },
   });
@@ -289,6 +323,129 @@ async function createFixture({
   });
   await service.recover();
   return { service, source, store, lease, time };
+}
+
+async function createLedgerMemoryPipeline(service, options = {}) {
+  const store = options.store ?? new MemoryStore();
+  const journal = new LocalMemoryJournal({
+    store,
+    exclusiveLease: new ExclusiveLease(),
+    ...(options.maximumRecords === undefined
+      ? {}
+      : { maximumRecords: options.maximumRecords }),
+  });
+  await journal.recover();
+  const projector = new MemoryProjector({
+    memoryProducer: journal,
+    memoryLifecycleProducer: journal,
+    memoryAuthoritySource: {
+      readSnapshot: (request) => service.readMemoryAuthoritySnapshot(request),
+    },
+    graphProjectionSource: {
+      ackBatch: (request) =>
+        service.acknowledgeGraphMemoryProjectionBatch(request),
+    },
+    store,
+  });
+  return { store, journal, projector };
+}
+
+async function restartMemoryRuntime(service, store) {
+  return createMemoryRuntime({
+    store,
+    authoritySource: {
+      readStatus: () => service.readMemoryAuthorityStatus(),
+    },
+    createGuard: () => ({
+      async acquire() {},
+      async run(operation) { return operation(); },
+      async close() {},
+    }),
+  });
+}
+
+async function restartStandaloneMemoryRuntime(store) {
+  return createMemoryRuntime({
+    store,
+    createGuard: () => ({
+      async acquire() {},
+      async run(operation) { return operation(); },
+      async close() {},
+    }),
+  });
+}
+
+function memoryAnswerForRuntime(runtime, generateCalls) {
+  const brain = {
+    provider: "local-test",
+    model: "authority-test",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+  return new MemoryAnswerService({
+    contextRetriever: new MemoryContextRetriever({
+      memorySearch: { search: runtime.search.search },
+      contextReader: runtime.contextReader,
+    }),
+    brainRouter: {
+      describe(value) {
+        return {
+          provider: value.provider,
+          model: value.model,
+          remote: false,
+          remoteData: structuredClone(value.remoteData),
+        };
+      },
+      async generate() {
+        generateCalls.push("generate");
+        return JSON.stringify({
+          schemaVersion: 1,
+          status: "insufficient_evidence",
+          claims: [],
+        });
+      },
+    },
+    configuredBrain: brain,
+    localBrain: brain,
+  });
+}
+
+function ordinaryMemoryFact(index) {
+  return {
+    schemaVersion: 1,
+    source: { kind: "local-session", id: `capacity-fill-${index}` },
+    occurredAt: "2026-08-02T03:00:00.000Z",
+    roleId: null,
+    repository: null,
+    eventType: "memory.capacity_fixture",
+    title: `Capacity filler ${index}`,
+    summary: "Ordinary memory must not overtake authority lifecycle.",
+    content: "local filler",
+    evidence: [],
+    tags: ["capacity"],
+    sourceUrl: null,
+    subjectNumber: null,
+  };
+}
+
+function legacySingleEventProjection(state, item, kind, graphRecord) {
+  const event = createLegacyWorkGraphMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    ledgerRevision: state.revision,
+    taskRevision: item.revision,
+    item,
+    kind,
+    record: graphRecord,
+  });
+  return {
+    revision: state.revision,
+    nextSequence: 2,
+    cursor: 0,
+    checkpointDigest: null,
+    sourceHistoryDigest: state.graphMemoryProjection.sourceHistoryDigest,
+    lastAcknowledgement: null,
+    pending: [event],
+  };
 }
 
 test("an explicit invalid ledger admission gate never degrades to direct mode", async () => {
@@ -389,11 +546,18 @@ test("PR engineer intake keeps one durable task across events on the same Head",
       { disposition: "accepted", headRevision: 1 },
     ],
   );
-  assert.deepEqual(await service.readGraphMemoryProjectionBatch({ limit: 10 }), {
-    cursor: 0,
-    highWatermark: 0,
-    items: [],
+  const memoryBaseline = await service.readGraphMemoryProjectionBatch({
+    limit: 10,
   });
+  assert.equal(memoryBaseline.cursor, 0);
+  assert.equal(memoryBaseline.highWatermark, 1);
+  assert.equal(memoryBaseline.items.length, 1);
+  assert.equal(memoryBaseline.items[0].kind, "authority_observed");
+  assert.equal(memoryBaseline.items[0].sourceAuthority.citable, false);
+  assert.equal(
+    memoryBaseline.items[0].authorityStateDigest,
+    memoryBaseline.authorityStateDigest,
+  );
   await service.reviseGraphAcceptance({
     authority: {
       actorId: "employee-orchestrator",
@@ -415,11 +579,11 @@ test("PR engineer intake keeps one durable task across events on the same Head",
     },
   });
   const projected = await service.readGraphMemoryProjectionBatch({ limit: 10 });
-  assert.equal(projected.highWatermark, 1);
-  assert.equal(projected.items[0].kind, "acceptance_contract");
-  assert.equal(projected.items[0].recordRevision, 2);
+  assert.equal(projected.highWatermark, 2);
+  assert.equal(projected.items.at(-1).kind, "acceptance_contract");
+  assert.equal(projected.items.at(-1).recordRevision, 2);
   assert.match(
-    projected.items[0].memoryRecord.title,
+    projected.items.at(-1).memoryRecord.title,
     /PR 42 latest source facts/,
   );
 });
@@ -814,6 +978,2385 @@ test("a sealed old-Head intent blocks cutover until its result is reconciled", a
   assert.equal(root.decisionContext, null);
   assert.equal(historical.status, "delivered");
   assert.equal(historical.sourceBinding.headRefOid, PR_HEAD_A);
+});
+
+async function stageSealedPrReview(fixture, itemId = null) {
+  await fixture.service.intake();
+  const items = (await fixture.service.listItems({ limit: 100 })).items;
+  let root = itemId === null
+    ? items[0]
+    : items.find((item) => item.itemId === itemId);
+  assert.notEqual(root, undefined);
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const outbox = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  return { outbox, rootItemId: staged.item.itemId };
+}
+
+async function stageSealedPrChildReview(fixture) {
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  const created = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, (await fixture.service.getSummary()).revision),
+  );
+  let child = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === created.taskId,
+  );
+  child = await fixture.service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    roleId: "developer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const outbox = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "developer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  return { childItemId: child.itemId, outbox };
+}
+
+test("same-root cutover releases durably rejected attention", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const result = await prepareAttentionResult(
+    fixture,
+    { type: "reject", reason: "需求需要重新梳理" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  await fixture.service.applyAttentionBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  }));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  const root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.source.pendingRevision, null);
+});
+
+for (const nextStatus of ["blocked", "retry_wait"]) {
+  test(`same-root cutover releases a definitively failed ${nextStatus} action`, async () => {
+    const fixture = await createFixture({ records: [prAssignment(1)] });
+    const sealed = await stageSealedPrReview(fixture);
+    let root = (await fixture.service.listItems()).items.find(
+      ({ itemId }) => itemId === sealed.rootItemId,
+    );
+    await fixture.service.ackIntent({
+      intentId: sealed.outbox.intentId,
+      expectedRevision: sealed.outbox.revision,
+      itemExpectedRevision: root.revision,
+      dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+      actorId: "work-intent-dispatcher",
+      outcome: "failed",
+      nextStatus,
+      ...(nextStatus === "retry_wait"
+        ? { availableAt: "2026-08-02T02:01:00.000Z" }
+        : {}),
+      details: { code: "definite_downstream_rejection" },
+    });
+    fixture.source.records.push(prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }));
+    fixture.source.highWatermark = 2;
+
+    await fixture.service.intake();
+
+    root = (await fixture.service.listItems()).items[0];
+    assert.equal(root.status, "queued");
+    assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(root.source.pendingRevision, null);
+  });
+}
+
+for (const predecessorStatus of ["queued", "working"]) {
+  test(`cross-root cutover retires a ${predecessorStatus} predecessor atomically`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    });
+    await fixture.service.intake();
+    let predecessor = (await fixture.service.listItems()).items[0];
+    if (predecessorStatus === "working") {
+      predecessor = await fixture.service.claim({
+        itemId: predecessor.itemId,
+        expectedRevision: predecessor.revision,
+        workerId: "employee-pr-engineer",
+        leaseDurationMs: 30_000,
+      });
+    }
+    fixture.source.records.push(prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 2;
+
+    await fixture.service.intake();
+
+    const roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const retired = roots.find(({ itemId }) => itemId === predecessor.itemId);
+    const active = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+    assert.equal(retired.status, "blocked");
+    assert.equal(retired.ownerId, null);
+    assert.equal(retired.leaseId, null);
+    assert.equal(retired.leaseUntil, null);
+    assert.equal(retired.activeIntentId, null);
+    assert.equal(active.status, "queued");
+    const claimed = await fixture.service.claim({
+      itemId: active.itemId,
+      expectedRevision: active.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    });
+    assert.equal(claimed.status, "working");
+  });
+}
+
+for (const cutover of ["same-root-head", "cross-provenance-root"]) {
+  test(`${cutover} invalidates old PR memory through the durable system pipeline`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, {
+        title: "PR authority memory fixture",
+        gitFacts: prGitFacts(PR_HEAD_A),
+      })],
+    });
+    await fixture.service.intake();
+    let root = (await fixture.service.listItems({ limit: 10 })).items[0];
+    await fixture.service.reviseGraphAcceptance({
+      authority: {
+        actorId: "employee-orchestrator",
+        scopeRootTaskId: root.itemId,
+      },
+      command: {
+        taskId: root.itemId,
+        acceptanceContract: {
+          revision: 2,
+          acceptanceCriteria: [{
+            criterionId: "old-authority-proof",
+            description: "Old authority conclusion must never survive cutover",
+          }],
+          expectedDeliverables: [],
+        },
+        reason: "memory-authority-integration",
+        expectedGraphRevision: (await fixture.service.getSummary()).revision,
+        expectedTaskRevision: root.revision,
+      },
+    });
+    const pendingBeforeProjection =
+      await fixture.service.readGraphMemoryProjectionBatch({ limit: 10 });
+    const contractEvent = pendingBeforeProjection.items.find(
+      ({ kind }) => kind === "acceptance_contract",
+    );
+    assert.notEqual(contractEvent, undefined);
+    const oldContractId = workGraphMemoryRecordReceipt(contractEvent)
+      .memoryRecordId;
+    const memory = await createLedgerMemoryPipeline(fixture.service);
+    await memory.projector.runCycle();
+    const oldWorkId = memory.journal.search({
+      eventType: "work.queued",
+      repository: "acme/repo",
+    }).items[0].id;
+    const sealedWork = memory.journal.readRecords({
+      recordIds: [oldWorkId],
+    }).items[0].record;
+    const sealedAuthority = JSON.parse(sealedWork.content).sourceAuthority;
+    assert.equal(sealedAuthority.executionBinding.schemaVersion, 2);
+    assert.equal(sealedAuthority.executionBinding.gitTarget.headRefOid, PR_HEAD_A);
+    assert.deepEqual(sealedAuthority.provenance, {
+      provider: "github",
+      scopeId: "github-dashboard",
+    });
+    const prTimeline = memory.journal.search({
+      q: "工作时间线",
+      repository: "acme/repo",
+    });
+    assert.equal(prTimeline.items.length > 0, true);
+    assert.equal(
+      memory.journal.readRecords({
+        recordIds: prTimeline.items.map(({ id }) => id),
+      }).items.every(({ labels }) => labels.lifecycle === "obsolete"),
+      true,
+    );
+    assert.deepEqual(
+      memory.journal.readRecords({ recordIds: [oldWorkId, oldContractId] })
+        .items.map(({ labels }) => labels.lifecycle),
+      ["current", "current"],
+    );
+
+    fixture.source.records.push(
+      cutover === "same-root-head"
+        ? prAssignment(2, {
+            occurredAt: "2026-08-02T01:05:00.000Z",
+            title: "PR authority memory fixture",
+            headRefOid: PR_HEAD_B,
+            previousHeadRefOid: PR_HEAD_A,
+            changedFields: ["headRefOid"],
+            gitFacts: prGitFacts(PR_HEAD_B),
+          })
+        : prAssignment(2, {
+            occurredAt: "2026-08-02T01:05:00.000Z",
+            title: "PR authority memory fixture",
+            sourceScopeId: "github-secondary",
+            gitFacts: prGitFacts(PR_HEAD_A),
+          }),
+    );
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    const authorityTail =
+      await fixture.service.readGraphMemoryProjectionBatch({ limit: 10 });
+    assert.equal(
+      authorityTail.items.some(({ kind }) => kind === "authority_invalidated"),
+      true,
+    );
+
+    const standalone = await restartStandaloneMemoryRuntime(memory.store);
+    for (const operation of [
+      () => standalone.search.search({
+        q: "Old authority conclusion must never survive cutover",
+        repository: "acme/repo",
+      }),
+      () => standalone.contextReader.readRecords({
+        recordIds: [oldWorkId, oldContractId],
+      }),
+    ]) {
+      await assert.rejects(
+        operation,
+        (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+      );
+    }
+    const generateCalls = [];
+    await assert.rejects(
+      memoryAnswerForRuntime(standalone, generateCalls).answer({
+        schemaVersion: 1,
+        question: "Can the old PR conclusion still be used?",
+        mode: "configured",
+        retrieval: {
+          kind: "query",
+          filters: {
+            query: "Old authority conclusion must never survive cutover",
+            repository: "acme/repo",
+          },
+        },
+      }),
+      (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+    );
+    assert.deepEqual(generateCalls, []);
+    await standalone.close();
+
+    const staleAuthoritativeRuntime = await restartMemoryRuntime(
+      fixture.service,
+      memory.store,
+    );
+    await assert.rejects(
+      staleAuthoritativeRuntime.search.search({ repository: "acme/repo" }),
+      (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+    );
+    await staleAuthoritativeRuntime.close();
+
+    await memory.projector.runCycle();
+    assert.deepEqual(
+      memory.journal.readRecords({ recordIds: [oldWorkId, oldContractId] })
+        .items.map(({ labels }) => labels.lifecycle),
+      ["obsolete", "obsolete"],
+    );
+
+    const runtime = await restartMemoryRuntime(fixture.service, memory.store);
+    const currentWork = await runtime.search.search({
+      q: "PR authority memory fixture",
+      eventType: "work.queued",
+      repository: "acme/repo",
+    });
+    const currentContext = await runtime.contextReader.readRecords({
+      recordIds: currentWork.items.map(({ id }) => id),
+    });
+    assert.equal(
+      currentContext.items.some(
+        ({ labels }) => labels.lifecycle === "current",
+      ),
+      true,
+    );
+    const packet = await new MemoryContextRetriever({
+      memorySearch: { search: runtime.search.search },
+      contextReader: runtime.contextReader,
+    }).retrieve({
+      question: "Can the old authority conclusion still be used?",
+      retrieval: {
+        kind: "query",
+        filters: {
+          query: "Old authority conclusion must never survive cutover",
+          repository: "acme/repo",
+        },
+      },
+    });
+    assert.equal(
+      packet.records.some(({ recordId }) => recordId === oldContractId),
+      true,
+    );
+    assert.equal(packet.citableRecordIds.includes(oldContractId), false);
+    await runtime.close();
+  });
+}
+
+test("a fenced pending Head immediately makes the active Head memory non-citable", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      gitFacts: prGitFacts(PR_HEAD_A),
+      title: "Pending Head memory fixture",
+    })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  await fixture.service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: root.itemId,
+    },
+    command: {
+      taskId: root.itemId,
+      acceptanceContract: {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "pending-head",
+          description: "Pending Head must fence this conclusion",
+        }],
+        expectedDeliverables: [],
+      },
+      reason: "pending-head-memory",
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedTaskRevision: root.revision,
+    },
+  });
+  const contractEvent = (await fixture.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  })).items.find(({ kind }) => kind === "acceptance_contract");
+  const contractId = workGraphMemoryRecordReceipt(contractEvent).memoryRecordId;
+  const memory = await createLedgerMemoryPipeline(fixture.service);
+  await memory.projector.runCycle();
+  const sealed = await stageSealedPrReview(fixture, root.itemId);
+  await memory.projector.runCycle();
+
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    title: "Pending Head memory fixture",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === sealed.rootItemId,
+  );
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.pending.headRefOid, PR_HEAD_B);
+  const authorityTail = await fixture.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  });
+  assert.equal(authorityTail.items.at(-1).kind, "authority_invalidated");
+  await memory.projector.runCycle();
+  assert.equal(
+    memory.journal.readRecords({ recordIds: [contractId] })
+      .items[0].labels.lifecycle,
+    "obsolete",
+  );
+  const runtime = await restartMemoryRuntime(fixture.service, memory.store);
+  const packet = await new MemoryContextRetriever({
+    memorySearch: { search: runtime.search.search },
+    contextReader: runtime.contextReader,
+  }).retrieve({
+    question: "May the active old Head conclusion be cited?",
+    retrieval: {
+      kind: "query",
+      filters: {
+        query: "Pending Head must fence this conclusion",
+        repository: "acme/repo",
+      },
+    },
+  });
+  assert.equal(packet.citableRecordIds.includes(contractId), false);
+  await runtime.close();
+});
+
+test("memory capacity failure leaves the ledger HWM pending and every read fails closed", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      gitFacts: prGitFacts(PR_HEAD_A),
+      title: "PR memory capacity fixture",
+    })],
+  });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  await fixture.service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: root.itemId,
+    },
+    command: {
+      taskId: root.itemId,
+      acceptanceContract: {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "capacity-authority",
+          description: "Authority lifecycle must be persisted before ack",
+        }],
+        expectedDeliverables: [],
+      },
+      reason: "memory-capacity-integration",
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedTaskRevision: root.revision,
+    },
+  });
+  const maximumRecords = 40;
+  const memory = await createLedgerMemoryPipeline(fixture.service, {
+    maximumRecords,
+  });
+  await memory.projector.runCycle();
+  const initialAuthority = await fixture.service.readMemoryAuthorityStatus();
+  const initialCount = memory.journal.getHealth().recordCount;
+  await memory.journal.appendBatch({
+    records: Array.from(
+      { length: maximumRecords - initialCount },
+      (_, index) => ordinaryMemoryFact(index + 1),
+    ),
+  });
+  assert.equal(memory.journal.getHealth().recordCount, maximumRecords);
+
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const pendingAuthority = await fixture.service.readMemoryAuthorityStatus();
+  assert.equal(pendingAuthority.graph.cursor, initialAuthority.graph.cursor);
+  assert.equal(
+    pendingAuthority.graph.highWatermark > pendingAuthority.graph.cursor,
+    true,
+  );
+  await assert.rejects(
+    memory.projector.runCycle(),
+    (error) => error.code === "MEMORY_CAPACITY_EXCEEDED",
+  );
+  const afterFailure = await fixture.service.readMemoryAuthorityStatus();
+  assert.equal(afterFailure.graph.cursor, initialAuthority.graph.cursor);
+  assert.equal(memory.journal.getHealth().recordCount, maximumRecords);
+
+  const runtime = await restartMemoryRuntime(fixture.service, memory.store);
+  await assert.rejects(
+    runtime.search.search({}),
+    (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+  );
+  await runtime.close();
+});
+
+test("a new PR provenance waits for the old sealed action across restart", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  let oldRoot = roots.find(({ itemId }) => itemId === sealed.rootItemId);
+  let pendingRoot = roots.find(({ itemId }) => itemId !== oldRoot.itemId);
+  assert.equal(oldRoot.status, "dispatch_pending");
+  assert.match(oldRoot.statusReason, /^pr_source_cross_root_cutover_blocker:/);
+  assert.equal(pendingRoot.status, "blocked");
+  assert.equal(
+    pendingRoot.statusReason,
+    `pr_source_cross_root_cutover_pending:${oldRoot.itemId}`,
+  );
+  await assert.rejects(
+    fixture.service.claim({
+      itemId: pendingRoot.itemId,
+      expectedRevision: pendingRoot.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  );
+  await assert.rejects(
+    fixture.service.transition({
+      itemId: pendingRoot.itemId,
+      expectedRevision: pendingRoot.revision,
+      leaseId: null,
+      actorId: "work-ledger-system",
+      toStatus: "queued",
+      reason: "bypass-cross-root-cutover",
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  );
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  oldRoot = roots.find(({ itemId }) => itemId === oldRoot.itemId);
+  pendingRoot = roots.find(({ itemId }) => itemId === pendingRoot.itemId);
+  await assert.rejects(
+    recovered.claim({
+      itemId: pendingRoot.itemId,
+      expectedRevision: pendingRoot.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  );
+
+  await recovered.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: oldRoot.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-cross-root" },
+  });
+  pendingRoot = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === pendingRoot.itemId,
+  );
+  const activated = await recovered.reconcilePullRequestSource({
+    itemId: pendingRoot.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingRoot.revision,
+    expectedPendingRevision: pendingRoot.source.activeRevision,
+  });
+
+  assert.equal(activated.applied, true);
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  oldRoot = roots.find(({ itemId }) => itemId === oldRoot.itemId);
+  pendingRoot = roots.find(({ itemId }) => itemId === pendingRoot.itemId);
+  assert.equal(oldRoot.status, "completed");
+  assert.equal(pendingRoot.status, "queued");
+  assert.equal(pendingRoot.statusReason, "pr_source_cutover_activated");
+});
+
+test("a newer provenance chains behind the same sealed predecessor", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-tertiary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+  );
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const oldRoot = roots.find(({ itemId }) => itemId === sealed.rootItemId);
+  const pending = roots.find(
+    ({ source }) => source.identity.scopeId === "github-tertiary",
+  );
+  const olderPending = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  assert.equal(roots.length, 3);
+  assert.equal(pending.source.identity.scopeId, "github-tertiary");
+  assert.equal(pending.status, "blocked");
+  assert.equal(olderPending.status, "blocked");
+  assert.equal(
+    olderPending.statusReason,
+    `pr_source_cross_root_cutover_pending:${oldRoot.itemId}`,
+  );
+  assert.equal(
+    oldRoot.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource({
+      itemId: olderPending.itemId,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedRevision: olderPending.revision,
+      expectedPendingRevision: olderPending.source.activeRevision,
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+  );
+  const currentOldRoot = (await fixture.service.listItems({ limit: 10 })).items
+    .find(({ itemId }) => itemId === oldRoot.itemId);
+  await fixture.service.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: currentOldRoot.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-latest-source" },
+  });
+  const currentPending = (await fixture.service.listItems({ limit: 10 })).items
+    .find(({ itemId }) => itemId === pending.itemId);
+  await fixture.service.reconcilePullRequestSource({
+    itemId: currentPending.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: currentPending.revision,
+    expectedPendingRevision: currentPending.source.activeRevision,
+  });
+  const activatedRoots = (await fixture.service.listItems({ limit: 10 })).items;
+  assert.equal(
+    activatedRoots.find(({ itemId }) => itemId === pending.itemId).status,
+    "queued",
+  );
+  assert.equal(
+    activatedRoots.find(({ itemId }) => itemId === olderPending.itemId).status,
+    "superseded",
+  );
+});
+
+async function createAuditedCrossRootCandidateRace({ restart }) {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  const staleA = {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:06:00.000Z",
+    sourceScopeId: "github-dashboard",
+    ciStatus: "FAILURE",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  };
+  const staleB = {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:04:00.000Z",
+    sourceScopeId: "github-secondary",
+    ciStatus: "FAILURE",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  };
+  const staleC = {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:07:00.000Z",
+    sourceScopeId: "github-tertiary",
+    ciStatus: "FAILURE",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  };
+  fixture.source.records.push(
+    prAssignment(3, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(4, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:15:00.000Z",
+      sourceScopeId: "github-tertiary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(5, staleA),
+    prAssignment(6, staleB),
+    prAssignment(7, staleC),
+    prAssignment(8, staleA),
+    prAssignment(9, staleB),
+    prAssignment(10, staleC),
+  );
+  fixture.source.highWatermark = 10;
+  await fixture.service.intake();
+
+  const service = restart
+    ? new WorkLedgerService({
+        store: fixture.store,
+        assignmentSource: fixture.source,
+        exclusiveLease: new ExclusiveLease(),
+        clock: fixture.time.clock,
+        idFactory: incrementingIds(),
+      })
+    : fixture.service;
+  if (restart) await service.recover();
+  roots = (await service.listItems({ limit: 10 })).items;
+  const pendingA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  const pendingC = roots.find(
+    ({ source }) => source.identity.scopeId === "github-tertiary",
+  );
+  return { pendingA, pendingC, sealed, sealedB, service };
+}
+
+for (const scenario of [
+  { reconcileOrder: "older-first", restart: false },
+  { reconcileOrder: "newer-first", restart: true },
+]) {
+  test(`audit-only bindings preserve cross-root candidate order (${scenario.reconcileOrder}, restart=${scenario.restart})`, async () => {
+    const {
+      pendingA,
+      pendingC,
+      sealed,
+      sealedB,
+      service,
+    } = await createAuditedCrossRootCandidateRace(scenario);
+
+    assert.deepEqual(crossRootPullRequestCutoverCandidate(pendingA), {
+      inputRevision: 2,
+      sourceSequence: 3,
+    });
+    assert.deepEqual(crossRootPullRequestCutoverCandidate(pendingC), {
+      inputRevision: 1,
+      sourceSequence: 4,
+    });
+    const tamperedPending = structuredClone(pendingA);
+    tamperedPending.source.pending.sourceSequence = 8;
+    assert.throws(
+      () => crossRootPullRequestCutoverCandidate(tamperedPending),
+      (error) =>
+        error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+    );
+    assert.equal(pendingA.source.bindings.at(-1).sourceSequence, 8);
+    assert.equal(pendingC.source.bindings.at(-1).sourceSequence, 10);
+    assert.equal(sealedB.source.current.sourceSequence, 2);
+    assert.equal(sealedB.source.bindings.at(-1).sourceSequence, 9);
+    assert.equal(pendingA.source.revisions.at(-1).disposition, "ignored_stale");
+    assert.equal(pendingC.source.revisions.at(-1).disposition, "ignored_stale");
+    assert.equal(sealedB.source.revisions.at(-1).disposition, "ignored_stale");
+    assert.equal(pendingA.source.bindings.length, 4);
+    assert.equal(pendingA.source.revisions.length, 3);
+    assert.equal(pendingC.source.bindings.length, 3);
+    assert.equal(pendingC.source.revisions.length, 2);
+    assert.equal(sealedB.source.bindings.length, 3);
+    assert.equal(sealedB.source.revisions.length, 2);
+    assert.equal(
+      sealedB.statusReason,
+      `pr_source_cross_root_cutover_blocker:${pendingC.itemId}`,
+    );
+    const summaryBeforeAck = await service.getSummary();
+    await assert.rejects(
+      service.reconcilePullRequestSource({
+        itemId: pendingC.itemId,
+        expectedGraphRevision: summaryBeforeAck.revision,
+        expectedRevision: pendingC.revision,
+        expectedPendingRevision: pendingC.source.activeRevision + 1,
+      }),
+      (error) =>
+        error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+    );
+    await assert.rejects(
+      service.reconcilePullRequestSource({
+        itemId: pendingC.itemId,
+        expectedGraphRevision: summaryBeforeAck.revision - 1,
+        expectedRevision: pendingC.revision,
+        expectedPendingRevision: pendingC.source.activeRevision,
+      }),
+      (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+    );
+    await assert.rejects(
+      service.reconcilePullRequestSource({
+        itemId: pendingC.itemId,
+        expectedGraphRevision: summaryBeforeAck.revision,
+        expectedRevision: pendingC.revision + 1,
+        expectedPendingRevision: pendingC.source.activeRevision,
+      }),
+      (error) => error.code === "WORK_LEDGER_REVISION_CONFLICT",
+    );
+    await service.ackIntent({
+      intentId: sealed.outbox.intentId,
+      expectedRevision: sealed.outbox.revision,
+      itemExpectedRevision: sealedB.revision,
+      dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+      actorId: "work-intent-dispatcher",
+      outcome: "delivered",
+      nextStatus: "completed",
+      details: { downstreamRef: "latest-candidate-after-audit-only-inputs" },
+    });
+
+    const graphRevision = (await service.getSummary()).revision;
+    const olderCommand = {
+      itemId: pendingA.itemId,
+      expectedGraphRevision: graphRevision,
+      expectedRevision: pendingA.revision,
+      expectedPendingRevision: pendingA.source.pendingRevision,
+    };
+    const newerCommand = {
+      itemId: pendingC.itemId,
+      expectedGraphRevision: graphRevision,
+      expectedRevision: pendingC.revision,
+      expectedPendingRevision: pendingC.source.activeRevision,
+    };
+    let activated;
+    if (scenario.reconcileOrder === "older-first") {
+      await assert.rejects(
+        service.reconcilePullRequestSource(olderCommand),
+        (error) =>
+          error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+      );
+      activated = await service.reconcilePullRequestSource(newerCommand);
+    } else {
+      activated = await service.reconcilePullRequestSource(newerCommand);
+      await assert.rejects(
+        service.reconcilePullRequestSource(olderCommand),
+        (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+      );
+    }
+
+    assert.equal(activated.applied, true);
+    const roots = (await service.listItems({ limit: 10 })).items;
+    assert.equal(
+      roots.find(({ itemId }) => itemId === pendingC.itemId).status,
+      "queued",
+    );
+    assert.equal(
+      roots.find(({ itemId }) => itemId === pendingA.itemId).status,
+      "superseded",
+    );
+    assert.equal(
+      roots.find(({ itemId }) => itemId === sealedB.itemId).status,
+      "completed",
+    );
+  });
+}
+
+test("an existing-root return supersedes an older cross-root candidate", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  let rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  let rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  assert.equal(rootA.source.pendingRevision, 2);
+  assert.equal(rootA.status, "dispatch_pending");
+  assert.equal(rootA.statusReason, "pr_source_revised");
+  assert.equal(rootB.status, "superseded");
+  assert.equal(
+    rootB.statusReason,
+    "pr_source_cross_root_cutover_replaced",
+  );
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const staleReconcile = await recovered.reconcilePullRequestSource({
+    itemId: rootB.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: rootB.revision,
+    expectedPendingRevision: rootB.source.activeRevision,
+  });
+  assert.equal(staleReconcile.applied, false);
+  assert.equal(
+    (await recovered.listItems({ limit: 10 })).items.find(
+      ({ itemId }) => itemId === rootB.itemId,
+    ).status,
+    "superseded",
+  );
+
+  rootA = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === rootA.itemId,
+  );
+  await recovered.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: rootA.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-returned-root" },
+  });
+  rootA = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === rootA.itemId,
+  );
+  await recovered.reconcilePullRequestSource({
+    itemId: rootA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: rootA.revision,
+    expectedPendingRevision: 2,
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  rootA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  rootB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(rootA.status, "queued");
+  assert.equal(rootA.source.pendingRevision, null);
+  assert.equal(rootB.status, "superseded");
+  const claimed = await recovered.claim({
+    itemId: rootA.itemId,
+    expectedRevision: rootA.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimed.status, "working");
+});
+
+test("an existing root returning behind an active sealed provenance waits for settlement", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  const dispatchingBeforeReturn = (
+    await fixture.service.listItems({ limit: 10 })
+  ).items.find(({ itemId }) => itemId === rootB.itemId);
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const returnedA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(returnedA.status, "blocked");
+  assert.equal(returnedA.source.activeRevision, 1);
+  assert.equal(returnedA.source.pendingRevision, 2);
+  assert.equal(
+    returnedA.statusReason,
+    `pr_source_cross_root_cutover_pending:${sealedB.itemId}`,
+  );
+  assert.equal(sealedB.status, "dispatch_pending");
+  assert.equal(
+    sealedB.statusReason,
+    `pr_source_cross_root_cutover_blocker:${returnedA.itemId}`,
+  );
+  assert.equal(sealedB.revision, dispatchingBeforeReturn.revision + 1);
+  assert.equal(sealed.outbox.itemId, sealedB.itemId);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const stillBlocked = await recovered.reconcilePullRequestSource({
+    itemId: returnedA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: returnedA.revision,
+    expectedPendingRevision: returnedA.source.pendingRevision,
+  });
+  assert.equal(stillBlocked.applied, false);
+  assert.deepEqual(
+    stillBlocked.blockers.map(({ itemId }) => itemId),
+    [sealedB.itemId],
+  );
+  await assert.rejects(
+    recovered.ackIntent({
+      intentId: sealed.outbox.intentId,
+      expectedRevision: sealed.outbox.revision,
+      itemExpectedRevision: dispatchingBeforeReturn.revision,
+      dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+      actorId: "work-intent-dispatcher",
+      outcome: "delivered",
+      nextStatus: "completed",
+      details: { downstreamRef: "stale-before-return-marker" },
+    }),
+    (error) => error.code === "WORK_LEDGER_REVISION_CONFLICT",
+  );
+  await recovered.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: sealedB.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-return-cutover" },
+  });
+  const pendingA = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === returnedA.itemId,
+  );
+  const activated = await recovered.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  assert.equal(activated.applied, true);
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const activeA = roots.find(({ itemId }) => itemId === returnedA.itemId);
+  const completedB = roots.find(({ itemId }) => itemId === sealedB.itemId);
+  assert.equal(activeA.status, "queued");
+  assert.equal(activeA.source.activeRevision, 2);
+  assert.equal(activeA.source.pendingRevision, null);
+  assert.equal(completedB.status, "completed");
+});
+
+for (const predecessorStatus of ["queued", "working"]) {
+  test(`an existing root return atomically retires an active ${predecessorStatus} provenance`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, {
+        sourceScopeId: "github-dashboard",
+        gitFacts: prGitFacts(PR_HEAD_A),
+      })],
+    });
+    await fixture.service.intake();
+    fixture.source.records.push(prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    let roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const rootA = roots.find(
+      ({ source }) => source.identity.scopeId === "github-dashboard",
+    );
+    let rootB = roots.find(
+      ({ source }) => source.identity.scopeId === "github-secondary",
+    );
+    if (predecessorStatus === "working") {
+      rootB = await fixture.service.claim({
+        itemId: rootB.itemId,
+        expectedRevision: rootB.revision,
+        workerId: "employee-pr-engineer",
+        leaseDurationMs: 30_000,
+      });
+    }
+    fixture.source.records.push(prAssignment(3, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 3;
+
+    await fixture.service.intake();
+
+    roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const activeA = roots.find(({ itemId }) => itemId === rootA.itemId);
+    const retiredB = roots.find(({ itemId }) => itemId === rootB.itemId);
+    assert.equal(activeA.status, "queued");
+    assert.equal(activeA.source.activeRevision, 2);
+    assert.equal(activeA.source.pendingRevision, null);
+    assert.equal(retiredB.status, "blocked");
+    assert.equal(
+      retiredB.statusReason,
+      "pr_source_cross_root_cutover_retired",
+    );
+    assert.equal(retiredB.ownerId, null);
+    assert.equal(retiredB.leaseId, null);
+    assert.equal(retiredB.leaseUntil, null);
+    assert.equal(retiredB.activeIntentId, null);
+  });
+}
+
+test("an acknowledgement before an existing-root return permits immediate activation", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  const dispatchingB = (await fixture.service.listItems({ limit: 10 })).items
+    .find(({ itemId }) => itemId === rootB.itemId);
+  await fixture.service.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: dispatchingB.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-before-return" },
+  });
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const activeA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const completedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(activeA.status, "queued");
+  assert.equal(activeA.source.activeRevision, 2);
+  assert.equal(activeA.source.pendingRevision, null);
+  assert.equal(activeA.statusReason, "pr_source_revised");
+  assert.equal(completedB.status, "completed");
+});
+
+test("an expired sealed active provenance is reclaimable after an existing-root return", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  fixture.time.advance(30_000);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const pendingA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  const reclaimed = await recovered.claimIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    dispatcherId: "dispatcher-after-return-crash",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(reclaimed.attempt, sealed.outbox.attempt + 1);
+  assert.deepEqual(reclaimed.dispatchBinding, sealed.outbox.dispatchBinding);
+  await recovered.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: sealedB.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-return-recovered" },
+  });
+  const activated = await recovered.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  assert.equal(activated.applied, true);
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  assert.equal(
+    roots.find(({ itemId }) => itemId === pendingA.itemId).status,
+    "queued",
+  );
+  assert.equal(
+    roots.find(({ itemId }) => itemId === sealedB.itemId).status,
+    "completed",
+  );
+});
+
+for (const fence of [
+  {
+    name: "unavailable target",
+    input: { gitFacts: { gitTargetAvailable: false } },
+  },
+  {
+    name: "legacy target",
+    input: { gitFacts: {} },
+  },
+  {
+    name: "unproven Head",
+    input: {
+      headRefOid: PR_HEAD_C,
+      gitFacts: prGitFacts(PR_HEAD_C),
+    },
+  },
+]) {
+  test(`an ${fence.name} fence registers the last operational sealed provenance`, async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const rootB = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  await stageSealedPrReview(fixture, rootB.itemId);
+  fixture.source.records.push(prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-tertiary",
+    ...fence.input,
+  }));
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  const fencedC = roots.find(
+    ({ source }) => source.identity.scopeId === "github-tertiary",
+  );
+  assert.equal(fencedC.status, "blocked");
+  assert.equal(
+    fencedC.statusReason,
+    `pr_source_cross_root_cutover_pending:${sealedB.itemId}`,
+  );
+  assert.equal(
+    sealedB.statusReason,
+    `pr_source_cross_root_cutover_blocker:${fencedC.itemId}`,
+  );
+  const fencedReconciliation = await fixture.service
+    .reconcilePullRequestSource({
+      itemId: fencedC.itemId,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedRevision: fencedC.revision,
+      expectedPendingRevision: fencedC.source.activeRevision,
+    });
+  assert.equal(fencedReconciliation.applied, false);
+  assert.equal(
+    fencedReconciliation.blockers[0].reason,
+    "source_authority_fenced",
+  );
+  });
+}
+
+for (const fence of [
+  {
+    name: "unavailable target",
+    input: { gitFacts: { gitTargetAvailable: false } },
+    disposition: "ignored_authority_fence",
+  },
+  {
+    name: "legacy target",
+    input: { gitFacts: {} },
+    disposition: "ignored_legacy_downgrade",
+  },
+  {
+    name: "unproven Head",
+    input: {
+      headRefOid: PR_HEAD_C,
+      gitFacts: prGitFacts(PR_HEAD_C),
+    },
+    disposition: "ignored_unproven_head",
+  },
+]) {
+  test(`an existing ${fence.name} fence registers its operational sealed predecessor`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, {
+        sourceScopeId: "github-dashboard",
+        gitFacts: prGitFacts(PR_HEAD_A),
+      })],
+    });
+    await fixture.service.intake();
+    fixture.source.records.push(prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    const roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const rootA = roots.find(
+      ({ source }) => source.identity.scopeId === "github-dashboard",
+    );
+    const rootB = roots.find(
+      ({ source }) => source.identity.scopeId === "github-secondary",
+    );
+    await stageSealedPrReview(fixture, rootB.itemId);
+    fixture.source.records.push(prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-dashboard",
+      ...fence.input,
+    }));
+    fixture.source.highWatermark = 3;
+
+    await fixture.service.intake();
+
+    const fencedRoots = (await fixture.service.listItems({ limit: 10 })).items;
+    const fencedA = fencedRoots.find(({ itemId }) => itemId === rootA.itemId);
+    const sealedB = fencedRoots.find(({ itemId }) => itemId === rootB.itemId);
+    assert.equal(fencedA.status, "blocked");
+    assert.equal(fencedA.source.pendingRevision, null);
+    assert.equal(fencedA.source.revisions.at(-1).disposition, fence.disposition);
+    assert.equal(
+      fencedA.statusReason,
+      `pr_source_cross_root_cutover_pending:${sealedB.itemId}`,
+    );
+    assert.equal(
+      sealedB.statusReason,
+      `pr_source_cross_root_cutover_blocker:${fencedA.itemId}`,
+    );
+    const fencedReconciliation = await fixture.service
+      .reconcilePullRequestSource({
+        itemId: fencedA.itemId,
+        expectedGraphRevision: (await fixture.service.getSummary()).revision,
+        expectedRevision: fencedA.revision,
+        expectedPendingRevision: fencedA.source.activeRevision,
+      });
+    assert.equal(fencedReconciliation.applied, false);
+    assert.equal(
+      fencedReconciliation.blockers[0].reason,
+      "source_authority_fenced",
+    );
+  });
+}
+
+async function createExistingFenceScenario() {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const oldBinding = prExecutionBinding(rootB);
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  const dispatchingBeforeFence = (
+    await fixture.service.listItems({ limit: 10 })
+  ).items.find(({ itemId }) => itemId === rootB.itemId);
+  fixture.source.records.push(prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: { gitTargetAvailable: false },
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  return {
+    fixture,
+    rootA: roots.find(({ itemId }) => itemId === rootA.itemId),
+    rootB: roots.find(({ itemId }) => itemId === rootB.itemId),
+    dispatchingBeforeFence,
+    oldBinding,
+    sealed,
+  };
+}
+
+test("a fenced candidate keeps its exact observation across audit-only bindings", async () => {
+  const { fixture, rootA, rootB } = await createExistingFenceScenario();
+  const staleAudit = {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T00:59:00.000Z",
+    sourceScopeId: "github-dashboard",
+    ciStatus: "FAILURE",
+    gitFacts: prGitFacts(PR_HEAD_A, {
+      sourceAccountId: "audit-only-account",
+    }),
+  };
+  fixture.source.records.push(
+    prAssignment(4, staleAudit),
+    prAssignment(5, staleAudit),
+  );
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake();
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const roots = (await recovered.listItems({ limit: 10 })).items;
+  const fencedA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(fencedA.source.pendingRevision, null);
+  assert.equal(fencedA.source.revisions.at(-1).disposition, "ignored_stale");
+  assert.equal(fencedA.source.bindings.at(-1).sourceSequence, 5);
+  assert.deepEqual(crossRootPullRequestCutoverCandidate(fencedA), {
+    inputRevision: 2,
+    sourceSequence: 3,
+  });
+  assert.equal(
+    sealedB.statusReason,
+    `pr_source_cross_root_cutover_blocker:${fencedA.itemId}`,
+  );
+
+  const tampered = structuredClone(fencedA);
+  const fenceBinding = tampered.source.bindings.find(
+    ({ inputRevision }) => inputRevision === 2,
+  );
+  fenceBinding.inputRevision = 3;
+  assert.throws(
+    () => crossRootPullRequestCutoverCandidate(tampered),
+    (error) =>
+      error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+  );
+  const fenced = await recovered.reconcilePullRequestSource({
+    itemId: fencedA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: fencedA.revision,
+    expectedPendingRevision: fencedA.source.activeRevision,
+  });
+  assert.equal(fenced.applied, false);
+  assert.equal(fenced.blockers[0].reason, "source_authority_fenced");
+});
+
+test("an active acknowledgement after an existing fence permits trusted return", async () => {
+  const { fixture, rootA, rootB, sealed } =
+    await createExistingFenceScenario();
+  await fixture.service.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: rootB.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "existing-fence-active-ack" },
+  });
+  fixture.source.records.push(prAssignment(4, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const activeA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  const completedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(activeA.status, "queued");
+  assert.equal(activeA.source.activeRevision, 3);
+  assert.equal(activeA.source.pendingRevision, null);
+  assert.equal(completedB.status, "completed");
+});
+
+test("an existing fence transfers to trusted pending input and survives restart recovery", async () => {
+  const {
+    fixture,
+    rootA: fencedA,
+    rootB: fencedB,
+    dispatchingBeforeFence,
+    oldBinding,
+    sealed,
+  } = await createExistingFenceScenario();
+  assert.equal(fencedB.revision, dispatchingBeforeFence.revision + 1);
+  await assert.rejects(
+    fixture.service.ackIntent({
+      intentId: sealed.outbox.intentId,
+      expectedRevision: sealed.outbox.revision,
+      itemExpectedRevision: dispatchingBeforeFence.revision,
+      dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+      actorId: "work-intent-dispatcher",
+      outcome: "delivered",
+      nextStatus: "completed",
+      details: { downstreamRef: "stale-existing-fence-ack" },
+    }),
+    (error) => error.code === "WORK_LEDGER_REVISION_CONFLICT",
+  );
+  fixture.source.records.push(prAssignment(4, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  let pendingA = roots.find(({ itemId }) => itemId === fencedA.itemId);
+  let sealedB = roots.find(({ itemId }) => itemId === fencedB.itemId);
+  assert.equal(pendingA.status, "blocked");
+  assert.equal(pendingA.source.pendingRevision, 3);
+  assert.equal(
+    pendingA.statusReason,
+    `pr_source_cross_root_cutover_pending:${sealedB.itemId}`,
+  );
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource({
+      itemId: pendingA.itemId,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedRevision: pendingA.revision,
+      expectedPendingRevision: fencedA.source.activeRevision,
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+  );
+  const blocked = await fixture.service.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  assert.equal(blocked.applied, false);
+  fixture.time.advance(30_000);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const reclaimed = await recovered.claimIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    dispatcherId: "dispatcher-after-existing-fence",
+    leaseDurationMs: 30_000,
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  pendingA = roots.find(({ itemId }) => itemId === pendingA.itemId);
+  sealedB = roots.find(({ itemId }) => itemId === sealedB.itemId);
+  await recovered.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: sealedB.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "existing-fence-reclaimed" },
+  });
+  await recovered.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const activeA = roots.find(({ itemId }) => itemId === pendingA.itemId);
+  assert.equal(activeA.status, "queued");
+  assert.equal(activeA.source.activeRevision, 3);
+  assert.equal(activeA.source.pendingRevision, null);
+  await assert.rejects(
+    recovered.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const newBinding = prExecutionBinding(activeA);
+  assert.deepEqual(
+    await recovered.verifyPullRequestExecutionBinding(newBinding),
+    newBinding,
+  );
+});
+
+test("a trusted return transfers a fenced sealed predecessor into recoverable cutover", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const oldBinding = prExecutionBinding(rootB);
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  fixture.source.records.push(prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-tertiary",
+    gitFacts: { gitTargetAvailable: false },
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(4, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  let pendingA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  let sealedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  const fencedC = roots.find(
+    ({ source }) => source.identity.scopeId === "github-tertiary",
+  );
+  assert.equal(pendingA.status, "blocked");
+  assert.equal(pendingA.source.pendingRevision, 2);
+  assert.equal(
+    pendingA.statusReason,
+    `pr_source_cross_root_cutover_pending:${sealedB.itemId}`,
+  );
+  assert.equal(
+    sealedB.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pendingA.itemId}`,
+  );
+  assert.equal(fencedC.status, "superseded");
+  assert.equal(
+    fencedC.statusReason,
+    "pr_source_cross_root_cutover_replaced",
+  );
+  const blocked = await fixture.service.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  assert.equal(blocked.applied, false);
+  fixture.time.advance(30_000);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const reclaimed = await recovered.claimIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    dispatcherId: "dispatcher-after-authority-fence",
+    leaseDurationMs: 30_000,
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  pendingA = roots.find(({ itemId }) => itemId === pendingA.itemId);
+  sealedB = roots.find(({ itemId }) => itemId === sealedB.itemId);
+  await recovered.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: sealedB.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-fenced-recovered" },
+  });
+  const activated = await recovered.reconcilePullRequestSource({
+    itemId: pendingA.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingA.revision,
+    expectedPendingRevision: pendingA.source.pendingRevision,
+  });
+  assert.equal(activated.applied, true);
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const activeA = roots.find(({ itemId }) => itemId === pendingA.itemId);
+  assert.equal(activeA.status, "queued");
+  assert.equal(activeA.source.activeRevision, 2);
+  assert.equal(activeA.source.pendingRevision, null);
+  await assert.rejects(
+    recovered.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await recovered.verifyPullRequestExecutionBinding(
+      prExecutionBinding(activeA),
+    ),
+    prExecutionBinding(activeA),
+  );
+});
+
+for (const acknowledgementOrder of ["before", "after"]) {
+  test(`a trusted return converges when sealed work is acknowledged ${acknowledgementOrder} its fence`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, {
+        sourceScopeId: "github-dashboard",
+        gitFacts: prGitFacts(PR_HEAD_A),
+      })],
+    });
+    await fixture.service.intake();
+    fixture.source.records.push(prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    let roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const rootA = roots.find(
+      ({ source }) => source.identity.scopeId === "github-dashboard",
+    );
+    const rootB = roots.find(
+      ({ source }) => source.identity.scopeId === "github-secondary",
+    );
+    const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+    const acknowledge = async () => {
+      const currentB = (
+        await fixture.service.listItems({ limit: 10 })
+      ).items.find(({ itemId }) => itemId === rootB.itemId);
+      await fixture.service.ackIntent({
+        intentId: sealed.outbox.intentId,
+        expectedRevision: sealed.outbox.revision,
+        itemExpectedRevision: currentB.revision,
+        dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+        actorId: "work-intent-dispatcher",
+        outcome: "delivered",
+        nextStatus: "completed",
+        details: { downstreamRef: `ack-${acknowledgementOrder}-fence` },
+      });
+    };
+    if (acknowledgementOrder === "before") await acknowledge();
+    fixture.source.records.push(prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-tertiary",
+      gitFacts: { gitTargetAvailable: false },
+    }));
+    fixture.source.highWatermark = 3;
+    await fixture.service.intake();
+    if (acknowledgementOrder === "after") await acknowledge();
+    fixture.source.records.push(prAssignment(4, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:15:00.000Z",
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }));
+    fixture.source.highWatermark = 4;
+
+    await fixture.service.intake();
+
+    roots = (await fixture.service.listItems({ limit: 10 })).items;
+    const activeA = roots.find(({ itemId }) => itemId === rootA.itemId);
+    const completedB = roots.find(({ itemId }) => itemId === rootB.itemId);
+    assert.equal(activeA.status, "queued");
+    assert.equal(activeA.source.activeRevision, 2);
+    assert.equal(activeA.source.pendingRevision, null);
+    assert.equal(completedB.status, "completed");
+  });
+}
+
+async function createReplacedPendingRootScenario() {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  const sealedA = await stageSealedPrReview(fixture);
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-tertiary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const rootA = roots.find(({ itemId }) => itemId === sealedA.rootItemId);
+  let rootB = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  let rootC = roots.find(
+    ({ source }) => source.identity.scopeId === "github-tertiary",
+  );
+  await fixture.service.ackIntent({
+    intentId: sealedA.outbox.intentId,
+    expectedRevision: sealedA.outbox.revision,
+    itemExpectedRevision: rootA.revision,
+    dispatchLeaseId: sealedA.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-before-c" },
+  });
+  await fixture.service.reconcilePullRequestSource({
+    itemId: rootC.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: rootC.revision,
+    expectedPendingRevision: rootC.source.activeRevision,
+  });
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  rootB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  rootC = roots.find(({ itemId }) => itemId === rootC.itemId);
+  assert.equal(rootB.status, "superseded");
+  assert.equal(
+    rootB.statusReason,
+    "pr_source_cross_root_cutover_replaced",
+  );
+  assert.equal(rootC.status, "queued");
+  return { fixture, rootB, rootC };
+}
+
+for (const predecessorStatus of ["queued", "working", "completed", "sealed"]) {
+  test(`a replaced pending source root returns after a ${predecessorStatus} successor`, async () => {
+  const { fixture, rootB: replacedB, rootC: queuedC } =
+    await createReplacedPendingRootScenario();
+  let rootC = queuedC;
+  let sealedC = null;
+  if (["working", "completed"].includes(predecessorStatus)) {
+    rootC = await fixture.service.claim({
+      itemId: rootC.itemId,
+      expectedRevision: rootC.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    });
+  }
+  if (predecessorStatus === "completed") {
+    rootC = await fixture.service.complete({
+      itemId: rootC.itemId,
+      expectedRevision: rootC.revision,
+      leaseId: rootC.leaseId,
+      actorId: "employee-pr-engineer",
+      result: { outcome: "successor-completed" },
+    });
+  }
+  if (predecessorStatus === "sealed") {
+    sealedC = await stageSealedPrReview(fixture, rootC.itemId);
+    rootC = (await fixture.service.listItems({ limit: 10 })).items.find(
+      ({ itemId }) => itemId === rootC.itemId,
+    );
+  }
+  const oldBinding = prExecutionBinding(replacedB);
+  fixture.source.records.push(prAssignment(4, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+
+  await fixture.service.intake();
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  let roots = (await recovered.listItems({ limit: 10 })).items;
+  let rootB = roots.find(({ itemId }) => itemId === replacedB.itemId);
+  rootC = roots.find(({ itemId }) => itemId === rootC.itemId);
+  if (sealedC !== null) {
+    assert.equal(rootB.status, "blocked");
+    assert.equal(rootB.source.pendingRevision, 2);
+    await recovered.ackIntent({
+      intentId: sealedC.outbox.intentId,
+      expectedRevision: sealedC.outbox.revision,
+      itemExpectedRevision: rootC.revision,
+      dispatchLeaseId: sealedC.outbox.dispatchLeaseId,
+      actorId: "work-intent-dispatcher",
+      outcome: "delivered",
+      nextStatus: "completed",
+      details: { downstreamRef: "github-review-proposal-before-b-return" },
+    });
+    await recovered.reconcilePullRequestSource({
+      itemId: rootB.itemId,
+      expectedGraphRevision: (await recovered.getSummary()).revision,
+      expectedRevision: rootB.revision,
+      expectedPendingRevision: rootB.source.pendingRevision,
+    });
+    roots = (await recovered.listItems({ limit: 10 })).items;
+    rootB = roots.find(({ itemId }) => itemId === rootB.itemId);
+    rootC = roots.find(({ itemId }) => itemId === rootC.itemId);
+  }
+  assert.equal(rootB.status, "queued");
+  assert.equal(
+    rootB.statusReason,
+    predecessorStatus === "sealed"
+      ? "pr_source_cutover_activated"
+      : "pr_source_revised",
+  );
+  assert.equal(rootB.source.activeRevision, 2);
+  assert.equal(rootB.source.pendingRevision, null);
+  assert.equal(rootC.ownerId, null);
+  assert.equal(rootC.leaseId, null);
+  assert.equal(rootC.leaseUntil, null);
+  assert.equal(
+    rootC.status,
+    ["completed", "sealed"].includes(predecessorStatus)
+      ? "completed"
+      : "blocked",
+  );
+  await assert.rejects(
+    recovered.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const newBinding = prExecutionBinding(rootB);
+  assert.deepEqual(
+    await recovered.verifyPullRequestExecutionBinding(newBinding),
+    newBinding,
+  );
+  const claimedB = await recovered.claim({
+    itemId: rootB.itemId,
+    expectedRevision: rootB.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimedB.status, "working");
+  });
+}
+
+test("reactivating a replaced source root never revives its old child or intent", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  let rootB = roots[0];
+  const childResult = await fixture.service.createGraphChild(
+    prGraphChildCommand(
+      rootB,
+      (await fixture.service.getSummary()).revision,
+      "historic-b-child",
+    ),
+  );
+  let child = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === childResult.taskId,
+  );
+  child = await fixture.service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  child = await fixture.service.complete({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "historic-child-completed" },
+  });
+  const oldChildBinding = prExecutionBinding(child);
+  const sealedB = await stageSealedPrReview(fixture, rootB.itemId);
+  rootB = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === rootB.itemId,
+  );
+  const oldRootBinding = prExecutionBinding(rootB);
+  await fixture.service.ackIntent({
+    intentId: sealedB.outbox.intentId,
+    expectedRevision: sealedB.outbox.revision,
+    itemExpectedRevision: rootB.revision,
+    dispatchLeaseId: sealedB.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "failed",
+    nextStatus: "retry_wait",
+    availableAt: "2026-08-02T03:00:00.000Z",
+    details: { code: "historic-b-intent-failed" },
+  });
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let rootA = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ source }) => source?.identity?.scopeId === "github-dashboard",
+  );
+  const sealedA = await stageSealedPrReview(fixture, rootA.itemId);
+  fixture.source.records.push(
+    prAssignment(3, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      sourceScopeId: "github-secondary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(4, {
+      occurredAt: "2026-08-02T01:15:00.000Z",
+      sourceScopeId: "github-tertiary",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+  );
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  rootA = roots.find(({ itemId }) => itemId === rootA.itemId);
+  let rootC = roots.find(
+    ({ source }) => source?.identity?.scopeId === "github-tertiary",
+  );
+  await fixture.service.ackIntent({
+    intentId: sealedA.outbox.intentId,
+    expectedRevision: sealedA.outbox.revision,
+    itemExpectedRevision: rootA.revision,
+    dispatchLeaseId: sealedA.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "a-before-c-activation" },
+  });
+  await fixture.service.reconcilePullRequestSource({
+    itemId: rootC.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: rootC.revision,
+    expectedPendingRevision: rootC.source.activeRevision,
+  });
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  rootB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  assert.equal(rootB.status, "superseded");
+  assert.equal(
+    rootB.statusReason,
+    "pr_source_cross_root_cutover_replaced",
+  );
+  fixture.source.records.push(prAssignment(5, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:20:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake();
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  roots = (await recovered.listItems({ limit: 20 })).items;
+  rootB = roots.find(({ itemId }) => itemId === rootB.itemId);
+  rootC = roots.find(({ itemId }) => itemId === rootC.itemId);
+  child = roots.find(({ itemId }) => itemId === child.itemId);
+  const historicalOutbox = (await recovered.listOutbox({ limit: 20 })).items
+    .find(({ intentId }) => intentId === sealedB.outbox.intentId);
+  assert.equal(rootB.status, "queued");
+  assert.equal(rootB.source.activeRevision, 3);
+  assert.equal(rootB.activeIntentId, null);
+  assert.equal(rootC.status, "blocked");
+  assert.equal(child.status, "completed");
+  assert.equal(historicalOutbox.status, "failed");
+  await assert.rejects(
+    recovered.verifyPullRequestExecutionBinding(oldRootBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  await assert.rejects(
+    recovered.verifyPullRequestExecutionBinding(oldChildBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const newBinding = prExecutionBinding(rootB);
+  assert.deepEqual(
+    await recovered.verifyPullRequestExecutionBinding(newBinding),
+    newBinding,
+  );
+  const claimedB = await recovered.claim({
+    itemId: rootB.itemId,
+    expectedRevision: rootB.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimedB.status, "working");
+});
+
+test("a crashed cross-root sealed action can be reclaimed only for settlement", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.time.advance(30_000);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  let roots = (await recovered.listItems({ limit: 10 })).items;
+  let oldRoot = roots.find(({ itemId }) => itemId === sealed.rootItemId);
+  let pendingRoot = roots.find(({ itemId }) => itemId !== oldRoot.itemId);
+  const reclaimed = await recovered.claimIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    dispatcherId: "dispatcher-after-crash",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(reclaimed.attempt, sealed.outbox.attempt + 1);
+  assert.deepEqual(reclaimed.dispatchBinding, sealed.outbox.dispatchBinding);
+  await recovered.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: oldRoot.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-recovered" },
+  });
+  pendingRoot = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === pendingRoot.itemId,
+  );
+  await recovered.reconcilePullRequestSource({
+    itemId: pendingRoot.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingRoot.revision,
+    expectedPendingRevision: pendingRoot.source.activeRevision,
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  assert.equal(
+    roots.find(({ itemId }) => itemId === pendingRoot.itemId).status,
+    "queued",
+  );
+});
+
+test("a crashed sealed child registered in cross-root cutover can settle", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrChildReview(fixture);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.time.advance(30_000);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  let items = (await recovered.listItems({ limit: 10 })).items;
+  let child = items.find(({ itemId }) => itemId === sealed.childItemId);
+  let pendingRoot = items.find(
+    ({ source }) => source?.identity?.scopeId === "github-secondary",
+  );
+  assert.equal(
+    child.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pendingRoot.itemId}`,
+  );
+  const reclaimed = await recovered.claimIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    dispatcherId: "dispatcher-after-child-crash",
+    leaseDurationMs: 30_000,
+  });
+  await recovered.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: child.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-child-recovered" },
+  });
+  pendingRoot = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === pendingRoot.itemId,
+  );
+  await recovered.reconcilePullRequestSource({
+    itemId: pendingRoot.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pendingRoot.revision,
+    expectedPendingRevision: pendingRoot.source.activeRevision,
+  });
+  items = (await recovered.listItems({ limit: 10 })).items;
+  child = items.find(({ itemId }) => itemId === child.itemId);
+  assert.equal(child.status, "completed");
+  assert.equal(
+    items.find(({ itemId }) => itemId === pendingRoot.itemId).status,
+    "queued",
+  );
 });
 
 test("an expired sealed old-Head intent is reclaimed and settled before cutover", async () => {
@@ -1372,6 +3915,501 @@ test("a legitimate A to B to A force-push creates three distinct Head epochs", a
   );
 });
 
+test("provenance return intake follows the global PR Head chain", async () => {
+  const records = [
+    prAssignment(1, {
+      occurredAt: "2026-08-02T01:00:00.000Z",
+      headRefOid: PR_HEAD_A,
+    }),
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+      sourceScopeId: "replacement-scope",
+    }),
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_C,
+      previousHeadRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  ];
+  const fixture = await createFixture({ records });
+  await fixture.service.intake({ limit: 10 });
+  const roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const returnedRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const replacedRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "replacement-scope",
+  );
+
+  assert.equal(roots.length, 2);
+  assert.equal(returnedRoot.source.current.headRefOid, PR_HEAD_C);
+  assert.equal(returnedRoot.source.revisions.at(-1).disposition, "accepted");
+  assert.equal(
+    returnedRoot.source.revisions.at(-1).causalHeadRefOid,
+    PR_HEAD_B,
+  );
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(
+      prExecutionBinding(returnedRoot),
+    ),
+    prExecutionBinding(returnedRoot),
+  );
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(
+      prExecutionBinding(replacedRoot),
+    ),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+});
+
+test("a status-only provenance return catches up to the trusted Head and recovers", async () => {
+  const records = [
+    prAssignment(1, {
+      occurredAt: "2026-08-02T01:00:00.000Z",
+      headRefOid: PR_HEAD_A,
+    }),
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+      sourceScopeId: "replacement-scope",
+    }),
+    prAssignment(3, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_B,
+      changedFields: ["ciStatus"],
+    }),
+  ];
+  const fixture = await createFixture({ records });
+  await fixture.service.intake({ limit: 10 });
+  const recovered = await createFixture({ records, store: fixture.store });
+  const roots = (await recovered.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const returnedRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const replacedRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "replacement-scope",
+  );
+
+  assert.equal(returnedRoot.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(returnedRoot.source.revisions.at(-1).previousHeadRefOid, null);
+  assert.equal(
+    returnedRoot.source.revisions.at(-1).causalHeadRefOid,
+    PR_HEAD_B,
+  );
+  assert.deepEqual(
+    await recovered.service.verifyPullRequestExecutionBinding(
+      prExecutionBinding(returnedRoot),
+    ),
+    prExecutionBinding(returnedRoot),
+  );
+  await assert.rejects(
+    recovered.service.verifyPullRequestExecutionBinding(
+      prExecutionBinding(replacedRoot),
+    ),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+});
+
+test("provenance round trips never resurrect an earlier exact binding", async (t) => {
+  for (const scenario of [
+    {
+      name: "same Head",
+      replacementHead: PR_HEAD_A,
+      returnOptions: {},
+      replacementOptions: {},
+    },
+    {
+      name: "A to B to A",
+      replacementHead: PR_HEAD_B,
+      replacementOptions: {
+        previousHeadRefOid: PR_HEAD_A,
+        changedFields: ["headRefOid"],
+      },
+      returnOptions: {
+        previousHeadRefOid: PR_HEAD_B,
+        changedFields: ["headRefOid"],
+      },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const initial = prAssignment(1, {
+        occurredAt: "2026-08-02T01:00:00.000Z",
+        headRefOid: PR_HEAD_A,
+        gitFacts: prGitFacts(PR_HEAD_A),
+      });
+      const fixture = await createFixture({ records: [initial] });
+      await fixture.service.intake({ limit: 10 });
+      const initialRoot = (await fixture.service.listItems({ limit: 10 }))
+        .items.find(({ kind }) => kind === "source_root");
+      const oldBinding = prExecutionBinding(initialRoot);
+      const replacement = prAssignment(2, {
+        occurredAt: "2026-08-02T01:05:00.000Z",
+        headRefOid: scenario.replacementHead,
+        sourceScopeId: "replacement-scope",
+        gitFacts: prGitFacts(scenario.replacementHead),
+        ...scenario.replacementOptions,
+      });
+      const returned = prAssignment(3, {
+        occurredAt: "2026-08-02T01:10:00.000Z",
+        headRefOid: PR_HEAD_A,
+        gitFacts: prGitFacts(PR_HEAD_A),
+        ...scenario.returnOptions,
+      });
+      fixture.source.records.push(replacement, returned);
+      fixture.source.highWatermark = 3;
+      await fixture.service.intake({ limit: 10 });
+
+      const recovered = await createFixture({
+        records: [initial, replacement, returned],
+        store: fixture.store,
+      });
+      const roots = (await recovered.service.listItems({ limit: 10 })).items
+        .filter(({ kind }) => kind === "source_root");
+      const returnedRoot = roots.find(
+        ({ source }) => source.identity.scopeId === "github-dashboard",
+      );
+      const currentBinding = prExecutionBinding(returnedRoot);
+
+      assert.deepEqual(
+        returnedRoot.source.revisions.map(({ headRevision }) => headRevision),
+        [1, 2],
+      );
+      assert.deepEqual(
+        returnedRoot.source.revisions.map(
+          ({ authorityEpochChanged }) => authorityEpochChanged,
+        ),
+        [false, true],
+      );
+      await assert.rejects(
+        recovered.service.verifyPullRequestExecutionBinding(oldBinding),
+        (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+      );
+      assert.deepEqual(
+        await recovered.service.verifyPullRequestExecutionBinding(
+          currentBinding,
+        ),
+        currentBinding,
+      );
+    });
+  }
+});
+
+test("an exact target rollback stays in a newer authority epoch after restart", async () => {
+  const initial = prAssignment(1, {
+    occurredAt: "2026-08-02T01:00:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake({ limit: 10 });
+  const initialRoot = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const oldBinding = prExecutionBinding(initialRoot);
+  const changed = prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A, { baseRefOid: "e".repeat(40) }),
+  });
+  const rolledBack = prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(changed, rolledBack);
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake({ limit: 10 });
+
+  const recovered = await createFixture({
+    records: [initial, changed, rolledBack],
+    store: fixture.store,
+  });
+  const currentRoot = (await recovered.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const currentBinding = prExecutionBinding(currentRoot);
+
+  assert.deepEqual(
+    currentRoot.source.revisions.map(({ headRevision }) => headRevision),
+    [1, 2, 3],
+  );
+  await assert.rejects(
+    recovered.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await recovered.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
+test("restart cuts over ambiguous legacy target history before authorizing bindings", async () => {
+  const records = [
+    prAssignment(1, {
+      occurredAt: "2026-08-02T01:00:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A, { baseRefOid: "e".repeat(40) }),
+    }),
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    }),
+  ];
+  const fixture = await createFixture({ records });
+  await fixture.service.intake({ limit: 10 });
+  const beforeUpgrade = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const preparedBeforeUpgrade = prExecutionBinding(beforeUpgrade);
+  const legacy = fixture.store.stored();
+  const legacyRoot = legacy.items.find(({ kind }) => kind === "source_root");
+  for (const revision of legacyRoot.source.revisions) {
+    delete revision.causalHeadRefOid;
+    delete revision.authorityEpochChanged;
+    delete revision.authorityEpochCutover;
+  }
+  fixture.store.replaceStored(legacy);
+
+  const recovered = await createFixture({ records, store: fixture.store });
+  const currentRoot = (await recovered.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+
+  assert.deepEqual(
+    currentRoot.source.revisions.map(({ headRevision }) => headRevision),
+    [1, 2, 4],
+  );
+  assert.equal(
+    currentRoot.source.revisions.at(-1).authorityEpochCutover,
+    true,
+  );
+  await assert.rejects(
+    recovered.service.verifyPullRequestExecutionBinding(preparedBeforeUpgrade),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const currentBinding = prExecutionBinding(currentRoot);
+  assert.deepEqual(
+    await recovered.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
+test("a new provenance with an unproven Head fences the whole PR", async () => {
+  const fixture = await createFixture({
+    records: [
+      prAssignment(1, {
+        occurredAt: "2026-08-02T01:00:00.000Z",
+        headRefOid: PR_HEAD_A,
+      }),
+      prAssignment(2, {
+        occurredAt: "2026-08-02T01:05:00.000Z",
+        headRefOid: PR_HEAD_B,
+        changedFields: ["headRefOid"],
+        sourceScopeId: "unproven-scope",
+      }),
+    ],
+  });
+  await fixture.service.intake({ limit: 10 });
+  const roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+
+  assert.equal(roots.length, 2);
+  for (const root of roots) {
+    await assert.rejects(
+      fixture.service.verifyPullRequestExecutionBinding(
+        prExecutionBinding(root),
+      ),
+      (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    );
+  }
+});
+
+test("a future-dated unproven provenance cannot permanently block recovery", async () => {
+  const initial = prAssignment(1, {
+    occurredAt: "2026-08-02T01:00:00.000Z",
+    headRefOid: PR_HEAD_A,
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake({ limit: 10 });
+  const initialRoot = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const oldBinding = prExecutionBinding(initialRoot);
+  const unprovenFuture = prAssignment(2, {
+    occurredAt: "2026-08-02T01:50:00.000Z",
+    headRefOid: PR_HEAD_B,
+    changedFields: ["headRefOid"],
+    sourceScopeId: "future-unproven-scope",
+    gitFacts: prGitFacts(PR_HEAD_B),
+  });
+  fixture.source.records.push(unprovenFuture);
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake({ limit: 10 });
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  const recoveredObservation = prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    headRefOid: PR_HEAD_A,
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(recoveredObservation);
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake({ limit: 10 });
+  const recovered = await createFixture({
+    records: [initial, unprovenFuture, recoveredObservation],
+    store: fixture.store,
+  });
+  const currentRoot = (await recovered.service.listItems({ limit: 10 }))
+    .items.find(
+      ({ kind, source }) =>
+        kind === "source_root" &&
+        source.identity.scopeId === "github-dashboard",
+    );
+  const currentBinding = prExecutionBinding(currentRoot);
+
+  assert.deepEqual(
+    currentRoot.source.revisions.map(({ headRevision }) => headRevision),
+    [1, 2],
+  );
+  await assert.rejects(
+    recovered.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await recovered.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
+test("future unavailable facts fence locally and exact normal-time recovery survives restart", async () => {
+  const initial = prAssignment(1, {
+    occurredAt: "2026-08-02T01:00:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake({ limit: 10 });
+  const initialRoot = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const oldBinding = prExecutionBinding(initialRoot);
+  const unavailableFuture = prAssignment(2, {
+    occurredAt: "2099-01-01T00:00:00.000Z",
+    gitFacts: { gitTargetAvailable: false },
+  });
+  fixture.source.records.push(unavailableFuture);
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake({ limit: 10 });
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  const exactRecovery = prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(exactRecovery);
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake({ limit: 10 });
+  const recovered = await createFixture({
+    records: [initial, unavailableFuture, exactRecovery],
+    store: fixture.store,
+  });
+  const currentRoot = (await recovered.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  const currentBinding = prExecutionBinding(currentRoot);
+
+  assert.deepEqual(
+    currentRoot.source.revisions.map(({ disposition }) => disposition),
+    ["accepted", "ignored_authority_fence", "accepted"],
+  );
+  assert.equal(currentRoot.source.headRevision, 2);
+  await assert.rejects(
+    recovered.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await recovered.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
+test("a trusted provenance recovers exactly after another source fences it", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      occurredAt: "2099-01-01T00:00:00.000Z",
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const initialRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const oldBinding = prExecutionBinding(initialRoot);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: { gitTargetAvailable: false },
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const recoveredRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const currentBinding = prExecutionBinding(recoveredRoot);
+  assert.equal(recoveredRoot.status, "queued");
+  assert.deepEqual(
+    recoveredRoot.source.revisions.map(({ disposition }) => disposition),
+    ["accepted", "accepted"],
+  );
+  assert.equal(recoveredRoot.source.headRevision, 2);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+
+  const restarted = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await restarted.recover();
+  assert.deepEqual(
+    await restarted.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
 test("a late old-Head event is audited without rolling the PR task back", async () => {
   const fixture = await createFixture({ records: [prAssignment(1)] });
   await fixture.service.intake();
@@ -1407,6 +4445,184 @@ test("a late old-Head event is audited without rolling the PR task back", async 
   assert.equal(item.source.headRevision, 2);
   assert.equal(item.source.current.headRefOid, PR_HEAD_B);
   assert.equal(item.source.revisions.at(-1).disposition, "ignored_stale");
+});
+
+test("a full limit-one v1 PR outbox gains one v2 baseline, restarts, and drains", async () => {
+  const input = prAssignment(1, {
+    gitFacts: prGitFacts(PR_HEAD_A),
+    title: "Legacy v1 PR memory",
+  });
+  const fixture = await createFixture({ records: [input] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  await fixture.service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: root.itemId,
+    },
+    command: {
+      taskId: root.itemId,
+      acceptanceContract: {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "legacy-v1",
+          description: "Legacy v1 graph conclusion",
+        }],
+        expectedDeliverables: [],
+      },
+      reason: "legacy-v1-fixture",
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedTaskRevision: root.revision,
+    },
+  });
+  const legacy = fixture.store.stored();
+  root = legacy.items.find(({ kind }) => kind === "source_root");
+  legacy.graphMemoryProjection = legacySingleEventProjection(
+    legacy,
+    root,
+    "acceptance_contract",
+    root.graph.acceptanceContracts.at(-1),
+  );
+  fixture.store.replaceStored(legacy);
+  const limits = normalizeWorkLedgerLimits({ graphMemoryOutboxLimit: 1 });
+
+  const recovered = await createFixture({
+    records: [input],
+    store: fixture.store,
+    limits,
+  });
+  const firstBatch = await recovered.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  });
+  assert.equal(firstBatch.highWatermark, 2);
+  assert.deepEqual(
+    firstBatch.items.map(({ schemaVersion, kind }) => ({ schemaVersion, kind })),
+    [
+      { schemaVersion: 1, kind: "acceptance_contract" },
+      { schemaVersion: 2, kind: "authority_observed" },
+    ],
+  );
+  const restartedBeforeDrain = await createFixture({
+    records: [input],
+    store: fixture.store,
+    limits,
+  });
+  assert.deepEqual(
+    await restartedBeforeDrain.service.readGraphMemoryProjectionBatch({
+      limit: 10,
+    }),
+    firstBatch,
+  );
+
+  const memory = await createLedgerMemoryPipeline(
+    restartedBeforeDrain.service,
+  );
+  await memory.projector.runCycle();
+  const v1RecordId = workGraphMemoryRecordReceipt(firstBatch.items[0])
+    .memoryRecordId;
+  assert.equal(
+    memory.journal.readRecords({ recordIds: [v1RecordId] })
+      .items[0].labels.lifecycle,
+    "obsolete",
+  );
+  const afterDrain = await createFixture({
+    records: [input],
+    store: fixture.store,
+    limits,
+  });
+  assert.deepEqual(
+    await afterDrain.service.readGraphMemoryProjectionBatch({ limit: 10 }),
+    {
+      cursor: 2,
+      highWatermark: 2,
+      checkpointDigest: firstBatch.highWatermarkDigest,
+      highWatermarkDigest: firstBatch.highWatermarkDigest,
+      authorityStateDigest: firstBatch.authorityStateDigest,
+      items: [],
+    },
+  );
+  root = (await afterDrain.service.listItems()).items[0];
+  await afterDrain.service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: root.itemId,
+    },
+    command: {
+      taskId: root.itemId,
+      acceptanceContract: {
+        revision: 3,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      reason: "cap-restored-after-drain",
+      expectedGraphRevision: (await afterDrain.service.getSummary()).revision,
+      expectedTaskRevision: root.revision,
+    },
+  });
+  const ordinaryAfterDrain =
+    await afterDrain.service.readGraphMemoryProjectionBatch({ limit: 10 });
+  assert.equal(ordinaryAfterDrain.items.length, 1);
+  assert.equal(ordinaryAfterDrain.items[0].kind, "acceptance_contract");
+});
+
+test("v1 non-PR graph memory drains without synthesizing a PR authority baseline", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  const legacy = fixture.store.stored();
+  const item = legacy.items[0];
+  legacy.graphMemoryProjection = legacySingleEventProjection(
+    legacy,
+    item,
+    "acceptance_contract",
+    item.graph.acceptanceContracts[0],
+  );
+  fixture.store.replaceStored(legacy);
+  const recovered = await createFixture({
+    records: [assignment(1)],
+    store: fixture.store,
+    limits: normalizeWorkLedgerLimits({ graphMemoryOutboxLimit: 1 }),
+  });
+  const batch = await recovered.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  });
+  assert.equal(batch.highWatermark, 1);
+  assert.equal(batch.items.length, 1);
+  assert.equal(batch.items[0].schemaVersion, 1);
+  assert.equal(batch.items.some(({ kind }) => kind === "authority_observed"), false);
+});
+
+test("recovery rejects deleting an authority invalidation tail with nextSequence rollback", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  const memory = await createLedgerMemoryPipeline(fixture.service);
+  await memory.projector.runCycle();
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const tampered = fixture.store.stored();
+  assert.equal(
+    tampered.graphMemoryProjection.pending.at(-1).kind,
+    "authority_invalidated",
+  );
+  tampered.graphMemoryProjection.pending.pop();
+  tampered.graphMemoryProjection.nextSequence -= 1;
+  fixture.store.replaceStored(tampered);
+
+  await assert.rejects(
+    createFixture({
+      records: fixture.source.records,
+      store: fixture.store,
+    }),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
 });
 
 test("schema v8 safely consolidates queued PR assignments into one source root", async () => {
@@ -1460,7 +4676,7 @@ test("schema v8 safely consolidates queued PR assignments into one source root",
   assert.equal(
     (await fixture.service.readGraphMemoryProjectionBatch({ limit: 10 }))
       .highWatermark,
-    3,
+    4,
   );
 
   await fixture.service.claim({
@@ -1470,9 +4686,10 @@ test("schema v8 safely consolidates queued PR assignments into one source root",
     leaseDurationMs: 30_000,
   });
   assert.equal(store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
-  assert.deepEqual(
-    store.stored().graphMemoryProjection,
-    legacy.graphMemoryProjection,
+  assert.equal(store.stored().graphMemoryProjection.nextSequence, 5);
+  assert.equal(
+    store.stored().graphMemoryProjection.pending.at(-1).kind,
+    "authority_observed",
   );
   const recovered = new WorkLedgerService({
     store,
@@ -1486,8 +4703,126 @@ test("schema v8 safely consolidates queued PR assignments into one source root",
   assert.equal(
     (await recovered.readGraphMemoryProjectionBatch({ limit: 10 }))
       .highWatermark,
-    3,
+    4,
   );
+});
+
+test("full schema v8 outbox with multiple PR roots only overflows for one trusted baseline", async () => {
+  const records = [
+    prAssignment(1, {
+      gitFacts: prGitFacts(PR_HEAD_A),
+      title: "PR 42 migration",
+    }),
+    prAssignment(2, {
+      pullRequestNumber: 43,
+      sourceScopeId: "github-secondary",
+      headRefOid: PR_HEAD_B,
+      gitFacts: prGitFacts(PR_HEAD_B),
+      title: "PR 43 migration",
+    }),
+  ];
+  const items = records.map((entry) => {
+    const item = createAssignmentWorkItem(
+      entry,
+      "2026-08-02T02:00:00.000Z",
+    );
+    delete item.source;
+    delete item.sourceQuarantine;
+    return item;
+  });
+  const limits = normalizeWorkLedgerLimits({ graphMemoryOutboxLimit: 2 });
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 1,
+    intakeCursor: 2,
+    sourceHighWatermark: 2,
+    items,
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(items, 1, limits),
+  };
+  const store = new MemoryStore({ [STATE_KEY]: legacy });
+  const first = await createFixture({ records, store, limits });
+  const firstBatch = await first.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  });
+  assert.equal((await first.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root").length, 2);
+  assert.equal(firstBatch.items.length, 3);
+  assert.equal(firstBatch.items.at(-1).kind, "authority_observed");
+  assert.equal(
+    firstBatch.items.slice(0, 2).every(
+      ({ kind }) => kind === "acceptance_contract",
+    ),
+    true,
+  );
+
+  const restarted = await createFixture({ records, store, limits });
+  assert.deepEqual(
+    await restarted.service.readGraphMemoryProjectionBatch({ limit: 10 }),
+    firstBatch,
+  );
+  let root = (await restarted.service.listItems({ limit: 10 })).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  const writesBeforeRejectedGraphAppend = store.writes.length;
+  await assert.rejects(
+    restarted.service.reviseGraphAcceptance({
+      authority: {
+        actorId: "employee-orchestrator",
+        scopeRootTaskId: root.itemId,
+      },
+      command: {
+        taskId: root.itemId,
+        acceptanceContract: {
+          revision: 2,
+          acceptanceCriteria: [{
+            criterionId: "migration-capacity",
+            description: "Migration authority tail has drained",
+          }],
+          expectedDeliverables: [],
+        },
+        reason: "ordinary-append-before-migration-drain",
+        expectedGraphRevision: (await restarted.service.getSummary()).revision,
+        expectedTaskRevision: root.revision,
+      },
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_GRAPH_MEMORY_CAPACITY_EXCEEDED",
+  );
+  assert.equal(store.writes.length, writesBeforeRejectedGraphAppend);
+
+  const memory = await createLedgerMemoryPipeline(restarted.service);
+  await memory.projector.runCycle();
+  const afterDrain = await createFixture({ records, store, limits });
+  root = (await afterDrain.service.listItems({ limit: 10 })).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  await afterDrain.service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: root.itemId,
+    },
+    command: {
+      taskId: root.itemId,
+      acceptanceContract: {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "migration-capacity",
+          description: "Migration authority tail has drained",
+        }],
+        expectedDeliverables: [],
+      },
+      reason: "ordinary-append-after-migration-drain",
+      expectedGraphRevision: (await afterDrain.service.getSummary()).revision,
+      expectedTaskRevision: root.revision,
+    },
+  });
+  const ordinary = await afterDrain.service.readGraphMemoryProjectionBatch({
+    limit: 10,
+  });
+  assert.equal(ordinary.cursor, 3);
+  assert.equal(ordinary.items.length, 1);
+  assert.equal(ordinary.items[0].kind, "acceptance_contract");
 });
 
 test("schema v8 mixed-Head PR work is durably fenced from new actions", async () => {

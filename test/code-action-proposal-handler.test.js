@@ -7,6 +7,7 @@ import {
 } from "../src/domain/code-job-contract.js";
 import {
   codeJobConfirmationIdForGrant,
+  codeJobConfirmationIdForProposal,
   createCodeActionProposalConfirmationPlan,
 } from "../src/domain/code-action-proposal-confirmation.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
@@ -22,7 +23,7 @@ const HEAD_REF_OID = "1".repeat(40);
 
 function inputBindingFor(number) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository: "acme/repo",
     pullRequestNumber: number,
@@ -34,6 +35,17 @@ function inputBindingFor(number) {
     eventId: `event-${number}`,
     eventDigest: `${"d".repeat(63)}${number % 10}`,
     inputDigest: `${"e".repeat(63)}${number % 10}`,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "2".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: `fix/pr-${number}`,
+      headRefOid: HEAD_REF_OID,
+    },
   };
 }
 
@@ -63,6 +75,24 @@ function proposal(number = 42) {
       summary: "创建受控代码任务",
       reason: "需要在隔离副本中验证修复",
     },
+  });
+}
+
+function legacyProposal(number = 42) {
+  const current = proposal(number);
+  const { gitTarget: _gitTarget, ...legacyBinding } =
+    current.binding.inputBinding;
+  return normalizeBoundWorkProposal({
+    proposalId: current.proposalId,
+    policyVersion: current.policyVersion,
+    kind: current.kind,
+    requestedBy: current.requestedBy,
+    source: current.source,
+    binding: {
+      ...current.binding,
+      inputBinding: { ...legacyBinding, schemaVersion: 1 },
+    },
+    payload: current.payload,
   });
 }
 
@@ -291,6 +321,10 @@ test("a proposal is enqueued once and waits on the exact code confirmation", asy
   const enqueued = normalizeConfirmationPlan(producer.plan);
   assert.equal(enqueued.action.grant.schemaVersion, 2);
   assert.equal(enqueued.action.grant.inputBinding.headRefOid, HEAD_REF_OID);
+  assert.equal(
+    enqueued.action.grant.inputBinding.gitTarget.baseRefOid,
+    "2".repeat(40),
+  );
   assert.deepEqual(
     enqueued.action.grant.inputBinding,
     handlerInput().proposal.binding.inputBinding,
@@ -647,6 +681,70 @@ test("revoked policy invalidates an existing confirmation before it can run", as
   assert.equal(producer.invalidateCalls.length, 1);
   assert.equal(producer.invalidateCalls[0][1].reason, "authorization_changed");
   assert.equal(reader.getCalls.length, 0);
+});
+
+test("a revoked proposal with no confirmation terminates stale without retry poison", async () => {
+  const producer = new FakeConfirmationProducer();
+  producer.get = async (id) => {
+    producer.getCalls.push(id);
+    const error = new Error("not found");
+    error.code = "CONFIRMATION_NOT_FOUND";
+    throw error;
+  };
+  const reader = new FakeCodeJobReader(null);
+  const value = new CodeActionProposalHandler({
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory: {
+      async create() {
+        const error = new Error("legacy binding is stale");
+        error.code = "INVALID_CODE_JOB_AUTHORITY";
+        throw error;
+      },
+    },
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+    pollIntervalMs: 5_000,
+  });
+
+  const transition = await value.handle(handlerInput());
+
+  assert.equal(transition.status, "stale");
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(producer.getCalls.length, 1);
+  assert.equal(reader.getCalls.length, 0);
+});
+
+test("a persisted legacy PR proposal becomes stale after restart without new admission", async () => {
+  const producer = new FakeConfirmationProducer();
+  producer.get = async (id) => {
+    producer.getCalls.push(id);
+    const error = new Error("not found");
+    error.code = "CONFIRMATION_NOT_FOUND";
+    throw error;
+  };
+  const reader = new FakeCodeJobReader(null);
+  const instance = handler(producer, reader);
+
+  const transition = await instance.value.handle(handlerInput({
+    proposal: legacyProposal(),
+  }));
+
+  assert.equal(transition.status, "stale");
+  assert.equal(instance.trusted.calls.length, 0);
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(producer.getCalls.length, 1);
+  assert.equal(reader.getCalls.length, 0);
+
+  const recovered = await instance.value.handle(handlerInput({
+    proposal: legacyProposal(),
+    status: "waiting_confirmation",
+    downstreamRef: codeJobConfirmationIdForProposal(legacyProposal()),
+  }));
+  assert.equal(recovered.status, "stale");
+  assert.equal(instance.trusted.calls.length, 0);
+  assert.equal(producer.getCalls.length, 2);
 });
 
 test("a lost proposal advance still finds and revokes its stable confirmation slot", async () => {

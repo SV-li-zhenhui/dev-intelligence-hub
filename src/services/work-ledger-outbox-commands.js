@@ -35,6 +35,9 @@ import {
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   pullRequestHeadAdmission,
 } from "./work-ledger-pr-source.js";
+import {
+  registeredCrossRootPullRequestCutover,
+} from "./work-ledger-pr-cutover-commands.js";
 
 const PROPOSAL_INTENT_TYPES = new Set([
   "propose_github_review",
@@ -313,10 +316,18 @@ export function planIntentClaim({ state, input, clock, newLeaseId }) {
     expiredLease &&
     outbox.sourceBinding !== null &&
     hasSealedDispatchBinding(outbox);
+  const registeredCrossRootSettlementReclaim =
+    sourceAdmission.applies &&
+    !sourceAdmission.current &&
+    expiredLease &&
+    outbox.sourceBinding !== null &&
+    hasSealedDispatchBinding(outbox) &&
+    registeredCrossRootPullRequestCutover(state, item, outbox) !== null;
   if (
     sourceAdmission.applies &&
     (!sourceAdmission.current ||
-      (sourceAdmission.pending && !sealedCutoverReclaim))
+      (sourceAdmission.pending && !sealedCutoverReclaim)) &&
+    !registeredCrossRootSettlementReclaim
   ) {
     throw workLedgerError(
       "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",

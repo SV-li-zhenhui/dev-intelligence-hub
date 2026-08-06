@@ -414,6 +414,47 @@ export function projectWorkLedgerGraphView(state, options) {
   });
 }
 
+function isReplacedPullRequestRootCutover(previous, next) {
+  if (
+    previous.kind !== "source_root" ||
+    previous.source?.kind !== "pull_request" ||
+    previous.status !== "superseded" ||
+    previous.statusReason !== "pr_source_cross_root_cutover_replaced" ||
+    next?.kind !== "source_root" ||
+    next.source?.kind !== "pull_request" ||
+    next.revision !== previous.revision + 1 ||
+    next.ownerId !== null ||
+    next.leaseId !== null ||
+    next.leaseUntil !== null ||
+    next.activeIntentId !== null ||
+    next.availableAt !== null
+  ) {
+    return false;
+  }
+  const activated =
+    next.status === "queued" &&
+    next.statusReason === "pr_source_revised" &&
+    next.source.pendingRevision === null &&
+    next.source.activeRevision > previous.source.activeRevision;
+  const deferred =
+    next.status === "blocked" &&
+    next.statusReason?.startsWith(
+      "pr_source_cross_root_cutover_pending:",
+    ) &&
+    next.source.activeRevision === previous.source.activeRevision &&
+    next.source.pendingRevision > previous.source.activeRevision;
+  if (!activated && !deferred) return false;
+  const previousSequence = previous.source.bindings.at(-1)?.sourceSequence;
+  const candidateRevision = next.source.pendingRevision ??
+    next.source.activeRevision;
+  const nextSequence = next.source.bindings
+    .filter(({ inputRevision }) => inputRevision === candidateRevision)
+    .at(-1)?.sourceSequence;
+  return Number.isSafeInteger(previousSequence) &&
+    Number.isSafeInteger(nextSequence) &&
+    nextSequence > previousSequence;
+}
+
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const previous = projectWorkLedgerGraphSnapshot(previousState);
   const next = projectWorkLedgerGraphSnapshot(nextState);
@@ -424,6 +465,11 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const nextItemsById = new Map(
     denseProjectionArray(nextState.items).map((item) => [item.itemId, item]),
   );
+  const supersededReactivationTaskIds = previousItems
+    .filter((item) =>
+      isReplacedPullRequestRootCutover(item, nextItemsById.get(item.itemId))
+    )
+    .map(({ itemId }) => itemId);
   const terminalReactivationTaskIds = previousItems
     .filter((item) => {
       const nextItem = nextItemsById.get(item.itemId);
@@ -462,6 +508,7 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
     })
     .map(({ itemId }) => itemId);
   validateWorkGraphTransition(previous, next, {
+    supersededReactivationTaskIds,
     terminalReactivationTaskIds,
     terminalSupersessionTaskIds,
   });

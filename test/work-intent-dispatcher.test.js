@@ -71,6 +71,7 @@ function controlledClock(initial = "2026-08-02T04:00:00.000Z") {
 }
 
 function workflowEvent(index = 1) {
+  const headRefOid = (index % 10).toString(16).repeat(40);
   return normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType: "pull_request.updated",
@@ -83,7 +84,19 @@ function workflowEvent(index = 1) {
     },
     payload: {
       title: `Fix race ${index}`,
-      headRefOid: `head-${index}`,
+      headRefOid,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: `fix/race-${index}`,
+        headRefOid,
+      },
+      gitTargetAvailable: true,
       state: "open",
       changedFields: ["headRefOid"],
     },

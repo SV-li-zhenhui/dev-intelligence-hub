@@ -1,5 +1,8 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import { digestValue } from "../domain/code-executor-contract.js";
+import {
+  canCreateCodeJobChangePackageEvent,
+} from "../domain/code-job-change-package-event.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import {
   assertSessionBinding,
@@ -1163,7 +1166,8 @@ export class CodeJobWorkerService {
       jobId: job.jobId,
       expectedRevision: job.revision,
       result: terminalResult(job, action, detail, workspaceRevision),
-      ...(this.#changePackageDeliveryEnabled
+      ...(this.#changePackageDeliveryEnabled &&
+          canCreateCodeJobChangePackageEvent(job)
         ? { changePackageDelivery: true }
         : {}),
     });

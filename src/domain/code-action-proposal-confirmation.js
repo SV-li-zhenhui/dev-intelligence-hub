@@ -165,6 +165,9 @@ function normalizeProposalDetails(proposal) {
     } catch {
       throw invalid("binding.inputBinding 无效");
     }
+    if (inputBinding.schemaVersion !== 2) {
+      throw invalid("旧版 PR 输入绑定只能恢复查看，不能创建新的代码任务确认");
+    }
     if (
       inputBinding.repository !== repository ||
       inputBinding.pullRequestNumber !== normalizedSubject.number ||

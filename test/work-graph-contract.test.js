@@ -772,6 +772,14 @@ test("supports non-terminal requeue while keeping terminal tasks immutable", () 
       )({ terminalReactivationTaskIds: ["one"] }),
     hasCode("WORK_GRAPH_INVALID_TRANSITION"),
   );
+  for (const status of ["in_progress", "pending"]) {
+    assert.doesNotThrow(() =>
+      transition(
+        superseded,
+        { ...superseded, revision: 3, status },
+      )({ supersededReactivationTaskIds: ["one"] })
+    );
+  }
 });
 
 test("rejects new tasks below terminal ancestors", () => {

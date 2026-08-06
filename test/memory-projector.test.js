@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 import {
   createWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../src/domain/work-graph-memory-event.js";
+import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
+import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
 
 function workItem(id, status, revision = 1) {
@@ -28,16 +31,9 @@ function workItem(id, status, revision = 1) {
   };
 }
 
-function paged(values) {
-  return async ({ cursor }) => {
-    const start = cursor ? Number(cursor) : 0;
-    const items = values.slice(start, start + 1);
-    return {
-      items,
-      nextCursor: start + items.length < values.length ? String(start + 1) : null,
-    };
-  };
-}
+const EMPTY_AUTHORITY_STATE_DIGEST = createHash("sha256")
+  .update("[]", "utf8")
+  .digest("hex");
 
 function graphProjectionSource(events = []) {
   let cursor = 0;
@@ -47,6 +43,10 @@ function graphProjectionSource(events = []) {
       return structuredClone({
         cursor,
         highWatermark: events.length,
+        checkpointDigest: events[cursor - 1]?.eventDigest ?? null,
+        highWatermarkDigest: events.at(-1)?.eventDigest ?? null,
+        authorityStateDigest:
+          events.at(-1)?.authorityStateDigest ?? EMPTY_AUTHORITY_STATE_DIGEST,
         items: events.slice(cursor, cursor + limit),
       });
     },
@@ -66,6 +66,45 @@ function graphProjectionSource(events = []) {
         cursor,
         highWatermark: events.length,
       };
+    },
+  };
+}
+
+function memoryAuthoritySource(items, timeline, graphSource, revision = null) {
+  return {
+    async readSnapshot({ limit }) {
+      return structuredClone({
+        ledgerRevision: revision ?? Math.max(
+          1,
+          ...items.map((item) => item.revision),
+        ),
+        items,
+        timeline,
+        graph: await graphSource.readBatch({ limit }),
+      });
+    },
+  };
+}
+
+function memoryLifecycleProducer(memoryProducer) {
+  return {
+    appendProjectionRecords({ records }) {
+      return typeof memoryProducer.appendProjectionRecords === "function"
+        ? memoryProducer.appendProjectionRecords({ records })
+        : memoryProducer.appendBatch({ records });
+    },
+    appendWorkItems({ records }) {
+      return records.length === 0
+        ? Promise.resolve({ added: 0, items: [] })
+        : memoryProducer.appendBatch({ records });
+    },
+    appendGraphEvents({ events }) {
+      return memoryProducer.appendBatch({
+        records: events.map(({ memoryRecord }) => memoryRecord),
+      });
+    },
+    async adoptGraphCheckpoint() {
+      return {};
     },
   };
 }
@@ -94,6 +133,22 @@ function graphEventsForItem(item) {
     previousDigest = event.eventDigest;
     return event;
   });
+}
+
+function localMemoryJournal() {
+  const values = new Map();
+  const journal = new LocalMemoryJournal({
+    store: {
+      async read(key, fallback = null) {
+        return structuredClone(values.has(key) ? values.get(key) : fallback);
+      },
+      async write(key, value) {
+        values.set(key, structuredClone(value));
+      },
+    },
+    exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  return journal.recover().then(() => journal);
 }
 
 test("memory projector imports work items, timeline, and legacy PR memory idempotently", async () => {
@@ -126,24 +181,29 @@ test("memory projector imports work items, timeline, and legacy PR memory idempo
   }];
   const records = new Map();
   const batches = [];
+  const graphSource = graphProjectionSource();
+  const trustedSink = {
+    async appendBatch({ records: supplied }) {
+      batches.push(structuredClone(supplied));
+      let added = 0;
+      for (const record of supplied) {
+        const key = `${record.source.kind}:${record.source.id}`;
+        if (!records.has(key)) added += 1;
+        records.set(key, structuredClone(record));
+      }
+      return { added };
+    },
+  };
+  const memoryProducer = {
+    async appendBatch() {
+      throw new Error("projector must not use the ordinary memory producer");
+    },
+  };
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch({ records: supplied }) {
-        batches.push(structuredClone(supplied));
-        let added = 0;
-        for (const record of supplied) {
-          const key = `${record.source.kind}:${record.source.id}`;
-          if (!records.has(key)) added += 1;
-          records.set(key, structuredClone(record));
-        }
-        return { added };
-      },
-    },
-    ledgerView: {
-      listItems: paged(items),
-      listTimeline: paged(timeline),
-    },
-    graphProjectionSource: graphProjectionSource(),
+    memoryProducer,
+    memoryLifecycleProducer: memoryLifecycleProducer(trustedSink),
+    memoryAuthoritySource: memoryAuthoritySource(items, timeline, graphSource),
+    graphProjectionSource: graphSource,
     store: {
       async read(name) {
         assert.equal(name, "pr-employee-memory");
@@ -172,11 +232,16 @@ test("memory projector imports work items, timeline, and legacy PR memory idempo
   });
   assert.equal(second.added, 0);
   assert.equal(records.size, 4);
-  assert.equal(batches[0][0].eventType, "work.waiting_user");
-  assert.equal(batches[0][2].eventType, "timeline.assignment_intaken");
-  assert.equal(batches[0][3].eventType, "analysis_ready");
-  assert.equal(batches[0][3].roleId, "pr-reviewer");
-  assert.deepEqual(batches[0][3].tags, ["legacy", "pr-reviewer", "derived"]);
+  assert.equal(records.get("work-item:work-1:revision:1").eventType, "work.waiting_user");
+  assert.equal(records.get("work-timeline:work-timeline-1").eventType, "timeline.assignment_intaken");
+  assert.equal(records.get("legacy-pr-memory:pr-work-1:analysis_ready").eventType, "analysis_ready");
+  assert.equal(records.get("legacy-pr-memory:pr-work-1:analysis_ready").roleId, "pr-reviewer");
+  assert.deepEqual(records.get("legacy-pr-memory:pr-work-1:analysis_ready").tags, [
+    "legacy",
+    "pr-reviewer",
+    "derived",
+    "obsolete",
+  ]);
 });
 
 test("graph contracts and deliveries remain searchable without retained timeline events", async () => {
@@ -243,32 +308,14 @@ test("graph contracts and deliveries remain searchable without retained timeline
       },
     ],
   };
-  const records = new Map();
-  const recordsBySource = new Map();
+  const events = graphEventsForItem(item);
+  const graphSource = graphProjectionSource(events);
+  const journal = await localMemoryJournal();
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch({ records: supplied }) {
-        let added = 0;
-        for (const candidate of supplied) {
-          const record = normalizeMemoryRecord(candidate);
-          if (!records.has(record.recordId)) added += 1;
-          records.set(record.recordId, record);
-          recordsBySource.set(`${record.source.kind}:${record.source.id}`, record);
-        }
-        return {
-          added,
-          items: supplied.map((candidate) => ({
-            recordId: normalizeMemoryRecord(candidate).recordId,
-            created: true,
-          })),
-        };
-      },
-    },
-    ledgerView: {
-      listItems: paged([item]),
-      listTimeline: paged([]),
-    },
-    graphProjectionSource: graphProjectionSource(graphEventsForItem(item)),
+    memoryProducer: journal,
+    memoryLifecycleProducer: journal,
+    memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
+    graphProjectionSource: graphSource,
     store: { async read() { return []; } },
   });
 
@@ -284,9 +331,17 @@ test("graph contracts and deliveries remain searchable without retained timeline
   assert.equal(first.added, 5);
   assert.equal(second.added, 1);
   assert.equal(third.added, 0);
-  const contract = recordsBySource.get("work-contract:work-3:contract:2");
-  const submitted = recordsBySource.get("work-delivery:work-3:delivery:1");
-  const accepted = recordsBySource.get("work-delivery:work-3:delivery:2");
+  const [oldContractId, contractId, submittedId, acceptedId] = events.map(
+    (event) => workGraphMemoryRecordReceipt(event).memoryRecordId,
+  );
+  const graphRecords = journal.readRecords({
+    recordIds: [oldContractId, contractId, submittedId, acceptedId],
+  }).items;
+  const [oldContractEntry, contractEntry, submittedEntry, acceptedEntry] =
+    graphRecords;
+  const contract = contractEntry.record;
+  const submitted = submittedEntry.record;
+  const accepted = acceptedEntry.record;
   assert.equal(contract.roleId, null);
   assert.equal(submitted.roleId, null);
   assert.match(contract.content, /All regression tests pass/);
@@ -303,28 +358,175 @@ test("graph contracts and deliveries remain searchable without retained timeline
   assert.deepEqual(accepted.evidence, [
     `test-report:artifact-test-report:${"a".repeat(64)}`,
   ]);
+  assert.deepEqual(
+    graphRecords.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "current", "current", "current"],
+  );
+  assert.equal(oldContractEntry.record.source.kind, "work-contract");
+  assert.equal(
+    journal.search({ eventType: "work.graph_record_obsoleted" }).items.length,
+    0,
+  );
+});
+
+test("superseded work invalidates prior work revisions and every graph delivery without deleting history", async () => {
+  const item = workItem(9, "completed", 3);
+  item.updatedAt = "2026-08-05T05:00:00.000Z";
+  item.graph = {
+    parentItemId: "work-1",
+    dependsOnItemIds: [],
+    acceptanceContracts: [
+      {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+        recordedAt: "2026-08-05T03:00:00.000Z",
+      },
+    ],
+    deliveries: [
+      {
+        deliverableId: "conflict-fix",
+        revision: 1,
+        contractRevision: 1,
+        status: "submitted",
+        summary: "Old provenance conflict fix",
+        evidence: [
+          {
+            kind: "test-report",
+            referenceId: "old-conflict-test",
+            contentDigest: "b".repeat(64),
+          },
+        ],
+        recordedAt: "2026-08-05T04:00:00.000Z",
+      },
+      {
+        deliverableId: "conflict-fix",
+        revision: 2,
+        contractRevision: 1,
+        status: "accepted",
+        summary: "Old provenance evidence accepted",
+        evidence: [
+          {
+            kind: "test-report",
+            referenceId: "old-conflict-test",
+            contentDigest: "b".repeat(64),
+          },
+        ],
+        recordedAt: "2026-08-05T04:30:00.000Z",
+      },
+    ],
+  };
+  const events = graphEventsForItem(item);
+  const contractId = workGraphMemoryRecordReceipt(events[0]).memoryRecordId;
+  const submittedId = workGraphMemoryRecordReceipt(events[1]).memoryRecordId;
+  const acceptedId = workGraphMemoryRecordReceipt(events[2]).memoryRecordId;
+  const journal = await localMemoryJournal();
+  const graphSource = graphProjectionSource(events);
+  const projector = new MemoryProjector({
+    memoryProducer: journal,
+    memoryLifecycleProducer: journal,
+    memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
+    graphProjectionSource: graphSource,
+    store: { async read() { return []; } },
+  });
+
+  await projector.runCycle();
+  const completedWorkId = journal.search({
+    eventType: "work.completed",
+  }).items[0].id;
+  assert.deepEqual(
+    journal.readRecords({ recordIds: [submittedId, acceptedId] })
+      .items.map(({ labels }) => labels.lifecycle),
+    ["current", "current"],
+  );
+
+  item.status = "superseded";
+  item.statusReason = "pr_head_superseded";
+  item.revision = 4;
+  item.updatedAt = "2026-08-05T06:00:00.000Z";
+  item.event.payload.title = "Renamed after a new PR Head";
+  item.decisionContext = { conclusion: "stale old-Head conclusion" };
+  const result = await projector.runCycle();
+
+  assert.equal(result.graph.observed, 0);
+  assert.equal(result.added, 1);
+  assert.deepEqual(
+    journal.readRecords({
+      recordIds: [completedWorkId, contractId, submittedId, acceptedId],
+    })
+      .items.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "obsolete", "obsolete", "obsolete"],
+  );
+  assert.equal(
+    journal.search({ eventType: "work.graph_record_obsoleted" }).items.length,
+    0,
+  );
+  const supersededWork = journal.search({
+    eventType: "work.superseded",
+  }).items[0];
+  assert.equal(
+    JSON.parse(journal.readRecords({ recordIds: [supersededWork.id] })
+      .items[0].record.content).decisionContext,
+    null,
+  );
+
+  const packet = await new MemoryContextRetriever({
+    memorySearch: { search: (value) => journal.search(value) },
+    contextReader: {
+      readRecords: (value) => journal.readRecords(value),
+    },
+  }).retrieve({
+    question: "旧冲突修复现在是否仍有效？",
+    retrieval: {
+      kind: "query",
+      filters: {
+        query: "Old provenance conflict fix",
+        repository: "acme/repo",
+      },
+    },
+  });
+  const deliveryRecords = packet.records.filter(({ recordId }) =>
+    [submittedId, acceptedId].includes(recordId)
+  );
+  assert.deepEqual(
+    new Set(deliveryRecords.map(({ recordId }) => recordId)),
+    new Set([submittedId, acceptedId]),
+  );
+  assert.deepEqual(
+    deliveryRecords.map(({ labels }) => labels.lifecycle),
+    ["obsolete", "obsolete"],
+  );
+  assert.equal(packet.citableRecordIds.includes(submittedId), false);
+  assert.equal(packet.citableRecordIds.includes(acceptedId), false);
 });
 
 test("memory projector coalesces concurrent runs", async () => {
   let release;
   let calls = 0;
+  const items = [workItem(1, "queued")];
+  const graphSource = graphProjectionSource();
+  const memoryProducer = { async appendBatch() { return { added: 0 }; } };
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch() {
+    memoryProducer,
+    memoryLifecycleProducer: {
+      ...memoryLifecycleProducer(memoryProducer),
+      async appendWorkItems() {
         await new Promise((resolve) => { release = resolve; });
         return { added: 1 };
       },
     },
-    ledgerView: {
-      async listItems() {
+    memoryAuthoritySource: {
+      async readSnapshot({ limit }) {
         calls += 1;
-        return { items: [workItem(1, "queued")], nextCursor: null };
-      },
-      async listTimeline() {
-        return { items: [], nextCursor: null };
+        return {
+          ledgerRevision: 1,
+          items,
+          timeline: [],
+          graph: await graphSource.readBatch({ limit }),
+        };
       },
     },
-    graphProjectionSource: graphProjectionSource(),
+    graphProjectionSource: graphSource,
     store: { async read() { return []; } },
   });
 
@@ -334,33 +536,25 @@ test("memory projector coalesces concurrent runs", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   release();
   await first;
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
-test("memory projector refuses looping and malformed source pagination", async () => {
+test("memory projector rejects malformed atomic authority snapshots before writes", async () => {
   const producer = { async appendBatch() { throw new Error("must not write"); } };
   const store = { async read() { return []; } };
-  const looping = new MemoryProjector({
-    memoryProducer: producer,
-    ledgerView: {
-      async listItems() { return { items: [], nextCursor: "same" }; },
-      async listTimeline() { return { items: [], nextCursor: null }; },
-    },
-    graphProjectionSource: graphProjectionSource(),
-    store,
-  });
-  await assert.rejects(looping.runCycle(), /did not advance/);
-
+  const graphSource = graphProjectionSource();
   const malformed = new MemoryProjector({
     memoryProducer: producer,
-    ledgerView: {
-      async listItems() { return { items: null, nextCursor: null }; },
-      async listTimeline() { return { items: [], nextCursor: null }; },
+    memoryLifecycleProducer: memoryLifecycleProducer(producer),
+    memoryAuthoritySource: {
+      async readSnapshot() {
+        return { ledgerRevision: 1, items: null, timeline: [], graph: null };
+      },
     },
-    graphProjectionSource: graphProjectionSource(),
+    graphProjectionSource: graphSource,
     store,
   });
-  await assert.rejects(malformed.runCycle(), /source page is invalid/);
+  await assert.rejects(malformed.runCycle(), /authority snapshot is invalid/);
 });
 
 test("task graph projection is bounded to 100 events per cycle", async () => {
@@ -392,25 +586,24 @@ test("task graph projection is bounded to 100 events per cycle", async () => {
   });
   const records = new Set();
   const source = graphProjectionSource(events);
+  const memoryProducer = {
+    async appendBatch({ records: supplied }) {
+      const items = supplied.map((candidate) => {
+        const record = normalizeMemoryRecord(candidate);
+        const created = !records.has(record.recordId);
+        records.add(record.recordId);
+        return { recordId: record.recordId, created };
+      });
+      return {
+        added: items.filter(({ created }) => created).length,
+        items,
+      };
+    },
+  };
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch({ records: supplied }) {
-        const items = supplied.map((candidate) => {
-          const record = normalizeMemoryRecord(candidate);
-          const created = !records.has(record.recordId);
-          records.add(record.recordId);
-          return { recordId: record.recordId, created };
-        });
-        return {
-          added: items.filter(({ created }) => created).length,
-          items,
-        };
-      },
-    },
-    ledgerView: {
-      listItems: paged([]),
-      listTimeline: paged([]),
-    },
+    memoryProducer,
+    memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },
   });
@@ -452,26 +645,25 @@ test("a lost graph acknowledgement response resumes from the durable cursor", as
   };
   const records = new Set();
   let appendCalls = 0;
+  const memoryProducer = {
+    async appendBatch({ records: supplied }) {
+      appendCalls += 1;
+      const items = supplied.map((candidate) => {
+        const record = normalizeMemoryRecord(candidate);
+        const created = !records.has(record.recordId);
+        records.add(record.recordId);
+        return { recordId: record.recordId, created };
+      });
+      return {
+        added: items.filter(({ created }) => created).length,
+        items,
+      };
+    },
+  };
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch({ records: supplied }) {
-        appendCalls += 1;
-        const items = supplied.map((candidate) => {
-          const record = normalizeMemoryRecord(candidate);
-          const created = !records.has(record.recordId);
-          records.add(record.recordId);
-          return { recordId: record.recordId, created };
-        });
-        return {
-          added: items.filter(({ created }) => created).length,
-          items,
-        };
-      },
-    },
-    ledgerView: {
-      listItems: paged([]),
-      listTimeline: paged([]),
-    },
+    memoryProducer,
+    memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },
   });
@@ -501,30 +693,29 @@ test("a lost graph append response replays idempotently before batch acknowledge
   const records = new Set();
   let appendCalls = 0;
   let loseResponse = true;
+  const memoryProducer = {
+    async appendBatch({ records: supplied }) {
+      appendCalls += 1;
+      const items = supplied.map((candidate) => {
+        const record = normalizeMemoryRecord(candidate);
+        const created = !records.has(record.recordId);
+        records.add(record.recordId);
+        return { recordId: record.recordId, created };
+      });
+      if (loseResponse) {
+        loseResponse = false;
+        throw new Error("append response lost");
+      }
+      return {
+        added: items.filter(({ created }) => created).length,
+        items,
+      };
+    },
+  };
   const projector = new MemoryProjector({
-    memoryProducer: {
-      async appendBatch({ records: supplied }) {
-        appendCalls += 1;
-        const items = supplied.map((candidate) => {
-          const record = normalizeMemoryRecord(candidate);
-          const created = !records.has(record.recordId);
-          records.add(record.recordId);
-          return { recordId: record.recordId, created };
-        });
-        if (loseResponse) {
-          loseResponse = false;
-          throw new Error("append response lost");
-        }
-        return {
-          added: items.filter(({ created }) => created).length,
-          items,
-        };
-      },
-    },
-    ledgerView: {
-      listItems: paged([]),
-      listTimeline: paged([]),
-    },
+    memoryProducer,
+    memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },
   });

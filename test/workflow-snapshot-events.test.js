@@ -226,6 +226,42 @@ test("a changed PR Head carries its causal predecessor on the update event", () 
   assert.deepEqual(events[0].payload.changedFields, ["headRefOid"]);
 });
 
+test("a changed PR base target emits a new event even when Head is unchanged", () => {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+  };
+  const previous = snapshot([
+    pullRequest(1, {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget,
+      gitTargetAvailable: true,
+    }),
+  ], { refreshedAt: "2026-08-02T01:00:00.000Z" });
+  const current = snapshot([
+    pullRequest(1, {
+      headRefOid: gitTarget.headRefOid,
+      gitTarget: { ...gitTarget, baseRefOid: "c".repeat(40) },
+      gitTargetAvailable: true,
+    }),
+  ]);
+
+  const events = workflowEventsFromSnapshots(previous, current);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].eventType, "pull_request.updated");
+  assert.equal(events[0].payload.headRefOid, gitTarget.headRefOid);
+  assert.equal(events[0].payload.gitTarget.baseRefOid, "c".repeat(40));
+  assert.deepEqual(events[0].payload.changedFields, ["gitTarget"]);
+});
+
 test("an unhealthy source suppresses all events for only its own item kind", () => {
   const previous = snapshot([pullRequest(1), issue(1)]);
   const current = snapshot([], {
@@ -240,6 +276,18 @@ test("an unhealthy source suppresses all events for only its own item kind", () 
   assert.deepEqual(eventTypes(events), [
     "github:issue:acme/repo#1:issue.left_scope",
   ]);
+});
+
+test("a contradictory ok and stale source status fails closed", () => {
+  const previous = snapshot([pullRequest(1), issue(1)]);
+  const current = snapshot([], {
+    sourceStatus: {
+      githubPullRequests: { ok: true, stale: true },
+      githubIssues: { ok: true, stale: true },
+    },
+  });
+
+  assert.deepEqual(workflowEventsFromSnapshots(previous, current), []);
 });
 
 test("a source without a previous healthy baseline observes recovered history", () => {

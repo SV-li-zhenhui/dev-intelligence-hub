@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import {
   GitHubReviewProposalHandler,
@@ -10,9 +11,9 @@ import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 
 const HEAD_REF_OID = "b".repeat(40);
 
-function inputBindingFor(number) {
-  return {
-    schemaVersion: 1,
+function inputBindingFor(number, { schemaVersion = 2 } = {}) {
+  const binding = {
+    schemaVersion,
     kind: "pull_request",
     repository: "acme/repo",
     pullRequestNumber: number,
@@ -25,9 +26,23 @@ function inputBindingFor(number) {
     eventDigest: `${"c".repeat(63)}${number % 10}`,
     inputDigest: `${"d".repeat(63)}${number % 10}`,
   };
+  if (schemaVersion === 2) {
+    binding.gitTarget = {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "review-account",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/review",
+      headRefOid: HEAD_REF_OID,
+    };
+  }
+  return binding;
 }
 
-function proposal(number = 42) {
+function proposal(number = 42, { schemaVersion = 2 } = {}) {
   return normalizeBoundWorkProposal({
     proposalId: `work-intent-${"a".repeat(63)}${number % 10}`,
     policyVersion: 1,
@@ -40,7 +55,7 @@ function proposal(number = 42) {
       repository: "acme/repo",
       pullRequestNumber: number,
       headRefOid: HEAD_REF_OID,
-      inputBinding: inputBindingFor(number),
+      inputBinding: inputBindingFor(number, { schemaVersion }),
     },
     payload: {
       verdict: "request_changes",
@@ -88,6 +103,7 @@ class FakeConfirmationProducer {
     this.plan = null;
     this.enqueueCalls = [];
     this.getCalls = [];
+    this.invalidateCalls = [];
   }
 
   async enqueue(plan) {
@@ -100,11 +116,34 @@ class FakeConfirmationProducer {
     this.getCalls.push(id);
     return confirmationItem(this.plan, this.status, this.overrides);
   }
+
+  async invalidate(id, input) {
+    this.invalidateCalls.push([id, structuredClone(input)]);
+    this.status = "stale";
+    this.overrides = {
+      invalidation: {
+        ...structuredClone(input),
+        at: "2026-08-02T03:00:00.000Z",
+      },
+    };
+    return confirmationItem(this.plan, this.status, this.overrides);
+  }
+}
+
+function acceptingVerifier() {
+  return {
+    calls: [],
+    async verify(value) {
+      this.calls.push(structuredClone(value));
+      return structuredClone(value);
+    },
+  };
 }
 
 function handler(producer, overrides = {}) {
   return new GitHubReviewProposalHandler({
     confirmationProducer: producer,
+    inputAuthorityVerifier: acceptingVerifier(),
     actorAccountId: "review-account",
     clock: () => new Date("2026-08-02T03:00:00.000Z"),
     pollIntervalMs: 5_000,
@@ -123,7 +162,7 @@ test("a pending proposal is idempotently enqueued and waits on its exact confirm
     /^confirmation-github-review-[a-f0-9]{64}$/,
   );
   assert.deepEqual(
-    producer.enqueueCalls[0].display.payload.inputBinding,
+    producer.enqueueCalls[0].action.inputBinding,
     handlerInput().proposal.binding.inputBinding,
   );
   assert.deepEqual(transition, {
@@ -234,6 +273,108 @@ test("mismatched confirmation bindings fail closed", async () => {
   }
 });
 
+test("revoked target authority prevents enqueue and invalidates an existing confirmation", async () => {
+  const producer = new FakeConfirmationProducer();
+  const revoked = {
+    async verify() {
+      throw Object.assign(new Error("stale"), {
+        code: "WORK_LEDGER_PR_BINDING_STALE",
+      });
+    },
+  };
+
+  const beforeEnqueue = await handler(producer, {
+    inputAuthorityVerifier: revoked,
+  }).handle(handlerInput());
+  assert.equal(beforeEnqueue.status, "stale");
+  assert.equal(producer.enqueueCalls.length, 0);
+
+  await handler(producer).handle(handlerInput());
+  const downstreamRef = producer.plan.id;
+  const afterEnqueue = await handler(producer, {
+    inputAuthorityVerifier: revoked,
+  }).handle(
+    handlerInput({ status: "waiting_confirmation", downstreamRef }),
+  );
+  assert.equal(afterEnqueue.status, "stale");
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(
+    producer.invalidateCalls[0][1].reason,
+    "authorization_changed",
+  );
+});
+
+test("persisted v1 review proposals terminate stale instead of retrying forever", async () => {
+  const producer = new FakeConfirmationProducer();
+  const legacyInput = handlerInput({ proposal: proposal(42, { schemaVersion: 1 }) });
+
+  const transition = await handler(producer).handle(legacyInput);
+
+  assert.equal(transition.status, "stale");
+  assert.equal(producer.enqueueCalls.length, 0);
+});
+
+test("persisted v1 review proposals recover stale when their confirmation is missing", async () => {
+  const legacyProposal = proposal(42, { schemaVersion: 1 });
+  const downstreamRef = createGitHubReviewProposalConfirmationPlan(
+    legacyProposal,
+    {
+      actorAccountId: "review-account",
+      legacyRecovery: true,
+    },
+  ).id;
+  const producer = new FakeConfirmationProducer();
+  producer.get = async function get(id) {
+    this.getCalls.push(id);
+    throw Object.assign(new Error("confirmation missing"), {
+      code: "CONFIRMATION_NOT_FOUND",
+    });
+  };
+
+  const transition = await handler(producer).handle(
+    handlerInput({
+      proposal: legacyProposal,
+      status: "waiting_confirmation",
+      downstreamRef,
+    }),
+  );
+
+  assert.equal(transition.status, "stale");
+  assert.deepEqual(producer.getCalls, [downstreamRef]);
+  assert.equal(producer.enqueueCalls.length, 0);
+});
+
+test("persisted v2 review proposals fail closed when their confirmation is missing", async () => {
+  const currentProposal = proposal();
+  const downstreamRef = createGitHubReviewProposalConfirmationPlan(
+    currentProposal,
+    {
+      actorAccountId: "review-account",
+      legacyRecovery: true,
+    },
+  ).id;
+  const producer = new FakeConfirmationProducer();
+  producer.get = async function get(id) {
+    this.getCalls.push(id);
+    throw Object.assign(new Error("confirmation missing"), {
+      code: "CONFIRMATION_NOT_FOUND",
+    });
+  };
+
+  await assert.rejects(
+    handler(producer).handle(
+      handlerInput({
+        proposal: currentProposal,
+        status: "waiting_confirmation",
+        downstreamRef,
+      }),
+    ),
+    (error) => error.code === "CONFIRMATION_NOT_FOUND",
+  );
+  assert.deepEqual(producer.getCalls, [downstreamRef]);
+  assert.equal(producer.enqueueCalls.length, 0);
+});
+
 test("disabled GitHub proposal execution constructs no service", () => {
   assert.equal(createGitHubReviewProposalRunnerService({ enabled: false }), null);
   assert.equal(createGitHubReviewProposalRunnerService({}), null);
@@ -282,6 +423,7 @@ test("the enabled service closes the real proposal loop through confirmation", a
     enabled: true,
     runner: runtime.runners["github-runner"],
     confirmationProducer: producer,
+    inputAuthorityVerifier: acceptingVerifier(),
     actorAccountId: "review-account",
     clock: () => new Date(now),
     pollIntervalMs: 1_000,

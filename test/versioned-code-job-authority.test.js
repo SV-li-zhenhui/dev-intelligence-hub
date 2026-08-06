@@ -223,13 +223,25 @@ function proposal(config) {
     payload: {
       title: "Fix race",
       headRefOid: "a".repeat(40),
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/race",
+        headRefOid: "a".repeat(40),
+      },
+      gitTargetAvailable: true,
       state: "open",
     },
   });
   const policy = config.workCoordination.policy;
   const workItemId = `work-item-${"d".repeat(64)}`;
   const inputBinding = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository: event.subject.repository,
     pullRequestNumber: event.subject.number,
@@ -241,6 +253,7 @@ function proposal(config) {
     eventId: event.eventId,
     eventDigest: event.contentDigest,
     inputDigest: "c".repeat(64),
+    gitTarget: structuredClone(event.payload.gitTarget),
   };
   const bound = createWorkIntentPolicy({
     version: policy.version,

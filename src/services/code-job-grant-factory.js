@@ -528,6 +528,9 @@ export class CodeJobGrantFactory {
 
   #verifyInputBinding(inputBinding, workspace) {
     if (inputBinding === null) return null;
+    if (inputBinding.schemaVersion !== 2) {
+      throw invalid("旧版 PR 输入绑定只能恢复查看，不能创建或授权新的代码执行");
+    }
     if (!GIT_OID.test(inputBinding.headRefOid)) {
       throw invalid("PR 代码任务没有绑定有效的 Git Head OID");
     }

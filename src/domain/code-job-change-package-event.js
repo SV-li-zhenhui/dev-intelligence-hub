@@ -185,7 +185,7 @@ function completionSource(job) {
     };
 }
 
-export function createCodeJobChangePackageEvent(value) {
+function normalizeCreationInput(value) {
   const fields = exact(
     value,
     ["sequence", "previousDigest", "job"],
@@ -199,10 +199,17 @@ export function createCodeJobChangePackageEvent(value) {
   }
   if (job.status !== "completed") throw invalid("代码任务尚未完成");
   const sequence = positiveInteger(fields.get("sequence"), "sequence");
-  const previousDigest = normalizePreviousDigest(
+  return {
+    job,
     sequence,
-    fields.get("previousDigest"),
-  );
+    previousDigest: normalizePreviousDigest(
+      sequence,
+      fields.get("previousDigest"),
+    ),
+  };
+}
+
+function eventForCompletedJob({ job, sequence, previousDigest }) {
   const observation = completeObservation(job);
   const source = completionSource(job);
   const content = eventContent({
@@ -232,6 +239,27 @@ export function createCodeJobChangePackageEvent(value) {
   };
   assertEventSize(event);
   return event;
+}
+
+export function canCreateCodeJobChangePackageEvent(job) {
+  return (
+    job.grant.schemaVersion === 2 &&
+    Object.hasOwn(job.grant, "inputBinding") &&
+    (job.grant.inputBinding === null ||
+      job.grant.inputBinding.schemaVersion === 2)
+  );
+}
+
+export function createCodeJobChangePackageEvent(value) {
+  const input = normalizeCreationInput(value);
+  if (!canCreateCodeJobChangePackageEvent(input.job)) {
+    throw invalid("旧版 PR 代码任务只能恢复已有结果，不能创建新的变更包事件");
+  }
+  return eventForCompletedJob(input);
+}
+
+export function reconstructCodeJobChangePackageEventForRecovery(value) {
+  return eventForCompletedJob(normalizeCreationInput(value));
 }
 
 export function normalizeCodeJobChangePackageEvent(value) {

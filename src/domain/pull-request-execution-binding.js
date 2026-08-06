@@ -1,9 +1,15 @@
+import {
+  normalizePullRequestGitTarget,
+  pullRequestGitTargetFromEvent,
+  samePullRequestGitTarget,
+} from "./git-tool-contract.js";
+
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const REPOSITORY =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9_.-]{1,100}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 
-const BINDING_KEYS = Object.freeze([
+const V1_BINDING_KEYS = Object.freeze([
   "schemaVersion",
   "kind",
   "repository",
@@ -17,6 +23,7 @@ const BINDING_KEYS = Object.freeze([
   "eventDigest",
   "inputDigest",
 ]);
+const V2_BINDING_KEYS = Object.freeze([...V1_BINDING_KEYS, "gitTarget"]);
 
 function defaultError() {
   return new TypeError("pull request execution binding is invalid");
@@ -81,12 +88,19 @@ export function normalizePullRequestExecutionBinding(
   value,
   error = defaultError(),
 ) {
-  exact(value, BINDING_KEYS, error);
-  if (value.schemaVersion !== 1 || value.kind !== "pull_request") {
+  const valueEntries = entries(value, error);
+  const schemaVersion = valueEntries.find(
+    ([key]) => key === "schemaVersion",
+  )?.[1];
+  const expectedKeys = schemaVersion === 2
+    ? V2_BINDING_KEYS
+    : V1_BINDING_KEYS;
+  exact(value, expectedKeys, error);
+  if (![1, 2].includes(schemaVersion) || value.kind !== "pull_request") {
     throw error;
   }
-  return {
-    schemaVersion: 1,
+  const result = {
+    schemaVersion,
     kind: "pull_request",
     repository: text(value.repository, 140, error, REPOSITORY),
     pullRequestNumber: positiveInteger(value.pullRequestNumber, error),
@@ -99,6 +113,22 @@ export function normalizePullRequestExecutionBinding(
     eventDigest: text(value.eventDigest, 64, error, SHA256),
     inputDigest: text(value.inputDigest, 64, error, SHA256),
   };
+  if (schemaVersion === 2) {
+    let gitTarget;
+    try {
+      gitTarget = normalizePullRequestGitTarget(value.gitTarget);
+    } catch {
+      throw error;
+    }
+    if (
+      gitTarget.baseRepository !== result.repository ||
+      gitTarget.headRefOid !== result.headRefOid
+    ) {
+      throw error;
+    }
+    result.gitTarget = gitTarget;
+  }
+  return result;
 }
 
 export function createPullRequestExecutionBinding({ sourceBinding, event }) {
@@ -142,9 +172,11 @@ export function createPullRequestExecutionBinding({ sourceBinding, event }) {
   ) {
     throw error;
   }
+  const gitTarget = pullRequestGitTargetFromEvent(event);
+  if (event.payload.gitTargetAvailable === false) throw error;
   return normalizePullRequestExecutionBinding(
     {
-      schemaVersion: 1,
+      schemaVersion: gitTarget === null ? 1 : 2,
       kind: "pull_request",
       repository: event.subject.repository,
       pullRequestNumber: event.subject.number,
@@ -156,6 +188,7 @@ export function createPullRequestExecutionBinding({ sourceBinding, event }) {
       eventId: sourceBinding.eventId,
       eventDigest: sourceBinding.eventDigest,
       inputDigest: sourceBinding.inputDigest,
+      ...(gitTarget === null ? {} : { gitTarget }),
     },
     error,
   );
@@ -164,7 +197,70 @@ export function createPullRequestExecutionBinding({ sourceBinding, event }) {
 export function samePullRequestExecutionBinding(left, right) {
   const normalizedLeft = normalizePullRequestExecutionBinding(left);
   const normalizedRight = normalizePullRequestExecutionBinding(right);
-  return BINDING_KEYS.every(
-    (key) => normalizedLeft[key] === normalizedRight[key],
+  if (normalizedLeft.schemaVersion !== normalizedRight.schemaVersion) {
+    return false;
+  }
+  if (
+    !V1_BINDING_KEYS.every(
+      (key) => normalizedLeft[key] === normalizedRight[key],
+    )
+  ) {
+    return false;
+  }
+  return normalizedLeft.schemaVersion === 1 || samePullRequestGitTarget(
+    normalizedLeft.gitTarget,
+    normalizedRight.gitTarget,
+  );
+}
+
+export function pullRequestExecutionBindingMatchesEvent(binding, event) {
+  const normalized = normalizePullRequestExecutionBinding(binding);
+  if (
+    normalized.repository !== event?.subject?.repository ||
+    normalized.pullRequestNumber !== event?.subject?.number ||
+    normalized.eventId !== event?.eventId ||
+    normalized.eventDigest !== event?.contentDigest ||
+    normalized.headRefOid !== event?.payload?.headRefOid
+  ) {
+    return false;
+  }
+  let currentTarget;
+  try {
+    currentTarget = pullRequestGitTargetFromEvent(event);
+  } catch {
+    return false;
+  }
+  if (normalized.schemaVersion === 1) {
+    return currentTarget === null &&
+      event?.payload?.gitTargetAvailable === undefined;
+  }
+  return currentTarget !== null && samePullRequestGitTarget(
+    normalized.gitTarget,
+    currentTarget,
+  );
+}
+
+export function pullRequestExecutionTargetMatchesEvent(binding, event) {
+  const normalized = normalizePullRequestExecutionBinding(binding);
+  if (
+    normalized.repository !== event?.subject?.repository ||
+    normalized.pullRequestNumber !== event?.subject?.number ||
+    normalized.headRefOid !== event?.payload?.headRefOid
+  ) {
+    return false;
+  }
+  let currentTarget;
+  try {
+    currentTarget = pullRequestGitTargetFromEvent(event);
+  } catch {
+    return false;
+  }
+  if (normalized.schemaVersion === 1) {
+    return currentTarget === null &&
+      event?.payload?.gitTargetAvailable === undefined;
+  }
+  return currentTarget !== null && samePullRequestGitTarget(
+    normalized.gitTarget,
+    currentTarget,
   );
 }

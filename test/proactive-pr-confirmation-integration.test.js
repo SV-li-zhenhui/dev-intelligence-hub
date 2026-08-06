@@ -153,6 +153,7 @@ function publicQueueItem(plan, overrides = {}) {
 }
 
 function pullRequest(overrides = {}) {
+  const headRefOid = overrides.headRefOid || HEAD;
   return {
     id: "github:pr:acme/repo#42",
     kind: "pull_request",
@@ -165,7 +166,19 @@ function pullRequest(overrides = {}) {
     state: "open",
     updatedAt: "2026-08-02T01:00:00.000Z",
     reviewFactsAvailable: true,
-    headRefOid: HEAD,
+    headRefOid,
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "sv-li-zhenhui",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/review",
+      headRefOid,
+    },
     actionState: "action_now",
     nextAction: "review",
     actionReasons: ["等待你首次审核"],
@@ -382,6 +395,50 @@ test("the intent is durable before enqueue and a lost acknowledgement is idempot
   assert.equal(second.jobs[0].status, "waiting_confirmation");
   assert.equal(second.jobs[0].confirmationIntent, null);
   assert.equal(second.jobs[0].error, "");
+});
+
+test("startup recovery invalidates a pending enqueue before exposing a changed Git target", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  const confirmationQueue = new RecordingConfirmationQueue({ store });
+  confirmationQueue.enqueueError = statusError(503, "queue unavailable");
+  const service = createService({ store, confirmationQueue });
+  const first = await service.tick({ trigger: "refresh_completed" });
+  const changed = pullRequest();
+  changed.gitTarget.baseRefOid = "c".repeat(40);
+  await store.write("snapshot", snapshot([changed]));
+  confirmationQueue.enqueueError = null;
+
+  const recovered = await service.recoverConfirmations();
+
+  assert.equal(first.jobs[0].status, "confirmation_enqueue_pending");
+  assert.equal(confirmationQueue.enqueueCalls.length, 1);
+  assert.equal(confirmationQueue.invalidateCalls.length, 1);
+  assert.equal(confirmationQueue.items.size, 0);
+  assert.equal(recovered.jobs[0].status, "superseded");
+});
+
+test("startup recovery never exposes a pending enqueue from an unhealthy PR snapshot", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  const confirmationQueue = new RecordingConfirmationQueue({ store });
+  confirmationQueue.enqueueError = statusError(503, "queue unavailable");
+  const service = createService({ store, confirmationQueue });
+  await service.tick({ trigger: "refresh_completed" });
+  confirmationQueue.enqueueError = null;
+  await store.write("snapshot", {
+    ...snapshot([pullRequest()]),
+    sourceStatus: { githubPullRequests: { ok: false } },
+  });
+
+  const fenced = await service.recoverConfirmations();
+
+  assert.equal(confirmationQueue.enqueueCalls.length, 1);
+  assert.equal(fenced.jobs[0].status, "confirmation_enqueue_pending");
+  assert.match(fenced.jobs[0].error, /尚未健康刷新/);
+
+  await store.write("snapshot", snapshot([pullRequest()]));
+  const recovered = await service.recoverConfirmations();
+  assert.equal(confirmationQueue.enqueueCalls.length, 2);
+  assert.equal(recovered.jobs[0].status, "waiting_confirmation");
 });
 
 test("startup recovery links one confirmation to a legacy ready_for_human job", async () => {
@@ -803,6 +860,16 @@ test("same-head work changes invalidate the durable confirmation before it can b
         actionReasons: ["暂时无需审核"],
       }),
       expectedJobs: 1,
+    },
+    {
+      name: "Git target changed under the same Head",
+      replacement: pullRequest({
+        gitTarget: {
+          ...pullRequest().gitTarget,
+          baseRefOid: "e".repeat(40),
+        },
+      }),
+      expectedJobs: 2,
     },
   ];
 

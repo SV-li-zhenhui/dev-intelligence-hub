@@ -1,16 +1,136 @@
 import { runCommand, runJson } from "../lib/command-runner.js";
+import {
+  normalizePullRequestGitTarget,
+  samePullRequestGitTarget,
+} from "../domain/git-tool-contract.js";
 
+const GITHUB_HOST = "github.com";
 const PR_SEARCH_FIELDS =
   "number,title,url,repository,updatedAt,createdAt,author,state";
 const PR_DETAIL_FIELDS =
-  "reviewDecision,statusCheckRollup,mergeStateStatus,isDraft,labels,assignees,milestone,headRefOid,reviews";
+  "number,url,reviewDecision,statusCheckRollup,mergeStateStatus,isDraft,labels,assignees,milestone,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,reviews";
 const PR_REVIEW_CONTEXT_FIELDS =
-  "title,body,headRefOid,additions,deletions,changedFiles,files";
+  "number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,additions,deletions,changedFiles,files";
 const ISSUE_FIELDS =
   "number,title,url,repository,updatedAt,createdAt,author,state,labels,assignees";
+const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
+  "githubAccount",
+  "baseRepository",
+  "baseRefName",
+  "baseRefOid",
+  "headRepository",
+  "headRefName",
+  "headRefOid",
+]);
 
 function repositoryName(item) {
   return item.repository?.nameWithOwner || item.repository?.name || "";
+}
+
+function headRepositoryName(detail) {
+  return detail?.headRepository?.nameWithOwner || "";
+}
+
+function pullRequestIdentity(url) {
+  try {
+    const parsed = new URL(url);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname.toLowerCase() !== GITHUB_HOST ||
+      parsed.port ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return null;
+    }
+    const match = parsed.pathname.match(
+      /^\/([A-Za-z0-9-]{1,39})\/([A-Za-z0-9_.-]{1,100})\/pull\/([1-9][0-9]*)\/?$/,
+    );
+    if (!match) return null;
+    return {
+      repository: `${match[1]}/${match[2]}`,
+      number: Number(match[3]),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function canonicalBaseRepository(item, detail, expectedTarget = null) {
+  if (expectedTarget === null) {
+    return item.repo || item.baseRepository || "";
+  }
+  const expectedIdentity = pullRequestIdentity(item.url);
+  const observedIdentity = pullRequestIdentity(detail.url);
+  const expectedNumber = Number.isSafeInteger(item.number)
+    ? item.number
+    : expectedIdentity?.number;
+  if (
+    expectedIdentity === null ||
+    observedIdentity === null ||
+    expectedIdentity.repository !== expectedTarget.baseRepository ||
+    observedIdentity.repository !== expectedTarget.baseRepository ||
+    observedIdentity.number !== expectedNumber ||
+    detail.number !== expectedNumber
+  ) {
+    return "";
+  }
+  return observedIdentity.repository;
+}
+
+function pullRequestGitFacts(detail, { repository, account }) {
+  return {
+    githubAccount: account || "",
+    baseRepository: repository || "",
+    baseRefName: detail.baseRefName || "",
+    baseRefOid: detail.baseRefOid || "",
+    headRepository: headRepositoryName(detail),
+    headRefName: detail.headRefName || "",
+    headRefOid: detail.headRefOid || "",
+  };
+}
+
+function completePullRequestGitFacts(facts) {
+  return PULL_REQUEST_GIT_FACT_FIELDS.every(
+    (field) => typeof facts[field] === "string" && facts[field].length > 0,
+  );
+}
+
+function gitTargetFromFacts(facts) {
+  return normalizePullRequestGitTarget({
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: facts.githubAccount,
+    baseRepository: facts.baseRepository,
+    baseRefName: facts.baseRefName,
+    baseRefOid: facts.baseRefOid,
+    headRepository: facts.headRepository,
+    headRefName: facts.headRefName,
+    headRefOid: facts.headRefOid,
+  });
+}
+
+function sameExpectedGitFacts(item, facts) {
+  if (item.gitTarget !== undefined && item.gitTarget !== null) {
+    if (!completePullRequestGitFacts(facts)) return false;
+    return samePullRequestGitTarget(
+      item.gitTarget,
+      gitTargetFromFacts(facts),
+    );
+  }
+  return PULL_REQUEST_GIT_FACT_FIELDS.every(
+    (field) => !item[field] || item[field] === facts[field],
+  );
+}
+
+function staleReviewContext() {
+  return Object.assign(new Error("PR Git target changed while reading context"), {
+    name: "GitHubReadError",
+    code: "PR_CONTEXT_STALE",
+    statusCode: 409,
+  });
 }
 
 export function classifyPullRequestRelation(source, author, currentUser) {
@@ -196,14 +316,21 @@ async function mapWithConcurrency(items, limit, transform) {
   return result;
 }
 
+function bindGitHubHost(port, environment) {
+  return (command, args, options = {}) =>
+    port(command, args, { ...options, env: environment });
+}
+
 export class GitHubAdapter {
   constructor({
     run = runJson,
     runText = runCommand,
+    env = process.env,
     maxPatchCharacters = 24_000,
   } = {}) {
-    this.run = run;
-    this.runText = runText;
+    const commandEnvironment = Object.freeze({ ...env, GH_HOST: GITHUB_HOST });
+    this.run = bindGitHubHost(run, commandEnvironment);
+    this.runText = bindGitHubHost(runText, commandEnvironment);
     this.maxPatchCharacters =
       Number.isFinite(maxPatchCharacters) && maxPatchCharacters > 0
         ? maxPatchCharacters
@@ -211,7 +338,12 @@ export class GitHubAdapter {
   }
 
   async currentUser() {
-    const data = await this.run("gh", ["api", "user"]);
+    const data = await this.run("gh", [
+      "api",
+      "--hostname",
+      GITHUB_HOST,
+      "user",
+    ]);
     return data.login;
   }
 
@@ -240,8 +372,25 @@ export class GitHubAdapter {
       "--json",
       PR_DETAIL_FIELDS,
     ]);
+    const recordIdentity = pullRequestIdentity(record.url);
+    const detailIdentity = pullRequestIdentity(detail.url);
     const repo = repositoryName(record);
+    if (
+      recordIdentity === null ||
+      detailIdentity === null ||
+      recordIdentity.repository !== repo ||
+      detailIdentity.repository !== repo ||
+      recordIdentity.number !== record.number ||
+      detailIdentity.number !== record.number ||
+      detail.number !== record.number
+    ) {
+      throw new Error("GitHub PR identity changed during refresh");
+    }
     const author = record.author?.login || "";
+    const gitFacts = pullRequestGitFacts(detail, {
+      repository: repo,
+      account: currentUser,
+    });
     return {
       id: `github:pr:${repo}#${record.number}`,
       kind: "pull_request",
@@ -265,6 +414,10 @@ export class GitHubAdapter {
       assignees: (detail.assignees || []).map((user) => user.login),
       milestone: detail.milestone?.title || "",
       headRefOid: detail.headRefOid || "",
+      gitTargetAvailable: completePullRequestGitFacts(gitFacts),
+      ...(completePullRequestGitFacts(gitFacts)
+        ? { ...gitFacts, gitTarget: gitTargetFromFacts(gitFacts) }
+        : {}),
       reviewFactsAvailable: true,
       ...summarizeReviewFacts(detail.reviews, currentUser),
     };
@@ -281,14 +434,19 @@ export class GitHubAdapter {
       authored,
       currentUser,
     );
-    return mapWithConcurrency(records, 4, (record) =>
+    const items = await mapWithConcurrency(records, 4, (record) =>
       this.#enrichPullRequest(record, currentUser),
     );
+    const finalUser = await this.currentUser();
+    if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
+      throw new Error("GitHub account changed during PR refresh");
+    }
+    return items;
   }
 
   async searchPullRequests(relation, currentUser) {
     const records = await this.#searchPullRequestRecords(relation);
-    return mapWithConcurrency(records, 4, (record) =>
+    const items = await mapWithConcurrency(records, 4, (record) =>
       this.#enrichPullRequest(
         {
           ...record,
@@ -306,6 +464,11 @@ export class GitHubAdapter {
         currentUser,
       ),
     );
+    const finalUser = await this.currentUser();
+    if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
+      throw new Error("GitHub account changed during PR refresh");
+    }
+    return items;
   }
 
   async searchIssues() {
@@ -340,6 +503,32 @@ export class GitHubAdapter {
   }
 
   async loadReviewContext(item, { includePatch = true } = {}) {
+    const hasTargetAvailability = Object.hasOwn(
+      item,
+      "gitTargetAvailable",
+    );
+    if (
+      hasTargetAvailability &&
+      (item.gitTargetAvailable !== true || !item.gitTarget)
+    ) {
+      throw staleReviewContext();
+    }
+    const expectedTarget = item.gitTarget
+      ? normalizePullRequestGitTarget(item.gitTarget)
+      : null;
+    if (expectedTarget && item.gitTargetAvailable === false) {
+      throw staleReviewContext();
+    }
+    const observesAccount = Boolean(expectedTarget || item.githubAccount);
+    const observedAccount = observesAccount
+      ? await this.currentUser()
+      : item.currentUser || "";
+    if (
+      expectedTarget &&
+      observedAccount.toLowerCase() !== expectedTarget.sourceAccountId
+    ) {
+      throw staleReviewContext();
+    }
     const metadata = await this.run("gh", [
       "pr",
       "view",
@@ -347,11 +536,19 @@ export class GitHubAdapter {
       "--json",
       PR_REVIEW_CONTEXT_FIELDS,
     ]);
+    const contextGitFacts = pullRequestGitFacts(metadata, {
+      repository: canonicalBaseRepository(item, metadata, expectedTarget),
+      account: observedAccount,
+    });
     const base = {
       ...item,
       title: metadata.title || item.title || "",
       description: metadata.body || "",
-      headRefOid: metadata.headRefOid || "",
+      ...contextGitFacts,
+      gitTarget: completePullRequestGitFacts(contextGitFacts)
+        ? gitTargetFromFacts(contextGitFacts)
+        : null,
+      gitTargetAvailable: completePullRequestGitFacts(contextGitFacts),
       additions: metadata.additions || 0,
       deletions: metadata.deletions || 0,
       changedFiles: metadata.changedFiles || 0,
@@ -363,28 +560,80 @@ export class GitHubAdapter {
       patch: "",
       patchTruncated: false,
     };
-    if (
-      !includePatch ||
-      !item.headRefOid ||
-      metadata.headRefOid !== item.headRefOid
-    ) {
+    if (!sameExpectedGitFacts(item, base)) {
+      if (expectedTarget) {
+        throw staleReviewContext();
+      }
       return base;
     }
 
+    if (!includePatch) {
+      if (expectedTarget) {
+        const [latest, latestAccount] = await Promise.all([
+          this.run("gh", [
+            "pr",
+            "view",
+            item.url,
+            "--json",
+            "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
+          ]),
+          this.currentUser(),
+        ]);
+        const latestFacts = pullRequestGitFacts(latest, {
+          repository: canonicalBaseRepository(item, latest, expectedTarget),
+          account: latestAccount,
+        });
+        if (!sameExpectedGitFacts(item, latestFacts)) {
+          throw staleReviewContext();
+        }
+      }
+      return base;
+    }
+
+    if (!(expectedTarget?.headRefOid || item.headRefOid)) return base;
+
     const patch = await this.runText(
       "gh",
-      ["pr", "diff", item.url, "--patch"],
+      expectedTarget
+        ? [
+            "api",
+            "--hostname",
+            GITHUB_HOST,
+            `repos/${expectedTarget.baseRepository}/compare/${expectedTarget.baseRefOid}...${expectedTarget.headRefOid}`,
+            "--header",
+            "Accept: application/vnd.github.patch",
+          ]
+        : ["pr", "diff", item.url, "--patch"],
       { timeoutMs: 60_000 },
     );
-    const latest = await this.run("gh", [
-      "pr",
-      "view",
-      item.url,
-      "--json",
-      "headRefOid",
+    const [latest, latestAccount] = await Promise.all([
+      this.run("gh", [
+        "pr",
+        "view",
+        item.url,
+        "--json",
+        "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
+      ]),
+      observesAccount ? this.currentUser() : observedAccount,
     ]);
-    if (latest.headRefOid !== item.headRefOid) {
-      return { ...base, headRefOid: latest.headRefOid || "" };
+    const latestFacts = pullRequestGitFacts(latest, {
+      repository: canonicalBaseRepository(item, latest, expectedTarget),
+      account: latestAccount,
+    });
+    if (
+      !sameExpectedGitFacts(item, latestFacts)
+    ) {
+      if (expectedTarget) {
+        throw staleReviewContext();
+      }
+      return {
+        ...base,
+        ...latestFacts,
+        gitTarget: completePullRequestGitFacts(latestFacts)
+          ? gitTargetFromFacts(latestFacts)
+          : null,
+        gitTargetAvailable: completePullRequestGitFacts(latestFacts),
+      };
     }
 
     const patchText = String(patch || "");

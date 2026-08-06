@@ -12,19 +12,60 @@ import {
   CodeJobChangePackageEventError,
   createCodeJobChangePackageEvent,
   normalizeCodeJobChangePackageEvent,
+  reconstructCodeJobChangePackageEventForRecovery,
 } from "../src/domain/code-job-change-package-event.js";
 
 const WORKSPACE_REVISION = "4".repeat(64);
 
-function completedJob() {
+function pullRequestInputBinding(schemaVersion) {
+  return {
+    schemaVersion,
+    kind: "pull_request",
+    repository: "acme/widgets",
+    pullRequestNumber: 17,
+    rootItemId: "work-1",
+    workKey: "pull-request-acme-widgets-17",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "1".repeat(40),
+    eventId: "event-1",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+    ...(schemaVersion === 2
+      ? {
+          gitTarget: {
+            schemaVersion: 1,
+            provider: "github",
+            sourceAccountId: "runtime-user",
+            baseRepository: "acme/widgets",
+            baseRefName: "main",
+            baseRefOid: "5".repeat(40),
+            headRepository: "contributor/widgets",
+            headRefName: "fix/retry-race",
+            headRefOid: "1".repeat(40),
+          },
+        }
+      : {}),
+  };
+}
+
+function completedJob({ inputBindingVersion = null, grantSchemaVersion = 2 } = {}) {
+  const inputBinding = inputBindingVersion === null
+    ? null
+    : pullRequestInputBinding(inputBindingVersion);
   const grant = createCodeJobGrant({
+    ...(grantSchemaVersion === 2
+      ? { schemaVersion: 2, inputBinding }
+      : {}),
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
     requestedBy: { roleId: "developer", workItemId: "work-1" },
     source: { assignmentId: "assignment-1", eventId: "event-1" },
     subject: {
-      id: "github:acme/widgets:pull-request:17",
+      id: inputBinding === null
+        ? "github:issue:acme/widgets#17"
+        : "github:pr:acme/widgets#17",
       repository: "acme/widgets",
       number: 17,
     },
@@ -122,6 +163,39 @@ function eventContent(event) {
   return content;
 }
 
+function persistedLegacyEvent(job) {
+  const source = job.execution.memoryProjection ?? {
+    sourceRevision: job.revision,
+    sourceRecordDigest: job.recordDigest,
+  };
+  const content = {
+    schemaVersion: 1,
+    sequence: 1,
+    previousDigest: null,
+    job: {
+      id: job.jobId,
+      revision: source.sourceRevision,
+      recordDigest: source.sourceRecordDigest,
+    },
+    proposal: {
+      id: job.proposal.proposalId,
+      contentDigest: job.proposal.contentDigest,
+    },
+    grant: { digest: job.grant.grantDigest },
+    exportRequest: {
+      sessionId: job.execution.sessionId,
+      completedActionId: "complete-action-1",
+      expectedWorkspaceRevision: job.execution.workspaceRevision,
+    },
+  };
+  const eventDigest = digestValue(content);
+  return {
+    ...content,
+    eventId: `code-job-change-package-event-${eventDigest}`,
+    eventDigest,
+  };
+}
+
 test("completed jobs produce a compact, digest-bound change-package event", () => {
   const job = completedJob();
   const event = createCodeJobChangePackageEvent({
@@ -149,6 +223,60 @@ test("completed jobs produce a compact, digest-bound change-package event", () =
   assert.equal(event.eventDigest, digestValue(eventContent(event)));
   assert.equal(event.eventId, `code-job-change-package-event-${event.eventDigest}`);
   assert.deepEqual(normalizeCodeJobChangePackageEvent(event), event);
+});
+
+test("only v2 PR and Issue jobs can create a new change-package event", () => {
+  assert.throws(
+    () => createCodeJobChangePackageEvent({
+      sequence: 1,
+      previousDigest: null,
+      job: completedJob({ inputBindingVersion: 1 }),
+    }),
+    (error) =>
+      error instanceof CodeJobChangePackageEventError &&
+      error.message.includes("旧版"),
+  );
+  assert.doesNotThrow(() => createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob({ inputBindingVersion: 2 }),
+  }));
+  assert.doesNotThrow(() => createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob(),
+  }));
+  assert.throws(
+    () => createCodeJobChangePackageEvent({
+      sequence: 1,
+      previousDigest: null,
+      job: completedJob({ grantSchemaVersion: 1 }),
+    }),
+    (error) =>
+      error instanceof CodeJobChangePackageEventError &&
+      error.message.includes("旧版"),
+  );
+});
+
+test("legacy event identities remain verifiable only for durable recovery", () => {
+  const job = completedJob({ inputBindingVersion: 1 });
+  const event = persistedLegacyEvent(job);
+  assert.deepEqual(
+    reconstructCodeJobChangePackageEventForRecovery({
+      sequence: event.sequence,
+      previousDigest: event.previousDigest,
+      job,
+    }),
+    event,
+  );
+  assert.throws(
+    () => createCodeJobChangePackageEvent({
+      sequence: event.sequence,
+      previousDigest: event.previousDigest,
+      job,
+    }),
+    CodeJobChangePackageEventError,
+  );
 });
 
 test("creation and normalization return detached DTOs", () => {

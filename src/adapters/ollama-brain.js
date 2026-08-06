@@ -1,4 +1,5 @@
 import { ActionAdmissionGateError } from "../lib/action-admission-gate.js";
+import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -73,7 +74,16 @@ function finiteNumberOrDefault(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function safeGitTarget(value) {
+  try {
+    return normalizePullRequestGitTarget(value);
+  } catch {
+    return null;
+  }
+}
+
 function selectPullRequestFacts(item) {
+  const gitTarget = safeGitTarget(item.gitTarget);
   return {
     id: item.id || "",
     repository: item.repo || item.repository || "",
@@ -85,6 +95,14 @@ function selectPullRequestFacts(item) {
     assignmentSource: item.assignmentSource || "",
     author: item.author || "",
     currentUser: item.currentUser || "",
+    gitTargetAvailable:
+      item.gitTargetAvailable === true && gitTarget !== null,
+    githubAccount: gitTarget?.sourceAccountId || item.githubAccount || "",
+    baseRepository: gitTarget?.baseRepository || item.baseRepository || "",
+    baseRefName: gitTarget?.baseRefName || item.baseRefName || "",
+    baseRefOid: gitTarget?.baseRefOid || item.baseRefOid || "",
+    headRepository: gitTarget?.headRepository || item.headRepository || "",
+    headRefName: gitTarget?.headRefName || item.headRefName || "",
     state: item.state || "",
     isDraft: Boolean(item.isDraft),
     createdAt: item.createdAt || null,
@@ -93,7 +111,7 @@ function selectPullRequestFacts(item) {
       ? item.inactiveDays
       : null,
     reviewFactsAvailable: item.reviewFactsAvailable === true,
-    headRefOid: item.headRefOid || "",
+    headRefOid: gitTarget?.headRefOid || item.headRefOid || "",
     myReviewState: item.myReviewState || "",
     myReviewCommitOid: item.myReviewCommitOid || "",
     latestOtherDecisionState: item.latestOtherDecisionState || "",

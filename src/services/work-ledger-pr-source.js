@@ -1,5 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
-import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
+import {
+  normalizePullRequestExecutionBinding,
+  pullRequestExecutionTargetMatchesEvent,
+} from "../domain/pull-request-execution-binding.js";
+import {
+  pullRequestGitTargetFromEvent,
+  samePullRequestGitTarget,
+} from "../domain/git-tool-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
   SHA256_PATTERN,
@@ -43,7 +50,7 @@ const CURRENT_KEYS = [
   "headRefOid",
   "event",
 ];
-const REVISION_KEYS = [
+const LEGACY_REVISION_KEYS = [
   "revision",
   "eventId",
   "eventDigest",
@@ -53,6 +60,18 @@ const REVISION_KEYS = [
   "headRefOid",
   "previousHeadRefOid",
   "disposition",
+];
+const CAUSAL_REVISION_KEYS = [
+  ...LEGACY_REVISION_KEYS,
+  "causalHeadRefOid",
+];
+const AUTHORITY_REVISION_KEYS = [
+  ...CAUSAL_REVISION_KEYS,
+  "authorityEpochChanged",
+];
+const REVISION_KEYS = [
+  ...AUTHORITY_REVISION_KEYS,
+  "authorityEpochCutover",
 ];
 const BINDING_KEYS = [
   "sourceSequence",
@@ -74,9 +93,46 @@ const INPUT_BINDING_KEYS = [
 ];
 const DISPOSITIONS = new Set([
   "accepted",
+  "ignored_legacy_downgrade",
+  "ignored_authority_fence",
   "ignored_stale",
   "ignored_unproven_head",
 ]);
+const CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON =
+  "pr_source_cross_root_cutover_pending";
+const CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_PREFIX =
+  "pr_source_cross_root_cutover_blocker:";
+
+function crossRootProtectedParticipant(state, item, binding) {
+  if (!item?.statusReason?.startsWith(
+    CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_PREFIX,
+  )) {
+    return false;
+  }
+  const pendingItemId = item.statusReason.slice(
+    CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_PREFIX.length,
+  );
+  const pendingRoot = state.items.find(
+    (candidate) => candidate.itemId === pendingItemId,
+  );
+  const pendingPrefix = `${CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON}:`;
+  if (!pendingRoot?.statusReason?.startsWith(pendingPrefix)) return false;
+  const predecessorItemId = pendingRoot.statusReason.slice(
+    pendingPrefix.length,
+  );
+  const predecessor = state.items.find(
+    (candidate) => candidate.itemId === predecessorItemId,
+  );
+  const predecessorBinding = currentWorkItemInputBinding(predecessor);
+  return Boolean(
+    predecessor !== undefined &&
+      samePullRequestSourceSubject(predecessor, pendingRoot) &&
+      binding.rootItemId === predecessor.itemId &&
+      predecessorBinding !== null &&
+      binding.headRevision === predecessorBinding.headRevision &&
+      binding.headRefOid === predecessorBinding.headRefOid,
+  );
+}
 const MAX_TEXT_BYTES = 512;
 
 export const LEGACY_PR_SOURCE_CUTOVER_REASON = "pr_source_legacy_cutover";
@@ -253,7 +309,14 @@ function normalizedEnvelope(value) {
   };
 }
 
-function revisionFrom(input, revision, headRevision, disposition) {
+function revisionFrom(
+  input,
+  revision,
+  headRevision,
+  disposition,
+  causalHeadRefOid,
+  authorityEpochChanged,
+) {
   return {
     revision,
     eventId: input.event.eventId,
@@ -263,6 +326,9 @@ function revisionFrom(input, revision, headRevision, disposition) {
     headRevision,
     headRefOid: input.headRefOid,
     previousHeadRefOid: input.previousHeadRefOid,
+    causalHeadRefOid,
+    authorityEpochChanged,
+    authorityEpochCutover: false,
     disposition,
   };
 }
@@ -309,7 +375,7 @@ export function createPullRequestWorkSource(envelope) {
       pendingRevision: null,
       current: currentFrom(input),
       pending: null,
-      revisions: [revisionFrom(input, 1, 1, "accepted")],
+      revisions: [revisionFrom(input, 1, 1, "accepted", null, false)],
       bindings: [bindingFrom(input, 1)],
     },
   };
@@ -319,23 +385,75 @@ function latestObservedInput(source) {
   return source.pending ?? source.current;
 }
 
-function acceptedHeadChange(source, input) {
+function hasGitTargetMarker(event) {
+  return Object.hasOwn(event?.payload ?? {}, "gitTargetAvailable");
+}
+
+function sameEventGitAuthority(left, right) {
+  const leftState = gitTargetStateForEvent(left);
+  const rightState = gitTargetStateForEvent(right);
+  if (leftState !== rightState) return false;
+  if (leftState !== "available") return true;
+  return samePullRequestGitTarget(
+    pullRequestGitTargetFromEvent(left),
+    pullRequestGitTargetFromEvent(right),
+  );
+}
+
+function sameEventExecutionAuthority(left, right) {
+  return Boolean(
+    left?.source?.provider === right?.source?.provider &&
+      left?.source?.scopeId === right?.source?.scopeId &&
+      sameEventGitAuthority(left, right),
+  );
+}
+
+function isAuthorityFenceDisposition(disposition) {
+  return disposition === "ignored_legacy_downgrade" ||
+    disposition === "ignored_authority_fence";
+}
+
+function hasUnresolvedAuthorityFence(source) {
+  const latestAcceptedIndex = source.revisions.findLastIndex(
+    ({ disposition }) => disposition === "accepted",
+  );
+  return source.revisions
+    .slice(latestAcceptedIndex + 1)
+    .some(({ disposition }) => isAuthorityFenceDisposition(disposition));
+}
+
+function acceptedHeadChange(source, input, causalHeadRefOid) {
   const observed = latestObservedInput(source);
-  if (input.headRefOid === observed.headRefOid) return true;
+  const predecessor = causalHeadRefOid ?? observed.headRefOid;
+  if (input.headRefOid === predecessor) return true;
   return (
     input.event.eventType === "pull_request.updated" &&
     Array.isArray(input.event.payload.changedFields) &&
     input.event.payload.changedFields.includes("headRefOid") &&
-    input.previousHeadRefOid === observed.headRefOid
+    input.previousHeadRefOid === predecessor
   );
 }
 
 export function appendPullRequestWorkSource(
   value,
   envelope,
-  { activate = true } = {},
+  {
+    activate = true,
+    causalHeadRefOid,
+    authorityEpochChanged = false,
+    authorityFenceRecovery = false,
+  } = {},
 ) {
-  if (typeof activate !== "boolean") throw invalid("PR 来源激活选项无效");
+  if (
+    typeof activate !== "boolean" ||
+    typeof authorityEpochChanged !== "boolean" ||
+    typeof authorityFenceRecovery !== "boolean"
+  ) {
+    throw invalid("PR 来源激活选项无效");
+  }
+  const causalHead = causalHeadRefOid === undefined
+    ? null
+    : head(causalHeadRefOid, "causalHeadRefOid");
   const source = normalizePullRequestWorkSource(value);
   const input = normalizedEnvelope(envelope);
   if (input === null || input.workKey !== source.workKey) {
@@ -385,17 +503,39 @@ export function appendPullRequestWorkSource(
 
   const revision = source.inputRevision + 1;
   const observed = latestObservedInput(source);
+  const acceptedCausalHead = causalHead ?? observed.headRefOid;
+  const recoveringAuthorityFence =
+    (hasUnresolvedAuthorityFence(source) || authorityFenceRecovery) &&
+    sameEventExecutionAuthority(source.current.event, input.event);
   const stale = Date.parse(input.event.occurredAt) <
-    Date.parse(observed.occurredAt);
-  const headChanged = input.headRefOid !== observed.headRefOid;
-  const headProven = acceptedHeadChange(source, input);
-  const disposition = stale
-    ? "ignored_stale"
-    : headChanged && !headProven
-      ? "ignored_unproven_head"
-      : "accepted";
+      Date.parse(observed.occurredAt) &&
+    !recoveringAuthorityFence;
+  const headChanged =
+    input.headRefOid !== observed.headRefOid ||
+    (causalHead !== null && input.headRefOid !== causalHead);
+  const headProven = acceptedHeadChange(source, input, causalHead);
+  const legacyDowngrade = gitTargetStateForEvent(input.event) === "legacy" &&
+    [source.current, source.pending]
+      .filter((pointer) => pointer !== null)
+      .some(({ event }) => gitTargetStateForEvent(event) !== "legacy");
+  const unavailableFence = gitTargetStateForEvent(input.event) ===
+    "unavailable";
+  const disposition = legacyDowngrade
+    ? "ignored_legacy_downgrade"
+    : unavailableFence
+      ? "ignored_authority_fence"
+      : stale
+        ? "ignored_stale"
+      : headChanged && !headProven
+        ? "ignored_unproven_head"
+        : "accepted";
   const accepted = disposition === "accepted";
-  const headRevision = accepted && headChanged
+  const executionAuthorityChanged =
+    headChanged ||
+    authorityEpochChanged ||
+    recoveringAuthorityFence ||
+    !sameEventGitAuthority(observed.event, input.event);
+  const headRevision = accepted && executionAuthorityChanged
     ? source.headRevision + 1
     : source.headRevision;
   return {
@@ -418,13 +558,15 @@ export function appendPullRequestWorkSource(
           revision,
           accepted ? headRevision : null,
           disposition,
+          acceptedCausalHead,
+          accepted && executionAuthorityChanged,
         ),
       ],
       bindings: [...source.bindings, bindingFrom(input, revision)],
     },
     changed: true,
     disposition,
-    headAdvanced: accepted && headChanged,
+    headAdvanced: accepted && executionAuthorityChanged,
     activeAdvanced: accepted && activate,
   };
 }
@@ -445,7 +587,17 @@ function normalizeIdentity(value) {
 }
 
 function normalizeRevision(value, expectedRevision) {
-  exact(value, REVISION_KEYS, "PR input revision");
+  const hasAuthorityCutover = hasExactLedgerKeys(value, REVISION_KEYS);
+  const hasAuthorityEpoch = hasAuthorityCutover ||
+    hasExactLedgerKeys(value, AUTHORITY_REVISION_KEYS);
+  const hasCausalHead = hasAuthorityEpoch ||
+    hasExactLedgerKeys(value, CAUSAL_REVISION_KEYS);
+  if (
+    !hasCausalHead &&
+    !hasExactLedgerKeys(value, LEGACY_REVISION_KEYS)
+  ) {
+    throw invalid("PR input revision 字段无效");
+  }
   const revision = positiveInteger(value.revision, "inputRevision.revision");
   const disposition = text(value.disposition, "disposition", 64);
   if (revision !== expectedRevision || !DISPOSITIONS.has(disposition)) {
@@ -467,8 +619,106 @@ function normalizeRevision(value, expectedRevision) {
     headRevision,
     headRefOid: head(value.headRefOid, "inputRevision.headRefOid"),
     previousHeadRefOid: previousHead(value.previousHeadRefOid),
+    causalHeadRefOid: hasCausalHead
+      ? previousHead(value.causalHeadRefOid)
+      : undefined,
+    authorityEpochChanged: hasAuthorityEpoch
+      ? value.authorityEpochChanged
+      : undefined,
+    authorityEpochCutover: hasAuthorityCutover
+      ? value.authorityEpochCutover
+      : undefined,
     disposition,
   };
+}
+
+function sealLegacyRevisionMetadata(revisions) {
+  let previousHeadRevision = 0;
+  let previousAcceptedHead = null;
+  for (const revision of revisions) {
+    if (revision.causalHeadRefOid === undefined) {
+      revision.causalHeadRefOid = previousAcceptedHead;
+    }
+    if (revision.authorityEpochChanged === undefined) {
+      revision.authorityEpochChanged =
+        revision.disposition === "accepted" &&
+        previousHeadRevision > 0 &&
+        revision.headRevision === previousHeadRevision + 1;
+    }
+    if (revision.authorityEpochCutover === undefined) {
+      revision.authorityEpochCutover = false;
+    }
+    if (revision.disposition === "accepted") {
+      previousHeadRevision = revision.headRevision;
+      previousAcceptedHead = revision.headRefOid;
+    }
+  }
+}
+
+function validateRevisionEpochHistory(revisions, expectedHeadRevision) {
+  let previousHeadRevision = 0;
+  let previousAcceptedHead = null;
+  let cutoverCount = 0;
+  for (const revision of revisions) {
+    if (
+      typeof revision.authorityEpochChanged !== "boolean" ||
+      typeof revision.authorityEpochCutover !== "boolean"
+    ) {
+      throw invalid("PR authority epoch 历史无效");
+    }
+    if (revision.disposition !== "accepted") {
+      if (revision.authorityEpochChanged || revision.authorityEpochCutover) {
+        throw invalid("PR authority epoch 历史无效");
+      }
+      continue;
+    }
+    if (revision.authorityEpochCutover) cutoverCount += 1;
+    const expectedRevision = previousHeadRevision === 0
+      ? 1
+      : previousHeadRevision + (revision.authorityEpochCutover
+        ? 2
+        : revision.authorityEpochChanged ? 1 : 0);
+    if (
+      revision.headRevision !== expectedRevision ||
+      (previousHeadRevision === 0 &&
+        (revision.authorityEpochChanged || revision.authorityEpochCutover)) ||
+      (revision.authorityEpochCutover &&
+        !revision.authorityEpochChanged) ||
+      (revision.authorityEpochChanged &&
+        previousHeadRevision > 0 &&
+        (revision.causalHeadRefOid === null ||
+          (revision.headRefOid !== revision.causalHeadRefOid &&
+            revision.previousHeadRefOid !== revision.causalHeadRefOid))) ||
+      (!revision.authorityEpochChanged &&
+        previousHeadRevision > 0 &&
+        revision.headRefOid !== previousAcceptedHead)
+    ) {
+      throw invalid("PR Head epoch 历史无效");
+    }
+    previousHeadRevision = revision.headRevision;
+    previousAcceptedHead = revision.headRefOid;
+  }
+  if (cutoverCount > 1 || previousHeadRevision !== expectedHeadRevision) {
+    throw invalid("PR Head epoch 历史无效");
+  }
+}
+
+function applyLegacyAuthorityCutover(revisions) {
+  const accepted = revisions.filter(
+    ({ disposition }) => disposition === "accepted",
+  );
+  if (
+    accepted.length < 2 ||
+    revisions.some(({ authorityEpochCutover }) => authorityEpochCutover)
+  ) {
+    return null;
+  }
+  const latest = accepted.at(-1);
+  const predecessor = accepted.at(-2);
+  latest.headRevision = predecessor.headRevision + 2;
+  latest.authorityEpochChanged = true;
+  latest.authorityEpochCutover = true;
+  return latest.headRevision;
 }
 
 function normalizeBinding(value, revisionsByEvent, previousSequence) {
@@ -550,12 +800,17 @@ export function normalizePullRequestWorkSource(value) {
   if (workKey !== workKeyFor(identity)) throw invalid("PR workKey 绑定无效");
   const inputRevision = positiveInteger(value.inputRevision, "inputRevision");
   const activeRevision = positiveInteger(value.activeRevision, "activeRevision");
-  const headRevision = positiveInteger(value.headRevision, "headRevision");
+  let headRevision = positiveInteger(value.headRevision, "headRevision");
   const pendingRevision = optionalPositiveInteger(
     value.pendingRevision,
     "pendingRevision",
   );
-  const revisions = plainArray(value.revisions, "revisions").map(
+  const rawRevisions = plainArray(value.revisions, "revisions");
+  const hasIncompleteAuthorityHistory = rawRevisions.some(
+    (revision) => !hasExactLedgerKeys(revision, AUTHORITY_REVISION_KEYS) &&
+      !hasExactLedgerKeys(revision, REVISION_KEYS),
+  );
+  const revisions = rawRevisions.map(
     (revision, index) => normalizeRevision(revision, index + 1),
   );
   if (revisions.length !== inputRevision || activeRevision > inputRevision) {
@@ -565,31 +820,17 @@ export function normalizePullRequestWorkSource(value) {
   if (new Set(eventIds).size !== eventIds.length) {
     throw invalid("PR source eventId 重复");
   }
-  let previousHeadRevision = 0;
-  let previousAcceptedHead = null;
-  for (const revision of revisions) {
-    if (revision.disposition !== "accepted") continue;
-    if (
-      ![previousHeadRevision, previousHeadRevision + 1].includes(
-        revision.headRevision,
-      ) ||
-      (revision.headRevision === previousHeadRevision + 1 &&
-        previousHeadRevision > 0 &&
-        revision.previousHeadRefOid !== previousAcceptedHead) ||
-      (revision.headRevision === previousHeadRevision &&
-        revision.headRefOid !== previousAcceptedHead)
-    ) {
-      throw invalid("PR Head epoch 历史无效");
-    }
-    previousHeadRevision = revision.headRevision;
-    previousAcceptedHead = revision.headRefOid;
+  sealLegacyRevisionMetadata(revisions);
+  validateRevisionEpochHistory(revisions, headRevision);
+  if (hasIncompleteAuthorityHistory) {
+    headRevision = applyLegacyAuthorityCutover(revisions) ?? headRevision;
+    validateRevisionEpochHistory(revisions, headRevision);
   }
   const acceptedRevisions = revisions.filter(
     ({ disposition }) => disposition === "accepted",
   );
   const latestAccepted = acceptedRevisions.at(-1);
   if (
-    previousHeadRevision !== headRevision ||
     !latestAccepted ||
     (pendingRevision === null && activeRevision !== latestAccepted.revision) ||
     (pendingRevision !== null &&
@@ -724,6 +965,208 @@ export function normalizePullRequestInputBinding(value) {
   };
 }
 
+function samePullRequestSourceSubject(left, right) {
+  return Boolean(
+    left?.source?.kind === "pull_request" &&
+      right?.source?.kind === "pull_request" &&
+      left.source.identity.subjectId === right.source.identity.subjectId &&
+      left.source.identity.repository === right.source.identity.repository &&
+      left.source.identity.pullRequestNumber ===
+        right.source.identity.pullRequestNumber,
+  );
+}
+
+function pointerForRevision(source, revision) {
+  if (revision === source.activeRevision) return source.current;
+  if (revision === source.pendingRevision) return source.pending;
+  return null;
+}
+
+function gitTargetStateForEvent(event) {
+  const target = pullRequestGitTargetFromEvent(event);
+  if (
+    hasGitTargetMarker(event) &&
+    event.payload.gitTargetAvailable === false
+  ) {
+    if (target !== null) throw invalid("PR Git target 事件无效");
+    return "unavailable";
+  }
+  if (target !== null) return "available";
+  if (hasGitTargetMarker(event)) {
+    throw invalid("PR Git target 事件无效");
+  }
+  return "legacy";
+}
+
+function subjectSourceObservations(item) {
+  const source = normalizePullRequestWorkSource(item.source);
+  const revisions = new Map(
+    source.revisions.map((revision) => [revision.revision, revision]),
+  );
+  const firstBindings = new Map();
+  for (const binding of source.bindings) {
+    if (!firstBindings.has(binding.inputRevision)) {
+      firstBindings.set(binding.inputRevision, binding);
+    }
+  }
+  return {
+    item,
+    source,
+    observations: [...firstBindings.values()].map((binding) => {
+      const revision = revisions.get(binding.inputRevision);
+      const pointer = pointerForRevision(source, revision.revision);
+      const occurredAtMs = Date.parse(revision.occurredAt);
+      if (!Number.isFinite(occurredAtMs)) {
+        throw invalid("PR 来源事件时间无效");
+      }
+      return {
+        item,
+        source,
+        sourceSequence: binding.sourceSequence,
+        revision,
+        pointer,
+        occurredAtMs,
+      };
+    }),
+  };
+}
+
+function evaluatePullRequestSubjectAuthority(state, root) {
+  if (
+    root?.source?.kind !== "pull_request" ||
+    !Array.isArray(state?.items)
+  ) {
+    return null;
+  }
+  const candidates = state.items
+    .filter((candidate) => samePullRequestSourceSubject(candidate, root))
+    .map(subjectSourceObservations);
+  const observations = candidates
+    .flatMap(({ observations: entries }) => entries)
+    .sort((left, right) => left.sourceSequence - right.sourceSequence);
+  if (
+    observations.length === 0 ||
+    observations.some(
+      (observation, index) =>
+        index > 0 &&
+        observation.sourceSequence ===
+          observations[index - 1].sourceSequence,
+    )
+  ) {
+    return null;
+  }
+  const markerRequired = candidates.some(({ source }) =>
+    [source.current, source.pending]
+      .filter((pointer) => pointer !== null)
+      .some(({ event }) => gitTargetStateForEvent(event) !== "legacy")
+  );
+  let predecessor = null;
+  let canonical = null;
+  let trustedOccurredAtWatermark = Number.NEGATIVE_INFINITY;
+  let trustedEvent = null;
+  let trustedObservation = null;
+  let authorityFenced = false;
+  for (const observation of observations) {
+    const gitTargetState = observation.pointer === null
+      ? null
+      : gitTargetStateForEvent(observation.pointer.event);
+    const authorityNegative =
+      observation.item.sourceQuarantine !== null ||
+      isAuthorityFenceDisposition(observation.revision.disposition) ||
+      (observation.pointer !== null &&
+        (gitTargetState === "unavailable" ||
+          (markerRequired && gitTargetState === "legacy")));
+    if (authorityNegative) {
+      canonical = null;
+      authorityFenced = true;
+      continue;
+    }
+    const exactFenceRecovery =
+      authorityFenced &&
+      observation.pointer !== null &&
+      trustedEvent !== null &&
+      sameEventExecutionAuthority(
+        trustedEvent,
+        observation.pointer.event,
+      );
+    if (
+      observation.occurredAtMs < trustedOccurredAtWatermark &&
+      !exactFenceRecovery
+    ) {
+      continue;
+    }
+    const causal = predecessor === null ||
+      observation.revision.headRefOid === predecessor.revision.headRefOid ||
+      observation.revision.previousHeadRefOid ===
+        predecessor.revision.headRefOid;
+    if (!causal) {
+      canonical = null;
+      authorityFenced = true;
+      continue;
+    }
+    predecessor = observation;
+    const targetAuthorityCurrent = observation.pointer === null ||
+      (markerRequired
+        ? gitTargetState === "available"
+        : gitTargetState === "legacy");
+    if (
+      observation.revision.disposition === "accepted" &&
+      targetAuthorityCurrent &&
+      observation.pointer !== null
+    ) {
+      trustedOccurredAtWatermark = observation.occurredAtMs;
+      trustedEvent = observation.pointer.event;
+      trustedObservation = observation;
+    }
+    const executable =
+      observation.revision.disposition === "accepted" &&
+      observation.pointer !== null &&
+      targetAuthorityCurrent;
+    canonical = executable ? observation : null;
+    if (executable) authorityFenced = false;
+  }
+  return {
+    canonical,
+    predecessor,
+    authorityFenced,
+    trustedObservation,
+  };
+}
+
+function canonicalPullRequestSourceRoot(state, root) {
+  try {
+    return evaluatePullRequestSubjectAuthority(state, root)?.canonical?.item ??
+      null;
+  } catch {
+    return null;
+  }
+}
+
+export function pullRequestTrustedPredecessor(state, root) {
+  try {
+    const authority = evaluatePullRequestSubjectAuthority(state, root);
+    const predecessor = authority?.predecessor;
+    if (predecessor === null || predecessor === undefined) return null;
+    return Object.freeze({
+      headRefOid: predecessor.revision.headRefOid,
+      sourceRootItemId: predecessor.item.itemId,
+      sourceSequence: predecessor.sourceSequence,
+      canonicalRootItemId: authority.canonical?.item?.itemId ?? null,
+      authorityFenced: authority.authorityFenced === true,
+      lastTrustedRootItemId:
+        authority.trustedObservation?.item?.itemId ?? null,
+      trustedSourceRootItemId:
+        authority.trustedObservation?.item?.itemId ?? null,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function pullRequestTrustedPredecessorHead(state, root) {
+  return pullRequestTrustedPredecessor(state, root)?.headRefOid ?? null;
+}
+
 export function pullRequestHeadAdmission(state, item) {
   const binding = currentWorkItemInputBinding(item);
   if (binding === null) {
@@ -735,17 +1178,54 @@ export function pullRequestHeadAdmission(state, item) {
   const current = root?.source?.kind === "pull_request"
     ? currentWorkItemInputBinding(root)
     : null;
+  const boundEvent = currentWorkItemEvent(item);
+  const currentEvent = root?.source?.kind === "pull_request"
+    ? currentWorkItemEvent(root)
+    : null;
+  const canonicalRoot = canonicalPullRequestSourceRoot(state, root);
+  const crossRootCutoverPending = state.items.some(
+    (candidate) =>
+      samePullRequestSourceSubject(candidate, root) &&
+      typeof candidate.statusReason === "string" &&
+      candidate.statusReason.startsWith(
+        CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON,
+      ),
+  );
+  const registeredCrossRootParticipant = crossRootProtectedParticipant(
+    state,
+    item,
+    binding,
+  );
+  let targetMatches = false;
+  try {
+    const boundTarget = pullRequestGitTargetFromEvent(boundEvent);
+    const currentTarget = pullRequestGitTargetFromEvent(currentEvent);
+    const provenanceMatches =
+      boundEvent?.source?.provider === currentEvent?.source?.provider &&
+      boundEvent?.source?.scopeId === currentEvent?.source?.scopeId;
+    targetMatches = provenanceMatches && (boundTarget === null || currentTarget === null
+      ? boundTarget === null &&
+        currentTarget === null &&
+        boundEvent?.payload?.gitTargetAvailable === undefined &&
+        currentEvent?.payload?.gitTargetAvailable === undefined
+      : samePullRequestGitTarget(boundTarget, currentTarget));
+  } catch {
+    targetMatches = false;
+  }
   const matches =
     current !== null &&
     binding.workKey === current.workKey &&
     binding.headRevision === current.headRevision &&
-    binding.headRefOid === current.headRefOid;
+    binding.headRefOid === current.headRefOid &&
+    targetMatches &&
+    (canonicalRoot?.itemId === root?.itemId ||
+      registeredCrossRootParticipant);
   return Object.freeze({
     applies: true,
     current: matches,
     pending:
       root?.source?.kind === "pull_request" &&
-      root.source.pendingRevision !== null,
+      (root.source.pendingRevision !== null || crossRootCutoverPending),
     rootItemId: binding.rootItemId,
     headRevision: binding.headRevision,
     currentHeadRevision: current?.headRevision ?? null,
@@ -801,6 +1281,7 @@ export function verifyPullRequestExecutionBinding(state, value) {
     current.workKey !== binding.workKey ||
     current.headRevision !== binding.headRevision ||
     current.headRefOid !== binding.headRefOid ||
+    !pullRequestExecutionTargetMatchesEvent(binding, source.current.event) ||
     admission.current !== true ||
     admission.pending !== false
   ) {

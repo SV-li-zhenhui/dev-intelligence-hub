@@ -1,13 +1,17 @@
 import {
+  createWorkGraphSourceAuthority,
   memoryRecordForWorkGraphMemoryEvent,
   normalizeWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../domain/work-graph-memory-event.js";
+import { createPullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
-import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import {
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
+  pullRequestHeadAdmission,
+} from "./work-ledger-pr-source.js";
 
-const PAGE_SIZE = 100;
-const MAX_PAGES = 100;
 const WRITE_BATCH = 100;
 const SAFE_ROLE = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
@@ -136,7 +140,37 @@ function githubUrl(repository, number, eventType) {
   return `https://github.com/${repository}/${kind}/${number}`;
 }
 
-function workItemRecord(raw) {
+function projectedSourceAuthority(state, item) {
+  const sourceBinding = currentWorkItemInputBinding(item);
+  if (sourceBinding === null) return createWorkGraphSourceAuthority();
+  const event = currentWorkItemEvent(item);
+  let executionBinding;
+  try {
+    executionBinding = createPullRequestExecutionBinding({ sourceBinding, event });
+  } catch {
+    executionBinding = {
+      schemaVersion: 1,
+      kind: "pull_request",
+      repository: event.subject.repository,
+      pullRequestNumber: event.subject.number,
+      ...sourceBinding,
+    };
+  }
+  const admission = pullRequestHeadAdmission(state, item);
+  return createWorkGraphSourceAuthority({
+    executionBinding,
+    provenance: {
+      provider: event.source.provider,
+      scopeId: event.source.scopeId,
+    },
+    citable:
+      executionBinding.schemaVersion === 2 &&
+      admission.current === true &&
+      admission.pending === false,
+  });
+}
+
+function workItemRecord(raw, state) {
   const item = plainData(raw);
   const event = plainData(currentWorkItemEvent(item));
   const subject = plainData(event?.subject);
@@ -148,6 +182,7 @@ function workItemRecord(raw) {
   const repository = safeRepository(subject?.repository);
   const number = safeNumber(subject?.number);
   const status = safeToken(item.status, "unknown");
+  const sourceAuthority = projectedSourceAuthority(state, item);
   const targetRole = target?.type === "role" ? safeRole(target.id) : null;
   return {
     schemaVersion: 1,
@@ -170,9 +205,10 @@ function workItemRecord(raw) {
       target,
       status,
       attempt: item.attempt,
-      decisionContext: item.decisionContext,
+      sourceAuthority,
+      decisionContext: status === "superseded" ? null : item.decisionContext,
     }),
-    evidence: [],
+    evidence: [`supersedes-work-item-revisions:${itemId}`],
     tags: ["work", status, ...(targetRole ? [targetRole] : [])],
     sourceUrl: githubUrl(repository, number, event?.eventType),
     subjectNumber: number,
@@ -185,6 +221,7 @@ function timelineRecord(raw, itemById) {
   const occurredAt = safeTimestamp(entry?.at);
   if (!timelineId || !occurredAt) return null;
   const item = itemById.get(entry.itemId);
+  const historicalPrTimeline = currentWorkItemInputBinding(item) !== null;
   const event = plainData(currentWorkItemEvent(item));
   const subject = plainData(event?.subject);
   const repository = safeRepository(subject?.repository);
@@ -199,9 +236,18 @@ function timelineRecord(raw, itemById) {
     eventType: `timeline.${type}`,
     title: `工作时间线：${type}`,
     summary: safeText(entry.itemId || "全局工作事件", 8_192),
-    content: safeJson(entry.details),
+    content: safeJson({
+      details: entry.details,
+      ...(historicalPrTimeline
+        ? { historicalOnly: true, citableConclusion: false }
+        : {}),
+    }),
     evidence: [],
-    tags: ["timeline", type],
+    tags: [
+      "timeline",
+      type,
+      ...(historicalPrTimeline ? ["derived", "obsolete"] : []),
+    ],
     sourceUrl: githubUrl(repository, number, event?.eventType),
     subjectNumber: number,
   };
@@ -236,6 +282,8 @@ function legacyRecord(raw) {
     title: safeText(memory.title || id, 1_024),
     summary: safeText(memory.summary, 8_192),
     content: safeJson({
+      fingerprint: safeText(memory.fingerprint, 1_024),
+      headRefOid: safeText(memory.headRefOid, 128),
       steps: stringList(memory.steps, 20),
       reviewBody: safeText(memory.reviewBody, 8_192),
       decision: safeText(memory.decision, 1_024),
@@ -243,18 +291,10 @@ function legacyRecord(raw) {
       brain: plainData(memory.brain),
     }),
     evidence: stringList(memory.evidence, 20),
-    tags: ["legacy", "pr-reviewer", "derived"],
+    tags: ["legacy", "pr-reviewer", "derived", "obsolete"],
     sourceUrl,
     subjectNumber: number,
   };
-}
-
-function validPage(value) {
-  const page = plainData(value);
-  if (!page || !Array.isArray(page.items) || !(page.nextCursor === null || typeof page.nextCursor === "string")) {
-    throw new TypeError("memory projection source page is invalid");
-  }
-  return page;
 }
 
 function exactProjectionObject(value, keys, message) {
@@ -284,11 +324,33 @@ function normalizeGraphProjectionBatch(value) {
   const message = "task graph memory projection source batch is invalid";
   const batch = exactProjectionObject(
     value,
-    ["cursor", "highWatermark", "items"],
+    [
+      "cursor",
+      "highWatermark",
+      "checkpointDigest",
+      "highWatermarkDigest",
+      "authorityStateDigest",
+      "items",
+    ],
     message,
   );
   const cursor = nonNegativeInteger(batch.cursor, message);
   const highWatermark = nonNegativeInteger(batch.highWatermark, message);
+  const checkpointDigest = batch.checkpointDigest;
+  const highWatermarkDigest = batch.highWatermarkDigest;
+  const authorityStateDigest = batch.authorityStateDigest;
+  const digestOrNull = (candidate) =>
+    candidate === null || /^[a-f0-9]{64}$/.test(candidate);
+  if (
+    !digestOrNull(checkpointDigest) ||
+    !digestOrNull(highWatermarkDigest) ||
+    typeof authorityStateDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(authorityStateDigest) ||
+    (cursor === 0) !== (checkpointDigest === null) ||
+    (highWatermark === 0) !== (highWatermarkDigest === null)
+  ) {
+    throw new TypeError(message);
+  }
   if (highWatermark < cursor) throw new TypeError(message);
   let items;
   try {
@@ -299,7 +361,14 @@ function normalizeGraphProjectionBatch(value) {
   }
   if (items.length === 0) {
     if (cursor !== highWatermark) throw new TypeError(message);
-    return { cursor, highWatermark, items };
+    return {
+      cursor,
+      highWatermark,
+      checkpointDigest,
+      highWatermarkDigest,
+      authorityStateDigest,
+      items,
+    };
   }
   for (let index = 0; index < items.length; index += 1) {
     const event = items[index];
@@ -309,7 +378,33 @@ function normalizeGraphProjectionBatch(value) {
     }
   }
   if (items.at(-1).sequence > highWatermark) throw new TypeError(message);
-  return { cursor, highWatermark, items };
+  return {
+    cursor,
+    highWatermark,
+    checkpointDigest,
+    highWatermarkDigest,
+    authorityStateDigest,
+    items,
+  };
+}
+
+function normalizeMemoryAuthoritySnapshot(value) {
+  const message = "memory authority snapshot is invalid";
+  const snapshot = exactProjectionObject(
+    value,
+    ["ledgerRevision", "items", "timeline", "graph"],
+    message,
+  );
+  const ledgerRevision = nonNegativeInteger(snapshot.ledgerRevision, message);
+  const items = dataList(snapshot.items, 20_000);
+  const timeline = dataList(snapshot.timeline, 50_000);
+  if (items === null || timeline === null) throw new TypeError(message);
+  return {
+    ledgerRevision,
+    items,
+    timeline,
+    graph: normalizeGraphProjectionBatch(snapshot.graph),
+  };
 }
 
 function normalizeGraphAppendResult(value, expectedRecords) {
@@ -372,35 +467,42 @@ function normalizeGraphAckResult(value, event, minimumHighWatermark) {
 }
 
 export class MemoryProjector {
-  #appendBatch;
+  #appendGraphEvents;
+  #appendProjectionRecords;
+  #appendWorkItems;
   #graphAckBatch;
-  #graphReadBatch;
-  #ledger;
+  #readSnapshot;
   #store;
   #inFlight = null;
 
   constructor({
-    memoryProducer,
-    ledgerView,
+    memoryLifecycleProducer,
+    memoryAuthoritySource,
     graphProjectionSource,
     store,
   } = {}) {
-    this.#appendBatch = requirePort(
-      memoryProducer,
-      ["appendBatch"],
-      "memoryProducer",
-    ).appendBatch;
-    this.#ledger = requirePort(
-      ledgerView,
-      ["listItems", "listTimeline"],
-      "ledgerView",
+    const lifecycle = requirePort(
+      memoryLifecycleProducer,
+      [
+        "appendWorkItems",
+        "appendGraphEvents",
+        "appendProjectionRecords",
+      ],
+      "memoryLifecycleProducer",
     );
+    this.#appendWorkItems = lifecycle.appendWorkItems;
+    this.#appendGraphEvents = lifecycle.appendGraphEvents;
+    this.#appendProjectionRecords = lifecycle.appendProjectionRecords;
+    this.#readSnapshot = requirePort(
+      memoryAuthoritySource,
+      ["readSnapshot"],
+      "memoryAuthoritySource",
+    ).readSnapshot;
     const graphSource = requirePort(
       graphProjectionSource,
-      ["readBatch", "ackBatch"],
+      ["ackBatch"],
       "graphProjectionSource",
     );
-    this.#graphReadBatch = graphSource.readBatch;
     this.#graphAckBatch = graphSource.ackBatch;
     if (!store || typeof store.read !== "function") {
       throw new TypeError("MemoryProjector requires a store");
@@ -419,26 +521,10 @@ export class MemoryProjector {
   }
 
   async #run() {
-    const [items, timeline, legacy, graphBatch] = await Promise.all([
-      this.#readAll(this.#ledger.listItems),
-      this.#readAll(this.#ledger.listTimeline),
-      this.#store.read("pr-employee-memory", []),
-      this.#graphReadBatch({ limit: GRAPH_BATCH_LIMIT }),
-    ]);
-    const graph = normalizeGraphProjectionBatch(graphBatch);
-    const itemById = new Map(items.map((item) => [item.itemId, item]));
-    const projected = [
-      ...items.map(workItemRecord),
-      ...timeline.map((entry) => timelineRecord(entry, itemById)),
-      ...(Array.isArray(legacy) ? legacy.map(legacyRecord) : []),
-    ].filter(Boolean);
-    let added = 0;
-    for (let index = 0; index < projected.length; index += WRITE_BATCH) {
-      const result = await this.#appendBatch({
-        records: projected.slice(index, index + WRITE_BATCH),
-      });
-      added += Number(result?.added) || 0;
-    }
+    const initial = normalizeMemoryAuthoritySnapshot(
+      await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
+    );
+    const graph = initial.graph;
     let graphAdded = 0;
     let graphCursor = graph.cursor;
     let graphHighWatermark = graph.highWatermark;
@@ -446,7 +532,12 @@ export class MemoryProjector {
       const records = graph.items.map(memoryRecordForWorkGraphMemoryEvent);
       const expectedRecords = records.map((record) => normalizeMemoryRecord(record));
       graphAdded = normalizeGraphAppendResult(
-        await this.#appendBatch({ records }),
+        await this.#appendGraphEvents({
+          events: graph.items,
+          ledgerRevision: initial.ledgerRevision,
+          highWatermark: graph.highWatermark,
+          authorityStateDigest: graph.authorityStateDigest,
+        }),
         expectedRecords,
       ).added;
       const acknowledgement = normalizeGraphAckResult(
@@ -459,8 +550,36 @@ export class MemoryProjector {
       graphCursor = acknowledgement.cursor;
       graphHighWatermark = acknowledgement.highWatermark;
     }
+    const finalSnapshot = normalizeMemoryAuthoritySnapshot(
+      await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
+    );
+    const { items, timeline } = finalSnapshot;
+    const legacy = await this.#store.read("pr-employee-memory", []);
+    const state = { items };
+    const workRecords = items.map((item) => workItemRecord(item, state))
+      .filter(Boolean);
+    const itemById = new Map(items.map((item) => [item.itemId, item]));
+    const historyRecords = [
+      ...timeline.map((entry) => timelineRecord(entry, itemById)),
+      ...(Array.isArray(legacy) ? legacy.map(legacyRecord) : []),
+    ].filter(Boolean);
+    let added = 0;
+    for (let index = 0; index < historyRecords.length; index += WRITE_BATCH) {
+      const result = await this.#appendProjectionRecords({
+        records: historyRecords.slice(index, index + WRITE_BATCH),
+      });
+      added += Number(result?.added) || 0;
+    }
+    const workResult = await this.#appendWorkItems({
+      records: workRecords,
+      ledgerRevision: finalSnapshot.ledgerRevision,
+      authorityStateDigest: finalSnapshot.graph.authorityStateDigest,
+      graphCursor: finalSnapshot.graph.cursor,
+      graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
+    });
+    added += Number(workResult?.added) || 0;
     return {
-      observed: projected.length + graph.items.length,
+      observed: historyRecords.length + workRecords.length + graph.items.length,
       added: added + graphAdded,
       workItems: items.length,
       timeline: timeline.length,
@@ -476,24 +595,4 @@ export class MemoryProjector {
     };
   }
 
-  async #readAll(method) {
-    const result = [];
-    let cursor;
-    const seen = new Set();
-    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = validPage(await method({
-        limit: PAGE_SIZE,
-        order: "oldest",
-        ...(cursor ? { cursor } : {}),
-      }));
-      result.push(...page.items);
-      if (page.nextCursor === null) return result;
-      if (seen.has(page.nextCursor)) {
-        throw new TypeError("memory projection pagination did not advance");
-      }
-      seen.add(page.nextCursor);
-      cursor = page.nextCursor;
-    }
-    throw new TypeError("memory projection exceeded its page bound");
-  }
 }

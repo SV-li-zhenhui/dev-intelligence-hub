@@ -421,6 +421,7 @@ export class ChangePackageApplicationService {
   #packageReader;
   #targets;
   #gitInspector;
+  #verifyApplicationAuthority;
   #store;
   #exclusiveLease;
   #operationQueue;
@@ -433,6 +434,7 @@ export class ChangePackageApplicationService {
     packageReader,
     trustedTargets = [],
     gitInspector,
+    applicationAuthorityVerifier,
     store,
     exclusiveLease,
     operationQueue = new OperationQueue(),
@@ -446,6 +448,11 @@ export class ChangePackageApplicationService {
     );
     this.#targets = normalizeTargets(trustedTargets);
     this.#gitInspector = requirePort(gitInspector, ["inspect"], "gitInspector");
+    this.#verifyApplicationAuthority = requirePort(
+      applicationAuthorityVerifier,
+      ["verify"],
+      "applicationAuthorityVerifier",
+    ).verify;
     this.#store = requirePort(store, ["read", "write"], "store");
     this.#exclusiveLease = requirePort(
       exclusiveLease,
@@ -550,6 +557,7 @@ export class ChangePackageApplicationService {
         );
       }
       const manifest = await this.#loadManifest(packageId);
+      await this.#assertApplicationAuthority(manifest);
       const target = this.#target(manifest.workspace.id);
       const mutations = await this.#loadMutations(manifest, target);
       const observation = await this.#observe(target);
@@ -637,14 +645,29 @@ export class ChangePackageApplicationService {
     if (record && !sameBinding(record, envelope)) {
       return unknown("CHANGE_PACKAGE_APPLICATION_BINDING_CONFLICT");
     }
+
+    let context;
+    try {
+      context = await this.#verifiedBindingContext(envelope, {
+        requireCurrentAuthority: true,
+      });
+    } catch (error) {
+      if (error?.code === "CHANGE_PACKAGE_APPLICATION_STALE") {
+        return { status: "stale" };
+      }
+      const code = stableCode(
+        error,
+        "CHANGE_PACKAGE_APPLICATION_CONTEXT_UNAVAILABLE",
+      );
+      return record ? unknown(code) : { status: "absent", code };
+    }
     if (record?.status === "applied") {
       return { status: "already", receipt: { ...record.receipt } };
     }
     if (record?.status === "unknown") return unknown(record.failure.code);
 
-    let context;
     try {
-      context = await this.#verifiedContext(envelope);
+      context = await this.#withMutations(context);
     } catch (error) {
       if (error?.code === "CHANGE_PACKAGE_APPLICATION_STALE") {
         return { status: "stale" };
@@ -819,8 +842,14 @@ export class ChangePackageApplicationService {
     return this.#fence(record, "CHANGE_PACKAGE_APPLICATION_MIXED_STATE");
   }
 
-  async #verifiedContext(envelope) {
+  async #verifiedBindingContext(
+    envelope,
+    { requireCurrentAuthority = false } = {},
+  ) {
     const manifest = await this.#loadManifest(envelope.action.packageId);
+    if (requireCurrentAuthority) {
+      await this.#assertApplicationAuthority(manifest);
+    }
     const target = this.#target(manifest.workspace.id);
     if (target.targetAuthorityDigest !== envelope.action.targetAuthorityDigest) {
       throw applicationError(
@@ -848,11 +877,33 @@ export class ChangePackageApplicationService {
         "change package application 绑定已变化",
       );
     }
+    return { manifest, target };
+  }
+
+  async #verifiedContext(envelope) {
+    return this.#withMutations(await this.#verifiedBindingContext(envelope));
+  }
+
+  async #withMutations(context) {
     return {
-      manifest,
-      target,
-      mutations: await this.#loadMutations(manifest, target),
+      ...context,
+      mutations: await this.#loadMutations(context.manifest, context.target),
     };
+  }
+
+  async #assertApplicationAuthority(manifest) {
+    try {
+      const verified = await this.#verifyApplicationAuthority(
+        structuredClone(manifest),
+      );
+      if (verified !== true) throw new Error("source authority not confirmed");
+    } catch (cause) {
+      throw applicationError(
+        "CHANGE_PACKAGE_APPLICATION_STALE",
+        "变更包来源授权已失效",
+        cause,
+      );
+    }
   }
 
   async #loadManifest(packageId) {

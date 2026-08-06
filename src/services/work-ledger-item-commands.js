@@ -29,6 +29,8 @@ import {
 
 const MIN_LEASE_MS = 1_000;
 const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
+const CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_PREFIX =
+  "pr_source_cross_root_cutover_pending:";
 
 export function normalizeWorkLeaseDuration(value) {
   if (
@@ -189,6 +191,15 @@ export function planWorkItemTransition({ state, input, clock }) {
   const context = normalizeWorkDetails(input.details ?? {});
   const item = requireWorkLedgerItem(state, itemId);
   assertWorkItemNotInLegacyPullRequestCutover(item);
+  if (item.statusReason?.startsWith(
+    CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_PREFIX,
+  )) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "跨来源 PR cutover 只能通过来源对账推进",
+      409,
+    );
+  }
   assertNoActiveIntent(item);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();

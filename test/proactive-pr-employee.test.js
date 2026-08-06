@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
+import { normalizePullRequestGitTarget } from "../src/domain/git-tool-contract.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactivePrEmployeeService } from "../src/services/proactive-pr-employee.js";
+
+const HEAD_42 = "b".repeat(40);
+const HEAD_43 = "c".repeat(40);
+const HEAD_OLD = "d".repeat(40);
 
 class MemoryStore {
   constructor(entries = {}) {
@@ -116,7 +122,8 @@ async function settlesBefore(promise, durationMs = 250) {
 }
 
 function pullRequest(overrides = {}) {
-  return {
+  const headRefOid = overrides.headRefOid || HEAD_42;
+  const item = {
     id: "github:pr:acme/repo#42",
     kind: "pull_request",
     relation: "review_requested",
@@ -128,12 +135,37 @@ function pullRequest(overrides = {}) {
     state: "open",
     updatedAt: "2026-07-31T09:00:00.000Z",
     reviewFactsAvailable: true,
-    headRefOid: "head-42",
+    headRefOid,
+    gitTargetAvailable: true,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo",
+      baseRefName: "main",
+      baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo",
+      headRefName: "fix/review",
+      headRefOid,
+    },
     actionState: "action_now",
     nextAction: "review",
     actionReasons: ["等待你首次审核"],
     ...overrides,
   };
+  if (
+    overrides.gitTargetAvailable === false &&
+    !Object.hasOwn(overrides, "gitTarget")
+  ) {
+    delete item.gitTarget;
+  }
+  return item;
+}
+
+function gitTargetDigest(item) {
+  return createHash("sha256")
+    .update(JSON.stringify(normalizePullRequestGitTarget(item.gitTarget)), "utf8")
+    .digest("hex");
 }
 
 function snapshot(items, overrides = {}) {
@@ -171,7 +203,7 @@ function queuedState(item = pullRequest(), overrides = {}) {
         id: "pr-work-existing",
         fingerprint: [
           item.id,
-          item.headRefOid,
+          gitTargetDigest(item),
           item.nextAction,
           policyVersion,
         ].join("\u0000"),
@@ -183,6 +215,7 @@ function queuedState(item = pullRequest(), overrides = {}) {
         url: item.url,
         relation: item.relation,
         headRefOid: item.headRefOid,
+        gitTargetDigest: gitTargetDigest(item),
         nextAction: item.nextAction,
         triggerReason: item.actionReasons[0],
         status: "queued",
@@ -303,7 +336,7 @@ test("an admitted job write releases cutover before storage settles", async () =
 test("configuration fencing does not block stale-job reconciliation", async () => {
   const gate = readyGate();
   await cutoverToVersion(gate, 2);
-  const oldItem = pullRequest({ headRefOid: "head-old" });
+  const oldItem = pullRequest({ headRefOid: HEAD_OLD });
   const store = new MemoryStore({
     snapshot: snapshot([pullRequest()]),
     "pr-employee-state": queuedState(oldItem),
@@ -323,7 +356,7 @@ test("configuration fencing does not block stale-job reconciliation", async () =
   const state = await store.read("pr-employee-state");
   assert.equal(state.jobs.length, 1);
   assert.equal(state.jobs[0].status, "superseded");
-  assert.equal(state.jobs[0].headRefOid, "head-old");
+  assert.equal(state.jobs[0].headRefOid, HEAD_OLD);
 });
 
 test("configuration-first running claim leaves queued work and controls available", async () => {
@@ -828,8 +861,8 @@ test("a new review head is analyzed proactively once and queued for human review
   const first = await service.tick({ trigger: "refresh_completed" });
   const second = await service.tick({ trigger: "scheduled" });
 
-  assert.deepEqual(loaded, ["head-42"]);
-  assert.deepEqual(reviewed, ["head-42"]);
+  assert.deepEqual(loaded, [HEAD_42]);
+  assert.deepEqual(reviewed, [HEAD_42]);
   assert.equal(first.jobs[0].status, "ready_for_human");
   assert.equal(first.confirmationQueue.length, 1);
   assert.equal(first.confirmationQueue[0].reviewBody, reviewResult().reviewBody);
@@ -1002,7 +1035,7 @@ test("a head change during model work supersedes the stale result", async () => 
     reviewer: {
       async analyze() {
         await store.write("snapshot", snapshot([
-          pullRequest({ headRefOid: "head-43" }),
+          pullRequest({ headRefOid: HEAD_43 }),
         ]));
         return reviewResult();
       },
@@ -1013,6 +1046,83 @@ test("a head change during model work supersedes the stale result", async () => 
 
   assert.equal(result.jobs[0].status, "superseded");
   assert.equal(result.confirmationQueue.length, 0);
+});
+
+test("an incomplete live Git target cannot start the legacy PR employee", async () => {
+  const incomplete = pullRequest({ gitTargetAvailable: false });
+  const store = new MemoryStore({ snapshot: snapshot([incomplete]) });
+  let contextCalls = 0;
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext() {
+        contextCalls += 1;
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs.length, 0);
+  assert.equal(contextCalls, 0);
+  assert.equal(reviewerCalls, 0);
+});
+
+test("a same-Head Git target change during model work supersedes the stale result", async () => {
+  const original = pullRequest();
+  const changed = pullRequest({
+    gitTarget: {
+      ...original.gitTarget,
+      baseRefOid: "e".repeat(40),
+    },
+  });
+  const store = new MemoryStore({ snapshot: snapshot([original]) });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext(item) {
+        return { ...item, patch: "diff", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        await store.write("snapshot", snapshot([changed]));
+        return reviewResult();
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "superseded");
+  assert.equal(result.confirmationQueue.length, 0);
+});
+
+test("a stale review-context read supersedes immediately without retrying", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({ snapshot: snapshot([item]) });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext() {
+        throw Object.assign(new Error("stale"), { code: "PR_CONTEXT_STALE" });
+      },
+    },
+    reviewer: { async analyze() { return reviewResult(); } },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "superseded");
+  assert.equal(result.jobs[0].attempts, 1);
+  assert.equal(result.jobs[0].nextAttemptAt, undefined);
 });
 
 test("fallback GitHub data never starts a proactive job", async () => {
@@ -1121,7 +1231,7 @@ test("a prolonged memory outage keeps the outbox bounded", async () => {
     pullRequest({
       id: `github:pr:acme/repo#${number}`,
       number,
-      headRefOid: `head-${number}`,
+      headRefOid: number.toString(16).padStart(40, "0"),
     }),
   );
   const store = new FailingMemoryStore({ snapshot: snapshot(requests) });

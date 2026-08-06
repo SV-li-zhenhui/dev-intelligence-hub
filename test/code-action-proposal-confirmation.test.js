@@ -29,6 +29,18 @@ function event(overrides = {}) {
     payload: {
       title: "Fix race",
       headRefOid: HEAD_REF_OID,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "2".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/race",
+        headRefOid: HEAD_REF_OID,
+      },
+      gitTargetAvailable: true,
       state: "open",
       changedFields: ["headRefOid"],
     },
@@ -38,7 +50,7 @@ function event(overrides = {}) {
 
 function inputBindingFor(trustedEvent, rootItemId) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository: trustedEvent.subject.repository,
     pullRequestNumber: trustedEvent.subject.number,
@@ -50,6 +62,7 @@ function inputBindingFor(trustedEvent, rootItemId) {
     eventId: trustedEvent.eventId,
     eventDigest: trustedEvent.contentDigest,
     inputDigest: INPUT_DIGEST,
+    gitTarget: structuredClone(trustedEvent.payload.gitTarget),
   };
 }
 
@@ -75,6 +88,64 @@ function proposal(operation = "modify", { roleId = "developer" } = {}) {
       objective: "修复并发覆盖",
       acceptanceCriteria: ["回归测试通过", "源工作区保持不变"],
       evidence: ["revision 未校验"],
+      summary: "创建受控代码任务",
+      reason: "需要在隔离副本中验证修复",
+    },
+  });
+  return normalizeBoundWorkProposal({
+    proposalId: bound.intentId,
+    policyVersion: bound.policyVersion,
+    kind: bound.kind,
+    requestedBy: bound.requestedBy,
+    source: bound.source,
+    binding: bound.binding,
+    payload: bound.payload,
+  });
+}
+
+function legacyProposal() {
+  const current = proposal();
+  const { gitTarget: _gitTarget, ...legacyBinding } =
+    current.binding.inputBinding;
+  return proposalWith(current, {
+    binding: {
+      inputBinding: { ...legacyBinding, schemaVersion: 1 },
+    },
+  });
+}
+
+function issueProposal() {
+  const trustedEvent = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "issue.created",
+    occurredAt: "2026-08-02T01:02:03.000Z",
+    source: { provider: "github", scopeId: "dashboard" },
+    subject: {
+      id: "github:issue:acme/repo#42",
+      repository: "acme/repo",
+      number: 42,
+    },
+    payload: { number: 42, title: "Fix race" },
+  });
+  const bound = createWorkIntentPolicy({
+    version: 7,
+    codeActionRoles: ["developer"],
+    workspaceByRepository: { "acme/repo": "acme-workspace" },
+  }).bind({
+    context: {
+      assignmentId: `workflow-assignment-${"c".repeat(64)}`,
+      workItemId: `work-item-${"d".repeat(64)}`,
+      roleId: "developer",
+      event: trustedEvent,
+      inputBinding: null,
+    },
+    intent: {
+      schemaVersion: 1,
+      type: "propose_code_action",
+      operation: "modify",
+      objective: "修复 Issue",
+      acceptanceCriteria: ["回归测试通过"],
+      evidence: [],
       summary: "创建受控代码任务",
       reason: "需要在隔离副本中验证修复",
     },
@@ -120,13 +191,30 @@ function grantFor(value, overrides = {}) {
     ...(overrides.subject ?? {}),
   };
   const source = { ...value.source, ...(overrides.source ?? {}) };
-  const inputBinding = {
-    ...value.binding.inputBinding,
-    repository,
-    pullRequestNumber: subject.number,
-    eventId: source.eventId,
-    ...(overrides.inputBinding ?? {}),
-  };
+  const inputBinding = value.binding.inputBinding === null
+    ? null
+    : (() => {
+        const requestedHeadRefOid =
+          overrides.inputBinding?.headRefOid ??
+          value.binding.inputBinding.headRefOid;
+        return {
+          ...value.binding.inputBinding,
+          repository,
+          pullRequestNumber: subject.number,
+          eventId: source.eventId,
+          headRefOid: requestedHeadRefOid,
+          ...(value.binding.inputBinding.schemaVersion === 2
+            ? {
+                gitTarget: {
+                  ...value.binding.inputBinding.gitTarget,
+                  baseRepository: repository,
+                  headRefOid: requestedHeadRefOid,
+                },
+              }
+            : {}),
+          ...(overrides.inputBinding ?? {}),
+        };
+      })();
   return createCodeJobGrant({
     schemaVersion: 2,
     proposalId: overrides.proposalId ?? value.proposalId,
@@ -234,6 +322,20 @@ test("a policy-bound code proposal becomes one exact local job creation approval
   const queued = normalizeConfirmationPlan(plan);
   assert.match(queued.displayedPayloadDigest, /^[a-f0-9]{64}$/);
   assert.match(queued.approvalBindingDigest, /^[a-f0-9]{64}$/);
+});
+
+test("legacy PR proposals cannot enter a new code-job confirmation", () => {
+  const value = legacyProposal();
+  assertInvalid(() =>
+    createCodeActionProposalConfirmationPlan(value, options(grantFor(value))),
+  );
+});
+
+test("Issue proposals with a null input binding still enter confirmation", () => {
+  const value = issueProposal();
+  assert.doesNotThrow(() =>
+    createCodeActionProposalConfirmationPlan(value, options(grantFor(value))),
+  );
 });
 
 test("confirmation accepts exact proposal authority and rejects ambiguous targets", () => {

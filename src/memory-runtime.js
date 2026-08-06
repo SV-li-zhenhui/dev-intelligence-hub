@@ -24,12 +24,31 @@ function frozenPort(source, methods) {
   );
 }
 
+function requireAuthoritySource(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value.readStatus !== "function"
+  ) {
+    throw new TypeError("memory authority source is invalid");
+  }
+  return Object.freeze({ readStatus: value.readStatus.bind(value) });
+}
+
+function authorityNotCurrent() {
+  return Object.assign(
+    new Error("记忆权威投影尚未追平当前工作台账"),
+    { code: "MEMORY_AUTHORITY_NOT_CURRENT", statusCode: 503 },
+  );
+}
+
 export async function createMemoryRuntime({
   store,
   operationQueue = new OperationQueue(),
   maximumRecords,
   maximumStateBytes,
   createGuard = (options) => new ProcessExclusiveGuard(options),
+  authoritySource = null,
 } = {}) {
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
@@ -50,10 +69,65 @@ export async function createMemoryRuntime({
       ...(maximumStateBytes === undefined ? {} : { maximumStateBytes }),
     });
     await journal.recover();
+    const boundAuthoritySource = authoritySource === null
+      ? null
+      : requireAuthoritySource(authoritySource);
+    const assertAuthorityCurrent = async () => {
+      if (boundAuthoritySource === null) {
+        if (journal.requiresLiveAuthority()) throw authorityNotCurrent();
+        return null;
+      }
+      const status = await boundAuthoritySource.readStatus();
+      const local = journal.getAuthorityState();
+      const graph = status?.graph;
+      if (
+        !Number.isSafeInteger(status?.ledgerRevision) ||
+        status.ledgerRevision !== local.workLedgerRevision ||
+        !Number.isSafeInteger(graph?.cursor) ||
+        graph.cursor !== graph.highWatermark ||
+        local.cursor !== graph.cursor ||
+        local.checkpointDigest !== graph.checkpointDigest ||
+        graph.checkpointDigest !== graph.highWatermarkDigest ||
+        local.authorityStateDigest !== graph.authorityStateDigest
+      ) {
+        throw authorityNotCurrent();
+      }
+      return { status, local };
+    };
     return Object.freeze({
       producer: frozenPort(journal, ["append", "appendBatch"]),
-      search: frozenPort(journal, ["search", "getHealth"]),
-      contextReader: frozenPort(journal, ["readRecords"]),
+      lifecycleProducer: frozenPort(journal, [
+        "appendWorkItems",
+        "appendGraphEvents",
+        "appendProjectionRecords",
+        "adoptGraphCheckpoint",
+      ]),
+      search: Object.freeze({
+        search: async (value) => {
+          await assertAuthorityCurrent();
+          return journal.search(value);
+        },
+        getHealth: async () => {
+          const authority = await assertAuthorityCurrent();
+          return Object.freeze({
+            ...journal.getHealth(),
+            authorityCurrent: true,
+            ...(authority === null
+              ? {}
+              : {
+                  workLedgerRevision: authority.local.workLedgerRevision,
+                  graphMemoryCursor: authority.local.cursor,
+                }),
+          });
+        },
+      }),
+      contextReader: Object.freeze({
+        readRecords: async (value) => {
+          await assertAuthorityCurrent();
+          return journal.readRecords(value);
+        },
+      }),
+      authorityReader: frozenPort(journal, ["getAuthorityState"]),
       receiptVerifier: Object.freeze({
         verify: journal.verifyReceipt.bind(journal),
       }),

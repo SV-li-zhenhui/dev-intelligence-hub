@@ -51,6 +51,7 @@ const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
   "confirmationProducer",
+  "inputAuthorityVerifier",
   "actorAccountId",
   "clock",
   "pollIntervalMs",
@@ -275,23 +276,32 @@ function transitionFor(item, clock, pollIntervalMs) {
 export class GitHubReviewProposalHandler {
   #enqueue;
   #get;
+  #invalidate;
+  #verifyInputAuthority;
   #actorAccountId;
   #clock;
   #pollIntervalMs;
 
   constructor({
     confirmationProducer,
+    inputAuthorityVerifier,
     actorAccountId,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
   } = {}) {
     const producer = requirePort(
       confirmationProducer,
-      ["enqueue", "get"],
+      ["enqueue", "get", "invalidate"],
       "confirmationProducer",
     );
     this.#enqueue = producer.enqueue;
     this.#get = producer.get;
+    this.#invalidate = producer.invalidate;
+    this.#verifyInputAuthority = requirePort(
+      inputAuthorityVerifier,
+      ["verify"],
+      "inputAuthorityVerifier",
+    ).verify;
     this.#actorAccountId = normalizeActor(actorAccountId);
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.#clock = clock;
@@ -306,18 +316,100 @@ export class GitHubReviewProposalHandler {
     const input = normalizeHandlerInput(value);
     const plan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
       actorAccountId: this.#actorAccountId,
+      legacyRecovery: true,
     });
     const expected = normalizeConfirmationPlan(plan);
+    const inputBinding =
+      plan.action.inputBinding ?? plan.display.payload.inputBinding;
+    const legacyInputBinding =
+      inputBinding !== null &&
+      inputBinding !== undefined &&
+      inputBinding.schemaVersion !== 2;
     if (input.downstreamRef !== null && input.downstreamRef !== expected.id) {
       throw invalidConfirmation("GitHub Review 确认绑定已变化");
     }
-    const item = normalizeConfirmationItem(
-      input.downstreamRef === null
-        ? await this.#enqueue(plan)
-        : await this.#get(input.downstreamRef),
-      expected,
-    );
+    let item = null;
+    if (input.downstreamRef !== null) {
+      try {
+        item = normalizeConfirmationItem(
+          await this.#get(input.downstreamRef),
+          expected,
+        );
+      } catch (error) {
+        if (!legacyInputBinding || error?.code !== "CONFIRMATION_NOT_FOUND") {
+          throw error;
+        }
+      }
+    }
+    if (!(await this.#hasCurrentAuthority(inputBinding))) {
+      if (item === null) {
+        return {
+          status: "stale",
+          summary: "GitHub Review 授权已变化，未进入确认队列",
+          evidence: [
+            "authorization_changed",
+            `proposal:${input.proposal.proposalId}`,
+          ],
+        };
+      }
+      return this.#invalidateChangedAuthorization(
+        item,
+        expected,
+        input.proposal,
+      );
+    }
+    if (item === null) {
+      item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
+    }
     return transitionFor(item, this.#clock, this.#pollIntervalMs);
+  }
+
+  async #hasCurrentAuthority(inputBinding) {
+    if (inputBinding?.schemaVersion !== 2) return false;
+    let verified;
+    try {
+      verified = await this.#verifyInputAuthority(
+        cloneWorkProposalValue(inputBinding),
+      );
+    } catch {
+      return false;
+    }
+    return sameValue(verified, inputBinding);
+  }
+
+  async #invalidateChangedAuthorization(item, expected, proposal) {
+    let current = item;
+    if (
+      item.status === "pending" ||
+      (item.status === "failed" && item.failure?.retryable) ||
+      item.status === "stale"
+    ) {
+      try {
+        current = normalizeConfirmationItem(
+          await this.#invalidate(item.id, {
+            requestedBy: proposal.requestedBy,
+            approvalBindingDigest: item.approvalBindingDigest,
+            reason: "authorization_changed",
+          }),
+          expected,
+        );
+      } catch (error) {
+        if (error?.code !== "CONFIRMATION_NOT_INVALIDATABLE") throw error;
+        current = normalizeConfirmationItem(
+          await this.#get(item.id),
+          expected,
+        );
+      }
+    }
+    if (current.status === "pending") {
+      throw invalidConfirmation("旧 GitHub Review 确认未能安全撤销");
+    }
+    return terminal(
+      "stale",
+      "GitHub Review 授权已变化，旧确认已撤销或隔离",
+      current,
+      ["authorization_changed", `old_confirmation_status:${current.status}`],
+    );
   }
 }
 
@@ -348,6 +440,7 @@ export function createGitHubReviewProposalRunnerService(value = {}) {
   }
   const handler = new GitHubReviewProposalHandler({
     confirmationProducer: options.confirmationProducer,
+    inputAuthorityVerifier: options.inputAuthorityVerifier,
     actorAccountId: options.actorAccountId,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,

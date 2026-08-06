@@ -150,6 +150,7 @@ test(
         gitInspector: inspector,
         store: new StateStore(stateRoot),
         exclusiveLease: guard,
+        applicationAuthorityVerifier: { verify: async () => true },
         clock: () => new Date("2026-08-02T03:00:00.000Z"),
       });
 

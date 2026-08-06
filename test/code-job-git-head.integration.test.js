@@ -63,7 +63,7 @@ async function git(gitCommand, cwd, args) {
 
 function inputBinding(headRefOid) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "pull_request",
     repository: "acme/dashboard",
     pullRequestNumber: 42,
@@ -75,6 +75,17 @@ function inputBinding(headRefOid) {
     eventId: "github-event-pr-42",
     eventDigest: "2".repeat(64),
     inputDigest: "3".repeat(64),
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/dashboard",
+      baseRefName: "main",
+      baseRefOid: headRefOid,
+      headRepository: "contributor/dashboard",
+      headRefName: "fix/conflict",
+      headRefOid,
+    },
   };
 }
 

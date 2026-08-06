@@ -6,7 +6,10 @@ import {
   normalizeWorkflowEvent,
 } from "../domain/workflow-events.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
-import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
+import {
+  normalizePullRequestExecutionBinding,
+  pullRequestExecutionBindingMatchesEvent,
+} from "../domain/pull-request-execution-binding.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -244,11 +247,7 @@ function normalizeContext(value) {
     const binding = context.inputBinding;
     if (
       !context.event.eventType.startsWith("pull_request.") ||
-      binding.repository !== context.event.subject.repository ||
-      binding.pullRequestNumber !== context.event.subject.number ||
-      binding.eventId !== context.event.eventId ||
-      binding.eventDigest !== context.event.contentDigest ||
-      binding.headRefOid !== context.event.payload?.headRefOid
+      !pullRequestExecutionBindingMatchesEvent(binding, context.event)
     ) {
       contextError("inputBinding 与工作事件不匹配");
     }
@@ -423,6 +422,10 @@ export function createWorkIntentPolicy({
       const repository = context.event.subject.repository;
       const workspaceId = trustedWorkspaces.get(repository);
       if (!workspaceId) denied("事件仓库没有受信工作区映射");
+      const inputBinding = proposalInputBinding(context);
+      if (inputBinding !== null && inputBinding.schemaVersion !== 2) {
+        denied("旧版 PR 输入绑定只能恢复查看，不能创建新的代码工作提案");
+      }
       return baseBound(
         context,
         version,
@@ -431,7 +434,7 @@ export function createWorkIntentPolicy({
           ...eventBinding(context.event),
           repository,
           workspaceId,
-          inputBinding: proposalInputBinding(context),
+          inputBinding,
           ...proposalAuthorityBinding(context, intent),
         },
         {

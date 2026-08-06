@@ -661,10 +661,22 @@ function terminalSupersessionTaskIds(value, maximumTasks) {
   return new Set(ids);
 }
 
+function supersededReactivationTaskIds(value, maximumTasks) {
+  if (value === undefined) return new Set();
+  const ids = denseArray(value, maximumTasks).map((taskId) =>
+    boundedText(taskId, "supersededReactivationTaskId", 256, SAFE_ID)
+  );
+  if (new Set(ids).size !== ids.length) {
+    throw invalid("supersededReactivationTaskIds 重复");
+  }
+  return new Set(ids);
+}
+
 function assertTaskStatusTransition(
   previousTask,
   nextTask,
   reactivationIds,
+  supersededReactivationIds,
   supersessionIds,
 ) {
   const {
@@ -689,10 +701,17 @@ function assertTaskStatusTransition(
     nextStatus === "superseded" &&
     nextRevision === previousRevision + 1 &&
     sameValue(previousContent, nextContent);
+  const allowedSupersededReactivation =
+    previousStatus === "superseded" &&
+    supersededReactivationIds.has(previousTask.taskId) &&
+    ["in_progress", "pending"].includes(nextStatus) &&
+    nextRevision === previousRevision + 1 &&
+    sameValue(previousContent, nextContent);
   if (
     TERMINAL_TASK_STATUSES.has(previousStatus) &&
     !sameValue(previousTask, nextTask) &&
     !allowedReactivation &&
+    !allowedSupersededReactivation &&
     !allowedSupersession
   ) {
     throw graphError(
@@ -719,6 +738,7 @@ function assertNoTerminalAncestor(task, tasksById) {
 export function validateWorkGraphTransition(previousValue, nextValue, optionsValue) {
   const options = normalizeOptions(optionsValue, [
     "limits",
+    "supersededReactivationTaskIds",
     "terminalReactivationTaskIds",
     "terminalSupersessionTaskIds",
   ]);
@@ -736,6 +756,10 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
   );
   const supersessionIds = terminalSupersessionTaskIds(
     options.terminalSupersessionTaskIds,
+    (normalizationOptions?.limits?.maxTasks ?? WORK_GRAPH_DEFAULT_LIMITS.maxTasks),
+  );
+  const supersededReactivationIds = supersededReactivationTaskIds(
+    options.supersededReactivationTaskIds,
     (normalizationOptions?.limits?.maxTasks ?? WORK_GRAPH_DEFAULT_LIMITS.maxTasks),
   );
   if (
@@ -764,6 +788,7 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
       previousTask,
       nextTask,
       reactivationIds,
+      supersededReactivationIds,
       supersessionIds,
     );
     const changed = !sameValue(

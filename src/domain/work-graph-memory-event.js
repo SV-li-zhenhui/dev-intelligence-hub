@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { MemoryRecordError, normalizeMemoryRecord } from "./memory-record.js";
+import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 import {
   normalizeWorkGraphAcceptanceContract,
   normalizeWorkGraphDelivery,
@@ -10,6 +12,8 @@ const EVENT_KINDS = new Set([
   "delivery_submitted",
   "delivery_accepted",
   "delivery_rejected",
+  "authority_invalidated",
+  "authority_observed",
 ]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -19,6 +23,14 @@ const MAX_MEMORY_TITLE_BYTES = 1_024;
 const MAX_MEMORY_CONTENT_BYTES = 32 * 1_024;
 const MEMORY_DESCRIPTION_PREVIEW_BYTES = 256;
 const MEMORY_DESCRIPTION_PREVIEW_COUNT = 4;
+const SOURCE_AUTHORITY_KEYS = [
+  "applies",
+  "citable",
+  "bindingDigest",
+  "executionBinding",
+  "provenance",
+];
+const PROVENANCE_KEYS = ["provider", "scopeId"];
 
 export class WorkGraphMemoryEventError extends Error {
   constructor(message = "任务图记忆事件无效", options) {
@@ -125,6 +137,107 @@ function digestValue(value) {
     .digest("hex");
 }
 
+export function normalizeWorkGraphSourceAuthority(value) {
+  const fields = exact(value, SOURCE_AUTHORITY_KEYS, "sourceAuthority");
+  if (
+    typeof fields.get("applies") !== "boolean" ||
+    typeof fields.get("citable") !== "boolean"
+  ) {
+    throw invalid("sourceAuthority 无效");
+  }
+  if (fields.get("applies") === false) {
+    if (
+      fields.get("citable") !== true ||
+      fields.get("bindingDigest") !== null ||
+      fields.get("executionBinding") !== null ||
+      fields.get("provenance") !== null
+    ) {
+      throw invalid("sourceAuthority 无效");
+    }
+    return {
+      applies: false,
+      citable: true,
+      bindingDigest: null,
+      executionBinding: null,
+      provenance: null,
+    };
+  }
+  let executionBinding;
+  try {
+    executionBinding = normalizePullRequestExecutionBinding(
+      fields.get("executionBinding"),
+    );
+  } catch {
+    throw invalid("sourceAuthority executionBinding 无效");
+  }
+  const provenanceFields = exact(
+    fields.get("provenance"),
+    PROVENANCE_KEYS,
+    "sourceAuthority.provenance",
+  );
+  const provenance = {
+    provider: text(
+      provenanceFields.get("provider"),
+      "sourceAuthority.provenance.provider",
+      128,
+    ),
+    scopeId: text(
+      provenanceFields.get("scopeId"),
+      "sourceAuthority.provenance.scopeId",
+      256,
+    ),
+  };
+  const bindingDigest = digest(
+    fields.get("bindingDigest"),
+    "sourceAuthority.bindingDigest",
+  );
+  if (
+    bindingDigest !== digestValue({ executionBinding, provenance }) ||
+    (fields.get("citable") && executionBinding.schemaVersion !== 2)
+  ) {
+    throw invalid("sourceAuthority 绑定摘要无效");
+  }
+  return {
+    applies: true,
+    citable: fields.get("citable"),
+    bindingDigest,
+    executionBinding: structuredClone(executionBinding),
+    provenance,
+  };
+}
+
+export function createWorkGraphSourceAuthority({
+  executionBinding = null,
+  provenance = null,
+  citable = true,
+} = {}) {
+  if (executionBinding === null) {
+    return normalizeWorkGraphSourceAuthority({
+      applies: false,
+      citable: true,
+      bindingDigest: null,
+      executionBinding: null,
+      provenance: null,
+    });
+  }
+  const normalizedBinding = normalizePullRequestExecutionBinding(
+    executionBinding,
+  );
+  const normalizedProvenance = Object.fromEntries(
+    exact(provenance, PROVENANCE_KEYS, "sourceAuthority.provenance"),
+  );
+  return normalizeWorkGraphSourceAuthority({
+    applies: true,
+    citable,
+    bindingDigest: digestValue({
+      executionBinding: normalizedBinding,
+      provenance: normalizedProvenance,
+    }),
+    executionBinding: normalizedBinding,
+    provenance: normalizedProvenance,
+  });
+}
+
 function rawMemoryRecord(value) {
   const { recordId: _recordId, contentDigest: _contentDigest, ...record } =
     normalizeMemoryRecord(value);
@@ -207,6 +320,7 @@ function acceptanceContractMemoryContent(context, record, sourceRecordDigest) {
     projectionSchemaVersion: 1,
     truncated: true,
     taskId: context.taskId,
+    sourceAuthority: context.sourceAuthority,
     sourceRecordDigest,
     contractRevision: record.revision,
     acceptanceCriteriaCount: record.acceptanceCriteria.length,
@@ -251,6 +365,7 @@ function deliveryMemoryContent(context, content, sourceRecordDigest) {
     projectionSchemaVersion: 1,
     truncated: true,
     taskId: context.taskId,
+    sourceAuthority: context.sourceAuthority,
     sourceRecordDigest,
     deliverableId: content.deliverableId,
     deliveryRevision: content.revision,
@@ -261,7 +376,7 @@ function deliveryMemoryContent(context, content, sourceRecordDigest) {
   return memoryContent({ ...summary, evidence: content.evidence }, summary);
 }
 
-function graphContext(item) {
+function graphContext(item, sourceAuthority) {
   const source = plainData(item.source);
   const current = plainData(source?.current);
   const event = plainData(
@@ -282,6 +397,7 @@ function graphContext(item) {
   const sourceKind = eventType?.startsWith("pull_request.") ? "pull" : "issues";
   return {
     taskId,
+    sourceAuthority,
     repository,
     subjectNumber,
     title: title.trim() ? title : taskId,
@@ -338,8 +454,14 @@ function normalizeStoredRecord(kind, value) {
   };
 }
 
-function memoryRecordForGraphRecord(item, kind, record, sourceRecordDigest) {
-  const context = graphContext(item);
+function memoryRecordForGraphRecord(
+  item,
+  kind,
+  record,
+  sourceRecordDigest,
+  sourceAuthority,
+) {
+  const context = graphContext(item, sourceAuthority);
   const { recordedAt, ...content } = record;
   if (kind === "acceptance_contract") {
     const candidate = {
@@ -356,6 +478,7 @@ function memoryRecordForGraphRecord(item, kind, record, sourceRecordDigest) {
       summary: `${record.acceptanceCriteria.length} 条验收标准 · ${record.expectedDeliverables.length} 项预期交付`,
       content: JSON.stringify({
         taskId: context.taskId,
+        sourceAuthority: context.sourceAuthority,
         acceptanceContract: content,
       }),
       evidence: [],
@@ -387,6 +510,7 @@ function memoryRecordForGraphRecord(item, kind, record, sourceRecordDigest) {
     summary: safeText(record.summary, 8_192),
     content: JSON.stringify({
       taskId: context.taskId,
+      sourceAuthority: context.sourceAuthority,
       deliverableId: content.deliverableId,
       deliveryRevision: content.revision,
       contractRevision: content.contractRevision,
@@ -410,7 +534,7 @@ function memoryRecordForGraphRecord(item, kind, record, sourceRecordDigest) {
 
 function eventCore(value) {
   return {
-    schemaVersion: 1,
+    schemaVersion: value.schemaVersion,
     sequence: value.sequence,
     previousDigest: value.previousDigest,
     ledgerRevision: value.ledgerRevision,
@@ -420,12 +544,23 @@ function eventCore(value) {
     sourceRecordDigest: value.sourceRecordDigest,
     kind: value.kind,
     occurredAt: value.occurredAt,
+    ...(value.schemaVersion === 2
+      ? {
+          sourceAuthority: value.sourceAuthority,
+          authorityStateDigest: value.authorityStateDigest,
+        }
+      : {}),
     memoryRecord: value.memoryRecord,
   };
 }
 
 export function workGraphMemorySourceRecordDigest({ taskId, kind, record }) {
-  if (!EVENT_KINDS.has(kind)) throw invalid("kind 无效");
+  if (
+    !EVENT_KINDS.has(kind) ||
+    ["authority_invalidated", "authority_observed"].includes(kind)
+  ) {
+    throw invalid("kind 无效");
+  }
   const normalizedTaskId = text(taskId, "taskId", 192);
   const normalizedRecord = normalizeStoredRecord(kind, record);
   return digestValue({
@@ -443,8 +578,87 @@ export function createWorkGraphMemoryEvent({
   item,
   kind,
   record,
+  sourceAuthority = createWorkGraphSourceAuthority(),
+  authorityStateDigest = digestValue([]),
 }) {
-  if (!EVENT_KINDS.has(kind)) throw invalid("kind 无效");
+  if (
+    !EVENT_KINDS.has(kind) ||
+    ["authority_invalidated", "authority_observed"].includes(kind)
+  ) {
+    throw invalid("kind 无效");
+  }
+  const normalizedSequence = integer(sequence, "sequence", 1);
+  const normalizedPreviousDigest = previousDigest === null
+    ? null
+    : digest(previousDigest, "previousDigest");
+  if ((normalizedSequence === 1) !== (normalizedPreviousDigest === null)) {
+    throw invalid("previousDigest 与 sequence 不一致");
+  }
+  const normalizedLedgerRevision = integer(
+    ledgerRevision,
+    "ledgerRevision",
+    1,
+  );
+  const normalizedTaskRevision = integer(taskRevision, "taskRevision", 1);
+  if (normalizedTaskRevision > normalizedLedgerRevision) {
+    throw invalid("taskRevision 超过 ledgerRevision");
+  }
+  const normalizedRecord = normalizeStoredRecord(kind, record);
+  const normalizedAuthority = normalizeWorkGraphSourceAuthority(sourceAuthority);
+  const normalizedAuthorityStateDigest = digest(
+    authorityStateDigest,
+    "authorityStateDigest",
+  );
+  const taskId = text(item?.itemId, "taskId", 192);
+  const sourceRecordDigest = workGraphMemorySourceRecordDigest({
+    taskId,
+    kind,
+    record: normalizedRecord,
+  });
+  const core = eventCore({
+    schemaVersion: 2,
+    sequence: normalizedSequence,
+    previousDigest: normalizedPreviousDigest,
+    ledgerRevision: normalizedLedgerRevision,
+    taskId,
+    taskRevision: normalizedTaskRevision,
+    recordRevision: normalizedRecord.revision,
+    sourceRecordDigest,
+    kind,
+    occurredAt: normalizedRecord.recordedAt,
+    sourceAuthority: normalizedAuthority,
+    authorityStateDigest: normalizedAuthorityStateDigest,
+    memoryRecord: memoryRecordForGraphRecord(
+      item,
+      kind,
+      normalizedRecord,
+      sourceRecordDigest,
+      normalizedAuthority,
+    ),
+  });
+  const eventDigest = digestValue(core);
+  return {
+    ...core,
+    eventId: `work-graph-memory-event-${eventDigest}`,
+    eventDigest,
+  };
+}
+
+export function createLegacyWorkGraphMemoryEvent({
+  sequence,
+  previousDigest,
+  ledgerRevision,
+  taskRevision,
+  item,
+  kind,
+  record,
+}) {
+  if (
+    !EVENT_KINDS.has(kind) ||
+    ["authority_invalidated", "authority_observed"].includes(kind)
+  ) {
+    throw invalid("kind 无效");
+  }
   const normalizedSequence = integer(sequence, "sequence", 1);
   const normalizedPreviousDigest = previousDigest === null
     ? null
@@ -469,6 +683,7 @@ export function createWorkGraphMemoryEvent({
     record: normalizedRecord,
   });
   const core = eventCore({
+    schemaVersion: 1,
     sequence: normalizedSequence,
     previousDigest: normalizedPreviousDigest,
     ledgerRevision: normalizedLedgerRevision,
@@ -483,7 +698,203 @@ export function createWorkGraphMemoryEvent({
       kind,
       normalizedRecord,
       sourceRecordDigest,
+      undefined,
     ),
+  });
+  const eventDigest = digestValue(core);
+  return {
+    ...core,
+    eventId: `work-graph-memory-event-${eventDigest}`,
+    eventDigest,
+  };
+}
+
+export function createWorkGraphAuthorityInvalidationEvent({
+  sequence,
+  previousDigest,
+  ledgerRevision,
+  taskRevision,
+  item,
+  occurredAt,
+  reason,
+  sourceAuthority,
+  authorityStateDigest,
+}) {
+  const normalizedSequence = integer(sequence, "sequence", 1);
+  const normalizedPreviousDigest = previousDigest === null
+    ? null
+    : digest(previousDigest, "previousDigest");
+  if ((normalizedSequence === 1) !== (normalizedPreviousDigest === null)) {
+    throw invalid("previousDigest 与 sequence 不一致");
+  }
+  const normalizedLedgerRevision = integer(
+    ledgerRevision,
+    "ledgerRevision",
+    1,
+  );
+  const normalizedTaskRevision = integer(taskRevision, "taskRevision", 1);
+  if (normalizedTaskRevision > normalizedLedgerRevision) {
+    throw invalid("taskRevision 超过 ledgerRevision");
+  }
+  const normalizedOccurredAt = timestamp(occurredAt, "occurredAt");
+  const normalizedReason = text(reason, "reason", 128);
+  const normalizedAuthority = normalizeWorkGraphSourceAuthority({
+    ...sourceAuthority,
+    citable: false,
+  });
+  const normalizedAuthorityStateDigest = digest(
+    authorityStateDigest,
+    "authorityStateDigest",
+  );
+  if (!normalizedAuthority.applies) {
+    throw invalid("authority invalidation 缺少 PR 来源绑定");
+  }
+  const context = graphContext(item, normalizedAuthority);
+  const sourceRecordDigest = digestValue({
+    taskId: context.taskId,
+    reason: normalizedReason,
+    sourceAuthority: normalizedAuthority,
+    authorityStateDigest: normalizedAuthorityStateDigest,
+  });
+  const memoryRecord = rawMemoryRecord({
+    schemaVersion: 1,
+    source: {
+      kind: "work-authority-lifecycle",
+      id:
+        `${context.taskId}:authority:${normalizedAuthority.bindingDigest}:` +
+        `ledger:${normalizedLedgerRevision}`,
+    },
+    occurredAt: normalizedOccurredAt,
+    roleId: null,
+    repository: context.repository,
+    eventType: "work.authority_invalidated",
+    title: memoryTitle("旧 PR 工作结论已失效：", context.title),
+    summary: safeText(normalizedReason, 8_192),
+    content: memoryContent({
+      projectionSchemaVersion: 2,
+      taskId: context.taskId,
+      reason: normalizedReason,
+      sourceAuthority: normalizedAuthority,
+      authorityStateDigest: normalizedAuthorityStateDigest,
+      sourceRecordDigest,
+    }, {
+      taskId: context.taskId,
+      reason: normalizedReason,
+      sourceAuthority: normalizedAuthority,
+      authorityStateDigest: normalizedAuthorityStateDigest,
+      sourceRecordDigest,
+    }),
+    evidence: [
+      `supersedes-work-authority-binding:${normalizedAuthority.bindingDigest}`,
+    ],
+    tags: ["work", "authority", "supersession", "obsolete"],
+    sourceUrl: context.sourceUrl,
+    subjectNumber: context.subjectNumber,
+  });
+  const core = eventCore({
+    schemaVersion: 2,
+    sequence: normalizedSequence,
+    previousDigest: normalizedPreviousDigest,
+    ledgerRevision: normalizedLedgerRevision,
+    taskId: context.taskId,
+    taskRevision: normalizedTaskRevision,
+    recordRevision: normalizedTaskRevision,
+    sourceRecordDigest,
+    kind: "authority_invalidated",
+    occurredAt: normalizedOccurredAt,
+    sourceAuthority: normalizedAuthority,
+    authorityStateDigest: normalizedAuthorityStateDigest,
+    memoryRecord,
+  });
+  const eventDigest = digestValue(core);
+  return {
+    ...core,
+    eventId: `work-graph-memory-event-${eventDigest}`,
+    eventDigest,
+  };
+}
+
+export function createWorkGraphAuthorityObservationEvent({
+  sequence,
+  previousDigest,
+  ledgerRevision,
+  taskRevision,
+  item,
+  occurredAt,
+  sourceAuthority,
+  authorityStateDigest,
+}) {
+  const normalizedSequence = integer(sequence, "sequence", 1);
+  const normalizedPreviousDigest = previousDigest === null
+    ? null
+    : digest(previousDigest, "previousDigest");
+  if ((normalizedSequence === 1) !== (normalizedPreviousDigest === null)) {
+    throw invalid("previousDigest 与 sequence 不一致");
+  }
+  const normalizedLedgerRevision = integer(ledgerRevision, "ledgerRevision", 1);
+  const normalizedTaskRevision = integer(taskRevision, "taskRevision", 1);
+  const normalizedOccurredAt = timestamp(occurredAt, "occurredAt");
+  const normalizedAuthority = normalizeWorkGraphSourceAuthority(sourceAuthority);
+  const normalizedAuthorityStateDigest = digest(
+    authorityStateDigest,
+    "authorityStateDigest",
+  );
+  if (!normalizedAuthority.applies || normalizedTaskRevision > normalizedLedgerRevision) {
+    throw invalid("authority observation 无效");
+  }
+  const context = graphContext(item, normalizedAuthority);
+  const sourceRecordDigest = digestValue({
+    taskId: context.taskId,
+    sourceAuthority: normalizedAuthority,
+    authorityStateDigest: normalizedAuthorityStateDigest,
+  });
+  const memoryRecord = rawMemoryRecord({
+    schemaVersion: 1,
+    source: {
+      kind: "work-authority-lifecycle",
+      id:
+        `${context.taskId}:authority-observed:${normalizedAuthority.bindingDigest}:` +
+        `ledger:${normalizedLedgerRevision}`,
+    },
+    occurredAt: normalizedOccurredAt,
+    roleId: null,
+    repository: context.repository,
+    eventType: "work.authority_observed",
+    title: memoryTitle("PR 工作来源权威已核验：", context.title),
+    summary: normalizedAuthority.citable
+      ? "当前 PR 来源绑定可用于工作结论"
+      : "当前 PR 来源绑定不可用于工作结论",
+    content: memoryContent({
+      projectionSchemaVersion: 2,
+      taskId: context.taskId,
+      sourceAuthority: normalizedAuthority,
+      authorityStateDigest: normalizedAuthorityStateDigest,
+      sourceRecordDigest,
+    }, {
+      taskId: context.taskId,
+      sourceAuthority: normalizedAuthority,
+      authorityStateDigest: normalizedAuthorityStateDigest,
+      sourceRecordDigest,
+    }),
+    evidence: [],
+    tags: ["work", "authority", "observation", "obsolete"],
+    sourceUrl: context.sourceUrl,
+    subjectNumber: context.subjectNumber,
+  });
+  const core = eventCore({
+    schemaVersion: 2,
+    sequence: normalizedSequence,
+    previousDigest: normalizedPreviousDigest,
+    ledgerRevision: normalizedLedgerRevision,
+    taskId: context.taskId,
+    taskRevision: normalizedTaskRevision,
+    recordRevision: normalizedTaskRevision,
+    sourceRecordDigest,
+    kind: "authority_observed",
+    occurredAt: normalizedOccurredAt,
+    sourceAuthority: normalizedAuthority,
+    authorityStateDigest: normalizedAuthorityStateDigest,
+    memoryRecord,
   });
   const eventDigest = digestValue(core);
   return {
@@ -495,6 +906,7 @@ export function createWorkGraphMemoryEvent({
 
 export function normalizeWorkGraphMemoryEvent(value) {
   try {
+    const schemaVersion = value?.schemaVersion;
     const fields = exact(
       value,
       [
@@ -510,11 +922,14 @@ export function normalizeWorkGraphMemoryEvent(value) {
         "sourceRecordDigest",
         "kind",
         "occurredAt",
+        ...(schemaVersion === 2
+          ? ["sourceAuthority", "authorityStateDigest"]
+          : []),
         "memoryRecord",
       ],
       "任务图记忆事件",
     );
-    if (fields.get("schemaVersion") !== 1) throw invalid("schemaVersion 无效");
+    if (![1, 2].includes(schemaVersion)) throw invalid("schemaVersion 无效");
     const sequence = integer(fields.get("sequence"), "sequence", 1);
     const previousDigest = fields.get("previousDigest") === null
       ? null
@@ -523,9 +938,14 @@ export function normalizeWorkGraphMemoryEvent(value) {
       throw invalid("previousDigest 与 sequence 不一致");
     }
     const kind = fields.get("kind");
-    if (!EVENT_KINDS.has(kind)) throw invalid("kind 无效");
+    if (
+      !EVENT_KINDS.has(kind) ||
+      (schemaVersion === 1 && kind === "authority_invalidated")
+    ) {
+      throw invalid("kind 无效");
+    }
     const event = {
-      schemaVersion: 1,
+      schemaVersion,
       sequence,
       eventId: text(fields.get("eventId"), "eventId", 128),
       eventDigest: digest(fields.get("eventDigest"), "eventDigest"),
@@ -540,12 +960,37 @@ export function normalizeWorkGraphMemoryEvent(value) {
       ),
       kind,
       occurredAt: timestamp(fields.get("occurredAt"), "occurredAt"),
+      ...(schemaVersion === 2
+        ? {
+            sourceAuthority: normalizeWorkGraphSourceAuthority(fields.get("sourceAuthority")),
+            authorityStateDigest: digest(
+              fields.get("authorityStateDigest"),
+              "authorityStateDigest",
+            ),
+          }
+        : {}),
       memoryRecord: rawMemoryRecord(fields.get("memoryRecord")),
     };
     if (event.taskRevision > event.ledgerRevision) {
       throw invalid("任务图记忆事件修订无效");
     }
-    const expectedSource = kind === "acceptance_contract"
+    const expectedSource = kind === "authority_invalidated"
+      ? {
+          kind: "work-authority-lifecycle",
+          id:
+            `${event.taskId}:authority:${event.sourceAuthority.bindingDigest}:` +
+            `ledger:${event.ledgerRevision}`,
+          eventType: "work.authority_invalidated",
+        }
+      : kind === "authority_observed"
+        ? {
+            kind: "work-authority-lifecycle",
+            id:
+              `${event.taskId}:authority-observed:` +
+              `${event.sourceAuthority.bindingDigest}:ledger:${event.ledgerRevision}`,
+            eventType: "work.authority_observed",
+          }
+      : kind === "acceptance_contract"
       ? {
           kind: "work-contract",
           id: `${event.taskId}:contract:${event.recordRevision}`,
@@ -563,6 +1008,38 @@ export function normalizeWorkGraphMemoryEvent(value) {
       event.memoryRecord.occurredAt !== event.occurredAt
     ) {
       throw invalid("任务图记忆记录与事件来源不一致");
+    }
+    if (schemaVersion === 2) {
+      let content;
+      try {
+        content = JSON.parse(event.memoryRecord.content);
+      } catch {
+        throw invalid("任务图记忆记录来源绑定无效");
+      }
+      if (
+        !isDeepStrictEqual(content?.sourceAuthority, event.sourceAuthority) ||
+        (["authority_invalidated", "authority_observed"].includes(kind) &&
+          content?.authorityStateDigest !== event.authorityStateDigest)
+      ) {
+        throw invalid("任务图记忆记录来源绑定无效");
+      }
+      if (
+        kind === "authority_invalidated" &&
+        (!event.sourceAuthority.applies ||
+          event.sourceAuthority.citable ||
+          !event.memoryRecord.evidence.includes(
+            `supersedes-work-authority-binding:${event.sourceAuthority.bindingDigest}`,
+          ))
+      ) {
+        throw invalid("任务图记忆权威失效记录无效");
+      }
+      if (
+        kind === "authority_observed" &&
+        (!event.sourceAuthority.applies ||
+          event.memoryRecord.evidence.length !== 0)
+      ) {
+        throw invalid("任务图记忆权威观察记录无效");
+      }
     }
     const eventDigest = digestValue(eventCore(event));
     if (

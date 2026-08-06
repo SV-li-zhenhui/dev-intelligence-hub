@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
+import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { createPrReviewConfirmationPlan } from "../domain/pr-review-confirmation.js";
 import { EmployeeController } from "./employee-controller.js";
 
@@ -112,6 +113,7 @@ function isSameRunningClaim(job, claimed) {
       job.status === "running" &&
       job.fingerprint === claimed.fingerprint &&
       job.headRefOid === claimed.headRefOid &&
+      job.gitTargetDigest === claimed.gitTargetDigest &&
       job.policyVersion === claimed.policyVersion &&
       job.attempts === claimed.attempts &&
       job.startedAt === claimed.startedAt &&
@@ -148,8 +150,48 @@ function normalizedState(value) {
   };
 }
 
+function itemGitTargetDigest(item) {
+  if (item?.gitTargetAvailable !== true || !item.gitTarget) return null;
+  try {
+    const target = normalizePullRequestGitTarget(item.gitTarget);
+    if (
+      target.baseRepository !== item.repo ||
+      target.headRefOid !== item.headRefOid
+    ) {
+      return null;
+    }
+    return createHash("sha256")
+      .update(JSON.stringify(target), "utf8")
+      .digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function sameJobGitTarget(job, item) {
+  const currentDigest = itemGitTargetDigest(item);
+  return currentDigest !== null && currentDigest === job.gitTargetDigest;
+}
+
+function jobMatchesCurrentCandidate(job, item, policyVersion) {
+  return Boolean(
+    item &&
+      isCandidate(item) &&
+      item.headRefOid === job.headRefOid &&
+      sameJobGitTarget(job, item) &&
+      item.nextAction === job.nextAction &&
+      item.relation === job.relation &&
+      job.policyVersion === policyVersion,
+  );
+}
+
 function jobFingerprint(item, policyVersion) {
-  return [item.id, item.headRefOid, item.nextAction, policyVersion].join("\u0000");
+  return [
+    item.id,
+    itemGitTargetDigest(item),
+    item.nextAction,
+    policyVersion,
+  ].join("\u0000");
 }
 
 function jobId(fingerprint) {
@@ -168,6 +210,7 @@ function isCandidate(item) {
       item.actionState === "action_now" &&
       item.reviewFactsAvailable === true &&
       item.headRefOid &&
+      itemGitTargetDigest(item) !== null &&
       workPolicy(item),
   );
 }
@@ -437,6 +480,28 @@ export class ProactivePrEmployeeService {
   async #recoverConfirmations() {
     let state = await this.controller.readState();
     if (!this.#usesExternalConfirmations()) {
+      if (!this.producerQueue) return this.controller.project(state);
+      const legacyIds = state.jobs
+        .filter(
+          (job) =>
+            job.confirmationId &&
+            [
+              "confirmation_enqueue_pending",
+              "confirmation_invalidation_pending",
+              "waiting_confirmation",
+              "waiting_retry_confirmation",
+              "superseded",
+            ].includes(job.status),
+        )
+        .map((job) => job.id);
+      for (const id of legacyIds) {
+        const invalidated = await this.#invalidateSupersededConfirmation(
+          state,
+          id,
+          { failClosed: true },
+        );
+        state = invalidated.state;
+      }
       return this.controller.project(state);
     }
 
@@ -498,7 +563,9 @@ export class ProactivePrEmployeeService {
         continue;
       }
       if (job.status === "confirmation_enqueue_pending") {
-        state = await this.#enqueuePendingConfirmation(state, id);
+        state = await this.#enqueuePendingConfirmation(state, id, {
+          failClosed: true,
+        });
         continue;
       }
       if (job.confirmationId) {
@@ -527,7 +594,11 @@ export class ProactivePrEmployeeService {
     return this.controller.project(state);
   }
 
-  async #enqueuePendingConfirmation(state, id) {
+  async #enqueuePendingConfirmation(
+    state,
+    id,
+    { failClosed = false } = {},
+  ) {
     const index = state.jobs.findIndex((job) => job.id === id);
     if (index < 0) return state;
     const job = state.jobs[index];
@@ -536,6 +607,29 @@ export class ProactivePrEmployeeService {
       !job.confirmationIntent
     ) {
       return state;
+    }
+    const snapshot = await this.store.read("snapshot", null);
+    if (
+      !Array.isArray(snapshot?.items) ||
+      snapshot.sourceStatus?.githubPullRequests?.ok !== true
+    ) {
+      const updatedAt = this.clock().toISOString();
+      state.jobs[index] = {
+        ...job,
+        error: "GitHub PR 事实尚未健康刷新，确认不会进入队列",
+        updatedAt,
+      };
+      state.lastError = `#${job.number}: ${state.jobs[index].error}`;
+      return this.controller.writeState(state, { bumpRevision: false });
+    }
+    const current = snapshot.items.find((item) => item.id === job.subjectId);
+    if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
+      const invalidated = await this.#invalidateSupersededConfirmation(
+        state,
+        id,
+        { failClosed },
+      );
+      return invalidated.state;
     }
     try {
       const item = await this.producerQueue.enqueue(job.confirmationIntent);
@@ -651,11 +745,7 @@ export class ProactivePrEmployeeService {
     for (const id of ids) {
       const job = state.jobs.find((candidate) => candidate.id === id);
       const current = currentBySubject.get(job.subjectId);
-      if (
-        current?.headRefOid === job.headRefOid &&
-        current?.nextAction === job.nextAction &&
-        job.policyVersion === this.config.policyVersion
-      ) {
+      if (jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
         continue;
       }
       if (job.confirmationId) {
@@ -857,7 +947,12 @@ export class ProactivePrEmployeeService {
     }
     const snapshot = await this.store.read("snapshot");
     const current = snapshot?.items?.find((item) => item.id === job.subjectId);
-    if (!current || current.headRefOid !== job.headRefOid || !isCandidate(current)) {
+    if (
+      !current ||
+      current.headRefOid !== job.headRefOid ||
+      !sameJobGitTarget(job, current) ||
+      !isCandidate(current)
+    ) {
       state.jobs[index] = {
         ...job,
         status: "superseded",
@@ -975,11 +1070,7 @@ export class ProactivePrEmployeeService {
         continue;
       }
       const current = currentBySubject.get(job.subjectId);
-      if (
-        current?.headRefOid === job.headRefOid &&
-        current?.nextAction === job.nextAction &&
-        job.policyVersion === this.config.policyVersion
-      ) {
+      if (jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
         continue;
       }
       if (this.#usesExternalConfirmations() && job.confirmationId) {
@@ -1082,6 +1173,7 @@ export class ProactivePrEmployeeService {
       url: item.url,
       relation: item.relation,
       headRefOid: item.headRefOid,
+      gitTargetDigest: itemGitTargetDigest(item),
       nextAction: item.nextAction,
       triggerReason: item.actionReasons?.[0] || "PR 状态需要你采取行动",
       status: "queued",
@@ -1137,6 +1229,7 @@ export class ProactivePrEmployeeService {
         (candidate) =>
           candidate.id === claimed.subjectId &&
           candidate.headRefOid === claimed.headRefOid &&
+          sameJobGitTarget(claimed, candidate) &&
           candidate.nextAction === claimed.nextAction &&
           candidate.relation === claimed.relation,
       );
@@ -1147,7 +1240,10 @@ export class ProactivePrEmployeeService {
       const context = await this.github.loadReviewContext(item, {
         includePatch: policy.mode === "review",
       });
-      if (context.headRefOid !== claimed.headRefOid) {
+      if (
+        context.headRefOid !== claimed.headRefOid ||
+        !sameJobGitTarget(claimed, context)
+      ) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
       const analysis = await runAdmittedOperation(
@@ -1165,6 +1261,7 @@ export class ProactivePrEmployeeService {
       if (
         !current ||
         current.headRefOid !== claimed.headRefOid ||
+        !sameJobGitTarget(claimed, current) ||
         current.nextAction !== claimed.nextAction ||
         current.relation !== claimed.relation ||
         !isCandidate(current)
@@ -1214,6 +1311,9 @@ export class ProactivePrEmployeeService {
       }
       return state;
     } catch (error) {
+      if (stableFailureCode(error) === "PR_CONTEXT_STALE") {
+        return this.#finishAsSuperseded(state, claimed.id);
+      }
       if (RUNTIME_ADMISSION_FAILURES.has(stableFailureCode(error))) {
         throw error;
       }

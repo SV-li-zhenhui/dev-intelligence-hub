@@ -20,18 +20,20 @@ const SOURCE_REVISION = "5".repeat(64);
 
 function completedJob() {
   const grant = createCodeJobGrant({
+    schemaVersion: 2,
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
     requestedBy: { roleId: "developer", workItemId: "work-1" },
     source: { assignmentId: "assignment-1", eventId: "event-1" },
     subject: {
-      id: "github:acme/widgets:pull-request:17",
+      id: "github:issue:acme/widgets#17",
       repository: "acme/widgets",
       number: 17,
     },
     repository: "acme/widgets",
     workspaceId: "widgets-local",
+    inputBinding: null,
     workspaceAuthorityDigest: "9".repeat(64),
     operation: "modify",
     objective: "Fix the retry race",

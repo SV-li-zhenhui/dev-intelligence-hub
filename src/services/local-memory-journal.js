@@ -1,13 +1,20 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   normalizeMemoryRecord,
   projectMemoryRecord,
 } from "../domain/memory-record.js";
+import {
+  normalizeWorkGraphMemoryEvent,
+  normalizeWorkGraphSourceAuthority,
+  workGraphMemoryRecordReceipt,
+} from "../domain/work-graph-memory-event.js";
 
 export const MEMORY_JOURNAL_KEY = "unified-memory-records";
 export const MEMORY_INDEX_KEY = "unified-memory-index";
 const MAX_BATCH = 160;
+const MAX_WORK_ITEM_BATCH = 20_000;
 const MAX_READ_RECORDS = 20;
 const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
@@ -15,6 +22,22 @@ const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
 const SHA256 = /^[a-f0-9]{64}$/;
 const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/;
+const WORK_ITEM_REVISION = /^(.*):revision:([1-9][0-9]*)$/u;
+const WORK_ITEM_REVISION_SUPERSESSION =
+  "supersedes-work-item-revisions:";
+const WORK_GRAPH_SOURCE_SUPERSESSION =
+  "supersedes-work-graph-source:";
+const WORK_AUTHORITY_BINDING_SUPERSESSION =
+  "supersedes-work-authority-binding:";
+const RESERVED_WORK_SOURCES = new Set([
+  "work-item",
+  "work-contract",
+  "work-delivery",
+  "work-obsolescence",
+  "work-authority-lifecycle",
+  "work-timeline",
+  "legacy-pr-memory",
+]);
 const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const RECEIPT_KEYS = ["recordId", "contentDigest", "source"];
@@ -142,8 +165,391 @@ function positiveInteger(value, name, maximum) {
   return value;
 }
 
+function nonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw memoryError("MEMORY_JOURNAL_CORRUPTED", `${name} 无效`, 503);
+  }
+  return value;
+}
+
+function optionalDigest(value, name) {
+  if (value === null) return null;
+  if (typeof value !== "string" || !SHA256.test(value)) {
+    throw memoryError("MEMORY_JOURNAL_CORRUPTED", `${name} 无效`, 503);
+  }
+  return value;
+}
+
+function emptyLifecycleAuthority() {
+  return {
+    schemaVersion: 1,
+    baseCursor: 0,
+    baseCheckpointDigest: null,
+    graphCursor: 0,
+    graphCheckpointDigest: null,
+    authorityStateDigest: createHash("sha256")
+      .update("[]", "utf8")
+      .digest("hex"),
+    workLedgerRevision: 0,
+    graphReceipts: [],
+    workItemAttestations: [],
+  };
+}
+
+function legacyWorkItemAttestations(records) {
+  return records.flatMap((record) => {
+    if (record.source.kind !== "work-item") return [];
+    const match = record.source.id.match(WORK_ITEM_REVISION);
+    if (match === null) return [];
+    let sourceAuthority = null;
+    try {
+      sourceAuthority = normalizeWorkGraphSourceAuthority(
+        JSON.parse(record.content)?.sourceAuthority,
+      );
+    } catch {
+      sourceAuthority = null;
+    }
+    let legacyPrWorkItem = record.sourceUrl?.includes("/pull/") === true;
+    try {
+      legacyPrWorkItem ||= String(JSON.parse(record.content)?.eventType || "")
+        .startsWith("pull_request.");
+    } catch {}
+    return [{
+      recordId: record.recordId,
+      contentDigest: record.contentDigest,
+      itemId: match[1],
+      revision: Number(match[2]),
+      trusted: false,
+      bindingDigest: sourceAuthority?.bindingDigest ?? null,
+      citable: sourceAuthority?.citable ?? !legacyPrWorkItem,
+    }];
+  });
+}
+
+function normalizeWorkItemAttestation(value, recordsById) {
+  const includesTrusted =
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, "trusted");
+  const fields = exact(value, [
+    "recordId",
+    "contentDigest",
+    "itemId",
+    "revision",
+    ...(includesTrusted ? ["trusted"] : []),
+    "bindingDigest",
+    "citable",
+  ], "work item lifecycle attestation");
+  const record = recordsById.get(fields.recordId);
+  const match = record?.source?.kind === "work-item"
+    ? record.source.id.match(WORK_ITEM_REVISION)
+    : null;
+  if (
+    record === undefined ||
+    record.contentDigest !== fields.contentDigest ||
+    match === null ||
+    match[1] !== fields.itemId ||
+    Number(match[2]) !== fields.revision ||
+    (includesTrusted && typeof fields.trusted !== "boolean") ||
+    typeof fields.citable !== "boolean"
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "work item lifecycle attestation 无效",
+      503,
+    );
+  }
+  let trusted = includesTrusted ? fields.trusted : false;
+  if (!includesTrusted) {
+    try {
+      normalizeWorkGraphSourceAuthority(
+        JSON.parse(record.content)?.sourceAuthority,
+      );
+      trusted =
+        record.evidence.length === 1 &&
+        record.evidence[0] ===
+          `${WORK_ITEM_REVISION_SUPERSESSION}${match[1]}`;
+    } catch {
+      trusted = false;
+    }
+  }
+  return {
+    recordId: fields.recordId,
+    contentDigest: fields.contentDigest,
+    itemId: fields.itemId,
+    revision: fields.revision,
+    trusted,
+    bindingDigest: optionalDigest(
+      fields.bindingDigest,
+      "work item bindingDigest",
+    ),
+    citable: fields.citable,
+  };
+}
+
+function normalizeGraphReceipt(value, recordsById) {
+  const fields = exact(value, [
+    "schemaVersion",
+    "eventSchemaVersion",
+    "sequence",
+    "eventId",
+    "eventDigest",
+    "previousDigest",
+    "ledgerRevision",
+    "taskId",
+    "taskRevision",
+    "kind",
+    "recordRevision",
+    "sourceRecordDigest",
+    "occurredAt",
+    "memoryRecordId",
+    "memoryRecordDigest",
+    "sourceAuthority",
+    "bindingDigest",
+    "citable",
+    "invalidatedBindingDigest",
+    "authorityStateDigest",
+  ], "graph lifecycle receipt");
+  const record = recordsById.get(fields.memoryRecordId);
+  if (
+    fields.schemaVersion !== 2 ||
+    ![1, 2].includes(fields.eventSchemaVersion) ||
+    !Number.isSafeInteger(fields.sequence) ||
+    fields.sequence < 1 ||
+    typeof fields.eventId !== "string" ||
+    fields.eventId !== `work-graph-memory-event-${fields.eventDigest}` ||
+    typeof fields.eventDigest !== "string" ||
+    !SHA256.test(fields.eventDigest) ||
+    !(fields.previousDigest === null || SHA256.test(fields.previousDigest)) ||
+    !Number.isSafeInteger(fields.ledgerRevision) ||
+    fields.ledgerRevision < 1 ||
+    typeof fields.taskId !== "string" ||
+    fields.taskId.length === 0 ||
+    !Number.isSafeInteger(fields.taskRevision) ||
+    fields.taskRevision < 1 ||
+    typeof fields.kind !== "string" ||
+    !Number.isSafeInteger(fields.recordRevision) ||
+    fields.recordRevision < 1 ||
+    typeof fields.sourceRecordDigest !== "string" ||
+    !SHA256.test(fields.sourceRecordDigest) ||
+    typeof fields.occurredAt !== "string" ||
+    record?.contentDigest !== fields.memoryRecordDigest ||
+    record.recordId !== fields.memoryRecordId ||
+    typeof fields.citable !== "boolean"
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "graph lifecycle receipt 无效",
+      503,
+    );
+  }
+  const bindingDigest = optionalDigest(
+    fields.bindingDigest,
+    "graph bindingDigest",
+  );
+  const invalidatedBindingDigest = optionalDigest(
+    fields.invalidatedBindingDigest,
+    "graph invalidatedBindingDigest",
+  );
+  const receiptAuthorityStateDigest = optionalDigest(
+    fields.authorityStateDigest,
+    "graph receipt authorityStateDigest",
+  );
+  if (
+    (fields.eventSchemaVersion === 1) !==
+      (fields.sourceAuthority === null && receiptAuthorityStateDigest === null) ||
+    (fields.kind === "authority_invalidated") !==
+      (invalidatedBindingDigest !== null) ||
+    (fields.kind === "authority_invalidated" && fields.citable)
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "graph lifecycle authority 无效",
+      503,
+    );
+  }
+  const { recordId: _recordId, contentDigest: _contentDigest, ...memoryRecord } =
+    record;
+  let event;
+  try {
+    event = normalizeWorkGraphMemoryEvent({
+      schemaVersion: fields.eventSchemaVersion,
+      sequence: fields.sequence,
+      eventId: fields.eventId,
+      eventDigest: fields.eventDigest,
+      previousDigest: fields.previousDigest,
+      ledgerRevision: fields.ledgerRevision,
+      taskId: fields.taskId,
+      taskRevision: fields.taskRevision,
+      recordRevision: fields.recordRevision,
+      sourceRecordDigest: fields.sourceRecordDigest,
+      kind: fields.kind,
+      occurredAt: fields.occurredAt,
+      ...(fields.eventSchemaVersion === 2
+        ? {
+            sourceAuthority: fields.sourceAuthority,
+            authorityStateDigest: receiptAuthorityStateDigest,
+          }
+        : {}),
+      memoryRecord,
+    });
+  } catch (cause) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "graph lifecycle event 摘要无效",
+      503,
+      cause,
+    );
+  }
+  const expectedReceipt = workGraphMemoryRecordReceipt(event);
+  if (
+    expectedReceipt.memoryRecordId !== fields.memoryRecordId ||
+    expectedReceipt.memoryRecordDigest !== fields.memoryRecordDigest ||
+    (event.schemaVersion === 2 &&
+      (event.sourceAuthority.bindingDigest !== bindingDigest ||
+        event.sourceAuthority.citable !== fields.citable)) ||
+    (event.schemaVersion === 1 && (bindingDigest !== null || fields.citable))
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "graph lifecycle event 与记录不一致",
+      503,
+    );
+  }
+  return {
+    schemaVersion: 2,
+    eventSchemaVersion: event.schemaVersion,
+    sequence: fields.sequence,
+    eventId: fields.eventId,
+    eventDigest: fields.eventDigest,
+    previousDigest: fields.previousDigest,
+    ledgerRevision: fields.ledgerRevision,
+    taskId: fields.taskId,
+    taskRevision: fields.taskRevision,
+    kind: fields.kind,
+    recordRevision: fields.recordRevision,
+    sourceRecordDigest: fields.sourceRecordDigest,
+    occurredAt: fields.occurredAt,
+    memoryRecordId: fields.memoryRecordId,
+    memoryRecordDigest: fields.memoryRecordDigest,
+    sourceAuthority: event.schemaVersion === 2
+      ? structuredClone(event.sourceAuthority)
+      : null,
+    bindingDigest,
+    citable: fields.citable,
+    invalidatedBindingDigest,
+    authorityStateDigest: receiptAuthorityStateDigest,
+  };
+}
+
+function normalizeLifecycleAuthority(value, records) {
+  const fields = exact(value, [
+    "schemaVersion",
+    "baseCursor",
+    "baseCheckpointDigest",
+    "graphCursor",
+    "graphCheckpointDigest",
+    "authorityStateDigest",
+    "workLedgerRevision",
+    "graphReceipts",
+    "workItemAttestations",
+  ], "memory lifecycle authority");
+  if (fields.schemaVersion !== 1) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory lifecycle authority 无效",
+      503,
+    );
+  }
+  const recordsById = new Map(records.map((record) => [record.recordId, record]));
+  const baseCursor = nonNegativeInteger(fields.baseCursor, "baseCursor");
+  const graphCursor = nonNegativeInteger(fields.graphCursor, "graphCursor");
+  const baseCheckpointDigest = optionalDigest(
+    fields.baseCheckpointDigest,
+    "baseCheckpointDigest",
+  );
+  const graphCheckpointDigest = optionalDigest(
+    fields.graphCheckpointDigest,
+    "graphCheckpointDigest",
+  );
+  const authorityStateDigest = optionalDigest(
+    fields.authorityStateDigest,
+    "authorityStateDigest",
+  );
+  const workLedgerRevision = nonNegativeInteger(
+    fields.workLedgerRevision,
+    "workLedgerRevision",
+  );
+  const graphReceipts = strictArray(
+    fields.graphReceipts,
+    records.length,
+    "graphReceipts",
+  ).map((receipt) => normalizeGraphReceipt(receipt, recordsById));
+  const workItemAttestations = strictArray(
+    fields.workItemAttestations,
+    records.length,
+    "workItemAttestations",
+  ).map((attestation) => normalizeWorkItemAttestation(attestation, recordsById));
+  if (
+    baseCursor > graphCursor ||
+    authorityStateDigest === null ||
+    (baseCursor === 0) !== (baseCheckpointDigest === null) ||
+    (graphCursor === 0) !== (graphCheckpointDigest === null) ||
+    graphReceipts.length !== graphCursor - baseCursor ||
+    new Set(graphReceipts.map(({ memoryRecordId }) => memoryRecordId)).size !==
+      graphReceipts.length ||
+    new Set(workItemAttestations.map(({ recordId }) => recordId)).size !==
+      workItemAttestations.length
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory lifecycle checkpoint 无效",
+      503,
+    );
+  }
+  let previousDigest = baseCheckpointDigest;
+  for (let index = 0; index < graphReceipts.length; index += 1) {
+    const receipt = graphReceipts[index];
+    if (
+      receipt.sequence !== baseCursor + index + 1 ||
+      receipt.previousDigest !== previousDigest
+    ) {
+      throw memoryError(
+        "MEMORY_JOURNAL_CORRUPTED",
+        "memory lifecycle receipt chain 无效",
+        503,
+      );
+    }
+    previousDigest = receipt.eventDigest;
+  }
+  if (previousDigest !== graphCheckpointDigest) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory lifecycle digest checkpoint 无效",
+      503,
+    );
+  }
+  return {
+    schemaVersion: 1,
+    baseCursor,
+    baseCheckpointDigest,
+    graphCursor,
+    graphCheckpointDigest,
+    authorityStateDigest,
+    workLedgerRevision,
+    graphReceipts,
+    workItemAttestations,
+  };
+}
+
 function emptyJournal() {
-  return { schemaVersion: 1, revision: 0, records: [] };
+  return {
+    schemaVersion: 2,
+    revision: 0,
+    records: [],
+    lifecycleAuthority: emptyLifecycleAuthority(),
+  };
 }
 
 function journalDigest(records) {
@@ -174,13 +580,19 @@ function storedRecord(value) {
 
 function normalizeJournal(value, limits) {
   if (value === null) return emptyJournal();
+  const schemaVersion = value?.schemaVersion;
   const state = exact(
     value,
-    ["schemaVersion", "revision", "records"],
+    [
+      "schemaVersion",
+      "revision",
+      "records",
+      ...(schemaVersion === 2 ? ["lifecycleAuthority"] : []),
+    ],
     "memory journal",
   );
   if (
-    state.schemaVersion !== 1 ||
+    ![1, 2].includes(state.schemaVersion) ||
     !Number.isSafeInteger(state.revision) ||
     state.revision < 0
   ) {
@@ -209,7 +621,18 @@ function normalizeJournal(value, limits) {
       503,
     );
   }
-  const normalized = { schemaVersion: 1, revision: state.revision, records };
+  const lifecycleAuthority = state.schemaVersion === 1
+    ? {
+        ...emptyLifecycleAuthority(),
+        workItemAttestations: legacyWorkItemAttestations(records),
+      }
+    : normalizeLifecycleAuthority(state.lifecycleAuthority, records);
+  const normalized = {
+    schemaVersion: 2,
+    revision: state.revision,
+    records,
+    lifecycleAuthority,
+  };
   if (serializedBytes(normalized) > limits.maximumStateBytes) {
     throw memoryError(
       "MEMORY_JOURNAL_CORRUPTED",
@@ -447,23 +870,191 @@ function readRecordIds(value) {
   return recordIds;
 }
 
-function supersededRecordIds(records) {
+function currentGraphRecordIds(records, graphReceipts) {
+  const recordsById = new Map(records.map((record) => [record.recordId, record]));
+  const byTask = new Map();
+  for (const receipt of graphReceipts) {
+    if (!["acceptance_contract", "delivery_submitted", "delivery_accepted", "delivery_rejected"].includes(receipt.kind)) {
+      continue;
+    }
+    const descriptors = byTask.get(receipt.taskId) ?? [];
+    descriptors.push({ receipt, record: recordsById.get(receipt.memoryRecordId) });
+    byTask.set(receipt.taskId, descriptors);
+  }
+  const current = new Set();
+  for (const descriptors of byTask.values()) {
+    const contracts = descriptors
+      .filter(({ receipt }) => receipt.kind === "acceptance_contract")
+      .sort((left, right) => left.receipt.recordRevision - right.receipt.recordRevision);
+    const latestContract = contracts.at(-1);
+    if (latestContract === undefined) continue;
+    current.add(latestContract.record.recordId);
+    const deliveries = descriptors.flatMap((descriptor) => {
+      if (!descriptor.receipt.kind.startsWith("delivery_")) return [];
+      try {
+        const content = JSON.parse(descriptor.record.content);
+        return [{ ...descriptor, content }];
+      } catch {
+        return [];
+      }
+    }).filter(({ content }) =>
+      content.contractRevision === latestContract.receipt.recordRevision
+    );
+    const latestByDeliverable = new Map();
+    for (const delivery of deliveries) {
+      const previous = latestByDeliverable.get(delivery.content.deliverableId);
+      if (
+        previous === undefined ||
+        previous.content.deliveryRevision < delivery.content.deliveryRevision
+      ) {
+        latestByDeliverable.set(delivery.content.deliverableId, delivery);
+      }
+    }
+    for (const latest of latestByDeliverable.values()) {
+      current.add(latest.record.recordId);
+      if (!["accepted", "rejected"].includes(latest.content.status)) continue;
+      const submission = deliveries.find(({ content }) =>
+        content.status === "submitted" &&
+        content.deliverableId === latest.content.deliverableId &&
+        content.deliveryRevision + 1 === latest.content.deliveryRevision &&
+        isDeepStrictEqual(content.evidence, latest.content.evidence)
+      );
+      if (submission !== undefined) current.add(submission.record.recordId);
+    }
+  }
+  return current;
+}
+
+function supersededRecordIds(records, lifecycleAuthority) {
   const result = new Set();
-  for (const { evidence } of records) {
-    for (const item of evidence) {
-      if (!item.startsWith("supersedes:")) continue;
-      const recordId = item.slice("supersedes:".length);
-      if (MEMORY_RECORD_ID.test(recordId)) result.add(recordId);
+  const workItemRecords = new Map();
+  const workAttestationById = new Map(
+    lifecycleAuthority.workItemAttestations.map((entry) => [entry.recordId, entry]),
+  );
+  const graphReceiptById = new Map(
+    lifecycleAuthority.graphReceipts.map((entry) => [entry.memoryRecordId, entry]),
+  );
+  const invalidatedBindings = new Set(
+    lifecycleAuthority.graphReceipts
+      .map(({ invalidatedBindingDigest }) => invalidatedBindingDigest)
+      .filter(Boolean),
+  );
+  const latestWorkAttestationByItem = new Map();
+  for (const attestation of lifecycleAuthority.workItemAttestations) {
+    const previous = latestWorkAttestationByItem.get(attestation.itemId);
+    if (
+      previous === undefined ||
+      previous.revision < attestation.revision ||
+      (previous.revision === attestation.revision &&
+        !previous.trusted && attestation.trusted)
+    ) {
+      latestWorkAttestationByItem.set(attestation.itemId, attestation);
+    }
+  }
+  const recordsById = new Map(records.map((record) => [record.recordId, record]));
+  const supersededTasks = new Set();
+  for (const [itemId, attestation] of latestWorkAttestationByItem) {
+    if (!attestation.trusted) continue;
+    try {
+      if (JSON.parse(recordsById.get(attestation.recordId).content)?.status === "superseded") {
+        supersededTasks.add(itemId);
+      }
+    } catch {
+      result.add(attestation.recordId);
+    }
+  }
+  const currentGraph = currentGraphRecordIds(
+    records,
+    lifecycleAuthority.graphReceipts,
+  );
+  for (const record of records) {
+    for (const item of record.evidence) {
+      if (item.startsWith("supersedes:")) {
+        const recordId = item.slice("supersedes:".length);
+        if (MEMORY_RECORD_ID.test(recordId)) result.add(recordId);
+      }
+    }
+    if (record.source.kind === "work-item") {
+      const attestation = workAttestationById.get(record.recordId);
+      if (attestation === undefined) {
+        result.add(record.recordId);
+        continue;
+      }
+      const found = workItemRecords.get(attestation.itemId) ?? [];
+      found.push(attestation);
+      workItemRecords.set(attestation.itemId, found);
+      if (
+        !attestation.citable ||
+        (attestation.bindingDigest !== null &&
+          invalidatedBindings.has(attestation.bindingDigest))
+      ) {
+        result.add(record.recordId);
+      }
+      continue;
+    }
+    if (["work-contract", "work-delivery"].includes(record.source.kind)) {
+      const receipt = graphReceiptById.get(record.recordId);
+      if (
+        receipt === undefined ||
+        !receipt.citable ||
+        supersededTasks.has(receipt.taskId) ||
+        !currentGraph.has(record.recordId) ||
+        (receipt.bindingDigest !== null &&
+          invalidatedBindings.has(receipt.bindingDigest))
+      ) {
+        result.add(record.recordId);
+      }
+      continue;
+    }
+    if (["work-obsolescence", "work-authority-lifecycle"].includes(record.source.kind)) {
+      result.add(record.recordId);
+    }
+  }
+  for (const candidates of workItemRecords.values()) {
+    const latestObservedRevision = candidates.reduce(
+      (maximum, candidate) => Math.max(maximum, candidate.revision),
+      0,
+    );
+    for (const candidate of candidates) {
+      const trustedAtLatestRevision = candidates.some(
+        (entry) => entry.revision === latestObservedRevision && entry.trusted,
+      );
+      if (
+        candidate.revision < latestObservedRevision ||
+        (candidate.revision === latestObservedRevision &&
+          trustedAtLatestRevision && !candidate.trusted)
+      ) {
+        result.add(candidate.recordId);
+      }
     }
   }
   return result;
+}
+
+function hasPullRequestMetadata(record) {
+  if (
+    record.eventType.startsWith("pull_request.") ||
+    record.sourceUrl?.includes("/pull/") === true
+  ) {
+    return true;
+  }
+  try {
+    return String(JSON.parse(record.content)?.eventType || "")
+      .startsWith("pull_request.");
+  } catch {
+    return false;
+  }
 }
 
 function recordLabels(record, supersededIds) {
   return {
     authority: record.tags.includes("derived") ? "derived" : "raw",
     lifecycle:
-      record.tags.includes("obsolete") || supersededIds.has(record.recordId)
+      record.source.kind === "legacy-pr-memory" ||
+      (!RESERVED_WORK_SOURCES.has(record.source.kind) &&
+        hasPullRequestMetadata(record)) ||
+      record.tags.includes("obsolete") ||
+      supersededIds.has(record.recordId)
         ? "obsolete"
         : "current",
   };
@@ -489,6 +1080,177 @@ function candidateIds(index, q, indexComplete) {
     if (!candidates.size) break;
   }
   return candidates;
+}
+
+function hasReservedLifecycleAuthority(record) {
+  return (
+    RESERVED_WORK_SOURCES.has(record.source.kind) ||
+    record.evidence.some((entry) =>
+      entry.startsWith("supersedes:") ||
+      entry.startsWith(WORK_ITEM_REVISION_SUPERSESSION) ||
+      entry.startsWith(WORK_GRAPH_SOURCE_SUPERSESSION) ||
+      entry.startsWith(WORK_AUTHORITY_BINDING_SUPERSESSION)
+    )
+  );
+}
+
+function requiresLiveLedgerAuthority(record) {
+  if (RESERVED_WORK_SOURCES.has(record.source.kind)) {
+    return true;
+  }
+  if (
+    record.evidence.some((entry) =>
+      entry.startsWith(WORK_ITEM_REVISION_SUPERSESSION) ||
+      entry.startsWith(WORK_GRAPH_SOURCE_SUPERSESSION) ||
+      entry.startsWith(WORK_AUTHORITY_BINDING_SUPERSESSION)
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function projectionRecord(record) {
+  const invalid = () => memoryError(
+    "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+    "可信工作历史投影无效",
+    409,
+  );
+  if (record.source.kind === "legacy-pr-memory") {
+    if (
+      record.roleId !== "pr-reviewer" ||
+      !isDeepStrictEqual(
+        record.tags,
+        ["legacy", "pr-reviewer", "derived", "obsolete"],
+      ) ||
+      record.evidence.some((entry) =>
+        entry.startsWith("supersedes:") ||
+        entry.startsWith(WORK_ITEM_REVISION_SUPERSESSION) ||
+        entry.startsWith(WORK_GRAPH_SOURCE_SUPERSESSION) ||
+        entry.startsWith(WORK_AUTHORITY_BINDING_SUPERSESSION)
+      )
+    ) {
+      throw invalid();
+    }
+    return record;
+  }
+  if (record.source.kind !== "work-timeline") throw invalid();
+  const type = record.eventType.startsWith("timeline.")
+    ? record.eventType.slice("timeline.".length)
+    : "";
+  let content;
+  try {
+    content = JSON.parse(record.content);
+  } catch {
+    throw invalid();
+  }
+  if (
+    !type ||
+    content === null ||
+    typeof content !== "object" ||
+    Array.isArray(content) ||
+    record.evidence.length !== 0
+  ) {
+    throw invalid();
+  }
+  const historicalTags = ["timeline", type, "derived", "obsolete"];
+  const currentTags = ["timeline", type];
+  const pullRequestHistory = record.sourceUrl?.includes("/pull/") === true;
+  if (pullRequestHistory) {
+    if (
+      !isDeepStrictEqual(record.tags, historicalTags) ||
+      content.historicalOnly !== true ||
+      content.citableConclusion !== false
+    ) {
+      throw invalid();
+    }
+  } else if (
+    !isDeepStrictEqual(record.tags, currentTags) ||
+    Object.hasOwn(content, "historicalOnly") ||
+    Object.hasOwn(content, "citableConclusion")
+  ) {
+    throw invalid();
+  }
+  return record;
+}
+
+function workItemAttestation(record) {
+  const match = record.source.kind === "work-item"
+    ? record.source.id.match(WORK_ITEM_REVISION)
+    : null;
+  let sourceAuthority;
+  try {
+    sourceAuthority = normalizeWorkGraphSourceAuthority(
+      JSON.parse(record.content)?.sourceAuthority,
+    );
+  } catch {
+    throw memoryError(
+      "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+      "work item 记忆缺少可信来源绑定",
+      409,
+    );
+  }
+  if (
+    match === null ||
+    record.evidence.length !== 1 ||
+    record.evidence[0] !== `${WORK_ITEM_REVISION_SUPERSESSION}${match[1]}`
+  ) {
+    throw memoryError(
+      "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+      "work item lifecycle marker 无效",
+      409,
+    );
+  }
+  return {
+    recordId: record.recordId,
+    contentDigest: record.contentDigest,
+    itemId: match[1],
+    revision: Number(match[2]),
+    trusted: true,
+    bindingDigest: sourceAuthority.bindingDigest,
+    citable: sourceAuthority.citable,
+  };
+}
+
+function graphReceiptForEvent(value) {
+  const event = normalizeWorkGraphMemoryEvent(value);
+  const receipt = workGraphMemoryRecordReceipt(event);
+  return {
+    event,
+    record: normalizeMemoryRecord(event.memoryRecord),
+    receipt: {
+      schemaVersion: 2,
+      eventSchemaVersion: event.schemaVersion,
+      sequence: event.sequence,
+      eventId: event.eventId,
+      eventDigest: event.eventDigest,
+      previousDigest: event.previousDigest,
+      ledgerRevision: event.ledgerRevision,
+      taskId: event.taskId,
+      taskRevision: event.taskRevision,
+      kind: event.kind,
+      recordRevision: event.recordRevision,
+      sourceRecordDigest: event.sourceRecordDigest,
+      occurredAt: event.occurredAt,
+      memoryRecordId: receipt.memoryRecordId,
+      memoryRecordDigest: receipt.memoryRecordDigest,
+      sourceAuthority: event.schemaVersion === 2
+        ? structuredClone(event.sourceAuthority)
+        : null,
+      bindingDigest: event.schemaVersion === 2
+        ? event.sourceAuthority.bindingDigest
+        : null,
+      citable: event.schemaVersion === 2
+        ? event.sourceAuthority.citable
+        : false,
+      invalidatedBindingDigest: event.kind === "authority_invalidated"
+        ? event.sourceAuthority.bindingDigest
+        : null,
+      authorityStateDigest: event.schemaVersion === 2
+        ? event.authorityStateDigest
+        : null,
+    },
+  };
 }
 
 export class LocalMemoryJournal {
@@ -550,7 +1312,10 @@ export class LocalMemoryJournal {
         this.#recordsById = new Map(
           journal.records.map((record) => [record.recordId, record]),
         );
-        this.#supersededIds = supersededRecordIds(journal.records);
+        this.#supersededIds = supersededRecordIds(
+          journal.records,
+          journal.lifecycleAuthority,
+        );
         this.#index = built.tokenMap;
         this.#indexComplete = built.complete;
         this.#lastIndexError = "";
@@ -580,8 +1345,291 @@ export class LocalMemoryJournal {
       throw memoryError("MEMORY_INPUT_INVALID", "records 不能为空");
     }
     const normalized = supplied.map(normalizeMemoryRecord);
+    if (normalized.some(hasReservedLifecycleAuthority)) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
+        "保留的工作记忆来源只能由可信台账投影写入",
+        403,
+      );
+    }
     return this.#operationQueue.enqueue(() =>
       this.#exclusiveLease.run(() => this.#append(normalized)),
+    );
+  }
+
+  appendWorkItems(value) {
+    const includesGraphCheckpoint =
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.hasOwn(value, "graphCursor");
+    const input = exact(
+      value,
+      [
+        "records",
+        "ledgerRevision",
+        "authorityStateDigest",
+        ...(includesGraphCheckpoint
+          ? ["graphCursor", "graphCheckpointDigest"]
+          : []),
+      ],
+      "work item append batch",
+    );
+    const ledgerRevision = nonNegativeInteger(
+      input.ledgerRevision,
+      "ledgerRevision",
+    );
+    const authorityStateDigest = optionalDigest(
+      input.authorityStateDigest,
+      "authorityStateDigest",
+    );
+    if (authorityStateDigest === null) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "authorityStateDigest 不能为空",
+        409,
+      );
+    }
+    const supplied = strictArray(
+      input.records,
+      MAX_WORK_ITEM_BATCH,
+      "records",
+    );
+    const records = supplied.map(normalizeMemoryRecord);
+    const attestations = records.map(workItemAttestation);
+    const graphCursor = includesGraphCheckpoint
+      ? nonNegativeInteger(input.graphCursor, "graphCursor")
+      : null;
+    const graphCheckpointDigest = includesGraphCheckpoint
+      ? optionalDigest(input.graphCheckpointDigest, "graphCheckpointDigest")
+      : null;
+    if (
+      includesGraphCheckpoint &&
+      (graphCursor === 0) !== (graphCheckpointDigest === null)
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "graph checkpoint 无效",
+        409,
+      );
+    }
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => {
+        let authority = this.#journal.lifecycleAuthority;
+        if (includesGraphCheckpoint) {
+          if (
+            authority.graphCursor === 0 &&
+            authority.graphReceipts.length === 0
+          ) {
+            authority = {
+              ...authority,
+              baseCursor: graphCursor,
+              baseCheckpointDigest: graphCheckpointDigest,
+              graphCursor,
+              graphCheckpointDigest,
+            };
+          } else if (
+            authority.graphCursor !== graphCursor ||
+            authority.graphCheckpointDigest !== graphCheckpointDigest
+          ) {
+            throw memoryError(
+              "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+              "work item snapshot 与 graph checkpoint 不一致",
+              409,
+            );
+          }
+        }
+        const byId = new Map(
+          authority.workItemAttestations.map(
+            (entry) => [entry.recordId, entry],
+          ),
+        );
+        for (const attestation of attestations) {
+          const existing = byId.get(attestation.recordId);
+          if (existing !== undefined && !isDeepStrictEqual(existing, attestation)) {
+            throw memoryError(
+              "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+              "work item lifecycle attestation 冲突",
+              409,
+            );
+          }
+          byId.set(attestation.recordId, attestation);
+        }
+        return this.#append(records, {
+          ...authority,
+          authorityStateDigest,
+          workLedgerRevision: ledgerRevision,
+          workItemAttestations: [...byId.values()],
+        });
+      }),
+    );
+  }
+
+  appendGraphEvents(value) {
+    const input = exact(
+      value,
+      [
+        "events",
+        "ledgerRevision",
+        "highWatermark",
+        "authorityStateDigest",
+      ],
+      "graph event append batch",
+    );
+    const ledgerRevision = nonNegativeInteger(
+      input.ledgerRevision,
+      "ledgerRevision",
+    );
+    const authorityStateDigest = optionalDigest(
+      input.authorityStateDigest,
+      "authorityStateDigest",
+    );
+    const highWatermark = nonNegativeInteger(
+      input.highWatermark,
+      "highWatermark",
+    );
+    if (authorityStateDigest === null) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "authorityStateDigest 不能为空",
+        409,
+      );
+    }
+    const supplied = strictArray(input.events, MAX_BATCH, "events");
+    if (supplied.length === 0) {
+      throw memoryError("MEMORY_INPUT_INVALID", "events 不能为空");
+    }
+    const descriptors = supplied.map(graphReceiptForEvent);
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => this.#appendGraphEvents(
+        descriptors,
+        ledgerRevision,
+        highWatermark,
+        authorityStateDigest,
+      )),
+    );
+  }
+
+  appendProjectionRecords(value) {
+    const input = exact(value, ["records"], "projection record append batch");
+    const supplied = strictArray(input.records, MAX_BATCH, "records");
+    if (supplied.length === 0) {
+      throw memoryError("MEMORY_INPUT_INVALID", "records 不能为空");
+    }
+    const records = supplied.map(normalizeMemoryRecord).map(projectionRecord);
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => this.#append(records)),
+    );
+  }
+
+  appendCorrections(value) {
+    const input = exact(value, ["records"], "correction append batch");
+    const supplied = strictArray(input.records, MAX_BATCH, "records");
+    if (supplied.length === 0) {
+      throw memoryError("MEMORY_INPUT_INVALID", "records 不能为空");
+    }
+    const records = supplied.map(normalizeMemoryRecord);
+    if (
+      records.some((record) =>
+        RESERVED_WORK_SOURCES.has(record.source.kind) ||
+        !record.evidence.some((entry) => {
+          if (!entry.startsWith("supersedes:")) return false;
+          return MEMORY_RECORD_ID.test(entry.slice("supersedes:".length));
+        })
+      )
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "可信纠错记录无效",
+        409,
+      );
+    }
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => this.#append(records)),
+    );
+  }
+
+  adoptGraphCheckpoint(value) {
+    const input = exact(
+      value,
+      [
+        "cursor",
+        "checkpointDigest",
+        "ledgerRevision",
+        "authorityStateDigest",
+      ],
+      "graph checkpoint adoption",
+    );
+    const cursor = nonNegativeInteger(input.cursor, "cursor");
+    const checkpointDigest = optionalDigest(
+      input.checkpointDigest,
+      "checkpointDigest",
+    );
+    const ledgerRevision = nonNegativeInteger(
+      input.ledgerRevision,
+      "ledgerRevision",
+    );
+    const authorityStateDigest = optionalDigest(
+      input.authorityStateDigest,
+      "authorityStateDigest",
+    );
+    if (
+      (cursor === 0) !== (checkpointDigest === null) ||
+      authorityStateDigest === null
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "graph checkpoint adoption 无效",
+        409,
+      );
+    }
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => {
+        const authority = this.#journal.lifecycleAuthority;
+        if (authority.graphCursor !== 0 || authority.graphReceipts.length > 0) {
+          if (
+            authority.graphCursor === cursor &&
+            authority.graphCheckpointDigest === checkpointDigest
+          ) {
+            return this.getAuthorityState();
+          }
+          throw memoryError(
+            "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+            "graph checkpoint 已由其他事件链占用",
+            409,
+          );
+        }
+        return this.#persistAuthority({
+          ...authority,
+          baseCursor: cursor,
+          baseCheckpointDigest: checkpointDigest,
+          graphCursor: cursor,
+          graphCheckpointDigest: checkpointDigest,
+          authorityStateDigest,
+          workLedgerRevision: ledgerRevision,
+        }).then(() => this.getAuthorityState());
+      }),
+    );
+  }
+
+  getAuthorityState() {
+    this.#assertReady();
+    const authority = this.#journal.lifecycleAuthority;
+    return Object.freeze({
+      cursor: authority.graphCursor,
+      checkpointDigest: authority.graphCheckpointDigest,
+      authorityStateDigest: authority.authorityStateDigest,
+      workLedgerRevision: authority.workLedgerRevision,
+    });
+  }
+
+  requiresLiveAuthority() {
+    this.#assertReady();
+    const authority = this.#journal.lifecycleAuthority;
+    return (
+      authority.graphReceipts.length > 0 ||
+      authority.workItemAttestations.length > 0 ||
+      this.#journal.records.some(requiresLiveLedgerAuthority)
     );
   }
 
@@ -692,7 +1740,88 @@ export class LocalMemoryJournal {
     );
   }
 
-  async #append(records) {
+  async #appendGraphEvents(
+    descriptors,
+    ledgerRevision,
+    highWatermark,
+    authorityStateDigest,
+  ) {
+    this.#assertReady();
+    const authority = this.#journal.lifecycleAuthority;
+    const receiptsBySequence = new Map(
+      authority.graphReceipts.map((receipt) => [receipt.sequence, receipt]),
+    );
+    const graphReceipts = [...authority.graphReceipts];
+    const receiptRecordIds = new Set(
+      graphReceipts.map(({ memoryRecordId }) => memoryRecordId),
+    );
+    let cursor = authority.graphCursor;
+    let checkpointDigest = authority.graphCheckpointDigest;
+    for (const { receipt } of descriptors) {
+      if (receipt.sequence <= cursor) {
+        if (!isDeepStrictEqual(receiptsBySequence.get(receipt.sequence), receipt)) {
+          throw memoryError(
+            "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+            "graph event replay 与持久摘要链不一致",
+            409,
+          );
+        }
+        continue;
+      }
+      if (
+        receipt.sequence !== cursor + 1 ||
+        receipt.previousDigest !== checkpointDigest ||
+        receiptRecordIds.has(receipt.memoryRecordId)
+      ) {
+        throw memoryError(
+          "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+          "graph event sequence 或 digest 链不连续",
+          409,
+        );
+      }
+      graphReceipts.push(receipt);
+      receiptRecordIds.add(receipt.memoryRecordId);
+      receiptsBySequence.set(receipt.sequence, receipt);
+      cursor = receipt.sequence;
+      checkpointDigest = receipt.eventDigest;
+    }
+    const highWatermarkReceipt = graphReceipts.at(-1) ?? null;
+    if (
+      cursor > highWatermark ||
+      (cursor === highWatermark &&
+        highWatermarkReceipt?.authorityStateDigest !== authorityStateDigest &&
+        !(
+          highWatermarkReceipt?.authorityStateDigest === null &&
+          authorityStateDigest === emptyLifecycleAuthority().authorityStateDigest
+        ))
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+        "graph high-watermark authority digest 不一致",
+        409,
+      );
+    }
+    return this.#append(
+      descriptors.map(({ record }) => record),
+      {
+        ...authority,
+        graphCursor: cursor,
+        graphCheckpointDigest: checkpointDigest,
+        authorityStateDigest,
+        workLedgerRevision: ledgerRevision,
+        graphReceipts,
+      },
+    );
+  }
+
+  async #persistAuthority(lifecycleAuthority) {
+    await this.#append([], lifecycleAuthority);
+  }
+
+  async #append(
+    records,
+    lifecycleAuthority = this.#journal.lifecycleAuthority,
+  ) {
     this.#assertReady();
     const byId = new Map(this.#recordsById);
     const receipts = [];
@@ -710,13 +1839,18 @@ export class LocalMemoryJournal {
       receipts.push({ recordId: record.recordId, created: true });
       added += 1;
     }
-    if (!added) {
+    const authorityChanged = !isDeepStrictEqual(
+      lifecycleAuthority,
+      this.#journal.lifecycleAuthority,
+    );
+    if (!added && !authorityChanged) {
       return { added: 0, items: structuredClone(receipts), health: this.getHealth() };
     }
     const candidate = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: this.#journal.revision + 1,
       records: [...byId.values()],
+      lifecycleAuthority,
     };
     if (
       candidate.records.length > this.#limits.maximumRecords ||
@@ -731,9 +1865,10 @@ export class LocalMemoryJournal {
     await this.#store.write(MEMORY_JOURNAL_KEY, candidate);
     this.#journal = candidate;
     this.#recordsById = byId;
-    for (const recordId of supersededRecordIds(records)) {
-      this.#supersededIds.add(recordId);
-    }
+    this.#supersededIds = supersededRecordIds(
+      candidate.records,
+      candidate.lifecycleAuthority,
+    );
     const built = buildIndex(candidate.records, candidate.revision);
     this.#index = built.tokenMap;
     this.#indexComplete = built.complete;

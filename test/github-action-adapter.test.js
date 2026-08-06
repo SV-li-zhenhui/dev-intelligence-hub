@@ -10,6 +10,7 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 
 const HEAD = "0123456789abcdef0123456789abcdef01234567";
 const OTHER_HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+const BASE_HEAD = "a".repeat(40);
 const GH_COMMAND =
   process.platform === "win32"
     ? "C:\\Program Files\\GitHub CLI\\gh.exe"
@@ -23,6 +24,16 @@ function createAdapter(runner, overrides = {}) {
     token: GH_TOKEN,
     ...overrides,
   });
+}
+
+function acceptingInputAuthorityVerifier() {
+  return {
+    calls: [],
+    async verify(value) {
+      this.calls.push(structuredClone(value));
+      return structuredClone(value);
+    },
+  };
 }
 
 function reviewEnvelope(overrides = {}) {
@@ -63,6 +74,44 @@ function commentEnvelope(overrides = {}) {
       type: "pull_request_review",
       reviewEvent: "COMMENT",
       body: "Please check `$PATH`, @notes.txt & the JSON {\"ok\":true}.\nSecond line.",
+    },
+    ...overrides,
+  });
+}
+
+function workProposalEnvelope(overrides = {}) {
+  const inputBinding = {
+    schemaVersion: 2,
+    kind: "pull_request",
+    repository: "SVisions/OCT-Software",
+    pullRequestNumber: 42,
+    rootItemId: "pr-work-42",
+    workKey: "github:dashboard:oct:42",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: HEAD,
+    eventId: "event-review-42",
+    eventDigest: "c".repeat(64),
+    inputDigest: "d".repeat(64),
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "sv-li-zhenhui",
+      baseRepository: "SVisions/OCT-Software",
+      baseRefName: "main",
+      baseRefOid: BASE_HEAD,
+      headRepository: "contributor/OCT-Software",
+      headRefName: "fix/conflict",
+      headRefOid: HEAD,
+    },
+  };
+  return reviewEnvelope({
+    kind: "github.work-proposal-review",
+    action: {
+      type: "pull_request_review",
+      reviewEvent: "APPROVE",
+      body: "Reviewed the error path.",
+      inputBinding,
     },
     ...overrides,
   });
@@ -181,7 +230,7 @@ test("the configured actor is checked before target or marker queries", async ()
 test("work proposal reviews use the same sealed GitHub review protocol", async () => {
   const runner = new FakeRunner([actor("different-user")]);
   const result = await createAdapter(runner).reconcile(
-    reviewEnvelope({ kind: "github.work-proposal-review" }),
+    workProposalEnvelope(),
   );
 
   assert.deepEqual(result, {
@@ -189,6 +238,123 @@ test("work proposal reviews use the same sealed GitHub review protocol", async (
     error: { trust: "trusted", code: "GITHUB_ACTOR_MISMATCH" },
   });
   assert.equal(runner.calls.length, 1);
+});
+
+test("work proposal reviews verify the full sealed Git target at execution time", async () => {
+  const currentTarget = {
+    number: 42,
+    url: "https://github.com/SVisions/OCT-Software/pull/42",
+    baseRefName: "main",
+    baseRefOid: BASE_HEAD,
+    headRefName: "fix/conflict",
+    headRefOid: HEAD,
+    headRepository: { nameWithOwner: "contributor/OCT-Software" },
+  };
+  const matchingVerifier = acceptingInputAuthorityVerifier();
+  const matching = new FakeRunner([actor(), pages([]), currentTarget]);
+  assert.deepEqual(
+    await createAdapter(matching, {
+      inputAuthorityVerifier: matchingVerifier,
+    }).reconcile(workProposalEnvelope()),
+    { status: "absent", code: "GITHUB_MARKER_ABSENT" },
+  );
+  assert.equal(matchingVerifier.calls.length, 1);
+  assert.equal(
+    matching.calls[2].args.at(-1),
+    "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
+  );
+
+  const changedBase = new FakeRunner([
+    actor(),
+    pages([]),
+    { ...currentTarget, baseRefOid: "e".repeat(40) },
+  ]);
+  assert.deepEqual(
+    await createAdapter(changedBase, {
+      inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+    }).reconcile(workProposalEnvelope()),
+    { status: "stale", expectedVersion: HEAD, actualVersion: HEAD },
+  );
+});
+
+test("work proposal execution rechecks ledger authority and the full target before POST", async () => {
+  const currentTarget = {
+    number: 42,
+    url: "https://github.com/SVisions/OCT-Software/pull/42",
+    baseRefName: "main",
+    baseRefOid: BASE_HEAD,
+    headRefName: "fix/conflict",
+    headRefOid: HEAD,
+    headRepository: { nameWithOwner: "contributor/OCT-Software" },
+  };
+  const verifier = acceptingInputAuthorityVerifier();
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    currentTarget,
+    actor(),
+    currentTarget,
+    (call) => reviewRecord(markerFromPost(call)),
+  ]);
+
+  const result = await createAdapter(runner, {
+    inputAuthorityVerifier: verifier,
+  }).execute(workProposalEnvelope());
+
+  assert.equal(result.status, "applied");
+  assert.equal(verifier.calls.length, 2);
+  assert.equal(runner.calls.at(-1).args.includes("POST"), true);
+  assert.equal(JSON.parse(runner.calls.at(-1).input).commit_id, HEAD);
+
+  const changedBase = new FakeRunner([
+    actor(),
+    pages([]),
+    currentTarget,
+    actor(),
+    { ...currentTarget, baseRefOid: "e".repeat(40) },
+  ]);
+  const stale = await createAdapter(changedBase, {
+    inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+  }).execute(workProposalEnvelope());
+  assert.deepEqual(stale, {
+    status: "stale",
+    expectedVersion: HEAD,
+    actualVersion: HEAD,
+  });
+  assert.equal(changedBase.calls.some((call) => call.args.includes("POST")), false);
+});
+
+test("revoked work proposal authority prevents every GitHub call", async () => {
+  let verifierCalls = 0;
+  const runner = new FakeRunner();
+  const result = await createAdapter(runner, {
+    inputAuthorityVerifier: {
+      async verify() {
+        verifierCalls += 1;
+        throw new Error("authority revoked");
+      },
+    },
+  }).execute(workProposalEnvelope());
+
+  assert.deepEqual(result, { status: "stale" });
+  assert.equal(verifierCalls, 1);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("legacy work-proposal actions are reconcile-only and cannot be retried", async () => {
+  const legacy = reviewEnvelope({ kind: "github.work-proposal-review" });
+  const executeRunner = new FakeRunner();
+  assert.deepEqual(await createAdapter(executeRunner).execute(legacy), {
+    status: "error",
+    error: { trust: "trusted", code: "INVALID_GITHUB_ACTION" },
+  });
+  assert.equal(executeRunner.calls.length, 0);
+
+  const reconcileRunner = new FakeRunner([actor(), pages([])]);
+  assert.deepEqual(await createAdapter(reconcileRunner).reconcile(legacy), {
+    status: "stale",
+  });
+  assert.equal(reconcileRunner.calls.length, 2);
 });
 
 test("every GitHub call uses one fixed token, absolute executable, and minimal environment", async () => {

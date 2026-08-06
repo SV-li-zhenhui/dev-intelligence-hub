@@ -256,13 +256,21 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "github.pull-request-review",
     "github.work-proposal-review",
   ]);
-  assert.strictEqual(
+  assert.notStrictEqual(
     routerOptions.executors["github.pull-request-review"],
     executor,
   );
   assert.strictEqual(
     routerOptions.executors["github.work-proposal-review"],
     executor,
+  );
+  assert.deepEqual(
+    await routerOptions.executors["github.pull-request-review"].execute({}),
+    { status: "stale" },
+  );
+  assert.deepEqual(
+    await routerOptions.executors["github.pull-request-review"].reconcile({}),
+    { status: "stale" },
   );
 
   assert.equal(Object.isFrozen(runtime), true);
@@ -337,6 +345,27 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(firstClose, secondClose);
   await firstClose;
   assert.deepEqual(events.slice(-1), ["close"]);
+});
+
+test("enabled runtime forwards the ledger authority verifier to the GitHub executor", async () => {
+  const inputAuthorityVerifier = { verify() {} };
+  let executorOptions;
+  const runtime = await createConfirmationRuntime(
+    enabledConfig(),
+    runtimeDependencies({
+      inputAuthorityVerifier,
+      createExecutor(options) {
+        executorOptions = options;
+        return { execute() {}, reconcile() {} };
+      },
+    }),
+  );
+
+  assert.strictEqual(
+    executorOptions.inputAuthorityVerifier,
+    inputAuthorityVerifier,
+  );
+  await runtime.close();
 });
 
 test("a local-only runtime starts without reading GitHub credentials", async () => {

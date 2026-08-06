@@ -277,6 +277,16 @@ function runtimeAdmissionGate(dependencies) {
     : assertPort(configured, ["run"], "actionAdmissionGate");
 }
 
+function runtimeInputAuthorityVerifier(dependencies) {
+  const configured = dataProperty(dependencies, "inputAuthorityVerifier");
+  if (configured === undefined) return null;
+  return assertPort(
+    configured,
+    ["verify"],
+    "inputAuthorityVerifier",
+  );
+}
+
 function fenceExecutor(kind, executor, admissionGate) {
   if (admissionGate === null || kind === CONFIGURATION_ACTIVATION_KIND) {
     return executor;
@@ -302,6 +312,19 @@ function fenceExecutor(kind, executor, admissionGate) {
   });
 }
 
+function reconcileOnlyExecutor(executor) {
+  const reconcile = executor.reconcile.bind(executor);
+  return Object.freeze({
+    async execute() {
+      return { status: "stale" };
+    },
+    async reconcile(value) {
+      const result = await reconcile(value);
+      return result?.status === "already" ? result : { status: "stale" };
+    },
+  });
+}
+
 function closeOnce(guard) {
   let result;
   return () => {
@@ -317,6 +340,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
 
   const factories = validateDependencies(dependencies);
   const actionAdmissionGate = runtimeAdmissionGate(dependencies);
+  const inputAuthorityVerifier = runtimeInputAuthorityVerifier(dependencies);
   let githubExecutorOptions = null;
   if (enabledConfig) {
     const configuredEnvironment = dataProperty(dependencies, "env");
@@ -328,6 +352,9 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       token,
       env: environment,
       networkEnv: enabledConfig.networkEnv,
+      ...(inputAuthorityVerifier === null
+        ? {}
+        : { inputAuthorityVerifier }),
       ...(enabledConfig.timeoutMs === undefined
         ? {}
         : { timeoutMs: enabledConfig.timeoutMs }),
@@ -358,7 +385,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   const unfencedExecutors = {
     ...(githubExecutor
       ? {
-          "github.pull-request-review": githubExecutor,
+          "github.pull-request-review": reconcileOnlyExecutor(githubExecutor),
           "github.work-proposal-review": githubExecutor,
         }
       : {}),

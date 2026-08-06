@@ -547,15 +547,49 @@ export class CodeActionProposalHandler {
 
   async handle(value) {
     const input = normalizeHandlerInput(value);
+    const legacyInputBinding =
+      input.proposal.binding.inputBinding !== null &&
+      input.proposal.binding.inputBinding.schemaVersion !== 2;
     let existingItem = null;
     let existingValue = null;
+    let knownMissingConfirmationId = null;
     if (input.downstreamRef !== null) {
-      existingValue = await this.#getConfirmation(input.downstreamRef);
-      existingItem = normalizeOwnedConfirmationItem(
-        existingValue,
-        input.proposal,
-        input.downstreamRef,
-      );
+      try {
+        existingValue = await this.#getConfirmation(input.downstreamRef);
+      } catch (error) {
+        if (!legacyInputBinding || error?.code !== "CONFIRMATION_NOT_FOUND") {
+          throw error;
+        }
+        knownMissingConfirmationId = input.downstreamRef;
+      }
+      if (existingValue !== null) {
+        existingItem = normalizeOwnedConfirmationItem(
+          existingValue,
+          input.proposal,
+          input.downstreamRef,
+        );
+      } else {
+        knownMissingConfirmationId = input.downstreamRef;
+      }
+    }
+    if (legacyInputBinding) {
+      const owned =
+        existingItem ??
+        (await this.#findOwnedConfirmation(
+          input.proposal,
+          knownMissingConfirmationId,
+        ));
+      if (owned) {
+        return this.#invalidateChangedAuthorization(owned, input.proposal);
+      }
+      return {
+        status: "stale",
+        summary: "旧版 PR 输入绑定只能恢复查看，未进入新的代码任务确认",
+        evidence: [
+          "legacy_input_binding",
+          `proposal:${input.proposal.proposalId}`,
+        ],
+      };
     }
     let authority;
     try {
@@ -570,6 +604,14 @@ export class CodeActionProposalHandler {
         if (owned) {
           return this.#invalidateChangedAuthorization(owned, input.proposal);
         }
+        return {
+          status: "stale",
+          summary: "代码任务授权已变化，未进入确认队列",
+          evidence: [
+            "authorization_changed",
+            `proposal:${input.proposal.proposalId}`,
+          ],
+        };
       }
       throw error;
     }
@@ -637,8 +679,9 @@ export class CodeActionProposalHandler {
     return this.#transitionConfirmation(item, grant);
   }
 
-  async #findOwnedConfirmation(proposal) {
+  async #findOwnedConfirmation(proposal, knownMissingId = null) {
     const id = codeJobConfirmationIdForProposal(proposal);
+    if (id === knownMissingId) return null;
     let value;
     try {
       value = await this.#getConfirmation(id);
