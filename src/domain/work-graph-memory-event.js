@@ -262,7 +262,11 @@ function deliveryMemoryContent(context, content, sourceRecordDigest) {
 }
 
 function graphContext(item) {
-  const event = plainData(item.event);
+  const source = plainData(item.source);
+  const current = plainData(source?.current);
+  const event = plainData(
+    source?.kind === "pull_request" ? current?.event : item.event,
+  );
   const subject = plainData(event?.subject);
   const payload = plainData(event?.payload);
   const assignment = plainData(item.assignment);

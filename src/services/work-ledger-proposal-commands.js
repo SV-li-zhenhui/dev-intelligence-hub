@@ -1,12 +1,17 @@
 import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js";
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
+  isWorkItemInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
 import {
   createWorkDecisionContext,
 } from "./work-ledger-state.js";
+import {
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  LEGACY_PR_SOURCE_QUARANTINE_KIND,
+} from "./work-ledger-pr-source.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import {
   hasExactLedgerKeys,
@@ -116,15 +121,26 @@ function normalizeBatch(input, state) {
 
 function requireBoundProposal(state, result) {
   const item = requireWorkLedgerItem(state, result.requestedBy.workItemId);
-  const outbox = state.outbox.find(
-    (candidate) => candidate.intentId === item.activeIntentId,
-  );
   const matchingDownstreams = state.outbox.filter(
     (candidate) =>
       candidate.status === "delivered" &&
       candidate.outcome?.status === "delivered" &&
       candidate.outcome.details?.downstreamRef === result.proposalId,
   );
+  const durablyQuarantined =
+    item.sourceQuarantine?.kind === LEGACY_PR_SOURCE_QUARANTINE_KIND;
+  const quarantinedSettlement =
+    durablyQuarantined &&
+    item.status === "blocked" &&
+    item.activeIntentId === null;
+  const outbox = state.outbox.find(
+    (candidate) => candidate.intentId === item.activeIntentId,
+  ) ?? (quarantinedSettlement && matchingDownstreams.length === 1
+    ? matchingDownstreams[0]
+    : null);
+  const waitingForResult =
+    item.status === "waiting_external" &&
+    item.activeIntentId === outbox?.intentId;
   const expectedIntentType = PROPOSAL_INTENT_TYPES.get(result.kind);
   if (
     !outbox ||
@@ -136,8 +152,7 @@ function requireBoundProposal(state, result) {
     outbox.status !== "delivered" ||
     outbox.intent.type !== expectedIntentType ||
     outbox.requestedBy.roleId !== result.requestedBy.roleId ||
-    item.status !== "waiting_external" ||
-    item.activeIntentId !== outbox.intentId ||
+    (!waitingForResult && !quarantinedSettlement) ||
     outbox.outcome?.status !== "delivered" ||
     outbox.outcome.details?.downstreamRef !== result.proposalId ||
     outbox.outcome.details?.proposalDigest !== result.proposalContentDigest
@@ -172,7 +187,15 @@ function requireBoundProposal(state, result) {
       );
     }
   }
-  return { item, evidenceTarget };
+  return {
+    item,
+    outbox,
+    evidenceTarget,
+    discardUnsealedLegacyResult:
+      durablyQuarantined &&
+      (outbox.dispatchBinding === null ||
+        !Object.hasOwn(outbox.dispatchBinding, "boundIntent")),
+  };
 }
 
 export function planProposalBatchApplication({ state, input, clock }) {
@@ -196,9 +219,37 @@ export function planProposalBatchApplication({ state, input, clock }) {
   const appliedItemIds = [];
   for (const result of batch.pending) {
     const workingState = { ...state, items };
-    const { item, evidenceTarget } = requireBoundProposal(workingState, result);
+    const {
+      item,
+      outbox,
+      evidenceTarget,
+      discardUnsealedLegacyResult,
+    } = requireBoundProposal(workingState, result);
     if (Date.parse(result.at) > Date.parse(now)) {
       throw invalid("工作提案结果时间晚于台账时钟");
+    }
+    if (discardUnsealedLegacyResult) {
+      const itemResult = moveWorkItem(item, {
+        status: "blocked",
+        now,
+        reason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+        activeIntentId: null,
+      });
+      items = replaceWorkLedgerRecord(items, "itemId", itemResult);
+      appliedItemIds.push(item.itemId);
+      timelineEvents.push({
+        itemId: item.itemId,
+        type: "legacy_result_discarded",
+        at: now,
+        actorId: "work-proposal-result-reconciler",
+        details: {
+          source: "proposal",
+          intentId: outbox.intentId,
+          resultRef: result.resultId,
+          reason: "unsealed_pr_source_quarantine",
+        },
+      });
+      continue;
     }
     const succeeded = result.outcome === "succeeded";
     const decisionContext = createWorkDecisionContext({
@@ -219,12 +270,15 @@ export function planProposalBatchApplication({ state, input, clock }) {
     if (succeeded) {
       nextStatus = continueForEvidence ? "queued" : "completed";
     }
+    const sealedByLegacyCutover = isWorkItemInLegacyPullRequestCutover(item);
     const itemResult = moveWorkItem(item, {
-      status: nextStatus,
+      status: sealedByLegacyCutover ? "blocked" : nextStatus,
       now,
-      reason: continueForEvidence
-        ? "proposal_evidence_ready"
-        : `proposal_${result.outcome}`,
+      reason: sealedByLegacyCutover
+        ? LEGACY_PR_SOURCE_CUTOVER_REASON
+        : continueForEvidence
+          ? "proposal_evidence_ready"
+          : `proposal_${result.outcome}`,
       activeIntentId: null,
       decisionContext,
     });

@@ -1,4 +1,5 @@
 import {
+  assertWorkItemNotInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
@@ -142,6 +143,7 @@ function normalizeReassignCommand(input) {
 
 function requireScopedTask(state, authority, taskId) {
   const item = requireWorkLedgerItem(state, taskId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertWorkGraphTasksInScope(state, [item.itemId], authority.scopeRootTaskId);
   return item;
 }

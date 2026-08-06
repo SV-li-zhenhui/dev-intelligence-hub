@@ -14,14 +14,28 @@ import {
 import {
   createDeliveryEvidenceTarget,
 } from "../src/domain/delivery-evidence-contract.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import {
+  emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
 import {
   migrateWorkGraphMemoryProjection,
 } from "../src/services/work-ledger-graph-memory.js";
+import {
+  appendPullRequestWorkSource,
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  LEGACY_PR_SOURCE_QUARANTINE_KIND,
+} from "../src/services/work-ledger-pr-source.js";
+import {
+  createAssignmentWorkItem,
+  createGraphChildWorkItem,
+  createPullRequestSourceRootWorkItem,
+  createWorkIntentRecord,
+} from "../src/services/work-ledger-records.js";
 
 const STATE_KEY = "work-ledger-state";
 
@@ -150,6 +164,84 @@ function assignment(sequence, target = { type: "role", id: "pr-reviewer" }) {
   };
 }
 
+const PR_HEAD_A = "a".repeat(40);
+const PR_HEAD_B = "b".repeat(40);
+
+function prAssignment(
+  sequence,
+  {
+    eventType = "pull_request.updated",
+    occurredAt = "2026-08-02T01:00:00.000Z",
+    headRefOid = PR_HEAD_A,
+    previousHeadRefOid,
+    changedFields = ["ciStatus"],
+    ciStatus = "PENDING",
+    title = "PR 42",
+    repository = "acme/repo",
+    pullRequestNumber = 42,
+  } = {},
+) {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType,
+    occurredAt,
+    source: { provider: "github", scopeId: "github-dashboard" },
+    subject: {
+      id: `github:pr:${repository}#${pullRequestNumber}`,
+      repository,
+      number: pullRequestNumber,
+    },
+    payload: {
+      title,
+      headRefOid,
+      ciStatus,
+      changedFields,
+      ...(previousHeadRefOid === undefined ? {} : { previousHeadRefOid }),
+    },
+  });
+  return {
+    sequence,
+    assignment: {
+      assignmentId: `workflow-assignment-pr-${sequence}`,
+      eventId: event.eventId,
+      target: { type: "role", id: "pr-engineer" },
+      reason: "pr-events-to-pr-engineer",
+      createdAt: occurredAt,
+    },
+    event,
+  };
+}
+
+function prGraphChildCommand(parent, graphRevision, childKey = "resolve-conflict") {
+  return {
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: parent.itemId,
+    },
+    command: {
+      parentTaskId: parent.itemId,
+      childKey,
+      work: {
+        title: "解决 PR 冲突",
+        description: "在绑定的 PR Head 上生成并验证冲突修复。",
+      },
+      target: { type: "role", id: "developer" },
+      dependsOnTaskIds: [],
+      acceptanceContract: {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      leaseId: null,
+      expectedGraphRevision: graphRevision,
+      expectedTaskRevisions: [{
+        taskId: parent.itemId,
+        revision: parent.revision,
+      }],
+    },
+  };
+}
+
 function controlledClock(initial = "2026-08-02T02:00:00.000Z") {
   let now = Date.parse(initial);
   return {
@@ -236,6 +328,1793 @@ test("intake atomically advances its cursor and preserves unresolved targets", a
   assert.equal(store.writes[0].name, STATE_KEY);
   assert.equal(store.writes[0].value.intakeCursor, 3);
   assert.equal(store.writes[0].value.items.length, 3);
+});
+
+test("PR engineer intake keeps one durable task across events on the same Head", async () => {
+  const records = [
+    prAssignment(1, {
+      eventType: "pull_request.updated",
+      changedFields: ["labels", "ciStatus"],
+    }),
+    prAssignment(2, {
+      eventType: "pull_request.classified",
+      changedFields: ["labels"],
+    }),
+    prAssignment(3, {
+      eventType: "pull_request.status",
+      changedFields: ["ciStatus"],
+      title: "PR 42 latest source facts",
+    }),
+  ];
+  const { service } = await createFixture({ records });
+
+  const result = await service.intake({ limit: 10 });
+  const items = (await service.listItems({ limit: 10 })).items;
+
+  assert.equal(result.received, 3);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].currentTarget.id, "pr-engineer");
+  assert.equal(items[0].source.kind, "pull_request");
+  assert.equal(items[0].source.inputRevision, 3);
+  assert.equal(items[0].source.activeRevision, 3);
+  assert.equal(items[0].source.headRevision, 1);
+  assert.equal(items[0].source.current.sourceSequence, 3);
+  assert.equal(items[0].source.current.headRefOid, PR_HEAD_A);
+  assert.equal(items[0].source.current.event.eventType, "pull_request.status");
+  const currentGraph = await service.getGraphSnapshot();
+  const projectedRoot = currentGraph.taskStates.find(
+    ({ taskId }) => taskId === items[0].itemId,
+  );
+  assert.equal(projectedRoot.work.title, "PR 42 latest source facts");
+  assert.deepEqual(
+    items[0].source.revisions.map(({ disposition, headRevision }) => ({
+      disposition,
+      headRevision,
+    })),
+    [
+      { disposition: "accepted", headRevision: 1 },
+      { disposition: "accepted", headRevision: 1 },
+      { disposition: "accepted", headRevision: 1 },
+    ],
+  );
+  assert.deepEqual(await service.readGraphMemoryProjectionBatch({ limit: 10 }), {
+    cursor: 0,
+    highWatermark: 0,
+    items: [],
+  });
+  await service.reviseGraphAcceptance({
+    authority: {
+      actorId: "employee-orchestrator",
+      scopeRootTaskId: items[0].itemId,
+    },
+    command: {
+      taskId: items[0].itemId,
+      acceptanceContract: {
+        revision: 2,
+        acceptanceCriteria: [{
+          criterionId: "fixed-head-reviewed",
+          description: "在固定 PR Head 上完成审查。",
+        }],
+        expectedDeliverables: [],
+      },
+      reason: "bind-real-pr-acceptance",
+      expectedGraphRevision: (await service.getSummary()).revision,
+      expectedTaskRevision: items[0].revision,
+    },
+  });
+  const projected = await service.readGraphMemoryProjectionBatch({ limit: 10 });
+  assert.equal(projected.highWatermark, 1);
+  assert.equal(projected.items[0].kind, "acceptance_contract");
+  assert.equal(projected.items[0].recordRevision, 2);
+  assert.match(
+    projected.items[0].memoryRecord.title,
+    /PR 42 latest source facts/,
+  );
+});
+
+test("empty assignment feed replay performs no durable ledger write", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  const before = fixture.store.stored();
+  fixture.store.writes.length = 0;
+
+  const replay = await fixture.service.intake();
+
+  assert.equal(replay.received, 0);
+  assert.equal(replay.deduplicated, 0);
+  assert.equal(fixture.store.writes.length, 0);
+  assert.deepEqual(fixture.store.stored(), before);
+});
+
+test("a new PR Head advances the epoch without creating another task", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].itemId, before.itemId);
+  assert.equal(items[0].source.inputRevision, 2);
+  assert.equal(items[0].source.headRevision, 2);
+  assert.equal(items[0].source.current.headRefOid, PR_HEAD_B);
+});
+
+test("a new PR Head clears an answered old-Head decision while same-Head facts preserve it", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const attentionResult = await prepareAttentionResult(
+    fixture,
+    { type: "choice", choiceId: "yes" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  await fixture.service.applyAttentionBatch({
+    items: [attentionResult],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  let root = (await fixture.service.listItems()).items[0];
+  const oldHeadDecision = structuredClone(root.decisionContext);
+  assert.equal(oldHeadDecision.source, "attention");
+  assert.deepEqual(oldHeadDecision.value.answer, {
+    type: "choice",
+    choiceId: "yes",
+  });
+
+  fixture.source.records.push(
+    prAssignment(2, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_A,
+      changedFields: ["ciStatus"],
+      ciStatus: "SUCCESS",
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.activeRevision, 2);
+  assert.equal(root.source.headRevision, 1);
+  assert.deepEqual(root.decisionContext, oldHeadDecision);
+
+  fixture.source.records.push(
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.activeRevision, 3);
+  assert.equal(root.source.headRevision, 2);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.decisionContext, null);
+});
+
+test("a new PR Head clears a completed old-Head proposal result", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const proposalResult = await prepareProposalResult(fixture, {
+    roleId: "pr-engineer",
+    workerId: "employee-pr-engineer",
+  });
+  await fixture.service.applyProposalBatch({
+    items: [proposalResult],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  let root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "completed");
+  assert.equal(root.decisionContext.source, "proposal");
+
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.decisionContext, null);
+});
+
+for (const claimedByDispatcher of [false, true]) {
+  const stateName = claimedByDispatcher ? "unbound dispatching" : "pending";
+  test(`a new PR Head atomically supersedes a ${stateName} old-Head intent`, async () => {
+    const fixture = await createFixture({ records: [prAssignment(1)] });
+    await fixture.service.intake();
+    let item = (await fixture.service.listItems()).items[0];
+    item = await fixture.service.claim({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    });
+    const staged = await fixture.service.stageIntent({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      leaseId: item.leaseId,
+      actorId: "employee-pr-engineer",
+      roleId: "pr-engineer",
+      intent: reviewIntent(),
+    });
+    if (claimedByDispatcher) {
+      await fixture.service.claimIntent({
+        intentId: staged.outbox.intentId,
+        expectedRevision: staged.outbox.revision,
+        dispatcherId: "work-intent-dispatcher",
+        leaseDurationMs: 30_000,
+      });
+    }
+    fixture.source.records.push(
+      prAssignment(2, {
+        occurredAt: "2026-08-02T01:05:00.000Z",
+        headRefOid: PR_HEAD_B,
+        previousHeadRefOid: PR_HEAD_A,
+        changedFields: ["headRefOid"],
+      }),
+    );
+    fixture.source.highWatermark = 2;
+
+    await fixture.service.intake();
+
+    const root = (await fixture.service.listItems()).items[0];
+    const outbox = (await fixture.service.listOutbox()).items[0];
+    assert.equal(root.itemId, item.itemId);
+    assert.equal(root.status, "queued");
+    assert.equal(root.activeIntentId, null);
+    assert.equal(root.source.activeRevision, 2);
+    assert.equal(root.source.pendingRevision, null);
+    assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(outbox.status, "failed");
+    assert.equal(outbox.sourceBinding.inputRevision, 1);
+    assert.equal(outbox.sourceBinding.headRevision, 1);
+    assert.equal(outbox.sourceBinding.headRefOid, PR_HEAD_A);
+    assert.equal(
+      outbox.outcome.details.reason,
+      "pr_source_superseded_before_dispatch",
+    );
+    assert.equal(outbox.dispatchLeaseId, null);
+
+    const recovered = new WorkLedgerService({
+      store: fixture.store,
+      assignmentSource: fixture.source,
+      exclusiveLease: new ExclusiveLease(),
+      clock: fixture.time.clock,
+      idFactory: incrementingIds(),
+    });
+    await recovered.recover();
+    assert.equal(
+      (await recovered.listOutbox()).items[0].sourceBinding.headRefOid,
+      PR_HEAD_A,
+    );
+  });
+}
+
+test("a sealed old-Head intent blocks cutover until its result is reconciled", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const attentionResult = await prepareAttentionResult(
+    fixture,
+    { type: "choice", choiceId: "yes" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  await fixture.service.applyAttentionBatch({
+    items: [attentionResult],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  let item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.decisionContext.source, "attention");
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  let root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.pending.headRefOid, PR_HEAD_B);
+  assert.equal(root.activeIntentId, sealed.intentId);
+  const pendingTimeline = (await fixture.service.listTimeline({
+    limit: 100,
+    order: "newest",
+  })).items.find(({ type }) => type === "pr_source_revised");
+  assert.deepEqual(
+    {
+      currentHeadRevision: pendingTimeline.details.currentHeadRevision,
+      currentHeadRefOid: pendingTimeline.details.currentHeadRefOid,
+      pendingHeadRevision: pendingTimeline.details.pendingHeadRevision,
+      pendingHeadRefOid: pendingTimeline.details.pendingHeadRefOid,
+    },
+    {
+      currentHeadRevision: 1,
+      currentHeadRefOid: PR_HEAD_A,
+      pendingHeadRevision: 2,
+      pendingHeadRefOid: PR_HEAD_B,
+    },
+  );
+  assert.equal(
+    pendingTimeline.details.headRevision,
+    pendingTimeline.details.currentHeadRevision,
+  );
+  assert.equal(
+    pendingTimeline.details.headRefOid,
+    pendingTimeline.details.currentHeadRefOid,
+  );
+  const writesBeforeBlockedReconciliation = fixture.store.writes.length;
+  const blocked = await fixture.service.reconcilePullRequestSource({
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  });
+  assert.equal(blocked.applied, false);
+  assert.deepEqual(blocked.blockers, [{
+      itemId: root.itemId,
+      status: "dispatch_pending",
+      reason: "active_intent",
+      activeIntentId: sealed.intentId,
+    }]);
+  assert.equal(fixture.store.writes.length, writesBeforeBlockedReconciliation);
+
+  await fixture.service.ackIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    itemExpectedRevision: root.revision,
+    dispatchLeaseId: sealed.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-1" },
+  });
+  root = (await fixture.service.listItems()).items[0];
+  const activationCommand = {
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  };
+  const activated = await fixture.service.reconcilePullRequestSource(
+    activationCommand,
+  );
+  assert.equal(activated.applied, true);
+  assert.equal(activated.activeRevision, 2);
+  assert.equal(activated.pendingRevision, null);
+  assert.deepEqual(activated.blockers, []);
+  const writesAfterActivation = fixture.store.writes.length;
+  const timelineAfterActivation = (await fixture.service.listTimeline({
+    limit: 100,
+  })).items.length;
+  const replay = await fixture.service.reconcilePullRequestSource(
+    activationCommand,
+  );
+  assert.equal(replay.applied, false);
+  assert.equal(replay.activeRevision, 2);
+  assert.equal(fixture.store.writes.length, writesAfterActivation);
+  assert.equal(
+    (await fixture.service.listTimeline({ limit: 100 })).items.length,
+    timelineAfterActivation,
+  );
+
+  root = (await fixture.service.listItems()).items[0];
+  const historical = (await fixture.service.listOutbox()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.source.pending, null);
+  assert.equal(root.decisionContext, null);
+  assert.equal(historical.status, "delivered");
+  assert.equal(historical.sourceBinding.headRefOid, PR_HEAD_A);
+});
+
+test("an expired sealed old-Head intent is reclaimed and settled before cutover", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "dispatcher-before-crash",
+    leaseDurationMs: 1_000,
+  });
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.time.advance(1_000);
+
+  root = (await fixture.service.listItems()).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  const reclaimed = await fixture.service.claimIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    dispatcherId: "dispatcher-after-crash",
+    leaseDurationMs: 30_000,
+  });
+  assert.deepEqual(reclaimed.dispatchBinding, sealed.dispatchBinding);
+  assert.equal(reclaimed.attempt, sealed.attempt + 1);
+  await fixture.service.ackIntent({
+    intentId: reclaimed.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: root.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-recovered" },
+  });
+  root = (await fixture.service.listItems()).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  const activated = await fixture.service.reconcilePullRequestSource({
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  });
+
+  assert.equal(activated.applied, true);
+  assert.equal(activated.activeRevision, 2);
+  assert.equal(
+    (await fixture.service.listOutbox()).items[0].sourceBinding.headRefOid,
+    PR_HEAD_A,
+  );
+});
+
+test("PR source reconciliation is targeted by graph, item, and pending revision CAS", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.transition({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: null,
+    toStatus: "blocked",
+    actorId: "work-ledger-system",
+    reason: "hold-for-cutover-cas-test",
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  const graphRevision = (await fixture.service.getSummary()).revision;
+  const command = {
+    itemId: root.itemId,
+    expectedGraphRevision: graphRevision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  };
+  const writesBefore = fixture.store.writes.length;
+
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource({
+      ...command,
+      expectedGraphRevision: graphRevision - 1,
+    }),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+  );
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource({
+      ...command,
+      expectedRevision: root.revision + 1,
+    }),
+    (error) => error.code === "WORK_LEDGER_REVISION_CONFLICT",
+  );
+  assert.equal(fixture.store.writes.length, writesBefore);
+
+  fixture.source.records.push(
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_A,
+      previousHeadRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource({
+      itemId: root.itemId,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      expectedRevision: root.revision,
+      expectedPendingRevision: 2,
+    }),
+    (error) =>
+      error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+  );
+  assert.equal(root.source.activeRevision, 1);
+  assert.equal(root.source.pendingRevision, 3);
+});
+
+test("PR source reconciliation converges after a lost durable acknowledgement", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.transition({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: null,
+    toStatus: "blocked",
+    actorId: "work-ledger-system",
+    reason: "hold-before-new-head",
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.transition({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: null,
+    toStatus: "queued",
+    actorId: "work-ledger-system",
+    reason: "local-work-is-quiescent",
+  });
+  const command = {
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  };
+  const durableWrite = fixture.store.write.bind(fixture.store);
+  let loseAcknowledgement = true;
+  fixture.store.write = async (...args) => {
+    await durableWrite(...args);
+    if (loseAcknowledgement) {
+      loseAcknowledgement = false;
+      throw new Error("durable acknowledgement lost");
+    }
+  };
+
+  await assert.rejects(
+    fixture.service.reconcilePullRequestSource(command),
+    (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
+  );
+  const writesAfterLostAcknowledgement = fixture.store.writes.length;
+  const durableRoot = fixture.store.stored().items.find(
+    ({ itemId }) => itemId === root.itemId,
+  );
+  assert.equal(durableRoot.source.activeRevision, 2);
+  assert.equal(durableRoot.source.pendingRevision, null);
+
+  const replay = await fixture.service.reconcilePullRequestSource(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.activeRevision, 2);
+  assert.equal(fixture.store.writes.length, writesAfterLostAcknowledgement);
+  assert.equal(
+    (await fixture.service.listTimeline({ limit: 100 })).items
+      .filter(({ type }) => type === "pr_source_activated").length,
+    1,
+  );
+});
+
+test("PR graph children are Head-bound and old epochs become neutral superseded work", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const first = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, 1),
+  );
+  let firstChild = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === first.taskId,
+  );
+  const graph = await fixture.service.getGraphSnapshot();
+  const projectedChild = graph.graph.tasks.find(
+    ({ taskId }) => taskId === first.taskId,
+  );
+  assert.equal(
+    graph.graph.tasks.some(({ taskId }) => taskId === root.itemId),
+    true,
+  );
+  assert.equal(projectedChild.parentTaskId, root.itemId);
+  assert.equal(firstChild.assignment.graphTask.sourceBinding.rootItemId, root.itemId);
+  assert.equal(firstChild.assignment.graphTask.sourceBinding.headRevision, 1);
+  assert.equal(firstChild.assignment.graphTask.sourceBinding.headRefOid, PR_HEAD_A);
+
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const afterCutover = (await fixture.service.listItems()).items;
+  root = afterCutover.find(({ kind }) => kind === "source_root");
+  firstChild = afterCutover.find(({ itemId }) => itemId === first.taskId);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(firstChild.status, "superseded");
+  assert.equal(firstChild.statusReason, "pr_head_superseded");
+  const claimedRoot = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  root = await fixture.service.handoff({
+    itemId: claimedRoot.itemId,
+    expectedRevision: claimedRoot.revision,
+    leaseId: claimedRoot.leaseId,
+    actorId: "employee-pr-engineer",
+    target: { type: "role", id: "pr-engineer" },
+    reason: "decompose-new-head",
+  });
+  const crossEpochDependency = prGraphChildCommand(
+    root,
+    (await fixture.service.getSummary()).revision,
+    "must-not-depend-on-old-head",
+  );
+  crossEpochDependency.command.dependsOnTaskIds = [first.taskId];
+  crossEpochDependency.command.expectedTaskRevisions.push({
+    taskId: first.taskId,
+    revision: firstChild.revision,
+  });
+  await assert.rejects(
+    fixture.service.createGraphChild(crossEpochDependency),
+    (error) => error.code === "WORK_LEDGER_GRAPH_SOURCE_EPOCH_CONFLICT",
+  );
+  const second = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, (await fixture.service.getSummary()).revision),
+  );
+  const secondChild = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === second.taskId,
+  );
+  assert.notEqual(second.taskId, first.taskId);
+  assert.equal(secondChild.assignment.graphTask.sourceBinding.headRevision, 2);
+  assert.equal(secondChild.assignment.graphTask.sourceBinding.headRefOid, PR_HEAD_B);
+
+  fixture.source.records.push(
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_A,
+      previousHeadRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  const third = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, (await fixture.service.getSummary()).revision),
+  );
+  const thirdChild = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === third.taskId,
+  );
+  assert.notEqual(third.taskId, first.taskId);
+  assert.notEqual(third.taskId, second.taskId);
+  assert.equal(thirdChild.assignment.graphTask.sourceBinding.headRevision, 3);
+  assert.equal(thirdChild.assignment.graphTask.sourceBinding.headRefOid, PR_HEAD_A);
+});
+
+test("a cancelled old-Head child becomes neutral when the next Head activates", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const created = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, (await fixture.service.getSummary()).revision),
+  );
+  let child = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === created.taskId,
+  );
+  await fixture.service.cancelGraphTask({
+    itemId: child.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: child.revision,
+    actorId: "employee-orchestrator",
+    reason: "obsolete-old-head-plan",
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  const items = (await fixture.service.listItems()).items;
+  root = items.find(({ kind }) => kind === "source_root");
+  child = items.find(({ itemId }) => itemId === child.itemId);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(child.status, "superseded");
+  assert.equal(child.statusReason, "pr_head_superseded");
+  const claimedRoot = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(claimedRoot.status, "working");
+});
+
+test("a sealed old-Head child blocks root activation until its action is settled", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const created = await fixture.service.createGraphChild(
+    prGraphChildCommand(root, 1),
+  );
+  let child = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === created.taskId,
+  );
+  child = await fixture.service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    roleId: "developer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "developer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.pending.headRefOid, PR_HEAD_B);
+  const blocked = await fixture.service.reconcilePullRequestSource({
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  });
+  assert.equal(blocked.applied, false);
+  assert.deepEqual(blocked.blockers, [{
+      itemId: child.itemId,
+      status: "dispatch_pending",
+      reason: "active_intent",
+      activeIntentId: sealed.intentId,
+    }]);
+  await assert.rejects(
+    fixture.service.claim({
+      itemId: root.itemId,
+      expectedRevision: root.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  );
+
+  await fixture.service.ackIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatchLeaseId: sealed.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-child-1" },
+  });
+  root = (await fixture.service.listItems()).items.find(
+    ({ kind }) => kind === "source_root",
+  );
+  const activated = await fixture.service.reconcilePullRequestSource({
+    itemId: root.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: 2,
+  });
+  assert.equal(activated.applied, true);
+  assert.equal(activated.activeRevision, 2);
+  assert.deepEqual(activated.blockers, []);
+
+  const settledItems = (await fixture.service.listItems()).items;
+  root = settledItems.find(({ kind }) => kind === "source_root");
+  child = settledItems.find(({ itemId }) => itemId === child.itemId);
+  const historical = (await fixture.service.listOutbox()).items[0];
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(child.status, "superseded");
+  assert.equal(historical.sourceBinding.rootItemId, root.itemId);
+  assert.equal(historical.sourceBinding.headRevision, 1);
+  assert.equal(historical.sourceBinding.headRefOid, PR_HEAD_A);
+});
+
+test("an unproven newer PR Head is audited but never activated", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+
+  assert.equal(item.source.inputRevision, 2);
+  assert.equal(item.source.activeRevision, 1);
+  assert.equal(item.source.headRevision, 1);
+  assert.equal(item.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(
+    item.source.revisions.at(-1).disposition,
+    "ignored_unproven_head",
+  );
+});
+
+test("a legitimate A to B to A force-push creates three distinct Head epochs", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      headRefOid: PR_HEAD_A,
+      previousHeadRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+
+  assert.equal(item.source.activeRevision, 3);
+  assert.equal(item.source.headRevision, 3);
+  assert.equal(item.source.current.headRefOid, PR_HEAD_A);
+  assert.deepEqual(
+    item.source.revisions.map(({ headRevision }) => headRevision),
+    [1, 2, 3],
+  );
+});
+
+test("a late old-Head event is audited without rolling the PR task back", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const headB = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(
+    prAssignment(3, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T01:01:00.000Z",
+      headRefOid: PR_HEAD_A,
+      changedFields: ["ciStatus"],
+      ciStatus: "FAILURE",
+    }),
+  );
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+
+  assert.equal((await fixture.service.getSummary()).intakeCursor, 3);
+  assert.equal(item.itemId, headB.itemId);
+  assert.equal(item.source.inputRevision, 3);
+  assert.equal(item.source.activeRevision, 2);
+  assert.equal(item.source.headRevision, 2);
+  assert.equal(item.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(item.source.revisions.at(-1).disposition, "ignored_stale");
+});
+
+test("schema v8 safely consolidates queued PR assignments into one source root", async () => {
+  const records = [
+    prAssignment(1, { eventType: "pull_request.updated" }),
+    prAssignment(2, { eventType: "pull_request.classified" }),
+    prAssignment(3, { eventType: "pull_request.status" }),
+  ];
+  const items = records.map((record) => {
+    const item = createAssignmentWorkItem(
+      record,
+      "2026-08-02T02:00:00.000Z",
+    );
+    delete item.source;
+    delete item.sourceQuarantine;
+    return item;
+  });
+  const limits = normalizeWorkLedgerLimits({ graphMemoryOutboxLimit: 3 });
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 1,
+    intakeCursor: 3,
+    sourceHighWatermark: 3,
+    items,
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(
+      items,
+      1,
+      limits,
+    ),
+  };
+  const store = new MemoryStore({ [STATE_KEY]: legacy });
+  const fixture = await createFixture({
+    records,
+    store,
+    limits,
+  });
+
+  const migrated = (await fixture.service.listItems({ limit: 10 })).items;
+  const roots = migrated.filter(({ kind }) => kind === "source_root");
+  const oldAssignments = migrated.filter(({ kind }) => kind === "assignment");
+
+  assert.equal(store.writes.length, 0);
+  assert.equal(store.stored().schemaVersion, 8);
+  assert.equal(roots.length, 1);
+  assert.equal(roots[0].status, "queued");
+  assert.equal(roots[0].source.inputRevision, 3);
+  assert.equal(roots[0].source.headRevision, 1);
+  assert.equal(oldAssignments.length, 3);
+  assert.equal(oldAssignments.every(({ status }) => status === "cancelled"), true);
+  assert.equal(
+    (await fixture.service.readGraphMemoryProjectionBatch({ limit: 10 }))
+      .highWatermark,
+    3,
+  );
+
+  await fixture.service.claim({
+    itemId: roots[0].itemId,
+    expectedRevision: roots[0].revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  assert.equal(store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  assert.deepEqual(
+    store.stored().graphMemoryProjection,
+    legacy.graphMemoryProjection,
+  );
+  const recovered = new WorkLedgerService({
+    store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+    limits,
+  });
+  await recovered.recover();
+  assert.equal(
+    (await recovered.readGraphMemoryProjectionBatch({ limit: 10 }))
+      .highWatermark,
+    3,
+  );
+});
+
+test("schema v8 mixed-Head PR work is durably fenced from new actions", async () => {
+  const records = [
+    prAssignment(1, { headRefOid: PR_HEAD_A }),
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  ];
+  const items = records.map((record) => {
+    const item = createAssignmentWorkItem(
+      record,
+      "2026-08-02T02:00:00.000Z",
+    );
+    delete item.source;
+    delete item.sourceQuarantine;
+    return item;
+  });
+  Object.assign(items[0], {
+    status: "working",
+    ownerId: "legacy-pr-worker",
+    leaseId: "legacy-pr-lease",
+    leaseUntil: "2026-08-03T02:00:00.000Z",
+    attempt: 1,
+  });
+  const legacyChild = createGraphChildWorkItem(
+    {
+      parentItemId: items[0].itemId,
+      childKey: "legacy-conflict-fix",
+      work: {
+        title: "旧版冲突修复",
+        description: "不得绕过 PR Head 切换继续执行。",
+      },
+      target: { type: "role", id: "developer" },
+      dependsOnItemIds: [],
+      acceptanceContract: {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      parentEvent: items[0].event,
+      sourceBinding: null,
+    },
+    "2026-08-02T02:00:00.000Z",
+  );
+  delete legacyChild.source;
+  delete legacyChild.sourceQuarantine;
+  delete legacyChild.assignment.graphTask.sourceBinding;
+  items.push(legacyChild);
+  const limits = normalizeWorkLedgerLimits();
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 1,
+    intakeCursor: 2,
+    sourceHighWatermark: 2,
+    items,
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(
+      items,
+      1,
+      limits,
+    ),
+  };
+  const store = new MemoryStore({ [STATE_KEY]: legacy });
+  const fixture = await createFixture({ records, store, limits });
+  const migrated = (await fixture.service.listItems({ limit: 10 })).items;
+  const working = migrated.find(
+    ({ assignmentId }) => assignmentId === items[0].assignmentId,
+  );
+  const root = migrated.find(({ kind }) => kind === "source_root");
+  const child = migrated.find(({ itemId }) => itemId === legacyChild.itemId);
+
+  assert.equal(store.writes.length, 0);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_legacy_cutover");
+  assert.equal(working.status, "working");
+  assert.equal(working.statusReason, "pr_source_legacy_cutover");
+  assert.equal(child.status, "blocked");
+  assert.equal(child.statusReason, "pr_source_legacy_cutover");
+  await assert.rejects(
+    fixture.service.claim({
+      itemId: child.itemId,
+      expectedRevision: child.revision,
+      workerId: "legacy-developer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+  await assert.rejects(
+    fixture.service.stageIntent({
+      itemId: working.itemId,
+      expectedRevision: working.revision,
+      leaseId: working.leaseId,
+      actorId: "legacy-pr-worker",
+      roleId: "pr-engineer",
+      intent: reviewIntent(),
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+  assert.equal(store.writes.length, 0);
+
+  fixture.source.records.push(assignment(3));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  assert.equal(store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+
+  const recovered = new WorkLedgerService({
+    store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const persisted = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === working.itemId,
+  );
+  assert.equal(persisted.statusReason, "pr_source_legacy_cutover");
+  await assert.rejects(
+    recovered.stageIntent({
+      itemId: persisted.itemId,
+      expectedRevision: persisted.revision,
+      leaseId: persisted.leaseId,
+      actorId: "legacy-pr-worker",
+      roleId: "pr-engineer",
+      intent: reviewIntent(),
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+});
+
+test("schema v8 quarantine closes over cross-tree and transitive dependency consumers", async () => {
+  const firstPr = prAssignment(1);
+  const secondPr = prAssignment(2, {
+    repository: "acme/other-repo",
+    pullRequestNumber: 7,
+    title: "PR 7",
+  });
+  const ordinaryRecord = prAssignment(3);
+  ordinaryRecord.assignment = {
+    ...ordinaryRecord.assignment,
+    assignmentId: "workflow-assignment-ordinary-3",
+    target: { type: "role", id: "developer" },
+  };
+  const firstPrItem = createAssignmentWorkItem(
+    firstPr,
+    "2026-08-02T02:00:00.000Z",
+  );
+  const secondPrItem = createAssignmentWorkItem(
+    secondPr,
+    "2026-08-02T02:00:00.000Z",
+  );
+  const ordinaryParent = createAssignmentWorkItem(
+    ordinaryRecord,
+    "2026-08-02T02:00:00.000Z",
+  );
+  for (const item of [firstPrItem, secondPrItem]) {
+    Object.assign(item, {
+      status: "completed",
+      revision: 2,
+      statusReason: "legacy_completed",
+    });
+  }
+  const crossTreeWorker = createGraphChildWorkItem(
+    {
+      parentItemId: ordinaryParent.itemId,
+      childKey: "cross-tree-worker",
+      work: {
+        title: "消费旧 PR 结果",
+        description: "不得基于无法证明 Head 的旧 PR 结果继续执行。",
+      },
+      target: { type: "role", id: "developer" },
+      dependsOnItemIds: [secondPrItem.itemId, firstPrItem.itemId].sort(),
+      acceptanceContract: {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      parentEvent: ordinaryParent.event,
+      sourceBinding: null,
+    },
+    "2026-08-02T02:00:00.000Z",
+  );
+  Object.assign(crossTreeWorker, {
+    status: "working",
+    revision: 2,
+    ownerId: "legacy-cross-tree-worker",
+    leaseId: "legacy-cross-tree-lease",
+    leaseUntil: "2026-08-03T02:00:00.000Z",
+    attempt: 1,
+  });
+  const directConsumer = createGraphChildWorkItem(
+    {
+      parentItemId: ordinaryParent.itemId,
+      childKey: "direct-consumer",
+      work: { title: "直接消费者", description: "消费旧 PR 交付。" },
+      target: { type: "role", id: "developer" },
+      dependsOnItemIds: [secondPrItem.itemId],
+      acceptanceContract: {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      parentEvent: ordinaryParent.event,
+      sourceBinding: null,
+    },
+    "2026-08-02T02:00:00.000Z",
+  );
+  Object.assign(directConsumer, {
+    status: "completed",
+    revision: 2,
+    statusReason: "legacy_completed",
+  });
+  const twoHopConsumer = createGraphChildWorkItem(
+    {
+      parentItemId: ordinaryParent.itemId,
+      childKey: "two-hop-consumer",
+      work: { title: "两跳消费者", description: "传递消费旧 PR 交付。" },
+      target: { type: "role", id: "developer" },
+      dependsOnItemIds: [directConsumer.itemId],
+      acceptanceContract: {
+        revision: 1,
+        acceptanceCriteria: [],
+        expectedDeliverables: [],
+      },
+      parentEvent: ordinaryParent.event,
+      sourceBinding: null,
+    },
+    "2026-08-02T02:00:00.000Z",
+  );
+  const items = [
+    secondPrItem,
+    firstPrItem,
+    ordinaryParent,
+    crossTreeWorker,
+    directConsumer,
+    twoHopConsumer,
+  ];
+  for (const item of items) {
+    delete item.source;
+    delete item.sourceQuarantine;
+    if (item.kind === "graph_task") {
+      delete item.assignment.graphTask.sourceBinding;
+    }
+  }
+  const limits = normalizeWorkLedgerLimits();
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 2,
+    intakeCursor: 3,
+    sourceHighWatermark: 3,
+    items,
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(
+      items,
+      2,
+      limits,
+    ),
+  };
+  const store = new MemoryStore({ [STATE_KEY]: legacy });
+  const fixture = await createFixture({
+    records: [firstPr, secondPr, ordinaryRecord],
+    store,
+    limits,
+  });
+  let migrated = (await fixture.service.listItems({ limit: 20 })).items;
+  const roots = migrated
+    .filter(({ kind }) => kind === "source_root")
+    .sort((left, right) =>
+      left.source.workKey === right.source.workKey
+        ? left.itemId.localeCompare(right.itemId)
+        : left.source.workKey.localeCompare(right.source.workKey)
+    );
+  const secondRoot = roots.find(
+    ({ source }) => source.identity.repository === "acme/other-repo",
+  );
+  let migratedWorker = migrated.find(
+    ({ itemId }) => itemId === crossTreeWorker.itemId,
+  );
+  let migratedDirect = migrated.find(
+    ({ itemId }) => itemId === directConsumer.itemId,
+  );
+  let migratedTwoHop = migrated.find(
+    ({ itemId }) => itemId === twoHopConsumer.itemId,
+  );
+
+  assert.equal(roots.length, 2);
+  assert.equal(
+    migratedWorker.sourceQuarantine.rootItemId,
+    roots[0].itemId,
+  );
+  assert.equal(migratedDirect.sourceQuarantine.rootItemId, secondRoot.itemId);
+  assert.equal(migratedTwoHop.sourceQuarantine.rootItemId, secondRoot.itemId);
+  assert.equal(migratedWorker.status, "working");
+  assert.equal(migratedTwoHop.status, "blocked");
+  await assert.rejects(
+    fixture.service.claim({
+      itemId: migratedTwoHop.itemId,
+      expectedRevision: migratedTwoHop.revision,
+      workerId: "legacy-two-hop-worker",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+  await assert.rejects(
+    fixture.service.stageIntent({
+      itemId: migratedWorker.itemId,
+      expectedRevision: migratedWorker.revision,
+      leaseId: migratedWorker.leaseId,
+      actorId: migratedWorker.ownerId,
+      roleId: "developer",
+      intent: reviewIntent(),
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+
+  fixture.source.records.push(assignment(4));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  assert.equal(store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  const recovered = new WorkLedgerService({
+    store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+    limits,
+  });
+  await recovered.recover();
+  migrated = (await recovered.listItems({ limit: 20 })).items;
+  migratedWorker = migrated.find(({ itemId }) => itemId === crossTreeWorker.itemId);
+  migratedDirect = migrated.find(({ itemId }) => itemId === directConsumer.itemId);
+  migratedTwoHop = migrated.find(({ itemId }) => itemId === twoHopConsumer.itemId);
+  assert.equal(migratedWorker.sourceQuarantine.rootItemId, roots[0].itemId);
+  assert.equal(migratedDirect.sourceQuarantine.rootItemId, secondRoot.itemId);
+  assert.equal(migratedTwoHop.sourceQuarantine.rootItemId, secondRoot.itemId);
+  await assert.rejects(
+    recovered.claim({
+      itemId: migratedTwoHop.itemId,
+      expectedRevision: migratedTwoHop.revision,
+      workerId: "legacy-two-hop-worker",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+  await assert.rejects(
+    recovered.stageIntent({
+      itemId: migratedWorker.itemId,
+      expectedRevision: migratedWorker.revision,
+      leaseId: migratedWorker.leaseId,
+      actorId: migratedWorker.ownerId,
+      roleId: "developer",
+      intent: reviewIntent(),
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+});
+
+for (const [legacyState, prepareOutbox] of [
+  ["pending", () => {}],
+  [
+    "unsealed dispatching",
+    (outbox) => {
+      Object.assign(outbox, {
+        status: "dispatching",
+        revision: 2,
+        attempt: 1,
+        dispatcherId: "legacy-dispatcher",
+        dispatchLeaseId: "legacy-dispatch-lease",
+        dispatchLeaseUntil: "2026-08-02T03:00:00.000Z",
+        dispatchBinding: null,
+      });
+    },
+  ],
+]) {
+  test(`schema v8 ${legacyState} intent is failed while entering PR-source quarantine`, async () => {
+    const record = prAssignment(1);
+    const item = createAssignmentWorkItem(record, "2026-08-02T02:00:00.000Z");
+    const outbox = createWorkIntentRecord(
+      item,
+      reviewIntent(),
+      { roleId: "pr-engineer", workerId: "employee-pr-engineer" },
+      "2026-08-02T02:00:00.000Z",
+    );
+    Object.assign(item, {
+      status: "dispatch_pending",
+      revision: 3,
+      activeIntentId: outbox.intentId,
+    });
+    delete item.source;
+    delete item.sourceQuarantine;
+    prepareOutbox(outbox);
+    delete outbox.sourceBinding;
+    const limits = normalizeWorkLedgerLimits();
+    const legacy = {
+      ...emptyWorkLedgerState(),
+      schemaVersion: 8,
+      revision: 3,
+      intakeCursor: 1,
+      sourceHighWatermark: 1,
+      items: [item],
+      outbox: [outbox],
+      graphMemoryProjection: migrateWorkGraphMemoryProjection(
+        [item],
+        3,
+        limits,
+      ),
+    };
+    const fixture = await createFixture({
+      records: [record],
+      store: new MemoryStore({ [STATE_KEY]: legacy }),
+    });
+
+    let migratedItem = (await fixture.service.listItems()).items.find(
+      ({ assignmentId }) => assignmentId === item.assignmentId,
+    );
+    let migratedOutbox = (await fixture.service.listOutbox()).items[0];
+    assert.equal(migratedItem.status, "blocked");
+    assert.equal(migratedItem.activeIntentId, null);
+    assert.equal(migratedItem.statusReason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+    assert.equal(
+      migratedItem.sourceQuarantine.reason,
+      LEGACY_PR_SOURCE_CUTOVER_REASON,
+    );
+    assert.equal(migratedOutbox.status, "failed");
+    assert.equal(migratedOutbox.dispatcherId, null);
+    assert.equal(migratedOutbox.dispatchLeaseId, null);
+    assert.equal(migratedOutbox.dispatchLeaseUntil, null);
+    assert.deepEqual(migratedOutbox.outcome, {
+      status: "failed",
+      details: { reason: "pr_source_legacy_cutover_before_dispatch" },
+    });
+
+    fixture.source.records.push(assignment(2));
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    assert.equal(
+      fixture.store.stored().schemaVersion,
+      WORK_LEDGER_STATE_SCHEMA_VERSION,
+    );
+    const recovered = new WorkLedgerService({
+      store: fixture.store,
+      assignmentSource: fixture.source,
+      exclusiveLease: new ExclusiveLease(),
+      clock: fixture.time.clock,
+      idFactory: incrementingIds(),
+    });
+    await recovered.recover();
+    migratedItem = (await recovered.listItems()).items.find(
+      ({ assignmentId }) => assignmentId === item.assignmentId,
+    );
+    migratedOutbox = (await recovered.listOutbox()).items.find(
+      ({ intentId }) => intentId === outbox.intentId,
+    );
+    assert.equal(migratedItem.status, "blocked");
+    assert.equal(migratedItem.activeIntentId, null);
+    assert.equal(
+      migratedItem.sourceQuarantine.reason,
+      LEGACY_PR_SOURCE_CUTOVER_REASON,
+    );
+    assert.equal(migratedOutbox.status, "failed");
+    assert.equal(
+      migratedOutbox.outcome.details.reason,
+      "pr_source_legacy_cutover_before_dispatch",
+    );
+  });
+}
+
+test("schema v8 sealed intent settlement cannot release its PR source quarantine", async () => {
+  const record = prAssignment(1);
+  const item = createAssignmentWorkItem(record, "2026-08-02T02:00:00.000Z");
+  const outbox = createWorkIntentRecord(
+    item,
+    reviewIntent(),
+    { roleId: "pr-engineer", workerId: "employee-pr-engineer" },
+    "2026-08-02T02:00:00.000Z",
+  );
+  const dispatchBinding = createWorkIntentDispatchBinding(
+    boundReviewIntent(item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  );
+  Object.assign(item, {
+    status: "dispatch_pending",
+    revision: 3,
+    activeIntentId: outbox.intentId,
+  });
+  delete item.source;
+  delete item.sourceQuarantine;
+  Object.assign(outbox, {
+    status: "dispatching",
+    revision: 3,
+    attempt: 1,
+    dispatcherId: "legacy-dispatcher",
+    dispatchLeaseId: "legacy-dispatch-lease",
+    dispatchLeaseUntil: "2026-08-02T02:00:00.000Z",
+    dispatchBinding,
+  });
+  delete outbox.sourceBinding;
+  const limits = normalizeWorkLedgerLimits();
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 3,
+    intakeCursor: 1,
+    sourceHighWatermark: 1,
+    items: [item],
+    outbox: [outbox],
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(
+      [item],
+      3,
+      limits,
+    ),
+  };
+  const fixture = await createFixture({
+    records: [record],
+    store: new MemoryStore({ [STATE_KEY]: legacy }),
+  });
+  let quarantined = (await fixture.service.listItems()).items.find(
+    ({ assignmentId }) => assignmentId === item.assignmentId,
+  );
+  assert.equal(quarantined.sourceQuarantine.reason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+
+  const reclaimed = await fixture.service.claimIntent({
+    intentId: outbox.intentId,
+    expectedRevision: outbox.revision,
+    dispatcherId: "legacy-settlement-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  assert.deepEqual(reclaimed.dispatchBinding, dispatchBinding);
+  await fixture.service.ackIntent({
+    intentId: outbox.intentId,
+    expectedRevision: reclaimed.revision,
+    itemExpectedRevision: quarantined.revision,
+    dispatchLeaseId: reclaimed.dispatchLeaseId,
+    actorId: reclaimed.dispatcherId,
+    outcome: "failed",
+    nextStatus: "retry_wait",
+    availableAt: "2026-08-02T04:00:00.000Z",
+    details: { code: "legacy_downstream_timeout" },
+  });
+  quarantined = (await fixture.service.listItems()).items.find(
+    ({ assignmentId }) => assignmentId === item.assignmentId,
+  );
+  assert.equal(quarantined.status, "blocked");
+  assert.equal(quarantined.activeIntentId, null);
+  assert.equal(quarantined.statusReason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+  assert.equal(quarantined.sourceQuarantine.reason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+  await assert.rejects(
+    fixture.service.claim({
+      itemId: quarantined.itemId,
+      expectedRevision: quarantined.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+  );
+});
+
+test("schema v8 PR history uses independent source-root byte budgets", async () => {
+  const migrationCapacity = normalizeWorkLedgerLimits({
+    sourceRootByteBudget: 16 * 1024 * 1024,
+    sourceStateByteBudget: 96 * 1024 * 1024,
+  });
+  assert.equal(migrationCapacity.sourceRootByteBudget, 16 * 1024 * 1024);
+  assert.equal(migrationCapacity.sourceStateByteBudget, 96 * 1024 * 1024);
+  const records = Array.from({ length: 12 }, (_, index) =>
+    prAssignment(index + 1, {
+      eventType: index === 0
+        ? "pull_request.updated"
+        : "pull_request.status",
+      occurredAt: `2026-08-02T01:${String(index).padStart(2, "0")}:00.000Z`,
+      ciStatus: index % 2 === 0 ? "PENDING" : "FAILURE",
+    })
+  );
+  const items = records.map((record) => {
+    const item = createAssignmentWorkItem(record, record.event.occurredAt);
+    delete item.source;
+    delete item.sourceQuarantine;
+    return item;
+  });
+  const root = createPullRequestSourceRootWorkItem(
+    records[0],
+    records[0].event.occurredAt,
+  );
+  for (const record of records.slice(1)) {
+    const appended = appendPullRequestWorkSource(root.source, record);
+    root.source = appended.source;
+    root.inputDigest = appended.source.current.inputDigest;
+    root.updatedAt = record.event.occurredAt;
+  }
+  const capacityBytes = (item) => {
+    const view = structuredClone(item);
+    delete view.graph;
+    if (view.source === null) delete view.source;
+    if (view.sourceQuarantine === null) delete view.sourceQuarantine;
+    return Buffer.byteLength(`${JSON.stringify(view, null, 2)}\n`, "utf8");
+  };
+  const operationalItemByteBudget = Math.max(
+    ...items.map((item) => capacityBytes({
+      ...item,
+      status: "cancelled",
+      statusReason: "consolidated_pr_source_root",
+    })),
+  );
+  const sourceRootByteBudget = capacityBytes(root);
+  assert.ok(sourceRootByteBudget > operationalItemByteBudget);
+  const limits = normalizeWorkLedgerLimits({
+    itemByteBudget: operationalItemByteBudget,
+    sourceRootByteBudget,
+  });
+  const legacy = {
+    ...emptyWorkLedgerState(),
+    schemaVersion: 8,
+    revision: 1,
+    intakeCursor: records.length,
+    sourceHighWatermark: records.length,
+    items,
+    graphMemoryProjection: migrateWorkGraphMemoryProjection(
+      items,
+      1,
+      limits,
+    ),
+  };
+  const store = new MemoryStore({ [STATE_KEY]: legacy });
+  const recovered = await createFixture({ records, store, limits });
+
+  const migratedRoot = (await recovered.service.listItems({ limit: 20 }))
+    .items.find(({ kind }) => kind === "source_root");
+  assert.equal(migratedRoot.source.inputRevision, records.length);
+  assert.ok(capacityBytes(migratedRoot) > limits.itemByteBudget);
+
+  const undersizedStore = new MemoryStore({ [STATE_KEY]: legacy });
+  const undersized = new WorkLedgerService({
+    store: undersizedStore,
+    assignmentSource: recovered.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: recovered.time.clock,
+    idFactory: incrementingIds(),
+    limits: {
+      itemByteBudget: operationalItemByteBudget,
+      sourceRootByteBudget: sourceRootByteBudget - 1,
+    },
+  });
+  await assert.rejects(
+    undersized.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+  assert.deepEqual(undersizedStore.stored(), legacy);
+  assert.equal(undersizedStore.writes.length, 0);
+});
+
+test("recovery rejects tampering with the append-only PR source history", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  const tampered = fixture.store.stored();
+  tampered.items[0].source.revisions[0].headRevision = 2;
+  fixture.store.replaceStored(tampered);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
 });
 
 test("a failed intake write advances neither the durable cursor nor live items", async () => {
@@ -1792,7 +3671,14 @@ test("schema v7 quarantines an in-flight intent whose old policy binding is unkn
   await prepareClaimedReviewIntent(fixture, 1_000);
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 7;
-  for (const entry of legacy.outbox) delete entry.dispatchBinding;
+  for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
+  for (const entry of legacy.outbox) {
+    delete entry.dispatchBinding;
+    delete entry.sourceBinding;
+  }
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -2467,13 +4353,20 @@ test("transition details reject untrusted command-like fields", async () => {
   );
 });
 
-async function prepareAttentionResult(fixture, answer) {
+async function prepareAttentionResult(
+  fixture,
+  answer,
+  {
+    workerId = "employee-pr-reviewer",
+    roleId = "pr-reviewer",
+  } = {},
+) {
   await fixture.service.intake();
   let item = (await fixture.service.listItems()).items[0];
   item = await fixture.service.claim({
     itemId: item.itemId,
     expectedRevision: item.revision,
-    workerId: "employee-pr-reviewer",
+    workerId,
     leaseDurationMs: 30_000,
   });
   const intent = askUserIntent();
@@ -2481,15 +4374,15 @@ async function prepareAttentionResult(fixture, answer) {
     itemId: item.itemId,
     expectedRevision: item.revision,
     leaseId: item.leaseId,
-    actorId: "employee-pr-reviewer",
-    roleId: "pr-reviewer",
+    actorId: workerId,
+    roleId,
     intent,
   });
   const request = normalizeAttentionRequest({
     requestKey: staged.outbox.intentId,
     type: "ask_user",
     producer: {
-      roleId: "pr-reviewer",
+      roleId,
       workItemId: item.itemId,
     },
     question: intent.question,
@@ -2527,6 +4420,84 @@ async function prepareAttentionResult(fixture, answer) {
     "2026-08-02T02:00:00.000Z",
     1,
   ).outbox;
+}
+
+function boundAttentionIntent(item, outbox) {
+  const content = {
+    policyVersion: 1,
+    kind: "attention_request",
+    requestedBy: {
+      roleId: outbox.requestedBy.roleId,
+      workItemId: item.itemId,
+    },
+    source: {
+      assignmentId: item.assignmentId,
+      eventId: item.event.eventId,
+    },
+    binding: { requestKey: outbox.intentId },
+    payload: {
+      question: outbox.intent.question,
+      choices: outbox.intent.choices,
+    },
+  };
+  return {
+    intentId: `work-intent-${workProposalDigest(content)}`,
+    ...content,
+  };
+}
+
+function quarantineStoredItem(
+  durable,
+  item,
+  { preserveWorkState = false } = {},
+) {
+  const sequence = Math.max(
+    durable.intakeCursor,
+    durable.sourceHighWatermark,
+  ) + 1;
+  const record = prAssignment(sequence, {
+    repository: "legacy/quarantine",
+    pullRequestNumber: 1_000 + sequence,
+    title: "Legacy quarantined PR source",
+  });
+  const root = createPullRequestSourceRootWorkItem(
+    record,
+    item.updatedAt,
+  );
+  const quarantine = {
+    kind: LEGACY_PR_SOURCE_QUARANTINE_KIND,
+    rootItemId: root.itemId,
+    workKey: root.source.workKey,
+    reason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+  };
+  Object.assign(root, {
+    status: "blocked",
+    statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+    sourceQuarantine: quarantine,
+  });
+  Object.assign(
+    item,
+    preserveWorkState
+      ? {
+          statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+          sourceQuarantine: quarantine,
+        }
+      : {
+          status: "blocked",
+          activeIntentId: null,
+          statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+          sourceQuarantine: quarantine,
+        },
+  );
+  durable.items.push(root);
+  durable.intakeCursor = sequence;
+  durable.sourceHighWatermark = sequence;
+  durable.graphMemoryProjection = migrateWorkGraphMemoryProjection(
+    durable.items,
+    durable.revision,
+    normalizeWorkLedgerLimits(),
+  );
+  return quarantine;
 }
 
 test("an answered attention result atomically advances its cursor and requeues durable context", async () => {
@@ -2622,6 +4593,128 @@ test("a rejected attention result blocks work while a gap advances nothing", asy
   assert.equal(item.decisionContext.outcome, "rejected");
 });
 
+test("a sealed attention result advances its cursor without reviving legacy PR-source work", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const outbox = await prepareAttentionResult(fixture, {
+    type: "choice",
+    choiceId: "yes",
+  });
+  const durable = fixture.store.stored();
+  durable.outbox[0].dispatchBinding = createWorkIntentDispatchBinding(
+    boundAttentionIntent(durable.items[0], durable.outbox[0]),
+  );
+  quarantineStoredItem(durable, durable.items[0]);
+  fixture.store.replaceStored(durable);
+  fixture.service = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: fixture.lease,
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await fixture.service.recover();
+
+  const applied = await fixture.service.applyAttentionBatch({
+    items: [outbox],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const item = (await fixture.service.listItems()).items[0];
+  const summary = await fixture.service.getSummary();
+
+  assert.equal(applied.applied, 1);
+  assert.equal(summary.attentionCursor, 1);
+  assert.equal(summary.attentionHighWatermark, 1);
+  assert.equal(item.status, "blocked");
+  assert.equal(item.activeIntentId, null);
+  assert.equal(item.statusReason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+  assert.equal(item.decisionContext.source, "attention");
+  assert.equal(item.decisionContext.outcome, "answered");
+  assert.deepEqual(item.decisionContext.value.answer, {
+    type: "choice",
+    choiceId: "yes",
+  });
+});
+
+test("legacy attention settlement discards unsealed quarantine and rejects reason-only fallback", async (t) => {
+  for (const seal of [false, true]) {
+    await t.test(
+      seal ? "status reason alone is not quarantine" : "unsealed quarantine",
+      async () => {
+        const fixture = await createFixture({ records: [assignment(1)] });
+        const outbox = await prepareAttentionResult(fixture, {
+          type: "choice",
+          choiceId: "yes",
+        });
+        const durable = fixture.store.stored();
+        const item = durable.items[0];
+        if (seal) {
+          durable.outbox[0].dispatchBinding = createWorkIntentDispatchBinding(
+            boundAttentionIntent(item, durable.outbox[0]),
+          );
+          Object.assign(item, {
+            status: "blocked",
+            activeIntentId: null,
+            statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+          });
+        } else {
+          quarantineStoredItem(durable, item, { preserveWorkState: true });
+        }
+        fixture.store.replaceStored(durable);
+        fixture.service = new WorkLedgerService({
+          store: fixture.store,
+          assignmentSource: fixture.source,
+          exclusiveLease: fixture.lease,
+          clock: fixture.time.clock,
+          idFactory: incrementingIds(),
+        });
+        await fixture.service.recover();
+        if (!seal) {
+          const waiting = (await fixture.service.listItems()).items.find(
+            ({ itemId }) => itemId === item.itemId,
+          );
+          assert.equal(waiting.status, "waiting_user");
+          assert.notEqual(waiting.activeIntentId, null);
+          assert.equal(
+            waiting.sourceQuarantine.kind,
+            LEGACY_PR_SOURCE_QUARANTINE_KIND,
+          );
+        }
+
+        const batch = {
+          items: [outbox],
+          nextSequence: 1,
+          highWatermark: 1,
+          oldestAvailableSequence: 1,
+        };
+        if (!seal) {
+          const applied = await fixture.service.applyAttentionBatch(batch);
+          const settled = (await fixture.service.listItems()).items.find(
+            ({ itemId }) => itemId === item.itemId,
+          );
+          assert.equal(applied.applied, 1);
+          assert.equal((await fixture.service.getSummary()).attentionCursor, 1);
+          assert.equal(settled.status, "blocked");
+          assert.equal(settled.activeIntentId, null);
+          assert.equal(settled.decisionContext, null);
+          const audit = (await fixture.service.listTimeline({
+            order: "newest",
+          })).items[0];
+          assert.equal(audit.type, "legacy_result_discarded");
+          assert.equal(audit.details.source, "attention");
+          return;
+        }
+        await assert.rejects(
+          fixture.service.applyAttentionBatch(batch),
+          (error) => error.code === "WORK_LEDGER_ATTENTION_BINDING_CONFLICT",
+        );
+        assert.equal((await fixture.service.getSummary()).attentionCursor, 0);
+      },
+    );
+  }
+});
+
 async function prepareProposalResult(
   fixture,
   {
@@ -2632,13 +4725,16 @@ async function prepareProposalResult(
     proposalDigest,
     authoritativeEvidence = false,
     intentOverrides = {},
+    roleId: configuredRoleId,
+    workerId: configuredWorkerId,
   } = {},
 ) {
   await fixture.service.intake();
   let item = (await fixture.service.listItems()).items[0];
   const codeProposal = kind === "code_action_proposal";
-  const roleId = codeProposal ? "developer" : "pr-reviewer";
-  const workerId = `employee-${roleId}`;
+  const roleId = configuredRoleId ??
+    (codeProposal ? "developer" : "pr-reviewer");
+  const workerId = configuredWorkerId ?? `employee-${roleId}`;
   let evidenceTarget;
   if (authoritativeEvidence) {
     const acceptanceContract = {
@@ -2821,6 +4917,117 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
   assert.equal(replayed.applied, 0);
   assert.equal(replayed.deduplicated, 1);
   assert.equal(fixture.store.writes.length, writesBeforeReplay);
+});
+
+test("a sealed proposal result advances its cursor without completing legacy PR-source work", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture, {
+    authoritativeEvidence: true,
+  });
+  const durable = fixture.store.stored();
+  quarantineStoredItem(durable, durable.items[0]);
+  fixture.store.replaceStored(durable);
+  fixture.service = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: fixture.lease,
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await fixture.service.recover();
+
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const item = (await fixture.service.listItems()).items[0];
+  const summary = await fixture.service.getSummary();
+
+  assert.equal(applied.applied, 1);
+  assert.equal(summary.proposalCursor, 1);
+  assert.equal(summary.proposalHighWatermark, 1);
+  assert.equal(item.status, "blocked");
+  assert.equal(item.activeIntentId, null);
+  assert.equal(item.statusReason, LEGACY_PR_SOURCE_CUTOVER_REASON);
+  assert.equal(item.decisionContext.source, "proposal");
+  assert.equal(item.decisionContext.outcome, "succeeded");
+  assert.equal(item.decisionContext.value.resultId, result.resultId);
+});
+
+test("legacy proposal settlement discards unsealed quarantine and rejects reason-only fallback", async (t) => {
+  for (const seal of [false, true]) {
+    await t.test(
+      seal ? "status reason alone is not quarantine" : "unsealed quarantine",
+      async () => {
+        const fixture = await createFixture({ records: [assignment(1)] });
+        const result = await prepareProposalResult(fixture, {
+          authoritativeEvidence: seal,
+        });
+        const durable = fixture.store.stored();
+        const item = durable.items[0];
+        if (seal) {
+          Object.assign(item, {
+            status: "blocked",
+            activeIntentId: null,
+            statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+          });
+        } else {
+          quarantineStoredItem(durable, item, { preserveWorkState: true });
+        }
+        fixture.store.replaceStored(durable);
+        fixture.service = new WorkLedgerService({
+          store: fixture.store,
+          assignmentSource: fixture.source,
+          exclusiveLease: fixture.lease,
+          clock: fixture.time.clock,
+          idFactory: incrementingIds(),
+        });
+        await fixture.service.recover();
+        if (!seal) {
+          const waiting = (await fixture.service.listItems()).items.find(
+            ({ itemId }) => itemId === item.itemId,
+          );
+          assert.equal(waiting.status, "waiting_external");
+          assert.notEqual(waiting.activeIntentId, null);
+          assert.equal(
+            waiting.sourceQuarantine.kind,
+            LEGACY_PR_SOURCE_QUARANTINE_KIND,
+          );
+        }
+
+        const batch = {
+          items: [result],
+          nextSequence: 1,
+          highWatermark: 1,
+          oldestAvailableSequence: 1,
+        };
+        if (!seal) {
+          const applied = await fixture.service.applyProposalBatch(batch);
+          const settled = (await fixture.service.listItems()).items.find(
+            ({ itemId }) => itemId === item.itemId,
+          );
+          assert.equal(applied.applied, 1);
+          assert.equal((await fixture.service.getSummary()).proposalCursor, 1);
+          assert.equal(settled.status, "blocked");
+          assert.equal(settled.activeIntentId, null);
+          assert.equal(settled.decisionContext, null);
+          const audit = (await fixture.service.listTimeline({
+            order: "newest",
+          })).items[0];
+          assert.equal(audit.type, "legacy_result_discarded");
+          assert.equal(audit.details.source, "proposal");
+          return;
+        }
+        await assert.rejects(
+          fixture.service.applyProposalBatch(batch),
+          (error) => error.code === "WORK_LEDGER_PROPOSAL_BINDING_CONFLICT",
+        );
+        assert.equal((await fixture.service.getSummary()).proposalCursor, 0);
+      },
+    );
+  }
 });
 
 test("authoritative proposal evidence requeues graph work with trusted result context", async () => {
@@ -3140,7 +5347,11 @@ test("work ledger recovers schema v1 state with an empty proposal checkpoint", a
   delete legacy.graphMemoryProjection;
   delete legacy.proposalCursor;
   delete legacy.proposalHighWatermark;
-  for (const item of legacy.items) delete item.graph;
+  for (const item of legacy.items) {
+    delete item.graph;
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -3178,8 +5389,15 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
   delete legacy.graphMemoryProjection;
-  for (const entry of legacy.items) delete entry.graph;
-  for (const entry of legacy.outbox) delete entry.dispatchBinding;
+  for (const entry of legacy.items) {
+    delete entry.graph;
+    delete entry.source;
+    delete entry.sourceQuarantine;
+  }
+  for (const entry of legacy.outbox) {
+    delete entry.dispatchBinding;
+    delete entry.sourceBinding;
+  }
   fixture.store.replaceStored(legacy);
   const writesBeforeRecovery = fixture.store.writes.length;
   const recovered = new WorkLedgerService({
@@ -3238,7 +5456,11 @@ test("schema v2 keeps its original byte budget while graph metadata stays separa
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
   delete legacy.graphMemoryProjection;
-  for (const item of legacy.items) delete item.graph;
+  for (const item of legacy.items) {
+    delete item.graph;
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const legacyBytes = Buffer.byteLength(
     `${JSON.stringify(legacy, null, 2)}\n`,
     "utf8",
@@ -3281,7 +5503,11 @@ test("schema v2 keeps the original per-item byte budget during migration", async
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 2;
   delete legacy.graphMemoryProjection;
-  for (const item of legacy.items) delete item.graph;
+  for (const item of legacy.items) {
+    delete item.graph;
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const legacyItemBytes = Buffer.byteLength(
     `${JSON.stringify(legacy.items[0], null, 2)}\n`,
     "utf8",

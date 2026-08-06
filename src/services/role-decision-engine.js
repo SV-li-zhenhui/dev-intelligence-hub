@@ -3,6 +3,7 @@ import {
   WORK_DECISION_JSON_SCHEMA,
 } from "../domain/structured-brain-contract.js";
 import { normalizeBrainConfig } from "./brain-router.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -199,7 +200,8 @@ function normalizeContext(value) {
 }
 
 function defaultContext({ item, trigger }) {
-  const eventType = item?.event?.eventType;
+  const event = currentWorkItemEvent(item);
+  const eventType = event?.eventType;
   const requirements = { trigger };
   if (item?.assignment !== undefined) {
     requirements.assignment = item.assignment;
@@ -211,9 +213,9 @@ function defaultContext({ item, trigger }) {
     typeof eventType === "string" &&
     eventType.startsWith("pull_request.")
   ) {
-    return { requirements, code: { event: item.event } };
+    return { requirements, code: { event } };
   }
-  if (item?.event !== undefined) requirements.event = item.event;
+  if (event !== undefined) requirements.event = event;
   return { requirements };
 }
 

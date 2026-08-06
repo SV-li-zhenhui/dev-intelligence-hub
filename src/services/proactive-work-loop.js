@@ -1,5 +1,6 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
 import { normalizeWorkCoordinationTiming } from "./work-coordination-timing.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const DEFAULT_INTAKE_LIMIT = 100;
@@ -294,7 +295,10 @@ function workerItemDto(item) {
     leaseUntil: _leaseUntil,
     ...visible
   } = item;
-  return structuredClone(visible);
+  return structuredClone({
+    ...visible,
+    event: currentWorkItemEvent(item),
+  });
 }
 
 function orchestratorDecision(target) {

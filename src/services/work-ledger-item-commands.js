@@ -20,6 +20,12 @@ import {
   assertWorkLedgerGraphClaimable,
   assertWorkLedgerGraphCompletable,
 } from "./work-ledger-graph.js";
+import {
+  hasPendingPullRequestSource,
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  LEGACY_PR_SOURCE_QUARANTINE_KIND,
+  pullRequestHeadAdmission,
+} from "./work-ledger-pr-source.js";
 
 const MIN_LEASE_MS = 1_000;
 const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
@@ -52,6 +58,21 @@ export function requireWorkLedgerItem(state, itemId) {
   return item;
 }
 
+export function isWorkItemInLegacyPullRequestCutover(item) {
+  return item.sourceQuarantine?.kind === LEGACY_PR_SOURCE_QUARANTINE_KIND ||
+    item.statusReason === LEGACY_PR_SOURCE_CUTOVER_REASON;
+}
+
+export function assertWorkItemNotInLegacyPullRequestCutover(item) {
+  if (isWorkItemInLegacyPullRequestCutover(item)) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_LEGACY_CUTOVER",
+      "旧版 PR 工作项尚未完成 Head 切换，只能对账已封印动作",
+      409,
+    );
+  }
+}
+
 function assertNoActiveIntent(item) {
   if (item.activeIntentId !== null) {
     throw workLedgerError(
@@ -62,12 +83,32 @@ function assertNoActiveIntent(item) {
   }
 }
 
+function assertCurrentPullRequestHead(state, item) {
+  const admission = pullRequestHeadAdmission(state, item);
+  if (admission.applies && (!admission.current || admission.pending)) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "PR Head 已变化，当前工作项不能继续启动新动作",
+      409,
+    );
+  }
+}
+
 export function planWorkItemClaim({ state, input, clock, newLeaseId }) {
   const itemId = boundedLedgerString(input.itemId, "itemId", 192);
   const ownerId = boundedLedgerString(input.workerId, "workerId", 128);
   const duration = normalizeWorkLeaseDuration(input.leaseDurationMs);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertItemRevision(item, input.expectedRevision);
+  if (hasPendingPullRequestSource(item)) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "PR 来源正在切换 Head，当前工作项不能领取",
+      409,
+    );
+  }
+  assertCurrentPullRequestHead(state, item);
   const now = clock();
   const expiredLease =
     item.status === "working" && Date.parse(item.leaseUntil) <= Date.parse(now);
@@ -147,6 +188,7 @@ export function planWorkItemTransition({ state, input, clock }) {
   const reason = normalizeWorkReason(input.reason);
   const context = normalizeWorkDetails(input.details ?? {});
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertNoActiveIntent(item);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();
@@ -184,6 +226,7 @@ export function planWorkItemRetry({ state, input, clock }) {
   const actorId = normalizeWorkActor(input.actorId);
   const reason = normalizeWorkReason(input.reason);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertNoActiveIntent(item);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();
@@ -223,6 +266,7 @@ export function planWorkItemHandoff({ state, input, clock }) {
   const target = normalizeHandoffTarget(input.target);
   const reason = normalizeWorkReason(input.reason);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertNoActiveIntent(item);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();
@@ -261,6 +305,7 @@ export function planWorkItemCompletion({ state, input, clock }) {
   const actorId = normalizeWorkActor(input.actorId);
   const result = normalizeWorkDetails(input.result);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertNoActiveIntent(item);
   assertItemRevision(item, input.expectedRevision);
   const now = clock();

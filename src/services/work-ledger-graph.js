@@ -11,6 +11,7 @@ import {
   normalizeLedgerTimestamp,
   workLedgerError,
 } from "./work-ledger-values.js";
+import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -26,6 +27,7 @@ const GRAPH_STATUS_BY_LEDGER_STATUS = new Map([
   ["waiting_external", "in_progress"],
   ["retry_wait", "in_progress"],
   ["completed", "completed"],
+  ["superseded", "superseded"],
   ["blocked", "in_progress"],
   ["cancelled", "cancelled"],
 ]);
@@ -129,6 +131,10 @@ export function workLedgerStatusToGraphStatus(status) {
     );
   }
   return graphStatus;
+}
+
+function isSatisfiedGraphTaskStatus(status) {
+  return status === "completed" || status === "superseded";
 }
 
 function exactGraphMetadata(fields) {
@@ -286,6 +292,20 @@ function freezeProjection(value) {
   return Object.freeze(value);
 }
 
+function projectedSourceRootPayload(item) {
+  const source = new Map(ledgerDataEntries(item.get("source")) ?? []);
+  const current = new Map(ledgerDataEntries(source.get("current")) ?? []);
+  const event = new Map(ledgerDataEntries(current.get("event")) ?? []);
+  const payloadEntries = ledgerDataEntries(event.get("payload"));
+  if (payloadEntries === null) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+      "PR 来源根缺少当前工作说明",
+    );
+  }
+  return new Map(payloadEntries);
+}
+
 function projectedItemWork(item) {
   const assignmentEntries = ledgerDataEntries(item.get("assignment"));
   const eventEntries = ledgerDataEntries(item.get("event"));
@@ -299,7 +319,9 @@ function projectedItemWork(item) {
   const event = new Map(eventEntries);
   const source = item.get("kind") === "graph_task"
     ? assignment.get("work")
-    : new Map(ledgerDataEntries(event.get("payload")) ?? []);
+    : item.get("kind") === "source_root"
+      ? projectedSourceRootPayload(item)
+      : new Map(ledgerDataEntries(event.get("payload")) ?? []);
   const entries = source instanceof Map ? source : new Map(
     ledgerDataEntries(source) ?? [],
   );
@@ -395,7 +417,54 @@ export function projectWorkLedgerGraphView(state, options) {
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const previous = projectWorkLedgerGraphSnapshot(previousState);
   const next = projectWorkLedgerGraphSnapshot(nextState);
-  validateWorkGraphTransition(previous, next);
+  const previousItems = denseProjectionArray(previousState.items);
+  const previousItemsById = new Map(
+    previousItems.map((item) => [item.itemId, item]),
+  );
+  const nextItemsById = new Map(
+    denseProjectionArray(nextState.items).map((item) => [item.itemId, item]),
+  );
+  const terminalReactivationTaskIds = previousItems
+    .filter((item) => {
+      const nextItem = nextItemsById.get(item.itemId);
+      return (
+        item.kind === "source_root" &&
+        item.source?.kind === "pull_request" &&
+        item.status === "completed" &&
+        nextItem?.kind === "source_root" &&
+        nextItem.source?.kind === "pull_request" &&
+        nextItem.status === "queued" &&
+        nextItem.source.activeRevision > item.source.activeRevision
+      );
+    })
+    .map(({ itemId }) => itemId);
+  const terminalSupersessionTaskIds = previousItems
+    .filter((item) => {
+      const nextItem = nextItemsById.get(item.itemId);
+      const binding = currentWorkItemInputBinding(item);
+      if (
+        item.kind !== "graph_task" ||
+        !["completed", "cancelled"].includes(item.status) ||
+        nextItem?.status !== "superseded" ||
+        binding === null
+      ) {
+        return false;
+      }
+      const previousRoot = previousItemsById.get(binding.rootItemId);
+      const nextRoot = nextItemsById.get(binding.rootItemId);
+      const previousRootBinding = currentWorkItemInputBinding(previousRoot);
+      const nextRootBinding = currentWorkItemInputBinding(nextRoot);
+      return (
+        previousRootBinding?.headRevision === binding.headRevision &&
+        previousRootBinding.headRefOid === binding.headRefOid &&
+        nextRootBinding?.headRevision > binding.headRevision
+      );
+    })
+    .map(({ itemId }) => itemId);
+  validateWorkGraphTransition(previous, next, {
+    terminalReactivationTaskIds,
+    terminalSupersessionTaskIds,
+  });
   assertStoredHistoryPrefixes(previousState, nextState);
   return next;
 }
@@ -457,10 +526,11 @@ function workLedgerGraphTaskContext(state, itemId) {
 export function assertWorkLedgerGraphClaimable(state, itemId) {
   const { task, byId, children } = workLedgerGraphTaskContext(state, itemId);
   const blockedByDependency = task.dependsOn.some(
-    (dependencyId) => byId.get(dependencyId).status !== "completed",
+    (dependencyId) =>
+      !isSatisfiedGraphTaskStatus(byId.get(dependencyId).status),
   );
   const blockedByChild = children.some(
-    ({ status }) => status !== "completed",
+    ({ status }) => !isSatisfiedGraphTaskStatus(status),
   );
   if (blockedByChild || blockedByDependency) {
     throw workLedgerError(
@@ -490,10 +560,11 @@ function missingRequiredDeliverables(task) {
 export function assertWorkLedgerGraphCompletable(state, itemId) {
   const { task, byId, children } = workLedgerGraphTaskContext(state, itemId);
   const hasIncompleteDependency = task.dependsOn.some(
-    (dependencyId) => byId.get(dependencyId).status !== "completed",
+    (dependencyId) =>
+      !isSatisfiedGraphTaskStatus(byId.get(dependencyId).status),
   );
   const hasIncompleteChild = children.some(
-    ({ status }) => status !== "completed",
+    ({ status }) => !isSatisfiedGraphTaskStatus(status),
   );
   if (
     hasIncompleteDependency ||

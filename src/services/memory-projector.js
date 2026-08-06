@@ -4,6 +4,7 @@ import {
   workGraphMemoryRecordReceipt,
 } from "../domain/work-graph-memory-event.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
@@ -137,7 +138,7 @@ function githubUrl(repository, number, eventType) {
 
 function workItemRecord(raw) {
   const item = plainData(raw);
-  const event = plainData(item?.event);
+  const event = plainData(currentWorkItemEvent(item));
   const subject = plainData(event?.subject);
   const target = plainData(item?.currentTarget);
   const payload = plainData(event?.payload);
@@ -184,7 +185,7 @@ function timelineRecord(raw, itemById) {
   const occurredAt = safeTimestamp(entry?.at);
   if (!timelineId || !occurredAt) return null;
   const item = itemById.get(entry.itemId);
-  const event = plainData(item?.event);
+  const event = plainData(currentWorkItemEvent(item));
   const subject = plainData(event?.subject);
   const repository = safeRepository(subject?.repository);
   const number = safeNumber(subject?.number);

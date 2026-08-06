@@ -176,7 +176,9 @@ export function assertRetryTransition(fromStatus) {
 }
 
 export function assertHandoffTransition(fromStatus) {
-  if (["paused", "completed", "cancelled"].includes(fromStatus)) {
+  if (
+    ["paused", "completed", "cancelled", "superseded"].includes(fromStatus)
+  ) {
     throw workLedgerError(
       "WORK_LEDGER_TRANSITION_INVALID",
       "暂停或终态工作项不能再转交",

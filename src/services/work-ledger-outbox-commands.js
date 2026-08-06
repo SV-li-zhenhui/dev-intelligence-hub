@@ -9,6 +9,8 @@ import {
   WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
 } from "./work-ledger-records.js";
 import {
+  assertWorkItemNotInLegacyPullRequestCutover,
+  isWorkItemInLegacyPullRequestCutover,
   normalizeWorkLeaseDuration,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
@@ -27,11 +29,33 @@ import {
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
+import {
+  currentWorkItemEvent,
+  hasPendingPullRequestSource,
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  pullRequestHeadAdmission,
+} from "./work-ledger-pr-source.js";
 
 const PROPOSAL_INTENT_TYPES = new Set([
   "propose_github_review",
   "propose_code_action",
 ]);
+const INTENT_WAITING_STATUSES = new Set([
+  "waiting_user",
+  "waiting_condition",
+  "waiting_external",
+]);
+
+function assertCurrentPullRequestHead(state, item, message) {
+  const admission = pullRequestHeadAdmission(state, item);
+  if (admission.applies && (!admission.current || admission.pending)) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      message,
+      409,
+    );
+  }
+}
 
 function requireIntent(state, intentId) {
   const intent = state.outbox.find(
@@ -45,6 +69,11 @@ function requireIntent(state, intentId) {
     );
   }
   return intent;
+}
+
+function hasSealedDispatchBinding(outbox) {
+  return outbox.dispatchBinding !== null &&
+    Object.hasOwn(outbox.dispatchBinding, "boundIntent");
 }
 
 function assertIntentRevision(intent, expectedRevision) {
@@ -180,7 +209,20 @@ export function planIntentStage({ state, input, clock }) {
   const itemId = boundedLedgerString(input.itemId, "itemId", 192);
   const suppliedIntent = normalizeLedgerWorkIntent(input.intent);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertItemRevision(item, input.expectedRevision);
+  if (hasPendingPullRequestSource(item)) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "PR 来源正在切换 Head，不能提交新的工作意图",
+      409,
+    );
+  }
+  assertCurrentPullRequestHead(
+    state,
+    item,
+    "PR Head 已变化，不能提交新的工作意图",
+  );
   const now = clock();
   assertWorkLease(item, input.leaseId, now);
   if (item.status !== "working") {
@@ -251,6 +293,48 @@ export function planIntentClaim({ state, input, clock, newLeaseId }) {
   const duration = normalizeWorkLeaseDuration(input.leaseDurationMs);
   const outbox = requireIntent(state, intentId);
   assertIntentRevision(outbox, input.expectedRevision);
+  const item = requireWorkLedgerItem(state, outbox.itemId);
+  const now = clock();
+  const expiredLease =
+    outbox.status === "dispatching" &&
+    Date.parse(outbox.dispatchLeaseUntil) <= Date.parse(now);
+  const legacySettlementReclaim =
+    isWorkItemInLegacyPullRequestCutover(item) &&
+    expiredLease &&
+    hasSealedDispatchBinding(outbox);
+  if (!legacySettlementReclaim) {
+    assertWorkItemNotInLegacyPullRequestCutover(item);
+  }
+  const sourceAdmission = pullRequestHeadAdmission(state, item);
+  const sealedCutoverReclaim =
+    sourceAdmission.applies &&
+    sourceAdmission.current &&
+    sourceAdmission.pending &&
+    expiredLease &&
+    outbox.sourceBinding !== null &&
+    hasSealedDispatchBinding(outbox);
+  if (
+    sourceAdmission.applies &&
+    (!sourceAdmission.current ||
+      (sourceAdmission.pending && !sealedCutoverReclaim))
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "工作意图的 PR 来源已进入切换，只能重领已封印的旧 Head 意图",
+      409,
+    );
+  }
+  if (
+    item.status !== "dispatch_pending" ||
+    item.activeIntentId !== outbox.intentId ||
+    item.inputDigest !== outbox.inputDigest
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_INTENT_BINDING_CONFLICT",
+      "工作意图与当前工作项不再一致",
+      409,
+    );
+  }
   if (
     outbox.dispatchBinding?.status ===
       LEGACY_UNKNOWN_WORK_INTENT_BINDING
@@ -261,10 +345,6 @@ export function planIntentClaim({ state, input, clock, newLeaseId }) {
       409,
     );
   }
-  const now = clock();
-  const expiredLease =
-    outbox.status === "dispatching" &&
-    Date.parse(outbox.dispatchLeaseUntil) <= Date.parse(now);
   if (outbox.status === "dispatching" && !expiredLease) {
     throw workLedgerError(
       "WORK_LEDGER_INTENT_LEASE_ACTIVE",
@@ -358,8 +438,15 @@ export function planIntentBinding({ state, input, clock }) {
   }
   const outbox = requireIntent(state, intentId);
   const item = requireWorkLedgerItem(state, outbox.itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertItemRevision(item, input.itemExpectedRevision);
+  assertCurrentPullRequestHead(
+    state,
+    item,
+    "工作意图的 PR Head 已变化，不能生成新的策略绑定",
+  );
   if (
+    hasPendingPullRequestSource(item) ||
     item.status !== "dispatch_pending" ||
     item.activeIntentId !== outbox.intentId ||
     item.inputDigest !== outbox.inputDigest
@@ -377,7 +464,7 @@ export function planIntentBinding({ state, input, clock }) {
       roleId: outbox.requestedBy.roleId,
       workItemId: item.itemId,
       assignmentId: item.assignmentId,
-      eventId: item.event.eventId,
+      eventId: currentWorkItemEvent(item).eventId,
     });
     dispatchBinding = createWorkIntentDispatchBinding(boundIntent);
   } catch (cause) {
@@ -560,19 +647,23 @@ export function planIntentAcknowledgement({ state, input, clock }) {
   const availableAt = input.nextStatus === "retry_wait"
     ? normalizeRetryAt(input.availableAt, now)
     : null;
+  const legacyCutover = isWorkItemInLegacyPullRequestCutover(item);
+  const nextStatus = legacyCutover ? "blocked" : input.nextStatus;
+  const activeIntentId = !legacyCutover &&
+      INTENT_WAITING_STATUSES.has(input.nextStatus)
+    ? outbox.intentId
+    : null;
   const itemResult = moveWorkItem(item, {
-    status: input.nextStatus,
+    status: nextStatus,
     now,
-    reason: input.outcome === "delivered" ? "intent_delivered" : "intent_failed",
-    availableAt,
-    activeIntentId: new Set([
-      "waiting_user",
-      "waiting_condition",
-      "waiting_external",
-    ]).has(input.nextStatus)
-      ? outbox.intentId
-      : null,
-    ...(handoffTarget ? { target: handoffTarget } : {}),
+    reason: legacyCutover
+      ? LEGACY_PR_SOURCE_CUTOVER_REASON
+      : input.outcome === "delivered"
+        ? "intent_delivered"
+        : "intent_failed",
+    availableAt: legacyCutover ? null : availableAt,
+    activeIntentId,
+    ...(!legacyCutover && handoffTarget ? { target: handoffTarget } : {}),
   });
   const outboxResult = {
     ...outbox,
@@ -593,13 +684,15 @@ export function planIntentAcknowledgement({ state, input, clock }) {
       details: {
         intentId: outbox.intentId,
         outcome: input.outcome,
-        nextStatus: input.nextStatus,
-        availableAt,
+        nextStatus,
+        requestedNextStatus: input.nextStatus,
+        availableAt: legacyCutover ? null : availableAt,
+        sourceQuarantined: legacyCutover,
         context,
       },
     },
   ];
-  if (input.nextStatus === "retry_wait") {
+  if (!legacyCutover && input.nextStatus === "retry_wait") {
     timelineEvents.push({
       itemId: item.itemId,
       type: "retry_scheduled",
@@ -612,7 +705,7 @@ export function planIntentAcknowledgement({ state, input, clock }) {
       },
     });
   }
-  if (input.nextStatus === "completed") {
+  if (!legacyCutover && input.nextStatus === "completed") {
     timelineEvents.push({
       itemId: item.itemId,
       type: "completed",
@@ -627,7 +720,7 @@ export function planIntentAcknowledgement({ state, input, clock }) {
       },
     });
   }
-  if (handoffTarget) {
+  if (!legacyCutover && handoffTarget) {
     timelineEvents.push({
       itemId: item.itemId,
       type: "handed_off",

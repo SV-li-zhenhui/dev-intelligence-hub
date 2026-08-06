@@ -2,7 +2,15 @@ import {
   attentionDigest,
   normalizeAttentionAnswer,
 } from "../domain/attention-contract.js";
-import { replaceWorkLedgerRecord, requireWorkLedgerItem } from "./work-ledger-item-commands.js";
+import {
+  isWorkItemInLegacyPullRequestCutover,
+  replaceWorkLedgerRecord,
+  requireWorkLedgerItem,
+} from "./work-ledger-item-commands.js";
+import {
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  LEGACY_PR_SOURCE_QUARANTINE_KIND,
+} from "./work-ledger-pr-source.js";
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import {
@@ -289,6 +297,19 @@ function requireBoundAskUser(state, entry) {
     (candidate) => candidate.intentId === entry.requestKey,
   );
   const outcome = outbox?.outcome;
+  const waitingForResult =
+    item.status === "waiting_user" && item.activeIntentId === outbox?.intentId;
+  const durablyQuarantined =
+    item.sourceQuarantine?.kind === LEGACY_PR_SOURCE_QUARANTINE_KIND;
+  const quarantinedSettlement =
+    durablyQuarantined &&
+    item.status === "blocked" &&
+    item.activeIntentId === null;
+  const sealedQuarantinedSettlement =
+    !durablyQuarantined ||
+    (outbox?.dispatchBinding !== null &&
+      outbox?.dispatchBinding !== undefined &&
+      Object.hasOwn(outbox.dispatchBinding, "boundIntent"));
   if (
     !outbox ||
     outbox.itemId !== item.itemId ||
@@ -296,8 +317,7 @@ function requireBoundAskUser(state, entry) {
     outbox.status !== "delivered" ||
     outbox.intent.type !== "ask_user" ||
     outbox.requestedBy.roleId !== entry.producer.roleId ||
-    item.status !== "waiting_user" ||
-    item.activeIntentId !== outbox.intentId ||
+    (!waitingForResult && !quarantinedSettlement) ||
     outcome?.status !== "delivered" ||
     outcome.details?.questionRef !== entry.requestId
   ) {
@@ -307,7 +327,12 @@ function requireBoundAskUser(state, entry) {
       409,
     );
   }
-  return { item, outbox };
+  return {
+    item,
+    outbox,
+    discardUnsealedLegacyResult:
+      durablyQuarantined && !sealedQuarantinedSettlement,
+  };
 }
 
 export function planAttentionBatchApplication({ state, input, clock }) {
@@ -330,9 +355,33 @@ export function planAttentionBatchApplication({ state, input, clock }) {
   const appliedItemIds = [];
   for (const entry of batch.pending) {
     const workingState = { ...state, items };
-    const { item } = requireBoundAskUser(workingState, entry);
+    const { item, outbox, discardUnsealedLegacyResult } =
+      requireBoundAskUser(workingState, entry);
     if (Date.parse(entry.result.at) > Date.parse(now)) {
       throw invalid("内部请示结果时间晚于台账时钟");
+    }
+    if (discardUnsealedLegacyResult) {
+      const itemResult = moveWorkItem(item, {
+        status: "blocked",
+        now,
+        reason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+        activeIntentId: null,
+      });
+      items = replaceWorkLedgerRecord(items, "itemId", itemResult);
+      appliedItemIds.push(item.itemId);
+      timelineEvents.push({
+        itemId: item.itemId,
+        type: "legacy_result_discarded",
+        at: now,
+        actorId: "attention-result-reconciler",
+        details: {
+          source: "attention",
+          intentId: outbox.intentId,
+          resultRef: entry.result.resultId,
+          reason: "unsealed_pr_source_quarantine",
+        },
+      });
+      continue;
     }
     const decisionContext = createWorkDecisionContext({
       source: "attention",
@@ -347,10 +396,20 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       observedAt: entry.result.at,
     });
     const rejected = entry.result.kind === "rejected";
+    const sealedByLegacyCutover = isWorkItemInLegacyPullRequestCutover(item);
     const itemResult = moveWorkItem(item, {
-      status: rejected ? "blocked" : "queued",
+      status: sealedByLegacyCutover
+        ? "blocked"
+        : rejected
+          ? "blocked"
+          : "queued",
       now,
-      reason: rejected ? "attention_rejected" : "attention_answered",
+      reason: sealedByLegacyCutover
+        ? LEGACY_PR_SOURCE_CUTOVER_REASON
+        : rejected
+          ? "attention_rejected"
+          : "attention_answered",
+      activeIntentId: null,
       decisionContext,
     });
     items = replaceWorkLedgerRecord(items, "itemId", itemResult);

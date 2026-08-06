@@ -12,13 +12,20 @@ const TASK_STATUSES = new Set([
   "completed",
   "failed",
   "cancelled",
+  "superseded",
 ]);
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "superseded",
+]);
+const SATISFIED_TASK_STATUSES = new Set(["completed", "superseded"]);
 const RESPONSIBILITY_TYPES = new Set(["role", "person", "node"]);
 const DELIVERY_STATUSES = new Set(["submitted", "accepted", "rejected"]);
 
 export const WORK_GRAPH_DEFAULT_LIMITS = Object.freeze({
-  maxTasks: 5_000,
+  maxTasks: 10_000,
   maxDepth: 32,
   maxFanOut: 64,
   maxDependenciesPerTask: 64,
@@ -323,6 +330,10 @@ function latestContractIsSatisfied(contracts, deliveries) {
     );
 }
 
+function isSatisfiedTaskStatus(status) {
+  return SATISFIED_TASK_STATUSES.has(status);
+}
+
 function normalizeTask(value, limits, deliveryBudget) {
   exactObject(value, [
     "taskId",
@@ -410,6 +421,7 @@ function normalizeTask(value, limits, deliveryBudget) {
 function assertReferencesAndHierarchy(tasks, limits) {
   const byId = new Map(tasks.map((entry) => [entry.taskId, entry]));
   const children = new Map();
+  const activeChildren = new Map();
   for (const task of tasks) {
     if (task.parentTaskId !== null && !byId.has(task.parentTaskId)) {
       throw graphError(
@@ -431,8 +443,12 @@ function assertReferencesAndHierarchy(tasks, limits) {
     const siblings = children.get(task.parentTaskId) ?? [];
     siblings.push(task.taskId);
     children.set(task.parentTaskId, siblings);
-    if (task.parentTaskId !== null && siblings.length > limits.maxFanOut) {
-      throw limitExceeded("父任务 fan-out 超过限制");
+    if (task.parentTaskId !== null && task.status !== "superseded") {
+      const activeSiblingCount = (activeChildren.get(task.parentTaskId) ?? 0) + 1;
+      activeChildren.set(task.parentTaskId, activeSiblingCount);
+      if (activeSiblingCount > limits.maxFanOut) {
+        throw limitExceeded("父任务有效 fan-out 超过限制");
+      }
     }
   }
 
@@ -441,16 +457,19 @@ function assertReferencesAndHierarchy(tasks, limits) {
     if (
       task.status === "completed" &&
       (
-        childIds.some((childId) => byId.get(childId).status !== "completed") ||
+        childIds.some(
+          (childId) => !isSatisfiedTaskStatus(byId.get(childId).status),
+        ) ||
         task.dependsOn.some(
-          (dependencyId) => byId.get(dependencyId).status !== "completed",
+          (dependencyId) =>
+            !isSatisfiedTaskStatus(byId.get(dependencyId).status),
         )
       )
     ) {
       throw invalid("completed 任务仍有未完成的依赖或直接子任务");
     }
     if (
-      ["failed", "cancelled"].includes(task.status) &&
+      TERMINAL_TASK_STATUSES.has(task.status) &&
       childIds.some((childId) =>
         ["pending", "paused", "in_progress"].includes(
           byId.get(childId).status,
@@ -620,10 +639,61 @@ function revisionBoundTaskContent(task, children) {
   };
 }
 
-function assertTaskStatusTransition(previousTask, nextTask) {
+function terminalReactivationTaskIds(value, maximumTasks) {
+  if (value === undefined) return new Set();
+  const ids = denseArray(value, maximumTasks).map((taskId) =>
+    boundedText(taskId, "terminalReactivationTaskId", 256, SAFE_ID)
+  );
+  if (new Set(ids).size !== ids.length) {
+    throw invalid("terminalReactivationTaskIds 重复");
+  }
+  return new Set(ids);
+}
+
+function terminalSupersessionTaskIds(value, maximumTasks) {
+  if (value === undefined) return new Set();
+  const ids = denseArray(value, maximumTasks).map((taskId) =>
+    boundedText(taskId, "terminalSupersessionTaskId", 256, SAFE_ID)
+  );
+  if (new Set(ids).size !== ids.length) {
+    throw invalid("terminalSupersessionTaskIds 重复");
+  }
+  return new Set(ids);
+}
+
+function assertTaskStatusTransition(
+  previousTask,
+  nextTask,
+  reactivationIds,
+  supersessionIds,
+) {
+  const {
+    revision: previousRevision,
+    status: previousStatus,
+    ...previousContent
+  } = previousTask;
+  const {
+    revision: nextRevision,
+    status: nextStatus,
+    ...nextContent
+  } = nextTask;
+  const allowedReactivation =
+    previousStatus !== "superseded" &&
+    reactivationIds.has(previousTask.taskId) &&
+    nextStatus === "pending" &&
+    nextRevision === previousRevision + 1 &&
+    sameValue(previousContent, nextContent);
+  const allowedSupersession =
+    previousStatus !== "superseded" &&
+    supersessionIds.has(previousTask.taskId) &&
+    nextStatus === "superseded" &&
+    nextRevision === previousRevision + 1 &&
+    sameValue(previousContent, nextContent);
   if (
-    TERMINAL_TASK_STATUSES.has(previousTask.status) &&
-    !sameValue(previousTask, nextTask)
+    TERMINAL_TASK_STATUSES.has(previousStatus) &&
+    !sameValue(previousTask, nextTask) &&
+    !allowedReactivation &&
+    !allowedSupersession
   ) {
     throw graphError(
       "WORK_GRAPH_INVALID_TRANSITION",
@@ -647,7 +717,11 @@ function assertNoTerminalAncestor(task, tasksById) {
 }
 
 export function validateWorkGraphTransition(previousValue, nextValue, optionsValue) {
-  const options = normalizeOptions(optionsValue, ["limits"]);
+  const options = normalizeOptions(optionsValue, [
+    "limits",
+    "terminalReactivationTaskIds",
+    "terminalSupersessionTaskIds",
+  ]);
   const normalizationOptions = Object.hasOwn(options, "limits")
     ? { limits: options.limits }
     : undefined;
@@ -656,6 +730,14 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
     normalizationOptions,
   );
   const next = normalizeWorkGraphSnapshot(nextValue, normalizationOptions);
+  const reactivationIds = terminalReactivationTaskIds(
+    options.terminalReactivationTaskIds,
+    (normalizationOptions?.limits?.maxTasks ?? WORK_GRAPH_DEFAULT_LIMITS.maxTasks),
+  );
+  const supersessionIds = terminalSupersessionTaskIds(
+    options.terminalSupersessionTaskIds,
+    (normalizationOptions?.limits?.maxTasks ?? WORK_GRAPH_DEFAULT_LIMITS.maxTasks),
+  );
   if (
     previous.graphId !== next.graphId ||
     previous.revision === Number.MAX_SAFE_INTEGER ||
@@ -678,7 +760,12 @@ export function validateWorkGraphTransition(previousValue, nextValue, optionsVal
         `既有任务 ${previousTask.taskId} 不可删除`,
       );
     }
-    assertTaskStatusTransition(previousTask, nextTask);
+    assertTaskStatusTransition(
+      previousTask,
+      nextTask,
+      reactivationIds,
+      supersessionIds,
+    );
     const changed = !sameValue(
       revisionBoundTaskContent(
         previousTask,
@@ -768,7 +855,7 @@ function terminalAncestor(task, byId) {
   let parentId = task.parentTaskId;
   while (parentId !== null) {
     const parent = byId.get(parentId);
-    if (["failed", "cancelled"].includes(parent.status)) return parent.taskId;
+    if (TERMINAL_TASK_STATUSES.has(parent.status)) return parent.taskId;
     parentId = parent.parentTaskId;
   }
   return null;
@@ -780,11 +867,12 @@ function pendingTasks(index) {
 
 function blockingTaskIds(task, index) {
   const blockers = task.dependsOn.filter(
-    (dependencyId) => index.byId.get(dependencyId).status !== "completed",
+    (dependencyId) =>
+      !isSatisfiedTaskStatus(index.byId.get(dependencyId).status),
   );
   blockers.push(
     ...(index.children.get(task.taskId) ?? []).filter(
-      (childId) => index.byId.get(childId).status !== "completed",
+      (childId) => !isSatisfiedTaskStatus(index.byId.get(childId).status),
     ),
   );
   const ancestor = terminalAncestor(task, index.byId);
@@ -858,6 +946,7 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
   const completedTaskIds = statusIds("completed");
   const failedTaskIds = statusIds("failed");
   const cancelledTaskIds = statusIds("cancelled");
+  const supersededTaskIds = statusIds("superseded");
   const activeTaskIds = children
     .filter((task) =>
       ["pending", "paused", "in_progress"].includes(task.status)
@@ -867,12 +956,18 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
 
   let outcome = "pending";
   if (parent.status === "cancelled") outcome = "cancelled";
+  else if (parent.status === "superseded") outcome = "superseded";
   else if (parent.status === "failed" || failedTaskIds.length > 0) outcome = "failed";
-  else if (cancelledTaskIds.length === children.length) outcome = "cancelled";
   else if (
-    completedTaskIds.length === children.length &&
+    cancelledTaskIds.length > 0 &&
+    cancelledTaskIds.length + supersededTaskIds.length === children.length
+  ) {
+    outcome = "cancelled";
+  } else if (
+    completedTaskIds.length + supersededTaskIds.length === children.length &&
     parent.dependsOn.every(
-      (dependencyId) => index.byId.get(dependencyId).status === "completed",
+      (dependencyId) =>
+        isSatisfiedTaskStatus(index.byId.get(dependencyId).status),
     ) &&
     latestContractIsSatisfied(parent.acceptanceContracts, parent.deliveries)
   ) {
@@ -894,6 +989,7 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
     completedTaskIds,
     failedTaskIds,
     cancelledTaskIds,
+    supersededTaskIds,
     activeTaskIds,
   });
 }

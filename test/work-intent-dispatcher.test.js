@@ -9,6 +9,10 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
+import {
+  appendPullRequestWorkSource,
+  createPullRequestWorkSource,
+} from "../src/services/work-ledger-pr-source.js";
 
 function clone(value) {
   return structuredClone(value);
@@ -214,6 +218,18 @@ function workPair(index, intent, {
     updatedAt: "2026-08-02T03:10:00.000Z",
   };
   return { item, outbox };
+}
+
+function prSourceEnvelope(sequence, event, assignmentId) {
+  return {
+    sequence,
+    assignment: {
+      assignmentId,
+      eventId: event.eventId,
+      target: { type: "role", id: "pr-engineer" },
+    },
+    event,
+  };
 }
 
 class FakeLedger {
@@ -1353,6 +1369,78 @@ test("dispatcher binds policy and attention producer only from durable requested
     roleId: "orchestrator",
     workItemId: pair.item.itemId,
   });
+});
+
+test("dispatcher binds a PR intent to the active Head instead of its origin event", async () => {
+  const headA = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "pull_request.updated",
+    occurredAt: "2026-08-02T03:00:00.000Z",
+    source: { provider: "github", scopeId: "dashboard" },
+    subject: {
+      id: "github:pr:acme/repo#23178",
+      repository: "acme/repo",
+      number: 23178,
+    },
+    payload: {
+      title: "Resolve conflicts",
+      headRefOid: "HEAD-A",
+      state: "open",
+      changedFields: ["title"],
+    },
+  });
+  const headB = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "pull_request.updated",
+    occurredAt: "2026-08-02T03:05:00.000Z",
+    source: { provider: "github", scopeId: "dashboard" },
+    subject: headA.subject,
+    payload: {
+      title: "Resolve conflicts",
+      headRefOid: "HEAD-B",
+      previousHeadRefOid: "HEAD-A",
+      state: "open",
+      changedFields: ["headRefOid"],
+    },
+  });
+  const pair = workPair(1, askUserIntent(), {
+    target: { type: "role", id: "pr-engineer" },
+  });
+  const created = createPullRequestWorkSource(
+    prSourceEnvelope(1, headA, "workflow-assignment-head-a"),
+  );
+  pair.item.event = headA;
+  pair.item.source = appendPullRequestWorkSource(
+    created.source,
+    prSourceEnvelope(2, headB, "workflow-assignment-head-b"),
+  ).source;
+
+  const contexts = [];
+  const trustedPolicy = policy();
+  const capturingPolicy = {
+    bind(input) {
+      contexts.push(clone(input.context));
+      return trustedPolicy.bind(input);
+    },
+  };
+  const { dispatcher, ledger } = fixture([pair], {
+    policy: capturingPolicy,
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.equal(pair.item.event.payload.headRefOid, "HEAD-A");
+  assert.equal(contexts[0].event.eventId, headB.eventId);
+  assert.equal(contexts[0].event.payload.headRefOid, "HEAD-B");
+  assert.equal(
+    ledger.bindCalls[0].boundIntent.source.eventId,
+    headB.eventId,
+  );
+  assert.notEqual(
+    ledger.bindCalls[0].boundIntent.source.eventId,
+    headA.eventId,
+  );
 });
 
 test("configuration-first intent admission rejects without claiming or dispatching", async () => {

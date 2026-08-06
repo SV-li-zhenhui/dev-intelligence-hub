@@ -14,6 +14,7 @@ export const WORK_LEDGER_STATUSES = new Set([
   "waiting_external",
   "retry_wait",
   "completed",
+  "superseded",
   "blocked",
   "cancelled",
 ]);

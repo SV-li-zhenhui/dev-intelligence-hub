@@ -13,6 +13,10 @@ import {
   createDefaultWorkGraphMetadata,
   createWorkGraphAcceptanceRecord,
 } from "./work-ledger-graph.js";
+import {
+  createPullRequestWorkSource,
+  currentWorkItemInputBinding,
+} from "./work-ledger-pr-source.js";
 
 export const MAX_WORK_LEDGER_INTAKE_BATCH = 100;
 export const MAX_WORK_LEDGER_QUERY_PAGE = 100;
@@ -236,23 +240,82 @@ export function createAssignmentWorkItem(envelope, createdAt) {
   });
 }
 
-export function graphChildAssignmentId(parentItemId, childKey) {
-  return `graph-assignment-${ledgerDigest({ parentItemId, childKey })}`;
+export function createPullRequestSourceRootWorkItem(envelope, createdAt) {
+  const created = createPullRequestWorkSource(envelope);
+  if (created === null) return null;
+  const { descriptor, source } = created;
+  const assignmentId = `pr-source-assignment-${ledgerDigest(source.identity)}`;
+  const assignment = {
+    assignmentId,
+    target: { type: "role", id: source.identity.targetRoleId },
+    reason: "stable_pr_source_root",
+  };
+  return {
+    itemId: `work-item-${ledgerDigest({
+      kind: "source_root",
+      workKey: source.workKey,
+    })}`,
+    kind: "source_root",
+    assignmentId,
+    sourceSequence: 0,
+    inputDigest: source.current.inputDigest,
+    assignment,
+    event: structuredClone(descriptor.event),
+    source,
+    sourceQuarantine: null,
+    graph: createDefaultWorkGraphMetadata(createdAt),
+    currentTarget: assignment.target,
+    activeIntentId: null,
+    decisionContext: null,
+    status: "queued",
+    revision: 1,
+    ownerId: null,
+    leaseId: null,
+    leaseUntil: null,
+    attempt: 0,
+    availableAt: null,
+    statusReason: null,
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+export function graphChildAssignmentId(
+  parentItemId,
+  childKey,
+  sourceBinding = null,
+) {
+  const identity = sourceBinding === null
+    ? { parentItemId, childKey }
+    : {
+        parentItemId,
+        childKey,
+        sourceRootItemId: sourceBinding.rootItemId,
+        sourceWorkKey: sourceBinding.workKey,
+        sourceHeadRevision: sourceBinding.headRevision,
+      };
+  return `graph-assignment-${ledgerDigest(identity)}`;
 }
 
 export function graphChildDefinitionDigest(definition) {
-  return ledgerDigest({
+  const content = {
     parentItemId: definition.parentItemId,
     childKey: definition.childKey,
     work: definition.work,
     target: definition.target,
     dependsOnItemIds: definition.dependsOnItemIds,
     acceptanceContract: definition.acceptanceContract,
-  });
+  };
+  return ledgerDigest(
+    definition.sourceBinding === null || definition.sourceBinding === undefined
+      ? content
+      : { ...content, sourceBinding: definition.sourceBinding },
+  );
 }
 
 export function createGraphChildWorkItem(definition, createdAt) {
   const initialDependsOnTaskIds = [...definition.dependsOnItemIds];
+  const sourceBinding = definition.sourceBinding ?? null;
   const definitionDigest = graphChildDefinitionDigest({
     parentItemId: definition.parentItemId,
     childKey: definition.childKey,
@@ -260,10 +323,12 @@ export function createGraphChildWorkItem(definition, createdAt) {
     target: definition.target,
     dependsOnItemIds: initialDependsOnTaskIds,
     acceptanceContract: definition.acceptanceContract,
+    sourceBinding,
   });
   const assignmentId = graphChildAssignmentId(
     definition.parentItemId,
     definition.childKey,
+    sourceBinding,
   );
   const item = createWorkItem({
     kind: "graph_task",
@@ -278,6 +343,9 @@ export function createGraphChildWorkItem(definition, createdAt) {
         childKey: definition.childKey,
         initialDependsOnTaskIds,
         definitionDigest,
+        sourceBinding: sourceBinding === null
+          ? null
+          : structuredClone(sourceBinding),
       },
       work: {
         title: definition.work.title,
@@ -348,6 +416,8 @@ function createWorkItem({
     inputDigest,
     assignment,
     event,
+    source: null,
+    sourceQuarantine: null,
     graph: createDefaultWorkGraphMetadata(createdAt),
     currentTarget: assignment.target,
     activeIntentId: null,
@@ -414,6 +484,7 @@ export function createWorkIntentRecord(item, intent, requestedBy, createdAt) {
     inputDigest: item.inputDigest,
     requestedBy,
     intent,
+    sourceBinding: currentWorkItemInputBinding(item),
     dispatchBinding: null,
     status: "pending",
     revision: 1,

@@ -3,6 +3,7 @@ import {
   normalizeWorkGraphDelivery,
 } from "../domain/work-graph-contract.js";
 import {
+  assertWorkItemNotInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
@@ -212,6 +213,7 @@ function reviseAcceptanceInput(input) {
 export function planWorkGraphAcceptanceRevision({ state, input, clock }) {
   const { authority, command } = reviseAcceptanceInput(input);
   const item = requireWorkLedgerItem(state, command.taskId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertWorkGraphTasksInScope(
     state,
     [item.itemId],
@@ -416,6 +418,7 @@ function assertCurrentDeliverable(item, delivery) {
 export function planWorkGraphDeliverySubmission({ state, input, clock }) {
   const { authority, command } = submitDeliveryInput(input);
   const item = requireWorkLedgerItem(state, authority.taskId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertWorkGraphTasksInScope(
     state,
     [item.itemId],
@@ -557,6 +560,7 @@ function completeWhenReady(state, item) {
 export function planWorkGraphDeliveryDecision({ state, input, clock }) {
   const { authority, command } = decideDeliveryInput(input);
   const item = requireWorkLedgerItem(state, command.taskId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   assertWorkGraphTasksInScope(
     state,
     [item.itemId],

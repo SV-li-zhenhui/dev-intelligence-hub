@@ -29,6 +29,7 @@ import {
 import {
   MAX_WORK_GRAPH_MEMORY_EVENTS,
   MAX_WORK_GRAPH_MEMORY_EVENT_BYTES,
+  appendWorkGraphMemoryEvents,
   emptyWorkGraphMemoryProjection,
   migrateLegacyWorkGraphMemoryProjection,
   migrateWorkGraphMemoryProjection,
@@ -37,16 +38,38 @@ import {
 import {
   graphChildAssignmentId,
   graphChildDefinitionDigest,
+  createPullRequestSourceRootWorkItem,
 } from "./work-ledger-records.js";
+import {
+  appendPullRequestWorkSource,
+  currentWorkItemEvent,
+  LEGACY_PR_SOURCE_CUTOVER_REASON,
+  LEGACY_PR_SOURCE_QUARANTINE_KIND,
+  normalizePullRequestInputBinding,
+  normalizePullRequestWorkSource,
+  pullRequestWorkDescriptor,
+} from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 8;
-const PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION = 7;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 9;
+const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
+const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
+const LEGACY_PR_SOURCE_UNSTARTED_INTENT_REASON =
+  "pr_source_legacy_cutover_before_dispatch";
+const LEGACY_PR_SOURCE_IDLE_STATUSES = new Set([
+  "queued",
+  "paused",
+  "retry_wait",
+  "blocked",
+]);
 export const MAX_WORK_LEDGER_ITEMS = 5_000;
+export const MAX_WORK_LEDGER_SOURCE_ROOTS = 5_000;
 export const MAX_WORK_LEDGER_TIMELINE = 20_000;
 export const MAX_WORK_LEDGER_OUTBOX = 5_000;
 export const MAX_WORK_LEDGER_STATE_BYTES = 32 * 1024 * 1024;
 export const MAX_WORK_LEDGER_ITEM_BYTES = 512 * 1024;
+export const MAX_WORK_LEDGER_SOURCE_ROOT_BYTES = 64 * 1024 * 1024;
+export const MAX_WORK_LEDGER_SOURCE_STATE_BYTES = 128 * 1024 * 1024;
 export const MAX_WORK_LEDGER_TIMELINE_BYTES = 64 * 1024;
 export const MAX_WORK_LEDGER_INTENT_BYTES = 64 * 1024;
 export const MAX_WORK_GRAPH_MEMORY_STATE_BYTES = 32 * 1024 * 1024;
@@ -66,6 +89,9 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "intent_bound",
   "intent_lease_expired",
   "intent_acknowledged",
+  "intent_superseded",
+  "superseded",
+  "legacy_result_discarded",
   "attention_answer_applied",
   "attention_rejection_applied",
   "proposal_result_applied",
@@ -77,6 +103,10 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "graph_delivery_submitted",
   "graph_delivery_accepted",
   "graph_delivery_rejected",
+  "pr_source_created",
+  "pr_source_revised",
+  "pr_source_ignored",
+  "pr_source_activated",
 ]);
 
 const ITEM_KEYS = [
@@ -87,6 +117,8 @@ const ITEM_KEYS = [
   "inputDigest",
   "assignment",
   "event",
+  "source",
+  "sourceQuarantine",
   "graph",
   "currentTarget",
   "activeIntentId",
@@ -102,6 +134,9 @@ const ITEM_KEYS = [
   "createdAt",
   "updatedAt",
 ];
+const LEGACY_ITEM_KEYS = ITEM_KEYS.filter(
+  (key) => !["source", "sourceQuarantine"].includes(key),
+);
 const GRAPH_CHILD_KEY =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const LEGACY_ACCEPTANCE_CONTRACT_KEYS = [
@@ -134,6 +169,7 @@ const OUTBOX_KEYS = [
   "inputDigest",
   "requestedBy",
   "intent",
+  "sourceBinding",
   "dispatchBinding",
   "status",
   "revision",
@@ -145,7 +181,10 @@ const OUTBOX_KEYS = [
   "createdAt",
   "updatedAt",
 ];
-const LEGACY_OUTBOX_KEYS = OUTBOX_KEYS.filter(
+const SCHEMA8_OUTBOX_KEYS = OUTBOX_KEYS.filter(
+  (key) => key !== "sourceBinding",
+);
+const LEGACY_OUTBOX_KEYS = SCHEMA8_OUTBOX_KEYS.filter(
   (key) => key !== "dispatchBinding",
 );
 
@@ -159,11 +198,14 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
   }
   const known = new Set([
     "itemLimit",
+    "sourceRootLimit",
     "timelineLimit",
     "outboxLimit",
     "graphMemoryOutboxLimit",
     "stateByteBudget",
     "itemByteBudget",
+    "sourceRootByteBudget",
+    "sourceStateByteBudget",
     "timelineByteBudget",
     "intentByteBudget",
     "graphMemoryEventByteBudget",
@@ -177,6 +219,11 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
       overrides.itemLimit ?? MAX_WORK_LEDGER_ITEMS,
       MAX_WORK_LEDGER_ITEMS,
       "itemLimit",
+    ),
+    sourceRootLimit: validatePositiveLimit(
+      overrides.sourceRootLimit ?? MAX_WORK_LEDGER_SOURCE_ROOTS,
+      MAX_WORK_LEDGER_SOURCE_ROOTS,
+      "sourceRootLimit",
     ),
     timelineLimit: validatePositiveLimit(
       overrides.timelineLimit ?? MAX_WORK_LEDGER_TIMELINE,
@@ -202,6 +249,16 @@ export function normalizeWorkLedgerLimits(overrides = {}) {
       overrides.itemByteBudget ?? MAX_WORK_LEDGER_ITEM_BYTES,
       MAX_WORK_LEDGER_ITEM_BYTES,
       "itemByteBudget",
+    ),
+    sourceRootByteBudget: validatePositiveLimit(
+      overrides.sourceRootByteBudget ?? MAX_WORK_LEDGER_SOURCE_ROOT_BYTES,
+      MAX_WORK_LEDGER_SOURCE_ROOT_BYTES,
+      "sourceRootByteBudget",
+    ),
+    sourceStateByteBudget: validatePositiveLimit(
+      overrides.sourceStateByteBudget ?? MAX_WORK_LEDGER_SOURCE_STATE_BYTES,
+      MAX_WORK_LEDGER_SOURCE_STATE_BYTES,
+      "sourceStateByteBudget",
     ),
     timelineByteBudget: validatePositiveLimit(
       overrides.timelineByteBudget ?? MAX_WORK_LEDGER_TIMELINE_BYTES,
@@ -375,6 +432,37 @@ function optionalString(value, name, maximumBytes = 256) {
   return value === null ? null : safeString(value, name, maximumBytes);
 }
 
+function normalizeSourceQuarantine(value) {
+  if (value === null) return null;
+  if (
+    !hasExactLedgerKeys(value, [
+      "kind",
+      "rootItemId",
+      "workKey",
+      "reason",
+    ])
+  ) {
+    throw corrupted("PR 来源隔离信息损坏");
+  }
+  const quarantine = {
+    kind: safeString(value.kind, "sourceQuarantine.kind", 64),
+    rootItemId: safeString(
+      value.rootItemId,
+      "sourceQuarantine.rootItemId",
+      192,
+    ),
+    workKey: safeString(value.workKey, "sourceQuarantine.workKey", 128),
+    reason: safeString(value.reason, "sourceQuarantine.reason", 128),
+  };
+  if (
+    quarantine.kind !== LEGACY_PR_SOURCE_QUARANTINE_KIND ||
+    quarantine.reason !== LEGACY_PR_SOURCE_CUTOVER_REASON
+  ) {
+    throw corrupted("PR 来源隔离类型损坏");
+  }
+  return quarantine;
+}
+
 function denseLedgerArrayValues(value) {
   if (
     !Array.isArray(value) ||
@@ -398,6 +486,8 @@ function denseLedgerArrayValues(value) {
 function workItemCapacityView(item) {
   const baseItem = { ...item };
   delete baseItem.graph;
+  if (baseItem.source === null) delete baseItem.source;
+  if (baseItem.sourceQuarantine === null) delete baseItem.sourceQuarantine;
   return baseItem;
 }
 
@@ -407,8 +497,16 @@ function workLedgerCapacityView(state) {
   const { graphMemoryProjection: _graphMemoryProjection, ...ledger } = state;
   return {
     ...ledger,
-    items: state.items.map(workItemCapacityView),
+    items: state.items
+      .filter(({ kind }) => kind !== "source_root")
+      .map(workItemCapacityView),
   };
+}
+
+function sourceRootCapacityView(state) {
+  return state.items
+    .filter(({ kind }) => kind === "source_root")
+    .map(workItemCapacityView);
 }
 
 function assertGraphDeliveryHistory(items) {
@@ -474,6 +572,7 @@ function assertGraphTaskProvenance(
       "childKey",
       "initialDependsOnTaskIds",
       "definitionDigest",
+      "sourceBinding",
     ]) ||
     !hasExactLedgerKeys(assignment.work, ["title", "description"])
   ) {
@@ -495,6 +594,17 @@ function assertGraphTaskProvenance(
     "graphTask.work.description",
     16 * 1024,
   );
+  let sourceBinding = null;
+  if (assignment.graphTask.sourceBinding !== null) {
+    try {
+      sourceBinding = normalizePullRequestInputBinding(
+        assignment.graphTask.sourceBinding,
+      );
+    } catch {
+      throw corrupted("图任务 PR 来源绑定损坏");
+    }
+  }
+  assignment.graphTask.sourceBinding = sourceBinding;
   const initialDependsOnTaskIds = denseLedgerArrayValues(
     assignment.graphTask.initialDependsOnTaskIds,
   );
@@ -506,7 +616,11 @@ function assertGraphTaskProvenance(
     !GRAPH_CHILD_KEY.test(childKey) ||
     !SHA256_PATTERN.test(assignment.graphTask.definitionDigest) ||
     graph.parentItemId !== parentTaskId ||
-    assignmentId !== graphChildAssignmentId(parentTaskId, childKey) ||
+    assignmentId !== graphChildAssignmentId(
+      parentTaskId,
+      childKey,
+      sourceBinding,
+    ) ||
     initialDependsOnTaskIds === null ||
     initialDependsOnTaskIds.length > 128 ||
     currentDependsOnTaskIds === null ||
@@ -546,6 +660,7 @@ function assertGraphTaskProvenance(
         acceptanceCriteria: initialContract.acceptanceCriteria,
         expectedDeliverables: initialContract.expectedDeliverables,
       },
+      sourceBinding,
     });
   } catch {
     throw corrupted("图任务定义摘要损坏");
@@ -555,7 +670,13 @@ function assertGraphTaskProvenance(
   }
   try {
     const normalizedEvent = normalizeStoredWorkflowEvent(event);
-    if (assignment.eventId !== normalizedEvent.eventId) {
+    if (
+      assignment.eventId !== normalizedEvent.eventId ||
+      (sourceBinding !== null &&
+        (sourceBinding.eventId !== normalizedEvent.eventId ||
+          sourceBinding.eventDigest !== normalizedEvent.contentDigest ||
+          sourceBinding.headRefOid !== normalizedEvent.payload.headRefOid))
+    ) {
       throw new Error("event binding mismatch");
     }
   } catch {
@@ -569,12 +690,23 @@ function normalizeItem(value, stateRevision, limits) {
   }
   const assignment = canonicalStoredValue(value.assignment, "分派内容损坏");
   const event = canonicalStoredValue(value.event, "分派事件损坏");
+  let source = null;
+  if (value.source !== null) {
+    try {
+      source = normalizePullRequestWorkSource(value.source);
+    } catch {
+      throw corrupted("PR 来源历史损坏");
+    }
+  }
+  const sourceQuarantine = normalizeSourceQuarantine(value.sourceQuarantine);
   const graph = canonicalStoredValue(value.graph, "工作图元数据损坏");
   const assignmentId = safeString(value.assignmentId, "assignmentId", 192);
+  const sourceRoot = value.kind === "source_root";
   if (
     assignment.assignmentId !== assignmentId ||
     !assignment.target ||
-    (assignment.eventId !== undefined &&
+    (!sourceRoot &&
+      assignment.eventId !== undefined &&
       event.eventId !== undefined &&
       assignment.eventId !== event.eventId)
   ) {
@@ -589,18 +721,58 @@ function normalizeItem(value, stateRevision, limits) {
     throw corrupted("员工工作项目标损坏");
   }
   assignment.target = originalTarget;
-  const inputDigest = ledgerDigest({ assignment, event }, {
+  const legacyInputDigest = ledgerDigest({ assignment, event }, {
     maximumEntries: 30_000,
     errorCode: "WORK_LEDGER_STATE_CORRUPTED",
   });
-  const expectedItemId = `work-item-${ledgerDigest({
-    assignmentId,
-    inputDigest,
-  })}`;
+  const inputDigest = sourceRoot
+    ? source?.current.inputDigest
+    : legacyInputDigest;
+  const expectedItemId = sourceRoot
+    ? `work-item-${ledgerDigest({
+        kind: "source_root",
+        workKey: source?.workKey,
+      })}`
+    : `work-item-${ledgerDigest({
+        assignmentId,
+        inputDigest,
+      })}`;
+  if (sourceRoot) {
+    let origin;
+    try {
+      origin = normalizeStoredWorkflowEvent(event);
+    } catch {
+      throw corrupted("PR 来源根初始事件损坏");
+    }
+    const firstRevision = source?.revisions[0];
+    const expectedAssignmentId = source
+      ? `pr-source-assignment-${ledgerDigest(source.identity)}`
+      : null;
+    if (
+      source === null ||
+      !hasExactLedgerKeys(assignment, [
+        "assignmentId",
+        "target",
+        "reason",
+      ]) ||
+      assignmentId !== expectedAssignmentId ||
+      assignment.reason !== "stable_pr_source_root" ||
+      originalTarget.type !== "role" ||
+      originalTarget.id !== source.identity.targetRoleId ||
+      origin.eventId !== firstRevision?.eventId ||
+      origin.contentDigest !== firstRevision?.eventDigest
+    ) {
+      throw corrupted("PR 来源根身份绑定损坏");
+    }
+  } else if (source !== null) {
+    throw corrupted("普通工作项不能携带 PR 来源流");
+  }
   if (
     value.inputDigest !== inputDigest ||
     value.itemId !== expectedItemId ||
-    !["assignment", "system_alert", "graph_task"].includes(value.kind) ||
+    !["assignment", "system_alert", "graph_task", "source_root"].includes(
+      value.kind,
+    ) ||
     !Number.isSafeInteger(value.sourceSequence) ||
     value.sourceSequence < 0 ||
     (value.kind === "assignment"
@@ -658,6 +830,8 @@ function normalizeItem(value, stateRevision, limits) {
     inputDigest,
     assignment,
     event,
+    source,
+    sourceQuarantine,
     graph,
     currentTarget,
     activeIntentId,
@@ -676,7 +850,9 @@ function normalizeItem(value, stateRevision, limits) {
   if (
     Date.parse(item.updatedAt) < Date.parse(item.createdAt) ||
     prettySerializedLedgerBytes(workItemCapacityView(item)) >
-      limits.itemByteBudget
+      (item.kind === "source_root"
+        ? limits.sourceRootByteBudget
+        : limits.itemByteBudget)
   ) {
     throw corrupted("员工工作项超过容量或时间顺序损坏");
   }
@@ -741,6 +917,14 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
   }
   const intent = normalizeIntent(value.intent);
   const requestedBy = normalizeRequestedBy(value.requestedBy);
+  let sourceBinding = null;
+  if (value.sourceBinding !== null) {
+    try {
+      sourceBinding = normalizePullRequestInputBinding(value.sourceBinding);
+    } catch {
+      throw corrupted("员工工作意图 PR 来源绑定损坏");
+    }
+  }
   let dispatchBinding = null;
   if (value.dispatchBinding !== null) {
     if (
@@ -804,6 +988,7 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     inputDigest,
     requestedBy,
     intent,
+    sourceBinding,
     dispatchBinding,
     status: value.status,
     revision: value.revision,
@@ -836,9 +1021,46 @@ function assertUnique(records, field, message) {
   if (new Set(values).size !== values.length) throw corrupted(message);
 }
 
+function pullRequestRevisionForBinding(binding, itemIndex) {
+  if (binding === null) return null;
+  const root = itemIndex.get(binding.rootItemId);
+  const revision = root?.source?.kind === "pull_request"
+    ? root.source.revisions[binding.inputRevision - 1]
+    : null;
+  return (
+      revision?.disposition === "accepted" &&
+      binding.workKey === root.source.workKey &&
+      binding.headRevision === revision.headRevision &&
+      binding.headRefOid === revision.headRefOid &&
+      binding.eventId === revision.eventId &&
+      binding.eventDigest === revision.eventDigest &&
+      binding.inputDigest === revision.inputDigest
+    )
+    ? { root, revision }
+    : null;
+}
+
+function samePullRequestBinding(left, right) {
+  return left !== null && right !== null &&
+    left.kind === right.kind &&
+    left.rootItemId === right.rootItemId &&
+    left.workKey === right.workKey &&
+    left.inputRevision === right.inputRevision &&
+    left.headRevision === right.headRevision &&
+    left.headRefOid === right.headRefOid &&
+    left.eventId === right.eventId &&
+    left.eventDigest === right.eventDigest &&
+    left.inputDigest === right.inputDigest;
+}
+
 export function assertWorkLedgerCapacity(state, limits) {
+  const sourceRootCount = state.items.filter(
+    ({ kind }) => kind === "source_root",
+  ).length;
+  const operationalItemCount = state.items.length - sourceRootCount;
   if (
-    state.items.length > limits.itemLimit ||
+    operationalItemCount > limits.itemLimit ||
+    sourceRootCount > limits.sourceRootLimit ||
     state.timeline.length > limits.timelineLimit ||
     state.outbox.length > limits.outboxLimit ||
     state.graphMemoryProjection.pending.length >
@@ -846,7 +1068,9 @@ export function assertWorkLedgerCapacity(state, limits) {
     state.items.some(
       (item) =>
         prettySerializedLedgerBytes(workItemCapacityView(item)) >
-        limits.itemByteBudget,
+        (item.kind === "source_root"
+          ? limits.sourceRootByteBudget
+          : limits.itemByteBudget),
     ) ||
     state.timeline.some(
       (entry) => prettySerializedLedgerBytes(entry) > limits.timelineByteBudget,
@@ -867,7 +1091,9 @@ export function assertWorkLedgerCapacity(state, limits) {
     prettySerializedLedgerBytes(state.graphMemoryProjection) >
       limits.graphMemoryStateByteBudget ||
     prettySerializedLedgerBytes(workLedgerCapacityView(state)) >
-      limits.stateByteBudget
+      limits.stateByteBudget ||
+    prettySerializedLedgerBytes(sourceRootCapacityView(state)) >
+      limits.sourceStateByteBudget
   ) {
     throw workLedgerError(
       "WORK_LEDGER_CAPACITY_EXCEEDED",
@@ -892,7 +1118,7 @@ function migrateLegacyGraphRecords(value, expectedKeys, recordedAt, label) {
 }
 
 function migrateLegacyGraphHistory(item) {
-  if (!hasExactLedgerKeys(item, ITEM_KEYS)) {
+  if (!hasExactLedgerKeys(item, LEGACY_ITEM_KEYS)) {
     throw corrupted("旧版员工工作项字段损坏");
   }
   if (
@@ -925,6 +1151,294 @@ function migrateLegacyGraphHistory(item) {
       ),
     },
   };
+}
+
+function safeLegacyPrSourceItem(item, referencedItemIds, outboxItemIds) {
+  const graph = item.graph;
+  const contract = Array.isArray(graph?.acceptanceContracts)
+    ? graph.acceptanceContracts[0]
+    : null;
+  return (
+    item.kind === "assignment" &&
+    item.status === "queued" &&
+    item.activeIntentId === null &&
+    item.decisionContext === null &&
+    item.ownerId === null &&
+    item.leaseId === null &&
+    item.leaseUntil === null &&
+    item.availableAt === null &&
+    graph?.parentItemId === null &&
+    Array.isArray(graph.dependsOnItemIds) &&
+    graph.dependsOnItemIds.length === 0 &&
+    Array.isArray(graph.deliveries) &&
+    graph.deliveries.length === 0 &&
+    Array.isArray(graph.acceptanceContracts) &&
+    graph.acceptanceContracts.length === 1 &&
+    contract?.revision === 1 &&
+    Array.isArray(contract.acceptanceCriteria) &&
+    contract.acceptanceCriteria.length === 0 &&
+    Array.isArray(contract.expectedDeliverables) &&
+    contract.expectedDeliverables.length === 0 &&
+    !referencedItemIds.has(item.itemId) &&
+    !outboxItemIds.has(item.itemId)
+  );
+}
+
+function unstartedLegacyCutoverIntentIds(items, outbox, legacyCutoverIds) {
+  const outboxById = new Map(outbox.map((entry) => [entry.intentId, entry]));
+  const intentIds = new Set();
+  for (const item of items) {
+    if (!legacyCutoverIds.has(item.itemId) || item.activeIntentId === null) {
+      continue;
+    }
+    const active = outboxById.get(item.activeIntentId);
+    if (
+      active?.status === "pending" ||
+      (active?.status === "dispatching" && active.dispatchBinding === null)
+    ) {
+      intentIds.add(active.intentId);
+    }
+  }
+  return intentIds;
+}
+
+function failUnstartedLegacyCutoverIntent(entry) {
+  return {
+    ...entry,
+    status: "failed",
+    dispatcherId: null,
+    dispatchLeaseId: null,
+    dispatchLeaseUntil: null,
+    outcome: {
+      status: "failed",
+      details: { reason: LEGACY_PR_SOURCE_UNSTARTED_INTENT_REASON },
+    },
+  };
+}
+
+function shouldBlockLegacyCutoverItem(item, unstartedIntentIds) {
+  return item.activeIntentId === null
+    ? LEGACY_PR_SOURCE_IDLE_STATUSES.has(item.status)
+    : unstartedIntentIds.has(item.activeIntentId);
+}
+
+function compareLegacySourceQuarantines(left, right) {
+  if (left.workKey !== right.workKey) return left.workKey < right.workKey ? -1 : 1;
+  if (left.rootItemId !== right.rootItemId) {
+    return left.rootItemId < right.rootItemId ? -1 : 1;
+  }
+  return 0;
+}
+
+function inheritedLegacySourceQuarantine(item, quarantineByItemId) {
+  const prerequisiteIds = [
+    ...(typeof item.graph?.parentItemId === "string"
+      ? [item.graph.parentItemId]
+      : []),
+    ...(item.graph?.dependsOnItemIds ?? []),
+  ];
+  return prerequisiteIds
+    .map((itemId) => quarantineByItemId.get(itemId))
+    .filter((quarantine) => quarantine !== undefined)
+    .sort(compareLegacySourceQuarantines)[0] ?? null;
+}
+
+function migrateDispatchBindingState(value, limits) {
+  const legacyItems = denseLedgerArrayValues(value.items);
+  const outbox = denseLedgerArrayValues(value.outbox);
+  if (
+    legacyItems === null ||
+    outbox === null ||
+    legacyItems.some((item) => !hasExactLedgerKeys(item, LEGACY_ITEM_KEYS)) ||
+    outbox.some((entry) => !hasExactLedgerKeys(entry, SCHEMA8_OUTBOX_KEYS))
+  ) {
+    throw corrupted("旧版员工工作项字段损坏");
+  }
+  const items = legacyItems.map((item) => ({
+    ...item,
+    assignment: item.kind === "graph_task"
+      ? {
+          ...item.assignment,
+          graphTask: {
+            ...item.assignment.graphTask,
+            sourceBinding: item.assignment.graphTask.sourceBinding ?? null,
+          },
+        }
+      : item.assignment,
+    source: null,
+    sourceQuarantine: null,
+  }));
+  const referencedItemIds = new Set();
+  for (const item of items) {
+    if (typeof item.graph?.parentItemId === "string") {
+      referencedItemIds.add(item.graph.parentItemId);
+    }
+    for (const dependencyId of item.graph?.dependsOnItemIds ?? []) {
+      referencedItemIds.add(dependencyId);
+    }
+  }
+  const outboxItemIds = new Set(outbox.map(({ itemId }) => itemId));
+  const groups = new Map();
+  for (const item of items) {
+    if (item.kind !== "assignment" || item.sourceSequence < 1) continue;
+    let descriptor;
+    try {
+      descriptor = pullRequestWorkDescriptor({
+        sequence: item.sourceSequence,
+        assignment: item.assignment,
+        event: item.event,
+      });
+    } catch {
+      throw corrupted("旧版 PR 员工来源无法验证");
+    }
+    if (descriptor === null) continue;
+    const group = groups.get(descriptor.workKey) ?? [];
+    group.push({ item, descriptor });
+    groups.set(descriptor.workKey, group);
+  }
+
+  const cancelledIds = new Set();
+  const legacyCutoverIds = new Set();
+  const legacyCutoverByItemId = new Map();
+  const roots = [];
+  for (const group of groups.values()) {
+    group.sort((left, right) =>
+      left.item.sourceSequence - right.item.sourceSequence,
+    );
+    const heads = new Set(group.map(({ descriptor }) => descriptor.headRefOid));
+    const safeGroup =
+      heads.size !== 1 ||
+      group.some(({ item }) =>
+        !safeLegacyPrSourceItem(item, referencedItemIds, outboxItemIds),
+      )
+        ? false
+        : true;
+    const seed = safeGroup ? group[0].item : group.at(-1).item;
+    const root = createPullRequestSourceRootWorkItem(
+      {
+        sequence: seed.sourceSequence,
+        assignment: seed.assignment,
+        event: seed.event,
+      },
+      seed.createdAt,
+    );
+    if (safeGroup) {
+      for (const { item } of group.slice(1)) {
+        const appended = appendPullRequestWorkSource(root.source, {
+          sequence: item.sourceSequence,
+          assignment: item.assignment,
+          event: item.event,
+        });
+        root.source = appended.source;
+        root.inputDigest = root.source.current.inputDigest;
+      }
+    } else {
+      const quarantine = {
+        kind: LEGACY_PR_SOURCE_QUARANTINE_KIND,
+        rootItemId: root.itemId,
+        workKey: root.source.workKey,
+        reason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+      };
+      root.status = "blocked";
+      root.statusReason = LEGACY_PR_SOURCE_CUTOVER_REASON;
+      root.sourceQuarantine = quarantine;
+      for (const { item } of group) {
+        legacyCutoverIds.add(item.itemId);
+        legacyCutoverByItemId.set(item.itemId, quarantine);
+      }
+    }
+    root.updatedAt = group.reduce(
+      (latest, { item }) =>
+        Date.parse(item.updatedAt) > Date.parse(latest)
+          ? item.updatedAt
+          : latest,
+      root.updatedAt,
+    );
+    roots.push(root);
+    for (const { item } of group) {
+      if (safeGroup) {
+        cancelledIds.add(item.itemId);
+      }
+    }
+  }
+
+  const directLegacyCutoverIds = new Set(legacyCutoverIds);
+  let quarantineChanged = true;
+  while (quarantineChanged) {
+    quarantineChanged = false;
+    for (const item of items) {
+      if (directLegacyCutoverIds.has(item.itemId)) continue;
+      const inherited = inheritedLegacySourceQuarantine(
+        item,
+        legacyCutoverByItemId,
+      );
+      const previous = legacyCutoverByItemId.get(item.itemId) ?? null;
+      if (
+        inherited !== null &&
+        (previous === null ||
+          compareLegacySourceQuarantines(inherited, previous) < 0)
+      ) {
+        legacyCutoverIds.add(item.itemId);
+        legacyCutoverByItemId.set(item.itemId, inherited);
+        quarantineChanged = true;
+      }
+    }
+  }
+
+  const unstartedIntentIds = unstartedLegacyCutoverIntentIds(
+    items,
+    outbox,
+    legacyCutoverIds,
+  );
+
+  const migratedItems = [
+    ...items.map((item) =>
+      cancelledIds.has(item.itemId)
+        ? {
+            ...item,
+            status: "cancelled",
+            statusReason: "consolidated_pr_source_root",
+          }
+        : legacyCutoverIds.has(item.itemId)
+          ? {
+              ...item,
+              sourceQuarantine: legacyCutoverByItemId.get(item.itemId),
+              ...(shouldBlockLegacyCutoverItem(item, unstartedIntentIds)
+                ? {
+                    status: "blocked",
+                    availableAt: null,
+                    activeIntentId: null,
+                  }
+                : {}),
+              statusReason: LEGACY_PR_SOURCE_CUTOVER_REASON,
+            }
+        : item,
+    ),
+    ...roots,
+  ];
+  let migrated = {
+    ...value,
+    schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+    items: migratedItems,
+    outbox: outbox.map((entry) => ({
+      ...(unstartedIntentIds.has(entry.intentId)
+        ? failUnstartedLegacyCutoverIntent(entry)
+        : entry),
+      sourceBinding: null,
+    })),
+  };
+  if (roots.length > 0) {
+    try {
+      migrated = appendWorkGraphMemoryEvents(
+        { ...value, items },
+        migrated,
+        limits,
+      );
+    } catch {
+      throw corrupted("无法迁移 PR 来源根的任务图记忆");
+    }
+  }
+  return migrated;
 }
 
 export function normalizeWorkLedgerPersistedState(value, limitsInput) {
@@ -974,7 +1488,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   if (
     schema2Items !== null &&
     schema2Items.every((item) => {
-      const legacyKeys = ITEM_KEYS.filter((key) => key !== "graph");
+      const legacyKeys = LEGACY_ITEM_KEYS.filter((key) => key !== "graph");
       return hasExactLedgerKeys(item, legacyKeys);
     })
   ) {
@@ -1045,7 +1559,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     }
     value = {
       ...value,
-      schemaVersion: PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: GRAPH_MEMORY_STATE_SCHEMA_VERSION,
       graphMemoryProjection,
     };
   }
@@ -1080,7 +1594,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     }
     value = {
       ...value,
-      schemaVersion: PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: GRAPH_MEMORY_STATE_SCHEMA_VERSION,
       graphMemoryProjection,
     };
   }
@@ -1100,7 +1614,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       "timeline",
       "outbox",
       "graphMemoryProjection",
-    ]) && value.schemaVersion === PREVIOUS_WORK_LEDGER_STATE_SCHEMA_VERSION
+    ]) && value.schemaVersion === GRAPH_MEMORY_STATE_SCHEMA_VERSION
       ? denseLedgerArrayValues(value.outbox)
       : null;
   if (
@@ -1109,7 +1623,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   ) {
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: DISPATCH_BINDING_STATE_SCHEMA_VERSION,
       outbox: schema7Outbox.map((entry) => ({
         ...entry,
         dispatchBinding: entry.status === "dispatching"
@@ -1117,6 +1631,27 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
           : null,
       })),
     };
+  }
+  if (
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+      "graphMemoryProjection",
+    ]) &&
+    value.schemaVersion === DISPATCH_BINDING_STATE_SCHEMA_VERSION
+  ) {
+    value = migrateDispatchBindingState(value, limits);
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
     "schemaVersion",
@@ -1167,7 +1702,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     itemValues === null ||
     timelineValues === null ||
     outboxValues === null ||
-    itemValues.length > limits.itemLimit ||
+    itemValues.length > limits.itemLimit + limits.sourceRootLimit ||
     timelineValues.length > limits.timelineLimit ||
     outboxValues.length > limits.outboxLimit
   ) {
@@ -1216,6 +1751,12 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   assertGraphDeliveryHistory(state.items);
   assertUnique(state.items, "itemId", "员工工作项 ID 重复");
   assertUnique(state.items, "assignmentId", "员工分派 ID 重复");
+  const prWorkKeys = state.items
+    .filter(({ source }) => source?.kind === "pull_request")
+    .map(({ source }) => source.workKey);
+  if (new Set(prWorkKeys).size !== prWorkKeys.length) {
+    throw corrupted("PR 来源工作键重复");
+  }
   assertUnique(
     state.items.filter(({ kind }) => kind === "assignment"),
     "sourceSequence",
@@ -1225,6 +1766,34 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   assertUnique(state.outbox, "intentId", "员工工作意图 ID 重复");
 
   const itemIndex = new Map(state.items.map((item) => [item.itemId, item]));
+  for (const item of state.items) {
+    const quarantine = item.sourceQuarantine;
+    if (quarantine === null) continue;
+    const root = itemIndex.get(quarantine.rootItemId);
+    if (
+      root?.kind !== "source_root" ||
+      root.source?.kind !== "pull_request" ||
+      root.source.workKey !== quarantine.workKey ||
+      root.sourceQuarantine?.rootItemId !== quarantine.rootItemId ||
+      root.sourceQuarantine?.workKey !== quarantine.workKey
+    ) {
+      throw corrupted("PR 来源隔离根引用不存在或已损坏");
+    }
+  }
+  for (const item of state.items) {
+    const binding = item.kind === "graph_task"
+      ? item.assignment.graphTask.sourceBinding
+      : null;
+    if (binding === null) continue;
+    const reference = pullRequestRevisionForBinding(binding, itemIndex);
+    if (
+      reference === null ||
+      item.graph.parentItemId === null ||
+      binding.rootItemId === item.itemId
+    ) {
+      throw corrupted("图任务引用的 PR 来源不存在或已损坏");
+    }
+  }
   for (const entry of state.timeline) {
     if (entry.itemId !== null && !itemIndex.has(entry.itemId)) {
       throw corrupted("员工工作时间线引用不存在的工作项");
@@ -1232,13 +1801,37 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   }
   for (const entry of state.outbox) {
     const item = itemIndex.get(entry.itemId);
-    if (!item || item.inputDigest !== entry.inputDigest) {
+    const sourceReference = pullRequestRevisionForBinding(
+      entry.sourceBinding,
+      itemIndex,
+    );
+    const itemSourceBinding = item?.kind === "graph_task"
+      ? item.assignment.graphTask.sourceBinding
+      : null;
+    const validSourceBinding =
+      entry.sourceBinding !== null &&
+      sourceReference !== null &&
+      ((item?.source?.kind === "pull_request" &&
+        item.itemId === entry.sourceBinding.rootItemId &&
+        entry.inputDigest === sourceReference.revision.inputDigest) ||
+        (item?.kind === "graph_task" &&
+          samePullRequestBinding(itemSourceBinding, entry.sourceBinding) &&
+          entry.inputDigest === item.inputDigest));
+    const validOrdinaryBinding =
+      item?.source === null &&
+      itemSourceBinding === null &&
+      entry.sourceBinding === null &&
+      item?.inputDigest === entry.inputDigest;
+    if (!item || (!validSourceBinding && !validOrdinaryBinding)) {
       throw corrupted("员工工作 outbox 引用不存在或已变化的工作项");
     }
     if (entry.status === "pending" && entry.dispatchBinding !== null) {
       throw corrupted("待分发工作意图不能复用旧策略绑定");
     }
-    if (entry.dispatchBinding?.boundIntent) {
+    if (
+      entry.dispatchBinding !== null &&
+      Object.hasOwn(entry.dispatchBinding, "boundIntent")
+    ) {
       if (entry.attempt < 1) {
         throw corrupted("未领取工作意图不能包含策略绑定");
       }
@@ -1248,7 +1841,8 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
           roleId: entry.requestedBy.roleId,
           workItemId: item.itemId,
           assignmentId: item.assignmentId,
-          eventId: item.event.eventId,
+          eventId: entry.sourceBinding?.eventId ??
+            currentWorkItemEvent(item).eventId,
         });
       } catch {
         throw corrupted("员工工作意图策略绑定与工作项不一致");

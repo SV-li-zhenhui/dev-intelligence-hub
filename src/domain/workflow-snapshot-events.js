@@ -288,12 +288,19 @@ function changeEvents(before, after, context) {
   if (!fields.length) return [];
 
   const facts = factsFor(after);
+  const previousHeadRefOid = fields.includes("headRefOid")
+    ? before.headRefOid
+    : undefined;
   const events = [
     normalizedEvent({
       ...context,
       eventName: "updated",
       item: after,
-      payload: { ...facts, changedFields: fields },
+      payload: {
+        ...facts,
+        changedFields: fields,
+        ...(previousHeadRefOid === undefined ? {} : { previousHeadRefOid }),
+      },
     }),
   ];
   const classificationChanges = fields.filter((field) =>

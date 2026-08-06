@@ -209,6 +209,23 @@ test("additions and material changes emit granular events without flooding uncha
   );
 });
 
+test("a changed PR Head carries its causal predecessor on the update event", () => {
+  const previous = snapshot([
+    pullRequest(1, { headRefOid: "head-a" }),
+  ], { refreshedAt: "2026-08-02T01:00:00.000Z" });
+  const current = snapshot([
+    pullRequest(1, { headRefOid: "head-b" }),
+  ]);
+
+  const events = workflowEventsFromSnapshots(previous, current);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].eventType, "pull_request.updated");
+  assert.equal(events[0].payload.headRefOid, "head-b");
+  assert.equal(events[0].payload.previousHeadRefOid, "head-a");
+  assert.deepEqual(events[0].payload.changedFields, ["headRefOid"]);
+});
+
 test("an unhealthy source suppresses all events for only its own item kind", () => {
   const previous = snapshot([pullRequest(1), issue(1)]);
   const current = snapshot([], {

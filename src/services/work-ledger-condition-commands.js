@@ -1,4 +1,5 @@
 import {
+  assertWorkItemNotInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
@@ -101,6 +102,7 @@ export function planConditionWake({ state, input, clock }) {
   const intentId = boundedLedgerString(input.intentId, "intentId", 192);
   const actorId = normalizeWorkActor(input.actorId);
   const item = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(item);
   const outbox = requireBoundCondition(state, item, intentId);
   const now = clock();
   const observation = normalizeObservation(

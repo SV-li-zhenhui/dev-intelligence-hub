@@ -6,6 +6,7 @@ import {
 } from "../domain/work-intent-dispatch-binding.js";
 import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const MAX_DISPATCH_BATCH = 100;
 const QUERY_PAGE_SIZE = 100;
@@ -409,7 +410,7 @@ function evidenceTargetFor(item, requester, intent) {
 }
 
 function validateBoundIntent(bound, item, intent, requester) {
-  const event = dataMap(item.event);
+  const event = dataMap(currentWorkItemEvent(item));
   const error = dispatcherError(
     "WORK_INTENT_BINDING_INVALID",
     "策略没有返回与可信工作项一致的绑定",
@@ -554,7 +555,7 @@ function attentionRequest(claimed, item, bound) {
     context: [
       { label: "工作摘要", value: safeContextText(payload.get("summary")) },
       { label: "判断依据", value: safeContextText(payload.get("reason")) },
-      { label: "来源事件", value: sourceContext(item.event) },
+      { label: "来源事件", value: sourceContext(currentWorkItemEvent(item)) },
     ],
     choices: payload.get("choices"),
   };
@@ -883,7 +884,7 @@ export class WorkIntentDispatcher {
               assignmentId: item.assignmentId,
               workItemId: item.itemId,
               roleId: requester.roleId,
-              event: item.event,
+              event: currentWorkItemEvent(item),
               ...(evidenceTarget === null ? {} : { evidenceTarget }),
             },
             intent: claimed.intent,

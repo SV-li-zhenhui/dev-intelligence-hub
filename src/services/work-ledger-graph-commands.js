@@ -4,6 +4,7 @@ import {
   normalizeWorkflowEvent,
 } from "../domain/workflow-events.js";
 import {
+  assertWorkItemNotInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
@@ -25,6 +26,11 @@ import {
   createGraphChildWorkItem,
   graphChildAssignmentId,
 } from "./work-ledger-records.js";
+import {
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
+  pullRequestHeadAdmission,
+} from "./work-ledger-pr-source.js";
 import {
   assertExpectedWorkGraphRevision,
   assertWorkGraphCommandTransition,
@@ -218,6 +224,7 @@ function normalizeGraphChildCommand(input) {
 function assertTaskRevisionBindings(state, revisions) {
   for (const [taskId, expectedRevision] of revisions) {
     const item = requireWorkLedgerItem(state, taskId);
+    assertWorkItemNotInLegacyPullRequestCutover(item);
     assertItemRevision(item, expectedRevision);
   }
 }
@@ -233,15 +240,47 @@ function graphChildResult(stateRevision, child, parent, applied) {
   };
 }
 
+function assertDependencySourceEpoch(dependency, sourceBinding) {
+  const dependencyBinding = currentWorkItemInputBinding(dependency);
+  if (dependencyBinding === null) return;
+  if (
+    sourceBinding === null ||
+    dependencyBinding.rootItemId !== sourceBinding.rootItemId ||
+    dependencyBinding.workKey !== sourceBinding.workKey ||
+    dependencyBinding.headRevision !== sourceBinding.headRevision ||
+    dependencyBinding.headRefOid !== sourceBinding.headRefOid
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_SOURCE_EPOCH_CONFLICT",
+      "子任务不能依赖不同 PR Head epoch 的任务",
+      409,
+    );
+  }
+}
+
 export function planWorkGraphChildCreation({ state, input, clock }) {
   const normalized = normalizeGraphChildCommand(input);
   const { authority, command } = normalized;
   const parent = requireWorkLedgerItem(state, command.parentTaskId);
+  assertWorkItemNotInLegacyPullRequestCutover(parent);
+  const sourceAdmission = pullRequestHeadAdmission(state, parent);
+  if (
+    sourceAdmission.applies &&
+    (!sourceAdmission.current || sourceAdmission.pending)
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      "父任务的 PR Head 已变化，不能继续创建旧 Head 子任务",
+      409,
+    );
+  }
+  const sourceBinding = currentWorkItemInputBinding(parent);
   let parentEvent;
   try {
-    parentEvent = Object.hasOwn(parent.event, "eventId")
-      ? normalizeStoredWorkflowEvent(parent.event)
-      : normalizeWorkflowEvent(parent.event);
+    const currentEvent = currentWorkItemEvent(parent);
+    parentEvent = Object.hasOwn(currentEvent, "eventId")
+      ? normalizeStoredWorkflowEvent(currentEvent)
+      : normalizeWorkflowEvent(currentEvent);
   } catch (cause) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_SOURCE_INVALID",
@@ -251,11 +290,14 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
     );
   }
   for (const dependencyId of command.dependsOnItemIds) {
-    requireWorkLedgerItem(state, dependencyId);
+    const dependency = requireWorkLedgerItem(state, dependencyId);
+    assertWorkItemNotInLegacyPullRequestCutover(dependency);
+    assertDependencySourceEpoch(dependency, sourceBinding);
   }
   const assignmentId = graphChildAssignmentId(
     command.parentTaskId,
     command.childKey,
+    sourceBinding,
   );
   const existing = state.items.find(
     (item) => item.assignmentId === assignmentId,
@@ -279,6 +321,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
       dependsOnItemIds: command.dependsOnItemIds,
       acceptanceContract: command.acceptanceContract,
       parentEvent,
+      sourceBinding,
     },
     now,
   );
@@ -302,7 +345,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
   assertExpectedWorkGraphRevision(command.expectedGraphRevision, state);
   assertTaskRevisionBindings(state, command.expectedTaskRevisions);
   if (
-    !["assignment", "graph_task"].includes(parent.kind) ||
+    !["assignment", "graph_task", "source_root"].includes(parent.kind) ||
     !CHILD_PARENT_STATUSES.has(parent.status)
   ) {
     throw workLedgerError(
@@ -350,6 +393,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
           childTaskId: child.itemId,
           childKey: command.childKey,
           inputDigest: child.inputDigest,
+          sourceBinding,
         },
       },
       {
@@ -477,6 +521,7 @@ export function planWorkGraphCancellation({ state, input, clock }) {
     );
   }
   const root = requireWorkLedgerItem(state, itemId);
+  assertWorkItemNotInLegacyPullRequestCutover(root);
   assertExpectedWorkGraphRevision(input.expectedGraphRevision, state);
   assertItemRevision(root, input.expectedRevision);
   if (root.status === "cancelled") {

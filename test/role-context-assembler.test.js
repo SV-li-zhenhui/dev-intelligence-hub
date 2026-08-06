@@ -7,6 +7,12 @@ import {
 } from "../src/services/role-context-assembler.js";
 import { deliveryAcceptanceContractDigest } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import {
+  appendPullRequestWorkSource,
+  createPullRequestWorkSource,
+  currentWorkItemInputBinding,
+} from "../src/services/work-ledger-pr-source.js";
 
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
@@ -593,6 +599,134 @@ test("classifies PR source and fresh facts as code while keeping requirements pr
     ],
   );
   assert.equal(factCalls.every(({ item }) => Object.keys(item).join() === "event"), true);
+});
+
+function pullRequestEvent(headRefOid, occurredAt, previousHeadRefOid) {
+  return normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "pull_request.updated",
+    occurredAt,
+    source: { provider: "github", scopeId: "github-dashboard" },
+    subject: {
+      id: "github:pr:octo/repo#12",
+      repository: "octo/repo",
+      number: 12,
+    },
+    payload: {
+      title: `PR at ${headRefOid[0]}`,
+      headRefOid,
+      changedFields: ["headRefOid"],
+      ...(previousHeadRefOid === undefined ? {} : { previousHeadRefOid }),
+    },
+  });
+}
+
+function pullRequestAssignment(sequence, sourceEvent) {
+  return {
+    sequence,
+    assignment: {
+      assignmentId: `workflow-assignment-${sequence}`,
+      eventId: sourceEvent.eventId,
+      target: { type: "role", id: "pr-engineer" },
+      reason: "pr-events-to-pr-engineer",
+    },
+    event: sourceEvent,
+  };
+}
+
+test("a PR source root binds context and facts to its active Head revision", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  const headA = "a".repeat(40);
+  const headB = "b".repeat(40);
+  const eventA = pullRequestEvent(headA, "2026-08-03T04:00:00.000Z");
+  const eventB = pullRequestEvent(headB, "2026-08-03T05:00:00.000Z", headA);
+  const initial = createPullRequestWorkSource(
+    pullRequestAssignment(1, eventA),
+  );
+  const advanced = appendPullRequestWorkSource(
+    initial.source,
+    pullRequestAssignment(2, eventB),
+  );
+  fixture.item = {
+    ...fixture.item,
+    currentTarget: { type: "role", id: "pr-engineer" },
+    decisionContext: null,
+    inputDigest: advanced.source.current.inputDigest,
+    event: eventA,
+    source: advanced.source,
+  };
+  fixture.snapshot.graph.tasks.find(
+    ({ taskId }) => taskId === fixture.item.itemId,
+  ).responsibility = { type: "role", id: "pr-engineer" };
+  const factCalls = [];
+
+  const packet = await assemble(fixture, {
+    roleId: "pr-engineer",
+    factSource: factSource({}, factCalls),
+  });
+
+  assert.equal(packet.binding.source.workKey, advanced.source.workKey);
+  assert.equal(packet.binding.source.inputRevision, 2);
+  assert.equal(packet.binding.source.headRevision, 2);
+  assert.equal(packet.binding.source.headRefOid, headB);
+  assert.equal(packet.context.requirements.source.eventId, eventB.eventId);
+  assert.equal(packet.context.requirements.source.inputRevision, 2);
+  assert.equal(packet.context.requirements.decisionContext, undefined);
+  assert.equal(packet.context.code.sourceEvent.eventId, eventB.eventId);
+  assert.equal(packet.context.code.sourceEvent.payload.headRefOid, headB);
+  assert.equal(packet.context.code.decisionContext, undefined);
+  assert.equal(
+    factCalls.every(({ item }) => item.event.eventId === eventB.eventId),
+    true,
+  );
+});
+
+test("a PR graph child gives its brain the inherited exact Head binding", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  const headA = "a".repeat(40);
+  const headB = "b".repeat(40);
+  const eventA = pullRequestEvent(headA, "2026-08-03T04:00:00.000Z");
+  const eventB = pullRequestEvent(headB, "2026-08-03T05:00:00.000Z", headA);
+  const initial = createPullRequestWorkSource(
+    pullRequestAssignment(1, eventA),
+  );
+  const advanced = appendPullRequestWorkSource(
+    initial.source,
+    pullRequestAssignment(2, eventB),
+  );
+  const sourceBinding = currentWorkItemInputBinding({
+    itemId: "pr-source-root",
+    source: advanced.source,
+  });
+  fixture.item = {
+    ...fixture.item,
+    kind: "graph_task",
+    currentTarget: { type: "role", id: "pr-engineer" },
+    event: eventB,
+    assignment: {
+      graphTask: { sourceBinding },
+    },
+  };
+  fixture.snapshot.graph.tasks.find(
+    ({ taskId }) => taskId === fixture.item.itemId,
+  ).responsibility = { type: "role", id: "pr-engineer" };
+
+  const packet = await assemble(fixture, { roleId: "pr-engineer" });
+
+  assert.deepEqual(packet.binding.source, sourceBinding);
+  assert.equal(packet.context.requirements.source.rootItemId, "pr-source-root");
+  assert.equal(packet.context.requirements.source.headRevision, 2);
+  assert.equal(packet.context.requirements.source.headRefOid, headB);
+  assert.equal(packet.context.code.sourceEvent.eventId, eventB.eventId);
+
+  const staleFixture = structuredClone(fixture);
+  staleFixture.item.event.payload.headRefOid = headA;
+  await assert.rejects(
+    assemble(staleFixture, { roleId: "pr-engineer" }),
+    (error) =>
+      error instanceof RoleContextAssemblerError &&
+      error.code === "ROLE_CONTEXT_INVALID",
+  );
 });
 
 test("projects bounded authoritative evidence for the exact current role and contract", async () => {
@@ -1366,10 +1500,14 @@ test("a configured root orchestrator receives exact direct-child coordination by
     "schemaVersion",
     "rootTaskId",
     "directChildren",
+    "history",
     "deliveryWindow",
   ]);
-  assert.equal(coordination.schemaVersion, 1);
+  assert.equal(coordination.schemaVersion, 2);
   assert.equal(coordination.rootTaskId, "task-root");
+  assert.deepEqual(coordination.history, {
+    supersededChildCount: 0,
+  });
   assert.deepEqual(coordination.deliveryWindow, {
     pendingCount: 1,
     shownCount: 1,
@@ -1528,6 +1666,41 @@ test("a configured root orchestrator receives exact direct-child coordination by
   assert.equal(Object.isFrozen(coordination.directChildren), true);
   assert.equal(Object.isFrozen(paused.deliverables[0]), true);
   assert.equal(Object.isFrozen(packet.context.code.childDeliveries[0]), true);
+});
+
+test("root coordination excludes bounded superseded-Head history", async () => {
+  const fixture = rootOrchestratorFixture();
+  const historicalCount = 3 * 64;
+  for (let index = 0; index < historicalCount; index += 1) {
+    const taskId = `task-superseded-${String(index).padStart(3, "0")}`;
+    fixture.snapshot.graph.tasks.push(task({
+      taskId,
+      revision: 1,
+      status: "superseded",
+      roleId: "developer",
+      parentTaskId: "task-root",
+    }));
+    fixture.snapshot.taskStates.push(state(
+      taskId,
+      1,
+      `OLD-HEAD-SECRET-${String(index).padStart(3, "0")}`,
+    ));
+  }
+
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const coordination = packet.context.requirements.coordination;
+
+  assert.equal(coordination.history.supersededChildCount, historicalCount);
+  assert.equal(coordination.directChildren.length, 5);
+  assert.equal(
+    coordination.directChildren.some(({ status }) => status === "superseded"),
+    false,
+  );
+  assert.equal(JSON.stringify(packet).includes("OLD-HEAD-SECRET"), false);
+  assert.equal(
+    Buffer.byteLength(JSON.stringify(packet.context), "utf8") < 128 * 1_024,
+    true,
+  );
 });
 
 test("root coordination fails closed for stale child state and bad delivery pairing", async () => {

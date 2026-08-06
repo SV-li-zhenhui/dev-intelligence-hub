@@ -17,6 +17,7 @@ const RUNTIME_METHODS = Object.freeze([
   "listOutbox",
   "readItemForReconciliation",
   "intake",
+  "reconcilePullRequestSource",
   "claim",
   "transition",
   "scheduleRetry",

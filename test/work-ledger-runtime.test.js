@@ -182,6 +182,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "listOutbox",
     "readItemForReconciliation",
     "intake",
+    "reconcilePullRequestSource",
     "claim",
     "transition",
     "scheduleRetry",

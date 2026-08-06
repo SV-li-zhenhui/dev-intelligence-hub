@@ -40,6 +40,7 @@ import {
   appendWorkLedgerTimeline,
   createAssignmentWorkItem,
   createGapAlertWorkItem,
+  createPullRequestSourceRootWorkItem,
   findAssignmentBatchGap,
   MAX_WORK_LEDGER_INTAKE_BATCH,
   MAX_WORK_LEDGER_QUERY_PAGE,
@@ -47,6 +48,16 @@ import {
   normalizeReportedAssignmentGap,
   WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
 } from "./work-ledger-records.js";
+import {
+  activatePendingPullRequestWorkSource,
+  appendPullRequestWorkSource,
+  validatePullRequestSourceTransition,
+} from "./work-ledger-pr-source.js";
+import {
+  applyReadyPullRequestSourceCutover,
+  inspectPullRequestSourceCutover,
+  planPullRequestSourceReconciliation,
+} from "./work-ledger-pr-cutover-commands.js";
 import {
   assertWorkLedgerCapacity,
   emptyWorkLedgerState,
@@ -76,6 +87,12 @@ const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
     return operation();
   },
 });
+
+const PR_SOURCE_REQUEUE_STATUSES = new Set([
+  "working",
+  "retry_wait",
+  "completed",
+]);
 
 function newWorkAdmissionRun(value) {
   const gate = value === undefined ? DIRECT_NEW_WORK_ADMISSION : value;
@@ -387,6 +404,10 @@ export class WorkLedgerService {
     }));
   }
 
+  async reconcilePullRequestSource(input = {}) {
+    return this.#executeCommand(planPullRequestSourceReconciliation, input);
+  }
+
   async claim(input = {}) {
     return this.#admitNewWork(() =>
       this.#executeCommand(planWorkItemClaim, input, true),
@@ -562,18 +583,63 @@ export class WorkLedgerService {
   }
 
   async #recordBatch(batch, now) {
+    if (batch.items.length === 0) {
+      return cloneLedgerValue({
+        received: 0,
+        deduplicated: 0,
+        cursor: this.state.intakeCursor,
+        highWatermark: this.state.sourceHighWatermark,
+        gap: null,
+        itemIds: [],
+        alertItemId: null,
+      });
+    }
     const knownAssignments = new Map(
-      this.state.items.map((item) => [item.assignmentId, item]),
+      this.state.items.map((item) => [
+        item.assignmentId,
+        {
+          inputDigest: item.kind === "source_root"
+            ? null
+            : item.inputDigest,
+          sourceSequence: item.sourceSequence,
+        },
+      ]),
     );
-    const created = [];
+    for (const item of this.state.items) {
+      if (item.source?.kind !== "pull_request") continue;
+      for (const binding of item.source.bindings) {
+        knownAssignments.set(binding.assignmentId, {
+          inputDigest: binding.assignmentDigest,
+          sourceSequence: binding.sourceSequence,
+        });
+      }
+    }
+    const initialItemIds = new Set(
+      this.state.items.map(({ itemId }) => itemId),
+    );
+    const rootByWorkKey = new Map(
+      this.state.items
+        .filter(({ source }) => source?.kind === "pull_request")
+        .map((item) => [item.source.workKey, item]),
+    );
+    const itemsById = new Map(
+      this.state.items.map((item) => [item.itemId, item]),
+    );
+    const outboxById = new Map(
+      this.state.outbox.map((entry) => [entry.intentId, entry]),
+    );
+    const touchedItemIds = new Set();
+    const revisedItemIds = new Set();
+    const timelineEvents = [];
+    let received = 0;
     let deduplicated = 0;
     for (const envelope of batch.items) {
-      const item = createAssignmentWorkItem(envelope, now);
-      const existing = knownAssignments.get(item.assignmentId);
+      const assignmentItem = createAssignmentWorkItem(envelope, now);
+      const existing = knownAssignments.get(assignmentItem.assignmentId);
       if (existing) {
         if (
-          existing.inputDigest !== item.inputDigest ||
-          existing.sourceSequence !== item.sourceSequence
+          existing.inputDigest !== assignmentItem.inputDigest ||
+          existing.sourceSequence !== assignmentItem.sourceSequence
         ) {
           throw workLedgerError(
             "WORK_LEDGER_ASSIGNMENT_CONFLICT",
@@ -584,21 +650,154 @@ export class WorkLedgerService {
         deduplicated += 1;
         continue;
       }
-      knownAssignments.set(item.assignmentId, item);
-      created.push(item);
+      const rootCandidate = createPullRequestSourceRootWorkItem(envelope, now);
+      if (rootCandidate === null) {
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        itemsById.set(assignmentItem.itemId, assignmentItem);
+        touchedItemIds.add(assignmentItem.itemId);
+        received += 1;
+        timelineEvents.push({
+          itemId: assignmentItem.itemId,
+          type: "assignment_intaken",
+          at: now,
+          actorId: "work-ledger-system",
+          details: {
+            assignmentId: assignmentItem.assignmentId,
+            sourceSequence: assignmentItem.sourceSequence,
+            inputDigest: assignmentItem.inputDigest,
+            kind: assignmentItem.kind,
+          },
+        });
+        continue;
+      }
+
+      let root = rootByWorkKey.get(rootCandidate.source.workKey);
+      let disposition = "accepted";
+      let headAdvanced = false;
+      if (!root) {
+        root = rootCandidate;
+        rootByWorkKey.set(root.source.workKey, root);
+        itemsById.set(root.itemId, root);
+        timelineEvents.push({
+          itemId: root.itemId,
+          type: "pr_source_created",
+          at: now,
+          actorId: "work-ledger-system",
+          details: {
+            workKey: root.source.workKey,
+            sourceSequence: envelope.sequence,
+            inputRevision: 1,
+            headRevision: 1,
+            headRefOid: root.source.current.headRefOid,
+          },
+        });
+      } else {
+        let appended = appendPullRequestWorkSource(
+          root.source,
+          envelope,
+          { activate: false },
+        );
+        if (appended.disposition === "accepted") {
+          const pendingRoot = { ...root, source: appended.source };
+          const activation = inspectPullRequestSourceCutover(
+            pendingRoot,
+            [...itemsById.values()],
+            outboxById,
+          );
+          if (activation.blockers.length === 0) {
+            const pendingRevision = appended.source.pendingRevision;
+            const pendingHeadRevision = appended.source.revisions[
+              pendingRevision - 1
+            ].headRevision;
+            root = applyReadyPullRequestSourceCutover({
+              root,
+              activation,
+              itemsById,
+              outboxById,
+              nextInputRevision: pendingRevision,
+              nextHeadRevision: pendingHeadRevision,
+              now,
+              timelineEvents,
+            });
+            const activated = activatePendingPullRequestWorkSource(
+              appended.source,
+            );
+            appended = {
+              ...appended,
+              source: activated.source,
+              activeAdvanced: true,
+            };
+          }
+        }
+        disposition = appended.disposition;
+        headAdvanced = appended.headAdvanced === true;
+        const firstRevisionInBatch =
+          initialItemIds.has(root.itemId) && !revisedItemIds.has(root.itemId);
+        root = {
+          ...root,
+          source: appended.source,
+          inputDigest: appended.source.current.inputDigest,
+          ...(firstRevisionInBatch
+            ? { revision: root.revision + 1 }
+            : {}),
+          ...(appended.activeAdvanced && PR_SOURCE_REQUEUE_STATUSES.has(root.status)
+            ? {
+                status: "queued",
+                ownerId: null,
+                leaseId: null,
+                leaseUntil: null,
+                availableAt: null,
+                statusReason: "pr_source_revised",
+              }
+            : {}),
+          updatedAt: now,
+        };
+        revisedItemIds.add(root.itemId);
+        rootByWorkKey.set(root.source.workKey, root);
+        itemsById.set(root.itemId, root);
+        const currentHeadRevision = root.source.revisions[
+          root.source.activeRevision - 1
+        ].headRevision;
+        const pendingHeadRevision = root.source.pendingRevision === null
+          ? null
+          : root.source.revisions[root.source.pendingRevision - 1].headRevision;
+        timelineEvents.push({
+          itemId: root.itemId,
+          type: disposition.startsWith("ignored_")
+            ? "pr_source_ignored"
+            : "pr_source_revised",
+          at: now,
+          actorId: "work-ledger-system",
+          details: {
+            workKey: root.source.workKey,
+            sourceSequence: envelope.sequence,
+            inputRevision: root.source.inputRevision,
+            activeRevision: root.source.activeRevision,
+            pendingRevision: root.source.pendingRevision,
+            headRevision: currentHeadRevision,
+            headRefOid: root.source.current.headRefOid,
+            currentHeadRevision,
+            currentHeadRefOid: root.source.current.headRefOid,
+            pendingHeadRevision,
+            pendingHeadRefOid: root.source.pending?.headRefOid ?? null,
+            observedHeadRevision: root.source.headRevision,
+            observedHeadRefOid: (root.source.pending ?? root.source.current)
+              .headRefOid,
+            disposition,
+            headAdvanced,
+          },
+        });
+      }
+      knownAssignments.set(assignmentItem.assignmentId, {
+        inputDigest: assignmentItem.inputDigest,
+        sourceSequence: assignmentItem.sourceSequence,
+      });
+      touchedItemIds.add(root.itemId);
+      received += 1;
     }
-    const timelineEvents = created.map((item) => ({
-      itemId: item.itemId,
-      type: "assignment_intaken",
-      at: now,
-      actorId: "work-ledger-system",
-      details: {
-        assignmentId: item.assignmentId,
-        sourceSequence: item.sourceSequence,
-        inputDigest: item.inputDigest,
-        kind: item.kind,
-      },
-    }));
     timelineEvents.push({
       itemId: null,
       type: "intake_completed",
@@ -608,7 +807,7 @@ export class WorkLedgerService {
         afterSequence: this.state.intakeCursor,
         nextSequence: batch.nextSequence,
         highWatermark: batch.highWatermark,
-        received: created.length,
+        received,
         deduplicated,
       },
     });
@@ -618,18 +817,19 @@ export class WorkLedgerService {
         revision: this.state.revision + 1,
         intakeCursor: batch.nextSequence,
         sourceHighWatermark: batch.highWatermark,
-        items: [...this.state.items, ...created],
+        items: [...itemsById.values()],
+        outbox: [...outboxById.values()],
       },
       timelineEvents,
     );
     await this.#persist(nextState);
     return cloneLedgerValue({
-      received: created.length,
+      received,
       deduplicated,
       cursor: this.state.intakeCursor,
       highWatermark: this.state.sourceHighWatermark,
       gap: null,
-      itemIds: created.map(({ itemId }) => itemId),
+      itemIds: [...touchedItemIds],
       alertItemId: null,
     });
   }
@@ -719,6 +919,16 @@ export class WorkLedgerService {
       throw workLedgerError(
         "WORK_LEDGER_GRAPH_TRANSITION_INVALID",
         "员工工作图转换与台账修订不一致",
+        409,
+        { cause: error },
+      );
+    }
+    try {
+      validatePullRequestSourceTransition(this.state.items, normalized.items);
+    } catch (error) {
+      throw workLedgerError(
+        "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",
+        "PR 来源历史与台账修订不一致",
         409,
         { cause: error },
       );

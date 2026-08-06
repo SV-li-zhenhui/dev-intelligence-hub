@@ -166,6 +166,17 @@ export function workGraphMemorySourceHistoryDigest(items) {
   );
 }
 
+function isSyntheticSourceRootContract(item, kind, record) {
+  return (
+    item.kind === "source_root" &&
+    kind === "acceptance_contract" &&
+    record.revision === 1 &&
+    record.recordedAt === item.createdAt &&
+    record.acceptanceCriteria.length === 0 &&
+    record.expectedDeliverables.length === 0
+  );
+}
+
 function recordEventsForItem(item, contractStart = 0, deliveryStart = 0) {
   return [
     ...item.graph.acceptanceContracts.slice(contractStart).map((record) => ({
@@ -178,7 +189,9 @@ function recordEventsForItem(item, contractStart = 0, deliveryStart = 0) {
       kind: `delivery_${record.status}`,
       record,
     })),
-  ];
+  ].filter(({ kind, record }) =>
+    !isSyntheticSourceRootContract(item, kind, record)
+  );
 }
 
 function compareRecordEvents(left, right) {
@@ -204,24 +217,16 @@ function appendEvents(projection, events, ledgerRevision, limits) {
 
 function graphRecordCount(items) {
   return items.reduce(
-    (total, item) =>
-      total +
-      item.graph.acceptanceContracts.length +
-      item.graph.deliveries.length,
+    (total, item) => total + recordEventsForItem(item).length,
     0,
   );
 }
 
 function sourceRecordForEvent(item, event) {
-  if (event.kind === "acceptance_contract") {
-    return item.graph.acceptanceContracts.find(
-      ({ revision }) => revision === event.recordRevision,
-    );
-  }
-  const record = item.graph.deliveries.find(
-    ({ revision }) => revision === event.recordRevision,
-  );
-  return record && event.kind === `delivery_${record.status}` ? record : null;
+  return recordEventsForItem(item).find(
+    ({ kind, record }) =>
+      kind === event.kind && record.revision === event.recordRevision,
+  )?.record ?? null;
 }
 
 function assertEventMatchesLedger(event, itemById, stateRevision, error) {

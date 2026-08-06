@@ -161,7 +161,7 @@ test("rejects duplicate ids, dangling references, self dependencies, and cycles"
 });
 
 test("rejects excessive task count, hierarchy depth, fan-out, and dependencies", () => {
-  assert.equal(WORK_GRAPH_DEFAULT_LIMITS.maxTasks, 5_000);
+  assert.equal(WORK_GRAPH_DEFAULT_LIMITS.maxTasks, 10_000);
   assert.throws(
     () =>
       createWorkGraphSnapshot(draft([task("one"), task("two")] ), {
@@ -209,6 +209,38 @@ test("rejects excessive task count, hierarchy depth, fan-out, and dependencies",
           task("consumer", { dependsOn: ["one", "two"] }),
         ]),
         { limits: { maxDependenciesPerTask: 1 } },
+      ),
+    hasCode("WORK_GRAPH_LIMIT_EXCEEDED"),
+  );
+});
+
+test("superseded history does not consume the active fan-out budget", () => {
+  const historical = Array.from({ length: 100 }, (_, index) =>
+    task(`historical-${index}`, {
+      parentTaskId: "root",
+      status: "superseded",
+    })
+  );
+  assert.doesNotThrow(() =>
+    createWorkGraphSnapshot(
+      draft([
+        task("root"),
+        ...historical,
+        task("active-one", { parentTaskId: "root" }),
+      ]),
+      { limits: { maxFanOut: 1 } },
+    )
+  );
+  assert.throws(
+    () =>
+      createWorkGraphSnapshot(
+        draft([
+          task("root"),
+          ...historical,
+          task("active-one", { parentTaskId: "root" }),
+          task("active-two", { parentTaskId: "root" }),
+        ]),
+        { limits: { maxFanOut: 1 } },
       ),
     hasCode("WORK_GRAPH_LIMIT_EXCEEDED"),
   );
@@ -672,7 +704,7 @@ test("supports non-terminal requeue while keeping terminal tasks immutable", () 
       draft([fromTask], { revision: 7 }),
     );
     const next = createWorkGraphSnapshot(draft([toTask], { revision: 8 }));
-    return () => validateWorkGraphTransition(previous, next);
+    return (options) => validateWorkGraphTransition(previous, next, options);
   };
 
   assert.doesNotThrow(
@@ -694,7 +726,12 @@ test("supports non-terminal requeue while keeping terminal tasks immutable", () 
     ),
   );
 
-  for (const terminalStatus of ["completed", "failed", "cancelled"]) {
+  for (const terminalStatus of [
+    "completed",
+    "failed",
+    "cancelled",
+    "superseded",
+  ]) {
     const terminalTask = task("one", {
       revision: 2,
       status: terminalStatus,
@@ -710,10 +747,35 @@ test("supports non-terminal requeue while keeping terminal tasks immutable", () 
       hasCode("WORK_GRAPH_INVALID_TRANSITION"),
     );
   }
+
+  const completed = task("one", {
+    revision: 2,
+    status: "completed",
+    deliveries: [delivery()],
+  });
+  const reactivated = { ...completed, revision: 3, status: "pending" };
+  assert.doesNotThrow(() =>
+    transition(completed, reactivated)({
+      terminalReactivationTaskIds: ["one"],
+    })
+  );
+
+  const superseded = task("one", {
+    revision: 2,
+    status: "superseded",
+  });
+  assert.throws(
+    () =>
+      transition(
+        superseded,
+        { ...superseded, revision: 3, status: "pending" },
+      )({ terminalReactivationTaskIds: ["one"] }),
+    hasCode("WORK_GRAPH_INVALID_TRANSITION"),
+  );
 });
 
 test("rejects new tasks below terminal ancestors", () => {
-  for (const terminalStatus of ["failed", "cancelled"]) {
+  for (const terminalStatus of ["failed", "cancelled", "superseded"]) {
     assert.throws(
       () =>
         createWorkGraphSnapshot(
@@ -1040,7 +1102,70 @@ test("pending parents are blocked only until every direct child completes", () =
   assert.deepEqual(getBlockedWorkGraphTasks(completedChild), []);
 });
 
-test("derives parent pending, partial, completed, failed, and cancelled outcomes", () => {
+test("superseded prerequisites are satisfied without waiving parent deliverables", () => {
+  const groupingContract = contract({
+    acceptanceCriteria: [],
+    expectedDeliverables: [],
+  });
+  const tasks = [
+    task("gate", { revision: 2, status: "superseded" }),
+    task("root", {
+      dependsOn: ["gate"],
+      acceptanceContracts: [groupingContract],
+    }),
+    task("child", {
+      revision: 2,
+      parentTaskId: "root",
+      status: "superseded",
+    }),
+  ];
+  const snapshot = createWorkGraphSnapshot(draft(tasks));
+
+  assert.deepEqual(getReadyWorkGraphTaskIds(snapshot), ["root"]);
+  assert.deepEqual(getBlockedWorkGraphTasks(snapshot), []);
+  const outcome = deriveParentTaskOutcome(snapshot, "root");
+  assert.equal(outcome.outcome, "completed");
+  assert.deepEqual(outcome.completedTaskIds, []);
+  assert.deepEqual(outcome.supersededTaskIds, ["child"]);
+  assert.deepEqual(outcome.activeTaskIds, []);
+
+  assert.throws(
+    () =>
+      createWorkGraphSnapshot(
+        draft([
+          tasks[0],
+          {
+            ...tasks[1],
+            revision: 2,
+            status: "completed",
+            acceptanceContracts: [contract()],
+          },
+          tasks[2],
+        ]),
+      ),
+    (error) =>
+      hasCode("WORK_GRAPH_INVALID")(error) &&
+      /已验收交付物/.test(error.message),
+  );
+
+  assert.doesNotThrow(() =>
+    createWorkGraphSnapshot(
+      draft([
+        tasks[0],
+        {
+          ...tasks[1],
+          revision: 2,
+          status: "completed",
+          acceptanceContracts: [contract()],
+          deliveries: [delivery()],
+        },
+        tasks[2],
+      ]),
+    )
+  );
+});
+
+test("derives parent pending, partial, completed, failed, cancelled, and superseded outcomes", () => {
   const parent = task("root", {
     status: "in_progress",
     acceptanceContracts: [
@@ -1121,6 +1246,22 @@ test("derives parent pending, partial, completed, failed, and cancelled outcomes
       "root",
     ).outcome,
     "cancelled",
+  );
+  const supersededParent = { ...parent, status: "superseded" };
+  assert.equal(
+    deriveParentTaskOutcome(
+      createWorkGraphSnapshot(
+        draft([
+          supersededParent,
+          {
+            ...task("one", { status: "superseded" }),
+            parentTaskId: "root",
+          },
+        ]),
+      ),
+      "root",
+    ).outcome,
+    "superseded",
   );
 });
 

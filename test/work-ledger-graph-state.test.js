@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { workGraphMemoryRecordReceipt } from "../src/domain/work-graph-memory-event.js";
 import {
+  assertWorkLedgerGraphClaimable,
+  assertWorkLedgerGraphCompletable,
   createDefaultWorkGraphMetadata,
   projectWorkLedgerGraphSnapshot,
   validateWorkLedgerGraphTransition,
@@ -141,6 +143,7 @@ test("new ledger items carry minimal graph metadata and project without a second
 test("every ledger status has an explicit graph projection", () => {
   const expected = new Map([
     ["queued", "pending"],
+    ["paused", "paused"],
     ["working", "in_progress"],
     ["dispatch_pending", "in_progress"],
     ["waiting_user", "in_progress"],
@@ -148,6 +151,7 @@ test("every ledger status has an explicit graph projection", () => {
     ["waiting_external", "in_progress"],
     ["retry_wait", "in_progress"],
     ["completed", "completed"],
+    ["superseded", "superseded"],
     ["blocked", "in_progress"],
     ["cancelled", "cancelled"],
   ]);
@@ -162,6 +166,26 @@ test("every ledger status has an explicit graph projection", () => {
   assert.throws(
     () => workLedgerStatusToGraphStatus({ toString: () => "queued" }),
     (error) => error.code === "WORK_LEDGER_GRAPH_PROJECTION_INVALID",
+  );
+});
+
+test("superseded ledger prerequisites no longer block claim or completion", () => {
+  const parent = createAssignmentWorkItem(assignment(1), CREATED_AT);
+  const dependency = createAssignmentWorkItem(assignment(2), CREATED_AT);
+  const child = createAssignmentWorkItem(assignment(3), CREATED_AT);
+  parent.graph.dependsOnItemIds = [dependency.itemId];
+  dependency.revision = 2;
+  dependency.status = "superseded";
+  child.revision = 2;
+  child.status = "superseded";
+  child.graph.parentItemId = parent.itemId;
+  const state = stateWithItems([parent, dependency, child]);
+
+  assert.doesNotThrow(() =>
+    assertWorkLedgerGraphClaimable(state, parent.itemId)
+  );
+  assert.doesNotThrow(() =>
+    assertWorkLedgerGraphCompletable(state, parent.itemId)
   );
 });
 
@@ -206,7 +230,11 @@ test("schema v2 composes graph and identity migrations without changing ledger f
   const legacy = structuredClone(current);
   legacy.schemaVersion = 2;
   delete legacy.graphMemoryProjection;
-  for (const item of legacy.items) delete item.graph;
+  for (const item of legacy.items) {
+    delete item.graph;
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const callerSnapshot = structuredClone(legacy);
 
   const migrated = normalizeWorkLedgerPersistedState(legacy);
@@ -224,6 +252,8 @@ test("schema v3 migrates identically to the current schema before graph tasks ar
   legacy.schemaVersion = 3;
   delete legacy.graphMemoryProjection;
   for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
     for (const contract of item.graph.acceptanceContracts) {
       delete contract.recordedAt;
     }
@@ -247,6 +277,8 @@ test("schema v4 backfills graph history timestamps without mutating the caller",
   legacy.schemaVersion = 4;
   delete legacy.graphMemoryProjection;
   for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
     for (const contract of item.graph.acceptanceContracts) {
       delete contract.recordedAt;
     }
@@ -280,6 +312,10 @@ test("schema v5 seeds a deterministic durable graph memory backlog", () => {
   const legacy = structuredClone(current);
   legacy.schemaVersion = 5;
   delete legacy.graphMemoryProjection;
+  for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const callerSnapshot = structuredClone(legacy);
 
   const migrated = normalizeWorkLedgerPersistedState(legacy);
@@ -299,6 +335,10 @@ test("schema v5 graph memory migration fails closed when event budget is exhaust
   const legacy = structuredClone(current);
   legacy.schemaVersion = 5;
   delete legacy.graphMemoryProjection;
+  for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const callerSnapshot = structuredClone(legacy);
 
   assert.throws(
@@ -332,6 +372,10 @@ test("schema v6 adds graph source integrity without rewriting its event queue", 
   const legacy = structuredClone(current);
   legacy.schemaVersion = 6;
   delete legacy.graphMemoryProjection.sourceHistoryDigest;
+  for (const item of legacy.items) {
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
   const legacyProjection = structuredClone(legacy.graphMemoryProjection);
 
   const migrated = normalizeWorkLedgerPersistedState(legacy);
@@ -408,7 +452,11 @@ test("schema v2 preserves responsibility IDs accepted by the existing ledger", (
     ]);
     current.schemaVersion = 2;
     delete current.graphMemoryProjection;
-    for (const item of current.items) delete item.graph;
+    for (const item of current.items) {
+      delete item.graph;
+      delete item.source;
+      delete item.sourceQuarantine;
+    }
 
     assert.deepEqual(
       normalizeWorkLedgerPersistedState(current).items[0].currentTarget,
@@ -426,7 +474,11 @@ test("schema v1 composes both migrations and initializes both later checkpoints"
   delete legacy.graphMemoryProjection;
   delete legacy.proposalCursor;
   delete legacy.proposalHighWatermark;
-  for (const item of legacy.items) delete item.graph;
+  for (const item of legacy.items) {
+    delete item.graph;
+    delete item.source;
+    delete item.sourceQuarantine;
+  }
 
   assert.deepEqual(normalizeWorkLedgerPersistedState(legacy), current);
 });

@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
+import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
 import {
   RoleContextAssemblerError,
   roleContextError,
 } from "./role-context-error.js";
+import {
+  normalizePullRequestInputBinding,
+  normalizePullRequestWorkSource,
+} from "./work-ledger-pr-source.js";
 
 export { RoleContextAssemblerError };
 
@@ -282,6 +287,29 @@ function normalizeTarget(value, name) {
   };
 }
 
+function inheritedPullRequestInputBinding(fields) {
+  if (!fields.has("kind") || fields.get("kind") !== "graph_task") {
+    return null;
+  }
+  if (!fields.has("assignment")) throw invalid("item is invalid");
+  const assignment = ownData(fields.get("assignment"), "item.assignment");
+  if (!assignment.has("graphTask")) throw invalid("item assignment is invalid");
+  const graphTask = ownData(
+    assignment.get("graphTask"),
+    "item.assignment.graphTask",
+  );
+  if (!graphTask.has("sourceBinding")) {
+    throw invalid("item source binding is invalid");
+  }
+  const sourceBinding = graphTask.get("sourceBinding");
+  if (sourceBinding === null) return null;
+  try {
+    return normalizePullRequestInputBinding(sourceBinding);
+  } catch (cause) {
+    throw invalid("item source binding is invalid", { cause });
+  }
+}
+
 function normalizeItem(value) {
   const fields = ownData(value, "item");
   for (const key of [
@@ -295,14 +323,63 @@ function normalizeItem(value) {
   ]) {
     if (!fields.has(key)) throw invalid("item is invalid");
   }
-  const event = canonicalValue(fields.get("event"));
+  let source = null;
+  if (fields.has("source") && fields.get("source") !== null) {
+    try {
+      source = normalizePullRequestWorkSource(fields.get("source"));
+    } catch (cause) {
+      throw invalid("item source is invalid", { cause });
+    }
+  }
+  const taskId = identifier(fields.get("itemId"), "item.itemId", 192);
+  let sourceBinding = inheritedPullRequestInputBinding(fields);
+  if (source !== null) {
+    const revision = source.revisions[source.activeRevision - 1];
+    sourceBinding = normalizePullRequestInputBinding({
+      kind: "pull_request",
+      rootItemId: taskId,
+      workKey: source.workKey,
+      inputRevision: source.activeRevision,
+      headRevision: revision.headRevision,
+      headRefOid: source.current.headRefOid,
+      eventId: source.current.eventId,
+      eventDigest: source.current.eventDigest,
+      inputDigest: source.current.inputDigest,
+    });
+  }
+  const rawEvent = canonicalValue(
+    source === null ? fields.get("event") : source.current.event,
+  );
+  let event = rawEvent;
+  if (sourceBinding !== null) {
+    try {
+      event = normalizeStoredWorkflowEvent(rawEvent);
+    } catch (cause) {
+      throw invalid("item source event is invalid", { cause });
+    }
+  }
   const eventFields = ownData(event, "item.event");
   const eventId = identifier(eventFields.get("eventId"), "eventId", 512);
   const eventType = text(eventFields.get("eventType"), "eventType", 128);
+  const inputDigest = digest(fields.get("inputDigest"), "item.inputDigest");
+  if (source !== null && inputDigest !== source.current.inputDigest) {
+    throw invalid("item source input is stale");
+  }
+  if (
+    sourceBinding !== null &&
+    (
+      eventId !== sourceBinding.eventId ||
+      event.contentDigest !== sourceBinding.eventDigest ||
+      event.payload?.headRefOid !== sourceBinding.headRefOid ||
+      !eventType.startsWith("pull_request.")
+    )
+  ) {
+    throw invalid("item source event is stale");
+  }
   return {
-    taskId: identifier(fields.get("itemId"), "item.itemId", 192),
+    taskId,
     taskRevision: positiveRevision(fields.get("revision"), "item.revision"),
-    inputDigest: digest(fields.get("inputDigest"), "item.inputDigest"),
+    inputDigest,
     assignmentId: identifier(
       fields.get("assignmentId"),
       "item.assignmentId",
@@ -313,6 +390,7 @@ function normalizeItem(value) {
     event,
     eventId,
     eventType,
+    sourceBinding,
   };
 }
 
@@ -729,9 +807,15 @@ function projectCurrentTaskRejection(roleId, currentTask, deliveryState) {
 function projectRootCoordination(roleId, currentTask, snapshot) {
   if (!isConfiguredRootOrchestrator(roleId, currentTask)) return null;
 
-  const children = [...snapshot.tasksById.values()]
+  const allChildren = [...snapshot.tasksById.values()]
     .filter(({ parentTaskId }) => parentTaskId === currentTask.taskId)
     .sort((left, right) => compareText(left.taskId, right.taskId));
+  const supersededChildCount = allChildren.filter(
+    ({ status }) => status === "superseded",
+  ).length;
+  const children = allChildren.filter(
+    ({ status }) => status !== "superseded",
+  );
   const childIds = new Set(children.map(({ taskId }) => taskId));
   const deliveryPayloads = [];
   const directChildren = children.map((child) => {
@@ -793,9 +877,12 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
     .map(({ payload }) => payload);
   return {
     coordination: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       rootTaskId: currentTask.taskId,
       directChildren,
+      history: {
+        supersededChildCount,
+      },
       deliveryWindow: {
         pendingCount: sortedPayloads.length,
         shownCount: selectedPayloads.length,
@@ -983,6 +1070,9 @@ export class RoleContextAssembler {
       graphRevision: snapshot.graphRevision,
       graphContentDigest: snapshot.graphContentDigest,
       contractRevision: currentContract.revision,
+      ...(item.sourceBinding === null
+        ? {}
+        : { source: item.sourceBinding }),
     };
     const proposalDecisionContext =
       item.decisionContext?.source === "proposal"
@@ -1012,6 +1102,7 @@ export class RoleContextAssembler {
         assignmentId: item.assignmentId,
         eventId: item.eventId,
         eventType: item.eventType,
+        ...(item.sourceBinding === null ? {} : item.sourceBinding),
       },
       ...(requirementsDecisionContext === null
         ? {}
