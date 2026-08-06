@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
+import { createConfirmationDialogOwnership } from "../public/confirmation-dialog-support.js";
+
 const root = path.resolve(import.meta.dirname, "..");
 
 test("the dashboard keeps one confirmation dialog for local and external decisions", async () => {
@@ -132,7 +134,7 @@ test("later closes the popup without entering the mutation branch", async () => 
   const laterBranch = app.slice(start, fetchStart);
 
   assert.match(laterBranch, /if \(operation === "later"\)/);
-  assert.match(laterBranch, /confirmationDialog\.close\(\)/);
+  assert.match(laterBranch, /closeConfirmationDialog\(\)/);
   assert.match(laterBranch, /await refreshAfterDeferral\(\)/);
   assert.match(laterBranch, /return;/);
   assert.equal(laterBranch.includes("fetch("), false);
@@ -155,4 +157,148 @@ test("a conflict hides the stale snapshot until a fresh queue read succeeds", as
       conflict.indexOf("await refreshConfirmationQueue"),
   );
   assert.match(conflict, /成功读取最新确认内容前不会再次弹出/);
+});
+
+test("external confirmation completion only cleans up its own modal", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("async function handleExternalConfirmation");
+  const end = app.indexOf("\nasync function handleReviewDraftDecision", start);
+  const handler = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(handler, /const submissionOwner = beginExternalConfirmationSubmission\(\)/);
+  assert.match(handler, /closeExternalConfirmation\(submissionOwner\)/);
+  assert.match(handler, /restoreExternalConfirmation\(submissionOwner\)/);
+  assert.match(
+    app,
+    /beginConfirmationSubmission\(setConfirmationButtonsDisabled\)/,
+  );
+  assert.match(app, /confirmationCloseButton\.disabled = true/);
+  assert.match(app, /if \(confirmationCloseButton\.disabled\) return;/);
+});
+
+test("a stale submission owner cannot finish or close the next modal", () => {
+  const ownership = createConfirmationDialogOwnership();
+  const firstOwner = ownership.open();
+
+  assert.equal(ownership.beginSubmission(firstOwner), true);
+  assert.equal(ownership.close(firstOwner), true);
+
+  const nextOwner = ownership.open();
+  assert.equal(ownership.beginSubmission(nextOwner), true);
+  assert.equal(ownership.finishSubmission(firstOwner), false);
+  assert.equal(ownership.close(firstOwner), false);
+  assert.equal(ownership.ownsSubmission(nextOwner), true);
+  assert.equal(ownership.finishSubmission(nextOwner), true);
+  assert.equal(ownership.close(nextOwner), true);
+});
+
+test("missing ownership cannot begin, own, finish, or close a submission", () => {
+  const ownership = createConfirmationDialogOwnership();
+
+  assert.equal(ownership.beginSubmission(null), false);
+  assert.equal(ownership.ownsSubmission(null), false);
+  assert.equal(ownership.finishSubmission(null), false);
+  assert.equal(ownership.close(null), false);
+});
+
+test("an old close task cannot release a modal opened by show-next first", async () => {
+  const ownership = createConfirmationDialogOwnership();
+  const firstOwner = ownership.open();
+  assert.equal(ownership.close(firstOwner), true);
+
+  let nextOwner = null;
+  await new Promise((resolve) => {
+    queueMicrotask(() => {
+      nextOwner = ownership.open();
+      assert.equal(ownership.beginSubmission(nextOwner), true);
+    });
+    setTimeout(() => {
+      assert.equal(
+        ownership.handleCloseEvent({ dialogOpen: true }),
+        false,
+      );
+      resolve();
+    }, 0);
+  });
+
+  assert.equal(ownership.current(), nextOwner);
+  assert.equal(ownership.ownsSubmission(nextOwner), true);
+});
+
+test("the native close event only releases ownership while the dialog stays closed", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf('confirmationDialog.addEventListener("close"');
+  const end = app.indexOf("\ndocument.addEventListener", start);
+  const listener = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(listener, /if \(confirmationDialog\.open\) return;/);
+  assert.match(
+    listener,
+    /confirmationDialogOwnership\.handleCloseEvent\(\{ dialogOpen: false \}\)/,
+  );
+  assert.equal((app.match(/confirmationDialog\.close\(\)/g) || []).length, 1);
+});
+
+test("every asynchronous confirmation mutation is bound to its modal owner", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const handlers = [
+    ["async function submitInternalAttention", "\nfunction handleInternalAttentionClick"],
+    ["async function handleConfirmation", "\nasync function handleExternalConfirmation"],
+    ["async function handleReviewDraftDecision", "\nfunction updateChrome"],
+  ];
+
+  for (const [startMarker, endMarker] of handlers) {
+    const start = app.indexOf(startMarker);
+    const end = app.indexOf(endMarker, start);
+    const handler = app.slice(start, end);
+
+    assert.ok(start >= 0 && end > start, startMarker);
+    assert.match(handler, /const submissionOwner = beginConfirmationSubmission\(/);
+    assert.match(handler, /confirmationDialogOwnership\.ownsSubmission\(submissionOwner\)/);
+    assert.match(handler, /closeConfirmationSubmission\(submissionOwner\)/);
+    assert.match(handler, /restoreConfirmationSubmission\(\s*submissionOwner/);
+  }
+});
+
+test("local-only deferrals close before refreshing without starting a submission", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const handlers = [
+    ["async function handleConfirmation", "\nasync function handleExternalConfirmation"],
+    ["async function handleReviewDraftDecision", "\nfunction updateChrome"],
+  ];
+
+  for (const [startMarker, endMarker] of handlers) {
+    const start = app.indexOf(startMarker);
+    const end = app.indexOf(endMarker, start);
+    const handler = app.slice(start, end);
+    const begin = handler.indexOf("const submissionOwner");
+    const laterBranch = handler.slice(0, begin);
+
+    assert.ok(start >= 0 && end > start && begin > 0, startMarker);
+    assert.match(laterBranch, /if \(decision === "later"\)/);
+    assert.ok(
+      laterBranch.indexOf("closeConfirmationDialog()") <
+        laterBranch.indexOf("await refreshAfterDeferral()"),
+      startMarker,
+    );
+    assert.doesNotMatch(laterBranch, /beginConfirmationSubmission/);
+  }
+});
+
+test("a late mutation cannot settle another modal for any confirmation kind", () => {
+  for (const kind of ["internal", "responsibility", "review_draft"]) {
+    const ownership = createConfirmationDialogOwnership();
+    const oldOwner = ownership.open();
+    assert.equal(ownership.beginSubmission(oldOwner), true, kind);
+    assert.equal(ownership.close(oldOwner), true, kind);
+
+    const nextOwner = ownership.open();
+    assert.equal(ownership.beginSubmission(nextOwner), true, kind);
+    assert.equal(ownership.ownsSubmission(oldOwner), false, kind);
+    assert.equal(ownership.finishSubmission(oldOwner), false, kind);
+    assert.equal(ownership.close(oldOwner), false, kind);
+    assert.equal(ownership.ownsSubmission(nextOwner), true, kind);
+  }
 });

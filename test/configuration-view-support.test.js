@@ -5,6 +5,8 @@ import {
   configurationImpactCategories,
   createConfigurationFetch,
   isCurrentConfigurationRequest,
+  normalizeConfigurationBinding,
+  sameConfigurationBinding,
 } from "../public/configuration-view-support.js";
 
 test("configuration impact keeps authoritative counts while bounding path details", () => {
@@ -89,5 +91,38 @@ test("only the newest non-aborted configuration request may change UI state", ()
       signal: { aborted: false },
     }),
     true,
+  );
+});
+
+test("draft and rollback bindings normalize missing resources before comparison", () => {
+  const rollbackPreview = normalizeConfigurationBinding({
+    expectedStateRevision: 7,
+    expectedActiveVersion: 3,
+    targetVersion: 1,
+  });
+  assert.deepEqual(rollbackPreview, {
+    expectedStateRevision: 7,
+    expectedActiveVersion: 3,
+    draftId: null,
+    draftRevision: null,
+    targetVersion: 1,
+  });
+  assert.equal(
+    sameConfigurationBinding(rollbackPreview, {
+      expectedStateRevision: 7,
+      expectedActiveVersion: 3,
+      draftId: null,
+      draftRevision: null,
+      targetVersion: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    sameConfigurationBinding(rollbackPreview, {
+      expectedStateRevision: 8,
+      expectedActiveVersion: 3,
+      targetVersion: 1,
+    }),
+    false,
   );
 });

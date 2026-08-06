@@ -9,6 +9,41 @@ function isPlainRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+export function normalizeConfigurationBinding(value) {
+  if (!isPlainRecord(value)) return null;
+  return {
+    expectedStateRevision: Number.isSafeInteger(value.expectedStateRevision)
+      ? value.expectedStateRevision
+      : null,
+    expectedActiveVersion: Number.isSafeInteger(value.expectedActiveVersion)
+      ? value.expectedActiveVersion
+      : null,
+    draftId: typeof value.draftId === "string" ? value.draftId : null,
+    draftRevision: Number.isSafeInteger(value.draftRevision)
+      ? value.draftRevision
+      : null,
+    targetVersion: Number.isSafeInteger(value.targetVersion)
+      ? value.targetVersion
+      : null,
+  };
+}
+
+export function sameConfigurationBinding(left, right) {
+  const normalizedLeft = normalizeConfigurationBinding(left);
+  const normalizedRight = normalizeConfigurationBinding(right);
+  return Boolean(
+    normalizedLeft &&
+      normalizedRight &&
+      normalizedLeft.expectedStateRevision ===
+        normalizedRight.expectedStateRevision &&
+      normalizedLeft.expectedActiveVersion ===
+        normalizedRight.expectedActiveVersion &&
+      normalizedLeft.draftId === normalizedRight.draftId &&
+      normalizedLeft.draftRevision === normalizedRight.draftRevision &&
+      normalizedLeft.targetVersion === normalizedRight.targetVersion,
+  );
+}
+
 function normalizedImpactCategory(impact, [label, camelName, snakeName]) {
   const source = impact?.[camelName] ?? impact?.[snakeName];
   const paths = (Array.isArray(source) ? source : source?.paths)?.filter(

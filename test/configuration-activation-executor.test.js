@@ -116,6 +116,40 @@ function activeRecord(version, configurationDigest) {
   return { version, configurationDigest };
 }
 
+function reconciliationProjection(state, version) {
+  const projectActive = (value) =>
+    value === null || value === undefined
+      ? null
+      : {
+          version: value.version,
+          configurationDigest: value.configurationDigest,
+        };
+  const projectObserved = (value) =>
+    value === null || value === undefined
+      ? null
+      : {
+          version: value.version,
+          configurationDigest: value.configurationDigest,
+          source: value.source,
+          previousVersion: value.previousVersion,
+          draftRevisionId: value.draftRevisionId,
+          rollbackOf: value.rollbackOf,
+          activatedBy: value.activatedBy,
+          activatedAt: value.activatedAt,
+          impactDigest: value.impactDigest,
+        };
+  return {
+    revision: state.revision,
+    activeVersion: state.activeVersion,
+    active: projectActive(
+      state.activeVersion === null
+        ? null
+        : state.versions[state.activeVersion - 1],
+    ),
+    observedVersion: projectObserved(state.versions[version - 1]),
+  };
+}
+
 function fixture({
   snapshot,
   activation,
@@ -143,13 +177,17 @@ function fixture({
     },
   };
   const reader = {
-    async readSnapshot() {
-      calls.push({ method: "readSnapshot" });
-      return snapshot?.() ?? {
+    async readActivationReconciliationSnapshot(value) {
+      calls.push({
+        method: "readActivationReconciliationSnapshot",
+        value,
+      });
+      const state = snapshot?.() ?? {
         revision: 4,
         activeVersion: null,
         versions: [],
       };
+      return reconciliationProjection(state, value.version);
     },
   };
   return {
@@ -240,7 +278,9 @@ test("runtime policy can fence actions whose live configuration is stale", async
   );
   assert.deepEqual(context.calls, []);
   assert.equal((await context.executor.reconcile(envelope)).status, "absent");
-  assert.deepEqual(context.calls.map(({ method }) => method), ["readSnapshot"]);
+  assert.deepEqual(context.calls.map(({ method }) => method), [
+    "readActivationReconciliationSnapshot",
+  ]);
 });
 
 test("reconcile is read-only and distinguishes already, absent, stale, and unknown", async (t) => {
@@ -255,7 +295,9 @@ test("reconcile is read-only and distinguishes already, absent, stale, and unkno
       }),
     });
     assert.equal((await context.executor.reconcile(envelope)).status, "already");
-    assert.deepEqual(context.calls.map(({ method }) => method), ["readSnapshot"]);
+    assert.deepEqual(context.calls.map(({ method }) => method), [
+      "readActivationReconciliationSnapshot",
+    ]);
   });
   await t.test("absent", async () => {
     const context = fixture({
@@ -322,7 +364,7 @@ test("acknowledgement loss reconciles every activation kind without replay", asy
     assert.equal((await context.executor.execute(envelope)).status, "already");
     assert.deepEqual(context.calls.map(({ method: name }) => name), [
       method,
-      "readSnapshot",
+      "readActivationReconciliationSnapshot",
     ]);
     assert.equal(
       context.actionAdmissionGate.readStatus().mode,
@@ -508,6 +550,46 @@ test("forged envelopes fail closed before activation or reads", async () => {
   assert.equal(context.calls.length, 0);
 });
 
+test("executor rejects a full-state reader and binds only reconciliation evidence", async () => {
+  const activationExecutor = {
+    async activateInitialization() {},
+    async activateDraft() {},
+    async activateRollback() {},
+  };
+  const actionAdmissionGate = new ActionAdmissionGate();
+  actionAdmissionGate.bindEffective(null);
+
+  assert.throws(
+    () =>
+      new ConfigurationActivationExecutor({
+        activationExecutor,
+        configurationReader: { async readSnapshot() {} },
+        actionAdmissionGate,
+      }),
+    /configuration reader is invalid/,
+  );
+
+  const reads = [];
+  const executor = new ConfigurationActivationExecutor({
+    activationExecutor,
+    configurationReader: {
+      async readActivationReconciliationSnapshot(value) {
+        reads.push(value);
+        return {
+          revision: 4,
+          activeVersion: null,
+          active: null,
+          observedVersion: null,
+        };
+      },
+    },
+    actionAdmissionGate,
+  });
+
+  assert.equal((await executor.reconcile(privateEnvelope())).status, "absent");
+  assert.deepEqual(reads, [{ version: 1 }]);
+});
+
 test("executor construction requires the shared cutover fence", () => {
   const activationExecutor = {
     async activateInitialization() {},
@@ -518,7 +600,9 @@ test("executor construction requires the shared cutover fence", () => {
     () =>
       new ConfigurationActivationExecutor({
         activationExecutor,
-        configurationReader: { async readSnapshot() {} },
+        configurationReader: {
+          async readActivationReconciliationSnapshot() {},
+        },
       }),
     /action admission gate is invalid/,
   );

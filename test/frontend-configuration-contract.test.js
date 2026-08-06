@@ -37,6 +37,7 @@ test("configuration center is a first-class view with an accessible editor", () 
 
 test("configuration and confirmation loading do not depend on a dashboard snapshot", () => {
   const load = functionSource("load");
+  const applyDashboard = functionSource("applyDashboard");
   const applyConfiguration = functionSource("applyConfigurationState");
   const showNext = functionSource("showNextConfirmation");
   const pending = functionSource("pendingConfirmations");
@@ -47,6 +48,16 @@ test("configuration and confirmation loading do not depend on a dashboard snapsh
     /if \(!hasConfigurationState\(\) \|\| currentView === "configuration"\)/,
   );
   assert.match(applyConfiguration, /sameConfigurationRevision/);
+  assert.match(applyDashboard, /\{ renderView = true \}/);
+  assert.match(applyDashboard, /if \(renderView\) render\(\)/);
+  assert.match(
+    load,
+    /renderView: currentView !== "configuration"/,
+  );
+  assert.match(
+    load,
+    /if \(currentView !== "configuration"\) render\(\)/,
+  );
   assert.match(app, /isCurrentConfigurationRequest/);
   assert.match(app, /configurationFetch/);
   assert.ok(
@@ -71,49 +82,57 @@ test("configuration navigation refreshes by identity instead of a positional sho
   assert.doesNotMatch(app, /querySelectorAll\("\.nav-item"\)\[9\]/);
 });
 
-test("initialization editor uses only the bounded draft REST contract", () => {
+test("configuration editor uses only the bounded staged lifecycle contract", () => {
   const save = functionSource("handleConfigurationSave");
   const preview = functionSource("handleConfigurationPreview");
   const request = functionSource("handleConfigurationRequest");
-  const mutationSources = `${save}\n${preview}\n${request}`;
+  const binding = functionSource("requiredConfigurationBinding");
+  const rollbackPreview = functionSource("handleConfigurationRollbackPreview");
+  const rollbackRequest = functionSource("handleConfigurationRollbackRequest");
+  const mutationSources = `${save}\n${preview}\n${request}\n${rollbackPreview}\n${rollbackRequest}`;
 
   assert.match(save, /"\/api\/configuration\/drafts"/);
   assert.match(save, /method: draftId \? "PUT" : "POST"/);
-  assert.match(
-    save,
-    /\{ expectedDraftRevision, expectedStateRevision, configuration \}/,
-  );
-  assert.match(save, /\{ expectedStateRevision, configuration \}/);
+  assert.match(save, /configurationAuthorityBinding/);
   assert.match(preview, /\/preview`/);
-  assert.match(
-    preview,
-    /JSON\.stringify\(\{\s*draftRevision: draft\.revision,\s*expectedStateRevision,\s*\}\)/,
-  );
+  assert.match(preview, /requiredConfigurationBinding/);
   assert.match(request, /\/request-confirmation`/);
+  assert.match(request, /requiredConfigurationBinding/);
+  assert.match(binding, /configurationAuthorityBinding/);
   assert.match(
-    request,
-    /JSON\.stringify\(\{\s*draftRevision: draft\.revision,\s*expectedStateRevision,\s*\}\)/,
+    rollbackPreview,
+    /\/api\/configuration\/versions\/\$\{targetVersion\}\/rollback\/preview/,
   );
-  assert.doesNotMatch(mutationSources, /\/api\/configuration\/(?:activate|rollback|enqueue)/);
+  assert.match(
+    rollbackRequest,
+    /\/api\/configuration\/versions\/\$\{targetVersion\}\/rollback\/request-confirmation/,
+  );
+  assert.doesNotMatch(
+    mutationSources,
+    /\/api\/configuration\/(?:activate|rollback|enqueue)(?:["'`/]|$)/,
+  );
   assert.doesNotMatch(
     mutationSources,
     /\b(?:activatedBy|executor|plan|action)\s*:/,
   );
 });
 
-test("configuration initialization reuses the immutable one-at-a-time dialog", () => {
+test("all configuration activations reuse the immutable one-at-a-time dialog", () => {
   const router = functionSource("showExternalActionConfirmation");
   const renderer = functionSource("showConfigurationActivationConfirmation");
   const impactMarkup = functionSource("configurationImpactMarkup");
 
   assert.match(router, /entry\.item\?\.kind === "local\.configuration-activate"/);
-  assert.match(
-    router,
-    /entry\.item\?\.display\?\.payload\?\.action\?\.type ===\s*"initialize_from_draft"/,
-  );
+  assert.match(router, /configurationActivationActions/);
+  for (const actionType of [
+    "initialize_from_draft",
+    "activate_draft",
+    "activate_rollback",
+  ]) {
+    assert.match(app, new RegExp(`${actionType}: Object\\.freeze`));
+  }
   for (const label of [
     "保存版本",
-    "初始化草稿",
     "状态修订",
     "配置摘要",
     "验证摘要",
@@ -125,6 +144,71 @@ test("configuration initialization reuses the immutable one-at-a-time dialog", (
   assert.match(renderer, /handleExternalConfirmation/);
   assert.match(impactMarkup, /category\.count/);
   assert.doesNotMatch(renderer, /data-external-operation="execute"/);
+});
+
+test("active configuration view exposes version history and staged rollback controls", () => {
+  const view = functionSource("configurationView");
+  const versions = functionSource("configurationVersionsMarkup");
+  const binding = functionSource("configurationAuthorityBinding");
+
+  assert.match(view, /!safeMode && activeVersion !== null/);
+  assert.doesNotMatch(view, /在线草稿激活和回滚尚未开放/);
+  assert.match(view, /configurationVersionsMarkup/);
+  assert.match(versions, /data-configuration-rollback-preview/);
+  assert.match(versions, /data-configuration-rollback-request/);
+  assert.match(binding, /expectedActiveVersion/);
+  assert.match(styles, /\.configuration-version-actions button:focus-visible/);
+});
+
+test("configuration interactions invalidate stale previews and preserve active editing", () => {
+  const view = functionSource("configurationView");
+  const input = functionSource("handleConfigurationEditorInput");
+  const invalidate = functionSource("invalidateConfigurationPreviewUi");
+  const applyConfiguration = functionSource("applyConfigurationState");
+  const preserveFocus = functionSource(
+    "renderConfigurationPreservingEditorFocus",
+  );
+  const operation = functionSource("runConfigurationOperation");
+  const versions = functionSource("configurationVersionsMarkup");
+
+  assert.match(view, /const activationPreviewReady/);
+  assert.match(view, /!activationPreviewReady \? "disabled" : ""/);
+  assert.match(input, /invalidateConfigurationPreviewUi\(\)/);
+  assert.match(invalidate, /configurationPreview = null/);
+  assert.match(invalidate, /querySelector\("\.configuration-preview"\)\?\.remove\(\)/);
+  assert.match(invalidate, /data-configuration-operation-notice/);
+  assert.match(invalidate, /data-configuration-rollback-request/);
+  assert.match(invalidate, /button\.disabled = true/);
+  assert.match(applyConfiguration, /const runtimeUnchanged/);
+  assert.match(
+    applyConfiguration,
+    /\(!runtimeUnchanged \|\| hadLoadError\)/,
+  );
+  assert.match(
+    applyConfiguration,
+    /renderConfigurationPreservingEditorFocus\(\)/,
+  );
+  assert.match(preserveFocus, /editor\.selectionStart/);
+  assert.match(preserveFocus, /nextEditor\.setSelectionRange/);
+  assert.match(operation, /\{ editorError = true, focusSelector = null \}/);
+  assert.match(operation, /configurationOperationError = error\.message/);
+  assert.match(versions, /aria-label="预览回滚到 v\$\{versionNumber\}"/);
+  assert.match(
+    versions,
+    /aria-label="请求回滚到 v\$\{versionNumber\} 的确认"/,
+  );
+});
+
+test("a stale draft save keeps local text behind an explicit reset", () => {
+  const view = functionSource("configurationView");
+  const save = functionSource("handleConfigurationSave");
+  const reset = functionSource("resetConfigurationEditor");
+
+  assert.match(save, /configurationEditorStale = true/);
+  assert.match(view, /放弃本地编辑并载入最新配置/);
+  assert.match(view, /configurationEditorStale \? "disabled" : ""/);
+  assert.match(reset, /configurationEditorStale = false/);
+  assert.match(reset, /configurationEditorBinding = currentConfigurationBinding\(\)/);
 });
 
 test("completed v1 reports a manual restart boundary without a restart endpoint", () => {

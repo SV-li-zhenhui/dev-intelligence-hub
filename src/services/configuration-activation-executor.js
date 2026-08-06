@@ -246,10 +246,11 @@ function normalizeActivationResult(value, envelope) {
   return completed(applied.value ? "applied" : "already", envelope, version);
 }
 
-function snapshotFields(value) {
+function reconciliationSnapshotFields(value, requestedVersion) {
   const revision = dataField(value, "revision");
   const activeVersion = dataField(value, "activeVersion");
-  const versions = dataField(value, "versions");
+  const active = dataField(value, "active");
+  const observedVersion = dataField(value, "observedVersion");
   if (
     !revision.found ||
     !Number.isSafeInteger(revision.value) ||
@@ -257,28 +258,20 @@ function snapshotFields(value) {
     !activeVersion.found ||
     (activeVersion.value !== null &&
       (!Number.isSafeInteger(activeVersion.value) || activeVersion.value < 1)) ||
-    !versions.found ||
-    !Array.isArray(versions.value) ||
-    Object.getPrototypeOf(versions.value) !== Array.prototype ||
-    Reflect.ownKeys(versions.value).length !== versions.value.length + 1 ||
-    (activeVersion.value === null
-      ? versions.value.length !== 0
-      : versions.value.length !== activeVersion.value) ||
-    revision.value < versions.value.length
+    !active.found ||
+    !observedVersion.found ||
+    revision.value < (activeVersion.value ?? 0) ||
+    (activeVersion.value === null && active.value !== null) ||
+    ((activeVersion.value ?? 0) < requestedVersion &&
+      observedVersion.value !== null)
   ) {
     return null;
-  }
-  for (let index = 0; index < versions.value.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(
-      versions.value,
-      `${index}`,
-    );
-    if (!descriptor?.enumerable || !("value" in descriptor)) return null;
   }
   return {
     revision: revision.value,
     activeVersion: activeVersion.value,
-    versions: versions.value,
+    active: active.value,
+    observedVersion: observedVersion.value,
   };
 }
 
@@ -286,7 +279,7 @@ function activeSnapshotBinding(state) {
   if (state.activeVersion === null) {
     return { known: true, value: null };
   }
-  const active = state.versions[state.activeVersion - 1];
+  const active = state.active;
   const version = dataField(active, "version");
   const configurationDigest = dataField(active, "configurationDigest");
   if (
@@ -308,7 +301,9 @@ function activeSnapshotBinding(state) {
 }
 
 function reconciliationOutcome(snapshot, envelope) {
-  const state = snapshotFields(snapshot);
+  const action = envelope.action;
+  const resultVersion = expectedVersion(action);
+  const state = reconciliationSnapshotFields(snapshot, resultVersion);
   if (!state) {
     return {
       result: unknown("CONFIGURATION_STATE_PROTOCOL_ERROR"),
@@ -316,11 +311,12 @@ function reconciliationOutcome(snapshot, envelope) {
       storedActive: null,
     };
   }
-  const action = envelope.action;
   const storedActive = activeSnapshotBinding(state);
-  const resultVersion = expectedVersion(action);
-  if (state.versions.length >= resultVersion) {
-    const version = matchingVersion(state.versions[resultVersion - 1], action);
+  if (
+    state.activeVersion !== null &&
+    state.activeVersion >= resultVersion
+  ) {
+    const version = matchingVersion(state.observedVersion, action);
     return {
       result: version ? completed("already", envelope, version) : stale(),
       storedActiveKnown: storedActive.known,
@@ -401,7 +397,7 @@ export class ConfigurationActivationExecutor {
   #cutover;
   #readFenceStatus;
   #reconcileCutover;
-  #readSnapshot;
+  #readReconciliationSnapshot;
 
   constructor({
     activationExecutor,
@@ -414,11 +410,11 @@ export class ConfigurationActivationExecutor {
       ["activateInitialization", "activateDraft", "activateRollback"],
       "configuration activation executor",
     );
-    this.#readSnapshot = requirePort(
+    this.#readReconciliationSnapshot = requirePort(
       configurationReader,
-      ["readSnapshot"],
+      ["readActivationReconciliationSnapshot"],
       "configuration reader",
-    ).readSnapshot;
+    ).readActivationReconciliationSnapshot;
     const cutoverFence = requirePort(
       actionAdmissionGate,
       ["cutover", "readStatus", "reconcileCutover"],
@@ -490,7 +486,12 @@ export class ConfigurationActivationExecutor {
 
   async #reconcileEnvelope(envelope) {
     try {
-      return reconciliationOutcome(await this.#readSnapshot(), envelope);
+      return reconciliationOutcome(
+        await this.#readReconciliationSnapshot({
+          version: expectedVersion(envelope.action),
+        }),
+        envelope,
+      );
     } catch {
       return {
         result: unknown(),

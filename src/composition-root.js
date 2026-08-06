@@ -649,7 +649,7 @@ export async function createApplication({
           ),
           configurationReader: frozenPort(
             configurationRuntime.reader,
-            ["readSnapshot"],
+            ["readActivationReconciliationSnapshot"],
             "configurationRuntime.reader",
           ),
           actionAdmissionGate: frozenPort(
@@ -660,7 +660,7 @@ export async function createApplication({
           allowedActionTypes: Object.freeze(
             configurationInitializationEnabled
               ? ["initialize_from_draft"]
-              : [],
+              : ["activate_draft", "activate_rollback"],
           ),
         });
       localExecutors["local.configuration-activate"] = frozenPort(
@@ -720,7 +720,7 @@ export async function createApplication({
     if (configurationActionRecoveryEnabled && !confirmationRuntime) {
       throw new Error("版本化配置动作恢复需要可用的确认运行时");
     }
-    if (configurationInitializationEnabled) {
+    if (configurationActionRecoveryEnabled) {
       configurationConfirmationRequester = frozenPort(
         configurationConfirmationRequesterFactory({
           simulator: frozenPort(
@@ -738,7 +738,9 @@ export async function createApplication({
             "confirmationRuntime.producerQueue",
           ),
         }),
-        ["requestInitialization"],
+        configurationInitializationEnabled
+          ? ["requestInitialization"]
+          : ["requestDraftActivation", "requestRollback"],
         "configurationConfirmationRequester",
       );
     }

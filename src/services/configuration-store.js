@@ -23,6 +23,11 @@ import {
 
 export { CONFIGURATION_STATE_KEY, ConfigurationStoreError };
 
+export const CONFIGURATION_CONTROL_PLANE_LIMITS = Object.freeze({
+  versions: 50,
+  auditEntries: 100,
+});
+
 const DIGEST = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -139,6 +144,82 @@ function sameRollbackBinding(actual, request) {
   );
 }
 
+function projectAuthorityVersion(version) {
+  return {
+    version: version.version,
+    configurationDigest: version.configurationDigest,
+  };
+}
+
+function projectActivationReconciliationVersion(version) {
+  return {
+    version: version.version,
+    configurationDigest: version.configurationDigest,
+    source: version.source,
+    previousVersion: version.previousVersion,
+    draftRevisionId: version.draftRevisionId,
+    rollbackOf: version.rollbackOf,
+    activatedBy: version.activatedBy,
+    activatedAt: version.activatedAt,
+    impactDigest: version.impactDigest,
+  };
+}
+
+function projectAuthorityDraft(draft) {
+  return {
+    draftId: draft.draftId,
+    draftRevisionId: draft.draftRevisionId,
+    baseVersion: draft.baseVersion,
+  };
+}
+
+function projectControlPlaneVersion(version) {
+  return {
+    version: version.version,
+    configurationDigest: version.configurationDigest,
+    source: version.source,
+    previousVersion: version.previousVersion,
+    draftRevisionId: version.draftRevisionId,
+    rollbackOf: version.rollbackOf,
+    activatedAt: version.activatedAt,
+    impactDigest: version.impactDigest,
+  };
+}
+
+function projectControlPlaneDraft(draft) {
+  return {
+    draftId: draft.draftId,
+    draftRevisionId: draft.draftRevisionId,
+    revision: draft.revision,
+    baseVersion: draft.baseVersion,
+    configurationDigest: draft.configurationDigest,
+    createdAt: draft.createdAt,
+  };
+}
+
+function projectControlPlaneAudit(entry) {
+  return {
+    sequence: entry.sequence,
+    stateRevision: entry.stateRevision,
+    kind: entry.kind,
+    actor: entry.actor,
+    occurredAt: entry.occurredAt,
+    draftId: entry.draftId,
+    configurationVersion: entry.configurationVersion,
+    targetVersion: entry.targetVersion,
+    impactDigest: entry.impactDigest,
+  };
+}
+
+function headDraftRevisions(state) {
+  const revisionIds = new Set(
+    state.draftHeads.map((head) => head.draftRevisionId),
+  );
+  return state.draftRevisions.filter((draft) =>
+    revisionIds.has(draft.draftRevisionId)
+  );
+}
+
 export class ConfigurationStore {
   constructor({
     store,
@@ -205,6 +286,73 @@ export class ConfigurationStore {
   async readSnapshot() {
     this.#assertReady();
     return cloneFrozenConfigurationValue(this.state);
+  }
+
+  async readAuthoritySnapshot() {
+    this.#assertReady();
+    const { active, drafts } = this.#projectionContext();
+    return cloneFrozenConfigurationValue({
+      revision: this.state.revision,
+      activeVersion: this.state.activeVersion,
+      versions: active ? [projectAuthorityVersion(active)] : [],
+      draftHeads: this.state.draftHeads,
+      draftRevisions: drafts.map(projectAuthorityDraft),
+    });
+  }
+
+  async readActivationReconciliationSnapshot({ version } = {}) {
+    this.#assertReady();
+    const expectedVersion = integer(version, "version", 1);
+    const active = this.#activeVersion();
+    const observedVersion = this.state.versions[expectedVersion - 1] ?? null;
+    return cloneFrozenConfigurationValue({
+      revision: this.state.revision,
+      activeVersion: this.state.activeVersion,
+      active: active ? projectAuthorityVersion(active) : null,
+      observedVersion: observedVersion
+        ? projectActivationReconciliationVersion(observedVersion)
+        : null,
+    });
+  }
+
+  async readControlPlaneSnapshot({
+    versionLimit = CONFIGURATION_CONTROL_PLANE_LIMITS.versions,
+    auditLimit = CONFIGURATION_CONTROL_PLANE_LIMITS.auditEntries,
+  } = {}) {
+    this.#assertReady();
+    const boundedVersionLimit = integer(
+      versionLimit,
+      "versionLimit",
+      1,
+    );
+    const boundedAuditLimit = integer(
+      auditLimit,
+      "auditLimit",
+      1,
+    );
+    const { active, drafts } = this.#projectionContext();
+    const editableDraft = drafts.findLast(
+      (draft) => draft.baseVersion === (this.state.activeVersion ?? 0),
+    );
+    return cloneFrozenConfigurationValue({
+      revision: this.state.revision,
+      activeVersion: this.state.activeVersion,
+      versions: this.state.versions
+        .slice(-boundedVersionLimit)
+        .map(projectControlPlaneVersion),
+      draftRevisions: drafts.map(projectControlPlaneDraft),
+      audit: this.state.audit
+        .slice(-boundedAuditLimit)
+        .map(projectControlPlaneAudit),
+      editableConfiguration:
+        editableDraft?.configuration ?? active?.configuration ?? null,
+      history: {
+        totalVersions: this.state.versions.length,
+        totalAuditEntries: this.state.audit.length,
+        versionsTruncated: this.state.versions.length > boundedVersionLimit,
+        auditTruncated: this.state.audit.length > boundedAuditLimit,
+      },
+    });
   }
 
   async readActive() {
@@ -716,6 +864,13 @@ export class ConfigurationStore {
     const draft = state.draftRevisions.find(
       (entry) => entry.draftRevisionId === head.draftRevisionId,
     );
+    if (draft.baseVersion !== expectedActiveVersion) {
+      throw invalid(
+        "CONFIGURATION_ACTIVATION_STALE",
+        "配置草稿基于旧活动版本",
+        409,
+      );
+    }
     const active = this.#activeVersion(state);
     const impact = configurationDocumentImpact(
       active.configuration,
@@ -1118,6 +1273,13 @@ export class ConfigurationStore {
         return operation();
       }),
     );
+  }
+
+  #projectionContext() {
+    return {
+      active: this.#activeVersion(),
+      drafts: headDraftRevisions(this.state),
+    };
   }
 
   #assertReady() {

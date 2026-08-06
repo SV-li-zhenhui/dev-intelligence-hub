@@ -83,6 +83,16 @@ function activationExecutor(runtime) {
   });
 }
 
+function approval(item, requestId) {
+  return {
+    requestId,
+    expectedQueueRevision: item.queueRevision,
+    expectedItemRevision: item.itemRevision,
+    displayedPayloadDigest: item.displayedPayloadDigest,
+    approvalBindingDigest: item.approvalBindingDigest,
+  };
+}
+
 test("a confirmed initialization fences the old process and restart rebinds v1", async () => {
   const store = memoryStore();
   const oldGate = new ActionAdmissionGate();
@@ -181,13 +191,10 @@ test("application restart reconciles a durable executing configuration confirmat
     expectedStateRevision: 1,
   });
   await assert.rejects(
-    first.confirmationQueue.approve(queued.id, {
-      requestId: "configuration-cutover-finalize-loss",
-      expectedQueueRevision: queued.queueRevision,
-      expectedItemRevision: queued.itemRevision,
-      displayedPayloadDigest: queued.displayedPayloadDigest,
-      approvalBindingDigest: queued.approvalBindingDigest,
-    }),
+    first.confirmationQueue.approve(
+      queued.id,
+      approval(queued, "configuration-cutover-finalize-loss"),
+    ),
     /confirmation finalize write failed/,
   );
   assert.equal(gates[0].readStatus().mode, "restart_required");
@@ -203,4 +210,91 @@ test("application restart reconciles a durable executing configuration confirmat
   assert.equal(configuration.versions.length, 1);
   assert.equal(restarted.config.refreshMinutes, desired.refreshMinutes);
   await restarted.close();
+});
+
+test("active application confirms v2 then restarts and confirms an append-only rollback v3", async () => {
+  const store = memoryStore();
+  const gates = [];
+  const baseConfiguration = createSafeDisabledConfiguration(
+    committedConfiguration,
+  );
+  const applicationOptions = {
+    store,
+    versionedConfiguration: true,
+    configBootstrapLoader: async () => ({
+      candidate: baseConfiguration,
+      fallbackConfiguration: baseConfiguration,
+      bootstrapError: null,
+    }),
+    actionAdmissionGateFactory() {
+      const gate = new ActionAdmissionGate();
+      gates.push(gate);
+      return gate;
+    },
+    configurationRuntimeDependencies: { createGuard: guard },
+    confirmationRuntimeDependencies: { createGuard: guard },
+    workflowRoutingDependencies: { createGuard: guard },
+    memoryRuntimeDependencies: { createGuard: guard },
+  };
+
+  const first = await createApplication(applicationOptions);
+  assert.equal(first.configuration.status.safeMode, false);
+  assert.equal(first.configuration.status.activeVersion, 1);
+  assert.deepEqual(
+    Object.keys(first.configuration.confirmationRequester),
+    ["requestDraftActivation", "requestRollback"],
+  );
+  const desired = structuredClone(baseConfiguration);
+  desired.refreshMinutes += 1;
+  const draft = await first.configuration.draftManager.createDraft({
+    configuration: desired,
+    expectedStateRevision: 1,
+    proposedBy: "owner:local",
+  });
+  const activation = await first.configuration.confirmationRequester
+    .requestDraftActivation({
+      draftId: draft.draftId,
+      draftRevision: draft.revision,
+      expectedStateRevision: 2,
+      expectedActiveVersion: 1,
+    });
+  const activated = await first.confirmationQueue.approve(
+    activation.id,
+    approval(activation, "configuration-activate-v2"),
+  );
+  assert.equal(activated.status, "completed");
+  assert.equal(gates[0].readStatus().mode, "restart_required");
+  assert.equal(
+    (await first.configuration.reader.readSnapshot()).activeVersion,
+    2,
+  );
+  await first.close();
+
+  const second = await createApplication(applicationOptions);
+  assert.equal(second.configuration.status.activeVersion, 2);
+  assert.equal(second.config.refreshMinutes, desired.refreshMinutes);
+  assert.equal(gates[1].readStatus().mode, "ready");
+  const rollback = await second.configuration.confirmationRequester
+    .requestRollback({
+      targetVersion: 1,
+      expectedStateRevision: 3,
+      expectedActiveVersion: 2,
+    });
+  const rolledBack = await second.confirmationQueue.approve(
+    rollback.id,
+    approval(rollback, "configuration-rollback-v3"),
+  );
+  assert.equal(rolledBack.status, "completed");
+  const rolledBackState = await second.configuration.reader.readSnapshot();
+  assert.equal(rolledBackState.activeVersion, 3);
+  assert.equal(rolledBackState.versions.at(-1).source, "rollback");
+  assert.equal(rolledBackState.versions.at(-1).rollbackOf, 1);
+  assert.equal(gates[1].readStatus().mode, "restart_required");
+  await second.close();
+
+  const third = await createApplication(applicationOptions);
+  assert.equal(third.configuration.status.activeVersion, 3);
+  assert.equal(third.config.refreshMinutes, baseConfiguration.refreshMinutes);
+  assert.equal(gates[2].readStatus().mode, "ready");
+  await third.close();
 });

@@ -57,7 +57,10 @@ test("runtime imports once and exposes frozen least-authority ports", async () =
 
   assert.deepEqual(runtime.startupConfiguration, committedConfiguration);
   assert.deepEqual(Object.keys(runtime.reader).sort(), [
+    "readActivationReconciliationSnapshot",
     "readActive",
+    "readAuthoritySnapshot",
+    "readControlPlaneSnapshot",
     "readDraft",
     "readProjectionBatch",
     "readSnapshot",

@@ -1800,6 +1800,7 @@ h1 {
 .configuration-status,
 .configuration-editor,
 .configuration-preview,
+.configuration-history,
 .configuration-locked {
   min-width: 0;
   padding: 20px;
@@ -1951,19 +1952,24 @@ h1 {
   margin-top: 14px;
 }
 
-.configuration-actions button {
+.configuration-actions button,
+.configuration-version-actions button {
   min-height: 40px;
-  padding: 9px 14px;
   color: white;
   background: var(--green);
   border: 1px solid var(--green);
   border-radius: 6px;
   cursor: pointer;
-  font-size: 11px;
   font-weight: 650;
 }
 
-.configuration-actions button.secondary-button {
+.configuration-actions button {
+  padding: 9px 14px;
+  font-size: 11px;
+}
+
+.configuration-actions button.secondary-button,
+.configuration-version-actions button.secondary-button {
   color: var(--muted);
   background: transparent;
   border-color: var(--line-strong);
@@ -2021,8 +2027,86 @@ h1 {
   font-size: 12px;
 }
 
+.configuration-history .section-heading {
+  align-items: flex-start;
+}
+
+.configuration-version-list,
+.configuration-audit ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.configuration-version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.configuration-version-row > div:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.configuration-version-row span,
+.configuration-version-row small,
+.configuration-audit li span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.configuration-version-row code {
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.configuration-version-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.configuration-version-actions button {
+  padding: 8px 12px;
+  font-size: 10px;
+}
+
+.configuration-version-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.configuration-audit {
+  margin-top: 14px;
+  font-size: 11px;
+}
+
+.configuration-audit summary {
+  min-height: 40px;
+  padding: 11px 0;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.configuration-audit li {
+  display: grid;
+  gap: 2px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
 .configuration-actions button:focus-visible,
 .configuration-editor textarea:focus-visible,
+.configuration-version-actions button:focus-visible,
+.configuration-audit summary:focus-visible,
 .configuration-panel [data-configuration-reload]:focus-visible,
 .configuration-confirmation button:focus-visible,
 .nav-item:focus-visible {
@@ -2031,12 +2115,14 @@ h1 {
 }
 
 .configuration-actions button:active:not(:disabled),
+.configuration-version-actions button:active:not(:disabled),
 .configuration-confirmation button:active:not(:disabled) {
   transform: scale(0.96);
 }
 
 @media (prefers-reduced-motion: no-preference) {
   .configuration-actions button,
+  .configuration-version-actions button,
   .configuration-confirmation button {
     transition-property: transform;
     transition-duration: 120ms;
@@ -2072,6 +2158,11 @@ dialog::backdrop {
   border: 0;
   cursor: pointer;
   font-size: 24px;
+}
+
+.confirmation-close:disabled {
+  cursor: wait;
+  opacity: 0.35;
 }
 
 .detail {
@@ -2598,7 +2689,22 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
-  .configuration-actions button {
+  .configuration-version-row,
+  .configuration-version-actions {
+    align-items: stretch;
+  }
+
+  .configuration-version-row {
+    display: grid;
+  }
+
+  .configuration-version-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .configuration-actions button,
+  .configuration-version-actions button {
     width: 100%;
   }
 

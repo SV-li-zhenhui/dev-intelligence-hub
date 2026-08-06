@@ -423,6 +423,66 @@ test("draft edits append immutable revisions and validation never writes", async
   assert.equal(Object.isFrozen(prepared), true);
 });
 
+test("control-plane and authority reads bound history before cloning", async () => {
+  const { configurations } = await importedFixture();
+  const first = await configurations.createDraft({
+    configuration: changedConfiguration(),
+    expectedStateRevision: 1,
+    proposedBy: "owner:local",
+  });
+  const revisedConfiguration = changedConfiguration();
+  revisedConfiguration.refreshMinutes += 1;
+  const revised = await configurations.reviseDraft({
+    draftId: first.draftId,
+    expectedDraftRevision: first.revision,
+    expectedStateRevision: 2,
+    configuration: revisedConfiguration,
+    proposedBy: "owner:local",
+  });
+
+  const authority = await configurations.readAuthoritySnapshot();
+  assert.equal(authority.revision, 3);
+  assert.equal(authority.activeVersion, 1);
+  assert.equal(authority.versions.length, 1);
+  assert.equal("configuration" in authority.versions[0], false);
+  assert.deepEqual(
+    authority.draftRevisions.map((draft) => draft.draftRevisionId),
+    [revised.draftRevisionId],
+  );
+  assert.equal("configuration" in authority.draftRevisions[0], false);
+  assert.equal("audit" in authority, false);
+  assert.equal("projectionOutbox" in authority, false);
+  assert.equal(Object.isFrozen(authority), true);
+
+  const controlPlane = await configurations.readControlPlaneSnapshot({
+    versionLimit: 1,
+    auditLimit: 2,
+  });
+  assert.equal(controlPlane.versions.length, 1);
+  assert.equal("configuration" in controlPlane.versions[0], false);
+  assert.equal(controlPlane.draftRevisions.length, 1);
+  assert.equal("configuration" in controlPlane.draftRevisions[0], false);
+  assert.deepEqual(controlPlane.editableConfiguration, revisedConfiguration);
+  assert.deepEqual(controlPlane.audit.map((entry) => entry.sequence), [2, 3]);
+  assert.deepEqual(controlPlane.history, {
+    totalVersions: 1,
+    totalAuditEntries: 3,
+    versionsTruncated: false,
+    auditTruncated: true,
+  });
+  assert.equal("projectionOutbox" in controlPlane, false);
+  assert.equal(Object.isFrozen(controlPlane), true);
+
+  await assert.rejects(
+    configurations.readControlPlaneSnapshot({ versionLimit: 0 }),
+    /versionLimit is invalid/,
+  );
+  await assert.rejects(
+    configurations.readControlPlaneSnapshot({ auditLimit: 0 }),
+    /auditLimit is invalid/,
+  );
+});
+
 test("activation is revision-bound, audited, projected, and idempotent", async () => {
   const { configurations, store } = await importedFixture();
   const draft = await configurations.createDraft({
@@ -466,6 +526,30 @@ test("activation is revision-bound, audited, projected, and idempotent", async (
     activated.active.configurationDigest,
   );
 
+  const reconciliation =
+    await configurations.readActivationReconciliationSnapshot({ version: 1 });
+  assert.deepEqual(reconciliation.active, {
+    version: 2,
+    configurationDigest: activated.active.configurationDigest,
+  });
+  assert.equal(reconciliation.observedVersion.version, 1);
+  assert.deepEqual(Object.keys(reconciliation.observedVersion), [
+    "version",
+    "configurationDigest",
+    "source",
+    "previousVersion",
+    "draftRevisionId",
+    "rollbackOf",
+    "activatedBy",
+    "activatedAt",
+    "impactDigest",
+  ]);
+  assert.equal("configuration" in reconciliation.observedVersion, false);
+  assert.equal("draftRevisions" in reconciliation, false);
+  assert.equal("audit" in reconciliation, false);
+  assert.equal("projectionOutbox" in reconciliation, false);
+  assert.equal(Object.isFrozen(reconciliation), true);
+
   const repeated = await configurations.activateDraft({
     ...plan,
     activatedBy: "owner",
@@ -473,6 +557,39 @@ test("activation is revision-bound, audited, projected, and idempotent", async (
   assert.equal(repeated.applied, false);
   assert.deepEqual(repeated.active, activated.active);
   assert.equal(store.writes.length, 3);
+});
+
+test("a draft from an older Active baseline cannot be disguised as a new activation", async () => {
+  const { configurations } = await importedFixture();
+  const staleDraft = await configurations.createDraft({
+    configuration: changedConfiguration(),
+    expectedStateRevision: 1,
+    proposedBy: "owner",
+  });
+  const winningConfiguration = configuration();
+  winningConfiguration.refreshMinutes += 1;
+  const winningDraft = await configurations.createDraft({
+    configuration: winningConfiguration,
+    expectedStateRevision: 2,
+    proposedBy: "owner",
+  });
+  const winningPlan = await configurations.prepareDraftActivation({
+    draftId: winningDraft.draftId,
+    draftRevision: 1,
+    expectedStateRevision: 3,
+    expectedActiveVersion: 1,
+  });
+  await configurations.activateDraft({ ...winningPlan, activatedBy: "owner" });
+
+  await assert.rejects(
+    configurations.prepareDraftActivation({
+      draftId: staleDraft.draftId,
+      draftRevision: 1,
+      expectedStateRevision: 4,
+      expectedActiveVersion: 2,
+    }),
+    assertCode("CONFIGURATION_ACTIVATION_STALE", 409),
+  );
 });
 
 test("rollback appends a new active version instead of moving the version backward", async () => {

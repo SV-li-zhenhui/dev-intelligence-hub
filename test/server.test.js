@@ -10,6 +10,7 @@ import {
 } from "../src/server.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
+import { ConfigurationStore } from "../src/services/configuration-store.js";
 
 const safeEditableConfiguration = createSafeDisabledConfiguration(
   JSON.parse(readFileSync(new URL("../config.json", import.meta.url), "utf8")),
@@ -254,6 +255,10 @@ function safeConfigurationApplication() {
     throw Object.assign(new Error(message), { statusCode });
   };
   const copy = (value) => structuredClone(value);
+  const headDrafts = () => {
+    const ids = new Set(snapshot.draftHeads.map((head) => head.draftRevisionId));
+    return snapshot.draftRevisions.filter((draft) => ids.has(draft.draftRevisionId));
+  };
   const requireDraft = (draftId, revision) => {
     const draft = snapshot.draftRevisions.find(
       (candidate) =>
@@ -488,6 +493,79 @@ function safeConfigurationApplication() {
       calls.push({ operation: "configuration_snapshot" });
       return copy(snapshot);
     },
+    async readAuthoritySnapshot() {
+      calls.push({ operation: "configuration_authority_snapshot" });
+      const active = snapshot.versions.find(
+        ({ version }) => version === snapshot.activeVersion,
+      );
+      return copy({
+        revision: snapshot.revision,
+        activeVersion: snapshot.activeVersion,
+        versions: active
+          ? [{
+              version: active.version,
+              configurationDigest: active.configurationDigest,
+            }]
+          : [],
+        draftHeads: snapshot.draftHeads,
+        draftRevisions: headDrafts().map((draft) => ({
+          draftId: draft.draftId,
+          draftRevisionId: draft.draftRevisionId,
+          baseVersion: draft.baseVersion,
+        })),
+      });
+    },
+    async readControlPlaneSnapshot({ versionLimit, auditLimit }) {
+      calls.push({ operation: "configuration_control_plane_snapshot" });
+      const drafts = headDrafts();
+      const editableDraft = drafts.findLast(
+        (draft) => draft.baseVersion === (snapshot.activeVersion ?? 0),
+      );
+      const active = snapshot.versions.find(
+        ({ version }) => version === snapshot.activeVersion,
+      );
+      return copy({
+        revision: snapshot.revision,
+        activeVersion: snapshot.activeVersion,
+        versions: snapshot.versions.slice(-versionLimit).map((version) => ({
+          version: version.version,
+          configurationDigest: version.configurationDigest,
+          source: version.source,
+          previousVersion: version.previousVersion,
+          draftRevisionId: version.draftRevisionId,
+          rollbackOf: version.rollbackOf,
+          activatedAt: version.activatedAt,
+          impactDigest: version.impactDigest,
+        })),
+        draftRevisions: drafts.map((draft) => ({
+          draftId: draft.draftId,
+          draftRevisionId: draft.draftRevisionId,
+          revision: draft.revision,
+          baseVersion: draft.baseVersion,
+          configurationDigest: draft.configurationDigest,
+          createdAt: draft.createdAt,
+        })),
+        audit: snapshot.audit.slice(-auditLimit).map((entry) => ({
+          sequence: entry.sequence,
+          stateRevision: entry.stateRevision,
+          kind: entry.kind,
+          actor: entry.actor,
+          occurredAt: entry.occurredAt,
+          draftId: entry.draftId,
+          configurationVersion: entry.configurationVersion,
+          targetVersion: entry.targetVersion,
+          impactDigest: entry.impactDigest,
+        })),
+        editableConfiguration:
+          editableDraft?.configuration ?? active?.configuration ?? null,
+        history: {
+          totalVersions: snapshot.versions.length,
+          totalAuditEntries: snapshot.audit.length,
+          versionsTruncated: snapshot.versions.length > versionLimit,
+          auditTruncated: snapshot.audit.length > auditLimit,
+        },
+      });
+    },
     async readActive() {
       return copy(
         snapshot.versions.find(({ version }) => version === snapshot.activeVersion) || null,
@@ -574,6 +652,83 @@ async function withSafeConfigurationServer(run) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     await run({ ...fixture, server, backgroundWork, reportedErrors });
+  } finally {
+    await server.shutdown();
+  }
+}
+
+async function activeConfigurationApplication() {
+  let durableState = null;
+  const durableStore = {
+    async read(_name, fallback = null) {
+      return structuredClone(durableState ?? fallback);
+    },
+    async write(_name, value) {
+      durableState = structuredClone(value);
+    },
+  };
+  const configurationStore = new ConfigurationStore({
+    store: durableStore,
+    exclusiveLease: { run: (operation) => operation() },
+    clock: (() => {
+      let offset = 0;
+      return () => new Date(Date.parse("2026-08-05T10:00:00.000Z") + offset++ * 1000);
+    })(),
+    idFactory: () => "active-draft",
+  });
+  await configurationStore.recover();
+  await configurationStore.importBootstrap({
+    configuration: safeEditableConfiguration,
+    importedBy: "bootstrap-file",
+  });
+
+  const calls = [];
+  const application = {
+    config: structuredClone(safeEditableConfiguration),
+    configuration: {
+      status: {
+        safeMode: false,
+        activeVersion: 1,
+        stateRevision: 1,
+        migrationError: null,
+      },
+      reader: configurationStore,
+      draftManager: configurationStore,
+      simulator: configurationStore,
+      confirmationRequester: {
+        async requestDraftActivation(input) {
+          calls.push({
+            operation: "configuration_request_activation",
+            input: structuredClone(input),
+          });
+          return { id: "confirmation-configuration-activation" };
+        },
+        async requestRollback(input) {
+          calls.push({
+            operation: "configuration_request_rollback",
+            input: structuredClone(input),
+          });
+          return { id: "confirmation-configuration-rollback" };
+        },
+      },
+    },
+    store: durableStore,
+    refreshService: { running: null, async refresh() {} },
+  };
+  return { application, calls, configurationStore };
+}
+
+async function withActiveConfigurationServer(run) {
+  const fixture = await activeConfigurationApplication();
+  const reportedErrors = [];
+  const server = createDashboardServer(fixture.application, {
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await run({ ...fixture, server, reportedErrors });
   } finally {
     await server.shutdown();
   }
@@ -1068,12 +1223,15 @@ test("safe-mode configuration API creates, revises, previews, and reloads only i
     assert.equal(initial.status, 200);
     const initialState = JSON.parse(initial.body);
     assert.deepEqual(Object.keys(initialState).sort(), [
+      "audit",
       "drafts",
       "editableConfiguration",
+      "history",
       "pendingRestart",
       "runtimeEffective",
       "status",
       "storedActive",
+      "versions",
     ]);
     assert.equal(initialState.status.safeMode, true);
     assert.equal(initialState.status.runtimeMode, "boot_safe");
@@ -1084,11 +1242,18 @@ test("safe-mode configuration API creates, revises, previews, and reloads only i
     assert.match(initialState.runtimeEffective.configurationDigest, /^[a-f0-9]{64}$/);
     assert.equal(initialState.pendingRestart, false);
     assert.deepEqual(initialState.drafts, []);
+    assert.deepEqual(initialState.versions, []);
+    assert.deepEqual(initialState.audit, []);
+    assert.deepEqual(initialState.history, {
+      totalVersions: 0,
+      totalAuditEntries: 0,
+      versionsTruncated: false,
+      auditTruncated: false,
+    });
     assert.deepEqual(
       initialState.editableConfiguration,
       safeEditableConfiguration,
     );
-    assert.equal("audit" in initialState, false);
     assert.equal("projectionOutbox" in initialState, false);
 
     const firstConfiguration = structuredClone(safeEditableConfiguration);
@@ -1352,6 +1517,383 @@ test("safe mode exposes and operates only initialization confirmations then repo
       body: JSON.stringify({ expectedStateRevision: 2, configuration }),
     });
     assert.equal(createAfterActivation.status, 409);
+  });
+});
+
+test("active configuration API stages revision-bound activation and rollback through confirmation", async () => {
+  await withActiveConfigurationServer(async ({
+    server,
+    calls,
+    configurationStore,
+    application,
+  }) => {
+    const initial = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(initial.status.safeMode, false);
+    assert.equal(initial.status.stateRevision, 1);
+    assert.equal(initial.storedActive.version, 1);
+    assert.deepEqual(initial.versions.map(({ version }) => version), [1]);
+    assert.equal("configuration" in initial.versions[0], false);
+    assert.equal(initial.audit.at(-1).kind, "bootstrap_imported");
+    assert.equal("draftRevisionId" in initial.audit.at(-1), false);
+    assert.equal("projectionOutbox" in initial, false);
+
+    const changed = structuredClone(safeEditableConfiguration);
+    changed.refreshMinutes = 19;
+    application.configuration.runtimeStatus = {
+      async readStatus() {
+        return {
+          mode: "unknown",
+          storedActive: null,
+          runtimeEffective: null,
+        };
+      },
+    };
+    const fenced = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration: changed,
+      }),
+    });
+    assert.equal(fenced.status, 409);
+    delete application.configuration.runtimeStatus;
+
+    const created = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration: changed,
+      }),
+    });
+    assert.equal(created.status, 201, created.body);
+    const draft = JSON.parse(created.body).draft;
+    assert.equal(draft.baseVersion, 1);
+    assert.equal(draft.revision, 1);
+
+    const revisedConfiguration = structuredClone(changed);
+    revisedConfiguration.refreshMinutes = 21;
+    const revised = await request(server, {
+      method: "PUT",
+      path: `/api/configuration/drafts/${draft.draftId}`,
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedDraftRevision: 1,
+        expectedStateRevision: 2,
+        expectedActiveVersion: 1,
+        configuration: revisedConfiguration,
+      }),
+    });
+    assert.equal(revised.status, 200, revised.body);
+    assert.equal(JSON.parse(revised.body).draft.revision, 2);
+
+    const staleRevision = await request(server, {
+      method: "PUT",
+      path: `/api/configuration/drafts/${draft.draftId}`,
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedDraftRevision: 1,
+        expectedStateRevision: 3,
+        expectedActiveVersion: 1,
+        configuration: revisedConfiguration,
+      }),
+    });
+    assert.equal(staleRevision.status, 409);
+
+    const afterRevision = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(afterRevision.status.stateRevision, 3);
+    assert.equal(afterRevision.drafts[0].draftId, draft.draftId);
+    assert.equal(afterRevision.drafts[0].revision, 2);
+    assert.deepEqual(
+      afterRevision.editableConfiguration,
+      revisedConfiguration,
+    );
+
+    const activationBinding = {
+      draftRevision: 2,
+      expectedStateRevision: 3,
+      expectedActiveVersion: 1,
+    };
+    const preview = await request(server, {
+      method: "POST",
+      path: `/api/configuration/drafts/${draft.draftId}/preview`,
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(activationBinding),
+    });
+    assert.equal(preview.status, 200, preview.body);
+    const activationPreview = JSON.parse(preview.body);
+    assert.equal(activationPreview.kind, "configuration.activate");
+    assert.equal(activationPreview.draftId, draft.draftId);
+    assert.equal(activationPreview.draftRevision, 2);
+    assert.equal(activationPreview.expectedStateRevision, 3);
+    assert.equal(activationPreview.expectedActiveVersion, 1);
+
+    const requested = await request(server, {
+      method: "POST",
+      path: `/api/configuration/drafts/${draft.draftId}/request-confirmation`,
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(activationBinding),
+    });
+    assert.equal(requested.status, 200, requested.body);
+    assert.equal(
+      JSON.parse(requested.body).request.id,
+      "confirmation-configuration-activation",
+    );
+    assert.deepEqual(
+      calls.find(({ operation }) => operation === "configuration_request_activation")
+        .input,
+      { draftId: draft.draftId, ...activationBinding },
+    );
+
+    const preparedActivation = await configurationStore.prepareDraftActivation({
+      draftId: draft.draftId,
+      ...activationBinding,
+    });
+    await configurationStore.activateDraft({
+      ...preparedActivation,
+      activatedBy: "owner:local",
+    });
+
+    const afterActivation = JSON.parse(
+      (await request(server, { path: "/api/configuration" })).body,
+    );
+    assert.equal(afterActivation.storedActive.version, 2);
+    assert.equal(afterActivation.runtimeEffective.activeVersion, 1);
+    assert.equal(afterActivation.pendingRestart, true);
+    assert.deepEqual(
+      afterActivation.versions.map(({ version }) => version),
+      [2, 1],
+    );
+
+    const rollbackBinding = {
+      expectedStateRevision: 4,
+      expectedActiveVersion: 2,
+    };
+    const beforeRestart = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(rollbackBinding),
+    });
+    assert.equal(beforeRestart.status, 409);
+
+    application.configuration.status.activeVersion = 2;
+    application.config = structuredClone(revisedConfiguration);
+    const rollbackPreview = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(rollbackBinding),
+    });
+    assert.equal(rollbackPreview.status, 200, rollbackPreview.body);
+    assert.equal(JSON.parse(rollbackPreview.body).kind, "configuration.rollback");
+
+    const rollbackRequested = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/request-confirmation",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify(rollbackBinding),
+    });
+    assert.equal(rollbackRequested.status, 200, rollbackRequested.body);
+    assert.equal(
+      JSON.parse(rollbackRequested.body).request.id,
+      "confirmation-configuration-rollback",
+    );
+    assert.deepEqual(
+      calls.find(({ operation }) => operation === "configuration_request_rollback")
+        .input,
+      { targetVersion: 1, ...rollbackBinding },
+    );
+
+    const stale = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 2,
+        expectedActiveVersion: 1,
+      }),
+    });
+    assert.equal(stale.status, 409);
+
+    const direct = await request(server, {
+      method: "POST",
+      path: "/api/configuration/rollback",
+      headers: trustedConfigurationHeaders(),
+      body: "{}",
+    });
+    assert.equal(direct.status, 404);
+  });
+});
+
+test("active configuration HTTP rejects stale Active and draft baselines without side effects", async () => {
+  await withActiveConfigurationServer(async ({
+    server,
+    calls,
+    configurationStore,
+    application,
+  }) => {
+    const changed = structuredClone(safeEditableConfiguration);
+    changed.refreshMinutes += 1;
+    const created = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration: changed,
+      }),
+    });
+    assert.equal(created.status, 201, created.body);
+    const draft = JSON.parse(created.body).draft;
+    const activationBinding = {
+      draftId: draft.draftId,
+      draftRevision: 1,
+      expectedStateRevision: 2,
+      expectedActiveVersion: 1,
+    };
+    const prepared = await configurationStore.prepareDraftActivation(
+      activationBinding,
+    );
+    await configurationStore.activateDraft({
+      ...prepared,
+      activatedBy: "owner:local",
+    });
+    application.configuration.status.activeVersion = 2;
+    application.config = structuredClone(changed);
+
+    let reviseCalls = 0;
+    application.configuration.draftManager = {
+      async reviseDraft(input) {
+        reviseCalls += 1;
+        return configurationStore.reviseDraft(input);
+      },
+    };
+    const revisedConfiguration = structuredClone(changed);
+    revisedConfiguration.refreshMinutes += 1;
+    const routeRequests = (expectedActiveVersion) => [
+      {
+        method: "PUT",
+        path: `/api/configuration/drafts/${draft.draftId}`,
+        body: {
+          expectedDraftRevision: 1,
+          expectedStateRevision: 3,
+          expectedActiveVersion,
+          configuration: revisedConfiguration,
+        },
+      },
+      {
+        method: "POST",
+        path: `/api/configuration/drafts/${draft.draftId}/preview`,
+        body: {
+          draftRevision: 1,
+          expectedStateRevision: 3,
+          expectedActiveVersion,
+        },
+      },
+      {
+        method: "POST",
+        path: `/api/configuration/drafts/${draft.draftId}/request-confirmation`,
+        body: {
+          draftRevision: 1,
+          expectedStateRevision: 3,
+          expectedActiveVersion,
+        },
+      },
+    ];
+
+    for (const expectedActiveVersion of [1, 2]) {
+      for (const candidate of routeRequests(expectedActiveVersion)) {
+        const response = await request(server, {
+          method: candidate.method,
+          path: candidate.path,
+          headers: trustedConfigurationHeaders(),
+          body: JSON.stringify(candidate.body),
+        });
+        assert.equal(
+          response.status,
+          409,
+          `${candidate.method} ${candidate.path}: ${response.body}`,
+        );
+      }
+    }
+
+    assert.equal(reviseCalls, 0);
+    assert.equal(
+      calls.filter(
+        ({ operation }) => operation === "configuration_request_activation",
+      ).length,
+      0,
+    );
+    const snapshot = await configurationStore.readSnapshot();
+    assert.equal(snapshot.revision, 3);
+    assert.equal(snapshot.activeVersion, 2);
+    assert.equal(snapshot.draftHeads[0].revision, 1);
+  });
+});
+
+test("active configuration mutations preserve the local owner trust boundary", async () => {
+  await withActiveConfigurationServer(async ({ server }) => {
+    const configuration = structuredClone(safeEditableConfiguration);
+    configuration.refreshMinutes += 1;
+    const untrusted = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration,
+      }),
+    });
+    const clientActor = await request(server, {
+      method: "POST",
+      path: "/api/configuration/drafts",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        configuration,
+        proposedBy: "attacker",
+      }),
+    });
+    const rollbackExtraField = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 1,
+        expectedActiveVersion: 1,
+        activatedBy: "attacker",
+      }),
+    });
+
+    assert.equal(untrusted.status, 403);
+    assert.equal(clientActor.status, 400);
+    assert.equal(rollbackExtraField.status, 400);
+  });
+
+  await withSafeConfigurationServer(async ({ server }) => {
+    const rollback = await request(server, {
+      method: "POST",
+      path: "/api/configuration/versions/1/rollback/preview",
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({
+        expectedStateRevision: 0,
+        expectedActiveVersion: 1,
+      }),
+    });
+    assert.equal(rollback.status, 409);
   });
 });
 

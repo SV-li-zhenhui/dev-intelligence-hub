@@ -2712,6 +2712,7 @@ test("versioned composition builds every subsystem from the stored active snapsh
     }),
     reader: port([
       "readSnapshot",
+      "readActivationReconciliationSnapshot",
       "readActive",
       "readVersion",
       "readDraft",
@@ -2743,6 +2744,7 @@ test("versioned composition builds every subsystem from the stored active snapsh
   };
   let activationOptions;
   let confirmationDependencies;
+  let requesterOptions;
 
   const application = await createApplication({
     config: bootstrap,
@@ -2771,6 +2773,14 @@ test("versioned composition builds every subsystem from the stored active snapsh
         },
       };
     },
+    configurationConfirmationRequesterFactory: (options) => {
+      requesterOptions = options;
+      return {
+        async requestInitialization() {},
+        async requestDraftActivation() {},
+        async requestRollback() {},
+      };
+    },
   });
 
   assert.deepEqual(calls[0].candidate, bootstrap);
@@ -2790,11 +2800,26 @@ test("versioned composition builds every subsystem from the stored active snapsh
     application.configuration.proposalPort,
     configurationRuntime.proposalPort,
   );
-  assert.equal(application.configuration.confirmationRequester, null);
+  assert.deepEqual(
+    Object.keys(application.configuration.confirmationRequester),
+    ["requestDraftActivation", "requestRollback"],
+  );
   assert.deepEqual(Object.keys(application.configuration.runtimeStatus), [
     "readStatus",
   ]);
-  assert.deepEqual(activationOptions.allowedActionTypes, []);
+  assert.deepEqual(activationOptions.allowedActionTypes, [
+    "activate_draft",
+    "activate_rollback",
+  ]);
+  assert.equal(Object.isFrozen(activationOptions.allowedActionTypes), true);
+  assert.deepEqual(Object.keys(requesterOptions.simulator), [
+    "prepareInitialization",
+    "prepareDraftActivation",
+    "prepareRollback",
+  ]);
+  assert.deepEqual(Object.keys(requesterOptions.confirmationProducer), [
+    "enqueue",
+  ]);
   assert.deepEqual(Object.keys(confirmationDependencies.localExecutors), [
     "local.configuration-activate",
   ]);
@@ -2826,6 +2851,7 @@ test("safe mode grants only initialization through the shared confirmation queue
       },
       reader: port([
         "readSnapshot",
+        "readActivationReconciliationSnapshot",
         "readActive",
         "readVersion",
         "readDraft",
@@ -2885,7 +2911,7 @@ test("safe mode grants only initialization through the shared confirmation queue
     "activateRollback",
   ]);
   assert.deepEqual(Object.keys(calls.activationOptions.configurationReader), [
-    "readSnapshot",
+    "readActivationReconciliationSnapshot",
   ]);
   assert.deepEqual(Object.keys(calls.activationOptions.actionAdmissionGate), [
     "cutover",
@@ -2943,6 +2969,7 @@ test("versioned maintenance mode does not construct configuration action authori
       },
       reader: port([
         "readSnapshot",
+        "readActivationReconciliationSnapshot",
         "readActive",
         "readVersion",
         "readDraft",
@@ -3014,6 +3041,7 @@ test("versioned local code shares one gate and reads Active authority", async ()
   const sharedGate = new ActionAdmissionGate();
   const configurationReader = {
     async readSnapshot() {},
+    async readActivationReconciliationSnapshot() {},
     async readActive() {},
     async readVersion() {},
     async readDraft() {},
@@ -3232,7 +3260,10 @@ test("versioned local code shares one gate and reads Active authority", async ()
     "run",
   ]);
   assert.equal("activationExecutor" in application.configuration, false);
-  assert.equal(application.configuration.confirmationRequester, null);
+  assert.deepEqual(
+    Object.keys(application.configuration.confirmationRequester),
+    ["requestDraftActivation", "requestRollback"],
+  );
 
   await application.close();
 });

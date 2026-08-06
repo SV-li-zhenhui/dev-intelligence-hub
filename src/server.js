@@ -9,6 +9,9 @@ import {
 } from "./domain/attention-deferred-contract.js";
 import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
 import { projectRoot } from "./lib/config.js";
+import {
+  CONFIGURATION_CONTROL_PLANE_LIMITS,
+} from "./services/configuration-store.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 
 const mimeTypes = {
@@ -750,15 +753,18 @@ function projectConfigurationVersion(version, { configuration = false } = {}) {
   };
 }
 
-function configurationHeadDrafts(snapshot) {
-  const heads = new Map(
-    snapshot.draftHeads.map((head) => [head.draftId, head.draftRevisionId]),
-  );
-  return snapshot.draftRevisions
-    .filter(
-      (draft) => heads.get(draft.draftId) === draft.draftRevisionId,
-    )
-    .reverse();
+function projectConfigurationAudit(entry) {
+  return {
+    sequence: entry.sequence,
+    stateRevision: entry.stateRevision,
+    kind: entry.kind,
+    actor: entry.actor,
+    occurredAt: entry.occurredAt,
+    draftId: entry.draftId,
+    configurationVersion: entry.configurationVersion,
+    targetVersion: entry.targetVersion,
+    impactDigest: entry.impactDigest,
+  };
 }
 
 function normalizeConfigurationRuntimeBinding(value) {
@@ -882,17 +888,14 @@ async function readConfigurationHttpState(application) {
   const reader = requireApplicationPort(
     application.configuration,
     "reader",
-    ["readSnapshot"],
-    "版本化配置读取端口未启用",
+    ["readControlPlaneSnapshot"],
+    "配置控制台读取端口未启用",
   );
-  const snapshot = await reader.readSnapshot();
-  const headDrafts = configurationHeadDrafts(snapshot);
-  const initializationDraft = headDrafts.find(
-    (draft) => draft.baseVersion === 0,
-  );
-  const editableConfiguration = initializationDraft
-    ? initializationDraft.configuration
-    : application.config;
+  const snapshot = await reader.readControlPlaneSnapshot({
+    versionLimit: CONFIGURATION_CONTROL_PLANE_LIMITS.versions,
+    auditLimit: CONFIGURATION_CONTROL_PLANE_LIMITS.auditEntries,
+  });
+  const headDrafts = snapshot.draftRevisions.toReversed();
   const storedActive = snapshot.activeVersion === null
     ? null
     : snapshot.versions.find(
@@ -901,6 +904,13 @@ async function readConfigurationHttpState(application) {
   if (snapshot.activeVersion !== null && !storedActive) {
     throw httpError(503, "活动配置版本状态不完整");
   }
+  const editableDraft = headDrafts.find(
+    (draft) => draft.baseVersion === (snapshot.activeVersion ?? 0),
+  );
+  const editableConfiguration = snapshot.editableConfiguration ??
+    editableDraft?.configuration ??
+    storedActive?.configuration ??
+    application.config;
   const runtimeActiveVersion = application.configuration.status.activeVersion ?? null;
   const runtimeConfigurationDigest = canonicalJsonDigest(application.config);
   const storedBinding = storedActive === null
@@ -942,6 +952,13 @@ async function readConfigurationHttpState(application) {
     },
     pendingRestart,
     drafts: headDrafts.map((draft) => projectConfigurationDraft(draft)),
+    versions: snapshot.versions
+      .toReversed()
+      .map((version) => projectConfigurationVersion(version)),
+    audit: snapshot.audit
+      .toReversed()
+      .map((entry) => projectConfigurationAudit(entry)),
+    history: snapshot.history,
     editableConfiguration,
   };
 }
@@ -955,15 +972,77 @@ function assertInitializationMutationAllowed(application, snapshot) {
   }
 }
 
-function assertInitializationDraft(snapshot, draftId) {
+function assertDraftBaseVersion(snapshot, draftId, baseVersion, message) {
   const head = snapshot.draftHeads.find((draft) => draft.draftId === draftId);
   if (!head) return;
   const draft = snapshot.draftRevisions.find(
     (candidate) => candidate.draftRevisionId === head.draftRevisionId,
   );
-  if (!draft || draft.baseVersion !== 0) {
-    throw httpError(409, "该草稿不是安全模式初始化草稿");
+  if (!draft || draft.baseVersion !== baseVersion) {
+    throw httpError(409, message);
   }
+}
+
+function assertInitializationDraft(snapshot, draftId) {
+  assertDraftBaseVersion(
+    snapshot,
+    draftId,
+    0,
+    "该草稿不是安全模式初始化草稿",
+  );
+}
+
+async function assertActiveMutationAllowed(
+  application,
+  snapshot,
+  expectedActiveVersion,
+) {
+  if (isConfigurationSafeMode(application)) {
+    throw httpError(409, "活动配置接口在安全初始化模式不可用");
+  }
+  const activeVersion = requirePositiveRevision(
+    expectedActiveVersion,
+    "expectedActiveVersion",
+  );
+  if (snapshot.activeVersion !== activeVersion) {
+    throw httpError(409, "活动配置版本已经变化");
+  }
+  if (application.configuration.status.activeVersion !== activeVersion) {
+    throw httpError(409, "活动配置尚未载入当前进程，请先重启服务");
+  }
+  const storedActive = snapshot.versions.find(
+    (version) => version.version === activeVersion,
+  );
+  if (!storedActive) {
+    throw httpError(503, "活动配置版本状态不完整");
+  }
+  const storedBinding = {
+    version: activeVersion,
+    configurationDigest: storedActive.configurationDigest,
+  };
+  const runtimeBinding = {
+    version: activeVersion,
+    configurationDigest: canonicalJsonDigest(application.config),
+  };
+  const reportedRuntimeStatus = await readConfigurationRuntimeStatus(application);
+  const runtimeMode = effectiveConfigurationRuntimeMode(
+    reportedRuntimeStatus,
+    storedBinding,
+    runtimeBinding,
+  );
+  if (runtimeMode !== "ready") {
+    throw httpError(409, "配置运行时尚未就绪，不能创建新的配置动作");
+  }
+  return activeVersion;
+}
+
+function assertActiveDraft(snapshot, draftId, activeVersion) {
+  assertDraftBaseVersion(
+    snapshot,
+    draftId,
+    activeVersion,
+    "该草稿基于旧活动配置，请创建新草稿",
+  );
 }
 
 function requireExpectedRevision(value) {
@@ -1600,9 +1679,16 @@ export function createDashboardServer(
       ) {
         requireNoQuery(url, "配置草稿创建查询参数无效");
         assertTrustedMutation(request, expectedOrigin, { json: true });
+        const safeMode = isConfigurationSafeMode(application);
         const input = requireExactJsonFields(
           await readJsonBody(request, configurationRequestMaximumBytes),
-          ["expectedStateRevision", "configuration"],
+          safeMode
+            ? ["expectedStateRevision", "configuration"]
+            : [
+                "expectedStateRevision",
+                "expectedActiveVersion",
+                "configuration",
+              ],
           "配置草稿创建请求字段无效",
         );
         const expectedStateRevision = requireNonNegativeRevision(
@@ -1612,22 +1698,37 @@ export function createDashboardServer(
         const reader = requireApplicationPort(
           application.configuration,
           "reader",
-          ["readSnapshot"],
-          "版本化配置读取端口未启用",
+          ["readAuthoritySnapshot"],
+          "配置权限读取端口未启用",
         );
-        const snapshot = await reader.readSnapshot();
-        assertInitializationMutationAllowed(application, snapshot);
+        const snapshot = await reader.readAuthoritySnapshot();
+        let activeVersion = null;
+        if (safeMode) {
+          assertInitializationMutationAllowed(application, snapshot);
+        } else {
+          activeVersion = await assertActiveMutationAllowed(
+            application,
+            snapshot,
+            input.expectedActiveVersion,
+          );
+        }
+        const createMethod = safeMode
+          ? "createInitializationDraft"
+          : "createDraft";
         const draftManager = requireApplicationPort(
           application.configuration,
           "draftManager",
-          ["createInitializationDraft"],
-          "配置初始化草稿写入端口未启用",
+          [createMethod],
+          "配置草稿写入端口未启用",
         );
-        const draft = await draftManager.createInitializationDraft({
+        const draft = await draftManager[createMethod]({
           configuration: input.configuration,
           expectedStateRevision,
           proposedBy: "owner:local",
         });
+        if (!safeMode && draft.baseVersion !== activeVersion) {
+          throw httpError(503, "配置草稿活动版本绑定无效");
+        }
         sendJson(response, 201, {
           draft: projectConfigurationDraft(draft),
         });
@@ -1639,13 +1740,21 @@ export function createDashboardServer(
       if (request.method === "PUT" && configurationDraftMutation) {
         requireNoQuery(url, "配置草稿修订查询参数无效");
         assertTrustedMutation(request, expectedOrigin, { json: true });
+        const safeMode = isConfigurationSafeMode(application);
         const input = requireExactJsonFields(
           await readJsonBody(request, configurationRequestMaximumBytes),
-          [
-            "expectedDraftRevision",
-            "expectedStateRevision",
-            "configuration",
-          ],
+          safeMode
+            ? [
+                "expectedDraftRevision",
+                "expectedStateRevision",
+                "configuration",
+              ]
+            : [
+                "expectedDraftRevision",
+                "expectedStateRevision",
+                "expectedActiveVersion",
+                "configuration",
+              ],
           "配置草稿修订请求字段无效",
         );
         const draftId = configurationResourceId(configurationDraftMutation[1]);
@@ -1660,17 +1769,26 @@ export function createDashboardServer(
         const reader = requireApplicationPort(
           application.configuration,
           "reader",
-          ["readSnapshot"],
-          "版本化配置读取端口未启用",
+          ["readAuthoritySnapshot"],
+          "配置权限读取端口未启用",
         );
-        const snapshot = await reader.readSnapshot();
-        assertInitializationMutationAllowed(application, snapshot);
-        assertInitializationDraft(snapshot, draftId);
+        const snapshot = await reader.readAuthoritySnapshot();
+        if (safeMode) {
+          assertInitializationMutationAllowed(application, snapshot);
+          assertInitializationDraft(snapshot, draftId);
+        } else {
+          const activeVersion = await assertActiveMutationAllowed(
+            application,
+            snapshot,
+            input.expectedActiveVersion,
+          );
+          assertActiveDraft(snapshot, draftId, activeVersion);
+        }
         const draftManager = requireApplicationPort(
           application.configuration,
           "draftManager",
           ["reviseDraft"],
-          "配置初始化草稿写入端口未启用",
+          "配置草稿写入端口未启用",
         );
         const draft = await draftManager.reviseDraft({
           draftId,
@@ -1684,19 +1802,26 @@ export function createDashboardServer(
         });
         return;
       }
-      const configurationInitializationRoute = url.pathname.match(
+      const configurationDraftActionRoute = url.pathname.match(
         /^\/api\/configuration\/drafts\/([^/]+)\/(preview|request-confirmation)$/,
       );
-      if (request.method === "POST" && configurationInitializationRoute) {
-        requireNoQuery(url, "配置初始化请求查询参数无效");
+      if (request.method === "POST" && configurationDraftActionRoute) {
+        requireNoQuery(url, "配置草稿请求查询参数无效");
         assertTrustedMutation(request, expectedOrigin, { json: true });
+        const safeMode = isConfigurationSafeMode(application);
         const input = requireExactJsonFields(
           await readJsonBody(request),
-          ["draftRevision", "expectedStateRevision"],
-          "配置初始化请求字段无效",
+          safeMode
+            ? ["draftRevision", "expectedStateRevision"]
+            : [
+                "draftRevision",
+                "expectedStateRevision",
+                "expectedActiveVersion",
+              ],
+          "配置草稿请求字段无效",
         );
         const draftId = configurationResourceId(
-          configurationInitializationRoute[1],
+          configurationDraftActionRoute[1],
         );
         const draftRevision = requirePositiveRevision(
           input.draftRevision,
@@ -1709,38 +1834,116 @@ export function createDashboardServer(
         const reader = requireApplicationPort(
           application.configuration,
           "reader",
-          ["readSnapshot"],
-          "版本化配置读取端口未启用",
+          ["readAuthoritySnapshot"],
+          "配置权限读取端口未启用",
         );
-        const snapshot = await reader.readSnapshot();
-        assertInitializationMutationAllowed(application, snapshot);
-        assertInitializationDraft(snapshot, draftId);
+        const snapshot = await reader.readAuthoritySnapshot();
+        let expectedActiveVersion = null;
+        if (safeMode) {
+          assertInitializationMutationAllowed(application, snapshot);
+          assertInitializationDraft(snapshot, draftId);
+        } else {
+          expectedActiveVersion = await assertActiveMutationAllowed(
+            application,
+            snapshot,
+            input.expectedActiveVersion,
+          );
+          assertActiveDraft(snapshot, draftId, expectedActiveVersion);
+        }
         const requestBinding = {
           draftId,
           draftRevision,
           expectedStateRevision,
+          ...(safeMode ? {} : { expectedActiveVersion }),
         };
-        if (configurationInitializationRoute[2] === "preview") {
+        const previewMethod = safeMode
+          ? "prepareInitialization"
+          : "prepareDraftActivation";
+        const requestMethod = safeMode
+          ? "requestInitialization"
+          : "requestDraftActivation";
+        if (configurationDraftActionRoute[2] === "preview") {
           const simulator = requireApplicationPort(
             application.configuration,
             "simulator",
-            ["prepareInitialization"],
-            "配置初始化预览端口未启用",
+            [previewMethod],
+            "配置影响预览端口未启用",
           );
           sendJson(
             response,
             200,
-            await simulator.prepareInitialization(requestBinding),
+            await simulator[previewMethod](requestBinding),
           );
         } else {
           const requester = requireApplicationPort(
             application.configuration,
             "confirmationRequester",
-            ["requestInitialization"],
-            "配置初始化确认请求端口未启用",
+            [requestMethod],
+            "配置确认请求端口未启用",
           );
           sendJson(response, 200, {
-            request: await requester.requestInitialization(requestBinding),
+            request: await requester[requestMethod](requestBinding),
+          });
+        }
+        return;
+      }
+      const configurationRollbackRoute = url.pathname.match(
+        /^\/api\/configuration\/versions\/([^/]+)\/rollback\/(preview|request-confirmation)$/,
+      );
+      if (request.method === "POST" && configurationRollbackRoute) {
+        requireNoQuery(url, "配置回滚请求查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const rawTargetVersion = configurationRollbackRoute[1];
+        if (!/^[1-9][0-9]*$/.test(rawTargetVersion)) {
+          throw httpError(400, "targetVersion 无效");
+        }
+        const targetVersion = requirePositiveRevision(
+          Number(rawTargetVersion),
+          "targetVersion",
+        );
+        const input = requireExactJsonFields(
+          await readJsonBody(request),
+          ["expectedStateRevision", "expectedActiveVersion"],
+          "配置回滚请求字段无效",
+        );
+        const expectedStateRevision = requireNonNegativeRevision(
+          input.expectedStateRevision,
+          "expectedStateRevision",
+        );
+        const reader = requireApplicationPort(
+          application.configuration,
+          "reader",
+          ["readAuthoritySnapshot"],
+          "配置权限读取端口未启用",
+        );
+        const snapshot = await reader.readAuthoritySnapshot();
+        const expectedActiveVersion = await assertActiveMutationAllowed(
+          application,
+          snapshot,
+          input.expectedActiveVersion,
+        );
+        const requestBinding = {
+          targetVersion,
+          expectedStateRevision,
+          expectedActiveVersion,
+        };
+        if (configurationRollbackRoute[2] === "preview") {
+          const simulator = requireApplicationPort(
+            application.configuration,
+            "simulator",
+            ["prepareRollback"],
+            "配置回滚预览端口未启用",
+          );
+          sendJson(response, 200, await simulator.prepareRollback(requestBinding));
+        } else {
+          const requester = requireApplicationPort(
+            application.configuration,
+            "confirmationRequester",
+            ["requestRollback"],
+            "配置回滚确认请求端口未启用",
+          );
+          sendJson(response, 200, {
+            request: await requester.requestRollback(requestBinding),
           });
         }
         return;

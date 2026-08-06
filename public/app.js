@@ -2,11 +2,34 @@ import {
   configurationImpactCategories,
   createConfigurationFetch,
   isCurrentConfigurationRequest,
+  normalizeConfigurationBinding,
+  sameConfigurationBinding,
 } from "./configuration-view-support.js";
+import { createConfirmationDialogOwnership } from "./confirmation-dialog-support.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 
 const configurationFetch = createConfigurationFetch({ timeoutMs: 45_000 });
+const configurationActivationActions = Object.freeze({
+  initialize_from_draft: Object.freeze({
+    eyebrow: "INITIALIZATION",
+    subject: "draft",
+    subjectLabel: "初始化草稿",
+    initialVersion: true,
+  }),
+  activate_draft: Object.freeze({
+    eyebrow: "ACTIVATION",
+    subject: "draft",
+    subjectLabel: "激活草稿",
+    initialVersion: false,
+  }),
+  activate_rollback: Object.freeze({
+    eyebrow: "ROLLBACK",
+    subject: "version",
+    subjectLabel: "回滚目标",
+    initialVersion: false,
+  }),
+});
 
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
@@ -18,6 +41,10 @@ const dialogContent = document.querySelector("#dialog-content");
 const detailCloseButton = dialog.querySelector(".dialog-close");
 const confirmationDialog = document.querySelector("#confirmation-dialog");
 const confirmationContent = document.querySelector("#confirmation-content");
+const confirmationCloseButton = confirmationDialog.querySelector(
+  ".confirmation-close",
+);
+const confirmationDialogOwnership = createConfirmationDialogOwnership();
 const pageTitle = document.querySelector("#page-title");
 
 let dashboard = null;
@@ -76,8 +103,10 @@ let lastAppliedConfigurationRequest = 0;
 let configurationAbortController = null;
 let configurationEditorValue = "";
 let configurationEditorDirty = false;
+let configurationEditorStale = false;
 let configurationEditorBinding = null;
 let configurationEditorError = "";
+let configurationOperationError = "";
 let configurationPreview = null;
 let configurationOperationPending = false;
 let configurationNotice = "";
@@ -717,53 +746,37 @@ function sameConfigurationRevision(left, right) {
 }
 
 function currentConfigurationBinding() {
-  const draft = initializationDraft();
+  const draft = configurationDraft();
   return {
     expectedStateRevision: configurationStateRevision(),
+    expectedActiveVersion: configurationActiveVersion(),
     draftId: typeof draft?.draftId === "string" ? draft.draftId : null,
     draftRevision: Number.isSafeInteger(draft?.revision) ? draft.revision : null,
   };
 }
 
-function sameConfigurationBinding(left, right) {
-  return Boolean(
-    left &&
-      right &&
-      left.expectedStateRevision === right.expectedStateRevision &&
-      left.draftId === right.draftId &&
-      left.draftRevision === right.draftRevision,
-  );
-}
-
 function currentPreviewBinding() {
   const preview = plainRecord(configurationPreview?.preview) ||
     plainRecord(configurationPreview);
-  if (!preview) return null;
-  return {
-    expectedStateRevision: preview.expectedStateRevision,
-    draftId: preview.draftId,
-    draftRevision: preview.draftRevision,
-  };
+  return normalizeConfigurationBinding(preview);
 }
 
-function initializationDraft() {
-  const drafts = Array.isArray(configurationState?.drafts)
-    ? configurationState.drafts.filter(plainRecord)
+function configurationDraft(state = configurationState) {
+  const drafts = Array.isArray(state?.drafts)
+    ? state.drafts.filter(plainRecord)
     : [];
-  return (
-    drafts.find((draft) => draft.baseVersion === 0) ||
-    drafts.find((draft) => draft.kind === "configuration.initialize") ||
-    drafts[0] ||
-    null
-  );
+  const baseVersion = configurationStatus(state).safeMode === true
+    ? 0
+    : configurationActiveVersion(state);
+  return drafts.find((draft) => draft.baseVersion === baseVersion) || null;
 }
 
-function storedActiveConfiguration() {
-  return plainRecord(configurationState?.storedActive);
+function storedActiveConfiguration(state = configurationState) {
+  return plainRecord(state?.storedActive);
 }
 
 function configurationDocumentCandidate() {
-  const draft = initializationDraft();
+  const draft = configurationDraft();
   const runtime = plainRecord(configurationState?.runtimeEffective);
   const stored = storedActiveConfiguration();
   const candidates = [
@@ -775,22 +788,33 @@ function configurationDocumentCandidate() {
   return candidates.map(plainRecord).find(Boolean) || null;
 }
 
-function configurationActiveVersion() {
+function configurationActiveVersion(state = configurationState) {
   const candidates = [
-    storedActiveConfiguration()?.version,
-    configurationStatus().activeVersion,
+    storedActiveConfiguration(state)?.version,
+    configurationStatus(state).activeVersion,
   ];
   return candidates.find(
     (value) => Number.isSafeInteger(value) && value >= 1,
   ) ?? null;
 }
 
-function configurationRequiresRestart() {
+function configurationRequiresRestart(state = configurationState) {
   return (
-    configurationState?.pendingRestart === true ||
-    plainRecord(configurationState?.pendingRestart) !== null ||
-    (configurationStatus().safeMode === true &&
-      configurationActiveVersion() !== null)
+    state?.pendingRestart === true ||
+    plainRecord(state?.pendingRestart) !== null ||
+    (configurationStatus(state).safeMode === true &&
+      configurationActiveVersion(state) !== null)
+  );
+}
+
+function sameConfigurationRuntimeState(left, right) {
+  const leftStatus = configurationStatus(left);
+  const rightStatus = configurationStatus(right);
+  return (
+    leftStatus.safeMode === rightStatus.safeMode &&
+    leftStatus.runtimeMode === rightStatus.runtimeMode &&
+    configurationActiveVersion(left) === configurationActiveVersion(right) &&
+    configurationRequiresRestart(left) === configurationRequiresRestart(right)
   );
 }
 
@@ -862,9 +886,14 @@ function configurationPreviewMarkup() {
   if (!configurationPreview) return "";
   const preview = plainRecord(configurationPreview.preview) || configurationPreview;
   const impact = plainRecord(preview.impact) || {};
+  const title = {
+    "configuration.initialize": "初始化影响预览",
+    "configuration.activate": "下一版本影响预览",
+    "configuration.rollback": `回滚到 v${preview.targetVersion ?? "?"} 的影响预览`,
+  }[preview.kind] || "配置影响预览";
   return `<section class="configuration-preview" aria-labelledby="configuration-preview-title">
     <div class="section-heading">
-      <h2 id="configuration-preview-title">初始化影响预览</h2>
+      <h2 id="configuration-preview-title">${escapeHtml(title)}</h2>
       <span>只显示路径，不展示敏感配置值</span>
     </div>
     ${configurationImpactMarkup(impact)}
@@ -872,6 +901,87 @@ function configurationPreviewMarkup() {
       <div><dt>配置摘要</dt><dd><code>${escapeHtml(preview.documentDigest || "未提供")}</code></dd></div>
       <div><dt>验证摘要</dt><dd><code>${escapeHtml(preview.validationDigest || "未提供")}</code></dd></div>
     </dl>
+  </section>`;
+}
+
+function configurationAuthorityBinding(
+  binding = currentConfigurationBinding(),
+) {
+  if (
+    configurationStatus().safeMode === true &&
+    binding.expectedActiveVersion === null
+  ) {
+    return {};
+  }
+  const expectedActiveVersion = binding.expectedActiveVersion;
+  if (!Number.isSafeInteger(expectedActiveVersion)) {
+    throw new Error("活动配置版本不可用，请重新读取后再试。");
+  }
+  return { expectedActiveVersion };
+}
+
+function configurationRollbackBinding(targetVersion) {
+  if (!Number.isSafeInteger(targetVersion) || targetVersion < 1) {
+    throw new Error("回滚目标版本无效。");
+  }
+  return {
+    expectedStateRevision: configurationStateRevision(),
+    expectedActiveVersion: configurationActiveVersion(),
+    targetVersion,
+  };
+}
+
+function configurationVersionSourceLabel(source) {
+  return {
+    bootstrap: "启动导入",
+    initialization: "安全初始化",
+    draft: "草稿激活",
+    rollback: "回滚生成",
+  }[source] || "版本变更";
+}
+
+function configurationVersionsMarkup(activeVersion, actionsEnabled) {
+  const versions = Array.isArray(configurationState?.versions)
+    ? configurationState.versions.filter(plainRecord)
+    : [];
+  const audit = Array.isArray(configurationState?.audit)
+    ? configurationState.audit.filter(plainRecord)
+    : [];
+  if (!versions.length && !audit.length) return "";
+  const previewBinding = currentPreviewBinding();
+  const versionRows = versions.map((version) => {
+    const versionNumber = Number(version.version);
+    const isActive = versionNumber === activeVersion;
+    const rollbackBinding = isActive
+      ? null
+      : configurationRollbackBinding(versionNumber);
+    const rollbackPreviewed = rollbackBinding &&
+      sameConfigurationBinding(previewBinding, rollbackBinding);
+    return `<li class="configuration-version-row">
+      <div>
+        <strong>v${escapeHtml(versionNumber)}</strong>
+        <span>${escapeHtml(configurationVersionSourceLabel(version.source))}${version.rollbackOf ? ` · 来自 v${escapeHtml(version.rollbackOf)}` : ""}</span>
+        <small>${escapeHtml(version.activatedAt || "时间未知")} · <code>${escapeHtml(version.configurationDigest || "无摘要")}</code></small>
+      </div>
+      ${isActive
+        ? '<span class="status-pill status-active">当前 Active</span>'
+        : `<div class="configuration-version-actions">
+            <button type="button" class="secondary-button" aria-label="预览回滚到 v${versionNumber}" data-configuration-rollback-preview="${versionNumber}" ${configurationOperationPending || !actionsEnabled ? "disabled" : ""}>预览回滚</button>
+            <button type="button" aria-label="请求回滚到 v${versionNumber} 的确认" data-configuration-rollback-request="${versionNumber}" ${configurationOperationPending || !actionsEnabled || !rollbackPreviewed ? "disabled" : ""}>请求回滚确认</button>
+          </div>`}
+    </li>`;
+  }).join("");
+  const auditRows = audit.slice(0, 12).map((entry) => `<li>
+    <strong>${escapeHtml(entry.kind || "配置事件")}</strong>
+    <span>revision ${escapeHtml(entry.stateRevision ?? "?")} · ${escapeHtml(entry.occurredAt || "时间未知")}</span>
+  </li>`).join("");
+  return `<section class="configuration-history" aria-labelledby="configuration-history-title">
+    <div class="section-heading">
+      <h2 id="configuration-history-title">版本与审计</h2>
+      <span>最近 ${versions.length} 个版本 · ${audit.length} 条审计</span>
+    </div>
+    <ol class="configuration-version-list">${versionRows}</ol>
+    ${auditRows ? `<details class="configuration-audit"><summary>查看最近审计记录</summary><ol>${auditRows}</ol></details>` : ""}
   </section>`;
 }
 
@@ -887,16 +997,20 @@ function configurationView() {
   const safeMode = status.safeMode === true;
   const activeVersion = configurationActiveVersion();
   const stateRevision = configurationStateRevision();
-  const draft = initializationDraft();
+  const draft = configurationDraft();
   const draftId = typeof draft?.draftId === "string" ? draft.draftId : null;
   const draftRevision = Number.isSafeInteger(draft?.revision) ? draft.revision : null;
   const initializationOpen = safeMode && activeVersion === null;
+  const activeEditingOpen =
+    !safeMode && activeVersion !== null && status.runtimeMode === "ready";
+  const editingOpen = initializationOpen || activeEditingOpen;
   const migrationError = configurationErrorText(status.migrationError);
   const runtime = configurationRuntimePresentation();
   const runtimeNotice = runtime.notice || (
     configurationRequiresRestart() ? "已保存，重启服务后生效" : ""
   );
   const notice = runtimeNotice || configurationNotice;
+  const operationNotice = !runtimeNotice && Boolean(configurationNotice);
   const noticeClass = runtime.tone === "error"
     ? "configuration-runtime-error"
     : runtime.tone === "warning"
@@ -907,29 +1021,37 @@ function configurationView() {
     : activeVersion === null
       ? "未初始化"
       : `已保存 v${activeVersion}`;
+  const activationPreviewReady =
+    !configurationEditorDirty &&
+    sameConfigurationBinding(
+      currentPreviewBinding(),
+      currentConfigurationBinding(),
+    );
 
-  const editor = initializationOpen
+  const editor = editingOpen
     ? configurationEditorBinding !== null
       ? `<form class="configuration-editor" id="configuration-editor-form" novalidate>
-          <label for="configuration-document">初始化配置（JSON）</label>
-          <p id="configuration-document-help" class="configuration-help">先保存本地草稿，再预览影响并加入统一确认队列。页面不会直接激活配置。</p>
+          <label for="configuration-document">${initializationOpen ? "初始化配置" : `基于 v${activeVersion} 的下一版本配置`}（JSON）</label>
+          <p id="configuration-document-help" class="configuration-help">先保存本地草稿，再预览逐项影响并加入统一确认队列。页面不会直接激活或回滚配置。</p>
           <textarea id="configuration-document" name="configuration" spellcheck="false" aria-describedby="configuration-document-help${configurationEditorError ? " configuration-document-error" : ""}" aria-invalid="${configurationEditorError ? "true" : "false"}">${escapeHtml(configurationEditorValue)}</textarea>
           <p id="configuration-document-error" class="configuration-inline-error" role="alert" ${configurationEditorError ? "" : "hidden"}>${escapeHtml(configurationEditorError)}</p>
           <div class="configuration-actions">
-            <button type="submit" ${configurationOperationPending ? "disabled" : ""}>${draftId ? "保存新修订" : "保存初始化草稿"}</button>
-            <button type="button" class="secondary-button" data-configuration-preview ${configurationOperationPending ? "disabled" : ""}>预览影响</button>
-            <button type="button" class="secondary-button" data-configuration-request ${configurationOperationPending ? "disabled" : ""}>请求确认</button>
+            <button type="submit" ${configurationOperationPending || configurationEditorStale ? "disabled" : ""}>${draftId ? "保存新修订" : initializationOpen ? "保存初始化草稿" : "保存下一版本草稿"}</button>
+            <button type="button" class="secondary-button" data-configuration-preview ${configurationOperationPending || configurationEditorStale ? "disabled" : ""}>预览影响</button>
+            <button type="button" class="secondary-button" data-configuration-request ${configurationOperationPending || configurationEditorStale || !activationPreviewReady ? "disabled" : ""}>请求激活确认</button>
+            ${configurationEditorStale ? '<button type="button" class="secondary-button" data-configuration-reset>放弃本地编辑并载入最新配置</button>' : ""}
           </div>
         </form>`
-      : `<div class="configuration-inline-error" role="alert">服务端没有提供可编辑的规范化配置。请重新读取配置状态，不能用空对象初始化。</div>`
+      : `<div class="configuration-inline-error" role="alert">服务端没有提供可编辑的规范化配置。请重新读取配置状态，不能用空对象创建草稿。</div>`
     : `<div class="configuration-locked">
         <strong>${activeVersion === null ? "当前不可编辑" : `活动配置 v${activeVersion}`}</strong>
-        <p>${safeMode ? "初始化版本已写入本地存储；当前进程仍保持安全模式。" : "在线草稿激活和回滚尚未开放，避免旧运行时继续使用过期权限。"}</p>
+        <p>${safeMode ? "初始化版本已写入本地存储；重启后才会进入 Active 配置模式。" : "配置运行时当前不可确认，系统保持封闭。"}</p>
       </div>`;
 
   return `<div class="configuration-panel">
-    ${notice ? `<div class="${noticeClass}" role="${runtime.tone === "error" ? "alert" : "status"}"><strong>${escapeHtml(notice)}</strong>${runtime.detail ? `<span>${escapeHtml(runtime.detail)}</span>` : ""}</div>` : ""}
+    ${notice ? `<div class="${noticeClass}" ${operationNotice ? "data-configuration-operation-notice" : ""} role="${runtime.tone === "error" ? "alert" : "status"}"><strong>${escapeHtml(notice)}</strong>${runtime.detail ? `<span>${escapeHtml(runtime.detail)}</span>` : ""}</div>` : ""}
     ${configurationLoadError ? `<div class="configuration-inline-error" role="alert">${escapeHtml(configurationLoadError)}</div>` : ""}
+    ${configurationOperationError ? `<div class="configuration-inline-error" data-configuration-operation-error role="alert">${escapeHtml(configurationOperationError)}</div>` : ""}
     <section class="configuration-status" aria-labelledby="configuration-status-title">
       <div class="configuration-status-heading">
         <div>
@@ -938,17 +1060,18 @@ function configurationView() {
         </div>
         <span class="status-pill ${initializationOpen ? "status-waiting_user" : "status-active"}">${escapeHtml(statusLabel)}</span>
       </div>
-      <p>${initializationOpen ? "当前没有 Active 配置。只有你确认的初始化草稿可以写入 v1，员工和外部动作保持关闭。" : "这里展示存储状态与当前进程实际使用状态；普通在线激活暂未开放。"}</p>
+      <p>${initializationOpen ? "当前没有 Active 配置。只有你确认的初始化草稿可以写入 v1，员工和外部动作保持关闭。" : "这里展示存储状态与当前进程实际使用状态；任何新版本或回滚都必须先预览，再由你逐项确认。"}</p>
       <dl class="configuration-summary">
         <div><dt>存储版本</dt><dd>${activeVersion === null ? "尚无 Active" : `v${activeVersion}`}</dd></div>
         <div><dt>状态修订</dt><dd>${stateRevision ?? "未知"}</dd></div>
-        <div><dt>初始化草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
+        <div><dt>当前草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
         <div><dt>运行时</dt><dd>${escapeHtml(runtime.label)}</dd></div>
       </dl>
       ${migrationError ? `<p class="configuration-migration-error"><strong>启动配置未导入：</strong>${escapeHtml(migrationError)}</p>` : ""}
     </section>
     ${editor}
     ${configurationPreviewMarkup()}
+    ${configurationVersionsMarkup(activeVersion, activeEditingOpen)}
   </div>`;
 }
 
@@ -1036,22 +1159,7 @@ function bindConfigurationView() {
   form?.addEventListener("submit", handleConfigurationSave);
   form?.querySelector("#configuration-document")?.addEventListener(
     "input",
-    (event) => {
-      configurationEditorValue = event.currentTarget.value;
-      configurationEditorDirty = true;
-      configurationEditorError = "";
-      configurationPreview = null;
-      event.currentTarget.setAttribute("aria-invalid", "false");
-      event.currentTarget.setAttribute(
-        "aria-describedby",
-        "configuration-document-help",
-      );
-      const error = form.querySelector("#configuration-document-error");
-      if (error) {
-        error.hidden = true;
-        error.textContent = "";
-      }
-    },
+    handleConfigurationEditorInput,
   );
   content
     .querySelector("[data-configuration-preview]")
@@ -1062,6 +1170,52 @@ function bindConfigurationView() {
   content
     .querySelector("[data-configuration-reload]")
     ?.addEventListener("click", () => void loadConfiguration());
+  content
+    .querySelector("[data-configuration-reset]")
+    ?.addEventListener("click", resetConfigurationEditor);
+  content
+    .querySelectorAll("[data-configuration-rollback-preview]")
+    .forEach((button) =>
+      button.addEventListener("click", handleConfigurationRollbackPreview),
+    );
+  content
+    .querySelectorAll("[data-configuration-rollback-request]")
+    .forEach((button) =>
+      button.addEventListener("click", handleConfigurationRollbackRequest),
+    );
+}
+
+function handleConfigurationEditorInput(event) {
+  configurationEditorValue = event.currentTarget.value;
+  configurationEditorDirty = true;
+  configurationEditorError = "";
+  configurationOperationError = "";
+  invalidateConfigurationPreviewUi();
+  event.currentTarget.setAttribute("aria-invalid", "false");
+  event.currentTarget.setAttribute(
+    "aria-describedby",
+    "configuration-document-help",
+  );
+  const error = content.querySelector("#configuration-document-error");
+  if (error) {
+    error.hidden = true;
+    error.textContent = "";
+  }
+}
+
+function invalidateConfigurationPreviewUi() {
+  configurationPreview = null;
+  configurationNotice = "";
+  content.querySelector(".configuration-preview")?.remove();
+  content.querySelector("[data-configuration-operation-error]")?.remove();
+  content.querySelector("[data-configuration-operation-notice]")?.remove();
+  content
+    .querySelectorAll(
+      "[data-configuration-request], [data-configuration-rollback-request]",
+    )
+    .forEach((button) => {
+      button.disabled = true;
+    });
 }
 
 function parsedConfigurationDocument() {
@@ -1078,11 +1232,16 @@ function parsedConfigurationDocument() {
 }
 
 function requiredConfigurationBinding() {
-  const expectedStateRevision = configurationStateRevision();
+  const binding = currentConfigurationBinding();
+  const expectedStateRevision = binding.expectedStateRevision;
   if (!Number.isSafeInteger(expectedStateRevision)) {
     throw new Error("配置状态修订不可用，请重新读取后再试。");
   }
-  return { expectedStateRevision, draft: initializationDraft() };
+  return {
+    expectedStateRevision,
+    draft: configurationDraft(),
+    ...configurationAuthorityBinding(binding),
+  };
 }
 
 function requiredConfigurationEditorBinding() {
@@ -1093,27 +1252,56 @@ function requiredConfigurationEditorBinding() {
   return binding;
 }
 
+function resetConfigurationEditor() {
+  const editable = configurationDocumentCandidate();
+  if (!editable) {
+    configurationEditorError = "服务端没有提供可载入的规范化配置。";
+    render();
+    return;
+  }
+  configurationEditorValue = JSON.stringify(editable, null, 2);
+  configurationEditorDirty = false;
+  configurationEditorStale = false;
+  configurationEditorBinding = currentConfigurationBinding();
+  configurationEditorError = "";
+  configurationOperationError = "";
+  configurationPreview = null;
+  configurationNotice = "已载入最新配置，请重新核对后保存";
+  render();
+  content.querySelector("#configuration-document")?.focus();
+}
+
 async function configurationResponseError(response, fallback) {
   const payload = await response.json().catch(() => null);
   const detail = configurationErrorText(payload?.error);
   return new Error(detail || `${fallback}（${response.status}）`);
 }
 
-async function runConfigurationOperation(operation) {
+async function runConfigurationOperation(
+  operation,
+  { editorError = true, focusSelector = null } = {},
+) {
   if (configurationOperationPending) return;
   configurationOperationPending = true;
   configurationEditorError = "";
+  configurationOperationError = "";
   if (currentView === "configuration") render();
   try {
     await operation();
   } catch (error) {
-    configurationEditorError = error.message;
+    if (editorError) {
+      configurationEditorError = error.message;
+    } else {
+      configurationOperationError = error.message;
+    }
   } finally {
     configurationOperationPending = false;
     if (currentView === "configuration") {
       render();
       if (configurationEditorError) {
         content.querySelector("#configuration-document")?.focus();
+      } else if (configurationOperationError && focusSelector) {
+        content.querySelector(focusSelector)?.focus();
       }
     }
   }
@@ -1125,11 +1313,13 @@ async function handleConfigurationSave(event) {
   configurationEditorDirty = true;
   await runConfigurationOperation(async () => {
     const configuration = parsedConfigurationDocument();
+    const editorBinding = requiredConfigurationEditorBinding();
     const {
       expectedStateRevision,
       draftId,
       draftRevision: expectedDraftRevision,
-    } = requiredConfigurationEditorBinding();
+    } = editorBinding;
+    const authorityBinding = configurationAuthorityBinding(editorBinding);
     if (draftId && !Number.isSafeInteger(expectedDraftRevision)) {
       throw new Error("草稿修订绑定无效，请刷新页面后再试。");
     }
@@ -1145,14 +1335,24 @@ async function handleConfigurationSave(event) {
         },
         body: JSON.stringify(
           draftId
-            ? { expectedDraftRevision, expectedStateRevision, configuration }
-            : { expectedStateRevision, configuration },
+            ? {
+                expectedDraftRevision,
+                expectedStateRevision,
+                ...authorityBinding,
+                configuration,
+              }
+            : {
+                expectedStateRevision,
+                ...authorityBinding,
+                configuration,
+              },
         ),
       },
     );
     if (response.status === 409) {
-      await loadConfiguration();
-      throw new Error("配置状态已有更新。为避免覆盖他人修改，请复制当前内容并刷新页面后重新核对。");
+      await loadConfiguration({ renderView: false });
+      configurationEditorStale = true;
+      throw new Error("配置状态已有更新。本地内容已保留供复制；请放弃本地编辑并载入最新配置，再重新核对修改。");
     }
     if (!response.ok) {
       throw await configurationResponseError(response, "保存配置草稿失败");
@@ -1160,20 +1360,23 @@ async function handleConfigurationSave(event) {
     await response.json();
     configurationEditorValue = JSON.stringify(configuration, null, 2);
     configurationEditorDirty = false;
+    configurationEditorStale = false;
     configurationPreview = null;
-    configurationNotice = "初始化草稿已保存";
-    await loadConfiguration();
+    configurationNotice = configurationStatus().safeMode === true
+      ? "初始化草稿已保存"
+      : "下一版本草稿已保存";
+    await loadConfiguration({ renderView: false });
   });
 }
 
 async function handleConfigurationPreview() {
   await runConfigurationOperation(async () => {
-    const { expectedStateRevision, draft } = requiredConfigurationBinding();
+    const { draft, ...requestBinding } = requiredConfigurationBinding();
     if (
       typeof draft?.draftId !== "string" ||
       !Number.isSafeInteger(draft.revision)
     ) {
-      throw new Error("请先保存初始化草稿，再预览影响。");
+      throw new Error("请先保存配置草稿，再预览影响。");
     }
     if (configurationEditorDirty) {
       throw new Error("编辑内容尚未保存。请先保存新修订，再预览影响。");
@@ -1188,12 +1391,12 @@ async function handleConfigurationPreview() {
         },
         body: JSON.stringify({
           draftRevision: draft.revision,
-          expectedStateRevision,
+          ...requestBinding,
         }),
       },
     );
     if (response.status === 409) {
-      await loadConfiguration();
+      await loadConfiguration({ renderView: false });
       throw new Error("草稿或配置状态已经变化。请根据最新修订重新预览。");
     }
     if (!response.ok) {
@@ -1206,12 +1409,12 @@ async function handleConfigurationPreview() {
 
 async function handleConfigurationRequest() {
   await runConfigurationOperation(async () => {
-    const { expectedStateRevision, draft } = requiredConfigurationBinding();
+    const { draft, ...requestBinding } = requiredConfigurationBinding();
     if (
       typeof draft?.draftId !== "string" ||
       !Number.isSafeInteger(draft.revision)
     ) {
-      throw new Error("请先保存并预览初始化草稿。");
+      throw new Error("请先保存并预览配置草稿。");
     }
     if (
       configurationEditorDirty ||
@@ -1233,26 +1436,120 @@ async function handleConfigurationRequest() {
         },
         body: JSON.stringify({
           draftRevision: draft.revision,
-          expectedStateRevision,
+          ...requestBinding,
         }),
       },
     );
     if (response.status === 409) {
-      await loadConfiguration();
+      await loadConfiguration({ renderView: false });
       throw new Error("草稿或配置状态已经变化。请重新预览后再请求确认。");
     }
     if (!response.ok) {
       throw await configurationResponseError(response, "请求配置确认失败");
     }
     await response.json();
-    configurationNotice = "初始化配置已加入确认队列";
+    configurationNotice = configurationStatus().safeMode === true
+      ? "初始化配置已加入确认队列"
+      : "下一版本配置已加入确认队列";
     try {
-      await refreshConfirmationQueue({ showConfirmation: false });
+      await refreshConfirmationQueue({
+        showConfirmation: false,
+        renderView: false,
+      });
     } catch (error) {
       statusBanner.hidden = false;
       statusBanner.textContent = `${error.message}。请求已经提交，页面会自动重试读取确认队列。`;
     }
     queueMicrotask(showNextConfirmation);
+  });
+}
+
+async function handleConfigurationRollbackPreview(event) {
+  const targetVersion = Number(
+    event.currentTarget.dataset.configurationRollbackPreview,
+  );
+  await runConfigurationOperation(async () => {
+    const binding = configurationRollbackBinding(targetVersion);
+    if (
+      !Number.isSafeInteger(binding.expectedStateRevision) ||
+      !Number.isSafeInteger(binding.expectedActiveVersion)
+    ) {
+      throw new Error("配置版本绑定不可用，请重新读取后再试。");
+    }
+    const response = await configurationFetch(
+      `/api/configuration/versions/${targetVersion}/rollback/preview`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify({
+          expectedStateRevision: binding.expectedStateRevision,
+          expectedActiveVersion: binding.expectedActiveVersion,
+        }),
+      },
+    );
+    if (response.status === 409) {
+      await loadConfiguration({ renderView: false });
+      throw new Error("活动配置或回滚目标已经变化，请重新预览。");
+    }
+    if (!response.ok) {
+      throw await configurationResponseError(response, "预览配置回滚失败");
+    }
+    configurationPreview = await response.json();
+    configurationNotice = `已预览回滚到 v${targetVersion} 的影响`;
+  }, {
+    editorError: false,
+    focusSelector: `[data-configuration-rollback-preview="${targetVersion}"]`,
+  });
+}
+
+async function handleConfigurationRollbackRequest(event) {
+  const targetVersion = Number(
+    event.currentTarget.dataset.configurationRollbackRequest,
+  );
+  await runConfigurationOperation(async () => {
+    const binding = configurationRollbackBinding(targetVersion);
+    if (!sameConfigurationBinding(currentPreviewBinding(), binding)) {
+      throw new Error("请先查看该目标版本的最新回滚影响预览。");
+    }
+    const response = await configurationFetch(
+      `/api/configuration/versions/${targetVersion}/rollback/request-confirmation`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify({
+          expectedStateRevision: binding.expectedStateRevision,
+          expectedActiveVersion: binding.expectedActiveVersion,
+        }),
+      },
+    );
+    if (response.status === 409) {
+      await loadConfiguration({ renderView: false });
+      throw new Error("活动配置或回滚目标已经变化，请重新预览后再确认。");
+    }
+    if (!response.ok) {
+      throw await configurationResponseError(response, "请求配置回滚确认失败");
+    }
+    await response.json();
+    configurationNotice = `回滚到 v${targetVersion} 的请求已加入确认队列`;
+    try {
+      await refreshConfirmationQueue({
+        showConfirmation: false,
+        renderView: false,
+      });
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = `${error.message}。请求已经提交，页面会自动重试读取确认队列。`;
+    }
+    queueMicrotask(showNextConfirmation);
+  }, {
+    editorError: false,
+    focusSelector: `[data-configuration-rollback-request="${targetVersion}"]`,
   });
 }
 
@@ -1324,12 +1621,16 @@ function showEmployeeJob(job) {
   dialog.showModal();
 }
 
-function applyDashboard(nextDashboard, sequence) {
+function applyDashboard(
+  nextDashboard,
+  sequence,
+  { renderView = true } = {},
+) {
   if (!nextDashboard || sequence < lastAppliedRequest) return false;
   lastAppliedRequest = sequence;
   dashboard = nextDashboard;
   updateChrome();
-  render();
+  if (renderView) render();
   return true;
 }
 
@@ -1864,6 +2165,56 @@ function confirmationKey(kind, item) {
   return `${kind}\u0000${item.id}\u0000${item.headRefOid || ""}`;
 }
 
+function setConfirmationButtonsDisabled(disabled) {
+  confirmationContent.querySelectorAll("button").forEach((control) => {
+    control.disabled = disabled;
+  });
+}
+
+function beginConfirmationSubmission(setContentControlsDisabled) {
+  const owner = confirmationDialogOwnership.current();
+  if (!confirmationDialogOwnership.beginSubmission(owner)) return null;
+  setContentControlsDisabled(true);
+  confirmationCloseButton.disabled = true;
+  return owner;
+}
+
+function restoreConfirmationSubmission(owner, setContentControlsDisabled) {
+  if (!confirmationDialogOwnership.finishSubmission(owner)) return false;
+  setContentControlsDisabled(false);
+  confirmationCloseButton.disabled = false;
+  return true;
+}
+
+function closeConfirmationSubmission(owner) {
+  if (!confirmationDialogOwnership.ownsSubmission(owner)) return false;
+  return closeConfirmationDialog(owner);
+}
+
+function beginExternalConfirmationSubmission() {
+  return beginConfirmationSubmission(setConfirmationButtonsDisabled);
+}
+
+function restoreExternalConfirmation(owner) {
+  return restoreConfirmationSubmission(owner, setConfirmationButtonsDisabled);
+}
+
+function closeConfirmationDialog(
+  owner = confirmationDialogOwnership.current(),
+) {
+  if (owner !== null && !confirmationDialogOwnership.close(owner)) return false;
+  confirmationCloseButton.disabled = false;
+  if (confirmationDialog.open) confirmationDialog.close();
+  return true;
+}
+
+function closeExternalConfirmation(owner) {
+  if (!closeConfirmationSubmission(owner)) return false;
+  activeConfirmationKey = "";
+  activeExternalConfirmation = null;
+  return true;
+}
+
 function pendingConfirmations() {
   if (!confirmationQueueLoaded) return [];
   const externalActions =
@@ -2089,29 +2440,35 @@ function showChangePackageApplicationConfirmation(entry, remaining) {
     .addEventListener("click", handleExternalConfirmation);
 }
 
-function showConfigurationActivationConfirmation(entry, remaining) {
+function showConfigurationActivationConfirmation(entry, remaining, descriptor) {
   const item = structuredClone(entry.item);
   activeInternalAttention = null;
   activeExternalConfirmation = item;
   const payload = item.display?.payload || {};
   const action = payload.action || {};
   const impact = payload.impact || {};
+  const nextVersion = descriptor.initialVersion
+    ? 1
+    : Number(action.expectedActiveVersion) + 1;
+  const subjectValue = descriptor.subject === "version"
+    ? `v${action.targetVersion ?? "未知"}`
+    : `${action.draftId || "未知"} · r${action.draftRevision ?? "未知"}`;
   const operation = item.retryable ? "retry" : "approve";
   const actionLabel = item.retryable
-    ? "确认并重试保存初始化配置"
-    : item.display?.actionLabel || "确认并保存初始化配置";
+    ? "确认并重试配置变更"
+    : item.display?.actionLabel || "确认并激活配置";
   confirmationDialog.setAttribute(
     "aria-labelledby",
     "configuration-confirmation-title",
   );
   confirmationContent.innerHTML = `
     <article class="confirmation external-confirmation configuration-confirmation">
-      <p class="eyebrow">CONFIGURATION INITIALIZATION / ${remaining} LEFT</p>
-      <h2 id="configuration-confirmation-title">${escapeHtml(item.display?.title || "确认初始化版本化配置")}</h2>
-      <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将只把初始化配置保存为本地 v1")}</p>
+      <p class="eyebrow">CONFIGURATION ${descriptor.eyebrow} / ${remaining} LEFT</p>
+      <h2 id="configuration-confirmation-title">${escapeHtml(item.display?.title || "确认版本化配置变更")}</h2>
+      <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将把当前摘要绑定的配置保存为新版本")}</p>
       <dl class="detail-grid confirmation-grid">
-        <dt>保存版本</dt><dd>v1</dd>
-        <dt>初始化草稿</dt><dd>${escapeHtml(action.draftId || "未知")} · r${escapeHtml(action.draftRevision ?? "未知")}</dd>
+        <dt>保存版本</dt><dd>v${escapeHtml(Number.isSafeInteger(nextVersion) ? nextVersion : "未知")}</dd>
+        <dt>${descriptor.subjectLabel}</dt><dd>${escapeHtml(subjectValue)}</dd>
         <dt>状态修订</dt><dd>${escapeHtml(action.expectedStateRevision ?? "未知")}</dd>
         <dt>配置摘要</dt><dd><code>${escapeHtml(action.documentDigest || "未知")}</code></dd>
         <dt>验证摘要</dt><dd><code>${escapeHtml(action.validationDigest || "未知")}</code></dd>
@@ -2123,10 +2480,10 @@ function showConfigurationActivationConfirmation(entry, remaining) {
       ${listMarkup(item.display?.evidence)}
       <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
         <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
-        <button class="secondary" data-external-operation="reject">驳回，不保存</button>
+        <button class="secondary" data-external-operation="reject">驳回，不激活</button>
         <button class="secondary wide" data-external-operation="later">稍后再看</button>
       </div>
-      <p class="confirmation-note">批准只会保存当前摘要绑定的初始化配置，不会自动重启服务，也不会直接启用员工、代码执行器或 GitHub 动作。</p>
+      <p class="confirmation-note">批准只会保存当前摘要、状态修订和版本绑定的配置变更；不会自动重启服务，也不会绕过岗位、代码执行器或 GitHub 动作的独立权限。</p>
     </article>`;
   confirmationContent
     .querySelector(".confirmation-actions")
@@ -2152,11 +2509,22 @@ function showUnsupportedExternalConfirmation(entry, remaining) {
 }
 
 function showExternalActionConfirmation(entry, remaining) {
+  const configurationActionType = entry.item?.display?.payload?.action?.type;
+  const configurationAction = Object.hasOwn(
+    configurationActivationActions,
+    configurationActionType,
+  )
+    ? configurationActivationActions[configurationActionType]
+    : null;
   if (
     entry.item?.kind === "local.configuration-activate" &&
-    entry.item?.display?.payload?.action?.type === "initialize_from_draft"
+    configurationAction
   ) {
-    showConfigurationActivationConfirmation(entry, remaining);
+    showConfigurationActivationConfirmation(
+      entry,
+      remaining,
+      configurationAction,
+    );
     return;
   }
   if (entry.item?.kind === "local.code-job-create") {
@@ -2234,7 +2602,8 @@ function setInternalButtonsDisabled(disabled) {
 async function submitInternalAttention(operation, answer) {
   const item = activeInternalAttention;
   if (!item || !["answer", "reject", "later"].includes(operation)) return;
-  setInternalButtonsDisabled(true);
+  const submissionOwner = beginConfirmationSubmission(setInternalButtonsDisabled);
+  if (submissionOwner === null) return;
   try {
     const response = await fetch(
       `/api/attention/internal/${encodeURIComponent(item.requestId)}/${operation}`,
@@ -2252,9 +2621,10 @@ async function submitInternalAttention(operation, answer) {
       },
     );
     if (response.status === 409) {
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+      if (!closeConfirmationSubmission(submissionOwner)) return;
       activeInternalAttention = null;
       activeConfirmationKey = "";
-      confirmationDialog.close();
       invalidateConfirmationQueueSnapshot();
       statusBanner.hidden = false;
       statusBanner.textContent = "员工请示内容已经变化，请查看最新问题后重新答复。";
@@ -2264,12 +2634,13 @@ async function submitInternalAttention(operation, answer) {
     }
     if (!response.ok) throw new Error(`员工请示处理失败（${response.status}）`);
     await response.json();
+    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
     if (operation === "later") {
       rememberDeferredConfirmation(activeConfirmationKey);
     }
+    if (!closeConfirmationSubmission(submissionOwner)) return;
     activeInternalAttention = null;
     activeConfirmationKey = "";
-    confirmationDialog.close();
     invalidateConfirmationQueueSnapshot();
     if (operation === "later") {
       await refreshAfterDeferral();
@@ -2279,9 +2650,14 @@ async function submitInternalAttention(operation, answer) {
     if (currentView === "work") await workView.load();
     if (operation !== "later") queueMicrotask(showNextConfirmation);
   } catch (error) {
+    if (!restoreConfirmationSubmission(
+      submissionOwner,
+      setInternalButtonsDisabled,
+    )) {
+      return;
+    }
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
-    setInternalButtonsDisabled(false);
   }
 }
 
@@ -2348,6 +2724,8 @@ function showNextConfirmation() {
   const pending = pendingConfirmations();
   const [entry] = pending;
   if (!entry) return;
+  confirmationDialogOwnership.open();
+  confirmationCloseButton.disabled = false;
   activeConfirmationKey = entry.key;
   confirmationDialog.removeAttribute("aria-labelledby");
   if (entry.kind === "external_action") {
@@ -2375,14 +2753,15 @@ async function handleConfirmation(event) {
   if (decision === "later") {
     rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
-    confirmationDialog.close();
+    closeConfirmationDialog();
     await refreshAfterDeferral();
     return;
   }
 
-  confirmationContent.querySelectorAll("button").forEach((candidate) => {
-    candidate.disabled = true;
-  });
+  const submissionOwner = beginConfirmationSubmission(
+    setConfirmationButtonsDisabled,
+  );
+  if (submissionOwner === null) return;
   const sequence = ++requestSequence;
   try {
     const response = await fetch("/api/pr-responsibility/confirm", {
@@ -2394,24 +2773,32 @@ async function handleConfirmation(event) {
       body: JSON.stringify({ id: itemId, actionState: decision, headRefOid }),
     });
     if (response.status === 409) {
-      applyDashboard(await fetchDashboard(), sequence);
-      confirmationDialog.close();
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+      const nextDashboard = await fetchDashboard();
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+      applyDashboard(nextDashboard, sequence);
+      if (!closeConfirmationSubmission(submissionOwner)) return;
       statusBanner.hidden = false;
       statusBanner.textContent = "PR 已出现新提交，请根据最新事实重新确认。";
       queueMicrotask(showNextConfirmation);
       return;
     }
     if (!response.ok) throw new Error(`确认保存失败（${response.status}）`);
-    applyDashboard(await response.json(), sequence);
+    const nextDashboard = await response.json();
+    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+    applyDashboard(nextDashboard, sequence);
+    if (!closeConfirmationSubmission(submissionOwner)) return;
     activeConfirmationKey = "";
-    confirmationDialog.close();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
+    if (!restoreConfirmationSubmission(
+      submissionOwner,
+      setConfirmationButtonsDisabled,
+    )) {
+      return;
+    }
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
-    confirmationContent.querySelectorAll("button").forEach((candidate) => {
-      candidate.disabled = false;
-    });
   }
 }
 
@@ -2423,15 +2810,14 @@ async function handleExternalConfirmation(event) {
     rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
     activeExternalConfirmation = null;
-    confirmationDialog.close();
+    closeConfirmationDialog();
     await refreshAfterDeferral();
     return;
   }
   const item = activeExternalConfirmation;
   if (!item || !["approve", "retry", "reject"].includes(operation)) return;
-  confirmationContent.querySelectorAll("button").forEach((candidate) => {
-    candidate.disabled = true;
-  });
+  const submissionOwner = beginExternalConfirmationSubmission();
+  if (submissionOwner === null) return;
   try {
     const response = await fetch(
       `/api/confirmations/${encodeURIComponent(item.id)}/${operation}`,
@@ -2452,12 +2838,11 @@ async function handleExternalConfirmation(event) {
       },
     );
     if (response.status === 409) {
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       invalidateConfirmationQueueSnapshot();
-      confirmationDialog.close();
+      if (!closeExternalConfirmation(submissionOwner)) return;
       statusBanner.hidden = false;
       statusBanner.textContent = "确认内容或目标状态已经变化，请查看最新内容后重新确认。";
-      activeExternalConfirmation = null;
-      activeConfirmationKey = "";
       try {
         await refreshConfirmationQueue({ showConfirmation: false });
         if (item.kind === "local.configuration-activate") {
@@ -2474,6 +2859,7 @@ async function handleExternalConfirmation(event) {
     }
     if (!response.ok) throw new Error(`外部动作确认失败（${response.status}）`);
     const confirmationResult = await response.json();
+    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
     const configurationCompleted =
       item.kind === "local.configuration-activate" &&
       ["approve", "retry"].includes(operation) &&
@@ -2484,18 +2870,14 @@ async function handleExternalConfirmation(event) {
       configurationEditorDirty = false;
     }
     invalidateConfirmationQueueSnapshot();
-    activeConfirmationKey = "";
-    activeExternalConfirmation = null;
-    confirmationDialog.close();
+    if (!closeExternalConfirmation(submissionOwner)) return;
     await load({ showConfirmation: false });
     if (configurationCompleted) await loadConfiguration();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
+    if (!restoreExternalConfirmation(submissionOwner)) return;
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
-    confirmationContent.querySelectorAll("button").forEach((candidate) => {
-      candidate.disabled = false;
-    });
   }
 }
 
@@ -2507,13 +2889,14 @@ async function handleReviewDraftDecision(event) {
   if (decision === "later") {
     rememberDeferredConfirmation(activeConfirmationKey);
     activeConfirmationKey = "";
-    confirmationDialog.close();
+    closeConfirmationDialog();
     await refreshAfterDeferral();
     return;
   }
-  confirmationContent.querySelectorAll("button").forEach((candidate) => {
-    candidate.disabled = true;
-  });
+  const submissionOwner = beginConfirmationSubmission(
+    setConfirmationButtonsDisabled,
+  );
+  if (submissionOwner === null) return;
   const sequence = ++requestSequence;
   try {
     const response = await fetch("/api/pr-review-jobs/decide", {
@@ -2530,9 +2913,11 @@ async function handleReviewDraftDecision(event) {
       }),
     });
     if (response.status === 409) {
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       const nextDashboard = await fetchDashboard();
+      if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       if (nextDashboard) applyDashboard(nextDashboard, sequence);
-      confirmationDialog.close();
+      if (!closeConfirmationSubmission(submissionOwner)) return;
       statusBanner.hidden = false;
       statusBanner.textContent = "员工草稿对应的 PR 已更新，请查看最新结果。";
       activeConfirmationKey = "";
@@ -2540,16 +2925,21 @@ async function handleReviewDraftDecision(event) {
       return;
     }
     if (!response.ok) throw new Error(`草稿确认失败（${response.status}）`);
-    applyDashboard(await response.json(), sequence);
+    const nextDashboard = await response.json();
+    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+    applyDashboard(nextDashboard, sequence);
+    if (!closeConfirmationSubmission(submissionOwner)) return;
     activeConfirmationKey = "";
-    confirmationDialog.close();
     queueMicrotask(showNextConfirmation);
   } catch (error) {
+    if (!restoreConfirmationSubmission(
+      submissionOwner,
+      setConfirmationButtonsDisabled,
+    )) {
+      return;
+    }
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
-    confirmationContent.querySelectorAll("button").forEach((candidate) => {
-      candidate.disabled = false;
-    });
   }
 }
 
@@ -2596,17 +2986,54 @@ function updateConfigurationChrome() {
     </div>`;
 }
 
-function applyConfigurationState(nextState, sequence) {
+function renderConfigurationPreservingEditorFocus() {
+  const editor = content.querySelector("#configuration-document");
+  const selection = document.activeElement === editor
+    ? {
+        start: editor.selectionStart,
+        end: editor.selectionEnd,
+        direction: editor.selectionDirection,
+      }
+    : null;
+  render();
+  if (!selection) return;
+  const nextEditor = content.querySelector("#configuration-document");
+  if (!nextEditor) return;
+  const maximum = nextEditor.value.length;
+  nextEditor.focus();
+  nextEditor.setSelectionRange(
+    Math.min(selection.start, maximum),
+    Math.min(selection.end, maximum),
+    selection.direction || undefined,
+  );
+}
+
+function applyConfigurationState(
+  nextState,
+  sequence,
+  { renderView = true } = {},
+) {
   if (!plainRecord(nextState) || sequence < lastAppliedConfigurationRequest) {
     return false;
   }
   const unchanged = sameConfigurationRevision(configurationState, nextState);
+  const runtimeUnchanged = sameConfigurationRuntimeState(
+    configurationState,
+    nextState,
+  );
+  const hadLoadError = Boolean(configurationLoadError);
   lastAppliedConfigurationRequest = sequence;
   configurationLoadError = "";
   configurationState = nextState;
   if (unchanged) {
-    updateConfigurationChrome();
-    if (currentView === "configuration") render();
+    if (!runtimeUnchanged) updateConfigurationChrome();
+    if (
+      renderView &&
+      currentView === "configuration" &&
+      (!runtimeUnchanged || hadLoadError)
+    ) {
+      renderConfigurationPreservingEditorFocus();
+    }
     return true;
   }
   const editable = configurationDocumentCandidate();
@@ -2620,23 +3047,25 @@ function applyConfigurationState(nextState, sequence) {
   if (editable && !configurationEditorDirty) {
     configurationEditorValue = JSON.stringify(editable, null, 2);
     configurationEditorDirty = false;
+    configurationEditorStale = false;
     configurationEditorBinding = binding;
   }
   updateConfigurationChrome();
   if (
+    renderView &&
     !configurationAutoSelected &&
     !dashboard &&
     configurationStatus().safeMode === true
   ) {
     configurationAutoSelected = true;
     activateView("configuration");
-  } else if (currentView === "configuration") {
+  } else if (renderView && currentView === "configuration") {
     render();
   }
   return true;
 }
 
-async function loadConfiguration() {
+async function loadConfiguration({ renderView = true } = {}) {
   const sequence = ++configurationRequestSequence;
   configurationAbortController?.abort();
   const controller = new AbortController();
@@ -2660,7 +3089,7 @@ async function loadConfiguration() {
     ) {
       return false;
     }
-    applyConfigurationState(nextState, sequence);
+    applyConfigurationState(nextState, sequence, { renderView });
     return true;
   } catch (error) {
     if (error?.name === "AbortError") return false;
@@ -2674,8 +3103,12 @@ async function loadConfiguration() {
     ) {
       return false;
     }
-    configurationLoadError = error.message;
-    if (currentView === "configuration") render();
+    const nextError = error.message;
+    const errorChanged = configurationLoadError !== nextError;
+    configurationLoadError = nextError;
+    if (renderView && errorChanged && currentView === "configuration") {
+      renderConfigurationPreservingEditorFocus();
+    }
     return false;
   } finally {
     if (configurationAbortController === controller) {
@@ -2697,11 +3130,14 @@ async function fetchConfirmationQueue() {
   return response.json();
 }
 
-async function refreshConfirmationQueue({ showConfirmation = true } = {}) {
+async function refreshConfirmationQueue({
+  showConfirmation = true,
+  renderView = true,
+} = {}) {
   const sequence = ++confirmationRequestSequence;
   const nextState = await fetchConfirmationQueue();
   const applied = applyConfirmationQueue(nextState, sequence);
-  if (applied && dashboard) render();
+  if (applied && dashboard && renderView) render();
   if (showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
 }
@@ -2731,10 +3167,12 @@ async function load({ showConfirmation = true } = {}) {
     applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
     if (showConfirmation) queueMicrotask(showNextConfirmation);
     if (!nextDashboard) {
-      render();
+      if (currentView !== "configuration") render();
       return;
     }
-    applyDashboard(nextDashboard, sequence);
+    applyDashboard(nextDashboard, sequence, {
+      renderView: currentView !== "configuration",
+    });
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
   } catch (error) {
@@ -2750,7 +3188,10 @@ async function refresh() {
     try {
       await Promise.all([
         loadConfiguration(),
-        refreshConfirmationQueue({ showConfirmation: false }),
+        refreshConfirmationQueue({
+          showConfirmation: false,
+          renderView: false,
+        }),
       ]);
       queueMicrotask(showNextConfirmation);
     } catch (error) {
@@ -2820,22 +3261,21 @@ document.querySelectorAll(".nav-item").forEach((button) => {
 
 refreshButton.addEventListener("click", refresh);
 document.querySelector(".dialog-close").addEventListener("click", closeDetailDialog);
-document
-  .querySelector(".confirmation-close")
-  .addEventListener("click", async () => {
-    if (activeInternalAttention) {
-      await submitInternalAttention("later", { type: "later" });
-      return;
-    }
-    if (activeConfirmationKey) {
-      rememberDeferredConfirmation(activeConfirmationKey);
-      activeConfirmationKey = "";
-    }
-    activeInternalAttention = null;
-    activeExternalConfirmation = null;
-    confirmationDialog.close();
-    await refreshAfterDeferral();
-  });
+confirmationCloseButton.addEventListener("click", async () => {
+  if (confirmationCloseButton.disabled) return;
+  if (activeInternalAttention) {
+    await submitInternalAttention("later", { type: "later" });
+    return;
+  }
+  if (activeConfirmationKey) {
+    rememberDeferredConfirmation(activeConfirmationKey);
+    activeConfirmationKey = "";
+  }
+  activeInternalAttention = null;
+  activeExternalConfirmation = null;
+  closeConfirmationDialog();
+  await refreshAfterDeferral();
+});
 dialog.addEventListener("click", (event) => {
   if (event.target === dialog) closeDetailDialog();
 });
@@ -2848,7 +3288,12 @@ dialog.addEventListener("close", () => {
 });
 confirmationDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
-  document.querySelector(".confirmation-close").click();
+  confirmationCloseButton.click();
+});
+confirmationDialog.addEventListener("close", () => {
+  if (confirmationDialog.open) return;
+  confirmationDialogOwnership.handleCloseEvent({ dialogOpen: false });
+  confirmationCloseButton.disabled = false;
 });
 document.addEventListener("keydown", (event) => {
   if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;

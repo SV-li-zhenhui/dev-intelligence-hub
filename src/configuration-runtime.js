@@ -123,11 +123,14 @@ export async function createConfigurationRuntime(
       safeMode = true;
       startupConfiguration = normalizeConfigurationDocument(fallbackConfiguration);
     }
-    const snapshot = await service.readSnapshot();
+    const snapshot = await service.readAuthoritySnapshot();
     const reader = port(
       service,
       [
         "readSnapshot",
+        "readActivationReconciliationSnapshot",
+        "readAuthoritySnapshot",
+        "readControlPlaneSnapshot",
         "readActive",
         "readVersion",
         "readDraft",
