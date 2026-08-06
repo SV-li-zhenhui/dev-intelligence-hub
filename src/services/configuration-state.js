@@ -6,7 +6,8 @@ import {
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 export const CONFIGURATION_STATE_KEY = "configuration-state";
-export const CONFIGURATION_STATE_SCHEMA_VERSION = 1;
+export const CONFIGURATION_STATE_SCHEMA_VERSION = 2;
+const LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION = 1;
 
 export const DEFAULT_CONFIGURATION_LIMITS = Object.freeze({
   maximumVersions: 256,
@@ -474,6 +475,7 @@ export function normalizeConfigurationLimits(overrides = {}) {
 export function emptyConfigurationState() {
   return {
     schemaVersion: CONFIGURATION_STATE_SCHEMA_VERSION,
+    schemaMigrations: [],
     revision: 0,
     migration: {
       status: "pending",
@@ -766,9 +768,54 @@ export function assertConfigurationCapacity(state, limits) {
   }
 }
 
-export function normalizeConfigurationState(value, limits) {
+function normalizeSchemaMigrations(value) {
+  const migrations = denseArray(
+    value,
+    "configurationState.schemaMigrations",
+    CONFIGURATION_STATE_SCHEMA_VERSION - 1,
+  ).map((entry, index) => {
+    const path = `configurationState.schemaMigrations[${index}]`;
+    const fields = objectFields(entry, path, ["from", "to"]);
+    const from = integer(
+      fields.get("from"),
+      `${path}.from`,
+      LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+      CONFIGURATION_STATE_SCHEMA_VERSION - 1,
+    );
+    const to = integer(
+      fields.get("to"),
+      `${path}.to`,
+      2,
+      CONFIGURATION_STATE_SCHEMA_VERSION,
+    );
+    if (to !== from + 1) throw corrupted(path, "迁移版本不连续");
+    return { from, to };
+  });
+  for (let index = 1; index < migrations.length; index += 1) {
+    if (migrations[index - 1].to !== migrations[index].from) {
+      throw corrupted(
+        "configurationState.schemaMigrations",
+        "迁移历史不连续",
+      );
+    }
+  }
+  if (
+    migrations.length > 0 &&
+    migrations.at(-1).to !== CONFIGURATION_STATE_SCHEMA_VERSION
+  ) {
+    throw corrupted(
+      "configurationState.schemaMigrations",
+      "迁移历史未到达当前版本",
+    );
+  }
+  return migrations;
+}
+
+function normalizeConfigurationStateVersion(value, limits, schemaVersion) {
+  const current = schemaVersion === CONFIGURATION_STATE_SCHEMA_VERSION;
   const fields = objectFields(value, "configurationState", [
     "schemaVersion",
+    ...(current ? ["schemaMigrations"] : []),
     "revision",
     "migration",
     "activeVersion",
@@ -778,14 +825,17 @@ export function normalizeConfigurationState(value, limits) {
     "audit",
     "projectionOutbox",
   ]);
-  if (
-    integer(fields.get("schemaVersion"), "configurationState.schemaVersion", 1, 1) !==
-    CONFIGURATION_STATE_SCHEMA_VERSION
-  ) {
-    throw corrupted("configurationState.schemaVersion");
-  }
+  integer(
+    fields.get("schemaVersion"),
+    "configurationState.schemaVersion",
+    schemaVersion,
+    schemaVersion,
+  );
   const state = {
-    schemaVersion: CONFIGURATION_STATE_SCHEMA_VERSION,
+    schemaVersion,
+    ...(current
+      ? { schemaMigrations: normalizeSchemaMigrations(fields.get("schemaMigrations")) }
+      : {}),
     revision: integer(fields.get("revision"), "configurationState.revision"),
     migration: normalizeMigration(fields.get("migration")),
     activeVersion: nullableInteger(
@@ -870,6 +920,66 @@ export function normalizeConfigurationState(value, limits) {
     throw corrupted("configurationState", "超过容量上限");
   }
   return state;
+}
+
+function declaredConfigurationStateSchemaVersion(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw corrupted("configurationState", "必须是普通对象");
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, "schemaVersion");
+  if (!descriptor?.enumerable || !("value" in descriptor)) {
+    throw corrupted("configurationState.schemaVersion");
+  }
+  return integer(
+    descriptor.value,
+    "configurationState.schemaVersion",
+    LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+  );
+}
+
+export function normalizeConfigurationState(value, limits) {
+  return normalizeConfigurationStateVersion(
+    value,
+    limits,
+    CONFIGURATION_STATE_SCHEMA_VERSION,
+  );
+}
+
+export function migrateConfigurationState(value, limits) {
+  const schemaVersion = declaredConfigurationStateSchemaVersion(value);
+  if (schemaVersion === CONFIGURATION_STATE_SCHEMA_VERSION) {
+    return {
+      migratedFrom: null,
+      state: normalizeConfigurationState(value, limits),
+    };
+  }
+  if (schemaVersion !== LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION) {
+    throw corrupted("configurationState.schemaVersion", "不受支持");
+  }
+  const legacy = normalizeConfigurationStateVersion(
+    value,
+    limits,
+    LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+  );
+  const state = normalizeConfigurationState({
+    ...legacy,
+    schemaVersion: CONFIGURATION_STATE_SCHEMA_VERSION,
+    schemaMigrations: [
+      {
+        from: LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+        to: CONFIGURATION_STATE_SCHEMA_VERSION,
+      },
+    ],
+  }, limits);
+  return {
+    migratedFrom: LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+    state,
+  };
 }
 
 export function configurationStateDigest(state) {

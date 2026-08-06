@@ -8,7 +8,10 @@ import {
   CONFIGURATION_STATE_KEY,
   ConfigurationStore,
 } from "../src/services/configuration-store.js";
-import { configurationContentDigest } from "../src/services/configuration-state.js";
+import {
+  CONFIGURATION_STATE_SCHEMA_VERSION,
+  configurationContentDigest,
+} from "../src/services/configuration-state.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
@@ -151,6 +154,77 @@ function replaceVersionConfiguration(state, versionNumber, replacement) {
     "configuration-outbox",
   );
 }
+
+function legacyConfigurationState(value) {
+  const legacy = clone(value);
+  legacy.schemaVersion = 1;
+  delete legacy.schemaMigrations;
+  return legacy;
+}
+
+test("recovery atomically upgrades legacy configuration state without changing domain history", async () => {
+  const seeded = await importedFixture();
+  const legacy = legacyConfigurationState(seeded.store.value);
+  const store = new MemoryStore(legacy);
+
+  const { configurations } = await readyStore({ store });
+  const recovered = await configurations.readSnapshot();
+
+  assert.equal(CONFIGURATION_STATE_SCHEMA_VERSION, 2);
+  assert.equal(recovered.schemaVersion, 2);
+  assert.deepEqual(recovered.schemaMigrations, [{ from: 1, to: 2 }]);
+  assert.equal(recovered.revision, legacy.revision);
+  assert.deepEqual(recovered.versions, legacy.versions);
+  assert.deepEqual(recovered.draftRevisions, legacy.draftRevisions);
+  assert.deepEqual(recovered.draftHeads, legacy.draftHeads);
+  assert.deepEqual(recovered.audit, legacy.audit);
+  assert.deepEqual(recovered.projectionOutbox, legacy.projectionOutbox);
+  assert.equal(store.writes.length, 1);
+  assert.deepEqual(store.value, recovered);
+});
+
+test("a failed configuration schema upgrade preserves the exact legacy state", async () => {
+  const seeded = await importedFixture();
+  const legacy = legacyConfigurationState(seeded.store.value);
+  const store = new MemoryStore(legacy);
+  store.failNextWrite("before");
+
+  await assert.rejects(
+    readyStore({ store }),
+    assertCode("CONFIGURATION_STATE_MIGRATION_FAILED", 503),
+  );
+  assert.deepEqual(store.value, legacy);
+  assert.equal(store.writes.length, 0);
+});
+
+test("configuration schema upgrade reconciles a lost durable acknowledgement", async () => {
+  const seeded = await importedFixture();
+  const legacy = legacyConfigurationState(seeded.store.value);
+  const store = new MemoryStore(legacy);
+  store.failNextWrite("after");
+
+  const { configurations } = await readyStore({ store });
+  const recovered = await configurations.readSnapshot();
+
+  assert.equal(recovered.schemaVersion, 2);
+  assert.deepEqual(recovered.schemaMigrations, [{ from: 1, to: 2 }]);
+  assert.deepEqual(store.value, recovered);
+  assert.equal(store.writes.length, 1);
+});
+
+test("recovery rejects an unknown future configuration schema without rewriting it", async () => {
+  const seeded = await importedFixture();
+  const future = clone(seeded.store.value);
+  future.schemaVersion = CONFIGURATION_STATE_SCHEMA_VERSION + 1;
+  const store = new MemoryStore(future);
+
+  await assert.rejects(
+    readyStore({ store }),
+    assertCode("CONFIGURATION_STATE_CORRUPTED", 503),
+  );
+  assert.deepEqual(store.value, future);
+  assert.equal(store.writes.length, 0);
+});
 
 test("bootstrap imports once and later file changes cannot replace active authority", async () => {
   const { configurations, store } = await readyStore();

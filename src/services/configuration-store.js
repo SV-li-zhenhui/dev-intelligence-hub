@@ -17,6 +17,7 @@ import {
   DEFAULT_CONFIGURATION_LIMITS,
   emptyConfigurationState,
   identifiedConfigurationRecord,
+  migrateConfigurationState,
   normalizeConfigurationLimits,
   normalizeConfigurationState,
 } from "./configuration-state.js";
@@ -1239,7 +1240,17 @@ export class ConfigurationStore {
       }
       return emptyConfigurationState();
     }
-    const durable = normalizeConfigurationState(stored, this.limits);
+    const recovered = migrateConfigurationState(stored, this.limits);
+    if (recovered.migratedFrom !== null && this.ready) {
+      throw invalid(
+        "CONFIGURATION_STATE_REVISION_CONFLICT",
+        "持久化配置状态回退到旧版结构",
+        409,
+      );
+    }
+    const durable = recovered.migratedFrom === null
+      ? recovered.state
+      : await this.#persistSchemaMigration(recovered.state);
     if (
       this.ready &&
       (durable.revision < this.state.revision ||
@@ -1253,6 +1264,35 @@ export class ConfigurationStore {
       );
     }
     return durable;
+  }
+
+  async #persistSchemaMigration(candidate) {
+    assertConfigurationCapacity(candidate, this.limits);
+    try {
+      await this.store.write(CONFIGURATION_STATE_KEY, candidate);
+      return candidate;
+    } catch (cause) {
+      try {
+        const stored = await this.store.read(CONFIGURATION_STATE_KEY, null);
+        if (stored !== null) {
+          const durable = normalizeConfigurationState(stored, this.limits);
+          if (
+            configurationStateDigest(durable) ===
+            configurationStateDigest(candidate)
+          ) {
+            return durable;
+          }
+        }
+      } catch {
+        // Only the exact upgraded state can prove a lost acknowledgement.
+      }
+      throw configurationStoreError(
+        "CONFIGURATION_STATE_MIGRATION_FAILED",
+        "无法原子升级版本化配置状态，旧状态保持不变",
+        503,
+        cause,
+      );
+    }
   }
 
   #writeTransaction(operation) {
