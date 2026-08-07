@@ -17,6 +17,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  createConflictPreparationBinding,
+} from "../src/domain/conflict-preparation-binding.js";
+import {
   ControlledGitService,
   ControlledGitServiceError,
 } from "../src/services/controlled-git-service.js";
@@ -92,6 +95,7 @@ function resultTreeProtocol({ mode = "100644", type = "blob" } = {}) {
 
 async function fixture(t, {
   mergeOutput = conflictProtocol(),
+  mergeExitCode = 1,
   headRaw = rawModification(ANCESTOR, OURS),
   baseRaw = rawModification(ANCESTOR, THEIRS),
   headNumstat = Buffer.from("1\t1\tsrc/value.js\0"),
@@ -180,7 +184,7 @@ async function fixture(t, {
       }
       if (request.args.includes("merge-tree")) {
         if (mutateGitDuringRun) await writeFile(gitCommand, "changed fake git");
-        return processResult(mergeOutput, { exitCode: 1 });
+        return processResult(mergeOutput, { exitCode: mergeExitCode });
       }
       if (request.args.includes("ls-tree")) {
         return processResult(treeOutput);
@@ -342,6 +346,95 @@ test("verification survives restart and detects manifest or mirror-boundary tamp
     restarted.verifyPreparation({ preparationId: prepared.preparationId }),
     (error) => error?.code === "CONTROLLED_GIT_PREPARATION_TAMPERED",
   );
+});
+
+test("verifies and materializes only the complete sealed conflict binding", async (t) => {
+  const setup = await fixture(t);
+  const prepared = await setup.createService().inspectConflict(
+    inspectionRequest(setup),
+  );
+  const binding = createConflictPreparationBinding({
+    preparation: prepared,
+    gitTarget: gitTarget(),
+  });
+  const restarted = setup.createService();
+
+  assert.deepEqual(
+    await restarted.verifyConflictPreparation({ binding }),
+    binding,
+  );
+
+  const mismatchedBindings = [
+    {
+      ...binding,
+      gitTarget: {
+        ...binding.gitTarget,
+        sourceAccountId: "other-user",
+      },
+    },
+    { ...binding, resultTreeOid: "9".repeat(40) },
+    { ...binding, boundaryDigest: "8".repeat(64) },
+    { ...binding, evidenceDigest: "7".repeat(64) },
+    { ...binding, resultObjectDigest: "6".repeat(64) },
+    {
+      ...binding,
+      conflicts: [{ path: "src/other.js", mode: "100644" }],
+    },
+  ];
+  for (const [index, changed] of mismatchedBindings.entries()) {
+    const rejectedTargetRoot = path.resolve(
+      setup.root,
+      `rejected-bound-code-job-${index}`,
+    );
+    await mkdir(rejectedTargetRoot);
+    await assert.rejects(
+      restarted.materializeConflictPreparationForCodeJob({
+        binding: changed,
+        targetRoot: rejectedTargetRoot,
+      }),
+      (error) =>
+        error?.code === "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+    );
+    assert.deepEqual(await readdir(rejectedTargetRoot), []);
+  }
+
+  const targetRoot = path.resolve(setup.root, "bound-code-job");
+  await mkdir(targetRoot);
+  const receipt = await restarted.materializeConflictPreparationForCodeJob({
+    binding,
+    targetRoot,
+  });
+  assert.equal(receipt.preparationId, binding.preparationId);
+  assert.equal(receipt.resultTreeOid, binding.resultTreeOid);
+  assert.equal(receipt.evidenceDigest, binding.evidenceDigest);
+  assert.equal(receipt.resultObjectDigest, binding.resultObjectDigest);
+  assert.equal(
+    await readFile(path.join(targetRoot, "src", "value.js"), "utf8"),
+    RESULT_CONFLICT_CONTENT.toString("utf8"),
+  );
+
+  const cleanSetup = await fixture(t, {
+    mergeOutput: Buffer.from(`${TREE}\0`),
+    mergeExitCode: 0,
+  });
+  const cleanService = cleanSetup.createService();
+  const cleanPrepared = await cleanService.inspectConflict(
+    inspectionRequest(cleanSetup),
+  );
+  assert.equal(cleanPrepared.status, "clean");
+  const cleanTargetRoot = path.resolve(
+    cleanSetup.root,
+    "rejected-clean-code-job",
+  );
+  await mkdir(cleanTargetRoot);
+  await assert.rejects(
+    cleanService.materializeConflictPreparationForCodeJob({
+      binding: { ...binding, preparationId: cleanPrepared.preparationId },
+      targetRoot: cleanTargetRoot,
+    }),
+    (error) => error?.code === "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+  );
+  assert.deepEqual(await readdir(cleanTargetRoot), []);
 });
 
 test("materializes fixed-label conflict evidence into a new empty code-job target", async (t) => {

@@ -21,6 +21,11 @@ import {
   CodeExecutionPolicy,
   normalizeWorkspacePath,
 } from "../domain/code-execution-policy.js";
+import {
+  createConflictPreparationBinding,
+  normalizeConflictPreparationBinding,
+  sameConflictPreparationBinding,
+} from "../domain/conflict-preparation-binding.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import {
   canonicalJsonDigest,
@@ -1188,6 +1193,49 @@ export class ControlledGitService {
     }
     const manifest = await this.#verifiedManifest(preparationId);
     return publicPreparation(manifest);
+  }
+
+  async verifyConflictPreparation(value) {
+    const fields = exactDataObject(value, ["binding"]);
+    let binding;
+    try {
+      binding = normalizeConflictPreparationBinding(fields.get("binding"));
+    } catch (cause) {
+      throw controlledGitError(
+        "INVALID_CONTROLLED_GIT_REQUEST",
+        "Conflict preparation binding 无效",
+        cause,
+      );
+    }
+    const manifest = await this.#verifiedManifest(binding.preparationId);
+    if (manifest.status !== "conflicted") {
+      throw controlledGitError(
+        "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+        "Conflict preparation binding 与 sealed evidence 不一致",
+      );
+    }
+    const expected = createConflictPreparationBinding({
+      preparation: publicPreparation(manifest),
+      gitTarget: manifest.gitTarget,
+    });
+    if (!sameConflictPreparationBinding(binding, expected)) {
+      throw controlledGitError(
+        "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+        "Conflict preparation binding 与 sealed evidence 不一致",
+      );
+    }
+    return deepFreeze(expected);
+  }
+
+  async materializeConflictPreparationForCodeJob(value) {
+    const fields = exactDataObject(value, ["binding", "targetRoot"]);
+    const binding = await this.verifyConflictPreparation({
+      binding: fields.get("binding"),
+    });
+    return this.materializeForCodeJob({
+      preparationId: binding.preparationId,
+      targetRoot: fields.get("targetRoot"),
+    });
   }
 
   async materializeForCodeJob(value) {

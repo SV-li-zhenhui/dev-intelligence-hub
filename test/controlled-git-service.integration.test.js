@@ -19,6 +19,9 @@ import test from "node:test";
 
 import { GitBareMirrorInspector } from "../src/adapters/git-bare-mirror-inspector.js";
 import {
+  createConflictPreparationBinding,
+} from "../src/domain/conflict-preparation-binding.js";
+import {
   ControlledGitService,
   ControlledGitServiceError,
 } from "../src/services/controlled-git-service.js";
@@ -369,10 +372,14 @@ test(
       prepared.resultTreeOid,
       "src/conflict.txt",
     );
+    const binding = createConflictPreparationBinding({
+      preparation: prepared,
+      gitTarget: setup.request.gitTarget,
+    });
 
     const restarted = serviceFor(gitCommand, setup);
-    const verified = await restarted.verifyPreparation({
-      preparationId: prepared.preparationId,
+    const verified = await restarted.verifyConflictPreparation({
+      binding,
     });
     assert.equal(verified.resultObjectDigest, prepared.resultObjectDigest);
     assert.equal(verified.materialization, "full-tree");
@@ -380,8 +387,8 @@ test(
 
     const workspaceRoot = path.join(setup.root, "workspace");
     await mkdir(workspaceRoot);
-    const receipt = await restarted.materializeForCodeJob({
-      preparationId: prepared.preparationId,
+    const receipt = await restarted.materializeConflictPreparationForCodeJob({
+      binding,
       targetRoot: workspaceRoot,
     });
     assert.equal(receipt.materialization, "full-tree");
