@@ -2399,6 +2399,53 @@ test("a durable complete observation finishes locally after authority revocation
   assert.equal(store.completionRequests[0].changePackageDelivery, true);
 });
 
+test("a durable schema v3 conflict completion keeps its sealed source and opens package delivery", async () => {
+  const inputBinding = conflictInputBinding();
+  const executionSource = conflictExecutionSource(inputBinding);
+  const completeAction = {
+    type: "complete",
+    actionId: "complete-sealed-conflict",
+    expectedWorkspaceRevision: REVISION_A,
+  };
+  const initial = job({
+    grant: grant({
+      schemaVersion: 3,
+      inputBinding,
+      executionSource,
+      writablePaths: ["src/app.js"],
+    }),
+    status: "active",
+    revision: 8,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 1,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [observation(completeAction, {
+        result: { created: [], modified: [], deleted: [] },
+      })],
+      result: null,
+      pause: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor: new FakeExecutor(initial),
+    brainDirectory: brain([]),
+    grantVerifier: verifier([], new Error("durable recovery must not re-enter authority")),
+    changePackageDeliveryEnabled: true,
+  });
+
+  const result = await worker.runCycle();
+
+  assert.equal(result.outcomes[0].status, "completed");
+  assert.equal(store.completionRequests.length, 1);
+  assert.equal(store.completionRequests[0].changePackageDelivery, true);
+  assert.deepEqual(initial.grant.executionSource, executionSource);
+});
+
 test("a durable legacy PR completion recovers locally without opening a new package", async () => {
   const completeAction = {
     type: "complete",

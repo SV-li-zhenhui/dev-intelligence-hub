@@ -9,6 +9,8 @@ import {
 } from "../src/domain/code-job-contract.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   CodeJobChangePackageDispatcher,
@@ -18,22 +20,78 @@ import {
 const WORKSPACE_REVISION = "4".repeat(64);
 const SOURCE_REVISION = "5".repeat(64);
 
-function completedJob() {
-  const grant = createCodeJobGrant({
+function conflictAuthority() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/widgets",
+    baseRefName: "main",
+    baseRefOid: "6".repeat(40),
+    headRepository: "contributor/widgets",
+    headRefName: "fix/retry-race",
+    headRefOid: "1".repeat(40),
+  };
+  const inputBinding = {
     schemaVersion: 2,
+    kind: "pull_request",
+    repository: "acme/widgets",
+    pullRequestNumber: 17,
+    rootItemId: "work-1",
+    workKey: "pull-request-acme-widgets-17",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: gitTarget.headRefOid,
+    eventId: "event-1",
+    eventDigest: "2".repeat(64),
+    inputDigest: "3".repeat(64),
+    gitTarget,
+  };
+  const executionSource = createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "7".repeat(64),
+        status: "conflicted",
+        baseCommitOid: gitTarget.baseRefOid,
+        headCommitOid: gitTarget.headRefOid,
+        mergeBaseOid: "8".repeat(40),
+        resultTreeOid: "9".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "a".repeat(64),
+        evidenceDigest: "b".repeat(64),
+        resultObjectDigest: "c".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget,
+    }),
+  });
+  return { inputBinding, executionSource };
+}
+
+function completedJob({ conflict = false } = {}) {
+  const authority = conflict ? conflictAuthority() : null;
+  const grant = createCodeJobGrant({
+    schemaVersion: conflict ? 3 : 2,
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
     requestedBy: { roleId: "developer", workItemId: "work-1" },
     source: { assignmentId: "assignment-1", eventId: "event-1" },
     subject: {
-      id: "github:issue:acme/widgets#17",
+      id: conflict
+        ? "github:pr:acme/widgets#17"
+        : "github:issue:acme/widgets#17",
       repository: "acme/widgets",
       number: 17,
     },
     repository: "acme/widgets",
     workspaceId: "widgets-local",
-    inputBinding: null,
+    inputBinding: authority?.inputBinding ?? null,
+    ...(authority === null
+      ? {}
+      : { executionSource: authority.executionSource }),
     workspaceAuthorityDigest: "9".repeat(64),
     operation: "modify",
     objective: "Fix the retry race",
@@ -42,7 +100,7 @@ function completedJob() {
     summary: "Fix the retry race",
     reason: "A trusted workflow event requested the change.",
     allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
-    writablePaths: ["src"],
+    writablePaths: conflict ? ["src/app.js"] : ["src"],
     requiredProfiles: [
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
@@ -255,6 +313,26 @@ test("dispatcher exports, creates, and acknowledges each event serially", async 
       packageDigest: manifest.packageDigest,
     });
   }
+});
+
+test("dispatcher delivers a schema v3 event while keeping raw source out of exporter and package drafts", async () => {
+  const event = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob({ conflict: true }),
+  });
+  const setup = fixture([event]);
+
+  const result = await setup.dispatcher.runCycle();
+
+  assert.equal(result.acknowledged, 1);
+  assert.equal(event.schemaVersion, 2);
+  assert.deepEqual(setup.state.exports, [event.exportRequest]);
+  assert.deepEqual(setup.state.drafts[0].grant, { digest: event.grant.digest });
+  assert.equal(
+    JSON.stringify(setup.state.drafts[0]).includes("executionSource"),
+    false,
+  );
 });
 
 test("lost create and ack responses converge through idempotent replay", async (t) => {

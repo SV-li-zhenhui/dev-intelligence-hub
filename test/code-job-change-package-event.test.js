@@ -7,6 +7,8 @@ import {
   createQueuedCodeJob,
   updateCodeJobLifecycle,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   CodeJobChangePackageEventError,
@@ -49,12 +51,46 @@ function pullRequestInputBinding(schemaVersion) {
   };
 }
 
-function completedJob({ inputBindingVersion = null, grantSchemaVersion = 2 } = {}) {
-  const inputBinding = inputBindingVersion === null
+function conflictExecutionSource(inputBinding, conflictPaths = ["src/app.js"]) {
+  return createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "6".repeat(64),
+        status: "conflicted",
+        baseCommitOid: inputBinding.gitTarget.baseRefOid,
+        headCommitOid: inputBinding.gitTarget.headRefOid,
+        mergeBaseOid: "7".repeat(40),
+        resultTreeOid: "8".repeat(40),
+        conflicts: conflictPaths.map((path) => ({ path, mode: "100644" })),
+        boundaryDigest: "9".repeat(64),
+        evidenceDigest: "a".repeat(64),
+        resultObjectDigest: "b".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: inputBinding.gitTarget,
+    }),
+  });
+}
+
+function completedJob({
+  inputBindingVersion = null,
+  grantSchemaVersion = 2,
+  conflictPaths = ["src/app.js"],
+} = {}) {
+  const inputBinding = grantSchemaVersion === 3
+    ? pullRequestInputBinding(2)
+    : inputBindingVersion === null
     ? null
     : pullRequestInputBinding(inputBindingVersion);
+  const executionSource = grantSchemaVersion === 3
+    ? conflictExecutionSource(inputBinding, conflictPaths)
+    : null;
   const grant = createCodeJobGrant({
-    ...(grantSchemaVersion === 2
+    ...(grantSchemaVersion === 3
+      ? { schemaVersion: 3, inputBinding, executionSource }
+      : grantSchemaVersion === 2
       ? { schemaVersion: 2, inputBinding }
       : {}),
     proposalId: "work-intent-proposal-1",
@@ -72,14 +108,22 @@ function completedJob({ inputBindingVersion = null, grantSchemaVersion = 2 } = {
     repository: "acme/widgets",
     workspaceId: "widgets-local",
     workspaceAuthorityDigest: "9".repeat(64),
-    operation: "inspect",
-    objective: "Inspect the retry race",
-    acceptanceCriteria: ["Report the root cause"],
+    operation: grantSchemaVersion === 3 ? "modify" : "inspect",
+    objective: grantSchemaVersion === 3
+      ? "Resolve the sealed conflict"
+      : "Inspect the retry race",
+    acceptanceCriteria: grantSchemaVersion === 3
+      ? ["The exact conflicted file is resolved"]
+      : ["Report the root cause"],
     evidence: [],
     summary: "Inspect the retry race",
     reason: "A trusted workflow event requested diagnosis.",
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.inspect],
-    writablePaths: [],
+    allowedActions: [
+      ...CODE_JOB_ACTIONS_BY_OPERATION[
+        grantSchemaVersion === 3 ? "modify" : "inspect"
+      ],
+    ],
+    writablePaths: grantSchemaVersion === 3 ? conflictPaths : [],
     requiredProfiles: [
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
@@ -225,7 +269,7 @@ test("completed jobs produce a compact, digest-bound change-package event", () =
   assert.deepEqual(normalizeCodeJobChangePackageEvent(event), event);
 });
 
-test("only v2 PR and Issue jobs can create a new change-package event", () => {
+test("v2 PR and Issue eligibility stays strict while legacy jobs remain recovery-only", () => {
   assert.throws(
     () => createCodeJobChangePackageEvent({
       sequence: 1,
@@ -256,6 +300,130 @@ test("only v2 PR and Issue jobs can create a new change-package event", () => {
       error instanceof CodeJobChangePackageEventError &&
       error.message.includes("旧版"),
   );
+});
+
+test("schema v3 conflict jobs produce self-contained v2 events without changing v2 events", () => {
+  const conflictJob = completedJob({ grantSchemaVersion: 3 });
+  const conflictEvent = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: conflictJob,
+  });
+  const ordinaryEvent = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob({ inputBindingVersion: 2 }),
+  });
+
+  assert.equal(conflictEvent.schemaVersion, 2);
+  assert.deepEqual(
+    conflictEvent.executionSource,
+    conflictJob.grant.executionSource,
+  );
+  assert.notEqual(
+    conflictEvent.executionSource,
+    conflictJob.grant.executionSource,
+  );
+  assert.equal(ordinaryEvent.schemaVersion, 1);
+  assert.equal(Object.hasOwn(ordinaryEvent, "executionSource"), false);
+  assert.deepEqual(normalizeCodeJobChangePackageEvent(conflictEvent), conflictEvent);
+});
+
+test("schema v3 event source is mandatory and covered by the event digest", () => {
+  const job = completedJob({ grantSchemaVersion: 3 });
+  const event = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job,
+  });
+
+  const missing = structuredClone(event);
+  delete missing.executionSource;
+  assert.throws(
+    () => normalizeCodeJobChangePackageEvent(missing),
+    CodeJobChangePackageEventError,
+  );
+
+  const changed = structuredClone(event);
+  changed.executionSource.preparationBinding.boundaryDigest = "e".repeat(64);
+  assert.throws(
+    () => normalizeCodeJobChangePackageEvent(changed),
+    CodeJobChangePackageEventError,
+  );
+
+  let proxyTrapCalls = 0;
+  const hostileSource = new Proxy(event.executionSource, {
+    getPrototypeOf() {
+      proxyTrapCalls += 1;
+      return Object.prototype;
+    },
+    ownKeys() {
+      proxyTrapCalls += 1;
+      return Reflect.ownKeys(event.executionSource);
+    },
+  });
+  assert.throws(
+    () => normalizeCodeJobChangePackageEvent({
+      ...event,
+      executionSource: hostileSource,
+    }),
+    CodeJobChangePackageEventError,
+  );
+  assert.equal(proxyTrapCalls, 0);
+});
+
+test("schema v3 event recovery is deterministic and keeps its fixed source authority", () => {
+  const completed = completedJob({ grantSchemaVersion: 3 });
+  const original = createCodeJobChangePackageEvent({
+    sequence: 2,
+    previousDigest: "f".repeat(64),
+    job: completed,
+  });
+  const memoryRecordDigest = "c".repeat(64);
+  const projectedAt = "2026-08-02T06:03:00.000Z";
+  const projected = updateCodeJobLifecycle(completed, {
+    status: "completed",
+    revision: 4,
+    updatedAt: projectedAt,
+    execution: {
+      ...completed.execution,
+      memoryProjection: {
+        jobId: completed.jobId,
+        sourceRecordDigest: completed.recordDigest,
+        sourceRevision: completed.revision,
+        sourceUpdatedAt: completed.updatedAt,
+        memoryRecordId: `memory-${memoryRecordDigest}`,
+        memoryRecordDigest,
+        projectedAt,
+      },
+    },
+  });
+
+  assert.deepEqual(
+    reconstructCodeJobChangePackageEventForRecovery({
+      sequence: original.sequence,
+      previousDigest: original.previousDigest,
+      job: projected,
+    }),
+    original,
+  );
+});
+
+test("schema v3 event envelope accommodates the maximum conflict-source path count", () => {
+  const conflictPaths = Array.from({ length: 32 }, (_, index) => {
+    const suffix = String(index).padStart(2, "0");
+    return `conflict-${suffix}/${"\"".repeat(240)}/${"\"".repeat(240)}-${suffix}.js`;
+  });
+  const event = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob({ grantSchemaVersion: 3, conflictPaths }),
+  });
+  const bytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+
+  assert.ok(bytes > 64 * 1024);
+  assert.ok(bytes <= 96 * 1024);
+  assert.deepEqual(normalizeCodeJobChangePackageEvent(event), event);
 });
 
 test("legacy event identities remain verifiable only for durable recovery", () => {
@@ -392,4 +560,18 @@ test("accessors, sparse data, cycles, extra keys, and oversized values fail clos
     ...event,
     proposal: { ...event.proposal, id: "x".repeat(10_000) },
   }));
+
+  let proxyTrapCalls = 0;
+  const proxy = new Proxy(event, {
+    getPrototypeOf() {
+      proxyTrapCalls += 1;
+      return Object.prototype;
+    },
+    ownKeys() {
+      proxyTrapCalls += 1;
+      return Reflect.ownKeys(event);
+    },
+  });
+  assert.throws(() => normalizeCodeJobChangePackageEvent(proxy));
+  assert.equal(proxyTrapCalls, 0);
 });

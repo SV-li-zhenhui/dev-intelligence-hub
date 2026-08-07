@@ -6,6 +6,8 @@ import {
   createCodeJobGrant,
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
@@ -128,6 +130,64 @@ function legacyPullRequestInputBinding() {
     eventDigest: "2".repeat(64),
     inputDigest: "3".repeat(64),
   };
+}
+
+function conflictPullRequestInputBinding() {
+  return {
+    ...legacyPullRequestInputBinding(),
+    schemaVersion: 2,
+    gitTarget: {
+      schemaVersion: 1,
+      provider: "github",
+      sourceAccountId: "runtime-user",
+      baseRepository: "acme/widgets",
+      baseRefName: "main",
+      baseRefOid: "5".repeat(40),
+      headRepository: "contributor/widgets",
+      headRefName: "fix/retry-race",
+      headRefOid: "1".repeat(40),
+    },
+  };
+}
+
+function conflictGrant() {
+  const inputBinding = conflictPullRequestInputBinding();
+  const executionSource = createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "6".repeat(64),
+        status: "conflicted",
+        baseCommitOid: inputBinding.gitTarget.baseRefOid,
+        headCommitOid: inputBinding.gitTarget.headRefOid,
+        mergeBaseOid: "7".repeat(40),
+        resultTreeOid: "8".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "9".repeat(64),
+        evidenceDigest: "a".repeat(64),
+        resultObjectDigest: "b".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: inputBinding.gitTarget,
+    }),
+  });
+  return grant({
+    schemaVersion: 3,
+    inputBinding,
+    executionSource,
+    subject: {
+      id: "github:pr:acme/widgets#17",
+      repository: "acme/widgets",
+      number: 17,
+    },
+    operation: "modify",
+    objective: "Resolve the exact sealed conflict.",
+    acceptanceCriteria: ["The conflicted file passes its fixed profile."],
+    summary: "Resolve one sealed conflict",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: ["src/app.js"],
+  });
 }
 
 function grant(overrides = {}) {
@@ -2620,6 +2680,63 @@ test("completed package delivery intent is atomic, durable, and idempotent", asy
     await recovered.jobs.readChangePackageDeliveryBatch({ limit: 10 }),
     batch,
   );
+});
+
+test("schema v3 conflict package delivery is self-contained, recoverable, and idempotent", async () => {
+  const fixture = await completedDeliveryFixture({
+    jobApproval: approval({ grant: conflictGrant() }),
+  });
+  const batch = await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 });
+  const [event] = batch.items;
+
+  assert.equal(event.schemaVersion, 2);
+  assert.deepEqual(
+    event.executionSource,
+    fixture.completed.job.grant.executionSource,
+  );
+  const writeCount = fixture.store.writeCount;
+  assert.equal((await fixture.jobs.complete({
+    jobId: fixture.completed.job.jobId,
+    expectedRevision: fixture.observed.job.revision,
+    result: fixture.result,
+    changePackageDelivery: true,
+  })).status, "already");
+  assert.equal(fixture.store.writeCount, writeCount);
+
+  const recovered = await readyStore({ store: fixture.store });
+  assert.deepEqual(
+    await recovered.jobs.readChangePackageDeliveryBatch({ limit: 10 }),
+    batch,
+  );
+});
+
+test("schema v3 recovery rejects a self-consistent event bound to another conflict source", async () => {
+  const fixture = await completedDeliveryFixture({
+    jobApproval: approval({ grant: conflictGrant() }),
+  });
+  const tampered = structuredClone(fixture.store.value);
+  const event = tampered.changePackageDelivery.pending[0];
+  event.executionSource.preparationBinding.boundaryDigest = "e".repeat(64);
+  const { eventId: _eventId, eventDigest: _eventDigest, ...content } = event;
+  event.eventDigest = digestValue(content);
+  event.eventId = `code-job-change-package-event-${event.eventDigest}`;
+  const tamperedStore = new MemoryStore(tampered);
+  let packageReads = 0;
+
+  await assert.rejects(
+    readyStore({
+      store: tamperedStore,
+      changePackageReader: {
+        async get() {
+          packageReads += 1;
+          throw new Error("must not inspect packages for a mismatched source");
+        },
+      },
+    }),
+    (error) => error.code === "CODE_JOB_STATE_CORRUPTED",
+  );
+  assert.equal(packageReads, 0);
+  assert.equal(tamperedStore.writeCount, 0);
 });
 
 test("package delivery chain corruption is rejected before work is served", async () => {

@@ -34,6 +34,7 @@ import {
   normalizeCodeJobChangePackageEvent,
   reconstructCodeJobChangePackageEventForRecovery,
 } from "../domain/code-job-change-package-event.js";
+import { sameCodeExecutionSource } from "../domain/code-execution-source.js";
 import {
   normalizeChangePackageManifest,
 } from "../domain/change-package-contract.js";
@@ -921,9 +922,19 @@ function changePackageEventMatchesJob(event, job) {
       memory.sourceRevision === event.job.revision &&
       memory.sourceRecordDigest === event.job.recordDigest);
   const completion = job.execution.observations.at(-1);
+  const conflictSourceMatches = job.grant.schemaVersion === 3
+    ? event.schemaVersion === 2 &&
+      Object.hasOwn(event, "executionSource") &&
+      sameCodeExecutionSource(
+        event.executionSource,
+        job.grant.executionSource,
+      )
+    : event.schemaVersion === 1 &&
+      !Object.hasOwn(event, "executionSource");
   return (
     job.status === "completed" &&
     sourceMatches &&
+    conflictSourceMatches &&
     event.job.id === job.jobId &&
     event.proposal.id === job.proposal.proposalId &&
     event.proposal.contentDigest === job.proposal.contentDigest &&

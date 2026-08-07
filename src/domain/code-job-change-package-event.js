@@ -1,12 +1,20 @@
+import { types as utilTypes } from "node:util";
+
 import { normalizeCodeJob } from "./code-job-contract.js";
+import {
+  codeExecutionSourceWritablePaths,
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "./code-execution-source.js";
 import { digestValue } from "./code-executor-contract.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const CONTROL_CHARACTER = /\p{Cc}/u;
 const EVENT_PREFIX = "code-job-change-package-event-";
-const MAX_EVENT_BYTES = 4 * 1024;
-const EVENT_KEYS = Object.freeze([
+const MAX_V1_EVENT_BYTES = 4 * 1024;
+const MAX_V2_EVENT_BYTES = 96 * 1024;
+const EVENT_V1_KEYS = Object.freeze([
   "schemaVersion",
   "sequence",
   "previousDigest",
@@ -16,6 +24,11 @@ const EVENT_KEYS = Object.freeze([
   "exportRequest",
   "eventId",
   "eventDigest",
+]);
+const EVENT_V2_KEYS = Object.freeze([
+  ...EVENT_V1_KEYS.slice(0, -2),
+  "executionSource",
+  ...EVENT_V1_KEYS.slice(-2),
 ]);
 
 export class CodeJobChangePackageEventError extends Error {
@@ -39,6 +52,7 @@ function dataEntries(value, name) {
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
     Object.getPrototypeOf(value) !== Object.prototype
   ) {
     throw invalid(`${name} 无效`);
@@ -150,18 +164,24 @@ function normalizeExportRequest(value) {
 
 function eventContent(value) {
   return {
-    schemaVersion: 1,
+    schemaVersion: value.schemaVersion,
     sequence: value.sequence,
     previousDigest: value.previousDigest,
     job: value.job,
     proposal: value.proposal,
     grant: value.grant,
     exportRequest: value.exportRequest,
+    ...(value.schemaVersion === 2
+      ? { executionSource: value.executionSource }
+      : {}),
   };
 }
 
 function assertEventSize(event) {
-  if (Buffer.byteLength(JSON.stringify(event), "utf8") > MAX_EVENT_BYTES) {
+  const maximum = event.schemaVersion === 2
+    ? MAX_V2_EVENT_BYTES
+    : MAX_V1_EVENT_BYTES;
+  if (Buffer.byteLength(JSON.stringify(event), "utf8") > maximum) {
     throw invalid("代码任务 change package 事件过大");
   }
 }
@@ -212,7 +232,11 @@ function normalizeCreationInput(value) {
 function eventForCompletedJob({ job, sequence, previousDigest }) {
   const observation = completeObservation(job);
   const source = completionSource(job);
+  const executionSource = job.grant.schemaVersion === 3
+    ? normalizeCodeExecutionSource(job.grant.executionSource)
+    : undefined;
   const content = eventContent({
+    schemaVersion: executionSource === undefined ? 1 : 2,
     sequence,
     previousDigest,
     job: {
@@ -230,6 +254,7 @@ function eventForCompletedJob({ job, sequence, previousDigest }) {
       completedActionId: observation.actionId,
       expectedWorkspaceRevision: job.execution.workspaceRevision,
     },
+    ...(executionSource === undefined ? {} : { executionSource }),
   });
   const eventDigest = digestValue(content);
   const event = {
@@ -242,12 +267,37 @@ function eventForCompletedJob({ job, sequence, previousDigest }) {
 }
 
 export function canCreateCodeJobChangePackageEvent(job) {
-  return (
-    job.grant.schemaVersion === 2 &&
-    Object.hasOwn(job.grant, "inputBinding") &&
-    (job.grant.inputBinding === null ||
-      job.grant.inputBinding.schemaVersion === 2)
-  );
+  const grant = job?.grant;
+  if (
+    grant?.schemaVersion === 2 &&
+    Object.hasOwn(grant, "inputBinding")
+  ) {
+    return grant.inputBinding === null || grant.inputBinding.schemaVersion === 2;
+  }
+  if (
+    grant?.schemaVersion !== 3 ||
+    grant.operation !== "modify" ||
+    !Object.hasOwn(grant, "inputBinding") ||
+    grant.inputBinding?.schemaVersion !== 2 ||
+    !Object.hasOwn(grant, "executionSource")
+  ) {
+    return false;
+  }
+  try {
+    const executionSource = normalizeCodeExecutionSource(
+      grant.executionSource,
+    );
+    return (
+      sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding: grant.inputBinding,
+      }) &&
+      JSON.stringify(codeExecutionSourceWritablePaths(executionSource)) ===
+        JSON.stringify(grant.writablePaths)
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function createCodeJobChangePackageEvent(value) {
@@ -264,10 +314,16 @@ export function reconstructCodeJobChangePackageEventForRecovery(value) {
 
 export function normalizeCodeJobChangePackageEvent(value) {
   try {
-    const fields = exact(value, EVENT_KEYS, "code job change package event");
-    if (fields.get("schemaVersion") !== 1) throw invalid("schemaVersion 无效");
+    const supplied = new Map(
+      dataEntries(value, "code job change package event"),
+    );
+    const schemaVersion = supplied.get("schemaVersion");
+    const keys = schemaVersion === 2 ? EVENT_V2_KEYS : EVENT_V1_KEYS;
+    const fields = exact(value, keys, "code job change package event");
+    if (![1, 2].includes(schemaVersion)) throw invalid("schemaVersion 无效");
     const sequence = positiveInteger(fields.get("sequence"), "sequence");
     const content = eventContent({
+      schemaVersion,
       sequence,
       previousDigest: normalizePreviousDigest(
         sequence,
@@ -277,6 +333,14 @@ export function normalizeCodeJobChangePackageEvent(value) {
       proposal: normalizeProposalReference(fields.get("proposal")),
       grant: normalizeGrantReference(fields.get("grant")),
       exportRequest: normalizeExportRequest(fields.get("exportRequest")),
+      ...(schemaVersion === 2
+        ? {
+            executionSource: normalizeCodeExecutionSource(
+              fields.get("executionSource"),
+              invalid("executionSource 无效"),
+            ),
+          }
+        : {}),
     });
     const eventDigest = digest(fields.get("eventDigest"), "eventDigest");
     const eventId = text(fields.get("eventId"), "eventId", 96);

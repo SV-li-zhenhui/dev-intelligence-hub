@@ -1,6 +1,8 @@
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import { DockerTestSandbox } from "./adapters/docker-test-sandbox.js";
 import { GitObjectSnapshotter } from "./adapters/git-object-snapshotter.js";
+import { createControlledGitRuntimeBundle } from "./controlled-git-runtime.js";
 import { projectRoot } from "./lib/config.js";
 import { StateStore } from "./lib/state-store.js";
 import { digestValue } from "./domain/code-executor-contract.js";
@@ -144,6 +146,53 @@ function normalizeEnabledConfig(config) {
     throw invalidConfig("至少需要配置一个固定测试配置");
   }
   return config;
+}
+
+function ownDataValue(value, key) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) return undefined;
+  if (!descriptor.enumerable || !("value" in descriptor)) {
+    throw invalidConfig();
+  }
+  return descriptor.value;
+}
+
+function configuredConflictGit(config, runtimeRoot) {
+  const conflictPreparation = ownDataValue(config, "conflictPreparation");
+  if (conflictPreparation === undefined) return undefined;
+  if (utilTypes.isProxy(conflictPreparation)) throw invalidConfig();
+  assertRecord(conflictPreparation);
+  const enabled = ownDataValue(conflictPreparation, "enabled");
+  const expectedKeys = enabled === false
+    ? ["enabled"]
+    : [
+        "enabled",
+        "baseMirrorsByRepository",
+        "headMirrorsByRepository",
+      ];
+  const keys = Reflect.ownKeys(conflictPreparation);
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some(
+      (key) => typeof key !== "string" || !expectedKeys.includes(key),
+    )
+  ) {
+    throw invalidConfig("Conflict preparation 配置字段无效");
+  }
+  if (enabled === false) return { enabled: false };
+  return {
+    enabled,
+    gitCommand: ownDataValue(config, "gitCommand"),
+    preparationRoot: path.join(runtimeRoot, "conflict-preparations"),
+    baseMirrorsByRepository: ownDataValue(
+      conflictPreparation,
+      "baseMirrorsByRepository",
+    ),
+    headMirrorsByRepository: ownDataValue(
+      conflictPreparation,
+      "headMirrorsByRepository",
+    ),
+  };
 }
 
 function resolveRuntimeRoot(value) {
@@ -378,15 +427,42 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     enabledConfig.requiredProfilesByWorkspace,
   );
   const gitSettings = normalizeGitSettings(enabledConfig, workspaces);
-  const conflictMaterializer = dependencies.conflictMaterializer === undefined
-    ? null
-    : Object.freeze({
-        materialize: method(
-          dependencies.conflictMaterializer,
-          "materialize",
-          "conflictMaterializer",
-        ),
-      });
+  const controlledGitConfig = configuredConflictGit(
+    enabledConfig,
+    runtimeRoot,
+  );
+  if (
+    controlledGitConfig?.enabled === true &&
+    dependencies.conflictMaterializer !== undefined
+  ) {
+    throw invalidConfig(
+      "生产 Controlled Git 不能与注入 conflict materializer 混用",
+    );
+  }
+  if (
+    controlledGitConfig?.enabled === true &&
+    dependencies.broker !== undefined
+  ) {
+    throw invalidConfig(
+      "生产 Controlled Git 不能使用未验证的注入 broker",
+    );
+  }
+  const controlledGitRuntime = await createControlledGitRuntimeBundle(
+    controlledGitConfig,
+    ownDataValue(dependencies, "controlledGitDependencies") ?? {},
+  );
+  const injectedConflictMaterializer =
+    dependencies.conflictMaterializer === undefined
+      ? null
+      : Object.freeze({
+          materialize: method(
+            dependencies.conflictMaterializer,
+            "materialize",
+            "conflictMaterializer",
+          ),
+        });
+  const conflictMaterializer =
+    controlledGitRuntime?.materializer ?? injectedConflictMaterializer;
   if (gitSettings && dependencies.broker !== undefined) {
     throw invalidConfig(
       "Git Head snapshot 工作区不能使用未验证的注入 broker",
@@ -517,6 +593,10 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     changePackageTargets,
     completedChangeExporter,
     auditArtifactReader,
+    conflictPreparationVerifier:
+      controlledGitRuntime?.verifier ?? null,
+    conflictExecutionSourcePreparer:
+      controlledGitRuntime?.preparer ?? null,
     recovery,
   });
 }

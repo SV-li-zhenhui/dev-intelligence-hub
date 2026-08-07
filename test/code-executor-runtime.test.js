@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -147,6 +154,32 @@ function fakeConflictMaterializer(content = "<<<<<<< base\n=======\n>>>>>>> head
         resultObjectDigest: request.binding.resultObjectDigest,
         residual: null,
       };
+    },
+  };
+}
+
+async function productionConflictGitConfig(setup) {
+  const gitCommand = path.join(
+    setup.root,
+    process.platform === "win32" ? "mingw64/bin/git.exe" : "bin/git",
+  );
+  const baseMirrorRoot = path.join(setup.root, "mirrors", "base.git");
+  const headMirrorRoot = path.join(setup.root, "mirrors", "head.git");
+  await Promise.all([
+    mkdir(path.dirname(gitCommand), { recursive: true }),
+    mkdir(baseMirrorRoot, { recursive: true }),
+    mkdir(headMirrorRoot, { recursive: true }),
+  ]);
+  await writeFile(gitCommand, "trusted fake git");
+  if (process.platform !== "win32") await chmod(gitCommand, 0o755);
+  return {
+    gitCommand,
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: { "acme/dashboard": baseMirrorRoot },
+      headMirrorsByRepository: {
+        "contributor/dashboard": headMirrorRoot,
+      },
     },
   };
 }
@@ -323,6 +356,8 @@ test("conflict capability is published only with its trusted materializer", asyn
     "directory_snapshot",
     "conflict_preparation_snapshot",
   ]);
+  assert.equal(runtime.conflictPreparationVerifier, null);
+  assert.equal(runtime.conflictExecutionSourcePreparer, null);
   const execution = await runtime.broker.createExecution({
     workspaceId: "dashboard",
     executionId: "conflict-runtime-run",
@@ -346,6 +381,69 @@ test("conflict capability is published only with its trusted materializer", asyn
     }),
     (error) => error?.code === "INVALID_CODE_EXECUTOR_CONFIG",
   );
+});
+
+test("configured Controlled Git exposes only frozen production ports", async (t) => {
+  const setup = await fixture(t);
+  const config = enabledConfig(setup.root);
+  Object.assign(config, await productionConflictGitConfig(setup));
+
+  const runtime = await createCodeExecutorRuntime(config, {
+    runtimeRoot: setup.runtimeRoot,
+    sourceBaseRoot: setup.sourceBaseRoot,
+    store: setup.store,
+  });
+
+  assert.deepEqual(runtime.authority.workspaces[0].capabilities, [
+    "directory_snapshot",
+    "conflict_preparation_snapshot",
+  ]);
+  assert.deepEqual(Object.keys(runtime.conflictPreparationVerifier), [
+    "verify",
+  ]);
+  assert.deepEqual(Object.keys(runtime.conflictExecutionSourcePreparer), [
+    "prepare",
+  ]);
+  assert.equal(Object.isFrozen(runtime.conflictPreparationVerifier), true);
+  assert.equal(Object.isFrozen(runtime.conflictExecutionSourcePreparer), true);
+  assert.equal("controlledGitService" in runtime, false);
+  assert.equal("controlledGitRuntime" in runtime, false);
+  await access(path.join(setup.runtimeRoot, "conflict-preparations"));
+});
+
+test("configured Controlled Git fails closed before publishing partial authority", async (t) => {
+  const setup = await fixture(t);
+  const controlledGit = await productionConflictGitConfig(setup);
+  const incomplete = enabledConfig(setup.root);
+  incomplete.gitCommand = controlledGit.gitCommand;
+  incomplete.conflictPreparation = {
+    enabled: true,
+    baseMirrorsByRepository:
+      controlledGit.conflictPreparation.baseMirrorsByRepository,
+  };
+
+  await assert.rejects(
+    createCodeExecutorRuntime(incomplete, {
+      runtimeRoot: setup.runtimeRoot,
+      sourceBaseRoot: setup.sourceBaseRoot,
+      store: setup.store,
+    }),
+    (error) => error?.code === "INVALID_CODE_EXECUTOR_CONFIG",
+  );
+  await assert.rejects(access(setup.runtimeRoot), (error) => error.code === "ENOENT");
+
+  const configured = enabledConfig(setup.root);
+  Object.assign(configured, controlledGit);
+  await assert.rejects(
+    createCodeExecutorRuntime(configured, {
+      runtimeRoot: setup.runtimeRoot,
+      sourceBaseRoot: setup.sourceBaseRoot,
+      store: setup.store,
+      conflictMaterializer: fakeConflictMaterializer(),
+    }),
+    (error) => error?.code === "INVALID_CODE_EXECUTOR_CONFIG",
+  );
+  await assert.rejects(access(setup.runtimeRoot), (error) => error.code === "ENOENT");
 });
 
 test("Git Head capability is advertised only after preflight and executes the sealed PR Head", async (t) => {
