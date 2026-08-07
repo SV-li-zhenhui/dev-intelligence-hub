@@ -240,6 +240,7 @@ test("new provider template is a complete openai-compatible provider", () => {
   const template = configurationStructureTemplate(["brainProviders"]).value;
   assert.equal(template.kind, "openai-compatible");
   assert.equal(template.apiKeyEnv, "MYDASHBOARD_MODEL_API_KEY");
+  assert.equal(template.responseFormat, "json-schema");
   assert.equal(template.remote, true);
   assert.equal(Object.hasOwn(template, "contextTokens"), false);
 });
@@ -260,6 +261,7 @@ test("provider variants expose complete Responses and Ollama forms without stale
     baseUrl: "https://api.openai.com/v1",
     apiKeyEnv: "OPENAI_API_KEY",
     protocol: "responses",
+    responseFormat: "json-schema",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -273,6 +275,13 @@ test("provider variants expose complete Responses and Ollama forms without stale
     ).options,
     ["chat-completions", "responses"],
   );
+  const responseFormat = configurationFieldDescriptor(
+    ["brainProviders", "codex", "responseFormat"],
+    "json-schema",
+  );
+  assert.equal(responseFormat.label, "结构化输出模式");
+  assert.equal(responseFormat.control, "select");
+  assert.deepEqual(responseFormat.options, ["json-schema", "json-object"]);
 
   const ollama = configurationStructureTemplate(["brainProviders"], "ollama");
   assert.equal(ollama.value.kind, "ollama");

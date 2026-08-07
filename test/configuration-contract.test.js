@@ -364,6 +364,7 @@ test("Responses providers use explicit credential references and stricter reques
     baseUrl: "https://api.openai.com/v1",
     apiKeyEnv: "OPENAI_API_KEY",
     protocol: "responses",
+    responseFormat: "json-schema",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -385,6 +386,8 @@ test("Responses providers use explicit credential references and stricter reques
     (provider) => { provider.remote = false; },
     (provider) => { delete provider.apiKeyEnv; },
     (provider) => { provider.protocol = "agents"; },
+    (provider) => { provider.responseFormat = "json-object"; },
+    (provider) => { provider.responseFormat = "markdown"; },
     (provider) => { provider.maxRequestBytes = 1024 * 1024 + 1; },
     (provider) => { provider.contextTokens = 16_384; },
   ]) {
@@ -396,6 +399,10 @@ test("Responses providers use explicit credential references and stricter reques
   const ollamaProtocol = document();
   ollamaProtocol.brainProviders.ollama.protocol = "responses";
   assertInvalid(ollamaProtocol);
+
+  const ollamaResponseFormat = document();
+  ollamaResponseFormat.brainProviders.ollama.responseFormat = "json-schema";
+  assertInvalid(ollamaResponseFormat);
 });
 
 test("providers without protocol preserve legacy numeric configuration ranges", () => {
@@ -448,6 +455,34 @@ test("provider protocol changes require new authority and restart", () => {
   assert.deepEqual(impact.benign_claim_change, []);
   assert.deepEqual(impact.restart_required, [
     "brainProviders.company.codex_api.protocol",
+  ]);
+});
+
+test("provider response format changes require new authority and restart", () => {
+  const before = document();
+  before.brainProviders["company.ark_coding"] = {
+    kind: "openai-compatible",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "ARK_API_KEY",
+    protocol: "chat-completions",
+    responseFormat: "json-schema",
+    remote: true,
+  };
+  before.employees.roles.developer.brain.provider = "company.ark_coding";
+  const after = structuredClone(before);
+  after.brainProviders["company.ark_coding"].responseFormat = "json-object";
+
+  const impact = configurationDocumentImpact(before, after);
+
+  assert.deepEqual(impact.security_tightening, [
+    "brainProviders.company.ark_coding.responseFormat",
+  ]);
+  assert.deepEqual(impact.authority_expansion, [
+    "brainProviders.company.ark_coding.responseFormat",
+  ]);
+  assert.deepEqual(impact.benign_claim_change, []);
+  assert.deepEqual(impact.restart_required, [
+    "brainProviders.company.ark_coding.responseFormat",
   ]);
 });
 

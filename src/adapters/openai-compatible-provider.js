@@ -8,6 +8,8 @@ const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
 const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
 const CHAT_COMPLETIONS_PROTOCOL = "chat-completions";
 const RESPONSES_PROTOCOL = "responses";
+const JSON_SCHEMA_RESPONSE_FORMAT = "json-schema";
+const JSON_OBJECT_RESPONSE_FORMAT = "json-object";
 const PROTOCOL_LIMITS = Object.freeze({
   [CHAT_COMPLETIONS_PROTOCOL]: Object.freeze({
     minimumTimeoutMs: 10,
@@ -42,6 +44,7 @@ const OPTION_KEYS = new Set([
   "maxResponseBytes",
   "maxRequestBytes",
   "protocol",
+  "responseFormat",
 ]);
 
 export class OpenAICompatibleProviderError extends Error {
@@ -111,6 +114,19 @@ function boundedInteger(value, name, minimum, maximum) {
 function safeProtocol(value) {
   if (typeof value !== "string" || !Object.hasOwn(PROTOCOL_LIMITS, value)) {
     throw new TypeError("OpenAI-compatible protocol is invalid");
+  }
+  return value;
+}
+
+function safeResponseFormat(value) {
+  if (
+    typeof value !== "string" ||
+    !new Set([
+      JSON_SCHEMA_RESPONSE_FORMAT,
+      JSON_OBJECT_RESPONSE_FORMAT,
+    ]).has(value)
+  ) {
+    throw new TypeError("OpenAI-compatible response format is invalid");
   }
   return value;
 }
@@ -447,7 +463,15 @@ function responseContent(text, protocol) {
     : chatCompletionContent(envelope);
 }
 
-function chatCompletionsBody({ model, messages, schema }) {
+function chatCompletionsBody({ model, messages, schema }, responseFormat) {
+  if (responseFormat === JSON_OBJECT_RESPONSE_FORMAT) {
+    return {
+      model,
+      messages,
+      temperature: 0,
+      response_format: { type: "json_object" },
+    };
+  }
   return {
     model,
     messages,
@@ -484,10 +508,10 @@ function responsesBody({ model, messages, schema }) {
   };
 }
 
-function requestBody(protocol, request) {
+function requestBody(protocol, responseFormat, request) {
   return protocol === RESPONSES_PROTOCOL
     ? responsesBody(request)
-    : chatCompletionsBody(request);
+    : chatCompletionsBody(request, responseFormat);
 }
 
 export class OpenAICompatibleProvider {
@@ -495,6 +519,7 @@ export class OpenAICompatibleProvider {
   #requestUrl;
   #apiKey;
   #protocol;
+  #responseFormat;
   #timeoutMs;
   #maxResponseBytes;
   #maxRequestBytes;
@@ -505,13 +530,26 @@ export class OpenAICompatibleProvider {
       throw new TypeError("OpenAI-compatible provider requires fetch");
     }
     const protocol = safeProtocol(options.protocol ?? CHAT_COMPLETIONS_PROTOCOL);
+    const responseFormat = safeResponseFormat(
+      options.responseFormat ?? JSON_SCHEMA_RESPONSE_FORMAT,
+    );
+    if (
+      protocol === RESPONSES_PROTOCOL &&
+      responseFormat === JSON_OBJECT_RESPONSE_FORMAT
+    ) {
+      throw new TypeError(
+        "OpenAI-compatible json-object response format requires chat-completions",
+      );
+    }
     const target = endpoint(options.baseUrl, protocol);
     const limits = PROTOCOL_LIMITS[protocol];
     this.id = safeId(options.id ?? "openai-compatible");
     this.kind = "openai-compatible";
     this.protocol = protocol;
+    this.responseFormat = responseFormat;
     this.remote = target.remote;
     this.#protocol = protocol;
+    this.#responseFormat = responseFormat;
     this.#fetch = options.fetch ?? globalThis.fetch;
     if (typeof this.#fetch !== "function") {
       throw new TypeError("OpenAI-compatible provider requires fetch");
@@ -547,7 +585,7 @@ export class OpenAICompatibleProvider {
   async generate({ model, messages, schema, signal = null } = {}) {
     const externalSignal = normalizeAbortSignal(signal);
     if (externalSignal?.aborted) throw cancellationError();
-    const body = JSON.stringify(requestBody(this.#protocol, {
+    const body = JSON.stringify(requestBody(this.#protocol, this.#responseFormat, {
       model: safeText(model, "model", 256),
       messages: normalizeMessages(messages),
       schema: normalizeSchema(schema),

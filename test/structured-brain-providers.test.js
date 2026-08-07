@@ -150,6 +150,7 @@ test("OpenAI-compatible credentials come only from the injected environment and 
   assert.equal(output, '{"ok":true}');
   assert.equal(OpenAICompatibleProvider, OpenAiCompatibleProvider);
   assert.equal(provider.protocol, "chat-completions");
+  assert.equal(provider.responseFormat, "json-schema");
   assert.equal(calls[0].url, "https://models.example/v1/chat/completions");
   assert.equal(calls[0].options.headers.authorization, `Bearer ${secret}`);
   assert.equal(calls[0].options.redirect, "error");
@@ -203,6 +204,73 @@ test("OpenAI-compatible credentials come only from the injected environment and 
   });
   assert.throws(() => new OpenAiCompatibleProvider(unsafeOptions));
   assert.equal(getterCalls, 0);
+});
+
+test("OpenAI-compatible chat json-object keeps the schema out of the remote request", async () => {
+  const calls = [];
+  const provider = new OpenAICompatibleProvider({
+    responseFormat: "json-object",
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+    fetch: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return textResponse({
+        choices: [{ message: { content: '{"ok":true}' } }],
+      });
+    },
+  });
+  const schema = {
+    ...SCHEMA,
+    properties: {
+      ok: { type: "boolean" },
+      tags: { type: "array", items: { type: "string" }, uniqueItems: true },
+    },
+  };
+
+  const output = await provider.generate({
+    model: "smart-model",
+    messages: MESSAGES,
+    schema,
+  });
+
+  assert.equal(output, '{"ok":true}');
+  assert.equal(provider.protocol, "chat-completions");
+  assert.equal(provider.responseFormat, "json-object");
+  assert.deepEqual(calls, [{
+    url: "https://models.example/v1/chat/completions",
+    body: {
+      model: "smart-model",
+      messages: MESSAGES,
+      temperature: 0,
+      response_format: { type: "json_object" },
+    },
+  }]);
+  assert.equal(JSON.stringify(calls[0].body).includes("uniqueItems"), false);
+});
+
+test("OpenAI-compatible response format rejects unsafe values and unsupported protocol combinations", () => {
+  const baseOptions = {
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+  };
+
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...baseOptions,
+      responseFormat: "markdown",
+    }),
+    /response format is invalid/i,
+  );
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...baseOptions,
+      protocol: "responses",
+      responseFormat: "json-object",
+    }),
+    /json-object.*chat-completions/i,
+  );
 });
 
 test("OpenAI-compatible Responses sends an explicitly tool-free schema request", async () => {

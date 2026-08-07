@@ -337,6 +337,49 @@ test("a dotted Responses provider is remote and denied data never starts fetch",
   assert.equal(fetchCalls, 1);
 });
 
+test("configured workforce forwards chat json-object response format", async () => {
+  const calls = [];
+  const router = createConfiguredBrainRouter({
+    brainProviders: {
+      "company.ark": {
+        kind: "openai-compatible",
+        baseUrl: "https://models.example/v1",
+        apiKeyEnv: "ARK_API_KEY",
+        protocol: "chat-completions",
+        responseFormat: "json-object",
+        remote: true,
+      },
+    },
+    dependencies: {
+      environment: { ARK_API_KEY: "fixture-key" },
+      fetch: async (url, options) => {
+        calls.push({ url, body: JSON.parse(options.body) });
+        return textResponse({
+          choices: [{ message: { content: '{"ok":true}' } }],
+        });
+      },
+    },
+  });
+  const brain = {
+    provider: "company.ark",
+    model: "ark-code-latest",
+    remoteData: { requirements: true, code: false, memory: false },
+  };
+
+  assert.equal(
+    await router.generate({
+      brain,
+      messages: MESSAGES,
+      schema: SCHEMA,
+      dataClasses: ["requirements"],
+    }),
+    '{"ok":true}',
+  );
+  assert.equal(calls[0].url, "https://models.example/v1/chat/completions");
+  assert.deepEqual(calls[0].body.response_format, { type: "json_object" });
+  assert.equal(Object.hasOwn(calls[0].body.response_format, "json_schema"), false);
+});
+
 test("provider remote declarations are optional booleans only", () => {
   assert.equal(
     createConfiguredBrainRouter({

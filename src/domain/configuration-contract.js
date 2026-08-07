@@ -71,6 +71,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "baseUrl",
   "apiKeyEnv",
   "protocol",
+  "responseFormat",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -410,6 +411,9 @@ function normalizeProvider(value, path, id) {
   if (kind === "ollama" && Object.hasOwn(config, "protocol")) {
     throw invalid(`${path}.protocol`);
   }
+  if (kind === "ollama" && Object.hasOwn(config, "responseFormat")) {
+    throw invalid(`${path}.responseFormat`);
+  }
   const protocol = Object.hasOwn(config, "protocol")
     ? text(config.protocol, `${path}.protocol`, 64)
     : null;
@@ -419,6 +423,21 @@ function normalizeProvider(value, path, id) {
   ) {
     throw invalid(`${path}.protocol`);
   }
+  const responseFormat = Object.hasOwn(config, "responseFormat")
+    ? text(config.responseFormat, `${path}.responseFormat`, 64)
+    : null;
+  if (
+    responseFormat !== null &&
+    !new Set(["json-schema", "json-object"]).has(responseFormat)
+  ) {
+    throw invalid(`${path}.responseFormat`);
+  }
+  if (protocol === "responses" && responseFormat === "json-object") {
+    throw invalid(
+      `${path}.responseFormat`,
+      "json-object 仅支持 chat-completions 协议",
+    );
+  }
   const normalized = {
     kind,
     baseUrl: target.value,
@@ -426,6 +445,7 @@ function normalizeProvider(value, path, id) {
       envReference(entry, `${path}.apiKeyEnv`),
     ),
     ...(protocol === null ? {} : { protocol }),
+    ...(responseFormat === null ? {} : { responseFormat }),
   };
   const limits = protocol === null
     ? {
@@ -1313,7 +1333,7 @@ function authorityDirection(change) {
   const providerIdentity =
     path.startsWith("brainProviders.") &&
     (
-      /\.(?:kind|baseUrl|apiKeyEnv|protocol|remote)$/.test(
+      /\.(?:kind|baseUrl|apiKeyEnv|protocol|responseFormat|remote)$/.test(
         path,
       ) ||
       before?.kind !== undefined ||

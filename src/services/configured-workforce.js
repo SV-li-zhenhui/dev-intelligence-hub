@@ -9,6 +9,7 @@ const PROVIDER_KEYS = new Set([
   "baseUrl",
   "apiKeyEnv",
   "protocol",
+  "responseFormat",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -108,7 +109,12 @@ function providerOptions(id, value, dependencies) {
     return providerWithBoundary(
       new OpenAiCompatibleProvider({
         ...common,
-        ...selectOptions(config, ["baseUrl", "apiKeyEnv", "protocol"]),
+        ...selectOptions(config, [
+          "baseUrl",
+          "apiKeyEnv",
+          "protocol",
+          "responseFormat",
+        ]),
         environment: dependencies.environment ?? process.env,
         ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       }),

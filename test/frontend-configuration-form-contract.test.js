@@ -48,6 +48,7 @@ function configurationWithResponsesProvider() {
     baseUrl: "https://api.openai.com/v1",
     apiKeyEnv: "OPENAI_API_KEY",
     protocol: "responses",
+    responseFormat: "json-schema",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -344,6 +345,7 @@ test("provider creation offers a complete Responses form instead of raw JSON", (
     "baseUrl",
     "apiKeyEnv",
     "protocol",
+    "responseFormat",
     "remote",
     "timeoutMs",
     "maxResponseBytes",
@@ -365,6 +367,7 @@ test("provider creation offers a complete Responses form instead of raw JSON", (
   assert.match(kindControl, / readonly(?:\s|>)/);
   assert.match(kindControl, / aria-readonly="true"/);
   assert.match(responsesTemplate, /<option value="responses" selected>/);
+  assert.match(responsesTemplate, /<option value="json-schema" selected>/);
 });
 
 test("invalid fields expose inline accessible errors while submit and status remain available", () => {

@@ -1445,6 +1445,19 @@ test("the Responses provider variant materializes as a closed structured configu
   const invalidResult = configurationDocumentFromForm(invalidState);
   assert.equal(invalidResult.ok, false);
   assert.match(JSON.stringify(invalidResult.issues), /1048576|整数/i);
+
+  const incompatibleState = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["brainProviders"],
+    key: "unsafe-json-object",
+    value: { ...template.value, responseFormat: "json-object" },
+  });
+  const incompatibleResult = configurationDocumentFromForm(incompatibleState);
+  assert.equal(incompatibleResult.ok, false);
+  assert.match(
+    JSON.stringify(incompatibleResult.issues),
+    /INVALID_PROVIDER_CONFIGURATION/,
+  );
 });
 
 test("provider forms preserve legacy limits when protocol is omitted", () => {

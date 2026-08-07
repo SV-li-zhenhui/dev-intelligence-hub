@@ -300,6 +300,7 @@ function assertProvider(value, path) {
       "baseUrl",
       "apiKeyEnv",
       "protocol",
+      "responseFormat",
       "timeoutMs",
       "maxResponseBytes",
       "maxRequestBytes",
@@ -1068,12 +1069,16 @@ function providerConfigurationIssues(configuration) {
     const path = ["brainProviders", id];
     const hasCredentialReference = Object.hasOwn(provider, "apiKeyEnv");
     const hasProtocol = Object.hasOwn(provider, "protocol");
+    const hasResponseFormat = Object.hasOwn(provider, "responseFormat");
     if (
       (provider.kind === "openai-compatible" && !hasCredentialReference) ||
       (provider.kind === "ollama" && hasCredentialReference) ||
       (provider.kind === "openai-compatible" && Object.hasOwn(provider, "contextTokens")) ||
       (provider.kind === "ollama" && hasProtocol) ||
-      (hasProtocol && !["chat-completions", "responses"].includes(provider.protocol))
+      (provider.kind === "ollama" && hasResponseFormat) ||
+      (hasProtocol && !["chat-completions", "responses"].includes(provider.protocol)) ||
+      (hasResponseFormat && !["json-schema", "json-object"].includes(provider.responseFormat)) ||
+      (provider.protocol === "responses" && provider.responseFormat === "json-object")
     ) {
       issues.push(issue(path, "INVALID_PROVIDER_CONFIGURATION", "Provider 字段组合无效。"));
     }
