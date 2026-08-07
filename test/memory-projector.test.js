@@ -479,6 +479,97 @@ test("schema 1 memory adopts a non-zero graph checkpoint before pending events",
   assert.equal(recovered.getAuthorityState().checkpointDigest, event.eventDigest);
 });
 
+test("schema 1 recovery preserves legacy pull request timelines as historical", async () => {
+  const values = new Map([
+    ["unified-memory-records", {
+      schemaVersion: 1,
+      revision: 1,
+      records: [],
+    }],
+  ]);
+  const store = {
+    async read(key, fallback = null) {
+      return structuredClone(values.has(key) ? values.get(key) : fallback);
+    },
+    async write(key, value) {
+      values.set(key, structuredClone(value));
+    },
+  };
+  const journal = new LocalMemoryJournal({
+    store,
+    exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  await journal.recover();
+
+  const item = workItem(12, "cancelled", 2);
+  item.kind = "assignment";
+  item.source = null;
+  item.event.eventType = "pull_request.observed";
+  item.event.subject.id = "github:pr:acme/repo#12";
+  const timeline = [{
+    timelineId: "legacy-pr-timeline-12",
+    sequence: 1,
+    itemId: item.itemId,
+    type: "assignment_intaken",
+    at: "2026-08-02T01:00:01.000Z",
+    actorId: "work-ledger-system",
+    details: { sourceSequence: 12 },
+  }];
+  const checkpointDigest = "b".repeat(64);
+  const graphSource = {
+    async readBatch() {
+      return {
+        cursor: 7,
+        highWatermark: 7,
+        checkpointDigest,
+        highWatermarkDigest: checkpointDigest,
+        authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+        items: [],
+      };
+    },
+    async ackBatch() {
+      throw new Error("checkpoint-only recovery must not acknowledge events");
+    },
+  };
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource(
+      [item],
+      timeline,
+      graphSource,
+      8,
+    ),
+    graphProjectionSource: graphSource,
+    store,
+  });
+
+  const first = await projector.runCycle();
+  const second = await projector.runCycle();
+
+  assert.equal(first.added, 2);
+  assert.equal(second.added, 0);
+  assert.equal(journal.getAuthorityState().cursor, 7);
+  assert.equal(journal.getAuthorityState().workLedgerRevision, 8);
+  const timelineMatch = journal.search({
+    eventType: "timeline.assignment_intaken",
+  }).items[0];
+  const timelineRecord = journal.readRecords({
+    recordIds: [timelineMatch.id],
+  }).items[0].record;
+  assert.deepEqual(timelineRecord.tags, [
+    "timeline",
+    "assignment_intaken",
+    "derived",
+    "obsolete",
+  ]);
+  assert.deepEqual(JSON.parse(timelineRecord.content), {
+    details: { sourceSequence: 12 },
+    historicalOnly: true,
+    citableConclusion: false,
+  });
+});
+
 test("superseded work invalidates prior work revisions and every graph delivery without deleting history", async () => {
   const item = workItem(9, "completed", 3);
   item.updatedAt = "2026-08-05T05:00:00.000Z";

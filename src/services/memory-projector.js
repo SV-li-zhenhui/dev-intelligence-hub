@@ -221,11 +221,12 @@ function timelineRecord(raw, itemById) {
   const occurredAt = safeTimestamp(entry?.at);
   if (!timelineId || !occurredAt) return null;
   const item = itemById.get(entry.itemId);
-  const historicalPrTimeline = currentWorkItemInputBinding(item) !== null;
   const event = plainData(currentWorkItemEvent(item));
   const subject = plainData(event?.subject);
   const repository = safeRepository(subject?.repository);
   const number = safeNumber(subject?.number);
+  const sourceUrl = githubUrl(repository, number, event?.eventType);
+  const historicalPrTimeline = sourceUrl?.includes("/pull/") === true;
   const type = safeToken(entry.type, "unknown");
   return {
     schemaVersion: 1,
@@ -248,7 +249,7 @@ function timelineRecord(raw, itemById) {
       type,
       ...(historicalPrTimeline ? ["derived", "obsolete"] : []),
     ],
-    sourceUrl: githubUrl(repository, number, event?.eventType),
+    sourceUrl,
     subjectNumber: number,
   };
 }
