@@ -109,6 +109,19 @@ function memoryLifecycleProducer(memoryProducer) {
   };
 }
 
+function emptyMemoryAuthorityReader() {
+  return {
+    async getAuthorityState() {
+      return {
+        cursor: 0,
+        checkpointDigest: null,
+        authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+        workLedgerRevision: 0,
+      };
+    },
+  };
+}
+
 function graphEventsForItem(item) {
   let previousDigest = null;
   return [
@@ -202,6 +215,7 @@ test("memory projector imports work items, timeline, and legacy PR memory idempo
   const projector = new MemoryProjector({
     memoryProducer,
     memoryLifecycleProducer: memoryLifecycleProducer(trustedSink),
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: memoryAuthoritySource(items, timeline, graphSource),
     graphProjectionSource: graphSource,
     store: {
@@ -314,6 +328,7 @@ test("graph contracts and deliveries remain searchable without retained timeline
   const projector = new MemoryProjector({
     memoryProducer: journal,
     memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
     memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
     graphProjectionSource: graphSource,
     store: { async read() { return []; } },
@@ -367,6 +382,101 @@ test("graph contracts and deliveries remain searchable without retained timeline
     journal.search({ eventType: "work.graph_record_obsoleted" }).items.length,
     0,
   );
+});
+
+test("schema 1 memory adopts a non-zero graph checkpoint before pending events", async () => {
+  const values = new Map([
+    ["unified-memory-records", {
+      schemaVersion: 1,
+      revision: 1,
+      records: [],
+    }],
+  ]);
+  const store = {
+    async read(key, fallback = null) {
+      return structuredClone(values.has(key) ? values.get(key) : fallback);
+    },
+    async write(key, value) {
+      values.set(key, structuredClone(value));
+    },
+  };
+  const journal = new LocalMemoryJournal({
+    store,
+    exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  await journal.recover();
+
+  const item = workItem(11, "completed", 4);
+  item.graph = {
+    parentItemId: null,
+    dependsOnItemIds: [],
+    acceptanceContracts: [{
+      revision: 1,
+      acceptanceCriteria: [],
+      expectedDeliverables: [],
+      recordedAt: "2026-08-04T02:00:00.000Z",
+    }],
+    deliveries: [],
+  };
+  const checkpointDigest = "a".repeat(64);
+  const event = createWorkGraphMemoryEvent({
+    sequence: 8,
+    previousDigest: checkpointDigest,
+    ledgerRevision: 8,
+    taskRevision: item.revision,
+    item,
+    kind: "acceptance_contract",
+    record: item.graph.acceptanceContracts[0],
+  });
+  const authorityStateDigest = event.authorityStateDigest ?? EMPTY_AUTHORITY_STATE_DIGEST;
+  let cursor = 7;
+  const acknowledgements = [];
+  const graphSource = {
+    async readBatch({ limit }) {
+      return structuredClone({
+        cursor,
+        highWatermark: event.sequence,
+        checkpointDigest: cursor === 7 ? checkpointDigest : event.eventDigest,
+        highWatermarkDigest: event.eventDigest,
+        authorityStateDigest,
+        items: cursor === 7 ? [event].slice(0, limit) : [],
+      });
+    },
+    async ackBatch({ receipts }) {
+      assert.deepEqual(receipts, [workGraphMemoryRecordReceipt(event)]);
+      acknowledgements.push(structuredClone(receipts));
+      cursor = event.sequence;
+      return {
+        status: "applied",
+        cursor,
+        highWatermark: event.sequence,
+      };
+    },
+  };
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource, 8),
+    graphProjectionSource: graphSource,
+    store,
+  });
+
+  const result = await projector.runCycle();
+
+  assert.equal(result.graph.added, 1);
+  assert.equal(result.graph.cursor, 8);
+  assert.equal(acknowledgements.length, 1);
+  const persisted = values.get("unified-memory-records");
+  assert.equal(persisted.schemaVersion, 2);
+  assert.equal(persisted.lifecycleAuthority.baseCursor, 7);
+  assert.equal(persisted.lifecycleAuthority.graphCursor, 8);
+  const recovered = new LocalMemoryJournal({
+    store,
+    exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  await recovered.recover();
+  assert.equal(recovered.getAuthorityState().cursor, 8);
+  assert.equal(recovered.getAuthorityState().checkpointDigest, event.eventDigest);
 });
 
 test("superseded work invalidates prior work revisions and every graph delivery without deleting history", async () => {
@@ -425,6 +535,7 @@ test("superseded work invalidates prior work revisions and every graph delivery 
   const projector = new MemoryProjector({
     memoryProducer: journal,
     memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
     memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
     graphProjectionSource: graphSource,
     store: { async read() { return []; } },
@@ -515,6 +626,7 @@ test("memory projector coalesces concurrent runs", async () => {
         return { added: 1 };
       },
     },
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: {
       async readSnapshot({ limit }) {
         calls += 1;
@@ -546,6 +658,7 @@ test("memory projector rejects malformed atomic authority snapshots before write
   const malformed = new MemoryProjector({
     memoryProducer: producer,
     memoryLifecycleProducer: memoryLifecycleProducer(producer),
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: {
       async readSnapshot() {
         return { ledgerRevision: 1, items: null, timeline: [], graph: null };
@@ -603,6 +716,7 @@ test("task graph projection is bounded to 100 events per cycle", async () => {
   const projector = new MemoryProjector({
     memoryProducer,
     memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },
@@ -663,6 +777,7 @@ test("a lost graph acknowledgement response resumes from the durable cursor", as
   const projector = new MemoryProjector({
     memoryProducer,
     memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },
@@ -715,6 +830,7 @@ test("a lost graph append response replays idempotently before batch acknowledge
   const projector = new MemoryProjector({
     memoryProducer,
     memoryLifecycleProducer: memoryLifecycleProducer(memoryProducer),
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
     memoryAuthoritySource: memoryAuthoritySource([], [], source),
     graphProjectionSource: source,
     store: { async read() { return []; } },

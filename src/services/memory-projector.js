@@ -407,6 +407,43 @@ function normalizeMemoryAuthoritySnapshot(value) {
   };
 }
 
+function normalizeLocalMemoryAuthorityState(value) {
+  const message = "local memory authority state is invalid";
+  const state = exactProjectionObject(
+    value,
+    [
+      "cursor",
+      "checkpointDigest",
+      "authorityStateDigest",
+      "workLedgerRevision",
+    ],
+    message,
+  );
+  const cursor = nonNegativeInteger(state.cursor, message);
+  const workLedgerRevision = nonNegativeInteger(
+    state.workLedgerRevision,
+    message,
+  );
+  const checkpointDigest = state.checkpointDigest;
+  if (
+    !(
+      checkpointDigest === null ||
+      (typeof checkpointDigest === "string" && /^[a-f0-9]{64}$/.test(checkpointDigest))
+    ) ||
+    (cursor === 0) !== (checkpointDigest === null) ||
+    typeof state.authorityStateDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(state.authorityStateDigest)
+  ) {
+    throw new TypeError(message);
+  }
+  return {
+    cursor,
+    checkpointDigest,
+    authorityStateDigest: state.authorityStateDigest,
+    workLedgerRevision,
+  };
+}
+
 function normalizeGraphAppendResult(value, expectedRecords) {
   const message = "task graph memory append receipt is invalid";
   const result = plainData(value);
@@ -467,9 +504,11 @@ function normalizeGraphAckResult(value, event, minimumHighWatermark) {
 }
 
 export class MemoryProjector {
+  #adoptGraphCheckpoint;
   #appendGraphEvents;
   #appendProjectionRecords;
   #appendWorkItems;
+  #getAuthorityState;
   #graphAckBatch;
   #readSnapshot;
   #store;
@@ -477,6 +516,7 @@ export class MemoryProjector {
 
   constructor({
     memoryLifecycleProducer,
+    memoryAuthorityReader,
     memoryAuthoritySource,
     graphProjectionSource,
     store,
@@ -487,12 +527,19 @@ export class MemoryProjector {
         "appendWorkItems",
         "appendGraphEvents",
         "appendProjectionRecords",
+        "adoptGraphCheckpoint",
       ],
       "memoryLifecycleProducer",
     );
     this.#appendWorkItems = lifecycle.appendWorkItems;
     this.#appendGraphEvents = lifecycle.appendGraphEvents;
     this.#appendProjectionRecords = lifecycle.appendProjectionRecords;
+    this.#adoptGraphCheckpoint = lifecycle.adoptGraphCheckpoint;
+    this.#getAuthorityState = requirePort(
+      memoryAuthorityReader,
+      ["getAuthorityState"],
+      "memoryAuthorityReader",
+    ).getAuthorityState;
     this.#readSnapshot = requirePort(
       memoryAuthoritySource,
       ["readSnapshot"],
@@ -525,6 +572,17 @@ export class MemoryProjector {
       await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
     );
     const graph = initial.graph;
+    const localAuthority = normalizeLocalMemoryAuthorityState(
+      await this.#getAuthorityState(),
+    );
+    if (localAuthority.cursor === 0 && graph.cursor > 0) {
+      await this.#adoptGraphCheckpoint({
+        cursor: graph.cursor,
+        checkpointDigest: graph.checkpointDigest,
+        ledgerRevision: initial.ledgerRevision,
+        authorityStateDigest: graph.authorityStateDigest,
+      });
+    }
     let graphAdded = 0;
     let graphCursor = graph.cursor;
     let graphHighWatermark = graph.highWatermark;

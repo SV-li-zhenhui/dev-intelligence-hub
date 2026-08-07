@@ -338,6 +338,7 @@ async function createLedgerMemoryPipeline(service, options = {}) {
   const projector = new MemoryProjector({
     memoryProducer: journal,
     memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
     memoryAuthoritySource: {
       readSnapshot: (request) => service.readMemoryAuthoritySnapshot(request),
     },

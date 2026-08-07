@@ -285,6 +285,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       async appendProjectionRecords() {},
       async adoptGraphCheckpoint() {},
     },
+    authorityReader: { async getAuthorityState() {} },
     search: { async search() {}, async getHealth() {} },
     contextReader: { async readRecords() {} },
     receiptVerifier: {
@@ -1195,6 +1196,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       async appendProjectionRecords() {},
       async adoptGraphCheckpoint() {},
     },
+    authorityReader: { async getAuthorityState() {} },
     search: {
       async search(value) { return { items: [value], nextCursor: null }; },
       async getHealth() { return { ready: true }; },
@@ -1272,8 +1274,17 @@ test("enabled unified memory exposes search only and projects the existing work 
   assert.equal(Object.isFrozen(calls.projector.memoryLifecycleProducer), true);
   assert.deepEqual(
     Object.keys(calls.projector.memoryLifecycleProducer).sort(),
-    ["appendGraphEvents", "appendProjectionRecords", "appendWorkItems"],
+    [
+      "adoptGraphCheckpoint",
+      "appendGraphEvents",
+      "appendProjectionRecords",
+      "appendWorkItems",
+    ],
   );
+  assert.equal(Object.isFrozen(calls.projector.memoryAuthorityReader), true);
+  assert.deepEqual(Object.keys(calls.projector.memoryAuthorityReader), [
+    "getAuthorityState",
+  ]);
   assert.equal(Object.isFrozen(calls.projector.memoryAuthoritySource), true);
   assert.deepEqual(Object.keys(calls.projector.memoryAuthoritySource), [
     "readSnapshot",

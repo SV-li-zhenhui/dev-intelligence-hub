@@ -1146,8 +1146,14 @@ export async function createApplication({
                 "appendWorkItems",
                 "appendGraphEvents",
                 "appendProjectionRecords",
+                "adoptGraphCheckpoint",
               ],
               "memoryRuntime.lifecycleProducer",
+            ),
+            memoryAuthorityReader: frozenPort(
+              memoryRuntime.authorityReader,
+              ["getAuthorityState"],
+              "memoryRuntime.authorityReader",
             ),
             memoryAuthoritySource: frozenPort(
               workLedgerRuntime.memoryAuthoritySource,
