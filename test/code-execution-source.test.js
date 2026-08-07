@@ -176,3 +176,18 @@ test("execution source rejects conflict paths that exceed its durable memory bou
     );
   }
 });
+
+test("execution source rejects control characters before they reach durable memory", () => {
+  for (const conflictPath of ["src/tab\tname.js", "src/line\nname.js"]) {
+    assert.throws(
+      () =>
+        createConflictCodeExecutionSource({
+          inputBinding: inputBinding(),
+          preparationBinding: preparationBinding(gitTarget(), [
+            { path: conflictPath, mode: "100644" },
+          ]),
+        }),
+      (error) => error?.code === "INVALID_CODE_EXECUTION_SOURCE",
+    );
+  }
+});

@@ -16,7 +16,10 @@ import {
   memoryRecordForCodeJobEvent,
   normalizeCodeJobMemoryEvent,
 } from "../src/domain/code-job-memory-event.js";
-import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
+import {
+  MAX_MEMORY_RECORD_CONTENT_BYTES,
+  normalizeMemoryRecord,
+} from "../src/domain/memory-record.js";
 
 const WORKSPACE_REVISION = "4".repeat(64);
 const FILE_BEFORE = "5".repeat(64);
@@ -476,7 +479,10 @@ test("conflict Code Job memory preserves a searchable sealed source summary", ()
     boundaryDigest: executionSource.preparationBinding.boundaryDigest,
     evidenceDigest: executionSource.preparationBinding.evidenceDigest,
     resultObjectDigest: executionSource.preparationBinding.resultObjectDigest,
-    writablePaths: ["src/app.js"],
+    writablePathCount: 1,
+    writablePathsDigest: digestValue(["src/app.js"]),
+    writablePathSamples: ["src/app.js"],
+    writablePathsTruncated: false,
   });
   assert.equal(record.tags.includes("conflict-preparation"), true);
   assert.equal(
@@ -522,7 +528,68 @@ test("large conflict summaries preserve lifecycle evidence before sampled paths"
     record.evidence.includes(`terminal-detail:${snapshot.terminal.detailDigest}`),
     true,
   );
-  assert.equal(snapshot.executionSource.writablePaths.length, 32);
+  assert.equal(snapshot.executionSource.writablePathCount, 32);
+  assert.equal(snapshot.executionSource.writablePathSamples.length, 8);
+  assert.equal(snapshot.executionSource.writablePathsTruncated, true);
+});
+
+test("maximum conflict paths and terminal manifest remain within memory limits", () => {
+  const binding = conflictInputBinding();
+  const conflicts = Array.from({ length: 32 }, (_, index) => ({
+    path: `src/${String(index).padStart(2, "0")}-${"a".repeat(236)}/${"b".repeat(240)}.js`,
+    mode: "100644",
+  }));
+  const executionSource = conflictExecutionSource(binding, conflicts);
+  const active = observedJob(binding, {
+    operation: "modify",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: conflicts.map(({ path: relativePath }) => relativePath),
+    executionSource,
+  });
+  const detail = {
+    schemaVersion: 1,
+    outcome: "fixed",
+    evidence: [],
+    checks: ["node-tests"],
+    workspaceRevision: WORKSPACE_REVISION,
+    manifest: {
+      created: [],
+      modified: conflicts.slice(0, 20).map(({ path: relativePath }) => ({
+        path: relativePath,
+        beforeSha256: FILE_BEFORE,
+        afterSha256: FILE_AFTER,
+      })),
+      deleted: [],
+    },
+    completedActionId: "complete-action-1",
+  };
+  const completed = updateCodeJobLifecycle(active, {
+    status: "completed",
+    revision: 3,
+    updatedAt: "2026-08-02T06:02:00.000Z",
+    execution: {
+      ...active.execution,
+      result: {
+        kind: "completed",
+        detail,
+        detailDigest: digestValue(detail),
+        recordedAt: "2026-08-02T06:02:00.000Z",
+      },
+    },
+  });
+
+  const event = createCodeJobMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completed,
+    kind: "completed",
+  });
+  assert.doesNotThrow(() => normalizeCodeJobMemoryEvent(event));
+  assert.equal(
+    Buffer.byteLength(event.memoryRecord.content, "utf8") <=
+      MAX_MEMORY_RECORD_CONTENT_BYTES,
+    true,
+  );
 });
 
 test("normalization rejects extra fields, accessors, cycles, and digest tampering", () => {

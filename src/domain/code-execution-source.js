@@ -17,6 +17,7 @@ const SOURCE_KEYS = Object.freeze([
 const WRITE_SCOPE_KEYS = Object.freeze(["mode", "paths"]);
 const MAX_EXECUTION_PATH_BYTES = 512;
 const MAX_EXECUTION_SEGMENT_BYTES = 255;
+const CONTROL_CHARACTER = /\p{Cc}/u;
 
 export class CodeExecutionSourceError extends Error {
   constructor(message = "代码执行来源无效", cause) {
@@ -124,6 +125,7 @@ function normalize(value, error) {
     expectedPaths.some(
       (relativePath) =>
         Buffer.byteLength(relativePath, "utf8") > MAX_EXECUTION_PATH_BYTES ||
+        CONTROL_CHARACTER.test(relativePath) ||
         relativePath.split("/").some(
           (segment) =>
             Buffer.byteLength(segment, "utf8") > MAX_EXECUTION_SEGMENT_BYTES,

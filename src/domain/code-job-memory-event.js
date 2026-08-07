@@ -40,6 +40,7 @@ const JOB_STATUS_SET = new Set(CODE_JOB_STATUSES);
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 20;
 const MAX_EVIDENCE_DIGESTS = 12;
+const MAX_EXECUTION_SOURCE_PATH_SAMPLES = 8;
 
 export class CodeJobMemoryEventError extends Error {
   constructor(message = "代码任务记忆事件无效", options) {
@@ -345,6 +346,7 @@ function terminalSummary(job) {
 function executionSourceSummary(value) {
   const source = normalizeCodeExecutionSource(value);
   const binding = source.preparationBinding;
+  const writablePaths = codeExecutionSourceWritablePaths(source);
   return {
     kind: source.kind,
     preparationId: binding.preparationId,
@@ -352,7 +354,14 @@ function executionSourceSummary(value) {
     boundaryDigest: binding.boundaryDigest,
     evidenceDigest: binding.evidenceDigest,
     resultObjectDigest: binding.resultObjectDigest,
-    writablePaths: codeExecutionSourceWritablePaths(source),
+    writablePathCount: writablePaths.length,
+    writablePathsDigest: safeDigest(writablePaths),
+    writablePathSamples: writablePaths.slice(
+      0,
+      MAX_EXECUTION_SOURCE_PATH_SAMPLES,
+    ),
+    writablePathsTruncated:
+      writablePaths.length > MAX_EXECUTION_SOURCE_PATH_SAMPLES,
   };
 }
 
@@ -417,7 +426,7 @@ function memoryEvidence(snapshot) {
     values.push(...snapshot.terminal.checks.map((value) => `check:${value}`));
   }
   if (snapshot.executionSource !== undefined) {
-    values.push(...snapshot.executionSource.writablePaths.map(
+    values.push(...snapshot.executionSource.writablePathSamples.map(
       (relativePath) => `conflict-path:${relativePath}`,
     ));
   }
@@ -655,7 +664,10 @@ function normalizeExecutionSourceSummary(value) {
       "boundaryDigest",
       "evidenceDigest",
       "resultObjectDigest",
-      "writablePaths",
+      "writablePathCount",
+      "writablePathsDigest",
+      "writablePathSamples",
+      "writablePathsTruncated",
     ],
     "executionSource",
   );
@@ -668,27 +680,50 @@ function normalizeExecutionSourceSummary(value) {
     64,
     GIT_OID,
   );
-  const writablePaths = denseArray(
-    fields.get("writablePaths"),
-    32,
-    "executionSource.writablePaths",
+  const writablePathCount = integer(
+    fields.get("writablePathCount"),
+    "executionSource.writablePathCount",
+    1,
+  );
+  if (writablePathCount > 32) {
+    throw invalid("executionSource.writablePathCount 无效");
+  }
+  const writablePathSamples = denseArray(
+    fields.get("writablePathSamples"),
+    MAX_EXECUTION_SOURCE_PATH_SAMPLES,
+    "executionSource.writablePathSamples",
   ).map((entry) => {
     const relativePath = safeManifestPath(entry);
     if (relativePath === null) {
-      throw invalid("executionSource.writablePaths[] 无效");
+      throw invalid("executionSource.writablePathSamples[] 无效");
     }
     return relativePath;
   });
-  const portablePaths = writablePaths.map((entry) => entry.toLowerCase());
+  const portablePaths = writablePathSamples.map((entry) =>
+    entry.toLowerCase(),
+  );
+  const writablePathsTruncated = fields.get("writablePathsTruncated");
+  const writablePathsDigest = digest(
+    fields.get("writablePathsDigest"),
+    "executionSource.writablePathsDigest",
+  );
+  const expectedSampleCount = Math.min(
+    writablePathCount,
+    MAX_EXECUTION_SOURCE_PATH_SAMPLES,
+  );
   if (
-    writablePaths.length < 1 ||
-    new Set(portablePaths).size !== portablePaths.length ||
-    writablePaths.some(
+    writablePathSamples.length !== expectedSampleCount ||
+    typeof writablePathsTruncated !== "boolean" ||
+    writablePathsTruncated !== (writablePathCount > expectedSampleCount) ||
+    new Set(portablePaths).size !== writablePathSamples.length ||
+    writablePathSamples.some(
       (entry, index) => index > 0 &&
-        writablePaths[index - 1].localeCompare(entry, "en") >= 0,
-    )
+        writablePathSamples[index - 1].localeCompare(entry, "en") >= 0,
+    ) ||
+    (!writablePathsTruncated &&
+      writablePathsDigest !== safeDigest(writablePathSamples))
   ) {
-    throw invalid("executionSource.writablePaths 无效");
+    throw invalid("executionSource.writablePathSamples 无效");
   }
   return {
     kind: "conflict_preparation",
@@ -709,7 +744,10 @@ function normalizeExecutionSourceSummary(value) {
       fields.get("resultObjectDigest"),
       "executionSource.resultObjectDigest",
     ),
-    writablePaths,
+    writablePathCount,
+    writablePathsDigest,
+    writablePathSamples,
+    writablePathsTruncated,
   };
 }
 
