@@ -450,9 +450,11 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
   }
   if (semanticAction.type === "write_text") {
     const path = normalizeSemanticPath(semanticAction.path);
-    const writable = job.grant.writablePaths.some(
-      (candidate) => path === candidate || path.startsWith(`${candidate}/`),
-    );
+    const writable = job.grant.schemaVersion === 3
+      ? job.grant.writablePaths.includes(path)
+      : job.grant.writablePaths.some(
+          (candidate) => path === candidate || path.startsWith(`${candidate}/`),
+        );
     if (!writable) {
       throw workerError(
         "CODE_BRAIN_WRITE_NOT_PERMITTED",

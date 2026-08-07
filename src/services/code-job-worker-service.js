@@ -80,6 +80,19 @@ function inputBindingForJob(job) {
     : null;
 }
 
+function executionSourceForJob(job) {
+  return job.grant.schemaVersion === 3
+    ? job.grant.executionSource
+    : undefined;
+}
+
+function executionSourceRequestForJob(job) {
+  const executionSource = executionSourceForJob(job);
+  return executionSource === undefined
+    ? {}
+    : { executionSource: structuredClone(executionSource) };
+}
+
 function assertJobSessionInputBinding(job, session) {
   const expectedProfiles = job.grant.requiredProfiles.map(({ id }) => id).sort();
   const actualProfiles = Array.isArray(session?.requiredProfiles)
@@ -91,7 +104,11 @@ function assertJobSessionInputBinding(job, session) {
     !sameValue(session.requestedBy, job.grant.requestedBy) ||
     !sameValue(actualProfiles, expectedProfiles) ||
     !Object.hasOwn(session, "inputBinding") ||
-    !sameValue(session.inputBinding, inputBindingForJob(job))
+    !sameValue(session.inputBinding, inputBindingForJob(job)) ||
+    (Object.hasOwn(session, "executionSource") !==
+      (executionSourceForJob(job) !== undefined)) ||
+    (executionSourceForJob(job) !== undefined &&
+      !sameValue(session.executionSource, executionSourceForJob(job)))
   ) {
     throw workerError(
       "CODE_JOB_SESSION_BINDING_INVALID",
@@ -633,6 +650,7 @@ export class CodeJobWorkerService {
     const response = await this.#executor.reconcileCancellation({
       sessionId: job.jobId,
       inputBinding: structuredClone(inputBindingForJob(job)),
+      ...executionSourceRequestForJob(job),
       cancellationDigest: job.execution.result.detailDigest,
       expectedWorkspaceRevision: job.execution.workspaceRevision,
       expectedAction: pending === null
@@ -862,6 +880,7 @@ export class CodeJobWorkerService {
       (current) => this.#executor.resume({
         sessionId: current.jobId,
         inputBinding: structuredClone(inputBindingForJob(current)),
+        ...executionSourceRequestForJob(current),
       }),
       { trustedReconciliation },
     );
@@ -874,6 +893,7 @@ export class CodeJobWorkerService {
         workspaceId: current.grant.workspaceId,
         requestedBy: current.grant.requestedBy,
         inputBinding: structuredClone(inputBindingForJob(current)),
+        ...executionSourceRequestForJob(current),
       }),
     );
   }

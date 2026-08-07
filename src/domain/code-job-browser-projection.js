@@ -1,4 +1,8 @@
 import { CODE_JOB_STATUSES } from "./code-job-vocabulary.js";
+import {
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "./code-execution-source.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
 import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
@@ -83,6 +87,14 @@ const BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY = Object.freeze([
 const BOUND_PROJECTION_KEYS = Object.freeze([
   ...PROJECTION_KEYS,
   "inputBinding",
+]);
+const CONFLICT_PROJECTION_KEYS_WITHOUT_UNCERTAINTY = Object.freeze([
+  ...BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY,
+  "executionSource",
+]);
+const CONFLICT_PROJECTION_KEYS = Object.freeze([
+  ...BOUND_PROJECTION_KEYS,
+  "executionSource",
 ]);
 const PROGRESS_KEYS = new Set([
   "turn",
@@ -474,6 +486,17 @@ function normalizeOptionalRecord(value, keys, error) {
 
 function projectionShape(suppliedKeys) {
   if (hasExactKeys(suppliedKeys, LEGACY_PROJECTION_KEYS)) return "legacy";
+  if (
+    hasExactKeys(
+      suppliedKeys,
+      CONFLICT_PROJECTION_KEYS_WITHOUT_UNCERTAINTY,
+    )
+  ) {
+    return "conflictWithoutUncertainty";
+  }
+  if (hasExactKeys(suppliedKeys, CONFLICT_PROJECTION_KEYS)) {
+    return "conflictCurrent";
+  }
   if (hasExactKeys(suppliedKeys, BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY)) {
     return "boundWithoutUncertainty";
   }
@@ -495,6 +518,10 @@ function expectedProjectionKeys(shape) {
     return BOUND_PROJECTION_KEYS_WITHOUT_UNCERTAINTY;
   }
   if (shape === "boundCurrent") return BOUND_PROJECTION_KEYS;
+  if (shape === "conflictWithoutUncertainty") {
+    return CONFLICT_PROJECTION_KEYS_WITHOUT_UNCERTAINTY;
+  }
+  if (shape === "conflictCurrent") return CONFLICT_PROJECTION_KEYS;
   return PROJECTION_KEYS;
 }
 
@@ -749,6 +776,32 @@ export function normalizeCodeJobBrowserProjection(
       throw error;
     }
   }
+  if (shape.startsWith("conflict")) {
+    let executionSource;
+    let inputBinding;
+    try {
+      executionSource = normalizeCodeExecutionSource(
+        projection.executionSource,
+        error,
+      );
+      inputBinding = normalizePullRequestExecutionBinding(
+        projection.inputBinding,
+        error,
+      );
+    } catch {
+      throw error;
+    }
+    if (
+      !sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding,
+      }) ||
+      inputBinding.repository !== projection.repository ||
+      inputBinding.pullRequestNumber !== projection.subject?.number
+    ) {
+      throw error;
+    }
+  }
   const progress = normalizeProgress(projection, error);
   assertProjectionLifecycle(projection, progress, error);
   return projection;
@@ -773,6 +826,9 @@ function projectBrowserFields(source, progress) {
     workspaceId: grant.workspaceId,
     ...(Object.hasOwn(grant, "inputBinding")
       ? { inputBinding: grant.inputBinding }
+      : {}),
+    ...(Object.hasOwn(grant, "executionSource")
+      ? { executionSource: grant.executionSource }
       : {}),
     operation: grant.operation,
     objective: grant.objective,

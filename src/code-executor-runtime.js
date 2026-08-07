@@ -159,6 +159,7 @@ function createWorkspaceAuthority(
   requiredProfiles,
   sandbox,
   gitSettings,
+  conflictMaterializerAvailable,
 ) {
   return Object.freeze({
     workspaces: Object.freeze(
@@ -172,6 +173,9 @@ function createWorkspaceAuthority(
         const capabilities = [
           "directory_snapshot",
           ...(workspace.gitBoundary === null ? [] : ["git_head_snapshot"]),
+          ...(conflictMaterializerAvailable
+            ? ["conflict_preparation_snapshot"]
+            : []),
         ];
         const gitSnapshot = workspace.gitBoundary === null
           ? null
@@ -184,6 +188,7 @@ function createWorkspaceAuthority(
           id: workspace.id,
           capabilities: Object.freeze(capabilities),
           writablePaths: Object.freeze([...workspace.writablePaths]),
+          excludePaths: Object.freeze([...workspace.excludePaths]),
           requiredProfiles: Object.freeze(profiles),
           authorityDigest: digestValue({
             schemaVersion: 3,
@@ -373,9 +378,23 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     enabledConfig.requiredProfilesByWorkspace,
   );
   const gitSettings = normalizeGitSettings(enabledConfig, workspaces);
+  const conflictMaterializer = dependencies.conflictMaterializer === undefined
+    ? null
+    : Object.freeze({
+        materialize: method(
+          dependencies.conflictMaterializer,
+          "materialize",
+          "conflictMaterializer",
+        ),
+      });
   if (gitSettings && dependencies.broker !== undefined) {
     throw invalidConfig(
       "Git Head snapshot 工作区不能使用未验证的注入 broker",
+    );
+  }
+  if (conflictMaterializer !== null && dependencies.broker !== undefined) {
+    throw invalidConfig(
+      "Conflict preparation 工作区不能使用未验证的注入 broker",
     );
   }
   let gitSnapshotter = null;
@@ -441,6 +460,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
       scratchRoot: path.join(runtimeRoot, "workspaces"),
       limits: enabledConfig.brokerLimits || {},
       gitSnapshotter,
+      conflictMaterializer,
     });
   const journal =
     dependencies.journal ||
@@ -480,6 +500,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     enabledConfig.requiredProfilesByWorkspace,
     sandbox,
     gitSettings,
+    conflictMaterializer !== null,
   );
   const changePackageTargets = createChangePackageTargets(
     workspaces,

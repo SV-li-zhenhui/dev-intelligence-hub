@@ -10,6 +10,8 @@ import {
   createCodeJobGrant,
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
@@ -87,13 +89,17 @@ function active(value, version = 1) {
   };
 }
 
-function executorAuthority() {
+function executorAuthority({ conflict = false } = {}) {
   return {
     workspaces: [
       {
         id: "dashboard",
-        capabilities: ["git_head_snapshot"],
+        capabilities: [
+          "git_head_snapshot",
+          ...(conflict ? ["conflict_preparation_snapshot"] : []),
+        ],
         writablePaths: ["src", "test"],
+        excludePaths: [],
         requiredProfiles: [
           { id: "node-tests", configDigest: "a".repeat(64) },
         ],
@@ -103,6 +109,7 @@ function executorAuthority() {
         id: "auxiliary",
         capabilities: ["git_head_snapshot"],
         writablePaths: ["src"],
+        excludePaths: [],
         requiredProfiles: [
           { id: "auxiliary-tests", configDigest: "b".repeat(64) },
         ],
@@ -209,7 +216,7 @@ function legacyGrant(configurations) {
   return createCodeJobGrant(legacyContent);
 }
 
-function proposal(config) {
+function proposal(config, { conflicts = null } = {}) {
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType: "pull_request.updated",
@@ -255,6 +262,28 @@ function proposal(config) {
     inputDigest: "c".repeat(64),
     gitTarget: structuredClone(event.payload.gitTarget),
   };
+  const executionSource = conflicts === null
+    ? undefined
+    : createConflictCodeExecutionSource({
+        inputBinding,
+        preparationBinding: createConflictPreparationBinding({
+          preparation: {
+            schemaVersion: 1,
+            preparationId: "1".repeat(64),
+            status: "conflicted",
+            baseCommitOid: inputBinding.gitTarget.baseRefOid,
+            headCommitOid: inputBinding.gitTarget.headRefOid,
+            mergeBaseOid: "e".repeat(40),
+            resultTreeOid: "f".repeat(40),
+            conflicts,
+            boundaryDigest: "2".repeat(64),
+            evidenceDigest: "3".repeat(64),
+            resultObjectDigest: "4".repeat(64),
+            materialization: "full-tree",
+          },
+          gitTarget: inputBinding.gitTarget,
+        }),
+      });
   const bound = createWorkIntentPolicy({
     version: policy.version,
     codeActionRoles: policy.codeActionRoles,
@@ -267,6 +296,7 @@ function proposal(config) {
       roleId: "developer",
       event,
       inputBinding,
+      ...(executionSource === undefined ? {} : { executionSource }),
     },
     intent: {
       schemaVersion: 1,
@@ -303,6 +333,8 @@ function fixture({
   actionAdmissionGate,
   grantFactoryFactory,
   inputAuthorityVerifier = acceptingInputAuthorityVerifier(),
+  conflictPreparationVerifier,
+  executorAuthorityValue = executorAuthority(),
 } = {}) {
   const startup = configuration();
   let current = active(startup);
@@ -325,10 +357,11 @@ function fixture({
         return { versions: structuredClone(versions) };
       },
     },
-    executorAuthority: executorAuthority(),
+    executorAuthority: executorAuthorityValue,
     startupConfiguration: startup,
     actionAdmissionGate: admissionGate,
     inputAuthorityVerifier,
+    ...(conflictPreparationVerifier ? { conflictPreparationVerifier } : {}),
     ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
     ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
   });
@@ -358,10 +391,11 @@ function fixture({
             return { versions: structuredClone(versions) };
           },
         },
-        executorAuthority: executorAuthority(),
+        executorAuthority: executorAuthorityValue,
         startupConfiguration: current.configuration,
         actionAdmissionGate: restartGate,
         inputAuthorityVerifier,
+        ...(conflictPreparationVerifier ? { conflictPreparationVerifier } : {}),
         ...(brainDirectoryFactory ? { brainDirectoryFactory } : {}),
         ...(grantFactoryFactory ? { grantFactoryFactory } : {}),
       });
@@ -520,6 +554,46 @@ test("an unrelated executor workspace change preserves a scoped grant after rest
   context.activate(changed);
 
   assert.deepEqual(await context.restart().verify(sealed), sealed);
+});
+
+test("versioned authority creates and revalidates sealed conflict grants", async () => {
+  const verified = [];
+  const conflictPreparationVerifier = {
+    verify(binding) {
+      verified.push(structuredClone(binding));
+      return structuredClone(binding);
+    },
+  };
+  const context = fixture({
+    executorAuthorityValue: executorAuthority({ conflict: true }),
+    conflictPreparationVerifier,
+  });
+  const currentProposal = proposal(context.startup, {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  });
+  const sealed = (await context.authority.create(currentProposal)).grant;
+
+  assert.equal(sealed.schemaVersion, 3);
+  assert.deepEqual(sealed.executionSource, currentProposal.binding.executionSource);
+  assert.deepEqual(sealed.writablePaths, ["src/value.js"]);
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+  assert.equal(verified.length, 3);
+
+  const missingVerifier = fixture({
+    executorAuthorityValue: executorAuthority({ conflict: true }),
+  });
+  assert.equal(
+    (await missingVerifier.authority.create(proposal(missingVerifier.startup)))
+      .grant.schemaVersion,
+    2,
+  );
+  await assert.rejects(
+    missingVerifier.authority.create(proposal(missingVerifier.startup, {
+      conflicts: [{ path: "src/value.js", mode: "100644" }],
+    })),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
 });
 
 test("current Active creates grants and security expansion invalidates old grants", async () => {

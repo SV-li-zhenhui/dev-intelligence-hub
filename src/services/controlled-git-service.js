@@ -213,6 +213,33 @@ function exactArray(value, code) {
   return entries;
 }
 
+function normalizeMaterializationExcludePaths(value) {
+  const entries = exactArray(value, "INVALID_CONTROLLED_GIT_REQUEST");
+  let policy;
+  try {
+    policy = new CodeExecutionPolicy({ excludePaths: entries });
+  } catch (cause) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "excludePaths 无效",
+      cause,
+    );
+  }
+  const portablePaths = new Set();
+  for (let index = 0; index < entries.length; index += 1) {
+    const normalized = policy.excludePaths[index];
+    const portable = normalized.toLowerCase();
+    if (entries[index] !== normalized || portablePaths.has(portable)) {
+      throw controlledGitError(
+        "INVALID_CONTROLLED_GIT_REQUEST",
+        "excludePaths 无效",
+      );
+    }
+    portablePaths.add(portable);
+  }
+  return Object.freeze([...policy.excludePaths]);
+}
+
 function validateLimits(value) {
   if (!isPlainRecord(value)) {
     throw controlledGitError(
@@ -1228,18 +1255,37 @@ export class ControlledGitService {
   }
 
   async materializeConflictPreparationForCodeJob(value) {
-    const fields = exactDataObject(value, ["binding", "targetRoot"]);
+    const fields = exactDataObject(value, [
+      "binding",
+      "targetRoot",
+      "excludePaths",
+    ]);
+    const excludePaths = normalizeMaterializationExcludePaths(
+      fields.get("excludePaths"),
+    );
     const binding = await this.verifyConflictPreparation({
       binding: fields.get("binding"),
     });
-    return this.materializeForCodeJob({
+    const receipt = await this.materializeForCodeJob({
       preparationId: binding.preparationId,
       targetRoot: fields.get("targetRoot"),
+      excludePaths,
     });
+    return deepFreeze({ ...receipt, binding });
   }
 
   async materializeForCodeJob(value) {
-    const fields = exactDataObject(value, ["preparationId", "targetRoot"]);
+    const hasExcludePaths = isPlainRecord(value) &&
+      Object.hasOwn(value, "excludePaths");
+    const fields = exactDataObject(value, [
+      "preparationId",
+      "targetRoot",
+      ...(hasExcludePaths ? ["excludePaths"] : []),
+    ]);
+    const excludePaths = hasExcludePaths
+      ? normalizeMaterializationExcludePaths(fields.get("excludePaths"))
+      : Object.freeze([]);
+    const materializationPolicy = new CodeExecutionPolicy({ excludePaths });
     const preparationId = fields.get("preparationId");
     const targetRoot = requireAbsolutePath(
       fields.get("targetRoot"),
@@ -1257,6 +1303,7 @@ export class ControlledGitService {
     const preparationDirectory = await this.#preparationDirectory(preparationId);
     const createdFiles = [];
     const createdDirectories = { ordered: [], byPath: new Map() };
+    const receiptFiles = [];
     let lease;
     let totalBytes = 0;
     try {
@@ -1265,6 +1312,7 @@ export class ControlledGitService {
         preparationId,
       );
       for (const entry of manifest.treeEntries) {
+        if (materializationPolicy.isExcluded(entry.path)) continue;
         await this.#assertMaterializationFence(targetBoundary, lease);
         const content = await this.#readSealedBlob(
           preparationDirectory,
@@ -1333,6 +1381,12 @@ export class ControlledGitService {
           await handle.close();
         }
         await this.#assertMaterializedFile(createdFiles.at(-1));
+        receiptFiles.push(deepFreeze({
+          path: entry.path,
+          sha256: sha256(content),
+          mode: entry.mode,
+          bytes: content.length,
+        }));
         await this.#assertMaterializationFence(
           targetBoundary,
           lease,
@@ -1369,11 +1423,13 @@ export class ControlledGitService {
       );
     }
     return deepFreeze({
-      schemaVersion: 1,
+      schemaVersion: 2,
       preparationId,
       targetRoot,
       materialization: "full-tree",
-      fileCount: manifest.treeEntries.length,
+      excludePaths: [...excludePaths],
+      files: receiptFiles,
+      fileCount: receiptFiles.length,
       totalBytes,
       resultTreeOid: manifest.resultTreeOid,
       evidenceDigest: manifest.evidenceDigest,

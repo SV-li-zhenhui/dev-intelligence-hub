@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { normalizeCodeJobGrant } from "./code-job-contract.js";
+import {
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "./code-execution-source.js";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 import { digestValue } from "./code-executor-contract.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
@@ -91,6 +95,9 @@ function normalizeProposalDetails(proposal) {
       "repository",
       "workspaceId",
       "inputBinding",
+      ...(Object.hasOwn(proposal.binding, "executionSource")
+        ? ["executionSource"]
+        : []),
       ...(Object.hasOwn(proposal.binding, "evidenceTarget")
         ? ["evidenceTarget"]
         : []),
@@ -179,6 +186,26 @@ function normalizeProposalDetails(proposal) {
   if (!OPERATIONS.has(payload.operation)) {
     throw invalid("payload.operation 无效");
   }
+  let executionSource = null;
+  if (Object.hasOwn(binding, "executionSource")) {
+    try {
+      executionSource = normalizeCodeExecutionSource(
+        binding.executionSource,
+      );
+    } catch {
+      throw invalid("binding.executionSource 无效");
+    }
+    if (
+      inputBinding === null ||
+      payload.operation !== "modify" ||
+      !sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding,
+      })
+    ) {
+      throw invalid("binding.executionSource 与提案权限不匹配");
+    }
+  }
   const acceptanceCriteria = stringList(
     payload.acceptanceCriteria,
     "payload.acceptanceCriteria",
@@ -192,6 +219,7 @@ function normalizeProposalDetails(proposal) {
     repository,
     workspaceId,
     inputBinding,
+    executionSource,
     operation: payload.operation,
     objective: text(payload.objective, "payload.objective", 4_096),
     acceptanceCriteria,
@@ -252,6 +280,12 @@ function normalizeOptions(value) {
 }
 
 function assertGrantMatchesProposal(proposal, details, grant) {
+  if (
+    (details.executionSource === null && grant.schemaVersion !== 2) ||
+    (details.executionSource !== null && grant.schemaVersion !== 3)
+  ) {
+    throw invalid("代码任务授权版本与工作提案不匹配");
+  }
   const expected = {
     proposalId: proposal.proposalId,
     contentDigest: proposal.contentDigest,
@@ -262,6 +296,9 @@ function assertGrantMatchesProposal(proposal, details, grant) {
     repository: details.repository,
     workspaceId: details.workspaceId,
     inputBinding: details.inputBinding,
+    ...(details.executionSource === null
+      ? {}
+      : { executionSource: details.executionSource }),
     operation: details.operation,
     objective: details.objective,
     acceptanceCriteria: details.acceptanceCriteria,

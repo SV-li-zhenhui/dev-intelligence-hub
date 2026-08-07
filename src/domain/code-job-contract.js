@@ -4,6 +4,11 @@ import {
 } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
 import {
+  codeExecutionSourceWritablePaths,
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "./code-execution-source.js";
+import {
   projectNormalizedCodeJobForBrowser,
 } from "./code-job-browser-projection.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
@@ -355,6 +360,10 @@ const GRANT_KEYS = Object.freeze([
   ...LEGACY_GRANT_KEYS,
   "inputBinding",
 ]);
+const CONFLICT_GRANT_KEYS = Object.freeze([
+  ...GRANT_KEYS,
+  "executionSource",
+]);
 
 function grantKeys(value, error, { digest = false } = {}) {
   const actual = plainDataEntries(value, error).map(([key]) => key);
@@ -363,6 +372,10 @@ function grantKeys(value, error, { digest = false } = {}) {
     ...(digest ? ["grantDigest"] : []),
   ];
   const current = [...GRANT_KEYS, ...(digest ? ["grantDigest"] : [])];
+  const conflict = [
+    ...CONFLICT_GRANT_KEYS,
+    ...(digest ? ["grantDigest"] : []),
+  ];
   if (
     actual.length === legacy.length &&
     legacy.every((key) => actual.includes(key))
@@ -374,6 +387,12 @@ function grantKeys(value, error, { digest = false } = {}) {
     current.every((key) => actual.includes(key))
   ) {
     return GRANT_KEYS;
+  }
+  if (
+    actual.length === conflict.length &&
+    conflict.every((key) => actual.includes(key))
+  ) {
+    return CONFLICT_GRANT_KEYS;
   }
   throw error;
 }
@@ -390,7 +409,10 @@ function normalizeInputBinding(value, error) {
 function normalizeGrantContent(value, error) {
   const keys = grantKeys(value, error);
   const entries = exactObject(value, keys, error);
-  if (keys === GRANT_KEYS && entries.get("schemaVersion") !== 2) {
+  if (
+    (keys === GRANT_KEYS && entries.get("schemaVersion") !== 2) ||
+    (keys === CONFLICT_GRANT_KEYS && entries.get("schemaVersion") !== 3)
+  ) {
     throw error;
   }
   const operation = entries.get("operation");
@@ -399,7 +421,9 @@ function normalizeGrantContent(value, error) {
   const subject = normalizeSubject(entries.get("subject"), error);
   if (subject.repository !== repository) throw error;
   const content = {
-    ...(keys === GRANT_KEYS ? { schemaVersion: 2 } : {}),
+    ...(keys === LEGACY_GRANT_KEYS
+      ? {}
+      : { schemaVersion: keys === GRANT_KEYS ? 2 : 3 }),
     proposalId: safeReference(
       entries.get("proposalId"),
       "proposalId",
@@ -460,7 +484,7 @@ function normalizeGrantContent(value, error) {
     ),
     brainDigest: sha256(entries.get("brainDigest"), "brainDigest", error),
   };
-  if (keys === GRANT_KEYS) {
+  if (keys !== LEGACY_GRANT_KEYS) {
     const inputBinding = normalizeInputBinding(
       entries.get("inputBinding"),
       error,
@@ -474,6 +498,30 @@ function normalizeGrantContent(value, error) {
       throw error;
     }
     content.inputBinding = inputBinding;
+  }
+  if (keys === CONFLICT_GRANT_KEYS) {
+    let executionSource;
+    try {
+      executionSource = normalizeCodeExecutionSource(
+        entries.get("executionSource"),
+        error,
+      );
+    } catch {
+      throw error;
+    }
+    if (
+      operation !== "modify" ||
+      content.inputBinding === null ||
+      !sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding: content.inputBinding,
+      }) ||
+      JSON.stringify(content.writablePaths) !==
+        JSON.stringify(codeExecutionSourceWritablePaths(executionSource))
+    ) {
+      throw error;
+    }
+    content.executionSource = executionSource;
   }
   return content;
 }
@@ -711,13 +759,14 @@ function assertActionAllowedByGrant(action, grant, error) {
     } catch {
       throw error;
     }
-    if (
-      !grant.writablePaths.some(
-        (writablePath) =>
-          relativePath === writablePath ||
-          relativePath.startsWith(`${writablePath}/`),
-      )
-    ) {
+    const writable = grant.schemaVersion === 3
+      ? grant.writablePaths.includes(relativePath)
+      : grant.writablePaths.some(
+          (writablePath) =>
+            relativePath === writablePath ||
+            relativePath.startsWith(`${writablePath}/`),
+        );
+    if (!writable) {
       throw error;
     }
   }

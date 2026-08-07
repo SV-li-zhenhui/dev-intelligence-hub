@@ -6,6 +6,8 @@ import {
   createQueuedCodeJob,
   updateCodeJobLifecycle,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   classifyCodeJobMemoryEvent,
@@ -38,7 +40,48 @@ function inputBinding() {
   };
 }
 
-function grant(binding) {
+function conflictInputBinding() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/widgets",
+    baseRefName: "main",
+    baseRefOid: "7".repeat(40),
+    headRepository: "contributor/widgets",
+    headRefName: "fix/conflict",
+    headRefOid: HEAD_REF_OID,
+  };
+  return { ...inputBinding(), schemaVersion: 2, gitTarget };
+}
+
+function conflictExecutionSource(
+  binding,
+  conflicts = [{ path: "src/app.js", mode: "100644" }],
+) {
+  return createConflictCodeExecutionSource({
+    inputBinding: binding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "8".repeat(64),
+        status: "conflicted",
+        baseCommitOid: binding.gitTarget.baseRefOid,
+        headCommitOid: binding.gitTarget.headRefOid,
+        mergeBaseOid: "9".repeat(40),
+        resultTreeOid: "a".repeat(40),
+        conflicts,
+        boundaryDigest: "b".repeat(64),
+        evidenceDigest: "c".repeat(64),
+        resultObjectDigest: "d".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: binding.gitTarget,
+    }),
+  });
+}
+
+function grant(binding, overrides = {}) {
   const content = {
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
@@ -66,21 +109,26 @@ function grant(binding) {
     ],
     brainDigest: "c".repeat(64),
   };
+  const next = { ...content, ...overrides };
   return createCodeJobGrant(
     binding === undefined
-      ? content
-      : { schemaVersion: 2, ...content, inputBinding: binding },
+      ? next
+      : {
+          schemaVersion: Object.hasOwn(next, "executionSource") ? 3 : 2,
+          ...next,
+          inputBinding: binding,
+        },
   );
 }
 
-function queuedJob(binding) {
+function queuedJob(binding, grantOverrides = {}) {
   return createQueuedCodeJob(
     {
       confirmationId: "confirmation-code-job-approval-1",
       requestId: "approval-request-0001",
       displayedPayloadDigest: "d".repeat(64),
       approvalBindingDigest: "e".repeat(64),
-      grant: grant(binding),
+      grant: grant(binding, grantOverrides),
     },
     {
       sequence: 1,
@@ -90,8 +138,8 @@ function queuedJob(binding) {
   );
 }
 
-function observedJob(binding) {
-  const queued = queuedJob(binding);
+function observedJob(binding, grantOverrides = {}) {
+  const queued = queuedJob(binding, grantOverrides);
   const action = {
     type: "complete",
     actionId: "complete-action-1",
@@ -143,8 +191,8 @@ function observedJob(binding) {
   });
 }
 
-function completedJob(binding) {
-  const active = observedJob(binding);
+function completedJob(binding, grantOverrides = {}) {
+  const active = observedJob(binding, grantOverrides);
   const detail = {
     schemaVersion: 1,
     outcome: "fixed",
@@ -400,6 +448,81 @@ test("creates a content-addressed safe Code Job memory event", () => {
   assert.match(serialized, /src\/app\.js/);
   assert.match(serialized, /node-tests/);
   assert.match(serialized, new RegExp(job.execution.result.detailDigest));
+});
+
+test("conflict Code Job memory preserves a searchable sealed source summary", () => {
+  const binding = conflictInputBinding();
+  const executionSource = conflictExecutionSource(binding);
+  const job = observedJob(binding, {
+    operation: "modify",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: ["src/app.js"],
+    executionSource,
+  });
+  const event = createCodeJobMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    job,
+    kind: "observation",
+  });
+  const record = memoryRecordForCodeJobEvent(event);
+  const snapshot = JSON.parse(record.content);
+
+  assert.equal(snapshot.schemaVersion, 3);
+  assert.deepEqual(snapshot.executionSource, {
+    kind: "conflict_preparation",
+    preparationId: executionSource.preparationBinding.preparationId,
+    resultTreeOid: executionSource.preparationBinding.resultTreeOid,
+    boundaryDigest: executionSource.preparationBinding.boundaryDigest,
+    evidenceDigest: executionSource.preparationBinding.evidenceDigest,
+    resultObjectDigest: executionSource.preparationBinding.resultObjectDigest,
+    writablePaths: ["src/app.js"],
+  });
+  assert.equal(record.tags.includes("conflict-preparation"), true);
+  assert.equal(
+    record.evidence.includes(
+      `conflict-preparation:${executionSource.preparationBinding.preparationId}`,
+    ),
+    true,
+  );
+  assert.equal(record.evidence.includes("conflict-path:src/app.js"), true);
+  assert.deepEqual(normalizeCodeJobMemoryEvent(event), event);
+});
+
+test("large conflict summaries preserve lifecycle evidence before sampled paths", () => {
+  const binding = conflictInputBinding();
+  const conflicts = Array.from({ length: 32 }, (_, index) => ({
+    path: `src/conflict-${String(index).padStart(2, "0")}.js`,
+    mode: "100644",
+  }));
+  const executionSource = conflictExecutionSource(binding, conflicts);
+  const job = completedJob(binding, {
+    operation: "modify",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: conflicts.map(({ path: relativePath }) => relativePath),
+    executionSource,
+  });
+  const event = createCodeJobMemoryEvent({
+    sequence: 1,
+    previousDigest: null,
+    job,
+    kind: "completed",
+  });
+  const record = memoryRecordForCodeJobEvent(event);
+  const snapshot = JSON.parse(record.content);
+
+  assert.equal(record.evidence.length <= 20, true);
+  assert.equal(
+    record.evidence.includes(
+      `observation-detail:${snapshot.latestObservation.detailDigest}`,
+    ),
+    true,
+  );
+  assert.equal(
+    record.evidence.includes(`terminal-detail:${snapshot.terminal.detailDigest}`),
+    true,
+  );
+  assert.equal(snapshot.executionSource.writablePaths.length, 32);
 });
 
 test("normalization rejects extra fields, accessors, cycles, and digest tampering", () => {

@@ -1,6 +1,8 @@
 import {
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
+import { codeExecutionSourceWritablePaths } from "../domain/code-execution-source.js";
+import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
 import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-directory.js";
@@ -463,14 +465,37 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
   ) {
     return false;
   }
+  const expectedWritablePaths = grant.schemaVersion === 3
+    ? codeExecutionSourceWritablePaths(grant.executionSource)
+    : grant.operation === "modify"
+      ? workspace.writablePaths
+      : [];
+  if (grant.schemaVersion === 3) {
+    if (
+      grant.operation !== "modify" ||
+      !workspace.capabilities?.includes("conflict_preparation_snapshot")
+    ) {
+      return false;
+    }
+    const executionPolicy = new CodeExecutionPolicy({
+      writablePaths: workspace.writablePaths,
+      excludePaths: workspace.excludePaths ?? [],
+    });
+    try {
+      for (const conflictPath of expectedWritablePaths) {
+        executionPolicy.assertWritable(conflictPath);
+      }
+    } catch {
+      return false;
+    }
+  }
   return (
     canonicalJsonDigest({
       writablePaths: grant.writablePaths,
       requiredProfiles: grant.requiredProfiles,
     }) ===
     canonicalJsonDigest({
-      writablePaths:
-        grant.operation === "modify" ? workspace.writablePaths : [],
+      writablePaths: expectedWritablePaths,
       requiredProfiles: workspace.requiredProfiles,
     })
   );
@@ -511,6 +536,7 @@ export class VersionedCodeJobAuthority {
   #brainDirectoryFactory;
   #actionAdmission;
   #inputAuthorityVerifier;
+  #conflictPreparationVerifier;
   #cache;
   #contexts;
 
@@ -521,6 +547,7 @@ export class VersionedCodeJobAuthority {
     brainDependencies = {},
     actionAdmissionGate,
     inputAuthorityVerifier,
+    conflictPreparationVerifier,
     grantFactoryFactory = (options) => new CodeJobGrantFactory(options),
     brainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
   } = {}) {
@@ -552,6 +579,22 @@ export class VersionedCodeJobAuthority {
             throw invalid("PR 当前 Head 授权校验器未配置");
           }
         : inputAuthorityVerifier.verify.bind(inputAuthorityVerifier),
+    });
+    if (
+      conflictPreparationVerifier !== undefined &&
+      (!conflictPreparationVerifier ||
+        typeof conflictPreparationVerifier.verify !== "function")
+    ) {
+      throw new TypeError(
+        "conflictPreparationVerifier must provide verify(binding)",
+      );
+    }
+    this.#conflictPreparationVerifier = Object.freeze({
+      verify: conflictPreparationVerifier === undefined
+        ? () => {
+            throw invalid("Conflict preparation 校验器未配置");
+          }
+        : conflictPreparationVerifier.verify.bind(conflictPreparationVerifier),
     });
     if (typeof grantFactoryFactory !== "function") {
       throw new TypeError("grantFactoryFactory must be a function");
@@ -762,6 +805,7 @@ export class VersionedCodeJobAuthority {
       brainProviders: configuration.brainProviders,
       scopeAuthorityDigest,
       inputAuthorityVerifier: this.#inputAuthorityVerifier,
+      conflictPreparationVerifier: this.#conflictPreparationVerifier,
     });
     method(grants, "create", "versioned code job grant factory");
     method(grants, "verify", "versioned code job grant factory");
@@ -829,6 +873,7 @@ export class VersionedCodeJobAuthority {
       brainByRole: roleBrains(configuration.employees.roles, roleIds),
       brainProviders: configuration.brainProviders,
       inputAuthorityVerifier: this.#inputAuthorityVerifier,
+      conflictPreparationVerifier: this.#conflictPreparationVerifier,
     });
     method(grants, "verify", "legacy code job grant factory");
     return { authority, grants };

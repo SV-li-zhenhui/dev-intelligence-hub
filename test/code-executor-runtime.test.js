@@ -8,6 +8,8 @@ import {
   CodeExecutorRuntimeError,
   createCodeExecutorRuntime,
 } from "../src/code-executor-runtime.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { mergeConfig } from "../src/lib/config.js";
 import { StateStore } from "../src/lib/state-store.js";
 
@@ -76,6 +78,76 @@ function pullRequestBinding(overrides = {}) {
     eventDigest: "2".repeat(64),
     inputDigest: "3".repeat(64),
     ...overrides,
+  };
+}
+
+function conflictExecutionSource() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/dashboard",
+    baseRefName: "main",
+    baseRefOid: "4".repeat(40),
+    headRepository: "contributor/dashboard",
+    headRefName: "fix/conflict",
+    headRefOid: "1".repeat(40),
+  };
+  const inputBinding = pullRequestBinding({ schemaVersion: 2, gitTarget });
+  return createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "5".repeat(64),
+        status: "conflicted",
+        baseCommitOid: gitTarget.baseRefOid,
+        headCommitOid: gitTarget.headRefOid,
+        mergeBaseOid: "6".repeat(40),
+        resultTreeOid: "7".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "8".repeat(64),
+        evidenceDigest: "9".repeat(64),
+        resultObjectDigest: "a".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget,
+    }),
+  });
+}
+
+function fakeConflictMaterializer(content = "<<<<<<< base\n=======\n>>>>>>> head\n") {
+  const calls = [];
+  return {
+    calls,
+    async materialize(request) {
+      calls.push(structuredClone(request));
+      const value = Buffer.from(content);
+      const relativePath = "src/app.js";
+      const target = path.join(request.targetRoot, "src", "app.js");
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, value);
+      return {
+        schemaVersion: 2,
+        preparationId: request.binding.preparationId,
+        binding: structuredClone(request.binding),
+        targetRoot: request.targetRoot,
+        materialization: "full-tree",
+        excludePaths: [...request.excludePaths],
+        files: [{
+          path: relativePath,
+          sha256: createHash("sha256").update(value).digest("hex"),
+          mode: "100644",
+          bytes: value.length,
+        }],
+        fileCount: 1,
+        totalBytes: value.length,
+        resultTreeOid: request.binding.resultTreeOid,
+        evidenceDigest: request.binding.evidenceDigest,
+        resultObjectDigest: request.binding.resultObjectDigest,
+        residual: null,
+      };
+    },
   };
 }
 
@@ -167,6 +239,7 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
         id: "dashboard",
         capabilities: ["directory_snapshot"],
         writablePaths: ["src"],
+        excludePaths: [],
         requiredProfiles: [
           {
             id: "node-tests",
@@ -232,6 +305,46 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
       expectedWorkspaceRevision: session.workspaceRevision,
     }),
     (error) => error.code === "EXECUTOR_SESSION_NOT_COMPLETED",
+  );
+});
+
+test("conflict capability is published only with its trusted materializer", async (t) => {
+  const setup = await fixture(t);
+  const materializer = fakeConflictMaterializer();
+  const runtime = await createCodeExecutorRuntime(enabledConfig(setup.root), {
+    runtimeRoot: setup.runtimeRoot,
+    sourceBaseRoot: setup.sourceBaseRoot,
+    store: setup.store,
+    conflictMaterializer: materializer,
+  });
+  const executionSource = conflictExecutionSource();
+
+  assert.deepEqual(runtime.authority.workspaces[0].capabilities, [
+    "directory_snapshot",
+    "conflict_preparation_snapshot",
+  ]);
+  const execution = await runtime.broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "conflict-runtime-run",
+    inputBinding: executionSource.inputBinding,
+    executionSource,
+  });
+  assert.deepEqual(execution.executionSource, executionSource);
+  assert.deepEqual(materializer.calls[0].excludePaths, []);
+  assert.equal(
+    (await runtime.broker.readFile({ ...execution, path: "src/app.js" })).content,
+    "<<<<<<< base\n=======\n>>>>>>> head\n",
+  );
+
+  await assert.rejects(
+    createCodeExecutorRuntime(enabledConfig(setup.root), {
+      runtimeRoot: path.join(setup.root, "injected-runtime"),
+      sourceBaseRoot: setup.sourceBaseRoot,
+      store: setup.store,
+      conflictMaterializer: materializer,
+      broker: {},
+    }),
+    (error) => error?.code === "INVALID_CODE_EXECUTOR_CONFIG",
   );
 });
 

@@ -4,6 +4,8 @@ import {
   createCodeJobGrant,
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
@@ -110,6 +112,46 @@ function legacyProposal() {
   });
 }
 
+function conflictProposal({
+  conflicts = [{ path: "src/value.js", mode: "100644" }],
+  operation = "modify",
+} = {}) {
+  const current = proposal();
+  const gitTarget = current.binding.inputBinding.gitTarget;
+  const workspaceSource = createConflictPreparationBinding({
+    preparation: {
+      schemaVersion: 1,
+      preparationId: "1".repeat(64),
+      status: "conflicted",
+      baseCommitOid: gitTarget.baseRefOid,
+      headCommitOid: gitTarget.headRefOid,
+      mergeBaseOid: "e".repeat(gitTarget.headRefOid.length),
+      resultTreeOid: "f".repeat(gitTarget.headRefOid.length),
+      conflicts,
+      boundaryDigest: "2".repeat(64),
+      evidenceDigest: "3".repeat(64),
+      resultObjectDigest: "4".repeat(64),
+      materialization: "full-tree",
+    },
+    gitTarget,
+  });
+  return normalizeBoundWorkProposal({
+    proposalId: current.proposalId,
+    policyVersion: current.policyVersion,
+    kind: current.kind,
+    requestedBy: current.requestedBy,
+    source: current.source,
+    binding: {
+      ...current.binding,
+      executionSource: createConflictCodeExecutionSource({
+        inputBinding: current.binding.inputBinding,
+        preparationBinding: workspaceSource,
+      }),
+    },
+    payload: { ...current.payload, operation },
+  });
+}
+
 function issueProposal(operation = "modify", roleId = "developer") {
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
@@ -167,8 +209,12 @@ function factory(overrides = {}) {
       workspaces: [
         {
           id: "acme-workspace",
-          capabilities: ["git_head_snapshot"],
+          capabilities: [
+            "conflict_preparation_snapshot",
+            "git_head_snapshot",
+          ],
           writablePaths: ["src", "test"],
+          excludePaths: [],
           requiredProfiles: [
             { id: "node-tests", configDigest: "a".repeat(64) },
           ],
@@ -252,6 +298,264 @@ test("trusted authority seals workspace, operation, profile, and brain bindings"
   assert.match(options.grant.brainDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(options.allowedOperationsByRole.tester, ["inspect", "verify"]);
   assert.equal(Object.isFrozen(options.allowedOperationsByRole), true);
+});
+
+test("conflict authority seals the full preparation and only its writable paths", () => {
+  const verified = [];
+  const grants = factory({
+    conflictPreparationVerifier: {
+      verify(binding) {
+        verified.push(structuredClone(binding));
+        return structuredClone(binding);
+      },
+    },
+  });
+  const options = grants.create(conflictProposal());
+
+  assert.equal(options.grant.schemaVersion, 3);
+  assert.equal(options.grant.inputBinding.schemaVersion, 2);
+  assert.deepEqual(options.grant.writablePaths, ["src/value.js"]);
+  assert.deepEqual(
+    options.grant.executionSource.preparationBinding,
+    verified[0],
+  );
+  assert.deepEqual(grants.verify(options.grant), options.grant);
+  assert.equal(verified.length, 2);
+
+  assert.throws(
+    () => factory().create(conflictProposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.throws(
+    () =>
+      factory({
+        conflictPreparationVerifier: {
+          verify: (binding) => structuredClone(binding),
+        },
+      }).create(conflictProposal({
+        conflicts: [{ path: "docs/value.md", mode: "100644" }],
+      })),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.throws(
+    () =>
+      factory({
+        executorAuthority: {
+          workspaces: [{
+            id: "acme-workspace",
+            capabilities: [
+              "conflict_preparation_snapshot",
+              "git_head_snapshot",
+            ],
+            writablePaths: ["src"],
+            excludePaths: ["src/private"],
+            requiredProfiles: [
+              { id: "node-tests", configDigest: "a".repeat(64) },
+            ],
+            authorityDigest: "d".repeat(64),
+          }],
+        },
+        conflictPreparationVerifier: {
+          verify: (binding) => structuredClone(binding),
+        },
+      }).create(conflictProposal({
+        conflicts: [{ path: "src/private/value.js", mode: "100644" }],
+      })),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("conflict authority verifies the current PR before sealed preparation evidence", () => {
+  let conflictVerifications = 0;
+  const grants = factory({
+    inputAuthorityVerifier: {
+      verify() {
+        throw new Error("stale PR");
+      },
+    },
+    conflictPreparationVerifier: {
+      verify(binding) {
+        conflictVerifications += 1;
+        return structuredClone(binding);
+      },
+    },
+  });
+
+  assert.throws(
+    () => grants.create(conflictProposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(conflictVerifications, 0);
+
+  assert.throws(
+    () =>
+      factory({
+        conflictPreparationVerifier: {
+          verify(binding) {
+            return {
+              ...structuredClone(binding),
+              evidenceDigest: "f".repeat(64),
+            };
+          },
+        },
+      }).create(conflictProposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("invalid conflict operations fail before any authority verifier call", () => {
+  let inputVerifications = 0;
+  let preparationVerifications = 0;
+  const grants = factory({
+    inputAuthorityVerifier: {
+      verify() {
+        inputVerifications += 1;
+        throw new Error("must not verify an invalid local proposal");
+      },
+    },
+    conflictPreparationVerifier: {
+      verify() {
+        preparationVerifications += 1;
+        throw new Error("must not verify an invalid local proposal");
+      },
+    },
+  });
+
+  assert.throws(
+    () => grants.create(conflictProposal({ operation: "inspect" })),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(inputVerifications, 0);
+  assert.equal(preparationVerifications, 0);
+});
+
+test("conflict scope, capability, and configuration fail before external verifiers", () => {
+  const validVerifier = {
+    verify: (binding) => structuredClone(binding),
+  };
+  for (const [name, createFactory, candidate] of [
+    [
+      "scope",
+      (inputAuthorityVerifier, conflictPreparationVerifier) =>
+        factory({ inputAuthorityVerifier, conflictPreparationVerifier }),
+      conflictProposal({
+        conflicts: [{ path: "docs/value.md", mode: "100644" }],
+      }),
+    ],
+    [
+      "capability",
+      (inputAuthorityVerifier, conflictPreparationVerifier) => factory({
+        inputAuthorityVerifier,
+        conflictPreparationVerifier,
+        executorAuthority: {
+          workspaces: [{
+            id: "acme-workspace",
+            capabilities: ["git_head_snapshot"],
+            writablePaths: ["src", "test"],
+            excludePaths: [],
+            requiredProfiles: [
+              { id: "node-tests", configDigest: "a".repeat(64) },
+            ],
+            authorityDigest: "d".repeat(64),
+          }],
+        },
+      }),
+      conflictProposal(),
+    ],
+    [
+      "missing verifier",
+      (inputAuthorityVerifier) => factory({ inputAuthorityVerifier }),
+      conflictProposal(),
+    ],
+  ]) {
+    let inputCalls = 0;
+    let preparationCalls = 0;
+    const grants = createFactory(
+      {
+        verify(binding) {
+          inputCalls += 1;
+          return structuredClone(binding);
+        },
+      },
+      {
+        verify(binding) {
+          preparationCalls += 1;
+          return structuredClone(binding);
+        },
+      },
+    );
+    assert.throws(
+      () => grants.create(candidate),
+      (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+      name,
+    );
+    assert.equal(inputCalls, 0, name);
+    assert.equal(preparationCalls, 0, name);
+  }
+
+  const original = factory({ conflictPreparationVerifier: validVerifier })
+    .create(conflictProposal()).grant;
+  let inputCalls = 0;
+  let preparationCalls = 0;
+  const changedBrain = factory({
+    inputAuthorityVerifier: {
+      verify(binding) {
+        inputCalls += 1;
+        return structuredClone(binding);
+      },
+    },
+    conflictPreparationVerifier: {
+      verify(binding) {
+        preparationCalls += 1;
+        return structuredClone(binding);
+      },
+    },
+    brainByRole: {
+      developer: {
+        provider: "ollama",
+        model: "qwen3.5:changed",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+      tester: {
+        provider: "ollama",
+        model: "qwen3.5:9b",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+    },
+  });
+  assert.throws(
+    () => changedBrain.verify(original),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(inputCalls, 0);
+  assert.equal(preparationCalls, 0);
+});
+
+test("conflict materialization capability does not require a Git Head snapshot port", () => {
+  const executorAuthority = {
+    workspaces: [{
+      id: "acme-workspace",
+      capabilities: ["conflict_preparation_snapshot"],
+      writablePaths: ["src", "test"],
+      excludePaths: [],
+      requiredProfiles: [
+        { id: "node-tests", configDigest: "a".repeat(64) },
+      ],
+      authorityDigest: "d".repeat(64),
+    }],
+  };
+  const grants = factory({
+    executorAuthority,
+    conflictPreparationVerifier: {
+      verify: (binding) => structuredClone(binding),
+    },
+  });
+
+  assert.equal(grants.create(conflictProposal()).grant.schemaVersion, 3);
+  assert.throws(
+    () => factory({ executorAuthority }).create(proposal()),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
 });
 
 test("legacy PR bindings cannot create or authorize new code jobs", () => {

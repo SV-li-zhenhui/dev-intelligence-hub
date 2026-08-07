@@ -12,12 +12,20 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import {
   CodeExecutionError,
   CodeExecutionPolicy,
+  normalizeWorkspacePath,
   validateExecutionId,
   validateWorkspaceId,
 } from "../domain/code-execution-policy.js";
+import {
+  codeExecutionSourceWritablePaths,
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "../domain/code-execution-source.js";
+import { sameConflictPreparationBinding } from "../domain/conflict-preparation-binding.js";
 import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
 
@@ -104,6 +112,25 @@ function bindGitSnapshotter(value) {
   );
 }
 
+function bindConflictMaterializer(value) {
+  if (value === null || value === undefined) return null;
+  let current = value;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, "materialize");
+    if (descriptor) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "function") {
+        break;
+      }
+      return Object.freeze({ materialize: descriptor.value.bind(value) });
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  throw new CodeExecutionError(
+    "INVALID_WORKSPACE_CONFIG",
+    "Conflict preparation materializer 端口无效",
+  );
+}
+
 function normalizeInputBinding(value) {
   if (value === undefined || value === null) return null;
   const error = new CodeExecutionError(
@@ -120,6 +147,7 @@ function exactDataResult(value, keys) {
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
     Object.getPrototypeOf(value) !== Object.prototype
   ) {
     return false;
@@ -137,6 +165,215 @@ function exactDataResult(value, keys) {
       );
     })
   );
+}
+
+function normalizeCreateExecutionRequest(value) {
+  const error = new CodeExecutionError(
+    "INVALID_EXECUTION_REQUEST",
+    "代码执行副本请求无效",
+  );
+  const hasExecutionId = value !== null && typeof value === "object" &&
+    Object.hasOwn(value, "executionId");
+  const hasInputBinding = value !== null && typeof value === "object" &&
+    Object.hasOwn(value, "inputBinding");
+  const hasExecutionSource = value !== null && typeof value === "object" &&
+    Object.hasOwn(value, "executionSource");
+  const keys = [
+    "workspaceId",
+    ...(hasExecutionId ? ["executionId"] : []),
+    ...(hasInputBinding ? ["inputBinding"] : []),
+    ...(hasExecutionSource ? ["executionSource"] : []),
+  ];
+  if (!exactDataResult(value, keys)) throw error;
+  const inputBinding = normalizeInputBinding(
+    hasInputBinding ? value.inputBinding : null,
+  );
+  let executionSource = null;
+  if (hasExecutionSource) {
+    try {
+      executionSource = normalizeCodeExecutionSource(
+        value.executionSource,
+        error,
+      );
+    } catch {
+      throw error;
+    }
+    if (
+      inputBinding === null ||
+      !sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding,
+      })
+    ) {
+      throw error;
+    }
+  }
+  return {
+    workspaceId: value.workspaceId,
+    executionId: hasExecutionId ? value.executionId : `run-${randomUUID()}`,
+    inputBinding,
+    executionSource,
+    hasExecutionSource,
+  };
+}
+
+function normalizeConflictMaterializationReceipt(
+  value,
+  { executionSource, targetRoot, workspace, limits },
+) {
+  if (
+    !exactDataResult(value, [
+      "schemaVersion",
+      "preparationId",
+      "binding",
+      "targetRoot",
+      "materialization",
+      "excludePaths",
+      "files",
+      "fileCount",
+      "totalBytes",
+      "resultTreeOid",
+      "evidenceDigest",
+      "resultObjectDigest",
+      "residual",
+    ]) ||
+    value.schemaVersion !== 2 ||
+    value.preparationId !== executionSource.preparationBinding.preparationId ||
+    !sameConflictPreparationBinding(
+      value.binding,
+      executionSource.preparationBinding,
+    ) ||
+    value.targetRoot !== targetRoot ||
+    value.materialization !== "full-tree" ||
+    !Array.isArray(value.excludePaths) ||
+    utilTypes.isProxy(value.excludePaths) ||
+    Object.getPrototypeOf(value.excludePaths) !== Array.prototype ||
+    !Array.isArray(value.files) ||
+    utilTypes.isProxy(value.files) ||
+    Object.getPrototypeOf(value.files) !== Array.prototype ||
+    !Number.isSafeInteger(value.fileCount) ||
+    value.fileCount < 1 ||
+    value.fileCount > limits.maxFiles ||
+    !Number.isSafeInteger(value.totalBytes) ||
+    value.totalBytes < 0 ||
+    value.totalBytes > limits.maxTotalBytes ||
+    value.resultTreeOid !== executionSource.preparationBinding.resultTreeOid ||
+    value.evidenceDigest !== executionSource.preparationBinding.evidenceDigest ||
+    value.resultObjectDigest !==
+      executionSource.preparationBinding.resultObjectDigest ||
+    value.residual !== null
+  ) {
+    throw new CodeExecutionError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 落盘回执无效",
+    );
+  }
+  const arrayHasExactItems = (entries) => {
+    const keys = Reflect.ownKeys(entries);
+    if (keys.length !== entries.length + 1 || !keys.includes("length")) {
+      return false;
+    }
+    return entries.every((_, index) => {
+      const descriptor = Object.getOwnPropertyDescriptor(entries, String(index));
+      return descriptor?.enumerable && "value" in descriptor;
+    });
+  };
+  if (
+    !arrayHasExactItems(value.excludePaths) ||
+    !arrayHasExactItems(value.files) ||
+    value.excludePaths.length !== workspace.policy.excludePaths.length ||
+    value.excludePaths.some(
+      (entry, index) => entry !== workspace.policy.excludePaths[index],
+    ) ||
+    value.files.length !== value.fileCount
+  ) {
+    throw new CodeExecutionError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 落盘回执无效",
+    );
+  }
+  const fileEvidence = new Map();
+  const portablePaths = new Set();
+  let evidenceBytes = 0;
+  let previousPath = null;
+  for (const entry of value.files) {
+    if (!exactDataResult(entry, ["path", "sha256", "mode", "bytes"])) {
+      throw new CodeExecutionError(
+        "CONFLICT_PREPARATION_RESULT_INVALID",
+        "Conflict preparation 落盘回执无效",
+      );
+    }
+    let relativePath;
+    try {
+      relativePath = normalizeWorkspacePath(entry.path);
+    } catch {
+      throw new CodeExecutionError(
+        "CONFLICT_PREPARATION_RESULT_INVALID",
+        "Conflict preparation 落盘回执无效",
+      );
+    }
+    const portablePath = relativePath.toLowerCase();
+    if (
+      entry.path !== relativePath ||
+      !SHA256.test(entry.sha256) ||
+      entry.mode !== "100644" ||
+      !Number.isSafeInteger(entry.bytes) ||
+      entry.bytes < 0 ||
+      entry.bytes > limits.maxFileBytes ||
+      portablePaths.has(portablePath) ||
+      (previousPath !== null &&
+        previousPath.localeCompare(relativePath, "en") >= 0)
+    ) {
+      throw new CodeExecutionError(
+        "CONFLICT_PREPARATION_RESULT_INVALID",
+        "Conflict preparation 落盘回执无效",
+      );
+    }
+    try {
+      if (workspace.policy.assertAccessible(relativePath) !== relativePath) {
+        throw new Error("non-canonical path");
+      }
+    } catch {
+      throw new CodeExecutionError(
+        "CONFLICT_PREPARATION_RESULT_INVALID",
+        "Conflict preparation 落盘回执无效",
+      );
+    }
+    portablePaths.add(portablePath);
+    previousPath = relativePath;
+    evidenceBytes += entry.bytes;
+    if (!Number.isSafeInteger(evidenceBytes) || evidenceBytes > limits.maxTotalBytes) {
+      throw new CodeExecutionError(
+        "CONFLICT_PREPARATION_RESULT_INVALID",
+        "Conflict preparation 落盘回执无效",
+      );
+    }
+    fileEvidence.set(relativePath, {
+      sha256: entry.sha256,
+      mode: entry.mode,
+      bytes: entry.bytes,
+    });
+  }
+  if (evidenceBytes !== value.totalBytes) {
+    throw new CodeExecutionError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 落盘回执无效",
+    );
+  }
+  return {
+    fileCount: value.fileCount,
+    totalBytes: value.totalBytes,
+    fileEvidence,
+  };
+}
+
+function conflictMaterializationFailure(error) {
+  if (error instanceof CodeExecutionError) return error;
+  const code = typeof error?.code === "string" &&
+      error.code.startsWith("CONTROLLED_GIT_")
+    ? error.code
+    : "CONFLICT_PREPARATION_MATERIALIZATION_FAILED";
+  return new CodeExecutionError(code, "无法创建 sealed conflict 代码快照");
 }
 
 function normalizeGitSnapshotReceipt(value, { workspace, inputBinding, limits }) {
@@ -223,6 +460,7 @@ export class CodeWorkspaceBroker {
     scratchRoot = path.join(tmpdir(), "my-dashboard-code-executions"),
     limits = {},
     gitSnapshotter = null,
+    conflictMaterializer = null,
     removeDirectory = rm,
   } = {}) {
     if (typeof scratchRoot !== "string" || !path.isAbsolute(scratchRoot)) {
@@ -234,6 +472,9 @@ export class CodeWorkspaceBroker {
     this.scratchRoot = path.resolve(scratchRoot);
     this.limits = validateLimits(limits);
     this.gitSnapshotter = bindGitSnapshotter(gitSnapshotter);
+    this.conflictMaterializer = bindConflictMaterializer(
+      conflictMaterializer,
+    );
     if (typeof removeDirectory !== "function") {
       throw new CodeExecutionError(
         "INVALID_WORKSPACE_CONFIG",
@@ -333,9 +574,11 @@ export class CodeWorkspaceBroker {
       async () => {
         const {
           workspaceId,
-          executionId = `run-${randomUUID()}`,
-        } = request;
-        const inputBinding = normalizeInputBinding(request.inputBinding);
+          executionId,
+          inputBinding,
+          executionSource,
+          hasExecutionSource,
+        } = normalizeCreateExecutionRequest(request);
         const workspace = this.#workspace(workspaceId);
         validateExecutionId(executionId);
         const key = this.#executionKey(workspaceId, executionId);
@@ -376,7 +619,56 @@ export class CodeWorkspaceBroker {
           const baseline = new Map();
           const copyState = { fileCount: 0, totalBytes: 0 };
           try {
-            if (inputBinding === null) {
+            if (hasExecutionSource) {
+              if (this.conflictMaterializer === null) {
+                throw new CodeExecutionError(
+                  "CONFLICT_PREPARATION_MATERIALIZER_UNAVAILABLE",
+                  "该工作区没有启用 sealed conflict 快照",
+                );
+              }
+              try {
+                for (const writablePath of
+                  codeExecutionSourceWritablePaths(executionSource)) {
+                  workspace.policy.assertWritable(writablePath);
+                }
+              } catch {
+                throw new CodeExecutionError(
+                  "CONFLICT_PREPARATION_SCOPE_INVALID",
+                  "Conflict preparation 超出工作区写权限",
+                );
+              }
+              let materialized;
+              try {
+                materialized = await this.conflictMaterializer.materialize({
+                  binding: structuredClone(
+                    executionSource.preparationBinding,
+                  ),
+                  targetRoot: executionRoot,
+                  excludePaths: [...workspace.policy.excludePaths],
+                });
+              } catch (error) {
+                throw conflictMaterializationFailure(error);
+              }
+              const receipt = normalizeConflictMaterializationReceipt(
+                materialized,
+                {
+                  executionSource,
+                  targetRoot: executionRoot,
+                  workspace,
+                  limits: this.limits,
+                },
+              );
+              const materializedBaseline =
+                await this.#verifyConflictMaterialization({
+                  workspace,
+                  executionRoot,
+                  executionSource,
+                  receipt,
+                });
+              for (const [relativePath, digest] of materializedBaseline) {
+                baseline.set(relativePath, digest);
+              }
+            } else if (inputBinding === null) {
               await this.#copySanitizedDirectory({
                 workspace,
                 sourceDirectory: workspace.sourceRoot,
@@ -457,6 +749,9 @@ export class CodeWorkspaceBroker {
             workspace,
             root: executionRoot,
             baseline,
+            exactWritablePaths: hasExecutionSource
+              ? new Set(codeExecutionSourceWritablePaths(executionSource))
+              : null,
             sourceRevision,
             workspaceState: {
               fileHashes: new Map(baseline),
@@ -469,6 +764,9 @@ export class CodeWorkspaceBroker {
             workspaceId,
             executionId,
             inputBinding: structuredClone(inputBinding),
+            ...(hasExecutionSource
+              ? { executionSource: structuredClone(executionSource) }
+              : {}),
             sourceRevision,
             workspaceRevision: sourceRevision,
           };
@@ -1021,6 +1319,117 @@ export class CodeWorkspaceBroker {
     }
   }
 
+  async #verifyConflictMaterialization({
+    workspace,
+    executionRoot,
+    executionSource,
+    receipt,
+  }) {
+    const invalid = () => new CodeExecutionError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 落盘结果与回执不一致",
+    );
+    await this.#assertDirectory(
+      executionRoot,
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+    );
+    await this.#assertCanonicalChild(path.dirname(executionRoot), executionRoot);
+    const actual = new Map();
+    const portablePaths = new Set();
+    const directories = new Set();
+    let totalBytes = 0;
+    let directoryCount = 0;
+    const visit = async (directory, relativeDirectory) => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+      for (const entry of entries) {
+        const relativePath = relativeDirectory
+          ? `${relativeDirectory}/${entry.name}`
+          : entry.name;
+        let normalizedPath;
+        try {
+          normalizedPath = workspace.policy.assertAccessible(relativePath);
+        } catch {
+          throw invalid();
+        }
+        if (normalizedPath !== relativePath) throw invalid();
+        const portablePath = relativePath.toLowerCase();
+        if (portablePaths.has(portablePath)) throw invalid();
+        portablePaths.add(portablePath);
+        const target = path.join(directory, entry.name);
+        const stats = await lstat(target);
+        if (stats.isSymbolicLink()) throw invalid();
+        if (stats.isDirectory()) {
+          directoryCount += 1;
+          if (directoryCount > this.limits.maxDirectories) throw invalid();
+          directories.add(relativePath);
+          await visit(target, relativePath);
+          continue;
+        }
+        if (!stats.isFile() || stats.nlink !== 1) throw invalid();
+        if (process.platform !== "win32" && (stats.mode & 0o777) !== 0o644) {
+          throw invalid();
+        }
+        if (
+          actual.size >= this.limits.maxFiles ||
+          stats.size > this.limits.maxFileBytes
+        ) {
+          throw invalid();
+        }
+        const value = await readFile(target);
+        totalBytes += value.length;
+        if (
+          !Number.isSafeInteger(totalBytes) ||
+          value.length > this.limits.maxFileBytes ||
+          totalBytes > this.limits.maxTotalBytes
+        ) {
+          throw invalid();
+        }
+        actual.set(relativePath, {
+          sha256: sha256(value),
+          mode: "100644",
+          bytes: value.length,
+        });
+      }
+    };
+    await visit(executionRoot, "");
+    const nonEmptyDirectories = new Set();
+    for (const relativePath of actual.keys()) {
+      const segments = relativePath.split("/").slice(0, -1);
+      for (let index = 1; index <= segments.length; index += 1) {
+        nonEmptyDirectories.add(segments.slice(0, index).join("/"));
+      }
+    }
+    if (
+      actual.size !== receipt.fileCount ||
+      totalBytes !== receipt.totalBytes ||
+      [...directories].some((directory) => !nonEmptyDirectories.has(directory)) ||
+      [...actual].some(([relativePath, evidence]) => {
+        const expected = receipt.fileEvidence.get(relativePath);
+        return (
+          expected === undefined ||
+          expected.sha256 !== evidence.sha256 ||
+          expected.mode !== evidence.mode ||
+          expected.bytes !== evidence.bytes
+        );
+      }) ||
+      [...receipt.fileEvidence.keys()].some(
+        (relativePath) => !actual.has(relativePath),
+      ) ||
+      codeExecutionSourceWritablePaths(executionSource).some(
+        (conflictPath) => !actual.has(conflictPath),
+      )
+    ) {
+      throw invalid();
+    }
+    return new Map(
+      [...actual].map(([relativePath, evidence]) => [
+        relativePath,
+        evidence.sha256,
+      ]),
+    );
+  }
+
   async #verifyGitSnapshotMaterialization({
     workspace,
     executionRoot,
@@ -1283,7 +1692,7 @@ export class CodeWorkspaceBroker {
   }
 
   async #writeFile(execution, action) {
-    const relativePath = execution.workspace.policy.assertWritable(action.path);
+    const relativePath = this.#assertExecutionWritable(execution, action.path);
     assertExpectedSha256(action.expectedSha256);
     if (typeof action.content !== "string" || action.content.includes("\0")) {
       throw new CodeExecutionError("TEXT_REQUIRED", "只能写入纯文本内容");
@@ -1387,7 +1796,7 @@ export class CodeWorkspaceBroker {
   }
 
   async #deleteFile(execution, action) {
-    const relativePath = execution.workspace.policy.assertWritable(action.path);
+    const relativePath = this.#assertExecutionWritable(execution, action.path);
     assertExpectedSha256(action.expectedSha256);
     if (action.expectedSha256 === null) {
       throw new CodeExecutionError("INVALID_SHA256", "删除操作需要文件版本");
@@ -1401,5 +1810,19 @@ export class CodeWorkspaceBroker {
     }
     await unlink(file.absolutePath);
     return { path: relativePath, deleted: true };
+  }
+
+  #assertExecutionWritable(execution, value) {
+    const relativePath = execution.workspace.policy.assertWritable(value);
+    if (
+      execution.exactWritablePaths !== null &&
+      !execution.exactWritablePaths.has(relativePath)
+    ) {
+      throw new CodeExecutionError(
+        "WRITE_NOT_ALLOWED",
+        "该执行来源只允许修改精确冲突文件",
+      );
+    }
+    return relativePath;
   }
 }

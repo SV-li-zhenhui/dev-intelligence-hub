@@ -5,6 +5,8 @@ import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
@@ -114,6 +116,36 @@ function legacyProposal() {
   });
 }
 
+function conflictProposal() {
+  const current = proposal();
+  const gitTarget = current.binding.inputBinding.gitTarget;
+  const workspaceSource = createConflictPreparationBinding({
+    preparation: {
+      schemaVersion: 1,
+      preparationId: "1".repeat(64),
+      status: "conflicted",
+      baseCommitOid: gitTarget.baseRefOid,
+      headCommitOid: gitTarget.headRefOid,
+      mergeBaseOid: "3".repeat(40),
+      resultTreeOid: "4".repeat(40),
+      conflicts: [{ path: "src/value.js", mode: "100644" }],
+      boundaryDigest: "5".repeat(64),
+      evidenceDigest: "6".repeat(64),
+      resultObjectDigest: "7".repeat(64),
+      materialization: "full-tree",
+    },
+    gitTarget,
+  });
+  return proposalWith(current, {
+    binding: {
+      executionSource: createConflictCodeExecutionSource({
+        inputBinding: current.binding.inputBinding,
+        preparationBinding: workspaceSource,
+      }),
+    },
+  });
+}
+
 function issueProposal() {
   const trustedEvent = normalizeWorkflowEvent({
     schemaVersion: 1,
@@ -216,7 +248,7 @@ function grantFor(value, overrides = {}) {
         };
       })();
   return createCodeJobGrant({
-    schemaVersion: 2,
+    schemaVersion: overrides.schemaVersion ?? 2,
     proposalId: overrides.proposalId ?? value.proposalId,
     contentDigest: overrides.contentDigest ?? value.contentDigest,
     policyVersion: overrides.policyVersion ?? value.policyVersion,
@@ -229,6 +261,9 @@ function grantFor(value, overrides = {}) {
     repository,
     workspaceId: overrides.workspaceId ?? value.binding.workspaceId,
     inputBinding,
+    ...(overrides.executionSource === undefined
+      ? {}
+      : { executionSource: overrides.executionSource }),
     workspaceAuthorityDigest:
       overrides.workspaceAuthorityDigest ?? "9".repeat(64),
     operation,
@@ -336,6 +371,27 @@ test("Issue proposals with a null input binding still enter confirmation", () =>
   assert.doesNotThrow(() =>
     createCodeActionProposalConfirmationPlan(value, options(grantFor(value))),
   );
+});
+
+test("sealed conflict proposals retain their exact source in confirmation", () => {
+  const value = conflictProposal();
+  const grant = grantFor(value, {
+    schemaVersion: 3,
+    executionSource: value.binding.executionSource,
+    writablePaths: ["src/value.js"],
+  });
+  const plan = createCodeActionProposalConfirmationPlan(
+    value,
+    options(grant),
+  );
+
+  assert.equal(plan.action.grant.schemaVersion, 3);
+  assert.equal(plan.action.grant.inputBinding.schemaVersion, 2);
+  assert.deepEqual(
+    plan.action.grant.executionSource,
+    value.binding.executionSource,
+  );
+  assert.deepEqual(plan.action.grant.writablePaths, ["src/value.js"]);
 });
 
 test("confirmation accepts exact proposal authority and rejects ambiguous targets", () => {

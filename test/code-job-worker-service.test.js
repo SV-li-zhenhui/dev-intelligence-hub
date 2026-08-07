@@ -4,6 +4,8 @@ import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
@@ -32,6 +34,44 @@ function pullRequestInputBinding(overrides = {}) {
     inputDigest: "3".repeat(64),
     ...overrides,
   };
+}
+
+function conflictInputBinding() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/dashboard",
+    baseRefName: "main",
+    baseRefOid: "4".repeat(40),
+    headRepository: "contributor/dashboard",
+    headRefName: "fix/conflict",
+    headRefOid: "1".repeat(40),
+  };
+  return pullRequestInputBinding({ schemaVersion: 2, gitTarget });
+}
+
+function conflictExecutionSource(binding) {
+  return createConflictCodeExecutionSource({
+    inputBinding: binding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "5".repeat(64),
+        status: "conflicted",
+        baseCommitOid: binding.gitTarget.baseRefOid,
+        headCommitOid: binding.gitTarget.headRefOid,
+        mergeBaseOid: "6".repeat(40),
+        resultTreeOid: "7".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "8".repeat(64),
+        evidenceDigest: "9".repeat(64),
+        resultObjectDigest: "a".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: binding.gitTarget,
+    }),
+  });
 }
 
 function deferred() {
@@ -488,6 +528,9 @@ class FakeExecutor {
       inputBinding: Object.hasOwn(jobValue.grant, "inputBinding")
         ? structuredClone(jobValue.grant.inputBinding)
         : null,
+      ...(Object.hasOwn(jobValue.grant, "executionSource")
+        ? { executionSource: structuredClone(jobValue.grant.executionSource) }
+        : {}),
       status: sessionStatus,
       workspaceRevision: REVISION_A,
       requiredProfiles: jobValue.grant.requiredProfiles.map(({ id }) => id),
@@ -851,6 +894,33 @@ test("worker forwards an exact PR input binding when starting a session", async 
   );
 });
 
+test("worker forwards the complete sealed conflict source when starting a session", async () => {
+  const inputBinding = conflictInputBinding();
+  const executionSource = conflictExecutionSource(inputBinding);
+  const initial = job({
+    grant: grant({
+      schemaVersion: 3,
+      inputBinding,
+      executionSource,
+      writablePaths: ["src/app.js"],
+    }),
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "read_text", path: "src/app.js" }]),
+    grantVerifier: verifier([]),
+  });
+
+  await worker.runCycle({ limit: 1, roleId: "developer" });
+
+  const started = executor.calls.find(({ method }) => method === "start").value;
+  assert.deepEqual(started.inputBinding, inputBinding);
+  assert.deepEqual(started.executionSource, executionSource);
+});
+
 test("session input binding tampering fences before brain or executor actions", async (t) => {
   const cases = [
     ["missing", (session) => delete session.inputBinding],
@@ -873,6 +943,78 @@ test("session input binding tampering fences before brain or executor actions", 
       const inputBinding = pullRequestInputBinding();
       const initial = job({
         grant: grant({ inputBinding }),
+        status: "active",
+        revision: 3,
+        execution: {
+          sessionId: job().jobId,
+          workspaceRevision: REVISION_A,
+          turn: 0,
+          pendingAction: null,
+          actionAdmission: null,
+          observations: [],
+          result: null,
+          pause: null,
+          uncertainty: null,
+        },
+      });
+      const store = new FakeJobStore([initial]);
+      const executor = new FakeExecutor(initial);
+      tamper(executor.session);
+      const brainCalls = [];
+      const worker = new CodeJobWorkerService({
+        jobStore: store,
+        executor,
+        brainDirectory: brain(
+          [{ type: "read_text", path: "src/app.js" }],
+          brainCalls,
+        ),
+        grantVerifier: verifier([]),
+      });
+
+      const result = await worker.runCycle({ limit: 1, roleId: "developer" });
+
+      assert.equal(result.outcomes[0].status, "fenced");
+      assert.equal(
+        result.outcomes[0].code,
+        "CODE_JOB_SESSION_BINDING_INVALID",
+      );
+      assert.equal(brainCalls.length, 0);
+      assert.equal(
+        executor.calls.some(({ method }) => method === "perform"),
+        false,
+      );
+    });
+  }
+});
+
+test("session conflict-source tampering fences before brain or executor actions", async (t) => {
+  const cases = [
+    ["missing", (session) => delete session.executionSource],
+    ["added field", (session) => {
+      session.executionSource = {
+        ...session.executionSource,
+        forged: true,
+      };
+    }],
+    ["preparation", (session) => {
+      session.executionSource.preparationBinding.preparationId = "f".repeat(64);
+    }],
+    ["write scope", (session) => {
+      session.executionSource.writeScope.paths = ["src/other.js"];
+    }],
+  ];
+
+  for (const [name, tamper] of cases) {
+    await t.test(name, async () => {
+      const inputBinding = conflictInputBinding();
+      const executionSource = conflictExecutionSource(inputBinding);
+      const initial = job({
+        grant: grant({
+          schemaVersion: 3,
+          inputBinding,
+          executionSource,
+          writablePaths: ["src/app.js"],
+        }),
         status: "active",
         revision: 3,
         execution: {

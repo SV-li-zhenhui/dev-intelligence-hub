@@ -3,11 +3,16 @@ import {
   normalizeCodeJob,
 } from "./code-job-contract.js";
 import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
+import {
+  codeExecutionSourceWritablePaths,
+  normalizeCodeExecutionSource,
+} from "./code-execution-source.js";
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeMemoryRecord } from "./memory-record.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const SAFE_JOB_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
@@ -337,10 +342,25 @@ function terminalSummary(job) {
   };
 }
 
+function executionSourceSummary(value) {
+  const source = normalizeCodeExecutionSource(value);
+  const binding = source.preparationBinding;
+  return {
+    kind: source.kind,
+    preparationId: binding.preparationId,
+    resultTreeOid: binding.resultTreeOid,
+    boundaryDigest: binding.boundaryDigest,
+    evidenceDigest: binding.evidenceDigest,
+    resultObjectDigest: binding.resultObjectDigest,
+    writablePaths: codeExecutionSourceWritablePaths(source),
+  };
+}
+
 function safeSnapshot(job, kind) {
   const currentGrant = Object.hasOwn(job.grant, "inputBinding");
+  const conflictGrant = Object.hasOwn(job.grant, "executionSource");
   return {
-    schemaVersion: currentGrant ? 2 : 1,
+    schemaVersion: conflictGrant ? 3 : currentGrant ? 2 : 1,
     jobId: job.jobId,
     jobRevision: job.revision,
     sourceRecordDigest: job.recordDigest,
@@ -350,6 +370,9 @@ function safeSnapshot(job, kind) {
     repository: job.grant.repository,
     subjectNumber: job.grant.subject.number,
     ...(currentGrant ? { inputBinding: job.grant.inputBinding } : {}),
+    ...(conflictGrant
+      ? { executionSource: executionSourceSummary(job.grant.executionSource) }
+      : {}),
     operation: job.grant.operation,
     turn: job.execution.turn,
     workspaceRevision: job.execution.workspaceRevision,
@@ -378,6 +401,11 @@ function memoryEvidence(snapshot) {
   if (snapshot.inputBinding !== undefined && snapshot.inputBinding !== null) {
     values.push(`pr-head:${snapshot.inputBinding.headRefOid}`);
   }
+  if (snapshot.executionSource !== undefined) {
+    values.push(
+      `conflict-preparation:${snapshot.executionSource.preparationId}`,
+    );
+  }
   if (snapshot.latestObservation !== null) {
     values.push(`observation-detail:${snapshot.latestObservation.detailDigest}`);
   }
@@ -387,6 +415,11 @@ function memoryEvidence(snapshot) {
       (value) => `terminal-evidence:${value}`,
     ));
     values.push(...snapshot.terminal.checks.map((value) => `check:${value}`));
+  }
+  if (snapshot.executionSource !== undefined) {
+    values.push(...snapshot.executionSource.writablePaths.map(
+      (relativePath) => `conflict-path:${relativePath}`,
+    ));
   }
   return [...new Set(values)].slice(0, 20);
 }
@@ -406,7 +439,15 @@ function memoryRecordFromSnapshot(event, snapshot) {
     summary: `${TITLES[event.kind]} · 状态 ${snapshot.status} · 动作 ${snapshot.turn} · 修订 ${event.jobRevision}`,
     content: JSON.stringify(snapshot),
     evidence: memoryEvidence(snapshot),
-    tags: [...new Set(["code-job", event.kind, snapshot.status, snapshot.operation])],
+    tags: [...new Set([
+      "code-job",
+      event.kind,
+      snapshot.status,
+      snapshot.operation,
+      ...(snapshot.executionSource === undefined
+        ? []
+        : ["conflict-preparation"]),
+    ])],
     sourceUrl: null,
     subjectNumber: snapshot.subjectNumber,
   };
@@ -604,10 +645,79 @@ function normalizeTerminalSummary(value) {
   };
 }
 
+function normalizeExecutionSourceSummary(value) {
+  const fields = exact(
+    value,
+    [
+      "kind",
+      "preparationId",
+      "resultTreeOid",
+      "boundaryDigest",
+      "evidenceDigest",
+      "resultObjectDigest",
+      "writablePaths",
+    ],
+    "executionSource",
+  );
+  if (fields.get("kind") !== "conflict_preparation") {
+    throw invalid("executionSource.kind 无效");
+  }
+  const resultTreeOid = text(
+    fields.get("resultTreeOid"),
+    "executionSource.resultTreeOid",
+    64,
+    GIT_OID,
+  );
+  const writablePaths = denseArray(
+    fields.get("writablePaths"),
+    32,
+    "executionSource.writablePaths",
+  ).map((entry) => {
+    const relativePath = safeManifestPath(entry);
+    if (relativePath === null) {
+      throw invalid("executionSource.writablePaths[] 无效");
+    }
+    return relativePath;
+  });
+  const portablePaths = writablePaths.map((entry) => entry.toLowerCase());
+  if (
+    writablePaths.length < 1 ||
+    new Set(portablePaths).size !== portablePaths.length ||
+    writablePaths.some(
+      (entry, index) => index > 0 &&
+        writablePaths[index - 1].localeCompare(entry, "en") >= 0,
+    )
+  ) {
+    throw invalid("executionSource.writablePaths 无效");
+  }
+  return {
+    kind: "conflict_preparation",
+    preparationId: digest(
+      fields.get("preparationId"),
+      "executionSource.preparationId",
+    ),
+    resultTreeOid,
+    boundaryDigest: digest(
+      fields.get("boundaryDigest"),
+      "executionSource.boundaryDigest",
+    ),
+    evidenceDigest: digest(
+      fields.get("evidenceDigest"),
+      "executionSource.evidenceDigest",
+    ),
+    resultObjectDigest: digest(
+      fields.get("resultObjectDigest"),
+      "executionSource.resultObjectDigest",
+    ),
+    writablePaths,
+  };
+}
+
 function normalizeSnapshot(value) {
   const rawFields = dataFieldsOrNull(value);
   const schemaVersion = rawFields?.get("schemaVersion");
-  const current = schemaVersion === 2;
+  const current = [2, 3].includes(schemaVersion);
+  const conflict = schemaVersion === 3;
   const fields = exact(
     value,
     [
@@ -621,6 +731,7 @@ function normalizeSnapshot(value) {
       "repository",
       "subjectNumber",
       ...(current ? ["inputBinding"] : []),
+      ...(conflict ? ["executionSource"] : []),
       "operation",
       "turn",
       "workspaceRevision",
@@ -631,7 +742,7 @@ function normalizeSnapshot(value) {
     ],
     "memoryRecord.content",
   );
-  if (![1, 2].includes(fields.get("schemaVersion"))) {
+  if (![1, 2, 3].includes(fields.get("schemaVersion"))) {
     throw invalid("memoryRecord.content.schemaVersion 无效");
   }
   const kind = fields.get("kind");
@@ -660,8 +771,11 @@ function normalizeSnapshot(value) {
       }
     }
   }
+  const executionSource = conflict
+    ? normalizeExecutionSourceSummary(fields.get("executionSource"))
+    : undefined;
   const normalized = {
-    schemaVersion: current ? 2 : 1,
+    schemaVersion: conflict ? 3 : current ? 2 : 1,
     jobId: text(fields.get("jobId"), "memoryRecord.content.jobId", 64, SAFE_JOB_ID),
     jobRevision: integer(fields.get("jobRevision"), "memoryRecord.content.jobRevision", 1),
     sourceRecordDigest: digest(fields.get("sourceRecordDigest"), "memoryRecord.content.sourceRecordDigest"),
@@ -671,6 +785,7 @@ function normalizeSnapshot(value) {
     repository: text(fields.get("repository"), "memoryRecord.content.repository", 256),
     subjectNumber: integer(fields.get("subjectNumber"), "memoryRecord.content.subjectNumber", 1),
     ...(current ? { inputBinding } : {}),
+    ...(conflict ? { executionSource } : {}),
     operation,
     turn: integer(fields.get("turn"), "memoryRecord.content.turn"),
     workspaceRevision: optionalDigest(fields.get("workspaceRevision"), "memoryRecord.content.workspaceRevision"),
@@ -686,6 +801,12 @@ function normalizeSnapshot(value) {
       inputBinding.pullRequestNumber !== normalized.subjectNumber)
   ) {
     throw invalid("memoryRecord.content.inputBinding 与任务不匹配");
+  }
+  if (
+    conflict &&
+    (inputBinding === null || normalized.operation !== "modify")
+  ) {
+    throw invalid("memoryRecord.content.executionSource 与任务不匹配");
   }
   return normalized;
 }

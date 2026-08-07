@@ -6,9 +6,11 @@ import {
   normalizeWorkflowEvent,
 } from "../domain/workflow-events.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import { normalizeCodeExecutionSource } from "../domain/code-execution-source.js";
 import {
   normalizePullRequestExecutionBinding,
   pullRequestExecutionBindingMatchesEvent,
+  samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -200,9 +202,11 @@ function stable(value) {
 }
 
 function normalizeContext(value) {
-  const optionalKeys = ["inputBinding", "evidenceTarget"].filter((key) =>
-    Object.hasOwn(value ?? {}, key),
-  );
+  const optionalKeys = [
+    "inputBinding",
+    "executionSource",
+    "evidenceTarget",
+  ].filter((key) => Object.hasOwn(value ?? {}, key));
   const entries = exact(value, [
     "assignmentId",
     "workItemId",
@@ -250,6 +254,25 @@ function normalizeContext(value) {
       !pullRequestExecutionBindingMatchesEvent(binding, context.event)
     ) {
       contextError("inputBinding 与工作事件不匹配");
+    }
+  }
+  if (entries.has("executionSource")) {
+    try {
+      context.executionSource = normalizeCodeExecutionSource(
+        entries.get("executionSource"),
+      );
+    } catch {
+      contextError("executionSource 无效");
+    }
+    if (
+      context.inputBinding === undefined ||
+      context.inputBinding === null ||
+      !samePullRequestExecutionBinding(
+        context.executionSource.inputBinding,
+        context.inputBinding,
+      )
+    ) {
+      contextError("executionSource 与 PR 输入绑定不匹配");
     }
   }
   return context;
@@ -352,6 +375,12 @@ export function createWorkIntentPolicy({
   function bind({ context: contextValue, intent: intentValue } = {}) {
     const context = normalizeContext(contextValue);
     const intent = normalizeWorkIntent(intentValue);
+    if (
+      context.executionSource !== undefined &&
+      intent.type !== "propose_code_action"
+    ) {
+      denied("Conflict preparation 只能用于代码工作提案");
+    }
     const commonPayload = { summary: intent.summary, reason: intent.reason };
 
     if (["orchestrate", "submit_delivery"].includes(intent.type)) {
@@ -426,6 +455,9 @@ export function createWorkIntentPolicy({
       if (inputBinding !== null && inputBinding.schemaVersion !== 2) {
         denied("旧版 PR 输入绑定只能恢复查看，不能创建新的代码工作提案");
       }
+      if (context.executionSource !== undefined && intent.operation !== "modify") {
+        denied("Conflict preparation 只能创建 modify 代码工作提案");
+      }
       return baseBound(
         context,
         version,
@@ -435,6 +467,9 @@ export function createWorkIntentPolicy({
           repository,
           workspaceId,
           inputBinding,
+          ...(context.executionSource === undefined
+            ? {}
+            : { executionSource: structuredClone(context.executionSource) }),
           ...proposalAuthorityBinding(context, intent),
         },
         {

@@ -5,6 +5,8 @@ import {
   createCodeJobGrant,
   createQueuedCodeJob,
 } from "../src/domain/code-job-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import {
   normalizeCodeJobBrowserProjection,
   projectNormalizedCodeJobForBrowser,
@@ -29,7 +31,48 @@ function inputBinding() {
   };
 }
 
-function grant({ bound }) {
+function conflictInputBinding() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/widgets",
+    baseRefName: "main",
+    baseRefOid: "4".repeat(40),
+    headRepository: "contributor/widgets",
+    headRefName: "fix/conflict",
+    headRefOid: HEAD_REF_OID,
+  };
+  return { ...inputBinding(), schemaVersion: 2, gitTarget };
+}
+
+function conflictExecutionSource(binding) {
+  return createConflictCodeExecutionSource({
+    inputBinding: binding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "5".repeat(64),
+        status: "conflicted",
+        baseCommitOid: binding.gitTarget.baseRefOid,
+        headCommitOid: binding.gitTarget.headRefOid,
+        mergeBaseOid: "6".repeat(40),
+        resultTreeOid: "7".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "8".repeat(64),
+        evidenceDigest: "9".repeat(64),
+        resultObjectDigest: "f".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: binding.gitTarget,
+    }),
+  });
+}
+
+function grant({ bound, conflict = false }) {
+  const binding = conflict ? conflictInputBinding() : inputBinding();
+  const executionSource = conflict ? conflictExecutionSource(binding) : null;
+  const operation = conflict ? "modify" : "inspect";
   const content = {
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
@@ -44,34 +87,36 @@ function grant({ bound }) {
     repository: "acme/widgets",
     workspaceId: "widgets-local",
     workspaceAuthorityDigest: "9".repeat(64),
-    operation: "inspect",
+    operation,
     objective: "Inspect the retry race",
     acceptanceCriteria: ["Explain the failure"],
     evidence: ["A trusted workflow event requested diagnosis"],
     summary: "Inspect the retry race",
     reason: "A trusted workflow event requested diagnosis.",
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.inspect],
-    writablePaths: [],
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[operation]],
+    writablePaths: conflict ? ["src/app.js"] : [],
     requiredProfiles: [
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
     brainDigest: "c".repeat(64),
   };
   return createCodeJobGrant(
-    bound
-      ? { schemaVersion: 2, ...content, inputBinding: inputBinding() }
+    conflict
+      ? { schemaVersion: 3, ...content, inputBinding: binding, executionSource }
+      : bound
+      ? { schemaVersion: 2, ...content, inputBinding: binding }
       : content,
   );
 }
 
-function queuedJob({ bound }) {
+function queuedJob({ bound, conflict = false }) {
   return createQueuedCodeJob(
     {
       confirmationId: "confirmation-code-job-approval-1",
       requestId: "approval-request-0001",
       displayedPayloadDigest: "d".repeat(64),
       approvalBindingDigest: "e".repeat(64),
-      grant: grant({ bound }),
+      grant: grant({ bound, conflict }),
     },
     {
       sequence: 1,
@@ -108,6 +153,25 @@ test("v2 browser projection rejects repository and pull request mismatches", () 
       TypeError,
     );
   }
+});
+
+test("v3 browser projection preserves the sealed conflict source", () => {
+  const projection = projectNormalizedCodeJobForBrowser(
+    queuedJob({ bound: true, conflict: true }),
+  );
+  const binding = conflictInputBinding();
+
+  assert.deepEqual(projection.inputBinding, binding);
+  assert.deepEqual(
+    projection.executionSource,
+    conflictExecutionSource(binding),
+  );
+  assert.deepEqual(projection.writablePaths, ["src/app.js"]);
+  assert.deepEqual(normalizeCodeJobBrowserProjection(projection), projection);
+
+  const changed = structuredClone(projection);
+  changed.executionSource.writeScope.paths = ["src/other.js"];
+  assert.throws(() => normalizeCodeJobBrowserProjection(changed), TypeError);
 });
 
 test("legacy browser projections remain readable without an input binding", () => {

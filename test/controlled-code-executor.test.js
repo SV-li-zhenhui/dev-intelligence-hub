@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  access,
   mkdir,
   mkdtemp,
   readFile,
@@ -11,6 +12,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
@@ -246,6 +249,41 @@ function pullRequestBinding(overrides = {}) {
   };
 }
 
+function conflictExecutionSource() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "Example/Repository",
+    baseRefName: "main",
+    baseRefOid: "1".repeat(40),
+    headRepository: "Contributor/Repository",
+    headRefName: "fix/conflict",
+    headRefOid: "a".repeat(40),
+  };
+  const inputBinding = pullRequestBinding({ schemaVersion: 2, gitTarget });
+  return createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "2".repeat(64),
+        status: "conflicted",
+        baseCommitOid: gitTarget.baseRefOid,
+        headCommitOid: gitTarget.headRefOid,
+        mergeBaseOid: "3".repeat(40),
+        resultTreeOid: "4".repeat(40),
+        conflicts: [{ path: "src/app.js", mode: "100644" }],
+        boundaryDigest: "5".repeat(64),
+        evidenceDigest: "6".repeat(64),
+        resultObjectDigest: "7".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget,
+    }),
+  });
+}
+
 function actionRequest(session, action) {
   return {
     sessionId: session.id,
@@ -477,6 +515,63 @@ test("start persists the exact PR input binding and requires the broker to echo 
   assert.equal(creationRequests.length, 1);
 });
 
+test("start seals and forwards one conflict execution source in the durable session", async (t) => {
+  const setup = await fixture(t);
+  const baseBroker = setup.createBroker();
+  const creationRequests = [];
+  const broker = overrideBroker(baseBroker, {
+    createExecution: async (request) => {
+      creationRequests.push(structuredClone(request));
+      const created = await baseBroker.createExecution({
+        workspaceId: request.workspaceId,
+        executionId: request.executionId,
+        inputBinding: null,
+      });
+      return {
+        ...created,
+        inputBinding: structuredClone(request.inputBinding),
+        executionSource: structuredClone(request.executionSource),
+      };
+    },
+  });
+  const { executor } = setup.createExecutor({ broker });
+  const executionSource = conflictExecutionSource();
+  const inputBinding = executionSource.inputBinding;
+  await executor.recover();
+
+  const created = await executor.start(
+    startRequest({ inputBinding, executionSource }),
+  );
+
+  assert.deepEqual(created.executionSource, executionSource);
+  assert.deepEqual(creationRequests, [{
+    workspaceId: "dashboard",
+    executionId: attemptExecutionIdFor("session-one", 1),
+    inputBinding,
+    executionSource,
+  }]);
+  const stored = await setup.innerStore.read("code-executor-state");
+  assert.deepEqual(
+    stored.sessions[created.id].executionSource,
+    executionSource,
+  );
+  assert.equal(
+    stored.sessions[created.id].requestDigest,
+    digestValue({
+      workspaceId: "dashboard",
+      requestedBy: startRequest().requestedBy,
+      inputBinding,
+      executionSource,
+      requiredProfiles: stored.sessions[created.id].requiredProfiles,
+    }),
+  );
+  await assert.rejects(
+    executor.start(startRequest({ inputBinding })),
+    hasCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.equal(creationRequests.length, 1);
+});
+
 test("non-null PR input bindings fail closed when the broker omits its echo", async (t) => {
   const setup = await fixture(t);
   const baseBroker = setup.createBroker();
@@ -495,6 +590,10 @@ test("non-null PR input bindings fail closed when the broker omits its echo", as
   assert.deepEqual(
     stored.sessions["session-one"].inputBinding,
     pullRequestBinding(),
+  );
+  await assert.rejects(
+    access(attemptFile(setup, "session-one", 1)),
+    (error) => error?.code === "ENOENT",
   );
 });
 
@@ -1159,6 +1258,108 @@ test("recovery interrupts unknown work and resumes confirmed writes", async (t) 
   );
   assert.equal(reread.result.content, "export const recovered = true;\n");
   assert.equal(recoverySandbox.calls.length, 0);
+});
+
+test("resume removes a newly materialized attempt when its source revision changed", async (t) => {
+  const setup = await fixture(t);
+  const initial = setup.createExecutor();
+  await initial.executor.recover();
+  const active = await initial.executor.start(startRequest());
+
+  const recoveryBroker = setup.createBroker();
+  const recovered = setup.createExecutor({ broker: recoveryBroker });
+  await recovered.executor.recover();
+  await writeFile(
+    path.join(setup.sourceRoot, "src", "app.js"),
+    "export const changed = true;\n",
+  );
+
+  await assert.rejects(
+    recovered.executor.resume(sessionRequest(active.id)),
+    hasCode("SOURCE_REVISION_CHANGED"),
+  );
+  await assert.rejects(
+    access(attemptFile(setup, active.id, 2)),
+  );
+  const failed = await recovered.executor.view({ sessionId: active.id });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.error.code, "SOURCE_REVISION_CHANGED");
+});
+
+test("failed source-mismatch disposal is retried before a restarted executor becomes ready", async (t) => {
+  const setup = await fixture(t);
+  const initial = setup.createExecutor();
+  await initial.executor.recover();
+  const active = await initial.executor.start(startRequest());
+  const secondExecutionId = attemptExecutionIdFor(active.id, 2);
+
+  const resumeBaseBroker = setup.createBroker();
+  let mismatchDisposalFailed = false;
+  const resumeBroker = overrideBroker(resumeBaseBroker, {
+    discardExecution: async (request) => {
+      if (
+        request.executionId === secondExecutionId &&
+        !mismatchDisposalFailed
+      ) {
+        mismatchDisposalFailed = true;
+        throw new Error("workspace removal unavailable");
+      }
+      return resumeBaseBroker.discardExecution(request);
+    },
+  });
+  const recovered = setup.createExecutor({ broker: resumeBroker });
+  await recovered.executor.recover();
+  await writeFile(
+    path.join(setup.sourceRoot, "src", "app.js"),
+    "export const changedAgain = true;\n",
+  );
+
+  await assert.rejects(
+    recovered.executor.resume(sessionRequest(active.id)),
+    hasCode("WORKSPACE_DISPOSAL_PENDING"),
+  );
+  await access(attemptFile(setup, active.id, 2));
+  const preparing = await setup.innerStore.read("code-executor-state");
+  assert.equal(preparing.sessions[active.id].status, "preparing");
+
+  const cleanupBaseBroker = setup.createBroker();
+  let recoveryDisposals = 0;
+  const cleanupBroker = overrideBroker(cleanupBaseBroker, {
+    discardExecution: async (request) => {
+      if (request.executionId === secondExecutionId) {
+        recoveryDisposals += 1;
+        if (recoveryDisposals === 1) {
+          throw new Error("workspace removal still unavailable");
+        }
+      }
+      return cleanupBaseBroker.discardExecution(request);
+    },
+  });
+  const restarted = setup.createExecutor({ broker: cleanupBroker });
+
+  await assert.rejects(
+    restarted.executor.recover(),
+    hasCode("WORKSPACE_DISPOSAL_PENDING"),
+  );
+  await assert.rejects(
+    restarted.executor.view({ sessionId: active.id }),
+    hasCode("EXECUTOR_NOT_READY"),
+  );
+  await access(attemptFile(setup, active.id, 2));
+
+  assert.deepEqual(await restarted.executor.recover(), {
+    recovered: true,
+    cleanupPending: 0,
+  });
+  await assert.rejects(
+    access(attemptFile(setup, active.id, 2)),
+    (error) => error?.code === "ENOENT",
+  );
+  assert.equal(recoveryDisposals, 2);
+  assert.equal(
+    (await restarted.executor.view({ sessionId: active.id })).status,
+    "interrupted",
+  );
 });
 
 test("cleanup uncertainty fences resume", async (t) => {
@@ -2156,6 +2357,10 @@ test("invalid clocks and broker creation results never corrupt persisted revisio
   assert.equal(stored.sessions["session-one"].status, "failed");
   assert.equal(stored.sessions["session-one"].sourceRevision, null);
   assert.equal(stored.sessions["session-one"].workspaceRevision, null);
+  await assert.rejects(
+    access(attemptFile(brokerSetup, "session-one", 1)),
+    (error) => error?.code === "ENOENT",
+  );
 });
 
 test("active cancellation discards its workspace and returns one stable proof", async (t) => {

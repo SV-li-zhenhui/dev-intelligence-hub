@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import {
   ControlledCodeExecutorError,
   digestValue,
@@ -28,6 +30,48 @@ function inputBinding(overrides = {}) {
     inputDigest: "d".repeat(64),
     ...overrides,
   };
+}
+
+function conflictInputBinding() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "1".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid: HEAD_REF_OID,
+  };
+  return {
+    ...inputBinding({ schemaVersion: 2 }),
+    gitTarget,
+  };
+}
+
+function executionSource() {
+  const binding = conflictInputBinding();
+  return createConflictCodeExecutionSource({
+    inputBinding: binding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "2".repeat(64),
+        status: "conflicted",
+        baseCommitOid: binding.gitTarget.baseRefOid,
+        headCommitOid: binding.gitTarget.headRefOid,
+        mergeBaseOid: "3".repeat(40),
+        resultTreeOid: "4".repeat(40),
+        conflicts: [{ path: "src/value.js", mode: "100644" }],
+        boundaryDigest: "5".repeat(64),
+        evidenceDigest: "6".repeat(64),
+        resultObjectDigest: "7".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget: binding.gitTarget,
+    }),
+  });
 }
 
 function assertInvalid(operation) {
@@ -176,6 +220,46 @@ test("start and resume bind a detached canonical pull request Head", () => {
       inputBinding: inputBinding({ headRefOid: "f".repeat(64) }),
     }).inputBinding.headRefOid.length,
     64,
+  );
+});
+
+test("conflict start and resume bind the complete atomic execution source", () => {
+  const source = executionSource();
+  const binding = source.inputBinding;
+  const start = normalizeStartRequest({
+    sessionId: "session-conflict",
+    workspaceId: "dashboard",
+    requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+    inputBinding: binding,
+    executionSource: source,
+  });
+  const resume = normalizeResumeRequest({
+    sessionId: "session-conflict",
+    inputBinding: binding,
+    executionSource: source,
+  });
+
+  assert.deepEqual(start.executionSource, source);
+  assert.deepEqual(resume.executionSource, source);
+  assert.notEqual(start.executionSource, source);
+  assertInvalid(() =>
+    normalizeStartRequest({
+      sessionId: "session-conflict",
+      workspaceId: "dashboard",
+      requestedBy: { roleId: "pr-engineer", workItemId: "PR-42" },
+      inputBinding: inputBinding(),
+      executionSource: source,
+    }),
+  );
+  assertInvalid(() =>
+    normalizeResumeRequest({
+      sessionId: "session-conflict",
+      inputBinding: binding,
+      executionSource: {
+        ...source,
+        writeScope: { ...source.writeScope, paths: ["src/other.js"] },
+      },
+    }),
   );
 });
 

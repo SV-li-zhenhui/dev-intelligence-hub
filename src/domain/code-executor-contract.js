@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "./code-execution-source.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -156,19 +160,46 @@ function normalizeInputBinding(value) {
   return binding;
 }
 
+function normalizeExecutionSource(value, inputBinding) {
+  let source;
+  try {
+    source = normalizeCodeExecutionSource(value, invalidRequest());
+  } catch {
+    throw invalidRequest();
+  }
+  if (
+    inputBinding === null ||
+    !sameCodeExecutionSource(source, { ...source, inputBinding })
+  ) {
+    throw invalidRequest();
+  }
+  return source;
+}
+
 export function normalizeStartRequest(value) {
   return normalize(() => {
+    const hasExecutionSource = Object.hasOwn(value ?? {}, "executionSource");
     assertExactKeys(value, [
       "sessionId",
       "workspaceId",
       "requestedBy",
       "inputBinding",
+      ...(hasExecutionSource ? ["executionSource"] : []),
     ]);
+    const inputBinding = normalizeInputBinding(value.inputBinding);
     return {
       sessionId: assertSafeId(value.sessionId),
       workspaceId: assertSafeId(value.workspaceId),
       requestedBy: normalizeRequestedBy(value.requestedBy),
-      inputBinding: normalizeInputBinding(value.inputBinding),
+      inputBinding,
+      ...(hasExecutionSource
+        ? {
+            executionSource: normalizeExecutionSource(
+              value.executionSource,
+              inputBinding,
+            ),
+          }
+        : {}),
     };
   });
 }
@@ -253,10 +284,24 @@ export function normalizeRuntimeOptions(value = {}) {
 
 export function normalizeResumeRequest(value) {
   return normalize(() => {
-    assertExactKeys(value, ["sessionId", "inputBinding"]);
+    const hasExecutionSource = Object.hasOwn(value ?? {}, "executionSource");
+    assertExactKeys(value, [
+      "sessionId",
+      "inputBinding",
+      ...(hasExecutionSource ? ["executionSource"] : []),
+    ]);
+    const inputBinding = normalizeInputBinding(value.inputBinding);
     return {
       sessionId: assertSafeId(value.sessionId),
-      inputBinding: normalizeInputBinding(value.inputBinding),
+      inputBinding,
+      ...(hasExecutionSource
+        ? {
+            executionSource: normalizeExecutionSource(
+              value.executionSource,
+              inputBinding,
+            ),
+          }
+        : {}),
     };
   });
 }

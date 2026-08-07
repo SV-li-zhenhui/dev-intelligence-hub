@@ -391,6 +391,7 @@ test("verifies and materializes only the complete sealed conflict binding", asyn
       restarted.materializeConflictPreparationForCodeJob({
         binding: changed,
         targetRoot: rejectedTargetRoot,
+        excludePaths: [],
       }),
       (error) =>
         error?.code === "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
@@ -403,11 +404,25 @@ test("verifies and materializes only the complete sealed conflict binding", asyn
   const receipt = await restarted.materializeConflictPreparationForCodeJob({
     binding,
     targetRoot,
+    excludePaths: [],
   });
+  assert.deepEqual(receipt.binding, binding);
   assert.equal(receipt.preparationId, binding.preparationId);
   assert.equal(receipt.resultTreeOid, binding.resultTreeOid);
   assert.equal(receipt.evidenceDigest, binding.evidenceDigest);
   assert.equal(receipt.resultObjectDigest, binding.resultObjectDigest);
+  assert.equal(receipt.schemaVersion, 2);
+  assert.deepEqual(receipt.excludePaths, []);
+  assert.deepEqual(
+    receipt.files.map(({ path: relativePath, mode }) => ({
+      path: relativePath,
+      mode,
+    })),
+    [
+      { path: "README.md", mode: "100644" },
+      { path: "src/value.js", mode: "100644" },
+    ],
+  );
   assert.equal(
     await readFile(path.join(targetRoot, "src", "value.js"), "utf8"),
     RESULT_CONFLICT_CONTENT.toString("utf8"),
@@ -431,6 +446,7 @@ test("verifies and materializes only the complete sealed conflict binding", asyn
     cleanService.materializeConflictPreparationForCodeJob({
       binding: { ...binding, preparationId: cleanPrepared.preparationId },
       targetRoot: cleanTargetRoot,
+      excludePaths: [],
     }),
     (error) => error?.code === "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
   );
@@ -453,6 +469,31 @@ test("materializes fixed-label conflict evidence into a new empty code-job targe
   assert.equal(receipt.residual, null);
   assert.match(receipt.resultObjectDigest, /^[a-f0-9]{64}$/u);
   assert.equal(receipt.fileCount, 2);
+  assert.deepEqual(receipt.excludePaths, []);
+  assert.deepEqual(
+    receipt.files.map(({ path: relativePath, sha256, mode, bytes }) => ({
+      path: relativePath,
+      sha256,
+      mode,
+      bytes,
+    })),
+    [
+      {
+        path: "README.md",
+        sha256: createHash("sha256").update("# Example\n").digest("hex"),
+        mode: "100644",
+        bytes: Buffer.byteLength("# Example\n"),
+      },
+      {
+        path: "src/value.js",
+        sha256: createHash("sha256")
+          .update(RESULT_CONFLICT_CONTENT)
+          .digest("hex"),
+        mode: "100644",
+        bytes: RESULT_CONFLICT_CONTENT.length,
+      },
+    ],
+  );
   assert.deepEqual((await readdir(targetRoot)).sort(), ["README.md", "src"]);
   assert.equal(await readFile(path.join(targetRoot, "README.md"), "utf8"), "# Example\n");
   assert.equal(
@@ -462,6 +503,20 @@ test("materializes fixed-label conflict evidence into a new empty code-job targe
       "=======\n" +
       "const value = 'base';\n" +
       ">>>>>>> BASE\n",
+  );
+
+  const filteredRoot = path.resolve(setup.root, "filtered-code-job");
+  await mkdir(filteredRoot);
+  const filtered = await service.materializeForCodeJob({
+    preparationId: prepared.preparationId,
+    targetRoot: filteredRoot,
+    excludePaths: ["README.md"],
+  });
+  assert.deepEqual(filtered.excludePaths, ["README.md"]);
+  assert.deepEqual(filtered.files.map((entry) => entry.path), ["src/value.js"]);
+  await assert.rejects(
+    access(path.join(filteredRoot, "README.md")),
+    (error) => error?.code === "ENOENT",
   );
   await assert.rejects(access(path.join(targetRoot, ".git")), { code: "ENOENT" });
   await assert.rejects(

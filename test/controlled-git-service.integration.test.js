@@ -390,7 +390,9 @@ test(
     const receipt = await restarted.materializeConflictPreparationForCodeJob({
       binding,
       targetRoot: workspaceRoot,
+      excludePaths: [],
     });
+    assert.deepEqual(receipt.binding, binding);
     assert.equal(receipt.materialization, "full-tree");
     assert.equal(receipt.residual, null);
     assert.deepEqual(await workspaceFiles(workspaceRoot), [

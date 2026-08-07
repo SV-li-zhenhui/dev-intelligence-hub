@@ -9,6 +9,10 @@ import {
 } from "../domain/code-executor-contract.js";
 import { CodeExecutionError } from "../domain/code-execution-policy.js";
 import {
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "../domain/code-execution-source.js";
+import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
@@ -104,6 +108,10 @@ const SESSION_STATE_KEYS = Object.freeze([
 const LEGACY_SESSION_STATE_KEYS = Object.freeze(
   SESSION_STATE_KEYS.filter((key) => key !== "inputBinding"),
 );
+const CONFLICT_SESSION_STATE_KEYS = Object.freeze([
+  ...SESSION_STATE_KEYS,
+  "executionSource",
+]);
 
 function executorError(code, message) {
   return new ControlledCodeExecutorError(code, message);
@@ -154,16 +162,32 @@ function sameInputBinding(left, right) {
   }
 }
 
+function isExecutionSource(value) {
+  try {
+    normalizeCodeExecutionSource(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sameExecutionSource(left, right) {
+  if (left === undefined || right === undefined) return left === right;
+  return sameCodeExecutionSource(left, right);
+}
+
 function sessionRequestDigest({
   workspaceId,
   requestedBy,
   inputBinding,
+  executionSource,
   requiredProfiles,
 }) {
   return digestValue({
     workspaceId,
     requestedBy,
     inputBinding,
+    ...(executionSource === undefined ? {} : { executionSource }),
     requiredProfiles,
   });
 }
@@ -176,8 +200,14 @@ function legacySessionRequestDigest({
   return digestValue({ workspaceId, requestedBy, requiredProfiles });
 }
 
-function assertSessionInputBinding(session, inputBinding) {
-  if (!sameInputBinding(session.inputBinding, inputBinding)) {
+function assertSessionInputBinding(session, inputBinding, executionSource) {
+  const sessionSource = Object.hasOwn(session, "executionSource")
+    ? session.executionSource
+    : undefined;
+  if (
+    !sameInputBinding(session.inputBinding, inputBinding) ||
+    !sameExecutionSource(sessionSource, executionSource)
+  ) {
     throw executorError(
       "IDEMPOTENCY_CONFLICT",
       "代码执行会话已绑定到不同的输入",
@@ -392,9 +422,14 @@ function validateProfileState(session) {
 }
 
 function validateSession(sessionId, session) {
+  const hasExecutionSource = isPlainRecord(session) &&
+    Object.hasOwn(session, "executionSource");
   if (
     !SAFE_ID.test(sessionId) ||
-    !hasExactKeys(session, SESSION_STATE_KEYS) ||
+    !hasExactKeys(
+      session,
+      hasExecutionSource ? CONFLICT_SESSION_STATE_KEYS : SESSION_STATE_KEYS,
+    ) ||
     session.id !== sessionId ||
     !SAFE_ID.test(session.workspaceId) ||
     !hasExactKeys(session.requestedBy, ["roleId", "workItemId"]) ||
@@ -407,6 +442,13 @@ function validateSession(sessionId, session) {
         !CONTROL_CHARACTER.test(session.requestedBy.workItemId))
     ) ||
     !isInputBinding(session.inputBinding) ||
+    (hasExecutionSource &&
+      (!isExecutionSource(session.executionSource) ||
+        session.inputBinding === null ||
+        !sameCodeExecutionSource(session.executionSource, {
+          ...session.executionSource,
+          inputBinding: session.inputBinding,
+        }))) ||
     typeof session.requestDigest !== "string" ||
     !SHA256.test(session.requestDigest) ||
     !SESSION_STATUSES.has(session.status) ||
@@ -775,9 +817,11 @@ function normalizeCancellationRequest(value) {
   if (!isPlainRecord(value)) {
     throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
   }
+  const hasExecutionSource = Object.hasOwn(value, "executionSource");
   const expectedKeys = [
     "sessionId",
     "inputBinding",
+    ...(hasExecutionSource ? ["executionSource"] : []),
     "cancellationDigest",
     "expectedWorkspaceRevision",
     "expectedAction",
@@ -809,11 +853,30 @@ function normalizeCancellationRequest(value) {
       actionDigest: value.expectedAction.actionDigest,
     };
   }
+  const inputBinding = value.inputBinding === null
+    ? null
+    : normalizePullRequestExecutionBinding(value.inputBinding);
+  let executionSource;
+  if (hasExecutionSource) {
+    try {
+      executionSource = normalizeCodeExecutionSource(value.executionSource);
+    } catch {
+      throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+    }
+    if (
+      inputBinding === null ||
+      !sameCodeExecutionSource(executionSource, {
+        ...executionSource,
+        inputBinding,
+      })
+    ) {
+      throw executorError("INVALID_EXECUTION_REQUEST", "代码执行请求无效");
+    }
+  }
   return {
     sessionId: value.sessionId,
-    inputBinding: value.inputBinding === null
-      ? null
-      : normalizePullRequestExecutionBinding(value.inputBinding),
+    inputBinding,
+    ...(hasExecutionSource ? { executionSource } : {}),
     cancellationDigest: value.cancellationDigest,
     expectedWorkspaceRevision: value.expectedWorkspaceRevision,
     expectedAction,
@@ -1115,16 +1178,21 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
 
 function validateExecutionCreation(
   value,
-  { workspaceId, executionId, inputBinding },
+  reference,
 ) {
+  const { workspaceId, executionId, inputBinding } = reference;
+  const expectsExecutionSource = Object.hasOwn(reference, "executionSource");
   const echoesBinding =
     isPlainRecord(value) && Object.hasOwn(value, "inputBinding");
+  const echoesExecutionSource =
+    isPlainRecord(value) && Object.hasOwn(value, "executionSource");
   const expectedKeys = [
     "workspaceId",
     "executionId",
     "sourceRevision",
     "workspaceRevision",
     ...(echoesBinding ? ["inputBinding"] : []),
+    ...(echoesExecutionSource ? ["executionSource"] : []),
   ];
   if (
     !hasExactKeys(value, expectedKeys) ||
@@ -1135,7 +1203,13 @@ function validateExecutionCreation(
     value.sourceRevision !== value.workspaceRevision ||
     (inputBinding === null
       ? echoesBinding && value.inputBinding !== null
-      : !echoesBinding || !sameInputBinding(value.inputBinding, inputBinding))
+      : !echoesBinding || !sameInputBinding(value.inputBinding, inputBinding)) ||
+    (expectsExecutionSource !== echoesExecutionSource) ||
+    (expectsExecutionSource &&
+      !sameExecutionSource(
+        value.executionSource,
+        reference.executionSource,
+      ))
   ) {
     throw executorError(
       "EXECUTION_RESULT_INVALID",
@@ -1498,6 +1572,9 @@ function projectSession(session) {
       workItemId: session.requestedBy.workItemId,
     },
     inputBinding: structuredClone(session.inputBinding),
+    ...(Object.hasOwn(session, "executionSource")
+      ? { executionSource: structuredClone(session.executionSource) }
+      : {}),
     status: session.status,
     revision: session.revision,
     sourceRevision: session.sourceRevision,
@@ -1944,6 +2021,9 @@ export class ControlledCodeExecutor {
       workspaceId: request.workspaceId,
       requestedBy: request.requestedBy,
       inputBinding: request.inputBinding,
+      ...(Object.hasOwn(request, "executionSource")
+        ? { executionSource: request.executionSource }
+        : {}),
       requiredProfiles,
     });
     const claimed = await this.#mutateState((state) => {
@@ -1969,6 +2049,9 @@ export class ControlledCodeExecutor {
         workspaceId: request.workspaceId,
         requestedBy: request.requestedBy,
         inputBinding: structuredClone(request.inputBinding),
+        ...(Object.hasOwn(request, "executionSource")
+          ? { executionSource: structuredClone(request.executionSource) }
+          : {}),
         requestDigest,
         status: "preparing",
         revision: 0,
@@ -2011,16 +2094,30 @@ export class ControlledCodeExecutor {
         workspaceId: request.workspaceId,
         executionId: claimed.executionId,
         inputBinding: structuredClone(request.inputBinding),
+        ...(Object.hasOwn(request, "executionSource")
+          ? { executionSource: structuredClone(request.executionSource) }
+          : {}),
       };
       created = validateExecutionCreation(
         await this.broker.createExecution(reference),
         reference,
       );
     } catch (error) {
-      await this.#markSessionFailed(request.sessionId, error, "START_FAILED", {
+      await this.#discardWorkspaceAttempt({
+        sessionId: request.sessionId,
+        workspaceId: request.workspaceId,
         executionId: claimed.executionId,
-        statuses: ["preparing"],
+        message: "启动失败后的隔离工作区清理尚未确认",
       });
+      try {
+        await this.#markSessionFailed(request.sessionId, error, "START_FAILED", {
+          executionId: claimed.executionId,
+          statuses: ["preparing"],
+        });
+      } catch (stateError) {
+        this.runtimeFences.add(request.sessionId);
+        throw stateError;
+      }
       throw executorError("START_FAILED", "无法创建受控代码副本");
     }
     try {
@@ -2048,6 +2145,12 @@ export class ControlledCodeExecutor {
       });
     } catch (error) {
       this.runtimeFences.add(request.sessionId);
+      await this.#discardWorkspaceAttempt({
+        sessionId: request.sessionId,
+        workspaceId: request.workspaceId,
+        executionId: claimed.executionId,
+        message: "未确认启动结果的隔离工作区清理尚未确认",
+      });
       throw error;
     }
     return this.#readProjectedSession(request.sessionId);
@@ -2087,6 +2190,20 @@ export class ControlledCodeExecutor {
       touchSession(session, at);
       return {};
     });
+  }
+
+  async #discardWorkspaceAttempt({
+    sessionId,
+    workspaceId,
+    executionId,
+    message,
+  }) {
+    try {
+      await this.broker.discardExecution({ workspaceId, executionId });
+    } catch {
+      this.runtimeFences.add(sessionId);
+      throw executorError("WORKSPACE_DISPOSAL_PENDING", message);
+    }
   }
 
   #assertProfileConfiguration(session) {
@@ -3003,7 +3120,11 @@ export class ControlledCodeExecutor {
     }
     const claimed = await this.#mutateState((state) => {
       const session = this.#requireSession(state, request.sessionId);
-      assertSessionInputBinding(session, request.inputBinding);
+      assertSessionInputBinding(
+        session,
+        request.inputBinding,
+        request.executionSource,
+      );
       if (session.cancellation !== null) {
         if (!sameCancellationRequest(session.cancellation, request)) {
           throw executorError(
@@ -3176,9 +3297,10 @@ export class ControlledCodeExecutor {
       this.#readState({ persistLegacyUpgrade: true }),
     );
     await this.#validateRecoveryArtifacts();
-    const fences = await this.#mutateState((state) => {
+    const recoveryWork = await this.#mutateState((state) => {
       let changed = false;
-      const pending = [];
+      const sandboxFences = [];
+      const workspaces = [];
       for (const session of Object.values(state.sessions)) {
         const runningActions = session.actions.filter(
           (action) => action.status === "running",
@@ -3186,11 +3308,15 @@ export class ControlledCodeExecutor {
         const runningReplays = currentAttempt(session).replays.filter(
           (replay) => replay.status === "running",
         );
-        if (
+        const requiresInterruption =
           RECOVERABLE_STATUSES.has(session.status) ||
           runningActions.length ||
-          runningReplays.length
-        ) {
+          runningReplays.length;
+        const requiresWorkspaceDisposal =
+          requiresInterruption ||
+          session.status === "interrupted" ||
+          session.status === "failed";
+        if (requiresInterruption) {
           const at = this.#now();
           session.status = "interrupted";
           currentAttempt(session).status = "interrupted";
@@ -3231,14 +3357,39 @@ export class ControlledCodeExecutor {
           touchSession(session, at);
           changed = true;
         }
+        if (requiresWorkspaceDisposal) {
+          for (const attempt of session.attempts) {
+            workspaces.push({
+              sessionId: session.id,
+              workspaceId: session.workspaceId,
+              executionId: attempt.executionId,
+            });
+          }
+        }
         if (session.cleanupFence) {
-          pending.push({ sessionId: session.id, ...session.cleanupFence });
+          sandboxFences.push({
+            sessionId: session.id,
+            ...session.cleanupFence,
+          });
         }
       }
-      return { changed, value: pending };
+      return { changed, value: { sandboxFences, workspaces } };
     });
 
-    for (const fence of fences) {
+    let workspaceDisposalError = null;
+    for (const workspace of recoveryWork.workspaces) {
+      try {
+        await this.broker.discardExecution({
+          workspaceId: workspace.workspaceId,
+          executionId: workspace.executionId,
+        });
+      } catch (error) {
+        workspaceDisposalError ??= error;
+        this.runtimeFences.add(workspace.sessionId);
+      }
+    }
+
+    for (const fence of recoveryWork.sandboxFences) {
       try {
         await this.sandbox.cleanup({
           executionId: fence.executionId,
@@ -3272,6 +3423,12 @@ export class ControlledCodeExecutor {
         });
       }
     }
+    if (workspaceDisposalError !== null) {
+      throw executorError(
+        "WORKSPACE_DISPOSAL_PENDING",
+        "中断执行的隔离工作区清理尚未确认",
+      );
+    }
     const cleanupPending = await this.stateQueue.enqueue(async () => {
       const state = await this.#readState();
       return Object.values(state.sessions).filter(
@@ -3281,11 +3438,11 @@ export class ControlledCodeExecutor {
     return { recovered: true, cleanupPending };
   }
 
-  async #resume({ sessionId, inputBinding }) {
+  async #resume({ sessionId, inputBinding, executionSource }) {
     let fence = await this.stateQueue.enqueue(async () => {
       const state = await this.#readState();
       const session = this.#requireSession(state, sessionId);
-      assertSessionInputBinding(session, inputBinding);
+      assertSessionInputBinding(session, inputBinding, executionSource);
       return structuredClone(session.cleanupFence);
     });
     this.#assertRuntimeAvailable(sessionId);
@@ -3324,7 +3481,7 @@ export class ControlledCodeExecutor {
 
     const prepared = await this.#mutateState((state) => {
       const session = this.#requireSession(state, sessionId);
-      assertSessionInputBinding(session, inputBinding);
+      assertSessionInputBinding(session, inputBinding, executionSource);
       if (session.status !== "interrupted") {
         throw executorError("SESSION_NOT_INTERRUPTED", "只有中断会话可以恢复");
       }
@@ -3382,6 +3539,9 @@ export class ControlledCodeExecutor {
           workspaceId: session.workspaceId,
           executionId,
           inputBinding: structuredClone(session.inputBinding),
+          ...(Object.hasOwn(session, "executionSource")
+            ? { executionSource: structuredClone(session.executionSource) }
+            : {}),
           number,
           sourceRevision: session.sourceRevision,
           targetWorkspaceRevision: session.workspaceRevision,
@@ -3396,16 +3556,30 @@ export class ControlledCodeExecutor {
         workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
         inputBinding: structuredClone(prepared.inputBinding),
+        ...(Object.hasOwn(prepared, "executionSource")
+          ? { executionSource: structuredClone(prepared.executionSource) }
+          : {}),
       };
       created = validateExecutionCreation(
         await this.broker.createExecution(reference),
         reference,
       );
     } catch (error) {
-      await this.#markSessionFailed(sessionId, error, "RESUME_FAILED", {
+      await this.#discardWorkspaceAttempt({
+        sessionId,
+        workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
-        statuses: ["preparing"],
+        message: "恢复创建失败后的隔离工作区清理尚未确认",
       });
+      try {
+        await this.#markSessionFailed(sessionId, error, "RESUME_FAILED", {
+          executionId: prepared.executionId,
+          statuses: ["preparing"],
+        });
+      } catch (stateError) {
+        this.runtimeFences.add(sessionId);
+        throw stateError;
+      }
       throw executorError("RESUME_FAILED", "无法创建新的恢复副本");
     }
     if (prepared.sourceRevision === null) {
@@ -3413,6 +3587,12 @@ export class ControlledCodeExecutor {
         prepared.writes.length !== 0 ||
         prepared.targetWorkspaceRevision !== null
       ) {
+        await this.#discardWorkspaceAttempt({
+          sessionId,
+          workspaceId: prepared.workspaceId,
+          executionId: prepared.executionId,
+          message: "无效首次恢复副本的清理尚未确认",
+        });
         throw executorError("EXECUTOR_STATE_INVALID", "首次恢复状态无效");
       }
       prepared.sourceRevision = created.sourceRevision;
@@ -3440,41 +3620,69 @@ export class ControlledCodeExecutor {
         });
       } catch (error) {
         this.runtimeFences.add(sessionId);
+        await this.#discardWorkspaceAttempt({
+          sessionId,
+          workspaceId: prepared.workspaceId,
+          executionId: prepared.executionId,
+          message: "未确认恢复结果的隔离工作区清理尚未确认",
+        });
         throw error;
       }
     } else if (created.sourceRevision !== prepared.sourceRevision) {
-      await this.#markSessionFailed(
+      await this.#discardWorkspaceAttempt({
         sessionId,
-        executorError("SOURCE_REVISION_CHANGED", "可信源工作区已经变化"),
-        "SOURCE_REVISION_CHANGED",
-        {
-          executionId: prepared.executionId,
-          statuses: ["preparing"],
-        },
-      );
+        workspaceId: prepared.workspaceId,
+        executionId: prepared.executionId,
+        message: "来源不一致的恢复副本尚未确认清理",
+      });
+      try {
+        await this.#markSessionFailed(
+          sessionId,
+          executorError("SOURCE_REVISION_CHANGED", "可信源工作区已经变化"),
+          "SOURCE_REVISION_CHANGED",
+          {
+            executionId: prepared.executionId,
+            statuses: ["preparing"],
+          },
+        );
+      } catch (error) {
+        this.runtimeFences.add(sessionId);
+        throw error;
+      }
       throw executorError("SOURCE_REVISION_CHANGED", "可信源工作区已经变化");
     }
 
-    await this.#mutateState((state) => {
-      const session = this.#requireSession(state, sessionId);
-      const attempt = currentAttempt(session);
-      if (
-        session.status !== "preparing" ||
-        attempt.executionId !== prepared.executionId ||
-        attempt.status !== "preparing"
-      ) {
-        throw executorError(
-          "EXECUTION_FENCED",
-          "执行生命周期已变化，恢复不能继续",
-        );
-      }
-      const at = this.#now();
-      session.status = "replaying";
-      attempt.status = "replaying";
-      appendEvent(session, "resume_replaying", at);
-      touchSession(session, at);
-      return {};
-    });
+    try {
+      await this.#mutateState((state) => {
+        const session = this.#requireSession(state, sessionId);
+        const attempt = currentAttempt(session);
+        if (
+          session.status !== "preparing" ||
+          attempt.executionId !== prepared.executionId ||
+          attempt.status !== "preparing"
+        ) {
+          throw executorError(
+            "EXECUTION_FENCED",
+            "执行生命周期已变化，恢复不能继续",
+          );
+        }
+        const at = this.#now();
+        session.status = "replaying";
+        attempt.status = "replaying";
+        appendEvent(session, "resume_replaying", at);
+        touchSession(session, at);
+        return {};
+      });
+    } catch (error) {
+      this.runtimeFences.add(sessionId);
+      await this.#discardWorkspaceAttempt({
+        sessionId,
+        workspaceId: prepared.workspaceId,
+        executionId: prepared.executionId,
+        message: "未确认回放状态的隔离工作区清理尚未确认",
+      });
+      throw error;
+    }
 
     try {
       for (const write of prepared.writes) {
@@ -3567,7 +3775,6 @@ export class ControlledCodeExecutor {
             return {};
           });
         } catch (error) {
-          this.runtimeFences.add(sessionId);
           throw error;
         }
       }
@@ -3580,10 +3787,21 @@ export class ControlledCodeExecutor {
       }
     } catch (error) {
       if (this.runtimeFences.has(sessionId)) throw error;
-      await this.#markSessionFailed(sessionId, error, "REPLAY_FAILED", {
+      await this.#discardWorkspaceAttempt({
+        sessionId,
+        workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
-        statuses: ["replaying"],
+        message: "回放失败后的隔离工作区清理尚未确认",
       });
+      try {
+        await this.#markSessionFailed(sessionId, error, "REPLAY_FAILED", {
+          executionId: prepared.executionId,
+          statuses: ["replaying"],
+        });
+      } catch (stateError) {
+        this.runtimeFences.add(sessionId);
+        throw stateError;
+      }
       throw executorError(
         error instanceof ControlledCodeExecutorError ? error.code : "REPLAY_FAILED",
         "无法安全重建代码执行副本",
@@ -3613,6 +3831,12 @@ export class ControlledCodeExecutor {
       });
     } catch (error) {
       this.runtimeFences.add(sessionId);
+      await this.#discardWorkspaceAttempt({
+        sessionId,
+        workspaceId: prepared.workspaceId,
+        executionId: prepared.executionId,
+        message: "未确认恢复完成结果的隔离工作区清理尚未确认",
+      });
       throw error;
     }
     return this.#readProjectedSession(sessionId);

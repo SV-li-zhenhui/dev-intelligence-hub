@@ -14,6 +14,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
 
 async function fixture(t, {
@@ -22,6 +24,7 @@ async function fixture(t, {
   limits = {},
   excludePaths = [],
   gitSnapshotter = null,
+  conflictMaterializer = null,
   gitBoundaryDigest = null,
   gitExecutableIdentity = undefined,
   removeDirectory = undefined,
@@ -56,6 +59,7 @@ async function fixture(t, {
       scratchRoot,
       limits,
       gitSnapshotter,
+      conflictMaterializer,
       ...(removeDirectory === undefined ? {} : { removeDirectory }),
       workspaces: [{
         id: "dashboard",
@@ -84,6 +88,91 @@ function pullRequestBinding(overrides = {}) {
     eventDigest: "2".repeat(64),
     inputDigest: "3".repeat(64),
     ...overrides,
+  };
+}
+
+function conflictExecutionSource() {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/dashboard",
+    baseRefName: "main",
+    baseRefOid: "4".repeat(40),
+    headRepository: "contributor/dashboard",
+    headRefName: "fix/conflict",
+    headRefOid: "1".repeat(40),
+  };
+  const inputBinding = pullRequestBinding({ schemaVersion: 2, gitTarget });
+  return createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding: createConflictPreparationBinding({
+      preparation: {
+        schemaVersion: 1,
+        preparationId: "5".repeat(64),
+        status: "conflicted",
+        baseCommitOid: gitTarget.baseRefOid,
+        headCommitOid: gitTarget.headRefOid,
+        mergeBaseOid: "6".repeat(40),
+        resultTreeOid: "7".repeat(40),
+        conflicts: [{ path: "src/value.js", mode: "100644" }],
+        boundaryDigest: "8".repeat(64),
+        evidenceDigest: "9".repeat(64),
+        resultObjectDigest: "a".repeat(64),
+        materialization: "full-tree",
+      },
+      gitTarget,
+    }),
+  });
+}
+
+function fixedConflictMaterializer(files, { receiptOverrides = {} } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async materialize(request) {
+      calls.push(structuredClone(request));
+      let totalBytes = 0;
+      const receiptFiles = [];
+      for (const [relativePath, content] of Object.entries(files).sort()) {
+        if (
+          request.excludePaths.some(
+            (excluded) =>
+              relativePath === excluded ||
+              relativePath.startsWith(`${excluded}/`),
+          )
+        ) {
+          continue;
+        }
+        const value = Buffer.from(content);
+        const target = path.join(request.targetRoot, ...relativePath.split("/"));
+        await mkdir(path.dirname(target), { recursive: true });
+        await writeFile(target, value, { mode: 0o644 });
+        totalBytes += value.length;
+        receiptFiles.push({
+          path: relativePath,
+          sha256: digest(value),
+          mode: "100644",
+          bytes: value.length,
+        });
+      }
+      return {
+        schemaVersion: 2,
+        preparationId: request.binding.preparationId,
+        binding: structuredClone(request.binding),
+        targetRoot: request.targetRoot,
+        materialization: "full-tree",
+        excludePaths: [...request.excludePaths],
+        files: receiptFiles,
+        fileCount: receiptFiles.length,
+        totalBytes,
+        resultTreeOid: request.binding.resultTreeOid,
+        evidenceDigest: request.binding.evidenceDigest,
+        resultObjectDigest: request.binding.resultObjectDigest,
+        residual: null,
+        ...receiptOverrides,
+      };
+    },
   };
 }
 
@@ -310,6 +399,181 @@ test("a PR-bound execution materializes only its sealed Git Head and echoes a de
       expectedGitExecutableGid: 0,
     },
   ]);
+});
+
+test("a conflict execution uses only its bound materializer and exact-file write scope", async (t) => {
+  const executionSource = conflictExecutionSource();
+  const materializer = fixedConflictMaterializer({
+    "README.md": "# prepared\n",
+    "src/other.js": "export const other = 1;\n",
+    "src/value.js": "<<<<<<< base\nold\n=======\nnew\n>>>>>>> head\n",
+  });
+  const snapshotter = fixedSnapshotter({ "src/wrong.js": "wrong\n" });
+  const { broker, scratchRoot } = await fixture(t, {
+    files: { "src/source-only.js": "must not be copied\n" },
+    writablePaths: ["src"],
+    conflictMaterializer: materializer,
+    gitSnapshotter: snapshotter,
+  });
+
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "conflict-run",
+    inputBinding: executionSource.inputBinding,
+    executionSource,
+  });
+
+  assert.deepEqual(execution.executionSource, executionSource);
+  assert.deepEqual(materializer.calls, [{
+    binding: executionSource.preparationBinding,
+    targetRoot: path.join(scratchRoot, "dashboard", "conflict-run"),
+    excludePaths: [],
+  }]);
+  assert.equal(snapshotter.calls.length, 0);
+  assert.deepEqual(await broker.listFiles(execution), [
+    "README.md",
+    "src/other.js",
+    "src/value.js",
+  ]);
+
+  const current = await broker.readFile({ ...execution, path: "src/value.js" });
+  const written = await broker.writeFile({
+    ...execution,
+    path: "src/value.js",
+    content: "export const value = 'resolved';\n",
+    expectedSha256: current.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  for (const candidate of [
+    "src/other.js",
+    "src/value.js/child.js",
+    "src/Value.js",
+  ]) {
+    await assert.rejects(
+      broker.writeFile({
+        ...execution,
+        path: candidate,
+        content: "forbidden\n",
+        expectedSha256: null,
+        expectedWorkspaceRevision: written.workspaceRevision,
+      }),
+      (error) => error.code === "WRITE_NOT_ALLOWED",
+    );
+  }
+  assert.equal(
+    await readFile(
+      path.join(scratchRoot, "dashboard", "conflict-run", "src", "value.js"),
+      "utf8",
+    ),
+    "export const value = 'resolved';\n",
+  );
+
+  await assert.rejects(
+    broker.createExecution({
+      workspaceId: "dashboard",
+      executionId: "unknown-field-run",
+      inputBinding: executionSource.inputBinding,
+      executionSource,
+      preparationId: executionSource.preparationBinding.preparationId,
+    }),
+    (error) => error.code === "INVALID_EXECUTION_REQUEST",
+  );
+  assert.equal(materializer.calls.length, 1);
+});
+
+test("conflict receipt evidence rejects same-size content replacement", async (t) => {
+  const executionSource = conflictExecutionSource();
+  const trusted = fixedConflictMaterializer({
+    "src/value.js": "trusted\n",
+  });
+  const materializer = {
+    async materialize(request) {
+      const receipt = await trusted.materialize(request);
+      await writeFile(
+        path.join(request.targetRoot, "src", "value.js"),
+        "forged!\n",
+      );
+      return receipt;
+    },
+  };
+  const { broker, scratchRoot } = await fixture(t, {
+    writablePaths: ["src"],
+    conflictMaterializer: materializer,
+  });
+
+  await assert.rejects(
+    broker.createExecution({
+      workspaceId: "dashboard",
+      executionId: "tampered-conflict-run",
+      inputBinding: executionSource.inputBinding,
+      executionSource,
+    }),
+    (error) => error.code === "CONFLICT_PREPARATION_RESULT_INVALID",
+  );
+  await assert.rejects(
+    access(path.join(scratchRoot, "dashboard", "tampered-conflict-run")),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("conflict materialization excludes workspace-private paths before writing", async (t) => {
+  const executionSource = conflictExecutionSource();
+  const materializer = fixedConflictMaterializer({
+    "private/secret.txt": "never materialize\n",
+    "src/value.js": "conflict\n",
+  });
+  const { broker, scratchRoot } = await fixture(t, {
+    writablePaths: ["src"],
+    excludePaths: ["private"],
+    conflictMaterializer: materializer,
+  });
+
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "excluded-conflict-run",
+    inputBinding: executionSource.inputBinding,
+    executionSource,
+  });
+
+  assert.deepEqual(materializer.calls[0].excludePaths, ["private"]);
+  assert.deepEqual(await broker.listFiles(execution), ["src/value.js"]);
+  await assert.rejects(
+    access(
+      path.join(
+        scratchRoot,
+        "dashboard",
+        "excluded-conflict-run",
+        "private",
+        "secret.txt",
+      ),
+    ),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("invalid conflict materialization receipts are cleaned before registration", async (t) => {
+  const executionSource = conflictExecutionSource();
+  const materializer = fixedConflictMaterializer(
+    { "src/value.js": "conflict\n" },
+    { receiptOverrides: { resultObjectDigest: "b".repeat(64) } },
+  );
+  const { broker, scratchRoot } = await fixture(t, {
+    writablePaths: ["src"],
+    conflictMaterializer: materializer,
+  });
+
+  await assert.rejects(
+    broker.createExecution({
+      workspaceId: "dashboard",
+      executionId: "bad-conflict-run",
+      inputBinding: executionSource.inputBinding,
+      executionSource,
+    }),
+    (error) => error.code === "CONFLICT_PREPARATION_RESULT_INVALID",
+  );
+  await assert.rejects(
+    access(path.join(scratchRoot, "dashboard", "bad-conflict-run")),
+  );
 });
 
 test("PR bindings fail before source copy when Git Head snapshot is unavailable", async (t) => {

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import {
@@ -90,6 +92,35 @@ function gitContext(overrides = {}) {
     },
     ...overrides,
   });
+}
+
+function conflictContext() {
+  const trusted = gitContext();
+  const gitTarget = trusted.inputBinding.gitTarget;
+  const workspaceSource = createConflictPreparationBinding({
+    preparation: {
+      schemaVersion: 1,
+      preparationId: "1".repeat(64),
+      status: "conflicted",
+      baseCommitOid: gitTarget.baseRefOid,
+      headCommitOid: gitTarget.headRefOid,
+      mergeBaseOid: "e".repeat(40),
+      resultTreeOid: "f".repeat(40),
+      conflicts: [{ path: "src/value.js", mode: "100644" }],
+      boundaryDigest: "2".repeat(64),
+      evidenceDigest: "3".repeat(64),
+      resultObjectDigest: "4".repeat(64),
+      materialization: "full-tree",
+    },
+    gitTarget,
+  });
+  return {
+    ...trusted,
+    executionSource: createConflictCodeExecutionSource({
+      inputBinding: trusted.inputBinding,
+      preparationBinding: workspaceSource,
+    }),
+  };
 }
 
 function common(type) {
@@ -343,6 +374,58 @@ test("code proposals preserve the complete trusted Git target and reject same-He
       intent,
     }),
     (error) => error.code === "WORK_INTENT_CONTEXT_INVALID",
+  );
+});
+
+test("code policy preserves sealed conflict workspace authority only for modify", () => {
+  const trustedContext = conflictContext();
+  const modify = policy().bind({
+    context: trustedContext,
+    intent: {
+      ...common("propose_code_action"),
+      operation: "modify",
+      objective: "解决已准备的冲突",
+      acceptanceCriteria: ["固定测试通过"],
+      evidence: ["conflict preparation sealed"],
+    },
+  });
+  assert.deepEqual(modify.binding.inputBinding, trustedContext.inputBinding);
+  assert.deepEqual(
+    modify.binding.executionSource,
+    trustedContext.executionSource,
+  );
+  assert.throws(
+    () =>
+      policy().bind({
+        context: trustedContext,
+        intent: {
+          ...common("propose_code_action"),
+          operation: "inspect",
+          objective: "绕过冲突写权限",
+          acceptanceCriteria: ["不应创建"],
+          evidence: [],
+        },
+      }),
+    (error) => error?.code === "WORK_INTENT_POLICY_DENIED",
+  );
+});
+
+test("sealed conflict workspace authority cannot leak into non-code intents", () => {
+  assert.throws(
+    () =>
+      policy().bind({
+        context: conflictContext(),
+        intent: {
+          ...common("ask_user"),
+          question: "是否绕过代码工作提案直接继续？",
+          choices: [
+            { id: "continue", label: "继续", description: "不应创建" },
+          ],
+        },
+      }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
   );
 });
 

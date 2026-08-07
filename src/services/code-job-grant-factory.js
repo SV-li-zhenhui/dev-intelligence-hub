@@ -4,7 +4,18 @@ import {
   normalizeCodeJobGrant,
 } from "../domain/code-job-contract.js";
 import { digestValue } from "../domain/code-executor-contract.js";
-import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
+import {
+  codeExecutionSourceWritablePaths,
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "../domain/code-execution-source.js";
+import {
+  CodeExecutionPolicy,
+  normalizeWorkspacePath,
+} from "../domain/code-execution-policy.js";
+import {
+  sameConflictPreparationBinding,
+} from "../domain/conflict-preparation-binding.js";
 import {
   assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
@@ -26,6 +37,7 @@ const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EXECUTOR_CAPABILITIES = new Set([
   "directory_snapshot",
   "git_head_snapshot",
+  "conflict_preparation_snapshot",
 ]);
 const PREPARED_CODE_JOB_GRANTS = new WeakSet();
 
@@ -133,11 +145,13 @@ function normalizeAuthority(value) {
   const result = new Map();
   for (const workspaceValue of workspaces) {
     const hasCapabilities = Object.hasOwn(workspaceValue, "capabilities");
+    const hasExcludePaths = Object.hasOwn(workspaceValue, "excludePaths");
     const workspace = exactRecord(
       workspaceValue,
       [
         "id",
         "writablePaths",
+        ...(hasExcludePaths ? ["excludePaths"] : []),
         "requiredProfiles",
         "authorityDigest",
         ...(hasCapabilities ? ["capabilities"] : []),
@@ -159,6 +173,22 @@ function normalizeAuthority(value) {
     });
     if (new Set(writablePaths).size !== writablePaths.length) {
       throw invalid("executorAuthority.workspace.writablePaths 重复");
+    }
+    const excludePaths = hasExcludePaths
+      ? normalizeStringArray(
+          workspace.excludePaths,
+          64,
+          "executorAuthority.workspace.excludePaths",
+        ).map((entry) => {
+          try {
+            return normalizeWorkspacePath(entry);
+          } catch {
+            throw invalid("executorAuthority.workspace.excludePaths 无效");
+          }
+        })
+      : [];
+    if (new Set(excludePaths).size !== excludePaths.length) {
+      throw invalid("executorAuthority.workspace.excludePaths 重复");
     }
     const requiredProfiles = workProposalArrayValues(
       workspace.requiredProfiles,
@@ -200,6 +230,7 @@ function normalizeAuthority(value) {
     result.set(id, {
       id,
       writablePaths,
+      excludePaths,
       requiredProfiles,
       capabilities,
       authorityDigest: sha256(
@@ -333,6 +364,9 @@ function normalizeStoredProposal(value) {
       "repository",
       "workspaceId",
       "inputBinding",
+      ...(Object.hasOwn(proposal.binding, "executionSource")
+        ? ["executionSource"]
+        : []),
       ...(Object.hasOwn(proposal.binding, "evidenceTarget")
         ? ["evidenceTarget"]
         : []),
@@ -360,7 +394,25 @@ function normalizeStoredProposal(value) {
     "proposal.payload",
   );
   assertExecutionInputKind(proposal.binding);
-  return proposal;
+  if (!Object.hasOwn(proposal.binding, "executionSource")) return proposal;
+  if (proposal.payload.operation !== "modify") {
+    throw invalid("Conflict preparation 只能授权 modify 代码任务");
+  }
+  let executionSource;
+  try {
+    executionSource = normalizeCodeExecutionSource(
+      proposal.binding.executionSource,
+    );
+  } catch {
+    throw invalid("proposal.binding.executionSource 无效");
+  }
+  if (proposal.binding.inputBinding === null) {
+    throw invalid("Conflict preparation 缺少 PR 输入绑定");
+  }
+  return {
+    ...proposal,
+    binding: { ...proposal.binding, executionSource },
+  };
 }
 
 function assertExecutionInputKind(binding) {
@@ -386,6 +438,28 @@ function publicRoleOperations(operationsByRole) {
   );
 }
 
+function writablePathsForGrant(operation, executionSource, workspace) {
+  if (executionSource === null) {
+    return operation === "modify" ? workspace.writablePaths : [];
+  }
+  if (operation !== "modify") {
+    throw invalid("Conflict preparation 只能授权 modify 代码任务");
+  }
+  const configuredPolicy = new CodeExecutionPolicy({
+    writablePaths: workspace.writablePaths,
+    excludePaths: workspace.excludePaths,
+  });
+  const conflictPaths = codeExecutionSourceWritablePaths(executionSource);
+  try {
+    for (const conflictPath of conflictPaths) {
+      configuredPolicy.assertWritable(conflictPath);
+    }
+  } catch {
+    throw invalid("Conflict preparation 超出工作区写权限");
+  }
+  return conflictPaths;
+}
+
 export class CodeJobGrantFactory {
   #workspaces;
   #policyVersion;
@@ -395,6 +469,7 @@ export class CodeJobGrantFactory {
   #publicOperations;
   #scopeAuthorityDigest;
   #verifyInputAuthority;
+  #verifyConflictPreparation;
 
   constructor({
     executorAuthority,
@@ -406,6 +481,7 @@ export class CodeJobGrantFactory {
     brainProviders,
     scopeAuthorityDigest,
     inputAuthorityVerifier,
+    conflictPreparationVerifier,
   } = {}) {
     if (
       scopeAuthorityDigest !== undefined &&
@@ -439,6 +515,18 @@ export class CodeJobGrantFactory {
     this.#verifyInputAuthority = inputAuthorityVerifier?.verify.bind(
       inputAuthorityVerifier,
     ) ?? null;
+    if (
+      conflictPreparationVerifier !== undefined &&
+      (!conflictPreparationVerifier ||
+        typeof conflictPreparationVerifier.verify !== "function")
+    ) {
+      throw new TypeError(
+        "conflictPreparationVerifier must provide verify(binding)",
+      );
+    }
+    this.#verifyConflictPreparation =
+      conflictPreparationVerifier?.verify.bind(conflictPreparationVerifier) ??
+      null;
     Object.freeze(this);
   }
 
@@ -446,6 +534,12 @@ export class CodeJobGrantFactory {
     const proposal = normalizeStoredProposal(value);
     const operation = proposal.payload.operation;
     const roleId = proposal.requestedBy.roleId;
+    const executionSource = Object.hasOwn(
+      proposal.binding,
+      "executionSource",
+    )
+      ? proposal.binding.executionSource
+      : null;
     const workspace = this.#currentAuthority({
       policyVersion: proposal.policyVersion,
       repository: proposal.binding.repository,
@@ -453,38 +547,67 @@ export class CodeJobGrantFactory {
       roleId,
       operation,
     });
-    const createGrant = () => createCodeJobGrant({
-      schemaVersion: 2,
-      proposalId: proposal.proposalId,
-      contentDigest: proposal.contentDigest,
-      policyVersion: proposal.policyVersion,
-      requestedBy: proposal.requestedBy,
-      source: proposal.source,
-      subject: proposal.binding.subject,
-      repository: proposal.binding.repository,
-      workspaceId: proposal.binding.workspaceId,
-      inputBinding: proposal.binding.inputBinding,
-      workspaceAuthorityDigest: workspace.authorityDigest,
-      operation,
-      objective: proposal.payload.objective,
-      acceptanceCriteria: proposal.payload.acceptanceCriteria,
-      evidence: proposal.payload.evidence,
-      summary: proposal.payload.summary,
-      reason: proposal.payload.reason,
-      allowedActions: CODE_JOB_ACTIONS_BY_OPERATION[operation],
-      writablePaths: operation === "modify" ? workspace.writablePaths : [],
-      requiredProfiles: workspace.requiredProfiles,
-      brainDigest: this.#brainDigests.get(roleId),
-    });
-    const authorized = this.#verifyInputBinding(
+    const locallyAdmittedSource = this.#verifyExecutionSource(
+      executionSource,
       proposal.binding.inputBinding,
       workspace,
+      { verifyEvidence: false },
     );
-    const result = () => Object.freeze({
-      grant: createGrant(),
-      allowedOperationsByRole: this.#publicOperations,
-    });
-    return authorized instanceof Promise ? authorized.then(result) : result();
+    const writablePaths = writablePathsForGrant(
+      operation,
+      locallyAdmittedSource,
+      workspace,
+    );
+    const createResult = (verifiedSource) => {
+      const grant = createCodeJobGrant({
+        schemaVersion: verifiedSource === null ? 2 : 3,
+        proposalId: proposal.proposalId,
+        contentDigest: proposal.contentDigest,
+        policyVersion: proposal.policyVersion,
+        requestedBy: proposal.requestedBy,
+        source: proposal.source,
+        subject: proposal.binding.subject,
+        repository: proposal.binding.repository,
+        workspaceId: proposal.binding.workspaceId,
+        inputBinding: proposal.binding.inputBinding,
+        ...(verifiedSource === null
+          ? {}
+          : { executionSource: verifiedSource }),
+        workspaceAuthorityDigest: workspace.authorityDigest,
+        operation,
+        objective: proposal.payload.objective,
+        acceptanceCriteria: proposal.payload.acceptanceCriteria,
+        evidence: proposal.payload.evidence,
+        summary: proposal.payload.summary,
+        reason: proposal.payload.reason,
+        allowedActions: CODE_JOB_ACTIONS_BY_OPERATION[operation],
+        writablePaths,
+        requiredProfiles: workspace.requiredProfiles,
+        brainDigest: this.#brainDigests.get(roleId),
+      });
+      return Object.freeze({
+        grant,
+        allowedOperationsByRole: this.#publicOperations,
+      });
+    };
+    const authorizeSource = (verifiedInput) => {
+      const source = this.#verifyExecutionSource(
+        locallyAdmittedSource,
+        verifiedInput,
+        workspace,
+      );
+      return source instanceof Promise
+        ? source.then(createResult)
+        : createResult(source);
+    };
+    const inputAuthorization = this.#verifyInputBinding(
+      proposal.binding.inputBinding,
+      workspace,
+      { requireGitHeadSnapshot: executionSource === null },
+    );
+    return inputAuthorization instanceof Promise
+      ? inputAuthorization.then(authorizeSource)
+      : authorizeSource(inputAuthorization);
   }
 
   verify(value) {
@@ -492,7 +615,7 @@ export class CodeJobGrantFactory {
       ? value
       : prepareCodeJobGrantVerification(value);
     if (
-      grant.schemaVersion !== 2 ||
+      ![2, 3].includes(grant.schemaVersion) ||
       !Object.hasOwn(grant, "inputBinding")
     ) {
       throw invalid("旧版代码任务授权只能恢复查看，不能接纳新的执行动作");
@@ -506,11 +629,23 @@ export class CodeJobGrantFactory {
       roleId,
       operation: grant.operation,
     });
+    const executionSource = grant.schemaVersion === 3
+      ? grant.executionSource
+      : null;
+    const locallyAdmittedSource = this.#verifyExecutionSource(
+      executionSource,
+      grant.inputBinding,
+      workspace,
+      { verifyEvidence: false },
+    );
     const expected = {
       workspaceAuthorityDigest: workspace.authorityDigest,
       allowedActions: CODE_JOB_ACTIONS_BY_OPERATION[grant.operation],
-      writablePaths:
-        grant.operation === "modify" ? workspace.writablePaths : [],
+      writablePaths: writablePathsForGrant(
+        grant.operation,
+        locallyAdmittedSource,
+        workspace,
+      ),
       requiredProfiles: workspace.requiredProfiles,
       brainDigest: this.#brainDigests.get(roleId),
     };
@@ -520,13 +655,31 @@ export class CodeJobGrantFactory {
     if (digestValue(actual) !== digestValue(expected)) {
       throw invalid("代码任务授权已不符合当前执行配置");
     }
-    const authorized = this.#verifyInputBinding(grant.inputBinding, workspace);
-    return authorized instanceof Promise
-      ? authorized.then(() => grant)
-      : grant;
+    const verifySource = (verifiedInput) => {
+      const source = this.#verifyExecutionSource(
+        locallyAdmittedSource,
+        verifiedInput,
+        workspace,
+      );
+      return source instanceof Promise
+        ? source.then(() => grant)
+        : grant;
+    };
+    const inputAuthorization = this.#verifyInputBinding(
+      grant.inputBinding,
+      workspace,
+      { requireGitHeadSnapshot: executionSource === null },
+    );
+    return inputAuthorization instanceof Promise
+      ? inputAuthorization.then(verifySource)
+      : verifySource(inputAuthorization);
   }
 
-  #verifyInputBinding(inputBinding, workspace) {
+  #verifyInputBinding(
+    inputBinding,
+    workspace,
+    { requireGitHeadSnapshot = true } = {},
+  ) {
     if (inputBinding === null) return null;
     if (inputBinding.schemaVersion !== 2) {
       throw invalid("旧版 PR 输入绑定只能恢复查看，不能创建或授权新的代码执行");
@@ -534,7 +687,10 @@ export class CodeJobGrantFactory {
     if (!GIT_OID.test(inputBinding.headRefOid)) {
       throw invalid("PR 代码任务没有绑定有效的 Git Head OID");
     }
-    if (!workspace.capabilities.includes("git_head_snapshot")) {
+    if (
+      requireGitHeadSnapshot &&
+      !workspace.capabilities.includes("git_head_snapshot")
+    ) {
       throw invalid("代码工作区不具备固定 Git Head 快照能力");
     }
     if (this.#verifyInputAuthority === null) {
@@ -557,6 +713,61 @@ export class CodeJobGrantFactory {
           throw invalid("PR 代码任务绑定的 Head 已失效");
         })
       : assertVerified(verified);
+  }
+
+  #verifyExecutionSource(
+    executionSource,
+    inputBinding,
+    workspace,
+    { verifyEvidence = true } = {},
+  ) {
+    if (executionSource === null) return null;
+    let normalized;
+    try {
+      normalized = normalizeCodeExecutionSource(executionSource);
+    } catch {
+      throw invalid("Conflict preparation 执行来源无效");
+    }
+    if (
+      inputBinding === null ||
+      !sameCodeExecutionSource(normalized, {
+        ...normalized,
+        inputBinding,
+      })
+    ) {
+      throw invalid("Conflict preparation 与当前 PR Head 不匹配");
+    }
+    if (!workspace.capabilities.includes("conflict_preparation_snapshot")) {
+      throw invalid("代码工作区不具备 sealed conflict 快照能力");
+    }
+    if (this.#verifyConflictPreparation === null) {
+      throw invalid("Conflict preparation 缺少 sealed evidence 校验器");
+    }
+    if (!verifyEvidence) return normalized;
+    let verification;
+    try {
+      verification = this.#verifyConflictPreparation(
+        structuredClone(normalized.preparationBinding),
+      );
+    } catch {
+      throw invalid("Conflict preparation 已失效");
+    }
+    const assertVerified = (verified) => {
+      if (
+        !sameConflictPreparationBinding(
+          verified,
+          normalized.preparationBinding,
+        )
+      ) {
+        throw invalid("Conflict preparation 校验结果不一致");
+      }
+      return normalized;
+    };
+    return verification instanceof Promise
+      ? verification.then(assertVerified, () => {
+          throw invalid("Conflict preparation 已失效");
+        })
+      : assertVerified(verification);
   }
 
   #currentAuthority({
