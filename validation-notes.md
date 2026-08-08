@@ -1,12 +1,12 @@
 # Validation notes
 
-## 2026-08-09 — supervised CLI brains and post-commit acceptance
+## 2026-08-09 — supervised CLI brains and earlier `50f816d` checkpoint
 
 - Local implementation checkpoint: `50f816d` contains the reviewed command-center integration, including versioned configuration, shared role coordination, controlled PR/code execution, recoverable operations, and supervised Codex/Claude CLI brains. It remains local and unpushed.
 - CLI acceptance: production version-only discovery/execution passed for Codex CLI `0.147.0` and Claude Code `2.1.222`; the fake local-process E2E covers employee and Code Job routes. No real model request, host CLI profile, source checkout, or GitHub credential was exposed.
 - Review result: two independent final reviews returned Ready with no P0/P1/P2 finding after deadline, cancellation, result-read, process-tree reaping, and cleanup precedence defects were reproduced and fixed.
 - Complete regression: `npm test` passed 2,777/2,784 with zero failures and seven explicit platform/environment skips. The focused/cross-layer CLI suite passed 369/370 with one Windows symbolic-link skip.
-- Distribution and UI: committed-tree packaging/clean-room checks passed 14/15 with one live machine-wide process-guard skip; 435 JavaScript/ESM files passed syntax checks; configuration and confirmation-history Edge fixtures passed; desktop and 390 px mobile validation reported no horizontal overflow, console error, or page error.
+- Distribution and UI at that checkpoint: committed-tree packaging/clean-room checks passed 14/15 with one live machine-wide process-guard skip; 435 JavaScript/ESM files passed syntax checks; configuration and confirmation-history Edge fixtures passed; desktop and 390 px mobile validation reported no horizontal overflow, console error, or page error. The process-guard gap was subsequently repaired with project-scoped guard identities and is retained here only as historical evidence.
 - Docker boundary: the opt-in real Docker smoke passed previously, and the Docker sandbox adapter/test have not changed since that evidence. It was not rerun in this checkpoint because the Docker Desktop Linux daemon was stopped.
 - Remaining owner gates: select one SPDX license before creating `LICENSE` or matching package metadata; separately authorize the product itself to perform a live PR acceptance. No service restart, real PR access/action, GitHub write, or push occurred in this acceptance.
 

@@ -469,7 +469,7 @@ git commit -m "feat: complete supervised CLI brain integration"
 - The reviewed implementation was consolidated into local checkpoint `50f816d` after the cross-layer dependencies had settled; this satisfies the scoped commit steps above without splitting mutually dependent authority, provider, UI, and recovery changes. Nothing was pushed.
 - Production discovery and version-only execution passed for Codex CLI `0.147.0` and Claude Code `2.1.222` from isolated temporary working directories. No model request was made.
 - The final CLI-focused/cross-layer suite passed 369/370 with one explicit Windows symbolic-link skip. Two independent final reviews returned Ready with no P0/P1/P2 findings.
-- The post-commit complete regression passed 2,777/2,784 with zero failures and seven documented platform/environment skips. Distribution and clean-room checks passed 14/15 with one live machine-wide process-guard skip.
+- At the `50f816d` checkpoint, the post-commit complete regression passed 2,777/2,784 with zero failures and seven documented platform/environment skips. Distribution and clean-room checks then passed 14/15 with one live machine-wide process-guard skip; the parent command-center plan records the later project-scoped guard repair, so this line is historical CLI-slice evidence rather than the current release verdict.
 - Syntax validation passed for 435 JavaScript/ESM files. The configuration and confirmation-history Edge fixtures passed, and the desktop/mobile UI validator reported no console error, page error, or horizontal overflow.
 - No paid/remote model request, source-repository mutation, service restart, GitHub access/write, PR action, or push was performed during this acceptance.
 

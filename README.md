@@ -23,7 +23,17 @@ npm run validate:system
 npm run validate:system -- --all
 ```
 
-验收结果只写入被 Git 忽略的 `validation-artifacts/system-validation.json`；其中可能包含本机运行信息，不应未经检查直接公开。
+验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。结果只写入被 Git 忽略的 `validation-artifacts/system-validation.json`，其中记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。
+
+完成 `--all`、保存两份独立最终审查后，可生成同样被忽略的 HEAD 绑定清单。清单要求 Docker 与桌面/移动端 UI 步骤都已通过，并按 SHA-256 绑定验证报告、UI 结果/截图和两份不同审查报告：
+
+```powershell
+node scripts/system-acceptance-manifest.mjs `
+  --review "security-reliability=validation-artifacts/reviews/security-reliability.md" `
+  --review "maintainability-usability=validation-artifacts/reviews/maintainability-usability.md"
+```
+
+这些本地产物可能包含运行环境或测试名称，仍应在任何对外使用前人工检查；清单不是许可证选择，也不能代替由产品自身执行的所有者确认真实 PR 验收。
 
 首次启动不需要私人配置：仓库自带的 `config.example.json` 是无真实账号、无仓库、无 GitHub 读取或写入的安全禁用配置。它预置了五个暂停岗位和通用 PR/Issue 路由，但 GitHub 读取、工作协调、路由、记忆、代码执行和外部动作总开关均保持关闭。需要启用功能时，先复制为不入库的本机配置：
 

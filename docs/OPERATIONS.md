@@ -44,10 +44,30 @@ managed service already listening on `127.0.0.1:4173`:
 npm run validate:system -- --all
 ```
 
-The command writes a machine-readable result to the ignored
-`validation-artifacts/system-validation.json`. Treat that artifact and the UI
-screenshots as private local operational data until they have been reviewed and
-sanitized.
+Validation must start from a clean committed worktree. It fails if HEAD, the Git
+tree, or tracked/untracked source changes during the run. The command writes a
+machine-readable result to the ignored
+`validation-artifacts/system-validation.json`, including the start/end source
+identity, sanitized logical commands and exit status, and Node pass/fail/skip
+identities.
+
+After `--all` and two independent final reviews have passed, bind those records
+to the same HEAD with:
+
+```powershell
+node scripts/system-acceptance-manifest.mjs `
+  --review "security-reliability=validation-artifacts/reviews/security-reliability.md" `
+  --review "maintainability-usability=validation-artifacts/reviews/maintainability-usability.md"
+```
+
+The ignored `validation-artifacts/system-acceptance-manifest.json` records the
+validation commands and test identities and hashes the validation report, UI
+results/screenshots, and both distinct review reports. Manifest creation fails
+for a stale or dirty HEAD, a partial validation without Docker/live UI, a failed
+command, missing UI evidence, or fewer than two review reports. Treat all local
+artifacts as private operational data until reviewed and sanitized. The manifest
+does not choose a license or replace the owner-confirmed product-only live PR
+acceptance.
 
 ## Managed lifecycle
 
