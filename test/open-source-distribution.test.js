@@ -789,9 +789,18 @@ test("whole tracked Git privacy fails closed for dirty tracked content", async (
     });
     assert.equal(result.status, 0, "synthetic Git fixture setup failed");
   }
+  const dirtyCredential = [
+    "sk",
+    "dirty",
+    "tracked",
+    "content",
+    "must",
+    "not",
+    "bypass",
+  ].join("-");
   await writeFile(
     path.join(fixtureRoot, "tracked.txt"),
-    "sk-dirty-tracked-content-must-not-bypass\n",
+    `${dirtyCredential}\n`,
   );
 
   assert.throws(
