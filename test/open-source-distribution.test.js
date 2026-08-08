@@ -495,10 +495,17 @@ test(
     assert.equal(probed.stdout, "SAFE_BOOTSTRAP_OK");
 
     const powershell = managerPowerShell();
+    if (process.platform === "win32") {
+      assert.notEqual(
+        powershell,
+        null,
+        "Windows release validation requires PowerShell for managed-start verification",
+      );
+    }
     await context.test(
       "the clean payload starts, reports status, and stops through its trusted manager",
-      { skip: powershell === null },
-      async (runtimeContext) => {
+      { skip: process.platform !== "win32" && powershell === null },
+      async () => {
         const port = await availablePort();
         const examplePath = path.join(cleanRoot, "config.example.json");
         const example = JSON.parse(await readFile(examplePath, "utf8"));
@@ -522,17 +529,6 @@ test(
               path.join(runtimeInfo.runtimeDirectory, "logs", "server.log"),
               "utf8",
             ).catch(() => "<managed log unavailable>");
-        if (
-          started.status !== 0 &&
-          /Another process already owns guard mydashboard-configuration-v1/iu.test(
-            managedLog,
-          )
-        ) {
-          runtimeContext.skip(
-            "a live MyDashboard instance owns the machine-wide runtime guard",
-          );
-          return;
-        }
         assert.equal(
           started.status,
           0,

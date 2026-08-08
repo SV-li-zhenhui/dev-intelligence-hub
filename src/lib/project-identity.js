@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import path from "node:path";
+import { ProcessExclusiveGuard } from "./process-exclusive-guard.js";
+
+const RUNTIME_GUARD_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u;
 
 function canonicalProjectRoot(projectRoot) {
   if (typeof projectRoot !== "string" || projectRoot.includes("\0")) {
@@ -21,4 +24,31 @@ export function projectIdentityDigest({ projectRoot, projectDigest = null }) {
     ? canonicalRoot.toUpperCase()
     : canonicalRoot;
   return createHash("sha256").update(identity, "utf8").digest("hex");
+}
+
+export function projectScopedRuntimeGuardName({ projectRoot, guardName }) {
+  if (typeof guardName !== "string" || !RUNTIME_GUARD_NAME.test(guardName)) {
+    throw new TypeError("guardName must be a safe process guard name");
+  }
+  const projectDigest = projectIdentityDigest({ projectRoot });
+  const scopeDigest = createHash("sha256")
+    .update(`${projectDigest}\0${guardName}`, "utf8")
+    .digest("hex");
+  return `mydashboard-runtime-${scopeDigest}`;
+}
+
+export function createProjectScopedGuardFactory({
+  projectRoot,
+  createGuard = (options) => new ProcessExclusiveGuard(options),
+} = {}) {
+  if (typeof createGuard !== "function") {
+    throw new TypeError("createGuard must be a function");
+  }
+  return (options = {}) => createGuard({
+    ...options,
+    name: projectScopedRuntimeGuardName({
+      projectRoot,
+      guardName: options.name,
+    }),
+  });
 }

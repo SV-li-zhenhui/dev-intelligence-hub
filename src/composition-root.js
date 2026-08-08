@@ -14,6 +14,7 @@ import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
+import { createProjectScopedGuardFactory } from "./lib/project-identity.js";
 import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { createOperationsRuntime } from "./operations-runtime.js";
@@ -74,6 +75,19 @@ const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
 const CODE_ACTION_PROPOSAL_RUNNER_ID = "code-action-runner";
 const CONFIGURATION_CHANGE_PROPOSAL_RUNNER_ID = "configuration-change-runner";
 const PR_ENGINEER_FACTS_GUARD_NAME = "mydashboard-pr-engineer-read-facts-v1";
+const defaultPrEngineerExclusiveGuardFactory = (options) =>
+  new ProcessExclusiveGuard(options);
+
+function scopedRuntimeDependencies(dependencies, createGuard) {
+  if (
+    dependencies !== null &&
+    (typeof dependencies === "object" || typeof dependencies === "function") &&
+    Object.hasOwn(dependencies, "createGuard")
+  ) {
+    return dependencies;
+  }
+  return { ...dependencies, createGuard };
+}
 
 function frozenPort(source, methods, name) {
   if (!source || methods.some((method) => typeof source[method] !== "function")) {
@@ -372,8 +386,7 @@ export async function createApplication({
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   configuredWorkforceFactory = createConfiguredWorkforce,
   pullRequestFactsLoaderFactory = ({ github }) => github,
-  prEngineerExclusiveGuardFactory = (options) =>
-    new ProcessExclusiveGuard(options),
+  prEngineerExclusiveGuardFactory = defaultPrEngineerExclusiveGuardFactory,
   prEngineerServiceFactory = (options) => new PrEngineerService(options),
   workflowFactSourceFactory = (options) => new WorkflowFactSource(options),
   attentionResultReconcilerFactory = (options) =>
@@ -466,6 +479,15 @@ export async function createApplication({
   if (typeof ownerWorkRequestRuntimeFactory !== "function") {
     throw new TypeError("ownerWorkRequestRuntimeFactory must be a function");
   }
+  const scopedRuntimeGuardFactory = createProjectScopedGuardFactory({
+    projectRoot,
+  });
+  const runtimeDependencies = (dependencies) =>
+    scopedRuntimeDependencies(dependencies, scopedRuntimeGuardFactory);
+  const effectivePrEngineerExclusiveGuardFactory =
+    prEngineerExclusiveGuardFactory === defaultPrEngineerExclusiveGuardFactory
+      ? scopedRuntimeGuardFactory
+      : prEngineerExclusiveGuardFactory;
   const ownsRuntimeLifecycle = suppliedRuntimeLifecycle === undefined;
   const runtimeLifecycle = frozenPort(
     ownsRuntimeLifecycle
@@ -539,7 +561,7 @@ export async function createApplication({
     if (versionedConfiguration) {
       configurationRuntime = trackRuntime(
         await configurationRuntimeFactory(bootstrap.candidate, {
-          ...configurationRuntimeDependencies,
+          ...runtimeDependencies(configurationRuntimeDependencies),
           store,
           actionAdmissionGate,
           fallbackConfiguration: bootstrap.fallbackConfiguration,
@@ -589,7 +611,7 @@ export async function createApplication({
       }
       changePackageRuntime = trackRuntime(
         await changePackageRuntimeFactory(config.changePackages, {
-          ...changePackageRuntimeDependencies,
+          ...runtimeDependencies(changePackageRuntimeDependencies),
           store,
           trustedTargets: codeExecutorRuntime.changePackageTargets,
           applicationAuthorityVerifier,
@@ -625,7 +647,7 @@ export async function createApplication({
     }
     workflowRouting = trackRuntime(
       await workflowRoutingRuntimeFactory(config, {
-        ...workflowRoutingDependencies,
+        ...runtimeDependencies(workflowRoutingDependencies),
         store,
         ...(ordinaryActionAdmissionGate === null
           ? {}
@@ -695,7 +717,7 @@ export async function createApplication({
     if (coordinationEnabled) {
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({
-          ...workLedgerDependencies,
+          ...runtimeDependencies(workLedgerDependencies),
           store,
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
@@ -706,14 +728,14 @@ export async function createApplication({
       );
       attentionInboxRuntime = trackRuntime(
         await attentionInboxRuntimeFactory({
-          ...attentionInboxDependencies,
+          ...runtimeDependencies(attentionInboxDependencies),
           store,
           operationQueue: new OperationQueue(),
         }),
       );
       workProposalRuntime = trackRuntime(
         await workProposalRuntimeFactory({
-          ...workProposalDependencies,
+          ...runtimeDependencies(workProposalDependencies),
           store,
           operationQueue: new OperationQueue(),
           runnerScopes: [
@@ -769,7 +791,7 @@ export async function createApplication({
         pullRequestExternalActionExecutionEnabled;
       memoryRuntime = trackRuntime(
         await memoryRuntimeFactory({
-          ...memoryRuntimeDependencies,
+          ...runtimeDependencies(memoryRuntimeDependencies),
           store,
           operationQueue: new OperationQueue(),
           maximumRecords: config.memory.maximumRecords,
@@ -998,7 +1020,7 @@ export async function createApplication({
     if (coordinationEnabled && memoryRuntime) {
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
-          ...codeJobRuntimeDependencies,
+          ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
           ...(ordinaryActionAdmissionGate === null
             ? {}
@@ -1217,7 +1239,7 @@ export async function createApplication({
     ) {
       confirmationRuntime = trackRuntime(
         await confirmationRuntimeFactory(config, {
-          ...confirmationRuntimeDependencies,
+          ...runtimeDependencies(confirmationRuntimeDependencies),
           store,
           ...(inputAuthorityVerifier === null
             ? {}
@@ -1496,7 +1518,7 @@ export async function createApplication({
       ownerWorkRequests = trackRuntime(
         createLazyOwnerWorkRequestRuntime(() =>
           ownerWorkRequestRuntimeFactory({
-            ...ownerWorkRequestDependencies,
+            ...runtimeDependencies(ownerWorkRequestDependencies),
             store: frozenPort(
               store,
               ["read", "write"],
@@ -1547,7 +1569,7 @@ export async function createApplication({
       });
       const prEngineerGuard = trackRuntime(
         frozenPort(
-          prEngineerExclusiveGuardFactory({
+          effectivePrEngineerExclusiveGuardFactory({
             name: PR_ENGINEER_FACTS_GUARD_NAME,
           }),
           ["run", "close"],
