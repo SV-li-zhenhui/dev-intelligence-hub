@@ -262,7 +262,23 @@ function requireRouter(value) {
   });
 }
 
-function normalizeBrains(roles) {
+function isSingleAttemptBrain(router, brain) {
+  const description = router.describe(brain);
+  if (description === null || typeof description !== "object") return false;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    description,
+    "singleAttempt",
+  );
+  if (
+    descriptor &&
+    (!("value" in descriptor) || typeof descriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain description is invalid");
+  }
+  return descriptor?.value === true;
+}
+
+function normalizeTaskBrains(roles) {
   const result = new Map();
   for (const [roleId, value] of dataEntries(roles, "employees.roles")) {
     if (!SAFE_ROLE_ID.test(roleId)) {
@@ -271,10 +287,14 @@ function normalizeBrains(roles) {
     const config = Object.fromEntries(
       dataEntries(value, `employees.roles.${roleId}`),
     );
-    if (!Object.hasOwn(config, "brain")) {
-      throw new TypeError(`employees.roles.${roleId}.brain is missing`);
-    }
-    result.set(roleId, normalizeBrainConfig(config.brain));
+    result.set(
+      roleId,
+      Object.hasOwn(config, "taskBrain") &&
+        config.taskBrain !== null &&
+        config.taskBrain !== undefined
+        ? normalizeBrainConfig(config.taskBrain)
+        : null,
+    );
   }
   return result;
 }
@@ -293,11 +313,11 @@ function systemPrompt() {
 
 export class CodeJobBrainDirectory {
   #router;
-  #brains;
+  #taskBrains;
 
   constructor({ brainRouter, roles = {} } = {}) {
     this.#router = requireRouter(brainRouter);
-    this.#brains = normalizeBrains(roles);
+    this.#taskBrains = normalizeTaskBrains(roles);
     Object.freeze(this);
   }
 
@@ -305,19 +325,27 @@ export class CodeJobBrainDirectory {
     const { roleId, context } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate } =
       requireDecisionAuthorization(authorization);
-    const brain = this.#brains.get(roleId);
-    if (!brain) {
+    if (!this.#taskBrains.has(roleId)) {
       throw directoryError(
         "CODE_BRAIN_ROLE_NOT_CONFIGURED",
-        "Code job role has no configured brain",
+        "Code job role is not configured",
         404,
+      );
+    }
+    const brain = this.#taskBrains.get(roleId);
+    if (brain === null) {
+      throw directoryError(
+        "CODE_TASK_BRAIN_NOT_CONFIGURED",
+        "Code job role has no configured task brain",
+        503,
       );
     }
     const messages = [
       { role: "system", content: systemPrompt() },
       { role: "user", content: JSON.stringify(context) },
     ];
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const maximumAttempts = isSingleAttemptBrain(this.#router, brain) ? 1 : 2;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       const admitted = exactData(
         await admitGenerate(async () => {
           await beforeGenerate();
@@ -375,10 +403,10 @@ export class CodeJobBrainDirectory {
         }
         return decision;
       } catch (error) {
-        if (attempt === 1) {
+        if (attempt + 1 === maximumAttempts) {
           throw directoryError(
             "CODE_BRAIN_RESPONSE_INVALID",
-            "Code brain response failed local validation twice",
+            "Code brain response failed local validation",
             400,
             { cause: error },
           );
@@ -395,12 +423,19 @@ export class CodeJobBrainDirectory {
     if (typeof roleId !== "string" || !SAFE_ROLE_ID.test(roleId)) {
       throw new TypeError("code brain roleId is invalid");
     }
-    const brain = this.#brains.get(roleId);
-    if (!brain) {
+    if (!this.#taskBrains.has(roleId)) {
       throw directoryError(
         "CODE_BRAIN_ROLE_NOT_CONFIGURED",
-        "Code job role has no configured brain",
+        "Code job role is not configured",
         404,
+      );
+    }
+    const brain = this.#taskBrains.get(roleId);
+    if (brain === null) {
+      throw directoryError(
+        "CODE_TASK_BRAIN_NOT_CONFIGURED",
+        "Code job role has no configured task brain",
+        503,
       );
     }
     return structuredClone(this.#router.describe(brain));

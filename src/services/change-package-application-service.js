@@ -30,7 +30,9 @@ import { digestValue } from "../domain/code-executor-contract.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 
-const STATE_KEY = "change-package-applications";
+export const CHANGE_PACKAGE_APPLICATION_STATE_KEY =
+  "change-package-applications";
+const STATE_KEY = CHANGE_PACKAGE_APPLICATION_STATE_KEY;
 const MAX_APPLICATIONS = 1_000;
 const SHA256 = /^[a-f0-9]{64}$/;
 const HEAD_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -265,6 +267,10 @@ function normalizeState(value) {
       cause,
     );
   }
+}
+
+export function normalizeChangePackageApplicationPersistedState(value) {
+  return normalizeState(value);
 }
 
 function requirePort(value, methods, name) {

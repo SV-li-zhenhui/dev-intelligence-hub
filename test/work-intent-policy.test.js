@@ -8,6 +8,7 @@ import {
   WorkIntentPolicyError,
   createWorkIntentPolicy,
 } from "../src/services/work-intent-policy.js";
+import { externalActionControlledCommit } from "./support/pull-request-external-action-fixture.js";
 
 function event(overrides = {}) {
   return normalizeWorkflowEvent({
@@ -286,6 +287,84 @@ test("derives a GitHub review target only from the trusted event", () => {
   assert.equal(repeated.intentId, bound.intentId);
 });
 
+test("binds five PR external actions only for a trusted role and v2 target", () => {
+  const trusted = gitContext({ roleId: "pr-reviewer" });
+  const controlledCommitEvidence = externalActionControlledCommit(
+    trusted.inputBinding,
+  );
+  const actions = [
+    { type: "comment", body: "请补充失败日志。" },
+    { type: "review", verdict: "comment", body: "建议补充并发测试。" },
+    { type: "update_branch" },
+    {
+      type: "push",
+      controlledCommitEvidenceId: controlledCommitEvidence.evidenceId,
+    },
+    { type: "merge", method: "squash" },
+  ];
+
+  for (const requestedAction of actions) {
+    const bound = policy().bind({
+      context: {
+        ...trusted,
+        ...(requestedAction.type === "push"
+          ? { controlledCommitEvidence }
+          : {}),
+      },
+      intent: {
+        ...common("propose_github_pull_request_action"),
+        action: requestedAction,
+        evidence: ["trusted-task-context"],
+      },
+    });
+    assert.equal(bound.kind, "github_pull_request_action_proposal");
+    assert.equal(bound.binding.inputBinding.schemaVersion, 2);
+    assert.equal(bound.binding.repository, trusted.event.subject.repository);
+    assert.equal(bound.binding.headRefOid, trusted.event.payload.headRefOid);
+    assert.equal(bound.payload.action.type, requestedAction.type);
+    if (requestedAction.type === "push") {
+      assert.equal(
+        bound.payload.action.controlledCommitEvidence.evidenceId,
+        controlledCommitEvidence.evidenceId,
+      );
+      assert.equal(
+        Object.hasOwn(bound.payload.action, "controlledCommitEvidenceId"),
+        false,
+      );
+    }
+  }
+
+  assert.throws(
+    () => policy().bind({
+      context: trusted,
+      intent: {
+        ...common("propose_github_pull_request_action"),
+        action: {
+          type: "push",
+          controlledCommitEvidenceId: controlledCommitEvidence.evidenceId,
+        },
+        evidence: [],
+      },
+    }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
+  assert.throws(
+    () => policy().bind({
+      context: context(),
+      intent: {
+        ...common("propose_github_pull_request_action"),
+        action: { type: "comment", body: "legacy binding" },
+        evidence: [],
+      },
+    }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
+});
+
 test("maps code workspaces and handoff roles from policy rather than model output", () => {
   const code = policy().bind({
     context: gitContext(),
@@ -557,6 +636,40 @@ test("completion remains internal and carries no execution capability", () => {
     subject: context().event.subject,
   });
   assert.equal(JSON.stringify(complete).includes("command"), false);
+});
+
+test("configuration proposals bind only an explicitly trusted role and no activation authority", () => {
+  const intent = {
+    ...common("propose_configuration_change"),
+    changes: [
+      {
+        path: ["employees", "roles", "developer", "scheduleMinutes"],
+        value: 15,
+      },
+    ],
+    evidence: ["queue depth increased"],
+  };
+  const bound = policy({ configurationChangeRoles: ["developer"] }).bind({
+    context: context({ roleId: "developer" }),
+    intent,
+  });
+
+  assert.equal(bound.kind, "configuration_change_proposal");
+  assert.deepEqual(bound.payload.changes, intent.changes);
+  assert.deepEqual(bound.binding, {
+    eventId: context().event.eventId,
+    subject: context().event.subject,
+  });
+  for (const forbidden of ["activate", "expectedStateRevision", "draftId"] ) {
+    assert.equal(JSON.stringify(bound).includes(forbidden), false);
+  }
+
+  assert.throws(
+    () => policy().bind({ context: context({ roleId: "developer" }), intent }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
 });
 
 test("orchestration and delivery intents create zero generic policy bindings", () => {

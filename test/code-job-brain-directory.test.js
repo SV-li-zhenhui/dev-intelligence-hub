@@ -14,7 +14,16 @@ function roleBrain(remoteData = {
   return {
     developer: {
       name: "Developer",
-      brain: { provider: "brain-one", model: "qwen3.5:9b", remoteData },
+      brain: {
+        provider: "routine-brain",
+        model: "qwen3.5:9b",
+        remoteData: {
+          requirements: false,
+          code: false,
+          memory: false,
+        },
+      },
+      taskBrain: { provider: "brain-one", model: "code-model", remoteData },
     },
   };
 }
@@ -95,7 +104,8 @@ test("a role brain receives only bounded semantic code context", async () => {
   );
   assert.equal(router.calls.length, 1);
   assert.deepEqual(router.calls[0].dataClasses, ["requirements", "code"]);
-  assert.equal(router.calls[0].brain.model, "qwen3.5:9b");
+  assert.equal(router.calls[0].brain.model, "code-model");
+  assert.equal(router.calls[0].brain.provider, "brain-one");
   const userContext = JSON.parse(router.calls[0].messages[1].content);
   assert.deepEqual(Object.keys(userContext), [
     "task",
@@ -130,6 +140,34 @@ test("one invalid model response gets exactly one local correction attempt", asy
   );
   assert.equal(router.calls.length, 2);
   assert.equal(router.calls[1].messages.length, 3);
+});
+
+test("a supervised CLI task brain fails locally without a correction process", async () => {
+  const calls = [];
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: {
+      async generate(value) {
+        calls.push(structuredClone(value));
+        return "invalid CLI output";
+      },
+      describe(config) {
+        return {
+          provider: config.provider,
+          model: config.model,
+          remote: true,
+          remoteData: structuredClone(config.remoteData),
+          singleAttempt: true,
+        };
+      },
+    },
+    roles: roleBrain({ requirements: true, code: true, memory: false }),
+  });
+
+  await assert.rejects(
+    directory.decide(input(), authorized()),
+    (error) => error?.code === "CODE_BRAIN_RESPONSE_INVALID",
+  );
+  assert.equal(calls.length, 1);
 });
 
 test("authority is rechecked before a local correction reaches the provider", async () => {
@@ -374,6 +412,42 @@ test("unknown roles and malformed untrusted context fail before generation", asy
   assert.equal(router.calls.length, 0);
 });
 
+test("a configured routine brain never substitutes for a missing task brain", async () => {
+  for (const taskBrain of [undefined, null]) {
+    const router = fakeRouter();
+    const directory = new CodeJobBrainDirectory({
+      brainRouter: router.port,
+      roles: {
+        developer: {
+          name: "Developer",
+          brain: {
+            provider: "routine-brain",
+            model: "qwen3.5:9b",
+            remoteData: {
+              requirements: false,
+              code: false,
+              memory: false,
+            },
+          },
+          ...(taskBrain === undefined ? {} : { taskBrain }),
+        },
+      },
+    });
+
+    await assert.rejects(
+      directory.decide(input(), authorized()),
+      (error) =>
+        error instanceof CodeJobBrainDirectoryError &&
+        error.code === "CODE_TASK_BRAIN_NOT_CONFIGURED",
+    );
+    assert.equal(router.calls.length, 0);
+    assert.throws(
+      () => directory.describe("developer"),
+      (error) => error?.code === "CODE_TASK_BRAIN_NOT_CONFIGURED",
+    );
+  }
+});
+
 test("oversize observation history is packed once before generation", async () => {
   const router = fakeRouter();
   const directory = new CodeJobBrainDirectory({
@@ -437,5 +511,5 @@ test("describe returns a detached provider view for the configured role", () => 
   });
   const first = directory.describe("developer");
   first.model = "changed";
-  assert.equal(directory.describe("developer").model, "qwen3.5:9b");
+  assert.equal(directory.describe("developer").model, "code-model");
 });

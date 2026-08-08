@@ -6,7 +6,7 @@ import {
 } from "../src/domain/pr-responsibility.js";
 
 const now = "2026-07-31T09:00:00.000Z";
-const currentUser = "SV-li-zhenhui";
+const currentUser = "local-owner";
 
 function pullRequest(overrides = {}) {
   return {
@@ -42,7 +42,7 @@ function assess(overrides) {
 test("a recent assigned PR without my review needs my review now", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
   });
 
   assert.equal(result.actionState, ACTION_STATES.ACTION_NOW);
@@ -54,7 +54,7 @@ test("a recent assigned PR without my review needs my review now", () => {
 test("a new head commit after my review needs my re-review", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     myReviewState: "APPROVED",
     myReviewCommitOid: "reviewed-head",
   });
@@ -66,7 +66,7 @@ test("a new head commit after my review needs my re-review", () => {
 test("changes I requested without a new commit are waiting on the author", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     myReviewState: "CHANGES_REQUESTED",
     myReviewCommitOid: "head-2",
   });
@@ -79,17 +79,17 @@ test("changes I requested without a new commit are waiting on the author", () =>
 test("an assigned draft or broken head waits on the author before review", () => {
   const draft = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     isDraft: true,
   });
   const conflict = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     mergeStateStatus: "DIRTY",
   });
   const failed = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     ciStatus: "FAILURE",
   });
 
@@ -181,7 +181,7 @@ test("an approved authored PR waits for merge instead of claiming modification w
 test("long inactive PRs go to cleanup even when their old CI failed", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     updatedAt: "2026-05-31T08:59:59.000Z",
     ciStatus: "FAILURE",
   });
@@ -193,7 +193,7 @@ test("long inactive PRs go to cleanup even when their old CI failed", () => {
 test("missing review facts are surfaced for confirmation instead of guessed", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     reviewFactsAvailable: false,
   });
 
@@ -204,7 +204,7 @@ test("missing review facts are surfaced for confirmation instead of guessed", ()
 test("a successful detail response without a head commit is still uncertain", () => {
   const result = assess({
     relation: "review_requested",
-    author: "SV-zhao-shanshan",
+    author: "contributor",
     headRefOid: "",
   });
 

@@ -90,7 +90,7 @@ test("unknown, person, and node targets remain available for orchestrator fallba
     null,
   );
   assert.equal(
-    await directory.resolve({ type: "person", id: "SV-li-zhenhui" }),
+    await directory.resolve({ type: "person", id: "local-owner" }),
     null,
   );
   assert.equal(

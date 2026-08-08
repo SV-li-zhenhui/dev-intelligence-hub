@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createPullRequestReadIdentity } from "../src/domain/pull-request-read-facts.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
 
 const NOW = "2026-08-02T04:00:00.000Z";
@@ -105,6 +107,41 @@ function source(value, options = {}) {
     clock: () => NOW,
     ...options,
   });
+}
+
+function taskContextFixture({ gitTargetAvailable = true } = {}) {
+  const target = gitTargetFacts().gitTarget;
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "pull_request.updated",
+    occurredAt: "2026-08-02T03:59:00.000Z",
+    source: { provider: "github", scopeId: "github-account:runtime-user" },
+    subject: {
+      id: "github:pr:acme/repo#42",
+      repository: "acme/repo",
+      number: 42,
+    },
+    payload: {
+      headRefOid: target.headRefOid,
+      ...(gitTargetAvailable
+        ? { gitTargetAvailable: true, gitTarget: target }
+        : {}),
+    },
+  });
+  return {
+    event,
+    sourceBinding: {
+      kind: "pull_request",
+      rootItemId: "work-item-pr-root",
+      workKey: "acme/repo#42:pr-engineer",
+      inputRevision: 3,
+      headRevision: 2,
+      headRefOid: target.headRefOid,
+      eventId: event.eventId,
+      eventDigest: event.contentDigest,
+      inputDigest: "d".repeat(64),
+    },
+  };
 }
 
 test("reads allowlisted facts only from a healthy fresh local snapshot", async () => {
@@ -401,6 +438,87 @@ test("malformed arrays and accessor-bearing inputs fail closed without execution
       value: null,
       observedAt: "2026-08-02T03:59:00.000Z",
     },
+  );
+  assert.equal(getterCalls, 0);
+});
+
+test("a frozen PR task-context reader constructs one exact v2 execution", async () => {
+  const calls = [];
+  const signals = [];
+  const facts = source(snapshot(), {
+    pullRequestFacts: {
+      async context(input, options) {
+        calls.push(structuredClone(input));
+        signals.push(options?.signal ?? null);
+        const identity = createPullRequestReadIdentity(input);
+        return Object.freeze({
+          schemaVersion: 1,
+          identityDigest: identity.identityDigest,
+          contentDigest: "e".repeat(64),
+          summary: { reviewDecision: "REVIEW_REQUIRED" },
+        });
+      },
+    },
+  });
+  const reader = facts.pullRequestTaskContextReader();
+  const fixture = taskContextFixture();
+  const controller = new AbortController();
+
+  assert.equal(Object.isFrozen(reader), true);
+  const context = await reader.read(fixture, { signal: controller.signal });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].executionBinding.schemaVersion, 2);
+  assert.equal(
+    calls[0].executionBinding.gitTarget.sourceAccountId,
+    "runtime-user",
+  );
+  assert.equal(calls[0].event.eventId, fixture.event.eventId);
+  assert.strictEqual(signals[0], controller.signal);
+  assert.equal(context.identityDigest,
+    createPullRequestReadIdentity(calls[0]).identityDigest);
+  assert.equal(source(snapshot()).pullRequestTaskContextReader(), null);
+});
+
+test("PR task-context reading rejects legacy or mismatched identity before use", async () => {
+  let calls = 0;
+  const facts = source(snapshot(), {
+    pullRequestFacts: {
+      async context() {
+        calls += 1;
+        return { identityDigest: "0".repeat(64) };
+      },
+    },
+  });
+  const reader = facts.pullRequestTaskContextReader();
+
+  await assert.rejects(
+    reader.read(taskContextFixture({ gitTargetAvailable: false })),
+    /atomic Git target/u,
+  );
+  assert.equal(calls, 0);
+
+  await assert.rejects(
+    reader.read(taskContextFixture()),
+    /identity is stale/u,
+  );
+  assert.equal(calls, 1);
+});
+
+test("PR task-context ports reject accessors without invoking them", () => {
+  let getterCalls = 0;
+  const pullRequestFacts = {};
+  Object.defineProperty(pullRequestFacts, "context", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return async () => null;
+    },
+  });
+
+  assert.throws(
+    () => source(snapshot(), { pullRequestFacts }),
+    /pullRequestFacts is invalid/u,
   );
   assert.equal(getterCalls, 0);
 });

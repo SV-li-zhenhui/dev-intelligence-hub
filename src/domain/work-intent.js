@@ -11,15 +11,35 @@ const DISPATCH_INTENT_ID = /^work-dispatch-intent-[a-f0-9]{64}$/;
 const INTENT_TYPES = new Set([
   "ask_user",
   "wait_condition",
+  "query_memory",
   "propose_github_review",
+  "propose_github_pull_request_action",
   "propose_code_action",
+  "propose_configuration_change",
   "handoff",
   "complete",
   "orchestrate",
   "submit_delivery",
 ]);
 const REVIEW_VERDICTS = new Set(["approve", "request_changes", "comment"]);
+const PULL_REQUEST_ACTION_TYPES = new Set([
+  "comment",
+  "review",
+  "update_branch",
+  "push",
+  "merge",
+]);
+const PULL_REQUEST_MERGE_METHODS = new Set(["merge", "squash", "rebase"]);
+const CONTROLLED_COMMIT_EVIDENCE_ID =
+  /^controlled-git-commit-[a-f0-9]{64}$/;
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
+const DANGEROUS_CONFIGURATION_PATH_SEGMENTS = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+]);
+const CREDENTIAL_VALUE = /^(?:bearer\s+|gh[pousr]_|github_pat_|sk-|AKIA)[^\s]+$/i;
+const PRIVATE_KEY_VALUE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 const HANDOFF_CAPABILITIES = new Set([
   "coordination",
   "requirements",
@@ -197,11 +217,139 @@ function normalizeEvidence(value) {
   return stringList(value, "evidence", 20, 2_048);
 }
 
+function credentialConfigurationPathSegment(value) {
+  const normalized = value.replaceAll(/[-_]/g, "").toLowerCase();
+  return (
+    [
+      "password",
+      "secret",
+      "token",
+      "credential",
+      "apikey",
+      "privatekey",
+      "accesskey",
+      "clientsecret",
+      "credentialenv",
+      "tokenenv",
+      "apikeyenv",
+      "networkenv",
+      "actoraccountid",
+      "accountid",
+      "githublogin",
+      "selfuserid",
+    ].includes(normalized) ||
+    normalized.endsWith("credentialenv") ||
+    normalized.endsWith("tokenenv") ||
+    normalized.endsWith("apikeyenv") ||
+    normalized.endsWith("actoraccountid")
+  );
+}
+
+function disablesConfigurationProposalRecovery(path) {
+  return (
+    path.length === 2 &&
+    path[0] === "workCoordination" &&
+    path[1] === "enabled"
+  );
+}
+
+function normalizeConfigurationScalar(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = text(value, "changes.value", 16 * 1_024, { empty: true });
+    if (CREDENTIAL_VALUE.test(normalized) || PRIVATE_KEY_VALUE.test(normalized)) {
+      invalid("changes.value 不得包含凭据");
+    }
+    return normalized;
+  }
+  invalid("changes.value 必须是字符串、数字或布尔值");
+}
+
+function normalizeConfigurationChanges(value) {
+  const changes = plainArray(value, 20).map((change) => {
+    const entries = exactObject(change, ["path", "value"]);
+    const path = plainArray(entries.get("path"), 16).map((segment) => {
+      const normalized = text(segment, "changes.path", 256);
+      if (
+        DANGEROUS_CONFIGURATION_PATH_SEGMENTS.has(normalized) ||
+        credentialConfigurationPathSegment(normalized)
+      ) {
+        invalid("changes.path 不得指向危险或凭据字段");
+      }
+      return normalized;
+    });
+    if (path.length === 0) invalid("changes.path 不能为空");
+    if (disablesConfigurationProposalRecovery(path)) {
+      invalid("changes.path 不得关闭配置提案恢复边界");
+    }
+    return { path, value: normalizeConfigurationScalar(entries.get("value")) };
+  });
+  if (changes.length === 0) invalid("changes 不能为空");
+  const paths = changes.map(({ path }) => JSON.stringify(path));
+  if (new Set(paths).size !== paths.length) invalid("changes.path 重复");
+  return changes;
+}
+
+function normalizePullRequestAction(value) {
+  const entries = plainDataEntries(value);
+  const type = entries.find(([key]) => key === "type")?.[1];
+  if (!PULL_REQUEST_ACTION_TYPES.has(type)) invalid("action.type 无效");
+  if (type === "comment") {
+    const fields = exactObject(value, ["type", "body"]);
+    return {
+      type,
+      body: text(fields.get("body"), "action.body", 8 * 1_024),
+    };
+  }
+  if (type === "review") {
+    const fields = exactObject(value, ["type", "verdict", "body"]);
+    const verdict = fields.get("verdict");
+    if (!REVIEW_VERDICTS.has(verdict)) invalid("action.verdict 无效");
+    return {
+      type,
+      verdict,
+      body: text(fields.get("body"), "action.body", 8 * 1_024),
+    };
+  }
+  if (type === "update_branch") {
+    exactObject(value, ["type"]);
+    return { type };
+  }
+  if (type === "push") {
+    const fields = exactObject(value, ["type", "controlledCommitEvidenceId"]);
+    const controlledCommitEvidenceId = fields.get("controlledCommitEvidenceId");
+    if (
+      typeof controlledCommitEvidenceId !== "string" ||
+      !CONTROLLED_COMMIT_EVIDENCE_ID.test(controlledCommitEvidenceId)
+    ) {
+      invalid("action.controlledCommitEvidenceId 无效");
+    }
+    return { type, controlledCommitEvidenceId };
+  }
+  const fields = exactObject(value, ["type", "method"]);
+  const method = fields.get("method");
+  if (!PULL_REQUEST_MERGE_METHODS.has(method)) {
+    invalid("action.method 无效");
+  }
+  return { type, method };
+}
+
 function proposalKeys(entries, requiredKeys) {
   const actual = new Set(entries.map(([key]) => key));
   return [
     ...requiredKeys,
     ...["deliverableId", "dispatchIntentId"].filter((key) => actual.has(key)),
+  ];
+}
+
+function externalActionProposalKeys(entries, requiredKeys) {
+  const actual = new Set(entries.map(([key]) => key));
+  return [
+    ...requiredKeys,
+    ...["dispatchIntentId"].filter((key) => actual.has(key)),
   ];
 }
 
@@ -304,6 +452,28 @@ function normalizeIntentVariant(value) {
         checkAfterSeconds,
       };
     }
+    case "query_memory": {
+      const keys = [
+        "schemaVersion",
+        "type",
+        "summary",
+        "reason",
+        "question",
+        "searchQuery",
+        "mode",
+      ];
+      const entries = exactObject(value, keys);
+      const mode = entries.get("mode");
+      if (!new Set(["local", "configured"]).has(mode)) {
+        invalid("mode 无效");
+      }
+      return {
+        ...common(value, keys),
+        question: text(entries.get("question"), "question", 4_096),
+        searchQuery: text(entries.get("searchQuery"), "searchQuery", 1_024),
+        mode,
+      };
+    }
     case "propose_github_review": {
       const keys = proposalKeys(typeEntries, [
         "schemaVersion",
@@ -322,6 +492,23 @@ function normalizeIntentVariant(value) {
         ...assertProposalAuthority(proposalAuthority(entries)),
         verdict,
         body: text(entries.get("body"), "body", 16 * 1024),
+        evidence: normalizeEvidence(entries.get("evidence")),
+      };
+    }
+    case "propose_github_pull_request_action": {
+      const keys = externalActionProposalKeys(typeEntries, [
+        "schemaVersion",
+        "type",
+        "summary",
+        "reason",
+        "action",
+        "evidence",
+      ]);
+      const entries = exactObject(value, keys);
+      return {
+        ...common(value, keys),
+        ...assertProposalAuthority(proposalAuthority(entries)),
+        action: normalizePullRequestAction(entries.get("action")),
         evidence: normalizeEvidence(entries.get("evidence")),
       };
     }
@@ -351,6 +538,23 @@ function normalizeIntentVariant(value) {
           2_048,
           { empty: false },
         ),
+        evidence: normalizeEvidence(entries.get("evidence")),
+      };
+    }
+    case "propose_configuration_change": {
+      const keys = externalActionProposalKeys(typeEntries, [
+        "schemaVersion",
+        "type",
+        "summary",
+        "reason",
+        "changes",
+        "evidence",
+      ]);
+      const entries = exactObject(value, keys);
+      return {
+        ...common(value, keys),
+        ...assertProposalAuthority(proposalAuthority(entries)),
+        changes: normalizeConfigurationChanges(entries.get("changes")),
         evidence: normalizeEvidence(entries.get("evidence")),
       };
     }

@@ -17,10 +17,20 @@ import {
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 
-const STATE_KEY = "confirmation-queue";
+export const CONFIRMATION_QUEUE_STATE_KEY = "confirmation-queue";
+const STATE_KEY = CONFIRMATION_QUEUE_STATE_KEY;
 const MAX_ITEMS = 1_000;
 const APPLICATION_RESULT_KIND = "local.change-package-apply";
+const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
 const APPLICATION_SNAPSHOT_REQUEST_ID = "application-snapshot-read";
+const CONFIRMATION_MEMORY_PAGE_LIMIT = 100;
+const PULL_REQUEST_MEMORY_KINDS = new Set([
+  "github.pull-request-comment",
+  "github.pull-request-review",
+  "github.pull-request-update-branch",
+  "github.pull-request-push",
+  "github.pull-request-merge",
+]);
 const ACTION_SELECTOR = /^[a-z][a-z0-9._-]{0,127}$/;
 const HISTORY_ROLE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const HISTORY_CURSOR = /^[A-Za-z0-9_-]{16,512}$/;
@@ -39,6 +49,10 @@ export const CONFIRMATION_HISTORY_STATUSES = Object.freeze([
 export const CONFIRMATION_HISTORY_KINDS = Object.freeze([
   "github.pull-request-review",
   "github.work-proposal-review",
+  "github.pull-request-comment",
+  "github.pull-request-update-branch",
+  "github.pull-request-push",
+  "github.pull-request-merge",
   "local.code-job-create",
   "local.change-package-apply",
   "local.configuration-activate",
@@ -152,6 +166,11 @@ function compareAscii(left, right) {
 
 function isProjectableHistoryItem(item) {
   return HISTORY_STATUS_SET.has(item.status) && HISTORY_KIND_SET.has(item.kind);
+}
+
+function requiresRecovery(item) {
+  return item.status === "executing" ||
+    (item.status === "failed" && item.failure?.outcome === "unknown");
 }
 
 function historyRoleIdFacets(items) {
@@ -358,6 +377,124 @@ function normalizeSnapshotRequest(value) {
   return { afterRevision };
 }
 
+function normalizeMemoryPageRequest(value) {
+  const error = queueError(
+    "INVALID_CONFIRMATION_MEMORY_QUERY",
+    "确认记忆投影查询无效",
+    400,
+  );
+  const fields = exactDataFields(
+    value,
+    ["cursor", "limit", "highWatermark"],
+    error,
+  );
+  const cursor = fields.get("cursor");
+  const limit = fields.get("limit");
+  const highWatermark = fields.get("highWatermark");
+  if (
+    !Number.isSafeInteger(cursor) ||
+    cursor < 0 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > CONFIRMATION_MEMORY_PAGE_LIMIT ||
+    !(
+      highWatermark === null ||
+      (Number.isSafeInteger(highWatermark) && highWatermark >= 0)
+    )
+  ) {
+    throw error;
+  }
+  return { cursor, limit, highWatermark };
+}
+
+function memoryAction(action) {
+  const result = {
+    type: action.type,
+    inputBinding: clone(action.inputBinding),
+  };
+  if (["pull_request_comment", "pull_request_review"].includes(action.type)) {
+    result.bodyDigest = digestValue(action.body);
+    result.bodyBytes = Buffer.byteLength(action.body, "utf8");
+  }
+  if (action.type === "pull_request_review") {
+    result.reviewEvent = action.reviewEvent;
+  } else if (action.type === "pull_request_update_branch") {
+    result.expectedHeadOid = action.expectedHeadOid;
+    result.expectedBaseOid = action.expectedBaseOid;
+  } else if (action.type === "pull_request_push") {
+    const controlled = action.controlledCommitEvidence;
+    result.expectedOldOid = action.expectedOldOid;
+    result.remote = clone(action.remote);
+    result.controlledCommit = {
+      evidenceId: controlled.evidenceId,
+      evidenceDigest: controlled.evidenceDigest,
+      commit: {
+        oid: controlled.commit.oid,
+        treeOid: controlled.commit.treeOid,
+        parents: [...controlled.commit.parents],
+      },
+    };
+  } else if (action.type === "pull_request_merge") {
+    result.method = action.method;
+    result.expectedHeadOid = action.expectedHeadOid;
+  }
+  return result;
+}
+
+function projectConfirmationMemoryItem(item) {
+  const result = {
+    confirmationId: item.id,
+    itemRevision: item.itemRevision,
+    statusDigest: digestValue({
+      confirmationId: item.id,
+      itemRevision: item.itemRevision,
+      status: item.status,
+      approvalBindingDigest: item.approvalBindingDigest,
+      updatedAt: item.updatedAt,
+    }),
+    kind: item.kind,
+    status: item.status,
+    requestedBy: clone(item.requestedBy),
+    actor: clone(item.actor),
+    target: clone(item.target),
+    action: memoryAction(item.action),
+    displayedPayloadDigest: item.displayedPayloadDigest,
+    approvalBindingDigest: item.approvalBindingDigest,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    execution: item.execution === null
+      ? null
+      : {
+          attempt: item.execution.attempt,
+          startedAt: item.execution.startedAt,
+          outcome: item.execution.outcome,
+        },
+    receipt: item.receipt === null ? null : { id: item.receipt.id },
+    failure: item.failure === null ? null : clone(item.failure),
+    rejectedAt: item.rejection?.at ?? null,
+    invalidation: item.invalidation === null
+      ? null
+      : { reason: item.invalidation.reason, at: item.invalidation.at },
+  };
+  return result;
+}
+
+function isProjectablePullRequestMemoryItem(item) {
+  return PULL_REQUEST_MEMORY_KINDS.has(item.kind) &&
+    item.action?.inputBinding?.schemaVersion === 2;
+}
+
+export function projectConfirmationMemoryState(value) {
+  const state = normalizeConfirmationState(value);
+  return structuredClone({
+    highWatermark: state.revision,
+    items: state.items
+      .filter(isProjectablePullRequestMemoryItem)
+      .sort((left, right) => left.id.localeCompare(right.id, "en"))
+      .map(projectConfirmationMemoryItem),
+  });
+}
+
 function applicationResultSourceCorrupted() {
   return queueError(
     "APPLICATION_RESULT_SOURCE_CORRUPTED",
@@ -492,11 +629,7 @@ export class ConfirmationQueue {
           this.ready = false;
           await this.#reload();
           const recoverableIds = this.state.items
-            .filter(
-              (item) =>
-                item.status === "executing" ||
-                (item.status === "failed" && item.failure?.outcome === "unknown"),
-            )
+            .filter(requiresRecovery)
             .map((item) => item.id);
           for (const id of recoverableIds) await this.#recoverItem(id);
           this.ready = true;
@@ -600,6 +733,28 @@ export class ConfirmationQueue {
     return this.#projectHistory(state, query);
   }
 
+  async readRecoveryStatus() {
+    this.#assertReady();
+    let state;
+    try {
+      state = normalizeConfirmationState(
+        await this.store.read(STATE_KEY, defaultConfirmationState()),
+      );
+    } catch {
+      throw queueError(
+        "CONFIRMATION_RECOVERY_STATUS_UNAVAILABLE",
+        "确认恢复状态暂不可用",
+        503,
+      );
+    }
+    const kinds = [...new Set(
+      state.items
+        .filter(requiresRecovery)
+        .map(({ kind }) => kind),
+    )].sort((left, right) => left.localeCompare(right, "en"));
+    return deepFreeze({ kinds });
+  }
+
   async readSnapshot(input) {
     this.#assertReady();
     const { afterRevision } = normalizeSnapshotRequest(input);
@@ -632,6 +787,54 @@ export class ConfirmationQueue {
           snapshotDigest,
           items: unchanged ? [] : items,
         });
+      }),
+    );
+  }
+
+  async readMemoryPage(input) {
+    this.#assertReady();
+    const query = normalizeMemoryPageRequest(input);
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        await this.#reload();
+        const state = normalizeConfirmationState(this.state);
+        if (
+          query.highWatermark !== null &&
+          query.highWatermark !== state.revision
+        ) {
+          throw queueError(
+            "CONFIRMATION_MEMORY_SOURCE_CHANGED",
+            "确认记忆投影期间来源已变化",
+            409,
+          );
+        }
+        const items = projectConfirmationMemoryState(state).items;
+        if (query.cursor > items.length) {
+          throw queueError(
+            "INVALID_CONFIRMATION_MEMORY_QUERY",
+            "确认记忆投影游标无效",
+            400,
+          );
+        }
+        const page = items.slice(query.cursor, query.cursor + query.limit);
+        const nextCursor = query.cursor + page.length;
+        return deepFreeze({
+          highWatermark: state.revision,
+          cursor: query.cursor,
+          items: structuredClone(page),
+          nextCursor: nextCursor < items.length ? nextCursor : null,
+        });
+      }),
+    );
+  }
+
+  async readMemoryStatus() {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        await this.#reload();
+        const state = normalizeConfirmationState(this.state);
+        return deepFreeze({ highWatermark: state.revision });
       }),
     );
   }
@@ -824,6 +1027,18 @@ export class ConfirmationQueue {
   }
 
   async #execute(item, request) {
+    if (
+      item.kind === CONFIGURATION_ACTIVATION_KIND &&
+      this.state.items.some(
+        (candidate) => candidate.id !== item.id && requiresRecovery(candidate),
+      )
+    ) {
+      throw queueError(
+        "CONFIRMATION_RECOVERY_REQUIRED",
+        "仍有结果未知的动作需要恢复，暂不能切换运行配置",
+        409,
+      );
+    }
     const timestamp = this.#now();
     const executing = {
       ...item,
@@ -849,7 +1064,13 @@ export class ConfirmationQueue {
 
   async #recoverItem(id) {
     const item = this.#requireItem(id);
-    const outcome = await this.#invokeReconcile(item);
+    let outcome = await this.#invokeReconcile(item);
+    if (outcome.status === "absent") {
+      outcome = {
+        status: "unknown",
+        code: "EXTERNAL_OUTCOME_UNKNOWN",
+      };
+    }
     if (
       item.status === "failed" &&
       item.failure?.outcome === "unknown" &&

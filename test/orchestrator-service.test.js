@@ -242,6 +242,7 @@ function fakePorts({ packet, views, plannerResult, deliveryResult, verifier } = 
     "decideDelivery",
     "stageEscalation",
     "pauseTask",
+    "resumeTask",
     "cancelTask",
   ]) {
     planner[method] = async (command) => {
@@ -394,7 +395,7 @@ function assertNoTrustedMutation(calls) {
   assert.equal(calls.delivery.length, 0);
 }
 
-test("maps all seven orchestration actions to the least-authority planner commands", async (t) => {
+test("maps all eight orchestration actions to the least-authority planner commands", async (t) => {
   const scenarios = [
     {
       name: "decompose",
@@ -503,6 +504,17 @@ test("maps all seven orchestration actions to the least-authority planner comman
       name: "pause",
       build: ({ child, view }) => commonAction("pause", child, view),
       method: "pauseTask",
+      expected: ({ child, view }) => ({
+        taskId: child.taskId,
+        reason: "当前任务需要协调",
+        expectedGraphRevision: view.graph.revision,
+        expectedTaskRevision: child.revision,
+      }),
+    },
+    {
+      name: "resume",
+      build: ({ child, view }) => commonAction("resume", child, view),
+      method: "resumeTask",
       expected: ({ child, view }) => ({
         taskId: child.taskId,
         reason: "当前任务需要协调",

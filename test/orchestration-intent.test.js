@@ -120,6 +120,7 @@ test("normalizes every bounded orchestration intent without trusted authority", 
       ],
     },
     common("pause"),
+    common("resume"),
     common("cancel"),
   ];
 
@@ -146,7 +147,7 @@ test("normalizes every bounded orchestration intent without trusted authority", 
     normalizeOrchestrationIntent(decomposeIntent()).dependsOn.map(({ taskId }) => taskId),
     ["work-item-design", "work-item-requirements"],
   );
-  assert.equal(ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.length, 7);
+  assert.equal(ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.length, 8);
   assert.equal(
     ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf[0].properties.reason.maxLength,
     1_024,

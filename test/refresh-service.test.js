@@ -23,7 +23,7 @@ function pullRequest(overrides = {}) {
     kind: "pull_request",
     relation: "review_requested",
     author: "someone-else",
-    currentUser: "SV-li-zhenhui",
+    currentUser: "local-owner",
     state: "open",
     updatedAt: "2026-07-31T08:00:00.000Z",
     reviewFactsAvailable: true,
@@ -34,6 +34,44 @@ function pullRequest(overrides = {}) {
     ...overrides,
   };
 }
+
+test("an explicitly disabled GitHub read boundary makes no adapter call", async () => {
+  let githubCalls = 0;
+  const unavailable = async () => {
+    githubCalls += 1;
+    throw new Error("GitHub must remain unreachable");
+  };
+  const store = new MemoryStore();
+  const service = new RefreshService({
+    github: {
+      searchRelevantPullRequests: unavailable,
+      searchIssues: unavailable,
+      versions: unavailable,
+    },
+    brain: null,
+    dingtalk: {},
+    store,
+    notifier: {},
+    config: {
+      githubRead: { enabled: false },
+      trackedRepositories: [],
+      dingtalk: { enabled: false },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+  });
+
+  await service.refresh();
+
+  assert.equal(githubCalls, 0);
+  const snapshot = await store.read("snapshot");
+  assert.deepEqual(snapshot.errors, []);
+  assert.deepEqual(snapshot.sources, { github: 0, dingtalk: 0 });
+  assert.deepEqual(snapshot.sourceStatus.githubPullRequests, {
+    ok: true,
+    stale: false,
+  });
+});
 
 test("refresh classifies complete PR facts and asks the brain only about uncertain items", async () => {
   const store = new MemoryStore();

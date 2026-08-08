@@ -35,12 +35,12 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     "intent",
   ]);
   const intentVariants = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf;
-  assert.equal(intentVariants.length, 8);
+  assert.equal(intentVariants.length, 11);
   assert.equal(
     intentVariants.find(
       ({ properties }) => properties?.type?.const === "orchestrate",
     ).properties.action.oneOf.length,
-    7,
+    8,
   );
   assert.equal(
     intentVariants.find(
@@ -62,6 +62,9 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
   const waitCondition = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(
     ({ properties }) => properties.type.const === "wait_condition",
   );
+  const memoryQuery = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(
+    ({ properties }) => properties.type.const === "query_memory",
+  );
   const choiceId = askUser.properties.choices.items.properties.id;
   const workflowFact = waitCondition.properties.condition.oneOf.find(
     ({ properties }) => properties.kind.const === "workflow_fact",
@@ -74,10 +77,17 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
       properties.type.const,
     ),
   );
+  const externalAction = intentVariants.find(
+    ({ properties }) =>
+      properties?.type?.const === "propose_github_pull_request_action",
+  );
   assert.equal(new RegExp(choiceId.pattern).test("more_details"), false);
   assert.equal(new RegExp(choiceId.pattern).test("more-details"), true);
   assert.equal(workflowFact.properties.oneOf.uniqueItems, true);
   assert.equal(time.properties.notBefore.format, "date-time");
+  assert.deepEqual(memoryQuery.properties.mode.enum, ["local", "configured"]);
+  assert.equal(Object.hasOwn(memoryQuery.properties, "url"), false);
+  assert.equal(Object.hasOwn(memoryQuery.properties, "path"), false);
   for (const proposal of proposalVariants) {
     assert.equal(proposal.required.includes("deliverableId"), false);
     assert.equal(
@@ -92,6 +102,14 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     );
     assert.equal(Object.hasOwn(proposal.properties, "dispatchIntentId"), false);
   }
+  assert.equal(externalAction.properties.action.oneOf.length, 5);
+  assert.deepEqual(
+    externalAction.properties.action.oneOf.map(
+      ({ properties }) => properties.type.const,
+    ),
+    ["comment", "review", "update_branch", "push", "merge"],
+  );
+  assert.equal(Object.hasOwn(externalAction.properties, "deliverableId"), false);
   assert.equal(
     WORK_DECISION_JSON_SCHEMA.properties.summary.maxLength,
     1_024,

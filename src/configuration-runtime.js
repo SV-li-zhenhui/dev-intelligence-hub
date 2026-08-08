@@ -143,6 +143,11 @@ export async function createConfigurationRuntime(
       "createInitializationDraft",
       "reviseDraft",
     ];
+    const proposalMethods = [
+      ...draftMethods,
+      "readProposalDraft",
+      "createProposalDraft",
+    ];
     actionAdmission.bindEffective(
       active === null
         ? null
@@ -166,6 +171,7 @@ export async function createConfigurationRuntime(
         [
           "prepareInitialization",
           "prepareDraftActivation",
+          "prepareProposalDraftActivation",
           "prepareRollback",
         ],
         "configuration simulator",
@@ -184,7 +190,11 @@ export async function createConfigurationRuntime(
         readStatus: actionAdmission.readStatus,
         reconcileCutover: actionAdmission.reconcileCutover,
       }),
-      proposalPort: port(service, draftMethods, "configuration proposal port"),
+      proposalPort: port(
+        service,
+        proposalMethods,
+        "configuration proposal port",
+      ),
       close,
     };
     return Object.freeze(runtime);

@@ -7,6 +7,7 @@ import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
 import { ChangePackageApplicationProjectionStore } from "./services/change-package-application-projection-store.js";
 import { ChangePackageApplicationService } from "./services/change-package-application-service.js";
+import { ChangePackageControlledCommitService } from "./services/change-package-controlled-commit-service.js";
 import { ChangePackageStore } from "./services/change-package-store.js";
 
 const APPLICATION_GUARD_NAME = "mydashboard-change-package-application-v1";
@@ -89,6 +90,8 @@ function validateDependencies(value) {
       new ChangePackageApplicationProjectionStore(options),
     createApplicationService: (options) =>
       new ChangePackageApplicationService(options),
+    createControlledCommitService: (options) =>
+      new ChangePackageControlledCommitService(options),
     createGitInspector: (options) => new GitCheckoutInspector(options),
     createGuard: (options) => new ProcessExclusiveGuard(options),
     createOperationQueue: () => new OperationQueue(),
@@ -230,6 +233,10 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
   );
   const configuredStore = dataProperty(dependencies, "store");
   const configuredTargets = dataProperty(dependencies, "trustedTargets");
+  const configuredControlledCommitBuilder = dataProperty(
+    dependencies,
+    "controlledCommitBuilder",
+  );
   const configuredApplicationAuthorityVerifier = dataProperty(
     dependencies,
     "applicationAuthorityVerifier",
@@ -315,6 +322,23 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
       ["getForJob", "getForPackage", "getSummary"],
       "applicationProjectionReader",
     );
+    const controlledCommitService = configuredControlledCommitBuilder === undefined
+      ? null
+      : bindPort(
+          factories.createControlledCommitService({
+            packageReader,
+            controlledCommitBuilder: bindPort(
+              configuredControlledCommitBuilder,
+              ["create", "find", "verify"],
+              "controlledCommitBuilder",
+            ),
+            store,
+            exclusiveLease: guard,
+            operationQueue,
+          }),
+          ["recover", "delivery"],
+          "controlledCommitService",
+        );
     const applicationOptions = {
       packageReader,
       trustedTargets,
@@ -332,6 +356,9 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
     );
     await packageStore.recover();
     await guard.acquire();
+    if (controlledCommitService !== null) {
+      await controlledCommitService.recover();
+    }
     await application.recover();
     await applicationProjectionStore.recover();
     return Object.freeze({
@@ -347,6 +374,20 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
         "packageReader",
         admission,
       ),
+      ...(controlledCommitService === null
+        ? {}
+        : {
+            controlledCommitDelivery: admittedPort(
+              bindPort(
+                controlledCommitService.delivery(),
+                ["deliver"],
+                "controlledCommitDelivery",
+              ),
+              ["deliver"],
+              "controlledCommitDelivery",
+              admission,
+            ),
+          }),
       applicationProducer: admittedPort(
         application.producer(),
         ["prepareConfirmation"],

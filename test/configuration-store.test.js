@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { OperationQueue } from "../src/lib/operation-queue.js";
-import { configurationDocumentDigest } from "../src/domain/configuration-contract.js";
+import {
+  configurationDocumentDigest,
+  configurationDocumentImpact,
+} from "../src/domain/configuration-contract.js";
 import {
   CONFIGURATION_STATE_KEY,
   ConfigurationStore,
@@ -11,11 +14,12 @@ import {
 import {
   CONFIGURATION_STATE_SCHEMA_VERSION,
   configurationContentDigest,
+  configurationImpactDigest,
 } from "../src/services/configuration-state.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
-  await readFile(path.join(projectRoot, "config.json"), "utf8"),
+  await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 
 function clone(value) {
@@ -84,13 +88,17 @@ function idFactory() {
   return () => `draft-${++id}`;
 }
 
-async function readyStore({ store = new MemoryStore(), limits } = {}) {
+async function readyStore({
+  store = new MemoryStore(),
+  limits,
+  idFactory: configuredIdFactory = idFactory(),
+} = {}) {
   const configurations = new ConfigurationStore({
     store,
     exclusiveLease: new ExclusiveLease(),
     operationQueue: new OperationQueue(),
     clock: clock(),
-    idFactory: idFactory(),
+    idFactory: configuredIdFactory,
     ...(limits ? { limits } : {}),
   });
   await configurations.recover();
@@ -155,10 +163,160 @@ function replaceVersionConfiguration(state, versionNumber, replacement) {
   );
 }
 
+function replaceVersionImpactDigest(state, versionNumber, impactDigest) {
+  const versionIndex = state.versions.findIndex(
+    (entry) => entry.version === versionNumber,
+  );
+  state.versions[versionIndex] = readdress(
+    { ...state.versions[versionIndex], impactDigest },
+    "versionId",
+    "configuration-version",
+  );
+  const auditIndex = state.audit.findIndex(
+    (entry) => entry.configurationVersion === versionNumber,
+  );
+  state.audit[auditIndex] = readdress(
+    { ...state.audit[auditIndex], impactDigest },
+    "auditId",
+    "configuration-audit",
+  );
+  const outboxIndex = state.projectionOutbox.findIndex(
+    (entry) => entry.configurationVersion === versionNumber,
+  );
+  state.projectionOutbox[outboxIndex] = readdress(
+    { ...state.projectionOutbox[outboxIndex], impactDigest },
+    "outboxId",
+    "configuration-outbox",
+  );
+}
+
+const CONFIGURATION_PROPOSAL = Object.freeze({
+  proposalId: "work-intent-configuration-change-1",
+  proposalContentDigest: "a".repeat(64),
+});
+
+function proposalConfiguration() {
+  const value = configuration();
+  value.refreshMinutes += 1;
+  return value;
+}
+
+test("configuration proposal drafts are content-bound, durable, and idempotent", async () => {
+  const { configurations } = await importedFixture();
+  const authority = await configurations.readAuthoritySnapshot();
+  const first = await configurations.createProposalDraft({
+    ...CONFIGURATION_PROPOSAL,
+    configuration: proposalConfiguration(),
+    expectedStateRevision: authority.revision,
+  });
+  const duplicate = await configurations.createProposalDraft({
+    ...CONFIGURATION_PROPOSAL,
+    configuration: proposalConfiguration(),
+    expectedStateRevision: 0,
+  });
+
+  assert.deepEqual(duplicate, first);
+  assert.equal(first.currentHead, true);
+  assert.match(first.draft.draftId, /^configuration-proposal-[a-f0-9]{64}$/);
+  assert.equal(first.draft.proposedBy, `work-proposal:${"a".repeat(64)}`);
+  assert.deepEqual(
+    await configurations.readProposalDraft(CONFIGURATION_PROPOSAL),
+    first,
+  );
+
+  const different = proposalConfiguration();
+  different.refreshMinutes += 1;
+  await assert.rejects(
+    configurations.createProposalDraft({
+      ...CONFIGURATION_PROPOSAL,
+      configuration: different,
+      expectedStateRevision: first.createdStateRevision,
+    }),
+    assertCode("CONFIGURATION_PROPOSAL_BINDING_CONFLICT", 409),
+  );
+});
+
+test("a lost proposal draft acknowledgement is recovered without a second draft", async () => {
+  const store = new MemoryStore();
+  const first = await importedFixture({ store });
+  const authority = await first.configurations.readAuthoritySnapshot();
+  store.failNextWrite("after");
+  const acknowledged = await first.configurations.createProposalDraft({
+    ...CONFIGURATION_PROPOSAL,
+    configuration: proposalConfiguration(),
+    expectedStateRevision: authority.revision,
+  });
+  assert.equal(acknowledged.currentHead, true);
+
+  const recovered = await readyStore({ store });
+  const record = await recovered.configurations.readProposalDraft(
+    CONFIGURATION_PROPOSAL,
+  );
+  assert.equal(record.currentHead, true);
+  assert.equal(
+    store.value.draftRevisions.filter(
+      ({ draftId }) => draftId === record.draft.draftId,
+    ).length,
+    1,
+  );
+});
+
+test("proposal activation recovery preserves the original confirmation binding", async () => {
+  const { configurations } = await importedFixture();
+  const authority = await configurations.readAuthoritySnapshot();
+  const record = await configurations.createProposalDraft({
+    ...CONFIGURATION_PROPOSAL,
+    configuration: proposalConfiguration(),
+    expectedStateRevision: authority.revision,
+  });
+  const prepared = await configurations.prepareProposalDraftActivation(
+    CONFIGURATION_PROPOSAL,
+  );
+  assert.equal(prepared.current, true);
+  assert.equal(
+    prepared.prepared.expectedStateRevision,
+    record.createdStateRevision,
+  );
+  assert.equal(prepared.prepared.draftRevisionId, record.draft.draftRevisionId);
+
+  const later = proposalConfiguration();
+  later.browserPollSeconds += 1;
+  await configurations.createDraft({
+    configuration: later,
+    expectedStateRevision: record.createdStateRevision,
+    proposedBy: "owner",
+  });
+  const historical = await configurations.prepareProposalDraftActivation(
+    CONFIGURATION_PROPOSAL,
+  );
+  assert.equal(historical.current, false);
+  assert.deepEqual(historical.prepared, prepared.prepared);
+});
+
+function legacyImpactDigest(before, after) {
+  const impact = configurationDocumentImpact(before, after);
+  const legacyRestartRequired = (path) =>
+    path === "port" ||
+    path === "githubLogin" ||
+    path.startsWith("brainProviders.") ||
+    path.startsWith("codeExecutor.") ||
+    path.startsWith("changePackages.") ||
+    path === "githubActions.enabled" ||
+    path.startsWith("githubActions.actorAccountId") ||
+    path.startsWith("githubActions.tokenEnv") ||
+    path.startsWith("githubActions.ghCommand") ||
+    path.startsWith("githubActions.networkEnv");
+  return configurationImpactDigest({
+    ...impact,
+    restart_required: impact.restart_required.filter(legacyRestartRequired),
+  });
+}
+
 function legacyConfigurationState(value) {
   const legacy = clone(value);
   legacy.schemaVersion = 1;
   delete legacy.schemaMigrations;
+  delete legacy.impactPolicy;
   return legacy;
 }
 
@@ -170,9 +328,16 @@ test("recovery atomically upgrades legacy configuration state without changing d
   const { configurations } = await readyStore({ store });
   const recovered = await configurations.readSnapshot();
 
-  assert.equal(CONFIGURATION_STATE_SCHEMA_VERSION, 2);
-  assert.equal(recovered.schemaVersion, 2);
-  assert.deepEqual(recovered.schemaMigrations, [{ from: 1, to: 2 }]);
+  assert.equal(CONFIGURATION_STATE_SCHEMA_VERSION, 3);
+  assert.equal(recovered.schemaVersion, 3);
+  assert.deepEqual(recovered.schemaMigrations, [
+    { from: 1, to: 2 },
+    { from: 2, to: 3 },
+  ]);
+  assert.deepEqual(recovered.impactPolicy, {
+    version: 2,
+    currentFromVersion: legacy.versions.length + 1,
+  });
   assert.equal(recovered.revision, legacy.revision);
   assert.deepEqual(recovered.versions, legacy.versions);
   assert.deepEqual(recovered.draftRevisions, legacy.draftRevisions);
@@ -206,8 +371,11 @@ test("configuration schema upgrade reconciles a lost durable acknowledgement", a
   const { configurations } = await readyStore({ store });
   const recovered = await configurations.readSnapshot();
 
-  assert.equal(recovered.schemaVersion, 2);
-  assert.deepEqual(recovered.schemaMigrations, [{ from: 1, to: 2 }]);
+  assert.equal(recovered.schemaVersion, 3);
+  assert.deepEqual(recovered.schemaMigrations, [
+    { from: 1, to: 2 },
+    { from: 2, to: 3 },
+  ]);
   assert.deepEqual(store.value, recovered);
   assert.equal(store.writes.length, 1);
 });
@@ -224,6 +392,101 @@ test("recovery rejects an unknown future configuration schema without rewriting 
   );
   assert.deepEqual(store.value, future);
   assert.equal(store.writes.length, 0);
+});
+
+test("recovery preserves pre-GitHub-read content addresses without rewriting history", async () => {
+  const legacyDocument = configuration();
+  delete legacyDocument.githubRead;
+  const store = new MemoryStore();
+  const first = await readyStore({ store });
+  await first.configurations.importBootstrap({
+    configuration: legacyDocument,
+    importedBy: "pre-boundary-bootstrap",
+  });
+  const durableBeforeRestart = clone(store.value);
+  const writesBeforeRestart = store.writes.length;
+
+  const restarted = await readyStore({ store });
+  const active = await restarted.configurations.readActive();
+
+  assert.equal(Object.hasOwn(active.configuration, "githubRead"), false);
+  assert.equal(active.configurationDigest, configurationDocumentDigest(legacyDocument));
+  assert.deepEqual(store.value, durableBeforeRestart);
+  assert.equal(store.writes.length, writesBeforeRestart);
+});
+
+test("schema v2 migration accepts historical impact policy only before its durable boundary", async () => {
+  const seeded = await importedFixture();
+  const draft = await seeded.configurations.createDraft({
+    configuration: changedConfiguration(),
+    expectedStateRevision: 1,
+    proposedBy: "owner:legacy",
+  });
+  const activation = await seeded.configurations.prepareDraftActivation({
+    draftId: draft.draftId,
+    draftRevision: draft.revision,
+    expectedStateRevision: 2,
+    expectedActiveVersion: 1,
+  });
+  await seeded.configurations.activateDraft({
+    ...activation,
+    activatedBy: "owner:legacy",
+  });
+
+  const schemaV2 = clone(seeded.store.value);
+  schemaV2.schemaVersion = 2;
+  schemaV2.schemaMigrations = [{ from: 1, to: 2 }];
+  delete schemaV2.impactPolicy;
+  replaceVersionImpactDigest(
+    schemaV2,
+    2,
+    legacyImpactDigest(
+      schemaV2.versions[0].configuration,
+      schemaV2.versions[1].configuration,
+    ),
+  );
+  const store = new MemoryStore(schemaV2);
+  const migrated = await readyStore({
+    store,
+    idFactory: () => "future-draft",
+  });
+  const migratedSnapshot = await migrated.configurations.readSnapshot();
+  assert.deepEqual(migratedSnapshot.impactPolicy, {
+    version: 2,
+    currentFromVersion: 3,
+  });
+
+  const futureConfiguration = clone(migratedSnapshot.versions[1].configuration);
+  futureConfiguration.employees.roles.tester.mission = "验证迁移后的当前影响策略。";
+  const futureDraft = await migrated.configurations.createDraft({
+    configuration: futureConfiguration,
+    expectedStateRevision: migratedSnapshot.revision,
+    proposedBy: "owner:current",
+  });
+  const futurePlan = await migrated.configurations.prepareDraftActivation({
+    draftId: futureDraft.draftId,
+    draftRevision: futureDraft.revision,
+    expectedStateRevision: migratedSnapshot.revision + 1,
+    expectedActiveVersion: 2,
+  });
+  await migrated.configurations.activateDraft({
+    ...futurePlan,
+    activatedBy: "owner:current",
+  });
+  const forged = clone(store.value);
+  replaceVersionImpactDigest(
+    forged,
+    3,
+    legacyImpactDigest(
+      forged.versions[1].configuration,
+      forged.versions[2].configuration,
+    ),
+  );
+
+  await assert.rejects(
+    readyStore({ store: new MemoryStore(forged) }),
+    assertCode("CONFIGURATION_STATE_CORRUPTED", 503),
+  );
 });
 
 test("bootstrap imports once and later file changes cannot replace active authority", async () => {

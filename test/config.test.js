@@ -121,6 +121,49 @@ test("configured brains and role permissions merge independently by id", () => {
   assert.deepEqual(result.employees.roles.tester, { name: "测试工程师" });
 });
 
+test("role task brain overrides merge independently from the routine brain", () => {
+  const result = mergeConfig(
+    {
+      employees: {
+        roles: {
+          developer: {
+            brain: {
+              provider: "ollama",
+              model: "routine-model",
+              remoteData: { requirements: false, code: false, memory: false },
+            },
+            taskBrain: {
+              provider: "remote-coder",
+              model: "task-model",
+              remoteData: { requirements: true, code: true, memory: false },
+            },
+          },
+        },
+      },
+    },
+    {
+      employees: {
+        roles: {
+          developer: {
+            brain: { model: "routine-model-v2" },
+            taskBrain: {
+              model: "task-model-v2",
+              remoteData: { memory: true },
+            },
+          },
+        },
+      },
+    },
+  );
+
+  assert.equal(result.employees.roles.developer.brain.model, "routine-model-v2");
+  assert.deepEqual(result.employees.roles.developer.taskBrain, {
+    provider: "remote-coder",
+    model: "task-model-v2",
+    remoteData: { requirements: true, code: true, memory: true },
+  });
+});
+
 test("GitHub action settings merge without storing a credential value", () => {
   const result = mergeConfig(
     {
@@ -283,6 +326,147 @@ test("code executor overrides preserve unspecified base defaults", () => {
       ...base.codeExecutor,
       enabled: true,
     },
+  );
+});
+
+test("conflict preparation overlays repository mirrors without erasing base entries", () => {
+  const result = mergeConfig(
+    {
+      codeExecutor: {
+        enabled: false,
+        conflictPreparation: {
+          enabled: true,
+          baseMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-base.git",
+          },
+          headMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-head.git",
+          },
+        },
+      },
+    },
+    {
+      codeExecutor: {
+        conflictPreparation: {
+          baseMirrorsByRepository: {
+            "acme/dashboard": "D:/mirrors/dashboard-base.git",
+          },
+          headMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/replacement-head.git",
+          },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(result.codeExecutor.conflictPreparation, {
+    enabled: true,
+    baseMirrorsByRepository: {
+      "acme/command-center": "D:/mirrors/command-center-base.git",
+      "acme/dashboard": "D:/mirrors/dashboard-base.git",
+    },
+    headMirrorsByRepository: {
+      "acme/command-center": "D:/mirrors/replacement-head.git",
+    },
+  });
+});
+
+test("conflict preparation repository overrides are case insensitive", () => {
+  const result = mergeConfig(
+    {
+      codeExecutor: {
+        enabled: false,
+        conflictPreparation: {
+          enabled: true,
+          baseMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-base.git",
+          },
+          headMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-head.git",
+          },
+        },
+      },
+    },
+    {
+      codeExecutor: {
+        conflictPreparation: {
+          baseMirrorsByRepository: {
+            "ACME/COMMAND-CENTER": "D:/local/command-center-base.git",
+          },
+          headMirrorsByRepository: {
+            "ACME/COMMAND-CENTER": "D:/local/command-center-head.git",
+          },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(result.codeExecutor.conflictPreparation, {
+    enabled: true,
+    baseMirrorsByRepository: {
+      "ACME/COMMAND-CENTER": "D:/local/command-center-base.git",
+    },
+    headMirrorsByRepository: {
+      "ACME/COMMAND-CENTER": "D:/local/command-center-head.git",
+    },
+  });
+});
+
+test("conflict preparation rejects case-only duplicates within either layer", () => {
+  const duplicateMirrors = {
+    "acme/command-center": "D:/mirrors/command-center-base.git",
+    "ACME/COMMAND-CENTER": "D:/mirrors/other-base.git",
+  };
+  for (const [baseMirrors, localMirrors] of [
+    [duplicateMirrors, {}],
+    [{}, duplicateMirrors],
+  ]) {
+    assert.throws(
+      () =>
+        mergeConfig(
+          {
+            codeExecutor: {
+              conflictPreparation: {
+                enabled: true,
+                baseMirrorsByRepository: baseMirrors,
+              },
+            },
+          },
+          {
+            codeExecutor: {
+              conflictPreparation: {
+                baseMirrorsByRepository: localMirrors,
+              },
+            },
+          },
+        ),
+      /case-insensitive duplicate names/,
+    );
+  }
+});
+
+test("disabling conflict preparation clears inherited privileged mirror fields", () => {
+  const result = mergeConfig(
+    {
+      codeExecutor: {
+        conflictPreparation: {
+          enabled: true,
+          baseMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-base.git",
+          },
+          headMirrorsByRepository: {
+            "acme/command-center": "D:/mirrors/command-center-head.git",
+          },
+        },
+      },
+    },
+    { codeExecutor: { conflictPreparation: { enabled: false } } },
+  );
+
+  assert.deepEqual(result.codeExecutor.conflictPreparation, { enabled: false });
+  assert.equal(
+    Object.hasOwn(mergeConfig({ codeExecutor: { enabled: false } }, {}).codeExecutor, "conflictPreparation"),
+    false,
   );
 });
 
@@ -458,8 +642,44 @@ test("the unified memory master switch preserves but does not activate child cho
   });
 });
 
+test("safe configuration disables conflict preparation without adding it to legacy documents", async () => {
+  const configPath = path.resolve(testDirectory, "../config.example.json");
+  const legacy = JSON.parse(await readFile(configPath, "utf8"));
+  const legacySafe = createSafeDisabledConfiguration(legacy);
+  assert.equal(
+    Object.hasOwn(legacySafe.codeExecutor, "conflictPreparation"),
+    false,
+  );
+
+  const configured = structuredClone(legacy);
+  configured.codeExecutor = {
+    enabled: false,
+    gitCommand: process.platform === "win32"
+      ? "C:\\Program Files\\Git\\mingw64\\bin\\git.exe"
+      : "/usr/bin/git",
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: {
+        "acme/command-center": process.platform === "win32"
+          ? "D:\\mirrors\\base.git"
+          : "/var/lib/mirrors/base.git",
+      },
+      headMirrorsByRepository: {
+        "acme/command-center": process.platform === "win32"
+          ? "D:\\mirrors\\head.git"
+          : "/var/lib/mirrors/head.git",
+      },
+    },
+  };
+
+  assert.deepEqual(
+    createSafeDisabledConfiguration(configured).codeExecutor.conflictPreparation,
+    { enabled: false },
+  );
+});
+
 test("safe configuration explicitly disables optional memory imports", async () => {
-  const configPath = path.resolve(testDirectory, "../config.json");
+  const configPath = path.resolve(testDirectory, "../config.example.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
   delete config.memory.imports;
 
@@ -472,13 +692,17 @@ test("safe configuration explicitly disables optional memory imports", async () 
 });
 
 test("committed privileged capabilities are disabled and secret-free", async () => {
-  const configPath = path.resolve(testDirectory, "../config.json");
+  const configPath = path.resolve(testDirectory, "../config.example.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
 
   assert.deepEqual(config.codeExecutor, { enabled: false });
   assert.deepEqual(config.changePackages, { enabled: false });
-  assert.deepEqual(config.githubActions, { enabled: false });
-  assert.equal(config.memory.enabled, true);
+  assert.deepEqual(config.githubActions, {
+    enabled: false,
+    enabledActions: [],
+  });
+  assert.deepEqual(config.githubRead, { enabled: false });
+  assert.equal(config.memory.enabled, false);
   assert.deepEqual(config.memory.imports, {
     localSessions: false,
     git: false,
@@ -494,8 +718,8 @@ test("committed privileged capabilities are disabled and secret-free", async () 
   assert.equal(JSON.stringify(config.githubActions).toLowerCase().includes("token"), false);
 });
 
-test("committed command-center roles route PR work to the durable PR engineer", async () => {
-  const configPath = path.resolve(testDirectory, "../config.json");
+test("published safe configuration predefines only paused generic roles", async () => {
+  const configPath = path.resolve(testDirectory, "../config.example.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
 
   assert.deepEqual(Object.keys(config.employees.roles), [
@@ -506,30 +730,24 @@ test("committed command-center roles route PR work to the durable PR engineer", 
     "tester",
   ]);
   assert.equal(
-    config.workflowRouting.rules.find(({ id }) =>
-      id === "pr-events-to-pr-engineer"
+    Object.values(config.employees.roles).every(
+      ({ initialPaused }) => initialPaused === true,
+    ),
+    true,
+  );
+  assert.deepEqual(config.trackedRepositories, []);
+  assert.equal(config.workflowRouting.enabled, false);
+  assert.equal(
+    config.workflowRouting.rules.find(
+      ({ id }) => id === "local-owner-triage",
     ).targets[0].id,
-    "pr-engineer",
+    "local-user",
   );
-  assert.deepEqual(config.workCoordination.policy.githubReviewRoles, [
-    "pr-engineer",
-  ]);
-  assert.deepEqual(config.workCoordination.policy.codeOperationsByRole, {
-    developer: ["inspect", "modify", "verify"],
-    tester: ["inspect", "verify"],
+  assert.deepEqual(config.workCoordination.policy.capabilityRoles, {
+    coordination: "orchestrator",
+    requirements: "requirements-analyst",
+    "pr-review": "pr-engineer",
+    development: "developer",
+    testing: "tester",
   });
-  assert.equal(config.workCoordination.codeJobLimit, 10);
-  assert.equal(config.workCoordination.codeJobMemoryLimit, 50);
-  assert.equal(
-    config.employees.roles["pr-engineer"].permissions.allowedIntents.includes(
-      "propose_github_review",
-    ),
-    true,
-  );
-  assert.equal(
-    Object.values(config.employees.roles).every(({ initialPaused }) =>
-      initialPaused === true
-    ),
-    true,
-  );
 });

@@ -7,6 +7,7 @@ import {
 } from "../domain/workflow-events.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
 import { normalizeCodeExecutionSource } from "../domain/code-execution-source.js";
+import { normalizeControlledCommitEvidence } from "../domain/controlled-commit-evidence.js";
 import {
   normalizePullRequestExecutionBinding,
   pullRequestExecutionBindingMatchesEvent,
@@ -205,6 +206,7 @@ function normalizeContext(value) {
   const optionalKeys = [
     "inputBinding",
     "executionSource",
+    "controlledCommitEvidence",
     "evidenceTarget",
   ].filter((key) => Object.hasOwn(value ?? {}, key));
   const entries = exact(value, [
@@ -273,6 +275,26 @@ function normalizeContext(value) {
       )
     ) {
       contextError("executionSource 与 PR 输入绑定不匹配");
+    }
+  }
+  if (entries.has("controlledCommitEvidence")) {
+    try {
+      context.controlledCommitEvidence = normalizeControlledCommitEvidence(
+        entries.get("controlledCommitEvidence"),
+      );
+    } catch {
+      contextError("controlledCommitEvidence 无效");
+    }
+    if (
+      context.inputBinding === undefined ||
+      context.inputBinding === null ||
+      context.inputBinding.schemaVersion !== 2 ||
+      !samePullRequestExecutionBinding(
+        context.controlledCommitEvidence.executionSource.inputBinding,
+        context.inputBinding,
+      )
+    ) {
+      contextError("controlledCommitEvidence 与 PR 输入绑定不匹配");
     }
   }
   return context;
@@ -354,6 +376,7 @@ export function createWorkIntentPolicy({
   capabilityRoles = {},
   githubReviewRoles = [],
   codeActionRoles = [],
+  configurationChangeRoles = [],
   workspaceByRepository = {},
   codeOperationsByRole = {},
 } = {}) {
@@ -366,6 +389,10 @@ export function createWorkIntentPolicy({
     "githubReviewRoles",
   );
   const trustedCodeRoles = normalizeRoleList(codeActionRoles, "codeActionRoles");
+  const trustedConfigurationChangeRoles = normalizeRoleList(
+    configurationChangeRoles,
+    "configurationChangeRoles",
+  );
   const trustedWorkspaces = normalizeWorkspaces(workspaceByRepository);
   const trustedCodeOperations = normalizeCodeOperations(
     codeOperationsByRole,
@@ -380,6 +407,15 @@ export function createWorkIntentPolicy({
       intent.type !== "propose_code_action"
     ) {
       denied("Conflict preparation 只能用于代码工作提案");
+    }
+    if (
+      context.controlledCommitEvidence !== undefined &&
+      !(
+        intent.type === "propose_github_pull_request_action" &&
+        intent.action.type === "push"
+      )
+    ) {
+      denied("受控 commit 证据只能用于 push 外部动作提案");
     }
     const commonPayload = { summary: intent.summary, reason: intent.reason };
 
@@ -442,6 +478,53 @@ export function createWorkIntentPolicy({
         },
       );
     }
+    if (intent.type === "propose_github_pull_request_action") {
+      if (!trustedGithubRoles.has(context.roleId)) denied();
+      if (!ACTIVE_PR_EVENTS.has(context.event.eventType)) {
+        denied("只有活动 PR 事件可以提出外部动作");
+      }
+      const headRefOid = context.event.payload?.headRefOid;
+      if (typeof headRefOid !== "string" || !headRefOid) {
+        denied("PR 事件缺少可信 Head");
+      }
+      const inputBinding = proposalInputBinding(context);
+      if (inputBinding === null || inputBinding.schemaVersion !== 2) {
+        denied("PR 外部动作必须绑定 v2 Git target");
+      }
+      let action = structuredClone(intent.action);
+      if (intent.action.type === "push") {
+        const controlledCommitEvidence = context.controlledCommitEvidence;
+        if (
+          controlledCommitEvidence === undefined ||
+          controlledCommitEvidence.evidenceId !==
+            intent.action.controlledCommitEvidenceId
+        ) {
+          denied("push 缺少匹配的受控 commit 证据");
+        }
+        action = {
+          type: "push",
+          controlledCommitEvidence: structuredClone(controlledCommitEvidence),
+        };
+      }
+      return baseBound(
+        context,
+        version,
+        "github_pull_request_action_proposal",
+        {
+          ...eventBinding(context.event),
+          repository: context.event.subject.repository,
+          pullRequestNumber: context.event.subject.number,
+          headRefOid,
+          inputBinding,
+          ...proposalAuthorityBinding(context, intent),
+        },
+        {
+          action,
+          evidence: intent.evidence,
+          ...commonPayload,
+        },
+      );
+    }
     if (intent.type === "propose_code_action") {
       if (!trustedCodeRoles.has(context.roleId)) denied();
       const allowedOperations = trustedCodeOperations.get(context.roleId);
@@ -476,6 +559,23 @@ export function createWorkIntentPolicy({
           operation: intent.operation,
           objective: intent.objective,
           acceptanceCriteria: intent.acceptanceCriteria,
+          evidence: intent.evidence,
+          ...commonPayload,
+        },
+      );
+    }
+    if (intent.type === "propose_configuration_change") {
+      if (!trustedConfigurationChangeRoles.has(context.roleId)) denied();
+      return baseBound(
+        context,
+        version,
+        "configuration_change_proposal",
+        {
+          ...eventBinding(context.event),
+          ...proposalAuthorityBinding(context, intent),
+        },
+        {
+          changes: intent.changes,
           evidence: intent.evidence,
           ...commonPayload,
         },

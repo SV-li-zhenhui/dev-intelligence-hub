@@ -231,7 +231,7 @@ export class RefreshService {
     return dashboard;
   }
 
-  async #assessUncertainPullRequests(items) {
+  async #assessUncertainPullRequests(items, signal) {
     const brainConfig = this.config.brain || {};
     const meta = {
       enabled: Boolean(brainConfig.enabled),
@@ -255,8 +255,9 @@ export class RefreshService {
       )
       .slice(0, limit);
     for (const item of candidates) {
+      signal?.throwIfAborted();
       try {
-        item.brainAssessment = await this.brain.assessPullRequest(item);
+        item.brainAssessment = await this.brain.assessPullRequest(item, { signal });
         meta.assessed += 1;
       } catch (error) {
         meta.errors.push(`${item.repo || item.id} #${item.number || "?"}: ${error.message}`);
@@ -265,7 +266,8 @@ export class RefreshService {
     return { items, meta };
   }
 
-  async #performRefresh({ notify = false } = {}) {
+  async #performRefresh({ notify = false, signal } = {}) {
+    signal?.throwIfAborted();
     const startedAt = clockMilliseconds(this.clock);
     const observationLowerBound = new Date(startedAt).toISOString();
     const [previous, notificationBaseline, responsibilityOverrides] =
@@ -274,15 +276,19 @@ export class RefreshService {
         this.store.read("notification-snapshot"),
         this.store.read("pr-responsibility-overrides", {}),
       ]);
+    signal?.throwIfAborted();
     const previousItems = previous?.items || [];
     const errors = [];
     const since = previous?.refreshedAt;
 
-    const githubCalls = await Promise.allSettled([
-      this.github.searchRelevantPullRequests(),
-      this.github.searchIssues(),
-      this.github.versions(this.config.trackedRepositories),
-    ]);
+    const githubCalls = this.config.githubRead?.enabled === false
+      ? [[], [], []].map((value) => ({ status: "fulfilled", value }))
+      : await Promise.allSettled([
+          this.github.searchRelevantPullRequests({ signal }),
+          this.github.searchIssues({ signal }),
+          this.github.versions(this.config.trackedRepositories, { signal }),
+        ]);
+    signal?.throwIfAborted();
     const names = [
       "GitHub 与我相关的 PR",
       "GitHub Issue",
@@ -349,9 +355,10 @@ export class RefreshService {
     });
     const brainAssessment = this.#assessUncertainPullRequests(
       classifiedPullRequests,
+      signal,
     );
     const dingtalkCollection = this.config.dingtalk.enabled
-      ? this.dingtalk.collect(since).catch((error) => ({
+      ? this.dingtalk.collect(since, { signal }).catch((error) => ({
           items: previousItems.filter((item) =>
             ["mention", "todo", "conversation"].includes(item.kind),
           ),
@@ -362,6 +369,7 @@ export class RefreshService {
       brainAssessment,
       dingtalkCollection,
     ]);
+    signal?.throwIfAborted();
     errors.push(...dingtalkResult.errors);
 
     const snapshot = {
@@ -412,13 +420,18 @@ export class RefreshService {
       notification = await this.notifier.send(
         notificationDiff,
         prioritize(snapshot.items, snapshot.refreshedAt),
+        { signal },
       );
+      signal?.throwIfAborted();
       await this.store.write("notification-snapshot", snapshot);
     }
 
     await this.store.write("previous-snapshot", previous);
+    signal?.throwIfAborted();
     await this.store.write("snapshot", snapshot);
+    signal?.throwIfAborted();
     await this.store.write("dashboard", dashboard);
+    signal?.throwIfAborted();
     await this.store.write("last-run", {
       diff,
       notificationDiff,

@@ -1,5 +1,7 @@
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
+  CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
+  CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
   createCodeJobGrant,
   normalizeCodeJobGrant,
 } from "../domain/code-job-contract.js";
@@ -43,6 +45,13 @@ const PREPARED_CODE_JOB_GRANTS = new WeakSet();
 
 function invalid(message = "代码任务授权配置无效") {
   return workProposalError("INVALID_CODE_JOB_AUTHORITY", message);
+}
+
+function taskBrainNotConfigured(roleId) {
+  return workProposalError(
+    "CODE_TASK_BRAIN_NOT_CONFIGURED",
+    `岗位 ${roleId} 尚未配置任务大脑`,
+  );
 }
 
 function freezePreparedGrant(value) {
@@ -284,9 +293,39 @@ function authorizedOperations(value, authorizedRoles) {
 
 export function codeJobBrainDigest({
   roleId: roleIdValue,
+  taskBrain: rawBrain,
+  brainProviders,
+} = {}) {
+  return configuredBrainDigest({
+    roleId: roleIdValue,
+    rawBrain,
+    brainProviders,
+    binding: "taskBrain",
+    schemaVersion: 2,
+  });
+}
+
+export function legacyCodeJobBrainDigest({
+  roleId: roleIdValue,
   brain: rawBrain,
   brainProviders,
 } = {}) {
+  return configuredBrainDigest({
+    roleId: roleIdValue,
+    rawBrain,
+    brainProviders,
+    binding: "brain",
+    schemaVersion: 1,
+  });
+}
+
+function configuredBrainDigest({
+  roleId: roleIdValue,
+  rawBrain,
+  brainProviders,
+  binding,
+  schemaVersion,
+}) {
   const roleId = safeRoleId(roleIdValue, "roleId");
   const providers = plainRecord(brainProviders, "brainProviders");
   let brain;
@@ -302,24 +341,41 @@ export function codeJobBrainDigest({
     providers[brain.provider],
     `brainProviders.${brain.provider}`,
   );
-  return digestValue({ schemaVersion: 1, roleId, brain, provider });
+  return digestValue({ schemaVersion, roleId, [binding]: brain, provider });
 }
 
-function normalizeBrainDigests(brainByRoleValue, providersValue, roleIds) {
-  const brainByRole = plainRecord(brainByRoleValue, "brainByRole");
+function normalizeBrainDigests({
+  brainByRoleValue,
+  providersValue,
+  roleIds,
+  legacy,
+}) {
+  const fieldName = legacy ? "legacyBrainByRole" : "taskBrainByRole";
+  const brainByRole = plainRecord(brainByRoleValue, fieldName);
   const providers = plainRecord(providersValue, "brainProviders");
   const result = new Map();
   for (const roleId of roleIds) {
-    if (!Object.hasOwn(brainByRole, roleId)) {
-      throw invalid(`岗位 ${roleId} 缺少大脑配置`);
+    if (
+      !Object.hasOwn(brainByRole, roleId) ||
+      brainByRole[roleId] === null ||
+      brainByRole[roleId] === undefined
+    ) {
+      if (legacy) throw invalid(`岗位 ${roleId} 缺少历史大脑配置`);
+      continue;
     }
     result.set(
       roleId,
-      codeJobBrainDigest({
-        roleId,
-        brain: brainByRole[roleId],
-        brainProviders: providers,
-      }),
+      legacy
+        ? legacyCodeJobBrainDigest({
+            roleId,
+            brain: brainByRole[roleId],
+            brainProviders: providers,
+          })
+        : codeJobBrainDigest({
+            roleId,
+            taskBrain: brainByRole[roleId],
+            brainProviders: providers,
+          }),
     );
   }
   return result;
@@ -470,6 +526,8 @@ export class CodeJobGrantFactory {
   #scopeAuthorityDigest;
   #verifyInputAuthority;
   #verifyConflictPreparation;
+  #creationEnabled;
+  #brainBindingSchema;
 
   constructor({
     executorAuthority,
@@ -477,7 +535,8 @@ export class CodeJobGrantFactory {
     workspaceByRepository,
     codeActionRoles,
     codeOperationsByRole,
-    brainByRole,
+    taskBrainByRole,
+    legacyBrainByRole,
     brainProviders,
     scopeAuthorityDigest,
     inputAuthorityVerifier,
@@ -498,11 +557,24 @@ export class CodeJobGrantFactory {
       normalizeOperationsByRole(codeOperationsByRole),
       normalizeCodeActionRoles(codeActionRoles),
     );
-    this.#brainDigests = normalizeBrainDigests(
-      brainByRole,
-      brainProviders,
-      this.#operationsByRole.keys(),
-    );
+    const usesLegacyBrains = legacyBrainByRole !== undefined;
+    if (usesLegacyBrains && taskBrainByRole !== undefined) {
+      throw invalid(
+        "taskBrainByRole 与 legacyBrainByRole 不能同时配置",
+      );
+    }
+    this.#brainDigests = normalizeBrainDigests({
+      brainByRoleValue: usesLegacyBrains
+        ? legacyBrainByRole
+        : taskBrainByRole ?? {},
+      providersValue: brainProviders,
+      roleIds: this.#operationsByRole.keys(),
+      legacy: usesLegacyBrains,
+    });
+    this.#creationEnabled = !usesLegacyBrains;
+    this.#brainBindingSchema = usesLegacyBrains
+      ? CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA
+      : CODE_JOB_TASK_BRAIN_BINDING_SCHEMA;
     this.#publicOperations = publicRoleOperations(this.#operationsByRole);
     this.#scopeAuthorityDigest = scopeAuthorityDigest ?? null;
     if (
@@ -531,6 +603,9 @@ export class CodeJobGrantFactory {
   }
 
   create(value) {
+    if (!this.#creationEnabled) {
+      throw invalid("历史岗位大脑授权只能恢复校验，不能创建新的代码任务");
+    }
     const proposal = normalizeStoredProposal(value);
     const operation = proposal.payload.operation;
     const roleId = proposal.requestedBy.roleId;
@@ -546,7 +621,10 @@ export class CodeJobGrantFactory {
       workspaceId: proposal.binding.workspaceId,
       roleId,
       operation,
+      executionSource,
     });
+    const brainDigest = this.#brainDigests.get(roleId);
+    if (brainDigest === undefined) throw taskBrainNotConfigured(roleId);
     const locallyAdmittedSource = this.#verifyExecutionSource(
       executionSource,
       proposal.binding.inputBinding,
@@ -561,6 +639,7 @@ export class CodeJobGrantFactory {
     const createResult = (verifiedSource) => {
       const grant = createCodeJobGrant({
         schemaVersion: verifiedSource === null ? 2 : 3,
+        brainBindingSchema: CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
         proposalId: proposal.proposalId,
         contentDigest: proposal.contentDigest,
         policyVersion: proposal.policyVersion,
@@ -583,7 +662,7 @@ export class CodeJobGrantFactory {
         allowedActions: CODE_JOB_ACTIONS_BY_OPERATION[operation],
         writablePaths,
         requiredProfiles: workspace.requiredProfiles,
-        brainDigest: this.#brainDigests.get(roleId),
+        brainDigest,
       });
       return Object.freeze({
         grant,
@@ -620,14 +699,25 @@ export class CodeJobGrantFactory {
     ) {
       throw invalid("旧版代码任务授权只能恢复查看，不能接纳新的执行动作");
     }
+    const brainBindingSchema = Object.hasOwn(grant, "brainBindingSchema")
+      ? grant.brainBindingSchema
+      : CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA;
+    if (brainBindingSchema !== this.#brainBindingSchema) {
+      throw invalid("代码任务授权的大脑绑定版本与校验上下文不一致");
+    }
     assertExecutionInputKind(grant);
     const roleId = grant.requestedBy.roleId;
+    const brainDigest = this.#brainDigests.get(roleId);
+    if (brainDigest === undefined) {
+      throw invalid("代码任务授权对应的任务大脑已移除");
+    }
     const workspace = this.#currentAuthority({
       policyVersion: grant.policyVersion,
       repository: grant.repository,
       workspaceId: grant.workspaceId,
       roleId,
       operation: grant.operation,
+      executionSource: grant.schemaVersion === 3 ? grant.executionSource : null,
     });
     const executionSource = grant.schemaVersion === 3
       ? grant.executionSource
@@ -647,7 +737,7 @@ export class CodeJobGrantFactory {
         workspace,
       ),
       requiredProfiles: workspace.requiredProfiles,
-      brainDigest: this.#brainDigests.get(roleId),
+      brainDigest,
     };
     const actual = Object.fromEntries(
       Object.keys(expected).map((key) => [key, grant[key]]),
@@ -776,6 +866,7 @@ export class CodeJobGrantFactory {
     workspaceId,
     roleId,
     operation,
+    executionSource = null,
   }) {
     const allowedOperations = this.#operationsByRole.get(roleId);
     const boundWorkspace = this.#workspaceByRepository.get(repository);
@@ -801,6 +892,7 @@ export class CodeJobGrantFactory {
           workspaceId,
           roleId,
           operation,
+          executionSource,
         }),
         "scopeAuthorityDigest result",
       ),

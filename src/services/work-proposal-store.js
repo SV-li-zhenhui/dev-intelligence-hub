@@ -471,6 +471,10 @@ function normalizeState(value, limits) {
   }
 }
 
+export function normalizeWorkProposalPersistedState(value, limits = {}) {
+  return normalizeState(value, normalizeLimits(limits));
+}
+
 function projectProducerReceipt(item) {
   return cloneWorkProposalValue({
     proposalId: item.proposal.proposalId,

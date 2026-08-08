@@ -167,7 +167,7 @@ if (CHILD_MODE) {
     await successor.close();
   });
 
-  test("close releases the OS handle and permanently closes that instance", async () => {
+test("close releases the OS handle and permanently closes that instance", async () => {
     const name = uniqueGuardName();
     const first = new ProcessExclusiveGuard({ name });
     await first.acquire();
@@ -181,5 +181,14 @@ if (CHILD_MODE) {
     const second = new ProcessExclusiveGuard({ name });
     await second.run(() => {});
     await second.close();
-  });
+});
+
+test("held assertions are valid only for the active OS-backed lease", async () => {
+  const guard = new ProcessExclusiveGuard({ name: uniqueGuardName() });
+  assert.throws(() => guard.assertHeld(), { code: "PROCESS_GUARD_NOT_HELD" });
+  await guard.acquire();
+  assert.equal(guard.assertHeld(), true);
+  await guard.close();
+  assert.throws(() => guard.assertHeld(), { code: "PROCESS_GUARD_NOT_HELD" });
+});
 }

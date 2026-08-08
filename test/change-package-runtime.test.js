@@ -79,6 +79,15 @@ test("runtime recovers packages before the application and exposes only narrow p
     async getCheckpoint() {},
     async applySnapshot() {},
   };
+  const controlledCommitBuilder = fakePort(["create", "find", "verify"]);
+  const controlledCommitDelivery = {
+    marker: "bound-controlled-delivery",
+    async deliver() { return this.marker; },
+  };
+  const controlledCommitService = {
+    async recover() { events.push("controlled-commit-recover"); },
+    delivery() { return controlledCommitDelivery; },
+  };
   const gitInspector = fakePort(["inspect"]);
   const guard = {
     async acquire() { events.push("acquire"); },
@@ -107,12 +116,14 @@ test("runtime recovers packages before the application and exposes only narrow p
   let inspectorOptions;
   let applicationOptions;
   let applicationProjectionOptions;
+  let controlledCommitOptions;
 
   const runtime = await createChangePackageRuntime(enabledConfig(), {
     dataDirectory,
     packageRoot,
     store: durableStore,
     trustedTargets,
+    controlledCommitBuilder,
     createPackageStore(options) {
       events.push("package-store");
       packageOptions = options;
@@ -141,6 +152,11 @@ test("runtime recovers packages before the application and exposes only narrow p
       applicationOptions = options;
       return application;
     },
+    createControlledCommitService(options) {
+      events.push("controlled-commit-service");
+      controlledCommitOptions = options;
+      return controlledCommitService;
+    },
     createStore() {
       throw new Error("injected store must be reused");
     },
@@ -152,9 +168,11 @@ test("runtime recovers packages before the application and exposes only narrow p
     "guard:mydashboard-change-package-application-v1",
     "operation-queue",
     "application-projection-store",
+    "controlled-commit-service",
     "application-service",
     "package-recover",
     "acquire",
+    "controlled-commit-recover",
     "application-recover",
     "application-projection-recover",
   ]);
@@ -195,6 +213,23 @@ test("runtime recovers packages before the application and exposes only narrow p
     applicationProjectionOptions.exclusiveLease,
     applicationOptions.exclusiveLease,
   );
+  assert.deepEqual(
+    Object.keys(controlledCommitOptions.packageReader).sort(),
+    ["get", "readFile"].sort(),
+  );
+  assert.deepEqual(
+    Object.keys(controlledCommitOptions.controlledCommitBuilder).sort(),
+    ["create", "find", "verify"].sort(),
+  );
+  assert.strictEqual(controlledCommitOptions.store, applicationOptions.store);
+  assert.strictEqual(
+    controlledCommitOptions.exclusiveLease,
+    applicationOptions.exclusiveLease,
+  );
+  assert.strictEqual(
+    controlledCommitOptions.operationQueue,
+    applicationOptions.operationQueue,
+  );
   assert.strictEqual(
     applicationProjectionOptions.operationQueue,
     applicationOptions.operationQueue,
@@ -208,10 +243,12 @@ test("runtime recovers packages before the application and exposes only narrow p
     "applicationProducer",
     "applicationReader",
     "close",
+    "controlledCommitDelivery",
     "packageProducer",
     "packageReader",
   ].sort());
   assert.deepEqual(Object.keys(runtime.packageProducer).sort(), ["create"]);
+  assert.deepEqual(Object.keys(runtime.controlledCommitDelivery), ["deliver"]);
   assert.deepEqual(
     Object.keys(runtime.packageReader).sort(),
     ["get", "readFile"].sort(),
@@ -237,6 +274,7 @@ test("runtime recovers packages before the application and exposes only narrow p
   for (const port of [
     runtime.packageProducer,
     runtime.packageReader,
+    runtime.controlledCommitDelivery,
     runtime.applicationProducer,
     runtime.applicationExecutor,
     runtime.applicationReader,
@@ -246,6 +284,10 @@ test("runtime recovers packages before the application and exposes only narrow p
     assert.equal(Object.isFrozen(port), true);
   }
   assert.equal(await runtime.packageReader.get("ignored"), "bound-package-reader");
+  assert.equal(
+    await runtime.controlledCommitDelivery.deliver({}),
+    "bound-controlled-delivery",
+  );
   assert.equal("guard" in runtime, false);
   assert.equal("store" in runtime, false);
 

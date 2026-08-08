@@ -19,6 +19,7 @@ const ORCHESTRATION_TYPES = new Set([
   "return_delivery",
   "escalate",
   "pause",
+  "resume",
   "cancel",
 ]);
 const MAX_ORCHESTRATION_INTENT_BYTES = 64 * 1_024;
@@ -381,6 +382,7 @@ function orchestrationIntentVariant(value) {
       };
     }
     case "pause":
+    case "resume":
     case "cancel": {
       const entries = exactObject(value, commonKeys, `${type} intent`);
       return commonIntent(entries, type);
@@ -663,6 +665,7 @@ export const ORCHESTRATION_INTENT_JSON_SCHEMA = deepFreeze({
       },
     }),
     orchestrationSchema("pause"),
+    orchestrationSchema("resume"),
     orchestrationSchema("cancel"),
   ],
 });

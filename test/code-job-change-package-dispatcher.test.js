@@ -242,9 +242,45 @@ function sourceFor(sourceEvents, override = {}) {
   return { source, state };
 }
 
+function controlledCommitReceipt(event, manifest) {
+  const executionSourceDigest = digestValue(event.executionSource);
+  const binding = {
+    schemaVersion: 1,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    executionSourceDigest,
+    recordedAt: event.recordedAt,
+  };
+  const bindingDigest = digestValue(binding);
+  const evidenceDigest = "d".repeat(64);
+  const content = {
+    schemaVersion: 1,
+    kind: "change_package_controlled_commit",
+    deliveryId: `change-package-controlled-commit-${bindingDigest}`,
+    bindingDigest,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    executionSourceDigest,
+    recordedAt: event.recordedAt,
+    evidenceId: `controlled-git-commit-${evidenceDigest}`,
+    evidenceDigest,
+    commitOid: "e".repeat(40),
+  };
+  const receiptDigest = digestValue(content);
+  return {
+    ...content,
+    receiptDigest,
+    receiptId: `change-package-controlled-commit-receipt-${receiptDigest}`,
+  };
+}
+
 function fixture(sourceEvents = events(1), overrides = {}) {
   const source = sourceFor(sourceEvents, overrides.source);
-  const state = { exports: [], drafts: [], order: [] };
+  const state = { exports: [], drafts: [], controlledCommits: [], order: [] };
   const completedChangeExporter = overrides.completedChangeExporter ?? {
     marker: "exporter-receiver",
     async export(request) {
@@ -276,6 +312,9 @@ function fixture(sourceEvents = events(1), overrides = {}) {
       deliverySource: source.source,
       completedChangeExporter,
       packageProducer,
+      ...(overrides.controlledCommitDelivery === undefined
+        ? {}
+        : { controlledCommitDelivery: overrides.controlledCommitDelivery }),
     }),
   };
 }
@@ -315,24 +354,78 @@ test("dispatcher exports, creates, and acknowledges each event serially", async 
   }
 });
 
-test("dispatcher delivers a schema v3 event while keeping raw source out of exporter and package drafts", async () => {
+test("dispatcher commits a schema v3 event before ack while keeping source and Git authority narrow", async () => {
   const event = createCodeJobChangePackageEvent({
     sequence: 1,
     previousDigest: null,
     job: completedJob({ conflict: true }),
   });
-  const setup = fixture([event]);
+  let setup;
+  const controlledCommitDelivery = {
+    async deliver(request) {
+      setup.state.order.push("commit");
+      setup.state.controlledCommits.push(request);
+      return controlledCommitReceipt(
+        event,
+        createChangePackage(setup.state.drafts[0]).manifest,
+      );
+    },
+  };
+  setup = fixture([event], { controlledCommitDelivery });
 
   const result = await setup.dispatcher.runCycle();
 
   assert.equal(result.acknowledged, 1);
-  assert.equal(event.schemaVersion, 2);
+  assert.equal(event.schemaVersion, 3);
   assert.deepEqual(setup.state.exports, [event.exportRequest]);
   assert.deepEqual(setup.state.drafts[0].grant, { digest: event.grant.digest });
   assert.equal(
     JSON.stringify(setup.state.drafts[0]).includes("executionSource"),
     false,
   );
+  const manifest = createChangePackage(setup.state.drafts[0]).manifest;
+  assert.deepEqual(setup.state.order, ["export", "create", "commit", "ack"]);
+  assert.deepEqual(setup.state.controlledCommits, [{
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    executionSource: event.executionSource,
+    recordedAt: "2026-08-02T06:01:00.000Z",
+  }]);
+  assert.deepEqual(
+    setup.source.state.acknowledgements[0].controlledCommit,
+    controlledCommitReceipt(event, manifest),
+  );
+});
+
+test("dispatcher reads but never delivers a legacy conflict event without stable commit time", async () => {
+  const current = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job: completedJob({ conflict: true }),
+  });
+  const {
+    eventId: _eventId,
+    eventDigest: _eventDigest,
+    recordedAt: _recordedAt,
+    ...legacyContent
+  } = current;
+  legacyContent.schemaVersion = 2;
+  const eventDigest = digestValue(legacyContent);
+  const legacy = {
+    ...legacyContent,
+    eventId: `code-job-change-package-event-${eventDigest}`,
+    eventDigest,
+  };
+  const setup = fixture([legacy]);
+
+  await assert.rejects(
+    setup.dispatcher.runCycle(),
+    (error) => error?.code === "CODE_JOB_CONTROLLED_COMMIT_EVENT_LEGACY",
+  );
+  assert.equal(setup.state.exports.length, 0);
+  assert.equal(setup.source.state.cursor, 0);
 });
 
 test("lost create and ack responses converge through idempotent replay", async (t) => {

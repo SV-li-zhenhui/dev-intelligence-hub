@@ -290,3 +290,79 @@ test("invalid dry-run JSON stays local and renders a safe error", async () => {
   assert.match(view.render(), /事件 JSON 格式无效/);
   assert.equal(view.render().includes("<not-json>"), false);
 });
+
+test("owner work form submits only structured business fields and preserves retry identity", async () => {
+  const calls = [];
+  const ids = [
+    "123e4567-e89b-42d3-a456-426614174000",
+    "123e4567-e89b-42d3-a456-426614174001",
+  ];
+  let ownerAttempts = 0;
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (url === "/api/workflow/routing") return jsonResponse(routingDefinition());
+    if (url === "/api/workflow/assignments?limit=30") {
+      return jsonResponse({ items: [] });
+    }
+    if (url === "/api/workflow/audit?limit=30") {
+      return jsonResponse({ items: [] });
+    }
+    ownerAttempts += 1;
+    if (ownerAttempts === 1) {
+      return jsonResponse({ error: "temporarily unavailable" }, 503);
+    }
+    const submitted = JSON.parse(options.body);
+    return jsonResponse({
+      deduplicated: true,
+      requestId: submitted.requestId,
+      phase: "intaken",
+      assignment: { target: { type: "role", id: "orchestrator" } },
+      workItemId: `work-item-${"a".repeat(64)}`,
+    });
+  };
+  const view = createWorkflowView({
+    fetchImpl,
+    requestIdFactory: () => ids.shift(),
+  });
+  await view.load();
+  const draft = {
+    workType: "development",
+    priority: "high",
+    title: "Implement bounded intake",
+    description: "Use the trusted command-center route.",
+    acceptanceCriteria: "One root\nNo injected role\n",
+  };
+  await view.submitOwnerRequest(draft);
+  assert.match(view.render(), /temporarily unavailable/);
+  await view.submitOwnerRequest(draft);
+
+  const ownerCalls = calls.filter(({ url }) => url === "/api/work/requests");
+  assert.equal(ownerCalls.length, 2);
+  const first = JSON.parse(ownerCalls[0].options.body);
+  const second = JSON.parse(ownerCalls[1].options.body);
+  assert.deepEqual(first, second);
+  assert.deepEqual(Object.keys(first).sort(), [
+    "acceptanceCriteria",
+    "description",
+    "priority",
+    "requestId",
+    "schemaVersion",
+    "title",
+    "workType",
+  ]);
+  assert.equal(first.requestId, "123e4567-e89b-42d3-a456-426614174000");
+  assert.deepEqual(first.acceptanceCriteria, ["One root", "No injected role"]);
+  assert.equal("roleId" in first, false);
+  assert.equal("nodeId" in first, false);
+  assert.equal("permissions" in first, false);
+  assert.deepEqual(ownerCalls[1].options.headers, {
+    "content-type": "application/json",
+    "x-mydashboard-action": "1",
+  });
+  const markup = view.render();
+  assert.match(markup, /创建共享工作/);
+  assert.match(markup, /页面不能指定/);
+  assert.match(markup, /请求已存在，已返回同一任务/);
+  assert.match(markup, /岗位 · orchestrator/);
+  assert.equal(markup.includes("事件 JSON（使用当前配置模拟）"), true);
+});

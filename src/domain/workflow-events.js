@@ -17,6 +17,7 @@ const EVENT_TYPES = new Set(
     EVENT_NAMES.map((eventName) => `${kind}.${eventName}`),
   ),
 );
+EVENT_TYPES.add("owner_request.created");
 const BASE_KEYS = Object.freeze([
   "schemaVersion",
   "eventType",
@@ -37,6 +38,14 @@ const STORED_KEYS = Object.freeze([
 ]);
 const SOURCE_KEYS = Object.freeze(["provider", "scopeId"]);
 const SUBJECT_KEYS = Object.freeze(["id", "repository", "number"]);
+const OWNER_REQUEST_SUBJECT_KEYS = Object.freeze(["id", "requestId"]);
+const OWNER_REQUEST_PAYLOAD_KEYS = Object.freeze([
+  "acceptanceCriteria",
+  "description",
+  "priority",
+  "title",
+  "workType",
+]);
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -46,6 +55,7 @@ const IDENTIFIER_CONTROL = /\p{Cc}/u;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const PAYLOAD_FIELDS = new Set([
   "actionState",
+  "acceptanceCriteria",
   "assignee",
   "assignees",
   "assignmentSource",
@@ -75,6 +85,7 @@ const PAYLOAD_FIELDS = new Set([
   "previousHeadRefOid",
   "previousState",
   "pullRequestType",
+  "priority",
   "relation",
   "requiresConfirmation",
   "reviewDecision",
@@ -86,6 +97,7 @@ const PAYLOAD_FIELDS = new Set([
   "title",
   "tokenCount",
   "updatedAt",
+  "workType",
 ]);
 const FILE_FACT_FIELDS = new Set([
   "additions",
@@ -113,6 +125,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "previousHeadRefOid",
   "previousState",
   "pullRequestType",
+  "priority",
   "relation",
   "reviewDecision",
   "riskLevel",
@@ -120,6 +133,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "summary",
   "title",
   "updatedAt",
+  "workType",
 ]);
 const BOOLEAN_PAYLOAD_FIELDS = new Set([
   "draft",
@@ -136,6 +150,7 @@ const NUMBER_PAYLOAD_FIELDS = new Set([
   "tokenCount",
 ]);
 const STRING_ARRAY_PAYLOAD_FIELDS = new Set([
+  "acceptanceCriteria",
   "assignees",
   "changedFields",
   "evidence",
@@ -275,7 +290,18 @@ function normalizeSource(value) {
   };
 }
 
-function normalizeSubject(value) {
+function normalizeSubject(value, eventType) {
+  if (eventType === "owner_request.created") {
+    assertExactKeys(value, OWNER_REQUEST_SUBJECT_KEYS, "subject");
+    const requestId = boundedString(value.requestId, "subject.requestId", {
+      maximumBytes: 64,
+      pattern:
+        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
+    });
+    const id = identifierString(value.id, "subject.id", 128);
+    if (id !== `owner-request:${requestId}`) throw invalid("subject.id");
+    return { id, requestId };
+  }
   assertExactKeys(value, SUBJECT_KEYS, "subject");
   if (!Number.isSafeInteger(value.number) || value.number < 1) {
     throw invalid("subject.number");
@@ -449,6 +475,38 @@ function normalizePayload(value) {
   return normalized;
 }
 
+function assertOwnerRequestSemantics(content) {
+  const ownerRequest = content.eventType === "owner_request.created";
+  if (!ownerRequest) return;
+  const payloadKeys = Object.keys(content.payload);
+  if (
+    content.source.provider !== "local-owner" ||
+    content.source.scopeId !== "owner-command-center" ||
+    payloadKeys.length !== OWNER_REQUEST_PAYLOAD_KEYS.length ||
+    OWNER_REQUEST_PAYLOAD_KEYS.some((key) => !payloadKeys.includes(key)) ||
+    !["general", "requirements", "development", "testing", "pull_request"]
+      .includes(content.payload.workType) ||
+    !["normal", "high", "urgent"].includes(content.payload.priority) ||
+    !content.payload.title.trim() ||
+    content.payload.title !== content.payload.title.trim() ||
+    Buffer.byteLength(content.payload.title, "utf8") > 256 ||
+    !content.payload.description.trim() ||
+    content.payload.description !== content.payload.description.trim() ||
+    Buffer.byteLength(content.payload.description, "utf8") > 12 * 1024 ||
+    content.payload.acceptanceCriteria.length > 20 ||
+    content.payload.acceptanceCriteria.some(
+      (criterion) =>
+        !criterion.trim() ||
+        criterion !== criterion.trim() ||
+        Buffer.byteLength(criterion, "utf8") > 1_000,
+    ) ||
+    new Set(content.payload.acceptanceCriteria).size !==
+      content.payload.acceptanceCriteria.length
+  ) {
+    throw invalid("owner request semantics");
+  }
+}
+
 function normalizeContent(value) {
   assertExactKeys(value, BASE_KEYS, "event");
   if (value.schemaVersion !== SCHEMA_VERSION) {
@@ -458,14 +516,16 @@ function normalizeContent(value) {
     throw invalid("eventType");
   }
 
+  const eventType = value.eventType;
   const content = {
     schemaVersion: SCHEMA_VERSION,
-    eventType: value.eventType,
+    eventType,
     occurredAt: normalizeTimestamp(value.occurredAt),
     source: normalizeSource(value.source),
-    subject: normalizeSubject(value.subject),
+    subject: normalizeSubject(value.subject, eventType),
     payload: normalizePayload(value.payload),
   };
+  assertOwnerRequestSemantics(content);
   const hasGitTarget = Object.hasOwn(content.payload, "gitTarget");
   const hasGitTargetAvailability = Object.hasOwn(
     content.payload,

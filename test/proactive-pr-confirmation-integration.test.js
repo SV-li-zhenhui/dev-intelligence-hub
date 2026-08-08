@@ -171,7 +171,7 @@ function pullRequest(overrides = {}) {
     gitTarget: {
       schemaVersion: 1,
       provider: "github",
-      sourceAccountId: "sv-li-zhenhui",
+      sourceAccountId: "local-owner",
       baseRepository: "acme/repo",
       baseRefName: "main",
       baseRefOid: "a".repeat(40),
@@ -213,7 +213,7 @@ function createService({
   producerQueue = confirmationQueue,
   githubActions = {
     enabled: true,
-    actorAccountId: "SV-li-zhenhui",
+    actorAccountId: "local-owner",
   },
   analyze = async () => reviewResult(),
   loadReviewContext = async (item) => ({
@@ -316,7 +316,7 @@ test("each review verdict enqueues one exact head-bound confirmation plan", asyn
       });
       assert.deepEqual(plan.actor, {
         provider: "github",
-        accountId: "SV-li-zhenhui",
+        accountId: "local-owner",
       });
       assert.deepEqual(plan.target, {
         provider: "github",

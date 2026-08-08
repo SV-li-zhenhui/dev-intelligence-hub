@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { digestValue } from "../src/domain/code-executor-contract.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
 import { createWorkGraphMemoryEvent } from "../src/domain/work-graph-memory-event.js";
 import {
@@ -71,6 +72,74 @@ const NON_PR_SOURCE_AUTHORITY = Object.freeze({
   executionBinding: null,
   provenance: null,
 });
+
+function pullRequestExecutionBinding() {
+  return {
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: "acme/repo",
+    pullRequestNumber: 42,
+    rootItemId: "work-item-pr-42",
+    workKey: "pr:acme/repo#42",
+    inputRevision: 1,
+    headRevision: 1,
+    headRefOid: "a".repeat(40),
+    eventId: "github:pull-request:acme/repo#42:head-1",
+    eventDigest: "b".repeat(64),
+    inputDigest: "c".repeat(64),
+  };
+}
+
+function authorityProjectionRecord(kind, authority) {
+  const authorityBinding = authority.inputBinding ?? null;
+  return record(1, {
+    source: { kind, id: `${kind}:fixture` },
+    eventType: `${kind.replaceAll("-", "_")}.fixture`,
+    content: JSON.stringify({
+      memoryType: kind,
+      ...(kind === "confirmation"
+        ? { action: { inputBinding: authorityBinding } }
+        : {}),
+      ...(kind === "external-result"
+        ? { inputBinding: authorityBinding }
+        : {}),
+      authority,
+    }),
+    evidence: [],
+    tags: [kind, "fixture", ...(authority.current ? [] : ["obsolete"])],
+    sourceUrl: null,
+    subjectNumber: 42,
+  });
+}
+
+function authorityProjectionCommit(records, {
+  revision = 1,
+  confirmationHighWatermark = 0,
+} = {}) {
+  const normalized = records.map(normalizeMemoryRecord);
+  return {
+    records,
+    projectionState: {
+      schemaVersion: 4,
+      revision,
+      workLedgerRevision: 0,
+      authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+      confirmationHighWatermark,
+      entries: normalized.map((record, index) => {
+        const authority = JSON.parse(record.content).authority;
+        return {
+          key: `${record.source.kind}:fixture:${index + 1}`,
+          fingerprint: digestValue({ recordId: record.recordId }),
+          recordId: record.recordId,
+          sourceKind: record.source.kind,
+          binding: authority.inputBinding,
+          current: authority.current,
+          occurredAt: record.occurredAt,
+        };
+      }),
+    },
+  };
+}
 
 function trustedWorkRecord(index, { revision = index, status = "queued", ...overrides } = {}) {
   const itemId = overrides.itemId ?? "work-item-local";
@@ -541,6 +610,188 @@ test("trusted projector records reject citable PR history without writing", asyn
   }
   assert.equal(journal.getHealth().recordCount, 0);
   assert.equal(store.writes.length, writesBefore);
+});
+
+test("authority-bound projections require an exact canonical PR authority", async () => {
+  const { store, journal } = await fixture();
+  const binding = pullRequestExecutionBinding();
+  const validAuthority = {
+    applies: true,
+    current: true,
+    bindingDigest: digestValue(binding),
+    inputBinding: binding,
+  };
+  const kinds = [
+    "work-decision",
+    "consultation-request",
+    "consultation-result",
+    "confirmation",
+    "external-result",
+  ];
+
+  const validRecords = kinds.map(
+    (kind) => authorityProjectionRecord(kind, validAuthority),
+  );
+  const accepted = await journal.appendAuthorityProjection(
+    authorityProjectionCommit(validRecords),
+  );
+  assert.equal(accepted.added, kinds.length);
+
+  const forgeries = [
+    {
+      ...validAuthority,
+      inputBinding: {},
+    },
+    {
+      ...validAuthority,
+      bindingDigest: "not-a-digest",
+    },
+    {
+      ...validAuthority,
+      injectedAuthority: true,
+    },
+  ];
+  const writesBefore = store.writes.length;
+  for (const [index, authority] of forgeries.entries()) {
+    const forgedRecord = authorityProjectionRecord("work-decision", {
+      ...authority,
+      current: index % 2 === 0,
+    });
+    await assert.rejects(
+      Promise.resolve().then(() => journal.appendAuthorityProjection(
+        authorityProjectionCommit([forgedRecord], { revision: 2 }),
+      )),
+      (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+    );
+  }
+  assert.equal(journal.getHealth().recordCount, kinds.length);
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("ordinary projector append cannot bypass the authority checkpoint", async () => {
+  const { store, journal } = await fixture();
+  const binding = pullRequestExecutionBinding();
+  const candidate = authorityProjectionRecord("external-result", {
+    applies: true,
+    current: true,
+    bindingDigest: digestValue(binding),
+    inputBinding: binding,
+  });
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    Promise.resolve().then(() => journal.appendProjectionRecords({
+      records: [candidate],
+    })),
+    (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
+  );
+  assert.equal(journal.getHealth().recordCount, 0);
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("confirmation authority cannot claim current without a PR binding", async () => {
+  const { store, journal } = await fixture();
+  const candidate = authorityProjectionRecord("confirmation", {
+    applies: false,
+    current: true,
+    bindingDigest: null,
+    inputBinding: null,
+  });
+  const writesBefore = store.writes.length;
+
+  await assert.rejects(
+    Promise.resolve().then(() => journal.appendAuthorityProjection(
+      authorityProjectionCommit([candidate]),
+    )),
+    (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+  );
+  assert.equal(journal.getHealth().recordCount, 0);
+  assert.equal(store.writes.length, writesBefore);
+});
+
+test("recovery rejects a current authority record missing from its checkpoint", async () => {
+  const store = memoryStore();
+  const { journal } = await fixture({ store });
+  const binding = pullRequestExecutionBinding();
+  const candidate = authorityProjectionRecord("external-result", {
+    applies: true,
+    current: true,
+    bindingDigest: digestValue(binding),
+    inputBinding: binding,
+  });
+  await journal.appendAuthorityProjection(
+    authorityProjectionCommit([candidate]),
+  );
+  const tampered = store.values.get(MEMORY_JOURNAL_KEY);
+  tampered.lifecycleAuthority.authorityProjection.entries = [];
+  store.values.set(MEMORY_JOURNAL_KEY, tampered);
+
+  const recovered = new LocalMemoryJournal({ store, exclusiveLease: lease });
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "MEMORY_JOURNAL_CORRUPTED",
+  );
+});
+
+test("legacy authority records omitted from the old checkpoint recover obsolete", async () => {
+  const store = memoryStore();
+  const { journal } = await fixture({ store });
+  const binding = pullRequestExecutionBinding();
+  const candidate = authorityProjectionRecord("external-result", {
+    applies: true,
+    current: true,
+    bindingDigest: digestValue(binding),
+    inputBinding: binding,
+  });
+  const normalized = normalizeMemoryRecord(candidate);
+  await journal.appendAuthorityProjection(
+    authorityProjectionCommit([candidate]),
+  );
+  const legacy = store.values.get(MEMORY_JOURNAL_KEY);
+  const projection = legacy.lifecycleAuthority.authorityProjection;
+  legacy.lifecycleAuthority.authorityProjection = {
+    schemaVersion: 3,
+    revision: projection.revision,
+    confirmationHighWatermark: projection.confirmationHighWatermark,
+    entries: [],
+  };
+  store.values.set(MEMORY_JOURNAL_KEY, legacy);
+
+  const recovered = await fixture({ store });
+  assert.deepEqual(
+    recovered.journal.readRecords({ recordIds: [normalized.recordId] })
+      .items[0].labels,
+    { authority: "raw", lifecycle: "obsolete" },
+  );
+});
+
+test("recovery rejects a rehashed reserved projection with forged authority", async () => {
+  const store = memoryStore();
+  const binding = pullRequestExecutionBinding();
+  const forged = normalizeMemoryRecord(authorityProjectionRecord(
+    "external-result",
+    {
+      applies: true,
+      current: true,
+      bindingDigest: digestValue(binding),
+      inputBinding: {},
+    },
+  ));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 1,
+    records: [forged],
+  });
+  const recovered = new LocalMemoryJournal({ store, exclusiveLease: lease });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+  );
+  assert.throws(
+    () => recovered.getHealth(),
+    (error) => error.code === "MEMORY_NOT_READY",
+  );
 });
 
 test("graph receipts reject duplicate memory references before persistence", async () => {

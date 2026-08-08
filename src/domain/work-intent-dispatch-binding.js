@@ -12,7 +12,12 @@ const EXPECTED_BOUND_KIND = new Map([
   ["ask_user", "attention_request"],
   ["wait_condition", "wait_condition"],
   ["propose_github_review", "github_review_proposal"],
+  [
+    "propose_github_pull_request_action",
+    "github_pull_request_action_proposal",
+  ],
   ["propose_code_action", "code_action_proposal"],
+  ["propose_configuration_change", "configuration_change_proposal"],
   ["handoff", "handoff"],
   ["complete", "complete"],
 ]);

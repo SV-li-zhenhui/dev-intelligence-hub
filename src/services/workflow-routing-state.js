@@ -8,7 +8,10 @@ import {
   migrateWorkflowAssignmentFeed,
   normalizeWorkflowAssignmentFeedEntry,
 } from "./workflow-assignment-feed.js";
-import { assertWorkflowStateCapacity } from "./workflow-routing-retention.js";
+import {
+  assertWorkflowStateCapacity,
+  retainWorkflowState,
+} from "./workflow-routing-retention.js";
 import {
   boundedWorkflowString,
   canonicalWorkflowValue,
@@ -566,6 +569,24 @@ export function normalizeLegacyWorkflowPersistedStateForMigration(
   return normalizeWorkflowPersistedStateInternal(value, options, {
     allowLegacyMigrationOverflow: true,
   });
+}
+
+export function migrateWorkflowPersistedState(value) {
+  if (!isLegacyWorkflowPersistedState(value)) {
+    return normalizeWorkflowPersistedState(value);
+  }
+  const normalized = normalizeLegacyWorkflowPersistedStateForMigration(value);
+  const retained = retainWorkflowState(
+    { ...normalized, revision: normalized.revision + 1 },
+    {
+      protectedEventIds: new Set(),
+      recordLimit: MAX_WORKFLOW_RECORDS,
+      stateByteBudget: MAX_WORKFLOW_STATE_BYTES,
+      auditByteBudget: MAX_WORKFLOW_AUDIT_BYTES,
+      bundleByteBudget: MAX_WORKFLOW_BUNDLE_BYTES,
+    },
+  ).state;
+  return normalizeWorkflowPersistedState(retained);
 }
 
 export function mergeWorkflowCheckpoint(previous, current) {

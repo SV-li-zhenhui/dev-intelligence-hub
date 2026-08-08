@@ -1,5 +1,8 @@
 import path from "node:path";
 import { createGitHubActionExecutor } from "./adapters/github-action-adapter.js";
+import {
+  PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS,
+} from "./domain/pull-request-external-action.js";
 import { ActionAdmissionGateError } from "./lib/action-admission-gate.js";
 import { projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
@@ -32,6 +35,11 @@ const USER_QUEUE_METHODS = [
 const HISTORY_READER_METHODS = ["list"];
 const PRODUCER_QUEUE_METHODS = ["enqueue", "get", "invalidate"];
 const APPLICATION_RESULT_SOURCE_METHODS = ["readSnapshot"];
+const MEMORY_PROJECTION_SOURCE_METHODS = [
+  "readMemoryPage",
+  "readMemoryStatus",
+];
+const RECOVERY_STATUS_READER_METHODS = ["readRecoveryStatus"];
 const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
 const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabled",
@@ -40,7 +48,11 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "ghCommand",
   "networkEnv",
   "timeoutMs",
+  "enabledActions",
 ]);
+const GITHUB_EXTERNAL_ACTIONS = new Set(
+  Object.keys(PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS),
+);
 const LOCAL_EXECUTOR_KINDS = new Set([
   "local.code-job-create",
   "local.change-package-apply",
@@ -97,20 +109,50 @@ function normalizeNetworkEnv(value) {
   return Object.freeze(result);
 }
 
-function configuredToken(environment, name) {
-  if (!environment || typeof environment !== "object") {
-    throw invalidConfig("运行环境无效");
+function normalizeEnabledActions(value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length > GITHUB_EXTERNAL_ACTIONS.size) {
+    throw invalidConfig("GitHub PR 动作白名单无效");
   }
-  const descriptor = Object.getOwnPropertyDescriptor(environment, name);
-  if (
-    !descriptor ||
-    !("value" in descriptor) ||
-    typeof descriptor.value !== "string" ||
-    !TOKEN_VALUE.test(descriptor.value)
-  ) {
-    throw invalidConfig(`环境变量 ${name} 未提供有效的 GitHub 凭据`);
+  const result = [];
+  const unique = new Set();
+  for (const action of value) {
+    if (
+      typeof action !== "string" ||
+      !GITHUB_EXTERNAL_ACTIONS.has(action) ||
+      unique.has(action)
+    ) {
+      throw invalidConfig("GitHub PR 动作白名单无效");
+    }
+    unique.add(action);
+    result.push(action);
   }
-  return descriptor.value;
+  return Object.freeze(result);
+}
+
+function githubCredentialProvider(dependencies, name) {
+  return () => {
+    let environment;
+    try {
+      const configuredEnvironment = dataProperty(dependencies, "env");
+      environment = configuredEnvironment === undefined
+        ? process.env
+        : configuredEnvironment;
+    } catch {
+      return null;
+    }
+    if (!environment || typeof environment !== "object") return null;
+    const descriptor = Object.getOwnPropertyDescriptor(environment, name);
+    if (
+      !descriptor ||
+      !("value" in descriptor) ||
+      typeof descriptor.value !== "string" ||
+      !TOKEN_VALUE.test(descriptor.value)
+    ) {
+      return null;
+    }
+    return { token: descriptor.value, environment };
+  };
 }
 
 function normalizeEnabledConfig(config) {
@@ -165,11 +207,16 @@ function normalizeEnabledConfig(config) {
   ) {
     throw invalidConfig("GitHub 动作超时时间无效");
   }
+  const enabledActionsSource = dataProperty(githubActions, "enabledActions");
+  const enabledActions = normalizeEnabledActions(enabledActionsSource);
 
   return Object.freeze({
     actorAccountId,
     ghCommand,
     tokenEnv,
+    enabledActions,
+    reviewEnabled:
+      enabledActionsSource === undefined || enabledActions.includes("review"),
     networkEnv: normalizeNetworkEnv(dataProperty(githubActions, "networkEnv")),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
@@ -261,6 +308,32 @@ function normalizeLocalExecutors(dependencies) {
   return Object.freeze(executors);
 }
 
+function normalizePullRequestExternalExecutors(enabledConfig, dependencies) {
+  const actions = enabledConfig?.enabledActions || [];
+  if (actions.length === 0) return Object.freeze({});
+
+  const configured = dataProperty(
+    dependencies,
+    "pullRequestExternalActionExecutor",
+  );
+  if (configured === undefined || configured === null) {
+    throw invalidConfig(
+      "已启用的 GitHub PR 动作缺少固定语义执行器",
+    );
+  }
+  const executor = assertPort(
+    configured,
+    ["execute", "reconcile"],
+    "pullRequestExternalActionExecutor",
+  );
+  return Object.freeze(Object.fromEntries(
+    actions.map((action) => [
+      PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS[action],
+      executor,
+    ]),
+  ));
+}
+
 function createQueueFacade(queue, methods) {
   const facade = {};
   for (const method of methods) {
@@ -336,21 +409,27 @@ function closeOnce(guard) {
 export async function createConfirmationRuntime(config, dependencies = {}) {
   const enabledConfig = normalizeEnabledConfig(config);
   const localExecutors = normalizeLocalExecutors(dependencies);
-  if (!enabledConfig && Object.keys(localExecutors).length === 0) return null;
+  const pullRequestExternalExecutors = normalizePullRequestExternalExecutors(
+    enabledConfig,
+    dependencies,
+  );
+  if (
+    !enabledConfig &&
+    Object.keys(localExecutors).length === 0 &&
+    Object.keys(pullRequestExternalExecutors).length === 0
+  ) return null;
 
   const factories = validateDependencies(dependencies);
   const actionAdmissionGate = runtimeAdmissionGate(dependencies);
   const inputAuthorityVerifier = runtimeInputAuthorityVerifier(dependencies);
   let githubExecutorOptions = null;
-  if (enabledConfig) {
-    const configuredEnvironment = dataProperty(dependencies, "env");
-    const environment =
-      configuredEnvironment === undefined ? process.env : configuredEnvironment;
-    const token = configuredToken(environment, enabledConfig.tokenEnv);
+  if (enabledConfig?.reviewEnabled) {
     githubExecutorOptions = {
       ghCommand: enabledConfig.ghCommand,
-      token,
-      env: environment,
+      credentialProvider: githubCredentialProvider(
+        dependencies,
+        enabledConfig.tokenEnv,
+      ),
       networkEnv: enabledConfig.networkEnv,
       ...(inputAuthorityVerifier === null
         ? {}
@@ -361,6 +440,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     };
   }
   const dataDirectory = runtimeDataDirectory(dependencies);
+  const clock = dataProperty(dependencies, "clock");
   const configuredStore = dataProperty(dependencies, "store");
   const store = assertPort(
     configuredStore === undefined
@@ -389,6 +469,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           "github.work-proposal-review": githubExecutor,
         }
       : {}),
+    ...pullRequestExternalExecutors,
     ...localExecutors,
   };
   const executors = Object.freeze(
@@ -412,13 +493,15 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   const close = closeOnce(guard);
 
   try {
+    const queueOptions = {
+      store,
+      executor,
+      operationQueue,
+      exclusiveLease: guard,
+      ...(clock === undefined ? {} : { clock }),
+    };
     const queue = assertPort(
-      factories.createQueue({
-        store,
-        executor,
-        operationQueue,
-        exclusiveLease: guard,
-      }),
+      factories.createQueue(queueOptions),
       [
         "recover",
         ...new Set([
@@ -426,6 +509,8 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           ...HISTORY_READER_METHODS,
           ...PRODUCER_QUEUE_METHODS,
           ...APPLICATION_RESULT_SOURCE_METHODS,
+          ...MEMORY_PROJECTION_SOURCE_METHODS,
+          ...RECOVERY_STATUS_READER_METHODS,
         ]),
       ],
       "queue",
@@ -443,6 +528,14 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       applicationResultSource: createQueueFacade(
         queue,
         APPLICATION_RESULT_SOURCE_METHODS,
+      ),
+      memoryProjectionSource: createQueueFacade(
+        queue,
+        MEMORY_PROJECTION_SOURCE_METHODS,
+      ),
+      recoveryStatusReader: createQueueFacade(
+        queue,
+        RECOVERY_STATUS_READER_METHODS,
       ),
       close,
     });

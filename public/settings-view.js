@@ -58,7 +58,15 @@ function scalarEditKind(value) {
 }
 
 function resolvedFieldDescriptor(path, value, context) {
-  const descriptor = configurationFieldDescriptor(path, value);
+  const providerKind =
+    path[0] === "brainProviders" && path.length >= 3
+      ? context?.providerKinds?.[path[1]]
+      : null;
+  const descriptor = configurationFieldDescriptor(
+    path,
+    value,
+    providerKind ? { providerKind } : null,
+  );
   if (descriptor.optionsFrom === undefined) return descriptor;
   if (descriptor.optionsFrom !== "brainProviders") {
     throw new TypeError(`unsupported configuration option source: ${descriptor.optionsFrom}`);
@@ -170,7 +178,12 @@ function renderField(path, value, context, { template = false } = {}) {
     }
     const editKind = descriptor.control === "env-reference" ? "text" : descriptor.kind;
     const readOnly = descriptor.readOnly ? ' readonly aria-readonly="true"' : "";
-    return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="${type}" value="${escapeHtml(value ?? "")}" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(editKind)}"${readOnly}></label>`;
+    const range = [
+      descriptor.minimum === undefined ? "" : ` min="${descriptor.minimum}"`,
+      descriptor.maximum === undefined ? "" : ` max="${descriptor.maximum}"`,
+      descriptor.kind === "integer" ? ' step="1"' : "",
+    ].join("");
+    return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="${type}" value="${escapeHtml(value ?? "")}" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(editKind)}"${range}${readOnly}></label>`;
   }
   const issue = context.issues.get(pathText(path));
   const accessibility = fieldAccessibility(path, issue, context);
@@ -225,6 +238,20 @@ function addTemplate(path, descriptor, context, variant = null) {
     descriptor.kind === "map"
       ? `<label class="configuration-structured-field"><span>新条目标识</span><input type="text" value="${escapeHtml(template.key)}" data-configuration-template-key></label>`
       : "";
+  const templateContext =
+    path.length === 1 &&
+    path[0] === "brainProviders" &&
+    template.value !== null &&
+    typeof template.value === "object" &&
+    typeof template.value.kind === "string"
+      ? {
+          ...context,
+          providerKinds: {
+            ...context.providerKinds,
+            [template.key]: template.value.kind,
+          },
+        }
+      : context;
   return `<details class="configuration-structure-template" data-configuration-structure-template="${pathAttribute(path)}" data-configuration-template-value-root="${pathAttribute(valueRoot)}"${templateVariant}>
     <summary>新增${escapeHtml(label)}</summary>
     <div class="configuration-structure-template-fields">
@@ -232,7 +259,7 @@ function addTemplate(path, descriptor, context, variant = null) {
       ${renderTemplateValue(
         template.value,
         valueRoot,
-        context,
+        templateContext,
       )}
       ${operationButton(
         "add",
@@ -423,6 +450,12 @@ export function renderConfigurationSettingsSkeleton(options) {
     issues: issueIndex(materialized.issues),
     firstInvalidRendered: false,
     providerIds: Object.keys(configuration.brainProviders),
+    providerKinds: Object.fromEntries(
+      Object.entries(configuration.brainProviders).map(([id, provider]) => [
+        id,
+        provider.kind,
+      ]),
+    ),
   };
   const groups = CONFIGURATION_FORM_GROUPS.map((group) => {
     const content = group.roots

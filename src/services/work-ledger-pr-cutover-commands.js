@@ -165,6 +165,9 @@ function definitivelySettledBlocked(item, outboxById) {
   if (item.statusReason === "pr_source_cross_root_cutover_retired") {
     return true;
   }
+  if (item.statusReason === "decision_attempts_exhausted") {
+    return true;
+  }
   if (
     item.statusReason === "attention_rejected" &&
     item.decisionContext?.source === "attention" &&

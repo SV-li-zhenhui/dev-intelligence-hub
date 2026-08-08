@@ -48,10 +48,10 @@ function reviewEnvelope(overrides = {}) {
     idempotencyKey: `confirmation-${"a".repeat(64)}`,
     kind: "github.pull-request-review",
     requestedBy: { roleId: "pr-reviewer", workItemId: "pr-work-42" },
-    actor: { provider: "github", accountId: "SV-li-zhenhui" },
+    actor: { provider: "github", accountId: "local-owner" },
     target: {
       provider: "github",
-      resourceId: "SVisions/OCT-Software#42",
+      resourceId: "acme/command-center#42",
       version: HEAD,
     },
     action,
@@ -83,7 +83,7 @@ function workProposalEnvelope(overrides = {}) {
   const inputBinding = {
     schemaVersion: 2,
     kind: "pull_request",
-    repository: "SVisions/OCT-Software",
+    repository: "acme/command-center",
     pullRequestNumber: 42,
     rootItemId: "pr-work-42",
     workKey: "github:dashboard:oct:42",
@@ -96,11 +96,11 @@ function workProposalEnvelope(overrides = {}) {
     gitTarget: {
       schemaVersion: 1,
       provider: "github",
-      sourceAccountId: "sv-li-zhenhui",
-      baseRepository: "SVisions/OCT-Software",
+      sourceAccountId: "local-owner",
+      baseRepository: "acme/command-center",
       baseRefName: "main",
       baseRefOid: BASE_HEAD,
-      headRepository: "contributor/OCT-Software",
+      headRepository: "contributor/command-center",
       headRefName: "fix/conflict",
       headRefOid: HEAD,
     },
@@ -143,7 +143,7 @@ class FakeRunner {
   }
 }
 
-function actor(login = "SV-li-zhenhui") {
+function actor(login = "local-owner") {
   return { login };
 }
 
@@ -163,9 +163,9 @@ function markerFromPost(call) {
 function commentReviewRecord(marker, overrides = {}) {
   return {
     id: 9001,
-    html_url: "https://github.com/SVisions/OCT-Software/pull/42#pullrequestreview-9001",
+    html_url: "https://github.com/acme/command-center/pull/42#pullrequestreview-9001",
     submitted_at: "2026-08-02T01:00:01Z",
-    user: { login: "SV-li-zhenhui" },
+    user: { login: "local-owner" },
     body: `Please check.\n\n${marker}`,
     state: "COMMENTED",
     commit_id: HEAD,
@@ -176,9 +176,9 @@ function commentReviewRecord(marker, overrides = {}) {
 function reviewRecord(marker, overrides = {}) {
   return {
     id: 8001,
-    html_url: "https://github.com/SVisions/OCT-Software/pull/42#pullrequestreview-8001",
+    html_url: "https://github.com/acme/command-center/pull/42#pullrequestreview-8001",
     submitted_at: "2026-08-02T01:00:01Z",
-    user: { login: "SV-li-zhenhui" },
+    user: { login: "local-owner" },
     body: `Reviewed the error path.\n\n${marker}`,
     state: "APPROVED",
     commit_id: HEAD,
@@ -243,12 +243,12 @@ test("work proposal reviews use the same sealed GitHub review protocol", async (
 test("work proposal reviews verify the full sealed Git target at execution time", async () => {
   const currentTarget = {
     number: 42,
-    url: "https://github.com/SVisions/OCT-Software/pull/42",
+    url: "https://github.com/acme/command-center/pull/42",
     baseRefName: "main",
     baseRefOid: BASE_HEAD,
     headRefName: "fix/conflict",
     headRefOid: HEAD,
-    headRepository: { nameWithOwner: "contributor/OCT-Software" },
+    headRepository: { nameWithOwner: "contributor/command-center" },
   };
   const matchingVerifier = acceptingInputAuthorityVerifier();
   const matching = new FakeRunner([actor(), pages([]), currentTarget]);
@@ -280,12 +280,12 @@ test("work proposal reviews verify the full sealed Git target at execution time"
 test("work proposal execution rechecks ledger authority and the full target before POST", async () => {
   const currentTarget = {
     number: 42,
-    url: "https://github.com/SVisions/OCT-Software/pull/42",
+    url: "https://github.com/acme/command-center/pull/42",
     baseRefName: "main",
     baseRefOid: BASE_HEAD,
     headRefName: "fix/conflict",
     headRefOid: HEAD,
-    headRepository: { nameWithOwner: "contributor/OCT-Software" },
+    headRepository: { nameWithOwner: "contributor/command-center" },
   };
   const verifier = acceptingInputAuthorityVerifier();
   const runner = new FakeRunner([
@@ -392,6 +392,62 @@ test("every GitHub call uses one fixed token, absolute executable, and minimal e
   }
 });
 
+test("lazy credentials are read only when an action runs and absence makes no GitHub call", async () => {
+  let reads = 0;
+  const runner = new FakeRunner();
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialProvider() {
+      reads += 1;
+      return null;
+    },
+  });
+
+  assert.equal(reads, 0);
+  assert.deepEqual(await adapter.reconcile(reviewEnvelope()), {
+    status: "error",
+    error: { code: "GITHUB_CREDENTIAL_MISSING", trust: "absent" },
+  });
+  assert.equal(reads, 1);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("one Review execution seals one lazy credential across every GitHub call", async () => {
+  let reads = 0;
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    head(),
+    actor(),
+    head(),
+    (input) => {
+      const marker = markerFromPost(input);
+      return reviewRecord(marker, {
+        body: `${reviewEnvelope().action.body}\n\n${marker}`,
+      });
+    },
+  ]);
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialProvider() {
+      reads += 1;
+      return {
+        token: `operation_token_${reads}`,
+        environment: { SystemRoot: "C:\\Windows" },
+      };
+    },
+  });
+
+  assert.equal((await adapter.execute(reviewEnvelope())).status, "applied");
+  assert.equal(reads, 1);
+  assert.equal(runner.calls.length, 6);
+  for (const call of runner.calls) {
+    assert.equal(call.env.GH_TOKEN, "operation_token_1");
+  }
+});
+
 test("reconciliation finds one exact COMMENT review marker across paginated results", async () => {
   const marker = markerForGitHubAction(commentEnvelope());
   const runner = new FakeRunner([
@@ -409,7 +465,7 @@ test("reconciliation finds one exact COMMENT review marker across paginated resu
   assert.equal(result.status, "already");
   assert.deepEqual(result.receipt, {
     id: "9001",
-    url: "https://github.com/SVisions/OCT-Software/pull/42",
+    url: "https://github.com/acme/command-center/pull/42",
     createdAt: "2026-08-02T01:00:01.000Z",
   });
   assert.deepEqual(runner.calls[1].args, [
@@ -418,7 +474,7 @@ test("reconciliation finds one exact COMMENT review marker across paginated resu
     "github.com",
     "--method",
     "GET",
-    "repos/SVisions/OCT-Software/pulls/42/reviews?per_page=100",
+    "repos/acme/command-center/pulls/42/reviews?per_page=100",
     "--paginate",
     "--jq",
     `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
@@ -444,10 +500,10 @@ test("copied, conflicting, or duplicate markers fail closed", async () => {
 test("a GitHub receipt must identify the exact PR and review record", async () => {
   const marker = markerForGitHubAction(reviewEnvelope());
   for (const html_url of [
-    "https://github.com/SVisions/OCT-Software/pull/43#pullrequestreview-8001",
-    "https://github.com/SVisions/OCT-Software/pull/42#pullrequestreview-9999",
+    "https://github.com/acme/command-center/pull/43#pullrequestreview-8001",
+    "https://github.com/acme/command-center/pull/42#pullrequestreview-9999",
     "https://github.com/other/repo/pull/42#pullrequestreview-8001",
-    "https://github.com:444/SVisions/OCT-Software/pull/42#pullrequestreview-8001",
+    "https://github.com:444/acme/command-center/pull/42#pullrequestreview-8001",
   ]) {
     const runner = new FakeRunner([
       actor(),
@@ -486,7 +542,7 @@ test("reconciliation reports absence only after marker and current head checks",
   assert.deepEqual(runner.calls[2].args, [
     "pr",
     "view",
-    "https://github.com/SVisions/OCT-Software/pull/42",
+    "https://github.com/acme/command-center/pull/42",
     "--json",
     "headRefOid",
   ]);
@@ -531,7 +587,7 @@ test("COMMENT review execution keeps arbitrary body text off process argv", asyn
     "github.com",
     "--method",
     "POST",
-    "repos/SVisions/OCT-Software/pulls/42/reviews",
+    "repos/acme/command-center/pulls/42/reviews",
     "--input",
     "-",
   ]);
@@ -570,7 +626,7 @@ test("review execution pins the exact commit and allowed event", async () => {
     "github.com",
     "--method",
     "POST",
-    "repos/SVisions/OCT-Software/pulls/42/reviews",
+    "repos/acme/command-center/pulls/42/reviews",
     "--input",
     "-",
   ]);

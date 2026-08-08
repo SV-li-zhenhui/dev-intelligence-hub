@@ -19,13 +19,19 @@ function textValue(message) {
 }
 
 export class DingTalkAdapter {
-  async collect(since) {
+  constructor({ run = runJson, runText = runCommand } = {}) {
+    this.run = run;
+    this.runText = runText;
+  }
+
+  async collect(since, { signal = null } = {}) {
     const now = new Date();
     const start = since ? new Date(since) : new Date(now.getTime() - 3_600_000);
+    const commandOptions = signal === null ? {} : { signal };
     const [unread, mentions, todos] = await Promise.allSettled([
-      this.unreadConversations(),
-      this.mentions(start, now),
-      this.todos(),
+      this.unreadConversations(commandOptions),
+      this.mentions(start, now, commandOptions),
+      this.todos(commandOptions),
     ]);
     const errors = [];
     const value = (result, label) => {
@@ -43,14 +49,14 @@ export class DingTalkAdapter {
     };
   }
 
-  async unreadConversations() {
-    const data = await runJson("dws", [
+  async unreadConversations(options = {}) {
+    const data = await this.run("dws", [
       "chat",
       "message",
       "list-unread-conversations",
       "--format",
       "json",
-    ]);
+    ], options);
     return (data.result?.conversations || []).map((conversation) => ({
       id: `dingtalk:conversation:${conversation.openConversationId}`,
       kind: "conversation",
@@ -62,8 +68,8 @@ export class DingTalkAdapter {
     }));
   }
 
-  async mentions(start, end) {
-    const data = await runJson("dws", [
+  async mentions(start, end, options = {}) {
+    const data = await this.run("dws", [
       "chat",
       "message",
       "search-advanced",
@@ -76,7 +82,7 @@ export class DingTalkAdapter {
       "50",
       "--format",
       "json",
-    ]);
+    ], options);
     const messages = data.result?.messages || data.result?.list || [];
     return messages.map((message, index) => {
       const id =
@@ -102,8 +108,8 @@ export class DingTalkAdapter {
     });
   }
 
-  async todos() {
-    const data = await runJson("dws", [
+  async todos(options = {}) {
+    const data = await this.run("dws", [
       "todo",
       "task",
       "list",
@@ -115,7 +121,7 @@ export class DingTalkAdapter {
       "false",
       "--format",
       "json",
-    ]);
+    ], options);
     return (data.result?.todoCards || []).map((todo) => ({
       id: `dingtalk:todo:${todo.taskId}`,
       kind: "todo",
@@ -132,8 +138,8 @@ export class DingTalkAdapter {
     }));
   }
 
-  async notifySelf(userId, title, message) {
-    await runCommand(
+  async notifySelf(userId, title, message, options = {}) {
+    await this.runText(
       "dws",
       [
         "chat",
@@ -148,7 +154,7 @@ export class DingTalkAdapter {
         "--format",
         "json",
       ],
-      { timeoutMs: 60_000 },
+      { timeoutMs: 60_000, ...options },
     );
   }
 }

@@ -14,6 +14,7 @@ import {
   safeAttentionInteger,
 } from "../domain/attention-contract.js";
 
+export const ATTENTION_INBOX_STATE_KEY = "attention-inbox";
 const MAX_ITEMS = 1_000;
 const MAX_OUTBOX_ITEMS = 1_000;
 const MAX_STATE_BYTES = 16 * 1024 * 1024;

@@ -38,6 +38,7 @@ import { sameCodeExecutionSource } from "../domain/code-execution-source.js";
 import {
   normalizeChangePackageManifest,
 } from "../domain/change-package-contract.js";
+import { normalizeChangePackageControlledCommitReceipt } from "../domain/change-package-controlled-commit.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
 
 export const CODE_JOB_STATE_KEY = "code-job-state";
@@ -727,6 +728,9 @@ function assertMemoryProjectionExtension(current, durable) {
 function normalizeChangePackageAcknowledgement(value, error, {
   delivered = false,
 } = {}) {
+  const hasControlledCommit = value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    Object.hasOwn(value, "controlledCommit");
   const keys = [
     "sequence",
     "eventId",
@@ -735,6 +739,7 @@ function normalizeChangePackageAcknowledgement(value, error, {
     "sourceRecordDigest",
     "packageId",
     "packageDigest",
+    ...(hasControlledCommit ? ["controlledCommit"] : []),
     ...(delivered ? ["deliveredAt"] : []),
   ];
   assertExactKeys(value, keys, error);
@@ -758,6 +763,19 @@ function normalizeChangePackageAcknowledgement(value, error, {
     sourceRecordDigest: normalizeSha256(value.sourceRecordDigest, error),
     packageId: value.packageId,
     packageDigest,
+    ...(hasControlledCommit
+      ? {
+          controlledCommit: (() => {
+            try {
+              return normalizeChangePackageControlledCommitReceipt(
+                value.controlledCommit,
+              );
+            } catch {
+              throw error;
+            }
+          })(),
+        }
+      : {}),
     ...(delivered
       ? { deliveredAt: normalizeCodeJobTimestamp(value.deliveredAt, error) }
       : {}),
@@ -923,12 +941,14 @@ function changePackageEventMatchesJob(event, job) {
       memory.sourceRecordDigest === event.job.recordDigest);
   const completion = job.execution.observations.at(-1);
   const conflictSourceMatches = job.grant.schemaVersion === 3
-    ? event.schemaVersion === 2 &&
+    ? [2, 3].includes(event.schemaVersion) &&
       Object.hasOwn(event, "executionSource") &&
       sameCodeExecutionSource(
         event.executionSource,
         job.grant.executionSource,
-      )
+      ) &&
+      (event.schemaVersion !== 3 ||
+        event.recordedAt === completion?.recordedAt)
     : event.schemaVersion === 1 &&
       !Object.hasOwn(event, "executionSource");
   return (
@@ -952,12 +972,13 @@ function deliveredChangePackageMatchesJob(entry, job) {
       sequence: entry.receipt.sequence,
       previousDigest: entry.previousDigest,
       job,
-    });
+    }, { expectedEventDigest: entry.receipt.eventDigest });
     return (
       changePackageEventMatchesJob(event, job) &&
       pendingChangePackageAcknowledgement(
         event,
         deliveredAcknowledgement(entry.receipt),
+        { allowLegacy: true },
       )
     );
   } catch {
@@ -1229,6 +1250,10 @@ function normalizeState(value, limits) {
     if (error?.code === "CODE_JOB_STATE_CORRUPTED") throw error;
     throw corruptedState(error);
   }
+}
+
+export function normalizeCodeJobStoreState(value, limits = {}) {
+  return normalizeState(value, normalizeLimits(limits));
 }
 
 function normalizeJobId(
@@ -1567,6 +1592,17 @@ function deliveryReceiptForBrowser(entry) {
         packageId: entry.receipt.packageId,
         packageDigest: entry.receipt.packageDigest,
         deliveredAt: entry.receipt.deliveredAt,
+        ...(entry.receipt.controlledCommit === undefined
+          ? {}
+          : {
+              controlledCommit: {
+                receiptId: entry.receipt.controlledCommit.receiptId,
+                receiptDigest: entry.receipt.controlledCommit.receiptDigest,
+                evidenceId: entry.receipt.controlledCommit.evidenceId,
+                evidenceDigest: entry.receipt.controlledCommit.evidenceDigest,
+                commitOid: entry.receipt.controlledCommit.commitOid,
+              },
+            }),
       };
 }
 
@@ -1636,14 +1672,32 @@ function changePackageAcknowledgementResult(status, delivery) {
   });
 }
 
-function pendingChangePackageAcknowledgement(event, request) {
-  return (
+function pendingChangePackageAcknowledgement(
+  event,
+  request,
+  { allowLegacy = false } = {},
+) {
+  const baseMatches =
     request.sequence === event.sequence &&
     request.eventId === event.eventId &&
     request.eventDigest === event.eventDigest &&
     request.jobId === event.job.id &&
-    request.sourceRecordDigest === event.job.recordDigest
-  );
+    request.sourceRecordDigest === event.job.recordDigest;
+  if (!baseMatches) return false;
+  if (event.schemaVersion === 2) {
+    return allowLegacy && request.controlledCommit === undefined;
+  }
+  if (event.schemaVersion === 1) {
+    return request.controlledCommit === undefined;
+  }
+  const receipt = request.controlledCommit;
+  return receipt !== undefined &&
+    receipt.eventId === event.eventId &&
+    receipt.eventDigest === event.eventDigest &&
+    receipt.packageId === request.packageId &&
+    receipt.packageDigest === request.packageDigest &&
+    receipt.executionSourceDigest === digestValue(event.executionSource) &&
+    receipt.recordedAt === event.recordedAt;
 }
 
 function deliveredAcknowledgement(receipt) {
@@ -2494,6 +2548,49 @@ function assertTombstoneMatchesManifest(tombstone, manifest) {
     throw corruptedArchive();
   }
   return bindings;
+}
+
+export function normalizeCodeJobArchiveTombstoneRecord(value, options) {
+  const error = corruptedArchive();
+  try {
+    assertExactKeys(options, ["storageKey", "manifest"], error);
+    const tombstone = normalizeArchiveTombstone(value);
+    if (options.storageKey !== archiveRecordKey(tombstone.jobId)) throw error;
+    const manifest = normalizeArchiveManifest(options.manifest, error);
+    const bindings = assertTombstoneMatchesManifest(tombstone, manifest);
+    return Object.freeze({
+      tombstone,
+      bindings: Object.freeze(bindings),
+    });
+  } catch (cause) {
+    if (cause?.code === "CODE_JOB_ARCHIVE_CORRUPTED") throw cause;
+    throw corruptedArchive(cause);
+  }
+}
+
+export function normalizeCodeJobArchiveIndexRecord(value, options) {
+  const error = corruptedArchive();
+  try {
+    assertExactKeys(options, ["storageKey", "tombstone"], error);
+    const tombstone = normalizeArchiveTombstone(options.tombstone);
+    const bindings = archiveBindingValuesFromTombstone(tombstone);
+    const kinds = ARCHIVE_BINDING_KINDS.filter(
+      (kind) => archiveIndexKey(kind, bindings[kind]) === options.storageKey,
+    );
+    if (kinds.length !== 1) throw error;
+    const kind = kinds[0];
+    const index = normalizeArchiveIndex(value, kind, bindings[kind]);
+    if (
+      index.jobId !== tombstone.jobId ||
+      index.tombstoneDigest !== tombstone.tombstoneDigest
+    ) {
+      throw error;
+    }
+    return Object.freeze({ kind, index });
+  } catch (cause) {
+    if (cause?.code === "CODE_JOB_ARCHIVE_CORRUPTED") throw cause;
+    throw corruptedArchive(cause);
+  }
 }
 
 function prepareArchiveEntry(state, archive, job, revision, limits) {

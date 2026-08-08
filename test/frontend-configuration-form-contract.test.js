@@ -13,7 +13,7 @@ import { renderConfigurationSettingsSkeleton } from "../public/settings-view.js"
 const [supportSource, settingsSource, currentConfigurationText] = await Promise.all([
   readFile(new URL("../public/configuration-form-support.js", import.meta.url), "utf8"),
   readFile(new URL("../public/settings-view.js", import.meta.url), "utf8"),
-  readFile(new URL("../config.json", import.meta.url), "utf8"),
+  readFile(new URL("../config.example.json", import.meta.url), "utf8"),
 ]);
 
 function configurationWithCredentialReferences() {
@@ -57,6 +57,18 @@ function configurationWithResponsesProvider() {
   return configuration;
 }
 
+function configurationWithCliProvider() {
+  const configuration = configurationWithCredentialReferences();
+  configuration.brainProviders["employee-cli"] = {
+    kind: "codex-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  return configuration;
+}
+
 function configurationWithScalarConditions() {
   const configuration = configurationWithCredentialReferences();
   configuration.workflowRouting.rules[0].fallback = false;
@@ -77,6 +89,12 @@ function configurationWithRemoteBrains() {
   };
   configuration.employees.roles.developer.brain.provider = "remote.openai";
   configuration.employees.roles.developer.brain.model = "gpt-5-mini";
+  configuration.memory.answering.brain = structuredClone(
+    configuration.employees.roles.developer.brain,
+  );
+  configuration.memory.answering.localBrain = structuredClone(
+    configuration.employees.roles.developer.brain,
+  );
   configuration.memory.answering.brain.provider = "remote.openai";
   configuration.memory.answering.brain.model = "gpt-5-mini";
   configuration.memory.answering.localBrain.provider = "remote.openai";
@@ -219,7 +237,7 @@ test("settings skeleton overlays valid edits and preserves invalid raw input", (
   state = setConfigurationFormField(state, {
     path: ["githubLogin"],
     kind: "text",
-    rawValue: "SV-li-zhenhui-next",
+    rawValue: "local-owner-next",
   });
   state = setConfigurationFormField(state, {
     path: ["refreshMinutes"],
@@ -230,12 +248,43 @@ test("settings skeleton overlays valid edits and preserves invalid raw input", (
   const markup = renderConfigurationSettingsSkeleton({ state });
   assert.match(
     markup,
-    /value="SV-li-zhenhui-next" data-configuration-field="\[&quot;githubLogin&quot;\]"/,
+    /value="local-owner-next" data-configuration-field="\[&quot;githubLogin&quot;\]"/,
   );
   assert.match(
     markup,
     /value="" data-configuration-field="\[&quot;refreshMinutes&quot;\]"/,
   );
+});
+
+test("CLI provider controls and templates render exact process limits", () => {
+  const state = createConfigurationFormState(configurationWithCliProvider());
+  const markup = renderConfigurationSettingsSkeleton({ state });
+
+  const timeout = controlForPath(markup, [
+    "brainProviders",
+    "employee-cli",
+    "timeoutMs",
+  ]);
+  assert.match(timeout, / min="1000"/);
+  assert.match(timeout, / max="3600000"/);
+
+  for (const field of ["maxResponseBytes", "maxRequestBytes"]) {
+    const control = controlForPath(markup, [
+      "brainProviders",
+      "employee-cli",
+      field,
+    ]);
+    assert.match(control, / min="1024"/, field);
+    assert.match(control, / max="1048576"/, field);
+  }
+
+  const templateTimeout = templateControlForPath(markup, [
+    "brainProviders",
+    "codex-cli",
+    "timeoutMs",
+  ]);
+  assert.match(templateTimeout, / min="1000"/);
+  assert.match(templateTimeout, / max="3600000"/);
 });
 
 test("credential controls render only environment variable names and explain the boundary", () => {

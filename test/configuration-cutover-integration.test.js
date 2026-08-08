@@ -17,7 +17,7 @@ import {
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
-  await readFile(path.join(projectRoot, "config.json"), "utf8"),
+  await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 
 function memoryStore({ failCompletedConfirmationOnce = false } = {}) {
@@ -297,4 +297,90 @@ test("active application confirms v2 then restarts and confirms an append-only r
   assert.equal(third.config.refreshMinutes, baseConfiguration.refreshMinutes);
   assert.equal(gates[2].readStatus().mode, "ready");
   await third.close();
+});
+
+test("a second configuration confirmation from the old runtime baseline becomes stale", async () => {
+  const store = memoryStore();
+  const gates = [];
+  const baseConfiguration = createSafeDisabledConfiguration(
+    committedConfiguration,
+  );
+  const applicationOptions = {
+    store,
+    versionedConfiguration: true,
+    configBootstrapLoader: async () => ({
+      candidate: baseConfiguration,
+      fallbackConfiguration: baseConfiguration,
+      bootstrapError: null,
+    }),
+    actionAdmissionGateFactory() {
+      const gate = new ActionAdmissionGate();
+      gates.push(gate);
+      return gate;
+    },
+    configurationRuntimeDependencies: { createGuard: guard },
+    confirmationRuntimeDependencies: { createGuard: guard },
+    workflowRoutingDependencies: { createGuard: guard },
+    memoryRuntimeDependencies: { createGuard: guard },
+  };
+
+  const first = await createApplication(applicationOptions);
+  const configurationA = structuredClone(baseConfiguration);
+  configurationA.refreshMinutes += 1;
+  const configurationB = structuredClone(baseConfiguration);
+  configurationB.browserPollSeconds += 1;
+  const draftA = await first.configuration.draftManager.createDraft({
+    configuration: configurationA,
+    expectedStateRevision: 1,
+    proposedBy: "owner:local",
+  });
+  const draftB = await first.configuration.draftManager.createDraft({
+    configuration: configurationB,
+    expectedStateRevision: 2,
+    proposedBy: "owner:local",
+  });
+  const confirmationA = await first.configuration.confirmationRequester
+    .requestDraftActivation({
+      draftId: draftA.draftId,
+      draftRevision: draftA.revision,
+      expectedStateRevision: 3,
+      expectedActiveVersion: 1,
+    });
+  const confirmationB = await first.configuration.confirmationRequester
+    .requestDraftActivation({
+      draftId: draftB.draftId,
+      draftRevision: draftB.revision,
+      expectedStateRevision: 3,
+      expectedActiveVersion: 1,
+    });
+
+  const currentA = await first.confirmationQueue.get(confirmationA.id);
+  const activated = await first.confirmationQueue.approve(
+    currentA.id,
+    approval(currentA, "configuration-first-old-baseline"),
+  );
+  assert.equal(activated.status, "completed");
+  assert.equal(gates[0].readStatus().mode, "restart_required");
+
+  const currentB = await first.confirmationQueue.get(confirmationB.id);
+  const superseded = await first.confirmationQueue.approve(
+    currentB.id,
+    approval(currentB, "configuration-second-old-baseline"),
+  );
+  assert.equal(superseded.status, "stale");
+  assert.equal(superseded.retryable, false);
+  assert.equal(
+    (await first.configuration.reader.readSnapshot()).activeVersion,
+    2,
+  );
+  await first.close();
+
+  const restarted = await createApplication(applicationOptions);
+  assert.equal(
+    (await restarted.confirmationQueue.get(confirmationB.id)).status,
+    "stale",
+  );
+  assert.equal(restarted.configuration.status.activeVersion, 2);
+  assert.equal(gates[1].readStatus().mode, "ready");
+  await restarted.close();
 });

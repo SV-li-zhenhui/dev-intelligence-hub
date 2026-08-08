@@ -12,6 +12,11 @@ import {
 } from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import {
+  normalizeCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "../domain/code-execution-source.js";
+import { normalizeControlledCommitEvidence } from "../domain/controlled-commit-evidence.js";
+import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
 } from "./work-ledger-pr-source.js";
@@ -66,6 +71,58 @@ const PROPOSAL_STATUSES = new Set([
   "stale",
   "failed",
   "unknown",
+]);
+const ACTIVE_PULL_REQUEST_EVENTS = new Set([
+  "pull_request.observed",
+  "pull_request.created",
+  "pull_request.updated",
+  "pull_request.classified",
+  "pull_request.status",
+]);
+const CONFLICT_PREPARATION_BLOCK_CODES = new Set([
+  "CONTROLLED_GIT_MIRROR_NOT_CONFIGURED",
+  "INVALID_CONFLICT_PREPARATION_INPUT",
+  "INVALID_CONFLICT_PREPARATION_RESULT",
+  "CONFLICT_PREPARATION_VERIFICATION_MISMATCH",
+  "CONTROLLED_GIT_BOUNDARY_INVALID",
+  "CONTROLLED_GIT_BOUNDARY_OVERLAP",
+  "CONTROLLED_GIT_EXECUTABLE_UNTRUSTED",
+  "CONTROLLED_GIT_MULTIPLE_MERGE_BASES",
+  "CONTROLLED_GIT_OBJECT_FORMAT_MISMATCH",
+  "CONTROLLED_GIT_OUTPUT_LIMIT",
+  "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+  "CONTROLLED_GIT_PREPARATION_LIMIT",
+  "CONTROLLED_GIT_PREPARATION_TAMPERED",
+  "CONTROLLED_GIT_PROTOCOL_ERROR",
+  "CONTROLLED_GIT_RESULT_OBJECT_INVALID",
+  "CONTROLLED_GIT_UNRELATED_HISTORY",
+  "CONTROLLED_GIT_UNSUPPORTED_CHANGE",
+  "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
+  "CONTROLLED_GIT_UNSUPPORTED_TREE",
+]);
+const CONFLICT_PREPARATION_STALE_CODES = new Set([
+  "CONFLICT_PREPARATION_INPUT_CHANGED",
+  "CONFLICT_PREPARATION_NOT_CONFLICTED",
+  "CONTROLLED_GIT_BOUNDARY_CHANGED",
+  "CONTROLLED_GIT_EXECUTABLE_CHANGED",
+  "CONTROLLED_GIT_TARGET_CHANGED",
+  "CONTROLLED_GIT_TARGET_UNAVAILABLE",
+]);
+const CONFLICT_PREPARATION_RETRY_CODES = new Set([
+  "CONTROLLED_GIT_CLEANUP_FAILED",
+  "CONTROLLED_GIT_INSPECTION_FAILED",
+  "CONTROLLED_GIT_PREFLIGHT_FAILED",
+  "CONTROLLED_GIT_PREPARATION_ROOT_UNAVAILABLE",
+  "CONTROLLED_GIT_PROCESS_FAILED",
+  "CONTROLLED_GIT_TIMEOUT",
+]);
+const CONTROLLED_COMMIT_EVIDENCE_BLOCK_CODES = new Set([
+  "INVALID_CONTROLLED_COMMIT_EVIDENCE",
+  "CONTROLLED_GIT_COMMIT_LIMIT",
+  "CONTROLLED_GIT_COMMIT_NOT_FOUND",
+  "CONTROLLED_GIT_COMMIT_OBJECT_INVALID",
+  "CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR",
+  "CONTROLLED_GIT_COMMIT_TAMPERED",
 ]);
 
 export class WorkIntentDispatcherError extends Error {
@@ -124,6 +181,11 @@ function validateDependency(value, methods, name) {
   return Object.fromEntries(
     methods.map((method) => [method, value[method].bind(value)]),
   );
+}
+
+function optionalDependency(value, methods, name) {
+  if (value === undefined || value === null) return null;
+  return validateDependency(value, methods, name);
 }
 
 function actionAdmissionRun(value) {
@@ -426,9 +488,127 @@ function proposalInputBindingFor(item) {
   });
 }
 
+function conflictPreparationRequirement(item, intent, inputBinding) {
+  if (intent.type !== "propose_code_action" || intent.operation !== "modify") {
+    return "none";
+  }
+  const event = dataMap(currentWorkItemEvent(item));
+  const payload = dataMap(event?.get("payload"));
+  const dirty = payload?.get("mergeStateStatus") === "DIRTY";
+  const resolveConflict = payload?.get("nextAction") === "resolve_conflict";
+  if (!dirty && !resolveConflict) return "none";
+  if (
+    dirty !== resolveConflict ||
+    !ACTIVE_PULL_REQUEST_EVENTS.has(event?.get("eventType")) ||
+    inputBinding === null ||
+    inputBinding.schemaVersion !== 2
+  ) {
+    return "inconsistent";
+  }
+  return "required";
+}
+
+function preparedExecutionSource(value, inputBinding) {
+  let normalized;
+  try {
+    normalized = normalizeCodeExecutionSource(value);
+  } catch (cause) {
+    throw dispatcherError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 没有返回可信执行源",
+      409,
+      { cause },
+    );
+  }
+  if (
+    normalized.kind !== "conflict_preparation" ||
+    !samePullRequestExecutionBinding(normalized.inputBinding, inputBinding)
+  ) {
+    throw dispatcherError(
+      "CONFLICT_PREPARATION_RESULT_INVALID",
+      "Conflict preparation 执行源与当前 PR 不匹配",
+      409,
+    );
+  }
+  return deepFreeze(normalized);
+}
+
+function conflictPreparationFailure(error) {
+  const code = ownErrorCode(error);
+  if (code && CONFLICT_PREPARATION_STALE_CODES.has(code)) {
+    return { nextStatus: "blocked", code: "conflict-source-stale" };
+  }
+  if (code && CONFLICT_PREPARATION_BLOCK_CODES.has(code)) {
+    return { nextStatus: "blocked", code: "conflict-source-blocked" };
+  }
+  if (code && CONFLICT_PREPARATION_RETRY_CODES.has(code)) {
+    return {
+      nextStatus: "retry_wait",
+      code: "conflict-source-temporarily-unavailable",
+    };
+  }
+  if (code === "CONFLICT_PREPARATION_RESULT_INVALID") {
+    return { nextStatus: "blocked", code: "conflict-source-invalid" };
+  }
+  return null;
+}
+
+function isPullRequestPushIntent(intent) {
+  return intent.type === "propose_github_pull_request_action" &&
+    intent.action.type === "push";
+}
+
+function verifiedControlledCommitEvidence(value, intent, inputBinding) {
+  let normalized;
+  try {
+    normalized = normalizeControlledCommitEvidence(value);
+  } catch (cause) {
+    throw dispatcherError(
+      "CONTROLLED_COMMIT_EVIDENCE_RESULT_INVALID",
+      "受控 commit 读取器没有返回有效证据",
+      409,
+      { cause },
+    );
+  }
+  if (
+    normalized.evidenceId !== intent.action.controlledCommitEvidenceId ||
+    inputBinding === null ||
+    inputBinding.schemaVersion !== 2 ||
+    !samePullRequestExecutionBinding(
+      normalized.executionSource.inputBinding,
+      inputBinding,
+    )
+  ) {
+    throw dispatcherError(
+      "CONTROLLED_COMMIT_EVIDENCE_RESULT_INVALID",
+      "受控 commit 证据与当前 PR 输入或岗位决策不匹配",
+      409,
+    );
+  }
+  return deepFreeze(normalized);
+}
+
+function controlledCommitEvidenceFailure(error) {
+  const code = ownErrorCode(error);
+  if (
+    code === "CONTROLLED_COMMIT_EVIDENCE_RESULT_INVALID" ||
+    (code && CONTROLLED_COMMIT_EVIDENCE_BLOCK_CODES.has(code))
+  ) {
+    return { nextStatus: "blocked", code: "controlled-commit-evidence-invalid" };
+  }
+  return {
+    nextStatus: "retry_wait",
+    code: "controlled-commit-evidence-temporarily-unavailable",
+  };
+}
+
 function assertProposalInputBinding(bound, item, error) {
   if (
-    !["github_review_proposal", "code_action_proposal"].includes(bound.kind)
+    ![
+      "github_review_proposal",
+      "github_pull_request_action_proposal",
+      "code_action_proposal",
+    ].includes(bound.kind)
   ) {
     return;
   }
@@ -447,7 +627,111 @@ function assertProposalInputBinding(bound, item, error) {
   if (!samePullRequestExecutionBinding(actual, expected)) throw error;
 }
 
-function validateBoundIntent(bound, item, intent, requester) {
+function assertPullRequestActionBinding(
+  bound,
+  intent,
+  expectedControlledCommitEvidence,
+  error,
+) {
+  if (bound.kind !== "github_pull_request_action_proposal") return;
+  if (intent.type !== "propose_github_pull_request_action") throw error;
+  let inputBinding;
+  try {
+    inputBinding = normalizePullRequestExecutionBinding(
+      bound.binding.inputBinding,
+    );
+  } catch {
+    throw error;
+  }
+  if (inputBinding.schemaVersion !== 2) throw error;
+  const payload = exactDataMap(bound.payload, [
+    "action",
+    "evidence",
+    "summary",
+    "reason",
+  ]);
+  if (
+    !payload ||
+    payload.get("summary") !== intent.summary ||
+    payload.get("reason") !== intent.reason ||
+    !Array.isArray(payload.get("evidence")) ||
+    payload.get("evidence").length !== intent.evidence.length ||
+    payload.get("evidence").some(
+      (entry, index) => entry !== intent.evidence[index],
+    )
+  ) {
+    throw error;
+  }
+  const action = dataMap(payload.get("action"));
+  if (!action || action.get("type") !== intent.action.type) throw error;
+  if (intent.action.type === "comment") {
+    if (
+      action.size !== 2 ||
+      !action.has("body") ||
+      action.get("body") !== intent.action.body
+    ) {
+      throw error;
+    }
+    return;
+  }
+  if (intent.action.type === "review") {
+    if (
+      action.size !== 3 ||
+      !action.has("verdict") ||
+      !action.has("body") ||
+      action.get("verdict") !== intent.action.verdict ||
+      action.get("body") !== intent.action.body
+    ) {
+      throw error;
+    }
+    return;
+  }
+  if (intent.action.type === "update_branch") {
+    if (action.size !== 1) throw error;
+    return;
+  }
+  if (intent.action.type === "merge") {
+    if (
+      action.size !== 2 ||
+      !action.has("method") ||
+      action.get("method") !== intent.action.method
+    ) {
+      throw error;
+    }
+    return;
+  }
+  if (action.size !== 2 || !action.has("controlledCommitEvidence")) {
+    throw error;
+  }
+  let evidence;
+  try {
+    evidence = normalizeControlledCommitEvidence(
+      action.get("controlledCommitEvidence"),
+    );
+  } catch {
+    throw error;
+  }
+  if (
+    evidence.evidenceId !== intent.action.controlledCommitEvidenceId ||
+    !samePullRequestExecutionBinding(
+      evidence.executionSource.inputBinding,
+      inputBinding,
+    ) ||
+    (expectedControlledCommitEvidence !== undefined &&
+      evidence.evidenceDigest !== expectedControlledCommitEvidence.evidenceDigest)
+  ) {
+    throw error;
+  }
+}
+
+function validateBoundIntent(
+  bound,
+  item,
+  intent,
+  requester,
+  expectedExecutionSource,
+  expectedControlledCommitEvidence,
+) {
   const event = dataMap(currentWorkItemEvent(item));
   const error = dispatcherError(
     "WORK_INTENT_BINDING_INVALID",
@@ -466,6 +750,27 @@ function validateBoundIntent(bound, item, intent, requester) {
       error,
     );
   assertProposalInputBinding(normalized, item, error);
+  assertPullRequestActionBinding(
+    normalized,
+    intent,
+    expectedControlledCommitEvidence,
+    error,
+  );
+  if (expectedExecutionSource !== undefined) {
+    let actual;
+    try {
+      if (
+        normalized.kind !== "code_action_proposal" ||
+        !Object.hasOwn(normalized.binding, "executionSource")
+      ) {
+        throw error;
+      }
+      actual = normalizeCodeExecutionSource(normalized.binding.executionSource);
+    } catch {
+      throw error;
+    }
+    if (!sameCodeExecutionSource(actual, expectedExecutionSource)) throw error;
+  }
   return deepFreeze(normalized);
 }
 
@@ -631,6 +936,8 @@ export class WorkIntentDispatcher {
   #admitAction;
   #createAttention;
   #createProposal;
+  #prepareConflictExecutionSource;
+  #verifyControlledCommitEvidence;
   #clock;
   #dispatcherId;
   #leaseDurationMs;
@@ -641,6 +948,8 @@ export class WorkIntentDispatcher {
     policy,
     attentionProducer,
     proposalProducer,
+    conflictExecutionSourcePreparer,
+    controlledCommitEvidenceReader,
     actionAdmissionGate,
     clock = () => new Date(),
     dispatcherId = "work-intent-dispatcher",
@@ -664,6 +973,16 @@ export class WorkIntentDispatcher {
       ["create"],
       "proposalProducer",
     ).create;
+    this.#prepareConflictExecutionSource = optionalDependency(
+      conflictExecutionSourcePreparer,
+      ["prepare"],
+      "conflictExecutionSourcePreparer",
+    )?.prepare ?? null;
+    this.#verifyControlledCommitEvidence = optionalDependency(
+      controlledCommitEvidenceReader,
+      ["verify"],
+      "controlledCommitEvidenceReader",
+    )?.verify ?? null;
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.#clock = clock;
     this.#dispatcherId = validateDispatcherId(dispatcherId);
@@ -905,10 +1224,100 @@ export class WorkIntentDispatcher {
       );
     }
 
+    const inputBinding = proposalInputBindingFor(item);
+    const conflictRequirement = conflictPreparationRequirement(
+      item,
+      claimed.intent,
+      inputBinding,
+    );
+    if (conflictRequirement === "inconsistent") {
+      return this.#ackFailure(claimed, item, {
+        nextStatus: "blocked",
+        code: "conflict-facts-inconsistent",
+      });
+    }
+
     let bound;
     if (persisted !== null) {
       bound = persisted.bound;
+      const hasExecutionSource =
+        bound.kind === "code_action_proposal" &&
+        Object.hasOwn(bound.binding, "executionSource");
+      if (conflictRequirement === "required") {
+        try {
+          if (!hasExecutionSource) throw new TypeError("execution source missing");
+          preparedExecutionSource(bound.binding.executionSource, inputBinding);
+        } catch {
+          return this.#ackFailure(claimed, item, {
+            nextStatus: "blocked",
+            code: "conflict-binding-unsealed",
+          });
+        }
+      } else if (hasExecutionSource) {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "blocked",
+          code: "conflict-source-unexpected",
+        });
+      }
     } else {
+      let executionSource;
+      if (conflictRequirement === "required") {
+        if (this.#prepareConflictExecutionSource === null) {
+          return this.#ackFailure(claimed, item, {
+            nextStatus: "blocked",
+            code: "conflict-preparer-not-configured",
+          });
+        }
+        try {
+          executionSource = await this.#admitAction(async () =>
+            preparedExecutionSource(
+              await this.#prepareConflictExecutionSource(
+                structuredClone(inputBinding),
+              ),
+              inputBinding,
+            ),
+          );
+        } catch (error) {
+          const failure = conflictPreparationFailure(error);
+          if (failure !== null) return this.#ackFailure(claimed, item, failure);
+          return {
+            claimed: true,
+            counter: "uncertain",
+            result: {
+              intentId: claimed.intentId,
+              status: "uncertain",
+              code: "conflict-preparation-result-uncertain",
+            },
+          };
+        }
+      }
+      let controlledCommitEvidence;
+      if (isPullRequestPushIntent(claimed.intent)) {
+        if (this.#verifyControlledCommitEvidence === null) {
+          return this.#ackFailure(claimed, item, {
+            nextStatus: "blocked",
+            code: "controlled-commit-evidence-reader-not-configured",
+          });
+        }
+        try {
+          controlledCommitEvidence = await this.#admitAction(async () =>
+            verifiedControlledCommitEvidence(
+              await this.#verifyControlledCommitEvidence({
+                evidenceId:
+                  claimed.intent.action.controlledCommitEvidenceId,
+              }),
+              claimed.intent,
+              inputBinding,
+            ),
+          );
+        } catch (error) {
+          return this.#ackFailure(
+            claimed,
+            item,
+            controlledCommitEvidenceFailure(error),
+          );
+        }
+      }
       const bindingPlan = await this.#admitAction(() => {
         let plannedBound;
         try {
@@ -923,7 +1332,11 @@ export class WorkIntentDispatcher {
               workItemId: item.itemId,
               roleId: requester.roleId,
               event: currentWorkItemEvent(item),
-              inputBinding: proposalInputBindingFor(item),
+              inputBinding,
+              ...(executionSource === undefined ? {} : { executionSource }),
+              ...(controlledCommitEvidence === undefined
+                ? {}
+                : { controlledCommitEvidence }),
               ...(evidenceTarget === null ? {} : { evidenceTarget }),
             },
             intent: claimed.intent,
@@ -941,6 +1354,8 @@ export class WorkIntentDispatcher {
             item,
             claimed.intent,
             requester,
+            executionSource,
+            controlledCommitEvidence,
           );
         } catch (error) {
           const code = ownErrorCode(error);
@@ -1016,7 +1431,9 @@ export class WorkIntentDispatcher {
     }
     if (
       bound.kind === "github_review_proposal" ||
-      bound.kind === "code_action_proposal"
+      bound.kind === "github_pull_request_action_proposal" ||
+      bound.kind === "code_action_proposal" ||
+      bound.kind === "configuration_change_proposal"
     ) {
       return this.#dispatchProposal(claimed, item, bound);
     }

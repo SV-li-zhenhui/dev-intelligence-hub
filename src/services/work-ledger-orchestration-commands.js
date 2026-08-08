@@ -26,6 +26,7 @@ import {
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
+import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 
 const PAUSABLE_STATUSES = new Set(["queued", "blocked"]);
 const ESCALATABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
@@ -466,6 +467,8 @@ export function planWorkGraphEscalation({ state, input, clock }) {
         at: now,
         actorId: authority.actorId,
         details: {
+          inputBinding: currentWorkItemExecutionBinding(item),
+          workItemRevision: itemResult.revision,
           intentId: outboxResult.intentId,
           intentDigest: outboxResult.intentDigest,
           intentType: outboxResult.intent.type,
@@ -473,6 +476,16 @@ export function planWorkGraphEscalation({ state, input, clock }) {
           requestedBy,
           reusedFailedIntent: existing !== undefined,
           deliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
+          ...(outboxResult.intent.type === "ask_user"
+            ? {
+                consultationRequest: {
+                  summary: outboxResult.intent.summary,
+                  reason: outboxResult.intent.reason,
+                  question: outboxResult.intent.question,
+                  choices: outboxResult.intent.choices,
+                },
+              }
+            : {}),
         },
       },
     ],

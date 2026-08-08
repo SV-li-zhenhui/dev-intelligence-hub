@@ -24,6 +24,7 @@ export { ControlledCodeExecutorError };
 
 const LEGACY_SCHEMA_VERSION = 1;
 const SCHEMA_VERSION = 2;
+export const CONTROLLED_CODE_EXECUTOR_STATE_KEY = "code-executor-state";
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
@@ -720,6 +721,16 @@ function validateState(value) {
     validateSession(sessionId, session);
   }
   return value;
+}
+
+export function normalizeControlledCodeExecutorState(value) {
+  let candidate;
+  try {
+    candidate = structuredClone(value);
+  } catch {
+    invalidState();
+  }
+  return validateState(upgradeLegacyState(candidate));
 }
 
 function validateDependency(value, methods, label) {

@@ -179,31 +179,39 @@ function normalizeImpact(value) {
     "impact",
   );
   if (typeof value.changed !== "boolean") throw invalid("impact.changed");
-  return {
-    changed: value.changed,
-    beforeDigest: sha256(value.beforeDigest, "impact.beforeDigest"),
-    afterDigest: sha256(value.afterDigest, "impact.afterDigest"),
-    securityTightening: impactCategory(
+  const paths = {
+    securityTightening: denseArray(
       value.security_tightening,
       "impact.security_tightening",
     ),
-    authorityExpansion: impactCategory(
+    authorityExpansion: denseArray(
       value.authority_expansion,
       "impact.authority_expansion",
     ),
-    benignClaimChange: impactCategory(
+    benignClaimChange: denseArray(
       value.benign_claim_change,
       "impact.benign_claim_change",
     ),
-    restartRequired: impactCategory(
+    restartRequired: denseArray(
       value.restart_required,
       "impact.restart_required",
     ),
   };
+  return {
+    display: {
+      changed: value.changed,
+      beforeDigest: sha256(value.beforeDigest, "impact.beforeDigest"),
+      afterDigest: sha256(value.afterDigest, "impact.afterDigest"),
+      securityTightening: impactCategory(paths.securityTightening),
+      authorityExpansion: impactCategory(paths.authorityExpansion),
+      benignClaimChange: impactCategory(paths.benignClaimChange),
+      restartRequired: impactCategory(paths.restartRequired),
+    },
+    changedPathCount: new Set(Object.values(paths).flat()).size,
+  };
 }
 
-function impactCategory(value, name) {
-  const paths = denseArray(value, name);
+function impactCategory(paths) {
   return {
     count: paths.length,
     paths: paths.slice(0, MAX_DISPLAY_IMPACT_PATHS),
@@ -286,6 +294,7 @@ function normalizePrepared(value) {
     : normalizeDraftBinding(value, {
         initialization: kindDescriptor.value === "configuration.initialize",
       });
+  const impact = normalizeImpact(value.impact);
   return {
     kind: kindDescriptor.value,
     actionType: {
@@ -294,7 +303,8 @@ function normalizePrepared(value) {
       "configuration.rollback": "activate_rollback",
     }[kindDescriptor.value],
     binding,
-    impact: normalizeImpact(value.impact),
+    impact: impact.display,
+    changedPathCount: impact.changedPathCount,
   };
 }
 
@@ -341,12 +351,7 @@ export function createConfigurationActivationConfirmationPlan(value) {
   const prepared = normalizePrepared(value);
   const action = actionForPrepared(prepared);
   const { requestedBy, actor, target } = confirmationIdentity(action);
-  const changedCount = [
-    prepared.impact.securityTightening,
-    prepared.impact.authorityExpansion,
-    prepared.impact.benignClaimChange,
-    prepared.impact.restartRequired,
-  ].reduce((total, category) => total + category.count, 0);
+  const changedCount = prepared.changedPathCount;
 
   return queuePlan({
     id: confirmationId(action),

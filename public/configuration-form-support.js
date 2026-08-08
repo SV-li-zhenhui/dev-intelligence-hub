@@ -18,6 +18,8 @@ const SAFE_ID_INSENSITIVE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_WORKSPACE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const CONTROLLED_GIT_REPOSITORY =
+  /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\/([A-Za-z0-9_.-]{1,100})$/;
 const PINNED_IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/;
 const SAFE_CONDITION_PATH_SEGMENT = /^[A-Za-z][A-Za-z0-9_]*$/;
 const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
@@ -267,7 +269,14 @@ const LEGACY_BRAIN_FIELDS = [
   "contextTokens",
   "maxAssessmentsPerRefresh",
 ];
-
+const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
+const CLI_PROVIDER_FORBIDDEN_FIELDS = [
+  "baseUrl",
+  "apiKeyEnv",
+  "protocol",
+  "responseFormat",
+  "contextTokens",
+];
 function assertLegacyBrain(value, path, { partial = false } = {}) {
   assertFields(
     value,
@@ -309,12 +318,36 @@ function assertProvider(value, path) {
     ],
     ["kind"],
   );
-  if (!["ollama", "openai-compatible"].includes(value.kind)) {
+  if (
+    !["ollama", "openai-compatible", ...CLI_PROVIDER_KINDS].includes(
+      value.kind,
+    )
+  ) {
     throw formError(
       "UNSUPPORTED_CONFIGURATION_SCHEMA",
       `unsupported brain provider kind ${value.kind}`,
       `${path}.kind`,
     );
+  }
+  if (CLI_PROVIDER_KINDS.has(value.kind)) {
+    if (value.remote !== true) {
+      throw formError(
+        "UNSUPPORTED_CONFIGURATION_SCHEMA",
+        `${path}.remote must explicitly classify CLI model processing as remote`,
+        `${path}.remote`,
+      );
+    }
+    const forbidden = CLI_PROVIDER_FORBIDDEN_FIELDS.find((name) =>
+      Object.hasOwn(value, name),
+    );
+    if (forbidden) {
+      throw formError(
+        "UNSUPPORTED_CONFIGURATION_SCHEMA",
+        `${path}.${forbidden} is unavailable for supervised CLI providers`,
+        `${path}.${forbidden}`,
+      );
+    }
+    return;
   }
   const required = ["baseUrl"];
   if (required.some((name) => !Object.hasOwn(value, name))) {
@@ -339,6 +372,7 @@ function assertRole(value, path) {
       "workerId",
       "permissions",
       "brain",
+      "taskBrain",
     ],
     [
       "name",
@@ -355,6 +389,9 @@ function assertRole(value, path) {
   ]);
   requireArray(value.permissions.allowedIntents, `${path}.permissions.allowedIntents`);
   assertAssignedBrain(value.brain, `${path}.brain`);
+  if (Object.hasOwn(value, "taskBrain")) {
+    assertAssignedBrain(value.taskBrain, `${path}.taskBrain`);
+  }
 }
 
 function assertEmployees(value, path) {
@@ -413,7 +450,34 @@ function assertCodeExecutor(value, path) {
     "maxArtifactBytes",
     "gitCommand",
     "gitTimeoutMs",
+    "conflictPreparation",
   ], ["enabled"]);
+  if (value.conflictPreparation) {
+    const conflictPath = `${path}.conflictPreparation`;
+    const allowed = [
+      "enabled",
+      "baseMirrorsByRepository",
+      "headMirrorsByRepository",
+    ];
+    assertFields(
+      value.conflictPreparation,
+      conflictPath,
+      value.conflictPreparation.enabled === false ? ["enabled"] : allowed,
+      value.conflictPreparation.enabled === false ? ["enabled"] : allowed,
+    );
+    if (value.conflictPreparation.enabled !== false) {
+      for (const name of [
+        "baseMirrorsByRepository",
+        "headMirrorsByRepository",
+      ]) {
+        assertNamedMap(
+          value.conflictPreparation[name],
+          `${conflictPath}.${name}`,
+          () => {},
+        );
+      }
+    }
+  }
   if (value.docker) {
     assertFields(value.docker, `${path}.docker`, ["executable", "host"], [
       "executable",
@@ -581,6 +645,7 @@ function assertWorkCoordination(value, path) {
       "capabilityRoles",
       "githubReviewRoles",
       "codeActionRoles",
+      "configurationChangeRoles",
       "codeOperationsByRole",
       "workspaceByRepository",
     ],
@@ -598,6 +663,12 @@ function assertWorkCoordination(value, path) {
   }
   requireArray(value.policy.githubReviewRoles, `${policyPath}.githubReviewRoles`);
   requireArray(value.policy.codeActionRoles, `${policyPath}.codeActionRoles`);
+  if (Object.hasOwn(value.policy, "configurationChangeRoles")) {
+    requireArray(
+      value.policy.configurationChangeRoles,
+      `${policyPath}.configurationChangeRoles`,
+    );
+  }
   for (const [roleId, operations] of Object.entries(value.policy.codeOperationsByRole)) {
     requireArray(operations, `${policyPath}.codeOperationsByRole.${roleId}`);
   }
@@ -641,6 +712,7 @@ function assertSupportedConfigurationShape(value) {
     "refreshMinutes",
     "browserPollSeconds",
     "githubLogin",
+    "githubRead",
     "trackedRepositories",
     "prResponsibility",
     "codeExecutor",
@@ -656,6 +728,7 @@ function assertSupportedConfigurationShape(value) {
   ];
   assertFields(value, "configuration", topLevelFields, topLevelFields);
   requireArray(value.trackedRepositories, "configuration.trackedRepositories");
+  assertFields(value.githubRead, "configuration.githubRead", ["enabled"], ["enabled"]);
   assertFields(
     value.prResponsibility,
     "configuration.prResponsibility",
@@ -672,9 +745,15 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.githubActions,
     "configuration.githubActions",
-    ["enabled", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs"],
+    ["enabled", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions"],
     ["enabled"],
   );
+  if (Object.hasOwn(value.githubActions, "enabledActions")) {
+    requireArray(
+      value.githubActions.enabledActions,
+      "configuration.githubActions.enabledActions",
+    );
+  }
   if (value.githubActions.networkEnv) {
     assertFields(value.githubActions.networkEnv, "configuration.githubActions.networkEnv", [
       "HTTP_PROXY",
@@ -697,6 +776,17 @@ function assertSupportedConfigurationShape(value) {
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
   );
+}
+
+function configurationForForm(value) {
+  const document = cloneConfiguration(value);
+  // Persisted pre-boundary documents omit this field. The runtime interprets
+  // omission as enabled; the form makes that effective value explicit without
+  // rewriting the durable content-addressed history during reads.
+  if (!Object.hasOwn(document, "githubRead")) {
+    document.githubRead = { enabled: true };
+  }
+  return document;
 }
 
 function envReferencePaths(configuration) {
@@ -789,6 +879,26 @@ function validWorkspacePath(value) {
     );
 }
 
+function validAbsoluteLocalPath(value) {
+  const normalized = value.replaceAll("\\", "/");
+  return (
+    !normalized.startsWith("//") &&
+    (/^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("/"))
+  );
+}
+
+function validControlledGitRepository(value) {
+  const match = value.match(CONTROLLED_GIT_REPOSITORY);
+  if (!match) return false;
+  const [, owner, repository] = match;
+  return (
+    !owner.includes("--") &&
+    !repository.includes("..") &&
+    !repository.startsWith(".") &&
+    !repository.endsWith(".")
+  );
+}
+
 function validConditionPath(value) {
   return (
     byteLength(value) <= 512 &&
@@ -810,6 +920,7 @@ function validFieldFormat(value, format) {
     environment: (entry) => SAFE_ENV_NAME.test(entry),
     "github-login": (entry) => SAFE_GITHUB_LOGIN.test(entry),
     repository: (entry) => SAFE_REPOSITORY.test(entry),
+    "controlled-git-repository": validControlledGitRepository,
     "safe-id": (entry) => SAFE_ID.test(entry),
     "safe-id-insensitive": (entry) => SAFE_ID_INSENSITIVE.test(entry),
     "role-id": (entry) => SAFE_ROLE_ID.test(entry),
@@ -819,6 +930,7 @@ function validFieldFormat(value, format) {
     "docker-host": (entry) => entry.startsWith("npipe://") || entry.startsWith("unix://"),
     "condition-path": validConditionPath,
     "workspace-path": validWorkspacePath,
+    "absolute-local-path": validAbsoluteLocalPath,
   };
   return validators[format]?.(value) ?? false;
 }
@@ -874,7 +986,15 @@ function descriptorAcceptsValue(descriptor, value, configuration) {
 function editableScalarIssues(configuration) {
   const issues = [];
   visitPrimitiveFields(configuration, [], (value, path) => {
-    const descriptor = configurationFieldDescriptor(path, value);
+    const providerKind =
+      path[0] === "brainProviders" && path.length >= 3
+        ? configuration.brainProviders[path[1]]?.kind
+        : null;
+    const descriptor = configurationFieldDescriptor(
+      path,
+      value,
+      providerKind ? { providerKind } : null,
+    );
     if (descriptor.format === "environment") return;
     if (descriptorAcceptsValue(descriptor, value, configuration)) return;
     const integer = descriptor.kind === "integer";
@@ -926,6 +1046,7 @@ function collectionConfigurationIssues(configuration) {
         }
       }
       if (descriptor.kind === "map") {
+        const portableKeys = new Set();
         for (const key of Object.keys(value)) {
           if (
             (descriptor.keyOptions && !descriptor.keyOptions.includes(key)) ||
@@ -935,6 +1056,19 @@ function collectionConfigurationIssues(configuration) {
             issues.push(
               issue([...path, key], "INVALID_CONFIGURATION_KEY", "映射键不符合配置约束。"),
             );
+          }
+          if (descriptor.keyFormat === "controlled-git-repository") {
+            const portableKey = key.toLowerCase();
+            if (portableKeys.has(portableKey)) {
+              issues.push(
+                issue(
+                  path,
+                  "DUPLICATE_CONFIGURATION_ENTRY",
+                  "同一仓库不能以不同大小写重复配置。",
+                ),
+              );
+            }
+            portableKeys.add(portableKey);
           }
         }
       }
@@ -964,9 +1098,17 @@ function configurationReferenceIssues(configuration) {
   const profiles = new Set(Object.keys(configuration.codeExecutor.profiles || {}));
   const providerFields = [
     [["brain", "provider"], configuration.brain.provider],
-    ...Object.entries(configuration.employees.roles).map(([id, role]) => [
-      ["employees", "roles", id, "brain", "provider"],
-      role.brain.provider,
+    ...Object.entries(configuration.employees.roles).flatMap(([id, role]) => [
+      [
+        ["employees", "roles", id, "brain", "provider"],
+        role.brain.provider,
+      ],
+      ...(role.taskBrain
+        ? [[
+            ["employees", "roles", id, "taskBrain", "provider"],
+            role.taskBrain.provider,
+          ]]
+        : []),
     ]),
   ];
   if (Object.hasOwn(configuration.employees.prReviewer.brain, "provider")) {
@@ -1010,8 +1152,12 @@ function configurationReferenceIssues(configuration) {
       );
     }
   }
-  for (const list of ["githubReviewRoles", "codeActionRoles"]) {
-    policy[list].forEach((roleId, index) => {
+  for (const list of [
+    "githubReviewRoles",
+    "codeActionRoles",
+    "configurationChangeRoles",
+  ]) {
+    (policy[list] || []).forEach((roleId, index) => {
       if (!roles.has(roleId)) {
         issues.push(referenceIssue(["workCoordination", "policy", list, index], "岗位 "));
       }
@@ -1067,39 +1213,44 @@ function providerConfigurationIssues(configuration) {
   const issues = [];
   for (const [id, provider] of Object.entries(configuration.brainProviders)) {
     const path = ["brainProviders", id];
+    const isCli = CLI_PROVIDER_KINDS.has(provider.kind);
     const hasCredentialReference = Object.hasOwn(provider, "apiKeyEnv");
     const hasProtocol = Object.hasOwn(provider, "protocol");
     const hasResponseFormat = Object.hasOwn(provider, "responseFormat");
     if (
-      (provider.kind === "openai-compatible" && !hasCredentialReference) ||
-      (provider.kind === "ollama" && hasCredentialReference) ||
-      (provider.kind === "openai-compatible" && Object.hasOwn(provider, "contextTokens")) ||
-      (provider.kind === "ollama" && hasProtocol) ||
-      (provider.kind === "ollama" && hasResponseFormat) ||
-      (hasProtocol && !["chat-completions", "responses"].includes(provider.protocol)) ||
-      (hasResponseFormat && !["json-schema", "json-object"].includes(provider.responseFormat)) ||
-      (provider.protocol === "responses" && provider.responseFormat === "json-object")
+      (isCli && provider.remote !== true) ||
+      (isCli && CLI_PROVIDER_FORBIDDEN_FIELDS.some((name) => Object.hasOwn(provider, name))) ||
+      (!isCli && provider.kind === "openai-compatible" && !hasCredentialReference) ||
+      (!isCli && provider.kind === "ollama" && hasCredentialReference) ||
+      (!isCli && provider.kind === "openai-compatible" && Object.hasOwn(provider, "contextTokens")) ||
+      (!isCli && provider.kind === "ollama" && hasProtocol) ||
+      (!isCli && provider.kind === "ollama" && hasResponseFormat) ||
+      (!isCli && hasProtocol && !["chat-completions", "responses"].includes(provider.protocol)) ||
+      (!isCli && hasResponseFormat && !["json-schema", "json-object"].includes(provider.responseFormat)) ||
+      (!isCli && provider.protocol === "responses" && provider.responseFormat === "json-object")
     ) {
       issues.push(issue(path, "INVALID_PROVIDER_CONFIGURATION", "Provider 字段组合无效。"));
     }
     const limits = !hasProtocol
-      ? {
-          timeoutMs: [1, 2 * 1024 * 1024],
-          maxResponseBytes: [1, 2 * 1024 * 1024],
-          maxRequestBytes: [1, 2 * 1024 * 1024],
-        }
-      : provider.protocol === "responses"
         ? {
-            timeoutMs: [1_000, 3_600_000],
-            maxResponseBytes: [1_024, 1024 * 1024],
-            maxRequestBytes: [1_024, 1024 * 1024],
+            timeoutMs: [1, 2 * 1024 * 1024],
+            maxResponseBytes: [1, 2 * 1024 * 1024],
+            maxRequestBytes: [1, 2 * 1024 * 1024],
           }
-        : {
-            timeoutMs: [10, 120_000],
-            maxResponseBytes: [1_024, 1024 * 1024],
-            maxRequestBytes: [1_024, 2 * 1024 * 1024],
-          };
-    for (const [name, [minimum, maximum]] of Object.entries(limits)) {
+        : provider.protocol === "responses"
+          ? {
+              timeoutMs: [1_000, 3_600_000],
+              maxResponseBytes: [1_024, 1024 * 1024],
+              maxRequestBytes: [1_024, 1024 * 1024],
+            }
+          : {
+              timeoutMs: [10, 120_000],
+              maxResponseBytes: [1_024, 1024 * 1024],
+              maxRequestBytes: [1_024, 2 * 1024 * 1024],
+            };
+    for (const [name, [minimum, maximum]] of Object.entries(
+      isCli ? {} : limits,
+    )) {
       if (
         Object.hasOwn(provider, name) &&
         (
@@ -1117,7 +1268,7 @@ function providerConfigurationIssues(configuration) {
         );
       }
     }
-    if (provider.remote === false) {
+    if (!isCli && provider.remote === false) {
       try {
         const endpoint = new URL(provider.baseUrl);
         if (
@@ -1239,6 +1390,46 @@ function configurationRelationshipIssues(configuration) {
     ...providerConfigurationIssues(configuration),
     ...workflowGraphIssues(configuration.workflowRouting),
   ];
+  const configurationChangeRoles =
+    configuration.workCoordination.policy.configurationChangeRoles || [];
+  const configuredChangeRoles = new Set(configurationChangeRoles);
+  configurationChangeRoles.forEach((roleId, index) => {
+    if (roleId === "pr-reviewer") {
+      issues.push(
+        issue(
+          [
+            "workCoordination",
+            "policy",
+            "configurationChangeRoles",
+            index,
+          ],
+          "INVALID_CONFIGURATION_CHANGE_AUTHORITY",
+          "配置变更提案只能授权给显式配置的岗位。",
+        ),
+      );
+    }
+  });
+  for (const [roleId, role] of Object.entries(configuration.employees.roles)) {
+    const permitted = role.permissions.allowedIntents.includes(
+      "propose_configuration_change",
+    );
+    if (permitted === configuredChangeRoles.has(roleId)) continue;
+    issues.push(
+      issue(
+        permitted
+          ? ["workCoordination", "policy", "configurationChangeRoles"]
+          : [
+              "employees",
+              "roles",
+              roleId,
+              "permissions",
+              "allowedIntents",
+            ],
+        "MISMATCHED_CONFIGURATION_CHANGE_AUTHORITY",
+        "岗位意图权限必须与配置变更提案岗位完全一致。",
+      ),
+    );
+  }
   if (
     configuration.codeExecutor.enabled &&
     (!configuration.codeExecutor.docker ||
@@ -1261,12 +1452,12 @@ function configurationRelationshipIssues(configuration) {
     issues.push(issue(["codeExecutor", "requiredProfilesByWorkspace"], "INCOMPLETE_CONFIGURATION", "每个工作区都需要 Profile 绑定。"));
   }
   if (
-    (configuration.codeExecutor.workspaces || []).some(
+    ((configuration.codeExecutor.workspaces || []).some(
       (workspace) => workspace.gitHeadSnapshot === true,
-    ) &&
+    ) || configuration.codeExecutor.conflictPreparation?.enabled === true) &&
     !configuration.codeExecutor.gitCommand
   ) {
-    issues.push(issue(["codeExecutor", "gitCommand"], "INCOMPLETE_CONFIGURATION", "启用 Git Head 固定快照前需要配置固定 Git 命令。"));
+    issues.push(issue(["codeExecutor", "gitCommand"], "INCOMPLETE_CONFIGURATION", "启用 Git Head 固定快照或冲突准备前需要配置固定 Git 命令。"));
   }
   const gitCommand = configuration.codeExecutor.gitCommand;
   const normalizedGitCommand = typeof gitCommand === "string"
@@ -1277,29 +1468,29 @@ function configurationRelationshipIssues(configuration) {
     (normalizedGitCommand.startsWith("/") &&
       !normalizedGitCommand.startsWith("//"));
   if (
-    (configuration.codeExecutor.workspaces || []).some(
+    ((configuration.codeExecutor.workspaces || []).some(
       (workspace) => workspace.gitHeadSnapshot === true,
-    ) &&
+    ) || configuration.codeExecutor.conflictPreparation?.enabled === true) &&
     normalizedGitCommand &&
     !gitCommandIsAbsolute
   ) {
     issues.push(issue(
       ["codeExecutor", "gitCommand"],
       "RELATIVE_GIT_COMMAND",
-      "Git Head 固定快照命令必须填写本机绝对路径。",
+      "Git 命令必须填写本机绝对路径。",
     ));
   }
   if (
-    (configuration.codeExecutor.workspaces || []).some(
+    ((configuration.codeExecutor.workspaces || []).some(
       (workspace) => workspace.gitHeadSnapshot === true,
-    ) &&
+    ) || configuration.codeExecutor.conflictPreparation?.enabled === true) &&
     WINDOWS_GIT_WRAPPER.test(normalizedGitCommand) &&
     !WINDOWS_GIT_IMPLEMENTATION.test(normalizedGitCommand)
   ) {
     issues.push(issue(
       ["codeExecutor", "gitCommand"],
       "UNSAFE_GIT_WRAPPER",
-      "Windows 固定 Head 快照需直接选择 mingw64/bin/git.exe，不能使用 cmd/bin 包装器。",
+      "Windows Git 需直接选择 mingw64/bin/git.exe，不能使用 cmd/bin 包装器。",
     ));
   }
   if (configuration.changePackages.enabled && !configuration.changePackages.gitCommand) {
@@ -1403,7 +1594,7 @@ function buildFormState({
 }
 
 export function createConfigurationFormState(configuration, binding = null) {
-  const document = cloneConfiguration(configuration);
+  const document = configurationForForm(configuration);
   assertSupportedConfigurationShape(document);
   assertEditableScalarConfiguration(document);
   assertEnvironmentReferences(document);
@@ -2361,6 +2552,13 @@ function providerReferences(configuration, id, references) {
     if (roleValue.brain.provider === id) {
       addReference(references, `employees.roles.${roleId}.brain.provider`, "employee_brain");
     }
+    if (roleValue.taskBrain?.provider === id) {
+      addReference(
+        references,
+        `employees.roles.${roleId}.taskBrain.provider`,
+        "employee_task_brain",
+      );
+    }
   }
   for (const name of ["brain", "localBrain"]) {
     if (configuration.memory.answering?.[name]?.provider === id) {
@@ -2392,8 +2590,12 @@ function roleReferences(configuration, id, references) {
       );
     }
   }
-  for (const listName of ["githubReviewRoles", "codeActionRoles"]) {
-    configuration.workCoordination.policy[listName].forEach((roleId, index) => {
+  for (const listName of [
+    "githubReviewRoles",
+    "codeActionRoles",
+    "configurationChangeRoles",
+  ]) {
+    (configuration.workCoordination.policy[listName] || []).forEach((roleId, index) => {
       if (roleId === id) {
         addReference(
           references,
@@ -2475,7 +2677,7 @@ function collectConfigurationReferences(configuration, { kind, id }) {
 
 export function configurationReferences(configuration, input) {
   const { kind, id } = normalizeEntityIdentity(input);
-  const document = cloneConfiguration(configuration);
+  const document = configurationForForm(configuration);
   assertSupportedConfigurationShape(document);
   return deepFreeze(collectConfigurationReferences(document, { kind, id }));
 }

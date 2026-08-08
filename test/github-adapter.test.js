@@ -10,14 +10,14 @@ import {
 
 test("a pull request assigned to me by another author means review", () => {
   assert.equal(
-    classifyPullRequestRelation("assigned", "SV-li-zhenhui", "SV-wang-xuepeng"),
+    classifyPullRequestRelation("assigned", "local-owner", "other-user"),
     "review_requested",
   );
 });
 
 test("my own assigned pull request remains my modification work", () => {
   assert.equal(
-    classifyPullRequestRelation("assigned", "SV-li-zhenhui", "SV-li-zhenhui"),
+    classifyPullRequestRelation("assigned", "local-owner", "local-owner"),
     "authored",
   );
 });
@@ -27,7 +27,7 @@ test("assigned and authored searches combine before detail lookup", () => {
     number: 7,
     url: "https://github.com/acme/repo/pull/7",
     repository: { nameWithOwner: "acme/repo" },
-    author: { login: "SV-li-zhenhui" },
+    author: { login: "local-owner" },
   };
   const assignedByOther = {
     number: 8,
@@ -39,7 +39,7 @@ test("assigned and authored searches combine before detail lookup", () => {
   const combined = combinePullRequestRecords(
     [own, assignedByOther],
     [own],
-    "SV-li-zhenhui",
+    "local-owner",
   );
 
   assert.equal(combined.length, 2);
@@ -61,19 +61,19 @@ test("review facts retain the commit reviewed by each responsible person", () =>
   const facts = summarizeReviewFacts(
     [
       {
-        author: { login: "SV-li-zhenhui" },
+        author: { login: "local-owner" },
         state: "COMMENTED",
         submittedAt: "2026-07-20T09:00:00Z",
         commit: { oid: "head-1" },
       },
       {
-        author: { login: "SV-li-zhenhui" },
+        author: { login: "local-owner" },
         state: "APPROVED",
         submittedAt: "2026-07-21T09:00:00Z",
         commit: { oid: "head-2" },
       },
       {
-        author: { login: "SV-li-zhenhui" },
+        author: { login: "local-owner" },
         state: "COMMENTED",
         submittedAt: "2026-07-23T09:00:00Z",
         commit: { oid: "head-3" },
@@ -85,7 +85,7 @@ test("review facts retain the commit reviewed by each responsible person", () =>
         commit: { oid: "head-3" },
       },
     ],
-    "SV-li-zhenhui",
+    "local-owner",
   );
 
   assert.equal(facts.myReviewState, "APPROVED");
@@ -118,7 +118,7 @@ test("resolved reviewer feedback is excluded from outstanding change requests", 
         commit: { oid: "head-1" },
       },
     ],
-    "SV-li-zhenhui",
+    "local-owner",
   );
 
   assert.deepEqual(facts.outstandingChangeRequestCommitOids, ["head-1"]);
@@ -204,6 +204,55 @@ test("every GitHub command is pinned to github.com through an explicit environme
   );
 });
 
+test("refresh-facing GitHub reads forward one shutdown signal to every command", async () => {
+  const calls = [];
+  const controller = new AbortController();
+  const run = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "search") return [];
+    if (args[0] === "api" && args.at(-1) === "user") {
+      return { login: "runtime-user" };
+    }
+    if (args[0] === "api" && args[1]?.includes("milestones")) return [];
+    if (args[0] === "api" && args[1]?.includes("releases")) return [];
+    throw new Error(`Unexpected call: ${args.join(" ")}`);
+  };
+  const adapter = new GitHubAdapter({ run });
+  const options = { signal: controller.signal };
+
+  await adapter.searchRelevantPullRequests(options);
+  await adapter.searchIssues(options);
+  await adapter.versions(["acme/repo"], options);
+
+  assert.equal(calls.length, 7);
+  assert.ok(calls.every((call) => call.command === "gh"));
+  assert.ok(calls.every((call) => call.options.signal === controller.signal));
+});
+
+test("a GitHub refresh cannot continue command work after shutdown abort", async () => {
+  const controller = new AbortController();
+  const shutdown = new Error("lifecycle shutdown");
+  const calls = [];
+  const adapter = new GitHubAdapter({
+    async run(_command, args, options) {
+      calls.push(args);
+      assert.strictEqual(options.signal, controller.signal);
+      if (args[0] === "api") {
+        controller.abort(shutdown);
+        return { login: "runtime-user" };
+      }
+      options.signal.throwIfAborted();
+      return [];
+    },
+  });
+
+  await assert.rejects(
+    adapter.searchRelevantPullRequests({ signal: controller.signal }),
+    (error) => error === shutdown,
+  );
+  assert.equal(calls.filter((args) => args[0] === "pr").length, 0);
+});
+
 test("relevant PR search uses the active account, returns every result, and fetches detail once", async () => {
   const calls = [];
   const own = {
@@ -238,7 +287,12 @@ test("relevant PR search uses the active account, returns every result, and fetc
         baseRefOid: "a".repeat(40),
         headRefName: `feature-${suffix}`,
         headRefOid: suffix.repeat(40),
-        headRepository: { nameWithOwner: "acme/repo" },
+        headRepository: { id: "R_kgDOExample", name: "repo" },
+        headRepositoryOwner: {
+          id: "U_kgDOExample",
+          name: "Acme",
+          login: "acme",
+        },
         reviews: [],
         assignees: [],
         labels: [],
@@ -276,6 +330,66 @@ test("relevant PR search uses the active account, returns every result, and fetc
     ),
   );
   assert.ok(items.every((item) => item.reviewFactsAvailable));
+});
+
+test("relevant PR search produces a complete atomic Git target from real CLI JSON", async () => {
+  const record = {
+    number: 42,
+    title: "Resolve conflict",
+    url: "https://github.com/acme/repo/pull/42",
+    repository: { nameWithOwner: "acme/repo" },
+    author: { login: "contributor" },
+    state: "open",
+  };
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      if (args[0] === "search" && args.includes("--assignee=@me")) {
+        return [record];
+      }
+      if (args[0] === "search") return [];
+      if (args[0] === "pr") {
+        return {
+          number: 42,
+          url: "https://github.com/acme/repo/pull/42",
+          reviewDecision: "CHANGES_REQUESTED",
+          statusCheckRollup: [],
+          mergeStateStatus: "CLEAN",
+          isDraft: false,
+          labels: [],
+          assignees: [],
+          milestone: null,
+          baseRefName: "main",
+          baseRefOid: "a".repeat(40),
+          headRefName: "fix/conflict",
+          headRefOid: "b".repeat(40),
+          headRepository: { id: "R_kgDOExample", name: "repo" },
+          headRepositoryOwner: {
+            id: "U_kgDOExample",
+            name: "Contributor",
+            login: "contributor",
+          },
+          reviews: [],
+        };
+      }
+      throw new Error(`Unexpected call: ${args.join(" ")}`);
+    },
+  });
+
+  const [item] = await adapter.searchRelevantPullRequests();
+
+  assert.equal(item.gitTargetAvailable, true);
+  assert.deepEqual(item.gitTarget, {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+  });
 });
 
 test("a partial PR detail failure makes the source stale instead of returning mixed facts", async () => {
@@ -329,6 +443,7 @@ test("an incomplete live Git target is explicit and cannot masquerade as legacy 
         headRefName: "fix/conflict",
         headRefOid: "b".repeat(40),
         headRepository: null,
+        headRepositoryOwner: null,
         reviews: [],
         assignees: [],
         labels: [],
@@ -452,7 +567,12 @@ test("review context drops a patch when the base target changes under the same H
             baseRefOid: "a".repeat(40),
             headRefName: "fix/conflict",
             headRefOid,
-            headRepository: { nameWithOwner: "contributor/repo" },
+            headRepository: { id: "R_kgDOExample", name: "repo" },
+            headRepositoryOwner: {
+              id: "U_kgDOExample",
+              name: "Contributor",
+              login: "contributor",
+            },
             files: [],
           }
         : {
@@ -462,7 +582,12 @@ test("review context drops a patch when the base target changes under the same H
             baseRefOid: "c".repeat(40),
             headRefName: "fix/conflict",
             headRefOid,
-            headRepository: { nameWithOwner: "contributor/repo" },
+            headRepository: { id: "R_kgDOExample", name: "repo" },
+            headRepositoryOwner: {
+              id: "U_kgDOExample",
+              name: "Contributor",
+              login: "contributor",
+            },
           };
     },
     runText: async () => "diff that is now stale",
@@ -503,7 +628,12 @@ test("review context drops a patch when the observing GitHub account changes", a
     baseRefOid: "a".repeat(40),
     headRefName: "fix/conflict",
     headRefOid,
-    headRepository: { nameWithOwner: "contributor/repo" },
+    headRepository: { id: "R_kgDOExample", name: "repo" },
+    headRepositoryOwner: {
+      id: "U_kgDOExample",
+      name: "Contributor",
+      login: "contributor",
+    },
     files: [],
   };
   const adapter = new GitHubAdapter({
@@ -570,7 +700,12 @@ test("target-aware review context reads an immutable compare by the sealed OIDs"
         baseRefOid,
         headRefName: "fix/conflict",
         headRefOid,
-        headRepository: { nameWithOwner: "contributor/repo" },
+        headRepository: { id: "R_kgDOExample", name: "repo" },
+        headRepositoryOwner: {
+          id: "U_kgDOExample",
+          name: "Contributor",
+          login: "contributor",
+        },
         files: [],
       };
     },
@@ -639,7 +774,12 @@ test("target-aware no-patch context verifies the target and account twice", asyn
         baseRefOid,
         headRefName: "fix/ci",
         headRefOid,
-        headRepository: { nameWithOwner: "acme/repo" },
+        headRepository: { id: "R_kgDOExample", name: "repo" },
+        headRepositoryOwner: {
+          id: "U_kgDOExample",
+          name: "Acme",
+          login: "acme",
+        },
         files: [],
       };
     },
@@ -687,7 +827,12 @@ test("a canonical base repository change invalidates target-aware context", asyn
         baseRefOid,
         headRefName: "fix/conflict",
         headRefOid,
-        headRepository: { nameWithOwner: "contributor/repo" },
+        headRepository: { id: "R_kgDOExample", name: "repo" },
+        headRepositoryOwner: {
+          id: "U_kgDOExample",
+          name: "Contributor",
+          login: "contributor",
+        },
         files: [],
       };
     },

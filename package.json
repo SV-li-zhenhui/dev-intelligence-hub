@@ -2,13 +2,25 @@
   "name": "my-dashboard",
   "version": "0.1.0",
   "private": true,
-  "description": "Local personal engineering dashboard for GitHub and DingTalk signals.",
+  "description": "Local-first engineering command center with autonomous roles, cited memory, controlled execution, and owner-confirmed actions.",
+  "files": [
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "config.example.json",
+    "docs/ARCHITECTURE.md",
+    "docs/OPERATIONS.md",
+    "docs/PRIVACY.md",
+    "public/",
+    "scripts/",
+    "src/"
+  ],
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "refresh": "node src/cli.js refresh",
     "refresh:notify": "node src/cli.js refresh --notify",
-    "test": "node --test"
+    "test": "node --test \"test/*.test.js\"",
+    "validate:system": "node scripts/validate-system.mjs"
   },
   "engines": {
     "node": ">=22"

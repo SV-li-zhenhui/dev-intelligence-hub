@@ -6,8 +6,11 @@ import {
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 export const CONFIGURATION_STATE_KEY = "configuration-state";
-export const CONFIGURATION_STATE_SCHEMA_VERSION = 2;
-const LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION = 1;
+export const CONFIGURATION_STATE_SCHEMA_VERSION = 3;
+const FIRST_CONFIGURATION_STATE_SCHEMA_VERSION = 1;
+const SCHEMA_MIGRATIONS_INTRODUCED_VERSION = 2;
+const IMPACT_POLICY_INTRODUCED_VERSION = 3;
+const CURRENT_CONFIGURATION_IMPACT_POLICY_VERSION = 2;
 
 export const DEFAULT_CONFIGURATION_LIMITS = Object.freeze({
   maximumVersions: 256,
@@ -476,6 +479,10 @@ export function emptyConfigurationState() {
   return {
     schemaVersion: CONFIGURATION_STATE_SCHEMA_VERSION,
     schemaMigrations: [],
+    impactPolicy: {
+      version: CURRENT_CONFIGURATION_IMPACT_POLICY_VERSION,
+      currentFromVersion: 1,
+    },
     revision: 0,
     migration: {
       status: "pending",
@@ -492,7 +499,40 @@ export function emptyConfigurationState() {
   };
 }
 
-function assertVersionConsistency(state) {
+function legacyRestartRequired(path) {
+  return (
+    path === "port" ||
+    path === "githubLogin" ||
+    path.startsWith("brainProviders.") ||
+    path.startsWith("codeExecutor.") ||
+    path.startsWith("changePackages.") ||
+    path === "githubActions.enabled" ||
+    path.startsWith("githubActions.actorAccountId") ||
+    path.startsWith("githubActions.tokenEnv") ||
+    path.startsWith("githubActions.ghCommand") ||
+    path.startsWith("githubActions.networkEnv")
+  );
+}
+
+function legacySafeDisabledConfiguration(configuration) {
+  const safe = structuredClone(createSafeDisabledConfiguration(configuration));
+  if (!Object.hasOwn(configuration, "githubRead")) delete safe.githubRead;
+  return normalizeConfigurationDocument(safe);
+}
+
+function impactDigest(before, after, { legacyRestartScope = false } = {}) {
+  const impact = configurationDocumentImpact(before, after);
+  return configurationImpactDigest(
+    legacyRestartScope
+      ? {
+          ...impact,
+          restart_required: impact.restart_required.filter(legacyRestartRequired),
+        }
+      : impact,
+  );
+}
+
+function assertVersionConsistency(state, currentImpactPolicyFromVersion) {
   const draftByRevisionId = new Map(
     state.draftRevisions.map((entry) => [entry.draftRevisionId, entry]),
   );
@@ -511,18 +551,26 @@ function assertVersionConsistency(state) {
             kind: "bootstrap",
             documentDigest: version.configurationDigest,
           })
-        : configurationImpactDigest(
-            configurationDocumentImpact(
-              createSafeDisabledConfiguration(version.configuration),
-              version.configuration,
-            ),
-          )
-      : configurationImpactDigest(
-          configurationDocumentImpact(
-            previous.configuration,
+        : impactDigest(
+            createSafeDisabledConfiguration(version.configuration),
             version.configuration,
-          ),
-        );
+          )
+      : impactDigest(previous.configuration, version.configuration);
+    const legacyImpactDigest = previous === null
+      ? version.source === "bootstrap"
+        ? expectedImpactDigest
+        : impactDigest(
+            legacySafeDisabledConfiguration(version.configuration),
+            version.configuration,
+            { legacyRestartScope: true },
+          )
+      : impactDigest(previous.configuration, version.configuration, {
+          legacyRestartScope: true,
+        });
+    const impactDigestMatches =
+      version.impactDigest === expectedImpactDigest ||
+      (version.version < currentImpactPolicyFromVersion &&
+        version.impactDigest === legacyImpactDigest);
     const validInitialSource =
       expectedVersion !== 1 ||
       ["bootstrap", "initialization"].includes(version.source);
@@ -539,7 +587,7 @@ function assertVersionConsistency(state) {
     if (
       version.version !== expectedVersion ||
       version.previousVersion !== (expectedVersion === 1 ? null : expectedVersion - 1) ||
-      version.impactDigest !== expectedImpactDigest ||
+      !impactDigestMatches ||
       !validInitialSource ||
       !validLaterSource ||
       !validDraftSource ||
@@ -768,25 +816,25 @@ export function assertConfigurationCapacity(state, limits) {
   }
 }
 
-function normalizeSchemaMigrations(value) {
+function normalizeSchemaMigrations(value, schemaVersion) {
   const migrations = denseArray(
     value,
     "configurationState.schemaMigrations",
-    CONFIGURATION_STATE_SCHEMA_VERSION - 1,
+    schemaVersion - 1,
   ).map((entry, index) => {
     const path = `configurationState.schemaMigrations[${index}]`;
     const fields = objectFields(entry, path, ["from", "to"]);
     const from = integer(
       fields.get("from"),
       `${path}.from`,
-      LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
-      CONFIGURATION_STATE_SCHEMA_VERSION - 1,
+      FIRST_CONFIGURATION_STATE_SCHEMA_VERSION,
+      schemaVersion - 1,
     );
     const to = integer(
       fields.get("to"),
       `${path}.to`,
       2,
-      CONFIGURATION_STATE_SCHEMA_VERSION,
+      schemaVersion,
     );
     if (to !== from + 1) throw corrupted(path, "迁移版本不连续");
     return { from, to };
@@ -801,7 +849,7 @@ function normalizeSchemaMigrations(value) {
   }
   if (
     migrations.length > 0 &&
-    migrations.at(-1).to !== CONFIGURATION_STATE_SCHEMA_VERSION
+    migrations.at(-1).to !== schemaVersion
   ) {
     throw corrupted(
       "configurationState.schemaMigrations",
@@ -811,11 +859,33 @@ function normalizeSchemaMigrations(value) {
   return migrations;
 }
 
+function normalizeImpactPolicy(value, maximumVersion) {
+  const path = "configurationState.impactPolicy";
+  const fields = objectFields(value, path, ["version", "currentFromVersion"]);
+  return {
+    version: integer(
+      fields.get("version"),
+      `${path}.version`,
+      CURRENT_CONFIGURATION_IMPACT_POLICY_VERSION,
+      CURRENT_CONFIGURATION_IMPACT_POLICY_VERSION,
+    ),
+    currentFromVersion: integer(
+      fields.get("currentFromVersion"),
+      `${path}.currentFromVersion`,
+      1,
+      maximumVersion + 1,
+    ),
+  };
+}
+
 function normalizeConfigurationStateVersion(value, limits, schemaVersion) {
-  const current = schemaVersion === CONFIGURATION_STATE_SCHEMA_VERSION;
+  const hasSchemaMigrations =
+    schemaVersion >= SCHEMA_MIGRATIONS_INTRODUCED_VERSION;
+  const hasImpactPolicy = schemaVersion >= IMPACT_POLICY_INTRODUCED_VERSION;
   const fields = objectFields(value, "configurationState", [
     "schemaVersion",
-    ...(current ? ["schemaMigrations"] : []),
+    ...(hasSchemaMigrations ? ["schemaMigrations"] : []),
+    ...(hasImpactPolicy ? ["impactPolicy"] : []),
     "revision",
     "migration",
     "activeVersion",
@@ -833,8 +903,13 @@ function normalizeConfigurationStateVersion(value, limits, schemaVersion) {
   );
   const state = {
     schemaVersion,
-    ...(current
-      ? { schemaMigrations: normalizeSchemaMigrations(fields.get("schemaMigrations")) }
+    ...(hasSchemaMigrations
+      ? {
+          schemaMigrations: normalizeSchemaMigrations(
+            fields.get("schemaMigrations"),
+            schemaVersion,
+          ),
+        }
       : {}),
     revision: integer(fields.get("revision"), "configurationState.revision"),
     migration: normalizeMigration(fields.get("migration")),
@@ -901,6 +976,13 @@ function normalizeConfigurationStateVersion(value, limits, schemaVersion) {
       ),
     ),
   };
+  const impactPolicy = hasImpactPolicy
+    ? normalizeImpactPolicy(fields.get("impactPolicy"), state.versions.length)
+    : {
+        version: 1,
+        currentFromVersion: state.versions.length + 1,
+      };
+  if (hasImpactPolicy) state.impactPolicy = impactPolicy;
   if (
     (state.migration.status === "pending" && state.versions.length !== 0) ||
     (state.migration.status === "imported" &&
@@ -913,7 +995,7 @@ function normalizeConfigurationStateVersion(value, limits, schemaVersion) {
     throw corrupted("configurationState.migration", "与版本历史不一致");
   }
   assertDraftConsistency(state);
-  assertVersionConsistency(state);
+  assertVersionConsistency(state, impactPolicy.currentFromVersion);
   assertAuditConsistency(state);
   assertOutboxConsistency(state);
   if (prettySerializedConfigurationBytes(state) > limits.maximumStateBytes) {
@@ -938,7 +1020,7 @@ function declaredConfigurationStateSchemaVersion(value) {
   return integer(
     descriptor.value,
     "configurationState.schemaVersion",
-    LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+    FIRST_CONFIGURATION_STATE_SCHEMA_VERSION,
   );
 }
 
@@ -958,26 +1040,37 @@ export function migrateConfigurationState(value, limits) {
       state: normalizeConfigurationState(value, limits),
     };
   }
-  if (schemaVersion !== LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION) {
+  if (
+    schemaVersion < FIRST_CONFIGURATION_STATE_SCHEMA_VERSION ||
+    schemaVersion >= CONFIGURATION_STATE_SCHEMA_VERSION
+  ) {
     throw corrupted("configurationState.schemaVersion", "不受支持");
   }
   const legacy = normalizeConfigurationStateVersion(
     value,
     limits,
-    LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+    schemaVersion,
   );
+  const priorMigrations = legacy.schemaMigrations || [];
+  const schemaMigrations = [...priorMigrations];
+  for (
+    let from = schemaVersion;
+    from < CONFIGURATION_STATE_SCHEMA_VERSION;
+    from += 1
+  ) {
+    schemaMigrations.push({ from, to: from + 1 });
+  }
   const state = normalizeConfigurationState({
     ...legacy,
     schemaVersion: CONFIGURATION_STATE_SCHEMA_VERSION,
-    schemaMigrations: [
-      {
-        from: LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
-        to: CONFIGURATION_STATE_SCHEMA_VERSION,
-      },
-    ],
+    schemaMigrations,
+    impactPolicy: {
+      version: CURRENT_CONFIGURATION_IMPACT_POLICY_VERSION,
+      currentFromVersion: legacy.versions.length + 1,
+    },
   }, limits);
   return {
-    migratedFrom: LEGACY_CONFIGURATION_STATE_SCHEMA_VERSION,
+    migratedFrom: schemaVersion,
     state,
   };
 }

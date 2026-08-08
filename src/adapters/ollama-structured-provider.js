@@ -2,6 +2,10 @@ import {
   normalizeAbortSignal,
   runStructuredProviderRequest,
 } from "../lib/structured-provider-request.js";
+import {
+  normalizeStructuredBrainRequest,
+  readStructuredBrainGenerateInput,
+} from "../lib/structured-brain-request.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
@@ -9,7 +13,6 @@ const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
 const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
-const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const OPTION_KEYS = new Set([
   "id",
   "fetch",
@@ -118,63 +121,6 @@ function endpoint(value) {
     remote,
     requestUrl: `${url.toString().replace(/\/+$/, "")}/api/chat`,
   };
-}
-
-function safeText(value, name, maximumBytes) {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    INVALID_CONTROL.test(value) ||
-    Buffer.byteLength(value, "utf8") > maximumBytes
-  ) {
-    throw new TypeError(`${name} is invalid`);
-  }
-  return value;
-}
-
-function normalizeMessages(value) {
-  if (
-    !Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Array.prototype ||
-    value.length < 1 ||
-    value.length > 16
-  ) {
-    throw new TypeError("messages are invalid");
-  }
-  return value.map((message) => {
-    if (
-      message === null ||
-      typeof message !== "object" ||
-      Array.isArray(message) ||
-      Object.getPrototypeOf(message) !== Object.prototype ||
-      Reflect.ownKeys(message).length !== 2 ||
-      !Object.hasOwn(message, "role") ||
-      !Object.hasOwn(message, "content") ||
-      !new Set(["system", "user", "assistant"]).has(message.role)
-    ) {
-      throw new TypeError("messages are invalid");
-    }
-    return {
-      role: message.role,
-      content: safeText(message.content, "message.content", 128 * 1024),
-    };
-  });
-}
-
-function normalizeSchema(value) {
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new TypeError("schema is invalid");
-  }
-  try {
-    return structuredClone(value);
-  } catch {
-    throw new TypeError("schema is invalid");
-  }
 }
 
 async function boundedResponseText(response, maximumBytes) {
@@ -289,17 +235,26 @@ export class OllamaStructuredProvider {
     Object.freeze(this);
   }
 
-  async generate({ model, messages, schema, signal = null } = {}) {
-    const externalSignal = normalizeAbortSignal(signal);
+  async generate(rawRequest = {}) {
+    const input = readStructuredBrainGenerateInput(rawRequest);
+    const externalSignal = normalizeAbortSignal(input.signal);
     if (externalSignal?.aborted) throw cancellationError();
+    const request = normalizeStructuredBrainRequest(
+      {
+        model: input.model,
+        messages: input.messages,
+        schema: input.schema,
+      },
+      { maxRequestBytes: this.#maxRequestBytes },
+    );
     const body = JSON.stringify({
-      model: safeText(model, "model", 256),
+      model: request.model,
       stream: false,
       think: false,
       keep_alive: "30m",
-      format: normalizeSchema(schema),
+      format: request.schema,
       options: { temperature: 0, num_ctx: this.#contextTokens },
-      messages: normalizeMessages(messages),
+      messages: request.messages,
     });
     if (Buffer.byteLength(body, "utf8") > this.#maxRequestBytes) {
       throw providerError(

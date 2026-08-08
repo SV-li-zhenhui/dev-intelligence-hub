@@ -150,6 +150,154 @@ test("housekeeping cycles reconcile and dispatch without making role decisions",
   assert.equal("work" in result.stages, false);
 });
 
+test("shutdown abort cancels active role work and prevents later dispatch", async () => {
+  const started = deferred();
+  let dispatches = 0;
+  let observedSignal = null;
+  const { service } = fixture({
+    workLoop: {
+      async runCycle({ signal }) {
+        observedSignal = signal;
+        started.resolve();
+        await new Promise((resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (signal?.aborted) onAbort();
+        });
+      },
+    },
+    dispatcher: {
+      async dispatchPending() {
+        dispatches += 1;
+      },
+    },
+  });
+  const controller = new AbortController();
+  const cycle = service.runCycle({
+    trigger: "employee:developer",
+    roleId: "developer",
+    signal: controller.signal,
+  });
+  await Promise.race([
+    started.promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("work did not start")), 50)),
+  ]);
+  const reason = Object.assign(new Error("shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  controller.abort(reason);
+
+  await assert.rejects(cycle, (error) => error === reason);
+  assert.strictEqual(observedSignal, controller.signal);
+  assert.equal(dispatches, 0);
+});
+
+test("housekeeping activates settled pending PR source revisions through ledger CAS", async () => {
+  const calls = [];
+  const root = {
+    itemId: "work-item-pr-root",
+    revision: 7,
+    statusReason: "pr_source_revised",
+    source: {
+      kind: "pull_request",
+      activeRevision: 1,
+      pendingRevision: 2,
+    },
+  };
+  const { service } = fixture({
+    ledger: {
+      async intake() {},
+      async listPendingPullRequestSources(input) {
+        calls.push(["list", input]);
+        return { items: [root], nextCursor: null };
+      },
+      async getSummary() {
+        calls.push(["summary"]);
+        return { revision: 19 };
+      },
+      async reconcilePullRequestSource(input) {
+        calls.push(["reconcile", input]);
+        return { applied: true, blockers: [] };
+      },
+    },
+  });
+
+  const result = await service.runCycle({ includeWork: false });
+
+  assert.deepEqual(calls, [
+    ["list", { limit: 100 }],
+    ["summary"],
+    ["reconcile", {
+      itemId: root.itemId,
+      expectedGraphRevision: 19,
+      expectedRevision: 7,
+      expectedPendingRevision: 2,
+    }],
+  ]);
+  assert.deepEqual(result.stages.pull_request_source_reconciliation.result, {
+    scanned: 1,
+    pending: 1,
+    applied: 1,
+    blocked: 0,
+    conflicted: 0,
+  });
+});
+
+test("blocked pending PR sources on the first page cannot starve later pages", async () => {
+  const roots = Array.from({ length: 101 }, (_, index) => ({
+    itemId: `work-item-pr-root-${String(index + 1).padStart(3, "0")}`,
+    revision: 7,
+    source: {
+      kind: "pull_request",
+      activeRevision: 1,
+      pendingRevision: 2,
+    },
+  }));
+  const listCalls = [];
+  const reconciled = [];
+  const { service } = fixture({
+    ledger: {
+      async intake() {},
+      async listPendingPullRequestSources(input) {
+        listCalls.push(input);
+        if (input.cursor === undefined) {
+          return {
+            items: roots.slice(0, 100),
+            nextCursor: roots[99].itemId,
+          };
+        }
+        assert.equal(input.cursor, roots[99].itemId);
+        return { items: [roots[100]], nextCursor: null };
+      },
+      async getSummary() {
+        return { revision: 19 };
+      },
+      async reconcilePullRequestSource(input) {
+        reconciled.push(input.itemId);
+        return input.itemId === roots[100].itemId
+          ? { applied: true, blockers: [] }
+          : { applied: false, blockers: ["sealed-action"] };
+      },
+    },
+  });
+
+  const result = await service.runCycle({ includeWork: false });
+
+  assert.deepEqual(listCalls, [
+    { limit: 100 },
+    { limit: 100, cursor: roots[99].itemId },
+  ]);
+  assert.equal(reconciled.length, 101);
+  assert.equal(reconciled.at(-1), roots[100].itemId);
+  assert.deepEqual(result.stages.pull_request_source_reconciliation.result, {
+    scanned: 101,
+    pending: 101,
+    applied: 1,
+    blocked: 100,
+    conflicted: 0,
+  });
+});
+
 test("role cycles forward the role scope to the proactive work loop", async () => {
   const { service, calls } = fixture();
 

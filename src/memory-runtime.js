@@ -49,6 +49,7 @@ export async function createMemoryRuntime({
   maximumStateBytes,
   createGuard = (options) => new ProcessExclusiveGuard(options),
   authoritySource = null,
+  confirmationAuthoritySource = null,
 } = {}) {
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
@@ -72,27 +73,56 @@ export async function createMemoryRuntime({
     const boundAuthoritySource = authoritySource === null
       ? null
       : requireAuthoritySource(authoritySource);
+    const boundConfirmationAuthoritySource =
+      confirmationAuthoritySource === null
+        ? null
+        : requireAuthoritySource(confirmationAuthoritySource);
     const assertAuthorityCurrent = async () => {
-      if (boundAuthoritySource === null) {
+      if (
+        boundAuthoritySource === null &&
+        boundConfirmationAuthoritySource === null
+      ) {
         if (journal.requiresLiveAuthority()) throw authorityNotCurrent();
         return null;
       }
-      const status = await boundAuthoritySource.readStatus();
+      if (boundAuthoritySource === null && journal.requiresLiveAuthority()) {
+        throw authorityNotCurrent();
+      }
+      const [status, confirmationStatus] = await Promise.all([
+        boundAuthoritySource === null
+          ? null
+          : boundAuthoritySource.readStatus(),
+        boundConfirmationAuthoritySource === null
+          ? null
+          : boundConfirmationAuthoritySource.readStatus(),
+      ]);
       const local = journal.getAuthorityState();
+      const localProjection = journal.getAuthorityProjectionState();
       const graph = status?.graph;
       if (
-        !Number.isSafeInteger(status?.ledgerRevision) ||
-        status.ledgerRevision !== local.workLedgerRevision ||
-        !Number.isSafeInteger(graph?.cursor) ||
-        graph.cursor !== graph.highWatermark ||
-        local.cursor !== graph.cursor ||
-        local.checkpointDigest !== graph.checkpointDigest ||
-        graph.checkpointDigest !== graph.highWatermarkDigest ||
-        local.authorityStateDigest !== graph.authorityStateDigest
+        (boundAuthoritySource !== null &&
+          (
+            !Number.isSafeInteger(status?.ledgerRevision) ||
+            status.ledgerRevision !== local.workLedgerRevision ||
+            !Number.isSafeInteger(graph?.cursor) ||
+            graph.cursor !== graph.highWatermark ||
+            local.cursor !== graph.cursor ||
+            local.checkpointDigest !== graph.checkpointDigest ||
+            graph.checkpointDigest !== graph.highWatermarkDigest ||
+            local.authorityStateDigest !== graph.authorityStateDigest ||
+            localProjection.workLedgerRevision !== status.ledgerRevision ||
+            localProjection.authorityStateDigest !== graph.authorityStateDigest
+          )) ||
+        (boundConfirmationAuthoritySource !== null &&
+          (
+            !Number.isSafeInteger(confirmationStatus?.highWatermark) ||
+            confirmationStatus.highWatermark !==
+              localProjection.confirmationHighWatermark
+          ))
       ) {
         throw authorityNotCurrent();
       }
-      return { status, local };
+      return { status, confirmationStatus, local, localProjection };
     };
     return Object.freeze({
       producer: frozenPort(journal, ["append", "appendBatch"]),
@@ -100,6 +130,7 @@ export async function createMemoryRuntime({
         "appendWorkItems",
         "appendGraphEvents",
         "appendProjectionRecords",
+        "appendAuthorityProjection",
         "adoptGraphCheckpoint",
       ]),
       search: Object.freeze({
@@ -117,6 +148,13 @@ export async function createMemoryRuntime({
               : {
                   workLedgerRevision: authority.local.workLedgerRevision,
                   graphMemoryCursor: authority.local.cursor,
+                  ...(authority.confirmationStatus === null
+                    ? {}
+                    : {
+                        confirmationMemoryHighWatermark:
+                          authority.localProjection
+                            .confirmationHighWatermark,
+                      }),
                 }),
           });
         },
@@ -127,7 +165,11 @@ export async function createMemoryRuntime({
           return journal.readRecords(value);
         },
       }),
-      authorityReader: frozenPort(journal, ["getAuthorityState"]),
+      authorityReader: frozenPort(journal, [
+        "getAuthorityState",
+        "getAuthorityProjectionState",
+        "requiresAuthorityProjectionCheckpoint",
+      ]),
       receiptVerifier: Object.freeze({
         verify: journal.verifyReceipt.bind(journal),
       }),

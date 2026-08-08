@@ -358,6 +358,8 @@ test("conflict capability is published only with its trusted materializer", asyn
   ]);
   assert.equal(runtime.conflictPreparationVerifier, null);
   assert.equal(runtime.conflictExecutionSourcePreparer, null);
+  assert.equal(runtime.controlledCommitBuilder, null);
+  assert.equal(runtime.controlledCommitPublisher, null);
   const execution = await runtime.broker.createExecution({
     workspaceId: "dashboard",
     executionId: "conflict-runtime-run",
@@ -404,8 +406,16 @@ test("configured Controlled Git exposes only frozen production ports", async (t)
   assert.deepEqual(Object.keys(runtime.conflictExecutionSourcePreparer), [
     "prepare",
   ]);
+  assert.deepEqual(Object.keys(runtime.controlledCommitBuilder), [
+    "create",
+    "find",
+    "verify",
+  ]);
+  assert.deepEqual(Object.keys(runtime.controlledCommitPublisher), ["publish"]);
   assert.equal(Object.isFrozen(runtime.conflictPreparationVerifier), true);
   assert.equal(Object.isFrozen(runtime.conflictExecutionSourcePreparer), true);
+  assert.equal(Object.isFrozen(runtime.controlledCommitBuilder), true);
+  assert.equal(Object.isFrozen(runtime.controlledCommitPublisher), true);
   assert.equal("controlledGitService" in runtime, false);
   assert.equal("controlledGitRuntime" in runtime, false);
   await access(path.join(setup.runtimeRoot, "conflict-preparations"));

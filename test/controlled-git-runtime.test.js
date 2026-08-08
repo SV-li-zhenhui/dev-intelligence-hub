@@ -101,9 +101,38 @@ async function fixture(t, overrides = {}) {
 }
 
 function fakeService(preparation) {
-  const calls = { inspect: [], verify: [], materialize: [] };
+  const calls = {
+    inspect: [],
+    verify: [],
+    materialize: [],
+    createCommit: [],
+    findCommit: [],
+    verifyCommit: [],
+    publishCommit: [],
+    recoverCommits: 0,
+  };
   return {
     calls,
+    async recoverControlledCommits() {
+      calls.recoverCommits += 1;
+      return { commits: 0, removedScratchDirectories: 0 };
+    },
+    async createControlledCommit(request) {
+      calls.createCommit.push(request);
+      return { evidenceId: "controlled-git-commit-created" };
+    },
+    async findControlledCommit(request) {
+      calls.findCommit.push(request);
+      return null;
+    },
+    async verifyControlledCommit(request) {
+      calls.verifyCommit.push(request);
+      return { evidenceId: request.evidenceId };
+    },
+    async publishControlledCommit(request) {
+      calls.publishCommit.push(request);
+      return { status: "stale" };
+    },
     async inspectConflict(request) {
       calls.inspect.push(structuredClone(request));
       return structuredClone(preparation);
@@ -119,7 +148,7 @@ function fakeService(preparation) {
   };
 }
 
-test("one Controlled Git service is hidden behind three frozen least-authority ports", async (t) => {
+test("one Controlled Git service is hidden behind five frozen least-authority ports", async (t) => {
   const setup = await fixture(t);
   const inputBinding = pullRequestBinding();
   const service = fakeService(preparationFor(inputBinding));
@@ -132,16 +161,27 @@ test("one Controlled Git service is hidden behind three frozen least-authority p
   });
 
   assert.equal(factoryCalls.length, 1);
-  assert.deepEqual(Object.keys(bundle), ["materializer", "verifier", "preparer"]);
+  assert.deepEqual(Object.keys(bundle), [
+    "commitBuilder",
+    "materializer",
+    "publisher",
+    "verifier",
+    "preparer",
+  ]);
   assert.equal(Object.isFrozen(bundle), true);
+  assert.deepEqual(Object.keys(bundle.commitBuilder), ["create", "find", "verify"]);
   assert.deepEqual(Object.keys(bundle.materializer), ["materialize"]);
+  assert.deepEqual(Object.keys(bundle.publisher), ["publish"]);
   assert.deepEqual(Object.keys(bundle.verifier), ["verify"]);
   assert.deepEqual(Object.keys(bundle.preparer), ["prepare"]);
   assert.equal(Object.isFrozen(bundle.materializer), true);
+  assert.equal(Object.isFrozen(bundle.publisher), true);
   assert.equal(Object.isFrozen(bundle.verifier), true);
   assert.equal(Object.isFrozen(bundle.preparer), true);
+  assert.equal(Object.isFrozen(bundle.commitBuilder), true);
   assert.equal("service" in bundle, false);
   assert.equal("controlledGitService" in bundle, false);
+  assert.equal(service.calls.recoverCommits, 1);
 
   const executionSource = await bundle.preparer.prepare(inputBinding);
   assert.deepEqual(service.calls.inspect, [{
@@ -170,6 +210,20 @@ test("one Controlled Git service is hidden behind three frozen least-authority p
   });
   assert.equal(service.calls.verify.length, 2);
   assert.equal(service.calls.materialize.length, 1);
+  const commitRequest = Object.freeze({ marker: "create" });
+  const findRequest = Object.freeze({ marker: "find" });
+  const verifyRequest = Object.freeze({ evidenceId: "controlled-git-commit-id" });
+  const publishRequest = Object.freeze({ marker: "publish" });
+  await bundle.commitBuilder.create(commitRequest);
+  await bundle.commitBuilder.find(findRequest);
+  await bundle.commitBuilder.verify(verifyRequest);
+  assert.deepEqual(await bundle.publisher.publish(publishRequest), {
+    status: "stale",
+  });
+  assert.deepEqual(service.calls.createCommit, [commitRequest]);
+  assert.deepEqual(service.calls.findCommit, [findRequest]);
+  assert.deepEqual(service.calls.verifyCommit, [verifyRequest]);
+  assert.deepEqual(service.calls.publishCommit, [publishRequest]);
 });
 
 test("same-repository PR resolves distinct trusted base and head mirrors", async (t) => {
@@ -247,6 +301,24 @@ test("enabled runtime rejects incomplete, overlapping, accessor and incomplete-p
     createControlledGitRuntimeBundle(accessor),
     (error) => error?.code === "INVALID_CONTROLLED_GIT_RUNTIME_CONFIG",
   );
+
+  for (const missingMethod of [
+    "recoverControlledCommits",
+    "createControlledCommit",
+    "verifyControlledCommit",
+    "publishControlledCommit",
+  ]) {
+    const inputBinding = pullRequestBinding();
+    const service = fakeService(preparationFor(inputBinding));
+    delete service[missingMethod];
+    await assert.rejects(
+      createControlledGitRuntimeBundle(setup.config, {
+        controlledGitServiceFactory: () => service,
+      }),
+      (error) => error?.code === "INVALID_CONTROLLED_GIT_RUNTIME_CONFIG",
+      missingMethod,
+    );
+  }
   await assert.rejects(
     createControlledGitRuntimeBundle(setup.config, {
       controlledGitServiceFactory: () => ({

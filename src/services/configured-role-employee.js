@@ -1,4 +1,5 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { EmployeeController } from "./employee-controller.js";
 import { normalizeBrainConfig } from "./brain-router.js";
 import {
@@ -6,9 +7,15 @@ import {
   normalizeRolePermissions,
   RoleDecisionEngine,
 } from "./role-decision-engine.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const SAFE_STATE_KEY = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
+const ASSIGNED_TASK_KINDS = new Set([
+  "assignment",
+  "graph_task",
+  "source_root",
+]);
 
 export class ConfiguredRoleEmployeeError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -40,6 +47,10 @@ function safeStateKey(value) {
     throw new TypeError("stateKey is invalid");
   }
   return value;
+}
+
+export function configuredRoleLifecycleStateKey(roleId) {
+  return safeStateKey(`configured-role-${safeStateKey(roleId)}-state`);
 }
 
 function isoTimestamp(value) {
@@ -77,6 +88,17 @@ function stableErrorCode(error) {
     // Untrusted errors collapse to one local classification.
   }
   return "ROLE_RUN_FAILED";
+}
+
+function decisionSignal(input) {
+  const request = dataObject(input);
+  return normalizeAbortSignal(request?.signal ?? null);
+}
+
+function throwIfDecisionAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw employeeError("ROLE_DECISION_CANCELLED", "Configured role decision was cancelled", 499);
 }
 
 function dataObject(value) {
@@ -163,6 +185,10 @@ function normalizeState(value) {
   };
 }
 
+export function normalizeConfiguredRoleLifecyclePersistedState(value) {
+  return normalizeState(value);
+}
+
 function requireDecisionEngine(value) {
   if (
     !value ||
@@ -175,6 +201,30 @@ function requireDecisionEngine(value) {
     decide: value.decide.bind(value),
     view: value.view.bind(value),
   });
+}
+
+function createDecisionEngine({
+  supplied,
+  definition,
+  permissions,
+  brain,
+  brainRouter,
+  actionAdmissionGate,
+  contextFactory,
+}) {
+  return requireDecisionEngine(
+    supplied ??
+      new RoleDecisionEngine({
+        definition,
+        permissions,
+        brain,
+        brainRouter,
+        ...(actionAdmissionGate === undefined
+          ? {}
+          : { actionAdmissionGate }),
+        ...(contextFactory ? { contextFactory } : {}),
+      }),
+  );
 }
 
 function safeBrainProjection(brain, engine) {
@@ -192,19 +242,73 @@ function safeBrainProjection(brain, engine) {
   });
 }
 
+function isBoundedBindingText(value, maximumBytes) {
+  return (
+    typeof value === "string" &&
+    Boolean(value) &&
+    !INVALID_CONTROL.test(value) &&
+    Buffer.byteLength(value, "utf8") <= maximumBytes
+  );
+}
+
+function assignedTaskRisk(input, canProposeCodeAction) {
+  const request = dataObject(input);
+  const item = request && dataObject(request.item);
+  if (!item || !ASSIGNED_TASK_KINDS.has(item.kind)) {
+    return "routine";
+  }
+  if (
+    !isBoundedBindingText(item.itemId, 192) ||
+    !isBoundedBindingText(item.assignmentId, 192)
+  ) {
+    return "invalid";
+  }
+  const assignment = dataObject(item.assignment);
+  const target = assignment && dataObject(assignment.target);
+  if (
+    !assignment ||
+    assignment.assignmentId !== item.assignmentId ||
+    !target ||
+    !isBoundedBindingText(target.type, 32) ||
+    !isBoundedBindingText(target.id, 128)
+  ) {
+    return "invalid";
+  }
+  let event;
+  try {
+    event = dataObject(currentWorkItemEvent(item));
+  } catch {
+    return "invalid";
+  }
+  if (
+    !event ||
+    !isBoundedBindingText(event.eventType, 128)
+  ) {
+    return "invalid";
+  }
+  if (canProposeCodeAction) return "task";
+  return event.eventType.startsWith("pull_request.")
+    ? "task"
+    : "routine";
+}
+
 export class ConfiguredRoleEmployee {
   #controller;
-  #decisionEngine;
+  #routineDecisionEngine;
+  #taskDecisionEngine;
+  #canProposeCodeAction;
   #workerPort;
 
   constructor({
     definition: definitionValue,
     permissions: permissionsValue,
     brain: brainValue,
+    taskBrain: taskBrainValue,
     brainRouter,
     actionAdmissionGate,
     contextFactory,
     decisionEngine: suppliedDecisionEngine,
+    taskDecisionEngine: suppliedTaskDecisionEngine,
     store,
     onRun = async () => {},
     clock = () => new Date(),
@@ -221,29 +325,51 @@ export class ConfiguredRoleEmployee {
     const definition = normalizeRoleDefinition(definitionValue);
     const permissions = normalizeRolePermissions(permissionsValue);
     const brain = normalizeBrainConfig(brainValue);
+    const taskBrain = taskBrainValue === undefined
+      ? null
+      : normalizeBrainConfig(taskBrainValue);
     this.roleId = definition.id;
     this.workerId = safeWorkerId(workerId ?? `configured-${definition.id}`);
     this.scheduleMinutes = definition.scheduleMinutes;
-    this.#decisionEngine = requireDecisionEngine(
-      suppliedDecisionEngine ??
-        new RoleDecisionEngine({
+    this.#canProposeCodeAction = permissions.allowedIntents.includes(
+      "propose_code_action",
+    );
+    this.#routineDecisionEngine = createDecisionEngine({
+      supplied: suppliedDecisionEngine,
+      definition,
+      permissions,
+      brain,
+      brainRouter,
+      actionAdmissionGate,
+      contextFactory,
+    });
+    if (taskBrain === null && suppliedTaskDecisionEngine !== undefined) {
+      throw new TypeError("taskDecisionEngine requires taskBrain");
+    }
+    this.#taskDecisionEngine = taskBrain === null
+      ? null
+      : createDecisionEngine({
+          supplied: suppliedTaskDecisionEngine,
           definition,
           permissions,
-          brain,
+          brain: taskBrain,
           brainRouter,
-          ...(actionAdmissionGate === undefined
-            ? {}
-            : { actionAdmissionGate }),
-          ...(contextFactory ? { contextFactory } : {}),
-        }),
+          actionAdmissionGate,
+          contextFactory,
+        });
+    const brainProjection = safeBrainProjection(
+      brain,
+      this.#routineDecisionEngine,
     );
-    const brainProjection = safeBrainProjection(brain, this.#decisionEngine);
+    const taskBrainProjection = taskBrain === null
+      ? null
+      : safeBrainProjection(taskBrain, this.#taskDecisionEngine);
     let controller;
     controller = new EmployeeController({
       definition,
       store,
       stateKey: safeStateKey(
-        stateKey ?? `configured-role-${definition.id}-state`,
+        stateKey ?? configuredRoleLifecycleStateKey(definition.id),
       ),
       operationQueue,
       createState: () => ({
@@ -266,6 +392,14 @@ export class ConfiguredRoleEmployee {
           ...brainProjection,
           remoteData: { ...brainProjection.remoteData },
         },
+        ...(taskBrainProjection === null
+          ? {}
+          : {
+              taskBrain: {
+                ...taskBrainProjection,
+                remoteData: { ...taskBrainProjection.remoteData },
+              },
+            }),
         lastRun: state.lastRun ? { ...state.lastRun } : null,
         lastErrorCode: state.lastErrorCode,
       }),
@@ -275,7 +409,9 @@ export class ConfiguredRoleEmployee {
         lastRun: state.lastRun ? { ...state.lastRun } : null,
         lastErrorCode: state.lastErrorCode,
       }),
-      run: async ({ state, trigger = "scheduled" }) => {
+      run: async ({ state, trigger = "scheduled", signal = null }) => {
+        signal = normalizeAbortSignal(signal);
+        throwIfDecisionAborted(signal);
         const normalizedTrigger = safeTrigger(trigger);
         let failure = null;
         try {
@@ -283,10 +419,14 @@ export class ConfiguredRoleEmployee {
             roleId: this.roleId,
             workerId: this.workerId,
             trigger: normalizedTrigger,
+            ...(signal === null ? {} : { signal }),
           });
+          throwIfDecisionAborted(signal);
         } catch (error) {
+          throwIfDecisionAborted(signal);
           failure = error;
         }
+        throwIfDecisionAborted(signal);
         const next = await controller.writeState({
           ...state,
           runCount: state.runCount + 1,
@@ -346,15 +486,38 @@ export class ConfiguredRoleEmployee {
   }
 
   async decide(input) {
+    const signal = decisionSignal(input);
+    throwIfDecisionAborted(signal);
     const before = await this.#controller.roleView();
+    throwIfDecisionAborted(signal);
     if (!before.enabled) {
       throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
     }
     if (before.paused) {
       throw employeeError("ROLE_PAUSED", "Configured role is paused", 409);
     }
-    const decision = await this.#decisionEngine.decide(input);
+    const risk = assignedTaskRisk(input, this.#canProposeCodeAction);
+    if (risk === "invalid") {
+      throw employeeError(
+        "ROLE_TASK_BINDING_INVALID",
+        "Configured role received an invalid assigned task binding",
+        409,
+      );
+    }
+    if (risk === "task" && this.#taskDecisionEngine === null) {
+      throw employeeError(
+        "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+        "Configured role requires an explicit task brain for this work",
+        503,
+      );
+    }
+    const decisionEngine = risk === "task"
+      ? this.#taskDecisionEngine
+      : this.#routineDecisionEngine;
+    const decision = await decisionEngine.decide(input);
+    throwIfDecisionAborted(signal);
     const after = await this.#controller.roleView();
+    throwIfDecisionAborted(signal);
     if (!after.enabled) {
       throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
     }

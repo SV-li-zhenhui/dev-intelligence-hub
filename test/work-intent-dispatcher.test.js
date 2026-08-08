@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
+import {
+  createConflictCodeExecutionSource,
+  sameCodeExecutionSource,
+} from "../src/domain/code-execution-source.js";
+import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
@@ -12,7 +18,10 @@ import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js"
 import {
   appendPullRequestWorkSource,
   createPullRequestWorkSource,
+  currentWorkItemEvent,
+  currentWorkItemInputBinding,
 } from "../src/services/work-ledger-pr-source.js";
+import { externalActionControlledCommit } from "./support/pull-request-external-action-fixture.js";
 
 function clone(value) {
   return structuredClone(value);
@@ -103,6 +112,23 @@ function workflowEvent(index = 1) {
   });
 }
 
+function conflictWorkflowEvent(index = 1, payloadOverrides = {}) {
+  const ordinary = workflowEvent(index);
+  return normalizeWorkflowEvent({
+    schemaVersion: ordinary.schemaVersion,
+    eventType: ordinary.eventType,
+    occurredAt: ordinary.occurredAt,
+    source: clone(ordinary.source),
+    subject: clone(ordinary.subject),
+    payload: {
+      ...clone(ordinary.payload),
+      mergeStateStatus: "DIRTY",
+      nextAction: "resolve_conflict",
+      ...payloadOverrides,
+    },
+  });
+}
+
 function common(type) {
   return {
     schemaVersion: 1,
@@ -146,6 +172,15 @@ function reviewIntent(overrides = {}) {
   };
 }
 
+function pullRequestActionIntent(action, overrides = {}) {
+  return {
+    ...common("propose_github_pull_request_action"),
+    action,
+    evidence: ["trusted-task-context"],
+    ...overrides,
+  };
+}
+
 function codeIntent(overrides = {}) {
   return {
     ...common("propose_code_action"),
@@ -153,6 +188,15 @@ function codeIntent(overrides = {}) {
     objective: "修复并发覆盖",
     acceptanceCriteria: ["回归测试通过"],
     evidence: ["revision 未校验"],
+    ...overrides,
+  };
+}
+
+function configurationChangeIntent(overrides = {}) {
+  return {
+    ...common("propose_configuration_change"),
+    changes: [{ path: ["refreshMinutes"], value: 15 }],
+    evidence: ["refresh cadence is too slow"],
     ...overrides,
   };
 }
@@ -238,6 +282,51 @@ function workPair(index, intent, {
     updatedAt: "2026-08-02T03:10:00.000Z",
   };
   return { item, outbox };
+}
+
+function conflictWorkPair(index = 1, intent = codeIntent(), payloadOverrides = {}) {
+  const pair = workPair(index, intent, {
+    target: { type: "role", id: "developer" },
+  });
+  pair.item.event = conflictWorkflowEvent(index, payloadOverrides);
+  pair.item.source = createPullRequestWorkSource(
+    prSourceEnvelope(index, pair.item.event, pair.item.assignmentId),
+  ).source;
+  return pair;
+}
+
+function conflictExecutionSource(inputBinding, seed = "1") {
+  const gitTarget = inputBinding.gitTarget;
+  const preparationBinding = createConflictPreparationBinding({
+    preparation: {
+      schemaVersion: 1,
+      preparationId: seed.repeat(64),
+      status: "conflicted",
+      baseCommitOid: gitTarget.baseRefOid,
+      headCommitOid: gitTarget.headRefOid,
+      mergeBaseOid: "e".repeat(40),
+      resultTreeOid: "f".repeat(40),
+      conflicts: [{ path: "src/value.js", mode: "100644" }],
+      boundaryDigest: "2".repeat(64),
+      evidenceDigest: "3".repeat(64),
+      resultObjectDigest: "4".repeat(64),
+      materialization: "full-tree",
+    },
+    gitTarget,
+  });
+  return createConflictCodeExecutionSource({
+    inputBinding,
+    preparationBinding,
+  });
+}
+
+function controlledEvidenceForPair(pair) {
+  return externalActionControlledCommit(
+    createPullRequestExecutionBinding({
+      sourceBinding: currentWorkItemInputBinding(pair.item),
+      event: currentWorkItemEvent(pair.item),
+    }),
+  );
 }
 
 function prSourceEnvelope(
@@ -530,6 +619,10 @@ function fixture(pairs, options = {}) {
     policy: options.policy ?? policy(),
     attentionProducer: attention,
     proposalProducer: proposals,
+    conflictExecutionSourcePreparer:
+      options.conflictExecutionSourcePreparer,
+    controlledCommitEvidenceReader:
+      options.controlledCommitEvidenceReader,
     actionAdmissionGate: options.actionAdmissionGate,
     clock: time.clock,
     leaseDurationMs: options.leaseDurationMs ?? 1_000,
@@ -604,25 +697,47 @@ test("internal outcomes and durable proposals map to explicit ledger states", as
     { name: "complete", intent: completeIntent(), role: "pr-reviewer", next: "completed" },
     { name: "github", intent: reviewIntent(), role: "pr-reviewer", next: "waiting_external" },
     { name: "code", intent: codeIntent(), role: "developer", next: "waiting_external" },
+    {
+      name: "configuration",
+      intent: configurationChangeIntent({
+        dispatchIntentId: `work-dispatch-intent-${"f".repeat(64)}`,
+      }),
+      role: "developer",
+      next: "waiting_external",
+      policy: policy({ configurationChangeRoles: ["developer"] }),
+    },
   ];
   for (const [index, entry] of cases.entries()) {
     await t.test(entry.name, async () => {
       const pair = workPair(index + 2, entry.intent, {
         target: { type: "role", id: entry.role },
       });
-      const { dispatcher, ledger, attention, proposals } = fixture([pair]);
+      const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+        ...(entry.policy === undefined ? {} : { policy: entry.policy }),
+      });
       const result = await dispatcher.dispatchPending();
 
       assert.equal(result.delivered, 1);
       assert.equal(ledger.items[0].status, entry.next);
       assert.match(ledger.ackCalls[0].details.downstreamRef ?? ledger.ackCalls[0].details.resultRef, WORK_INTENT_REF);
       assert.equal(attention.calls.length, 0);
-      if (["github", "code"].includes(entry.name)) {
+      if (["github", "code", "configuration"].includes(entry.name)) {
         assert.equal(proposals.calls.length, 1);
         assert.equal(
           ledger.ackCalls[0].details.proposalDigest,
           proposals.calls[0].contentDigest,
         );
+        if (entry.name === "configuration") {
+          assert.equal(
+            proposals.calls[0].kind,
+            "configuration_change_proposal",
+          );
+          assert.deepEqual(Object.keys(proposals.calls[0].binding).sort(), [
+            "dispatchIntentId",
+            "eventId",
+            "subject",
+          ]);
+        }
       } else {
         assert.equal(proposals.calls.length, 0);
       }
@@ -630,6 +745,164 @@ test("internal outcomes and durable proposals map to explicit ledger states", as
       assert.equal(Object.hasOwn(ledger.ackCalls[0], "accountId"), false);
     });
   }
+});
+
+test("trusted PR role decisions produce five durable external action proposals", async (t) => {
+  const actionFactories = [
+    () => ({ type: "comment", body: "请补充失败日志。" }),
+    () => ({ type: "review", verdict: "comment", body: "建议补充并发测试。" }),
+    () => ({ type: "update_branch" }),
+    (evidence) => ({
+      type: "push",
+      controlledCommitEvidenceId: evidence.evidenceId,
+    }),
+    () => ({ type: "merge", method: "squash" }),
+  ];
+  for (const [offset, createAction] of actionFactories.entries()) {
+    await t.test(["comment", "review", "update", "push", "merge"][offset], async () => {
+      const pair = workPair(
+        10 + offset,
+        pullRequestActionIntent({ type: "update_branch" }),
+      );
+      const evidence = controlledEvidenceForPair(pair);
+      const requestedAction = createAction(evidence);
+      pair.outbox.intent = pullRequestActionIntent(requestedAction);
+      const reads = [];
+      const { dispatcher, ledger, proposals } = fixture([pair], {
+        controlledCommitEvidenceReader: {
+          async verify(input) {
+            reads.push(clone(input));
+            return clone(evidence);
+          },
+        },
+      });
+
+      const result = await dispatcher.dispatchPending();
+
+      assert.equal(result.delivered, 1);
+      assert.equal(ledger.items[0].status, "waiting_external");
+      assert.equal(proposals.calls.length, 1);
+      assert.equal(
+        proposals.calls[0].kind,
+        "github_pull_request_action_proposal",
+      );
+      assert.equal(proposals.calls[0].payload.action.type, requestedAction.type);
+      assert.equal(
+        proposals.calls[0].binding.inputBinding.schemaVersion,
+        2,
+      );
+      if (requestedAction.type === "push") {
+        assert.deepEqual(reads, [{ evidenceId: evidence.evidenceId }]);
+        assert.equal(
+          proposals.calls[0].payload.action.controlledCommitEvidence.evidenceId,
+          evidence.evidenceId,
+        );
+      } else {
+        assert.equal(reads.length, 0);
+        assert.deepEqual(proposals.calls[0].payload.action, requestedAction);
+      }
+    });
+  }
+});
+
+test("push proposal fails closed before proposal creation without trusted evidence", async (t) => {
+  await t.test("reader missing", async () => {
+    const pair = workPair(15, pullRequestActionIntent({
+      type: "push",
+      controlledCommitEvidenceId: `controlled-git-commit-${"a".repeat(64)}`,
+    }));
+    const { dispatcher, ledger, proposals } = fixture([pair]);
+    const result = await dispatcher.dispatchPending();
+    assert.equal(result.blocked, 1);
+    assert.equal(
+      ledger.ackCalls[0].details.code,
+      "controlled-commit-evidence-reader-not-configured",
+    );
+    assert.equal(proposals.calls.length, 0);
+  });
+
+  await t.test("reader returns evidence for another PR", async () => {
+    const pair = workPair(16, pullRequestActionIntent({
+      type: "push",
+      controlledCommitEvidenceId: `controlled-git-commit-${"a".repeat(64)}`,
+    }));
+    const foreignPair = workPair(17, reviewIntent());
+    const foreignEvidence = controlledEvidenceForPair(foreignPair);
+    pair.outbox.intent = pullRequestActionIntent({
+      type: "push",
+      controlledCommitEvidenceId: foreignEvidence.evidenceId,
+    });
+    const { dispatcher, ledger, proposals } = fixture([pair], {
+      controlledCommitEvidenceReader: {
+        async verify() { return clone(foreignEvidence); },
+      },
+    });
+    const result = await dispatcher.dispatchPending();
+    assert.equal(result.blocked, 1);
+    assert.equal(
+      ledger.ackCalls[0].details.code,
+      "controlled-commit-evidence-invalid",
+    );
+    assert.equal(proposals.calls.length, 0);
+  });
+
+  await t.test("reader temporarily unavailable", async () => {
+    const pair = workPair(18, pullRequestActionIntent({
+      type: "push",
+      controlledCommitEvidenceId: `controlled-git-commit-${"a".repeat(64)}`,
+    }));
+    const { dispatcher, ledger, proposals } = fixture([pair], {
+      controlledCommitEvidenceReader: {
+        async verify() { throw new Error("store busy"); },
+      },
+    });
+    const result = await dispatcher.dispatchPending();
+    assert.equal(result.retryWait, 1);
+    assert.equal(
+      ledger.ackCalls[0].details.code,
+      "controlled-commit-evidence-temporarily-unavailable",
+    );
+    assert.equal(proposals.calls.length, 0);
+  });
+});
+
+test("a restarted push dispatch reuses the sealed binding without rereading evidence", async () => {
+  const pair = workPair(19, pullRequestActionIntent({ type: "update_branch" }));
+  const evidence = controlledEvidenceForPair(pair);
+  pair.outbox.intent = pullRequestActionIntent({
+    type: "push",
+    controlledCommitEvidenceId: evidence.evidenceId,
+  });
+  const time = controlledClock();
+  const proposals = new FakeProposalProducer();
+  proposals.failAfterCreateOnce = true;
+  let reads = 0;
+  const first = fixture([pair], {
+    time,
+    proposals,
+    controlledCommitEvidenceReader: {
+      async verify() { reads += 1; return clone(evidence); },
+    },
+  });
+
+  const uncertain = await first.dispatcher.dispatchPending();
+  assert.equal(uncertain.uncertain, 1);
+  assert.equal(reads, 1);
+  assert.notEqual(first.ledger.outbox[0].dispatchBinding, null);
+
+  time.advance(1_000);
+  const restarted = fixture([], {
+    time,
+    ledger: first.ledger,
+    proposals,
+    controlledCommitEvidenceReader: {
+      async verify() { throw new Error("must not reread sealed evidence"); },
+    },
+  });
+  const recovered = await restarted.dispatcher.dispatchPending();
+  assert.equal(recovered.delivered, 1);
+  assert.equal(reads, 1);
+  assert.equal(first.ledger.items[0].status, "waiting_external");
 });
 
 test("proposal evidence authority is derived from the trusted graph contract", async () => {
@@ -1610,6 +1883,271 @@ test("asynchronous intent policy binding fails closed without downstream effects
   assert.equal(ledger.claimCalls.length, 1);
   assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
   assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("DIRTY resolve_conflict prepares one sealed source before durable proposal binding", async () => {
+  const pair = conflictWorkPair(5);
+  const calls = [];
+  const preparer = {
+    async prepare(inputBinding) {
+      calls.push(clone(inputBinding));
+      return conflictExecutionSource(inputBinding);
+    },
+  };
+  const { dispatcher, ledger, proposals } = fixture([pair], {
+    conflictExecutionSourcePreparer: preparer,
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].schemaVersion, 2);
+  const boundSource = ledger.bindCalls[0].boundIntent.binding.executionSource;
+  assert.equal(sameCodeExecutionSource(boundSource, conflictExecutionSource(calls[0])), true);
+  assert.equal(
+    sameCodeExecutionSource(
+      proposals.calls[0].binding.executionSource,
+      boundSource,
+    ),
+    true,
+  );
+  assert.deepEqual(Object.keys(calls[0]).sort(), [
+    "eventDigest",
+    "eventId",
+    "gitTarget",
+    "headRefOid",
+    "headRevision",
+    "inputDigest",
+    "inputRevision",
+    "kind",
+    "pullRequestNumber",
+    "repository",
+    "rootItemId",
+    "schemaVersion",
+    "workKey",
+  ]);
+});
+
+test("persisted conflict binding retries delivery without preparing a second source", async () => {
+  const pair = conflictWorkPair(6);
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], {
+    time,
+    ledger,
+    conflictExecutionSourcePreparer: {
+      async prepare(inputBinding) {
+        preparations += 1;
+        return conflictExecutionSource(inputBinding);
+      },
+    },
+  });
+
+  const first = await dispatcher.dispatchPending();
+  assert.equal(first.uncertain, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls.length, 0);
+
+  time.advance(1_001);
+  const recovered = await dispatcher.dispatchPending();
+  assert.equal(recovered.delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls.length, 1);
+});
+
+test("upgrade recovery blocks a persisted conflict proposal without a sealed source", async () => {
+  const pair = conflictWorkPair(15);
+  const trustedPolicy = policy();
+  const inputBinding = createPullRequestExecutionBinding({
+    sourceBinding: currentWorkItemInputBinding(pair.item),
+    event: currentWorkItemEvent(pair.item),
+  });
+  const legacyBound = trustedPolicy.bind({
+    context: {
+      assignmentId: pair.item.assignmentId,
+      workItemId: pair.item.itemId,
+      roleId: pair.outbox.requestedBy.roleId,
+      event: pair.item.event,
+      inputBinding,
+    },
+    intent: pair.outbox.intent,
+  });
+  pair.outbox.dispatchBinding = createWorkIntentDispatchBinding(legacyBound);
+  let preparations = 0;
+  const { dispatcher, ledger, proposals } = fixture([pair], {
+    conflictExecutionSourcePreparer: {
+      async prepare() {
+        preparations += 1;
+        throw new Error("persisted policy binding must not be replaced");
+      },
+    },
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.blocked, 1);
+  assert.equal(result.items[0].code, "conflict-binding-unsealed");
+  assert.equal(ledger.bindCalls.length, 0);
+  assert.equal(preparations, 0);
+  assert.equal(proposals.calls.length, 0);
+});
+
+test("configuration cutover after preparation fences binding and safely re-prepares after restart", async () => {
+  const pair = conflictWorkPair(14);
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  let preparations = 0;
+  let admissions = 0;
+  const preparer = {
+    async prepare(inputBinding) {
+      preparations += 1;
+      return conflictExecutionSource(inputBinding);
+    },
+  };
+  const cutoverGate = {
+    run(operation) {
+      admissions += 1;
+      if (admissions === 3) {
+        throw Object.assign(new Error("restart required"), {
+          code: "RUNTIME_RESTART_REQUIRED",
+        });
+      }
+      return operation();
+    },
+  };
+  const firstRuntime = fixture([pair], {
+    time,
+    ledger,
+    actionAdmissionGate: cutoverGate,
+    conflictExecutionSourcePreparer: preparer,
+  });
+
+  await assert.rejects(
+    firstRuntime.dispatcher.dispatchPending(),
+    (error) => error.code === "RUNTIME_RESTART_REQUIRED",
+  );
+  assert.equal(preparations, 1);
+  assert.equal(ledger.bindCalls.length, 0);
+  assert.equal(firstRuntime.proposals.calls.length, 0);
+
+  time.advance(1_001);
+  const restarted = fixture([pair], {
+    time,
+    ledger,
+    conflictExecutionSourcePreparer: preparer,
+  });
+  const result = await restarted.dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.equal(preparations, 2);
+  assert.equal(ledger.bindCalls.length, 1);
+  assert.equal(restarted.proposals.calls.length, 1);
+});
+
+test("conflict facts and missing preparation capability fail closed without ordinary modify fallback", async (t) => {
+  await t.test("inconsistent facts", async () => {
+    const pair = conflictWorkPair(7, codeIntent(), { nextAction: "wait_other" });
+    let preparations = 0;
+    const { dispatcher, ledger, proposals } = fixture([pair], {
+      conflictExecutionSourcePreparer: {
+        async prepare() {
+          preparations += 1;
+          throw new Error("must not prepare");
+        },
+      },
+    });
+
+    const result = await dispatcher.dispatchPending();
+    assert.equal(result.blocked, 1);
+    assert.equal(ledger.ackCalls[0].details.code, "conflict-facts-inconsistent");
+    assert.equal(preparations, 0);
+    assert.equal(proposals.calls.length, 0);
+  });
+
+  await t.test("preparer absent", async () => {
+    const pair = conflictWorkPair(8);
+    const { dispatcher, ledger, proposals } = fixture([pair]);
+
+    const result = await dispatcher.dispatchPending();
+    assert.equal(result.blocked, 1);
+    assert.equal(ledger.ackCalls[0].details.code, "conflict-preparer-not-configured");
+    assert.equal(proposals.calls.length, 0);
+  });
+});
+
+test("conflict preparation errors are classified without creating a proposal", async (t) => {
+  const cases = [
+    {
+      name: "unsupported conflict",
+      errorCode: "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
+      counter: "blocked",
+      resultCode: "conflict-source-blocked",
+    },
+    {
+      name: "temporary process failure",
+      errorCode: "CONTROLLED_GIT_TIMEOUT",
+      counter: "retryWait",
+      resultCode: "conflict-source-temporarily-unavailable",
+    },
+    {
+      name: "source became stale",
+      errorCode: "CONFLICT_PREPARATION_INPUT_CHANGED",
+      counter: "blocked",
+      resultCode: "conflict-source-stale",
+    },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.name, async () => {
+      const pair = conflictWorkPair(index + 9);
+      const { dispatcher, ledger, proposals } = fixture([pair], {
+        conflictExecutionSourcePreparer: {
+          async prepare() {
+            throw Object.assign(new Error(entry.name), { code: entry.errorCode });
+          },
+        },
+      });
+
+      const result = await dispatcher.dispatchPending();
+      assert.equal(result[entry.counter], 1);
+      assert.equal(ledger.ackCalls[0].details.code, entry.resultCode);
+      assert.equal(proposals.calls.length, 0);
+    });
+  }
+});
+
+test("dispatcher rejects a policy that substitutes the prepared execution source", async () => {
+  const pair = conflictWorkPair(13);
+  const trustedPolicy = policy();
+  const { dispatcher, ledger, proposals } = fixture([pair], {
+    conflictExecutionSourcePreparer: {
+      async prepare(inputBinding) {
+        return conflictExecutionSource(inputBinding, "1");
+      },
+    },
+    policy: {
+      bind(input) {
+        return trustedPolicy.bind({
+          ...input,
+          context: {
+            ...input.context,
+            executionSource: conflictExecutionSource(
+              input.context.inputBinding,
+              "5",
+            ),
+          },
+        });
+      },
+    },
+  });
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.blocked, 1);
+  assert.equal(ledger.ackCalls[0].details.code, "policy-binding-invalid");
   assert.equal(proposals.calls.length, 0);
 });
 

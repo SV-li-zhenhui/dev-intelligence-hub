@@ -4,6 +4,10 @@ import {
   pullRequestGitTargetFromEvent,
   samePullRequestGitTarget,
 } from "../domain/git-tool-contract.js";
+import { createPullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
+import { createPullRequestReadIdentity } from "../domain/pull-request-read-facts.js";
+import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
+import { normalizePullRequestInputBinding } from "./work-ledger-pr-source.js";
 
 const FACT_FIELDS = new Map([
   ["action-state", "actionState"],
@@ -30,8 +34,8 @@ const OPTIONAL_REPEATED_GIT_TARGET_FIELDS = Object.freeze(
   FLAT_GIT_TARGET_FIELDS.filter(([, field]) => field !== "headRefOid"),
 );
 
-function invalid(message) {
-  return new TypeError(message);
+function invalid(message, options) {
+  return new TypeError(message, options);
 }
 
 function ownData(value) {
@@ -74,6 +78,81 @@ function exactInput(value) {
     throw invalid("workflow fact is invalid");
   }
   return { item: entries.get("item"), fact };
+}
+
+function exactPullRequestContextInput(value) {
+  const entries = ownData(value);
+  if (
+    !entries ||
+    entries.size !== 2 ||
+    !entries.has("sourceBinding") ||
+    !entries.has("event")
+  ) {
+    throw invalid("PR task context request is invalid");
+  }
+  let sourceBinding;
+  let event;
+  try {
+    sourceBinding = normalizePullRequestInputBinding(
+      entries.get("sourceBinding"),
+    );
+    event = normalizeStoredWorkflowEvent(entries.get("event"));
+  } catch (cause) {
+    throw invalid("PR task context binding is invalid", { cause });
+  }
+  return { sourceBinding, event };
+}
+
+function bindPortMethod(value, method, name) {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function") ||
+    utilTypes.isProxy(value)
+  ) {
+    throw invalid(`${name} is invalid`);
+  }
+  let current = value;
+  try {
+    while (current !== null) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, method);
+      if (descriptor) {
+        if (
+          !Object.hasOwn(descriptor, "value") ||
+          typeof descriptor.value !== "function"
+        ) {
+          throw invalid(`${name} is invalid`);
+        }
+        return descriptor.value.bind(value);
+      }
+      current = Object.getPrototypeOf(current);
+    }
+  } catch (error) {
+    if (error instanceof TypeError && error.message === `${name} is invalid`) {
+      throw error;
+    }
+    throw invalid(`${name} is invalid`, { cause: error });
+  }
+  throw invalid(`${name} is invalid`);
+}
+
+function optionalPullRequestContext(value) {
+  return value === undefined || value === null
+    ? null
+    : bindPortMethod(value, "context", "pullRequestFacts");
+}
+
+function requestSignal(options) {
+  if (options === undefined) return null;
+  const entries = ownData(options);
+  const signal = entries?.size === 1 ? entries.get("signal") : null;
+  if (
+    !signal ||
+    typeof signal !== "object" ||
+    typeof signal.throwIfAborted !== "function"
+  ) {
+    throw invalid("PR task context options are invalid");
+  }
+  return signal;
 }
 
 function isoTimestamp(value) {
@@ -212,18 +291,20 @@ function result({ healthy, fresh, value = null, observedAt = null }) {
 }
 
 export class WorkflowFactSource {
-  #store;
+  #readSnapshot;
+  #readPullRequestContext;
+  #pullRequestTaskContextReader;
   #clock;
   #maximumAgeMs;
 
   constructor({
     store,
+    pullRequestFacts,
     clock = () => new Date(),
     maximumAgeMs = DEFAULT_MAXIMUM_AGE_MS,
   } = {}) {
-    if (!store || typeof store.read !== "function") {
-      throw invalid("WorkflowFactSource requires a store");
-    }
+    this.#readSnapshot = bindPortMethod(store, "read", "store");
+    this.#readPullRequestContext = optionalPullRequestContext(pullRequestFacts);
     if (typeof clock !== "function") throw invalid("clock is invalid");
     if (
       !Number.isSafeInteger(maximumAgeMs) ||
@@ -232,7 +313,11 @@ export class WorkflowFactSource {
     ) {
       throw invalid("maximumAgeMs is invalid");
     }
-    this.#store = store;
+    this.#pullRequestTaskContextReader = this.#readPullRequestContext === null
+      ? null
+      : Object.freeze({
+          read: this.#readBoundPullRequestContext.bind(this),
+        });
     this.#clock = clock;
     this.#maximumAgeMs = maximumAgeMs;
     Object.freeze(this);
@@ -246,7 +331,7 @@ export class WorkflowFactSource {
       return result({ healthy: false, fresh: false });
     }
 
-    const snapshot = await this.#store.read("snapshot", null);
+    const snapshot = await this.#readSnapshot("snapshot", null);
     const snapshotEntries = ownData(snapshot);
     const observedAt = isoTimestamp(snapshotEntries?.get("refreshedAt"));
     const sourceStatus = ownData(snapshotEntries?.get("sourceStatus"));
@@ -320,5 +405,38 @@ export class WorkflowFactSource {
       value: selectedFactValue(matched, field),
       observedAt,
     });
+  }
+
+  pullRequestTaskContextReader() {
+    return this.#pullRequestTaskContextReader;
+  }
+
+  async #readBoundPullRequestContext(value, options) {
+    const signal = requestSignal(options);
+    signal?.throwIfAborted();
+    const { sourceBinding, event } = exactPullRequestContextInput(value);
+    let executionBinding;
+    try {
+      executionBinding = createPullRequestExecutionBinding({
+        sourceBinding,
+        event,
+      });
+    } catch (cause) {
+      throw invalid("PR task context execution binding is invalid", { cause });
+    }
+    if (executionBinding.schemaVersion !== 2) {
+      throw invalid("PR task context requires an atomic Git target");
+    }
+    const identity = createPullRequestReadIdentity({ executionBinding, event });
+    const context = await this.#readPullRequestContext(
+      { executionBinding, event },
+      signal === null ? undefined : { signal },
+    );
+    signal?.throwIfAborted();
+    const fields = ownData(context);
+    if (fields?.get("identityDigest") !== identity.identityDigest) {
+      throw invalid("PR task context identity is stale");
+    }
+    return context;
   }
 }

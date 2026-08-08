@@ -17,6 +17,71 @@ function sectionByTitle(page, title) {
   });
 }
 
+function deferred() {
+  let resolve;
+  return {
+    promise: new Promise((next) => {
+      resolve = next;
+    }),
+    resolve,
+  };
+}
+
+async function assertPending(promise, message) {
+  let settled = false;
+  promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, message);
+}
+
+async function systemStatusResult(
+  page,
+  { expectError = false, expectedCheckedAt = "" } = {},
+) {
+  const systemBackup = page.locator("[data-system-backup-create]");
+  const systemError = page.locator('.system-status-panel [role="alert"]');
+  if (expectError) {
+    await systemError.waitFor();
+  } else {
+    if (!expectedCheckedAt) {
+      throw new Error("successful System status response is missing readiness.checkedAt");
+    }
+    await page
+      .locator(".system-status-checked")
+      .filter({ hasText: `检查时间：${expectedCheckedAt}` })
+      .waitFor();
+  }
+  const systemErrorVisible = await systemError.isVisible();
+  return {
+    systemStatusText: await page.locator(".system-status-panel").innerText(),
+    systemBackupVisible: await systemBackup.isVisible(),
+    systemErrorVisible,
+    systemErrorText: systemErrorVisible ? await systemError.innerText() : "",
+  };
+}
+
+async function activateSystemAndReadStatus(page) {
+  const systemStatusResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET" &&
+      url.origin === new URL(baseUrl).origin &&
+      url.pathname === "/api/system/status";
+  });
+  await page.locator('[data-view="system"]').click();
+  const response = await systemStatusResponse;
+  if (!response.ok()) return systemStatusResult(page, { expectError: true });
+  const status = await response.json();
+  const checkedAt = status?.readiness?.checkedAt;
+  return systemStatusResult(page, { expectedCheckedAt: checkedAt });
+}
+
 async function validate(name, viewport) {
   const page = await browser.newPage({ viewport, acceptDownloads: true });
   const consoleErrors = [];
@@ -74,6 +139,7 @@ async function validate(name, viewport) {
   const memorySearchVisible = await page
     .getByLabel("搜索 PR、仓库、问题或处理结论")
     .isVisible();
+  const system = await activateSystemAndReadStatus(page);
   const horizontalOverflow = await page.evaluate(
     () => document.documentElement.scrollWidth > window.innerWidth,
   );
@@ -85,6 +151,13 @@ async function validate(name, viewport) {
     employeeState,
     employeeJobCount,
     memorySearchVisible,
+    systemStatusVisible:
+      system.systemStatusText.includes("Liveness") &&
+      system.systemStatusText.includes("Readiness") &&
+      system.systemStatusText.includes("一致性备份"),
+    systemBackupVisible: system.systemBackupVisible,
+    systemErrorVisible: system.systemErrorVisible,
+    systemErrorText: system.systemErrorText,
     detailHasResponsibility,
     prSectionTitles,
     versionRows,
@@ -920,7 +993,171 @@ async function validateExternalReviewConfirmation() {
   await page.close();
 }
 
+async function validateSystemStatusFailureStates() {
+  const initialFailure = await browser.newPage({
+    viewport: { width: 1100, height: 820 },
+  });
+  await initialFailure.route("**/api/system/status", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "fixture failure" }),
+    }),
+  );
+  await initialFailure.goto(baseUrl, { waitUntil: "networkidle" });
+  const initial = await activateSystemAndReadStatus(initialFailure);
+  results.push({ name: "system-status-initial-error", ...initial });
+  await initialFailure.close();
+
+  const staleFailure = await browser.newPage({
+    viewport: { width: 1100, height: 820 },
+  });
+  await staleFailure.goto(baseUrl, { waitUntil: "networkidle" });
+  await activateSystemAndReadStatus(staleFailure);
+  await staleFailure.locator('[data-view="memory"]').click();
+  await staleFailure.locator("#memory-search-form").waitFor();
+  const staleFailureResponse = deferred();
+  const staleFailureRouteEntered = deferred();
+  await staleFailure.route("**/api/system/status", async (route) => {
+    staleFailureRouteEntered.resolve();
+    await staleFailureResponse.promise;
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "fixture failure" }),
+    });
+  });
+  const staleResult = activateSystemAndReadStatus(staleFailure);
+  await staleFailureRouteEntered.promise;
+  await assertPending(staleResult, "stale 503 activation must remain pending");
+  staleFailureResponse.resolve();
+  const stale = await staleResult;
+  results.push({ name: "system-status-stale-error", ...stale });
+  await staleFailure.close();
+
+  const staleSuccess = await browser.newPage({
+    viewport: { width: 1100, height: 820 },
+  });
+  await staleSuccess.addInitScript(() => {
+    const fetchWithHeldSystemStatusJson = window.fetch.bind(window);
+    window.fetch = async (...args) => {
+      const response = await fetchWithHeldSystemStatusJson(...args);
+      const input = args[0];
+      const url = new URL(
+        typeof input === "string" ? input : input.url,
+        window.location.href,
+      );
+      if (
+        !window.__validatorHoldSystemStatusJson ||
+        url.pathname !== "/api/system/status"
+      ) {
+        return response;
+      }
+      window.__validatorHoldSystemStatusJson = false;
+      window.fetch = fetchWithHeldSystemStatusJson;
+      return new Proxy(response, {
+        get(target, property) {
+          if (property === "json") {
+            return async () => {
+              window.__validatorSystemStatusJsonEntered = true;
+              await new Promise((resolve) => {
+                window.__validatorReleaseSystemStatusJson = resolve;
+              });
+              return target.json();
+            };
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    };
+  });
+  await staleSuccess.goto(baseUrl, { waitUntil: "networkidle" });
+  await activateSystemAndReadStatus(staleSuccess);
+  const heldSuccess = await staleSuccess.evaluate(async () => {
+    const response = await fetch("/api/system/status", { cache: "no-store" });
+    if (!response.ok) throw new Error(`fixture status ${response.status}`);
+    return response.json();
+  });
+  const expectedCheckedAt = "2035-01-02T03:04:05.000Z";
+  heldSuccess.readiness = { ...heldSuccess.readiness, checkedAt: expectedCheckedAt };
+  await staleSuccess.locator('[data-view="memory"]').click();
+  await staleSuccess.locator("#memory-search-form").waitFor();
+  const staleSuccessResponse = deferred();
+  const staleSuccessRouteEntered = deferred();
+  const staleSuccessResponseEvent = deferred();
+  staleSuccess.waitForResponse = () => staleSuccessResponseEvent.promise;
+  await staleSuccess.route("**/api/system/status", async (route) => {
+    staleSuccessRouteEntered.resolve();
+    await staleSuccessResponse.promise;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(heldSuccess),
+    });
+    const response = {
+      url: () => `${baseUrl}/api/system/status`,
+      request: () => ({ method: () => "GET" }),
+      ok: () => true,
+      json: async () => structuredClone(heldSuccess),
+    };
+    staleSuccessResponseEvent.resolve(response);
+  });
+  await staleSuccess.evaluate(() => {
+    window.__validatorHoldSystemStatusJson = true;
+    window.__validatorSystemStatusJsonEntered = false;
+    window.__validatorReleaseSystemStatusJson = null;
+  });
+  const staleSuccessResult = activateSystemAndReadStatus(staleSuccess);
+  await staleSuccessRouteEntered.promise;
+  await assertPending(staleSuccessResult, "stale 200 activation must remain pending");
+  staleSuccessResponse.resolve();
+  await staleSuccess.waitForFunction(
+    () => window.__validatorSystemStatusJsonEntered === true,
+  );
+  let staleSuccessSettled = false;
+  let staleSuccessValue;
+  let staleSuccessError;
+  staleSuccessResult.then(
+    (value) => {
+      staleSuccessSettled = true;
+      staleSuccessValue = value;
+    },
+    (error) => {
+      staleSuccessSettled = true;
+      staleSuccessError = error;
+    },
+  );
+  await staleSuccess.evaluate(() => null);
+  await new Promise((resolve) => setImmediate(resolve));
+  if (staleSuccessError) throw staleSuccessError;
+  if (staleSuccessSettled) {
+    assert.equal(
+      staleSuccessValue.systemStatusText.includes(`检查时间：${expectedCheckedAt}`),
+      true,
+      "stale 200 activation returned pre-response System content",
+    );
+  }
+  assert.equal(
+    staleSuccessSettled,
+    false,
+    "stale 200 activation must wait for current response rendering",
+  );
+  await staleSuccess.evaluate(() => {
+    window.__validatorHoldSystemStatusJson = false;
+    window.__validatorReleaseSystemStatusJson();
+  });
+  const success = await staleSuccessResult;
+  results.push({
+    name: "system-status-stale-success",
+    expectedCheckedAt,
+    ...success,
+  });
+  await staleSuccess.close();
+}
+
 await validateExternalReviewConfirmation();
+await validateSystemStatusFailureStates();
 await browser.close();
 
 await writeFile(
@@ -936,6 +1173,13 @@ for (const result of results.filter((entry) => entry.name.includes("-"))) {
     assert.deepEqual(result.pageErrors, [], `${result.name}: page errors`);
     assert.equal(result.horizontalOverflow, false, `${result.name}: overflow`);
     assert.equal(result.memorySearchVisible, true, `${result.name}: memory search`);
+    assert.equal(result.systemStatusVisible, true, `${result.name}: system status`);
+    assert.equal(result.systemBackupVisible, true, `${result.name}: system backup`);
+    assert.equal(
+      result.systemErrorVisible,
+      false,
+      `${result.name}: system error ${result.systemErrorText}`,
+    );
     assert.equal(
       result.newestVersionFirstNote,
       true,
@@ -981,6 +1225,32 @@ assert.equal(reviewResult.request.body.expectedQueueRevision, 8);
 assert.equal(reviewResult.request.body.expectedItemRevision, 2);
 assert.equal(reviewResult.request.body.displayedPayloadDigest, "a".repeat(64));
 assert.equal(reviewResult.request.body.approvalBindingDigest, "b".repeat(64));
+
+const initialSystemFailure = results.find(
+  (entry) => entry.name === "system-status-initial-error",
+);
+assert.equal(initialSystemFailure.systemErrorVisible, true);
+assert.equal(initialSystemFailure.systemBackupVisible, false);
+assert.match(initialSystemFailure.systemErrorText, /读取系统状态失败（503）/);
+
+const staleSystemFailure = results.find(
+  (entry) => entry.name === "system-status-stale-error",
+);
+assert.equal(staleSystemFailure.systemErrorVisible, true);
+assert.equal(staleSystemFailure.systemBackupVisible, true);
+assert.match(staleSystemFailure.systemErrorText, /读取系统状态失败（503）/);
+
+const staleSystemSuccess = results.find(
+  (entry) => entry.name === "system-status-stale-success",
+);
+assert.equal(staleSystemSuccess.systemErrorVisible, false);
+assert.equal(staleSystemSuccess.systemBackupVisible, true);
+assert.equal(
+  staleSystemSuccess.systemStatusText.includes(
+    `检查时间：${staleSystemSuccess.expectedCheckedAt}`,
+  ),
+  true,
+);
 
 const codeJobResults = results.filter((entry) =>
   entry.name.startsWith("code-job-control-package-"),

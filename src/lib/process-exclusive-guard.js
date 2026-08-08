@@ -3,6 +3,7 @@ import net from "node:net";
 import { OperationQueue } from "./operation-queue.js";
 
 const GUARD_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+const PROJECT_DIGEST = /^[a-f0-9]{64}$/u;
 const FIRST_PRIVATE_PORT = 49_152;
 const PRIVATE_PORT_COUNT = 16_384;
 
@@ -12,6 +13,13 @@ export class ProcessExclusiveGuardError extends Error {
     this.name = "ProcessExclusiveGuardError";
     this.code = code;
   }
+}
+
+export function applicationWriterGuardName(projectDigest) {
+  if (typeof projectDigest !== "string" || !PROJECT_DIGEST.test(projectDigest)) {
+    throw new TypeError("projectDigest must be one lowercase SHA-256 digest");
+  }
+  return `mydashboard-data-writer-${projectDigest}`;
 }
 
 function guardEndpoint(name) {
@@ -44,6 +52,13 @@ function closedError(name) {
   return new ProcessExclusiveGuardError(
     "PROCESS_GUARD_CLOSED",
     `Process guard ${name} is closed`,
+  );
+}
+
+function notHeldError(name) {
+  return new ProcessExclusiveGuardError(
+    "PROCESS_GUARD_NOT_HELD",
+    `Process guard ${name} is not held by this process`,
   );
 }
 
@@ -120,6 +135,13 @@ export class ProcessExclusiveGuard {
       await acquired;
       return operation();
     });
+  }
+
+  assertHeld() {
+    if (this.state !== "active" || this.server?.listening !== true) {
+      throw notHeldError(this.name);
+    }
+    return true;
   }
 
   close() {

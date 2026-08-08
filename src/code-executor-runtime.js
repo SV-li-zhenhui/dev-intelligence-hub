@@ -597,6 +597,10 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
       controlledGitRuntime?.verifier ?? null,
     conflictExecutionSourcePreparer:
       controlledGitRuntime?.preparer ?? null,
+    controlledCommitBuilder:
+      controlledGitRuntime?.commitBuilder ?? null,
+    controlledCommitPublisher:
+      controlledGitRuntime?.publisher ?? null,
     recovery,
   });
 }

@@ -13,6 +13,7 @@ import {
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
+  ATTENTION_INBOX_STATE_KEY,
   ATTENTION_STATE_LIMITS,
   attentionStateBytes,
   createAttentionItem,
@@ -23,7 +24,7 @@ import {
   resolveAttentionItem,
 } from "./attention-inbox-state.js";
 
-const STATE_KEY = "attention-inbox";
+const STATE_KEY = ATTENTION_INBOX_STATE_KEY;
 const MAX_OUTBOX_BATCH = 100;
 
 function inboxError(code, message, statusCode = 400) {

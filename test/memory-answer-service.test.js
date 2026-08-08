@@ -391,6 +391,41 @@ test("a mixed raw and derived citation set gets one fresh bounded correction att
   assert.match(setup.generateCalls[1].messages.at(-1).content, /citation validation/i);
 });
 
+test("configured supervised CLI memory answers never start a correction process", async () => {
+  const calls = [];
+  const configuredBrain = {
+    provider: "cli",
+    model: "claude-opus-4-6",
+    remoteData: { requirements: false, code: true, memory: true },
+  };
+  const service = new MemoryAnswerService({
+    contextRetriever: { async retrieve() { return packet(); } },
+    brainRouter: {
+      describe(value) {
+        return {
+          provider: value.provider,
+          model: value.model,
+          remote: value.provider === "cli",
+          remoteData: structuredClone(value.remoteData),
+          ...(value.provider === "cli" ? { singleAttempt: true } : {}),
+        };
+      },
+      async generate(value) {
+        calls.push(structuredClone(value));
+        return "invalid CLI output";
+      },
+    },
+    configuredBrain,
+    localBrain: brain(),
+  });
+
+  await assert.rejects(
+    service.answer(request()),
+    (error) => error?.code === "MEMORY_ANSWER_RESPONSE_INVALID",
+  );
+  assert.equal(calls.length, 1);
+});
+
 test("local reruns select the separately configured local brain", async () => {
   const calls = [];
   const configuredBrain = { ...brain(), model: "configured-model" };

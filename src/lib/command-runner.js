@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { normalizeAbortSignal } from "./structured-provider-request.js";
 
 export class CommandError extends Error {
   constructor(command, code, stderr) {
@@ -8,11 +9,44 @@ export class CommandError extends Error {
   }
 }
 
+function lifecycleError(command, code, message, cause) {
+  const error = new Error(
+    `${command} ${message}`,
+    cause instanceof Error ? { cause } : undefined,
+  );
+  error.name = code === "COMMAND_ABORTED" ? "AbortError" : "CommandTimeoutError";
+  error.code = code;
+  return error;
+}
+
+function abortError(command, signal) {
+  return lifecycleError(
+    command,
+    "COMMAND_ABORTED",
+    "was aborted",
+    signal?.reason,
+  );
+}
+
+function timeoutError(command, timeoutMs) {
+  return lifecycleError(
+    command,
+    "COMMAND_TIMEOUT",
+    `timed out after ${timeoutMs} ms`,
+  );
+}
+
 export function runCommand(
   command,
   args,
-  { timeoutMs = 60_000, env = process.env } = {},
+  { timeoutMs = 60_000, env = process.env, signal = null } = {},
 ) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new TypeError("timeoutMs must be a positive integer");
+  }
+  signal = normalizeAbortSignal(signal);
+  if (signal?.aborted) return Promise.reject(abortError(command, signal));
+
   return new Promise((resolve, reject) => {
     const invocation =
       process.platform === "win32" && command === "dws"
@@ -31,11 +65,41 @@ export function runCommand(
     });
     let stdout = "";
     let stderr = "";
+    let processError = null;
+    let terminalError = null;
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const settle = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      operation(value);
+    };
+    const terminate = (error) => {
+      if (terminalError || settled) return;
+      terminalError = error;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        child.kill("SIGKILL");
+      } catch (killError) {
+        terminalError = new AggregateError(
+          [error, killError],
+          `${command} could not be terminated`,
+        );
+        terminalError.code = error.code;
+      }
+    };
+    const onAbort = () => terminate(abortError(command, signal));
 
     const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`${command} timed out after ${timeoutMs} ms`));
+      terminate(timeoutError(command, timeoutMs));
     }, timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -46,16 +110,22 @@ export function runCommand(
       stderr += chunk;
     });
     child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      processError ||= error;
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new CommandError(command, code, stderr));
+      if (terminalError) {
+        settle(reject, terminalError);
         return;
       }
-      resolve(stdout);
+      if (processError) {
+        settle(reject, processError);
+        return;
+      }
+      if (code !== 0) {
+        settle(reject, new CommandError(command, code, stderr));
+        return;
+      }
+      settle(resolve, stdout);
     });
   });
 }

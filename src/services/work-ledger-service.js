@@ -57,6 +57,7 @@ import {
 } from "./work-ledger-pr-source.js";
 import {
   applyReadyPullRequestSourceCutover,
+  CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON,
   crossRootPullRequestCutoverCandidate,
   crossRootPullRequestCutoverActivation,
   crossRootPullRequestCutoverBlockerReason,
@@ -333,6 +334,26 @@ export class WorkLedgerService {
   async listItems(options = {}) {
     this.#assertReady();
     return queryPage(this.state.items, "itemId", options, WORK_LEDGER_STATUSES);
+  }
+
+  async listPendingPullRequestSources(options = {}) {
+    this.#assertReady();
+    const pendingRoots = this.state.items.filter((item) =>
+      item.kind === "source_root" &&
+      item.source?.kind === "pull_request" &&
+      (
+        item.source.pendingRevision !== null ||
+        item.statusReason?.startsWith(
+          `${CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON}:`,
+        )
+      )
+    );
+    return queryPage(
+      pendingRoots,
+      "itemId",
+      options,
+      WORK_LEDGER_STATUSES,
+    );
   }
 
   async listTimeline(options = {}) {

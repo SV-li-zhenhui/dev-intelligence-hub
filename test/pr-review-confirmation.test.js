@@ -14,7 +14,7 @@ function reviewJob(overrides = {}) {
     workType: "review_draft",
     status: "ready_for_human",
     requiresApproval: true,
-    repo: "SVisions/OCT-Software",
+    repo: "acme/command-center",
     number: 42,
     headRefOid: HEAD,
     title: "Protect the checkout flow",
@@ -26,7 +26,7 @@ function reviewJob(overrides = {}) {
   };
 }
 
-function options(actorAccountId = "SV-li-zhenhui") {
+function options(actorAccountId = "local-owner") {
   return { githubActions: { actorAccountId } };
 }
 
@@ -50,11 +50,11 @@ test("maps every employee verdict to a head-bound GitHub Review event", () => {
       },
       actor: {
         provider: "github",
-        accountId: "SV-li-zhenhui",
+        accountId: "local-owner",
       },
       target: {
         provider: "github",
-        resourceId: "SVisions/OCT-Software#42",
+        resourceId: "acme/command-center#42",
         version: HEAD,
       },
       action: {
@@ -63,18 +63,18 @@ test("maps every employee verdict to a head-bound GitHub Review event", () => {
         body: job.reviewBody,
       },
       display: {
-        title: "SVisions/OCT-Software #42 · Protect the checkout flow",
+        title: "acme/command-center #42 · Protect the checkout flow",
         summary: job.summary,
         actionLabel: "确认并发布到 GitHub",
         evidence: job.evidence,
         payload: {
           actor: {
             provider: "github",
-            accountId: "SV-li-zhenhui",
+            accountId: "local-owner",
           },
           target: {
             provider: "github",
-            resourceId: "SVisions/OCT-Software#42",
+            resourceId: "acme/command-center#42",
             version: HEAD,
           },
           action: {
@@ -135,9 +135,9 @@ test("fails closed for invalid verdict, body, head, or repository", () => {
     { reviewBody: "\u0000hidden" },
     { headRefOid: "head-42" },
     { headRefOid: "A".repeat(40) },
-    { repo: "SVisions" },
-    { repo: "../SVisions/OCT-Software" },
-    { repo: "SVisions/.hidden" },
+    { repo: "acme" },
+    { repo: "../acme/command-center" },
+    { repo: "acme/.hidden" },
   ];
 
   for (const overrides of cases) {

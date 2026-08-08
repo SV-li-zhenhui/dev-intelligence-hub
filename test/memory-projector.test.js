@@ -1,14 +1,25 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { digestValue } from "../src/domain/code-executor-contract.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
+import { createPullRequestExecutionBinding } from
+  "../src/domain/pull-request-execution-binding.js";
 import {
   createWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../src/domain/work-graph-memory-event.js";
-import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
+import {
+  LocalMemoryJournal,
+  MEMORY_JOURNAL_KEY,
+} from "../src/services/local-memory-journal.js";
+import { createMemoryRuntime } from "../src/memory-runtime.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
+import {
+  pullRequestExternalActionBinding,
+  pullRequestExternalActionPlan,
+} from "./support/pull-request-external-action-fixture.js";
 
 function workItem(id, status, revision = 1) {
   return {
@@ -88,6 +99,11 @@ function memoryAuthoritySource(items, timeline, graphSource, revision = null) {
 
 function memoryLifecycleProducer(memoryProducer) {
   return {
+    appendAuthorityProjection({ records, projectionState }) {
+      return typeof memoryProducer.appendAuthorityProjection === "function"
+        ? memoryProducer.appendAuthorityProjection({ records, projectionState })
+        : memoryProducer.appendBatch({ records });
+    },
     appendProjectionRecords({ records }) {
       return typeof memoryProducer.appendProjectionRecords === "function"
         ? memoryProducer.appendProjectionRecords({ records })
@@ -117,6 +133,16 @@ function emptyMemoryAuthorityReader() {
         checkpointDigest: null,
         authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
         workLedgerRevision: 0,
+      };
+    },
+    async getAuthorityProjectionState() {
+      return {
+        schemaVersion: 4,
+        revision: 0,
+        workLedgerRevision: 0,
+        authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+        confirmationHighWatermark: 0,
+        entries: [],
       };
     },
   };
@@ -149,19 +175,170 @@ function graphEventsForItem(item) {
 }
 
 function localMemoryJournal() {
+  return localMemoryFixture().then(({ journal }) => journal);
+}
+
+async function localMemoryFixture() {
   const values = new Map();
-  const journal = new LocalMemoryJournal({
-    store: {
-      async read(key, fallback = null) {
-        return structuredClone(values.has(key) ? values.get(key) : fallback);
-      },
-      async write(key, value) {
-        values.set(key, structuredClone(value));
-      },
+  const store = {
+    async read(key, fallback = null) {
+      return structuredClone(values.has(key) ? values.get(key) : fallback);
     },
+    async write(key, value) {
+      values.set(key, structuredClone(value));
+    },
+  };
+  const journal = new LocalMemoryJournal({
+    store,
     exclusiveLease: { async run(operation) { return operation(); } },
   });
-  return journal.recover().then(() => journal);
+  await journal.recover();
+  return { journal, store, values };
+}
+
+function pullRequestWorkItem(binding, {
+  revision = 4,
+  status = "completed",
+  updatedAt = "2026-08-08T07:00:00.000Z",
+} = {}) {
+  const item = workItem(42, status, revision);
+  item.itemId = binding.rootItemId;
+  item.assignmentId = `assignment-${binding.eventId}`;
+  item.kind = "graph_task";
+  item.currentTarget = { type: "role", id: "pr-engineer" };
+  item.assignment = {
+    graphTask: {
+      sourceBinding: {
+        kind: binding.kind,
+        rootItemId: binding.rootItemId,
+        workKey: binding.workKey,
+        inputRevision: binding.inputRevision,
+        headRevision: binding.headRevision,
+        headRefOid: binding.headRefOid,
+        eventId: binding.eventId,
+        eventDigest: binding.eventDigest,
+        inputDigest: binding.inputDigest,
+      },
+    },
+  };
+  item.event = {
+    schemaVersion: 1,
+    eventId: binding.eventId,
+    contentDigest: binding.eventDigest,
+    eventType: "pull_request.status",
+    occurredAt: updatedAt,
+    source: { provider: "github", scopeId: "github-account:runtime-user" },
+    subject: {
+      id: `github:pr:${binding.repository}#${binding.pullRequestNumber}`,
+      repository: binding.repository,
+      number: binding.pullRequestNumber,
+    },
+    payload: {
+      title: "Resolve mirrored PR conflict",
+      headRefOid: binding.headRefOid,
+      gitTargetAvailable: true,
+      gitTarget: structuredClone(binding.gitTarget),
+    },
+  };
+  item.updatedAt = updatedAt;
+  return item;
+}
+
+function completedConfirmationMemoryItem(
+  binding,
+  {
+    body = "Safe review summary",
+    revision = 2,
+    updatedAt = "2026-08-08T07:01:00.000Z",
+    receiptId = "github-comment-receipt-42",
+  } = {},
+) {
+  const plan = pullRequestExternalActionPlan(
+    { type: "comment", body },
+    { binding },
+  );
+  return {
+    confirmationId: plan.id,
+    itemRevision: revision,
+    statusDigest: digestValue({
+      confirmationId: plan.id,
+      itemRevision: revision,
+      status: "completed",
+      approvalBindingDigest: plan.approvalBindingDigest,
+      updatedAt,
+    }),
+    kind: plan.kind,
+    status: "completed",
+    requestedBy: structuredClone(plan.requestedBy),
+    actor: structuredClone(plan.actor),
+    target: structuredClone(plan.target),
+    action: {
+      type: plan.action.type,
+      inputBinding: structuredClone(plan.action.inputBinding),
+      bodyDigest: digestValue(body),
+      bodyBytes: Buffer.byteLength(body, "utf8"),
+    },
+    displayedPayloadDigest: plan.displayedPayloadDigest,
+    approvalBindingDigest: plan.approvalBindingDigest,
+    createdAt: "2026-08-08T07:00:30.000Z",
+    updatedAt,
+    execution: {
+      attempt: 1,
+      startedAt: "2026-08-08T07:00:40.000Z",
+      outcome: "applied",
+    },
+    receipt: { id: receiptId },
+    failure: null,
+    rejectedAt: null,
+    invalidation: null,
+  };
+}
+
+function proposalDecisionTimeline(item, suffix = "old") {
+  const value = {
+    kind: "github_pull_request_action_proposal",
+    resultId: `proposal-result-${suffix}`,
+    resultDigest: suffix === "old" ? "a".repeat(64) : "b".repeat(64),
+    summary: `Push decision ${suffix}`,
+    downstreamRef: `confirmation-${suffix}`,
+    evidence: [
+      `confirmation:confirmation-${suffix}`,
+      `controlled-commit:controlled-${suffix}`,
+    ],
+  };
+  const core = {
+    source: "proposal",
+    referenceId: `proposal-${suffix}`,
+    outcome: "succeeded",
+    value,
+    observedAt: item.updatedAt,
+  };
+  const decision = { ...core, contentDigest: digestValue(core) };
+  return {
+    timelineId: `work-timeline-decision-${suffix}`,
+    sequence: suffix === "old" ? 1 : 4,
+    itemId: item.itemId,
+    type: "proposal_result_applied",
+    at: item.updatedAt,
+    actorId: "work-proposal-result-reconciler",
+    details: {
+      inputBinding: createPullRequestExecutionBinding({
+        sourceBinding: item.assignment.graphTask.sourceBinding,
+        event: item.event,
+      }),
+      workItemRevision: item.revision,
+      resultAttestationDigest: digestValue({
+        kind: "proposal_result",
+        suffix,
+      }),
+      decision,
+      proposalId: decision.referenceId,
+      resultRef: value.resultId,
+      outcome: decision.outcome,
+      downstreamRef: value.downstreamRef,
+      evidenceRefs: [...value.evidence],
+    },
+  };
 }
 
 test("memory projector imports work items, timeline, and legacy PR memory idempotently", async () => {
@@ -256,6 +433,765 @@ test("memory projector imports work items, timeline, and legacy PR memory idempo
     "derived",
     "obsolete",
   ]);
+});
+
+test("current work memory carries a bounded PR and CI observation", async () => {
+  const item = workItem(9, "completed", 4);
+  const headRefOid = "2".repeat(40);
+  item.kind = "graph_task";
+  item.assignment = {
+    graphTask: {
+      sourceBinding: {
+        kind: "pull_request",
+        rootItemId: "work-root-9",
+        workKey: "pr:acme/repo#9",
+        inputRevision: 2,
+        headRevision: 2,
+        headRefOid,
+        eventId: "github-event-pr-9-head-2",
+        eventDigest: "3".repeat(64),
+        inputDigest: "4".repeat(64),
+      },
+    },
+  };
+  item.event = {
+    schemaVersion: 1,
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:00:08.000Z",
+    source: { provider: "github", scopeId: "github-account:runtime-user" },
+    subject: {
+      id: "github:pr:acme/repo#9",
+      repository: "acme/repo",
+      number: 9,
+    },
+    payload: {
+      title: "Resolve the current PR conflict",
+      headRefOid,
+      ciStatus: "SUCCESS",
+      mergeStateStatus: "CLEAN",
+      changedFields: ["ciStatus", "mergeStateStatus"],
+      gitTargetAvailable: true,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "1".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/conflict",
+        headRefOid,
+      },
+    },
+  };
+  const graphSource = graphProjectionSource();
+  const journal = await localMemoryJournal();
+  const projector = new MemoryProjector({
+    memoryProducer: journal,
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
+    graphProjectionSource: graphSource,
+    store: { async read() { return []; } },
+  });
+
+  await projector.runCycle();
+
+  const match = journal.search({ eventType: "work.completed" }).items[0];
+  const content = JSON.parse(
+    journal.readRecords({ recordIds: [match.id] }).items[0].record.content,
+  );
+  assert.deepEqual(content.pullRequestObservation, {
+    eventId: "github-event-pr-9-head-2",
+    occurredAt: "2026-08-02T01:00:08.000Z",
+    headRefOid,
+    ciStatus: "SUCCESS",
+    mergeStateStatus: "CLEAN",
+    changedFields: ["ciStatus", "mergeStateStatus"],
+  });
+});
+
+test("authority-bound PR memory is independent, sanitized, memoized, and invalidated after timeline trim", async () => {
+  const oldBinding = pullRequestExternalActionBinding();
+  const newHead = "7".repeat(40);
+  const newBinding = pullRequestExternalActionBinding({
+    inputRevision: 4,
+    headRevision: 6,
+    headRefOid: newHead,
+    eventId: "github-event-42-head-6",
+    eventDigest: "8".repeat(64),
+    inputDigest: "9".repeat(64),
+    gitTarget: { headRefOid: newHead },
+  });
+  const oldItem = pullRequestWorkItem(oldBinding);
+  const newItem = pullRequestWorkItem(newBinding, {
+    revision: 8,
+    updatedAt: "2026-08-08T08:00:00.000Z",
+  });
+  const consultationTimeline = (item, suffix, sequence) => [{
+    timelineId: `work-timeline-consultation-request-${suffix}`,
+    sequence,
+    itemId: item.itemId,
+    type: "intent_staged",
+    at: item.updatedAt,
+    actorId: "pr-engineer",
+    details: {
+      inputBinding: createPullRequestExecutionBinding({
+        sourceBinding: item.assignment.graphTask.sourceBinding,
+        event: item.event,
+      }),
+      workItemRevision: item.revision,
+      inputDigest: item.event.contentDigest,
+      intentType: "ask_user",
+      consultationRequest: {
+        summary: `Need owner decision ${suffix}`,
+        reason: "Two safe resolutions remain",
+        question: "Which compatible behavior should be preserved?",
+        choices: [
+          { id: "preserve", label: "Preserve compatibility" },
+          { id: "strict", label: "Use strict behavior" },
+        ],
+      },
+    },
+  }, {
+    timelineId: `work-timeline-consultation-result-${suffix}`,
+    sequence: sequence + 1,
+    itemId: item.itemId,
+    type: "attention_answer_applied",
+    at: item.updatedAt,
+    actorId: "dashboard-owner",
+    details: {
+      inputBinding: createPullRequestExecutionBinding({
+        sourceBinding: item.assignment.graphTask.sourceBinding,
+        event: item.event,
+      }),
+      workItemRevision: item.revision,
+      inputDigest: item.event.contentDigest,
+      resultAttestationDigest: digestValue({
+        kind: "attention_result",
+        suffix,
+      }),
+      answer: { choiceId: "preserve", note: `owner answer ${suffix}` },
+      requestContentDigest: suffix === "old" ? "c".repeat(64) : "d".repeat(64),
+      resultDigest: suffix === "old" ? "e".repeat(64) : "f".repeat(64),
+    },
+  }];
+
+  let items = [oldItem];
+  let timeline = [
+    proposalDecisionTimeline(oldItem, "old"),
+    ...consultationTimeline(oldItem, "old", 2),
+  ];
+  let confirmationRevision = 1;
+  const secretBody = "do not persist this raw review body";
+  const oldConfirmation = completedConfirmationMemoryItem(oldBinding, {
+    body: secretBody,
+    receiptId: "opaque-old-receipt",
+  });
+  const newConfirmation = completedConfirmationMemoryItem(newBinding, {
+    body: "new head review body",
+    revision: 3,
+    updatedAt: "2026-08-08T08:01:00.000Z",
+    receiptId: "opaque-new-receipt",
+  });
+  let confirmations = [oldConfirmation];
+  const graphSource = graphProjectionSource();
+  const { journal, store, values } = await localMemoryFixture();
+  const confirmationProjectionSource = {
+    async readMemoryPage({ cursor, limit, highWatermark }) {
+      if (
+        highWatermark !== null &&
+        highWatermark !== confirmationRevision
+      ) {
+        throw new Error("confirmation source changed");
+      }
+      const page = confirmations.slice(cursor, cursor + limit);
+      const nextCursor = cursor + page.length;
+      return structuredClone({
+        highWatermark: confirmationRevision,
+        cursor,
+        items: page,
+        nextCursor: nextCursor < confirmations.length ? nextCursor : null,
+      });
+    },
+  };
+  let currentHead = oldBinding.headRefOid;
+  const verificationCalls = new Map();
+  const inputAuthorityVerifier = {
+    async verify(binding) {
+      const count = verificationCalls.get(binding.headRefOid) ?? 0;
+      verificationCalls.set(binding.headRefOid, count + 1);
+      if (binding.headRefOid !== currentHead) throw new Error("stale head");
+      return structuredClone(binding);
+    },
+  };
+  const memoryAuthoritySource = {
+    async readSnapshot({ limit }) {
+      return structuredClone({
+        ledgerRevision: items[0].revision,
+        items,
+        timeline,
+        graph: await graphSource.readBatch({ limit }),
+      });
+    },
+  };
+  const createProjector = () => new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource,
+    graphProjectionSource: graphSource,
+    confirmationProjectionSource,
+    inputAuthorityVerifier,
+    store,
+  });
+  const recordsFor = (kind) =>
+    values.get("unified-memory-records").records.filter(
+      (record) => record.source.kind === kind,
+    );
+
+  const first = await createProjector().runCycle();
+  assert.equal(first.authorityBound.added, 5);
+  assert.equal(verificationCalls.get(oldBinding.headRefOid), 1);
+  assert.equal(
+    journal.getAuthorityProjectionState().confirmationHighWatermark,
+    1,
+  );
+  const initialByKind = Object.fromEntries([
+    "work-decision",
+    "consultation-request",
+    "consultation-result",
+    "confirmation",
+    "external-result",
+  ].map((kind) => [kind, recordsFor(kind)[0]]));
+  assert.ok(Object.values(initialByKind).every(Boolean));
+  const initialEntries = journal.readRecords({
+    recordIds: Object.values(initialByKind).map(({ recordId }) => recordId),
+  }).items;
+  assert.deepEqual(
+    initialEntries.map(({ labels }) => labels),
+    Array.from({ length: 5 }, () => ({
+      authority: "raw",
+      lifecycle: "current",
+    })),
+  );
+  const decisionContent = JSON.parse(initialByKind["work-decision"].content);
+  assert.equal(decisionContent.workItemId, oldItem.itemId);
+  assert.equal(decisionContent.workItemRevision, oldItem.revision);
+  assert.equal(decisionContent.decision.outcome, "succeeded");
+  assert.deepEqual(decisionContent.decision.value.evidence, [
+    "confirmation:confirmation-old",
+    "controlled-commit:controlled-old",
+  ]);
+  const confirmationContent = JSON.parse(initialByKind.confirmation.content);
+  const externalContent = JSON.parse(initialByKind["external-result"].content);
+  assert.equal(confirmationContent.action.bodyDigest, digestValue(secretBody));
+  assert.equal(confirmationContent.action.bodyBytes, Buffer.byteLength(secretBody));
+  assert.equal(Object.hasOwn(confirmationContent.action, "body"), false);
+  assert.deepEqual(externalContent.receipt, { id: "opaque-old-receipt" });
+  assert.deepEqual(externalContent.actor, oldConfirmation.actor);
+  assert.deepEqual(externalContent.target, oldConfirmation.target);
+  assert.equal(initialByKind.confirmation.content.includes(secretBody), false);
+  assert.equal(initialByKind["external-result"].content.includes(secretBody), false);
+
+  currentHead = newBinding.headRefOid;
+  items = [newItem];
+  timeline = [
+    proposalDecisionTimeline(newItem, "new"),
+    ...consultationTimeline(newItem, "new", 5),
+  ];
+  confirmations = [oldConfirmation, newConfirmation];
+  confirmationRevision = 2;
+  const callsBeforeHeadChange = new Map(verificationCalls);
+  const second = await createProjector().runCycle();
+  assert.equal(second.authorityBound.lifecycleInvalidations, 3);
+  assert.equal(
+    journal.getAuthorityProjectionState().confirmationHighWatermark,
+    2,
+  );
+  assert.equal(
+    verificationCalls.get(oldBinding.headRefOid) -
+      callsBeforeHeadChange.get(oldBinding.headRefOid),
+    1,
+  );
+  assert.equal(
+    verificationCalls.get(newBinding.headRefOid) -
+      (callsBeforeHeadChange.get(newBinding.headRefOid) ?? 0),
+    1,
+  );
+
+  const oldEntries = journal.readRecords({
+    recordIds: Object.values(initialByKind).map(({ recordId }) => recordId),
+  }).items;
+  assert.ok(oldEntries.every(({ labels }) => labels.lifecycle === "obsolete"));
+  const currentRecords = [
+    "work-decision",
+    "consultation-request",
+    "consultation-result",
+    "confirmation",
+    "external-result",
+  ].map((kind) => recordsFor(kind).find((record) => {
+    const content = JSON.parse(record.content);
+    return content.authority.current === true &&
+      content.authority.inputBinding?.headRefOid === newBinding.headRefOid;
+  }));
+  assert.ok(currentRecords.every(Boolean));
+  assert.ok(journal.readRecords({
+    recordIds: currentRecords.map(({ recordId }) => recordId),
+  }).items.every(({ labels }) =>
+    labels.authority === "raw" && labels.lifecycle === "current"
+  ));
+
+  const beforeRestartCount = values.get("unified-memory-records").records.length;
+  const restarted = await createProjector().runCycle();
+  assert.equal(restarted.added, 0);
+  assert.equal(values.get("unified-memory-records").records.length, beforeRestartCount);
+});
+
+test("authority verification runs once per distinct binding for a large projection cycle", async () => {
+  const bindingFor = (number, marker) => pullRequestExternalActionBinding({
+    repository: `acme/repo-${number}`,
+    pullRequestNumber: number,
+    rootItemId: `github:pr:acme/repo-${number}#${number}`,
+    workKey: `pr:acme/repo-${number}#${number}`,
+    eventId: `github-event-${number}`,
+    eventDigest: marker.repeat(64),
+    inputDigest: String((Number(marker) + 1) % 10).repeat(64),
+    headRefOid: marker.repeat(40),
+    gitTarget: {
+      baseRepository: `acme/repo-${number}`,
+      headRepository: `contributor/repo-${number}`,
+      headRefOid: marker.repeat(40),
+    },
+  });
+  const bindings = [
+    bindingFor(51, "5"),
+    bindingFor(61, "6"),
+    bindingFor(71, "7"),
+  ];
+  const items = bindings.map((binding, index) => pullRequestWorkItem(binding, {
+    revision: index + 2,
+    updatedAt: `2026-08-08T09:0${index}:00.000Z`,
+  }));
+  const timeline = items.flatMap((item, itemIndex) =>
+    Array.from({ length: 75 }, (_, index) => {
+      const entry = proposalDecisionTimeline(
+        item,
+        `bulk-${itemIndex}-${index}`,
+      );
+      entry.sequence = itemIndex * 75 + index + 1;
+      return entry;
+    })
+  );
+  const graphSource = graphProjectionSource();
+  const { journal, store } = await localMemoryFixture();
+  const calls = new Map();
+  const validHeads = new Set(bindings.slice(0, 2).map(({ headRefOid }) => headRefOid));
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource(
+      items,
+      timeline,
+      graphSource,
+      10,
+    ),
+    graphProjectionSource: graphSource,
+    inputAuthorityVerifier: {
+      async verify(binding) {
+        calls.set(binding.headRefOid, (calls.get(binding.headRefOid) ?? 0) + 1);
+        if (!validHeads.has(binding.headRefOid)) {
+          throw new Error("not authoritative");
+        }
+        return structuredClone(binding);
+      },
+    },
+    store,
+  });
+
+  const result = await projector.runCycle();
+
+  assert.equal(result.authorityBound.decisions, 225);
+  assert.deepEqual([...calls.values()], [1, 1, 1]);
+  const matches = journal.search({
+    q: "Push decision bulk-2",
+    repository: bindings[2].repository,
+    limit: 20,
+  }).items;
+  assert.ok(matches.length > 0);
+  const decisionMatches = matches.filter(
+    ({ source }) => source.kind === "work-decision",
+  );
+  assert.ok(decisionMatches.length > 0);
+  assert.ok(journal.readRecords({
+    recordIds: decisionMatches.map(({ id }) => id),
+  }).items.every(({ labels }) => labels.lifecycle === "obsolete"));
+});
+
+test("an interrupted authority projection cannot orphan current records across a Head change", async () => {
+  const oldBinding = pullRequestExternalActionBinding();
+  const newHead = "7".repeat(40);
+  const newBinding = pullRequestExternalActionBinding({
+    inputRevision: 2,
+    headRevision: 2,
+    headRefOid: newHead,
+    eventId: "github-event-42-head-2",
+    eventDigest: "8".repeat(64),
+    inputDigest: "9".repeat(64),
+    gitTarget: { headRefOid: newHead },
+  });
+  const oldItem = pullRequestWorkItem(oldBinding);
+  const newItem = pullRequestWorkItem(newBinding, {
+    revision: 8,
+    updatedAt: "2026-08-08T10:00:00.000Z",
+  });
+  let items = [oldItem];
+  let timeline = Array.from({ length: 125 }, (_, index) => {
+    const entry = proposalDecisionTimeline(oldItem, `interrupted-${index}`);
+    entry.sequence = index + 1;
+    return entry;
+  });
+  let currentHead = oldBinding.headRefOid;
+  let failAuthorityCommit = true;
+  const values = new Map();
+  const store = {
+    async read(key, fallback = null) {
+      return structuredClone(values.has(key) ? values.get(key) : fallback);
+    },
+    async write(key, value) {
+      if (
+        key === MEMORY_JOURNAL_KEY &&
+        value.lifecycleAuthority?.authorityProjection?.revision > 0 &&
+        failAuthorityCommit
+      ) {
+        failAuthorityCommit = false;
+        throw new Error("injected atomic authority commit failure");
+      }
+      values.set(key, structuredClone(value));
+    },
+  };
+  const journal = new LocalMemoryJournal({
+    store,
+    exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  await journal.recover();
+  const graphSource = graphProjectionSource();
+  const source = {
+    async readSnapshot({ limit }) {
+      return structuredClone({
+        ledgerRevision: items[0].revision,
+        items,
+        timeline,
+        graph: await graphSource.readBatch({ limit }),
+      });
+    },
+  };
+  const createProjector = () => new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: source,
+    graphProjectionSource: graphSource,
+    inputAuthorityVerifier: {
+      async verify(binding) {
+        if (binding.headRefOid !== currentHead) throw new Error("stale Head");
+        return structuredClone(binding);
+      },
+    },
+    store,
+  });
+
+  await assert.rejects(
+    createProjector().runCycle(),
+    /injected atomic authority commit failure/,
+  );
+  assert.equal(
+    values.get(MEMORY_JOURNAL_KEY).records.some(
+      ({ source }) => source.kind === "work-decision",
+    ),
+    false,
+  );
+
+  currentHead = newBinding.headRefOid;
+  items = [newItem];
+  timeline = [proposalDecisionTimeline(newItem, "after-restart")];
+  await createProjector().runCycle();
+
+  const decisions = values.get(MEMORY_JOURNAL_KEY).records.filter(
+    ({ source }) => source.kind === "work-decision",
+  );
+  assert.equal(decisions.length, 1);
+  assert.equal(
+    JSON.parse(decisions[0].content).authority.inputBinding.headRefOid,
+    newBinding.headRefOid,
+  );
+  assert.equal(
+    journal.getAuthorityProjectionState().confirmationHighWatermark,
+    0,
+  );
+});
+
+test("a failed Head-change authority commit fences old memory immediately and after restart", async () => {
+  const oldBinding = pullRequestExternalActionBinding();
+  const newHead = "4".repeat(40);
+  const newBinding = pullRequestExternalActionBinding({
+    inputRevision: 2,
+    headRevision: 2,
+    headRefOid: newHead,
+    eventId: "github-event-42-head-2-fenced",
+    eventDigest: "5".repeat(64),
+    inputDigest: "6".repeat(64),
+    gitTarget: { headRefOid: newHead },
+  });
+  const oldItem = pullRequestWorkItem(oldBinding);
+  const newItem = pullRequestWorkItem(newBinding, {
+    revision: oldItem.revision + 1,
+    updatedAt: "2026-08-08T10:01:00.000Z",
+  });
+  let items = [oldItem];
+  let timeline = [proposalDecisionTimeline(oldItem, "old-current")];
+  let currentHead = oldBinding.headRefOid;
+  let failAuthorityCommit = false;
+  const values = new Map();
+  const store = {
+    async read(key, fallback = null) {
+      return structuredClone(values.has(key) ? values.get(key) : fallback);
+    },
+    async write(key, value) {
+      if (
+        failAuthorityCommit &&
+        key === MEMORY_JOURNAL_KEY &&
+        value.lifecycleAuthority?.authorityProjection?.revision > 1
+      ) {
+        throw new Error("injected changed-Head authority commit failure");
+      }
+      values.set(key, structuredClone(value));
+    },
+  };
+  const graphSource = graphProjectionSource();
+  const authoritySource = {
+    async readStatus() {
+      return {
+        ledgerRevision: items[0].revision,
+        graph: {
+          cursor: 0,
+          highWatermark: 0,
+          checkpointDigest: null,
+          highWatermarkDigest: null,
+          authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+        },
+      };
+    },
+  };
+  const createRuntime = () => createMemoryRuntime({
+    store,
+    authoritySource,
+    createGuard: () => ({
+      async acquire() {},
+      async run(operation) { return operation(); },
+      async close() {},
+    }),
+  });
+  let runtime = await createRuntime();
+  const snapshotSource = {
+    async readSnapshot({ limit }) {
+      return structuredClone({
+        ledgerRevision: items[0].revision,
+        items,
+        timeline,
+        graph: await graphSource.readBatch({ limit }),
+      });
+    },
+  };
+  const createProjector = () => new MemoryProjector({
+    memoryLifecycleProducer: runtime.lifecycleProducer,
+    memoryAuthorityReader: runtime.authorityReader,
+    memoryAuthoritySource: snapshotSource,
+    graphProjectionSource: graphSource,
+    inputAuthorityVerifier: {
+      async verify(binding) {
+        if (binding.headRefOid !== currentHead) throw new Error("stale Head");
+        return structuredClone(binding);
+      },
+    },
+    store,
+  });
+
+  await createProjector().runCycle();
+  assert.equal(
+    runtime.authorityReader.getAuthorityProjectionState().workLedgerRevision,
+    oldItem.revision,
+  );
+  assert.ok((await runtime.search.search({ q: "old-current" })).items.length > 0);
+
+  currentHead = newBinding.headRefOid;
+  items = [newItem];
+  timeline = [proposalDecisionTimeline(newItem, "new-current")];
+  failAuthorityCommit = true;
+  await assert.rejects(
+    createProjector().runCycle(),
+    /injected changed-Head authority commit failure/,
+  );
+  assert.equal(
+    runtime.authorityReader.getAuthorityState().workLedgerRevision,
+    newItem.revision,
+  );
+  assert.equal(
+    runtime.authorityReader.getAuthorityProjectionState().workLedgerRevision,
+    oldItem.revision,
+  );
+  await assert.rejects(
+    runtime.search.search({ q: "old-current" }),
+    (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+  );
+
+  await runtime.close();
+  runtime = await createRuntime();
+  await assert.rejects(
+    runtime.search.search({ q: "old-current" }),
+    (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+  );
+  await runtime.close();
+});
+
+test("legacy PR decisions and consultations without immutable timeline bindings stay non-authoritative", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const item = pullRequestWorkItem(binding);
+  const decision = proposalDecisionTimeline(item, "legacy");
+  delete decision.details.inputBinding;
+  const timeline = [
+    decision,
+    {
+      timelineId: "work-timeline-legacy-consultation-request",
+      sequence: 2,
+      itemId: item.itemId,
+      type: "intent_staged",
+      at: item.updatedAt,
+      actorId: "pr-engineer",
+      details: {
+        intentType: "ask_user",
+        consultationRequest: {
+          summary: "Legacy request",
+          reason: "Unsealed history",
+          question: "Should this old request be trusted?",
+          choices: [],
+        },
+      },
+    },
+    {
+      timelineId: "work-timeline-legacy-consultation-result",
+      sequence: 3,
+      itemId: item.itemId,
+      type: "attention_answer_applied",
+      at: item.updatedAt,
+      actorId: "attention-result-reconciler",
+      details: {
+        answer: { choiceId: "yes" },
+        requestContentDigest: "a".repeat(64),
+        resultDigest: "b".repeat(64),
+      },
+    },
+  ];
+  const graphSource = graphProjectionSource();
+  const { journal, store } = await localMemoryFixture();
+  let verificationCalls = 0;
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource(
+      [item],
+      timeline,
+      graphSource,
+    ),
+    graphProjectionSource: graphSource,
+    inputAuthorityVerifier: {
+      async verify(value) {
+        verificationCalls += 1;
+        return value;
+      },
+    },
+    store,
+  });
+
+  const result = await projector.runCycle();
+
+  assert.equal(result.authorityBound.decisions, 0);
+  assert.equal(result.authorityBound.consultations, 0);
+  assert.equal(verificationCalls, 0);
+  for (const kind of [
+    "work-decision",
+    "consultation-request",
+    "consultation-result",
+  ]) {
+    assert.equal(journal.search({ q: kind }).items.some(
+      ({ source }) => source.kind === kind,
+    ), false);
+  }
+});
+
+test("confirmation projection page capacity fails before any memory or state write", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const template = completedConfirmationMemoryItem(binding);
+  const confirmations = Array.from({ length: 1_000 }, (_, index) => {
+    const confirmationId = `confirmation-capacity-${String(index).padStart(4, "0")}`;
+    return {
+      ...structuredClone(template),
+      confirmationId,
+      statusDigest: digestValue({
+        confirmationId,
+        itemRevision: template.itemRevision,
+        status: template.status,
+        approvalBindingDigest: template.approvalBindingDigest,
+        updatedAt: template.updatedAt,
+      }),
+    };
+  });
+  const graphSource = graphProjectionSource();
+  let memoryWrites = 0;
+  let stateWrites = 0;
+  let verificationCalls = 0;
+  const rejectWrite = async () => {
+    memoryWrites += 1;
+    throw new Error("must fail before memory write");
+  };
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: {
+      appendAuthorityProjection: rejectWrite,
+      appendWorkItems: rejectWrite,
+      appendGraphEvents: rejectWrite,
+      appendProjectionRecords: rejectWrite,
+      adoptGraphCheckpoint: rejectWrite,
+    },
+    memoryAuthorityReader: emptyMemoryAuthorityReader(),
+    memoryAuthoritySource: memoryAuthoritySource([], [], graphSource),
+    graphProjectionSource: graphSource,
+    confirmationProjectionSource: {
+      async readMemoryPage({ cursor, limit }) {
+        return {
+          highWatermark: 1,
+          cursor,
+          items: confirmations.slice(cursor, cursor + limit),
+          nextCursor: cursor + limit,
+        };
+      },
+    },
+    inputAuthorityVerifier: {
+      async verify(value) {
+        verificationCalls += 1;
+        return value;
+      },
+    },
+    store: {
+      async read(_key, fallback = null) { return fallback; },
+      async write() { stateWrites += 1; },
+    },
+  });
+
+  await assert.rejects(
+    projector.runCycle(),
+    /confirmation memory projection exceeds page capacity/,
+  );
+  assert.equal(memoryWrites, 0);
+  assert.equal(stateWrites, 0);
+  assert.equal(verificationCalls, 0);
 });
 
 test("graph contracts and deliveries remain searchable without retained timeline events", async () => {

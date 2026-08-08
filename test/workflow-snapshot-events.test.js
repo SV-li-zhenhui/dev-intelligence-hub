@@ -20,7 +20,7 @@ function pullRequest(number, overrides = {}) {
     createdAt: "2026-08-01T01:00:00.000Z",
     updatedAt: "2026-08-01T02:00:00.000Z",
     labels: ["backend"],
-    assignees: ["zhenhui"],
+    assignees: ["local-owner"],
     isDraft: false,
     actionState: "action_now",
     nextActor: "me",
@@ -48,7 +48,7 @@ function issue(number, overrides = {}) {
     createdAt: "2026-08-01T03:00:00.000Z",
     updatedAt: "2026-08-01T04:00:00.000Z",
     labels: ["bug"],
-    assignees: ["zhenhui"],
+    assignees: ["local-owner"],
     ...overrides,
   };
 }
@@ -178,7 +178,7 @@ test("additions and material changes emit granular events without flooding uncha
   ]);
 
   const events = workflowEventsFromSnapshots(previous, current, {
-    sourceScopeId: "SV-li-zhenhui",
+    sourceScopeId: "local-owner",
   });
 
   assert.deepEqual(eventTypes(events), [
@@ -189,7 +189,7 @@ test("additions and material changes emit granular events without flooding uncha
     "github:pr:acme/repo#4:pull_request.left_scope",
     "github:issue:acme/repo#11:issue.created",
   ]);
-  assert.equal(events.every((event) => event.source.scopeId === "SV-li-zhenhui"), true);
+  assert.equal(events.every((event) => event.source.scopeId === "local-owner"), true);
 
   const changed = events.filter((event) => event.subject.number === 1);
   assert.deepEqual(changed[0].payload.changedFields, [

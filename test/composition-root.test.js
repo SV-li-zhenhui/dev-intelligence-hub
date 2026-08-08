@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
   createBrain,
   createApplication,
+  createApplicationRuntimeLifecycle,
   createEmployeeRegistry,
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
@@ -26,6 +28,42 @@ function applicationConfig(codeExecutor = { enabled: false }) {
     codeExecutor,
   };
 }
+
+test("application exposes one operations runtime bound to explicit local directories", async () => {
+  const calls = {};
+  const marker = Object.freeze({
+    admission: Object.freeze({ async run(operation) { return operation(); } }),
+  });
+  const dependencies = Object.freeze({ marker: true });
+  const dataDirectory = path.join(process.cwd(), "test-operations-data");
+  const backupDirectory = path.join(process.cwd(), "test-operations-backups");
+  const application = await createApplication({
+    config: applicationConfig(),
+    versionedConfiguration: false,
+    externalActions: false,
+    operationsOptions: {
+      dataDirectory,
+      backupDirectory,
+      probeTimeoutMs: 1234,
+      migration: { async migrate() { throw new Error("must not forward"); } },
+    },
+    operationsRuntimeDependencies: dependencies,
+    operationsRuntimeFactory(options, suppliedDependencies) {
+      calls.options = options;
+      calls.dependencies = suppliedDependencies;
+      return marker;
+    },
+  });
+
+  assert.strictEqual(application.operations, marker);
+  assert.deepEqual(calls.options, {
+    dataDirectory,
+    backupDirectory,
+    probeTimeoutMs: 1234,
+  });
+  assert.strictEqual(calls.dependencies, dependencies);
+  await application.close();
+});
 
 function externalActionConfig(codeExecutor = { enabled: false }) {
   return {
@@ -100,11 +138,21 @@ function localCodeCoordinationConfig({ githubActions = true } = {}) {
             model: "developer-model",
             remoteData: { requirements: false, code: false, memory: false },
           },
+          taskBrain: {
+            provider: "ollama",
+            model: "developer-task-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
         },
         tester: {
           brain: {
             provider: "ollama",
             model: "tester-model",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
+          taskBrain: {
+            provider: "ollama",
+            model: "tester-task-model",
             remoteData: { requirements: false, code: false, memory: false },
           },
         },
@@ -150,6 +198,22 @@ function confirmationProducerPort(overrides = {}) {
     async get() {},
     async invalidate() {},
     ...overrides,
+  });
+}
+
+function confirmationMemoryProjectionSourcePort() {
+  return Object.freeze({
+    async readMemoryPage({ cursor }) {
+      return {
+        highWatermark: 0,
+        cursor,
+        items: [],
+        nextCursor: null,
+      };
+    },
+    async readMemoryStatus() {
+      return { highWatermark: 0 };
+    },
   });
 }
 
@@ -237,6 +301,28 @@ function workProposalRuntimePort(overrides = {}) {
   };
 }
 
+function inProcessExclusiveGuard(onClose = () => {}) {
+  return {
+    run(operation) {
+      return Promise.resolve().then(operation);
+    },
+    async close() {
+      onClose();
+    },
+  };
+}
+
+function workflowFactSourcePort(overrides = {}) {
+  const pullRequestContextReader = Object.freeze({ async read() {} });
+  return {
+    async read() {},
+    pullRequestTaskContextReader() {
+      return pullRequestContextReader;
+    },
+    ...overrides,
+  };
+}
+
 function localCoordinationStubs({ calls, closeCalls, runners }) {
   const workflow = {
     async readAssignmentBatch() {},
@@ -283,9 +369,14 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
       async appendWorkItems() {},
       async appendGraphEvents() {},
       async appendProjectionRecords() {},
+      async appendAuthorityProjection() {},
       async adoptGraphCheckpoint() {},
     },
-    authorityReader: { async getAuthorityState() {} },
+    authorityReader: {
+      async getAuthorityState() {},
+      async getAuthorityProjectionState() {},
+      requiresAuthorityProjectionCheckpoint() { return false; },
+    },
     search: { async search() {}, async getHealth() {} },
     contextReader: { async readRecords() {} },
     receiptVerifier: {
@@ -320,7 +411,8 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     },
     workIntentPolicyFactory: () => ({ async bind() {} }),
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
-    workflowFactSourceFactory: () => ({ async read() {} }),
+    prEngineerExclusiveGuardFactory: () => inProcessExclusiveGuard(),
+    workflowFactSourceFactory: () => workflowFactSourcePort(),
     roleContextAssemblerFactory: () => ({ async assemble() {} }),
     orchestratorServiceFactory: (options) => {
       calls.orchestratorService = options;
@@ -607,7 +699,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const confirmationQueue = confirmationQueuePort();
   const policy = { async bind() {} };
   const roleDirectory = { async resolve() {} };
-  const factSource = { async read() {} };
+  const factSource = workflowFactSourcePort();
   const roleContextAssembler = { async assemble() {} };
   const orchestratorService = { async execute() {} };
   const reconciler = { async runCycle() {} };
@@ -686,6 +778,25 @@ test("enabled work coordination composes private runtimes into frozen applicatio
         workers: [configuredWorker],
       };
     },
+    pullRequestFactsLoaderFactory: ({ github }) => {
+      calls.pullRequestFactsGithub = github;
+      return { async loadPullRequestFacts() {} };
+    },
+    prEngineerExclusiveGuardFactory: (options) => {
+      serviceOrder.push("pr-facts-guard");
+      calls.prFactsGuard = options;
+      return inProcessExclusiveGuard(() => closeCalls.push("pr-facts-guard"));
+    },
+    prEngineerServiceFactory: (options) => {
+      serviceOrder.push("pr-facts-service");
+      calls.prFactsService = options;
+      return {
+        async recover() {
+          serviceOrder.push("pr-facts-recover");
+        },
+        async context() {},
+      };
+    },
     workIntentPolicyFactory: (options) => {
       serviceOrder.push("policy");
       calls.policy = options;
@@ -759,6 +870,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.deepEqual(serviceOrder, [
     "policy",
     "directory",
+    "pr-facts-guard",
+    "pr-facts-service",
+    "pr-facts-recover",
     "facts",
     "context-assembler",
     "orchestrator-service",
@@ -815,10 +929,65 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       roleId: "requirements-analyst",
     },
   );
+  const shutdownController = new AbortController();
+  const signalledRun = await calls.workforce.onRun({
+    roleId: "requirements-analyst",
+    signal: shutdownController.signal,
+  });
+  const { signal: signalledRunSignal, ...signalledRunOptions } = signalledRun;
+  assert.strictEqual(signalledRunSignal, shutdownController.signal);
+  assert.deepEqual(signalledRunOptions, {
+    trigger: "employee:requirements-analyst",
+    includeWork: true,
+    roleId: "requirements-analyst",
+  });
   assert.deepEqual(calls.policy, workCoordinationConfig().workCoordination.policy);
+  assert.deepEqual(calls.prFactsGuard, {
+    name: "mydashboard-pr-engineer-read-facts-v1",
+  });
+  assert.equal(
+    typeof calls.pullRequestFactsGithub.loadPullRequestFacts,
+    "function",
+  );
+  assert.deepEqual(Object.keys(calls.prFactsService.store).sort(), [
+    "read",
+    "write",
+  ]);
+  assert.equal(Object.isFrozen(calls.prFactsService.store), true);
+  assert.deepEqual(Object.keys(calls.prFactsService.pullRequestFactsLoader), [
+    "loadPullRequestFacts",
+  ]);
+  assert.equal(
+    Object.isFrozen(calls.prFactsService.pullRequestFactsLoader),
+    true,
+  );
+  assert.deepEqual(Object.keys(calls.prFactsService.exclusiveLease), ["run"]);
+  assert.equal(Object.isFrozen(calls.prFactsService.exclusiveLease), true);
+  assert.equal(calls.prFactsService.maximumAgeMs, 7_000);
   assert.equal(calls.facts.maximumAgeMs, 7_000);
-  assert.strictEqual(calls.contextAssembler.graphReader, ledgerRuntime.graphReader);
-  assert.strictEqual(calls.contextAssembler.factSource, factSource);
+  assert.deepEqual(Object.keys(calls.facts.store), ["read"]);
+  assert.equal(Object.isFrozen(calls.facts.store), true);
+  assert.deepEqual(Object.keys(calls.facts.pullRequestFacts), ["context"]);
+  assert.equal(Object.isFrozen(calls.facts.pullRequestFacts), true);
+  assert.notStrictEqual(
+    calls.contextAssembler.graphReader,
+    ledgerRuntime.graphReader,
+  );
+  assert.deepEqual(Object.keys(calls.contextAssembler.graphReader), [
+    "getSnapshot",
+  ]);
+  assert.equal(Object.isFrozen(calls.contextAssembler.graphReader), true);
+  assert.notStrictEqual(calls.contextAssembler.factSource, factSource);
+  assert.deepEqual(Object.keys(calls.contextAssembler.factSource), ["read"]);
+  assert.equal(Object.isFrozen(calls.contextAssembler.factSource), true);
+  assert.deepEqual(
+    Object.keys(calls.contextAssembler.pullRequestContextReader),
+    ["read"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.contextAssembler.pullRequestContextReader),
+    true,
+  );
   assert.strictEqual(
     calls.orchestratorService.contextAssembler,
     roleContextAssembler,
@@ -834,7 +1003,10 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.reconciler.ledger, ledgerRuntime);
   assert.strictEqual(calls.proposalReconciler.proposalConsumer, proposalConsumer);
   assert.strictEqual(calls.proposalReconciler.ledger, ledgerRuntime);
-  assert.strictEqual(calls.waker.factSource, factSource);
+  assert.strictEqual(
+    calls.waker.factSource,
+    calls.contextAssembler.factSource,
+  );
   assert.strictEqual(calls.waker.ledger, ledgerRuntime);
   assert.strictEqual(calls.loop.roleDirectory, roleDirectory);
   assert.strictEqual(calls.loop.roleContextAssembler, roleContextAssembler);
@@ -914,9 +1086,122 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "coordinated-attention",
   );
 
-  await application.close();
+  await Promise.all([application.close(), application.close()]);
   assert.deepEqual(closeCalls, [
+    "pr-facts-guard",
     "confirmation",
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+  ]);
+});
+
+test("a late PR fact composition failure closes its guard before prior runtimes", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const startupFailure = new Error("workflow facts failed to compose");
+
+  await assert.rejects(
+    createApplication({
+      config: workCoordinationConfig({ externalActions: false }),
+      store: memoryStore(),
+      externalActions: false,
+      ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+      prEngineerExclusiveGuardFactory: () =>
+        inProcessExclusiveGuard(() => closeCalls.push("pr-facts-guard")),
+      prEngineerServiceFactory: () => ({
+        async recover() {},
+        async context() {},
+      }),
+      workflowFactSourceFactory: () => {
+        throw startupFailure;
+      },
+    }),
+    (error) => error === startupFailure,
+  );
+
+  assert.deepEqual(closeCalls, [
+    "pr-facts-guard",
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+  ]);
+  assert.equal(calls.loop, undefined);
+});
+
+test("missing GitHub PR facts authority fails startup and releases its guard", async () => {
+  const calls = {};
+  const closeCalls = [];
+  let serviceCalls = 0;
+
+  await assert.rejects(
+    createApplication({
+      config: workCoordinationConfig({ externalActions: false }),
+      store: memoryStore(),
+      externalActions: false,
+      ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+      pullRequestFactsLoaderFactory: () => ({}),
+      prEngineerExclusiveGuardFactory: () =>
+        inProcessExclusiveGuard(() => closeCalls.push("pr-facts-guard")),
+      prEngineerServiceFactory: () => {
+        serviceCalls += 1;
+        return { async recover() {}, async context() {} };
+      },
+    }),
+    /GitHub pull request facts loader is invalid/u,
+  );
+
+  assert.equal(serviceCalls, 0);
+  assert.equal(calls.loop, undefined);
+  assert.deepEqual(closeCalls, [
+    "pr-facts-guard",
+    "proposals",
+    "attention",
+    "ledger",
+    "workflow",
+  ]);
+});
+
+test("corrupted PR fact state aborts before facts or employee loops open", async () => {
+  const calls = {};
+  const closeCalls = [];
+  let factSourceCalls = 0;
+  const store = storedValues({
+    "pr-engineer-read-facts": {
+      schemaVersion: 1,
+      revision: 0,
+      records: [],
+      contentDigest: "0".repeat(64),
+    },
+  });
+
+  await assert.rejects(
+    createApplication({
+      config: workCoordinationConfig({ externalActions: false }),
+      store,
+      externalActions: false,
+      ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+      pullRequestFactsLoaderFactory: () => ({
+        async loadPullRequestFacts() {
+          throw new Error("corruption recovery must not call GitHub");
+        },
+      }),
+      prEngineerExclusiveGuardFactory: () =>
+        inProcessExclusiveGuard(() => closeCalls.push("pr-facts-guard")),
+      workflowFactSourceFactory: () => {
+        factSourceCalls += 1;
+        return workflowFactSourcePort();
+      },
+    }),
+    (error) => error.code === "PR_FACT_STATE_CORRUPTED",
+  );
+
+  assert.equal(factSourceCalls, 0);
+  assert.equal(calls.loop, undefined);
+  assert.deepEqual(closeCalls, [
+    "pr-facts-guard",
     "proposals",
     "attention",
     "ledger",
@@ -1194,9 +1479,14 @@ test("enabled unified memory exposes search only and projects the existing work 
       async appendWorkItems() {},
       async appendGraphEvents() {},
       async appendProjectionRecords() {},
+      async appendAuthorityProjection() {},
       async adoptGraphCheckpoint() {},
     },
-    authorityReader: { async getAuthorityState() {} },
+    authorityReader: {
+      async getAuthorityState() {},
+      async getAuthorityProjectionState() {},
+      requiresAuthorityProjectionCheckpoint() { return false; },
+    },
     search: {
       async search(value) { return { items: [value], nextCursor: null }; },
       async getHealth() { return { ready: true }; },
@@ -1258,7 +1548,8 @@ test("enabled unified memory exposes search only and projects the existing work 
     },
     workIntentPolicyFactory: () => ({ async bind() {} }),
     roleWorkerDirectoryFactory: () => ({ async resolve() {} }),
-    workflowFactSourceFactory: () => ({ async read() {} }),
+    prEngineerExclusiveGuardFactory: () => inProcessExclusiveGuard(),
+    workflowFactSourceFactory: () => workflowFactSourcePort(),
     attentionResultReconcilerFactory: () => ({ async runCycle() {} }),
     workProposalResultReconcilerFactory: () => ({ async runCycle() {} }),
     workConditionWakerFactory: () => ({ async runCycle() {} }),
@@ -1276,15 +1567,21 @@ test("enabled unified memory exposes search only and projects the existing work 
     Object.keys(calls.projector.memoryLifecycleProducer).sort(),
     [
       "adoptGraphCheckpoint",
+      "appendAuthorityProjection",
       "appendGraphEvents",
       "appendProjectionRecords",
       "appendWorkItems",
     ],
   );
   assert.equal(Object.isFrozen(calls.projector.memoryAuthorityReader), true);
-  assert.deepEqual(Object.keys(calls.projector.memoryAuthorityReader), [
-    "getAuthorityState",
-  ]);
+  assert.deepEqual(
+    Object.keys(calls.projector.memoryAuthorityReader).sort(),
+    [
+      "getAuthorityProjectionState",
+      "getAuthorityState",
+      "requiresAuthorityProjectionCheckpoint",
+    ],
+  );
   assert.equal(Object.isFrozen(calls.projector.memoryAuthoritySource), true);
   assert.deepEqual(Object.keys(calls.projector.memoryAuthoritySource), [
     "readSnapshot",
@@ -1400,6 +1697,138 @@ test("cited memory answering wires only trusted retrieval and configured brain p
     value: { safe: true },
   });
   await application.close();
+});
+
+test("query_memory roles receive one recovered least-authority agent primitive", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig({ externalActions: false });
+  config.memory = {
+    enabled: true,
+    answering: {
+      enabled: true,
+      maximumRecords: 7,
+      maximumContextBytes: 110_000,
+      maximumConcurrent: 2,
+      brain: {
+        provider: "ollama",
+        model: "memory-model",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+      localBrain: {
+        provider: "ollama",
+        model: "memory-local",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+    },
+  };
+  config.brainProviders = { ollama: { kind: "ollama" } };
+  config.employees.roles = {
+    developer: {
+      permissions: { allowedIntents: ["complete", "query_memory"] },
+    },
+  };
+  const answerPort = { async answer() {} };
+  const agentPort = {
+    async recover() {
+      calls.recovered = true;
+    },
+    async execute() {},
+    async readContext() {},
+    async verifyContext() {},
+  };
+  const contextAssembler = { async assemble() {} };
+  const workLoop = { async runCycle() {} };
+  const composition = localCoordinationStubs({
+    calls,
+    closeCalls,
+    runners: {},
+  });
+
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...composition,
+    memoryBrainRouterFactory() {
+      return { async generate() {}, describe() {} };
+    },
+    memoryContextRetrieverFactory() {
+      return { async retrieve() {} };
+    },
+    memoryAnswerServiceFactory() {
+      return answerPort;
+    },
+    codeJobRuntimeFactory: async () => ({
+      confirmationExecutor: null,
+      reader: {
+        async get() {},
+        async getDetail() {},
+        async list() {},
+        async listNewest() {},
+      },
+      control: codeJobControlPort(),
+      worker: null,
+      projectionSource: codeJobProjectionSourcePort(),
+      async close() {},
+    }),
+    agentMemoryQueryServiceFactory(options) {
+      calls.agentMemory = options;
+      return agentPort;
+    },
+    roleContextAssemblerFactory(options) {
+      calls.contextAssembler = options;
+      return contextAssembler;
+    },
+    proactiveWorkLoopFactory(options) {
+      calls.loop = options;
+      return workLoop;
+    },
+  });
+
+  assert.equal(calls.recovered, true);
+  assert.deepEqual(calls.agentMemory.allowedRoleIds, ["developer"]);
+  assert.deepEqual(Object.keys(calls.agentMemory.store).sort(), ["read", "write"]);
+  assert.deepEqual(Object.keys(calls.agentMemory.memoryAnswer), ["answer"]);
+  assert.deepEqual(Object.keys(calls.agentMemory.memoryContextReader), [
+    "readRecords",
+  ]);
+  assert.deepEqual(Object.keys(calls.agentMemory.memoryProducer), ["append"]);
+  assert.equal(Object.isFrozen(calls.agentMemory.store), true);
+  assert.deepEqual(Object.keys(calls.contextAssembler.memoryQueryReader), [
+    "readContext",
+  ]);
+  assert.equal(Object.isFrozen(calls.contextAssembler.memoryQueryReader), true);
+  assert.deepEqual(Object.keys(calls.loop.memoryQueryService).sort(), [
+    "execute",
+    "verifyContext",
+  ]);
+  assert.equal(Object.isFrozen(calls.loop.memoryQueryService), true);
+  assert.equal("agentMemoryQueries" in application, false);
+  await application.close();
+});
+
+test("query_memory permission fails closed when cited memory answering is disabled", async () => {
+  const config = workCoordinationConfig({ externalActions: false });
+  config.employees.roles = {
+    developer: {
+      permissions: { allowedIntents: ["complete", "query_memory"] },
+    },
+  };
+  let constructed = 0;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      ...localCoordinationStubs({ calls: {}, closeCalls: [], runners: {} }),
+      agentMemoryQueryServiceFactory() {
+        constructed += 1;
+        return {};
+      },
+    }),
+    /query_memory.*统一记忆问答/,
+  );
+  assert.equal(constructed, 0);
 });
 
 test("memory imports are explicit opt-in ports with append-only authority", async () => {
@@ -1562,6 +1991,151 @@ test("application close is idempotent and attempts every runtime in reverse orde
   assert.deepEqual(closeCalls, ["confirmation", "workflow", "code-executor"]);
 });
 
+test("application close retries only runtimes that failed the prior close attempt", async () => {
+  const closeCalls = [];
+  const closeFailure = new Error("workflow close failed once");
+  let workflowAttempts = 0;
+  const application = await createApplication({
+    config: applicationConfig(),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      async close() {
+        closeCalls.push("code-executor");
+      },
+    }),
+    workflowRoutingRuntimeFactory: async () => ({
+      async close() {
+        workflowAttempts += 1;
+        closeCalls.push(`workflow-${workflowAttempts}`);
+        if (workflowAttempts === 1) throw closeFailure;
+      },
+    }),
+  });
+
+  await assert.rejects(application.close(), (error) => error === closeFailure);
+  const recoveryClose = application.close();
+  assert.strictEqual(application.close(), recoveryClose);
+  await recoveryClose;
+  await application.close();
+  assert.deepEqual(closeCalls, [
+    "workflow-1",
+    "code-executor",
+    "workflow-2",
+  ]);
+});
+
+test("runtime lifecycle preserves every ordered failure event after recovery", async () => {
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const workflowFailureOne = new Error("workflow close failed first");
+  const executorFailure = new Error("executor close failed first");
+  const workflowFailureTwo = new Error("workflow close failed second");
+  let workflowAttempts = 0;
+  let executorAttempts = 0;
+  lifecycle.track({
+    async close() {
+      executorAttempts += 1;
+      if (executorAttempts === 1) throw executorFailure;
+    },
+  });
+  lifecycle.track({
+    async close() {
+      workflowAttempts += 1;
+      if (workflowAttempts === 1) throw workflowFailureOne;
+      if (workflowAttempts === 2) throw workflowFailureTwo;
+    },
+  });
+
+  await assert.rejects(
+    lifecycle.close(),
+    (error) => error === workflowFailureOne,
+  );
+  const firstStatus = lifecycle.readStatus();
+  assert.strictEqual(firstStatus.failure, workflowFailureOne);
+  assert.deepEqual(firstStatus.failures, [
+    workflowFailureOne,
+    executorFailure,
+  ]);
+  assert.equal(Object.isFrozen(firstStatus.failures), true);
+
+  await assert.rejects(
+    lifecycle.close(),
+    (error) => error === workflowFailureTwo,
+  );
+  await lifecycle.close();
+  const recoveredStatus = lifecycle.readStatus();
+  assert.equal(recoveredStatus.complete, true);
+  assert.equal(recoveredStatus.failure, null);
+  assert.deepEqual(recoveredStatus.failures, [
+    workflowFailureOne,
+    executorFailure,
+    workflowFailureTwo,
+  ]);
+  assert.equal(Object.isFrozen(recoveredStatus.failures), true);
+});
+
+test("explicit null runtime lifecycle is rejected instead of internally orphaned", async () => {
+  let application = null;
+  const failure = await createApplication({
+    config: applicationConfig(),
+    store: memoryStore(),
+    externalActions: false,
+    runtimeLifecycle: null,
+  }).then(
+    (value) => {
+      application = value;
+      return null;
+    },
+    (error) => error,
+  );
+
+  try {
+    assert.equal(application, null);
+    assert.match(failure.message, /runtimeLifecycle is invalid/u);
+  } finally {
+    await application?.close();
+  }
+});
+
+test("default construction waits for pending startup cleanup", async () => {
+  const startupFailure = new Error("workflow startup failed");
+  let signalCleanupStarted;
+  let releaseCleanup;
+  const cleanupStarted = new Promise((resolve) => {
+    signalCleanupStarted = resolve;
+  });
+  const cleanupRelease = new Promise((resolve) => {
+    releaseCleanup = resolve;
+  });
+  let constructionSettled = false;
+  const construction = createApplication({
+    config: applicationConfig(),
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => ({
+      async close() {
+        signalCleanupStarted();
+        await cleanupRelease;
+      },
+    }),
+    workflowRoutingRuntimeFactory: async () => {
+      throw startupFailure;
+    },
+  }).then(
+    () => null,
+    (error) => error,
+  ).finally(() => {
+    constructionSettled = true;
+  });
+
+  await cleanupStarted;
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(constructionSettled, false);
+  } finally {
+    releaseCleanup();
+  }
+  assert.strictEqual(await construction, startupFailure);
+});
+
 test("a later startup failure releases the acquired workflow runtime", async () => {
   const closeCalls = [];
   const startupFailure = new Error("confirmation startup failed");
@@ -1650,6 +2224,269 @@ test("external confirmation runtime requires both action authorization gates", a
   await withoutProcessAuthorization.close();
 });
 
+test("an explicit comment-only PR action composes one fixed executor and one scoped runner", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    networkEnv: { HTTPS_PROXY: "http://127.0.0.1:8080" },
+    timeoutMs: 12_000,
+    enabledActions: ["comment"],
+  };
+  const environment = { TEST_GITHUB_TOKEN: "test-only-token" };
+  const transport = { async observe() {}, async perform() {} };
+  let executorCalls = 0;
+  const executor = {
+    async execute() { executorCalls += 1; },
+    async reconcile() { executorCalls += 1; },
+  };
+  const proposalRunnerPort = { async runCycle() {} };
+  const groupedRunner = { async runCycle() {} };
+  const runnerAuthority = { async claim() {}, async advance() {} };
+  const confirmationProducer = confirmationProducerPort();
+  const recoveryStatusReader = { async readRecoveryStatus() { return { kinds: [] }; } };
+
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: { "github-pr-action-runner": runnerAuthority },
+    }),
+    pullRequestExternalActionDependencies: { env: environment },
+    pullRequestExternalActionTransportFactory(options) {
+      calls.transport = options;
+      return transport;
+    },
+    pullRequestExternalActionExecutorFactory(options) {
+      calls.externalExecutor = options;
+      return executor;
+    },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducer,
+        recoveryStatusReader,
+        async close() { closeCalls.push("confirmation"); },
+      };
+    },
+    pullRequestExternalActionProposalRunnerFactory(options) {
+      calls.externalRunner = options;
+      return proposalRunnerPort;
+    },
+    githubReviewProposalRunnerFactory() {
+      throw new Error("legacy Review runner must stay disabled");
+    },
+    workProposalRunnerGroupFactory(runners) {
+      calls.runnerGroup = runners;
+      return groupedRunner;
+    },
+    operationsRuntimeFactory(options) {
+      calls.operations = options;
+      return { admission: { async run(operation) { return operation(); } } };
+    },
+  });
+
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, [{
+    runnerId: "github-pr-action-runner",
+    allowedKinds: ["github_pull_request_action_proposal"],
+    allowedRoleIds: ["pr-reviewer"],
+  }]);
+  assert.deepEqual(calls.externalExecutor.enabledActions, ["comment"]);
+  assert.equal(calls.externalExecutor.credentialProvider(), "test-only-token");
+  assert.strictEqual(calls.externalExecutor.transport, transport);
+  assert.deepEqual(calls.transport, {
+    ghCommand: process.execPath,
+    env: environment,
+    networkEnv: { HTTPS_PROXY: "http://127.0.0.1:8080" },
+    timeoutMs: 12_000,
+  });
+  assert.deepEqual(Object.keys(calls.externalExecutor.inputAuthorityVerifier), [
+    "verify",
+  ]);
+  assert.equal(
+    Object.isFrozen(calls.confirmation.pullRequestExternalActionExecutor),
+    true,
+  );
+  await calls.confirmation.pullRequestExternalActionExecutor.execute({});
+  await calls.confirmation.pullRequestExternalActionExecutor.reconcile({});
+  assert.equal(executorCalls, 2);
+  assert.strictEqual(calls.externalRunner.runner, runnerAuthority);
+  assert.strictEqual(calls.externalRunner.confirmationProducer, confirmationProducer);
+  assert.deepEqual(calls.externalRunner.enabledActions, ["comment"]);
+  assert.equal(calls.externalRunner.actorAccountId, "review-account");
+  assert.deepEqual(calls.runnerGroup, [proposalRunnerPort]);
+  assert.strictEqual(calls.operations.externalActionStatus, recoveryStatusReader);
+  await application.close();
+});
+
+test("an explicit empty PR action allow-list remains inert and never reads transport authority", async () => {
+  const calls = {};
+  const closeCalls = [];
+  let authorityReads = 0;
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    enabledActions: [],
+  };
+  const externalDependencies = {};
+  for (const name of ["credentialProvider", "transport", "executor"]) {
+    Object.defineProperty(externalDependencies, name, {
+      enumerable: true,
+      get() {
+        authorityReads += 1;
+        throw new Error(`${name} must stay unread`);
+      },
+    });
+  }
+  let confirmations = 0;
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+    pullRequestExternalActionDependencies: externalDependencies,
+    pullRequestExternalActionExecutorFactory() {
+      throw new Error("external executor must stay disabled");
+    },
+    pullRequestExternalActionProposalRunnerFactory() {
+      throw new Error("external proposal runner must stay disabled");
+    },
+    githubReviewProposalRunnerFactory() {
+      throw new Error("legacy Review runner must stay disabled");
+    },
+    confirmationRuntimeFactory: async () => {
+      confirmations += 1;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {},
+      };
+    },
+    workProposalRunnerGroupFactory() {
+      throw new Error("an empty runner set must not be grouped");
+    },
+  });
+
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, []);
+  assert.equal(confirmations, 1);
+  assert.equal(authorityReads, 0);
+  await application.close();
+});
+
+test("an explicit Review keeps legacy intake while unified execution owns work-proposal side effects", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    enabledActions: ["review"],
+  };
+  const legacyAuthority = { async claim() {}, async advance() {} };
+  const unifiedAuthority = { async claim() {}, async advance() {} };
+  const legacyRunner = { async runCycle() {} };
+  const unifiedRunner = { async runCycle() {} };
+  let executorCalls = 0;
+  const executor = {
+    async execute() { executorCalls += 1; },
+    async reconcile() { executorCalls += 1; },
+  };
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "github-review-runner": legacyAuthority,
+        "github-pr-action-runner": unifiedAuthority,
+      },
+    }),
+    pullRequestExternalActionDependencies: {
+      credentialProvider: () => ({ token: "test-only" }),
+      transport: { async review() {} },
+    },
+    pullRequestExternalActionExecutorFactory() { return executor; },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducerPort(),
+        async close() {},
+      };
+    },
+    githubReviewProposalRunnerFactory(options) {
+      calls.legacyRunner = options;
+      return legacyRunner;
+    },
+    pullRequestExternalActionProposalRunnerFactory(options) {
+      calls.unifiedRunner = options;
+      return unifiedRunner;
+    },
+    workProposalRunnerGroupFactory(runners) {
+      calls.runnerGroup = runners;
+      return { async runCycle() {} };
+    },
+  });
+
+  assert.deepEqual(calls.proposalRuntime.runnerScopes, [
+    {
+      runnerId: "github-review-runner",
+      allowedKinds: ["github_review_proposal"],
+      allowedRoleIds: ["pr-reviewer"],
+    },
+    {
+      runnerId: "github-pr-action-runner",
+      allowedKinds: ["github_pull_request_action_proposal"],
+      allowedRoleIds: ["pr-reviewer"],
+    },
+  ]);
+  assert.strictEqual(calls.legacyRunner.runner, legacyAuthority);
+  assert.strictEqual(calls.unifiedRunner.runner, unifiedAuthority);
+  await calls.confirmation.pullRequestExternalActionExecutor.execute({});
+  await calls.confirmation.pullRequestExternalActionExecutor.reconcile({});
+  assert.equal(executorCalls, 2);
+  assert.deepEqual(calls.runnerGroup, [legacyRunner, unifiedRunner]);
+  await application.close();
+});
+
+test("a configured PR push fails closed without sealed controlled-commit verification", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    enabledActions: ["push"],
+  };
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      ...localCoordinationStubs({
+        calls,
+        closeCalls,
+        runners: {
+          "github-pr-action-runner": { async claim() {}, async advance() {} },
+        },
+      }),
+      pullRequestExternalActionDependencies: {
+        credentialProvider: () => ({ token: "test-only" }),
+        transport: { async push() {} },
+      },
+    }),
+    /push 动作需要可核验的受控 commit 证据/,
+  );
+});
+
 test("application awaits recovered executor composition and propagates failure", async () => {
   const executor = { id: "controlled-executor" };
   let release;
@@ -1687,6 +2524,82 @@ test("application awaits recovered executor composition and propagates failure",
     }),
     (error) => error === startupFailure,
   );
+});
+
+test("conflict preparation composition rejects partial or injected production authority", async (t) => {
+  const enabledConflict = {
+    enabled: true,
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: { "acme/repo": "D:\\mirrors\\base.git" },
+      headMirrorsByRepository: {
+        "contributor/repo": "D:\\mirrors\\head.git",
+      },
+    },
+  };
+  const verifier = { async verify(value) { return value; } };
+  const preparer = { async prepare(value) { return value; } };
+  const cases = [
+    {
+      name: "configured without ports",
+      config: applicationConfig(enabledConflict),
+      runtime: {
+        authority: {
+          workspaces: [{ capabilities: ["conflict_preparation_snapshot"] }],
+        },
+      },
+    },
+    {
+      name: "configured without advertised workspace capability",
+      config: applicationConfig(enabledConflict),
+      runtime: {
+        authority: { workspaces: [{ capabilities: [] }] },
+        conflictPreparationVerifier: verifier,
+        conflictExecutionSourcePreparer: preparer,
+      },
+    },
+    {
+      name: "unconfigured injected conflict materializer",
+      config: applicationConfig({ enabled: true }),
+      runtime: {
+        authority: {
+          workspaces: [{ capabilities: ["conflict_preparation_snapshot"] }],
+        },
+      },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      await assert.rejects(
+        createApplication({
+          config: entry.config,
+          store: memoryStore(),
+          codeExecutorRuntimeFactory: async () => entry.runtime,
+        }),
+        /配置、工作区能力和生产端口不一致/,
+      );
+    });
+  }
+});
+
+test("disabled code executor keeps staged conflict preparation inactive", async () => {
+  const config = applicationConfig({
+    enabled: false,
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: { "acme/repo": "D:\\mirrors\\base.git" },
+      headMirrorsByRepository: {
+        "contributor/repo": "D:\\mirrors\\head.git",
+      },
+    },
+  });
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    codeExecutorRuntimeFactory: async () => null,
+  });
+
+  await application.close();
 });
 
 test("application awaits the private confirmation runtime and exposes only its queue facade", async () => {
@@ -1775,6 +2688,7 @@ test("application does not open until a persisted invalidation intent is recover
     store,
     confirmationRuntimeFactory: async () => ({
       queue: confirmationQueuePort(),
+      memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
       producerQueue: confirmationProducerPort({
         async invalidate(id, intent) {
           invalidationCalls += 1;
@@ -2079,6 +2993,9 @@ test("local code and change package composition injects only frozen delivery por
       executor: controlledCodeExecutorPort(),
       changePackageTargets: [{ workspaceId: "dashboard" }],
       completedChangeExporter: { async export() {} },
+      controlledCommitBuilder: {
+        async create() {}, async find() {}, async verify() {},
+      },
       auditArtifactReader: {
         async read(value) { return Buffer.from(JSON.stringify(value)); },
       },
@@ -2089,6 +3006,7 @@ test("local code and change package composition injects only frozen delivery por
       return {
         packageProducer: { async create() {} },
         packageReader: { async get() {}, async readFile() {} },
+        controlledCommitDelivery: { async deliver() {} },
         applicationProducer: {
           async prepareConfirmation(value) {
             applicationRequestOrder.push("prepare");
@@ -2142,6 +3060,7 @@ test("local code and change package composition injects only frozen delivery por
     },
     confirmationRuntimeFactory: async () => ({
       queue: confirmationQueuePort(),
+      memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
       producerQueue: confirmationProducerPort({
         async enqueue(value) {
           applicationRequestOrder.push("enqueue");
@@ -2170,6 +3089,23 @@ test("local code and change package composition injects only frozen delivery por
     codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
     workProposalRunnerGroupFactory: (runners) => runners[0],
   });
+
+  assert.deepEqual(
+    Object.keys(calls.changePackageRuntime.controlledCommitBuilder),
+    ["create", "find", "verify"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.changePackageRuntime.controlledCommitBuilder),
+    true,
+  );
+  assert.deepEqual(
+    Object.keys(calls.codeJobRuntime.controlledCommitDelivery),
+    ["deliver"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.codeJobRuntime.controlledCommitDelivery),
+    true,
+  );
 
   calls.authorityJob = {
     jobId: "code-job-1",
@@ -2237,6 +3173,14 @@ test("local code and change package composition injects only frozen delivery por
     assert.equal(Object.isFrozen(calls.codeJobRuntime[name]), true);
     assert.deepEqual(Object.keys(calls.codeJobRuntime[name]), methods);
   }
+  assert.deepEqual(
+    Object.keys(calls.dispatcher.controlledCommitEvidenceReader),
+    ["verify"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.dispatcher.controlledCommitEvidenceReader),
+    true,
+  );
   assert.equal(
     Object.isFrozen(calls.coordination.codeJobChangePackageDispatcher),
     true,
@@ -2353,6 +3297,19 @@ test("local code execution fails closed when unified memory is disabled", async 
 test("local code composition binds authority, both proposal runners, and one safe reader", async () => {
   const calls = {};
   const closeCalls = [];
+  const config = localCodeCoordinationConfig();
+  config.codeExecutor = {
+    ...config.codeExecutor,
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: { "acme/repo": "D:\\mirrors\\base.git" },
+      headMirrorsByRepository: {
+        "contributor/repo": "D:\\mirrors\\head.git",
+      },
+    },
+  };
+  const conflictPreparationVerifier = { async verify(value) { return value; } };
+  const conflictExecutionSourcePreparer = { async prepare(value) { return value; } };
   const githubRunnerPort = { async claim() {}, async advance() {} };
   const codeRunnerPort = { async claim() {}, async advance() {} };
   const githubRunner = { id: "github-runner", async runCycle() {} };
@@ -2375,15 +3332,18 @@ test("local code composition binds authority, both proposal runners, and one saf
           Object.freeze({ id: "node-tests", configDigest: "a".repeat(64) }),
         ]),
         authorityDigest: "b".repeat(64),
+        capabilities: Object.freeze(["conflict_preparation_snapshot"]),
       }),
     ]),
   });
   const application = await createApplication({
-    config: localCodeCoordinationConfig(),
+    config,
     store: memoryStore(),
     codeExecutorRuntimeFactory: async () => ({
       authority: executorAuthority,
       executor: controlledCodeExecutorPort(),
+      conflictPreparationVerifier,
+      conflictExecutionSourcePreparer,
       async close() {
         closeCalls.push("code-executor");
       },
@@ -2417,6 +3377,7 @@ test("local code composition binds authority, both proposal runners, and one saf
       calls.confirmation = dependencies;
       return {
         queue: confirmationQueuePort(),
+        memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
         producerQueue: confirmationProducerPort(),
         async close() {
           closeCalls.push("confirmation");
@@ -2491,6 +3452,26 @@ test("local code composition binds authority, both proposal runners, and one saf
     "reconcile",
   ]);
   assert.strictEqual(calls.grantFactory.executorAuthority, executorAuthority);
+  assert.deepEqual(Object.keys(calls.grantFactory.conflictPreparationVerifier), [
+    "verify",
+  ]);
+  assert.equal(Object.isFrozen(calls.grantFactory.conflictPreparationVerifier), true);
+  assert.notStrictEqual(
+    calls.grantFactory.conflictPreparationVerifier,
+    conflictPreparationVerifier,
+  );
+  assert.deepEqual(
+    Object.keys(calls.dispatcher.conflictExecutionSourcePreparer),
+    ["prepare"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.dispatcher.conflictExecutionSourcePreparer),
+    true,
+  );
+  assert.notStrictEqual(
+    calls.dispatcher.conflictExecutionSourcePreparer,
+    conflictExecutionSourcePreparer,
+  );
   assert.equal(calls.grantFactory.policyVersion, 2);
   assert.deepEqual(calls.grantFactory.workspaceByRepository, {
     "acme/repo": "acme-workspace",
@@ -2505,11 +3486,11 @@ test("local code composition binds authority, both proposal runners, and one saf
     tester: ["inspect", "verify"],
     "policy-only-role": ["inspect"],
   });
-  assert.deepEqual(calls.grantFactory.brainByRole, {
-    developer: localCodeCoordinationConfig().employees.roles.developer.brain,
-    tester: localCodeCoordinationConfig().employees.roles.tester.brain,
-    "policy-only-role":
-      localCodeCoordinationConfig().employees.roles["policy-only-role"].brain,
+  assert.deepEqual(calls.grantFactory.taskBrainByRole, {
+    developer:
+      localCodeCoordinationConfig().employees.roles.developer.taskBrain,
+    tester: localCodeCoordinationConfig().employees.roles.tester.taskBrain,
+    "policy-only-role": null,
   });
   assert.deepEqual(
     calls.grantFactory.brainProviders,
@@ -2643,6 +3624,7 @@ test("local-only code actions create confirmation while maintenance keeps projec
       confirmationCalls += 1;
       return {
         queue: confirmationQueuePort(),
+        memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
         producerQueue: confirmationProducerPort(),
         async close() {
           closeCalls.push("confirmation");
@@ -2736,6 +3718,7 @@ test("local composition constructs the real grant, handler, and runner group cha
     }),
     confirmationRuntimeFactory: async () => ({
       queue: confirmationQueuePort(),
+      memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
       producerQueue: confirmationProducerPort(),
       async close() {},
     }),
@@ -2911,6 +3894,7 @@ test("versioned composition builds every subsystem from the stored active snapsh
       confirmationDependencies = dependencies;
       return {
         queue: confirmationQueuePort(),
+        memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
         producerQueue: confirmationProducerPort(),
         async close() {
           calls.push("confirmation-close");
@@ -3168,6 +4152,16 @@ test("versioned local code shares one gate and reads Active authority", async ()
   };
   const config = {
     ...baseConfig,
+    codeExecutor: {
+      ...baseConfig.codeExecutor,
+      conflictPreparation: {
+        enabled: true,
+        baseMirrorsByRepository: { "acme/repo": "D:\\mirrors\\base.git" },
+        headMirrorsByRepository: {
+          "contributor/repo": "D:\\mirrors\\head.git",
+        },
+      },
+    },
     memory: {
       ...baseConfig.memory,
       answering: {
@@ -3199,6 +4193,8 @@ test("versioned local code shares one gate and reads Active authority", async ()
     async decide() {},
   };
   const localExecutor = { async execute() {}, async reconcile() {} };
+  const conflictPreparationVerifier = { async verify(value) { return value; } };
+  const conflictExecutionSourcePreparer = { async prepare(value) { return value; } };
 
   const application = await createApplication({
     config,
@@ -3266,10 +4262,13 @@ test("versioned local code shares one gate and reads Active authority", async ()
               { id: "node-tests", configDigest: "a".repeat(64) },
             ],
             authorityDigest: "b".repeat(64),
+            capabilities: ["conflict_preparation_snapshot"],
           },
         ],
       },
       executor: controlledCodeExecutorPort(),
+      conflictPreparationVerifier,
+      conflictExecutionSourcePreparer,
       async close() {
         closeCalls.push("code-executor");
       },
@@ -3315,6 +4314,7 @@ test("versioned local code shares one gate and reads Active authority", async ()
       calls.confirmation = dependencies;
       return {
         queue: confirmationQueuePort(),
+        memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
         producerQueue: confirmationProducerPort(),
         async close() {
           closeCalls.push("confirmation");
@@ -3390,6 +4390,22 @@ test("versioned local code shares one gate and reads Active authority", async ()
   assert.strictEqual(
     calls.versionedAuthority.configurationReader,
     configurationReader,
+  );
+  assert.deepEqual(
+    Object.keys(calls.versionedAuthority.conflictPreparationVerifier),
+    ["verify"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.versionedAuthority.conflictPreparationVerifier),
+    true,
+  );
+  assert.deepEqual(
+    Object.keys(calls.dispatcher.conflictExecutionSourcePreparer),
+    ["prepare"],
+  );
+  assert.equal(
+    Object.isFrozen(calls.dispatcher.conflictExecutionSourcePreparer),
+    true,
   );
   assert.equal(
     await calls.codeJobRuntime.grantVerifier.verify("sealed-grant"),

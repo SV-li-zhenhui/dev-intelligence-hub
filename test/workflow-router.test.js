@@ -16,15 +16,15 @@ function workflowEvent(overrides = {}) {
     contentDigest: "a".repeat(64),
     eventType: "pull_request.created",
     occurredAt: "2026-08-02T01:00:00.000Z",
-    source: { provider: "github", scopeId: "SVisions/OCT-Software" },
+    source: { provider: "github", scopeId: "acme/command-center" },
     subject: {
-      id: "SVisions/OCT-Software#42",
-      repository: "SVisions/OCT-Software",
+      id: "acme/command-center#42",
+      repository: "acme/command-center",
       number: 42,
     },
     payload: {
       author: "alice",
-      assignee: "zhenhui",
+      assignee: "local-owner",
       labels: ["backend", "risk:high"],
       files: ["src/api/routes.js", "test/routes.test.js"],
       riskScore: 8,
@@ -124,7 +124,7 @@ test("routes by descending priority and preserves declaration order for ties", (
       id: "second-tie",
       priority: 20,
       onMatch: "stop",
-      targets: [{ type: "person", id: "zhenhui" }],
+      targets: [{ type: "person", id: "local-owner" }],
     }),
     rule({
       id: "never-evaluated",
@@ -143,7 +143,7 @@ test("routes by descending priority and preserves declaration order for ties", (
     },
     {
       ruleId: "second-tie",
-      target: { type: "person", id: "zhenhui" },
+      target: { type: "person", id: "local-owner" },
       priority: 20,
     },
   ]);
@@ -487,7 +487,7 @@ test("deduplicates the same target after the highest-priority assignment", () =>
       onMatch: "continue",
       targets: [
         { type: "role", id: "pr-reviewer" },
-        { type: "person", id: "zhenhui" },
+        { type: "person", id: "local-owner" },
       ],
     }),
   ]);
@@ -496,7 +496,7 @@ test("deduplicates the same target after the highest-priority assignment", () =>
     result.assignments.map(({ target }) => target),
     [
       { type: "role", id: "pr-reviewer" },
-      { type: "person", id: "zhenhui" },
+      { type: "person", id: "local-owner" },
     ],
   );
   assert.deepEqual(

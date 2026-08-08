@@ -67,6 +67,13 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
   );
 });
 
+test("cutover treats side-effect-free decision exhaustion as settled", () => {
+  assert.deepEqual(
+    blockersFor(root({ statusReason: "decision_attempts_exhausted" })),
+    [],
+  );
+});
+
 test("cutover keeps unknown waiting states blocked and accepts retry settlement", () => {
   for (const status of [
     "waiting_user",

@@ -96,13 +96,21 @@ function changePackageDeliveryPorts({
   completedChangeExporter,
   changePackageProducer,
   changePackageReader,
+  controlledCommitDelivery,
 }) {
   const supplied = [
     completedChangeExporter,
     changePackageProducer,
     changePackageReader,
   ].filter((value) => value !== undefined).length;
-  if (supplied === 0) return null;
+  if (supplied === 0) {
+    if (controlledCommitDelivery !== undefined) {
+      throw new TypeError(
+        "change package delivery dependencies must be configured together",
+      );
+    }
+    return null;
+  }
   if (supplied !== 3) {
     throw new TypeError(
       "change package delivery dependencies must be configured together",
@@ -124,6 +132,15 @@ function changePackageDeliveryPorts({
       ["get"],
       "change package reader",
     ),
+    ...(controlledCommitDelivery === undefined
+      ? {}
+      : {
+          controlledCommitDelivery: bindPort(
+            controlledCommitDelivery,
+            ["deliver"],
+            "change package controlled commit delivery",
+          ),
+        }),
   });
 }
 
@@ -192,6 +209,7 @@ export async function createCodeJobRuntime({
   completedChangeExporter,
   changePackageProducer,
   changePackageReader,
+  controlledCommitDelivery,
   workerLimits = {},
   workerFactory = (options) => new CodeJobWorkerService(options),
   createGuard = (options) => new ProcessExclusiveGuard(options),
@@ -218,6 +236,7 @@ export async function createCodeJobRuntime({
     completedChangeExporter,
     changePackageProducer,
     changePackageReader,
+    controlledCommitDelivery,
   });
   const normalizedWorkerLimits = normalizeWorkerLimits(workerLimits);
   const durableStore = validateStore(
@@ -262,6 +281,12 @@ export async function createCodeJobRuntime({
           completedChangeExporter:
             changePackagePorts.completedChangeExporter,
           packageProducer: changePackagePorts.changePackageProducer,
+          ...(changePackagePorts.controlledCommitDelivery === undefined
+            ? {}
+            : {
+                controlledCommitDelivery:
+                  changePackagePorts.controlledCommitDelivery,
+              }),
         });
     const approvalExecutor = grantVerifier === undefined
       ? null

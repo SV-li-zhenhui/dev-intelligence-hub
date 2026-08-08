@@ -15,6 +15,7 @@ import {
 export { RoleContextAssemblerError };
 
 const MAX_CONTEXT_BYTES = 128 * 1024;
+const MAX_PULL_REQUEST_CONTEXT_BYTES = 64 * 1024;
 const MAX_CANONICAL_DEPTH = 16;
 const MAX_CANONICAL_ENTRIES = 500;
 const MAX_ROOT_DELIVERABLE_SLOTS = 4;
@@ -274,6 +275,20 @@ function optionalFactSource(value) {
   if (value === undefined || value === null) return null;
   return Object.freeze({
     read: bindPortMethod(value, "read", "factSource"),
+  });
+}
+
+function optionalPullRequestContextReader(value) {
+  if (value === undefined || value === null) return null;
+  return Object.freeze({
+    read: bindPortMethod(value, "read", "pullRequestContextReader"),
+  });
+}
+
+function optionalMemoryQueryReader(value) {
+  if (value === undefined || value === null) return null;
+  return Object.freeze({
+    readContext: bindPortMethod(value, "readContext", "memoryQueryReader"),
   });
 }
 
@@ -957,6 +972,125 @@ async function readFacts(factSource, event, signal) {
   return facts;
 }
 
+function normalizePullRequestContext(value) {
+  const normalized = canonicalValue(value);
+  const fields = exactData(
+    normalized,
+    [
+      "schemaVersion",
+      "identityDigest",
+      "contentDigest",
+      "observedAt",
+      "summary",
+      "comments",
+      "reviews",
+      "reviewThreads",
+      "checks",
+      "contextTruncated",
+    ],
+    "pullRequest context",
+  );
+  if (
+    fields.get("schemaVersion") !== 1 ||
+    typeof fields.get("contextTruncated") !== "boolean"
+  ) {
+    throw invalid("pullRequest context is invalid");
+  }
+  digest(fields.get("identityDigest"), "pullRequest.identityDigest");
+  digest(fields.get("contentDigest"), "pullRequest.contentDigest");
+  const observedAt = fields.get("observedAt");
+  if (
+    typeof observedAt !== "string" ||
+    !Number.isFinite(Date.parse(observedAt)) ||
+    new Date(Date.parse(observedAt)).toISOString() !== observedAt ||
+    Buffer.byteLength(JSON.stringify(normalized), "utf8") >
+      MAX_PULL_REQUEST_CONTEXT_BYTES
+  ) {
+    throw invalid("pullRequest context is invalid");
+  }
+  return normalized;
+}
+
+async function readPullRequestContext(reader, item, signal) {
+  signal?.throwIfAborted();
+  if (!item.eventType.startsWith("pull_request.") || reader === null) {
+    return null;
+  }
+  if (item.sourceBinding === null) {
+    throw contextError(
+      "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+      "Current PR task has no exact source binding",
+      503,
+    );
+  }
+  try {
+    const value = await reader.read(
+      {
+        sourceBinding: item.sourceBinding,
+        event: item.event,
+      },
+      signal === undefined ? undefined : { signal },
+    );
+    signal?.throwIfAborted();
+    return normalizePullRequestContext(value);
+  } catch (cause) {
+    signal?.throwIfAborted();
+    if (
+      cause instanceof RoleContextAssemblerError &&
+      cause.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE"
+    ) {
+      throw cause;
+    }
+    throw contextError(
+      "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+      "Unable to read bounded PR task facts",
+      503,
+      { cause },
+    );
+  }
+}
+
+async function readMemoryQueryContext(reader, roleId, item, signal) {
+  signal?.throwIfAborted();
+  if (reader === null) return null;
+  try {
+    const result = await reader.readContext({
+      roleId,
+      item: {
+        itemId: item.taskId,
+        itemRevision: item.taskRevision,
+        inputDigest: item.inputDigest,
+        currentTarget: { ...item.currentTarget },
+      },
+    });
+    signal?.throwIfAborted();
+    return result === null ? null : canonicalValue(result);
+  } catch (cause) {
+    signal?.throwIfAborted();
+    let code = null;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(cause, "code");
+      code = descriptor && "value" in descriptor ? descriptor.value : null;
+    } catch {
+      // Untrusted errors collapse to the unavailable classification below.
+    }
+    if (code === "AGENT_MEMORY_QUERY_CITATION_STALE") {
+      throw contextError(
+        "ROLE_CONTEXT_MEMORY_STALE",
+        "The persisted agent memory answer no longer has current citations",
+        409,
+        { cause },
+      );
+    }
+    throw contextError(
+      "ROLE_CONTEXT_MEMORY_UNAVAILABLE",
+      "Unable to read the persisted agent memory answer",
+      503,
+      { cause },
+    );
+  }
+}
+
 function assertPacketSize(value) {
   if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_CONTEXT_BYTES) {
     throw contextError(
@@ -970,11 +1104,23 @@ function assertPacketSize(value) {
 export class RoleContextAssembler {
   #graphReader;
   #factSource;
+  #pullRequestContextReader;
+  #memoryQueryReader;
   #evidenceCatalogAdapter;
 
-  constructor({ graphReader, factSource, evidenceCatalog } = {}) {
+  constructor({
+    graphReader,
+    factSource,
+    pullRequestContextReader,
+    memoryQueryReader,
+    evidenceCatalog,
+  } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
+    this.#pullRequestContextReader = optionalPullRequestContextReader(
+      pullRequestContextReader,
+    );
+    this.#memoryQueryReader = optionalMemoryQueryReader(memoryQueryReader);
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
     Object.freeze(this);
@@ -1049,7 +1195,7 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
-    const [facts, authoritativeEvidence] = await Promise.all([
+    const [facts, authoritativeEvidence, pullRequest, memoryQuery] = await Promise.all([
       readFacts(this.#factSource, item.event, signal),
       this.#evidenceCatalogAdapter.read({
         roleId,
@@ -1057,6 +1203,8 @@ export class RoleContextAssembler {
         acceptanceContract: currentAcceptanceContract,
         signal,
       }),
+      readPullRequestContext(this.#pullRequestContextReader, item, signal),
+      readMemoryQueryContext(this.#memoryQueryReader, roleId, item, signal),
     ]);
     signal?.throwIfAborted();
     const isPullRequest = item.eventType.startsWith("pull_request.");
@@ -1130,6 +1278,7 @@ export class RoleContextAssembler {
     ) {
       context.code = {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
+        ...(pullRequest === null ? {} : { pullRequest }),
         acceptedDependencies: dependencies.code,
         facts: isPullRequest ? facts : [],
         ...(proposalDecisionContext === null
@@ -1145,6 +1294,9 @@ export class RoleContextAssembler {
           ? { authoritativeEvidence }
           : {}),
       };
+    }
+    if (memoryQuery !== null) {
+      context.memory = { agentQuery: memoryQuery };
     }
     assertPacketSize(context);
 

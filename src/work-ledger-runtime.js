@@ -13,6 +13,7 @@ const ORCHESTRATOR_PRINCIPAL_ID = "employee-orchestrator";
 const RUNTIME_METHODS = Object.freeze([
   "getSummary",
   "listItems",
+  "listPendingPullRequestSources",
   "listTimeline",
   "listOutbox",
   "readItemForReconciliation",

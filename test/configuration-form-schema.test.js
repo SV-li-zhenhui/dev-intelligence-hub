@@ -5,12 +5,13 @@ import {
   CONFIGURATION_FORM_SCHEMA,
   configurationCollectionDescriptor,
   configurationFieldDescriptor,
+  configurationSlotDescriptor,
   configurationStructureTemplate,
 } from "../public/configuration-form-schema.js";
 import { normalizeConfigurationDocument } from "../src/domain/configuration-contract.js";
 
 const configurationText = await readFile(
-  new URL("../config.json", import.meta.url),
+  new URL("../config.example.json", import.meta.url),
   "utf8",
 );
 
@@ -43,12 +44,21 @@ function extendedConfiguration() {
     requiredProfilesByWorkspace: {
       dashboard: ["node-contract"],
     },
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: {
+        "acme/command-center": "D:/mirrors/oct-base.git",
+      },
+      headMirrorsByRepository: {
+        "acme/command-center": "D:/mirrors/oct-head.git",
+      },
+    },
   };
   configuration.githubActions.networkEnv = {
     HTTPS_PROXY: "http://127.0.0.1:7890",
   };
   configuration.workCoordination.policy.workspaceByRepository = {
-    "SVisions/OCT-Software": "dashboard",
+    "acme/command-center": "dashboard",
   };
   return normalizeConfigurationDocument(configuration);
 }
@@ -100,6 +110,8 @@ test("every supported array and mapping exposes add, remove, replace and a safe 
     ["employees", "roles"],
     ["codeExecutor", "profiles"],
     ["codeExecutor", "requiredProfilesByWorkspace"],
+    ["codeExecutor", "conflictPreparation", "baseMirrorsByRepository"],
+    ["codeExecutor", "conflictPreparation", "headMirrorsByRepository"],
     ["githubActions", "networkEnv"],
     ["workCoordination", "policy", "capabilityRoles"],
     ["workCoordination", "policy", "codeOperationsByRole"],
@@ -117,6 +129,45 @@ test("every supported array and mapping exposes add, remove, replace and a safe 
     const template = configurationStructureTemplate(path);
     assert.equal(template.kind, Array.isArray(value) ? "array" : "map");
     assert.equal(typeof template.value === "string" && /^[\[{]/.test(template.value), false);
+  }
+});
+
+test("conflict preparation exposes an optional structured form instead of raw JSON", () => {
+  const slot = configurationSlotDescriptor([
+    "codeExecutor",
+    "conflictPreparation",
+  ]);
+  assert.equal(slot.optional, true);
+  assert.deepEqual(slot.operations, ["add", "remove", "replace"]);
+  assert.deepEqual(
+    configurationStructureTemplate([
+      "codeExecutor",
+      "conflictPreparation",
+    ]).value,
+    { enabled: false },
+  );
+
+  for (const name of [
+    "baseMirrorsByRepository",
+    "headMirrorsByRepository",
+  ]) {
+    const path = ["codeExecutor", "conflictPreparation", name];
+    const descriptor = configurationCollectionDescriptor(path, {});
+    assert.equal(descriptor.kind, "map");
+    assert.equal(descriptor.keyFormat, "controlled-git-repository");
+    assert.equal(descriptor.minimum, 1);
+    assert.equal(descriptor.maximum, 1_000);
+    assert.deepEqual(configurationStructureTemplate(path), {
+      kind: "map",
+      key: "owner/repository",
+      value: "C:/path/to/repository.git",
+    });
+    const mirror = configurationFieldDescriptor(
+      [...path, "acme/command-center"],
+      "D:/mirrors/oct.git",
+    );
+    assert.equal(mirror.control, "text");
+    assert.equal(mirror.format, "absolute-local-path");
   }
 });
 
@@ -181,6 +232,24 @@ test("schema identifies enum, numeric, boolean and environment-reference control
   assert.equal(gitHeadSnapshot.kind, "boolean");
 });
 
+test("GitHub PR external actions use an optional structured allow-list", () => {
+  const path = ["githubActions", "enabledActions"];
+  const collection = configurationCollectionDescriptor(path);
+  assert.equal(collection.kind, "array");
+  assert.equal(collection.optional, true);
+  assert.equal(collection.maximum, 5);
+  assert.equal(collection.uniqueBy, "value");
+  assert.deepEqual(collection.operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path), {
+    kind: "array",
+    value: "review",
+  });
+  assert.deepEqual(
+    configurationFieldDescriptor([...path, 0], "review").options,
+    ["comment", "review", "update_branch", "push", "merge"],
+  );
+});
+
 test("Git Head snapshot fields expose safe scalar templates for old configurations", () => {
   assert.deepEqual(
     configurationStructureTemplate(["codeExecutor", "gitCommand"]),
@@ -217,6 +286,7 @@ test("Git Head snapshot fields expose safe scalar templates for old configuratio
 test("router-backed brain references declare a dynamic provider option source", () => {
   for (const path of [
     ["employees", "roles", "developer", "brain", "provider"],
+    ["employees", "roles", "developer", "taskBrain", "provider"],
     ["memory", "answering", "brain", "provider"],
     ["memory", "answering", "localBrain", "provider"],
   ]) {
@@ -236,10 +306,35 @@ test("router-backed brain references declare a dynamic provider option source", 
   }
 });
 
+test("task brains expose an optional assigned-brain form", () => {
+  const path = ["employees", "roles", "developer", "taskBrain"];
+  const slot = configurationSlotDescriptor(path);
+  assert.equal(slot.optional, true);
+  assert.deepEqual(slot.operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path).value, {
+    provider: "ollama",
+    model: "qwen3.5:9b",
+    remoteData: { requirements: false, code: false, memory: false },
+  });
+  assert.equal(
+    configurationFieldDescriptor([...path, "provider"], "ollama").optionsFrom,
+    "brainProviders",
+  );
+  const model = configurationFieldDescriptor([...path, "model"], "qwen3.5:9b");
+  assert.equal(model.control, "text");
+  assert.equal(model.maximumBytes, 256);
+  assert.equal(
+    configurationFieldDescriptor([...path, "remoteData", "code"], false)
+      .control,
+    "checkbox",
+  );
+});
+
 test("new provider template is a complete openai-compatible provider", () => {
   const template = configurationStructureTemplate(["brainProviders"]).value;
   assert.equal(template.kind, "openai-compatible");
   assert.equal(template.apiKeyEnv, "MYDASHBOARD_MODEL_API_KEY");
+  assert.equal(template.protocol, "chat-completions");
   assert.equal(template.responseFormat, "json-schema");
   assert.equal(template.remote, true);
   assert.equal(Object.hasOwn(template, "contextTokens"), false);
@@ -291,6 +386,76 @@ test("provider variants expose complete Responses and Ollama forms without stale
     () => configurationStructureTemplate(["brainProviders"], "missing"),
     /variant is unavailable/i,
   );
+});
+
+test("provider variants expose fixed supervised Codex and Claude CLI forms", () => {
+  const collection = configurationCollectionDescriptor(["brainProviders"], {});
+  const variants = new Map(
+    collection.additionalTemplates.map(({ id, label }) => [id, label]),
+  );
+  assert.equal(variants.get("codex-cli"), "Codex CLI（单任务受监管）");
+  assert.equal(variants.get("claude-cli"), "Claude CLI（单任务受监管）");
+
+  for (const kind of ["codex-cli", "claude-cli"]) {
+    const template = configurationStructureTemplate(["brainProviders"], kind);
+    assert.equal(template.key, kind);
+    assert.deepEqual(template.value, {
+      kind,
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+    });
+    for (const field of [
+      "baseUrl",
+      "apiKeyEnv",
+      "protocol",
+      "responseFormat",
+      "contextTokens",
+      "executable",
+      "args",
+    ]) {
+      assert.equal(Object.hasOwn(template.value, field), false, `${kind}.${field}`);
+    }
+  }
+});
+
+test("CLI provider field descriptors expose their exact bounded ranges", () => {
+  for (const providerKind of ["codex-cli", "claude-cli"]) {
+    const context = { providerKind };
+    assert.deepEqual(
+      {
+        minimum: configurationFieldDescriptor(
+          ["brainProviders", "employee-cli", "timeoutMs"],
+          300_000,
+          context,
+        ).minimum,
+        maximum: configurationFieldDescriptor(
+          ["brainProviders", "employee-cli", "timeoutMs"],
+          300_000,
+          context,
+        ).maximum,
+      },
+      { minimum: 1_000, maximum: 3_600_000 },
+    );
+    for (const field of ["maxResponseBytes", "maxRequestBytes"]) {
+      const descriptor = configurationFieldDescriptor(
+        ["brainProviders", "employee-cli", field],
+        131_072,
+        context,
+      );
+      assert.equal(descriptor.minimum, 1_024, `${providerKind}.${field}`);
+      assert.equal(descriptor.maximum, 1_048_576, `${providerKind}.${field}`);
+    }
+  }
+
+  const legacy = configurationFieldDescriptor(
+    ["brainProviders", "legacy", "maxResponseBytes"],
+    2 * 1024 * 1024,
+    { providerKind: "openai-compatible" },
+  );
+  assert.equal(legacy.minimum, 1);
+  assert.equal(legacy.maximum, 2 * 1024 * 1024);
 });
 
 test("schema public path boundary rejects accessors, prototypes and oversized paths", () => {

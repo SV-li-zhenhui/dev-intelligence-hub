@@ -1,4 +1,8 @@
 import {
+  CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
+  CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+} from "../domain/code-job-contract.js";
+import {
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
 import { codeExecutionSourceWritablePaths } from "../domain/code-execution-source.js";
@@ -9,6 +13,7 @@ import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-director
 import {
   codeJobBrainDigest,
   CodeJobGrantFactory,
+  legacyCodeJobBrainDigest,
   prepareCodeJobGrantVerification,
 } from "./code-job-grant-factory.js";
 
@@ -69,8 +74,18 @@ function providerAuthority(configuration, providerId) {
   };
 }
 
-function roleAuthority(configuration, roleId) {
+function roleBrainForBinding(role, brainBindingSchema) {
+  if (!role) return null;
+  return brainBindingSchema === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
+    ? role.taskBrain ?? null
+    : role.brain;
+}
+
+function roleAuthority(configuration, roleId, brainBindingSchema) {
   const role = configuration.employees.roles[roleId];
+  const brain = roleBrainForBinding(role, brainBindingSchema);
+  const taskBrainBinding =
+    brainBindingSchema === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA;
   const policy = configuration.workCoordination.policy;
   return {
     prerequisites: {
@@ -82,11 +97,17 @@ function roleAuthority(configuration, roleId) {
       ? {
           enabled: role.enabled,
           allowedIntents: [...role.permissions.allowedIntents].sort(),
-          brain: {
-            provider: role.brain.provider,
-            remoteData: role.brain.remoteData,
-          },
-          provider: providerAuthority(configuration, role.brain.provider),
+          ...(taskBrainBinding ? { brainBindingSchema } : {}),
+          [taskBrainBinding ? "taskBrain" : "brain"]:
+            brain === null
+              ? null
+              : {
+                  provider: brain.provider,
+                  remoteData: brain.remoteData,
+                },
+          provider: brain === null
+            ? null
+            : providerAuthority(configuration, brain.provider),
         }
       : null,
     codePolicy: {
@@ -124,10 +145,41 @@ function globalExecutorAuthority(configuration) {
   };
 }
 
-function grantAuthority(configuration, { repository, workspaceId, roleId }) {
+function conflictPreparationAuthority(configuration, executionSource) {
+  if (executionSource === null) return null;
+  const conflict = configuration.codeExecutor.conflictPreparation;
+  const gitTarget = executionSource.preparationBinding.gitTarget;
+  const mirrorFor = (mirrors, repository) => {
+    const portableRepository = repository.toLowerCase();
+    const configured = Object.entries(mirrors ?? {}).find(
+      ([candidate]) => candidate.toLowerCase() === portableRepository,
+    );
+    return configured?.[1] ?? null;
+  };
+  return {
+    enabled: conflict?.enabled === true,
+    gitCommand: configuration.codeExecutor.gitCommand ?? null,
+    baseRepository: gitTarget.baseRepository.toLowerCase(),
+    baseMirror: mirrorFor(
+      conflict?.baseMirrorsByRepository,
+      gitTarget.baseRepository,
+    ),
+    headRepository: gitTarget.headRepository.toLowerCase(),
+    headMirror: mirrorFor(
+      conflict?.headMirrorsByRepository,
+      gitTarget.headRepository,
+    ),
+  };
+}
+
+function grantAuthority(
+  configuration,
+  { repository, workspaceId, roleId, executionSource },
+  brainBindingSchema,
+) {
   return {
     policyVersion: configuration.workCoordination.policy.version,
-    role: roleAuthority(configuration, roleId),
+    role: roleAuthority(configuration, roleId, brainBindingSchema),
     repository: {
       tracked: configuration.trackedRepositories.includes(repository),
       workspaceId:
@@ -136,6 +188,14 @@ function grantAuthority(configuration, { repository, workspaceId, roleId }) {
         ] ?? null,
     },
     executor: workspaceAuthority(configuration, workspaceId),
+    ...(brainBindingSchema === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
+      ? {
+          conflictPreparation: conflictPreparationAuthority(
+            configuration,
+            executionSource,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -146,16 +206,16 @@ function advanceAuthority(previous, fingerprint) {
   };
 }
 
-function roleAuthorityDigest(authority) {
+function roleAuthorityDigest(authority, brainBindingSchema) {
   return canonicalJsonDigest({
-    schemaVersion: 1,
+    schemaVersion: brainBindingSchema,
     ...authority,
   });
 }
 
-function grantAuthorityDigest(authority, scope) {
+function grantAuthorityDigest(authority, scope, brainBindingSchema) {
   return canonicalJsonDigest({
-    schemaVersion: 1,
+    schemaVersion: brainBindingSchema,
     executorAuthorityDigest: scope.executorAuthorityDigest,
     scope: {
       repository: scope.repository,
@@ -166,6 +226,21 @@ function grantAuthorityDigest(authority, scope) {
     },
     authorization: authority,
   });
+}
+
+export function codeJobAuthorityScopeCacheIdentity(scope) {
+  const executionSource = scope.executionSource;
+  const gitTarget = executionSource?.preparationBinding?.gitTarget;
+  return {
+    ...scope,
+    executionSource:
+      executionSource === null || executionSource === undefined
+        ? null
+        : {
+            baseRepository: gitTarget.baseRepository.toLowerCase(),
+            headRepository: gitTarget.headRepository.toLowerCase(),
+          },
+  };
 }
 
 function executorWorkspaceAuthorityDigest(value, workspaceId) {
@@ -249,6 +324,7 @@ class AuthorityHistory {
   }
 
   verificationTimeline(grant) {
+    const brainBindingSchema = grantBrainBindingSchema(grant);
     const scope = {
       executorAuthorityDigest: executorWorkspaceAuthorityDigest(
         this.#executorAuthority,
@@ -259,8 +335,9 @@ class AuthorityHistory {
       workspaceId: grant.workspaceId,
       roleId: grant.requestedBy.roleId,
       operation: grant.operation,
+      executionSource: grant.schemaVersion === 3 ? grant.executionSource : null,
     };
-    const scopedDigests = this.#scopeTimeline(scope);
+    const scopedDigests = this.#scopeTimeline(scope, brainBindingSchema);
     let legacyStates = this.#legacyStates;
     if (!legacyStates) {
       let legacyAuthority = { digest: null, epoch: 0 };
@@ -290,28 +367,42 @@ class AuthorityHistory {
     };
   }
 
-  scopeAuthorityDigestAt(index, scope) {
-    return this.#scopeTimeline(scope)[index];
+  scopeAuthorityDigestAt(
+    index,
+    scope,
+    brainBindingSchema = CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+  ) {
+    return this.#scopeTimeline(scope, brainBindingSchema)[index];
   }
 
-  roleAuthorityDigestAt(index, roleId) {
-    let timeline = this.#roleTimelines.get(roleId);
+  roleAuthorityDigestAt(
+    index,
+    roleId,
+    brainBindingSchema = CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+  ) {
+    const timelineKey = `${brainBindingSchema}:${roleId}`;
+    let timeline = this.#roleTimelines.get(timelineKey);
     if (!timeline) {
       let authority = { epoch: 0, fingerprint: null };
       timeline = this.#versions.map(({ configuration }) => {
         authority = advanceAuthority(
           authority,
-          canonicalJsonDigest(roleAuthority(configuration, roleId)),
+          canonicalJsonDigest(
+            roleAuthority(configuration, roleId, brainBindingSchema),
+          ),
         );
-        return roleAuthorityDigest(authority);
+        return roleAuthorityDigest(authority, brainBindingSchema);
       });
-      this.#roleTimelines.set(roleId, timeline);
+      this.#roleTimelines.set(timelineKey, timeline);
     }
     return timeline[index];
   }
 
-  #scopeTimeline(scope) {
-    const key = canonicalJsonDigest(scope);
+  #scopeTimeline(scope, brainBindingSchema) {
+    const key = canonicalJsonDigest({
+      brainBindingSchema,
+      scope: codeJobAuthorityScopeCacheIdentity(scope),
+    });
     let timeline = this.#scopeTimelines.get(key);
     if (timeline) return timeline;
     let authority = { epoch: 0, fingerprint: null };
@@ -319,14 +410,19 @@ class AuthorityHistory {
       authority = advanceAuthority(
         authority,
         canonicalJsonDigest(
-          grantAuthority(configuration, {
-            repository: scope.repository,
-            workspaceId: scope.workspaceId,
-            roleId: scope.roleId,
-          }),
+          grantAuthority(
+            configuration,
+            {
+              repository: scope.repository,
+              workspaceId: scope.workspaceId,
+              roleId: scope.roleId,
+              executionSource: scope.executionSource,
+            },
+            brainBindingSchema,
+          ),
         ),
       );
-      return grantAuthorityDigest(authority, scope);
+      return grantAuthorityDigest(authority, scope, brainBindingSchema);
     });
     this.#scopeTimelines.set(key, timeline);
     return timeline;
@@ -363,8 +459,16 @@ function enabledCodeRoles(configuration) {
   );
 }
 
-function roleBrains(roles, roleIds) {
-  return Object.fromEntries(roleIds.map((roleId) => [roleId, roles[roleId].brain]));
+function roleTaskBrains(roles, roleIds) {
+  return Object.fromEntries(
+    roleIds.map((roleId) => [roleId, roles[roleId].taskBrain ?? null]),
+  );
+}
+
+function legacyRoleBrains(roles, roleIds) {
+  return Object.fromEntries(
+    roleIds.map((roleId) => [roleId, roles[roleId].brain]),
+  );
 }
 
 function roleOperations(policy, roleIds) {
@@ -420,14 +524,37 @@ function decisionRoleId(value) {
   return descriptor.value;
 }
 
-function roleBrainDigest(configuration, roleId) {
+function grantBrainBindingSchema(grant) {
+  return Object.hasOwn(grant, "brainBindingSchema")
+    ? CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
+    : CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA;
+}
+
+function roleTaskBrainDigest(configuration, roleId) {
+  const role = configuration.employees.roles[roleId];
+  if (!role?.taskBrain) return null;
+  return codeJobBrainDigest({
+    roleId,
+    taskBrain: role.taskBrain,
+    brainProviders: configuration.brainProviders,
+  });
+}
+
+function legacyRoleBrainDigest(configuration, roleId) {
   const role = configuration.employees.roles[roleId];
   if (!role) return null;
-  return codeJobBrainDigest({
+  return legacyCodeJobBrainDigest({
     roleId,
     brain: role.brain,
     brainProviders: configuration.brainProviders,
   });
+}
+
+function grantRoleBrainDigest(configuration, grant) {
+  return grantBrainBindingSchema(grant) ===
+      CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
+    ? roleTaskBrainDigest(configuration, grant.requestedBy.roleId)
+    : legacyRoleBrainDigest(configuration, grant.requestedBy.roleId);
 }
 
 function executableConfiguration(configuration) {
@@ -461,7 +588,7 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
     !policy.codeOperationsByRole[roleId]?.includes(grant.operation) ||
     !configuration.trackedRepositories.includes(grant.repository) ||
     !workspace ||
-    roleBrainDigest(configuration, roleId) !== grant.brainDigest
+    grantRoleBrainDigest(configuration, grant) !== grant.brainDigest
   ) {
     return false;
   }
@@ -712,7 +839,7 @@ export class VersionedCodeJobAuthority {
       try {
         if (
           configurationAdmitsRole(version.configuration, roleId) &&
-          roleBrainDigest(version.configuration, roleId) === brainDigest
+          roleTaskBrainDigest(version.configuration, roleId) === brainDigest
         ) {
           return this.#context(version, current.history, index);
         }
@@ -793,15 +920,33 @@ export class VersionedCodeJobAuthority {
     if (roleIds.length === 0) {
       throw invalid("活动配置没有可执行代码动作的岗位");
     }
-    const scopeAuthorityDigest = (scope) =>
-      history.scopeAuthorityDigestAt(historyIndex, scope);
+    const scopeAuthorityDigest = (scope) => {
+      if (scope.executionSource !== null) {
+        const conflict = conflictPreparationAuthority(
+          configuration,
+          scope.executionSource,
+        );
+        if (
+          !conflict.enabled ||
+          conflict.baseMirror === null ||
+          conflict.headMirror === null
+        ) {
+          throw invalid("Conflict preparation 的仓库镜像授权未配置");
+        }
+      }
+      return history.scopeAuthorityDigestAt(
+        historyIndex,
+        scope,
+        CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+      );
+    };
     const grants = this.#grantFactoryFactory({
       executorAuthority: this.#executorAuthority,
       policyVersion: policy.version,
       workspaceByRepository: policy.workspaceByRepository,
       codeActionRoles: roleIds,
       codeOperationsByRole: roleOperations(policy, roleIds),
-      brainByRole: roleBrains(configuration.employees.roles, roleIds),
+      taskBrainByRole: roleTaskBrains(configuration.employees.roles, roleIds),
       brainProviders: configuration.brainProviders,
       scopeAuthorityDigest,
       inputAuthorityVerifier: this.#inputAuthorityVerifier,
@@ -815,27 +960,38 @@ export class VersionedCodeJobAuthority {
       configuration,
       roleAuthorityDigest: (roleId) =>
         roleIds.includes(roleId)
-          ? history.roleAuthorityDigestAt(historyIndex, roleId)
+          ? history.roleAuthorityDigestAt(
+              historyIndex,
+              roleId,
+              CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+            )
           : undefined,
       brainDigests: new Map(
         roleIds.map((roleId) => [
           roleId,
-          roleBrainDigest(configuration, roleId),
+          roleTaskBrainDigest(configuration, roleId),
         ]),
       ),
       grantAuthorityDigest: (grant) =>
-        history.scopeAuthorityDigestAt(historyIndex, {
-          executorAuthorityDigest: executorWorkspaceAuthorityDigest(
-            this.#executorAuthority,
-            grant.workspaceId,
-          ),
-          repository: grant.repository,
-          workspaceId: grant.workspaceId,
-          roleId: grant.requestedBy.roleId,
-          operation: grant.operation,
-          policyVersion: grant.policyVersion,
-        }),
+        history.scopeAuthorityDigestAt(
+          historyIndex,
+          {
+            executorAuthorityDigest: executorWorkspaceAuthorityDigest(
+              this.#executorAuthority,
+              grant.workspaceId,
+            ),
+            repository: grant.repository,
+            workspaceId: grant.workspaceId,
+            roleId: grant.requestedBy.roleId,
+            operation: grant.operation,
+            policyVersion: grant.policyVersion,
+            executionSource:
+              grant.schemaVersion === 3 ? grant.executionSource : null,
+          },
+          grantBrainBindingSchema(grant),
+        ),
       grants,
+      legacyGrants: null,
       directory: null,
       history,
       historyIndex,
@@ -870,7 +1026,10 @@ export class VersionedCodeJobAuthority {
       workspaceByRepository: policy.workspaceByRepository,
       codeActionRoles: roleIds,
       codeOperationsByRole: roleOperations(policy, roleIds),
-      brainByRole: roleBrains(configuration.employees.roles, roleIds),
+      legacyBrainByRole: legacyRoleBrains(
+        configuration.employees.roles,
+        roleIds,
+      ),
       brainProviders: configuration.brainProviders,
       inputAuthorityVerifier: this.#inputAuthorityVerifier,
       conflictPreparationVerifier: this.#conflictPreparationVerifier,
@@ -880,7 +1039,11 @@ export class VersionedCodeJobAuthority {
   }
 
   async #verifyWithContext(value, context, current) {
-    const grant = await context.grants.verify(value);
+    const verifier = ![2, 3].includes(value.schemaVersion) ||
+        grantBrainBindingSchema(value) === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
+      ? context.grants
+      : this.#legacyScopedGrants(context);
+    const grant = await verifier.verify(value);
     if (!grant || typeof grant.repository !== "string") {
       throw invalid("代码任务授权校验器返回了无效结果");
     }
@@ -891,6 +1054,36 @@ export class VersionedCodeJobAuthority {
       throw invalid("代码任务授权已被相关活动配置失效");
     }
     return grant;
+  }
+
+  #legacyScopedGrants(context) {
+    if (context.legacyGrants) return context.legacyGrants;
+    const configuration = context.configuration;
+    const policy = configuration.workCoordination.policy;
+    const roleIds = enabledCodeRoles(configuration);
+    const grants = this.#grantFactoryFactory({
+      executorAuthority: this.#executorAuthority,
+      policyVersion: policy.version,
+      workspaceByRepository: policy.workspaceByRepository,
+      codeActionRoles: roleIds,
+      codeOperationsByRole: roleOperations(policy, roleIds),
+      legacyBrainByRole: legacyRoleBrains(
+        configuration.employees.roles,
+        roleIds,
+      ),
+      brainProviders: configuration.brainProviders,
+      scopeAuthorityDigest: (scope) =>
+        context.history.scopeAuthorityDigestAt(
+          context.historyIndex,
+          scope,
+          CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
+        ),
+      inputAuthorityVerifier: this.#inputAuthorityVerifier,
+      conflictPreparationVerifier: this.#conflictPreparationVerifier,
+    });
+    method(grants, "verify", "legacy scoped code job grant factory");
+    context.legacyGrants = grants;
+    return grants;
   }
 
   async #verifyLegacy(value, context, current) {

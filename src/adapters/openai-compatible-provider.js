@@ -1,7 +1,13 @@
+import { types as utilTypes } from "node:util";
+
 import {
   normalizeAbortSignal,
   runStructuredProviderRequest,
 } from "../lib/structured-provider-request.js";
+import {
+  normalizeStructuredBrainRequest,
+  readStructuredBrainGenerateInput,
+} from "../lib/structured-brain-request.js";
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024;
@@ -10,29 +16,38 @@ const CHAT_COMPLETIONS_PROTOCOL = "chat-completions";
 const RESPONSES_PROTOCOL = "responses";
 const JSON_SCHEMA_RESPONSE_FORMAT = "json-schema";
 const JSON_OBJECT_RESPONSE_FORMAT = "json-object";
+// Persisted providers created before protocol became explicit retain their
+// bounded historical limits. New configuration templates always write a
+// protocol; tightening old records requires a separately previewed migration.
+const LEGACY_LIMITS = Object.freeze({
+  minimumTimeoutMs: 1,
+  maximumTimeoutMs: 2 * 1024 * 1024,
+  minimumResponseBytes: 1,
+  maximumResponseBytes: 2 * 1024 * 1024,
+  minimumRequestBytes: 1,
+  maximumRequestBytes: 2 * 1024 * 1024,
+});
 const PROTOCOL_LIMITS = Object.freeze({
   [CHAT_COMPLETIONS_PROTOCOL]: Object.freeze({
     minimumTimeoutMs: 10,
     maximumTimeoutMs: 120_000,
+    minimumResponseBytes: 1_024,
     maximumResponseBytes: 1024 * 1024,
+    minimumRequestBytes: 1_024,
     maximumRequestBytes: 2 * 1024 * 1024,
   }),
   [RESPONSES_PROTOCOL]: Object.freeze({
     minimumTimeoutMs: 1_000,
     maximumTimeoutMs: 3_600_000,
+    minimumResponseBytes: 1_024,
     maximumResponseBytes: 1024 * 1024,
+    minimumRequestBytes: 1_024,
     maximumRequestBytes: 1024 * 1024,
   }),
 });
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const API_KEY = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
-const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
-const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
-const MAX_SCHEMA_DEPTH = 32;
-const MAX_SCHEMA_NODES = 20_000;
-const MAX_SCHEMA_KEYS = 20_000;
-const MAX_SCHEMA_STRING_BYTES = 1024 * 1024;
 const OPTION_KEYS = new Set([
   "id",
   "fetch",
@@ -171,13 +186,22 @@ function endpoint(value, protocol) {
   };
 }
 
-function configuredApiKey(environment, name) {
+function credentialReference(environment, name) {
   if (typeof name !== "string" || !SAFE_ENV_NAME.test(name)) {
     throw new TypeError("apiKeyEnv is invalid");
   }
-  if (!environment || typeof environment !== "object") {
+  if (
+    !environment ||
+    typeof environment !== "object" ||
+    utilTypes.isProxy(environment)
+  ) {
     throw new TypeError("injected environment is invalid");
   }
+  return Object.freeze({ environment, name });
+}
+
+function configuredApiKey(reference) {
+  const { environment, name } = reference;
   const descriptor = Object.getOwnPropertyDescriptor(environment, name);
   if (
     !descriptor ||
@@ -185,155 +209,13 @@ function configuredApiKey(environment, name) {
     typeof descriptor.value !== "string" ||
     !API_KEY.test(descriptor.value)
   ) {
-    throw new TypeError("OpenAI-compatible credential is unavailable");
+    throw providerError(
+      "BRAIN_CREDENTIAL_UNAVAILABLE",
+      "OpenAI-compatible credential is unavailable",
+      503,
+    );
   }
   return descriptor.value;
-}
-
-function safeText(value, name, maximumBytes) {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    INVALID_CONTROL.test(value) ||
-    Buffer.byteLength(value, "utf8") > maximumBytes
-  ) {
-    throw new TypeError(`${name} is invalid`);
-  }
-  return value;
-}
-
-function normalizeMessages(value) {
-  if (
-    !Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Array.prototype ||
-    value.length < 1 ||
-    value.length > 16
-  ) {
-    throw new TypeError("messages are invalid");
-  }
-  const keys = Reflect.ownKeys(value);
-  if (keys.length !== value.length + 1 || !keys.includes("length")) {
-    throw new TypeError("messages are invalid");
-  }
-  return value.map((_message, index) => {
-    const entry = Object.getOwnPropertyDescriptor(value, `${index}`);
-    if (!entry?.enumerable || !("value" in entry)) {
-      throw new TypeError("messages are invalid");
-    }
-    const message = entry.value;
-    if (
-      message === null ||
-      typeof message !== "object" ||
-      Array.isArray(message) ||
-      Object.getPrototypeOf(message) !== Object.prototype ||
-      Reflect.ownKeys(message).length !== 2 ||
-      !Object.hasOwn(message, "role") ||
-      !Object.hasOwn(message, "content") ||
-      !new Set(["system", "user", "assistant"]).has(message.role)
-    ) {
-      throw new TypeError("messages are invalid");
-    }
-    for (const key of ["role", "content"]) {
-      const descriptor = Object.getOwnPropertyDescriptor(message, key);
-      if (!descriptor?.enumerable || !("value" in descriptor)) {
-        throw new TypeError("messages are invalid");
-      }
-    }
-    return {
-      role: message.role,
-      content: safeText(message.content, "message.content", 128 * 1024),
-    };
-  });
-}
-
-function schemaBudget() {
-  return {
-    nodes: MAX_SCHEMA_NODES,
-    keys: MAX_SCHEMA_KEYS,
-    stringBytes: MAX_SCHEMA_STRING_BYTES,
-  };
-}
-
-function consumeSchemaBudget(budget, { keys = 0, stringBytes = 0 } = {}) {
-  budget.nodes -= 1;
-  budget.keys -= keys;
-  budget.stringBytes -= stringBytes;
-  if (budget.nodes < 0 || budget.keys < 0 || budget.stringBytes < 0) {
-    throw new TypeError("schema is invalid");
-  }
-}
-
-function cloneSchemaData(value, depth = 0, budget = schemaBudget()) {
-  if (depth > MAX_SCHEMA_DEPTH) throw new TypeError("schema is invalid");
-  if (value === null || typeof value === "boolean") {
-    consumeSchemaBudget(budget);
-    return value;
-  }
-  if (typeof value === "string") {
-    consumeSchemaBudget(budget, { stringBytes: Buffer.byteLength(value, "utf8") });
-    return value;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("schema is invalid");
-    consumeSchemaBudget(budget);
-    return value;
-  }
-  if (typeof value !== "object") throw new TypeError("schema is invalid");
-  if (Array.isArray(value)) {
-    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 4_096) {
-      throw new TypeError("schema is invalid");
-    }
-    const keys = Reflect.ownKeys(value);
-    if (keys.length !== value.length + 1 || !keys.includes("length")) {
-      throw new TypeError("schema is invalid");
-    }
-    consumeSchemaBudget(budget, { keys: value.length });
-    return value.map((_entry, index) => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, `${index}`);
-      if (!descriptor?.enumerable || !("value" in descriptor)) {
-        throw new TypeError("schema is invalid");
-      }
-      return cloneSchemaData(descriptor.value, depth + 1, budget);
-    });
-  }
-  if (Object.getPrototypeOf(value) !== Object.prototype) {
-    throw new TypeError("schema is invalid");
-  }
-  const keys = Reflect.ownKeys(value);
-  if (keys.length > 4_096) throw new TypeError("schema is invalid");
-  let keyBytes = 0;
-  for (const key of keys) {
-    if (typeof key !== "string" || DANGEROUS_KEYS.has(key)) {
-      throw new TypeError("schema is invalid");
-    }
-    keyBytes += Buffer.byteLength(key, "utf8");
-    if (keyBytes > MAX_SCHEMA_STRING_BYTES) throw new TypeError("schema is invalid");
-  }
-  consumeSchemaBudget(budget, { keys: keys.length, stringBytes: keyBytes });
-  const entries = [];
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !("value" in descriptor)) {
-      throw new TypeError("schema is invalid");
-    }
-    entries.push([
-      key,
-      cloneSchemaData(descriptor.value, depth + 1, budget),
-    ]);
-  }
-  return Object.fromEntries(entries);
-}
-
-function normalizeSchema(value) {
-  const normalized = cloneSchemaData(value);
-  if (
-    normalized === null ||
-    typeof normalized !== "object" ||
-    Array.isArray(normalized)
-  ) {
-    throw new TypeError("schema is invalid");
-  }
-  return normalized;
 }
 
 async function boundedResponseText(response, maximumBytes) {
@@ -517,7 +399,7 @@ function requestBody(protocol, responseFormat, request) {
 export class OpenAICompatibleProvider {
   #fetch;
   #requestUrl;
-  #apiKey;
+  #credentialReference;
   #protocol;
   #responseFormat;
   #timeoutMs;
@@ -529,6 +411,7 @@ export class OpenAICompatibleProvider {
     if (options.fetch !== undefined && typeof options.fetch !== "function") {
       throw new TypeError("OpenAI-compatible provider requires fetch");
     }
+    const protocolWasOmitted = !Object.hasOwn(options, "protocol");
     const protocol = safeProtocol(options.protocol ?? CHAT_COMPLETIONS_PROTOCOL);
     const responseFormat = safeResponseFormat(
       options.responseFormat ?? JSON_SCHEMA_RESPONSE_FORMAT,
@@ -542,7 +425,7 @@ export class OpenAICompatibleProvider {
       );
     }
     const target = endpoint(options.baseUrl, protocol);
-    const limits = PROTOCOL_LIMITS[protocol];
+    const limits = protocolWasOmitted ? LEGACY_LIMITS : PROTOCOL_LIMITS[protocol];
     this.id = safeId(options.id ?? "openai-compatible");
     this.kind = "openai-compatible";
     this.protocol = protocol;
@@ -560,7 +443,10 @@ export class OpenAICompatibleProvider {
     }
     const environment =
       options.env === undefined ? options.environment : options.env;
-    this.#apiKey = configuredApiKey(environment, options.apiKeyEnv);
+    this.#credentialReference = credentialReference(
+      environment,
+      options.apiKeyEnv,
+    );
     this.#timeoutMs = boundedInteger(
       options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       "timeoutMs",
@@ -570,26 +456,34 @@ export class OpenAICompatibleProvider {
     this.#maxResponseBytes = boundedInteger(
       options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
       "maxResponseBytes",
-      1_024,
+      limits.minimumResponseBytes,
       limits.maximumResponseBytes,
     );
     this.#maxRequestBytes = boundedInteger(
       options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES,
       "maxRequestBytes",
-      1_024,
+      limits.minimumRequestBytes,
       limits.maximumRequestBytes,
     );
     Object.freeze(this);
   }
 
-  async generate({ model, messages, schema, signal = null } = {}) {
-    const externalSignal = normalizeAbortSignal(signal);
+  async generate(rawRequest = {}) {
+    const input = readStructuredBrainGenerateInput(rawRequest);
+    const externalSignal = normalizeAbortSignal(input.signal);
     if (externalSignal?.aborted) throw cancellationError();
-    const body = JSON.stringify(requestBody(this.#protocol, this.#responseFormat, {
-      model: safeText(model, "model", 256),
-      messages: normalizeMessages(messages),
-      schema: normalizeSchema(schema),
-    }));
+    const apiKey = configuredApiKey(this.#credentialReference);
+    const request = normalizeStructuredBrainRequest(
+      {
+        model: input.model,
+        messages: input.messages,
+        schema: input.schema,
+      },
+      { maxRequestBytes: this.#maxRequestBytes },
+    );
+    const body = JSON.stringify(
+      requestBody(this.#protocol, this.#responseFormat, request),
+    );
     if (Buffer.byteLength(body, "utf8") > this.#maxRequestBytes) {
       throw providerError(
         "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE",
@@ -611,7 +505,7 @@ export class OpenAICompatibleProvider {
             method: "POST",
             redirect: "error",
             headers: {
-              authorization: `Bearer ${this.#apiKey}`,
+              authorization: `Bearer ${apiKey}`,
               "content-type": "application/json",
             },
             body,

@@ -78,10 +78,19 @@ export class EmployeeController {
       if (!this.definition.enabled || state.paused) {
         return this.project(state);
       }
-      const next = await this.runEmployee({
+      const runInput = {
         ...options,
         state,
-      });
+      };
+      if (options != null && Object.hasOwn(options, "signal")) {
+        Object.defineProperty(runInput, "signal", {
+          configurable: false,
+          enumerable: false,
+          value: options.signal,
+          writable: false,
+        });
+      }
+      const next = await this.runEmployee(runInput);
       return this.project(next || (await this.readState()));
     });
     const tracked = operation.finally(() => {

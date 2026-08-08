@@ -30,6 +30,12 @@ const EVENT_V2_KEYS = Object.freeze([
   "executionSource",
   ...EVENT_V1_KEYS.slice(-2),
 ]);
+const EVENT_V3_KEYS = Object.freeze([
+  ...EVENT_V1_KEYS.slice(0, -2),
+  "executionSource",
+  "recordedAt",
+  ...EVENT_V1_KEYS.slice(-2),
+]);
 
 export class CodeJobChangePackageEventError extends Error {
   constructor(message = "代码任务 change package 事件无效", options) {
@@ -108,6 +114,18 @@ function positiveInteger(value, name) {
   return value;
 }
 
+function canonicalTimestamp(value, name) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(Date.parse(value)).toISOString() !== value
+  ) {
+    throw invalid(`${name} 无效`);
+  }
+  return value;
+}
+
 function normalizePreviousDigest(sequence, value) {
   const previousDigest = value === null ? null : digest(value, "previousDigest");
   if ((sequence === 1) !== (previousDigest === null)) {
@@ -171,14 +189,15 @@ function eventContent(value) {
     proposal: value.proposal,
     grant: value.grant,
     exportRequest: value.exportRequest,
-    ...(value.schemaVersion === 2
+    ...(value.schemaVersion >= 2
       ? { executionSource: value.executionSource }
       : {}),
+    ...(value.schemaVersion === 3 ? { recordedAt: value.recordedAt } : {}),
   };
 }
 
 function assertEventSize(event) {
-  const maximum = event.schemaVersion === 2
+  const maximum = event.schemaVersion >= 2
     ? MAX_V2_EVENT_BYTES
     : MAX_V1_EVENT_BYTES;
   if (Buffer.byteLength(JSON.stringify(event), "utf8") > maximum) {
@@ -229,14 +248,21 @@ function normalizeCreationInput(value) {
   };
 }
 
-function eventForCompletedJob({ job, sequence, previousDigest }) {
+function eventForCompletedJob(
+  { job, sequence, previousDigest },
+  { legacyConflict = false } = {},
+) {
   const observation = completeObservation(job);
   const source = completionSource(job);
   const executionSource = job.grant.schemaVersion === 3
     ? normalizeCodeExecutionSource(job.grant.executionSource)
     : undefined;
   const content = eventContent({
-    schemaVersion: executionSource === undefined ? 1 : 2,
+    schemaVersion: executionSource === undefined
+      ? 1
+      : legacyConflict
+      ? 2
+      : 3,
     sequence,
     previousDigest,
     job: {
@@ -254,7 +280,12 @@ function eventForCompletedJob({ job, sequence, previousDigest }) {
       completedActionId: observation.actionId,
       expectedWorkspaceRevision: job.execution.workspaceRevision,
     },
-    ...(executionSource === undefined ? {} : { executionSource }),
+    ...(executionSource === undefined
+      ? {}
+      : {
+          executionSource,
+          ...(legacyConflict ? {} : { recordedAt: observation.recordedAt }),
+        }),
   });
   const eventDigest = digestValue(content);
   const event = {
@@ -308,8 +339,23 @@ export function createCodeJobChangePackageEvent(value) {
   return eventForCompletedJob(input);
 }
 
-export function reconstructCodeJobChangePackageEventForRecovery(value) {
-  return eventForCompletedJob(normalizeCreationInput(value));
+export function reconstructCodeJobChangePackageEventForRecovery(
+  value,
+  { expectedEventDigest } = {},
+) {
+  const input = normalizeCreationInput(value);
+  const current = eventForCompletedJob(input);
+  if (
+    expectedEventDigest === undefined ||
+    current.eventDigest === expectedEventDigest
+  ) {
+    return current;
+  }
+  if (input.job.grant.schemaVersion === 3) {
+    const legacy = eventForCompletedJob(input, { legacyConflict: true });
+    if (legacy.eventDigest === expectedEventDigest) return legacy;
+  }
+  throw invalid("持久事件摘要与完成任务不一致");
 }
 
 export function normalizeCodeJobChangePackageEvent(value) {
@@ -318,9 +364,13 @@ export function normalizeCodeJobChangePackageEvent(value) {
       dataEntries(value, "code job change package event"),
     );
     const schemaVersion = supplied.get("schemaVersion");
-    const keys = schemaVersion === 2 ? EVENT_V2_KEYS : EVENT_V1_KEYS;
+    const keys = schemaVersion === 3
+      ? EVENT_V3_KEYS
+      : schemaVersion === 2
+      ? EVENT_V2_KEYS
+      : EVENT_V1_KEYS;
     const fields = exact(value, keys, "code job change package event");
-    if (![1, 2].includes(schemaVersion)) throw invalid("schemaVersion 无效");
+    if (![1, 2, 3].includes(schemaVersion)) throw invalid("schemaVersion 无效");
     const sequence = positiveInteger(fields.get("sequence"), "sequence");
     const content = eventContent({
       schemaVersion,
@@ -333,11 +383,19 @@ export function normalizeCodeJobChangePackageEvent(value) {
       proposal: normalizeProposalReference(fields.get("proposal")),
       grant: normalizeGrantReference(fields.get("grant")),
       exportRequest: normalizeExportRequest(fields.get("exportRequest")),
-      ...(schemaVersion === 2
+      ...(schemaVersion >= 2
         ? {
             executionSource: normalizeCodeExecutionSource(
               fields.get("executionSource"),
               invalid("executionSource 无效"),
+            ),
+          }
+        : {}),
+      ...(schemaVersion === 3
+        ? {
+            recordedAt: canonicalTimestamp(
+              fields.get("recordedAt"),
+              "recordedAt",
             ),
           }
         : {}),

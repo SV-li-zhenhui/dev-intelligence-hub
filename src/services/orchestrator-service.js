@@ -1154,8 +1154,13 @@ function planEscalation({ action, source, rootId, summary }) {
 }
 
 function planTaskControl({ action, source, rootId }) {
+  const method = {
+    pause: "pauseTask",
+    resume: "resumeTask",
+    cancel: "cancelTask",
+  }[action.type];
   return {
-    method: action.type === "pause" ? "pauseTask" : "cancelTask",
+    method,
     command: {
       taskId: source.taskId,
       reason: action.reason,
@@ -1179,6 +1184,7 @@ async function createOrchestrationPlan(options) {
     case "escalate":
       return planEscalation(options);
     case "pause":
+    case "resume":
     case "cancel":
       return planTaskControl(options);
     default:

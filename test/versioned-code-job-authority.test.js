@@ -16,13 +16,19 @@ import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
-import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
+import {
+  CodeJobGrantFactory,
+  legacyCodeJobBrainDigest,
+} from "../src/services/code-job-grant-factory.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
-import { VersionedCodeJobAuthority } from "../src/services/versioned-code-job-authority.js";
+import {
+  codeJobAuthorityScopeCacheIdentity,
+  VersionedCodeJobAuthority,
+} from "../src/services/versioned-code-job-authority.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
-  await readFile(path.join(projectRoot, "config.json"), "utf8"),
+  await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 const IMAGE =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
@@ -32,6 +38,18 @@ function configuration() {
   value.trackedRepositories = ["acme/repo"];
   value.codeExecutor = {
     enabled: true,
+    gitCommand: "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: {
+        "acme/repo": "D:\\mirrors\\acme-repo.git",
+        "acme/other": "D:\\mirrors\\acme-other.git",
+      },
+      headMirrorsByRepository: {
+        "contributor/repo": "D:\\mirrors\\contributor-repo.git",
+        "contributor/other": "D:\\mirrors\\contributor-other.git",
+      },
+    },
     docker: {
       executable: "docker",
       host: "npipe:////./pipe/docker_engine",
@@ -66,6 +84,9 @@ function configuration() {
     executorLimits: { maxSessions: 4, maxActionsPerSession: 100 },
     maxArtifactBytes: 16_777_216,
   };
+  for (const role of Object.values(value.employees.roles)) {
+    role.taskBrain = structuredClone(role.brain);
+  }
   value.workCoordination.enabled = true;
   value.workCoordination.policy = {
     ...value.workCoordination.policy,
@@ -117,6 +138,91 @@ function executorAuthority({ conflict = false } = {}) {
       },
     ],
   };
+}
+
+function historicalScopedAuthorityDigest(configurationValue, scope) {
+  const role = configurationValue.employees.roles[scope.roleId];
+  const policy = configurationValue.workCoordination.policy;
+  const provider = configurationValue.brainProviders[role.brain.provider];
+  const workspace = configurationValue.codeExecutor.workspaces.find(
+    ({ id }) => id === scope.workspaceId,
+  );
+  const profileIds = [
+    ...(configurationValue.codeExecutor.requiredProfilesByWorkspace?.[
+      scope.workspaceId
+    ] ?? []),
+  ].sort();
+  const authorization = {
+    policyVersion: policy.version,
+    role: {
+      prerequisites: {
+        executor: {
+          enabled: configurationValue.codeExecutor.enabled,
+          docker: configurationValue.codeExecutor.docker ?? null,
+          brokerLimits: configurationValue.codeExecutor.brokerLimits ?? {},
+          executorLimits: configurationValue.codeExecutor.executorLimits ?? {},
+          maxArtifactBytes:
+            configurationValue.codeExecutor.maxArtifactBytes ?? null,
+        },
+        workCoordinationEnabled: configurationValue.workCoordination.enabled,
+        memoryEnabled: configurationValue.memory.enabled,
+      },
+      role: {
+        enabled: role.enabled,
+        allowedIntents: [...role.permissions.allowedIntents].sort(),
+        brain: {
+          provider: role.brain.provider,
+          remoteData: role.brain.remoteData,
+        },
+        provider: {
+          kind: provider.kind,
+          baseUrl: provider.baseUrl,
+          apiKeyEnv: provider.apiKeyEnv ?? null,
+          ...(provider.protocol === undefined
+            ? {}
+            : { protocol: provider.protocol }),
+          ...(provider.responseFormat === undefined
+            ? {}
+            : { responseFormat: provider.responseFormat }),
+          remote: provider.remote ?? null,
+        },
+      },
+      codePolicy: {
+        admitted: policy.codeActionRoles.includes(scope.roleId),
+        operations: [
+          ...(policy.codeOperationsByRole[scope.roleId] ?? []),
+        ].sort(),
+      },
+    },
+    repository: {
+      tracked: configurationValue.trackedRepositories.includes(scope.repository),
+      workspaceId: policy.workspaceByRepository[scope.repository] ?? null,
+    },
+    executor: {
+      workspace: workspace ?? null,
+      requiredProfiles: profileIds.map((profileId) => ({
+        id: profileId,
+        configuration:
+          configurationValue.codeExecutor.profiles?.[profileId] ?? null,
+      })),
+    },
+  };
+  const authority = {
+    epoch: 1,
+    fingerprint: canonicalJsonDigest(authorization),
+  };
+  return canonicalJsonDigest({
+    schemaVersion: 1,
+    executorAuthorityDigest: scope.executorAuthorityDigest,
+    scope: {
+      repository: scope.repository,
+      workspaceId: scope.workspaceId,
+      roleId: scope.roleId,
+      operation: scope.operation,
+      policyVersion: scope.policyVersion,
+    },
+    authorization: authority,
+  });
 }
 
 function legacyConfigurationAuthority(configurationValue) {
@@ -199,10 +305,10 @@ function legacyGrant(configurations) {
         policy.codeOperationsByRole[roleId],
       ]),
     ),
-    brainByRole: Object.fromEntries(
+    taskBrainByRole: Object.fromEntries(
       roleIds.map((roleId) => [
         roleId,
-        current.employees.roles[roleId].brain,
+        current.employees.roles[roleId].taskBrain,
       ]),
     ),
     brainProviders: current.brainProviders,
@@ -210,7 +316,13 @@ function legacyGrant(configurations) {
   });
   const currentGrant = factory.create(proposal(current)).grant;
   const legacyContent = structuredClone(currentGrant);
+  legacyContent.brainDigest = legacyCodeJobBrainDigest({
+    roleId: "developer",
+    brain: current.employees.roles.developer.brain,
+    brainProviders: current.brainProviders,
+  });
   delete legacyContent.schemaVersion;
+  delete legacyContent.brainBindingSchema;
   delete legacyContent.inputBinding;
   delete legacyContent.grantDigest;
   return createCodeJobGrant(legacyContent);
@@ -420,6 +532,48 @@ function activateHistory(context, targetVersion, change) {
   }
 }
 
+test("conflict authority cache identity stays bounded across preparation evidence", () => {
+  const executionSource = proposal(configuration(), {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  }).binding.executionSource;
+  const scope = {
+    executorAuthorityDigest: "a".repeat(64),
+    policyVersion: 1,
+    repository: "acme/repo",
+    workspaceId: "acme-workspace",
+    roleId: "developer",
+    operation: "modify",
+    executionSource,
+  };
+  const identities = new Set();
+  for (let index = 0; index < 2_000; index += 1) {
+    const distinctEvidence = structuredClone(executionSource);
+    distinctEvidence.preparationBinding.preparationId = index
+      .toString(16)
+      .padStart(64, "0");
+    identities.add(
+      canonicalJsonDigest(
+        codeJobAuthorityScopeCacheIdentity({
+          ...scope,
+          executionSource: distinctEvidence,
+        }),
+      ),
+    );
+  }
+
+  assert.equal(identities.size, 1);
+  const otherRepository = structuredClone(executionSource);
+  otherRepository.preparationBinding.gitTarget.headRepository =
+    "contributor/other";
+  assert.notDeepEqual(
+    codeJobAuthorityScopeCacheIdentity(scope),
+    codeJobAuthorityScopeCacheIdentity({
+      ...scope,
+      executionSource: otherRepository,
+    }),
+  );
+});
+
 test("malformed grants fail before reading or constructing authority history", async () => {
   let factoryCreations = 0;
   const context = fixture({
@@ -574,6 +728,7 @@ test("versioned authority creates and revalidates sealed conflict grants", async
   const sealed = (await context.authority.create(currentProposal)).grant;
 
   assert.equal(sealed.schemaVersion, 3);
+  assert.equal(sealed.brainBindingSchema, 2);
   assert.deepEqual(sealed.executionSource, currentProposal.binding.executionSource);
   assert.deepEqual(sealed.writablePaths, ["src/value.js"]);
   assert.deepEqual(await context.authority.verify(sealed), sealed);
@@ -596,11 +751,150 @@ test("versioned authority creates and revalidates sealed conflict grants", async
   );
 });
 
+test("ordinary grants ignore conflict mirror configuration changes", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+    "acme/repo"
+  ] = "D:\\replacement\\acme-repo.git";
+  context.activate(changed);
+
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+});
+
+test("conflict grants ignore mirrors for unrelated repositories", async () => {
+  const verifier = { verify: (binding) => structuredClone(binding) };
+  const context = fixture({
+    executorAuthorityValue: executorAuthority({ conflict: true }),
+    conflictPreparationVerifier: verifier,
+  });
+  const sealed = (await context.authority.create(proposal(context.startup, {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  }))).grant;
+  const changed = structuredClone(context.startup);
+  changed.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+    "acme/other"
+  ] = "D:\\replacement\\acme-other.git";
+  changed.codeExecutor.conflictPreparation.headMirrorsByRepository[
+    "contributor/other"
+  ] = "D:\\replacement\\contributor-other.git";
+  context.activate(changed);
+
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+});
+
+test("conflict grants bind only the relevant mirrors, git command, and enablement", async () => {
+  const verifier = { verify: (binding) => structuredClone(binding) };
+  for (const [name, change] of [
+    [
+      "base mirror",
+      (configurationValue) => {
+        configurationValue.codeExecutor.conflictPreparation
+          .baseMirrorsByRepository["acme/repo"] =
+            "D:\\replacement\\acme-repo.git";
+      },
+    ],
+    [
+      "head mirror",
+      (configurationValue) => {
+        configurationValue.codeExecutor.conflictPreparation
+          .headMirrorsByRepository["contributor/repo"] =
+            "D:\\replacement\\contributor-repo.git";
+      },
+    ],
+    [
+      "git command",
+      (configurationValue) => {
+        configurationValue.codeExecutor.gitCommand =
+          "D:\\PortableGit\\mingw64\\bin\\git.exe";
+      },
+    ],
+    [
+      "enablement",
+      (configurationValue) => {
+        configurationValue.codeExecutor.conflictPreparation = {
+          enabled: false,
+        };
+      },
+    ],
+  ]) {
+    const context = fixture({
+      executorAuthorityValue: executorAuthority({ conflict: true }),
+      conflictPreparationVerifier: verifier,
+    });
+    const sealed = (await context.authority.create(proposal(context.startup, {
+      conflicts: [{ path: "src/value.js", mode: "100644" }],
+    }))).grant;
+    assert.equal(JSON.stringify(sealed).includes("mirrors"), false, name);
+    assert.equal(JSON.stringify(sealed).includes("mingw64"), false, name);
+    const changed = structuredClone(context.startup);
+    change(changed);
+    context.activate(changed);
+
+    await assert.rejects(
+      context.restart().verify(sealed),
+      (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+      name,
+    );
+  }
+});
+
+test("restoring a relevant conflict mirror does not resurrect its old epoch", async () => {
+  const verifier = { verify: (binding) => structuredClone(binding) };
+  const context = fixture({
+    executorAuthorityValue: executorAuthority({ conflict: true }),
+    conflictPreparationVerifier: verifier,
+  });
+  const sealed = (await context.authority.create(proposal(context.startup, {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  }))).grant;
+  const changed = structuredClone(context.startup);
+  changed.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+    "acme/repo"
+  ] = "D:\\replacement\\acme-repo.git";
+  context.activate(changed);
+  await assert.rejects(
+    context.restart().verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  context.activate(structuredClone(context.startup));
+
+  await assert.rejects(
+    context.restart().verify(sealed),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
+test("conflict mirror lookup follows runtime case-insensitive repository semantics", async () => {
+  const verifier = { verify: (binding) => structuredClone(binding) };
+  const context = fixture({
+    executorAuthorityValue: executorAuthority({ conflict: true }),
+    conflictPreparationVerifier: verifier,
+  });
+  const cased = structuredClone(context.startup);
+  const conflict = cased.codeExecutor.conflictPreparation;
+  conflict.baseMirrorsByRepository["ACME/REPO"] =
+    conflict.baseMirrorsByRepository["acme/repo"];
+  delete conflict.baseMirrorsByRepository["acme/repo"];
+  conflict.headMirrorsByRepository["CONTRIBUTOR/REPO"] =
+    conflict.headMirrorsByRepository["contributor/repo"];
+  delete conflict.headMirrorsByRepository["contributor/repo"];
+  context.activate(cased);
+  const restarted = context.restart();
+  const sealed = (await restarted.create(proposal(cased, {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  }))).grant;
+
+  assert.deepEqual(await restarted.verify(sealed), sealed);
+});
+
 test("current Active creates grants and security expansion invalidates old grants", async () => {
   const context = fixture();
   const currentProposal = proposal(context.startup);
   const sealed = (await context.authority.create(currentProposal)).grant;
   assert.equal(sealed.schemaVersion, 2);
+  assert.equal(sealed.brainBindingSchema, 2);
   assert.deepEqual(sealed.inputBinding, currentProposal.binding.inputBinding);
   assert.deepEqual(await context.authority.verify(sealed), sealed);
 
@@ -614,6 +908,154 @@ test("current Active creates grants and security expansion invalidates old grant
     context.authority.verify(sealed),
     (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
   );
+});
+
+test("a missing task brain waits at grant creation without using the routine brain", async () => {
+  let factoryCreations = 0;
+  const context = fixture({
+    grantFactoryFactory: (options) => {
+      factoryCreations += 1;
+      return new CodeJobGrantFactory(options);
+    },
+  });
+  const waiting = structuredClone(context.startup);
+  delete waiting.employees.roles.developer.taskBrain;
+  context.activate(waiting);
+
+  await assert.rejects(
+    context.authority.create(proposal(waiting)),
+    (error) => error?.code === "CODE_TASK_BRAIN_NOT_CONFIGURED",
+  );
+  assert.equal(factoryCreations, 1);
+  assert.equal(waiting.employees.roles.developer.brain.model.length > 0, true);
+});
+
+test("routine brain changes do not invalidate task-brain grants", async () => {
+  const context = fixture();
+  const sealed = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.developer.brain.model = "routine-only-change";
+  context.activate(changed);
+
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+});
+
+test("schema 2 historical grants use an explicit legacy-brain verifier only", async () => {
+  let legacyVerifierCreated = false;
+  let providerCalls = 0;
+  const context = fixture({
+    grantFactoryFactory: (options) => {
+      if (options.legacyBrainByRole && options.scopeAuthorityDigest) {
+        legacyVerifierCreated = true;
+      }
+      return new CodeJobGrantFactory(options);
+    },
+    brainDirectoryFactory: () => ({
+      async decide() {
+        providerCalls += 1;
+        return { action: { type: "complete" } };
+      },
+    }),
+  });
+  const historicalBrainDigest = legacyCodeJobBrainDigest({
+    roleId: "developer",
+    brain: context.startup.employees.roles.developer.brain,
+    brainProviders: context.startup.brainProviders,
+  });
+  const asHistorical = (grant) => {
+    const {
+      brainBindingSchema: _brainBindingSchema,
+      grantDigest: _grantDigest,
+      ...content
+    } = grant;
+    return createCodeJobGrant({
+      ...content,
+      brainDigest: historicalBrainDigest,
+    });
+  };
+
+  const policy = context.startup.workCoordination.policy;
+  const roleIds = policy.codeActionRoles;
+  const historicallyScoped = new CodeJobGrantFactory({
+    executorAuthority: executorAuthority(),
+    policyVersion: policy.version,
+    workspaceByRepository: policy.workspaceByRepository,
+    codeActionRoles: roleIds,
+    codeOperationsByRole: policy.codeOperationsByRole,
+    taskBrainByRole: Object.fromEntries(
+      roleIds.map((roleId) => [
+        roleId,
+        context.startup.employees.roles[roleId].taskBrain,
+      ]),
+    ),
+    brainProviders: context.startup.brainProviders,
+    scopeAuthorityDigest: (scope) =>
+      historicalScopedAuthorityDigest(context.startup, scope),
+    inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+  }).create(proposal(context.startup)).grant;
+  const historical = asHistorical(historicallyScoped);
+
+  assert.deepEqual(await context.authority.verify(historical), historical);
+  assert.equal(legacyVerifierCreated, true);
+  await assert.rejects(
+    context.authority.decide(
+      { roleId: "developer" },
+      {
+        beforeGenerate: () => context.authority.verify(historical),
+        brainDigest: historical.brainDigest,
+      },
+    ),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  assert.equal(providerCalls, 0);
+});
+
+test("schema 3 historical conflict grants retain their legacy recovery path", async () => {
+  const verifier = { verify: (binding) => structuredClone(binding) };
+  const authority = executorAuthority({ conflict: true });
+  const context = fixture({
+    executorAuthorityValue: authority,
+    conflictPreparationVerifier: verifier,
+  });
+  const policy = context.startup.workCoordination.policy;
+  const roleIds = policy.codeActionRoles;
+  const current = new CodeJobGrantFactory({
+    executorAuthority: authority,
+    policyVersion: policy.version,
+    workspaceByRepository: policy.workspaceByRepository,
+    codeActionRoles: roleIds,
+    codeOperationsByRole: policy.codeOperationsByRole,
+    taskBrainByRole: Object.fromEntries(
+      roleIds.map((roleId) => [
+        roleId,
+        context.startup.employees.roles[roleId].taskBrain,
+      ]),
+    ),
+    brainProviders: context.startup.brainProviders,
+    scopeAuthorityDigest: (scope) =>
+      historicalScopedAuthorityDigest(context.startup, scope),
+    inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+    conflictPreparationVerifier: verifier,
+  }).create(proposal(context.startup, {
+    conflicts: [{ path: "src/value.js", mode: "100644" }],
+  })).grant;
+  const {
+    brainBindingSchema: _brainBindingSchema,
+    grantDigest: _grantDigest,
+    ...content
+  } = current;
+  const historical = createCodeJobGrant({
+    ...content,
+    brainDigest: legacyCodeJobBrainDigest({
+      roleId: "developer",
+      brain: context.startup.employees.roles.developer.brain,
+      brainProviders: context.startup.brainProviders,
+    }),
+  });
+
+  assert.equal(historical.schemaVersion, 3);
+  assert.equal(Object.hasOwn(historical, "brainBindingSchema"), false);
+  assert.deepEqual(await context.authority.verify(historical), historical);
 });
 
 test("unrelated role, provider, and repository changes keep sealed work valid", async () => {
@@ -695,8 +1137,8 @@ test("an assigned provider protocol change invalidates its sealed grants", async
     protocol: "chat-completions",
     remote: true,
   };
-  configured.employees.roles.developer.brain.provider = "codex";
-  configured.employees.roles.developer.brain.remoteData.code = true;
+  configured.employees.roles.developer.taskBrain.provider = "codex";
+  configured.employees.roles.developer.taskBrain.remoteData.code = true;
   context.activate(configured);
   const sealed = (await context.authority.create(proposal(configured))).grant;
   const replaced = structuredClone(configured);
@@ -720,8 +1162,8 @@ test("an assigned provider response format change invalidates its sealed grants"
     responseFormat: "json-schema",
     remote: true,
   };
-  configured.employees.roles.developer.brain.provider = "ark";
-  configured.employees.roles.developer.brain.remoteData.code = true;
+  configured.employees.roles.developer.taskBrain.provider = "ark";
+  configured.employees.roles.developer.taskBrain.remoteData.code = true;
   context.activate(configured);
   const sealed = (await context.authority.create(proposal(configured))).grant;
   const replaced = structuredClone(configured);
@@ -835,7 +1277,7 @@ test("a brain authorization change between selection and generation sends no con
   });
   activate = () => {
     const changed = structuredClone(context.startup);
-    changed.employees.roles.developer.brain.remoteData.code = true;
+    changed.employees.roles.developer.taskBrain.remoteData.code = true;
     context.activate(changed);
   };
   const sealed = (await context.authority.create(proposal(context.startup))).grant;
@@ -876,7 +1318,7 @@ test("activation admitted first prevents the stale brain request", async () => {
     activationEntered.resolve();
     await releaseActivation.promise;
     const changed = structuredClone(context.startup);
-    changed.employees.roles.developer.brain.remoteData.code = true;
+    changed.employees.roles.developer.taskBrain.remoteData.code = true;
     context.activate(changed);
   });
   await activationEntered.promise;
@@ -930,7 +1372,7 @@ test("an admitted brain request releases activation before its response", async 
   let activationFinished = false;
   await gate.run(() => {
     const changed = structuredClone(context.startup);
-    changed.employees.roles.developer.brain.remoteData.code = true;
+    changed.employees.roles.developer.taskBrain.remoteData.code = true;
     context.activate(changed);
     activationFinished = true;
   });
@@ -946,7 +1388,7 @@ test("a benign model change affects new claims while old work keeps its sealed b
   const context = fixture({
     brainDirectoryFactory: (options) => ({
       async decide(_value, authorization) {
-        selectedModels.push(options.roles.developer.brain.model);
+        selectedModels.push(options.roles.developer.taskBrain.model);
         await authorization.beforeGenerate();
         return { action: { type: "complete" } };
       },
@@ -954,7 +1396,7 @@ test("a benign model change affects new claims while old work keeps its sealed b
   });
   const oldGrant = (await context.authority.create(proposal(context.startup))).grant;
   const changed = structuredClone(context.startup);
-  changed.employees.roles.developer.brain.model = "new-local-model";
+  changed.employees.roles.developer.taskBrain.model = "new-local-model";
   context.activate(changed);
 
   assert.deepEqual(await context.authority.verify(oldGrant), oldGrant);
@@ -969,6 +1411,6 @@ test("a benign model change affects new claims while old work keeps its sealed b
   );
 
   assert.deepEqual(selectedModels, [
-    context.startup.employees.roles.developer.brain.model,
+    context.startup.employees.roles.developer.taskBrain.model,
   ]);
 });

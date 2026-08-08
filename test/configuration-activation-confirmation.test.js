@@ -135,6 +135,24 @@ test("the modal shows bounded impact names without configuration values", () => 
   assert.equal(Object.isFrozen(plan), true);
 });
 
+test("the confirmation summary counts unique changed paths across overlapping classifications", () => {
+  const input = prepared("configuration.activate");
+  input.impact.authority_expansion = [
+    "employees.roles.developer.brain.remoteData.code",
+  ];
+  input.impact.restart_required = [
+    "employees.roles.developer.brain.remoteData.code",
+    "employees.roles.developer.brain.model",
+  ];
+  input.impact.benign_claim_change = [
+    "employees.roles.developer.brain.model",
+  ];
+
+  const plan = createConfigurationActivationConfirmationPlan(input);
+
+  assert.equal(plan.display.summary, "该配置影响 3 个已识别路径。");
+});
+
 test("prepared bindings and private envelopes reject accessors and tampering", () => {
   const hostile = prepared("configuration.initialize");
   let reads = 0;

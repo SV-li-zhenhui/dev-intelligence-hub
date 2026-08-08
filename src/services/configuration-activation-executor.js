@@ -2,11 +2,17 @@ import {
   normalizeConfigurationActivationEnvelope,
 } from "../domain/configuration-activation-confirmation.js";
 import { digestValue } from "../domain/code-executor-contract.js";
+import { ActionAdmissionGateError } from "../lib/action-admission-gate.js";
 
 const TRUSTED_OWNER = "owner:local";
 const CANONICAL_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const CONFIGURATION_DIGEST = /^[a-f0-9]{64}$/;
+const PRE_CUTOVER_FENCE_ERRORS = new Set([
+  "RUNTIME_RESTART_REQUIRED",
+  "RUNTIME_CONFIGURATION_NOT_READY",
+  "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
+]);
 
 const ACTIONS = Object.freeze({
   initialize_from_draft: Object.freeze({
@@ -450,16 +456,30 @@ export class ConfigurationActivationExecutor {
     return this.#runCutover(envelope, { execute: false });
   }
 
-  #runCutover(envelope, { execute }) {
+  async #runCutover(envelope, { execute }) {
     const run = execute ? this.#cutover : this.#reconcileCutover;
-    return run(async (control) => {
-      const runtimeEffective = this.#readFenceStatus().runtimeEffective;
-      const outcome = execute
-        ? await this.#executeEnvelope(envelope)
-        : await this.#reconcileEnvelope(envelope);
-      settleCutover(control, runtimeEffective, outcome);
-      return outcome.result;
-    });
+    try {
+      return await run(async (control) => {
+        const runtimeEffective = this.#readFenceStatus().runtimeEffective;
+        const outcome = execute
+          ? await this.#executeEnvelope(envelope)
+          : await this.#reconcileEnvelope(envelope);
+        settleCutover(control, runtimeEffective, outcome);
+        return outcome.result;
+      });
+    } catch (error) {
+      // These errors are emitted before the cutover callback is admitted, so
+      // no configuration write can have happened. A queued approval bound to
+      // the superseded runtime is therefore stale, never outcome-unknown.
+      if (
+        execute &&
+        error instanceof ActionAdmissionGateError &&
+        PRE_CUTOVER_FENCE_ERRORS.has(error.code)
+      ) {
+        return stale();
+      }
+      throw error;
+    }
   }
 
   async #executeEnvelope(envelope) {

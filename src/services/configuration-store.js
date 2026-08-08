@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   configurationDocumentImpact,
   createSafeDisabledConfiguration,
@@ -32,6 +32,7 @@ export const CONFIGURATION_CONTROL_PLANE_LIMITS = Object.freeze({
 const DIGEST = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const WORK_PROPOSAL_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,190}[A-Za-z0-9])?$/;
 
 function invalid(code, message, statusCode = 400) {
   return configurationStoreError(code, message, statusCode);
@@ -221,6 +222,21 @@ function headDraftRevisions(state) {
   );
 }
 
+function configurationProposalIdentity({ proposalId, proposalContentDigest }) {
+  const id = boundedText(proposalId, "proposalId", 192, WORK_PROPOSAL_ID);
+  const contentDigest = exactDigest(
+    proposalContentDigest,
+    "proposalContentDigest",
+  );
+  const identityDigest = createHash("sha256")
+    .update(`${id}\u0000${contentDigest}`, "utf8")
+    .digest("hex");
+  return {
+    draftId: `configuration-proposal-${identityDigest}`,
+    proposedBy: `work-proposal:${contentDigest}`,
+  };
+}
+
 export class ConfigurationStore {
   constructor({
     store,
@@ -385,6 +401,15 @@ export class ConfigurationStore {
     return cloneFrozenConfigurationValue(entry);
   }
 
+  async readProposalDraft(request = {}) {
+    this.#assertReady();
+    const identity = configurationProposalIdentity(request);
+    const record = this.#proposalDraftRecord(this.state, identity);
+    return record === null
+      ? null
+      : cloneFrozenConfigurationValue(record);
+  }
+
   async importBootstrap({ configuration, importedBy } = {}) {
     const actor = boundedText(importedBy, "importedBy", 128);
     return this.#writeTransaction(async () => {
@@ -460,6 +485,85 @@ export class ConfigurationStore {
       expectedStateRevision,
       proposedBy,
       initialization: false,
+    });
+  }
+
+  async createProposalDraft({
+    proposalId,
+    proposalContentDigest,
+    configuration,
+    expectedStateRevision,
+  } = {}) {
+    const identity = configurationProposalIdentity({
+      proposalId,
+      proposalContentDigest,
+    });
+    const document = normalizeConfigurationDocument(configuration);
+    const expected = integer(expectedStateRevision, "expectedStateRevision");
+    return this.#writeTransaction(async () => {
+      const existing = this.#proposalDraftRecord(this.state, identity);
+      if (existing !== null) {
+        if (
+          existing.draft.configurationDigest !==
+          configurationContentDigest(document)
+        ) {
+          throw invalid(
+            "CONFIGURATION_PROPOSAL_BINDING_CONFLICT",
+            "同一配置提案身份对应了不同文档",
+            409,
+          );
+        }
+        return cloneFrozenConfigurationValue(existing);
+      }
+      this.#assertStateRevision(expected);
+      const active = this.#requireActive();
+      const draftId = identity.draftId;
+      if (this.state.draftHeads.some((head) => head.draftId === draftId)) {
+        throw invalid(
+          "CONFIGURATION_DRAFT_ID_CONFLICT",
+          "配置提案草稿 ID 已绑定其他来源",
+          409,
+        );
+      }
+      const occurredAt = normalizedTimestamp(this.clock);
+      const draft = identifiedDraftRevision({
+        draftId,
+        revision: 1,
+        baseVersion: active.version,
+        configurationDigest: configurationContentDigest(document),
+        configuration: document,
+        proposedBy: identity.proposedBy,
+        createdAt: occurredAt,
+        supersedesRevisionId: null,
+      });
+      const audit = identifiedAudit(
+        auditContent(
+          this.state,
+          {
+            kind: "draft_created",
+            draftId,
+            draftRevisionId: draft.draftRevisionId,
+          },
+          identity.proposedBy,
+          occurredAt,
+        ),
+      );
+      const candidate = {
+        ...this.state,
+        revision: this.state.revision + 1,
+        draftRevisions: [...this.state.draftRevisions, draft],
+        draftHeads: [
+          ...this.state.draftHeads,
+          { draftId, revision: 1, draftRevisionId: draft.draftRevisionId },
+        ],
+        audit: [...this.state.audit, audit],
+      };
+      await this.#persist(candidate);
+      return cloneFrozenConfigurationValue({
+        draft,
+        createdStateRevision: candidate.revision,
+        currentHead: true,
+      });
     });
   }
 
@@ -622,6 +726,42 @@ export class ConfigurationStore {
     return cloneFrozenConfigurationValue(
       this.#prepareDraftActivation(this.state, request),
     );
+  }
+
+  async prepareProposalDraftActivation(request = {}) {
+    this.#assertReady();
+    const identity = configurationProposalIdentity(request);
+    const record = this.#proposalDraftRecord(this.state, identity);
+    if (record === null) {
+      throw invalid(
+        "CONFIGURATION_DRAFT_NOT_FOUND",
+        "配置提案草稿不存在",
+        404,
+      );
+    }
+    const active = this.state.versions.find(
+      (entry) => entry.version === record.draft.baseVersion,
+    );
+    if (!active) {
+      throw invalid(
+        "CONFIGURATION_STATE_CORRUPTED",
+        "配置提案引用的活动版本不存在",
+        503,
+      );
+    }
+    const prepared = this.#draftActivationPlan({
+      draft: record.draft,
+      active,
+      expectedStateRevision: record.createdStateRevision,
+      expectedActiveVersion: record.draft.baseVersion,
+    });
+    return cloneFrozenConfigurationValue({
+      prepared,
+      current:
+        record.currentHead &&
+        this.state.revision === record.createdStateRevision &&
+        this.state.activeVersion === record.draft.baseVersion,
+    });
   }
 
   async prepareInitialization(request = {}) {
@@ -873,6 +1013,20 @@ export class ConfigurationStore {
       );
     }
     const active = this.#activeVersion(state);
+    return this.#draftActivationPlan({
+      draft,
+      active,
+      expectedStateRevision,
+      expectedActiveVersion,
+    });
+  }
+
+  #draftActivationPlan({
+    draft,
+    active,
+    expectedStateRevision,
+    expectedActiveVersion,
+  }) {
     const impact = configurationDocumentImpact(
       active.configuration,
       draft.configuration,
@@ -882,8 +1036,8 @@ export class ConfigurationStore {
       expectedStateRevision,
       expectedActiveVersion,
       activeDigest: active.configurationDigest,
-      draftId,
-      draftRevision,
+      draftId: draft.draftId,
+      draftRevision: draft.revision,
       draftRevisionId: draft.draftRevisionId,
       documentDigest: draft.configurationDigest,
     };
@@ -1134,6 +1288,43 @@ export class ConfigurationStore {
         409,
       );
     }
+  }
+
+  #proposalDraftRecord(state, identity) {
+    const draft = state.draftRevisions.find(
+      (entry) => entry.draftId === identity.draftId && entry.revision === 1,
+    );
+    const head = state.draftHeads.find(
+      (entry) => entry.draftId === identity.draftId,
+    );
+    if (!draft && !head) return null;
+    if (!draft || !head || draft.proposedBy !== identity.proposedBy) {
+      throw invalid(
+        "CONFIGURATION_DRAFT_ID_CONFLICT",
+        "配置提案草稿 ID 已绑定其他来源",
+        409,
+      );
+    }
+    const creation = state.audit.find(
+      (entry) =>
+        entry.kind === "draft_created" &&
+        entry.draftRevisionId === draft.draftRevisionId &&
+        entry.actor === identity.proposedBy,
+    );
+    if (!creation) {
+      throw invalid(
+        "CONFIGURATION_STATE_CORRUPTED",
+        "配置提案草稿缺少创建审计",
+        503,
+      );
+    }
+    return {
+      draft,
+      createdStateRevision: creation.stateRevision,
+      currentHead:
+        head.revision === draft.revision &&
+        head.draftRevisionId === draft.draftRevisionId,
+    };
   }
 
   #draftByRevisionId(draftRevisionId) {

@@ -364,6 +364,16 @@ const CONFLICT_GRANT_KEYS = Object.freeze([
   ...GRANT_KEYS,
   "executionSource",
 ]);
+export const CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA = 1;
+export const CODE_JOB_TASK_BRAIN_BINDING_SCHEMA = 2;
+const TASK_GRANT_KEYS = Object.freeze([
+  ...GRANT_KEYS,
+  "brainBindingSchema",
+]);
+const TASK_CONFLICT_GRANT_KEYS = Object.freeze([
+  ...CONFLICT_GRANT_KEYS,
+  "brainBindingSchema",
+]);
 
 function grantKeys(value, error, { digest = false } = {}) {
   const actual = plainDataEntries(value, error).map(([key]) => key);
@@ -374,6 +384,14 @@ function grantKeys(value, error, { digest = false } = {}) {
   const current = [...GRANT_KEYS, ...(digest ? ["grantDigest"] : [])];
   const conflict = [
     ...CONFLICT_GRANT_KEYS,
+    ...(digest ? ["grantDigest"] : []),
+  ];
+  const task = [
+    ...TASK_GRANT_KEYS,
+    ...(digest ? ["grantDigest"] : []),
+  ];
+  const taskConflict = [
+    ...TASK_CONFLICT_GRANT_KEYS,
     ...(digest ? ["grantDigest"] : []),
   ];
   if (
@@ -394,6 +412,18 @@ function grantKeys(value, error, { digest = false } = {}) {
   ) {
     return CONFLICT_GRANT_KEYS;
   }
+  if (
+    actual.length === task.length &&
+    task.every((key) => actual.includes(key))
+  ) {
+    return TASK_GRANT_KEYS;
+  }
+  if (
+    actual.length === taskConflict.length &&
+    taskConflict.every((key) => actual.includes(key))
+  ) {
+    return TASK_CONFLICT_GRANT_KEYS;
+  }
   throw error;
 }
 
@@ -409,9 +439,17 @@ function normalizeInputBinding(value, error) {
 function normalizeGrantContent(value, error) {
   const keys = grantKeys(value, error);
   const entries = exactObject(value, keys, error);
+  const current = keys === GRANT_KEYS || keys === TASK_GRANT_KEYS;
+  const conflict =
+    keys === CONFLICT_GRANT_KEYS || keys === TASK_CONFLICT_GRANT_KEYS;
+  const taskBrainBinding =
+    keys === TASK_GRANT_KEYS || keys === TASK_CONFLICT_GRANT_KEYS;
   if (
-    (keys === GRANT_KEYS && entries.get("schemaVersion") !== 2) ||
-    (keys === CONFLICT_GRANT_KEYS && entries.get("schemaVersion") !== 3)
+    (current && entries.get("schemaVersion") !== 2) ||
+    (conflict && entries.get("schemaVersion") !== 3) ||
+    (taskBrainBinding &&
+      entries.get("brainBindingSchema") !==
+        CODE_JOB_TASK_BRAIN_BINDING_SCHEMA)
   ) {
     throw error;
   }
@@ -423,7 +461,10 @@ function normalizeGrantContent(value, error) {
   const content = {
     ...(keys === LEGACY_GRANT_KEYS
       ? {}
-      : { schemaVersion: keys === GRANT_KEYS ? 2 : 3 }),
+      : { schemaVersion: current ? 2 : 3 }),
+    ...(taskBrainBinding
+      ? { brainBindingSchema: CODE_JOB_TASK_BRAIN_BINDING_SCHEMA }
+      : {}),
     proposalId: safeReference(
       entries.get("proposalId"),
       "proposalId",
@@ -499,7 +540,7 @@ function normalizeGrantContent(value, error) {
     }
     content.inputBinding = inputBinding;
   }
-  if (keys === CONFLICT_GRANT_KEYS) {
+  if (conflict) {
     let executionSource;
     try {
       executionSource = normalizeCodeExecutionSource(

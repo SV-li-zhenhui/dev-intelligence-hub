@@ -34,6 +34,7 @@ import {
   normalizeWorkLedgerLimits,
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
+import { ledgerDigest } from "../src/services/work-ledger-values.js";
 import {
   migrateWorkGraphMemoryProjection,
 } from "../src/services/work-ledger-graph-memory.js";
@@ -979,6 +980,111 @@ test("a sealed old-Head intent blocks cutover until its result is reconciled", a
   assert.equal(root.decisionContext, null);
   assert.equal(historical.status, "delivered");
   assert.equal(historical.sourceBinding.headRefOid, PR_HEAD_A);
+});
+
+test("pending PR source discovery is filtered before paging and survives restart", async () => {
+  const ordinary = Array.from({ length: 130 }, (_, index) =>
+    assignment(index + 1, { type: "role", id: "requirements-analyst" })
+  );
+  const fixture = await createFixture({
+    records: [...ordinary, prAssignment(131)],
+  });
+  await fixture.service.intake({ limit: 100 });
+  await fixture.service.intake({ limit: 100 });
+  let root = (await fixture.service.listItems({ limit: 100, order: "newest" }))
+    .items.find(({ source }) => source?.kind === "pull_request");
+  assert.ok(root);
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  fixture.source.records.push(prAssignment(132, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  }));
+  fixture.source.highWatermark = 132;
+  await fixture.service.intake({ limit: 100 });
+
+  assert.equal(
+    (await fixture.service.listItems({ limit: 100 })).items.some(
+      ({ source }) =>
+        source?.kind === "pull_request" && source.pendingRevision !== null,
+    ),
+    false,
+  );
+  let pending = await fixture.service.listPendingPullRequestSources({
+    limit: 100,
+  });
+  assert.deepEqual(pending.items.map(({ itemId }) => itemId), [root.itemId]);
+  assert.equal(pending.nextCursor, null);
+
+  const recovered = await createFixture({
+    source: fixture.source,
+    store: fixture.store,
+    time: fixture.time,
+  });
+  pending = await recovered.service.listPendingPullRequestSources({ limit: 1 });
+  assert.deepEqual(pending.items.map(({ itemId }) => itemId), [root.itemId]);
+  root = pending.items[0];
+  await recovered.service.ackIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    dispatchLeaseId: sealed.dispatchLeaseId,
+    itemExpectedRevision: root.revision,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "github-review-proposal-paged" },
+  });
+  root = (await recovered.service.listPendingPullRequestSources({ limit: 1 }))
+    .items[0];
+  const command = {
+    itemId: root.itemId,
+    expectedGraphRevision: (await recovered.service.getSummary()).revision,
+    expectedRevision: root.revision,
+    expectedPendingRevision: root.source.pendingRevision,
+  };
+  const outcomes = await Promise.all([
+    recovered.service.reconcilePullRequestSource(command),
+    recovered.service.reconcilePullRequestSource(command),
+  ]);
+  assert.deepEqual(outcomes.map(({ applied }) => applied).sort(), [false, true]);
+  assert.deepEqual(
+    await recovered.service.listPendingPullRequestSources({ limit: 100 }),
+    { items: [], nextCursor: null },
+  );
 });
 
 async function stageSealedPrReview(fixture, itemId = null) {
@@ -5503,6 +5609,111 @@ test("recovery rejects tampering with the append-only PR source history", async 
   );
 });
 
+test("PR decision timeline recovery rejects a rehashed foreign execution binding", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: askUserIntent(),
+  });
+  const stored = fixture.store.stored();
+  const timeline = stored.timeline.find(({ type }) => type === "intent_staged");
+  assert.deepEqual(timeline.details.inputBinding, prExecutionBinding(item));
+  assert.equal(timeline.details.workItemRevision, item.revision + 1);
+  timeline.details.inputBinding.repository = "foreign/repo";
+  timeline.details.inputBinding.gitTarget.baseRepository = "foreign/repo";
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  const contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${contentDigest}`;
+  timeline.contentDigest = contentDigest;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+});
+
+test("PR timeline recovery rejects rebinding an old decision to the current Head", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: askUserIntent(),
+  });
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T02:00:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+      gitFacts: prGitFacts(PR_HEAD_B),
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const current = (await fixture.service.listItems()).items[0];
+  const currentBinding = prExecutionBinding(current);
+  const stored = fixture.store.stored();
+  const timeline = stored.timeline.find(({ type }) => type === "intent_staged");
+  timeline.details.inputBinding = structuredClone(currentBinding);
+  timeline.details.inputDigest = currentBinding.inputDigest;
+  timeline.details.workItemRevision = current.revision;
+  timeline.at = current.updatedAt;
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  const contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${contentDigest}`;
+  timeline.contentDigest = contentDigest;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+});
+
 test("a failed intake write advances neither the durable cursor nor live items", async () => {
   const { service, source, store } = await createFixture({
     records: [assignment(1)],
@@ -6490,6 +6701,18 @@ function reviewIntent(overrides = {}) {
   };
 }
 
+function externalPullRequestActionIntent(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    type: "propose_github_pull_request_action",
+    summary: "请求更新 PR 分支",
+    reason: "当前 Head 已落后 base",
+    action: { type: "update_branch" },
+    evidence: ["merge-state:behind"],
+    ...overrides,
+  };
+}
+
 function boundReviewIntent(item, overrides = {}) {
   const content = {
     policyVersion: 4,
@@ -6574,6 +6797,35 @@ async function prepareClaimedPullRequestReviewIntent(
   return { staged, claimed };
 }
 
+async function prepareClaimedPullRequestExternalActionIntent(
+  fixture,
+  leaseDurationMs = 30_000,
+) {
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: externalPullRequestActionIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs,
+  });
+  return { staged, claimed };
+}
+
 function pullRequestReviewProposalBinding(item) {
   const event = currentWorkItemEvent(item);
   return {
@@ -6606,6 +6858,33 @@ function boundPullRequestReviewIntent(item, binding) {
       reason: "检查通过",
     },
   });
+}
+
+function boundPullRequestExternalActionIntent(item, binding) {
+  const event = currentWorkItemEvent(item);
+  const content = {
+    policyVersion: 4,
+    kind: "github_pull_request_action_proposal",
+    requestedBy: {
+      roleId: "pr-engineer",
+      workItemId: item.itemId,
+    },
+    source: {
+      assignmentId: item.assignmentId,
+      eventId: event.eventId,
+    },
+    binding,
+    payload: {
+      action: { type: "update_branch" },
+      evidence: ["merge-state:behind"],
+      summary: "请求更新 PR 分支",
+      reason: "当前 Head 已落后 base",
+    },
+  };
+  return {
+    intentId: `work-intent-${workProposalDigest(content)}`,
+    ...content,
+  };
 }
 
 function codeActionIntent(overrides = {}) {
@@ -7201,6 +7480,40 @@ test("schema v9 quarantines a sealed PR proposal without an input binding", asyn
     );
   }
   assert.equal(fixture.store.writes.length, writesBeforeClaims);
+});
+
+test("schema v9 also quarantines a sealed PR external action without input binding", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  const { staged, claimed } =
+    await prepareClaimedPullRequestExternalActionIntent(fixture, 1_000);
+  const legacyBinding = pullRequestReviewProposalBinding(staged.item);
+  delete legacyBinding.inputBinding;
+  await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundPullRequestExternalActionIntent(
+      staged.item,
+      legacyBinding,
+    ),
+  });
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 9;
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+
+  const quarantined = (await recovered.listOutbox()).items[0];
+  assert.deepEqual(quarantined.dispatchBinding, { status: "legacy_unknown" });
 });
 
 test("schema v9 preserves a sealed PR proposal with an input binding", async () => {
@@ -8072,6 +8385,16 @@ test("an answered attention result atomically advances its cursor and requeues d
   });
   assert.equal(summary.attentionCursor, 1);
   assert.equal(summary.attentionHighWatermark, 1);
+  const stored = fixture.store.stored();
+  const resultTimeline = stored.timeline.find(
+    ({ type }) => type === "attention_answer_applied",
+  );
+  const resultAttestation = stored.outbox[0].outcome.details.resultAttestation;
+  assert.match(resultAttestation.attestationDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    resultTimeline.details.resultAttestationDigest,
+    resultAttestation.attestationDigest,
+  );
 
   const writesBeforeReplay = fixture.store.writes.length;
   const replayed = await fixture.service.applyAttentionBatch(batch);
@@ -8091,6 +8414,42 @@ test("an answered attention result atomically advances its cursor and requeues d
   assert.deepEqual(
     (await recovered.listItems()).items[0].decisionContext,
     item.decisionContext,
+  );
+});
+
+test("recovery rejects a rehashed attention conclusion that disagrees with its receipt", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const outbox = await prepareAttentionResult(fixture, {
+    type: "choice",
+    choiceId: "yes",
+  });
+  await fixture.service.applyAttentionBatch({
+    items: [outbox],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const stored = fixture.store.stored();
+  const timeline = stored.timeline.find(
+    ({ type }) => type === "attention_answer_applied",
+  );
+  timeline.details.answer = { type: "choice", choiceId: "forged" };
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  timeline.contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${timeline.contentDigest}`;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
   );
 });
 
@@ -8123,6 +8482,47 @@ test("a rejected attention result blocks work while a gap advances nothing", asy
   const item = (await fixture.service.listItems()).items[0];
   assert.equal(item.status, "blocked");
   assert.equal(item.decisionContext.outcome, "rejected");
+});
+
+test("PR ask_user answers and rejections retain the exact immutable execution binding", async (t) => {
+  for (const [name, answer] of [
+    ["answered", { type: "choice", choiceId: "yes" }],
+    ["rejected", { type: "reject", reason: "owner stopped this Head" }],
+  ]) {
+    await t.test(name, async () => {
+      const fixture = await createFixture({
+        records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+      });
+      const outbox = await prepareAttentionResult(fixture, answer, {
+        workerId: "employee-pr-engineer",
+        roleId: "pr-engineer",
+      });
+      const waiting = (await fixture.service.listItems()).items[0];
+      const expectedBinding = prExecutionBinding(waiting);
+      await fixture.service.applyAttentionBatch({
+        items: [outbox],
+        nextSequence: 1,
+        highWatermark: 1,
+        oldestAvailableSequence: 1,
+      });
+      const timeline = (await fixture.service.listTimeline({ limit: 20 })).items;
+      const staged = timeline.find(({ type }) => type === "intent_staged");
+      const settled = timeline.find(({ type }) =>
+        ["attention_answer_applied", "attention_rejection_applied"].includes(
+          type,
+        )
+      );
+      assert.deepEqual(staged.details.inputBinding, expectedBinding);
+      assert.deepEqual(settled.details.inputBinding, expectedBinding);
+      assert.equal(Number.isSafeInteger(staged.details.workItemRevision), true);
+      assert.equal(staged.details.workItemRevision > 0, true);
+      assert.equal(Number.isSafeInteger(settled.details.workItemRevision), true);
+      assert.equal(
+        settled.details.workItemRevision > staged.details.workItemRevision,
+        true,
+      );
+    });
+  }
 });
 
 test("a sealed attention result advances its cursor without reviving legacy PR-source work", async () => {
@@ -8264,6 +8664,8 @@ async function prepareProposalResult(
   await fixture.service.intake();
   let item = (await fixture.service.listItems()).items[0];
   const codeProposal = kind === "code_action_proposal";
+  const externalActionProposal =
+    kind === "github_pull_request_action_proposal";
   const roleId = configuredRoleId ??
     (codeProposal ? "developer" : "pr-reviewer");
   const workerId = configuredWorkerId ?? `employee-${roleId}`;
@@ -8328,7 +8730,9 @@ async function prepareProposalResult(
     roleId,
     intent: codeProposal
       ? codeActionIntent(intentOverrides)
-      : reviewIntent(intentOverrides),
+      : externalActionProposal
+        ? externalPullRequestActionIntent(intentOverrides)
+        : reviewIntent(intentOverrides),
   });
   const proposalContent = {
     policyVersion: 1,
@@ -8358,12 +8762,20 @@ async function prepareProposalResult(
           objective: "修复并发覆盖",
           acceptanceCriteria: ["回归测试通过"],
         }
-      : { verdict: "approve", body: "本地审查通过。" },
+      : externalActionProposal
+        ? { action: { type: "update_branch" } }
+        : { verdict: "approve", body: "本地审查通过。" },
   };
   const proposal = normalizeBoundWorkProposal({
     proposalId: authoritativeEvidence
       ? `work-intent-${workProposalDigest(proposalContent)}`
-      : `work-intent-${codeProposal ? "c".repeat(64) : "b".repeat(64)}`,
+      : `work-intent-${
+          codeProposal
+            ? "c".repeat(64)
+            : externalActionProposal
+              ? "d".repeat(64)
+              : "b".repeat(64)
+        }`,
     ...proposalContent,
   });
   let claimed = await fixture.service.claimIntent({
@@ -8439,9 +8851,34 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
   assert.equal(item.decisionContext.value.resultId, result.resultId);
   assert.equal(summary.proposalCursor, 1);
   assert.equal(summary.proposalHighWatermark, 1);
+  const decisionTimeline =
+    (await fixture.service.listTimeline({ order: "newest" })).items[0];
+  assert.equal(decisionTimeline.type, "proposal_result_applied");
   assert.equal(
-    (await fixture.service.listTimeline({ order: "newest" })).items[0].type,
-    "proposal_result_applied",
+    decisionTimeline.details.intentId,
+    fixture.store.stored().outbox[0].intentId,
+  );
+  assert.equal(decisionTimeline.details.workItemRevision, item.revision);
+  assert.deepEqual(decisionTimeline.details.decision, item.decisionContext);
+  assert.equal(
+    decisionTimeline.details.decision.value.resultId,
+    result.resultId,
+  );
+  assert.deepEqual(
+    decisionTimeline.details.decision.value.evidence,
+    result.evidence,
+  );
+
+  const restarted = await createFixture({
+    records: [assignment(1)],
+    store: fixture.store,
+  });
+  const recoveredTimeline =
+    (await restarted.service.listTimeline({ order: "newest" })).items[0];
+  assert.equal(recoveredTimeline.entryId, decisionTimeline.entryId);
+  assert.equal(
+    recoveredTimeline.details.intentId,
+    fixture.store.stored().outbox[0].intentId,
   );
 
   const writesBeforeReplay = fixture.store.writes.length;
@@ -8449,6 +8886,129 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
   assert.equal(replayed.applied, 0);
   assert.equal(replayed.deduplicated, 1);
   assert.equal(fixture.store.writes.length, writesBeforeReplay);
+});
+
+test("recovery rejects a rehashed proposal conclusion not sealed by its result attestation", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture);
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const stored = fixture.store.stored();
+  const timeline = stored.timeline.find(
+    ({ type }) => type === "proposal_result_applied",
+  );
+  timeline.details.decision.value.summary = "forged successful conclusion";
+  timeline.details.decision.value.evidence = ["forged-evidence"];
+  timeline.details.evidenceRefs = ["forged-evidence"];
+  timeline.details.decision.contentDigest = ledgerDigest({
+    source: timeline.details.decision.source,
+    referenceId: timeline.details.decision.referenceId,
+    outcome: timeline.details.decision.outcome,
+    value: timeline.details.decision.value,
+    observedAt: timeline.details.decision.observedAt,
+  });
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  timeline.contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${timeline.contentDigest}`;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+});
+
+test("current state rejects removing both copies of a proposal result receipt", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture);
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const stored = fixture.store.stored();
+  const timeline = stored.timeline.find(
+    ({ type }) => type === "proposal_result_applied",
+  );
+  delete timeline.details.resultAttestationDigest;
+  delete stored.outbox[0].outcome.details.resultAttestation;
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  timeline.contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${timeline.contentDigest}`;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await assert.rejects(
+    recovered.recover(),
+    (error) => error.code === "WORK_LEDGER_STATE_CORRUPTED",
+  );
+});
+
+test("schema 10 migration quarantines an unattested proposal conclusion", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture);
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const stored = fixture.store.stored();
+  stored.schemaVersion = 10;
+  const timeline = stored.timeline.find(
+    ({ type }) => type === "proposal_result_applied",
+  );
+  delete timeline.details.resultAttestationDigest;
+  delete stored.outbox[0].outcome.details.resultAttestation;
+  const { timelineId: _timelineId, contentDigest: _contentDigest, ...content } =
+    timeline;
+  timeline.contentDigest = ledgerDigest(content);
+  timeline.timelineId = `work-timeline-${timeline.contentDigest}`;
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+
+  await recovered.recover();
+  const recoveredTimeline = await recovered.listTimeline({ limit: 20 });
+  assert.equal(
+    recoveredTimeline.items.some(
+      ({ type }) => type === "proposal_result_applied",
+    ),
+    false,
+  );
+  const discarded = recoveredTimeline.items.find(
+    ({ type }) => type === "legacy_result_discarded",
+  );
+  assert.equal(discarded.details.originalType, "proposal_result_applied");
+  assert.equal(
+    discarded.details.reason,
+    "unsealed_result_attestation_migration",
+  );
 });
 
 test("a sealed proposal result advances its cursor without completing legacy PR-source work", async () => {
@@ -8610,6 +9170,7 @@ test("authoritative proposal evidence requeues graph work with trusted result co
         resultDigest: result.contentDigest,
         summary: result.summary,
         downstreamRef: result.downstreamRef,
+        evidence: result.evidence,
       },
       observedAt: result.at,
     },
@@ -8714,6 +9275,34 @@ test("a bound code proposal id distinct from its staged intent completes work", 
     fixture.store.stored().outbox[0].intentId,
     result.proposalId,
   );
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const item = (await fixture.service.listItems()).items[0];
+
+  assert.equal(applied.applied, 1);
+  assert.equal(item.status, "completed");
+  assert.equal(item.statusReason, "proposal_succeeded");
+});
+
+test("a PR external action result settles only its trusted external-action intent", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareProposalResult(fixture, {
+    kind: "github_pull_request_action_proposal",
+  });
+  const stored = fixture.store.stored().outbox[0];
+  assert.equal(
+    stored.intent.type,
+    "propose_github_pull_request_action",
+  );
+  assert.match(
+    stored.intent.dispatchIntentId,
+    /^work-dispatch-intent-[a-f0-9]{64}$/,
+  );
+
   const applied = await fixture.service.applyProposalBatch({
     items: [result],
     nextSequence: 1,

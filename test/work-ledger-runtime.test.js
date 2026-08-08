@@ -178,6 +178,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
   for (const method of [
     "getSummary",
     "listItems",
+    "listPendingPullRequestSources",
     "listTimeline",
     "listOutbox",
     "readItemForReconciliation",

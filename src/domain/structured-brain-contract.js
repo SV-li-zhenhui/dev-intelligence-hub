@@ -10,6 +10,8 @@ const UTF8_MAXIMUM_BYTES_PER_CHARACTER = 4;
 const SAFE_TOKEN_PATTERN = "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$";
 const SAFE_DELIVERABLE_ID_PATTERN =
   "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$";
+const CONTROLLED_COMMIT_EVIDENCE_ID_PATTERN =
+  "^controlled-git-commit-[a-f0-9]{64}$";
 const PROPOSAL_DELIVERABLE_DESCRIPTION =
   "Select the expected deliverable this proposal will produce. " +
   "It is required when the current task has multiple compatible expected " +
@@ -79,6 +81,59 @@ function intentSchema(type, fields, { optional = [] } = {}) {
 }
 
 const evidence = stringArraySchema(20, 2_048);
+const pullRequestExternalAction = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["type", "body"],
+      properties: {
+        type: { type: "string", const: "comment" },
+        body: stringSchema(8 * 1_024),
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["type", "verdict", "body"],
+      properties: {
+        type: { type: "string", const: "review" },
+        verdict: {
+          type: "string",
+          enum: ["approve", "request_changes", "comment"],
+        },
+        body: stringSchema(8 * 1_024),
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["type"],
+      properties: { type: { type: "string", const: "update_branch" } },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["type", "controlledCommitEvidenceId"],
+      properties: {
+        type: { type: "string", const: "push" },
+        controlledCommitEvidenceId: stringSchema(128, {
+          ascii: true,
+          pattern: CONTROLLED_COMMIT_EVIDENCE_ID_PATTERN,
+        }),
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["type", "method"],
+      properties: {
+        type: { type: "string", const: "merge" },
+        method: { type: "string", enum: ["merge", "squash", "rebase"] },
+      },
+    },
+  ],
+};
 const intentVariants = [
   intentSchema("ask_user", {
     question: stringSchema(4_096),
@@ -137,6 +192,11 @@ const intentVariants = [
       maximum: 86_400,
     },
   }),
+  intentSchema("query_memory", {
+    question: stringSchema(4_096),
+    searchQuery: stringSchema(1_024),
+    mode: { type: "string", enum: ["local", "configured"] },
+  }),
   intentSchema("propose_github_review", {
     deliverableId: stringSchema(128, {
       ascii: true,
@@ -150,6 +210,10 @@ const intentVariants = [
     body: stringSchema(16 * 1_024),
     evidence,
   }, { optional: ["deliverableId"] }),
+  intentSchema("propose_github_pull_request_action", {
+    action: pullRequestExternalAction,
+    evidence,
+  }),
   intentSchema("propose_code_action", {
     deliverableId: stringSchema(128, {
       ascii: true,
@@ -161,6 +225,34 @@ const intentVariants = [
     acceptanceCriteria: stringArraySchema(20, 2_048, { minimum: 1 }),
     evidence,
   }, { optional: ["deliverableId"] }),
+  intentSchema("propose_configuration_change", {
+    changes: {
+      type: "array",
+      minItems: 1,
+      maxItems: 20,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path", "value"],
+        properties: {
+          path: {
+            type: "array",
+            minItems: 1,
+            maxItems: 16,
+            items: stringSchema(256),
+          },
+          value: {
+            oneOf: [
+              stringSchema(16 * 1_024, { minimum: 0 }),
+              { type: "number" },
+              { type: "boolean" },
+            ],
+          },
+        },
+      },
+    },
+    evidence,
+  }),
   intentSchema("handoff", {
     capability: {
       type: "string",

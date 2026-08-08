@@ -1,19 +1,36 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { createApplication } from "../src/composition-root.js";
 import {
   createDashboardServer,
+  DRAIN_PARTICIPANTS,
   startApplicationBackgroundWork,
   startDashboardServer,
 } from "../src/server.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
+import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
+import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
+import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 import { ConfigurationStore } from "../src/services/configuration-store.js";
+import {
+  OperationalQuiescenceGate,
+} from "../src/services/operational-quiescence-gate.js";
+import { ProcessExclusiveGuard } from "../src/lib/process-exclusive-guard.js";
+import { runCommand } from "../src/lib/command-runner.js";
+import { normalizeOwnerWorkRequest } from "../src/domain/owner-work-request.js";
 
 const safeEditableConfiguration = createSafeDisabledConfiguration(
-  JSON.parse(readFileSync(new URL("../config.json", import.meta.url), "utf8")),
+  JSON.parse(
+    readFileSync(new URL("../config.example.json", import.meta.url), "utf8"),
+  ),
 );
 
 function request(server, {
@@ -64,6 +81,64 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function operationalApplication({
+  refresh = async () => ({ dashboard: {} }),
+  createBackup = async () => ({
+    backupId: `backup-${"a".repeat(64)}`,
+    createdAt: "2026-08-08T01:02:03.004Z",
+    checkpointId: `backup-checkpoint-${"b".repeat(64)}`,
+    fileCount: 3,
+    totalBytes: 1024,
+  }),
+} = {}) {
+  const gate = new OperationalQuiescenceGate();
+  const status = async () => ({
+    schemaVersion: 1,
+    liveness: { schemaVersion: 1, live: true },
+    readiness: {
+      schemaVersion: 1,
+      checkedAt: "2026-08-08T01:02:03.004Z",
+      ready: true,
+      recoveryBlockers: [],
+      unknownExternalActions: [],
+      capacityWarnings: [],
+      probeFailures: [],
+      probeSummary: { total: 3, succeeded: 3, failed: 0, timedOut: 0 },
+    },
+    maintenance: gate.readStatus(),
+    backups: {
+      available: true,
+      items: [],
+      incompleteCount: 0,
+      unrecognizedCount: 0,
+    },
+  });
+  const application = {
+    config: {
+      port: 4173,
+      refreshMinutes: 10,
+      githubActions: { enabled: false },
+    },
+    store: { async read() { return null; } },
+    refreshService: { running: null, refresh },
+    operations: {
+      admission: { run: gate.run.bind(gate) },
+      browser: {
+        readStatus: status,
+        async createBackup() {
+          const token = await gate.enter();
+          try {
+            return await createBackup();
+          } finally {
+            gate.leave(token);
+          }
+        },
+      },
+    },
+  };
+  return { application, gate, status };
 }
 
 async function availablePort() {
@@ -868,6 +943,7 @@ async function withServer(
     workflowRouting,
     workLedgerView,
     workGraphView,
+    ownerWorkRequests,
     attentionCoordinator,
     attentionBrowser,
     memorySearch,
@@ -1088,6 +1164,7 @@ async function withServer(
   }
   if (workLedgerView) application.workLedgerView = workLedgerView;
   if (workGraphView) application.workGraphView = workGraphView;
+  if (ownerWorkRequests) application.ownerWorkRequests = ownerWorkRequests;
   if (attentionCoordinator) {
     application.attentionCoordinator = attentionCoordinator;
   }
@@ -1122,6 +1199,350 @@ async function withServer(
     await server.shutdown();
   }
 }
+
+test("system operations API preserves the browser projection and validates backup requests", async (t) => {
+  const privateMarker = "private-producer-token-marker";
+  const fixture = operationalApplication({
+    async createBackup() {
+      return {
+        backupId: `backup-${"c".repeat(64)}`,
+        createdAt: "2026-08-08T02:03:04.005Z",
+        checkpointId: `backup-checkpoint-${"d".repeat(64)}`,
+        fileCount: 4,
+        totalBytes: 2048,
+      };
+    },
+  });
+  const server = createDashboardServer(fixture.application, {
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+
+  const expectedStatus = await fixture.status();
+  const status = await request(server, { path: "/api/system/status" });
+  assert.equal(status.status, 200);
+  assert.deepEqual(JSON.parse(status.body), expectedStatus);
+  assert.equal(status.body.includes(privateMarker), false);
+  assert.equal(status.body.includes("producer"), false);
+  assert.equal(status.body.includes("credential"), false);
+
+  const statusWithQuery = await request(server, {
+    path: "/api/system/status?path=private",
+  });
+  assert.equal(statusWithQuery.status, 400);
+
+  const missingOrigin = await request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(missingOrigin.status, 403);
+
+  const invalidContentType = await request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+    },
+    body: "{}",
+  });
+  assert.equal(invalidContentType.status, 415);
+
+  const extraField = await request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(),
+    body: JSON.stringify({ producer: privateMarker }),
+  });
+  assert.equal(extraField.status, 400);
+
+  const backup = await request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(),
+    body: "{}",
+  });
+  assert.equal(backup.status, 201);
+  assert.deepEqual(JSON.parse(backup.body), {
+    backupId: `backup-${"c".repeat(64)}`,
+    createdAt: "2026-08-08T02:03:04.005Z",
+    checkpointId: `backup-checkpoint-${"d".repeat(64)}`,
+    fileCount: 4,
+    totalBytes: 2048,
+  });
+  assert.equal(backup.body.includes(privateMarker), false);
+
+  fixture.application.operations.browser.readStatus = async () => {
+    throw new Error("private readiness failure");
+  };
+  const [failedStatus, independentLive] = await Promise.all([
+    request(server, { path: "/api/system/status" }),
+    request(server, { path: "/api/live" }),
+  ]);
+  assert.equal(failedStatus.status, 500);
+  assert.equal(failedStatus.body.includes("private readiness failure"), false);
+  assert.equal(independentLive.status, 200);
+});
+
+test("backup drains an admitted HTTP mutation while liveness and status remain independent", async (t) => {
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const backupStarted = deferred();
+  const releaseBackup = deferred();
+  let refreshCalls = 0;
+  const fixture = operationalApplication({
+    async refresh() {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      }
+      return { dashboard: {} };
+    },
+    async createBackup() {
+      backupStarted.resolve();
+      await releaseBackup.promise;
+      return {
+        backupId: `backup-${"e".repeat(64)}`,
+        createdAt: "2026-08-08T03:04:05.006Z",
+        checkpointId: `backup-checkpoint-${"f".repeat(64)}`,
+        fileCount: 1,
+        totalBytes: 1,
+      };
+    },
+  });
+  const server = createDashboardServer(fixture.application, {
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    releaseRefresh.resolve();
+    releaseBackup.resolve();
+    await server.shutdown();
+  });
+
+  const refresh = request(server, {
+    method: "POST",
+    path: "/api/refresh",
+    headers: {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+    },
+  });
+  await refreshStarted.promise;
+  const backup = request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(),
+    body: "{}",
+  });
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (fixture.gate.readStatus().mode !== "open") break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.deepEqual(fixture.gate.readStatus(), {
+    mode: "closing",
+    activeOperations: 1,
+  });
+
+  const [live, status, rejectedMutation] = await Promise.all([
+    request(server, { path: "/api/live" }),
+    request(server, { path: "/api/system/status" }),
+    request(server, {
+      method: "POST",
+      path: "/api/refresh",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+      },
+    }),
+  ]);
+  assert.equal(live.status, 200);
+  assert.equal(status.status, 200);
+  assert.deepEqual(JSON.parse(status.body).maintenance, {
+    mode: "closing",
+    activeOperations: 1,
+  });
+  assert.equal(rejectedMutation.status, 503);
+  assert.equal(refreshCalls, 1);
+
+  releaseRefresh.resolve();
+  assert.equal((await refresh).status, 200);
+  await backupStarted.promise;
+  assert.deepEqual(fixture.gate.readStatus(), {
+    mode: "closed",
+    activeOperations: 0,
+  });
+  const rejectedWhileClosed = await request(server, {
+    method: "POST",
+    path: "/api/refresh",
+    headers: {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+    },
+  });
+  assert.equal(rejectedWhileClosed.status, 503);
+  assert.equal(refreshCalls, 1);
+
+  releaseBackup.resolve();
+  assert.equal((await backup).status, 201);
+  assert.equal(fixture.gate.readStatus().mode, "open");
+});
+
+test("failed backup reopens admission and does not poison later HTTP work", async (t) => {
+  let refreshCalls = 0;
+  const fixture = operationalApplication({
+    async refresh() {
+      refreshCalls += 1;
+      return { dashboard: {} };
+    },
+    async createBackup() {
+      throw new Error("private backup failure");
+    },
+  });
+  const server = createDashboardServer(fixture.application, {
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+
+  const failed = await request(server, {
+    method: "POST",
+    path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(),
+    body: "{}",
+  });
+  assert.equal(failed.status, 500);
+  assert.equal(failed.body.includes("private backup failure"), false);
+  assert.equal(fixture.gate.readStatus().mode, "open");
+
+  const laterMutation = await request(server, {
+    method: "POST",
+    path: "/api/refresh",
+    headers: {
+      origin: "http://127.0.0.1:4173",
+      "x-mydashboard-action": "1",
+    },
+  });
+  assert.equal(laterMutation.status, 200);
+  assert.equal(refreshCalls, 1);
+});
+
+test("the same-origin process endpoint acknowledges before graceful shutdown", async () => {
+  let applicationCloses = 0;
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const live = await request(server, { path: "/api/live" });
+      assert.equal(live.status, 200);
+      assert.deepEqual(JSON.parse(live.body), {
+        schemaVersion: 1,
+        live: true,
+        service: "mydashboard",
+        processId: process.pid,
+        managed: false,
+        lifecycleState: "running",
+      });
+      const health = await request(server, { path: "/api/health" });
+      assert.equal(health.status, 200);
+      assert.equal(JSON.parse(health.body).service, "mydashboard");
+      assert.equal(JSON.parse(health.body).processId, process.pid);
+      const closed = new Promise((resolve) => server.once("close", resolve));
+      const response = await request(server, {
+        method: "POST",
+        path: "/api/system/shutdown",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+        },
+      });
+      assert.equal(response.status, 202);
+      assert.deepEqual(JSON.parse(response.body), {
+        accepted: true,
+        state: "stopping",
+      });
+      await closed;
+      await server.shutdown();
+      assert.equal(applicationCloses, 1);
+      assert.deepEqual(reportedErrors, []);
+    },
+    {
+      async onClose() {
+        applicationCloses += 1;
+      },
+    },
+  );
+});
+
+test("the process endpoint rejects cross-origin, stale-query, and GET requests", async () => {
+  await withServer(async ({ server }) => {
+    const crossOrigin = await request(server, {
+      method: "POST",
+      path: "/api/system/shutdown",
+      headers: {
+        origin: "http://malicious.invalid",
+        "x-mydashboard-action": "1",
+      },
+    });
+    assert.equal(crossOrigin.status, 403);
+
+    const query = await request(server, {
+      method: "POST",
+      path: "/api/system/shutdown?force=1",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+      },
+    });
+    assert.equal(query.status, 400);
+
+    const get = await request(server, { path: "/api/system/shutdown" });
+    assert.equal(get.status, 404);
+    assert.equal(server.listening, true);
+  });
+});
+
+test("a shutdown drain failure sets a nonzero process outcome", async () => {
+  const failure = new Error("durable runtime failed to close");
+  const exitCodes = [];
+  const reportedErrors = [];
+  const application = startupApplication({
+    port: 4173,
+    async close() {
+      throw failure;
+    },
+  });
+  const server = createDashboardServer(application, {
+    backgroundWork: { async stop() {} },
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+    setProcessExitCode(code) {
+      exitCodes.push(code);
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const response = await request(server, {
+      method: "POST",
+      path: "/api/system/shutdown",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+      },
+    });
+    assert.equal(response.status, 202);
+    await assert.rejects(() => server.shutdown(), (error) => error === failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(exitCodes, [1]);
+    assert.deepEqual(reportedErrors, [failure]);
+  } finally {
+    await server.shutdown().catch(() => {});
+  }
+});
 
 test("configuration safe mode starts no background reads or employees but permits confirmation operations", async () => {
   let refreshCalls = 0;
@@ -1200,6 +1621,162 @@ test("configuration safe mode shutdown drains an accepted confirmation operation
   assert.equal(await operation, "completed");
   await stopping;
   assert.equal(stopped, true);
+});
+
+test("production drain participants reject every public trigger before execution and resume together", async (t) => {
+  const gate = new OperationalQuiescenceGate();
+  const agencyStarted = deferred();
+  const releaseAgency = deferred();
+  const reportedErrors = [];
+  const executed = [];
+  const participantIds = Object.values(DRAIN_PARTICIPANTS).map(
+    (participant) => participant.id,
+  );
+  let employeeCycles = 0;
+  const application = startupApplication({
+    async refresh() {
+      return healthyRefreshResult();
+    },
+    async runAll() {
+      employeeCycles += 1;
+      if (employeeCycles === 2) {
+        agencyStarted.resolve();
+        await releaseAgency.promise;
+      }
+    },
+  });
+  application.operations = {
+    admission: { run: gate.run.bind(gate) },
+  };
+  application.workflowRouting = {
+    async ingestSnapshot() {
+      return { events: [], assignments: [] };
+    },
+  };
+  application.workCoordination = {
+    async intake() {},
+    async runCycle() {},
+  };
+  application.employeeRegistry.get("pr-reviewer").recoverConfirmations = async () => {};
+  application.memoryProjector = {
+    async runCycle() {},
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn() {
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+    observeDrainParticipant(participant) {
+      executed.push(participant.id);
+    },
+  });
+  let maintenanceToken = null;
+  t.after(async () => {
+    releaseAgency.resolve();
+    if (gate.readStatus().mode === "closed" && maintenanceToken) {
+      gate.leave(maintenanceToken);
+    }
+    await backgroundWork.stop();
+  });
+  await backgroundWork.initialRefresh;
+  await backgroundWork.runConfirmationOperation(async () => {});
+  assert.deepEqual(executed, participantIds);
+
+  async function assertRejectedBeforeParticipant(trigger) {
+    const baseline = [...executed];
+    await assert.rejects(trigger(), { code: "SYSTEM_QUIESCING" });
+    assert.deepEqual(executed, baseline);
+  }
+
+  const admittedAgency = backgroundWork.runEmployee("pr-reviewer", {
+    trigger: "manual",
+  });
+  await agencyStarted.promise;
+  const entering = gate.enter();
+  assert.deepEqual(gate.readStatus(), {
+    mode: "closing",
+    activeOperations: 1,
+  });
+  await assertRejectedBeforeParticipant(() => backgroundWork.refresh());
+  await assertRejectedBeforeParticipant(() => backgroundWork.signalAgency());
+  await assertRejectedBeforeParticipant(() =>
+    backgroundWork.runEmployee("pr-reviewer"),
+  );
+  await assertRejectedBeforeParticipant(() =>
+    backgroundWork.runConfirmationOperation(async () => "must-not-run"),
+  );
+
+  releaseAgency.resolve();
+  await admittedAgency;
+  const token = await entering;
+  maintenanceToken = token;
+
+  await assertRejectedBeforeParticipant(() => backgroundWork.refresh());
+  await assertRejectedBeforeParticipant(() => backgroundWork.signalAgency());
+  await assertRejectedBeforeParticipant(() =>
+    backgroundWork.runEmployee("pr-reviewer"),
+  );
+  await assertRejectedBeforeParticipant(() =>
+    backgroundWork.runConfirmationOperation(async () => "must-not-run"),
+  );
+
+  gate.leave(token);
+  maintenanceToken = null;
+
+  executed.length = 0;
+  await backgroundWork.refresh();
+  await backgroundWork.runConfirmationOperation(async () => {});
+  assert.deepEqual(executed, participantIds);
+  assert.deepEqual(
+    reportedErrors.map((error) => error.code),
+    Array(6).fill("SYSTEM_QUIESCING"),
+  );
+});
+
+test("configuration safe mode cannot bypass closed operational admission", async (t) => {
+  const gate = new OperationalQuiescenceGate();
+  const fixture = safeConfigurationApplication();
+  fixture.application.operations = {
+    admission: { run: gate.run.bind(gate) },
+    browser: {
+      async readStatus() {
+        return { maintenance: gate.readStatus() };
+      },
+      async createBackup() {
+        throw new Error("not used");
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(fixture.application);
+  const server = createDashboardServer(fixture.application, {
+    backgroundWork,
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let token = null;
+  t.after(async () => {
+    if (gate.readStatus().mode === "closed") gate.leave(token);
+    await server.shutdown();
+  });
+  token = await gate.enter();
+
+  await assert.rejects(
+    backgroundWork.runConfirmationOperation(async () => "must-not-run"),
+    { code: "SYSTEM_QUIESCING" },
+  );
+  const mutation = await request(server, {
+    method: "POST",
+    path: "/api/configuration/drafts",
+    headers: trustedConfigurationHeaders(),
+    body: "{}",
+  });
+  assert.equal(mutation.status, 503);
+  assert.deepEqual(fixture.calls, []);
+  const live = await request(server, { path: "/api/live" });
+  assert.equal(live.status, 200);
 });
 
 test("configuration API exposes an uncertain runtime fence", async () => {
@@ -3127,6 +3704,178 @@ test("workflow APIs fail closed when routing is unavailable", async () => {
   });
 });
 
+test("owner work request HTTP API is same-origin, structured, and read-back capable", async () => {
+  const calls = [];
+  const id = "123e4567-e89b-42d3-a456-426614174000";
+  const result = (deduplicated) => ({
+    deduplicated,
+    requestId: id,
+    requestDigest: "a".repeat(64),
+    phase: "intaken",
+    request: {
+      schemaVersion: 1,
+      requestId: id,
+      workType: "general",
+      priority: "normal",
+      title: "Coordinate release",
+      description: "Create one shared command-center task.",
+      acceptanceCriteria: ["One shared root"],
+    },
+    eventId: `workflow-event-${"b".repeat(64)}`,
+    assignment: {
+      assignmentId: `workflow-assignment-${"c".repeat(64)}`,
+      eventId: `workflow-event-${"b".repeat(64)}`,
+      target: { type: "role", id: "orchestrator" },
+      configVersion: 1,
+      configDigest: "d".repeat(64),
+      ruleId: "system-owner-request-to-orchestrator",
+    },
+    workItemId: `work-item-${"e".repeat(64)}`,
+    createdAt: "2026-08-08T01:00:00.000Z",
+    updatedAt: "2026-08-08T01:00:02.000Z",
+    audit: [],
+  });
+  let submitted = false;
+  const ownerWorkRequests = {
+    async submit(input) {
+      calls.push({ operation: "submit", input });
+      const response = result(submitted);
+      submitted = true;
+      return response;
+    },
+    async list(options) {
+      calls.push({ operation: "list", options });
+      return { items: [result(true)], nextCursor: null };
+    },
+    async get(requestId) {
+      calls.push({ operation: "get", requestId });
+      return requestId === id ? result(true) : null;
+    },
+  };
+  const input = result(false).request;
+  const trustedHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const untrusted = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      assert.equal(untrusted.status, 403);
+
+      const injected = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: JSON.stringify({
+          ...input,
+          targetRoleId: "developer",
+        }),
+      });
+      assert.equal(injected.status, 400);
+      assert.equal(calls.length, 0);
+
+      const created = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: JSON.stringify(input),
+      });
+      const replay = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: JSON.stringify(input),
+      });
+      assert.equal(created.status, 201);
+      assert.equal(replay.status, 200);
+      assert.equal(JSON.parse(created.body).assignment.target.id, "orchestrator");
+
+      const listed = await request(server, {
+        path: `/api/work/requests?limit=7&cursor=${id}`,
+      });
+      const read = await request(server, {
+        path: `/api/work/requests/${id}`,
+      });
+      assert.equal(listed.status, 200);
+      assert.equal(read.status, 200);
+      assert.deepEqual(calls, [
+        { operation: "submit", input },
+        { operation: "submit", input },
+        { operation: "list", options: { limit: "7", cursor: id } },
+        { operation: "get", requestId: id },
+      ]);
+    },
+    { ownerWorkRequests },
+  );
+});
+
+test("owner work request HTTP limit accepts the largest canonical contract and rejects excess bytes", async () => {
+  const submissions = [];
+  const maximumRequest = normalizeOwnerWorkRequest({
+    schemaVersion: 1,
+    requestId: "123e4567-e89b-42d3-a456-426614174000",
+    workType: "general",
+    priority: "urgent",
+    title: "T".repeat(256),
+    description: "\\".repeat(12 * 1024),
+    acceptanceCriteria: Array.from(
+      { length: 20 },
+      (_, index) => `${String(index).padStart(2, "0")}${"\\".repeat(998)}`,
+    ),
+  });
+  const maximumBody = JSON.stringify(maximumRequest);
+  assert.equal(Buffer.byteLength(maximumBody) > 16 * 1024, true);
+  assert.equal(Buffer.byteLength(maximumBody) < 72 * 1024, true);
+  const trustedHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json",
+  };
+  const ownerWorkRequests = {
+    async submit(input) {
+      submissions.push(input);
+      return { deduplicated: false, requestId: input.requestId };
+    },
+    async list() {
+      return { items: [], nextCursor: null };
+    },
+    async get() {
+      return null;
+    },
+  };
+
+  await withServer(
+    async ({ server }) => {
+      const accepted = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: maximumBody,
+      });
+      assert.equal(accepted.status, 201);
+      assert.equal(submissions.length, 1);
+      assert.deepEqual(submissions[0], maximumRequest);
+
+      const oversized = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: " ".repeat(72 * 1024 + 1),
+      });
+      assert.equal(oversized.status, 413);
+      assert.equal(submissions.length, 1);
+    },
+    { ownerWorkRequests },
+  );
+});
+
 test("work APIs expose only newest-first ledger projections", async () => {
   const calls = [];
   const workLedgerView = {
@@ -4865,6 +5614,612 @@ test("closing the HTTP server releases application-owned runtimes", async () => 
     },
   );
   assert.equal(closed, 1);
+});
+
+test(
+  "pending composition startup cleanup obeys the server deadline and holds its lease",
+  { timeout: 2_000 },
+  async () => {
+    const events = [];
+    const cleanupStarted = deferred();
+    const releaseCleanup = deferred();
+    const startupFailure = new Error("workflow startup failed");
+    let suppliedRuntimeLifecycle = null;
+    let leaseReleased = false;
+    const writerLease = {
+      async acquire() {
+        events.push("lease-acquire");
+      },
+      async close() {
+        if (leaseReleased) return;
+        leaseReleased = true;
+        events.push("lease-release");
+      },
+    };
+    const starting = startDashboardServer({
+      writerLease,
+      createApplicationFn: (options = {}) => {
+        suppliedRuntimeLifecycle = options.runtimeLifecycle || null;
+        return createApplication({
+          config: structuredClone(safeEditableConfiguration),
+          store: {
+            async read(_key, fallback = null) {
+              return fallback;
+            },
+            async write() {},
+          },
+          externalActions: false,
+          runtimeLifecycle: options.runtimeLifecycle,
+          codeExecutorRuntimeFactory: async () => ({
+            async close() {
+              events.push("runtime-close");
+              cleanupStarted.resolve();
+              await releaseCleanup.promise;
+              events.push("runtime-closed");
+            },
+          }),
+          workflowRoutingRuntimeFactory: async () => {
+            throw startupFailure;
+          },
+        });
+      },
+      shutdownDrainTimeoutMs: 20,
+      log() {},
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    await cleanupStarted.promise;
+
+    const stillPending = Symbol("still pending");
+    const beforeRelease = await Promise.race([
+      starting,
+      new Promise((resolve) => setTimeout(() => resolve(stillPending), 250)),
+    ]);
+    try {
+      assert.notStrictEqual(
+        beforeRelease,
+        stillPending,
+        "server startup remained trapped inside composition cleanup",
+      );
+      assert.equal(beforeRelease instanceof AggregateError, true);
+      assert.strictEqual(beforeRelease.errors[0], startupFailure);
+      assert.equal(beforeRelease.errors[1].code, "LIFECYCLE_DRAIN_TIMEOUT");
+      assert.deepEqual(events, ["lease-acquire", "runtime-close"]);
+      assert.notEqual(suppliedRuntimeLifecycle, null);
+    } finally {
+      releaseCleanup.resolve();
+      if (suppliedRuntimeLifecycle) {
+        await suppliedRuntimeLifecycle.close();
+      }
+      await starting;
+      if (!leaseReleased) await writerLease.close();
+    }
+
+    assert.deepEqual(events, [
+      "lease-acquire",
+      "runtime-close",
+      "runtime-closed",
+      "lease-release",
+    ]);
+  },
+);
+
+test("the application writer lease covers recovery through final runtime close", async () => {
+  const events = [];
+  const application = startupApplication({
+    port: await availablePort(),
+    async close() {
+      events.push("application-close");
+    },
+  });
+  const writerLease = {
+    async acquire() {
+      events.push("lease-acquire");
+    },
+    async close() {
+      events.push("lease-close");
+    },
+  };
+  const server = await startDashboardServer({
+    writerLease,
+    createApplicationFn: async () => {
+      assert.deepEqual(events, ["lease-acquire"]);
+      events.push("application-recovery");
+      return application;
+    },
+    log() {},
+  });
+
+  assert.deepEqual(events, ["lease-acquire", "application-recovery"]);
+  await server.shutdown();
+  assert.deepEqual(events, [
+    "lease-acquire",
+    "application-recovery",
+    "application-close",
+    "lease-close",
+  ]);
+});
+
+test("a failed runtime close retains the writer lease fail-closed", async () => {
+  const closeFailure = new Error("runtime writer may still be active");
+  let leaseCloses = 0;
+  const application = startupApplication({
+    port: await availablePort(),
+    async close() {
+      throw closeFailure;
+    },
+  });
+  const writerLease = {
+    async acquire() {},
+    async close() {
+      leaseCloses += 1;
+    },
+  };
+  const server = await startDashboardServer({
+    writerLease,
+    createApplicationFn: async () => application,
+    log() {},
+  });
+
+  await assert.rejects(server.shutdown(), (error) => error === closeFailure);
+  assert.equal(leaseCloses, 0);
+});
+
+test("shutdown aborts cooperative background work before bounded draining", async () => {
+  const refreshStarted = deferred();
+  let observedSignal = null;
+  const application = startupApplication({
+    async refresh({ signal } = {}) {
+      observedSignal = signal;
+      refreshStarted.resolve();
+      await new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 100,
+  });
+  await refreshStarted.promise;
+
+  await backgroundWork.stop();
+  assert.equal(observedSignal instanceof AbortSignal, true);
+  assert.equal(observedSignal.aborted, true);
+  await Promise.allSettled([backgroundWork.initialRefresh]);
+});
+
+test("shutdown reaps an active external refresh command before completing", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "server-command-drain-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const marker = path.join(directory, "pid.txt");
+  let observedSignal = null;
+  const application = startupApplication({
+    async refresh({ signal } = {}) {
+      observedSignal = signal;
+      try {
+        await runCommand(
+          process.execPath,
+          [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1000)`,
+          ],
+          { timeoutMs: 10_000, signal },
+        );
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      }
+    },
+  });
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 2_000,
+  });
+  let processId = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      processId = Number(await readFile(marker, "utf8"));
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.equal(Number.isSafeInteger(processId), true);
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 2_500,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  const startedAt = performance.now();
+  await server.shutdown();
+  const durationMs = performance.now() - startedAt;
+
+  assert.equal(observedSignal instanceof AbortSignal, true);
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(durationMs < 2_000, true, `shutdown took ${durationMs} ms`);
+  assert.throws(
+    () => process.kill(processId, 0),
+    (error) => error?.code === "ESRCH",
+  );
+  await Promise.allSettled([backgroundWork.initialRefresh]);
+});
+
+test("shutdown abort reaches an active role provider before runtimes and lease close", async () => {
+  const providerStarted = deferred();
+  let providerSignal = null;
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  const application = startupApplication({
+    async close() {
+      applicationCloses += 1;
+    },
+  });
+  application.employeeRegistry = {
+    get(id) {
+      return id === "pr-reviewer" ? { async recoverConfirmations() {} } : null;
+    },
+    schedules() {
+      return [];
+    },
+    async runSelected(ids, options) {
+      if (!ids.includes("developer")) return;
+      providerSignal = options.signal;
+      providerStarted.resolve();
+      await new Promise((resolve, reject) => {
+        const onAbort = () => reject(providerSignal.reason);
+        providerSignal?.addEventListener("abort", onAbort, { once: true });
+        if (providerSignal?.aborted) onAbort();
+      });
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 100,
+  });
+  await backgroundWork.initialRefresh;
+  const running = backgroundWork.runEmployee("developer", { trigger: "manual" });
+  const observed = running.then(
+    () => null,
+    (error) => error,
+  );
+  await providerStarted.promise;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 150,
+    writerLease: {
+      async acquire() {},
+      async close() {
+        leaseCloses += 1;
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  await server.shutdown();
+  assert.equal(providerSignal instanceof AbortSignal, true);
+  assert.equal(providerSignal.aborted, true);
+  assert.equal((await observed)?.code, "LIFECYCLE_SHUTDOWN_ABORTED");
+  assert.equal(applicationCloses, 1);
+  assert.equal(leaseCloses, 1);
+});
+
+test("an active role provider that ignores abort keeps shutdown fail-closed", async () => {
+  const providerStarted = deferred();
+  const providerRelease = deferred();
+  let providerSignal = null;
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  const application = startupApplication({
+    async close() {
+      applicationCloses += 1;
+    },
+  });
+  application.employeeRegistry = {
+    get(id) {
+      return id === "pr-reviewer" ? { async recoverConfirmations() {} } : null;
+    },
+    schedules() {
+      return [];
+    },
+    async runSelected(ids, options) {
+      if (!ids.includes("developer")) return;
+      providerSignal = options.signal;
+      providerStarted.resolve();
+      await providerRelease.promise;
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 20,
+  });
+  await backgroundWork.initialRefresh;
+  const running = backgroundWork.runEmployee("developer", { trigger: "manual" });
+  await providerStarted.promise;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 40,
+    writerLease: {
+      async acquire() {},
+      async close() {
+        leaseCloses += 1;
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  try {
+    await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
+    assert.equal(providerSignal instanceof AbortSignal, true);
+    assert.equal(providerSignal.aborted, true);
+    assert.equal(applicationCloses, 0);
+    assert.equal(leaseCloses, 0);
+  } finally {
+    providerRelease.resolve();
+    await running.catch(() => {});
+  }
+});
+
+test("a composed role provider cannot detach from shutdown by ignoring its signal", async () => {
+  const providerStarted = deferred();
+  const providerRelease = deferred();
+  let providerSignal = null;
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  const roleState = new Map();
+  const roleStore = {
+    async read(key, fallback) {
+      return structuredClone(roleState.has(key) ? roleState.get(key) : fallback);
+    },
+    async write(key, value) {
+      roleState.set(key, structuredClone(value));
+    },
+  };
+  const decisionEngine = {
+    async decide({ signal }) {
+      providerSignal = signal;
+      providerStarted.resolve();
+      await providerRelease.promise;
+      return {
+        schemaVersion: 1,
+        confidence: 100,
+        summary: "released test provider",
+        intent: {
+          schemaVersion: 1,
+          type: "complete",
+          summary: "released test provider",
+          reason: "test cleanup",
+          outcome: "no-action",
+          evidence: [],
+        },
+      };
+    },
+    view() {
+      return {
+        definition: {
+          id: "developer",
+          name: "Developer",
+          mission: "Implement assigned work",
+          enabled: true,
+          scheduleMinutes: 5,
+        },
+        permissions: { allowedIntents: ["complete"] },
+        brain: {
+          provider: "local-test",
+          model: "ignored-signal-provider",
+          remote: false,
+          remoteData: { requirements: false, code: false, memory: false },
+        },
+      };
+    },
+  };
+  let workCoordination = null;
+  const developer = new ConfiguredRoleEmployee({
+    definition: decisionEngine.view().definition,
+    permissions: decisionEngine.view().permissions,
+    brain: {
+      provider: "local-test",
+      model: "ignored-signal-provider",
+      remoteData: { requirements: false, code: false, memory: false },
+    },
+    decisionEngine,
+    store: roleStore,
+    onRun: ({ roleId, signal }) => workCoordination.runCycle({
+      trigger: `employee:${roleId}`,
+      includeWork: true,
+      roleId,
+      signal,
+    }),
+  });
+  const legacyReviewer = {
+    id: "pr-reviewer",
+    scheduleMinutes: 0,
+    async recoverConfirmations() {},
+    async view() { return {}; },
+    async roleView() {
+      return { id: "pr-reviewer", enabled: true, paused: false };
+    },
+    async run() {},
+    async control() {},
+  };
+  const employeeRegistry = new EmployeeRegistry([legacyReviewer, developer]);
+  const item = {
+    itemId: "work-item-shutdown-provider",
+    kind: "assignment",
+    assignmentId: "assignment-shutdown-provider",
+    sourceSequence: 1,
+    inputDigest: "shutdown-provider-input",
+    assignment: {
+      assignmentId: "assignment-shutdown-provider",
+      target: { type: "role", id: "developer" },
+    },
+    event: {
+      eventId: "event-shutdown-provider",
+      eventType: "issue.created",
+      subject: { id: "github:issue:acme/repo#1" },
+      payload: {},
+    },
+    graph: {
+      parentItemId: null,
+      dependsOnItemIds: [],
+      acceptanceContracts: [],
+      deliveries: [],
+    },
+    currentTarget: { type: "role", id: "developer" },
+    activeIntentId: null,
+    decisionContext: null,
+    status: "queued",
+    revision: 1,
+    ownerId: null,
+    leaseId: null,
+    leaseUntil: null,
+    attempt: 0,
+    availableAt: null,
+    statusReason: null,
+    createdAt: "2026-08-08T01:00:00.000Z",
+    updatedAt: "2026-08-08T01:00:00.000Z",
+  };
+  const ledger = {
+    async intake() {
+      return { received: 0 };
+    },
+    async listItems() {
+      return { items: [structuredClone(item)], nextCursor: null };
+    },
+    async claim(input) {
+      item.status = "working";
+      item.revision += 1;
+      item.ownerId = input.workerId;
+      item.leaseId = "lease-shutdown-provider";
+      item.leaseUntil = "2026-08-08T01:02:00.000Z";
+      item.attempt += 1;
+      return structuredClone(item);
+    },
+    async stageIntent() {
+      throw new Error("shutdown provider must not stage an intent");
+    },
+    async scheduleRetry() {},
+    async transition() {},
+  };
+  const roleDirectory = new RoleWorkerDirectory({
+    workers: [developer.asRoleWorker()],
+    legacyEmployeeRegistry: employeeRegistry,
+    legacyOwnedRoleIds: ["pr-reviewer"],
+  });
+  const workLoop = new ProactiveWorkLoop({
+    ledger,
+    roleDirectory,
+    clock: () => "2026-08-08T01:00:00.000Z",
+  });
+  const noOpCycle = { async runCycle() {} };
+  workCoordination = new WorkCoordinationService({
+    ledger,
+    proposalResultReconciler: noOpCycle,
+    attentionResultReconciler: noOpCycle,
+    conditionWaker: noOpCycle,
+    workLoop,
+    dispatcher: { async dispatchPending() {} },
+  });
+  const application = startupApplication({
+    async close() {
+      applicationCloses += 1;
+    },
+  });
+  application.employeeRegistry = employeeRegistry;
+  application.workCoordination = workCoordination;
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 20,
+  });
+  await backgroundWork.initialRefresh;
+  const running = backgroundWork.runEmployee("developer", { trigger: "manual" });
+  await providerStarted.promise;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 40,
+    writerLease: {
+      async acquire() {},
+      async close() {
+        leaseCloses += 1;
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  try {
+    await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
+    assert.equal(providerSignal instanceof AbortSignal, true);
+    assert.equal(providerSignal.aborted, true);
+    assert.equal(applicationCloses, 0);
+    assert.equal(leaseCloses, 0);
+  } finally {
+    providerRelease.resolve();
+    await running.catch(() => {});
+  }
+});
+
+test("a bounded shutdown timeout retains the application and writer lease fail-closed", async () => {
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  const application = startupApplication({
+    async close() {
+      applicationCloses += 1;
+    },
+  });
+  const server = createDashboardServer(application, {
+    backgroundWork: { stop: () => new Promise(() => {}) },
+    writerLease: {
+      async acquire() {},
+      async close() {
+        leaseCloses += 1;
+      },
+    },
+    shutdownDrainTimeoutMs: 20,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
+  assert.equal(applicationCloses, 0);
+  assert.equal(leaseCloses, 0);
+});
+
+test("the writer lease excludes restore before recovery has opened a listener", async () => {
+  const name = `mydashboard-test-writer-${createHash("sha256")
+    .update(`${process.pid}-${Date.now()}-${Math.random()}`)
+    .digest("hex")}`;
+  const owner = new ProcessExclusiveGuard({ name });
+  const competitor = new ProcessExclusiveGuard({ name });
+  const recoveryStarted = deferred();
+  const releaseRecovery = deferred();
+  const application = startupApplication({ port: await availablePort() });
+  let server = null;
+  const starting = startDashboardServer({
+    writerLease: owner,
+    createApplicationFn: async () => {
+      recoveryStarted.resolve();
+      await releaseRecovery.promise;
+      return application;
+    },
+    log() {},
+  });
+
+  try {
+    await recoveryStarted.promise;
+    const contention = await competitor.acquire().then(
+      () => null,
+      (error) => error,
+    );
+    assert.equal(contention?.code, "PROCESS_GUARD_HELD");
+    assert.equal(server, null);
+  } finally {
+    await competitor.close();
+    releaseRecovery.resolve();
+    server = await starting.catch(() => null);
+    if (server) await server.shutdown();
+    else await owner.close();
+  }
+
+  const successor = new ProcessExclusiveGuard({ name });
+  await successor.acquire();
+  await successor.close();
 });
 
 test("awaited shutdown releases a delayed runtime before an immediate restart", async () => {

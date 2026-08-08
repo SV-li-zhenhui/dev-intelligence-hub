@@ -278,6 +278,11 @@ function applicationConfig(sourceRoot, git) {
             model: "fixed-e2e-brain",
             remoteData: { requirements: false, code: false, memory: false },
           },
+          taskBrain: {
+            provider: "ollama",
+            model: "fixed-e2e-brain",
+            remoteData: { requirements: false, code: false, memory: false },
+          },
         },
       },
     },
@@ -339,6 +344,7 @@ test("code action confirmation reaches memory and an exactly-once package applic
     },
     memoryRuntimeDependencies: { createGuard: guardFactory },
     workCoordinationDependencies: { clock, workers: [developerWorker] },
+    prEngineerExclusiveGuardFactory: guardFactory,
     configuredWorkforceFactory: () => ({ employees: [], workers: [] }),
     codeJobBrainDirectoryFactory: () => brain,
     workProposalRuntimeFactory: async (options) => {

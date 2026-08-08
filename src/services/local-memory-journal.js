@@ -5,6 +5,10 @@ import {
   normalizeMemoryRecord,
   projectMemoryRecord,
 } from "../domain/memory-record.js";
+import { digestValue } from "../domain/code-executor-contract.js";
+import {
+  normalizePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
 import {
   normalizeWorkGraphMemoryEvent,
   normalizeWorkGraphSourceAuthority,
@@ -20,7 +24,11 @@ const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
+const MAX_AUTHORITY_PROJECTION_ENTRIES = 100_000;
 const SHA256 = /^[a-f0-9]{64}$/;
+const EMPTY_AUTHORITY_STATE_DIGEST = createHash("sha256")
+  .update("[]", "utf8")
+  .digest("hex");
 const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/;
 const WORK_ITEM_REVISION = /^(.*):revision:([1-9][0-9]*)$/u;
 const WORK_ITEM_REVISION_SUPERSESSION =
@@ -37,6 +45,18 @@ const RESERVED_WORK_SOURCES = new Set([
   "work-authority-lifecycle",
   "work-timeline",
   "legacy-pr-memory",
+  "work-decision",
+  "consultation-request",
+  "consultation-result",
+  "confirmation",
+  "external-result",
+]);
+const AUTHORITY_BOUND_PROJECTION_SOURCES = new Set([
+  "work-decision",
+  "consultation-request",
+  "consultation-result",
+  "confirmation",
+  "external-result",
 ]);
 const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -182,17 +202,23 @@ function optionalDigest(value, name) {
 
 function emptyLifecycleAuthority() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     baseCursor: 0,
     baseCheckpointDigest: null,
     graphCursor: 0,
     graphCheckpointDigest: null,
-    authorityStateDigest: createHash("sha256")
-      .update("[]", "utf8")
-      .digest("hex"),
+    authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
     workLedgerRevision: 0,
     graphReceipts: [],
     workItemAttestations: [],
+    authorityProjection: {
+      schemaVersion: 4,
+      revision: 0,
+      workLedgerRevision: 0,
+      authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+      confirmationHighWatermark: 0,
+      entries: [],
+    },
   };
 }
 
@@ -443,7 +469,234 @@ function normalizeGraphReceipt(value, recordsById) {
   };
 }
 
+function authorityProjectionFields(value, expected, name) {
+  let entries;
+  try {
+    entries = dataEntries(value, name);
+  } catch (cause) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      `${name} 无效`,
+      503,
+      cause,
+    );
+  }
+  if (
+    entries.length !== expected.length ||
+    expected.some((key) => !entries.some(([entryKey]) => entryKey === key))
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      `${name} 字段无效`,
+      503,
+    );
+  }
+  return Object.fromEntries(entries);
+}
+
+function normalizeAuthorityProjection(value, recordsById) {
+  let rawFields;
+  try {
+    rawFields = dataEntries(value, "memory authority projection");
+  } catch (cause) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection 无效",
+      503,
+      cause,
+    );
+  }
+  const schemaVersion = rawFields.find(
+    ([key]) => key === "schemaVersion",
+  )?.[1];
+  if (![3, 4].includes(schemaVersion)) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection 版本无效",
+      503,
+    );
+  }
+  const expectedFields = [
+    "schemaVersion",
+    "revision",
+    ...(schemaVersion === 4
+      ? ["workLedgerRevision", "authorityStateDigest"]
+      : []),
+    "confirmationHighWatermark",
+    "entries",
+  ];
+  if (
+    rawFields.length !== expectedFields.length ||
+    expectedFields.some(
+      (key) => !rawFields.some(([entryKey]) => entryKey === key),
+    )
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection 字段无效",
+      503,
+    );
+  }
+  const fields = Object.fromEntries(rawFields);
+  const revision = nonNegativeInteger(
+    fields.revision,
+    "authorityProjection.revision",
+  );
+  const workLedgerRevision = schemaVersion === 4
+    ? nonNegativeInteger(
+        fields.workLedgerRevision,
+        "authorityProjection.workLedgerRevision",
+      )
+    : 0;
+  const authorityStateDigest = schemaVersion === 4
+    ? optionalDigest(
+        fields.authorityStateDigest,
+        "authorityProjection.authorityStateDigest",
+      )
+    : EMPTY_AUTHORITY_STATE_DIGEST;
+  if (authorityStateDigest === null) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection authority digest 无效",
+      503,
+    );
+  }
+  const confirmationHighWatermark = nonNegativeInteger(
+    fields.confirmationHighWatermark,
+    "authorityProjection.confirmationHighWatermark",
+  );
+  let rawEntries;
+  try {
+    rawEntries = strictArray(
+      fields.entries,
+      MAX_AUTHORITY_PROJECTION_ENTRIES,
+      "authorityProjection.entries",
+    );
+  } catch (cause) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection entries 无效",
+      503,
+      cause,
+    );
+  }
+  const entries = rawEntries.map((valueEntry) => {
+    const entry = authorityProjectionFields(valueEntry, [
+      "key",
+      "fingerprint",
+      "recordId",
+      "sourceKind",
+      "binding",
+      "current",
+      "occurredAt",
+    ], "memory authority projection entry");
+    if (
+      typeof entry.key !== "string" ||
+      entry.key.length === 0 ||
+      Buffer.byteLength(entry.key, "utf8") > 512 ||
+      typeof entry.fingerprint !== "string" ||
+      !SHA256.test(entry.fingerprint) ||
+      typeof entry.recordId !== "string" ||
+      !MEMORY_RECORD_ID.test(entry.recordId) ||
+      !AUTHORITY_BOUND_PROJECTION_SOURCES.has(entry.sourceKind) ||
+      typeof entry.current !== "boolean" ||
+      typeof entry.occurredAt !== "string" ||
+      !Number.isFinite(Date.parse(entry.occurredAt)) ||
+      new Date(Date.parse(entry.occurredAt)).toISOString() !== entry.occurredAt
+    ) {
+      throw memoryError(
+        "MEMORY_JOURNAL_CORRUPTED",
+        "memory authority projection entry 值无效",
+        503,
+      );
+    }
+    let binding = null;
+    if (entry.binding !== null) {
+      try {
+        binding = normalizePullRequestExecutionBinding(entry.binding);
+      } catch (cause) {
+        throw memoryError(
+          "MEMORY_JOURNAL_CORRUPTED",
+          "memory authority projection binding 无效",
+          503,
+          cause,
+        );
+      }
+      if (!isDeepStrictEqual(binding, entry.binding)) {
+        throw memoryError(
+          "MEMORY_JOURNAL_CORRUPTED",
+          "memory authority projection binding 非规范",
+          503,
+        );
+      }
+    }
+    const record = recordsById.get(entry.recordId);
+    let content;
+    try {
+      content = JSON.parse(record?.content);
+    } catch {
+      content = null;
+    }
+    const authority = content?.authority;
+    const bindingMatches = authority?.applies === true
+      ? binding !== null && isDeepStrictEqual(binding, authority.inputBinding)
+      : binding === null && authority?.applies === false;
+    const kindBindingMatches = entry.sourceKind === "confirmation"
+      ? authority?.applies === true &&
+        isDeepStrictEqual(content?.action?.inputBinding, authority.inputBinding)
+      : entry.sourceKind === "external-result"
+        ? authority?.applies === true &&
+          isDeepStrictEqual(content?.inputBinding, authority.inputBinding)
+        : true;
+    if (
+      record?.source.kind !== entry.sourceKind ||
+      record.occurredAt !== entry.occurredAt ||
+      authority?.current !== entry.current ||
+      !bindingMatches ||
+      !kindBindingMatches
+    ) {
+      throw memoryError(
+        "MEMORY_JOURNAL_CORRUPTED",
+        "memory authority projection record 引用无效",
+        503,
+      );
+    }
+    return {
+      key: entry.key,
+      fingerprint: entry.fingerprint,
+      recordId: entry.recordId,
+      sourceKind: entry.sourceKind,
+      binding,
+      current: entry.current,
+      occurredAt: entry.occurredAt,
+    };
+  });
+  if (new Set(entries.map(({ key }) => key)).size !== entries.length) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection key 重复",
+      503,
+    );
+  }
+  if (new Set(entries.map(({ recordId }) => recordId)).size !== entries.length) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "memory authority projection record 重复引用",
+      503,
+    );
+  }
+  return {
+    schemaVersion: 4,
+    revision,
+    workLedgerRevision,
+    authorityStateDigest,
+    confirmationHighWatermark,
+    entries,
+  };
+}
+
 function normalizeLifecycleAuthority(value, records) {
+  const schemaVersion = value?.schemaVersion;
   const fields = exact(value, [
     "schemaVersion",
     "baseCursor",
@@ -454,8 +707,9 @@ function normalizeLifecycleAuthority(value, records) {
     "workLedgerRevision",
     "graphReceipts",
     "workItemAttestations",
+    ...(schemaVersion === 2 ? ["authorityProjection"] : []),
   ], "memory lifecycle authority");
-  if (fields.schemaVersion !== 1) {
+  if (![1, 2].includes(fields.schemaVersion)) {
     throw memoryError(
       "MEMORY_JOURNAL_CORRUPTED",
       "memory lifecycle authority 无效",
@@ -491,6 +745,55 @@ function normalizeLifecycleAuthority(value, records) {
     records.length,
     "workItemAttestations",
   ).map((attestation) => normalizeWorkItemAttestation(attestation, recordsById));
+  const authorityProjection = fields.schemaVersion === 1
+    ? emptyLifecycleAuthority().authorityProjection
+    : normalizeAuthorityProjection(fields.authorityProjection, recordsById);
+  const activeAuthorityRecordIds = new Set(
+    authorityProjection.entries.map(({ recordId }) => recordId),
+  );
+  const supersededAuthorityRecordIds = new Set();
+  for (const record of records) {
+    if (!AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind)) continue;
+    for (const evidence of record.evidence) {
+      if (!evidence.startsWith("supersedes:")) continue;
+      const supersededId = evidence.slice("supersedes:".length);
+      const superseded = recordsById.get(supersededId);
+      if (
+        superseded?.source.kind !== record.source.kind ||
+        supersededId === record.recordId
+      ) {
+        throw memoryError(
+          "MEMORY_JOURNAL_CORRUPTED",
+          "memory authority projection supersession 无效",
+          503,
+        );
+      }
+      supersededAuthorityRecordIds.add(supersededId);
+    }
+  }
+  const currentProjectionSchema =
+    fields.schemaVersion === 2 && fields.authorityProjection.schemaVersion === 4;
+  if (
+    currentProjectionSchema &&
+    records.some((record) => {
+      if (!AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind)) {
+        return false;
+      }
+      let current = false;
+      try {
+        current = JSON.parse(record.content).authority.current === true;
+      } catch {}
+      return current &&
+        !activeAuthorityRecordIds.has(record.recordId) &&
+        !supersededAuthorityRecordIds.has(record.recordId);
+    })
+  ) {
+    throw memoryError(
+      "MEMORY_JOURNAL_CORRUPTED",
+      "current authority memory 缺少投影 checkpoint",
+      503,
+    );
+  }
   if (
     baseCursor > graphCursor ||
     authorityStateDigest === null ||
@@ -531,7 +834,7 @@ function normalizeLifecycleAuthority(value, records) {
     );
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     baseCursor,
     baseCheckpointDigest,
     graphCursor,
@@ -540,6 +843,7 @@ function normalizeLifecycleAuthority(value, records) {
     workLedgerRevision,
     graphReceipts,
     workItemAttestations,
+    authorityProjection,
   };
 }
 
@@ -613,7 +917,12 @@ function normalizeJournal(value, limits) {
       error,
     );
   }
-  const records = rawRecords.map(storedRecord);
+  const records = rawRecords.map((value) => {
+    const record = storedRecord(value);
+    return AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind)
+      ? projectionRecord(record)
+      : record;
+  });
   if (new Set(records.map(({ recordId }) => recordId)).size !== records.length) {
     throw memoryError(
       "MEMORY_JOURNAL_CORRUPTED",
@@ -641,6 +950,59 @@ function normalizeJournal(value, limits) {
     );
   }
   return normalized;
+}
+
+function normalizeJournalLimits({
+  maximumRecords = DEFAULT_MAX_RECORDS,
+  maximumStateBytes = DEFAULT_MAX_STATE_BYTES,
+} = {}) {
+  return Object.freeze({
+    maximumRecords: positiveInteger(
+      maximumRecords,
+      "maximumRecords",
+      100_000,
+    ),
+    maximumStateBytes: positiveInteger(
+      maximumStateBytes,
+      "maximumStateBytes",
+      256 * 1024 * 1024,
+    ),
+  });
+}
+
+export function normalizeMemoryJournalState(value, options = {}) {
+  return normalizeJournal(value, normalizeJournalLimits(options));
+}
+
+export function normalizeMemoryAuthorityProjectionReferences(value, records) {
+  const normalizedRecords = strictArray(
+    records,
+    100_000,
+    "memory authority projection records",
+  ).map(storedRecord).map((record) =>
+    AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind)
+      ? projectionRecord(record)
+      : record
+  );
+  const recordsById = new Map(
+    normalizedRecords.map((record) => [record.recordId, record]),
+  );
+  return structuredClone(normalizeAuthorityProjection(value, recordsById));
+}
+
+export function normalizeMemoryAuthorityProjectionState(
+  value,
+  journal,
+  options = {},
+) {
+  const normalizedJournal = normalizeJournal(
+    journal,
+    normalizeJournalLimits(options),
+  );
+  const recordsById = new Map(
+    normalizedJournal.records.map((record) => [record.recordId, record]),
+  );
+  return structuredClone(normalizeAuthorityProjection(value, recordsById));
 }
 
 function serializedBytes(value) {
@@ -763,6 +1125,28 @@ function indexMatches(value, expected) {
       index.entries !== null &&
       typeof index.entries === "object" &&
       !Array.isArray(index.entries)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function buildMemoryJournalIndexState(journal, options = {}) {
+  const normalized = normalizeMemoryJournalState(journal, options);
+  return structuredClone(
+    buildIndex(normalized.records, normalized.revision).persisted,
+  );
+}
+
+export function isMemoryJournalIndexStateCurrent(
+  value,
+  journal,
+  options = {},
+) {
+  try {
+    return isDeepStrictEqual(
+      value,
+      buildMemoryJournalIndexState(journal, options),
     );
   } catch {
     return false;
@@ -927,6 +1311,11 @@ function currentGraphRecordIds(records, graphReceipts) {
 
 function supersededRecordIds(records, lifecycleAuthority) {
   const result = new Set();
+  const activeAuthorityRecordIds = new Set(
+    lifecycleAuthority.authorityProjection.entries.map(
+      ({ recordId }) => recordId,
+    ),
+  );
   const workItemRecords = new Map();
   const workAttestationById = new Map(
     lifecycleAuthority.workItemAttestations.map((entry) => [entry.recordId, entry]),
@@ -968,6 +1357,12 @@ function supersededRecordIds(records, lifecycleAuthority) {
     lifecycleAuthority.graphReceipts,
   );
   for (const record of records) {
+    if (
+      AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind) &&
+      !activeAuthorityRecordIds.has(record.recordId)
+    ) {
+      result.add(record.recordId);
+    }
     for (const item of record.evidence) {
       if (item.startsWith("supersedes:")) {
         const recordId = item.slice("supersedes:".length);
@@ -1116,6 +1511,93 @@ function projectionRecord(record) {
     "可信工作历史投影无效",
     409,
   );
+  if (AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind)) {
+    let content;
+    try {
+      content = JSON.parse(record.content);
+    } catch {
+      throw invalid();
+    }
+    let authority;
+    try {
+      authority = exact(
+        content?.authority,
+        ["applies", "current", "bindingDigest", "inputBinding"],
+        "memory projection authority",
+      );
+    } catch {
+      throw invalid();
+    }
+    const obsolete = record.tags.includes("obsolete");
+    const eventPrefix = `${record.source.kind.replaceAll("-", "_")}.`;
+    const forbidden = new Set([
+      "credential",
+      "credentials",
+      "header",
+      "headers",
+      "body",
+      "localPath",
+      "absolutePath",
+    ]);
+    const safeTree = (value, depth = 0) => {
+      if (depth > 24) return false;
+      if (Array.isArray(value)) {
+        return value.every((entry) => safeTree(entry, depth + 1));
+      }
+      if (value === null || typeof value !== "object") return true;
+      return Object.keys(value).every(
+        (key) => !forbidden.has(key) && safeTree(value[key], depth + 1),
+      );
+    };
+    const supersessions = record.evidence.filter((entry) =>
+      entry.startsWith("supersedes:")
+    );
+    if (
+      content === null ||
+      typeof content !== "object" ||
+      Array.isArray(content) ||
+      content.memoryType !== record.source.kind ||
+      typeof authority.applies !== "boolean" ||
+      typeof authority.current !== "boolean" ||
+      obsolete === authority.current ||
+      record.tags[0] !== record.source.kind ||
+      record.tags.includes("derived") ||
+      !record.eventType.startsWith(eventPrefix) ||
+      record.sourceUrl !== null ||
+      supersessions.length > 1 ||
+      supersessions.some((entry) =>
+        !MEMORY_RECORD_ID.test(entry.slice("supersedes:".length))
+      ) ||
+      !safeTree(content)
+    ) {
+      throw invalid();
+    }
+    if (authority.applies) {
+      let inputBinding;
+      try {
+        inputBinding = normalizePullRequestExecutionBinding(
+          authority.inputBinding,
+        );
+      } catch {
+        throw invalid();
+      }
+      if (
+        !isDeepStrictEqual(authority.inputBinding, inputBinding) ||
+        typeof authority.bindingDigest !== "string" ||
+        !SHA256.test(authority.bindingDigest) ||
+        authority.bindingDigest !== digestValue(inputBinding)
+      ) {
+        throw invalid();
+      }
+    } else if (
+      authority.inputBinding !== null ||
+      authority.bindingDigest !== null ||
+      ["confirmation", "external-result"].includes(record.source.kind)
+    ) {
+      throw invalid();
+    }
+    return record;
+  }
   if (record.source.kind === "legacy-pr-memory") {
     if (
       record.roleId !== "pr-reviewer" ||
@@ -1251,6 +1733,196 @@ function graphReceiptForEvent(value) {
         : null,
     },
   };
+}
+
+function prepareAuthorityProjectionCommit(
+  journal,
+  value,
+  adoptedPreviousEntries = [],
+) {
+  const input = exact(
+    value,
+    ["records", "projectionState"],
+    "authority projection append",
+  );
+  if (
+    !Object.hasOwn(input, "records") ||
+    !Object.hasOwn(input, "projectionState")
+  ) {
+    throw memoryError(
+      "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+      "权威记忆投影提交无效",
+      409,
+    );
+  }
+  const supplied = strictArray(
+    input.records,
+    journal.records.length + MAX_AUTHORITY_PROJECTION_ENTRIES,
+    "records",
+  );
+  const records = supplied.map(normalizeMemoryRecord).map(projectionRecord);
+  const recordsById = new Map(
+    journal.records.map((record) => [record.recordId, record]),
+  );
+  for (const record of records) recordsById.set(record.recordId, record);
+  let projectionState;
+  try {
+    projectionState = normalizeAuthorityProjection(
+      input.projectionState,
+      recordsById,
+    );
+  } catch (cause) {
+    throw memoryError(
+      "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+      "权威记忆投影 checkpoint 无效",
+      409,
+      cause,
+    );
+  }
+  const previous = journal.lifecycleAuthority.authorityProjection;
+  const nextEntryByRecordId = new Map(
+    projectionState.entries.map((entry) => [entry.recordId, entry]),
+  );
+  const previousEntryByRecordId = new Map(
+    [...previous.entries, ...adoptedPreviousEntries].map(
+      (entry) => [entry.recordId, entry],
+    ),
+  );
+  for (const record of records) {
+    if (nextEntryByRecordId.has(record.recordId)) continue;
+    let content;
+    try {
+      content = JSON.parse(record.content);
+    } catch {
+      content = null;
+    }
+    const supersessions = record.evidence.filter((entry) =>
+      entry.startsWith("supersedes:")
+    );
+    const priorRecordId = supersessions.length === 1
+      ? supersessions[0].slice("supersedes:".length)
+      : null;
+    if (
+      content?.lifecycleOnly !== true ||
+      content?.authority?.current !== false ||
+      priorRecordId === null ||
+      !previousEntryByRecordId.has(priorRecordId)
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "权威记忆记录未绑定投影 checkpoint",
+        409,
+      );
+    }
+  }
+  const replay = projectionState.revision === previous.revision;
+  if (
+    (replay && !isDeepStrictEqual(projectionState, previous)) ||
+    (!replay && projectionState.revision !== previous.revision + 1) ||
+    projectionState.workLedgerRevision < previous.workLedgerRevision ||
+    (projectionState.workLedgerRevision === previous.workLedgerRevision &&
+      projectionState.authorityStateDigest !== previous.authorityStateDigest) ||
+    projectionState.confirmationHighWatermark <
+      previous.confirmationHighWatermark
+  ) {
+    throw memoryError(
+      "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+      "权威记忆投影 checkpoint 不连续",
+      409,
+    );
+  }
+  return { records, projectionState };
+}
+
+function applyMemoryAuthorityProjectionCandidateCore(
+  journal,
+  value,
+  options,
+  adoptedProjectionState,
+) {
+  const limits = normalizeJournalLimits(options);
+  const normalizedJournal = normalizeJournal(journal, limits);
+  const adoptedPreviousEntries = adoptedProjectionState === null
+    ? []
+    : normalizeAuthorityProjection(
+        adoptedProjectionState,
+        new Map(
+          normalizedJournal.records.map((record) => [record.recordId, record]),
+        ),
+      ).entries;
+  const { records, projectionState } = prepareAuthorityProjectionCommit(
+    normalizedJournal,
+    value,
+    adoptedPreviousEntries,
+  );
+  const recordsById = new Map(
+    normalizedJournal.records.map((record) => [record.recordId, record]),
+  );
+  let added = 0;
+  for (const record of records) {
+    const existing = recordsById.get(record.recordId);
+    if (existing !== undefined) {
+      if (existing.contentDigest !== record.contentDigest) {
+        throw memoryError("MEMORY_ID_CONFLICT", "统一记忆 ID 冲突", 409);
+      }
+      continue;
+    }
+    recordsById.set(record.recordId, record);
+    added += 1;
+  }
+  const lifecycleAuthority = {
+    ...normalizedJournal.lifecycleAuthority,
+    authorityProjection: projectionState,
+  };
+  const authorityChanged = !isDeepStrictEqual(
+    lifecycleAuthority,
+    normalizedJournal.lifecycleAuthority,
+  );
+  if (!added && !authorityChanged) return normalizedJournal;
+  const candidate = {
+    schemaVersion: 2,
+    revision: normalizedJournal.revision + 1,
+    records: [...recordsById.values()],
+    lifecycleAuthority,
+  };
+  if (
+    candidate.records.length > limits.maximumRecords ||
+    serializedBytes(candidate) > limits.maximumStateBytes
+  ) {
+    throw memoryError(
+      "MEMORY_CAPACITY_EXCEEDED",
+      "统一记忆已达到本地容量上限",
+      507,
+    );
+  }
+  return normalizeJournal(candidate, limits);
+}
+
+export function applyMemoryAuthorityProjectionCandidate(
+  journal,
+  value,
+  options = {},
+) {
+  return applyMemoryAuthorityProjectionCandidateCore(
+    journal,
+    value,
+    options,
+    null,
+  );
+}
+
+export function applyMemoryAuthorityProjectionAdoptionCandidate(
+  journal,
+  value,
+  adoptedProjectionState,
+  options = {},
+) {
+  return applyMemoryAuthorityProjectionCandidateCore(
+    journal,
+    value,
+    options,
+    adoptedProjectionState,
+  );
 }
 
 export class LocalMemoryJournal {
@@ -1516,9 +2188,118 @@ export class LocalMemoryJournal {
     if (supplied.length === 0) {
       throw memoryError("MEMORY_INPUT_INVALID", "records 不能为空");
     }
-    const records = supplied.map(normalizeMemoryRecord).map(projectionRecord);
+    const records = supplied.map(normalizeMemoryRecord);
+    if (records.some(({ source }) =>
+      AUTHORITY_BOUND_PROJECTION_SOURCES.has(source.kind)
+    )) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
+        "权威记忆必须与投影 checkpoint 原子提交",
+        409,
+      );
+    }
+    records.forEach(projectionRecord);
     return this.#operationQueue.enqueue(() =>
       this.#exclusiveLease.run(() => this.#append(records)),
+    );
+  }
+
+  appendAuthorityProjection(value) {
+    const input = exact(
+      value,
+      ["records", "projectionState"],
+      "authority projection append",
+    );
+    if (
+      !Object.hasOwn(input, "records") ||
+      !Object.hasOwn(input, "projectionState")
+    ) {
+      throw memoryError(
+        "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+        "权威记忆投影提交无效",
+        409,
+      );
+    }
+    const supplied = strictArray(
+      input.records,
+      this.#limits.maximumRecords,
+      "records",
+    );
+    const records = supplied.map(normalizeMemoryRecord).map(projectionRecord);
+    return this.#operationQueue.enqueue(() =>
+      this.#exclusiveLease.run(() => {
+        const recordsById = new Map(this.#recordsById);
+        for (const record of records) recordsById.set(record.recordId, record);
+        let projectionState;
+        try {
+          projectionState = normalizeAuthorityProjection(
+            input.projectionState,
+            recordsById,
+          );
+        } catch (cause) {
+          throw memoryError(
+            "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+            "权威记忆投影 checkpoint 无效",
+            409,
+            cause,
+          );
+        }
+        const previous = this.#journal.lifecycleAuthority.authorityProjection;
+        const nextEntryByRecordId = new Map(
+          projectionState.entries.map((entry) => [entry.recordId, entry]),
+        );
+        const previousEntryByRecordId = new Map(
+          previous.entries.map((entry) => [entry.recordId, entry]),
+        );
+        for (const record of records) {
+          if (nextEntryByRecordId.has(record.recordId)) continue;
+          let content;
+          try {
+            content = JSON.parse(record.content);
+          } catch {
+            content = null;
+          }
+          const supersessions = record.evidence.filter((entry) =>
+            entry.startsWith("supersedes:")
+          );
+          const priorRecordId = supersessions.length === 1
+            ? supersessions[0].slice("supersedes:".length)
+            : null;
+          if (
+            content?.lifecycleOnly !== true ||
+            content?.authority?.current !== false ||
+            priorRecordId === null ||
+            !previousEntryByRecordId.has(priorRecordId)
+          ) {
+            throw memoryError(
+              "MEMORY_LIFECYCLE_AUTHORITY_INVALID",
+              "权威记忆记录未绑定投影 checkpoint",
+              409,
+            );
+          }
+        }
+        const replay = projectionState.revision === previous.revision;
+        if (
+          (replay && !isDeepStrictEqual(projectionState, previous)) ||
+          (!replay && projectionState.revision !== previous.revision + 1) ||
+          projectionState.workLedgerRevision < previous.workLedgerRevision ||
+          (projectionState.workLedgerRevision === previous.workLedgerRevision &&
+            projectionState.authorityStateDigest !==
+              previous.authorityStateDigest) ||
+          projectionState.confirmationHighWatermark <
+            previous.confirmationHighWatermark
+        ) {
+          throw memoryError(
+            "MEMORY_LIFECYCLE_AUTHORITY_CONFLICT",
+            "权威记忆投影 checkpoint 不连续",
+            409,
+          );
+        }
+        return this.#append(records, {
+          ...this.#journal.lifecycleAuthority,
+          authorityProjection: projectionState,
+        });
+      }),
     );
   }
 
@@ -1623,6 +2404,11 @@ export class LocalMemoryJournal {
     });
   }
 
+  getAuthorityProjectionState() {
+    this.#assertReady();
+    return structuredClone(this.#journal.lifecycleAuthority.authorityProjection);
+  }
+
   requiresLiveAuthority() {
     this.#assertReady();
     const authority = this.#journal.lifecycleAuthority;
@@ -1630,6 +2416,14 @@ export class LocalMemoryJournal {
       authority.graphReceipts.length > 0 ||
       authority.workItemAttestations.length > 0 ||
       this.#journal.records.some(requiresLiveLedgerAuthority)
+    );
+  }
+
+  requiresAuthorityProjectionCheckpoint() {
+    this.#assertReady();
+    const projection = this.#journal.lifecycleAuthority.authorityProjection;
+    return projection.entries.length > 0 || this.#journal.records.some(
+      ({ source }) => AUTHORITY_BOUND_PROJECTION_SOURCES.has(source.kind),
     );
   }
 

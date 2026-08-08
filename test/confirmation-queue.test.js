@@ -4,10 +4,28 @@ import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.j
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
+  CONFIRMATION_HISTORY_KINDS,
   CONFIRMATION_HISTORY_MAX_ROLE_FACETS,
   ConfirmationExecutionError,
   ConfirmationQueue,
 } from "../src/services/confirmation-queue.js";
+import {
+  pullRequestExternalActionQueuePlan,
+} from "./support/pull-request-external-action-fixture.js";
+
+test("history recognizes every independently confirmed PR external action", () => {
+  assert.deepEqual(
+    CONFIRMATION_HISTORY_KINDS.filter((kind) => kind.startsWith("github.")),
+    [
+      "github.pull-request-review",
+      "github.work-proposal-review",
+      "github.pull-request-comment",
+      "github.pull-request-update-branch",
+      "github.pull-request-push",
+      "github.pull-request-merge",
+    ],
+  );
+});
 
 class MemoryStore {
   constructor(initial = null) {
@@ -51,11 +69,11 @@ function createClock(...timestamps) {
 function actionPlan(overrides = {}) {
   const actor = overrides.actor || {
     provider: "github",
-    accountId: "SV-li-zhenhui",
+    accountId: "local-owner",
   };
   const target = overrides.target || {
     provider: "github",
-    resourceId: "SVisions/OCT-Software#42",
+    resourceId: "acme/command-center#42",
     version: "0123456789abcdef0123456789abcdef01234567",
   };
   const action = overrides.action || {
@@ -73,7 +91,7 @@ function actionPlan(overrides = {}) {
       target,
       action,
       subject: {
-        repository: "SVisions/OCT-Software",
+        repository: "acme/command-center",
         number: 42,
         headRefOid: "0123456789abcdef0123456789abcdef01234567",
       },
@@ -295,6 +313,103 @@ test("enqueue freezes an exact plan and is idempotent only for the same binding"
     queue.enqueue(actionPlan({ action: { type: "pull_request_review", reviewEvent: "COMMENT", body: "changed" } })),
     (error) => error.code === "CONFIRMATION_ID_CONFLICT" && error.statusCode === 409,
   );
+});
+
+test("recovery status exposes only sorted distinct uncertain kinds without executor calls", async () => {
+  const store = new MemoryStore();
+  const executeCalls = [];
+  const actionExecutor = executor({
+    async execute(envelope) {
+      executeCalls.push(structuredClone(envelope));
+      throw new ConfirmationExecutionError(
+        "TEST_EXTERNAL_OUTCOME_UNKNOWN",
+        "unknown",
+      );
+    },
+  });
+  const queue = await readyQueue({ store, actionExecutor });
+  for (const [id, kind, action] of [
+    [
+      "confirmation-recovery-push",
+      "github.pull-request-push",
+      { type: "pull_request_push", secret: "push-private-payload" },
+    ],
+    [
+      "confirmation-recovery-comment",
+      "github.pull-request-comment",
+      { type: "pull_request_comment", body: "comment-private-body" },
+    ],
+  ]) {
+    await queue.enqueue(actionPlan({ id, kind, action }));
+    const next = await queue.next();
+    await queue.approve(
+      next.item.id,
+      approvalRequest(next, `request-${id}`),
+    );
+  }
+  await queue.enqueue(actionPlan({
+    id: "confirmation-recovery-pending",
+    kind: "github.pull-request-merge",
+    action: { type: "pull_request_merge", method: "squash" },
+  }));
+  const writesBeforeRead = store.writeCount;
+  const callsBeforeRead = executeCalls.length;
+
+  const status = await queue.readRecoveryStatus();
+
+  assert.deepEqual(status, {
+    kinds: [
+      "github.pull-request-comment",
+      "github.pull-request-push",
+    ],
+  });
+  assert.equal(Object.isFrozen(status), true);
+  assert.equal(Object.isFrozen(status.kinds), true);
+  assert.equal(store.writeCount, writesBeforeRead);
+  assert.equal(executeCalls.length, callsBeforeRead);
+  const serialized = JSON.stringify(status);
+  for (const privateValue of [
+    "confirmation-recovery",
+    "push-private-payload",
+    "comment-private-body",
+    "request-confirmation",
+  ]) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+});
+
+test("recovery status reads a durable executing kind without waiting for executor completion", async () => {
+  let releaseExecution;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const released = new Promise((resolve) => { releaseExecution = resolve; });
+  const queue = await readyQueue({
+    actionExecutor: executor({
+      async execute() {
+        markStarted();
+        await released;
+        return { status: "applied", receipt: { id: "done" } };
+      },
+    }),
+  });
+  await queue.enqueue(actionPlan({
+    id: "confirmation-recovery-executing",
+    kind: "github.pull-request-merge",
+    action: { type: "pull_request_merge", method: "squash" },
+  }));
+  const next = await queue.next();
+  const approval = queue.approve(
+    next.item.id,
+    approvalRequest(next, "request-recovery-executing"),
+  );
+  await started;
+
+  assert.deepEqual(await queue.readRecoveryStatus(), {
+    kinds: ["github.pull-request-merge"],
+  });
+
+  releaseExecution();
+  await approval;
 });
 
 test("history listing is read-only, newest-first, cursor paged, filtered, and safely projected", async () => {
@@ -685,6 +800,69 @@ test("application result snapshots expose only immutable minimal projections", a
     items: [],
   });
   assert.equal(Object.isFrozen(unchanged.items), true);
+});
+
+test("confirmation memory pages are sanitized, high-water bound, and restart stable", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  const secretBody = "Do not retain C:\\private\\secret.txt or token=hidden";
+  await queue.enqueue(pullRequestExternalActionQueuePlan({
+    type: "comment",
+    body: secretBody,
+  }));
+  const next = await queue.next();
+  await queue.approve(
+    next.item.id,
+    approvalRequest(next, "memory-page-approval"),
+  );
+
+  const first = await queue.readMemoryPage({
+    cursor: 0,
+    limit: 100,
+    highWatermark: null,
+  });
+  assert.deepEqual(await queue.readMemoryStatus(), {
+    highWatermark: first.highWatermark,
+  });
+
+  assert.equal(first.items.length, 1);
+  assert.equal(first.items[0].status, "completed");
+  assert.equal(first.items[0].action.type, "pull_request_comment");
+  assert.equal(first.items[0].action.inputBinding.schemaVersion, 2);
+  assert.match(first.items[0].action.bodyDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(first.items[0].action.bodyBytes, Buffer.byteLength(secretBody));
+  assert.deepEqual(first.items[0].receipt, { id: "review-42" });
+  const serialized = JSON.stringify(first);
+  assert.equal(serialized.includes(secretBody), false);
+  assert.equal(serialized.includes("C:\\private"), false);
+  assert.equal(serialized.includes("token=hidden"), false);
+
+  const recovered = await readyQueue({ store });
+  assert.deepEqual(
+    await recovered.readMemoryPage({
+      cursor: 0,
+      limit: 100,
+      highWatermark: null,
+    }),
+    first,
+  );
+
+  await recovered.enqueue(pullRequestExternalActionQueuePlan(
+    { type: "comment", body: "Second action" },
+    { proposalId: "proposal-comment-second" },
+  ));
+  assert.equal(
+    (await recovered.readMemoryStatus()).highWatermark > first.highWatermark,
+    true,
+  );
+  await assert.rejects(
+    recovered.readMemoryPage({
+      cursor: 0,
+      limit: 100,
+      highWatermark: first.highWatermark,
+    }),
+    (error) => error?.code === "CONFIRMATION_MEMORY_SOURCE_CHANGED",
+  );
 });
 
 test("application result snapshots sort deterministically and reject invalid cursors", async () => {
@@ -1531,6 +1709,128 @@ test("startup recovery reconciles an applied action after the final local write 
   assert.equal(recoveryExecutor.executeCalls.length, 0);
 });
 
+test("startup recovery never turns an unknown action into a retryable absence", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store, actionExecutor: executor() });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  store.failWriteAt = store.writeCount + 2;
+
+  await assert.rejects(queue.approve(next.item.id, approvalRequest(next)), /disk unavailable/);
+  assert.equal(store.value.items[0].status, "executing");
+  store.failWriteAt = null;
+
+  const recoveryExecutor = executor({
+    async reconcile(envelope) {
+      this.reconcileCalls.push(structuredClone(envelope));
+      return { status: "absent", code: "GITHUB_MARKER_ABSENT" };
+    },
+  });
+  const recovered = await readyQueue({ store, actionExecutor: recoveryExecutor });
+  const item = await recovered.get(next.item.id);
+
+  assert.equal(item.status, "failed");
+  assert.equal(item.retryable, false);
+  assert.deepEqual(item.failure, {
+    code: "EXTERNAL_OUTCOME_UNKNOWN",
+    outcome: "unknown",
+    retryable: false,
+    at: "2026-08-02T01:00:00.000Z",
+  });
+  assert.equal((await recovered.next()).item, null);
+  assert.equal(recoveryExecutor.reconcileCalls.length, 1);
+  assert.equal(recoveryExecutor.executeCalls.length, 0);
+});
+
+test("unknown external recovery blocks configuration activation across restarts", async () => {
+  const store = new MemoryStore();
+  const clock = () => new Date("2026-08-02T02:00:00.000Z");
+  const firstExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      if (envelope.kind === "github.pull-request-review") {
+        throw new ConfirmationExecutionError(
+          "GITHUB_RESPONSE_LOST",
+          "unknown",
+        );
+      }
+      return { status: "applied", receipt: { id: "configuration-v2" } };
+    },
+  });
+  const first = await readyQueue({ store, actionExecutor: firstExecutor, clock });
+  await first.enqueue(actionPlan());
+  let next = await first.next();
+  const unknown = await first.approve(next.item.id, approvalRequest(next));
+  const configuration = await first.enqueue(
+    configurationPlan("activate_draft", "blocked-by-recovery"),
+  );
+  next = await first.nextForAction(
+    "local.configuration-activate",
+    "activate_draft",
+  );
+
+  assert.equal(unknown.failure.outcome, "unknown");
+  await assert.rejects(
+    first.approve(next.item.id, approvalRequest(next, "activate-before-recovery")),
+    (error) => error.code === "CONFIRMATION_RECOVERY_REQUIRED",
+  );
+  assert.equal((await first.get(configuration.id)).status, "pending");
+  assert.equal(firstExecutor.executeCalls.length, 1);
+
+  const stillUnknownExecutor = executor({
+    async reconcile(envelope) {
+      this.reconcileCalls.push(structuredClone(envelope));
+      throw new ConfirmationExecutionError(
+        "GITHUB_OBSERVATION_UNAVAILABLE",
+        "unknown",
+      );
+    },
+  });
+  const second = await readyQueue({
+    store,
+    actionExecutor: stillUnknownExecutor,
+    clock,
+  });
+  next = await second.nextForAction(
+    "local.configuration-activate",
+    "activate_draft",
+  );
+  await assert.rejects(
+    second.approve(next.item.id, approvalRequest(next, "activate-after-restart")),
+    (error) => error.code === "CONFIRMATION_RECOVERY_REQUIRED",
+  );
+  assert.equal(stillUnknownExecutor.executeCalls.length, 0);
+  assert.equal(stillUnknownExecutor.reconcileCalls.length, 1);
+
+  const recoveredExecutor = executor({
+    async reconcile(envelope) {
+      this.reconcileCalls.push(structuredClone(envelope));
+      return { status: "already", receipt: { id: "review-42" } };
+    },
+  });
+  const third = await readyQueue({
+    store,
+    actionExecutor: recoveredExecutor,
+    clock,
+  });
+  next = await third.nextForAction(
+    "local.configuration-activate",
+    "activate_draft",
+  );
+  const activated = await third.approve(
+    next.item.id,
+    approvalRequest(next, "activate-after-recovery"),
+  );
+
+  assert.equal(activated.status, "completed");
+  assert.equal(recoveredExecutor.reconcileCalls.length, 1);
+  assert.equal(recoveredExecutor.executeCalls.length, 1);
+  assert.equal(
+    recoveredExecutor.executeCalls[0].kind,
+    "local.configuration-activate",
+  );
+});
+
 test("corrupted durable state fails closed without making the queue ready", async () => {
   const store = new MemoryStore({ schemaVersion: 1, revision: 1, items: [{ id: "bad" }] });
   const queue = new ConfirmationQueue({
@@ -1662,7 +1962,7 @@ test("executor receipts are whitelisted before they reach durable or public stat
         status: "applied",
         receipt: {
           id: "review-43",
-          url: "https://github.com/SVisions/OCT-Software/pull/42?token=must-not-persist",
+          url: "https://github.com/acme/command-center/pull/42?token=must-not-persist",
         },
       };
     },

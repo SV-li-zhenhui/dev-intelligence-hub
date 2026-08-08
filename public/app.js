@@ -12,6 +12,7 @@ import {
   createConfigurationFormState,
 } from "./configuration-form-support.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
+import { renderSystemStatus } from "./system-status-view.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 
@@ -146,6 +147,14 @@ let configurationPreview = null;
 let configurationOperationPending = false;
 let configurationNotice = "";
 let configurationAutoSelected = false;
+let systemStatusState = null;
+let systemStatusError = "";
+let systemStatusLoading = false;
+let systemStatusOperationPending = false;
+let systemStatusNotice = "";
+let systemStatusRequestSequence = 0;
+let lastAppliedSystemStatusRequest = 0;
+let systemStatusAbortController = null;
 const MAX_DEFERRED_CONFIRMATIONS = 32;
 const deferredConfirmations = new Set();
 
@@ -187,6 +196,7 @@ const viewTitles = {
   workflow: "工作流指挥",
   work: "主动工作台账",
   configuration: "配置中心",
+  system: "系统状态与恢复",
 };
 
 const workflowView = createWorkflowView({
@@ -1326,7 +1336,7 @@ function bindConfirmationHistoryView() {
 }
 
 function render() {
-  if (currentView !== "configuration" && !dashboard) {
+  if (!["configuration", "system"].includes(currentView) && !dashboard) {
     pageTitle.textContent = viewTitles[currentView];
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
@@ -1359,6 +1369,13 @@ function render() {
     workflow: () => workflowView.render(),
     work: () => workView.render(),
     configuration: configurationView,
+    system: () => renderSystemStatus({
+      state: systemStatusState,
+      loading: systemStatusLoading,
+      error: systemStatusError,
+      operationPending: systemStatusOperationPending,
+      notice: systemStatusNotice,
+    }),
   };
   const preservedHistoryPanel = preserveConfirmationHistoryPanel();
   content.innerHTML = views[currentView]();
@@ -1403,8 +1420,87 @@ function render() {
     handleMemoryLocalRerun,
   );
   bindConfigurationView();
+  bindSystemStatusView();
   workflowView.bind(content);
   workView.bind(content);
+}
+
+function bindSystemStatusView() {
+  content.querySelector("[data-system-status-reload]")?.addEventListener(
+    "click",
+    () => void loadSystemStatus(),
+  );
+  content.querySelector("[data-system-backup-create]")?.addEventListener(
+    "click",
+    () => void createSystemBackup(),
+  );
+}
+
+async function loadSystemStatus() {
+  const sequence = ++systemStatusRequestSequence;
+  systemStatusAbortController?.abort();
+  const controller = new AbortController();
+  systemStatusAbortController = controller;
+  systemStatusLoading = true;
+  if (currentView === "system") render();
+  try {
+    const response = await fetch("/api/system/status", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`读取系统状态失败（${response.status}）`);
+    const result = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== systemStatusRequestSequence ||
+      sequence < lastAppliedSystemStatusRequest
+    ) {
+      return false;
+    }
+    lastAppliedSystemStatusRequest = sequence;
+    systemStatusState = result;
+    systemStatusError = "";
+    return true;
+  } catch (error) {
+    if (error?.name === "AbortError") return false;
+    if (sequence === systemStatusRequestSequence) {
+      systemStatusError = error.message || "读取系统状态失败";
+    }
+    return false;
+  } finally {
+    if (systemStatusAbortController === controller) {
+      systemStatusAbortController = null;
+      systemStatusLoading = false;
+      if (currentView === "system") render();
+    }
+  }
+}
+
+async function createSystemBackup() {
+  if (systemStatusOperationPending) return;
+  systemStatusOperationPending = true;
+  systemStatusError = "";
+  systemStatusNotice = "";
+  if (currentView === "system") render();
+  try {
+    const response = await fetch("/api/system/backups", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-mydashboard-action": "1",
+      },
+      body: "{}",
+    });
+    if (!response.ok) throw new Error(`创建备份失败（${response.status}）`);
+    const result = await response.json();
+    systemStatusNotice = `备份 ${result.backupId || ""} 已完成并通过校验。`;
+    await loadSystemStatus();
+  } catch (error) {
+    systemStatusError = error.message || "创建备份失败";
+  } finally {
+    systemStatusOperationPending = false;
+    if (currentView === "system") render();
+  }
 }
 
 function bindConfigurationView() {
@@ -3999,6 +4095,9 @@ async function load({ showConfirmation = true } = {}) {
   if (!hasConfigurationState() || currentView === "configuration") {
     void loadConfiguration();
   }
+  if (currentView === "system") {
+    void loadSystemStatus();
+  }
   try {
     const [nextDashboard, nextConfirmationQueue] = await Promise.all([
       fetchDashboard(),
@@ -4045,6 +4144,15 @@ async function refresh() {
     }
     return;
   }
+  if (currentView === "system") {
+    try {
+      await loadSystemStatus();
+    } finally {
+      refreshButton.disabled = false;
+      refreshButton.classList.remove("loading");
+    }
+    return;
+  }
   const sequence = ++requestSequence;
   try {
     const response = await fetch("/api/refresh", {
@@ -4080,6 +4188,9 @@ function activateView(view) {
   render();
   if (currentView === "configuration") {
     void loadConfiguration();
+  }
+  if (currentView === "system") {
+    void loadSystemStatus();
   }
   if (currentView === "memory" && !memoryLoaded) {
     loadMemories().catch((error) => {
@@ -4154,6 +4265,9 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "0") {
     activateView("configuration");
+  }
+  if (event.key.toLowerCase() === "s") {
+    activateView("system");
   }
 });
 

@@ -9,17 +9,32 @@ export function deepFreeze(value) {
   return value;
 }
 
+const CLI_PROVIDER_INTEGER_LIMITS = deepFreeze({
+  timeoutMs: {
+    "codex-cli": { minimum: 1_000, maximum: 3_600_000 },
+    "claude-cli": { minimum: 1_000, maximum: 3_600_000 },
+  },
+  maxResponseBytes: {
+    "codex-cli": { minimum: 1_024, maximum: 1024 * 1024 },
+    "claude-cli": { minimum: 1_024, maximum: 1024 * 1024 },
+  },
+  maxRequestBytes: {
+    "codex-cli": { minimum: 1_024, maximum: 1024 * 1024 },
+    "claude-cli": { minimum: 1_024, maximum: 1024 * 1024 },
+  },
+});
+
 export const CONFIGURATION_FORM_GROUPS = deepFreeze([
   {
     id: "general",
     label: "基础与 PR 范围",
-    description: "服务刷新、GitHub 身份和需要跟踪的仓库。",
-    roots: ["port", "refreshMinutes", "browserPollSeconds", "githubLogin", "trackedRepositories", "prResponsibility"],
+    description: "服务刷新、GitHub 读取边界、身份和需要跟踪的仓库。",
+    roots: ["port", "refreshMinutes", "browserPollSeconds", "githubLogin", "githubRead", "trackedRepositories", "prResponsibility"],
   },
   {
     id: "brains",
     label: "大脑 Provider",
-    description: "本地或经授权的远程模型端点及凭据引用。",
+    description: "本地端点、经授权的远程模型，以及单任务受监管的 CLI 大脑。",
     roots: ["brain", "brainProviders"],
   },
   {
@@ -71,6 +86,7 @@ const LABELS = deepFreeze({
   refreshMinutes: "数据刷新（分钟）",
   browserPollSeconds: "浏览器轮询（秒）",
   githubLogin: "GitHub 登录名",
+  githubRead: "GitHub 读取",
   trackedRepositories: "跟踪仓库",
   prResponsibility: "PR 责任范围",
   historicalAfterDays: "历史 PR 天数",
@@ -85,6 +101,9 @@ const LABELS = deepFreeze({
   brokerLimits: "文件代理限额",
   executorLimits: "执行器限额",
   maxArtifactBytes: "最大产物字节数",
+  conflictPreparation: "冲突准备",
+  baseMirrorsByRepository: "Base 仓库 Mirror",
+  headMirrorsByRepository: "Head 仓库 Mirror",
   id: "标识",
   sourceRoot: "源码根目录",
   gitHeadSnapshot: "Git Head 固定快照",
@@ -104,6 +123,7 @@ const LABELS = deepFreeze({
   gitCommand: "固定 Git 命令",
   gitTimeoutMs: "Git 超时（毫秒）",
   githubActions: "GitHub 动作",
+  enabledActions: "启用的 PR 外部动作",
   actorAccountId: "GitHub 操作账号",
   tokenEnv: "GitHub Token 环境变量",
   ghCommand: "固定 GitHub CLI 命令",
@@ -149,6 +169,7 @@ const LABELS = deepFreeze({
   capabilityRoles: "能力岗位映射",
   githubReviewRoles: "GitHub Review 岗位",
   codeActionRoles: "代码动作岗位",
+  configurationChangeRoles: "配置变更提案岗位",
   codeOperationsByRole: "岗位代码操作映射",
   workspaceByRepository: "仓库工作区映射",
   memory: "记忆",
@@ -161,6 +182,7 @@ const LABELS = deepFreeze({
   maximumContextBytes: "最大上下文字节数",
   maximumConcurrent: "最大并发数",
   brain: "大脑",
+  taskBrain: "任务大脑",
   localBrain: "本地大脑",
   provider: "Provider",
   model: "模型",
@@ -243,9 +265,24 @@ const INTEGER_FIELDS = deepFreeze([
   { pattern: ["memory", "answering", "maximumContextBytes"], minimum: 1_024, maximum: 128 * 1_024 },
   { pattern: ["memory", "answering", "maximumConcurrent"], minimum: 1, maximum: 16 },
   { pattern: ["brainProviders", "*", "contextTokens"], minimum: 1_024, maximum: 128 * 1_024 },
-  { pattern: ["brainProviders", "*", "timeoutMs"], minimum: 1, maximum: 3_600_000 },
-  { pattern: ["brainProviders", "*", "maxResponseBytes"], minimum: 1, maximum: 2 * 1024 * 1024 },
-  { pattern: ["brainProviders", "*", "maxRequestBytes"], minimum: 1, maximum: 2 * 1024 * 1024 },
+  {
+    pattern: ["brainProviders", "*", "timeoutMs"],
+    minimum: 1,
+    maximum: 3_600_000,
+    limitsByProviderKind: CLI_PROVIDER_INTEGER_LIMITS.timeoutMs,
+  },
+  {
+    pattern: ["brainProviders", "*", "maxResponseBytes"],
+    minimum: 1,
+    maximum: 2 * 1024 * 1024,
+    limitsByProviderKind: CLI_PROVIDER_INTEGER_LIMITS.maxResponseBytes,
+  },
+  {
+    pattern: ["brainProviders", "*", "maxRequestBytes"],
+    minimum: 1,
+    maximum: 2 * 1024 * 1024,
+    limitsByProviderKind: CLI_PROVIDER_INTEGER_LIMITS.maxRequestBytes,
+  },
   ...["timeoutMs", "numCtx", "contextTokens", "maxAssessmentsPerRefresh"].map(
     (name) => ({ pattern: ["brain", name], minimum: 1, maximum: 2 ** 31 - 1 }),
   ),
@@ -290,12 +327,14 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["workflowRouting", "rules", "#", "targets", "#", "type"], control: "select", kind: "text", options: ["role", "person", "node"] },
   { pattern: ["workflowRouting", "rules", "#", "onMatch"], control: "select", kind: "text", options: ["stop", "continue"] },
   { pattern: ["workflowRouting", "rules", "#", "condition", "**", "op"], control: "select", kind: "text", options: ["all", "any", "not", "equals", "oneOf", "hasAny", "hasAll", "globAny", "globAll", "atLeast"] },
-  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents", "#"], control: "select", kind: "text", options: ["ask_user", "wait_condition", "propose_github_review", "propose_code_action", "handoff", "complete", "orchestrate", "submit_delivery"] },
+  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents", "#"], control: "select", kind: "text", options: ["ask_user", "wait_condition", "query_memory", "propose_github_review", "propose_github_pull_request_action", "propose_code_action", "propose_configuration_change", "handoff", "complete", "orchestrate", "submit_delivery"] },
+  { pattern: ["githubActions", "enabledActions", "#"], control: "select", kind: "text", options: ["comment", "review", "update_branch", "push", "merge"] },
   { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*", "#"], control: "select", kind: "text", options: ["inspect", "modify", "verify"] },
   { pattern: ["brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
   { pattern: ["employees", "prReviewer", "brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
   ...[
     ["employees", "roles", "*", "brain", "provider"],
+    ["employees", "roles", "*", "taskBrain", "provider"],
     ["memory", "answering", "brain", "provider"],
     ["memory", "answering", "localBrain", "provider"],
   ].map((pattern) => ({
@@ -312,10 +351,13 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["githubActions", "networkEnv", "*"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["changePackages", "gitCommand"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["codeExecutor", "gitCommand"], kind: "text", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "conflictPreparation", "baseMirrorsByRepository", "*"], kind: "text", format: "absolute-local-path", maximumBytes: 4_096 },
+  { pattern: ["codeExecutor", "conflictPreparation", "headMirrorsByRepository", "*"], kind: "text", format: "absolute-local-path", maximumBytes: 4_096 },
   { pattern: ["trackedRepositories", "#"], kind: "text", format: "repository", maximumBytes: 256 },
   { pattern: ["workCoordination", "policy", "capabilityRoles", "*"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "githubReviewRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "codeActionRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
+  { pattern: ["workCoordination", "policy", "configurationChangeRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "workspaceByRepository", "*"], kind: "text", format: "workspace-id", maximumBytes: 64 },
   { pattern: ["codeExecutor", "profiles", "*", "image"], kind: "text", format: "pinned-image", maximumBytes: 1_024 },
   { pattern: ["codeExecutor", "workspaces", "#", "id"], kind: "text", format: "workspace-id", maximumBytes: 64 },
@@ -336,6 +378,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["employees", "roles", "*", "mission"], kind: "text", maximumBytes: 4_096 },
   { pattern: ["employees", "roles", "*", "workerId"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["employees", "roles", "*", "brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "roles", "*", "taskBrain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["memory", "answering", "brain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["memory", "answering", "localBrain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["workflowRouting", "rules", "#", "id"], kind: "text", format: "safe-id-insensitive", maximumBytes: 128 },
@@ -370,12 +413,24 @@ const COLLECTIONS = deepFreeze([
         template: "provider-ollama",
         keyTemplate: "new-ollama",
       },
+      {
+        id: "codex-cli",
+        label: "Codex CLI（单任务受监管）",
+        template: "provider-codex-cli",
+        keyTemplate: "codex-cli",
+      },
+      {
+        id: "claude-cli",
+        label: "Claude CLI（单任务受监管）",
+        template: "provider-claude-cli",
+        keyTemplate: "claude-cli",
+      },
     ],
     maximum: 100,
     keyFormat: "safe-id",
   },
   { pattern: ["employees", "roles"], kind: "map", label: "岗位", template: "role", keyTemplate: "new-role", maximum: 256, keyFormat: "role-id" },
-  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents"], kind: "array", label: "允许意图", template: "intent", minimum: 1, maximum: 8, uniqueBy: "value" },
+  { pattern: ["employees", "roles", "*", "permissions", "allowedIntents"], kind: "array", label: "允许意图", template: "intent", minimum: 1, maximum: 11, uniqueBy: "value" },
   { pattern: ["employees", "prReviewer", "retryMinutes"], kind: "array", label: "重试间隔", template: "retry-minute", minimum: 1, maximum: 32, uniqueBy: "value" },
   { pattern: ["codeExecutor", "workspaces"], kind: "array", label: "受控工作区", template: "workspace", maximum: 100, uniqueBy: "id", optional: true },
   { pattern: ["codeExecutor", "workspaces", "#", "writablePaths"], kind: "array", label: "可写路径", template: "workspace-path", maximum: 256, uniqueBy: "value" },
@@ -383,7 +438,10 @@ const COLLECTIONS = deepFreeze([
   { pattern: ["codeExecutor", "profiles"], kind: "map", label: "验证 Profile", template: "profile", keyTemplate: "new-profile", maximum: 100, keyFormat: "safe-id", optional: true },
   { pattern: ["codeExecutor", "requiredProfilesByWorkspace"], kind: "map", label: "工作区 Profile 绑定", template: "profile-binding", keyTemplate: "workspace-id", maximum: 256, keyFormat: "workspace-id", optional: true },
   { pattern: ["codeExecutor", "requiredProfilesByWorkspace", "*"], kind: "array", label: "所需 Profile", template: "profile-id", minimum: 1, maximum: 100, uniqueBy: "value" },
+  { pattern: ["codeExecutor", "conflictPreparation", "baseMirrorsByRepository"], kind: "map", label: "Base 仓库 Mirror", template: "local-mirror-path", keyTemplate: "owner/repository", minimum: 1, maximum: 1_000, keyFormat: "controlled-git-repository", optional: true },
+  { pattern: ["codeExecutor", "conflictPreparation", "headMirrorsByRepository"], kind: "map", label: "Head 仓库 Mirror", template: "local-mirror-path", keyTemplate: "owner/repository", minimum: 1, maximum: 1_000, keyFormat: "controlled-git-repository", optional: true },
   { pattern: ["githubActions", "networkEnv"], kind: "map", label: "网络环境映射", template: "network-env", keyTemplate: "HTTPS_PROXY", maximum: 6, keyOptions: ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR"], optional: true },
+  { pattern: ["githubActions", "enabledActions"], kind: "array", label: "启用的 PR 外部动作", template: "github-pr-action", maximum: 5, uniqueBy: "value", optional: true },
   { pattern: ["workflowRouting", "rules"], kind: "array", label: "路由规则", template: "routing-rule", maximum: 200, uniqueBy: "id" },
   { pattern: ["workflowRouting", "rules", "#", "targets"], kind: "array", label: "分派目标", template: "routing-target", minimum: 1, maximum: 20, uniqueBy: "type-id" },
   { pattern: ["workflowRouting", "rules", "#", "condition", "**", "conditions"], kind: "array", label: "子条件", template: "condition", minimum: 1, maximum: 128 },
@@ -392,12 +450,27 @@ const COLLECTIONS = deepFreeze([
   { pattern: ["workCoordination", "policy", "capabilityRoles"], kind: "map", label: "能力岗位映射", template: "role-id", keyTemplate: "coordination", maximum: 5, keyOptions: ["coordination", "requirements", "pr-review", "development", "testing"] },
   { pattern: ["workCoordination", "policy", "githubReviewRoles"], kind: "array", label: "GitHub Review 岗位", template: "role-id", maximum: 100, uniqueBy: "value" },
   { pattern: ["workCoordination", "policy", "codeActionRoles"], kind: "array", label: "代码动作岗位", template: "role-id", maximum: 100, uniqueBy: "value" },
+  { pattern: ["workCoordination", "policy", "configurationChangeRoles"], kind: "array", label: "配置变更提案岗位", template: "role-id", maximum: 100, uniqueBy: "value", optional: true },
   { pattern: ["workCoordination", "policy", "codeOperationsByRole"], kind: "map", label: "岗位代码操作映射", template: "code-operations", keyTemplate: "role-id", maximum: 256, keyFormat: "role-id" },
   { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*"], kind: "array", label: "允许代码操作", template: "code-operation", minimum: 1, maximum: 3, uniqueBy: "value" },
   { pattern: ["workCoordination", "policy", "workspaceByRepository"], kind: "map", label: "仓库工作区映射", template: "workspace-id", keyTemplate: "owner/repository", maximum: 256, keyFormat: "repository" },
 ]);
 
 const SLOTS = deepFreeze([
+  {
+    pattern: ["employees", "roles", "*", "taskBrain"],
+    label: "任务大脑",
+    template: "task-brain",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
+    pattern: ["codeExecutor", "conflictPreparation"],
+    label: "冲突准备",
+    template: "conflict-preparation",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
   {
     pattern: ["codeExecutor", "gitCommand"],
     label: "固定 Git 命令",
@@ -429,6 +502,7 @@ const TEMPLATES = deepFreeze({
     kind: "openai-compatible",
     baseUrl: "https://models.example.invalid/v1",
     apiKeyEnv: "MYDASHBOARD_MODEL_API_KEY",
+    protocol: "chat-completions",
     responseFormat: "json-schema",
     remote: true,
     timeoutMs: 120_000,
@@ -455,6 +529,20 @@ const TEMPLATES = deepFreeze({
     maxRequestBytes: 262_144,
     contextTokens: 8_192,
   },
+  "provider-codex-cli": {
+    kind: "codex-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  },
+  "provider-claude-cli": {
+    kind: "claude-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  },
   role: {
     name: "新岗位",
     mission: "描述该岗位的职责、边界和完成标准。",
@@ -468,7 +556,13 @@ const TEMPLATES = deepFreeze({
       remoteData: { requirements: false, code: false, memory: false },
     },
   },
+  "task-brain": {
+    provider: "ollama",
+    model: "qwen3.5:9b",
+    remoteData: { requirements: false, code: false, memory: false },
+  },
   intent: "ask_user",
+  "github-pr-action": "review",
   "retry-minute": 5,
   workspace: {
     id: "workspace-id",
@@ -479,6 +573,8 @@ const TEMPLATES = deepFreeze({
   },
   "code-executor-git-command": "C:/Program Files/Git/mingw64/bin/git.exe",
   "code-executor-git-timeout": 30_000,
+  "conflict-preparation": { enabled: false },
+  "local-mirror-path": "C:/path/to/repository.git",
   "workspace-git-head-snapshot": true,
   "workspace-path": "src",
   profile: { kind: "node-test", image: `node:22-alpine@sha256:${"0".repeat(64)}`, timeoutMs: 120_000 },
@@ -590,15 +686,47 @@ function defaultField(value) {
   throw new TypeError("configuration field value must be primitive");
 }
 
-export function configurationFieldDescriptor(path, value) {
+function fieldContext(value) {
+  if (value === null || value === undefined) return null;
+  if (
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError("configuration field context must be a plain object");
+  }
+  const keys = Reflect.ownKeys(value);
+  const descriptor = Object.getOwnPropertyDescriptor(value, "providerKind");
+  if (
+    keys.length !== 1 ||
+    keys[0] !== "providerKind" ||
+    !descriptor?.enumerable ||
+    !("value" in descriptor) ||
+    typeof descriptor.value !== "string"
+  ) {
+    throw new TypeError("configuration field context is invalid");
+  }
+  return { providerKind: descriptor.value };
+}
+
+export function configurationFieldDescriptor(path, value, context = null) {
   const normalized = normalizePath(path);
   const integerRule = matchingRule(INTEGER_FIELDS, normalized);
   const fieldRule = matchingRule(FIELD_RULES, normalized);
+  const normalizedContext = fieldContext(context);
+  const contextualLimits = normalizedContext && integerRule
+    ? integerRule.limitsByProviderKind?.[normalizedContext.providerKind]
+    : null;
   return deepFreeze({
     label: labelFor(normalized),
     ...defaultField(value),
     ...(integerRule
-      ? { control: integerRule.options ? "select" : "number", kind: "integer", ...integerRule }
+      ? {
+          control: integerRule.options ? "select" : "number",
+          kind: "integer",
+          ...integerRule,
+          ...(contextualLimits || {}),
+        }
       : {}),
     ...(fieldRule || {}),
     path: normalized,

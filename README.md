@@ -1,6 +1,6 @@
 # MyDashboard
 
-本机个人研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与钉钉 @我、待办、未读会话合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及可独立配置职责、权限、调度和大脑的主控、需求、PR、开发与测试岗位。
+本地优先的研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与协作消息合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及可独立配置职责、权限、调度和大脑的主控、需求、PR、开发与测试岗位。
 
 PR 责任语义遵循团队当前流程：
 
@@ -11,19 +11,35 @@ PR 责任语义遵循团队当前流程：
 ## 使用
 
 ```powershell
-cd D:\claude\MyDashboard
+npm ci
 npm test
-npm run refresh
 npm start
 ```
 
-浏览器打开 `http://127.0.0.1:4173`。服务端每 10 分钟刷新，页面每分钟读取一次最新快照；“刷新”按钮可立即采集。
+发布或升级前可运行可重复的整体验收。基础命令执行完整 Node 回归、全部 JavaScript 语法检查和两组真实浏览器行为测试；`--all` 还要求 Docker Desktop 可用，并要求已经由受管生命周期启动且健康的 `127.0.0.1:4173` 服务完成桌面/移动端验收：
+
+```powershell
+npm run validate:system
+npm run validate:system -- --all
+```
+
+验收结果只写入被 Git 忽略的 `validation-artifacts/system-validation.json`；其中可能包含本机运行信息，不应未经检查直接公开。
+
+首次启动不需要私人配置：仓库自带的 `config.example.json` 是无真实账号、无仓库、无 GitHub 读取或写入的安全禁用配置。它预置了五个暂停岗位和通用 PR/Issue 路由，但 GitHub 读取、工作协调、路由、记忆、代码执行和外部动作总开关均保持关闭。需要启用功能时，先复制为不入库的本机配置：
+
+```powershell
+Copy-Item config.example.json config.json
+```
+
+然后只在 `config.json` 或 `config.local.json` 中填写首次导入所需的本机设置；密钥本身只放在环境变量中。首次导入形成活动版本后，以浏览器“配置”页面中的结构化草稿、校验、影响预览和逐项确认激活为准，后续修改启动文件不会静默覆盖活动权限。当前运行时按一个不可变活动版本组装，所以任何确认激活或回滚都会明确进入“需要重启”状态；使用受管重启后，新版本才成为岗位、路由、大脑和权限的实际运行配置。浏览器打开 `http://127.0.0.1:4173`。服务端按配置定时刷新，页面定时读取最新快照；“刷新”按钮可立即采集。
+
+完整设计、隐私边界、安全报告、运维与贡献说明分别见 [架构](docs/ARCHITECTURE.md)、[隐私](docs/PRIVACY.md)、[安全](SECURITY.md)、[运维](docs/OPERATIONS.md) 和 [贡献指南](CONTRIBUTING.md)。
 
 “跟踪版本”按版本的创建/发布时间倒序展示，最近添加或发布的记录在最上方。
 
 ## PR 能力与岗位
 
-新的 PR 工作默认路由到持久化工作台账中的 `pr-engineer`；旧 `pr-reviewer` 保留原有数据、作业和兼容接口，不再是默认工作流目标。两个岗位首次创建都保持暂停，必须由你在“岗位”页面明确恢复后才会主动领取新工作。
+启用示例中的工作流路由后，新的 PR 工作默认路由到持久化工作台账中的 `pr-engineer`；旧 `pr-reviewer` 保留原有数据、作业和兼容接口，不再是默认工作流目标。两个岗位首次创建都保持暂停，必须由你在“岗位”页面明确恢复后才会主动领取新工作。
 
 旧 PR 员工的兼容链路仍保留以下能力：
 
@@ -36,7 +52,7 @@ npm start
 
 ## 多岗位与多大脑
 
-当前配置包含 `pr-engineer`、`orchestrator`、`requirements-analyst`、`developer` 和 `tester` 五个新岗位；每个岗位分别持久化暂停状态、运行修订号、职责、权限、调度频率和模型。默认大脑是本机 Ollama 的 `qwen3.5:9b`。
+安全示例预置 `pr-engineer`、`orchestrator`、`requirements-analyst`、`developer` 和 `tester` 五个岗位；每个岗位分别持久化暂停状态、运行修订号、职责、权限、调度频率和模型。默认大脑是本机 Ollama 的 `qwen3.5:9b`，但 Ollama 不会因读取示例配置而被自动启动或调用。
 
 `brainProviders` 支持本地 Ollama 和 OpenAI-compatible 第三方接口。密钥只从指定环境变量读取，不写入配置或日志。例如，只给需求分析师接入第三方大脑：
 
@@ -68,23 +84,59 @@ npm start
 }
 ```
 
+### 受监管 Codex / Claude CLI 大脑
+
+首个完整版本还支持把 Codex CLI 或 Claude CLI 配置为主控或任一员工的 `brain` / `taskBrain`。它们不是常驻代理，而是“一个已领取任务对应一个受监管进程”：MyDashboard 传入有界结构化上下文，校验结构化结果，把跨任务台账和记忆留在本地，然后关闭该进程。持久 CLI 会话暂不属于首版。
+
+首版运行平台和经过验证的版本范围是 Windows x64、Codex CLI `0.147.x`（`>=0.147.0 <0.148.0`）及 Claude CLI `>=2.1.222 <2.2.0`。CLI 必须以官方 npm 包安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统会核对包清单、平台包、版本、真实路径、文件身份与摘要，不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
+
+CLI 不复用宿主机已经登录的 Codex/Claude 个人配置、OAuth 会话、插件、MCP 或规则。启动 MyDashboard 前，分别通过服务进程环境提供固定名称 `OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`；密钥不能写入配置。一个安全但尚未分配、尚未授权出机的 Provider 示例是：
+
+```json
+{
+  "brainProviders": {
+    "codex-local-cli": {
+      "kind": "codex-cli",
+      "remote": true,
+      "timeoutMs": 300000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    },
+    "claude-local-cli": {
+      "kind": "claude-cli",
+      "remote": true,
+      "timeoutMs": 300000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    }
+  }
+}
+```
+
+在“配置”页面选择“Codex CLI（单任务受监管）”或“Claude CLI（单任务受监管）”创建 Provider，再把 Provider 和模型分配给岗位的日常大脑或任务大脑。CLI 始终视为远程推理；任务包含需求、代码或记忆时，必须分别打开该岗位对应的 `remoteData` 授权。保存草稿、查看影响并逐项确认激活后，使用受管重启使新版本生效。
+
+每次调用都使用空白临时 profile 和独立工作目录，不继承 `PATH`、Git/GitHub/SSH 凭据或宿主仓库，也不允许工具、插件、浏览器、MCP、持久会话或直接动作。CLI 只返回不可信判断；代码修改、GitHub 写入等请求仍必须经过原有策略、隔离执行器和逐项确认。超时、取消、输出越界、异常退出或无效结果都不会在同一任务修订上自动再次调用 CLI。远程模型调用可能产生供应商费用；具体计费和数据保留规则由供应商决定。
+
+每个岗位的 `brain` 负责日常巡查、摘要和低风险判断；可选的 `taskBrain` 专门处理已分派的 PR、代码或其他高风险任务。真实 PR 的冲突处理、代码修改、Review 和 CI 诊断会选择岗位明确配置的高能力 `taskBrain`；缺少该配置、凭据引用或代码出机授权时，任务等待所有者处理，不会偷偷降级到日常 Ollama。更换任一大脑只改变推理质量，不会增加岗位、代码或 GitHub 权限。
+
 远程地址必须使用 HTTPS。需求、代码和记忆三类数据分别默认拒绝出机；只有岗位的 `remoteData` 对应分类显式为 `true` 时才允许发送。页面持续显示岗位实际使用的 Provider、模型以及是否为远程大脑。旧 PR 员工的正文、文件名和 diff 仍默认只允许发送到 loopback Ollama；它的远程代码授权继续由 `employees.prReviewer.allowRemoteCodeContext` 单独控制。
 
 ## GitHub 外部动作确认
 
-GitHub 写入默认关闭。启用后，PR 员工只能准备 `APPROVE`、`REQUEST_CHANGES` 或 `COMMENT` Review；三种动作都固定到确认时展示的 PR Head。普通 Issue Comment 写入被禁用，避免在 Head 变化后发布失去版本语境的评论。
+GitHub 写入默认关闭。可以按动作分别启用 PR comment、Review、update branch、受控 commit push 和 merge。每项动作都绑定观察账号、base/head 仓库与 ref、精确 Head OID、事件来源和证据；同一 PR 的 Head 或来源发生变化会使旧结论和确认失效。push 只接受系统已经验证的受控 commit 证据，不接受浏览器或模型提供 ref、路径或提交对象。
 
-所有外部动作都经过同一个逐条弹框。弹框会展示写入账号、仓库与 PR、Head、Review 类型、完整正文和依据；浏览器只提交队列修订号与内容摘要，不能覆盖服务端保存的动作。点击“稍后”不会产生写入，点击“确认并发布到 GitHub”后才会执行。
+所有外部动作都经过同一个逐条弹框。弹框展示写入账号、目标、Head、动作、完整正文和依据；浏览器只提交队列修订号与内容摘要，不能覆盖服务端保存的动作。点击“稍后”不会产生写入，点击确认后才会执行这一项。外部结果不确定时会阻塞重复动作，重启后先只读对账；无法安全证明的结果保持 `unknown`，不会猜测成功或重复提交。
 
-账号和凭据只配置在本机。`config.local.json` 保存账号、`gh.exe` 路径和凭据环境变量名，不保存 Token 本身：
+账号和凭据只配置在本机。首次导入前可由 `config.local.json` 保存账号、`gh.exe` 路径和凭据环境变量名；已有活动版本时应在“配置”页面创建并确认新版本。两种方式都只保存环境变量名，不保存 Token 本身：
 
 ```json
 {
   "githubActions": {
     "enabled": true,
+    "enabledActions": ["comment", "review"],
     "actorAccountId": "用于发布 Review 的 GitHub 登录名",
     "tokenEnv": "MYDASHBOARD_GITHUB_TOKEN",
-    "ghCommand": "C:\\Program Files\\GitHub CLI\\gh.exe"
+    "ghCommand": "<GitHub CLI 的绝对可执行文件路径>"
   }
 }
 ```
@@ -95,13 +147,15 @@ GitHub 写入默认关闭。启用后，PR 员工只能准备 `APPROVE`、`REQUE
 
 ## 可配置工作流路由
 
-GitHub PR 和 Issue 的首次观察、创建、更新、分类、状态变化、完成及离开当前范围都会转换成只包含安全事实的本地事件。刷新成功后，系统按照 `config.json` 中的 `workflowRouting` 整份规则定义进行分派，并保留事件、配置版本、分派结果和完整匹配解释。
+GitHub PR 和 Issue 的首次观察、创建、更新、分类、状态变化、完成及离开当前范围都会转换成只包含安全事实的本地事件。刷新成功后，系统按照当前活动配置版本中的 `workflowRouting` 整份规则定义进行分派，并保留事件、配置版本、分派结果和完整匹配解释。
 
 规则按优先级从高到低判断；同优先级保持配置顺序。普通规则均未命中时才使用兜底规则。目标可以是岗位（`role`）、具体人员（`person`）或后续流程节点（`node`）；节点路由有静态环路检查、运行时已访问节点检查和最大跳数限制。当前默认把 PR 事件交给 `pr-engineer`，Issue 事件交给 `requirements-analyst`，其他事项回到本人分诊。
 
-页面“工作流”视图可读取当前版本、规则、最新分派和审计解释，也可以用候选事件做不落盘试跑。HTTP 不提供规则替换或直接 dispatch 接口；目前修改规则需要编辑本机配置并安全重启。路由只回答“交给谁”，不会调用 GitHub、受控代码执行器或确认队列，更不能绕过外部写入与高风险执行的逐项确认。
+页面“工作流”视图可读取当前版本、规则、最新分派和审计解释，也可以用候选事件做不落盘试跑。修改规则、岗位、大脑和权限时，在“配置”页面使用结构化表单创建草稿、校验和预览影响，再由统一确认弹框激活；HTTP 不提供直接替换活动规则或 dispatch 的旁路。路由只回答“交给谁”，不会调用 GitHub、受控代码执行器或确认队列，更不能绕过外部写入与高风险执行的逐项确认。
 
 路由状态采用进程级单写者和单调快照检查点。事件、配置、分派与审计通过内容摘要互相绑定，恢复时会拒绝回滚、分叉和损坏引用；保留策略只按完整事件包淘汰。持久化总量限制为 32 MiB，单个事件包和单条审计也有独立上限，避免异常输入无限占用本机资源。
+
+“创建共享工作”表单是所有者把新事项交给指挥中枢的生产入口。浏览器只提交类型、优先级、标题、说明和验收条件，不能指定岗位、节点、权限或内部标识；服务端将可信的所有者请求转换为工作流事件，并以不可被普通规则覆盖的系统规则交给 `orchestrator`。请求 ID 在失败重试时保持不变，路由、分派和台账写入均可恢复并去重；创建结果及其内容寻址审计只保存在本机。
 
 ## 主动工作循环与统一请示
 
@@ -118,6 +172,8 @@ PR Review 提案已有持久化 runner、岗位与提案类型双重权限范围
 ## 本地记忆与可引用回答
 
 “记忆”页面的关键词、岗位、仓库、事件类型和时间筛选完全使用本地索引，即使 Ollama 和第三方模型均不可用仍可搜索。页面也可以向当前筛选范围提问：服务先读取完整的本地权威记录，再让所选大脑返回结构化结论；每条结论必须引用当前有效的原始记录，派生记录和已被替代的记录不能单独支撑结论。回答会展示 Provider、模型、本地/远程状态、上下文摘要和完整引用，也可以用同一批记录和摘要切换到本地模型复现。
+
+岗位也可以获得主动查证能力：只有在该岗位的 `permissions.allowedIntents` 显式加入 `query_memory`，并且统一记忆及带引用问答均已启用时，员工才能请求一次与当前任务修订绑定的记忆查询。系统先持久化查询预约，再调用选定大脑；结果必须引用仍然可访问的原始记录，随后才回到同一轮岗位判断。崩溃后不能证明结果的查询保持未知且不会重复调用模型。远程岗位要读取查询结果时还必须单独允许 `remoteData.memory`。
 
 默认回答大脑与本地复现大脑都是 `ollama / qwen3.5:9b`。可在 `memory.answering.brain` 中选择第三方 Provider，在 `memory.answering.localBrain` 中保留本地 Provider。远程调用仍受 `requirements`、`code`、`memory` 三类数据授权约束；任何一类未明确允许都会在发送请求前拒绝。并发回答默认限制为一个，避免本机推理任务堆积。
 
@@ -140,17 +196,17 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
 
 代码执行基础能力默认关闭，原始执行器、Code Job 生产端口和 worker 均不向 HTTP 暴露。启用后，开发、测试岗位也只能通过已封存的授权创建 Code Job；worker 会在每次大脑调用和新动作入场前重新核验授权，只能调用固定语义工具，并在隔离工作区内执行。启动时会先恢复持久化任务和执行器会话；恢复校验失败会直接阻止服务开放，不会退回宿主机命令执行。暂停中的已入场动作和结果未知动作只允许可信对账，不会再次询问模型或重复执行。
 
-私人工作区和 Docker 设置只写入不入库的 `config.local.json`。下面是本项目在 Windows Docker Desktop 上的示例；镜像必须固定到 digest，工作区写权限必须逐项列出：
+私人工作区和 Docker 设置只保存在不入库的首次导入配置或本机版本化配置数据中。已有活动版本时从“配置”页面创建草稿并逐项确认，不能靠修改启动文件绕过影响预览。下面是本项目在 Windows Docker Desktop 上的首次导入示例；镜像必须固定到 digest，工作区写权限必须逐项列出：
 
 ```json
 {
   "codeExecutor": {
     "enabled": true,
     "docker": {
-      "executable": "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      "executable": "<Docker CLI 的绝对可执行文件路径>",
       "host": "npipe:////./pipe/dockerDesktopLinuxEngine"
     },
-    "gitCommand": "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    "gitCommand": "<Git 实现的绝对可执行文件路径>",
     "gitTimeoutMs": 30000,
     "workspaces": [
       {
@@ -176,7 +232,7 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
 
 临时工作副本和不可变审计产物保存在被 Git 忽略的 `data/code-executor/`。源仓库保持只读；员工只能提交固定语义动作，不能传入任意 shell 命令。
 
-PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对象生成执行副本，不读取当前 checkout 的脏文件，也不会运行 hook、filter 或网络拉取。Windows 必须把 `gitCommand` 直接指向 Git for Windows 的实际实现（通常是 `mingw64\bin\git.exe`），不能使用 `cmd\git.exe` 或安装目录下的分发包装器；程序路径、内容摘要和大小都会随工作区权限一起封存。该能力只接受本地普通仓库的真实 `.git` 目录，不接受 UNC、linked worktree、alternate/partial object store 或对象链接。
+PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对象生成执行副本，不读取当前 checkout 的脏文件，也不会运行 hook、filter 或网络拉取。Windows 必须把 `gitCommand` 直接指向 Git for Windows 的实际实现（通常位于 `mingw64\bin\git.exe`），不能使用 `cmd\git.exe` 或安装目录下的分发包装器；程序路径、内容摘要和大小都会随工作区权限一起封存。该能力只接受本地普通仓库的真实 `.git` 目录，不接受 UNC、linked worktree、alternate/partial object store 或对象链接。
 
 ## 本地安全边界
 
@@ -189,7 +245,7 @@ PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对�
 - 仅优先级不低于 80 的变化发送钉钉消息。
 - 每次最多 5 项，不重复播报静止状态。
 
-配置位于 `config.json`。私人覆盖项可写入不入库的 `config.local.json`。
+`config.example.json`、`config.json` 和 `config.local.json` 只负责首次安全导入；活动配置版本保存在本机 `data/` 中，并通过“配置”页面的草稿、确认、回滚和审计管理。私人文件均不入库。
 
 ## 定时任务
 

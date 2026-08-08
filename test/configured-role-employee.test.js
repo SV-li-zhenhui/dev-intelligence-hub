@@ -109,7 +109,7 @@ function brain(overrides = {}) {
   };
 }
 
-function fakeDecisionEngine(id, calls = []) {
+function fakeDecisionEngine(id, calls = [], { remote = false } = {}) {
   return {
     async decide(input) {
       calls.push({ id, input: structuredClone(input) });
@@ -119,9 +119,23 @@ function fakeDecisionEngine(id, calls = []) {
       return {
         definition: definition(id),
         permissions: permissions("complete"),
-        brain: { ...brain(), remote: false },
+        brain: { ...brain(), remote },
       };
     },
+  };
+}
+
+function assignedTask(eventType, suffix = "1") {
+  const assignmentId = `assignment-${suffix}`;
+  return {
+    itemId: `work-item-${suffix}`,
+    kind: "assignment",
+    assignmentId,
+    assignment: {
+      assignmentId,
+      target: { type: "role", id: "developer" },
+    },
+    event: { eventType },
   };
 }
 
@@ -358,6 +372,36 @@ test("RoleDecisionEngine retries one invalid structured response without replayi
   assert.match(calls[1].messages.at(-1).content, /corrected JSON object/);
 });
 
+test("RoleDecisionEngine never starts a correction CLI after invalid output", async () => {
+  const calls = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"),
+    permissions: permissions("complete"),
+    brain: brain({ provider: "cli" }),
+    brainRouter: {
+      async generate(request) {
+        calls.push(structuredClone(request));
+        return "invalid CLI output";
+      },
+      describe(config) {
+        return {
+          provider: config.provider,
+          model: config.model,
+          remote: true,
+          remoteData: structuredClone(config.remoteData),
+          singleAttempt: true,
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    engine.decide(),
+    (error) => error?.code === "STRUCTURED_BRAIN_RESPONSE_INVALID",
+  );
+  assert.equal(calls.length, 1);
+});
+
 test("RoleDecisionEngine admits each provider request without holding the gate for network time", async () => {
   const digest = (value) => value.repeat(64);
   const gate = new ActionAdmissionGate();
@@ -411,6 +455,47 @@ test("RoleDecisionEngine admits each provider request without holding the gate f
     (error) => error.code === "RUNTIME_RESTART_REQUIRED",
   );
   assert.equal(generateCalls, 2);
+});
+
+test("RoleDecisionEngine forwards cancellation and rejects a late provider result", async () => {
+  const pending = deferred();
+  let providerInput = null;
+  const router = new BrainRouter({
+    providers: [{
+      id: "local-brain",
+      remote: false,
+      async generate(input) {
+        providerInput = input;
+        await pending.promise;
+        return JSON.stringify(completeDecision());
+      },
+    }],
+  });
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: router,
+  });
+  const controller = new AbortController();
+  const deadline = Object.assign(new Error("role decision timed out"), {
+    code: "ROLE_DECISION_TIMEOUT",
+  });
+  const decision = engine.decide({
+    item: null,
+    context: { requirements: { task: "bounded" } },
+    signal: controller.signal,
+  });
+  while (providerInput === null) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  controller.abort(deadline);
+  pending.resolve();
+
+  await assert.rejects(decision, (error) => error === deadline);
+  assert.strictEqual(providerInput.signal, controller.signal);
+  assert.equal(providerInput.signal.aborted, true);
 });
 
 test("the default role context separates PR code from minimum requirements data", async () => {
@@ -494,53 +579,244 @@ test("the default PR context cannot cross a remote requirements denial", async (
   assert.equal(calls.length, 0);
 });
 
-test("four configured roles keep definition, permissions, brain, pause, and revision independent", async () => {
+test("all shipped roles pause, restart, and resume independently", async () => {
   const store = new MemoryStore();
   const roleSpecs = [
+    ["pr-engineer", ["ask_user", "propose_github_review", "complete"], "pr-model"],
     ["orchestrator", ["ask_user", "handoff", "complete"], "orchestrator-model"],
     ["requirements-analyst", ["ask_user", "handoff", "complete"], "requirements-model"],
     ["developer", ["ask_user", "propose_code_action", "complete"], "developer-model"],
     ["tester", ["ask_user", "handoff", "complete"], "tester-model"],
   ];
-  const employees = roleSpecs.map(([id, intents, model]) =>
-    new ConfiguredRoleEmployee({
-      definition: definition(id),
-      permissions: permissions(...intents),
-      brain: brain({ model }),
-      decisionEngine: fakeDecisionEngine(id),
-      store,
+  const createRegistry = () => new EmployeeRegistry(
+    roleSpecs.map(([id, intents, model]) =>
+      new ConfiguredRoleEmployee({
+        definition: definition(id),
+        permissions: permissions(...intents),
+        brain: brain({ model }),
+        decisionEngine: fakeDecisionEngine(id),
+        store,
+      }),
+    ),
+  );
+  let registry = createRegistry();
+
+  for (const [roleId] of roleSpecs) {
+    const before = await registry.list();
+    const selected = before.find(({ role }) => role.id === roleId).role;
+    await registry.control(roleId, "pause", selected.revision);
+    const paused = await registry.list();
+    assert.deepEqual(
+      paused.map(({ role }) => role.id),
+      roleSpecs.map(([id]) => id),
+    );
+    assert.deepEqual(
+      paused.filter(({ role }) => role.paused).map(({ role }) => role.id),
+      [roleId],
+    );
+
+    registry = createRegistry();
+    const restarted = await registry.list();
+    const restoredRole = restarted.find(({ role }) => role.id === roleId).role;
+    assert.equal(restoredRole.paused, true);
+    assert.equal(restoredRole.revision, selected.revision + 1);
+    assert.deepEqual(
+      restarted.filter(({ role }) => role.paused).map(({ role }) => role.id),
+      [roleId],
+    );
+
+    await registry.control(roleId, "resume", restoredRole.revision);
+    registry = createRegistry();
+    const resumed = await registry.list();
+    assert.equal(resumed.every(({ role }) => role.paused === false), true);
+  }
+
+  const final = await registry.list();
+  assert.deepEqual(
+    final.map(({ role }) => role.brain.model),
+    roleSpecs.map(([, , model]) => model),
+  );
+});
+
+test("task brain is safely projected while non-task activity keeps routine routing", async () => {
+  const routineCalls = [];
+  const taskCalls = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({
+      provider: "remote-task-brain",
+      model: "high-capability-model",
+      remoteData: { requirements: true, code: true, memory: false },
     }),
-  );
-  const registry = new EmployeeRegistry(employees);
-  const before = await registry.list();
-  const analyst = before.find(({ role }) => role.id === "requirements-analyst");
-  await registry.control("requirements-analyst", "pause", analyst.role.revision);
-  const after = await registry.list();
-
-  assert.deepEqual(after.map(({ role }) => role.id), roleSpecs.map(([id]) => id));
-  assert.equal(
-    after.find(({ role }) => role.id === "requirements-analyst").role.paused,
-    true,
-  );
-  assert.equal(
-    after.find(({ role }) => role.id === "requirements-analyst").role.revision,
-    1,
-  );
-  assert.equal(after.find(({ role }) => role.id === "developer").role.revision, 0);
-  assert.equal(
-    after.find(({ role }) => role.id === "developer").role.brain.model,
-    "developer-model",
-  );
-
-  const restored = new ConfiguredRoleEmployee({
-    definition: definition("requirements-analyst"),
-    permissions: permissions("ask_user", "handoff", "complete"),
-    brain: brain({ model: "requirements-model" }),
-    decisionEngine: fakeDecisionEngine("requirements-analyst"),
-    store,
+    decisionEngine: fakeDecisionEngine("developer", routineCalls),
+    taskDecisionEngine: fakeDecisionEngine("developer", taskCalls, {
+      remote: true,
+    }),
+    store: new MemoryStore(),
   });
-  assert.equal((await restored.roleView()).paused, true);
-  assert.equal((await restored.roleView()).revision, 1);
+
+  const view = await employee.roleView();
+  assert.equal(view.brain.model, "routine-model");
+  assert.deepEqual(view.taskBrain, {
+    provider: "remote-task-brain",
+    model: "high-capability-model",
+    remote: true,
+    remoteData: { requirements: true, code: true, memory: false },
+  });
+
+  const decision = await employee.decide({ item: { itemId: "work-1" } });
+  assert.equal(decision.intent.type, "complete");
+  await employee.decide({
+    item: { event: { eventType: "pull_request.updated" } },
+    context: { code: { untrustedClaim: "this is assigned work" } },
+  });
+  assert.equal(routineCalls.length, 2);
+  assert.equal(taskCalls.length, 0);
+});
+
+test("assigned PR work uses the task brain while assigned issue work stays routine", async () => {
+  const routineCalls = [];
+  const taskCalls = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("complete"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine("requirements-analyst", routineCalls),
+    taskDecisionEngine: fakeDecisionEngine(
+      "requirements-analyst",
+      taskCalls,
+    ),
+    store: new MemoryStore(),
+  });
+
+  await employee.decide({ item: assignedTask("issue.updated", "issue") });
+  await employee.decide({
+    item: assignedTask("pull_request.updated", "pull-request"),
+  });
+  const sourceBoundPullRequest = assignedTask(
+    "issue.updated",
+    "source-bound-pull-request",
+  );
+  sourceBoundPullRequest.source = {
+    kind: "pull_request",
+    current: { event: { eventType: "pull_request.updated" } },
+  };
+  await employee.decide({ item: sourceBoundPullRequest });
+
+  assert.equal(routineCalls.length, 1);
+  assert.equal(taskCalls.length, 2);
+  assert.equal(routineCalls[0].input.item.event.eventType, "issue.updated");
+  assert.equal(
+    taskCalls[0].input.item.event.eventType,
+    "pull_request.updated",
+  );
+});
+
+test("every assigned task for a code-capable role uses the task brain", async () => {
+  const routineCalls = [];
+  const taskCalls = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete", "propose_code_action"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine("developer", routineCalls),
+    taskDecisionEngine: fakeDecisionEngine("developer", taskCalls),
+    store: new MemoryStore(),
+  });
+
+  await employee.decide({ item: assignedTask("issue.updated", "code-task") });
+
+  assert.equal(routineCalls.length, 0);
+  assert.equal(taskCalls.length, 1);
+});
+
+test("task-risk work fails closed when no task brain is configured", async () => {
+  const codeRoutineCalls = [];
+  const codeEmployee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete", "propose_code_action"),
+    brain: brain({ model: "routine-model" }),
+    decisionEngine: fakeDecisionEngine("developer", codeRoutineCalls),
+    store: new MemoryStore(),
+  });
+
+  await assert.rejects(
+    codeEmployee.decide({
+      item: assignedTask("issue.updated", "missing-code-brain"),
+    }),
+    (error) =>
+      error instanceof Error &&
+      error.code === "ROLE_TASK_BRAIN_NOT_CONFIGURED" &&
+      error.statusCode === 503,
+  );
+  assert.equal(codeRoutineCalls.length, 0);
+
+  const prRoutineCalls = [];
+  const prEmployee = new ConfiguredRoleEmployee({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("complete"),
+    brain: brain({ model: "routine-model" }),
+    decisionEngine: fakeDecisionEngine(
+      "requirements-analyst",
+      prRoutineCalls,
+    ),
+    store: new MemoryStore(),
+  });
+  await assert.rejects(
+    prEmployee.decide({
+      item: assignedTask("pull_request.updated", "missing-pr-brain"),
+    }),
+    (error) => error.code === "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+  );
+  assert.equal(prRoutineCalls.length, 0);
+});
+
+test("malformed assigned-task bindings reach neither decision engine", async () => {
+  const routineCalls = [];
+  const taskCalls = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete", "propose_code_action"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine("developer", routineCalls),
+    taskDecisionEngine: fakeDecisionEngine("developer", taskCalls),
+    store: new MemoryStore(),
+  });
+  const missingAssignment = assignedTask(
+    "pull_request.updated",
+    "missing-assignment",
+  );
+  delete missingAssignment.assignment;
+  const mismatchedAssignment = assignedTask(
+    "pull_request.updated",
+    "mismatched-assignment",
+  );
+  mismatchedAssignment.assignment.assignmentId = "assignment-other";
+  const malformedEvent = assignedTask(
+    "pull_request.updated",
+    "malformed-event",
+  );
+  malformedEvent.event = { eventType: null };
+
+  for (const item of [
+    missingAssignment,
+    mismatchedAssignment,
+    malformedEvent,
+  ]) {
+    await assert.rejects(
+      employee.decide({ item }),
+      (error) =>
+        error.code === "ROLE_TASK_BINDING_INVALID" &&
+        error.statusCode === 409,
+    );
+  }
+  assert.equal(routineCalls.length, 0);
+  assert.equal(taskCalls.length, 0);
 });
 
 test("the explicit role worker port resolves and decide never deadlocks an onRun central cycle", async () => {
@@ -579,7 +855,49 @@ test("the explicit role worker port resolves and decide never deadlocks an onRun
   assert.equal((await employee.view()).runCount, 1);
 });
 
-test("pausing a role invalidates a decision that is already in flight", async () => {
+test("an employee run forwards its shutdown signal and performs no state write after abort", async () => {
+  const store = new MemoryStore();
+  const started = deferred();
+  let observedSignal = null;
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: fakeDecisionEngine("developer"),
+    store,
+    onRun: async ({ signal }) => {
+      observedSignal = signal;
+      started.resolve();
+      await new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
+    },
+  });
+  const controller = new AbortController();
+  const running = employee.run({ trigger: "manual", signal: controller.signal });
+  await started.promise;
+  const reason = Object.assign(new Error("shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  controller.abort(reason);
+
+  await assert.rejects(
+    Promise.race([
+      running,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("employee did not abort")),
+        50,
+      )),
+    ]),
+    (error) => error === reason,
+  );
+  assert.strictEqual(observedSignal, controller.signal);
+  assert.equal((await employee.view()).runCount, 0);
+});
+
+test("pausing a role invalidates a task-brain decision already in flight", async () => {
   const store = new MemoryStore();
   let entered;
   let release;
@@ -593,7 +911,9 @@ test("pausing a role invalidates a decision that is already in flight", async ()
     definition: definition("tester"),
     permissions: permissions("complete"),
     brain: brain(),
-    decisionEngine: {
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine("tester"),
+    taskDecisionEngine: {
       view() {
         return { brain: { remote: false } };
       },
@@ -606,7 +926,9 @@ test("pausing a role invalidates a decision that is already in flight", async ()
     store,
   });
 
-  const deciding = employee.decide({ item: { itemId: "work-1" } });
+  const deciding = employee.decide({
+    item: assignedTask("pull_request.updated", "in-flight"),
+  });
   await started;
   await employee.control("pause", 0);
   release();

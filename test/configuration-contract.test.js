@@ -11,11 +11,41 @@ import {
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedDocument = JSON.parse(
-  await readFile(path.join(projectRoot, "config.json"), "utf8"),
+  await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 
 function document() {
   return structuredClone(committedDocument);
+}
+
+function trustedGitCommand() {
+  return process.platform === "win32"
+    ? "C:\\Program Files\\Git\\mingw64\\bin\\git.exe"
+    : "/usr/bin/git";
+}
+
+function mirrorPath(name) {
+  return process.platform === "win32"
+    ? `D:\\mirrors\\${name}.git`
+    : `/var/lib/mirrors/${name}.git`;
+}
+
+function conflictPreparationDocument() {
+  const value = document();
+  value.codeExecutor = {
+    enabled: false,
+    gitCommand: trustedGitCommand(),
+    conflictPreparation: {
+      enabled: true,
+      baseMirrorsByRepository: {
+        "acme/command-center": mirrorPath("oct-base"),
+      },
+      headMirrorsByRepository: {
+        "acme/command-center": mirrorPath("oct-head"),
+      },
+    },
+  };
+  return value;
 }
 
 function assertInvalid(value) {
@@ -68,6 +98,32 @@ test("the canonical digest is stable across object insertion order", () => {
   assert.equal(second, first);
 });
 
+test("pre-boundary documents preserve their content-addressed shape", () => {
+  const legacy = document();
+  delete legacy.githubRead;
+
+  const normalized = normalizeConfigurationDocument(legacy);
+  assert.equal(Object.hasOwn(normalized, "githubRead"), false);
+  assert.deepEqual(normalized, legacy);
+  assert.equal(configurationDocumentDigest(legacy), configurationDocumentDigest(normalized));
+});
+
+test("the legacy GitHub-read default is classified by effective authority", () => {
+  const legacy = document();
+  delete legacy.githubRead;
+  const disabled = structuredClone(legacy);
+  disabled.githubRead = { enabled: false };
+
+  const tightening = configurationDocumentImpact(legacy, disabled);
+  assert.deepEqual(tightening.security_tightening, ["githubRead"]);
+  assert.deepEqual(tightening.authority_expansion, []);
+  assert.deepEqual(tightening.restart_required, ["githubRead"]);
+
+  const restored = configurationDocumentImpact(disabled, legacy);
+  assert.deepEqual(restored.security_tightening, []);
+  assert.deepEqual(restored.authority_expansion, ["githubRead"]);
+});
+
 test("unknown and dangerous fields are rejected even below a disabled feature", () => {
   const unknown = document();
   unknown.codeExecutor.unrestrictedShell = true;
@@ -79,6 +135,79 @@ test("unknown and dangerous fields are rejected even below a disabled feature", 
     value: { polluted: true },
   });
   assertInvalid(dangerous);
+});
+
+test("role task brains are optional exact assigned brains without legacy backfill", () => {
+  const legacy = normalizeConfigurationDocument(document());
+  assert.equal(
+    Object.hasOwn(legacy.employees.roles.developer, "taskBrain"),
+    false,
+  );
+
+  const configured = document();
+  configured.employees.roles.developer.taskBrain = {
+    provider: "ollama",
+    model: "qwen3.5:task",
+    remoteData: { requirements: true, code: true, memory: false },
+  };
+  const normalized = normalizeConfigurationDocument(configured);
+  assert.deepEqual(
+    normalized.employees.roles.developer.taskBrain,
+    configured.employees.roles.developer.taskBrain,
+  );
+  assertDeepFrozen(normalized.employees.roles.developer.taskBrain);
+
+  const unknownField = structuredClone(configured);
+  unknownField.employees.roles.developer.taskBrain.temperature = 0.2;
+  assertInvalid(unknownField);
+
+  const incomplete = structuredClone(configured);
+  delete incomplete.employees.roles.developer.taskBrain.remoteData;
+  assertInvalid(incomplete);
+
+  const unknownProvider = structuredClone(configured);
+  unknownProvider.employees.roles.developer.taskBrain.provider = "missing";
+  assertInvalid(unknownProvider);
+});
+
+test("configuration change authority requires the same explicit role permission and policy", () => {
+  const legacy = normalizeConfigurationDocument(document());
+  assert.equal(
+    Object.hasOwn(
+      legacy.workCoordination.policy,
+      "configurationChangeRoles",
+    ),
+    false,
+  );
+
+  const configured = document();
+  configured.employees.roles.developer.permissions.allowedIntents.push(
+    "propose_configuration_change",
+  );
+  configured.workCoordination.policy.configurationChangeRoles = ["developer"];
+  assert.deepEqual(
+    normalizeConfigurationDocument(configured).workCoordination.policy
+      .configurationChangeRoles,
+    ["developer"],
+  );
+
+  const missingPolicy = document();
+  missingPolicy.employees.roles.developer.permissions.allowedIntents.push(
+    "propose_configuration_change",
+  );
+  assertInvalid(missingPolicy);
+
+  const missingPermission = document();
+  missingPermission.workCoordination.policy.configurationChangeRoles = [
+    "developer",
+  ];
+  assertInvalid(missingPermission);
+
+  const legacyReviewer = document();
+  legacyReviewer.workCoordination.policy.configurationChangeRoles = [
+    "pr-reviewer",
+  ];
+  assertInvalid(legacyReviewer);
 });
 
 test("Git Head snapshot configuration is opt-in and preserves legacy workspaces", () => {
@@ -177,6 +306,95 @@ test("Windows Git Head snapshots reject wrapper executables before activation", 
 
 });
 
+test("conflict preparation is opt-in and preserves the legacy code executor shape", () => {
+  const legacy = normalizeConfigurationDocument(document());
+  assert.equal(
+    Object.hasOwn(legacy.codeExecutor, "conflictPreparation"),
+    false,
+  );
+
+  const disabled = document();
+  disabled.codeExecutor.conflictPreparation = { enabled: false };
+  assert.deepEqual(
+    normalizeConfigurationDocument(disabled).codeExecutor.conflictPreparation,
+    { enabled: false },
+  );
+
+  const enabled = normalizeConfigurationDocument(conflictPreparationDocument());
+  assert.deepEqual(enabled.codeExecutor.conflictPreparation, {
+    enabled: true,
+    baseMirrorsByRepository: {
+      "acme/command-center": mirrorPath("oct-base"),
+    },
+    headMirrorsByRepository: {
+      "acme/command-center": mirrorPath("oct-head"),
+    },
+  });
+  assertDeepFrozen(enabled.codeExecutor.conflictPreparation);
+});
+
+test("conflict preparation uses exact enabled and disabled shapes", () => {
+  const staleDisabled = document();
+  staleDisabled.codeExecutor.conflictPreparation = {
+    enabled: false,
+    baseMirrorsByRepository: {},
+  };
+  assertInvalid(staleDisabled);
+
+  for (const name of [
+    "baseMirrorsByRepository",
+    "headMirrorsByRepository",
+  ]) {
+    const missing = conflictPreparationDocument();
+    delete missing.codeExecutor.conflictPreparation[name];
+    assertInvalid(missing);
+
+    const empty = conflictPreparationDocument();
+    empty.codeExecutor.conflictPreparation[name] = {};
+    assertInvalid(empty);
+  }
+});
+
+test("conflict preparation accepts only canonical repository keys and local absolute mirrors", () => {
+  const duplicate = conflictPreparationDocument();
+  duplicate.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+    "ACME/COMMAND-CENTER"
+  ] = mirrorPath("duplicate");
+  assertInvalid(duplicate);
+
+  for (const repository of ["owner-/repository", "bad--owner/repository", "owner/.repo", "owner/repo..git"]) {
+    const invalidRepository = conflictPreparationDocument();
+    invalidRepository.codeExecutor.conflictPreparation.baseMirrorsByRepository = {
+      [repository]: mirrorPath("invalid-repository"),
+    };
+    assertInvalid(invalidRepository);
+  }
+
+  for (const mirror of ["relative/repository.git", "//server/share/repository.git"]) {
+    const invalidMirror = conflictPreparationDocument();
+    invalidMirror.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+      "acme/command-center"
+    ] = mirror;
+    assertInvalid(invalidMirror);
+  }
+});
+
+test("conflict preparation requires the same trusted Git implementation as snapshots", () => {
+  const missing = conflictPreparationDocument();
+  delete missing.codeExecutor.gitCommand;
+  assertInvalid(missing);
+
+  const relative = conflictPreparationDocument();
+  relative.codeExecutor.gitCommand = "tools/mingw64/bin/git.exe";
+  assertInvalid(relative);
+
+  if (process.platform === "win32") {
+    const wrapper = conflictPreparationDocument();
+    wrapper.codeExecutor.gitCommand = "C:\\Program Files\\Git\\cmd\\git.exe";
+    assertInvalid(wrapper);
+  }
+});
+
 test("Git Head snapshot fields retain strict data-only boundaries", () => {
   const extra = document();
   extra.codeExecutor = {
@@ -252,7 +470,7 @@ test("accessors, symbols, and abnormal prototypes are rejected without invoking 
 test("sparse, decorated, and cyclic configuration values are rejected", () => {
   const sparse = document();
   sparse.trackedRepositories = new Array(2);
-  sparse.trackedRepositories[1] = "SVisions/OCT-Product";
+  sparse.trackedRepositories[1] = "acme/product";
   assertInvalid(sparse);
 
   const decorated = document();
@@ -307,6 +525,92 @@ test("actual credentials are rejected while bounded environment references remai
   assert.equal(JSON.stringify(normalized).includes("not-a-real"), false);
 });
 
+test("GitHub PR external actions require an explicit unique allow-list", () => {
+  const configured = document();
+  configured.githubActions = {
+    enabled: true,
+    actorAccountId: "runtime-user",
+    tokenEnv: "MYDASHBOARD_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    enabledActions: ["comment", "review", "update_branch", "merge"],
+  };
+
+  assert.deepEqual(
+    normalizeConfigurationDocument(configured).githubActions.enabledActions,
+    ["comment", "review", "update_branch", "merge"],
+  );
+
+  for (const enabledActions of [
+    ["comment", "comment"],
+    ["delete_branch"],
+    "comment",
+  ]) {
+    const invalid = structuredClone(configured);
+    invalid.githubActions.enabledActions = enabledActions;
+    assertInvalid(invalid);
+  }
+
+  assert.equal(
+    Object.hasOwn(
+      normalizeConfigurationDocument((() => {
+        const legacy = document();
+        delete legacy.githubActions.enabledActions;
+        return legacy;
+      })()).githubActions,
+      "enabledActions",
+    ),
+    false,
+  );
+});
+
+test("GitHub PR action capability changes are authority changes requiring restart", () => {
+  const legacy = document();
+  delete legacy.githubActions.enabledActions;
+  const enabled = structuredClone(legacy);
+  enabled.githubActions.enabledActions = ["comment", "merge"];
+  const expansion = configurationDocumentImpact(legacy, enabled);
+  assert.deepEqual(expansion.authority_expansion, [
+    "githubActions.enabledActions",
+  ]);
+  assert.deepEqual(expansion.security_tightening, [
+    "githubActions.enabledActions",
+  ]);
+  assert.deepEqual(expansion.restart_required, [
+    "githubActions.enabledActions",
+  ]);
+
+  const tightened = structuredClone(enabled);
+  tightened.githubActions.enabledActions = ["comment"];
+  const removal = configurationDocumentImpact(enabled, tightened);
+  assert.deepEqual(removal.security_tightening, [
+    "githubActions.enabledActions",
+  ]);
+  assert.deepEqual(removal.authority_expansion, []);
+  assert.deepEqual(removal.restart_required, [
+    "githubActions.enabledActions",
+  ]);
+
+  const explicitlyDisabled = structuredClone(legacy);
+  explicitlyDisabled.githubActions.enabledActions = [];
+  const legacyDisabled = configurationDocumentImpact(
+    legacy,
+    explicitlyDisabled,
+  );
+  assert.deepEqual(legacyDisabled.security_tightening, [
+    "githubActions.enabledActions",
+  ]);
+  assert.deepEqual(legacyDisabled.authority_expansion, []);
+
+  const legacyRestored = configurationDocumentImpact(
+    explicitlyDisabled,
+    legacy,
+  );
+  assert.deepEqual(legacyRestored.security_tightening, []);
+  assert.deepEqual(legacyRestored.authority_expansion, [
+    "githubActions.enabledActions",
+  ]);
+});
+
 test("role brains, routing targets, and trusted policies must reference declared configuration", () => {
   const missingProvider = document();
   missingProvider.employees.roles.developer.brain.provider = "missing-provider";
@@ -351,6 +655,9 @@ test("legacy brains stay on Ollama while routed role and memory brains accept re
     remote: true,
   };
   routed.employees.roles.developer.brain.provider = "remote-smart";
+  routed.memory.answering.brain = structuredClone(
+    routed.employees.roles.developer.brain,
+  );
   routed.memory.answering.brain.provider = "remote-smart";
   const normalized = normalizeConfigurationDocument(routed);
   assert.equal(normalized.employees.roles.developer.brain.provider, "remote-smart");
@@ -405,6 +712,113 @@ test("Responses providers use explicit credential references and stricter reques
   assertInvalid(ollamaResponseFormat);
 });
 
+test("supervised CLI providers are closed remote-only brain identities", () => {
+  for (const kind of ["codex-cli", "claude-cli"]) {
+    const value = document();
+    value.brainProviders[kind] = {
+      kind,
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+    };
+    value.employees.roles.orchestrator.brain.provider = kind;
+
+    const normalized = normalizeConfigurationDocument(value);
+    assert.deepEqual(normalized.brainProviders[kind], value.brainProviders[kind]);
+    assert.equal(normalized.employees.roles.orchestrator.brain.provider, kind);
+  }
+});
+
+test("supervised CLI provider configuration cannot widen process authority", () => {
+  const cases = [
+    {
+      name: "missing remote classification",
+      mutate(provider) { delete provider.remote; },
+      path: "brainProviders.codex-cli.remote",
+    },
+    {
+      name: "local classification",
+      mutate(provider) { provider.remote = false; },
+      path: "brainProviders.codex-cli.remote",
+    },
+    {
+      name: "model endpoint",
+      mutate(provider) { provider.baseUrl = "https://models.example/v1"; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "credential reference",
+      mutate(provider) { provider.apiKeyEnv = "OPENAI_API_KEY"; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "wire protocol",
+      mutate(provider) { provider.protocol = "responses"; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "response format",
+      mutate(provider) { provider.responseFormat = "json-schema"; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "context window",
+      mutate(provider) { provider.contextTokens = 16_384; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "executable",
+      mutate(provider) { provider.executable = "codex"; },
+      path: "brainProviders.codex-cli",
+    },
+    {
+      name: "arguments",
+      mutate(provider) { provider.args = ["--dangerously-bypass-approvals-and-sandbox"]; },
+      path: "brainProviders.codex-cli",
+    },
+  ];
+
+  for (const { name, mutate, path } of cases) {
+    const value = document();
+    value.brainProviders["codex-cli"] = {
+      kind: "codex-cli",
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+    };
+    mutate(value.brainProviders["codex-cli"]);
+    assert.throws(
+      () => normalizeConfigurationDocument(value),
+      (error) =>
+        error instanceof ConfigurationContractError &&
+        error.message.includes(path),
+      name,
+    );
+  }
+
+  for (const [field, value] of [
+    ["timeoutMs", 999],
+    ["timeoutMs", 3_600_001],
+    ["maxResponseBytes", 1_023],
+    ["maxResponseBytes", 1_048_577],
+    ["maxRequestBytes", 1_023],
+    ["maxRequestBytes", 1_048_577],
+  ]) {
+    const invalid = document();
+    invalid.brainProviders["claude-cli"] = {
+      kind: "claude-cli",
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+      [field]: value,
+    };
+    assertInvalid(invalid);
+  }
+});
+
 test("providers without protocol preserve legacy numeric configuration ranges", () => {
   const value = document();
   value.brainProviders["legacy.remote"] = {
@@ -426,6 +840,17 @@ test("providers without protocol preserve legacy numeric configuration ranges", 
   const explicitChat = structuredClone(value);
   explicitChat.brainProviders["legacy.remote"].protocol = "chat-completions";
   assertInvalid(explicitChat);
+});
+
+test("change package activation requires the code executor it composes with", () => {
+  const invalid = document();
+  invalid.changePackages = {
+    enabled: true,
+    gitCommand: trustedGitCommand(),
+  };
+  invalid.codeExecutor = { enabled: false };
+
+  assertInvalid(invalid);
 });
 
 test("provider protocol changes require new authority and restart", () => {
@@ -521,7 +946,7 @@ test("impact treats provider identity and repository scope changes as authority 
     remote: true,
   };
   expandedDocument.employees.roles.developer.brain.provider = "remote-smart";
-  expandedDocument.trackedRepositories.push("SVisions/New-Product");
+  expandedDocument.trackedRepositories.push("acme/new-product");
 
   const expanded = configurationDocumentImpact(document(), expandedDocument);
   assert.deepEqual(expanded.security_tightening, [
@@ -532,7 +957,11 @@ test("impact treats provider identity and repository scope changes as authority 
     "employees.roles.developer.brain.provider",
     "trackedRepositories",
   ]);
-  assert.deepEqual(expanded.restart_required, ["brainProviders.remote-smart"]);
+  assert.deepEqual(expanded.restart_required, [
+    "brainProviders.remote-smart",
+    "employees.roles.developer.brain.provider",
+    "trackedRepositories",
+  ]);
 
   const tightened = configurationDocumentImpact(expandedDocument, document());
   assert.deepEqual(tightened.security_tightening, [
@@ -545,7 +974,81 @@ test("impact treats provider identity and repository scope changes as authority 
   ]);
 });
 
-test("impact separates claim-time behavior from restart-required infrastructure", () => {
+test("task brain authority changes invalidate precisely and require runtime restart", () => {
+  const configured = document();
+  configured.employees.roles.developer.taskBrain = {
+    provider: "ollama",
+    model: "qwen3.5:task",
+    remoteData: { requirements: false, code: false, memory: false },
+  };
+  const addition = configurationDocumentImpact(document(), configured);
+  assert.deepEqual(addition.security_tightening, []);
+  assert.deepEqual(addition.authority_expansion, [
+    "employees.roles.developer.taskBrain",
+  ]);
+  assert.deepEqual(addition.restart_required, [
+    "employees.roles.developer.taskBrain",
+  ]);
+
+  const changedModel = structuredClone(configured);
+  changedModel.employees.roles.developer.taskBrain.model = "qwen3.5:task-v2";
+  const replacement = configurationDocumentImpact(configured, changedModel);
+  const modelPath = "employees.roles.developer.taskBrain.model";
+  assert.deepEqual(replacement.security_tightening, []);
+  assert.deepEqual(replacement.authority_expansion, []);
+  assert.deepEqual(replacement.benign_claim_change, [modelPath]);
+  assert.deepEqual(replacement.restart_required, [modelPath]);
+
+  const expandedData = structuredClone(configured);
+  expandedData.employees.roles.developer.taskBrain.remoteData.code = true;
+  const dataExpansion = configurationDocumentImpact(configured, expandedData);
+  const dataPath = "employees.roles.developer.taskBrain.remoteData.code";
+  assert.deepEqual(dataExpansion.security_tightening, []);
+  assert.deepEqual(dataExpansion.authority_expansion, [dataPath]);
+  assert.deepEqual(dataExpansion.restart_required, [dataPath]);
+
+  const removed = configurationDocumentImpact(configured, document());
+  assert.deepEqual(removed.security_tightening, [
+    "employees.roles.developer.taskBrain",
+  ]);
+  assert.deepEqual(removed.authority_expansion, []);
+  assert.deepEqual(removed.restart_required, [
+    "employees.roles.developer.taskBrain",
+  ]);
+});
+
+test("conflict preparation changes invalidate authority and restart classifications precisely", () => {
+  const enabled = conflictPreparationDocument();
+  const activation = configurationDocumentImpact(document(), enabled);
+
+  assert.equal(
+    activation.authority_expansion.includes(
+      "codeExecutor.conflictPreparation",
+    ),
+    true,
+  );
+  assert.equal(
+    activation.restart_required.includes("codeExecutor.conflictPreparation"),
+    true,
+  );
+  assert.equal(
+    activation.restart_required.includes("codeExecutor.gitCommand"),
+    true,
+  );
+
+  const changedMirror = structuredClone(enabled);
+  changedMirror.codeExecutor.conflictPreparation.baseMirrorsByRepository[
+    "acme/command-center"
+  ] = mirrorPath("replacement-base");
+  const replacement = configurationDocumentImpact(enabled, changedMirror);
+  const changedPath =
+    "codeExecutor.conflictPreparation.baseMirrorsByRepository.acme/command-center";
+  assert.equal(replacement.security_tightening.includes(changedPath), true);
+  assert.equal(replacement.authority_expansion.includes(changedPath), true);
+  assert.equal(replacement.restart_required.includes(changedPath), true);
+});
+
+test("impact separates semantic claim changes while reporting actual restart needs", () => {
   const changed = document();
   changed.port += 1;
   changed.employees.roles.developer.brain.model = "qwen3.5:small";
@@ -561,7 +1064,36 @@ test("impact separates claim-time behavior from restart-required infrastructure"
     "employees.roles.developer.brain.model",
     "employees.roles.developer.mission",
   ]);
-  assert.deepEqual(impact.restart_required, ["port"]);
+  assert.deepEqual(impact.restart_required, [
+    "employees.roles.developer.brain.model",
+    "employees.roles.developer.mission",
+    "port",
+  ]);
+});
+
+test("every changed path is reported as restart-required while runtime composition is immutable", () => {
+  const changed = document();
+  changed.refreshMinutes += 1;
+  changed.employees.roles.developer.brain.model = "qwen3.5:replacement";
+  changed.employees.roles.developer.mission = "Use the replacement mission.";
+  changed.employees.roles.developer.brain.remoteData.code = true;
+
+  const impact = configurationDocumentImpact(document(), changed);
+
+  assert.deepEqual(impact.restart_required, [
+    "employees.roles.developer.brain.model",
+    "employees.roles.developer.brain.remoteData.code",
+    "employees.roles.developer.mission",
+    "refreshMinutes",
+  ]);
+  assert.deepEqual(impact.authority_expansion, [
+    "employees.roles.developer.brain.remoteData.code",
+  ]);
+  assert.deepEqual(impact.benign_claim_change, [
+    "employees.roles.developer.brain.model",
+    "employees.roles.developer.mission",
+    "refreshMinutes",
+  ]);
 });
 
 test("identical documents have no impact and expose immutable empty classifications", () => {

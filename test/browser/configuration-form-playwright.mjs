@@ -6,7 +6,19 @@ import path from "node:path";
 import { chromium } from "playwright";
 
 const publicDirectory = path.resolve("public");
-const baseConfiguration = JSON.parse(await readFile("config.json", "utf8"));
+const baseConfiguration = JSON.parse(
+  await readFile("config.example.json", "utf8"),
+);
+baseConfiguration.trackedRepositories = [
+  "fixture/existing-application",
+  "fixture/existing-service",
+];
+baseConfiguration.memory.answering.brain = structuredClone(
+  baseConfiguration.employees.roles.developer.brain,
+);
+baseConfiguration.memory.answering.localBrain = structuredClone(
+  baseConfiguration.employees.roles.developer.brain,
+);
 const ACTIVE_DIGEST = "a".repeat(64);
 const DOCUMENT_DIGEST = "b".repeat(64);
 const VALIDATION_DIGEST = "c".repeat(64);
@@ -523,6 +535,13 @@ try {
   assert.equal(
     await templateField(
       providerTemplate,
+      ["brainProviders", "new-provider", "protocol"],
+    ).inputValue(),
+    "chat-completions",
+  );
+  assert.equal(
+    await templateField(
+      providerTemplate,
       ["brainProviders", "new-provider", "apiKeyEnv"],
     ).count(),
     1,
@@ -627,6 +646,175 @@ try {
       ])}']`,
     ).count(),
     0,
+  );
+
+  const forbiddenCliProviderFields = [
+    "baseUrl",
+    "apiKeyEnv",
+    "protocol",
+    "responseFormat",
+    "contextTokens",
+    "executable",
+    "command",
+    "args",
+    "cwd",
+    "directory",
+    "plugins",
+    "mcpServers",
+  ];
+  const addCliProvider = async ({
+    templateSummary,
+    templateKey,
+    providerId,
+    kind,
+  }) => {
+    const template = await openDetailsBySummary(page, templateSummary);
+    await template.locator("[data-configuration-template-key]").fill(providerId);
+    assert.equal(
+      await templateField(template, ["brainProviders", templateKey, "kind"])
+        .inputValue(),
+      kind,
+    );
+    assert.equal(
+      await templateField(template, ["brainProviders", templateKey, "kind"])
+        .getAttribute("readonly"),
+      "",
+    );
+    assert.equal(
+      await templateField(template, ["brainProviders", templateKey, "remote"])
+        .isChecked(),
+      true,
+    );
+    for (const name of forbiddenCliProviderFields) {
+      assert.equal(
+        await templateField(template, ["brainProviders", templateKey, name]).count(),
+        0,
+        `${kind} template must not expose ${name}`,
+      );
+    }
+    await template.getByRole("button", { name: templateSummary }).click();
+
+    const card = attributeLocator(
+      page,
+      "data-configuration-entry",
+      ["brainProviders", providerId],
+    );
+    assert.equal(
+      await field(page, ["brainProviders", providerId, "kind"]).inputValue(),
+      kind,
+    );
+    assert.equal(
+      await field(page, ["brainProviders", providerId, "kind"])
+        .getAttribute("readonly"),
+      "",
+    );
+    assert.equal(
+      await field(page, ["brainProviders", providerId, "remote"]).isChecked(),
+      true,
+    );
+    for (const name of forbiddenCliProviderFields) {
+      assert.equal(
+        await field(page, ["brainProviders", providerId, name]).count(),
+        0,
+        `${kind} card must not expose ${name}`,
+      );
+    }
+    return card;
+  };
+
+  await addCliProvider({
+    templateSummary: "新增Codex CLI（单任务受监管）",
+    templateKey: "codex-cli",
+    providerId: "codex.local-cli",
+    kind: "codex-cli",
+  });
+  await addCliProvider({
+    templateSummary: "新增Claude CLI（单任务受监管）",
+    templateKey: "claude-cli",
+    providerId: "claude.local-cli",
+    kind: "claude-cli",
+  });
+
+  await field(page, ["employees", "roles", "orchestrator", "brain", "provider"])
+    .selectOption("codex.local-cli");
+  await field(page, ["employees", "roles", "orchestrator", "brain", "model"])
+    .fill("gpt-5.6-codex");
+  await field(page, [
+    "employees",
+    "roles",
+    "orchestrator",
+    "brain",
+    "remoteData",
+    "requirements",
+  ]).check();
+  await field(page, [
+    "employees",
+    "roles",
+    "orchestrator",
+    "brain",
+    "remoteData",
+    "code",
+  ]).check();
+
+  const developerCard = attributeLocator(
+    page,
+    "data-configuration-entry",
+    ["employees", "roles", "developer"],
+  );
+  const taskBrainTemplate = await openDetailsBySummary(
+    developerCard,
+    "新增任务大脑",
+  );
+  await templateField(taskBrainTemplate, [
+    "employees",
+    "roles",
+    "developer",
+    "taskBrain",
+    "provider",
+  ]).selectOption("claude.local-cli");
+  await templateField(taskBrainTemplate, [
+    "employees",
+    "roles",
+    "developer",
+    "taskBrain",
+    "model",
+  ]).fill("claude-opus-4-6");
+  await templateField(taskBrainTemplate, [
+    "employees",
+    "roles",
+    "developer",
+    "taskBrain",
+    "remoteData",
+    "requirements",
+  ]).check();
+  await templateField(taskBrainTemplate, [
+    "employees",
+    "roles",
+    "developer",
+    "taskBrain",
+    "remoteData",
+    "code",
+  ]).check();
+  await taskBrainTemplate.getByRole("button", { name: "新增任务大脑" }).click();
+  assert.equal(
+    await field(page, [
+      "employees",
+      "roles",
+      "developer",
+      "taskBrain",
+      "provider",
+    ]).inputValue(),
+    "claude.local-cli",
+  );
+  assert.equal(
+    await field(page, [
+      "employees",
+      "roles",
+      "developer",
+      "taskBrain",
+      "model",
+    ]).inputValue(),
+    "claude-opus-4-6",
   );
 
   await field(page, ["employees", "roles", "developer", "brain", "provider"])
@@ -779,6 +967,7 @@ try {
     kind: "openai-compatible",
     baseUrl: "https://models.example.invalid/v1",
     apiKeyEnv: "MYDASHBOARD_MODEL_API_KEY",
+    protocol: "chat-completions",
     responseFormat: "json-schema",
     remote: true,
     timeoutMs: 120_000,
@@ -796,7 +985,31 @@ try {
     maxResponseBytes: 131_072,
     maxRequestBytes: 262_144,
   };
+  expectedConfiguration.brainProviders["codex.local-cli"] = {
+    kind: "codex-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  expectedConfiguration.brainProviders["claude.local-cli"] = {
+    kind: "claude-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  expectedConfiguration.employees.roles.orchestrator.brain = {
+    provider: "codex.local-cli",
+    model: "gpt-5.6-codex",
+    remoteData: { requirements: true, code: true, memory: false },
+  };
   expectedConfiguration.employees.roles.developer.brain.provider = "remote.fixture";
+  expectedConfiguration.employees.roles.developer.taskBrain = {
+    provider: "claude.local-cli",
+    model: "claude-opus-4-6",
+    remoteData: { requirements: true, code: true, memory: false },
+  };
   expectedConfiguration.memory.answering.brain.provider = "remote.fixture";
   expectedConfiguration.trackedRepositories.push("fixture/repository");
   assert.deepEqual(draftWrites, [
@@ -809,6 +1022,21 @@ try {
       },
     },
   ]);
+  assert.equal(
+    await field(page, ["employees", "roles", "orchestrator", "brain", "provider"])
+      .inputValue(),
+    "codex.local-cli",
+  );
+  assert.equal(
+    await field(page, [
+      "employees",
+      "roles",
+      "developer",
+      "taskBrain",
+      "provider",
+    ]).inputValue(),
+    "claude.local-cli",
+  );
 
   assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
   assert.equal(confirmationRequests.length, 0);

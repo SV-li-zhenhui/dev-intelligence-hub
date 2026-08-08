@@ -59,6 +59,20 @@ function role(model, initialPaused = false) {
   };
 }
 
+function assignedTask(eventType, suffix = "1") {
+  const assignmentId = `assignment-${suffix}`;
+  return {
+    itemId: `work-item-${suffix}`,
+    kind: "assignment",
+    assignmentId,
+    assignment: {
+      assignmentId,
+      target: { type: "role", id: "developer" },
+    },
+    event: { eventType },
+  };
+}
+
 test("workforce builds independently controlled roles over one local provider", async () => {
   const calls = [];
   const workforce = createConfiguredWorkforce({
@@ -86,6 +100,65 @@ test("workforce builds independently controlled roles over one local provider", 
   assert.equal((await workforce.employees[1].roleView()).paused, true);
   assert.equal(Object.isFrozen(workforce.employees), true);
   assert.equal(Object.isFrozen(workforce.workers), true);
+});
+
+test("workforce preserves an optional high-capability task brain separately", async () => {
+  const workforce = createConfiguredWorkforce({
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+      "task-brain": {
+        kind: "ollama",
+        baseUrl: "http://127.0.0.1:11435",
+        remote: true,
+      },
+    },
+    roles: {
+      developer: {
+        ...role("routine-model"),
+        taskBrain: {
+          provider: "task-brain",
+          model: "high-capability-model",
+          remoteData: { requirements: true, code: true, memory: false },
+        },
+      },
+      tester: role("test-model"),
+    },
+    store: new MemoryStore(),
+  });
+
+  const developer = await workforce.employees[0].roleView();
+  assert.equal(developer.brain.model, "routine-model");
+  assert.deepEqual(developer.taskBrain, {
+    provider: "task-brain",
+    model: "high-capability-model",
+    remote: true,
+    remoteData: { requirements: true, code: true, memory: false },
+  });
+  assert.equal(
+    Object.hasOwn(await workforce.employees[1].roleView(), "taskBrain"),
+    false,
+  );
+
+  assert.throws(
+    () =>
+      createConfiguredWorkforce({
+        brainProviders: {
+          ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+        },
+        roles: {
+          developer: {
+            ...role("routine-model"),
+            taskBrain: {
+              provider: "missing",
+              model: "high-capability-model",
+              remoteData: { requirements: true, code: true, memory: false },
+            },
+          },
+        },
+        store: new MemoryStore(),
+      }),
+    /provider is unavailable/i,
+  );
 });
 
 test("workforce forwards one run-only admission gate to every role brain", async () => {
@@ -174,6 +247,65 @@ test("provider options are isolated by adapter kind", () => {
         },
       },
     }),
+  );
+});
+
+test("configured supervised CLIs stay remote and declare one process attempt", async () => {
+  for (const kind of ["codex-cli", "claude-cli"]) {
+    const router = createConfiguredBrainRouter({
+      brainProviders: {
+        cli: { kind, remote: false },
+      },
+    });
+    const configuredBrain = {
+      provider: "cli",
+      model: kind === "codex-cli" ? "gpt-5.6-codex" : "claude-opus-4-6",
+      remoteData: { requirements: false, code: false, memory: false },
+    };
+
+    assert.deepEqual(router.describe(configuredBrain), {
+      provider: "cli",
+      model: configuredBrain.model,
+      remote: true,
+      remoteData: { requirements: false, code: false, memory: false },
+      singleAttempt: true,
+    });
+    await assert.rejects(
+      router.generate({
+        brain: configuredBrain,
+        messages: MESSAGES,
+        schema: SCHEMA,
+        dataClasses: ["requirements"],
+      }),
+      (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
+    );
+  }
+});
+
+test("configured supervised CLIs reject adapter fields and command controls", () => {
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: {
+        cli: {
+          kind: "codex-cli",
+          baseUrl: "https://models.example/v1",
+          remote: true,
+        },
+      },
+    }),
+    /unsupported by CLI providers/,
+  );
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: {
+        cli: {
+          kind: "claude-cli",
+          executable: "claude --dangerously-skip-permissions",
+          remote: true,
+        },
+      },
+    }),
+    /unknown field/,
   );
 });
 
@@ -464,4 +596,86 @@ test("remote providers read credentials only from the injected environment", asy
     }),
     (error) => error.code === "REMOTE_DATA_NOT_AUTHORIZED",
   );
+});
+
+test("remote task-brain code denial stops before every provider call", async () => {
+  let fetchCalls = 0;
+  const workforce = createConfiguredWorkforce({
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+      remote: {
+        kind: "openai-compatible",
+        baseUrl: "https://models.example/v1",
+        apiKeyEnv: "MODEL_TOKEN",
+      },
+    },
+    roles: {
+      developer: {
+        ...role("routine-model"),
+        taskBrain: {
+          provider: "remote",
+          model: "task-model",
+          remoteData: { requirements: true, code: false, memory: false },
+        },
+      },
+    },
+    store: new MemoryStore(),
+    dependencies: {
+      environment: { MODEL_TOKEN: "secret-token" },
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("authorization denial must block before fetch");
+      },
+    },
+  });
+
+  await assert.rejects(
+    workforce.workers[0].decide({
+      item: assignedTask("pull_request.updated", "remote-denial"),
+      trigger: "assigned",
+    }),
+    (error) => error.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test("workforce starts without a task credential and fails before remote egress", async () => {
+  let fetchCalls = 0;
+  const workforce = createConfiguredWorkforce({
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+      remote: {
+        kind: "openai-compatible",
+        baseUrl: "https://models.example/v1",
+        apiKeyEnv: "MODEL_TOKEN",
+      },
+    },
+    roles: {
+      developer: {
+        ...role("routine-model"),
+        taskBrain: {
+          provider: "remote",
+          model: "task-model",
+          remoteData: { requirements: true, code: true, memory: false },
+        },
+      },
+    },
+    store: new MemoryStore(),
+    dependencies: {
+      environment: {},
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("missing credentials must block before fetch");
+      },
+    },
+  });
+
+  await assert.rejects(
+    workforce.workers[0].decide({
+      item: assignedTask("pull_request.updated", "missing-credential"),
+      trigger: "assigned",
+    }),
+    (error) => error.code === "BRAIN_CREDENTIAL_UNAVAILABLE",
+  );
+  assert.equal(fetchCalls, 0);
 });

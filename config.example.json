@@ -2,11 +2,11 @@
   "port": 4173,
   "refreshMinutes": 10,
   "browserPollSeconds": 60,
-  "githubLogin": "SV-li-zhenhui",
-  "trackedRepositories": [
-    "SVisions/OCT-Software",
-    "SVisions/OCT-Product"
-  ],
+  "githubLogin": "local-user",
+  "githubRead": {
+    "enabled": false
+  },
+  "trackedRepositories": [],
   "prResponsibility": {
     "historicalAfterDays": 60
   },
@@ -17,11 +17,12 @@
     "enabled": false
   },
   "githubActions": {
-    "enabled": false
+    "enabled": false,
+    "enabledActions": []
   },
   "workflowRouting": {
     "schemaVersion": 1,
-    "enabled": true,
+    "enabled": false,
     "maxHops": 8,
     "rules": [
       {
@@ -44,10 +45,7 @@
           ]
         },
         "targets": [
-          {
-            "type": "role",
-            "id": "pr-engineer"
-          }
+          { "type": "role", "id": "pr-engineer" }
         ],
         "onMatch": "stop"
       },
@@ -71,48 +69,26 @@
           ]
         },
         "targets": [
-          {
-            "type": "role",
-            "id": "requirements-analyst"
-          }
+          { "type": "role", "id": "requirements-analyst" }
         ],
         "onMatch": "stop"
       },
       {
-        "id": "owner-triage-fallback",
+        "id": "local-owner-triage",
         "source": "root",
         "enabled": true,
         "priority": 0,
         "fallback": true,
         "condition": null,
         "targets": [
-          {
-            "type": "person",
-            "id": "SV-li-zhenhui"
-          }
+          { "type": "person", "id": "local-user" }
         ],
         "onMatch": "stop"
       }
     ]
   },
   "workCoordination": {
-    "enabled": true,
-    "tickSeconds": 30,
-    "intakeLimit": 100,
-    "workLimit": 20,
-    "dispatchLimit": 50,
-    "attentionLimit": 50,
-    "proposalLimit": 50,
-    "conditionLimit": 50,
-    "codeJobLimit": 10,
-    "codeJobMemoryLimit": 50,
-    "leaseDurationMs": 180000,
-    "resolveTimeoutMs": 5000,
-    "decisionTimeoutMs": 150000,
-    "maxAttempts": 3,
-    "retryBaseMs": 30000,
-    "retryMaxMs": 900000,
-    "factMaximumAgeMs": 900000,
+    "enabled": false,
     "policy": {
       "version": 1,
       "capabilityRoles": {
@@ -122,84 +98,57 @@
         "development": "developer",
         "testing": "tester"
       },
-      "githubReviewRoles": [
-        "pr-engineer"
-      ],
-      "codeActionRoles": [
-        "developer",
-        "tester"
-      ],
+      "githubReviewRoles": ["pr-engineer"],
+      "codeActionRoles": ["pr-engineer", "developer", "tester"],
       "codeOperationsByRole": {
-        "developer": [
-          "inspect",
-          "modify",
-          "verify"
-        ],
-        "tester": [
-          "inspect",
-          "verify"
-        ]
+        "pr-engineer": ["inspect", "modify", "verify"],
+        "developer": ["inspect", "modify", "verify"],
+        "tester": ["inspect", "verify"]
       },
       "workspaceByRepository": {}
     }
   },
   "memory": {
-    "enabled": true,
-    "maximumRecords": 20000,
-    "maximumStateBytes": 67108864,
+    "enabled": false,
     "imports": {
       "localSessions": false,
       "git": false
     },
     "answering": {
-      "enabled": true,
-      "maximumRecords": 12,
-      "maximumContextBytes": 114688,
-      "maximumConcurrent": 1,
-      "brain": {
-        "provider": "ollama",
-        "model": "qwen3.5:9b",
-        "remoteData": {
-          "requirements": false,
-          "code": false,
-          "memory": false
-        }
-      },
-      "localBrain": {
-        "provider": "ollama",
-        "model": "qwen3.5:9b",
-        "remoteData": {
-          "requirements": false,
-          "code": false,
-          "memory": false
-        }
-      }
+      "enabled": false
     }
   },
   "brain": {
-    "enabled": true,
+    "enabled": false,
     "provider": "ollama",
     "model": "qwen3.5:9b",
-    "baseUrl": "http://127.0.0.1:11434",
-    "contextTokens": 8192,
-    "timeoutMs": 45000,
-    "maxAssessmentsPerRefresh": 3
+    "baseUrl": "http://127.0.0.1:11434"
   },
   "brainProviders": {
     "ollama": {
       "kind": "ollama",
       "baseUrl": "http://127.0.0.1:11434",
-      "remote": false,
-      "contextTokens": 8192,
-      "timeoutMs": 120000,
+      "remote": false
+    },
+    "codex-local-cli": {
+      "kind": "codex-cli",
+      "remote": true,
+      "timeoutMs": 300000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    },
+    "claude-local-cli": {
+      "kind": "claude-cli",
+      "remote": true,
+      "timeoutMs": 300000,
       "maxResponseBytes": 131072,
       "maxRequestBytes": 262144
     }
   },
   "employees": {
     "prReviewer": {
-      "enabled": true,
-      "name": "PR 推进员工",
+      "enabled": false,
+      "name": "PR reviewer",
       "initialPaused": true,
       "policyVersion": 1,
       "tickMinutes": 2,
@@ -216,7 +165,7 @@
     "roles": {
       "pr-engineer": {
         "name": "PR 工程师",
-        "mission": "主动分析与你相关的 PR，形成有证据的 Review 建议；任何 GitHub Review 都先生成持久提案并逐条进入用户确认队列。",
+        "mission": "主动分析相关 PR，形成证据绑定的评审、代码和推进建议；所有外部动作逐项等待所有者确认。",
         "enabled": true,
         "scheduleMinutes": 2,
         "initialPaused": true,
@@ -225,6 +174,8 @@
             "ask_user",
             "wait_condition",
             "propose_github_review",
+            "propose_github_pull_request_action",
+            "propose_code_action",
             "handoff",
             "submit_delivery",
             "complete"
@@ -242,16 +193,13 @@
       },
       "orchestrator": {
         "name": "主控调度员",
-        "mission": "主动观察共享任务图，按验收契约拆分、分派、验收或退回直属任务；需要所有者决定时使用编排升级动作，所有子任务完成后再结束根任务。",
+        "mission": "主动观察共享任务图，按验收契约拆分、分派、验收、退回、升级或结束工作。",
         "enabled": true,
         "scheduleMinutes": 2,
         "initialPaused": true,
         "workerId": "employee-orchestrator",
         "permissions": {
-          "allowedIntents": [
-            "orchestrate",
-            "complete"
-          ]
+          "allowedIntents": ["orchestrate", "complete"]
         },
         "brain": {
           "provider": "ollama",
@@ -265,7 +213,7 @@
       },
       "requirements-analyst": {
         "name": "需求分析师",
-        "mission": "主动梳理需求、识别歧义和验收条件；围绕当前任务契约形成 requirement-spec 交付，能自行判断的就推进，需要产品决策时把一个明确问题送入确认队列。",
+        "mission": "主动澄清需求、风险和验收条件，提交可修订的需求交付；只把真正需要产品决定的问题交给所有者。",
         "enabled": true,
         "scheduleMinutes": 3,
         "initialPaused": true,
@@ -290,7 +238,7 @@
       },
       "developer": {
         "name": "开发工程师",
-        "mission": "主动读取已验收的需求输入，分析实现方案和风险，提出受策略约束的代码动作，并按任务契约提交 change-package；任何真实代码变更都必须经过受控执行器。",
+        "mission": "主动读取已验收输入，提出受策略约束的代码动作并提交可验证的变更交付。",
         "enabled": true,
         "scheduleMinutes": 3,
         "initialPaused": true,
@@ -316,7 +264,7 @@
       },
       "tester": {
         "name": "测试工程师",
-        "mission": "主动读取已验收实现和验收标准，设计验证并按任务契约提交 test-report，失败时提供可复现证据；必要时提出只在受控执行器中运行的测试动作。",
+        "mission": "主动依据验收标准验证交付，提交可复现的测试证据，并把失败返回共享任务图。",
         "enabled": true,
         "scheduleMinutes": 4,
         "initialPaused": true,
@@ -343,8 +291,8 @@
     }
   },
   "dingtalk": {
-    "enabled": true,
-    "selfUserId": "1137300121374851",
+    "enabled": false,
+    "selfUserId": "local-user",
     "notifyMinimumScore": 80,
     "maxNotificationsPerRun": 5
   }

@@ -21,6 +21,13 @@ import {
   CodeExecutionPolicy,
   normalizeWorkspacePath,
 } from "../domain/code-execution-policy.js";
+import { normalizeCodeExecutionSource } from "../domain/code-execution-source.js";
+import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
+import {
+  createControlledCommitMessage,
+  normalizeControlledCommitEvidence,
+  sameControlledCommitEvidence,
+} from "../domain/controlled-commit-evidence.js";
 import {
   createConflictPreparationBinding,
   normalizeConflictPreparationBinding,
@@ -28,13 +35,34 @@ import {
 } from "../domain/conflict-preparation-binding.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import {
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
+import {
   canonicalJsonDigest,
   canonicalJsonStringify,
 } from "../lib/canonical-json-digest.js";
+import {
+  CONTROLLED_COMMIT_ID,
+  CONTROLLED_COMMIT_SCRATCH_PREFIX,
+  ControlledGitCommitBuilder,
+} from "./controlled-git-commit-builder.js";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const SHA1 = /^[a-f0-9]{40}$/u;
+const GITHUB_LOGIN =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
+const GITHUB_REPOSITORY =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9_.-]{1,100}$/u;
+const GITHUB_ACTION_MARKER =
+  /^<!-- mydashboard-action:v1:[a-f0-9]{64} -->$/u;
+const PUBLICATION_CREDENTIAL = /^[^\s\u0000-\u001f\u007f]{1,4096}$/u;
 const MANIFEST_KIND = "controlled-git-conflict-preparation";
+const DEFAULT_COMMIT_IDENTITY = Object.freeze({
+  name: "MyDashboard PR Engineer",
+  email: "pr-engineer@mydashboard.local",
+  timezone: "+0000",
+});
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "kind",
@@ -990,6 +1018,381 @@ function publicPreparation(manifest) {
   });
 }
 
+function canonicalTimestamp(value) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(Date.parse(value)).toISOString() !== value
+  ) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "Controlled commit createdAt 无效",
+    );
+  }
+  return value;
+}
+
+function normalizeCommitIdentity(value) {
+  const fields = exactDataObject(
+    value,
+    ["name", "email", "timezone"],
+    "INVALID_CONTROLLED_GIT_CONFIG",
+  );
+  const name = fields.get("name");
+  const email = fields.get("email");
+  const timezone = fields.get("timezone");
+  const timezoneMatch = typeof timezone === "string"
+    ? /^([+-])(\d{2})(\d{2})$/u.exec(timezone)
+    : null;
+  if (
+    typeof name !== "string" ||
+    name.length === 0 ||
+    Buffer.byteLength(name, "utf8") > 128 ||
+    /[<>\0\r\n]/u.test(name) ||
+    typeof email !== "string" ||
+    Buffer.byteLength(email, "utf8") > 254 ||
+    !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$/u.test(email) ||
+    timezoneMatch === null ||
+    Number(timezoneMatch[2]) > 14 ||
+    Number(timezoneMatch[3]) > 59 ||
+    (Number(timezoneMatch[2]) === 14 && Number(timezoneMatch[3]) !== 0)
+  ) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_CONFIG",
+      "Controlled commit identity 无效",
+    );
+  }
+  return Object.freeze({ name, email, timezone });
+}
+
+function normalizeControlledCommitBlobs(value, manifest, limits) {
+  const entries = exactArray(value, "INVALID_CONTROLLED_GIT_REQUEST");
+  const references = new Map(
+    [...manifest.changes.created, ...manifest.changes.modified]
+      .map(({ blob }) => [blob.sha256, blob.bytes]),
+  );
+  if (entries.length !== references.size || entries.length > limits.maxFiles) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "Controlled commit blobs 未精确覆盖 change package",
+    );
+  }
+  const blobs = [];
+  let totalBytes = 0;
+  const seen = new Set();
+  for (const entry of entries) {
+    const fields = exactDataObject(
+      entry,
+      ["sha256", "content"],
+      "INVALID_CONTROLLED_GIT_REQUEST",
+    );
+    const digest = fields.get("sha256");
+    const contentValue = fields.get("content");
+    if (
+      !SHA256.test(digest) ||
+      seen.has(digest) ||
+      !(Buffer.isBuffer(contentValue) || contentValue instanceof Uint8Array)
+    ) {
+      throw controlledGitError(
+        "INVALID_CONTROLLED_GIT_REQUEST",
+        "Controlled commit blob 无效",
+      );
+    }
+    const content = Buffer.from(contentValue);
+    totalBytes += content.length;
+    if (
+      references.get(digest) !== content.length ||
+      sha256(content) !== digest ||
+      content.length > limits.maxBlobBytes ||
+      totalBytes > limits.maxTotalBytes
+    ) {
+      throw controlledGitError(
+        "INVALID_CONTROLLED_GIT_REQUEST",
+        "Controlled commit blob 与 change package 不一致",
+      );
+    }
+    seen.add(digest);
+    blobs.push({ sha256: digest, content });
+  }
+  if ([...references.keys()].some((digest) => !seen.has(digest))) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "Controlled commit blobs 未精确覆盖 change package",
+    );
+  }
+  blobs.sort((left, right) => left.sha256.localeCompare(right.sha256, "en"));
+  return blobs;
+}
+
+function normalizeControlledCommitRequest(value, limits) {
+  const fields = exactDataObject(value, [
+    "executionSource",
+    "manifest",
+    "blobs",
+    "createdAt",
+  ]);
+  let executionSource;
+  let manifest;
+  let message;
+  try {
+    executionSource = normalizeCodeExecutionSource(fields.get("executionSource"));
+    manifest = normalizeChangePackageManifest(fields.get("manifest"));
+    message = createControlledCommitMessage({
+      executionSource,
+      manifest,
+    });
+  } catch (cause) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "Controlled commit source 或 change package 无效",
+      cause,
+    );
+  }
+  return {
+    executionSource,
+    manifest,
+    blobs: normalizeControlledCommitBlobs(fields.get("blobs"), manifest, limits),
+    createdAt: canonicalTimestamp(fields.get("createdAt")),
+    message,
+  };
+}
+
+function normalizeControlledCommitLookup(value) {
+  const fields = exactDataObject(value, [
+    "executionSource",
+    "manifest",
+    "createdAt",
+  ]);
+  let executionSource;
+  let manifest;
+  try {
+    executionSource = normalizeCodeExecutionSource(fields.get("executionSource"));
+    manifest = normalizeChangePackageManifest(fields.get("manifest"));
+    createControlledCommitMessage({ executionSource, manifest });
+  } catch (cause) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_REQUEST",
+      "Controlled commit lookup source 或 change package 无效",
+      cause,
+    );
+  }
+  return {
+    executionSource,
+    manifest,
+    createdAt: canonicalTimestamp(fields.get("createdAt")),
+  };
+}
+
+function normalizeControlledCommitPublicationAction(value) {
+  const fields = exactDataObject(
+    value,
+    [
+      "type",
+      "expectedOldOid",
+      "remote",
+      "controlledCommitEvidence",
+      "inputBinding",
+    ],
+    "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+  );
+  if (fields.get("type") !== "pull_request_push") {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Controlled commit publisher 只接受 pull_request_push",
+    );
+  }
+  const remoteFields = exactDataObject(
+    fields.get("remote"),
+    ["repository", "refName"],
+    "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+  );
+  let inputBinding;
+  let evidence;
+  try {
+    if (!isPlainRecord(fields.get("inputBinding"))) throw new TypeError();
+    inputBinding = normalizePullRequestExecutionBinding(
+      fields.get("inputBinding"),
+    );
+    evidence = normalizeControlledCommitEvidence(
+      fields.get("controlledCommitEvidence"),
+    );
+  } catch (cause) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Controlled commit publication binding 无效",
+      cause,
+    );
+  }
+  if (inputBinding.schemaVersion !== 2) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Controlled commit publication 需要 v2 PR binding",
+    );
+  }
+  const target = inputBinding.gitTarget;
+  if (
+    fields.get("expectedOldOid") !== target.headRefOid ||
+    remoteFields.get("repository") !== target.headRepository ||
+    remoteFields.get("refName") !== target.headRefName ||
+    !samePullRequestExecutionBinding(
+      evidence.executionSource.inputBinding,
+      inputBinding,
+    ) ||
+    evidence.commit.parents[0] !== target.headRefOid ||
+    evidence.commit.parents[1] !== target.baseRefOid
+  ) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Controlled commit publication 未精确绑定 sealed commit 与 PR Head",
+    );
+  }
+  return {
+    type: "pull_request_push",
+    expectedOldOid: target.headRefOid,
+    remote: {
+      repository: target.headRepository,
+      refName: target.headRefName,
+    },
+    controlledCommitEvidence: evidence,
+    inputBinding,
+  };
+}
+
+function normalizeControlledCommitPublicationRequest(value) {
+  const fields = exactDataObject(
+    value,
+    [
+      "credential",
+      "actorAccountId",
+      "repository",
+      "pullRequestNumber",
+      "marker",
+      "action",
+    ],
+    "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+  );
+  const credential = fields.get("credential");
+  const actorAccountId = fields.get("actorAccountId");
+  const repository = fields.get("repository");
+  const pullRequestNumber = fields.get("pullRequestNumber");
+  const marker = fields.get("marker");
+  if (
+    typeof credential !== "string" ||
+    !PUBLICATION_CREDENTIAL.test(credential) ||
+    typeof actorAccountId !== "string" ||
+    !GITHUB_LOGIN.test(actorAccountId) ||
+    actorAccountId.includes("--") ||
+    typeof repository !== "string" ||
+    !GITHUB_REPOSITORY.test(repository) ||
+    !Number.isSafeInteger(pullRequestNumber) ||
+    Object.is(pullRequestNumber, -0) ||
+    pullRequestNumber < 1 ||
+    typeof marker !== "string" ||
+    !GITHUB_ACTION_MARKER.test(marker)
+  ) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Controlled commit publication request 无效",
+    );
+  }
+  const action = normalizeControlledCommitPublicationAction(
+    fields.get("action"),
+  );
+  const target = action.inputBinding.gitTarget;
+  if (
+    repository !== action.inputBinding.repository ||
+    pullRequestNumber !== action.inputBinding.pullRequestNumber ||
+    actorAccountId.toLowerCase() !== target.sourceAccountId.toLowerCase()
+  ) {
+    throw controlledGitError(
+      "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
+      "Publisher actor、PR target 与 action binding 不一致",
+    );
+  }
+  return {
+    credential,
+    actorAccountId: actorAccountId.toLowerCase(),
+    repository,
+    pullRequestNumber,
+    marker,
+    action,
+  };
+}
+
+function publicationResult(status, commitOid = null) {
+  if (["applied", "already"].includes(status)) {
+    return deepFreeze({ status, receipt: { id: commitOid } });
+  }
+  if (status === "stale") return Object.freeze({ status: "stale" });
+  return Object.freeze({
+    status: "unknown",
+    code: "CONTROLLED_GIT_PUBLISH_OUTCOME_UNKNOWN",
+  });
+}
+
+function publicationProcessResult(value, maximumBytes) {
+  const fields = dataObject(value, {
+    allowed: [
+      "exitCode",
+      "signal",
+      "stdout",
+      "stderr",
+      "truncated",
+      "durationMs",
+    ],
+    required: ["exitCode", "signal", "stdout", "stderr", "truncated"],
+    code: "CONTROLLED_GIT_PUBLISH_PROTOCOL_ERROR",
+    message: "Controlled Git publication process result 无效",
+  });
+  const stdout = bytesFromOutput(fields.get("stdout"));
+  const stderr = bytesFromOutput(fields.get("stderr"));
+  if (
+    !Number.isSafeInteger(fields.get("exitCode")) ||
+    fields.get("signal") !== null ||
+    fields.get("truncated") !== false ||
+    stdout === null ||
+    stderr === null ||
+    stdout.length > maximumBytes ||
+    stderr.length > maximumBytes
+  ) {
+    throw controlledGitError(
+      "CONTROLLED_GIT_PUBLISH_PROTOCOL_ERROR",
+      "Controlled Git publication process result 无效",
+    );
+  }
+  return { exitCode: fields.get("exitCode"), stdout, stderr };
+}
+
+function parsePublishedHead(result, refName, oidLength) {
+  if (
+    result.exitCode === 2 &&
+    result.stdout.length === 0 &&
+    result.stderr.length === 0
+  ) {
+    return null;
+  }
+  if (result.exitCode !== 0 || result.stderr.length !== 0) return undefined;
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+  } catch {
+    return undefined;
+  }
+  const normalized = text.replace(/\r\n/gu, "\n");
+  const suffix = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+  if (suffix.includes("\n")) return undefined;
+  const separator = suffix.indexOf("\t");
+  if (separator < 1 || suffix.indexOf("\t", separator + 1) !== -1) {
+    return undefined;
+  }
+  const oid = suffix.slice(0, separator);
+  return oidPattern(oidLength).test(oid) &&
+      suffix.slice(separator + 1) === refName
+    ? oid
+    : undefined;
+}
+
 class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
     return new Promise((resolve, reject) => {
@@ -1053,6 +1456,8 @@ class BinaryExecFileRunner {
 }
 
 export class ControlledGitService {
+  #commitBuilder;
+  #commitIdentity;
   #gitCommand;
   #mirrorInspector;
   #preparationRoot;
@@ -1067,6 +1472,7 @@ export class ControlledGitService {
         "preparationRoot",
         "processRunner",
         "limits",
+        "commitIdentity",
       ],
       required: ["gitCommand", "mirrorInspector", "preparationRoot"],
       code: "INVALID_CONTROLLED_GIT_CONFIG",
@@ -1079,6 +1485,9 @@ export class ControlledGitService {
       ? fields.get("processRunner")
       : new BinaryExecFileRunner();
     const limits = fields.has("limits") ? fields.get("limits") : {};
+    const commitIdentity = fields.has("commitIdentity")
+      ? fields.get("commitIdentity")
+      : DEFAULT_COMMIT_IDENTITY;
     this.#gitCommand = requireAbsolutePath(
       gitCommand,
       "INVALID_CONTROLLED_GIT_CONFIG",
@@ -1108,6 +1517,34 @@ export class ControlledGitService {
     this.#mirrorInspector = bindDataMethod(mirrorInspector, "preflight");
     this.#run = bindDataMethod(processRunner, "run");
     this.#limits = validateLimits(limits);
+    this.#commitIdentity = normalizeCommitIdentity(commitIdentity);
+    this.#commitBuilder = new ControlledGitCommitBuilder({
+      preparationRoot: this.#preparationRoot,
+      identity: this.#commitIdentity,
+      limits: this.#limits,
+      fail: controlledGitError,
+      assertRoot: () => this.#assertPreparationRoot(),
+      verifyPreparation: (executionSource, manifest) =>
+        this.#verifiedCommitPreparation(executionSource, manifest),
+      normalizeBlobs: (blobs, manifest) =>
+        normalizeControlledCommitBlobs(blobs, manifest, this.#limits),
+      directoryEvidence: (root, options) =>
+        this.#directoryEvidence(root, options),
+      createObjectEnvironment: (resultObjects, ...alternates) =>
+        this.#gitEnvironment(resultObjects, ...alternates),
+      git: Object.freeze({
+        readTree: (request) =>
+          this.#runControlledCommitGit("read-tree", request),
+        hashObject: (request) =>
+          this.#runControlledCommitGit("hash-object", request),
+        updateIndex: (request) =>
+          this.#runControlledCommitGit("update-index", request),
+        writeTree: (request) =>
+          this.#runControlledCommitGit("write-tree", request),
+        commitTree: (request) =>
+          this.#runControlledCommitGit("commit-tree", request),
+      }),
+    });
     Object.freeze(this);
   }
 
@@ -1436,6 +1873,355 @@ export class ControlledGitService {
       resultObjectDigest: manifest.resultObjectDigest,
       residual: null,
     });
+  }
+
+  async recoverControlledCommits() {
+    try {
+      return await this.#commitBuilder.recover();
+    } catch (cause) {
+      if (cause instanceof ControlledGitServiceError) throw cause;
+      throw controlledGitError(
+        "CONTROLLED_GIT_COMMIT_RECOVERY_FAILED",
+        "Controlled commit recovery 失败",
+        cause,
+      );
+    }
+  }
+
+  async createControlledCommit(value) {
+    const request = normalizeControlledCommitRequest(value, this.#limits);
+    try {
+      return await this.#commitBuilder.create(request);
+    } catch (cause) {
+      if (cause instanceof ControlledGitServiceError) throw cause;
+      throw controlledGitError(
+        "CONTROLLED_GIT_COMMIT_FAILED",
+        "Controlled Git commit 构建失败",
+        cause,
+      );
+    }
+  }
+
+  async findControlledCommit(value) {
+    const request = normalizeControlledCommitLookup(value);
+    try {
+      return await this.#commitBuilder.find(request);
+    } catch (cause) {
+      if (cause instanceof ControlledGitServiceError) throw cause;
+      throw controlledGitError(
+        "CONTROLLED_GIT_COMMIT_LOOKUP_FAILED",
+        "Controlled Git commit lookup 失败",
+        cause,
+      );
+    }
+  }
+
+  async verifyControlledCommit(value) {
+    const fields = exactDataObject(value, ["evidenceId"]);
+    const evidenceId = fields.get("evidenceId");
+    if (!CONTROLLED_COMMIT_ID.test(evidenceId)) {
+      throw controlledGitError(
+        "INVALID_CONTROLLED_GIT_REQUEST",
+        "Controlled commit evidenceId 无效",
+      );
+    }
+    try {
+      return await this.#commitBuilder.verify(evidenceId);
+    } catch (cause) {
+      if (cause instanceof ControlledGitServiceError) throw cause;
+      throw controlledGitError(
+        "CONTROLLED_GIT_COMMIT_TAMPERED",
+        "Controlled commit 校验失败",
+        cause,
+      );
+    }
+  }
+
+  async publishControlledCommit(value) {
+    const request = normalizeControlledCommitPublicationRequest(value);
+    const initialSource = await this.#controlledCommitPublicationSource(
+      request.action,
+    );
+    let scratchRoot;
+    let result = publicationResult("unknown");
+    try {
+      const scratch = await this.#createPublicationScratch(
+        initialSource.evidence.commit.objectFormat,
+      );
+      scratchRoot = scratch.root;
+      result = await this.#publishFromScratch(request, initialSource, scratch);
+    } finally {
+      if (scratchRoot !== undefined) {
+        await rm(scratchRoot, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+    return result;
+  }
+
+  async #publishFromScratch(request, initialSource, scratch) {
+    const target = request.action.inputBinding.gitTarget;
+    const commitOid = initialSource.evidence.commit.oid;
+    const fullRefName = `refs/heads/${target.headRefName}`;
+    const remoteUrl = `https://github.com/${target.headRepository}.git`;
+    const initialEnvironment = this.#publicationEnvironment({
+      credential: request.credential,
+      scratch,
+      source: initialSource,
+    });
+    const observedBefore = await this.#observePublishedHead({
+      scratch,
+      environment: initialEnvironment,
+      remoteUrl,
+      fullRefName,
+      oidLength: commitOid.length,
+    });
+    if (observedBefore === undefined) return publicationResult("unknown");
+    if (observedBefore === commitOid) {
+      return publicationResult("already", commitOid);
+    }
+    if (observedBefore !== target.headRefOid) {
+      return publicationResult("stale");
+    }
+
+    let finalSource;
+    try {
+      finalSource = await this.#controlledCommitPublicationSource(
+        request.action,
+      );
+    } catch {
+      return publicationResult("stale");
+    }
+    const environment = this.#publicationEnvironment({
+      credential: request.credential,
+      scratch,
+      source: finalSource,
+    });
+    await this.#runPublicationGit({
+      args: [
+        ...SAFE_GIT_PREFIX,
+        `--git-dir=${scratch.gitDirectory}`,
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "push",
+        "--porcelain",
+        "--no-verify",
+        "--no-follow-tags",
+        "--no-signed",
+        "--recurse-submodules=no",
+        `--force-with-lease=${fullRefName}:${target.headRefOid}`,
+        "--",
+        remoteUrl,
+        `${commitOid}:${fullRefName}`,
+      ],
+      cwd: scratch.root,
+      environment,
+      maxOutputBytes: 64 * 1024,
+    });
+
+    const observedAfter = await this.#observePublishedHead({
+      scratch,
+      environment,
+      remoteUrl,
+      fullRefName,
+      oidLength: commitOid.length,
+    });
+    try {
+      await this.#controlledCommitPublicationSource(request.action);
+    } catch {
+      return publicationResult("unknown");
+    }
+    return observedAfter === commitOid
+      ? publicationResult("applied", commitOid)
+      : publicationResult("unknown");
+  }
+
+  async #controlledCommitPublicationSource(action) {
+    const source = await this.#commitBuilder.preparePublication(
+      action.controlledCommitEvidence.evidenceId,
+    );
+    if (!sameControlledCommitEvidence(
+      source.evidence,
+      action.controlledCommitEvidence,
+    )) {
+      throw controlledGitError(
+        "CONTROLLED_GIT_COMMIT_TAMPERED",
+        "Publication action 与 sealed controlled commit 不一致",
+      );
+    }
+    const preparation = await this.#verifiedCommitPreparation(
+      source.evidence.executionSource,
+      source.manifest,
+    );
+    return Object.freeze({
+      evidence: source.evidence,
+      commitObjectDirectory: source.objectDirectory,
+      preparationObjectDirectory: path.join(
+        this.#preparationRoot,
+        "preparations",
+        preparation.preparationId,
+        "objects",
+      ),
+      baseObjectDirectory: preparation.baseBoundary.objectDirectory,
+      headObjectDirectory: preparation.headBoundary.objectDirectory,
+    });
+  }
+
+  async #createPublicationScratch(objectFormat) {
+    await this.#assertPreparationRoot();
+    const root = await mkdtemp(path.join(
+      this.#preparationRoot,
+      `${CONTROLLED_COMMIT_SCRATCH_PREFIX}publish-`,
+    ));
+    const gitDirectory = path.join(root, "git");
+    const objectDirectory = path.join(root, "objects");
+    const hooksDirectory = path.join(root, "no-hooks");
+    await Promise.all([
+      mkdir(path.join(gitDirectory, "refs", "heads"), { recursive: true }),
+      mkdir(path.join(gitDirectory, "refs", "tags"), { recursive: true }),
+      mkdir(path.join(objectDirectory, "info"), { recursive: true }),
+      mkdir(path.join(objectDirectory, "pack"), { recursive: true }),
+      mkdir(hooksDirectory),
+    ]);
+    const config = objectFormat === "sha1"
+      ? "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+      : "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectFormat = sha256\n";
+    await Promise.all([
+      writeFile(path.join(gitDirectory, "HEAD"), "ref: refs/heads/unused\n", {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      }),
+      writeFile(path.join(gitDirectory, "config"), config, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      }),
+    ]);
+    return Object.freeze({
+      root,
+      gitDirectory,
+      objectDirectory,
+      hooksDirectory,
+    });
+  }
+
+  #publicationEnvironment({ credential, scratch, source }) {
+    const authorization = Buffer.from(
+      `x-access-token:${credential}`,
+      "utf8",
+    ).toString("base64");
+    return Object.freeze({
+      ...this.#gitEnvironment(
+        scratch.objectDirectory,
+        source.commitObjectDirectory,
+        source.preparationObjectDirectory,
+        source.baseObjectDirectory,
+        source.headObjectDirectory,
+      ),
+      GIT_CONFIG_COUNT: "8",
+      GIT_CONFIG_KEY_0: "core.hooksPath",
+      GIT_CONFIG_VALUE_0: scratch.hooksDirectory,
+      GIT_CONFIG_KEY_1: "credential.helper",
+      GIT_CONFIG_VALUE_1: "",
+      GIT_CONFIG_KEY_2: "credential.useHttpPath",
+      GIT_CONFIG_VALUE_2: "true",
+      GIT_CONFIG_KEY_3: "http.https://github.com/.extraHeader",
+      GIT_CONFIG_VALUE_3: `AUTHORIZATION: basic ${authorization}`,
+      GIT_CONFIG_KEY_4: "http.followRedirects",
+      GIT_CONFIG_VALUE_4: "false",
+      GIT_CONFIG_KEY_5: "http.sslVerify",
+      GIT_CONFIG_VALUE_5: "true",
+      GIT_CONFIG_KEY_6: "protocol.allow",
+      GIT_CONFIG_VALUE_6: "never",
+      GIT_CONFIG_KEY_7: "protocol.https.allow",
+      GIT_CONFIG_VALUE_7: "always",
+    });
+  }
+
+  async #observePublishedHead({
+    scratch,
+    environment,
+    remoteUrl,
+    fullRefName,
+    oidLength,
+  }) {
+    const result = await this.#runPublicationGit({
+      args: [
+        ...SAFE_GIT_PREFIX,
+        `--git-dir=${scratch.gitDirectory}`,
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "ls-remote",
+        "--exit-code",
+        "--refs",
+        "--",
+        remoteUrl,
+        fullRefName,
+      ],
+      cwd: scratch.root,
+      environment,
+      maxOutputBytes: 4_096,
+    });
+    if (result === null) return undefined;
+    return parsePublishedHead(result, fullRefName, oidLength);
+  }
+
+  async #runPublicationGit({
+    args,
+    cwd,
+    environment,
+    maxOutputBytes,
+  }) {
+    try {
+      const value = await this.#run({
+        command: this.#gitCommand,
+        args,
+        cwd,
+        env: environment,
+        timeoutMs: this.#limits.timeoutMs,
+        maxOutputBytes,
+      });
+      return publicationProcessResult(value, maxOutputBytes);
+    } catch {
+      return null;
+    }
+  }
+
+  async #verifiedCommitPreparation(executionSource, manifest) {
+    const binding = executionSource.preparationBinding;
+    const preparation = await this.#verifiedManifest(binding.preparationId);
+    if (preparation.status !== "conflicted") {
+      throw controlledGitError(
+        "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+        "Controlled commit 只接受 conflicted preparation",
+      );
+    }
+    const expectedBinding = createConflictPreparationBinding({
+      preparation: publicPreparation(preparation),
+      gitTarget: preparation.gitTarget,
+    });
+    if (!sameConflictPreparationBinding(binding, expectedBinding)) {
+      throw controlledGitError(
+        "CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH",
+        "Controlled commit execution source 与 sealed preparation 不一致",
+      );
+    }
+    const treeByPath = new Map(
+      preparation.treeEntries.map((entry) => [entry.path, entry]),
+    );
+    if (manifest.changes.modified.some(
+      (change) => treeByPath.get(change.path)?.sha256 !== change.beforeSha256,
+    )) {
+      throw controlledGitError(
+        "CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH",
+        "Change package beforeSha256 未绑定 sealed result tree",
+      );
+    }
+    return preparation;
   }
 
   async #inspectInScratch({
@@ -1950,13 +2736,87 @@ export class ControlledGitService {
     });
   }
 
-  async #runGit({ args, cwd, env, maxOutputBytes }) {
+  async #runControlledCommitGit(operation, request) {
+    const prefix = [
+      ...SAFE_GIT_PREFIX,
+      `--git-dir=${request.gitDirectory}`,
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.untrackedCache=false",
+      "-c",
+      "protocol.allow=never",
+      "-c",
+      "core.commitGraph=false",
+    ];
+    let args;
+    let input;
+    let returnsOid = false;
+    switch (operation) {
+      case "read-tree":
+        args = [...prefix, "read-tree", request.treeOid];
+        break;
+      case "hash-object":
+        args = [...prefix, "hash-object", "-w", "--stdin"];
+        input = request.content;
+        returnsOid = true;
+        break;
+      case "update-index":
+        args = [...prefix, "update-index", "-z", "--index-info"];
+        input = request.records;
+        break;
+      case "write-tree":
+        args = [...prefix, "write-tree"];
+        returnsOid = true;
+        break;
+      case "commit-tree":
+        args = [
+          ...prefix,
+          "commit-tree",
+          request.treeOid,
+          "-p",
+          request.parents[0],
+          "-p",
+          request.parents[1],
+        ];
+        input = request.message;
+        returnsOid = true;
+        break;
+      default:
+        throw controlledGitError(
+          "CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR",
+          "Controlled commit Git operation 不在固定 allowlist",
+        );
+    }
+    const maximumBytes = returnsOid ? 256 : 64;
+    const output = checkedProcessOutput(
+      await this.#runGit({
+        args,
+        cwd: request.cwd,
+        env: request.environment,
+        input,
+        maxOutputBytes: maximumBytes,
+      }),
+      [0],
+      maximumBytes,
+    ).stdout;
+    return returnsOid
+      ? parseSingleOid(
+          output,
+          request.oidLength,
+          "CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR",
+        )
+      : undefined;
+  }
+
+  async #runGit({ args, cwd, env, input, maxOutputBytes }) {
     try {
       return await this.#run({
         command: this.#gitCommand,
         args,
         cwd,
         env,
+        input,
         timeoutMs: this.#limits.timeoutMs,
         maxOutputBytes,
       });

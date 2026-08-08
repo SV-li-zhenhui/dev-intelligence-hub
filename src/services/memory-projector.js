@@ -1,23 +1,63 @@
+import { createHash } from "node:crypto";
 import {
   createWorkGraphSourceAuthority,
   memoryRecordForWorkGraphMemoryEvent,
   normalizeWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../domain/work-graph-memory-event.js";
-import { createPullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
 import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   pullRequestHeadAdmission,
 } from "./work-ledger-pr-source.js";
+import { digestValue } from "../domain/code-executor-contract.js";
+import {
+  createPullRequestExecutionBinding,
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
 
 const WRITE_BATCH = 100;
 const SAFE_ROLE = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const GRAPH_BATCH_LIMIT = 100;
+const CONFIRMATION_PAGE_LIMIT = 100;
+const CONFIRMATION_MAXIMUM_ITEMS = 1_000;
+export const LEGACY_AUTHORITY_PROJECTION_STATE_KEY =
+  "authority-bound-memory-projection";
+const AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION = 4;
+const AUTHORITY_PROJECTION_MAXIMUM_ENTRIES = 100_000;
+const MEMORY_RECORD_ID = /^memory-[a-f0-9]{64}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
+const EMPTY_AUTHORITY_STATE_DIGEST = createHash("sha256")
+  .update("[]", "utf8")
+  .digest("hex");
+const CONFIRMATION_STATUSES = new Set([
+  "pending",
+  "executing",
+  "completed",
+  "failed",
+  "stale",
+  "rejected",
+]);
+const ACTION_BY_CONFIRMATION_KIND = Object.freeze({
+  "github.pull-request-comment": "pull_request_comment",
+  "github.pull-request-review": "pull_request_review",
+  "github.pull-request-update-branch": "pull_request_update_branch",
+  "github.pull-request-push": "pull_request_push",
+  "github.pull-request-merge": "pull_request_merge",
+});
+const AUTHORITY_MEMORY_KINDS = new Set([
+  "work-decision",
+  "consultation-request",
+  "consultation-result",
+  "confirmation",
+  "external-result",
+]);
 
 function requirePort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -170,6 +210,34 @@ function projectedSourceAuthority(state, item) {
   });
 }
 
+function pullRequestObservation(item, event, payload) {
+  if (!event?.eventType?.startsWith("pull_request.")) return null;
+  let sourceBinding = null;
+  try {
+    sourceBinding = currentWorkItemInputBinding(item);
+  } catch {
+    // Keep the observable event bounded even when an optional binding is absent.
+  }
+  const eventId = safeText(sourceBinding?.eventId || event?.eventId, 256);
+  const headCandidate = payload?.headRefOid ||
+    plainData(payload?.gitTarget)?.headRefOid || sourceBinding?.headRefOid;
+  const headRefOid = typeof headCandidate === "string" && GIT_OID.test(headCandidate)
+    ? headCandidate
+    : null;
+  const ciStatus = safeText(payload?.ciStatus, 64);
+  const mergeStateStatus = safeText(payload?.mergeStateStatus, 64);
+  const changedFields = stringList(payload?.changedFields, 20)
+    .map((entry) => safeText(entry, 128));
+  return {
+    eventId: eventId || null,
+    occurredAt: safeTimestamp(event?.occurredAt),
+    headRefOid,
+    ciStatus: ciStatus || null,
+    mergeStateStatus: mergeStateStatus || null,
+    changedFields,
+  };
+}
+
 function workItemRecord(raw, state) {
   const item = plainData(raw);
   const event = plainData(currentWorkItemEvent(item));
@@ -183,6 +251,7 @@ function workItemRecord(raw, state) {
   const number = safeNumber(subject?.number);
   const status = safeToken(item.status, "unknown");
   const sourceAuthority = projectedSourceAuthority(state, item);
+  const prObservation = pullRequestObservation(item, event, payload);
   const targetRole = target?.type === "role" ? safeRole(target.id) : null;
   return {
     schemaVersion: 1,
@@ -207,6 +276,9 @@ function workItemRecord(raw, state) {
       attempt: item.attempt,
       sourceAuthority,
       decisionContext: status === "superseded" ? null : item.decisionContext,
+      ...(prObservation === null
+        ? {}
+        : { pullRequestObservation: prObservation }),
     }),
     evidence: [`supersedes-work-item-revisions:${itemId}`],
     tags: ["work", status, ...(targetRole ? [targetRole] : [])],
@@ -319,6 +391,998 @@ function strictProjectionList(value, maximum, message) {
   const result = dataList(value, maximum);
   if (result === null) throw new TypeError(message);
   return result;
+}
+
+function projectionTimestamp(value, message) {
+  if (!validTimestamp(value)) throw new TypeError(message);
+  return value;
+}
+
+function projectionText(value, maximum, message) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    safeText(value, maximum) !== value
+  ) {
+    throw new TypeError(message);
+  }
+  return value;
+}
+
+function normalizeMemoryAction(value, kind, message) {
+  const expectedType = ACTION_BY_CONFIRMATION_KIND[kind];
+  const action = plainData(value);
+  if (action === null || action.type !== expectedType) {
+    throw new TypeError(message);
+  }
+  let inputBinding;
+  try {
+    inputBinding = normalizePullRequestExecutionBinding(action.inputBinding);
+  } catch {
+    throw new TypeError(message);
+  }
+  if (inputBinding.schemaVersion !== 2) throw new TypeError(message);
+  const common = { type: expectedType, inputBinding };
+  if (expectedType === "pull_request_comment") {
+    exactProjectionObject(
+      action,
+      ["type", "inputBinding", "bodyDigest", "bodyBytes"],
+      message,
+    );
+    if (!SHA256.test(action.bodyDigest)) throw new TypeError(message);
+    return {
+      ...common,
+      bodyDigest: action.bodyDigest,
+      bodyBytes: nonNegativeInteger(action.bodyBytes, message),
+    };
+  }
+  if (expectedType === "pull_request_review") {
+    exactProjectionObject(
+      action,
+      ["type", "inputBinding", "bodyDigest", "bodyBytes", "reviewEvent"],
+      message,
+    );
+    if (
+      !SHA256.test(action.bodyDigest) ||
+      !["APPROVE", "COMMENT", "REQUEST_CHANGES"].includes(action.reviewEvent)
+    ) {
+      throw new TypeError(message);
+    }
+    return {
+      ...common,
+      bodyDigest: action.bodyDigest,
+      bodyBytes: nonNegativeInteger(action.bodyBytes, message),
+      reviewEvent: action.reviewEvent,
+    };
+  }
+  if (expectedType === "pull_request_update_branch") {
+    exactProjectionObject(
+      action,
+      ["type", "inputBinding", "expectedHeadOid", "expectedBaseOid"],
+      message,
+    );
+    if (
+      action.expectedHeadOid !== inputBinding.gitTarget.headRefOid ||
+      action.expectedBaseOid !== inputBinding.gitTarget.baseRefOid
+    ) {
+      throw new TypeError(message);
+    }
+    return {
+      ...common,
+      expectedHeadOid: action.expectedHeadOid,
+      expectedBaseOid: action.expectedBaseOid,
+    };
+  }
+  if (expectedType === "pull_request_push") {
+    exactProjectionObject(
+      action,
+      [
+        "type",
+        "inputBinding",
+        "expectedOldOid",
+        "remote",
+        "controlledCommit",
+      ],
+      message,
+    );
+    const remote = exactProjectionObject(
+      action.remote,
+      ["repository", "refName"],
+      message,
+    );
+    const controlled = exactProjectionObject(
+      action.controlledCommit,
+      ["evidenceId", "evidenceDigest", "commit"],
+      message,
+    );
+    const commit = exactProjectionObject(
+      controlled.commit,
+      ["oid", "treeOid", "parents"],
+      message,
+    );
+    const parents = strictProjectionList(commit.parents, 2, message);
+    if (
+      parents.length !== 2 ||
+      !SHA256.test(controlled.evidenceDigest) ||
+      controlled.evidenceId !==
+        `controlled-git-commit-${controlled.evidenceDigest}` ||
+      action.expectedOldOid !== inputBinding.gitTarget.headRefOid ||
+      remote.repository !== inputBinding.gitTarget.headRepository ||
+      remote.refName !== inputBinding.gitTarget.headRefName ||
+      parents[0] !== inputBinding.gitTarget.headRefOid ||
+      parents[1] !== inputBinding.gitTarget.baseRefOid ||
+      !GIT_OID.test(commit.oid) ||
+      !GIT_OID.test(commit.treeOid)
+    ) {
+      throw new TypeError(message);
+    }
+    return {
+      ...common,
+      expectedOldOid: action.expectedOldOid,
+      remote: { ...remote },
+      controlledCommit: {
+        evidenceId: controlled.evidenceId,
+        evidenceDigest: controlled.evidenceDigest,
+        commit: { oid: commit.oid, treeOid: commit.treeOid, parents: [...parents] },
+      },
+    };
+  }
+  exactProjectionObject(
+    action,
+    ["type", "inputBinding", "method", "expectedHeadOid"],
+    message,
+  );
+  if (
+    !["merge", "squash", "rebase"].includes(action.method) ||
+    action.expectedHeadOid !== inputBinding.gitTarget.headRefOid
+  ) {
+    throw new TypeError(message);
+  }
+  return {
+    ...common,
+    method: action.method,
+    expectedHeadOid: action.expectedHeadOid,
+  };
+}
+
+function normalizeConfirmationMemoryItem(value) {
+  const message = "confirmation memory projection item is invalid";
+  const item = exactProjectionObject(
+    value,
+    [
+      "confirmationId",
+      "itemRevision",
+      "statusDigest",
+      "kind",
+      "status",
+      "requestedBy",
+      "actor",
+      "target",
+      "action",
+      "displayedPayloadDigest",
+      "approvalBindingDigest",
+      "createdAt",
+      "updatedAt",
+      "execution",
+      "receipt",
+      "failure",
+      "rejectedAt",
+      "invalidation",
+    ],
+    message,
+  );
+  if (
+    !Object.hasOwn(ACTION_BY_CONFIRMATION_KIND, item.kind) ||
+    !CONFIRMATION_STATUSES.has(item.status) ||
+    !SHA256.test(item.displayedPayloadDigest) ||
+    !SHA256.test(item.approvalBindingDigest)
+  ) {
+    throw new TypeError(message);
+  }
+  const confirmationId = projectionText(item.confirmationId, 256, message);
+  const itemRevision = nonNegativeInteger(item.itemRevision, message);
+  if (itemRevision < 1) throw new TypeError(message);
+  const requestedBy = exactProjectionObject(
+    item.requestedBy,
+    ["roleId", "workItemId"],
+    message,
+  );
+  const actor = exactProjectionObject(
+    item.actor,
+    ["provider", "accountId"],
+    message,
+  );
+  const target = exactProjectionObject(
+    item.target,
+    ["provider", "resourceId", "version"],
+    message,
+  );
+  const action = normalizeMemoryAction(item.action, item.kind, message);
+  if (
+    projectionText(requestedBy.roleId, 128, message) === "" ||
+    projectionText(requestedBy.workItemId, 256, message) === "" ||
+    actor.provider !== "github" ||
+    projectionText(actor.accountId, 64, message).toLowerCase() !==
+      action.inputBinding.gitTarget.sourceAccountId.toLowerCase() ||
+    target.provider !== "github" ||
+    target.resourceId !==
+      `${action.inputBinding.repository}#${action.inputBinding.pullRequestNumber}` ||
+    target.version !== action.inputBinding.headRefOid
+  ) {
+    throw new TypeError(message);
+  }
+  const execution = item.execution === null
+    ? null
+    : exactProjectionObject(
+        item.execution,
+        ["attempt", "startedAt", "outcome"],
+        message,
+      );
+  if (execution !== null) {
+    if (
+      nonNegativeInteger(execution.attempt, message) < 1 ||
+      !validTimestamp(execution.startedAt) ||
+      safeText(execution.outcome, 64) !== execution.outcome
+    ) {
+      throw new TypeError(message);
+    }
+  }
+  const receipt = item.receipt === null
+    ? null
+    : exactProjectionObject(item.receipt, ["id"], message);
+  if (receipt !== null) projectionText(receipt.id, 256, message);
+  const failure = item.failure === null
+    ? null
+    : exactProjectionObject(
+        item.failure,
+        ["code", "outcome", "retryable", "at"],
+        message,
+      );
+  if (
+    failure !== null &&
+    (
+      safeText(failure.code, 128) !== failure.code ||
+      !["absent", "unknown"].includes(failure.outcome) ||
+      typeof failure.retryable !== "boolean" ||
+      !validTimestamp(failure.at)
+    )
+  ) {
+    throw new TypeError(message);
+  }
+  if (!(item.rejectedAt === null || validTimestamp(item.rejectedAt))) {
+    throw new TypeError(message);
+  }
+  const invalidation = item.invalidation === null
+    ? null
+    : exactProjectionObject(item.invalidation, ["reason", "at"], message);
+  if (
+    invalidation !== null &&
+    (
+      safeText(invalidation.reason, 1_024) !== invalidation.reason ||
+      !validTimestamp(invalidation.at)
+    )
+  ) {
+    throw new TypeError(message);
+  }
+  const normalized = {
+    confirmationId,
+    itemRevision,
+    statusDigest: item.statusDigest,
+    kind: item.kind,
+    status: item.status,
+    requestedBy: { ...requestedBy },
+    actor: { ...actor },
+    target: { ...target },
+    action,
+    displayedPayloadDigest: item.displayedPayloadDigest,
+    approvalBindingDigest: item.approvalBindingDigest,
+    createdAt: projectionTimestamp(item.createdAt, message),
+    updatedAt: projectionTimestamp(item.updatedAt, message),
+    execution: execution === null ? null : { ...execution },
+    receipt: receipt === null ? null : { ...receipt },
+    failure: failure === null ? null : { ...failure },
+    rejectedAt: item.rejectedAt,
+    invalidation: invalidation === null ? null : { ...invalidation },
+  };
+  const expectedStatusDigest = digestValue({
+    confirmationId,
+    itemRevision,
+    status: item.status,
+    approvalBindingDigest: item.approvalBindingDigest,
+    updatedAt: item.updatedAt,
+  });
+  if (item.statusDigest !== expectedStatusDigest) throw new TypeError(message);
+  return normalized;
+}
+
+function normalizeConfirmationMemoryPage(value, expected) {
+  const message = "confirmation memory projection page is invalid";
+  const page = exactProjectionObject(
+    value,
+    ["highWatermark", "cursor", "items", "nextCursor"],
+    message,
+  );
+  const highWatermark = nonNegativeInteger(page.highWatermark, message);
+  const cursor = nonNegativeInteger(page.cursor, message);
+  if (
+    cursor !== expected.cursor ||
+    (expected.highWatermark !== null &&
+      highWatermark !== expected.highWatermark)
+  ) {
+    throw new TypeError(message);
+  }
+  const items = strictProjectionList(
+    page.items,
+    CONFIRMATION_PAGE_LIMIT,
+    message,
+  ).map(normalizeConfirmationMemoryItem);
+  const nextCursor = page.nextCursor;
+  if (
+    !(
+      nextCursor === null ||
+      (Number.isSafeInteger(nextCursor) &&
+        nextCursor === cursor + items.length &&
+        nextCursor > cursor)
+    )
+  ) {
+    throw new TypeError(message);
+  }
+  return { highWatermark, cursor, items, nextCursor };
+}
+
+async function readConfirmationMemorySnapshot(readPage) {
+  if (readPage === null) return { highWatermark: 0, items: [] };
+  const items = [];
+  let cursor = 0;
+  let highWatermark = null;
+  for (let pageNumber = 0; pageNumber < 10; pageNumber += 1) {
+    const page = normalizeConfirmationMemoryPage(
+      await readPage({
+        cursor,
+        limit: CONFIRMATION_PAGE_LIMIT,
+        highWatermark,
+      }),
+      { cursor, highWatermark },
+    );
+    highWatermark = page.highWatermark;
+    items.push(...page.items);
+    if (items.length > CONFIRMATION_MAXIMUM_ITEMS) {
+      throw new TypeError("confirmation memory projection exceeds capacity");
+    }
+    if (page.nextCursor === null) {
+      if (new Set(items.map(({ confirmationId }) => confirmationId)).size !== items.length) {
+        throw new TypeError("confirmation memory projection contains duplicates");
+      }
+      return { highWatermark, items };
+    }
+    cursor = page.nextCursor;
+  }
+  throw new TypeError("confirmation memory projection exceeds page capacity");
+}
+
+function normalizeConfirmationMemorySnapshot(value) {
+  const message = "confirmation memory projection snapshot is invalid";
+  const snapshot = exactProjectionObject(
+    value,
+    ["highWatermark", "items"],
+    message,
+  );
+  const highWatermark = nonNegativeInteger(snapshot.highWatermark, message);
+  const items = strictProjectionList(
+    snapshot.items,
+    CONFIRMATION_MAXIMUM_ITEMS,
+    message,
+  ).map(normalizeConfirmationMemoryItem);
+  if (
+    new Set(items.map(({ confirmationId }) => confirmationId)).size !==
+      items.length
+  ) {
+    throw new TypeError(message);
+  }
+  return { highWatermark, items };
+}
+
+export function normalizeLegacyAuthorityProjectionState(value) {
+  if (value === null) {
+    return {
+      schemaVersion: AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION,
+      revision: 0,
+      workLedgerRevision: 0,
+      authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+      confirmationHighWatermark: 0,
+      entries: [],
+    };
+  }
+  const message = "authority-bound memory projection state is invalid";
+  const hasConfirmationHighWatermark = Object.hasOwn(
+    value,
+    "confirmationHighWatermark",
+  );
+  const hasLedgerAuthority = Object.hasOwn(value, "workLedgerRevision") ||
+    Object.hasOwn(value, "authorityStateDigest");
+  const state = exactProjectionObject(
+    value,
+    [
+      "schemaVersion",
+      "revision",
+      ...(hasLedgerAuthority
+        ? ["workLedgerRevision", "authorityStateDigest"]
+        : []),
+      ...(hasConfirmationHighWatermark
+        ? ["confirmationHighWatermark"]
+        : []),
+      "entries",
+    ],
+    message,
+  );
+  if (![1, 2, 3, AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION].includes(
+    state.schemaVersion,
+  ) || hasConfirmationHighWatermark !== (state.schemaVersion >= 3) ||
+      hasLedgerAuthority !==
+        (state.schemaVersion === AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION)) {
+    throw new TypeError(message);
+  }
+  const revision = nonNegativeInteger(state.revision, message);
+  const workLedgerRevision = hasLedgerAuthority
+    ? nonNegativeInteger(state.workLedgerRevision, message)
+    : 0;
+  const authorityStateDigest = hasLedgerAuthority
+    ? state.authorityStateDigest
+    : EMPTY_AUTHORITY_STATE_DIGEST;
+  if (typeof authorityStateDigest !== "string" || !SHA256.test(
+    authorityStateDigest,
+  )) {
+    throw new TypeError(message);
+  }
+  const confirmationHighWatermark = hasConfirmationHighWatermark
+    ? nonNegativeInteger(state.confirmationHighWatermark, message)
+    : 0;
+  const entries = strictProjectionList(
+    state.entries,
+    AUTHORITY_PROJECTION_MAXIMUM_ENTRIES,
+    message,
+  ).map(
+    (valueEntry) => {
+      const legacy = state.schemaVersion === 1;
+      const entry = exactProjectionObject(valueEntry, legacy
+        ? ["key", "fingerprint", "recordId"]
+        : [
+            "key",
+            "fingerprint",
+            "recordId",
+            "sourceKind",
+            "binding",
+            "current",
+            "occurredAt",
+          ], message);
+      const sourceKind = legacy
+        ? entry.key.slice(0, entry.key.indexOf(":"))
+        : entry.sourceKind;
+      if (
+        typeof entry.key !== "string" ||
+        entry.key.length === 0 ||
+        Buffer.byteLength(entry.key, "utf8") > 512 ||
+        !SHA256.test(entry.fingerprint) ||
+        !MEMORY_RECORD_ID.test(entry.recordId) ||
+        !AUTHORITY_MEMORY_KINDS.has(sourceKind)
+      ) {
+        throw new TypeError(message);
+      }
+      if (legacy) {
+        return {
+          ...entry,
+          sourceKind,
+          binding: null,
+          current: null,
+          occurredAt: "1970-01-01T00:00:00.000Z",
+        };
+      }
+      let binding = null;
+      if (entry.binding !== null) {
+        try {
+          binding = normalizePullRequestExecutionBinding(entry.binding);
+        } catch {
+          throw new TypeError(message);
+        }
+      }
+      if (
+        ![true, false].includes(entry.current) ||
+        !validTimestamp(entry.occurredAt)
+      ) {
+        throw new TypeError(message);
+      }
+      return { ...entry, sourceKind, binding };
+    },
+  );
+  if (new Set(entries.map(({ key }) => key)).size !== entries.length) {
+    throw new TypeError(message);
+  }
+  return {
+    schemaVersion: AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION,
+    revision,
+    workLedgerRevision,
+    authorityStateDigest,
+    confirmationHighWatermark,
+    entries,
+  };
+}
+
+function normalizeProjectionPlannerState(value) {
+  try {
+    return normalizeLegacyAuthorityProjectionState(value);
+  } catch (error) {
+    const message = "authority-bound memory projection state is invalid";
+    const state = exactProjectionObject(
+      value,
+      [
+        "schemaVersion",
+        "revision",
+        "workLedgerRevision",
+        "authorityStateDigest",
+        "confirmationHighWatermark",
+        "entries",
+      ],
+      message,
+    );
+    if (state.schemaVersion !== AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION) {
+      throw error;
+    }
+    const metadata = normalizeLegacyAuthorityProjectionState({
+      ...state,
+      entries: [],
+    });
+    const rawEntries = strictProjectionList(
+      state.entries,
+      AUTHORITY_PROJECTION_MAXIMUM_ENTRIES,
+      message,
+    ).map((entry) => {
+      const fields = exactProjectionObject(
+        entry,
+        [
+          "key",
+          "fingerprint",
+          "recordId",
+          "sourceKind",
+          "binding",
+          "current",
+          "occurredAt",
+        ],
+        message,
+      );
+      if (
+        fields.binding !== null ||
+        fields.current !== null ||
+        fields.occurredAt !== "1970-01-01T00:00:00.000Z"
+      ) {
+        throw error;
+      }
+      return {
+        key: fields.key,
+        fingerprint: fields.fingerprint,
+        recordId: fields.recordId,
+      };
+    });
+    const legacy = normalizeLegacyAuthorityProjectionState({
+      schemaVersion: 1,
+      revision: metadata.revision,
+      entries: rawEntries,
+    });
+    if (digestValue(legacy.entries) !== digestValue(state.entries)) {
+      throw error;
+    }
+    return {
+      ...legacy,
+      workLedgerRevision: metadata.workLedgerRevision,
+      authorityStateDigest: metadata.authorityStateDigest,
+      confirmationHighWatermark: metadata.confirmationHighWatermark,
+    };
+  }
+}
+
+function memoryRepository(binding) {
+  return binding.repository;
+}
+
+function memoryNumber(binding) {
+  return binding.pullRequestNumber;
+}
+
+function boundedRecord({
+  sourceKind,
+  sourceKey,
+  occurredAt,
+  roleId,
+  binding,
+  eventType,
+  title,
+  summary,
+  content,
+  evidence,
+  tags,
+}) {
+  const fingerprint = digestValue({ sourceKind, sourceKey, content, tags });
+  return {
+    schemaVersion: 1,
+    source: { kind: sourceKind, id: `${sourceKey}:${fingerprint}` },
+    occurredAt,
+    roleId,
+    repository: memoryRepository(binding),
+    eventType,
+    title,
+    summary,
+    content: JSON.stringify(content),
+    evidence,
+    tags,
+    sourceUrl: null,
+    subjectNumber: memoryNumber(binding),
+  };
+}
+
+function authorityBindingDigest(binding) {
+  return digestValue(normalizePullRequestExecutionBinding(binding));
+}
+
+function memoizedBindingAuthority(verify, { strict = false } = {}) {
+  const results = new Map();
+  return async (binding, { stale = false } = {}) => {
+    if (stale && !strict) return false;
+    const normalized = normalizePullRequestExecutionBinding(binding);
+    const key = authorityBindingDigest(normalized);
+    if (!results.has(key)) {
+      results.set(key, Promise.resolve().then(async () => {
+        try {
+          const verified = await verify(structuredClone(normalized));
+          if (!samePullRequestExecutionBinding(verified, normalized)) {
+            if (strict) {
+              throw new TypeError("input authority verification mismatch");
+            }
+            return false;
+          }
+          return true;
+        } catch (error) {
+          if (strict) throw error;
+          return false;
+        }
+      }));
+    }
+    const current = await results.get(key);
+    return stale ? false : current;
+  };
+}
+
+function authorityContent(binding, current) {
+  return {
+    applies: true,
+    current,
+    bindingDigest: authorityBindingDigest(binding),
+    inputBinding: binding,
+  };
+}
+
+function projectionTags(kind, status, actionType, current) {
+  return [kind, status, actionType, ...(current ? [] : ["obsolete"])];
+}
+
+function confirmationMemoryRecord(item, current, previousRecordId) {
+  const binding = item.action.inputBinding;
+  const content = {
+    memoryType: "confirmation",
+    confirmationId: item.confirmationId,
+    itemRevision: item.itemRevision,
+    statusDigest: item.statusDigest,
+    kind: item.kind,
+    status: item.status,
+    requestedBy: item.requestedBy,
+    actor: item.actor,
+    target: item.target,
+    action: item.action,
+    displayedPayloadDigest: item.displayedPayloadDigest,
+    approvalBindingDigest: item.approvalBindingDigest,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    authority: authorityContent(binding, current),
+  };
+  return boundedRecord({
+    sourceKind: "confirmation",
+    sourceKey:
+      `${item.confirmationId}:revision:${item.itemRevision}:${item.statusDigest}`,
+    occurredAt: item.updatedAt,
+    roleId: item.requestedBy.roleId,
+    binding,
+    eventType: `confirmation.${item.status}`,
+    title: `确认 ${item.action.type}：${binding.repository}#${binding.pullRequestNumber}`,
+    summary: `${item.status} · ${item.actor.accountId} · ${item.target.resourceId}`,
+    content,
+    evidence: previousRecordId === null
+      ? []
+      : [`supersedes:${previousRecordId}`],
+    tags: projectionTags(
+      "confirmation",
+      item.status,
+      item.action.type,
+      current,
+    ),
+  });
+}
+
+function hasExternalResult(item) {
+  return item.execution !== null ||
+    ["completed", "failed"].includes(item.status);
+}
+
+function externalResultMemoryRecord(
+  item,
+  current,
+  confirmationRecordId,
+  previousRecordId,
+) {
+  const binding = item.action.inputBinding;
+  const content = {
+    memoryType: "external-result",
+    confirmationId: item.confirmationId,
+    itemRevision: item.itemRevision,
+    statusDigest: item.statusDigest,
+    kind: item.kind,
+    status: item.status,
+    actionType: item.action.type,
+    actor: item.actor,
+    target: item.target,
+    inputBinding: binding,
+    execution: item.execution,
+    receipt: item.receipt,
+    failure: item.failure,
+    rejectedAt: item.rejectedAt,
+    invalidation: item.invalidation,
+    updatedAt: item.updatedAt,
+    authority: authorityContent(binding, current),
+  };
+  const evidence = [
+    `confirmation-record:${confirmationRecordId}`,
+    ...(item.receipt === null ? [] : [`receipt:${item.receipt.id}`]),
+    ...(previousRecordId === null ? [] : [`supersedes:${previousRecordId}`]),
+  ];
+  return boundedRecord({
+    sourceKind: "external-result",
+    sourceKey:
+      `${item.confirmationId}:revision:${item.itemRevision}:${item.statusDigest}`,
+    occurredAt: item.updatedAt,
+    roleId: item.requestedBy.roleId,
+    binding,
+    eventType: `external_result.${item.status}`,
+    title: `外部结果 ${item.action.type}：${binding.repository}#${binding.pullRequestNumber}`,
+    summary: item.receipt === null
+      ? `${item.status} · ${item.actor.accountId}`
+      : `${item.status} · receipt ${item.receipt.id}`,
+    content,
+    evidence,
+    tags: projectionTags(
+      "external-result",
+      item.status,
+      item.action.type,
+      current,
+    ),
+  });
+}
+
+function timelineProjectionKind(entry) {
+  if (
+    entry.type === "proposal_result_applied" &&
+    SHA256.test(entry.details?.resultAttestationDigest) &&
+    workDecisionFromTimeline(entry) !== null
+  ) {
+    return "work-decision";
+  }
+  if (
+    entry.type === "intent_staged" &&
+    entry.details?.intentType === "ask_user" &&
+    entry.details?.consultationRequest
+  ) {
+    return "consultation-request";
+  }
+  if (["attention_answer_applied", "attention_rejection_applied"].includes(
+    entry.type,
+  ) && SHA256.test(entry.details?.resultAttestationDigest)) {
+    return "consultation-result";
+  }
+  return null;
+}
+
+function workDecisionFromTimeline(entry) {
+  const details = plainData(entry?.details);
+  const decision = plainData(details?.decision);
+  const value = plainData(decision?.value);
+  if (
+    details === null ||
+    decision === null ||
+    value === null ||
+    !Number.isSafeInteger(details.workItemRevision) ||
+    details.workItemRevision < 1 ||
+    decision.source !== "proposal" ||
+    decision.referenceId !== details.proposalId ||
+    decision.outcome !== details.outcome ||
+    value.resultId !== details.resultRef ||
+    !SHA256.test(details.resultAttestationDigest) ||
+    !Array.isArray(value.evidence) ||
+    !Array.isArray(details.evidenceRefs) ||
+    !validTimestamp(decision.observedAt) ||
+    !SHA256.test(decision.contentDigest)
+  ) {
+    return null;
+  }
+  let expectedDigest;
+  try {
+    expectedDigest = digestValue({
+      source: decision.source,
+      referenceId: decision.referenceId,
+      outcome: decision.outcome,
+      value: decision.value,
+      observedAt: decision.observedAt,
+    });
+    if (digestValue(value.evidence) !== digestValue(details.evidenceRefs)) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  if (decision.contentDigest !== expectedDigest) {
+    return null;
+  }
+  return {
+    workItemRevision: details.workItemRevision,
+    decision: structuredClone(decision),
+  };
+}
+
+function timelineBinding(entry, item) {
+  if (Object.hasOwn(entry.details ?? {}, "inputBinding")) {
+    if (entry.details.inputBinding === null) {
+      return currentWorkItemInputBinding(item) === null ? null : undefined;
+    }
+    try {
+      return normalizePullRequestExecutionBinding(entry.details.inputBinding);
+    } catch {
+      return undefined;
+    }
+  }
+  const sourceBinding = currentWorkItemInputBinding(item);
+  if (sourceBinding !== null) {
+    // Legacy PR timelines did not seal their historical execution binding.
+    // Never reinterpret them using a newer current Head.
+    return undefined;
+  }
+  return null;
+}
+
+function timelineAuthorityContent(binding, current) {
+  return binding === null
+    ? {
+        applies: false,
+        current: true,
+        bindingDigest: null,
+        inputBinding: null,
+      }
+    : authorityContent(binding, current);
+}
+
+function timelineMemoryRecord(
+  entry,
+  item,
+  kind,
+  binding,
+  current,
+  previousRecordId,
+) {
+  const event = currentWorkItemEvent(item);
+  const repository = event?.subject?.repository ?? null;
+  const number = event?.subject?.number ?? null;
+  const sourceKey = `${entry.timelineId}:${digestValue({
+    type: entry.type,
+    details: entry.details,
+    authority: timelineAuthorityContent(binding, current),
+  })}`;
+  const workDecision = kind === "work-decision"
+    ? workDecisionFromTimeline(entry)
+    : null;
+  const content = {
+    memoryType: kind,
+    timelineId: entry.timelineId,
+    workItemId: entry.itemId,
+    ...(workDecision === null ? {} : workDecision),
+    decisionType: entry.type,
+    actorId: entry.actorId,
+    details: entry.details,
+    occurredAt: entry.at,
+    authority: timelineAuthorityContent(binding, current),
+  };
+  const fingerprint = digestValue({ kind, sourceKey, content });
+  return {
+    schemaVersion: 1,
+    source: { kind, id: `${sourceKey}:${fingerprint}` },
+    occurredAt: entry.at,
+    roleId: safeRole(item?.currentTarget?.id) || safeRole(entry.actorId),
+    repository: safeRepository(repository),
+    eventType: `${kind.replaceAll("-", "_")}.${entry.type}`,
+    title: `${kind}：${safeText(event?.payload?.title || entry.itemId, 1_024)}`,
+    summary: `${entry.type} · ${entry.itemId}`,
+    content: JSON.stringify(content),
+    evidence: previousRecordId === null
+      ? []
+      : [`supersedes:${previousRecordId}`],
+    tags: [kind, entry.type, ...(current ? [] : ["obsolete"])],
+    sourceUrl: null,
+    subjectNumber: safeNumber(number),
+  };
+}
+
+function authorityProjectionEntry({
+  key,
+  fingerprint,
+  recordId,
+  sourceKind,
+  binding,
+  current,
+  occurredAt,
+}) {
+  return {
+    key,
+    fingerprint,
+    recordId,
+    sourceKind,
+    binding: binding === null
+      ? null
+      : normalizePullRequestExecutionBinding(binding),
+    current,
+    occurredAt,
+  };
+}
+
+function authorityLifecycleMemoryRecord(entry) {
+  const binding = entry.binding;
+  const authority = binding === null
+    ? {
+        applies: false,
+        current: false,
+        bindingDigest: null,
+        inputBinding: null,
+      }
+    : authorityContent(binding, false);
+  const content = {
+    memoryType: entry.sourceKind,
+    lifecycleOnly: true,
+    priorRecordId: entry.recordId,
+    reason: binding === null
+      ? "projection_state_migrated"
+      : "input_authority_superseded",
+    authority,
+  };
+  const sourceKey = `${entry.key}:authority-obsolete:${digestValue({
+    priorRecordId: entry.recordId,
+    authority,
+  })}`;
+  return {
+    schemaVersion: 1,
+    source: {
+      kind: entry.sourceKind,
+      id: `${sourceKey}:${digestValue({
+        sourceKind: entry.sourceKind,
+        sourceKey,
+        content,
+      })}`,
+    },
+    occurredAt: entry.occurredAt,
+    roleId: null,
+    repository: binding?.repository ?? null,
+    eventType: `${entry.sourceKind.replaceAll("-", "_")}.authority_obsolete`,
+    title: `${entry.sourceKind} 权威已失效`,
+    summary: binding === null
+      ? "旧投影状态已安全失效"
+      : `${binding.repository}#${binding.pullRequestNumber} · ${binding.headRefOid}`,
+    content: JSON.stringify(content),
+    evidence: [`supersedes:${entry.recordId}`],
+    tags: [entry.sourceKind, "authority_obsolete", "obsolete"],
+    sourceUrl: null,
+    subjectNumber: binding?.pullRequestNumber ?? null,
+  };
 }
 
 function normalizeGraphProjectionBatch(value) {
@@ -504,15 +1568,230 @@ function normalizeGraphAckResult(value, event, minimumHighWatermark) {
   return { cursor, highWatermark };
 }
 
+export async function planAuthorityBoundProjectionCandidate(value) {
+  const message = "authority-bound memory projection plan is invalid";
+  const request = exactProjectionObject(
+    value,
+    [
+      "stored",
+      "snapshot",
+      "confirmationSnapshot",
+      "verifyInputAuthority",
+      "requiresJournalAdoption",
+      "strictBindings",
+    ],
+    message,
+  );
+  if (
+    typeof request.verifyInputAuthority !== "function" ||
+    typeof request.requiresJournalAdoption !== "boolean" ||
+    typeof request.strictBindings !== "boolean"
+  ) {
+    throw new TypeError(message);
+  }
+  const stored = normalizeProjectionPlannerState(request.stored);
+  const snapshot = normalizeMemoryAuthoritySnapshot(request.snapshot);
+  const confirmationSnapshot = normalizeConfirmationMemorySnapshot(
+    request.confirmationSnapshot,
+  );
+  const readBindingAuthority = memoizedBindingAuthority(
+    request.verifyInputAuthority,
+    { strict: request.strictBindings },
+  );
+  const entries = new Map(stored.entries.map((entry) => [entry.key, entry]));
+  const observedKeys = new Set();
+  const records = [];
+  const project = (descriptor, factory) => {
+    const { key, fingerprint } = descriptor;
+    observedKeys.add(key);
+    const previous = entries.get(key) ?? null;
+    if (previous?.fingerprint === fingerprint) {
+      entries.set(key, authorityProjectionEntry({
+        ...descriptor,
+        recordId: previous.recordId,
+      }));
+      return previous.recordId;
+    }
+    const record = factory(previous?.recordId ?? null);
+    const normalizedRecord = normalizeMemoryRecord(record);
+    records.push(record);
+    entries.set(key, authorityProjectionEntry({
+      ...descriptor,
+      recordId: normalizedRecord.recordId,
+    }));
+    return normalizedRecord.recordId;
+  };
+
+  let externalResults = 0;
+  for (const item of confirmationSnapshot.items) {
+    const current = await readBindingAuthority(
+      item.action.inputBinding,
+      { stale: item.status === "stale" },
+    );
+    const confirmationKey = `confirmation:${item.confirmationId}`;
+    const confirmationFingerprint = digestValue({
+      memoryType: "confirmation",
+      item,
+      current,
+    });
+    const confirmationRecordId = project(
+      {
+        key: confirmationKey,
+        fingerprint: confirmationFingerprint,
+        sourceKind: "confirmation",
+        binding: item.action.inputBinding,
+        current,
+        occurredAt: item.updatedAt,
+      },
+      (previousRecordId) =>
+        confirmationMemoryRecord(item, current, previousRecordId),
+    );
+    if (!hasExternalResult(item)) continue;
+    externalResults += 1;
+    const externalKey = `external-result:${item.confirmationId}`;
+    const externalFingerprint = digestValue({
+      memoryType: "external-result",
+      item,
+      current,
+      confirmationRecordId,
+    });
+    project(
+      {
+        key: externalKey,
+        fingerprint: externalFingerprint,
+        sourceKind: "external-result",
+        binding: item.action.inputBinding,
+        current,
+        occurredAt: item.updatedAt,
+      },
+      (previousRecordId) =>
+        externalResultMemoryRecord(
+          item,
+          current,
+          confirmationRecordId,
+          previousRecordId,
+        ),
+    );
+  }
+
+  const itemById = new Map(snapshot.items.map((item) => [item.itemId, item]));
+  let decisions = 0;
+  let consultations = 0;
+  for (const entry of snapshot.timeline) {
+    const kind = timelineProjectionKind(entry);
+    if (kind === null) continue;
+    const item = itemById.get(entry.itemId);
+    if (item === undefined) continue;
+    const binding = timelineBinding(entry, item);
+    if (binding === undefined) continue;
+    const current = binding === null
+      ? true
+      : await readBindingAuthority(binding, {
+          stale: item.status === "superseded",
+        });
+    const key = `${kind}:${entry.timelineId}`;
+    const fingerprint = digestValue({
+      memoryType: kind,
+      entry,
+      binding,
+      current,
+    });
+    project(
+      {
+        key,
+        fingerprint,
+        sourceKind: kind,
+        binding,
+        current,
+        occurredAt: entry.at,
+      },
+      (previousRecordId) =>
+        timelineMemoryRecord(
+          entry,
+          item,
+          kind,
+          binding,
+          current,
+          previousRecordId,
+        ),
+    );
+    if (kind === "work-decision") decisions += 1;
+    else consultations += 1;
+  }
+
+  let lifecycleInvalidations = 0;
+  for (const [key, entry] of entries) {
+    if (observedKeys.has(key)) continue;
+    if (entry.current !== true || entry.binding === null) {
+      if (entry.current === null) {
+        records.push(authorityLifecycleMemoryRecord(entry));
+        lifecycleInvalidations += 1;
+      }
+      entries.delete(key);
+      continue;
+    }
+    if (await readBindingAuthority(entry.binding)) continue;
+    records.push(authorityLifecycleMemoryRecord(entry));
+    lifecycleInvalidations += 1;
+    entries.delete(key);
+  }
+
+  if (entries.size > AUTHORITY_PROJECTION_MAXIMUM_ENTRIES) {
+    throw new TypeError("authority-bound memory projection exceeds capacity");
+  }
+  const nextEntries = [...entries.values()].sort((left, right) =>
+    left.key.localeCompare(right.key, "en")
+  );
+  const projectionStateChanged =
+    digestValue(nextEntries) !== digestValue(stored.entries);
+  const changed =
+    records.length > 0 ||
+    projectionStateChanged ||
+    request.requiresJournalAdoption ||
+    stored.workLedgerRevision !== snapshot.ledgerRevision ||
+    stored.authorityStateDigest !== snapshot.graph.authorityStateDigest ||
+    stored.confirmationHighWatermark !== confirmationSnapshot.highWatermark;
+  const projectionState = changed
+    ? normalizeLegacyAuthorityProjectionState({
+        schemaVersion: AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION,
+        revision: stored.revision + 1,
+        workLedgerRevision: snapshot.ledgerRevision,
+        authorityStateDigest: snapshot.graph.authorityStateDigest,
+        confirmationHighWatermark: confirmationSnapshot.highWatermark,
+        entries: nextEntries,
+      })
+    : null;
+  return {
+    records: structuredClone(records),
+    projectionState,
+    observed:
+      confirmationSnapshot.items.length +
+      externalResults +
+      decisions +
+      consultations,
+    confirmations: confirmationSnapshot.items.length,
+    externalResults,
+    decisions,
+    consultations,
+    lifecycleInvalidations,
+    highWatermark: confirmationSnapshot.highWatermark,
+  };
+}
+
 export class MemoryProjector {
   #adoptGraphCheckpoint;
   #appendGraphEvents;
   #appendProjectionRecords;
+  #appendAuthorityProjection;
   #appendWorkItems;
   #getAuthorityState;
+  #getAuthorityProjectionState;
+  #requiresAuthorityProjectionCheckpoint;
   #graphAckBatch;
+  #readConfirmationPage;
   #readSnapshot;
   #store;
+  #verifyInputAuthority;
   #inFlight = null;
 
   constructor({
@@ -520,6 +1799,8 @@ export class MemoryProjector {
     memoryAuthorityReader,
     memoryAuthoritySource,
     graphProjectionSource,
+    confirmationProjectionSource,
+    inputAuthorityVerifier,
     store,
   } = {}) {
     const lifecycle = requirePort(
@@ -535,12 +1816,15 @@ export class MemoryProjector {
     this.#appendWorkItems = lifecycle.appendWorkItems;
     this.#appendGraphEvents = lifecycle.appendGraphEvents;
     this.#appendProjectionRecords = lifecycle.appendProjectionRecords;
+    this.#appendAuthorityProjection = null;
     this.#adoptGraphCheckpoint = lifecycle.adoptGraphCheckpoint;
     this.#getAuthorityState = requirePort(
       memoryAuthorityReader,
       ["getAuthorityState"],
       "memoryAuthorityReader",
     ).getAuthorityState;
+    this.#getAuthorityProjectionState = null;
+    this.#requiresAuthorityProjectionCheckpoint = null;
     this.#readSnapshot = requirePort(
       memoryAuthoritySource,
       ["readSnapshot"],
@@ -554,6 +1838,64 @@ export class MemoryProjector {
     this.#graphAckBatch = graphSource.ackBatch;
     if (!store || typeof store.read !== "function") {
       throw new TypeError("MemoryProjector requires a store");
+    }
+    this.#verifyInputAuthority = inputAuthorityVerifier === undefined
+      ? null
+      : requirePort(
+          inputAuthorityVerifier,
+          ["verify"],
+          "inputAuthorityVerifier",
+        ).verify;
+    this.#readConfirmationPage = confirmationProjectionSource === undefined
+      ? null
+      : requirePort(
+          confirmationProjectionSource,
+          ["readMemoryPage"],
+          "confirmationProjectionSource",
+        ).readMemoryPage;
+    if (
+      this.#readConfirmationPage !== null &&
+      this.#verifyInputAuthority === null
+    ) {
+      throw new TypeError(
+        "confirmationProjectionSource requires inputAuthorityVerifier",
+      );
+    }
+    if (
+      this.#verifyInputAuthority !== null &&
+      typeof store.write !== "function"
+    ) {
+      throw new TypeError(
+        "authority-bound memory projection requires a writable store",
+      );
+    }
+    const canCheckpointAuthority =
+      typeof memoryLifecycleProducer?.appendAuthorityProjection === "function" &&
+      typeof memoryAuthorityReader?.getAuthorityProjectionState === "function";
+    if (canCheckpointAuthority) {
+      this.#appendAuthorityProjection = requirePort(
+        memoryLifecycleProducer,
+        ["appendAuthorityProjection"],
+        "memoryLifecycleProducer",
+      ).appendAuthorityProjection;
+      this.#getAuthorityProjectionState = requirePort(
+        memoryAuthorityReader,
+        ["getAuthorityProjectionState"],
+        "memoryAuthorityReader",
+      ).getAuthorityProjectionState;
+      if (
+        typeof memoryAuthorityReader?.requiresAuthorityProjectionCheckpoint ===
+          "function"
+      ) {
+        this.#requiresAuthorityProjectionCheckpoint =
+          memoryAuthorityReader.requiresAuthorityProjectionCheckpoint.bind(
+            memoryAuthorityReader,
+          );
+      }
+    } else if (this.#verifyInputAuthority !== null) {
+      throw new TypeError(
+        "authority-bound memory projection requires checkpoint ports",
+      );
     }
     this.#store = store;
   }
@@ -572,6 +1914,9 @@ export class MemoryProjector {
     const initial = normalizeMemoryAuthoritySnapshot(
       await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
     );
+    const confirmationSnapshot = this.#verifyInputAuthority === null
+      ? null
+      : await readConfirmationMemorySnapshot(this.#readConfirmationPage);
     const graph = initial.graph;
     const localAuthority = normalizeLocalMemoryAuthorityState(
       await this.#getAuthorityState(),
@@ -637,8 +1982,17 @@ export class MemoryProjector {
       graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
     });
     added += Number(workResult?.added) || 0;
+    const authorityBound = await this.#projectAuthorityBoundRecords(
+      finalSnapshot,
+      confirmationSnapshot,
+    );
+    added += authorityBound?.added ?? 0;
     return {
-      observed: historyRecords.length + workRecords.length + graph.items.length,
+      observed:
+        historyRecords.length +
+        workRecords.length +
+        graph.items.length +
+        (authorityBound?.observed ?? 0),
       added: added + graphAdded,
       workItems: items.length,
       timeline: timeline.length,
@@ -651,6 +2005,112 @@ export class MemoryProjector {
         highWatermark: graphHighWatermark,
         pending: graphHighWatermark - graphCursor,
       },
+      ...(authorityBound === null ? {} : { authorityBound }),
+    };
+  }
+
+  async #projectAuthorityBoundRecords(snapshot, confirmationSnapshot) {
+    if (this.#verifyInputAuthority === null) {
+      if (
+        this.#appendAuthorityProjection === null ||
+        this.#getAuthorityProjectionState === null ||
+        this.#requiresAuthorityProjectionCheckpoint === null
+      ) {
+        return null;
+      }
+      const stored = normalizeLegacyAuthorityProjectionState(
+        await this.#getAuthorityProjectionState(),
+      );
+      const authorityMemoryExists =
+        stored.entries.length > 0 ||
+        await this.#requiresAuthorityProjectionCheckpoint();
+      if (authorityMemoryExists) return null;
+      if (
+        stored.workLedgerRevision !== snapshot.ledgerRevision ||
+        stored.authorityStateDigest !== snapshot.graph.authorityStateDigest
+      ) {
+        const nextState = {
+          schemaVersion: AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION,
+          revision: stored.revision + 1,
+          workLedgerRevision: snapshot.ledgerRevision,
+          authorityStateDigest: snapshot.graph.authorityStateDigest,
+          confirmationHighWatermark: stored.confirmationHighWatermark,
+          entries: [],
+        };
+        normalizeLegacyAuthorityProjectionState(nextState);
+        await this.#appendAuthorityProjection({
+          records: [],
+          projectionState: nextState,
+        });
+      }
+      return {
+        observed: 0,
+        added: 0,
+        confirmations: 0,
+        externalResults: 0,
+        decisions: 0,
+        consultations: 0,
+        lifecycleInvalidations: 0,
+      };
+    }
+    const journalState = normalizeLegacyAuthorityProjectionState(
+      await this.#getAuthorityProjectionState(),
+    );
+    const legacyState =
+      journalState.revision === 0 &&
+        journalState.workLedgerRevision === 0 &&
+        journalState.authorityStateDigest === EMPTY_AUTHORITY_STATE_DIGEST &&
+        journalState.confirmationHighWatermark === 0 &&
+        journalState.entries.length === 0
+        ? normalizeLegacyAuthorityProjectionState(
+            await this.#store.read(
+              LEGACY_AUTHORITY_PROJECTION_STATE_KEY,
+              null,
+            ),
+          )
+        : null;
+    const stored = legacyState === null ||
+        (legacyState.revision === 0 && legacyState.entries.length === 0)
+      ? journalState
+      : {
+          ...legacyState,
+          revision: journalState.revision,
+          workLedgerRevision: journalState.workLedgerRevision,
+          authorityStateDigest: journalState.authorityStateDigest,
+          confirmationHighWatermark:
+            journalState.confirmationHighWatermark,
+        };
+    const plan = await planAuthorityBoundProjectionCandidate({
+      stored,
+      snapshot,
+      confirmationSnapshot,
+      verifyInputAuthority: this.#verifyInputAuthority,
+      requiresJournalAdoption: legacyState !== null &&
+        (legacyState.revision > 0 || legacyState.entries.length > 0),
+      strictBindings: false,
+    });
+    let added = 0;
+    if (plan.projectionState !== null) {
+      const expected = plan.records.map((record) =>
+        normalizeMemoryRecord(record)
+      );
+      added = normalizeGraphAppendResult(
+        await this.#appendAuthorityProjection({
+          records: plan.records,
+          projectionState: plan.projectionState,
+        }),
+        expected,
+      ).added;
+    }
+    return {
+      observed: plan.observed,
+      added,
+      confirmations: plan.confirmations,
+      externalResults: plan.externalResults,
+      decisions: plan.decisions,
+      consultations: plan.consultations,
+      lifecycleInvalidations: plan.lifecycleInvalidations,
+      highWatermark: plan.highWatermark,
     };
   }
 

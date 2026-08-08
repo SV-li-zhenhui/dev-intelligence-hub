@@ -364,6 +364,12 @@ async function assemble(fixture, options = {}) {
   const assembler = new RoleContextAssembler({
     graphReader: reader(fixture.snapshot),
     ...(options.factSource ? { factSource: options.factSource } : {}),
+    ...(options.pullRequestContextReader
+      ? { pullRequestContextReader: options.pullRequestContextReader }
+      : {}),
+    ...(options.memoryQueryReader
+      ? { memoryQueryReader: options.memoryQueryReader }
+      : {}),
     ...(options.evidenceCatalog
       ? { evidenceCatalog: options.evidenceCatalog }
       : {}),
@@ -548,6 +554,64 @@ test("assembles one exact frozen packet from direct accepted dependencies only",
   }
 });
 
+test("adds only a validated persisted agent answer to the memory data class", async () => {
+  const fixture = graphFixture();
+  const calls = [];
+  const agentQuery = {
+    schemaVersion: 1,
+    queryId: `agent-memory-query-${"a".repeat(64)}`,
+    question: "上次如何修复？",
+    searchQuery: "上次 修复",
+    mode: "local",
+    status: "answered",
+    answer: "恢复了空值分支保护。",
+    claims: [{
+      statement: "恢复了空值分支保护。",
+      citationIds: [`memory-${"b".repeat(64)}`],
+    }],
+    citations: [{
+      recordId: `memory-${"b".repeat(64)}`,
+      contentDigest: "b".repeat(64),
+      title: "旧回归测试",
+      occurredAt: "2026-08-07T08:00:00.000Z",
+      eventType: "test.completed",
+      roleId: "tester",
+      repository: "acme/repo",
+      source: { kind: "test-result", id: "test-result-1" },
+    }],
+    contextDigest: "c".repeat(64),
+    answeredAt: "2026-08-08T01:00:00.000Z",
+    brain: {
+      mode: "local",
+      provider: "ollama",
+      model: "qwen-local",
+      remote: false,
+    },
+    truncated: false,
+  };
+  const packet = await assemble(fixture, {
+    memoryQueryReader: {
+      async readContext(input) {
+        calls.push(structuredClone(input));
+        return structuredClone(agentQuery);
+      },
+    },
+  });
+
+  assert.deepEqual(packet.context.memory, { agentQuery });
+  assert.deepEqual(calls, [{
+    roleId: "developer",
+    item: {
+      itemId: "task-current",
+      itemRevision: 8,
+      inputDigest: DIGEST_D,
+      currentTarget: { type: "role", id: "developer" },
+    },
+  }]);
+  assert.equal(Object.isFrozen(packet.context.memory.agentQuery), true);
+  assert.match(packet.contextDigest, /^[a-f0-9]{64}$/);
+});
+
 test("classifies PR source and fresh facts as code while keeping requirements present", async () => {
   const fixture = graphFixture({ pullRequest: true });
   const factCalls = [];
@@ -659,10 +723,29 @@ test("a PR source root binds context and facts to its active Head revision", asy
     ({ taskId }) => taskId === fixture.item.itemId,
   ).responsibility = { type: "role", id: "pr-engineer" };
   const factCalls = [];
+  const contextCalls = [];
+  const pullRequestContext = {
+    schemaVersion: 1,
+    identityDigest: "1".repeat(64),
+    contentDigest: "2".repeat(64),
+    observedAt: "2026-08-03T05:01:00.000Z",
+    summary: { reviewDecision: "REVIEW_REQUIRED" },
+    comments: [],
+    reviews: [],
+    reviewThreads: [],
+    checks: [],
+    contextTruncated: false,
+  };
 
   const packet = await assemble(fixture, {
     roleId: "pr-engineer",
     factSource: factSource({}, factCalls),
+    pullRequestContextReader: {
+      async read(value) {
+        contextCalls.push(structuredClone(value));
+        return pullRequestContext;
+      },
+    },
   });
 
   assert.equal(packet.binding.source.workKey, advanced.source.workKey);
@@ -674,11 +757,37 @@ test("a PR source root binds context and facts to its active Head revision", asy
   assert.equal(packet.context.requirements.decisionContext, undefined);
   assert.equal(packet.context.code.sourceEvent.eventId, eventB.eventId);
   assert.equal(packet.context.code.sourceEvent.payload.headRefOid, headB);
+  assert.deepEqual(packet.context.code.pullRequest, pullRequestContext);
   assert.equal(packet.context.code.decisionContext, undefined);
   assert.equal(
     factCalls.every(({ item }) => item.event.eventId === eventB.eventId),
     true,
   );
+  assert.deepEqual(contextCalls, [{
+    sourceBinding: packet.binding.source,
+    event: eventB,
+  }]);
+});
+
+test("a configured PR context reader fails closed without an exact source", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  let contextCalls = 0;
+
+  await assert.rejects(
+    assemble(fixture, {
+      pullRequestContextReader: {
+        async read() {
+          contextCalls += 1;
+          throw new Error("must not run without a source binding");
+        },
+      },
+    }),
+    (error) =>
+      error instanceof RoleContextAssemblerError &&
+      error.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" &&
+      error.statusCode === 503,
+  );
+  assert.equal(contextCalls, 0);
 });
 
 test("a PR graph child gives its brain the inherited exact Head binding", async () => {
@@ -1920,6 +2029,7 @@ test("constructor rejects accessor ports without invoking them", () => {
   for (const [portName, method] of [
     ["graphReader", "getSnapshot"],
     ["factSource", "read"],
+    ["pullRequestContextReader", "read"],
     ["evidenceCatalog", "listForTask"],
   ]) {
     let getterCalls = 0;
@@ -1934,6 +2044,9 @@ test("constructor rejects accessor ports without invoking them", () => {
     const options = {
       graphReader: reader(graphFixture().snapshot),
       ...(portName === "factSource" ? { factSource: accessorPort } : {}),
+      ...(portName === "pullRequestContextReader"
+        ? { pullRequestContextReader: accessorPort }
+        : {}),
       ...(portName === "graphReader" ? { graphReader: accessorPort } : {}),
       ...(portName === "evidenceCatalog"
         ? { evidenceCatalog: accessorPort }

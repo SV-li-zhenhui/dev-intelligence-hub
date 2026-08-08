@@ -17,7 +17,7 @@ function request(overrides = {}) {
     producer: { roleId: "workflow-router", workItemId: "assignment-42" },
     question: "这个未匹配的工作应该交给谁？",
     context: [
-      { label: "来源", value: "OCT-Software#42" },
+      { label: "来源", value: "command-center#42" },
       { label: "原因", value: "没有匹配的角色" },
     ],
     choices: [

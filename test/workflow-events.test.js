@@ -12,10 +12,10 @@ function event(overrides = {}) {
     schemaVersion: 1,
     eventType: "pull_request.observed",
     occurredAt: "2026-08-02T03:04:05.006Z",
-    source: { provider: "github", scopeId: "SV-li-zhenhui" },
+    source: { provider: "github", scopeId: "local-owner" },
     subject: {
-      id: "github:pr:SVisions/OCT-Software#42",
-      repository: "SVisions/OCT-Software",
+      id: "github:pr:acme/command-center#42",
+      repository: "acme/command-center",
       number: 42,
     },
     payload: {
@@ -37,7 +37,7 @@ function assertInvalid(operation) {
   );
 }
 
-test("supports every PR and Issue workflow event", () => {
+test("supports every PR and Issue workflow event plus trusted owner intake", () => {
   const eventNames = [
     "observed",
     "created",
@@ -51,7 +51,10 @@ test("supports every PR and Issue workflow event", () => {
     eventNames.map((name) => `${kind}.${name}`),
   );
 
-  assert.deepEqual(WORKFLOW_EVENT_TYPES, expectedTypes);
+  assert.deepEqual(WORKFLOW_EVENT_TYPES, [
+    ...expectedTypes,
+    "owner_request.created",
+  ]);
   for (const eventType of expectedTypes) {
     const normalized = normalizeWorkflowEvent(event({ eventType }));
     assert.equal(normalized.eventType, eventType);
@@ -60,6 +63,20 @@ test("supports every PR and Issue workflow event", () => {
       normalized.eventId,
       `workflow-event-${normalized.contentDigest}`,
     );
+  }
+});
+
+test("PR and Issue events retain business fields that are also used by owner requests", () => {
+  const payload = {
+    title: "Shared title",
+    description: "Shared description",
+    priority: "high",
+    workType: "requirements",
+    acceptanceCriteria: ["Verified behavior"],
+  };
+  for (const eventType of ["pull_request.created", "issue.created"]) {
+    const normalized = normalizeWorkflowEvent(event({ eventType, payload }));
+    assert.deepEqual(normalized.payload, payload);
   }
 });
 
@@ -79,10 +96,10 @@ test("normalizes key order into a stable content-addressed event", () => {
     },
     subject: {
       number: 42,
-      repository: "SVisions/OCT-Software",
-      id: "github:pr:SVisions/OCT-Software#42",
+      repository: "acme/command-center",
+      id: "github:pr:acme/command-center#42",
     },
-    source: { scopeId: "SV-li-zhenhui", provider: "github" },
+    source: { scopeId: "local-owner", provider: "github" },
     occurredAt: "2026-08-02T03:04:05.006Z",
     eventType: "pull_request.observed",
     schemaVersion: 1,
@@ -112,8 +129,8 @@ test("event identity binds timestamp, type, subject, source, and payload", () =>
     event({ source: { provider: "github", scopeId: "another-user" } }),
     event({
       subject: {
-        id: "github:pr:SVisions/OCT-Software#43",
-        repository: "SVisions/OCT-Software",
+        id: "github:pr:acme/command-center#43",
+        repository: "acme/command-center",
         number: 43,
       },
     }),
@@ -132,10 +149,10 @@ test("PR events carry one atomic Git target bound to the subject and legacy Head
     schemaVersion: 1,
     provider: "github",
     sourceAccountId: "runtime-user",
-    baseRepository: "SVisions/OCT-Software",
+    baseRepository: "acme/command-center",
     baseRefName: "main",
     baseRefOid: "a".repeat(40),
-    headRepository: "contributor/OCT-Software",
+    headRepository: "contributor/command-center",
     headRefName: "fix/conflict",
     headRefOid: "b".repeat(40),
   };
@@ -434,21 +451,21 @@ test("rejects malformed event semantics and non-canonical scalar values", () => 
     event({
       subject: {
         id: "github:pr:bad\nid",
-        repository: "SVisions/OCT-Software",
+        repository: "acme/command-center",
         number: 42,
       },
     }),
     event({
       subject: {
         id: "github:pr:repo#0",
-        repository: "SVisions/OCT-Software",
+        repository: "acme/command-center",
         number: 0,
       },
     }),
     event({
       subject: {
         id: "github:pr:hidden#1",
-        repository: "SVisions/.hidden",
+        repository: "acme/.hidden",
         number: 1,
       },
     }),

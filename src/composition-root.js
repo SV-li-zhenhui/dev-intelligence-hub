@@ -1,6 +1,7 @@
 import path from "node:path";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
+import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
@@ -12,8 +13,14 @@ import { createConfigurationRuntime } from "./configuration-runtime.js";
 import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
+import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
+import { createOperationsRuntime } from "./operations-runtime.js";
+import {
+  createLazyOwnerWorkRequestRuntime,
+  createOwnerWorkRequestRuntime,
+} from "./owner-work-request-runtime.js";
 import { AttentionCoordinator } from "./services/attention-coordinator.js";
 import { AttentionResultReconciler } from "./services/attention-result-reconciler.js";
 import { ConfigurationActivationExecutor } from "./services/configuration-activation-executor.js";
@@ -31,21 +38,26 @@ import { ChangePackageApplicationResultReconciler } from "./services/change-pack
 import { MemoryProjector } from "./services/memory-projector.js";
 import { MemoryAnswerService } from "./services/memory-answer-service.js";
 import { MemoryContextRetriever } from "./services/memory-context-retriever.js";
+import { AgentMemoryQueryService } from "./services/agent-memory-query-service.js";
 import { LocalSessionImporter } from "./services/local-session-importer.js";
 import { GitActivityImporter } from "./services/git-activity-importer.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
+import { PrEngineerService } from "./services/pr-engineer-service.js";
 import { RefreshService } from "./services/refresh-service.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { normalizeWorkCoordinationTiming } from "./services/work-coordination-timing.js";
 import { WorkCoordinationService } from "./services/work-coordination-service.js";
 import { createCodeActionProposalRunnerService } from "./services/code-action-proposal-handler.js";
+import { createConfigurationChangeProposalRunnerService } from "./services/configuration-change-proposal-handler.js";
 import { CodeJobGrantFactory } from "./services/code-job-grant-factory.js";
 import { createConfiguredCodeJobBrainDirectory } from "./services/code-job-brain-directory.js";
 import { createGitHubReviewProposalRunnerService } from "./services/github-review-proposal-handler.js";
+import { createPullRequestExternalActionExecutor } from "./services/pull-request-external-action-executor.js";
+import { createPullRequestExternalActionProposalRunnerService } from "./services/pull-request-external-action-handler.js";
 import { WorkIntentDispatcher } from "./services/work-intent-dispatcher.js";
 import { WorkProposalResultReconciler } from "./services/work-proposal-result-reconciler.js";
 import { VersionedCodeJobAuthority } from "./services/versioned-code-job-authority.js";
@@ -58,7 +70,10 @@ import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
+const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
 const CODE_ACTION_PROPOSAL_RUNNER_ID = "code-action-runner";
+const CONFIGURATION_CHANGE_PROPOSAL_RUNNER_ID = "configuration-change-runner";
+const PR_ENGINEER_FACTS_GUARD_NAME = "mydashboard-pr-engineer-read-facts-v1";
 
 function frozenPort(source, methods, name) {
   if (!source || methods.some((method) => typeof source[method] !== "function")) {
@@ -71,16 +86,72 @@ function frozenPort(source, methods, name) {
   );
 }
 
-async function closeRuntimes(runtimes) {
-  let firstFailure = null;
-  for (let index = runtimes.length - 1; index >= 0; index -= 1) {
-    try {
-      await runtimes[index]();
-    } catch (error) {
-      firstFailure ||= error;
-    }
-  }
-  if (firstFailure) throw firstFailure;
+function environmentCredentialProvider(environment, name) {
+  return () => {
+    if (!environment || typeof environment !== "object") return null;
+    const descriptor = Object.getOwnPropertyDescriptor(environment, name);
+    return descriptor?.enumerable && "value" in descriptor &&
+        typeof descriptor.value === "string"
+      ? descriptor.value
+      : null;
+  };
+}
+
+export function createApplicationRuntimeLifecycle() {
+  const runtimes = [];
+  const failures = [];
+  let closeAttempt = null;
+  let lastFailure = null;
+
+  const close = () => {
+    if (closeAttempt) return closeAttempt;
+    const attempt = (async () => {
+      let firstFailure = null;
+      for (let index = runtimes.length - 1; index >= 0; index -= 1) {
+        const runtime = runtimes[index];
+        if (runtime.closed) continue;
+        try {
+          await runtime.close();
+          runtime.closed = true;
+        } catch (error) {
+          failures.push(error);
+          firstFailure ||= error;
+        }
+      }
+      lastFailure = firstFailure;
+      if (firstFailure) throw firstFailure;
+    })();
+    closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+    );
+    return attempt;
+  };
+
+  return Object.freeze({
+    track(runtime) {
+      if (runtime && typeof runtime.close === "function") {
+        runtimes.push({ close: runtime.close.bind(runtime), closed: false });
+      }
+      return runtime;
+    },
+    close,
+    readStatus() {
+      const pendingRuntimes = runtimes.filter(({ closed }) => !closed).length;
+      return Object.freeze({
+        acquiredRuntimes: runtimes.length,
+        pendingRuntimes,
+        complete: pendingRuntimes === 0,
+        failure: lastFailure,
+        failures: Object.freeze([...failures]),
+      });
+    },
+  });
 }
 
 function codeActionRunnerRoles(policy = {}) {
@@ -101,11 +172,64 @@ function codeActionRunnerRoles(policy = {}) {
   return [...new Set(eligibleRoles)];
 }
 
-function brainConfigurationsByRole(roles) {
+function agentMemoryQueryRoleIds(roles = {}) {
+  return Object.entries(roles)
+    .filter(([, role]) =>
+      Array.isArray(role?.permissions?.allowedIntents) &&
+      role.permissions.allowedIntents.includes("query_memory")
+    )
+    .map(([roleId]) => roleId)
+    .sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function conflictPreparationPorts(config, runtime) {
+  const configured =
+    config?.enabled === true && config?.conflictPreparation?.enabled === true;
+  const workspaces = Array.isArray(runtime?.authority?.workspaces)
+    ? runtime.authority.workspaces
+    : [];
+  const advertises = (workspace) =>
+    Array.isArray(workspace?.capabilities) &&
+    workspace.capabilities.includes("conflict_preparation_snapshot");
+  const anyAdvertised = workspaces.some(advertises);
+  const allAdvertised = workspaces.length > 0 && workspaces.every(advertises);
+  const verifierAvailable =
+    typeof runtime?.conflictPreparationVerifier?.verify === "function";
+  const preparerAvailable =
+    typeof runtime?.conflictExecutionSourcePreparer?.prepare === "function";
+  if (
+    anyAdvertised !== allAdvertised ||
+    configured !== allAdvertised ||
+    configured !== verifierAvailable ||
+    configured !== preparerAvailable
+  ) {
+    throw new Error(
+      "Conflict preparation 配置、工作区能力和生产端口不一致",
+    );
+  }
+  if (!configured) return Object.freeze({ verifier: null, preparer: null });
+  return Object.freeze({
+    verifier: frozenPort(
+      runtime.conflictPreparationVerifier,
+      ["verify"],
+      "codeExecutorRuntime.conflictPreparationVerifier",
+    ),
+    preparer: frozenPort(
+      runtime.conflictExecutionSourcePreparer,
+      ["prepare"],
+      "codeExecutorRuntime.conflictExecutionSourcePreparer",
+    ),
+  });
+}
+
+function taskBrainConfigurationsByRole(roles) {
   const configured =
     roles && typeof roles === "object" && !Array.isArray(roles) ? roles : {};
   return Object.fromEntries(
-    Object.entries(configured).map(([roleId, role]) => [roleId, role?.brain]),
+    Object.entries(configured).map(([roleId, role]) => [
+      roleId,
+      role?.taskBrain ?? null,
+    ]),
   );
 }
 
@@ -215,6 +339,8 @@ export async function createApplication({
   confirmationRuntimeDependencies = {},
   workflowRoutingRuntimeFactory = createWorkflowRoutingRuntime,
   workflowRoutingDependencies = {},
+  ownerWorkRequestRuntimeFactory = createOwnerWorkRequestRuntime,
+  ownerWorkRequestDependencies = {},
   workLedgerRuntimeFactory = createWorkLedgerRuntime,
   workLedgerDependencies = {},
   attentionInboxRuntimeFactory = createAttentionInboxRuntime,
@@ -223,10 +349,15 @@ export async function createApplication({
   workProposalDependencies = {},
   memoryRuntimeFactory = createMemoryRuntime,
   memoryRuntimeDependencies = {},
+  operationsRuntimeFactory = createOperationsRuntime,
+  operationsRuntimeDependencies = {},
+  operationsOptions = {},
   memoryProjectorFactory = (options) => new MemoryProjector(options),
   memoryContextRetrieverFactory = (options) =>
     new MemoryContextRetriever(options),
   memoryAnswerServiceFactory = (options) => new MemoryAnswerService(options),
+  agentMemoryQueryServiceFactory = (options) =>
+    new AgentMemoryQueryService(options),
   memoryBrainRouterFactory = createConfiguredBrainRouter,
   memoryAnswerDependencies = {},
   localSessionImporterFactory = (options) => new LocalSessionImporter(options),
@@ -240,6 +371,10 @@ export async function createApplication({
   workIntentPolicyFactory = createWorkIntentPolicy,
   roleWorkerDirectoryFactory = (options) => new RoleWorkerDirectory(options),
   configuredWorkforceFactory = createConfiguredWorkforce,
+  pullRequestFactsLoaderFactory = ({ github }) => github,
+  prEngineerExclusiveGuardFactory = (options) =>
+    new ProcessExclusiveGuard(options),
+  prEngineerServiceFactory = (options) => new PrEngineerService(options),
   workflowFactSourceFactory = (options) => new WorkflowFactSource(options),
   attentionResultReconcilerFactory = (options) =>
     new AttentionResultReconciler(options),
@@ -247,12 +382,21 @@ export async function createApplication({
     new WorkProposalResultReconciler(options),
   githubReviewProposalRunnerFactory =
     createGitHubReviewProposalRunnerService,
+  pullRequestExternalActionExecutorFactory =
+    createPullRequestExternalActionExecutor,
+  pullRequestExternalActionTransportFactory =
+    createGitHubPullRequestActionTransport,
+  pullRequestExternalActionProposalRunnerFactory =
+    createPullRequestExternalActionProposalRunnerService,
+  pullRequestExternalActionDependencies = {},
   codeJobGrantFactory = (options) => new CodeJobGrantFactory(options),
   codeJobBrainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
   versionedCodeJobAuthorityFactory = (options) =>
     new VersionedCodeJobAuthority(options),
   codeActionProposalRunnerFactory =
     createCodeActionProposalRunnerService,
+  configurationChangeProposalRunnerFactory =
+    createConfigurationChangeProposalRunnerService,
   workProposalRunnerGroupFactory = createWorkProposalRunnerGroup,
   workConditionWakerFactory = (options) => new WorkConditionWaker(options),
   proactiveWorkLoopFactory = (options) => new ProactiveWorkLoop(options),
@@ -268,6 +412,7 @@ export async function createApplication({
   attentionCoordinatorFactory = (options) => new AttentionCoordinator(options),
   workCoordinationDependencies = {},
   externalActions = true,
+  runtimeLifecycle: suppliedRuntimeLifecycle,
 } = {}) {
   if (typeof versionedConfiguration !== "boolean") {
     throw new TypeError("versionedConfiguration must be a boolean");
@@ -277,6 +422,30 @@ export async function createApplication({
   }
   if (typeof versionedCodeJobAuthorityFactory !== "function") {
     throw new TypeError("versionedCodeJobAuthorityFactory must be a function");
+  }
+  if (typeof pullRequestFactsLoaderFactory !== "function") {
+    throw new TypeError("pullRequestFactsLoaderFactory must be a function");
+  }
+  if (typeof prEngineerExclusiveGuardFactory !== "function") {
+    throw new TypeError("prEngineerExclusiveGuardFactory must be a function");
+  }
+  if (typeof prEngineerServiceFactory !== "function") {
+    throw new TypeError("prEngineerServiceFactory must be a function");
+  }
+  if (typeof pullRequestExternalActionExecutorFactory !== "function") {
+    throw new TypeError(
+      "pullRequestExternalActionExecutorFactory must be a function",
+    );
+  }
+  if (typeof pullRequestExternalActionTransportFactory !== "function") {
+    throw new TypeError(
+      "pullRequestExternalActionTransportFactory must be a function",
+    );
+  }
+  if (typeof pullRequestExternalActionProposalRunnerFactory !== "function") {
+    throw new TypeError(
+      "pullRequestExternalActionProposalRunnerFactory must be a function",
+    );
   }
   if (typeof configurationActivationExecutorFactory !== "function") {
     throw new TypeError(
@@ -288,6 +457,23 @@ export async function createApplication({
       "configurationConfirmationRequesterFactory must be a function",
     );
   }
+  if (typeof operationsRuntimeFactory !== "function") {
+    throw new TypeError("operationsRuntimeFactory must be a function");
+  }
+  if (typeof agentMemoryQueryServiceFactory !== "function") {
+    throw new TypeError("agentMemoryQueryServiceFactory must be a function");
+  }
+  if (typeof ownerWorkRequestRuntimeFactory !== "function") {
+    throw new TypeError("ownerWorkRequestRuntimeFactory must be a function");
+  }
+  const ownsRuntimeLifecycle = suppliedRuntimeLifecycle === undefined;
+  const runtimeLifecycle = frozenPort(
+    ownsRuntimeLifecycle
+      ? createApplicationRuntimeLifecycle()
+      : suppliedRuntimeLifecycle,
+    ["track", "close", "readStatus"],
+    "runtimeLifecycle",
+  );
   const actionAdmissionGate = versionedConfiguration
     ? frozenPort(
         actionAdmissionGateFactory(),
@@ -312,22 +498,19 @@ export async function createApplication({
   let config = bootstrap.candidate ?? bootstrap.fallbackConfiguration;
   const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
   const operationQueue = new OperationQueue();
-  const acquiredRuntimes = [];
-  const trackRuntime = (runtime) => {
-    if (runtime && typeof runtime.close === "function") {
-      acquiredRuntimes.push(runtime.close.bind(runtime));
-    }
-    return runtime;
-  };
+  const trackRuntime = runtimeLifecycle.track;
   let configurationRuntime = null;
   let configurationConfirmationRequester = null;
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  let ownerWorkRequests = null;
   let attentionInboxRuntime = null;
   let workProposalRuntime = null;
   let memoryRuntime = null;
+  let memoryAnswer = null;
+  let agentMemoryQueries = null;
   let codeJobRuntime = null;
   let confirmationRuntime = null;
   let codeJobReader = null;
@@ -371,6 +554,9 @@ export async function createApplication({
     const roleConfig = config.employees?.prReviewer || { enabled: false };
     const github = new GitHubAdapter({
       maxPatchCharacters: roleConfig.maxPatchCharacters,
+      ...(workCoordinationDependencies.clock
+        ? { clock: workCoordinationDependencies.clock }
+        : {}),
     });
     const dingtalk = new DingTalkAdapter();
     const brain = createBrain(
@@ -384,6 +570,10 @@ export async function createApplication({
         ...codeExecutorDependencies,
         store,
       }),
+    );
+    const controlledConflictPorts = conflictPreparationPorts(
+      config.codeExecutor,
+      codeExecutorRuntime,
     );
     const changePackageActionsEnabled =
       externalActions && config.changePackages?.enabled === true;
@@ -403,6 +593,15 @@ export async function createApplication({
           store,
           trustedTargets: codeExecutorRuntime.changePackageTargets,
           applicationAuthorityVerifier,
+          ...(codeExecutorRuntime.controlledCommitBuilder == null
+            ? {}
+            : {
+                controlledCommitBuilder: frozenPort(
+                  codeExecutorRuntime.controlledCommitBuilder,
+                  ["create", "find", "verify"],
+                  "codeExecutorRuntime.controlledCommitBuilder",
+                ),
+              }),
         }),
       );
       if (!changePackageRuntime) {
@@ -445,12 +644,46 @@ export async function createApplication({
           { roleContextEnabled: true },
         )
       : null;
+    const configuredGithubActions = config.githubActions || {};
+    const explicitPullRequestActions = Array.isArray(
+      configuredGithubActions.enabledActions,
+    )
+      ? [...configuredGithubActions.enabledActions]
+      : [];
     const githubProposalExecutionEnabled =
       coordinationEnabled &&
       externalActions &&
-      config.githubActions?.enabled === true;
+      configuredGithubActions.enabled === true &&
+      (
+        configuredGithubActions.enabledActions === undefined ||
+        explicitPullRequestActions.includes("review")
+      );
+    const pullRequestExternalActionExecutionEnabled =
+      coordinationEnabled &&
+      externalActions &&
+      configuredGithubActions.enabled === true &&
+      explicitPullRequestActions.length > 0;
     const localCodeExecutionEnabled =
       coordinationEnabled && externalActions && Boolean(codeExecutorRuntime);
+    const configurationChangeRoleIds = Array.isArray(
+      coordinationConfig.policy?.configurationChangeRoles,
+    )
+      ? [...new Set(coordinationConfig.policy.configurationChangeRoles)]
+      : [];
+    const configurationProposalExecutionEnabled =
+      coordinationEnabled &&
+      externalActions &&
+      versionedConfiguration &&
+      configurationChangeRoleIds.length > 0;
+    if (
+      coordinationEnabled &&
+      configurationChangeRoleIds.length > 0 &&
+      (!externalActions || !versionedConfiguration)
+    ) {
+      throw new Error(
+        "配置变更提案需要启用版本化配置与外部动作恢复边界",
+      );
+    }
     const codeJobChangePackageDeliveryEnabled =
       localCodeExecutionEnabled && changePackageActionsEnabled;
     const codeRunnerRoleIds = localCodeExecutionEnabled
@@ -494,12 +727,31 @@ export async function createApplication({
                   },
                 ]
               : []),
+            ...(pullRequestExternalActionExecutionEnabled
+              ? [
+                  {
+                    runnerId: GITHUB_PULL_REQUEST_ACTION_RUNNER_ID,
+                    allowedKinds: ["github_pull_request_action_proposal"],
+                    allowedRoleIds:
+                      coordinationConfig.policy?.githubReviewRoles || [],
+                  },
+                ]
+              : []),
             ...(localCodeExecutionEnabled
               ? [
                   {
                     runnerId: CODE_ACTION_PROPOSAL_RUNNER_ID,
                     allowedKinds: ["code_action_proposal"],
                     allowedRoleIds: codeRunnerRoleIds,
+                  },
+                ]
+              : []),
+            ...(configurationProposalExecutionEnabled
+              ? [
+                  {
+                    runnerId: CONFIGURATION_CHANGE_PROPOSAL_RUNNER_ID,
+                    allowedKinds: ["configuration_change_proposal"],
+                    allowedRoleIds: configurationChangeRoleIds,
                   },
                 ]
               : []),
@@ -512,6 +764,9 @@ export async function createApplication({
     }
     const memoryEnabled = config.memory?.enabled === true;
     if (memoryEnabled) {
+      const confirmationMemoryAuthorityRequired =
+        githubProposalExecutionEnabled ||
+        pullRequestExternalActionExecutionEnabled;
       memoryRuntime = trackRuntime(
         await memoryRuntimeFactory({
           ...memoryRuntimeDependencies,
@@ -528,8 +783,95 @@ export async function createApplication({
                   "workLedgerRuntime.memoryAuthoritySource",
                 ),
               }),
+          ...(confirmationMemoryAuthorityRequired
+            ? {
+                confirmationAuthoritySource: Object.freeze({
+                  readStatus: () => {
+                    if (confirmationRuntime === null) {
+                      throw new Error("确认记忆权威尚未启动");
+                    }
+                    return confirmationRuntime.memoryProjectionSource
+                      .readMemoryStatus();
+                  },
+                }),
+              }
+            : {}),
         }),
       );
+    }
+    const memoryAnswerConfig = config.memory?.answering;
+    if (memoryEnabled && memoryAnswerConfig?.enabled === true) {
+      if (!memoryRuntime) {
+        throw new Error("记忆问答需要启用统一记忆运行时");
+      }
+      const memoryBrainRouter = memoryBrainRouterFactory({
+        brainProviders: config.brainProviders || {},
+        dependencies: memoryAnswerDependencies.brainDependencies || {},
+      });
+      const contextRetriever = memoryContextRetrieverFactory({
+        memorySearch: frozenPort(
+          memoryRuntime.search,
+          ["search"],
+          "memoryRuntime.search",
+        ),
+        contextReader: frozenPort(
+          memoryRuntime.contextReader,
+          ["readRecords"],
+          "memoryRuntime.contextReader",
+        ),
+        maximumRecords: memoryAnswerConfig.maximumRecords,
+        maximumContextBytes: memoryAnswerConfig.maximumContextBytes,
+      });
+      memoryAnswer = frozenPort(
+        memoryAnswerServiceFactory({
+          contextRetriever,
+          brainRouter: memoryBrainRouter,
+          configuredBrain: memoryAnswerConfig.brain,
+          localBrain: memoryAnswerConfig.localBrain,
+          maximumConcurrent: memoryAnswerConfig.maximumConcurrent,
+          ...(ordinaryActionAdmissionGate === null
+            ? {}
+            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+          ...(memoryAnswerDependencies.beforeGenerate
+            ? { beforeGenerate: memoryAnswerDependencies.beforeGenerate }
+            : {}),
+        }),
+        ["answer"],
+        "memoryAnswerService",
+      );
+    }
+    const memoryQueryRoleIds = coordinationEnabled
+      ? agentMemoryQueryRoleIds(config.employees?.roles || {})
+      : [];
+    if (memoryQueryRoleIds.length > 0) {
+      if (!memoryRuntime || !memoryAnswer) {
+        throw new Error(
+          "岗位 query_memory 权限需要启用带引用的统一记忆问答",
+        );
+      }
+      agentMemoryQueries = agentMemoryQueryServiceFactory({
+        store: frozenPort(store, ["read", "write"], "agent memory query store"),
+        memoryAnswer,
+        memoryContextReader: frozenPort(
+          memoryRuntime.contextReader,
+          ["readRecords"],
+          "agent memory query context reader",
+        ),
+        memoryProducer: frozenPort(
+          memoryRuntime.producer,
+          ["append"],
+          "agent memory query producer",
+        ),
+        allowedRoleIds: memoryQueryRoleIds,
+        ...(workCoordinationDependencies.clock
+          ? { clock: workCoordinationDependencies.clock }
+          : {}),
+      });
+      await frozenPort(
+        agentMemoryQueries,
+        ["recover"],
+        "agentMemoryQueryService",
+      ).recover();
     }
     if (localCodeExecutionEnabled && !memoryRuntime) {
       throw new Error("本地代码工作提案需要启用统一记忆运行时");
@@ -555,6 +897,12 @@ export async function createApplication({
             workCoordinationDependencies.brainDependencies || {},
           actionAdmissionGate: ordinaryActionAdmissionGate,
           inputAuthorityVerifier,
+          ...(controlledConflictPorts.verifier === null
+            ? {}
+            : {
+                conflictPreparationVerifier:
+                  controlledConflictPorts.verifier,
+              }),
           grantFactoryFactory: codeJobGrantFactory,
           brainDirectoryFactory: codeJobBrainDirectoryFactory,
         });
@@ -568,9 +916,17 @@ export async function createApplication({
           codeActionRoles: coordinationConfig.policy?.codeActionRoles || [],
           codeOperationsByRole:
             coordinationConfig.policy?.codeOperationsByRole || {},
-          brainByRole: brainConfigurationsByRole(config.employees?.roles),
+          taskBrainByRole: taskBrainConfigurationsByRole(
+            config.employees?.roles,
+          ),
           brainProviders: config.brainProviders || {},
           inputAuthorityVerifier,
+          ...(controlledConflictPorts.verifier === null
+            ? {}
+            : {
+                conflictPreparationVerifier:
+                  controlledConflictPorts.verifier,
+              }),
         });
         codeJobBrainDirectory = codeJobBrainDirectoryFactory({
           brainProviders: config.brainProviders || {},
@@ -626,6 +982,15 @@ export async function createApplication({
                 "changePackageRuntime.packageProducer",
               ),
               changePackageReader,
+              ...(changePackageRuntime.controlledCommitDelivery === undefined
+                ? {}
+                : {
+                    controlledCommitDelivery: frozenPort(
+                      changePackageRuntime.controlledCommitDelivery,
+                      ["deliver"],
+                      "changePackageRuntime.controlledCommitDelivery",
+                    ),
+                  }),
             }
           : {}),
       };
@@ -763,6 +1128,88 @@ export async function createApplication({
         "changePackageRuntime.applicationExecutor",
       );
     }
+    let pullRequestExternalActionExecutor = null;
+    if (pullRequestExternalActionExecutionEnabled) {
+      if (inputAuthorityVerifier === null) {
+        throw new Error("GitHub PR 外部动作需要可核验的 PR 输入授权");
+      }
+      const controlledCommitVerifier =
+        codeExecutorRuntime?.controlledCommitBuilder == null
+          ? null
+          : frozenPort(
+              codeExecutorRuntime.controlledCommitBuilder,
+              ["verify"],
+              "codeExecutorRuntime.controlledCommitBuilder",
+            );
+      const controlledCommitPublisher =
+        codeExecutorRuntime?.controlledCommitPublisher == null
+          ? null
+          : frozenPort(
+              codeExecutorRuntime.controlledCommitPublisher,
+              ["publish"],
+              "codeExecutorRuntime.controlledCommitPublisher",
+            );
+      if (
+        explicitPullRequestActions.includes("push") &&
+        controlledCommitVerifier === null
+      ) {
+        throw new Error("GitHub push 动作需要可核验的受控 commit 证据");
+      }
+      if (pullRequestExternalActionDependencies.executor === undefined) {
+        const environment =
+          pullRequestExternalActionDependencies.env ?? process.env;
+        const credentialProvider =
+          pullRequestExternalActionDependencies.credentialProvider ??
+          environmentCredentialProvider(
+            environment,
+            configuredGithubActions.tokenEnv,
+          );
+        let transport = pullRequestExternalActionDependencies.transport;
+        if (transport === undefined) {
+          if (
+            explicitPullRequestActions.includes("push") &&
+            controlledCommitPublisher === null
+          ) {
+            throw new Error("GitHub push 动作需要受控 commit 发布端口");
+          }
+          transport = pullRequestExternalActionTransportFactory({
+            ghCommand: configuredGithubActions.ghCommand,
+            env: environment,
+            networkEnv: configuredGithubActions.networkEnv,
+            ...(configuredGithubActions.timeoutMs === undefined
+              ? {}
+              : { timeoutMs: configuredGithubActions.timeoutMs }),
+            ...(controlledCommitPublisher === null
+              ? {}
+              : { controlledCommitPublisher }),
+            ...(pullRequestExternalActionDependencies.processRunner === undefined
+              ? {}
+              : {
+                  runner:
+                    pullRequestExternalActionDependencies.processRunner,
+                }),
+          });
+        }
+        pullRequestExternalActionExecutor =
+          pullRequestExternalActionExecutorFactory({
+            enabledActions: explicitPullRequestActions,
+            credentialProvider,
+            transport,
+            inputAuthorityVerifier,
+            ...(controlledCommitVerifier === null
+              ? {}
+              : { controlledCommitVerifier }),
+          });
+      } else {
+        pullRequestExternalActionExecutor =
+          pullRequestExternalActionDependencies.executor;
+      }
+      pullRequestExternalActionExecutor = frozenPort(
+        pullRequestExternalActionExecutor,
+        ["execute", "reconcile"],
+        "pullRequestExternalActionExecutor",
+      );
+    }
     if (
       externalActions &&
       (Object.keys(localExecutors).length > 0 ||
@@ -783,6 +1230,9 @@ export async function createApplication({
           ...(Object.keys(localExecutors).length === 0
             ? {}
             : { localExecutors: Object.freeze(localExecutors) }),
+          ...(pullRequestExternalActionExecutor === null
+            ? {}
+            : { pullRequestExternalActionExecutor }),
         }),
       );
     }
@@ -791,6 +1241,9 @@ export async function createApplication({
     }
     if (githubProposalExecutionEnabled && !confirmationRuntime) {
       throw new Error("GitHub 工作提案需要可用的确认运行时");
+    }
+    if (pullRequestExternalActionExecutionEnabled && !confirmationRuntime) {
+      throw new Error("GitHub PR 外部动作提案需要可用的确认运行时");
     }
     if (changePackageActionsEnabled && !confirmationRuntime) {
       throw new Error("change package 应用需要可用的确认运行时");
@@ -806,19 +1259,33 @@ export async function createApplication({
             [
               "prepareInitialization",
               "prepareDraftActivation",
+              ...(configurationProposalExecutionEnabled
+                ? ["prepareProposalDraftActivation"]
+                : []),
               "prepareRollback",
             ],
             "configurationRuntime.simulator",
           ),
           confirmationProducer: frozenPort(
             confirmationRuntime.producerQueue,
-            ["enqueue"],
+            [
+              "enqueue",
+              ...(configurationProposalExecutionEnabled
+                ? ["get", "invalidate"]
+                : []),
+            ],
             "confirmationRuntime.producerQueue",
           ),
         }),
         configurationInitializationEnabled
           ? ["requestInitialization"]
-          : ["requestDraftActivation", "requestRollback"],
+          : [
+              "requestDraftActivation",
+              "requestRollback",
+              ...(configurationProposalExecutionEnabled
+                ? ["requestProposalDraftActivation"]
+                : []),
+            ],
         "configurationConfirmationRequester",
       );
     }
@@ -890,6 +1357,28 @@ export async function createApplication({
         }),
       );
     }
+    if (pullRequestExternalActionExecutionEnabled) {
+      proposalRunners.push(
+        pullRequestExternalActionProposalRunnerFactory({
+          enabled: true,
+          enabledActions: explicitPullRequestActions,
+          runner:
+            workProposalRuntime.runners[
+              GITHUB_PULL_REQUEST_ACTION_RUNNER_ID
+            ],
+          confirmationProducer: confirmationRuntime.producerQueue,
+          inputAuthorityVerifier,
+          actorAccountId: configuredGithubActions.actorAccountId,
+          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          retryBaseMs: coordinationConfig.retryBaseMs,
+          retryMaxMs: coordinationConfig.retryMaxMs,
+          defaultBatchLimit: coordinationConfig.proposalLimit,
+          ...(workCoordinationDependencies.clock
+            ? { clock: workCoordinationDependencies.clock }
+            : {}),
+        }),
+      );
+    }
     if (localCodeExecutionEnabled) {
       proposalRunners.push(
         codeActionProposalRunnerFactory({
@@ -898,6 +1387,27 @@ export async function createApplication({
           confirmationProducer: confirmationRuntime.producerQueue,
           codeJobReader,
           grantFactory,
+          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          retryBaseMs: coordinationConfig.retryBaseMs,
+          retryMaxMs: coordinationConfig.retryMaxMs,
+          defaultBatchLimit: coordinationConfig.proposalLimit,
+          ...(workCoordinationDependencies.clock
+            ? { clock: workCoordinationDependencies.clock }
+            : {}),
+        }),
+      );
+    }
+    if (configurationProposalExecutionEnabled) {
+      proposalRunners.push(
+        configurationChangeProposalRunnerFactory({
+          enabled: true,
+          runner:
+            workProposalRuntime.runners[
+              CONFIGURATION_CHANGE_PROPOSAL_RUNNER_ID
+            ],
+          configurationReader: configurationRuntime.reader,
+          configurationProposalPort: configurationRuntime.proposalPort,
+          confirmationRequester: configurationConfirmationRequester,
           leaseDurationMs: coordinationConfig.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,
           retryMaxMs: coordinationConfig.retryMaxMs,
@@ -957,7 +1467,7 @@ export async function createApplication({
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
-          onRun: ({ roleId }) => {
+          onRun: ({ roleId, signal = null }) => {
             if (!workCoordination) {
               const error = new Error("员工主动循环尚未就绪");
               error.code = "WORK_COORDINATION_NOT_READY";
@@ -967,6 +1477,7 @@ export async function createApplication({
               trigger: `employee:${roleId}`,
               includeWork: true,
               roleId,
+              ...(signal === null ? {} : { signal }),
             });
           },
         })
@@ -982,6 +1493,45 @@ export async function createApplication({
     let memoryProjector = null;
     let deliveryEvidence = null;
     if (coordinationEnabled) {
+      ownerWorkRequests = trackRuntime(
+        createLazyOwnerWorkRequestRuntime(() =>
+          ownerWorkRequestRuntimeFactory({
+            ...ownerWorkRequestDependencies,
+            store: frozenPort(
+              store,
+              ["read", "write"],
+              "owner work request store",
+            ),
+            workflowRouting: frozenPort(
+              workflowRouting,
+              ["dryRun", "ingest"],
+              "owner work request workflow routing",
+            ),
+            ledger: frozenPort(
+              workLedgerRuntime,
+              ["intake", "listItems"],
+              "owner work request ledger",
+            ),
+            roleReadiness: Object.freeze({
+              async read(roleId) {
+                const employee = employeeRegistry.get(roleId);
+                if (!employee) {
+                  return { roleId, enabled: false, paused: true };
+                }
+                const role = await employee.roleView();
+                return {
+                  roleId,
+                  enabled: role?.enabled === true,
+                  paused: role?.paused === true,
+                };
+              },
+            }),
+            ...(ordinaryActionAdmissionGate === null
+              ? {}
+              : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+          }),
+        ),
+      );
       const clockOptions = workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
         : {};
@@ -995,11 +1545,68 @@ export async function createApplication({
         legacyEmployeeRegistry: employeeRegistry,
         legacyOwnedRoleIds: ["pr-reviewer"],
       });
-      const factSource = workflowFactSourceFactory({
-        store,
+      const prEngineerGuard = trackRuntime(
+        frozenPort(
+          prEngineerExclusiveGuardFactory({
+            name: PR_ENGINEER_FACTS_GUARD_NAME,
+          }),
+          ["run", "close"],
+          "PR engineer fact guard",
+        ),
+      );
+      const prEngineerService = prEngineerServiceFactory({
+        store: frozenPort(
+          store,
+          ["read", "write"],
+          "PR engineer fact state store",
+        ),
+        pullRequestFactsLoader: frozenPort(
+          pullRequestFactsLoaderFactory({ github }),
+          ["loadPullRequestFacts"],
+          "GitHub pull request facts loader",
+        ),
+        exclusiveLease: frozenPort(
+          prEngineerGuard,
+          ["run"],
+          "PR engineer fact exclusive lease",
+        ),
         ...clockOptions,
         maximumAgeMs: coordinationConfig.factMaximumAgeMs,
       });
+      await frozenPort(
+        prEngineerService,
+        ["recover"],
+        "PR engineer fact recovery",
+      ).recover();
+      const pullRequestFacts = frozenPort(
+        prEngineerService,
+        ["context"],
+        "PR engineer fact context",
+      );
+      const factSourceService = workflowFactSourceFactory({
+        store: frozenPort(
+          store,
+          ["read"],
+          "workflow fact snapshot store",
+        ),
+        pullRequestFacts,
+        ...clockOptions,
+        maximumAgeMs: coordinationConfig.factMaximumAgeMs,
+      });
+      const factSource = frozenPort(
+        factSourceService,
+        ["read"],
+        "workflow fact source",
+      );
+      const pullRequestContextReader = frozenPort(
+        frozenPort(
+          factSourceService,
+          ["pullRequestTaskContextReader"],
+          "workflow PR task context reader factory",
+        ).pullRequestTaskContextReader(),
+        ["read"],
+        "workflow PR task context reader",
+      );
       const proposalResultReader = workProposalRuntime.evidenceReader
         ? frozenPort(
             workProposalRuntime.evidenceReader,
@@ -1025,9 +1632,23 @@ export async function createApplication({
         "deliveryEvidenceService",
       );
       const roleContextAssembler = roleContextAssemblerFactory({
-        graphReader: workLedgerRuntime.graphReader,
+        graphReader: frozenPort(
+          workLedgerRuntime.graphReader,
+          ["getSnapshot"],
+          "workLedgerRuntime.graphReader",
+        ),
         factSource,
+        pullRequestContextReader,
         evidenceCatalog: deliveryEvidence,
+        ...(agentMemoryQueries === null
+          ? {}
+          : {
+              memoryQueryReader: frozenPort(
+                agentMemoryQueries,
+                ["readContext"],
+                "agentMemoryQueryService.reader",
+              ),
+            }),
       });
       const orchestratorService = orchestratorServiceFactory({
         contextAssembler: roleContextAssembler,
@@ -1069,6 +1690,15 @@ export async function createApplication({
         roleDirectory,
         roleContextAssembler,
         orchestratorService,
+        ...(agentMemoryQueries === null
+          ? {}
+          : {
+              memoryQueryService: frozenPort(
+                agentMemoryQueries,
+                ["execute", "verifyContext"],
+                "agentMemoryQueryService.executor",
+              ),
+            }),
         ...clockOptions,
         leaseDurationMs: coordinationTiming.leaseDurationMs,
         maxAttempts: coordinationConfig.maxAttempts,
@@ -1082,6 +1712,21 @@ export async function createApplication({
         policy,
         attentionProducer: attentionInboxRuntime.producer,
         proposalProducer: workProposalRuntime.producer,
+        ...(codeExecutorRuntime?.controlledCommitBuilder == null
+          ? {}
+          : {
+              controlledCommitEvidenceReader: frozenPort(
+                codeExecutorRuntime.controlledCommitBuilder,
+                ["verify"],
+                "codeExecutorRuntime.controlledCommitBuilder",
+              ),
+            }),
+        ...(controlledConflictPorts.preparer === null
+          ? {}
+          : {
+              conflictExecutionSourcePreparer:
+                controlledConflictPorts.preparer,
+            }),
         ...clockOptions,
         ...(ordinaryActionAdmissionGate === null
           ? {}
@@ -1146,13 +1791,18 @@ export async function createApplication({
                 "appendWorkItems",
                 "appendGraphEvents",
                 "appendProjectionRecords",
+                "appendAuthorityProjection",
                 "adoptGraphCheckpoint",
               ],
               "memoryRuntime.lifecycleProducer",
             ),
             memoryAuthorityReader: frozenPort(
               memoryRuntime.authorityReader,
-              ["getAuthorityState"],
+              [
+                "getAuthorityState",
+                "getAuthorityProjectionState",
+                "requiresAuthorityProjectionCheckpoint",
+              ],
               "memoryRuntime.authorityReader",
             ),
             memoryAuthoritySource: frozenPort(
@@ -1165,6 +1815,18 @@ export async function createApplication({
               ["ackBatch"],
               "workLedgerRuntime.graphMemoryProjectionSource",
             ),
+            ...(confirmationRuntime === null
+              ? {}
+              : {
+                  confirmationProjectionSource: frozenPort(
+                    confirmationRuntime.memoryProjectionSource,
+                    ["readMemoryPage", "readMemoryStatus"],
+                    "confirmationRuntime.memoryProjectionSource",
+                  ),
+                }),
+            ...(inputAuthorityVerifier === null
+              ? {}
+              : { inputAuthorityVerifier }),
             store,
           }),
           ["runCycle"],
@@ -1179,49 +1841,7 @@ export async function createApplication({
           "memoryRuntime.search",
         )
       : null;
-    let memoryAnswer = null;
     let memoryImports = null;
-    const memoryAnswerConfig = config.memory?.answering;
-    if (memoryEnabled && memoryAnswerConfig?.enabled === true) {
-      if (!memoryRuntime) {
-        throw new Error("记忆问答需要启用统一记忆运行时");
-      }
-      const memoryBrainRouter = memoryBrainRouterFactory({
-        brainProviders: config.brainProviders || {},
-        dependencies: memoryAnswerDependencies.brainDependencies || {},
-      });
-      const contextRetriever = memoryContextRetrieverFactory({
-        memorySearch: frozenPort(
-          memoryRuntime.search,
-          ["search"],
-          "memoryRuntime.search",
-        ),
-        contextReader: frozenPort(
-          memoryRuntime.contextReader,
-          ["readRecords"],
-          "memoryRuntime.contextReader",
-        ),
-        maximumRecords: memoryAnswerConfig.maximumRecords,
-        maximumContextBytes: memoryAnswerConfig.maximumContextBytes,
-      });
-      memoryAnswer = frozenPort(
-        memoryAnswerServiceFactory({
-          contextRetriever,
-          brainRouter: memoryBrainRouter,
-          configuredBrain: memoryAnswerConfig.brain,
-          localBrain: memoryAnswerConfig.localBrain,
-          maximumConcurrent: memoryAnswerConfig.maximumConcurrent,
-          ...(ordinaryActionAdmissionGate === null
-            ? {}
-            : { actionAdmissionGate: ordinaryActionAdmissionGate }),
-          ...(memoryAnswerDependencies.beforeGenerate
-            ? { beforeGenerate: memoryAnswerDependencies.beforeGenerate }
-            : {}),
-        }),
-        ["answer"],
-        "memoryAnswerService",
-      );
-    }
     const memoryImportConfig = config.memory?.imports || {};
     const localSessionImportEnabled =
       memoryEnabled && memoryImportConfig.localSessions === true;
@@ -1258,7 +1878,13 @@ export async function createApplication({
       }
       memoryImports = Object.freeze(imports);
     }
-    const notifier = new NotificationService(dingtalk, config.dingtalk);
+    const notifier = new NotificationService(
+      dingtalk,
+      config.dingtalk,
+      ordinaryActionAdmissionGate === null
+        ? undefined
+        : { actionAdmissionGate: ordinaryActionAdmissionGate },
+    );
     const refreshService = new RefreshService({
       github,
       brain,
@@ -1268,11 +1894,38 @@ export async function createApplication({
       config,
       operationQueue,
     });
-    let closePromise = null;
-    const close = () => {
-      closePromise ||= closeRuntimes(acquiredRuntimes);
-      return closePromise;
-    };
+    const configuredOperations =
+      operationsOptions &&
+      typeof operationsOptions === "object" &&
+      !Array.isArray(operationsOptions)
+        ? operationsOptions
+        : {};
+    const dataDirectory = typeof configuredOperations.dataDirectory === "string"
+      ? configuredOperations.dataDirectory
+      : store instanceof StateStore &&
+          typeof store.dataDirectory === "string" &&
+          path.isAbsolute(store.dataDirectory)
+        ? store.dataDirectory
+        : path.join(projectRoot, "data");
+    const operations = operationsRuntimeFactory(
+      {
+        dataDirectory,
+        backupDirectory:
+          typeof configuredOperations.backupDirectory === "string"
+            ? configuredOperations.backupDirectory
+            : path.join(projectRoot, "backups"),
+        ...(configuredOperations.probeTimeoutMs === undefined
+          ? {}
+          : { probeTimeoutMs: configuredOperations.probeTimeoutMs }),
+        ...(confirmationRuntime?.recoveryStatusReader === undefined
+          ? {}
+          : {
+              externalActionStatus: confirmationRuntime.recoveryStatusReader,
+            }),
+      },
+      operationsRuntimeDependencies,
+    );
+    const close = () => runtimeLifecycle.close();
     return {
       config,
       configuration: configurationRuntime
@@ -1308,16 +1961,23 @@ export async function createApplication({
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      ownerWorkRequests,
       deliveryEvidence,
       memorySearch,
       memoryAnswer,
       memoryImports,
       memoryProjector,
+      operations,
       close,
     };
   } catch (error) {
     try {
-      await closeRuntimes(acquiredRuntimes);
+      const cleanupAttempt = Promise.resolve(runtimeLifecycle.close());
+      if (ownsRuntimeLifecycle) {
+        await cleanupAttempt;
+      } else {
+        void cleanupAttempt.catch(() => {});
+      }
     } catch {
       // Preserve the startup failure after attempting every acquired runtime.
     }

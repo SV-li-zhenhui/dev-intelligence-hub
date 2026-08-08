@@ -21,6 +21,39 @@ const codeExecutorNestedConfigs = [
   "executorLimits",
 ];
 
+function mergeCaseInsensitiveNames(base = {}, local = {}) {
+  const merged = new Map();
+  const appendLayer = (value) => {
+    const layerNames = new Set();
+    for (const [name, entry] of Object.entries(value)) {
+      const portableName = name.toLowerCase();
+      if (layerNames.has(portableName)) {
+        throw new TypeError(
+          "repository mirror map contains case-insensitive duplicate names",
+        );
+      }
+      layerNames.add(portableName);
+      merged.set(portableName, [name, entry]);
+    }
+  };
+  appendLayer(base);
+  appendLayer(local);
+  return Object.fromEntries(merged.values());
+}
+
+function mergeConflictPreparationConfig(base = {}, local = {}) {
+  if (local.enabled === false) return { ...local };
+  const merged = { ...base, ...local };
+  for (const name of [
+    "baseMirrorsByRepository",
+    "headMirrorsByRepository",
+  ]) {
+    if (base[name] === undefined && local[name] === undefined) continue;
+    merged[name] = mergeCaseInsensitiveNames(base[name], local[name]);
+  }
+  return merged;
+}
+
 function mergeCodeExecutorConfig(base = {}, local = {}) {
   const merged = { ...base, ...local };
   for (const name of codeExecutorNestedConfigs) {
@@ -31,6 +64,15 @@ function mergeCodeExecutorConfig(base = {}, local = {}) {
     merged.requiredProfilesByWorkspace = {
       ...(local.requiredProfilesByWorkspace || {}),
     };
+  }
+  if (
+    base.conflictPreparation !== undefined ||
+    local.conflictPreparation !== undefined
+  ) {
+    merged.conflictPreparation = mergeConflictPreparationConfig(
+      base.conflictPreparation,
+      local.conflictPreparation,
+    );
   }
   return merged;
 }
@@ -91,6 +133,8 @@ function mergeBrainConfig(base = {}, local = {}) {
 function mergeRoleConfig(base = {}, local = {}) {
   const baseBrain = base.brain || {};
   const localBrain = local.brain || {};
+  const baseTaskBrain = base.taskBrain || {};
+  const localTaskBrain = local.taskBrain || {};
   return {
     ...base,
     ...local,
@@ -100,6 +144,11 @@ function mergeRoleConfig(base = {}, local = {}) {
     ...(base.brain !== undefined || local.brain !== undefined
       ? {
           brain: mergeBrainConfig(baseBrain, localBrain),
+        }
+      : {}),
+    ...(base.taskBrain !== undefined || local.taskBrain !== undefined
+      ? {
+          taskBrain: mergeBrainConfig(baseTaskBrain, localTaskBrain),
         }
       : {}),
   };
@@ -247,9 +296,16 @@ export function mergeConfig(base, local = {}) {
 }
 
 async function readBaseConfig() {
-  return JSON.parse(
-    await readFile(path.join(projectRoot, "config.json"), "utf8"),
-  );
+  try {
+    return JSON.parse(
+      await readFile(path.join(projectRoot, "config.json"), "utf8"),
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    return JSON.parse(
+      await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
+    );
+  }
 }
 
 async function readLocalConfig() {

@@ -370,7 +370,7 @@ function githubReceipt(record, envelope) {
 class GitHubActionAdapter {
   #runner;
   #command;
-  #env;
+  #childEnvironment;
   #timeoutMs;
   #verifyInputAuthority;
 
@@ -385,6 +385,7 @@ class GitHubActionAdapter {
     env = process.env,
     networkEnv = {},
     token = env?.GH_TOKEN || env?.GITHUB_TOKEN,
+    credentialProvider,
     ghCommand,
     timeoutMs = 60_000,
     inputAuthorityVerifier,
@@ -403,23 +404,18 @@ class GitHubActionAdapter {
     ) {
       throw new TypeError("ghCommand must be an absolute executable path");
     }
-    if (typeof token !== "string" || !GITHUB_TOKEN.test(token)) {
-      throw new TypeError("A fixed GitHub token is required");
+    if (
+      credentialProvider !== undefined &&
+      typeof credentialProvider !== "function"
+    ) {
+      throw new TypeError("credentialProvider must be a function");
     }
     if (!isPlainObject(networkEnv)) {
       throw new TypeError("networkEnv must be a plain object");
     }
     this.#runner = runner;
     this.#command = ghCommand;
-    const childEnv = {
-      GH_TOKEN: token,
-      GH_PROMPT_DISABLED: "1",
-      GH_NO_UPDATE_NOTIFIER: "1",
-      NO_COLOR: "1",
-    };
-    for (const key of CHILD_ENV_KEYS) {
-      if (typeof env?.[key] === "string") childEnv[key] = env[key];
-    }
+    const normalizedNetworkEnv = {};
     for (const key of Reflect.ownKeys(networkEnv)) {
       if (typeof key !== "string" || !NETWORK_ENV_KEYS.includes(key)) {
         throw new TypeError("networkEnv contains an unsupported key");
@@ -434,9 +430,42 @@ class GitHubActionAdapter {
       ) {
         throw new TypeError("networkEnv contains an invalid value");
       }
-      childEnv[key] = descriptor.value;
+      normalizedNetworkEnv[key] = descriptor.value;
     }
-    this.#env = Object.freeze(childEnv);
+    const network = Object.freeze(normalizedNetworkEnv);
+    if (credentialProvider === undefined) {
+      if (typeof token !== "string" || !GITHUB_TOKEN.test(token)) {
+        throw new TypeError("A fixed GitHub token is required");
+      }
+      const fixedEnvironment = this.#buildChildEnvironment(token, env, network);
+      this.#childEnvironment = () => fixedEnvironment;
+    } else {
+      this.#childEnvironment = () => {
+        let credentials;
+        try {
+          credentials = credentialProvider();
+        } catch (cause) {
+          throw actionError("GITHUB_CREDENTIAL_MISSING", "absent", { cause });
+        }
+        if (
+          !isPlainObject(credentials) ||
+          Reflect.ownKeys(credentials).length !== 2 ||
+          !Object.hasOwn(credentials, "token") ||
+          !Object.hasOwn(credentials, "environment") ||
+          typeof credentials.token !== "string" ||
+          !GITHUB_TOKEN.test(credentials.token) ||
+          credentials.environment === null ||
+          typeof credentials.environment !== "object"
+        ) {
+          throw actionError("GITHUB_CREDENTIAL_MISSING", "absent");
+        }
+        return this.#buildChildEnvironment(
+          credentials.token,
+          credentials.environment,
+          network,
+        );
+      };
+    }
     this.#timeoutMs = timeoutMs;
     if (
       inputAuthorityVerifier !== undefined &&
@@ -458,8 +487,9 @@ class GitHubActionAdapter {
       return errorResult(error);
     }
     try {
-      await this.#assertActor(envelope.actor.accountId);
-      const matched = await this.#findMarker(envelope);
+      const childEnvironment = this.#childEnvironment();
+      await this.#assertActor(envelope.actor.accountId, childEnvironment);
+      const matched = await this.#findMarker(envelope, childEnvironment);
       if (matched) return { status: "already", receipt: matched };
       if (
         envelope.kind === "github.work-proposal-review" &&
@@ -470,7 +500,10 @@ class GitHubActionAdapter {
       if (!(await this.#inputAuthorityCurrent(envelope))) {
         return { status: "stale" };
       }
-      const currentTarget = await this.#currentTarget(envelope);
+      const currentTarget = await this.#currentTarget(
+        envelope,
+        childEnvironment,
+      );
       if (!currentTarget.matches) {
         return {
           status: "stale",
@@ -496,10 +529,14 @@ class GitHubActionAdapter {
       if (!(await this.#inputAuthorityCurrent(envelope))) {
         return { status: "stale" };
       }
-      await this.#assertActor(envelope.actor.accountId);
-      const matched = await this.#findMarker(envelope);
+      const childEnvironment = this.#childEnvironment();
+      await this.#assertActor(envelope.actor.accountId, childEnvironment);
+      const matched = await this.#findMarker(envelope, childEnvironment);
       if (matched) return { status: "already", receipt: matched };
-      const observedTarget = await this.#currentTarget(envelope);
+      const observedTarget = await this.#currentTarget(
+        envelope,
+        childEnvironment,
+      );
       if (!observedTarget.matches) {
         return {
           status: "stale",
@@ -507,8 +544,8 @@ class GitHubActionAdapter {
           actualVersion: observedTarget.actualVersion,
         };
       }
-      await this.#assertActor(envelope.actor.accountId);
-      const finalTarget = await this.#currentTarget(envelope);
+      await this.#assertActor(envelope.actor.accountId, childEnvironment);
+      const finalTarget = await this.#currentTarget(envelope, childEnvironment);
       if (!finalTarget.matches) {
         return {
           status: "stale",
@@ -522,7 +559,7 @@ class GitHubActionAdapter {
       postStarted = true;
       return {
         status: "applied",
-        receipt: await this.#post(envelope),
+        receipt: await this.#post(envelope, childEnvironment),
       };
     } catch (error) {
       return errorResult(error, {
@@ -531,8 +568,11 @@ class GitHubActionAdapter {
     }
   }
 
-  async #assertActor(expectedLogin) {
-    const value = await this.#runJson(["api", "--method", "GET", "user"]);
+  async #assertActor(expectedLogin, childEnvironment) {
+    const value = await this.#runJson(
+      ["api", "--method", "GET", "user"],
+      { childEnvironment },
+    );
     if (!isPlainObject(value) || typeof value.login !== "string") {
       throw actionError("GITHUB_PROTOCOL");
     }
@@ -557,17 +597,20 @@ class GitHubActionAdapter {
     }
   }
 
-  async #currentTarget(envelope) {
+  async #currentTarget(envelope, childEnvironment) {
     const targetAware = Boolean(envelope.action.inputBinding);
-    const value = await this.#runJson([
-      "pr",
-      "view",
-      `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
-      "--json",
-      targetAware
-        ? "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
-        : "headRefOid",
-    ]);
+    const value = await this.#runJson(
+      [
+        "pr",
+        "view",
+        `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
+        "--json",
+        targetAware
+          ? "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+          : "headRefOid",
+      ],
+      { childEnvironment },
+    );
     if (
       !isPlainObject(value) ||
       typeof value.headRefOid !== "string" ||
@@ -612,18 +655,21 @@ class GitHubActionAdapter {
     };
   }
 
-  async #findMarker(envelope) {
+  async #findMarker(envelope, childEnvironment) {
     const route = `repos/${envelope.target.repo}/pulls/${envelope.target.number}/reviews?per_page=100`;
     const marker = markerForEnvelope(envelope);
-    const records = await this.#runJsonLines([
-      "api",
-      "--method",
-      "GET",
-      route,
-      "--paginate",
-      "--jq",
-      `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
-    ]);
+    const records = await this.#runJsonLines(
+      [
+        "api",
+        "--method",
+        "GET",
+        route,
+        "--paginate",
+        "--jq",
+        `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
+      ],
+      { childEnvironment },
+    );
     const candidates = records.filter(
       (record) => typeof record?.body === "string" && record.body.includes(marker),
     );
@@ -649,7 +695,7 @@ class GitHubActionAdapter {
     );
   }
 
-  async #post(envelope) {
+  async #post(envelope, childEnvironment) {
     const marker = markerForEnvelope(envelope);
     const body = `${envelope.action.body}\n\n${marker}`;
     const args = [
@@ -666,6 +712,7 @@ class GitHubActionAdapter {
         body,
         commit_id: envelope.target.version,
       }),
+      childEnvironment,
     });
     if (!this.#matchesRecord(envelope, record, marker)) {
       throw actionError("GITHUB_PROTOCOL");
@@ -673,8 +720,8 @@ class GitHubActionAdapter {
     return githubReceipt(record, envelope);
   }
 
-  async #runJson(args, { input } = {}) {
-    const result = await this.#run(args, { input });
+  async #runJson(args, { input, childEnvironment } = {}) {
+    const result = await this.#run(args, { input, childEnvironment });
     try {
       return JSON.parse(result.stdout);
     } catch {
@@ -682,8 +729,8 @@ class GitHubActionAdapter {
     }
   }
 
-  async #runJsonLines(args) {
-    const result = await this.#run(args);
+  async #runJsonLines(args, { childEnvironment } = {}) {
+    const result = await this.#run(args, { childEnvironment });
     if (!result.stdout.trim()) return [];
     try {
       return result.stdout.split("\n").map((line) => JSON.parse(line));
@@ -692,7 +739,7 @@ class GitHubActionAdapter {
     }
   }
 
-  async #run(args, { input } = {}) {
+  async #run(args, { input, childEnvironment } = {}) {
     const fixedArgs =
       args[0] === "api"
         ? ["api", "--hostname", "github.com", ...args.slice(1)]
@@ -702,7 +749,7 @@ class GitHubActionAdapter {
       result = await this.#runner.run({
         command: this.#command,
         args: fixedArgs,
-        env: { ...this.#env },
+        env: { ...childEnvironment },
         ...(input === undefined ? {} : { input }),
         timeoutMs: this.#timeoutMs,
       });
@@ -713,6 +760,21 @@ class GitHubActionAdapter {
       throw actionError("GITHUB_REJECTED");
     }
     return result;
+  }
+
+  #buildChildEnvironment(token, environment, networkEnv) {
+    const childEnv = {
+      GH_TOKEN: token,
+      GH_PROMPT_DISABLED: "1",
+      GH_NO_UPDATE_NOTIFIER: "1",
+      NO_COLOR: "1",
+    };
+    for (const key of CHILD_ENV_KEYS) {
+      if (typeof environment?.[key] === "string") {
+        childEnv[key] = environment[key];
+      }
+    }
+    return Object.freeze({ ...childEnv, ...networkEnv });
   }
 }
 

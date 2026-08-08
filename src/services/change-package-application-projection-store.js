@@ -1,7 +1,9 @@
 import { digestValue } from "../domain/code-executor-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 
-const STATE_KEY = "change-package-application-projections";
+export const CHANGE_PACKAGE_APPLICATION_PROJECTION_STATE_KEY =
+  "change-package-application-projections";
+const STATE_KEY = CHANGE_PACKAGE_APPLICATION_PROJECTION_STATE_KEY;
 const MAX_ENTRIES = 1_000;
 const SHA256 = /^[a-f0-9]{64}$/;
 const CONFIRMATION_ID = /^confirmation-change-package-apply-[a-f0-9]{64}$/;
@@ -351,6 +353,12 @@ function normalizeState(value) {
     }
     throw stateCorrupted(cause);
   }
+}
+
+export function normalizeChangePackageApplicationProjectionPersistedState(
+  value,
+) {
+  return normalizeState(value);
 }
 
 function normalizeSnapshot(value) {

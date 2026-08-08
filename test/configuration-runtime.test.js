@@ -8,7 +8,7 @@ import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
-  await readFile(path.join(projectRoot, "config.json"), "utf8"),
+  await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 
 function configuration() {
@@ -74,6 +74,7 @@ test("runtime imports once and exposes frozen least-authority ports", async () =
   assert.deepEqual(Object.keys(runtime.simulator).sort(), [
     "prepareDraftActivation",
     "prepareInitialization",
+    "prepareProposalDraftActivation",
     "prepareRollback",
   ]);
   assert.deepEqual(Object.keys(runtime.activationExecutor).sort(), [
@@ -84,6 +85,8 @@ test("runtime imports once and exposes frozen least-authority ports", async () =
   assert.deepEqual(Object.keys(runtime.proposalPort).sort(), [
     "createDraft",
     "createInitializationDraft",
+    "createProposalDraft",
+    "readProposalDraft",
     "reviseDraft",
   ]);
   assert.deepEqual(Object.keys(runtime.runtimeAdmission).sort(), [

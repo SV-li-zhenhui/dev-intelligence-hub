@@ -50,8 +50,9 @@ function representativeConfiguration() {
     port: 4173,
     refreshMinutes: 10,
     browserPollSeconds: 60,
-    githubLogin: "SV-li-zhenhui",
-    trackedRepositories: ["SVisions/OCT-Software", "SVisions/OCT-Product"],
+    githubLogin: "local-owner",
+    githubRead: { enabled: true },
+    trackedRepositories: ["acme/command-center", "acme/product"],
     prResponsibility: { historicalAfterDays: 60 },
     codeExecutor: {
       enabled: true,
@@ -61,8 +62,8 @@ function representativeConfiguration() {
       },
       workspaces: [
         {
-          id: "oct-software",
-          sourceRoot: "D:/code/OCT-Software",
+          id: "command-center",
+          sourceRoot: "D:/code/command-center",
           writablePaths: ["Source", "Tests"],
           excludePaths: [".git", "Build"],
         },
@@ -86,7 +87,7 @@ function representativeConfiguration() {
         },
       },
       requiredProfilesByWorkspace: {
-        "oct-software": ["node-contract"],
+        "command-center": ["node-contract"],
         dashboard: ["node-unit", "node-contract"],
       },
       brokerLimits: {
@@ -106,7 +107,7 @@ function representativeConfiguration() {
     },
     githubActions: {
       enabled: true,
-      actorAccountId: "SV-li-zhenhui",
+      actorAccountId: "local-owner",
       tokenEnv: "MYDASHBOARD_GITHUB_TOKEN",
       ghCommand: "gh.exe",
       networkEnv: {
@@ -164,7 +165,7 @@ function representativeConfiguration() {
           priority: 0,
           fallback: true,
           condition: null,
-          targets: [{ type: "person", id: "SV-li-zhenhui" }],
+          targets: [{ type: "person", id: "local-owner" }],
           onMatch: "stop",
         },
       ],
@@ -205,8 +206,8 @@ function representativeConfiguration() {
           tester: ["inspect", "verify"],
         },
         workspaceByRepository: {
-          "SVisions/OCT-Software": "oct-software",
-          "SVisions/OCT-Product": "dashboard",
+          "acme/command-center": "command-center",
+          "acme/product": "dashboard",
         },
       },
     },
@@ -314,6 +315,53 @@ function configurationWithGitHeadSnapshot() {
   return configuration;
 }
 
+function conflictPreparationFormState({ withGitCommand = true } = {}) {
+  let state = createConfigurationFormState(representativeConfiguration());
+  if (withGitCommand) {
+    state = applyConfigurationStructureOperation(state, {
+      operation: "add",
+      path: ["codeExecutor", "gitCommand"],
+      value: configurationStructureTemplate([
+        "codeExecutor",
+        "gitCommand",
+      ]).value,
+    });
+  }
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["codeExecutor", "conflictPreparation"],
+    value: configurationStructureTemplate([
+      "codeExecutor",
+      "conflictPreparation",
+    ]).value,
+  });
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "conflictPreparation", "enabled"],
+    kind: "boolean",
+    rawValue: true,
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: [
+      "codeExecutor",
+      "conflictPreparation",
+      "baseMirrorsByRepository",
+    ],
+    key: "acme/command-center",
+    value: "D:/mirrors/oct-base.git",
+  });
+  return applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: [
+      "codeExecutor",
+      "conflictPreparation",
+      "headMirrorsByRepository",
+    ],
+    key: "acme/command-center",
+    value: "D:/mirrors/oct-head.git",
+  });
+}
+
 function assertDeepFrozen(value) {
   if (value === null || typeof value !== "object") return;
   assert.equal(Object.isFrozen(value), true);
@@ -336,6 +384,17 @@ test("a complete supported configuration round-trips without losing fields", () 
   assert.notStrictEqual(result.configuration, configuration);
   assertDeepFrozen(state);
   assertDeepFrozen(result);
+});
+
+test("a pre-boundary configuration is editable with its effective GitHub-read default", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  delete configuration.githubRead;
+
+  const state = createConfigurationFormState(configuration);
+  const result = configurationDocumentFromForm(state);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration.githubRead, { enabled: true });
 });
 
 test("Git Head snapshot scalar fields round-trip and remain directly editable", () => {
@@ -437,6 +496,118 @@ test("old configurations can add and remove Git Head snapshot fields without JSO
       "gitHeadSnapshot",
     ),
     false,
+  );
+});
+
+test("old configurations can build and disable conflict preparation without JSON", () => {
+  const initial = conflictPreparationFormState();
+  const configured = configurationDocumentFromForm(initial);
+  assert.equal(configured.ok, true);
+  assert.deepEqual(configured.configuration.codeExecutor.conflictPreparation, {
+    enabled: true,
+    baseMirrorsByRepository: {
+      "acme/command-center": "D:/mirrors/oct-base.git",
+    },
+    headMirrorsByRepository: {
+      "acme/command-center": "D:/mirrors/oct-head.git",
+    },
+  });
+  assert.doesNotThrow(() =>
+    normalizeConfigurationDocument(configured.configuration),
+  );
+
+  const staleDisabled = setConfigurationFormField(initial, {
+    path: ["codeExecutor", "conflictPreparation", "enabled"],
+    kind: "boolean",
+    rawValue: false,
+  });
+  assert.equal(configurationDocumentFromForm(staleDisabled).ok, false);
+
+  const safelyDisabled = applyConfigurationStructureOperation(initial, {
+    operation: "replace",
+    path: ["codeExecutor", "conflictPreparation"],
+    value: configurationStructureTemplate([
+      "codeExecutor",
+      "conflictPreparation",
+    ]).value,
+  });
+  const disabled = configurationDocumentFromForm(safelyDisabled);
+  assert.equal(disabled.ok, true);
+  assert.deepEqual(disabled.configuration.codeExecutor.conflictPreparation, {
+    enabled: false,
+  });
+});
+
+test("conflict preparation form validates repository identity, mirror paths, and Git coupling", () => {
+  const missingGit = configurationDocumentFromForm(
+    conflictPreparationFormState({ withGitCommand: false }),
+  );
+  assert.equal(missingGit.ok, false);
+  assert.equal(
+    missingGit.issues.some(
+      ({ path, code }) =>
+        path === "codeExecutor.gitCommand" &&
+        code === "INCOMPLETE_CONFIGURATION",
+    ),
+    true,
+  );
+
+  const initial = conflictPreparationFormState();
+  const duplicate = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: [
+      "codeExecutor",
+      "conflictPreparation",
+      "baseMirrorsByRepository",
+    ],
+    key: "ACME/COMMAND-CENTER",
+    value: "D:/mirrors/duplicate.git",
+  });
+  assert.equal(
+    configurationDocumentFromForm(duplicate).issues.some(
+      ({ path, code }) =>
+        path ===
+          "codeExecutor.conflictPreparation.baseMirrorsByRepository" &&
+        code === "DUPLICATE_CONFIGURATION_ENTRY",
+    ),
+    true,
+  );
+
+  for (const value of ["relative/mirror.git", "//server/share/mirror.git"]) {
+    const invalidMirror = applyConfigurationStructureOperation(initial, {
+      operation: "replace",
+      path: [
+        "codeExecutor",
+        "conflictPreparation",
+        "baseMirrorsByRepository",
+      ],
+      key: "acme/command-center",
+      value,
+    });
+    assert.equal(
+      configurationDocumentFromForm(invalidMirror).issues.some(
+        ({ path, code }) =>
+          path ===
+            "codeExecutor.conflictPreparation.baseMirrorsByRepository.acme/command-center" &&
+          code === "INVALID_CONFIGURATION_TEXT",
+      ),
+      true,
+    );
+  }
+
+  assert.throws(
+    () =>
+      applyConfigurationStructureOperation(initial, {
+        operation: "add",
+        path: [
+          "codeExecutor",
+          "conflictPreparation",
+          "headMirrorsByRepository",
+        ],
+        key: "owner/.repository",
+        value: "D:/mirrors/invalid.git",
+      }),
+    /unsafe map key/i,
   );
 });
 
@@ -585,6 +756,103 @@ test("form saves reject remote legacy brains but accept remote role and memory b
   assert.equal(result.configuration.memory.answering.localBrain.provider, "remote-openai");
 });
 
+test("task brains can be added, edited, removed, and reference-protected without JSON", () => {
+  const path = ["employees", "roles", "developer", "taskBrain"];
+  const initial = createConfigurationFormState(representativeConfiguration());
+  let state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path,
+    value: configurationStructureTemplate(path).value,
+  });
+  state = setConfigurationFormField(state, {
+    path: [...path, "provider"],
+    kind: "text",
+    rawValue: "remote-openai",
+  });
+  state = setConfigurationFormField(state, {
+    path: [...path, "model"],
+    kind: "text",
+    rawValue: "high-capability-code-model",
+  });
+
+  const configured = configurationDocumentFromForm(state);
+  assert.equal(configured.ok, true);
+  assert.deepEqual(
+    configured.configuration.employees.roles.developer.taskBrain,
+    {
+      provider: "remote-openai",
+      model: "high-capability-code-model",
+      remoteData: { requirements: false, code: false, memory: false },
+    },
+  );
+  assert.doesNotThrow(() =>
+    normalizeConfigurationDocument(configured.configuration),
+  );
+  assert.deepEqual(
+    configurationReferences(configured.configuration, {
+      kind: "provider",
+      id: "remote-openai",
+    })
+      .map(({ path: referencePath }) => referencePath)
+      .filter((referencePath) => referencePath.includes("taskBrain")),
+    ["employees.roles.developer.taskBrain.provider"],
+  );
+  assert.equal(
+    removeConfigurationEntity(state, {
+      kind: "provider",
+      id: "remote-openai",
+    }).reason,
+    "referenced",
+  );
+
+  state = applyConfigurationStructureOperation(state, {
+    operation: "remove",
+    path,
+  });
+  const removed = configurationDocumentFromForm(state);
+  assert.equal(removed.ok, true);
+  assert.equal(
+    Object.hasOwn(removed.configuration.employees.roles.developer, "taskBrain"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(initial.baseDocument.employees.roles.developer, "taskBrain"),
+    false,
+  );
+});
+
+test("task brain forms reject unknown providers and non-assigned-brain shapes", () => {
+  const path = ["employees", "roles", "developer", "taskBrain"];
+  const initial = createConfigurationFormState(representativeConfiguration());
+  let state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path,
+    value: configurationStructureTemplate(path).value,
+  });
+  state = setConfigurationFormField(state, {
+    path: [...path, "provider"],
+    kind: "text",
+    rawValue: "missing-provider",
+  });
+  const unknown = configurationDocumentFromForm(state);
+  assert.equal(unknown.ok, false);
+  assert.equal(
+    unknown.issues.some(
+      ({ path: issuePath, code }) =>
+        issuePath === "employees.roles.developer.taskBrain.provider" &&
+        code === "UNKNOWN_CONFIGURATION_REFERENCE",
+    ),
+    true,
+  );
+
+  const malformed = structuredClone(representativeConfiguration());
+  malformed.employees.roles.developer.taskBrain = { enabled: true };
+  assert.throws(
+    () => createConfigurationFormState(malformed),
+    /taskBrain|unknown field|schema/i,
+  );
+});
+
 test("unknown schemas and unknown nested fields fail closed", () => {
   const configuration = structuredClone(representativeConfiguration());
   configuration.unrecognized = true;
@@ -632,7 +900,7 @@ test("dangerous keys, accessors, hostile prototypes, and sparse arrays are rejec
     enumerable: true,
     get() {
       arrayAccessorCalled = true;
-      return "SVisions/OCT-Software";
+      return "acme/command-center";
     },
   });
   assert.throws(() => createConfigurationFormState(arrayAccessor), /data properties/i);
@@ -644,7 +912,7 @@ test("dangerous keys, accessors, hostile prototypes, and sparse arrays are rejec
 
   const sparse = structuredClone(representativeConfiguration());
   sparse.trackedRepositories = new Array(2);
-  sparse.trackedRepositories[1] = "SVisions/OCT-Software";
+  sparse.trackedRepositories[1] = "acme/command-center";
   assert.throws(() => createConfigurationFormState(sparse), /dense array/i);
 });
 
@@ -1027,7 +1295,7 @@ test("reference graph blocks deleting providers, roles, workspaces, and profiles
     "referenced",
   );
   assert.equal(
-    removeConfigurationEntity(state, { kind: "workspace", id: "oct-software" })
+    removeConfigurationEntity(state, { kind: "workspace", id: "command-center" })
       .reason,
     "referenced",
   );
@@ -1040,7 +1308,7 @@ test("reference graph blocks deleting providers, roles, workspaces, and profiles
   const editedState = setConfigurationFormField(state, {
     path: ["githubLogin"],
     kind: "text",
-    rawValue: "SV-li-zhenhui-next",
+    rawValue: "local-owner-next",
   });
   const removedProvider = removeConfigurationEntity(editedState, {
     kind: "provider",
@@ -1064,7 +1332,7 @@ test("reference graph blocks deleting providers, roles, workspaces, and profiles
   const removedDocument = configurationDocumentFromForm(removedProvider.state);
   assert.equal(removedDocument.ok, true);
   assert.equal("unused" in removedDocument.configuration.brainProviders, false);
-  assert.equal(removedDocument.configuration.githubLogin, "SV-li-zhenhui-next");
+  assert.equal(removedDocument.configuration.githubLogin, "local-owner-next");
   assert.equal("unused" in state.baseDocument.brainProviders, true);
 
   const removedRole = removeConfigurationEntity(state, {
@@ -1135,13 +1403,13 @@ test("structured array operations preserve baseline and retain a dirty audit tra
   let state = applyConfigurationStructureOperation(initial, {
     operation: "add",
     path: ["trackedRepositories"],
-    value: "SVisions/New-Product",
+    value: "acme/new-product",
   });
   state = applyConfigurationStructureOperation(state, {
     operation: "replace",
     path: ["trackedRepositories"],
     index: 2,
-    value: "SVisions/Renamed-Product",
+    value: "acme/renamed-product",
   });
   state = applyConfigurationStructureOperation(state, {
     operation: "remove",
@@ -1234,13 +1502,13 @@ test("structured operations cover routing, roles, policies and profile bindings"
   state = applyConfigurationStructureOperation(state, {
     operation: "add",
     path: ["workCoordination", "policy", "workspaceByRepository"],
-    key: "SVisions/New-Product",
-    value: "oct-software",
+    key: "acme/new-product",
+    value: "command-center",
   });
   state = applyConfigurationStructureOperation(state, {
     operation: "replace",
     path: ["codeExecutor", "requiredProfilesByWorkspace"],
-    key: "oct-software",
+    key: "command-center",
     value: ["node-contract", "node-unit"],
   });
 
@@ -1259,14 +1527,138 @@ test("structured operations cover routing, roles, policies and profile bindings"
   assert.equal(result.configuration.workflowRouting.rules[0].condition.op, "equals");
   assert.equal(
     result.configuration.workCoordination.policy.workspaceByRepository[
-      "SVisions/New-Product"
+      "acme/new-product"
     ],
-    "oct-software",
+    "command-center",
   );
   assert.deepEqual(
-    result.configuration.codeExecutor.requiredProfilesByWorkspace["oct-software"],
+    result.configuration.codeExecutor.requiredProfilesByWorkspace["command-center"],
     ["node-contract", "node-unit"],
   );
+});
+
+test("configuration-change proposal authority is configured structurally and must match role intent permission", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  assert.equal(
+    Object.hasOwn(
+      initial.baseDocument.workCoordination.policy,
+      "configurationChangeRoles",
+    ),
+    false,
+    "legacy configurations remain valid without widening authority",
+  );
+
+  let state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: [
+      "employees",
+      "roles",
+      "developer",
+      "permissions",
+      "allowedIntents",
+    ],
+    value: "propose_configuration_change",
+  });
+  const incomplete = configurationDocumentFromForm(state);
+  assert.equal(incomplete.ok, false);
+  assert.equal(
+    incomplete.issues.some(
+      ({ code }) => code === "MISMATCHED_CONFIGURATION_CHANGE_AUTHORITY",
+    ),
+    true,
+  );
+
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["workCoordination", "policy", "configurationChangeRoles"],
+    value: "developer",
+  });
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.configuration.workCoordination.policy.configurationChangeRoles,
+    ["developer"],
+  );
+  assert.equal(
+    result.configuration.employees.roles.developer.permissions.allowedIntents.includes(
+      "propose_configuration_change",
+    ),
+    true,
+  );
+  assert.deepEqual(
+    normalizeConfigurationDocument(result.configuration),
+    result.configuration,
+  );
+  assert.equal(
+    configurationFieldDescriptor(
+      [
+        "employees",
+        "roles",
+        "developer",
+        "permissions",
+        "allowedIntents",
+        3,
+      ],
+      "propose_configuration_change",
+    ).options.includes("propose_configuration_change"),
+    true,
+  );
+  assert.equal(
+    configurationReferences(result.configuration, {
+      kind: "role",
+      id: "developer",
+    }).some(
+      ({ path }) =>
+        path === "workCoordination.policy.configurationChangeRoles[0]",
+    ),
+    true,
+  );
+});
+
+test("built-in PR reviewer cannot receive configuration-change proposal authority", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  const state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["workCoordination", "policy", "configurationChangeRoles"],
+    value: "pr-reviewer",
+  });
+  const result = configurationDocumentFromForm(state);
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.issues.some(
+      ({ code }) => code === "INVALID_CONFIGURATION_CHANGE_AUTHORITY",
+    ),
+    true,
+  );
+});
+
+test("PR external action capabilities can be configured without editing JSON", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  let edited = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["githubActions", "enabledActions"],
+    value: "comment",
+  });
+  edited = applyConfigurationStructureOperation(edited, {
+    operation: "add",
+    path: ["githubActions", "enabledActions"],
+    value: "merge",
+  });
+
+  const result = configurationDocumentFromForm(edited);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration.githubActions.enabledActions, [
+    "comment",
+    "merge",
+  ]);
+
+  const unknown = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["githubActions", "enabledActions"],
+    value: "delete_branch",
+  });
+  assert.equal(configurationDocumentFromForm(unknown).ok, false);
 });
 
 test("structured operation boundary rejects getters, aliases, prototypes and disallowed paths", () => {
@@ -1280,7 +1672,7 @@ test("structured operation boundary rejects getters, aliases, prototypes and dis
     enumerable: true,
     get() {
       getterCalled = true;
-      return "SVisions/Unsafe";
+      return "acme/unsafe";
     },
   });
   assert.throws(() => applyConfigurationStructureOperation(initial, input), /data properties/i);
@@ -1458,6 +1850,92 @@ test("the Responses provider variant materializes as a closed structured configu
     JSON.stringify(incompatibleResult.issues),
     /INVALID_PROVIDER_CONFIGURATION/,
   );
+});
+
+test("supervised CLI providers round-trip through the structured form", () => {
+  for (const kind of ["codex-cli", "claude-cli"]) {
+    const configuration = structuredClone(representativeConfiguration());
+    configuration.brainProviders[kind] = {
+      kind,
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+    };
+    configuration.employees.roles.orchestrator.brain.provider = kind;
+
+    const result = configurationDocumentFromForm(
+      createConfigurationFormState(configuration),
+    );
+    assert.equal(result.ok, true, kind);
+    assert.deepEqual(result.configuration.brainProviders[kind], configuration.brainProviders[kind]);
+    assert.equal(result.configuration.employees.roles.orchestrator.brain.provider, kind);
+    assert.doesNotThrow(() => normalizeConfigurationDocument(result.configuration));
+  }
+});
+
+test("each invalid supervised CLI numeric field produces one form issue", () => {
+  for (const [providerId, field, value] of [
+    ["invalid-cli-timeout", "timeoutMs", 999],
+    ["invalid-cli-response", "maxResponseBytes", 1_023],
+    ["invalid-cli-request", "maxRequestBytes", 1024 * 1024 + 1],
+  ]) {
+    const initial = createConfigurationFormState(representativeConfiguration());
+    const state = applyConfigurationStructureOperation(initial, {
+      operation: "add",
+      path: ["brainProviders"],
+      key: providerId,
+      value: {
+        kind: "codex-cli",
+        remote: true,
+        timeoutMs: 300_000,
+        maxResponseBytes: 131_072,
+        maxRequestBytes: 262_144,
+        [field]: value,
+      },
+    });
+
+    const result = configurationDocumentFromForm(state);
+    const matching = result.issues.filter(
+      (entry) => entry.path === `brainProviders.${providerId}.${field}`,
+    );
+    assert.equal(result.ok, false, field);
+    assert.equal(matching.length, 1, field);
+    assert.equal(matching[0].code, "INVALID_CONFIGURATION_INTEGER", field);
+  }
+});
+
+test("supervised CLI provider forms reject authority-bearing fields", () => {
+  const cases = [
+    ["remote", (provider) => { delete provider.remote; }],
+    ["remote", (provider) => { provider.remote = false; }],
+    ["baseUrl", (provider) => { provider.baseUrl = "https://models.example/v1"; }],
+    ["apiKeyEnv", (provider) => { provider.apiKeyEnv = "OPENAI_API_KEY"; }],
+    ["protocol", (provider) => { provider.protocol = "responses"; }],
+    ["responseFormat", (provider) => { provider.responseFormat = "json-schema"; }],
+    ["contextTokens", (provider) => { provider.contextTokens = 16_384; }],
+    ["executable", (provider) => { provider.executable = "claude"; }],
+    ["args", (provider) => { provider.args = ["--dangerously-skip-permissions"]; }],
+  ];
+
+  for (const [field, mutate] of cases) {
+    const configuration = structuredClone(representativeConfiguration());
+    configuration.brainProviders["claude-cli"] = {
+      kind: "claude-cli",
+      remote: true,
+      timeoutMs: 300_000,
+      maxResponseBytes: 131_072,
+      maxRequestBytes: 262_144,
+    };
+    mutate(configuration.brainProviders["claude-cli"]);
+    assert.throws(
+      () => createConfigurationFormState(configuration),
+      (error) =>
+        error?.path?.includes("brainProviders.claude-cli") &&
+        error.message.includes("brainProviders.claude-cli"),
+      field,
+    );
+  }
 });
 
 test("provider forms preserve legacy limits when protocol is omitted", () => {

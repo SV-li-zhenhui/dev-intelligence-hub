@@ -20,6 +20,8 @@ import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   CODE_JOB_STATE_KEY,
   CodeJobStore,
+  normalizeCodeJobArchiveIndexRecord,
+  normalizeCodeJobArchiveTombstoneRecord,
 } from "../src/services/code-job-store.js";
 
 class MemoryStore {
@@ -452,6 +454,42 @@ function changePackageAcknowledgement(event, manifest, overrides = {}) {
     packageId: manifest.packageId,
     packageDigest: manifest.packageDigest,
     ...overrides,
+  };
+}
+
+function controlledCommitReceipt(event, manifest) {
+  const executionSourceDigest = digestValue(event.executionSource);
+  const binding = {
+    schemaVersion: 1,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    executionSourceDigest,
+    recordedAt: event.recordedAt,
+  };
+  const bindingDigest = digestValue(binding);
+  const evidenceDigest = "a".repeat(64);
+  const content = {
+    schemaVersion: 1,
+    kind: "change_package_controlled_commit",
+    deliveryId: `change-package-controlled-commit-${bindingDigest}`,
+    bindingDigest,
+    eventId: event.eventId,
+    eventDigest: event.eventDigest,
+    packageId: manifest.packageId,
+    packageDigest: manifest.packageDigest,
+    executionSourceDigest,
+    recordedAt: event.recordedAt,
+    evidenceId: `controlled-git-commit-${evidenceDigest}`,
+    evidenceDigest,
+    commitOid: "b".repeat(40),
+  };
+  const receiptDigest = digestValue(content);
+  return {
+    ...content,
+    receiptDigest,
+    receiptId: `change-package-controlled-commit-receipt-${receiptDigest}`,
   };
 }
 
@@ -2689,7 +2727,11 @@ test("schema v3 conflict package delivery is self-contained, recoverable, and id
   const batch = await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 });
   const [event] = batch.items;
 
-  assert.equal(event.schemaVersion, 2);
+  assert.equal(event.schemaVersion, 3);
+  assert.equal(
+    event.recordedAt,
+    fixture.completed.job.execution.observations.at(-1).recordedAt,
+  );
   assert.deepEqual(
     event.executionSource,
     fixture.completed.job.grant.executionSource,
@@ -2708,6 +2750,57 @@ test("schema v3 conflict package delivery is self-contained, recoverable, and id
     await recovered.jobs.readChangePackageDeliveryBatch({ limit: 10 }),
     batch,
   );
+});
+
+test("schema v3 delivery requires and retains exact controlled commit evidence", async () => {
+  let manifest;
+  const fixture = await completedDeliveryFixture({
+    jobApproval: approval({ grant: conflictGrant() }),
+    changePackageReader: {
+      async get() { return structuredClone(manifest); },
+    },
+  });
+  const [event] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })
+  ).items;
+  manifest = changePackageForEvent(event);
+  const base = changePackageAcknowledgement(event, manifest);
+
+  await assert.rejects(
+    fixture.jobs.acknowledgeChangePackageDelivery(base),
+    (error) => error.code === "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT",
+  );
+  const controlledCommit = controlledCommitReceipt(event, manifest);
+  assert.equal((await fixture.jobs.acknowledgeChangePackageDelivery({
+    ...base,
+    controlledCommit,
+  })).status, "applied");
+  assert.deepEqual(
+    fixture.store.value.changePackageDelivery.delivered[0].receipt
+      .controlledCommit,
+    controlledCommit,
+  );
+  assert.deepEqual(
+    (await fixture.jobs.getDetail({ jobId: fixture.completed.job.jobId }))
+      .changePackage.receipt.controlledCommit,
+    {
+      receiptId: controlledCommit.receiptId,
+      receiptDigest: controlledCommit.receiptDigest,
+      evidenceId: controlledCommit.evidenceId,
+      evidenceDigest: controlledCommit.evidenceDigest,
+      commitOid: controlledCommit.commitOid,
+    },
+  );
+  const recovered = await readyStore({
+    store: fixture.store,
+    changePackageReader: {
+      async get() { return structuredClone(manifest); },
+    },
+  });
+  assert.equal((await recovered.jobs.acknowledgeChangePackageDelivery({
+    ...base,
+    controlledCommit,
+  })).status, "already");
 });
 
 test("schema v3 recovery rejects a self-consistent event bound to another conflict source", async () => {
@@ -2988,6 +3081,97 @@ test("a completed job cannot be archived before its package delivery receipt", a
   );
   assert.equal(compacted.status, "applied");
   assert.equal(compacted.receipt.archived, 1);
+});
+
+test("pure archive adapters bind immutable records to their keys and manifest", async () => {
+  let packageManifest = null;
+  const fixture = await completedDeliveryFixture({
+    changePackageReader: {
+      async get() {
+        return structuredClone(packageManifest);
+      },
+    },
+  });
+  const memoryEvents = await fixture.jobs.readMemoryProjectionBatch({
+    limit: 10,
+  });
+  for (const event of memoryEvents.items) {
+    await fixture.jobs.acknowledgeMemoryProjection(
+      memoryAcknowledgement(event),
+    );
+  }
+  const [delivery] = (
+    await fixture.jobs.readChangePackageDeliveryBatch({ limit: 10 })
+  ).items;
+  packageManifest = changePackageForEvent(delivery);
+  await fixture.jobs.acknowledgeChangePackageDelivery(
+    changePackageAcknowledgement(delivery, packageManifest),
+  );
+  await fixture.jobs.compactTerminalPrefix(
+    compactionRequest(fixture.store, {
+      compactionId: "pure-archive-adapter-fixture",
+      targetThroughSequence: fixture.completed.job.sequence,
+    }),
+  );
+
+  const [archiveManifest] = fixture.store.value.archiveIndex;
+  const tombstoneKey = `code-job-tombstone-record-${archiveManifest.jobId}`;
+  const rawTombstone = await fixture.store.read(tombstoneKey, null);
+  const tombstoneBytes = JSON.stringify(rawTombstone);
+  const normalizedTombstone = normalizeCodeJobArchiveTombstoneRecord(
+    rawTombstone,
+    { storageKey: tombstoneKey, manifest: archiveManifest },
+  );
+  assert.deepEqual(normalizedTombstone.tombstone, rawTombstone);
+  assert.deepEqual(
+    Object.keys(normalizedTombstone.bindings),
+    ["job", "proposal", "confirmation", "approval"],
+  );
+  assert.equal(JSON.stringify(rawTombstone), tombstoneBytes);
+
+  const indexKeys = [...fixture.store.values.keys()]
+    .filter((key) => key.startsWith("code-job-tombstone-index-"))
+    .sort();
+  assert.equal(indexKeys.length, 4);
+  const kinds = [];
+  for (const storageKey of indexKeys) {
+    const rawIndex = await fixture.store.read(storageKey, null);
+    const indexBytes = JSON.stringify(rawIndex);
+    const normalized = normalizeCodeJobArchiveIndexRecord(rawIndex, {
+      storageKey,
+      tombstone: normalizedTombstone.tombstone,
+    });
+    kinds.push(normalized.kind);
+    assert.deepEqual(normalized.index, rawIndex);
+    assert.equal(JSON.stringify(rawIndex), indexBytes);
+  }
+  assert.deepEqual(kinds.sort(), [
+    "approval",
+    "confirmation",
+    "job",
+    "proposal",
+  ]);
+
+  assert.throws(
+    () =>
+      normalizeCodeJobArchiveTombstoneRecord(rawTombstone, {
+        storageKey: `${tombstoneKey}-wrong`,
+        manifest: archiveManifest,
+    }),
+    (error) => error?.code === "CODE_JOB_ARCHIVE_CORRUPTED",
+  );
+  const firstRawIndex = await fixture.store.read(indexKeys[0], null);
+  assert.throws(
+    () =>
+      normalizeCodeJobArchiveIndexRecord(
+        firstRawIndex,
+        {
+          storageKey: `${indexKeys[0]}0`,
+          tombstone: normalizedTombstone.tombstone,
+        },
+      ),
+    (error) => error?.code === "CODE_JOB_ARCHIVE_CORRUPTED",
+  );
 });
 
 test("archived package delivery remains bound to the exact completed job version", async () => {

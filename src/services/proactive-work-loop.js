@@ -1,5 +1,10 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
-import { normalizeWorkCoordinationTiming } from "./work-coordination-timing.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import {
+  normalizeWorkCoordinationTiming,
+  WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
+  WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
+} from "./work-coordination-timing.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -10,11 +15,20 @@ const PAGE_SIZE = 100;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
+const SATISFIED_GRAPH_STATUSES = new Set(["completed", "superseded"]);
 const RUNTIME_ADMISSION_ERROR_CODES = new Set([
   "RUNTIME_RESTART_REQUIRED",
   "RUNTIME_CONFIGURATION_NOT_READY",
   "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
 ]);
+const DECISION_FAILURE_REASONS = Object.freeze({
+  retry: "decision_failed",
+  exhausted: "decision_attempts_exhausted",
+});
+const DELIVERY_FAILURE_REASONS = Object.freeze({
+  retry: "delivery_failed",
+  exhausted: "delivery_attempts_exhausted",
+});
 
 function requirePort(value, methods, name) {
   if (
@@ -136,7 +150,9 @@ function cycleOptions(value = {}) {
   if (
     Object.keys(input).some(
       (key) =>
-        !["trigger", "intakeLimit", "workLimit", "roleId"].includes(key),
+        !["trigger", "intakeLimit", "workLimit", "roleId", "signal"].includes(
+          key,
+        ),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
@@ -155,6 +171,15 @@ function cycleOptions(value = {}) {
         ? DEFAULT_WORK_LIMIT
         : positiveInteger(input.workLimit, "workLimit", 100),
     roleId: input.roleId === undefined ? null : safeRoleId(input.roleId),
+    signal: normalizeAbortSignal(input.signal ?? null),
+  });
+}
+
+function throwIfLoopAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw Object.assign(new Error("Proactive work cycle was cancelled"), {
+    code: "PROACTIVE_WORK_CANCELLED",
   });
 }
 
@@ -208,10 +233,12 @@ function graphBlockedItemIds(items) {
         const dependencies = item.graph?.dependsOnItemIds;
         const blockedByDependency = Array.isArray(dependencies) &&
           dependencies.some(
-            (dependencyId) => statusById.get(dependencyId) !== "completed",
+            (dependencyId) =>
+              !SATISFIED_GRAPH_STATUSES.has(statusById.get(dependencyId)),
           );
         const blockedByChild = (childrenByParent.get(item.itemId) ?? []).some(
-          (childId) => statusById.get(childId) !== "completed",
+          (childId) =>
+            !SATISFIED_GRAPH_STATUSES.has(statusById.get(childId)),
         );
         return blockedByDependency || blockedByChild;
       })
@@ -245,46 +272,102 @@ function stableFailureCode(error) {
   return "ROLE_DECISION_FAILED";
 }
 
+const OWNER_BRAIN_ATTENTION = new Map([
+  [
+    "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+    {
+      summary: "岗位任务大脑尚未配置",
+      action: "在配置中心为该岗位添加并激活 taskBrain",
+    },
+  ],
+  [
+    "BRAIN_PROVIDER_NOT_CONFIGURED",
+    {
+      summary: "岗位任务大脑 Provider 不可用",
+      action: "在配置中心修正并激活 taskBrain 的 Provider",
+    },
+  ],
+  [
+    "BRAIN_CREDENTIAL_UNAVAILABLE",
+    {
+      summary: "岗位任务大脑凭据不可用",
+      action: "提供配置中引用的凭据环境变量，并在需要时重启服务",
+    },
+  ],
+  [
+    "REMOTE_DATA_NOT_AUTHORIZED",
+    {
+      summary: "岗位任务大脑缺少远程数据授权",
+      action: "在配置中心检查 taskBrain 的远程 requirements/code 数据授权并激活",
+    },
+  ],
+]);
+
+function ownerBrainAttentionDecision(error, roleId) {
+  const code = stableFailureCode(error);
+  const attention = OWNER_BRAIN_ATTENTION.get(code);
+  if (!attention) return null;
+  const summary = `${attention.summary}（${roleId}）`;
+  return {
+    schemaVersion: 1,
+    confidence: 100,
+    summary,
+    intent: {
+      schemaVersion: 1,
+      type: "ask_user",
+      summary,
+      reason: `真实任务不得回退到例行大脑；系统已在调用 Provider 前停止（${code}）`,
+      question: `${attention.action}。完成后请选择“已配置，重试”；若不再继续该任务，请拒绝本次请示。`,
+      choices: [
+        {
+          id: "configured-retry",
+          label: "已配置，重试",
+          description: "重新唤醒原任务，并再次核验任务大脑和授权。",
+        },
+      ],
+    },
+  };
+}
+
 function timeoutError(code) {
   return Object.assign(new Error(code), { code });
 }
 
-async function within(operation, durationMs, code) {
-  let timer;
-  try {
-    return await Promise.race([
-      Promise.resolve().then(operation),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(timeoutError(code)), durationMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function waitForAbortable(operation, signal) {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    Promise.resolve(operation).then(resolve, reject).finally(() => {
-      signal.removeEventListener("abort", onAbort);
-    });
-  });
-}
-
-async function withinAbortable(operation, durationMs, code) {
+async function withinAbortable(
+  operation,
+  durationMs,
+  code,
+  parentSignal = null,
+) {
   const controller = new AbortController();
   const deadline = timeoutError(code);
-  const timer = setTimeout(() => controller.abort(deadline), durationMs);
-  try {
-    return await waitForAbortable(
-      Promise.resolve().then(() => operation(controller.signal)),
-      controller.signal,
+  const handleParentAbort = () => {
+    if (controller.signal.aborted) return;
+    controller.abort(
+      parentSignal.reason instanceof Error
+        ? parentSignal.reason
+        : Object.assign(new Error("Proactive work cycle was cancelled"), {
+            code: "PROACTIVE_WORK_CANCELLED",
+          }),
     );
+  };
+  if (parentSignal?.aborted) handleParentAbort();
+  parentSignal?.addEventListener("abort", handleParentAbort, { once: true });
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) controller.abort(deadline);
+  }, durationMs);
+  try {
+    const result = await Promise.resolve().then(() =>
+      operation(controller.signal),
+    );
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return result;
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
   } finally {
     clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", handleParentAbort);
   }
 }
 
@@ -357,6 +440,7 @@ export class ProactiveWorkLoop {
     decideTimeoutMs,
     roleContextAssembler,
     orchestratorService,
+    memoryQueryService,
   } = {}) {
     this.ledger = requirePort(
       ledger,
@@ -429,6 +513,26 @@ export class ProactiveWorkLoop {
           ["execute"],
           "orchestratorService",
         );
+    if (memoryQueryService != null && this.roleContextAssembler === null) {
+      throw new TypeError(
+        "memoryQueryService requires roleContextAssembler",
+      );
+    }
+    this.memoryQueryService = memoryQueryService == null
+      ? null
+      : requirePort(
+          memoryQueryService,
+          ["execute", "verifyContext"],
+          "memoryQueryService",
+        );
+    const leaseSafeDecisionPhaseMs =
+      this.leaseDurationMs -
+      this.resolveTimeoutMs -
+      WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS -
+      WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS;
+    this.decisionPhaseTimeoutMs = this.memoryQueryService === null
+      ? this.decideTimeoutMs
+      : Math.min(this.decideTimeoutMs * 3, leaseSafeDecisionPhaseMs);
     this.inFlightByScope = new Map();
     this.inFlightItemIds = new Set();
     this.inFlightQuestionTargets = new Set();
@@ -436,6 +540,7 @@ export class ProactiveWorkLoop {
 
   runCycle(input = {}) {
     const options = cycleOptions(input);
+    throwIfLoopAborted(options.signal);
     const scope = options.roleId ?? "*";
     const running = this.inFlightByScope.get(scope);
     if (running) return running;
@@ -450,8 +555,11 @@ export class ProactiveWorkLoop {
   }
 
   async #executeCycle(options) {
+    throwIfLoopAborted(options.signal);
     const intake = await this.ledger.intake({ limit: options.intakeLimit });
-    const items = await this.#listAllItems();
+    throwIfLoopAborted(options.signal);
+    const items = await this.#listAllItems(options.signal);
+    throwIfLoopAborted(options.signal);
     const graphBlocked = graphBlockedItemIds(items);
     const activeQuestions = activeQuestionTargets(items);
     const resolutions = new Map();
@@ -461,6 +569,7 @@ export class ProactiveWorkLoop {
     let workAttempts = 0;
 
     for (const item of items) {
+      throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
       if (
@@ -476,8 +585,12 @@ export class ProactiveWorkLoop {
       try {
         if (!resolutions.has(key)) {
           try {
-            resolutions.set(key, await this.#resolve(item.currentTarget));
+            resolutions.set(
+              key,
+              await this.#resolve(item.currentTarget, options.signal),
+            );
           } catch (error) {
+            throwIfLoopAborted(options.signal);
             resolutions.set(key, { status: "resolution_failed", error });
           }
         }
@@ -526,8 +639,9 @@ export class ProactiveWorkLoop {
         let questionAlreadyExists;
         try {
           questionAlreadyExists = activeQuestionTargets(
-            await this.#listAllItems(),
+            await this.#listAllItems(options.signal),
           ).has(key);
+          throwIfLoopAborted(options.signal);
         } catch (error) {
           this.inFlightQuestionTargets.delete(key);
           throw error;
@@ -577,7 +691,7 @@ export class ProactiveWorkLoop {
         }
 
         claimAttempts += 1;
-        const claim = await this.#claim(item, resolution, options.intakeLimit);
+        const claim = await this.#claim(item, resolution, options);
         if (!claim.item) {
           outcomes.push({ itemId: item.itemId, status: claim.status });
           continue;
@@ -601,6 +715,7 @@ export class ProactiveWorkLoop {
       }
     }
 
+    throwIfLoopAborted(options.signal);
     return {
       trigger: options.trigger,
       roleId: options.roleId,
@@ -628,13 +743,16 @@ export class ProactiveWorkLoop {
     };
   }
 
-  async #resolve(target) {
+  async #resolve(target, signal) {
+    throwIfLoopAborted(signal);
     if (target.type !== "role") return this.#orchestrator(target);
-    const candidate = await within(
+    const candidate = await withinAbortable(
       () => this.roleDirectory.resolve({ ...target }),
       this.resolveTimeoutMs,
       "ROLE_RESOLUTION_TIMEOUT",
+      signal,
     );
+    throwIfLoopAborted(signal);
     if (candidate === null || candidate === undefined) {
       return this.#orchestrator(target);
     }
@@ -676,9 +794,10 @@ export class ProactiveWorkLoop {
     };
   }
 
-  async #claim(item, worker, intakeLimit) {
+  async #claim(item, worker, options) {
+    throwIfLoopAborted(options.signal);
     try {
-      return {
+      const claimed = {
         status: "claimed",
         item: await this.ledger.claim({
           itemId: item.itemId,
@@ -687,11 +806,19 @@ export class ProactiveWorkLoop {
           leaseDurationMs: this.leaseDurationMs,
         }),
       };
+      throwIfLoopAborted(options.signal);
+      return claimed;
     } catch (error) {
+      throwIfLoopAborted(options.signal);
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         throw error;
       }
-      const observed = await this.#observeItem(item.itemId, intakeLimit);
+      const observed = await this.#observeItem(
+        item.itemId,
+        options.intakeLimit,
+        options.signal,
+      );
+      throwIfLoopAborted(options.signal);
       if (
         observed &&
         observed.status === "working" &&
@@ -719,20 +846,181 @@ export class ProactiveWorkLoop {
       }),
       this.resolveTimeoutMs,
       "ROLE_CONTEXT_TIMEOUT",
+      options.signal,
     );
   }
 
   async #decide(item, worker, options, context) {
     return normalizeWorkDecision(
-      await within(
-        () => worker.decide({
+      await withinAbortable(
+        (signal) => worker.decide({
           item: workerItemDto(item),
           trigger: options.trigger,
           ...(context === undefined ? {} : { context }),
+          signal,
         }),
         this.decideTimeoutMs,
         "ROLE_DECISION_TIMEOUT",
+        options.signal,
       ),
+    );
+  }
+
+  async #decideWithMemory(item, worker, options, packet) {
+    return withinAbortable(
+      (signal) => this.#runDecisionPhaseWithMemory(
+        item,
+        worker,
+        options,
+        packet,
+        signal,
+      ),
+      this.decisionPhaseTimeoutMs,
+      "ROLE_DECISION_TIMEOUT",
+      options.signal,
+    );
+  }
+
+  async #runDecisionPhaseWithMemory(item, worker, options, packet, signal) {
+    const decide = async (context) => {
+      signal.throwIfAborted();
+      const decision = normalizeWorkDecision(
+        await withinAbortable(
+          (stageSignal) => worker.decide({
+            item: workerItemDto(item),
+            trigger: options.trigger,
+            context,
+            signal: stageSignal,
+          }),
+          this.decideTimeoutMs,
+          "ROLE_DECISION_TIMEOUT",
+          signal,
+        ),
+      );
+      signal.throwIfAborted();
+      return decision;
+    };
+    const first = await decide(packet.context);
+    if (first.intent.type !== "query_memory") {
+      await this.#verifyDecisionAuthority(item, worker, packet, signal);
+      return { decision: first, packet };
+    }
+    if (this.memoryQueryService === null) {
+      throw Object.assign(
+        new Error("Agent memory query is not configured"),
+        { code: "AGENT_MEMORY_QUERY_UNAVAILABLE" },
+      );
+    }
+    await this.#verifyDecisionAuthority(item, worker, packet, signal);
+    await withinAbortable(
+      (stageSignal) => this.memoryQueryService.execute({
+        roleId: worker.roleId,
+        workerId: worker.workerId,
+        item,
+        intent: first.intent,
+        signal: stageSignal,
+      }),
+      this.decideTimeoutMs,
+      "AGENT_MEMORY_QUERY_TIMEOUT",
+      signal,
+    );
+    signal.throwIfAborted();
+    const refreshedPacket = await withinAbortable(
+      (stageSignal) => this.roleContextAssembler.assemble({
+        roleId: worker.roleId,
+        item,
+        trigger: options.trigger,
+        signal: stageSignal,
+      }),
+      this.resolveTimeoutMs,
+      "ROLE_CONTEXT_TIMEOUT",
+      signal,
+    );
+    signal.throwIfAborted();
+    const second = await decide(refreshedPacket.context);
+    if (second.intent.type === "query_memory") {
+      throw Object.assign(
+        new Error("Only one memory query is allowed per work iteration"),
+        { code: "AGENT_MEMORY_QUERY_LIMIT_EXCEEDED" },
+      );
+    }
+    await this.#verifyDecisionAuthority(
+      item,
+      worker,
+      refreshedPacket,
+      signal,
+    );
+    return { decision: second, packet: refreshedPacket };
+  }
+
+  async #verifyDecisionAuthority(item, worker, packet, signal) {
+    const current = await withinAbortable(
+      (verificationSignal) =>
+        this.#readCurrentDecisionItem(item.itemId, verificationSignal),
+      this.resolveTimeoutMs,
+      "ROLE_DECISION_INPUT_TIMEOUT",
+      signal,
+    );
+    signal.throwIfAborted();
+    if (!this.#sameDecisionInput(item, current)) {
+      throw Object.assign(
+        new Error("Role decision input changed while the provider was running"),
+        { code: "ROLE_DECISION_INPUT_STALE" },
+      );
+    }
+    const memoryContext = packet?.context?.memory?.agentQuery;
+    if (memoryContext === undefined) return;
+    if (this.memoryQueryService === null) {
+      throw Object.assign(
+        new Error("Memory context cannot be verified"),
+        { code: "AGENT_MEMORY_QUERY_UNAVAILABLE" },
+      );
+    }
+    await withinAbortable(
+      (verificationSignal) => this.memoryQueryService.verifyContext({
+        roleId: worker.roleId,
+        item,
+        context: memoryContext,
+        signal: verificationSignal,
+      }),
+      this.resolveTimeoutMs,
+      "AGENT_MEMORY_QUERY_VERIFICATION_TIMEOUT",
+      signal,
+    );
+    signal.throwIfAborted();
+  }
+
+  async #readCurrentDecisionItem(itemId, signal = null) {
+    throwIfLoopAborted(signal);
+    try {
+      const current = this.readItemForReconciliation === null
+        ? await this.#findItem(itemId, signal)
+        : await this.readItemForReconciliation({ itemId });
+      throwIfLoopAborted(signal);
+      if (current == null) {
+        throw new Error("Role decision work item disappeared");
+      }
+      return current;
+    } catch (cause) {
+      throwIfLoopAborted(signal);
+      throw Object.assign(
+        new Error("Unable to revalidate the role decision input", { cause }),
+        { code: "ROLE_DECISION_INPUT_UNAVAILABLE" },
+      );
+    }
+  }
+
+  #sameDecisionInput(expected, current) {
+    return (
+      current.itemId === expected.itemId &&
+      current.revision === expected.revision &&
+      current.inputDigest === expected.inputDigest &&
+      current.status === expected.status &&
+      current.ownerId === expected.ownerId &&
+      current.leaseId === expected.leaseId &&
+      current.leaseUntil === expected.leaseUntil &&
+      current.currentTarget?.type === expected.currentTarget?.type &&
+      current.currentTarget?.id === expected.currentTarget?.id
     );
   }
 
@@ -742,20 +1030,25 @@ export class ProactiveWorkLoop {
     options,
     graphBlocked,
   }) {
-    const packet = await this.#assembleContext(item, worker, options);
-    const decision = await this.#decide(
+    throwIfLoopAborted(options.signal);
+    let packet = await this.#assembleContext(item, worker, options);
+    let decision;
+    ({ decision, packet } = await this.#decideWithMemory(
       item,
       worker,
       options,
-      packet.context,
-    );
+      packet,
+    ));
+    throwIfLoopAborted(options.signal);
     if (decision.intent.type === "orchestrate") {
+      throwIfLoopAborted(options.signal);
       const executed = await this.orchestratorService.execute({
         worker: { roleId: worker.roleId, workerId: worker.workerId },
         item,
         contextPacket: packet,
         intent: decision.intent,
       });
+      throwIfLoopAborted(options.signal);
       return {
         claimAttempted: false,
         claimed: false,
@@ -780,7 +1073,7 @@ export class ProactiveWorkLoop {
         outcome: { status: "graph_blocked", workerId: worker.workerId },
       };
     }
-    const claim = await this.#claim(item, worker, options.intakeLimit);
+    const claim = await this.#claim(item, worker, options);
     if (!claim.item) {
       return {
         claimAttempted: true,
@@ -801,23 +1094,29 @@ export class ProactiveWorkLoop {
   }
 
   async #processSpecialist(item, worker, options) {
+    throwIfLoopAborted(options.signal);
     let packet;
     let decision;
+    let failureReasons = DECISION_FAILURE_REASONS;
     try {
       packet = await this.#assembleContext(item, worker, options);
-      decision = await this.#decide(
+      ({ decision, packet } = await this.#decideWithMemory(
         item,
         worker,
         options,
-        packet.context,
-      );
+        packet,
+      ));
+      throwIfLoopAborted(options.signal);
       if (decision.intent.type === "submit_delivery") {
+        failureReasons = DELIVERY_FAILURE_REASONS;
+        throwIfLoopAborted(options.signal);
         const executed = await this.orchestratorService.execute({
           worker: { roleId: worker.roleId, workerId: worker.workerId },
           item,
           contextPacket: packet,
           intent: decision.intent,
         });
+        throwIfLoopAborted(options.signal);
         return {
           status: executed.recovered
             ? "delivery_recovered"
@@ -833,28 +1132,55 @@ export class ProactiveWorkLoop {
         );
       }
     } catch (error) {
+      throwIfLoopAborted(options.signal);
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         // Configuration cutover is not an employee failure. Keep the durable
         // claim intact so the item can be recomputed after restart.
         throw error;
       }
-      return this.#recordFailure(item, worker.workerId, error, options);
+      const attention = ownerBrainAttentionDecision(error, worker.roleId);
+      if (attention !== null) {
+        return this.#stageDecision(
+          item,
+          worker,
+          options,
+          attention,
+          failureReasons,
+        );
+      }
+      return this.#recordFailure(
+        item,
+        worker.workerId,
+        error,
+        options,
+        failureReasons,
+      );
     }
     return this.#stageDecision(item, worker, options, decision);
   }
 
   async #decideAndStage(item, worker, options) {
+    throwIfLoopAborted(options.signal);
     let decision;
     try {
       decision = await this.#decide(item, worker, options);
     } catch (error) {
+      throwIfLoopAborted(options.signal);
       return this.#recordFailure(item, worker.workerId, error, options);
     }
 
+    throwIfLoopAborted(options.signal);
     return this.#stageDecision(item, worker, options, decision);
   }
 
-  async #stageDecision(item, worker, options, decision) {
+  async #stageDecision(
+    item,
+    worker,
+    options,
+    decision,
+    failureReasons = DECISION_FAILURE_REASONS,
+  ) {
+    throwIfLoopAborted(options.signal);
     try {
       await this.ledger.stageIntent({
         itemId: item.itemId,
@@ -864,12 +1190,16 @@ export class ProactiveWorkLoop {
         roleId: worker.roleId,
         intent: decision.intent,
       });
+      throwIfLoopAborted(options.signal);
       return { status: "staged", workerId: worker.workerId };
     } catch (error) {
+      throwIfLoopAborted(options.signal);
       const observed = await this.#observeItem(
         item.itemId,
         options.intakeLimit,
+        options.signal,
       );
+      throwIfLoopAborted(options.signal);
       if (
         ["dispatch_pending", "waiting_user"].includes(observed?.status) &&
         observed.inputDigest === item.inputDigest &&
@@ -883,7 +1213,13 @@ export class ProactiveWorkLoop {
         observed.revision === item.revision &&
         observed.leaseId === item.leaseId
       ) {
-        return this.#recordFailure(item, worker.workerId, error, options);
+        return this.#recordFailure(
+          item,
+          worker.workerId,
+          error,
+          options,
+          failureReasons,
+        );
       }
       return {
         status: observed ? "stage_state_changed" : "stage_uncertain",
@@ -892,7 +1228,14 @@ export class ProactiveWorkLoop {
     }
   }
 
-  async #recordFailure(item, actorId, error, options) {
+  async #recordFailure(
+    item,
+    actorId,
+    error,
+    options,
+    reasons = DECISION_FAILURE_REASONS,
+  ) {
+    throwIfLoopAborted(options.signal);
     const code = stableFailureCode(error);
     const input = {
       itemId: item.itemId,
@@ -901,16 +1244,18 @@ export class ProactiveWorkLoop {
       actorId,
       reason:
         item.attempt >= this.maxAttempts
-          ? "decision_attempts_exhausted"
-          : "decision_failed",
+          ? reasons.exhausted
+          : reasons.retry,
     };
     try {
+      throwIfLoopAborted(options.signal);
       if (item.attempt >= this.maxAttempts) {
         await this.ledger.transition({
           ...input,
           toStatus: "blocked",
           details: { code },
         });
+        throwIfLoopAborted(options.signal);
         return { status: "blocked", workerId: actorId, code };
       }
       const exponent = Math.min(item.attempt - 1, 30);
@@ -924,12 +1269,16 @@ export class ProactiveWorkLoop {
           Date.parse(normalizeLoopClock(this.clock)) + delay,
         ).toISOString(),
       });
+      throwIfLoopAborted(options.signal);
       return { status: "retry_scheduled", workerId: actorId, code };
     } catch {
+      throwIfLoopAborted(options.signal);
       const observed = await this.#observeItem(
         item.itemId,
         options.intakeLimit,
+        options.signal,
       );
+      throwIfLoopAborted(options.signal);
       if (observed?.status === "blocked") {
         return { status: "blocked", workerId: actorId, code };
       }
@@ -944,25 +1293,32 @@ export class ProactiveWorkLoop {
     }
   }
 
-  async #observeItem(itemId, intakeLimit) {
+  async #observeItem(itemId, intakeLimit, signal = null) {
+    throwIfLoopAborted(signal);
     try {
       if (this.readItemForReconciliation !== null) {
-        return await this.readItemForReconciliation({ itemId });
+        const observed = await this.readItemForReconciliation({ itemId });
+        throwIfLoopAborted(signal);
+        return observed;
       }
       await this.ledger.intake({ limit: Math.min(intakeLimit, 1) });
-      return await this.#findItem(itemId);
+      throwIfLoopAborted(signal);
+      return await this.#findItem(itemId, signal);
     } catch {
+      throwIfLoopAborted(signal);
       return null;
     }
   }
 
-  async #findItem(itemId) {
+  async #findItem(itemId, signal = null) {
     let cursor = null;
     for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      throwIfLoopAborted(signal);
       const result = await this.ledger.listItems({
         limit: PAGE_SIZE,
         ...(cursor ? { cursor } : {}),
       });
+      throwIfLoopAborted(signal);
       const found = result.items.find((item) => item.itemId === itemId);
       if (found) return found;
       if (!result.nextCursor) return null;
@@ -974,14 +1330,16 @@ export class ProactiveWorkLoop {
     throw new TypeError("ledger pagination exceeded its safety bound");
   }
 
-  async #listAllItems() {
+  async #listAllItems(signal = null) {
     const items = [];
     let cursor = null;
     for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      throwIfLoopAborted(signal);
       const result = await this.ledger.listItems({
         limit: PAGE_SIZE,
         ...(cursor ? { cursor } : {}),
       });
+      throwIfLoopAborted(signal);
       if (!result || !Array.isArray(result.items)) {
         throw new TypeError("ledger listItems result is invalid");
       }

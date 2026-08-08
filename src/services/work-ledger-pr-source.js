@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import {
+  createPullRequestExecutionBinding,
   normalizePullRequestExecutionBinding,
   pullRequestExecutionTargetMatchesEvent,
 } from "../domain/pull-request-execution-binding.js";
@@ -941,6 +942,19 @@ export function currentWorkItemInputBinding(item) {
   return inherited === null || inherited === undefined
     ? null
     : Object.freeze(normalizePullRequestInputBinding(inherited));
+}
+
+export function currentWorkItemExecutionBinding(item) {
+  const sourceBinding = currentWorkItemInputBinding(item);
+  if (sourceBinding === null) return null;
+  try {
+    return createPullRequestExecutionBinding({
+      sourceBinding,
+      event: currentWorkItemEvent(item),
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function normalizePullRequestInputBinding(value) {

@@ -8,9 +8,13 @@ import {
   requireWorkLedgerItem,
 } from "./work-ledger-item-commands.js";
 import {
+  currentWorkItemExecutionBinding,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "./work-ledger-pr-source.js";
+import {
+  createAttentionResultAttestation,
+} from "./work-ledger-result-attestation.js";
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import {
@@ -351,10 +355,11 @@ export function planAttentionBatchApplication({ state, input, clock }) {
   }
   const now = clock();
   let items = state.items;
+  let outboxEntries = state.outbox;
   const timelineEvents = [];
   const appliedItemIds = [];
   for (const entry of batch.pending) {
-    const workingState = { ...state, items };
+    const workingState = { ...state, items, outbox: outboxEntries };
     const { item, outbox, discardUnsealedLegacyResult } =
       requireBoundAskUser(workingState, entry);
     if (Date.parse(entry.result.at) > Date.parse(now)) {
@@ -395,6 +400,28 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       },
       observedAt: entry.result.at,
     });
+    const resultAttestation = createAttentionResultAttestation({
+      entry,
+      intentId: outbox.intentId,
+      decisionContentDigest: decisionContext.contentDigest,
+    });
+    const outboxResult = {
+      ...outbox,
+      revision: outbox.revision + 1,
+      outcome: {
+        ...outbox.outcome,
+        details: {
+          ...outbox.outcome.details,
+          resultAttestation,
+        },
+      },
+      updatedAt: now,
+    };
+    outboxEntries = replaceWorkLedgerRecord(
+      outboxEntries,
+      "intentId",
+      outboxResult,
+    );
     const rejected = entry.result.kind === "rejected";
     const sealedByLegacyCutover = isWorkItemInLegacyPullRequestCutover(item);
     const itemResult = moveWorkItem(item, {
@@ -422,16 +449,24 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       at: now,
       actorId: "attention-result-reconciler",
       details: {
+        inputBinding: currentWorkItemExecutionBinding(item),
+        workItemRevision: itemResult.revision,
+        inputDigest: item.inputDigest,
         intentId: entry.requestKey,
+        resultAttestationDigest: resultAttestation.attestationDigest,
         questionRef: entry.requestId,
         resultRef: entry.result.resultId,
         outcome: entry.result.kind,
+        answer: entry.result.answer,
+        requestContentDigest: entry.requestContentDigest,
+        resultDigest: entry.result.contentDigest,
       },
     });
   }
   return {
     patch: {
       items,
+      outbox: outboxEntries,
       attentionCursor: batch.nextSequence,
       attentionHighWatermark: batch.highWatermark,
     },

@@ -1,6 +1,18 @@
+import { MAX_WORK_LEDGER_QUERY_PAGE } from "./work-ledger-records.js";
+import { MAX_WORK_LEDGER_ITEMS } from "./work-ledger-state.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+
 const SAFE_TRIGGER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const NO_ROLE_SCOPE = "*";
+const SOURCE_RECONCILIATION_MAX_PAGES = Math.ceil(
+  MAX_WORK_LEDGER_ITEMS / MAX_WORK_LEDGER_QUERY_PAGE,
+);
+const SOURCE_RECONCILIATION_CONFLICTS = new Set([
+  "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+  "WORK_LEDGER_STATE_REVISION_CONFLICT",
+  "WORK_LEDGER_REVISION_CONFLICT",
+]);
 
 function requirePort(value, method, name) {
   if (!value || typeof value[method] !== "function") {
@@ -37,7 +49,7 @@ function cycleOptions(value = {}) {
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(
-      (key) => !["trigger", "includeWork", "roleId"].includes(key),
+      (key) => !["trigger", "includeWork", "roleId", "signal"].includes(key),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
@@ -54,6 +66,15 @@ function cycleOptions(value = {}) {
     trigger: safeTrigger(value.trigger ?? "scheduled"),
     includeWork,
     roleId,
+    signal: normalizeAbortSignal(value.signal ?? null),
+  });
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw Object.assign(new Error("Work coordination was cancelled"), {
+    code: "WORK_COORDINATION_CANCELLED",
   });
 }
 
@@ -77,6 +98,125 @@ async function skipCodeJobMemory() {
   return { skipped: "not_configured" };
 }
 
+async function skipPullRequestSourceReconciliation() {
+  return { skipped: "not_configured" };
+}
+
+async function readPendingPullRequestSources(listPendingSources, signal) {
+  const roots = [];
+  const seenItemIds = new Set();
+  const seenCursors = new Set();
+  let cursor = null;
+  for (
+    let pageNumber = 0;
+    pageNumber < SOURCE_RECONCILIATION_MAX_PAGES;
+    pageNumber += 1
+  ) {
+    throwIfAborted(signal);
+    const page = await listPendingSources({
+      limit: MAX_WORK_LEDGER_QUERY_PAGE,
+      ...(cursor === null ? {} : { cursor }),
+    });
+    throwIfAborted(signal);
+    if (
+      !page ||
+      !Array.isArray(page.items) ||
+      (page.nextCursor !== null && typeof page.nextCursor !== "string")
+    ) {
+      throw new TypeError(
+        "ledger listPendingPullRequestSources returned an invalid page",
+      );
+    }
+    for (const root of page.items) {
+      if (
+        typeof root?.itemId !== "string" ||
+        seenItemIds.has(root.itemId)
+      ) {
+        throw new TypeError(
+          "ledger listPendingPullRequestSources returned an invalid page",
+        );
+      }
+      seenItemIds.add(root.itemId);
+      roots.push(root);
+    }
+    if (page.nextCursor === null) return roots;
+    if (
+      page.items.length === 0 ||
+      page.items.at(-1).itemId !== page.nextCursor ||
+      seenCursors.has(page.nextCursor)
+    ) {
+      throw new TypeError(
+        "ledger listPendingPullRequestSources returned an invalid cursor",
+      );
+    }
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+  throw new TypeError(
+    "ledger listPendingPullRequestSources exceeded the bounded page limit",
+  );
+}
+
+function optionalPullRequestSourceReconciler(ledger) {
+  const methods = [
+    "listPendingPullRequestSources",
+    "getSummary",
+    "reconcilePullRequestSource",
+  ];
+  const available = methods.filter(
+    (method) => typeof ledger?.[method] === "function",
+  );
+  if (available.length === 0) return skipPullRequestSourceReconciliation;
+  if (available.length !== methods.length) {
+    throw new TypeError(
+      "ledger PR source reconciliation port is only partially configured",
+    );
+  }
+  const listPendingSources = ledger.listPendingPullRequestSources.bind(ledger);
+  const getSummary = ledger.getSummary.bind(ledger);
+  const reconcile = ledger.reconcilePullRequestSource.bind(ledger);
+  return async ({ limit, signal = null }) => {
+    const pendingRoots = await readPendingPullRequestSources(
+      listPendingSources,
+      signal,
+    );
+    const result = {
+      scanned: 0,
+      pending: pendingRoots.length,
+      applied: 0,
+      blocked: 0,
+      conflicted: 0,
+    };
+    for (const root of pendingRoots) {
+      throwIfAborted(signal);
+      if (result.applied >= limit) break;
+      result.scanned += 1;
+      try {
+        const summary = await getSummary();
+        throwIfAborted(signal);
+        const outcome = await reconcile({
+          itemId: root.itemId,
+          expectedGraphRevision: summary.revision,
+          expectedRevision: root.revision,
+          expectedPendingRevision:
+            root.source.pendingRevision ?? root.source.activeRevision,
+        });
+        throwIfAborted(signal);
+        if (outcome.applied === true) result.applied += 1;
+        else if (Array.isArray(outcome.blockers) && outcome.blockers.length > 0) {
+          result.blocked += 1;
+        } else {
+          result.conflicted += 1;
+        }
+      } catch (error) {
+        if (!SOURCE_RECONCILIATION_CONFLICTS.has(error?.code)) throw error;
+        result.conflicted += 1;
+      }
+    }
+    return result;
+  };
+}
+
 function stageFailure(stage, error) {
   const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
@@ -94,6 +234,7 @@ export class WorkCoordinationService {
   #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
+  #reconcilePullRequestSources;
   #runWork;
   #dispatch;
   #defaults;
@@ -166,6 +307,9 @@ export class WorkCoordinationService {
       "runCycle",
       "conditionWaker",
     );
+    this.#reconcilePullRequestSources = optionalPullRequestSourceReconciler(
+      ledger,
+    );
     this.#runWork = requirePort(workLoop, "runCycle", "workLoop");
     this.#dispatch = requirePort(dispatcher, "dispatchPending", "dispatcher");
     this.#defaults = Object.freeze({
@@ -183,12 +327,17 @@ export class WorkCoordinationService {
     });
   }
 
-  intake() {
-    return this.#intake({ limit: this.#defaults.intakeLimit });
+  async intake({ signal = null } = {}) {
+    signal = normalizeAbortSignal(signal);
+    throwIfAborted(signal);
+    const result = await this.#intake({ limit: this.#defaults.intakeLimit });
+    throwIfAborted(signal);
+    return result;
   }
 
   runCycle(input = {}) {
     const options = cycleOptions(input);
+    throwIfAborted(options.signal);
     const scope = options.includeWork
       ? `work:${options.roleId ?? NO_ROLE_SCOPE}`
       : "housekeeping";
@@ -209,6 +358,7 @@ export class WorkCoordinationService {
   }
 
   async #performCycle(options) {
+    throwIfAborted(options.signal);
     const stages = options.roleId === null
       ? [
           ["code_jobs", () =>
@@ -231,6 +381,11 @@ export class WorkCoordinationService {
             this.#reconcileAttention({ limit: this.#defaults.attentionLimit })],
           ["conditions", () =>
             this.#wakeConditions({ limit: this.#defaults.conditionLimit })],
+          ["pull_request_source_reconciliation", () =>
+            this.#reconcilePullRequestSources({
+              limit: this.#defaults.intakeLimit,
+              signal: options.signal,
+            })],
         ]
       : [];
     if (options.includeWork) {
@@ -242,6 +397,7 @@ export class WorkCoordinationService {
             intakeLimit: this.#defaults.intakeLimit,
             workLimit: this.#defaults.workLimit,
             ...(options.roleId === null ? {} : { roleId: options.roleId }),
+            ...(options.signal === null ? {} : { signal: options.signal }),
           }),
       ]);
     }
@@ -258,8 +414,11 @@ export class WorkCoordinationService {
     const failures = [];
     for (const [name, operation] of stages) {
       try {
+        throwIfAborted(options.signal);
         result.stages[name] = { ok: true, result: await operation() };
+        throwIfAborted(options.signal);
       } catch (error) {
+        if (options.signal?.aborted) throwIfAborted(options.signal);
         const failure = stageFailure(name, error);
         failures.push(failure);
         result.stages[name] = { ok: false, code: failure.code };

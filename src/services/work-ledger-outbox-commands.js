@@ -30,6 +30,7 @@ import {
   workLedgerError,
 } from "./work-ledger-values.js";
 import {
+  currentWorkItemExecutionBinding,
   currentWorkItemEvent,
   hasPendingPullRequestSource,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
@@ -41,7 +42,9 @@ import {
 
 const PROPOSAL_INTENT_TYPES = new Set([
   "propose_github_review",
+  "propose_github_pull_request_action",
   "propose_code_action",
+  "propose_configuration_change",
 ]);
 const INTENT_WAITING_STATUSES = new Set([
   "waiting_user",
@@ -268,6 +271,8 @@ export function planIntentStage({ state, input, clock }) {
         at: now,
         actorId,
         details: {
+          inputBinding: currentWorkItemExecutionBinding(item),
+          workItemRevision: itemResult.revision,
           intentId: outboxResult.intentId,
           intentDigest: outboxResult.intentDigest,
           intentType: outboxResult.intent.type,
@@ -275,6 +280,16 @@ export function planIntentStage({ state, input, clock }) {
           requestedBy,
           reusedFailedIntent: existing !== undefined,
           deliverySemantics: WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
+          ...(outboxResult.intent.type === "ask_user"
+            ? {
+                consultationRequest: {
+                  summary: outboxResult.intent.summary,
+                  reason: outboxResult.intent.reason,
+                  question: outboxResult.intent.question,
+                  choices: outboxResult.intent.choices,
+                },
+              }
+            : {}),
         },
       },
     ],

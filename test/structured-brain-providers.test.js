@@ -5,6 +5,7 @@ import {
   OpenAICompatibleProvider,
   OpenAiCompatibleProvider,
 } from "../src/adapters/openai-compatible-provider.js";
+import { normalizeStructuredBrainRequest } from "../src/lib/structured-brain-request.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 
 const SCHEMA = Object.freeze({
@@ -55,6 +56,213 @@ function responsesEnvelope(text = '{"ok":true}', overrides = {}) {
     ...overrides,
   };
 }
+
+test("the shared structured request normalizer returns a detached deep-frozen request", () => {
+  const source = {
+    model: "bounded-model",
+    messages: [
+      { role: "system", content: "Return JSON." },
+      { role: "user", content: "{}" },
+    ],
+    schema: {
+      type: "object",
+      properties: { nested: { type: "array", items: { type: "string" } } },
+    },
+  };
+
+  const normalized = normalizeStructuredBrainRequest(source, {
+    maxRequestBytes: 8 * 1024,
+  });
+
+  source.messages[0].content = "changed";
+  source.schema.properties.nested.items.type = "number";
+  assert.equal(normalized.messages[0].content, "Return JSON.");
+  assert.equal(normalized.schema.properties.nested.items.type, "string");
+  assert.equal(Object.isFrozen(normalized), true);
+  assert.equal(Object.isFrozen(normalized.messages), true);
+  assert.equal(Object.isFrozen(normalized.messages[0]), true);
+  assert.equal(Object.isFrozen(normalized.schema.properties.nested.items), true);
+});
+
+test("the shared structured request normalizer rejects hostile data before touching it", () => {
+  let proxyTraps = 0;
+  const hostileSchema = new Proxy({}, {
+    getPrototypeOf() {
+      proxyTraps += 1;
+      throw new Error("private proxy trap");
+    },
+  });
+  assert.throws(
+    () => normalizeStructuredBrainRequest({
+      model: "model",
+      messages: MESSAGES,
+      schema: hostileSchema,
+    }, { maxRequestBytes: 8 * 1024 }),
+    /schema is invalid/i,
+  );
+  assert.equal(proxyTraps, 0);
+
+  let getterCalls = 0;
+  const accessorMessage = { role: "user" };
+  Object.defineProperty(accessorMessage, "content", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "private getter";
+    },
+  });
+  assert.throws(
+    () => normalizeStructuredBrainRequest({
+      model: "model",
+      messages: [accessorMessage],
+      schema: SCHEMA,
+    }, { maxRequestBytes: 8 * 1024 }),
+    /messages are invalid/i,
+  );
+  assert.equal(getterCalls, 0);
+
+  const sparseMessages = new Array(1);
+  assert.throws(
+    () => normalizeStructuredBrainRequest({
+      model: "model",
+      messages: sparseMessages,
+      schema: SCHEMA,
+    }, { maxRequestBytes: 8 * 1024 }),
+    /messages are invalid/i,
+  );
+
+  const cyclicSchema = { type: "object" };
+  cyclicSchema.self = cyclicSchema;
+  assert.throws(
+    () => normalizeStructuredBrainRequest({
+      model: "model",
+      messages: MESSAGES,
+      schema: cyclicSchema,
+    }, { maxRequestBytes: 8 * 1024 }),
+    /schema is invalid/i,
+  );
+
+  assert.throws(
+    () => normalizeStructuredBrainRequest({
+      model: "model",
+      messages: [{ role: "user", content: "x".repeat(2_000) }],
+      schema: SCHEMA,
+    }, { maxRequestBytes: 1_024 }),
+    (error) => error.code === "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE" &&
+      error.statusCode === 413,
+  );
+});
+
+test("Ollama and OpenAI-compatible providers use the shared hostile-data boundary", async () => {
+  const calls = { ollama: 0, openai: 0 };
+  const providers = [
+    new OllamaStructuredProvider({
+      fetch: async () => {
+        calls.ollama += 1;
+        return textResponse({ message: { content: '{"ok":true}' } });
+      },
+    }),
+    new OpenAICompatibleProvider({
+      protocol: "responses",
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "token" },
+      fetch: async () => {
+        calls.openai += 1;
+        return textResponse(responsesEnvelope());
+      },
+    }),
+  ];
+
+  for (const provider of providers) {
+    let proxyTraps = 0;
+    const proxy = new Proxy({}, {
+      getPrototypeOf() {
+        proxyTraps += 1;
+        throw new Error("private proxy trap");
+      },
+    });
+    await assert.rejects(
+      provider.generate({
+        model: "model",
+        messages: MESSAGES,
+        schema: proxy,
+      }),
+      /schema is invalid/i,
+    );
+    assert.equal(proxyTraps, 0);
+
+    let getterCalls = 0;
+    const accessorSchema = { type: "object" };
+    Object.defineProperty(accessorSchema, "properties", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return {};
+      },
+    });
+    await assert.rejects(
+      provider.generate({
+        model: "model",
+        messages: MESSAGES,
+        schema: accessorSchema,
+      }),
+      /schema is invalid/i,
+    );
+    assert.equal(getterCalls, 0);
+
+    const sparse = new Array(1);
+    await assert.rejects(
+      provider.generate({
+        model: "model",
+        messages: MESSAGES,
+        schema: { type: "object", anyOf: sparse },
+      }),
+      /schema is invalid/i,
+    );
+  }
+  assert.deepEqual(calls, { ollama: 0, openai: 0 });
+});
+
+test("structured providers reject a top-level request Proxy without reading it", async () => {
+  let getterCalls = 0;
+  let fetchCalls = 0;
+  const requestProxy = new Proxy({}, {
+    get(_target, property) {
+      getterCalls += 1;
+      throw new Error(`PRIVATE_${String(property)}`);
+    },
+  });
+  const providers = [
+    new OllamaStructuredProvider({
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("must not fetch");
+      },
+    }),
+    new OpenAICompatibleProvider({
+      baseUrl: "https://models.example/v1",
+      apiKeyEnv: "MODEL_TOKEN",
+      env: { MODEL_TOKEN: "private-token" },
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("must not fetch");
+      },
+    }),
+  ];
+
+  for (const provider of providers) {
+    await assert.rejects(
+      provider.generate(requestProxy),
+      (error) =>
+        error instanceof TypeError &&
+        !error.message.includes("PRIVATE_") &&
+        !JSON.stringify(error).includes("PRIVATE_"),
+    );
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(fetchCalls, 0);
+});
 
 test("Ollama defaults to loopback and sends a bounded schema request without redirects", async () => {
   const calls = [];
@@ -204,6 +412,45 @@ test("OpenAI-compatible credentials come only from the injected environment and 
   });
   assert.throws(() => new OpenAiCompatibleProvider(unsafeOptions));
   assert.equal(getterCalls, 0);
+});
+
+test("OpenAI-compatible missing credentials fail lazily before fetch and can recover in-place", async () => {
+  const environment = {};
+  let fetchCalls = 0;
+  const provider = new OpenAICompatibleProvider({
+    baseUrl: "https://models.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    environment,
+    fetch: async () => {
+      fetchCalls += 1;
+      return textResponse({
+        choices: [{ message: { content: '{"ok":true}' } }],
+      });
+    },
+  });
+  const request = {
+    model: "smart-model",
+    messages: MESSAGES,
+    schema: SCHEMA,
+  };
+
+  await assert.rejects(
+    provider.generate(request),
+    (error) => error.code === "BRAIN_CREDENTIAL_UNAVAILABLE" &&
+      error.statusCode === 503,
+  );
+  assert.equal(fetchCalls, 0);
+
+  environment.MODEL_TOKEN = "configured-after-startup";
+  assert.equal(await provider.generate(request), '{"ok":true}');
+  assert.equal(fetchCalls, 1);
+
+  delete environment.MODEL_TOKEN;
+  await assert.rejects(
+    provider.generate(request),
+    (error) => error.code === "BRAIN_CREDENTIAL_UNAVAILABLE",
+  );
+  assert.equal(fetchCalls, 1);
 });
 
 test("OpenAI-compatible chat json-object keeps the schema out of the remote request", async () => {
@@ -455,6 +702,7 @@ test("OpenAI-compatible Responses keeps request, response, and timeout limits bo
   );
 
   const chatOptions = {
+    protocol: "chat-completions",
     baseUrl: "https://models.example/v1",
     apiKeyEnv: "MODEL_TOKEN",
     env: { MODEL_TOKEN: "token" },
@@ -483,6 +731,32 @@ test("OpenAI-compatible Responses keeps request, response, and timeout limits bo
       maxRequestBytes: 2 * 1024 * 1024 + 1,
     }),
     /maxRequestBytes is outside/i,
+  );
+});
+
+test("an omitted protocol preserves the bounded legacy provider ranges", () => {
+  const options = {
+    baseUrl: "https://legacy.example/v1",
+    apiKeyEnv: "MODEL_TOKEN",
+    env: { MODEL_TOKEN: "token" },
+    fetch: async () => textResponse({
+      choices: [{ message: { content: '{"ok":true}' } }],
+    }),
+  };
+
+  assert.doesNotThrow(() => new OpenAICompatibleProvider({
+    ...options,
+    timeoutMs: 180_000,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxRequestBytes: 1,
+  }));
+  assert.throws(
+    () => new OpenAICompatibleProvider({
+      ...options,
+      protocol: "chat-completions",
+      timeoutMs: 180_000,
+    }),
+    /timeoutMs is outside/i,
   );
 });
 

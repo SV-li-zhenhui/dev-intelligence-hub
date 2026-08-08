@@ -2749,10 +2749,13 @@ test("deterministic context overflow fails once instead of retrying forever", as
 
 test("stable brain configuration failures pause instead of spinning forever", async (t) => {
   for (const code of [
+    "BRAIN_CREDENTIAL_UNAVAILABLE",
     "CODE_BRAIN_ROLE_NOT_CONFIGURED",
+    "CODE_TASK_BRAIN_NOT_CONFIGURED",
     "CODE_BRAIN_PATH_INVALID",
     "CODE_BRAIN_COMPLETION_NOT_READY",
     "REMOTE_DATA_NOT_AUTHORIZED",
+    "STRUCTURED_PROVIDER_UNAVAILABLE",
     "STRUCTURED_PROVIDER_TIMEOUT",
   ]) {
     await t.test(code, async () => {
@@ -2825,7 +2828,7 @@ test("two locally invalid model responses pause once without another cycle call"
     },
     roles: {
       developer: {
-        brain: {
+        taskBrain: {
           provider: "brain-one",
           model: "qwen3.5:9b",
           remoteData: { requirements: false, code: false, memory: false },
@@ -2883,7 +2886,7 @@ test("revocation after an invalid response blocks the correction provider call",
     },
     roles: {
       developer: {
-        brain: {
+        taskBrain: {
           provider: "brain-one",
           model: "qwen3.5:9b",
           remoteData: { requirements: false, code: false, memory: false },

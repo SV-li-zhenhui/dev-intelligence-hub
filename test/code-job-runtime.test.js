@@ -187,6 +187,7 @@ async function runtimeFixture({
   completedChangeExporter,
   changePackageProducer,
   changePackageReader,
+  controlledCommitDelivery,
 } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
@@ -208,6 +209,9 @@ async function runtimeFixture({
       : { completedChangeExporter }),
     ...(changePackageProducer === undefined ? {} : { changePackageProducer }),
     ...(changePackageReader === undefined ? {} : { changePackageReader }),
+    ...(controlledCommitDelivery === undefined
+      ? {}
+      : { controlledCommitDelivery }),
   });
   return { runtime, store, guard };
 }
@@ -422,6 +426,7 @@ test("change-package delivery dependencies are all-or-none narrow ports", async 
     { completedChangeExporter: exporter },
     { completedChangeExporter: exporter, changePackageProducer: producer },
     { changePackageProducer: producer, changePackageReader: reader },
+    { controlledCommitDelivery: { async deliver() {} } },
   ]) {
     let guardCalls = 0;
     await assert.rejects(
@@ -442,6 +447,12 @@ test("change-package delivery dependencies are all-or-none narrow ports", async 
     { completedChangeExporter: {}, changePackageProducer: producer, changePackageReader: reader },
     { completedChangeExporter: exporter, changePackageProducer: {}, changePackageReader: reader },
     { completedChangeExporter: exporter, changePackageProducer: producer, changePackageReader: {} },
+    {
+      completedChangeExporter: exporter,
+      changePackageProducer: producer,
+      changePackageReader: reader,
+      controlledCommitDelivery: {},
+    },
   ]) {
     await assert.rejects(
       createCodeJobRuntime({ store: new MemoryStore(), ...dependencies }),

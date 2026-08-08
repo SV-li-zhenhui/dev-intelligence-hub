@@ -394,8 +394,8 @@ export class ProactivePrEmployeeService {
       }),
       projectWork,
       operationQueue,
-      run: ({ trigger = "scheduled", state }) =>
-        this.#performTick(trigger, state),
+      run: ({ trigger = "scheduled", state, signal = null }) =>
+        this.#performTick(trigger, state, signal),
     });
   }
 
@@ -979,8 +979,10 @@ export class ProactivePrEmployeeService {
     return this.controller.project(state);
   }
 
-  async #performTick(trigger, state) {
+  async #performTick(trigger, state, signal = null) {
+    signal?.throwIfAborted();
     state = await this.#flushMemoryOutbox(state);
+    signal?.throwIfAborted();
     if (this.#usesExternalConfirmations()) {
       const invalidationIds = state.jobs
         .filter(
@@ -988,17 +990,21 @@ export class ProactivePrEmployeeService {
         )
         .map((job) => job.id);
       for (const id of invalidationIds) {
+        signal?.throwIfAborted();
         const invalidated = await this.#invalidateSupersededConfirmation(
           state,
           id,
         );
         state = invalidated.state;
+        signal?.throwIfAborted();
       }
       const pendingIds = state.jobs
         .filter((job) => job.status === "confirmation_enqueue_pending")
         .map((job) => job.id);
       for (const id of pendingIds) {
+        signal?.throwIfAborted();
         state = await this.#enqueuePendingConfirmation(state, id);
+        signal?.throwIfAborted();
       }
       const linkedIds = state.jobs
         .filter((job) =>
@@ -1008,11 +1014,14 @@ export class ProactivePrEmployeeService {
         )
         .map((job) => job.id);
       for (const id of linkedIds) {
+        signal?.throwIfAborted();
         const job = state.jobs.find((candidate) => candidate.id === id);
         try {
           const item = await this.producerQueue.get(job.confirmationId);
+          signal?.throwIfAborted();
           state = await this.#applyConfirmationOutcome(state, item);
         } catch {
+          signal?.throwIfAborted();
           state.lastError = `#${job.number}: 暂时无法同步外部动作确认状态`;
           state = await this.controller.writeState(state, {
             bumpRevision: false,
@@ -1026,6 +1035,7 @@ export class ProactivePrEmployeeService {
       this.store.read("snapshot"),
       this.store.read(MEMORY_KEY, []),
     ]);
+    signal?.throwIfAborted();
     if (!snapshot?.items) {
       state.lastRun = {
         trigger,
@@ -1034,6 +1044,7 @@ export class ProactivePrEmployeeService {
         summary: "尚无事实快照，等待数据源完成首次刷新",
       };
       state = await this.controller.writeState(state, { bumpRevision: false });
+      signal?.throwIfAborted();
       return state;
     }
     if (snapshot.sourceStatus?.githubPullRequests?.ok !== true) {
@@ -1044,6 +1055,7 @@ export class ProactivePrEmployeeService {
         summary: "GitHub PR 本轮未刷新，未使用旧数据触发员工",
       };
       state = await this.controller.writeState(state, { bumpRevision: false });
+      signal?.throwIfAborted();
       return state;
     }
 
@@ -1064,6 +1076,7 @@ export class ProactivePrEmployeeService {
       .filter((job) => ACTIVE_JOB_STATES.has(job.status))
       .map((job) => job.id);
     for (const id of activeIds) {
+      signal?.throwIfAborted();
       let job = state.jobs.find((candidate) => candidate.id === id);
       if (job.status === "confirmation_invalidation_pending") {
         unresolvedSubjects.add(job.subjectId);
@@ -1078,6 +1091,7 @@ export class ProactivePrEmployeeService {
           state,
           job.id,
         );
+        signal?.throwIfAborted();
         state = invalidated.state;
         job = state.jobs.find((candidate) => candidate.id === id);
         if (!invalidated.safe) unresolvedSubjects.add(job.subjectId);
@@ -1095,6 +1109,7 @@ export class ProactivePrEmployeeService {
 
     if (jobsChanged) {
       state = await this.controller.writeState(state);
+      signal?.throwIfAborted();
     }
 
     const fingerprints = new Set(
@@ -1123,6 +1138,7 @@ export class ProactivePrEmployeeService {
         this.#admitAction,
         () => this.controller.writeState(admittedState),
       );
+      signal?.throwIfAborted();
     }
     const jobsBeforeTrim = state.jobs.length;
     if (!newJobs.length) {
@@ -1151,13 +1167,16 @@ export class ProactivePrEmployeeService {
     state = await this.controller.writeState(state, {
       bumpRevision: jobsTrimmed,
     });
+    signal?.throwIfAborted();
 
     const readyToRun = state.jobs
       .filter((job) => this.#canRun(job, runAt))
       .slice(0, Math.max(1, this.config.maxJobsPerTick));
     for (const job of readyToRun) {
-      state = await this.#runJob(state, job.id);
+      signal?.throwIfAborted();
+      state = await this.#runJob(state, job.id, signal);
     }
+    signal?.throwIfAborted();
     return state;
   }
 
@@ -1194,7 +1213,8 @@ export class ProactivePrEmployeeService {
     return false;
   }
 
-  async #runJob(state, id) {
+  async #runJob(state, id, signal = null) {
+    signal?.throwIfAborted();
     let index = state.jobs.findIndex((job) => job.id === id);
     if (index < 0) return state;
     const startedAt = this.clock().toISOString();
@@ -1221,10 +1241,12 @@ export class ProactivePrEmployeeService {
       this.#admitAction,
       () => this.controller.writeState(claimedState),
     );
+    signal?.throwIfAborted();
 
     try {
       if (!this.reviewer) throw new Error("岗位大脑未配置");
       const snapshot = await this.store.read("snapshot");
+      signal?.throwIfAborted();
       const item = snapshot?.items?.find(
         (candidate) =>
           candidate.id === claimed.subjectId &&
@@ -1239,7 +1261,9 @@ export class ProactivePrEmployeeService {
       const policy = workPolicy(item);
       const context = await this.github.loadReviewContext(item, {
         includePatch: policy.mode === "review",
+        ...(signal === null ? {} : { signal }),
       });
+      signal?.throwIfAborted();
       if (
         context.headRefOid !== claimed.headRefOid ||
         !sameJobGitTarget(claimed, context)
@@ -1248,13 +1272,18 @@ export class ProactivePrEmployeeService {
       }
       const analysis = await runAdmittedOperation(
         this.#admitAction,
-        () => this.reviewer.analyze({
-          ...context,
-          workMode: policy.mode,
-          requestedAction: item.nextAction,
-        }),
+        () => this.reviewer.analyze(
+          {
+            ...context,
+            workMode: policy.mode,
+            requestedAction: item.nextAction,
+          },
+          signal === null ? undefined : { signal },
+        ),
       );
+      signal?.throwIfAborted();
       const latest = await this.store.read("snapshot");
+      signal?.throwIfAborted();
       const current = latest?.items?.find(
         (candidate) => candidate.id === claimed.subjectId,
       );
@@ -1304,13 +1333,17 @@ export class ProactivePrEmployeeService {
       }
       state.lastError = "";
       state = this.#queueMemory(state, state.jobs[index], "analysis_ready");
+      signal?.throwIfAborted();
       state = await this.controller.writeState(state);
+      signal?.throwIfAborted();
       state = await this.#flushMemoryOutbox(state);
+      signal?.throwIfAborted();
       if (state.jobs[index].status === "confirmation_enqueue_pending") {
         return this.#enqueuePendingConfirmation(state, claimed.id);
       }
       return state;
     } catch (error) {
+      signal?.throwIfAborted();
       if (stableFailureCode(error) === "PR_CONTEXT_STALE") {
         return this.#finishAsSuperseded(state, claimed.id);
       }

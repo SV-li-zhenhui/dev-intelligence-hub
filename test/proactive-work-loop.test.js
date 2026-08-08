@@ -833,7 +833,13 @@ test("a bounded decision timeout schedules a safe retry before the lease expires
   const time = controlledClock();
   const ledger = new FakeLedger({ source: [workItem(1)], time });
   const directory = new FakeRoleDirectory({
-    "pr-reviewer": worker({ decide: async () => new Promise(() => {}) }),
+    "pr-reviewer": worker({
+      decide: async ({ signal }) => new Promise((_resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }),
+    }),
   });
   const loop = createLoop({
     ledger,
@@ -853,6 +859,51 @@ test("a bounded decision timeout schedules a safe retry before the lease expires
     "employee-pr-reviewer",
   );
   assert.equal(ledger.items[0].status, "retry_wait");
+});
+
+test("shutdown abort reaches an active role decision and stages no later intent", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(70)], time });
+  const started = deferred();
+  let providerSignal = null;
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker({
+      decide: async ({ signal }) => {
+        providerSignal = signal;
+        started.resolve();
+        return new Promise((resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        });
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+  const controller = new AbortController();
+  const running = loop.runCycle({
+    trigger: "scheduled",
+    signal: controller.signal,
+  });
+  await Promise.race([
+    started.promise,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("role provider did not start")),
+      100,
+    )),
+  ]);
+  const reason = Object.assign(new Error("shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  controller.abort(reason);
+
+  await assert.rejects(running, (error) => error === reason);
+  assert.equal(providerSignal instanceof AbortSignal, true);
+  assert.equal(providerSignal.aborted, true);
+  assert.strictEqual(providerSignal.reason, reason);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.equal(ledger.calls.transition.length, 0);
 });
 
 test("a bounded context timeout aborts a hanging graph read before retrying", async () => {
@@ -976,6 +1027,23 @@ function orchestrationDecision(item, actionType = "pause") {
   };
 }
 
+function memoryQueryDecision() {
+  return {
+    schemaVersion: 1,
+    confidence: 88,
+    summary: "需要查询可引用的历史证据",
+    intent: {
+      schemaVersion: 1,
+      type: "query_memory",
+      summary: "查询旧回归证据",
+      reason: "当前判断缺少可复现的历史记录",
+      question: "上次同类回归是如何修复的？",
+      searchQuery: "同类 回归 修复",
+      mode: "local",
+    },
+  };
+}
+
 test("trusted specialist claims, assembles, decides, and submits without staging", async () => {
   const time = controlledClock();
   const source = workItem(31, { type: "role", id: "developer" });
@@ -1026,6 +1094,333 @@ test("trusted specialist claims, assembles, decides, and submits without staging
   assert.equal(executions[0].item.ownerId, "employee-developer");
   assert.equal(executions[0].contextPacket.binding.roleId, "developer");
   assert.equal(executions[0].intent.type, "submit_delivery");
+});
+
+test("a specialist can query cited memory once and re-enter the same work decision", async () => {
+  const time = controlledClock();
+  const source = workItem(32, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  let memoryReady = false;
+  const contexts = [];
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      decide: async ({ context }) => {
+        contexts.push(clone(context));
+        return context.memory ? completeDecision("已结合引用继续判断") : memoryQueryDecision();
+      },
+    }),
+  });
+  let assembleCalls = 0;
+  const assembler = {
+    async assemble({ roleId, item }) {
+      assembleCalls += 1;
+      const packet = contextPacket(item, roleId);
+      if (memoryReady) {
+        packet.context.memory = {
+          agentQuery: {
+            queryId: `agent-memory-query-${"a".repeat(64)}`,
+            claims: [{
+              statement: "旧回归通过恢复空值分支保护修复。",
+              citationIds: [`memory-${"b".repeat(64)}`],
+            }],
+          },
+        };
+      }
+      return packet;
+    },
+  };
+  const queryCalls = [];
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: assembler,
+    orchestratorService: { async execute() {} },
+    memoryQueryService: {
+      async execute(input) {
+        queryCalls.push(clone({ ...input, signal: undefined }));
+        assert.equal(input.signal instanceof AbortSignal, true);
+        memoryReady = true;
+        return { recovered: false, context: { queryId: "persisted" } };
+      },
+      async verifyContext({ context, signal }) {
+        assert.equal(signal instanceof AbortSignal, true);
+        return clone(context);
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(assembleCalls, 2);
+  assert.equal(contexts.length, 2);
+  assert.equal(contexts[0].memory, undefined);
+  assert.match(contexts[1].memory.agentQuery.claims[0].statement, /空值分支/);
+  assert.equal(queryCalls.length, 1);
+  assert.equal(queryCalls[0].roleId, "developer");
+  assert.equal(queryCalls[0].workerId, "employee-developer");
+  assert.equal(queryCalls[0].intent.type, "query_memory");
+  assert.equal(ledger.outbox[0].intent.type, "complete");
+});
+
+test("a second memory query in one work iteration is rejected without another primitive call", async () => {
+  const time = controlledClock();
+  const source = workItem(33, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  let queryCalls = 0;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async () => memoryQueryDecision(),
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+    memoryQueryService: {
+      async execute() {
+        queryCalls += 1;
+        return { recovered: false, context: { queryId: "persisted" } };
+      },
+      async verifyContext({ context }) {
+        return clone(context);
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(queryCalls, 1);
+  assert.equal(cycle.retried, 1);
+  assert.equal(cycle.outcomes[0].code, "AGENT_MEMORY_QUERY_LIMIT_EXCEEDED");
+  assert.equal(ledger.calls.stageIntent.length, 0);
+});
+
+test("the complete memory-assisted decision phase shares one lease-safe deadline", async () => {
+  const time = controlledClock();
+  const source = workItem(34, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  let decisions = 0;
+  let queryAborted = false;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async () => {
+          decisions += 1;
+          return memoryQueryDecision();
+        },
+      }),
+    }),
+    time,
+    leaseDurationMs: 13_000,
+    resolveTimeoutMs: 1_000,
+    decideTimeoutMs: 1_000,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+    memoryQueryService: {
+      async execute({ signal }) {
+        await new Promise((_resolve, reject) => {
+          const onAbort = () => {
+            queryAborted = true;
+            reject(signal.reason);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        });
+      },
+      async verifyContext({ context }) {
+        return clone(context);
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(queryAborted, true);
+  assert.equal(decisions, 1);
+  assert.equal(cycle.retried, 1);
+  assert.equal(cycle.outcomes[0].code, "ROLE_DECISION_TIMEOUT");
+  assert.equal(ledger.calls.stageIntent.length, 0);
+});
+
+test("healthy memory decision stages use separate deadlines inside one hard total budget", async () => {
+  const time = controlledClock();
+  const source = workItem(35, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  let memoryReady = false;
+  let decisions = 0;
+  const delay = () => new Promise((resolve) => setTimeout(resolve, 600));
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async ({ context, signal }) => {
+          assert.equal(signal instanceof AbortSignal, true);
+          await delay();
+          signal.throwIfAborted();
+          decisions += 1;
+          return context.memory
+            ? completeDecision("记忆阶段完成后继续")
+            : memoryQueryDecision();
+        },
+      }),
+    }),
+    time,
+    leaseDurationMs: 15_000,
+    resolveTimeoutMs: 1_000,
+    decideTimeoutMs: 1_000,
+    roleContextAssembler: {
+      async assemble({ roleId, item, signal }) {
+        signal?.throwIfAborted();
+        const packet = contextPacket(item, roleId);
+        if (memoryReady) {
+          packet.context.memory = {
+            agentQuery: {
+              queryId: `agent-memory-query-${"a".repeat(64)}`,
+              claims: [{
+                statement: "引用仍然有效。",
+                citationIds: [`memory-${"b".repeat(64)}`],
+              }],
+            },
+          };
+        }
+        return packet;
+      },
+    },
+    orchestratorService: { async execute() {} },
+    memoryQueryService: {
+      async execute({ signal }) {
+        await delay();
+        signal.throwIfAborted();
+        memoryReady = true;
+        return { recovered: false, context: { queryId: "persisted" } };
+      },
+      async verifyContext({ context, signal }) {
+        signal.throwIfAborted();
+        return clone(context);
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(decisions, 2);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.equal(ledger.outbox[0].intent.type, "complete");
+});
+
+test("citation invalidation after the provider returns stages no decision", async () => {
+  const time = controlledClock();
+  const source = workItem(36, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  let memoryReady = false;
+  let citationCurrent = true;
+  let verificationCalls = 0;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async ({ context }) => {
+          if (!context.memory) return memoryQueryDecision();
+          citationCurrent = false;
+          return completeDecision("不得采用已过期引用");
+        },
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        const packet = contextPacket(item, roleId);
+        if (memoryReady) {
+          packet.context.memory = {
+            agentQuery: {
+              queryId: `agent-memory-query-${"a".repeat(64)}`,
+              claims: [{
+                statement: "即将失效的结论。",
+                citationIds: [`memory-${"b".repeat(64)}`],
+              }],
+            },
+          };
+        }
+        return packet;
+      },
+    },
+    orchestratorService: { async execute() {} },
+    memoryQueryService: {
+      async execute() {
+        memoryReady = true;
+        return { recovered: false, context: { queryId: "persisted" } };
+      },
+      async verifyContext({ context }) {
+        verificationCalls += 1;
+        if (!citationCurrent) {
+          throw Object.assign(new Error("citation is obsolete"), {
+            code: "AGENT_MEMORY_QUERY_CITATION_STALE",
+          });
+        }
+        return clone(context);
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(cycle.retried, 1);
+  assert.equal(cycle.outcomes[0].code, "AGENT_MEMORY_QUERY_CITATION_STALE");
+  assert.equal(verificationCalls, 1);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.outbox.length, 0);
+});
+
+test("authoritative task changes after the provider returns stage no decision", async () => {
+  const time = controlledClock();
+  const source = workItem(37, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async () => {
+          const authoritative = ledger.items[0];
+          authoritative.revision += 1;
+          authoritative.inputDigest = "superseding-input-digest";
+          return completeDecision("不得采用旧任务输入的判断");
+        },
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(cycle.outcomes[0].status, "failure_state_unchanged");
+  assert.equal(cycle.outcomes[0].code, "ROLE_DECISION_INPUT_STALE");
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.outbox.length, 0);
 });
 
 test("runtime cutover is never recorded as a specialist failure", async (t) => {
@@ -1156,6 +1551,95 @@ test("trusted specialist retries assembler and delivery-service failures", async
   }
 });
 
+test("specialist delivery exhaustion remains distinct from decision exhaustion", async () => {
+  const time = controlledClock();
+  const source = workItem(72, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      decide: async ({ item }) => deliveryDecision(item),
+    }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    maxAttempts: 2,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        throw new Error("delivery outcome remains unproven");
+      },
+    },
+  });
+
+  const first = await loop.runCycle({ roleId: "developer" });
+  assert.equal(first.retried, 1);
+  assert.equal(ledger.items[0].statusReason, "delivery_failed");
+  time.advance(1_000);
+
+  const second = await loop.runCycle({ roleId: "developer" });
+  assert.equal(second.blocked, 1);
+  assert.equal(ledger.items[0].statusReason, "delivery_attempts_exhausted");
+  assert.equal(ledger.calls.scheduleRetry[0].reason, "delivery_failed");
+  assert.equal(
+    ledger.calls.transition[0].reason,
+    "delivery_attempts_exhausted",
+  );
+});
+
+test("delivery attention staging exhaustion remains delivery-classified", async () => {
+  const time = controlledClock();
+  const source = workItem(73, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      decide: async ({ item }) => deliveryDecision(item),
+    }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    maxAttempts: 2,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        throw Object.assign(new Error("delivery credential state is unknown"), {
+          code: "BRAIN_CREDENTIAL_UNAVAILABLE",
+        });
+      },
+    },
+  });
+
+  ledger.stageFailure = "before_write";
+  const first = await loop.runCycle({ roleId: "developer" });
+  assert.equal(first.retried, 1);
+  assert.equal(ledger.items[0].statusReason, "delivery_failed");
+  time.advance(1_000);
+
+  ledger.stageFailure = "before_write";
+  const second = await loop.runCycle({ roleId: "developer" });
+  assert.equal(second.blocked, 1);
+  assert.equal(ledger.items[0].statusReason, "delivery_attempts_exhausted");
+  assert.equal(ledger.calls.stageIntent.length, 2);
+  assert.equal(ledger.calls.scheduleRetry[0].reason, "delivery_failed");
+  assert.equal(
+    ledger.calls.transition[0].reason,
+    "delivery_attempts_exhausted",
+  );
+});
+
 test("trusted specialist generic decisions retain the durable stage path", async () => {
   const time = controlledClock();
   const source = workItem(32, { type: "role", id: "tester" });
@@ -1185,6 +1669,53 @@ test("trusted specialist generic decisions retain the durable stage path", async
   assert.equal(cycle.staged, 1);
   assert.equal(serviceCalls, 0);
   assert.equal(ledger.calls.stageIntent.length, 1);
+});
+
+test("task-brain owner decisions enter one durable attention request without fallback", async (t) => {
+  for (const code of [
+    "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+    "BRAIN_PROVIDER_NOT_CONFIGURED",
+    "BRAIN_CREDENTIAL_UNAVAILABLE",
+    "REMOTE_DATA_NOT_AUTHORIZED",
+  ]) {
+    await t.test(code, async () => {
+      const time = controlledClock();
+      const source = workItem(80, { type: "role", id: "developer" });
+      const ledger = new FakeLedger({ source: [source], time });
+      let decisions = 0;
+      const directory = new FakeRoleDirectory({
+        developer: worker({
+          roleId: "developer",
+          decide: async () => {
+            decisions += 1;
+            throw Object.assign(new Error(code), { code });
+          },
+        }),
+      });
+      const loop = createLoop({
+        ledger,
+        directory,
+        time,
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            return contextPacket(item, roleId);
+          },
+        },
+        orchestratorService: { async execute() {} },
+      });
+
+      const cycle = await loop.runCycle({ roleId: "developer" });
+
+      assert.equal(cycle.staged, 1);
+      assert.equal(decisions, 1);
+      assert.equal(ledger.calls.scheduleRetry.length, 0);
+      assert.equal(ledger.calls.transition.length, 0);
+      assert.equal(ledger.outbox.length, 1);
+      assert.equal(ledger.outbox[0].intent.type, "ask_user");
+      assert.match(ledger.outbox[0].intent.reason, new RegExp(code));
+      assert.equal(ledger.outbox[0].intent.choices[0].id, "configured-retry");
+    });
+  }
 });
 
 test("a child-blocked configured root orchestrates without obtaining a lease", async () => {
@@ -1353,6 +1884,40 @@ test("a child-blocked root generic decision stays unclaimed", async () => {
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);
   assert.equal(serviceCalls, 0);
+});
+
+test("a superseded child is terminal and does not block root completion", async () => {
+  const time = controlledClock();
+  const root = workItem(142, { type: "role", id: "orchestrator" });
+  const child = workItem(143, { type: "role", id: "developer" });
+  child.graph = { parentItemId: root.itemId, dependsOnItemIds: [] };
+  child.status = "superseded";
+  const ledger = new FakeLedger({ source: [root, child], time });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async () => completeDecision(),
+    }),
+    developer: worker({ roleId: "developer" }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(cycle.claimed, 1);
+  assert.equal(ledger.calls.stageIntent.length, 1);
 });
 
 test("a ready root decides before claiming and staging a generic intent", async () => {

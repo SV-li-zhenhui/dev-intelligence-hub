@@ -15,7 +15,17 @@ const dryRunExample = JSON.stringify(
   2,
 );
 
-function initialState() {
+function emptyOwnerDraft() {
+  return {
+    workType: "general",
+    priority: "normal",
+    title: "",
+    description: "",
+    acceptanceCriteria: "",
+  };
+}
+
+function initialState(requestIdFactory) {
   return {
     loaded: false,
     loading: false,
@@ -27,6 +37,11 @@ function initialState() {
     dryRunLoading: false,
     dryRunResult: null,
     dryRunError: "",
+    ownerRequestId: requestIdFactory(),
+    ownerDraft: emptyOwnerDraft(),
+    ownerRequestLoading: false,
+    ownerRequestResult: null,
+    ownerRequestError: "",
   };
 }
 
@@ -175,6 +190,65 @@ function dryRunResult(state) {
     </div>`;
 }
 
+function selectedOption(value, expected) {
+  return value === expected ? " selected" : "";
+}
+
+function ownerRequestFeedback(state) {
+  if (state.ownerRequestError) {
+    return `<p class="workflow-inline-error" role="alert">${escapeWorkflowHtml(state.ownerRequestError)}</p>`;
+  }
+  const result = state.ownerRequestResult;
+  if (!result) {
+    return '<p class="workflow-help">请求会先写入本地审计，再经可信路由进入唯一共享任务图；提交不会授予代码或 GitHub 权限。</p>';
+  }
+  return `<div class="workflow-dry-run-result" role="status">
+    <strong>${result.deduplicated ? "请求已存在，已返回同一任务" : "已进入共享任务图"}</strong>
+    <span>${escapeWorkflowHtml(targetLabel(result.assignment?.target))} · ${escapeWorkflowHtml(result.phase || "unknown")}</span>
+    <small>请求 ${escapeWorkflowHtml(result.requestId)} · 工作项 ${escapeWorkflowHtml(result.workItemId || "等待台账接收")}</small>
+  </div>`;
+}
+
+function ownerRequestPanel(state) {
+  const draft = state.ownerDraft || emptyOwnerDraft();
+  const loading = state.ownerRequestLoading === true;
+  return `<section class="section workflow-panel workflow-owner-request">
+    <div class="section-heading"><h2>创建共享工作</h2><span>OWNER → ROUTER → ORCHESTRATOR</span></div>
+    <p class="workflow-safety-note">这里只收集业务目标。岗位、内部节点、工具与权限由可信配置决定，页面不能指定。</p>
+    <form id="owner-work-request-form" class="workflow-owner-form">
+      <div class="workflow-owner-fields">
+        <label>工作类型
+          <select name="workType"${loading ? " disabled" : ""}>
+            <option value="general"${selectedOption(draft.workType, "general")}>综合协调</option>
+            <option value="requirements"${selectedOption(draft.workType, "requirements")}>需求梳理</option>
+            <option value="development"${selectedOption(draft.workType, "development")}>开发实现</option>
+            <option value="testing"${selectedOption(draft.workType, "testing")}>测试验收</option>
+            <option value="pull_request"${selectedOption(draft.workType, "pull_request")}>PR 推进</option>
+          </select>
+        </label>
+        <label>优先级
+          <select name="priority"${loading ? " disabled" : ""}>
+            <option value="normal"${selectedOption(draft.priority, "normal")}>普通</option>
+            <option value="high"${selectedOption(draft.priority, "high")}>高</option>
+            <option value="urgent"${selectedOption(draft.priority, "urgent")}>紧急</option>
+          </select>
+        </label>
+      </div>
+      <label>标题
+        <input name="title" maxlength="256" required value="${escapeWorkflowHtml(draft.title)}" placeholder="一句话说明要完成什么"${loading ? " disabled" : ""} />
+      </label>
+      <label>目标与背景
+        <textarea name="description" maxlength="12288" required placeholder="说明结果、约束和必要背景"${loading ? " disabled" : ""}>${escapeWorkflowHtml(draft.description)}</textarea>
+      </label>
+      <label>验收条件（每行一条，最多 20 条，每条最多 1000 字节）
+        <textarea name="acceptanceCriteria" maxlength="20019" placeholder="例如：真实浏览器验证通过"${loading ? " disabled" : ""}>${escapeWorkflowHtml(draft.acceptanceCriteria)}</textarea>
+      </label>
+      <button class="refresh-button" type="submit"${loading ? " disabled" : ""}>${loading ? "正在创建…" : "创建并交给中枢"}</button>
+    </form>
+    ${ownerRequestFeedback(state)}
+  </section>`;
+}
+
 export function renderWorkflowView(state, { now = Date.now() } = {}) {
   if (!state.loaded) {
     return '<div class="empty">正在读取工作流配置与路由记录…</div>';
@@ -199,6 +273,7 @@ export function renderWorkflowView(state, { now = Date.now() } = {}) {
       <div><span>最大跳数</span><strong>${escapeWorkflowHtml(definition.maxHops ?? "—")}</strong></div>
     </section>
     <p class="workflow-safety-note">这里负责解释“什么工作给哪个岗位”。路由只生成本地分派与审计，不会执行代码或发布 GitHub；任何外部动作仍进入唯一确认队列。</p>
+    ${ownerRequestPanel(state)}
     <div class="workflow-columns">
       <section class="section workflow-panel">
         <div class="section-heading"><h2>当前路由配置</h2><span>v${escapeWorkflowHtml(current.version)} · ${escapeWorkflowHtml(String(current.digest || "").slice(0, 10))}</span></div>
@@ -245,8 +320,9 @@ export function createWorkflowView({
   fetchImpl = globalThis.fetch,
   onChange = () => {},
   clock = () => Date.now(),
+  requestIdFactory = () => globalThis.crypto.randomUUID(),
 } = {}) {
-  let state = initialState();
+  let state = initialState(requestIdFactory);
 
   function change(patch) {
     state = { ...state, ...patch };
@@ -315,7 +391,73 @@ export function createWorkflowView({
     }
   }
 
+  async function submitOwnerRequest(input) {
+    const draft = {
+      workType: String(input.workType || ""),
+      priority: String(input.priority || ""),
+      title: String(input.title || ""),
+      description: String(input.description || ""),
+      acceptanceCriteria: String(input.acceptanceCriteria || ""),
+    };
+    change({
+      ownerDraft: draft,
+      ownerRequestLoading: true,
+      ownerRequestResult: null,
+      ownerRequestError: "",
+    });
+    const request = {
+      schemaVersion: 1,
+      requestId: state.ownerRequestId,
+      workType: draft.workType,
+      priority: draft.priority,
+      title: draft.title,
+      description: draft.description,
+      acceptanceCriteria: draft.acceptanceCriteria
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter(Boolean),
+    };
+    try {
+      const response = await fetchImpl("/api/work/requests", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify(request),
+      });
+      const result = await responseJson(response, "创建共享工作");
+      change({
+        ownerRequestId: requestIdFactory(),
+        ownerDraft: emptyOwnerDraft(),
+        ownerRequestLoading: false,
+        ownerRequestResult: result,
+        ownerRequestError: "",
+      });
+    } catch (error) {
+      change({
+        ownerRequestLoading: false,
+        ownerRequestResult: null,
+        ownerRequestError: errorMessage(error),
+      });
+    }
+  }
+
   function bind(root) {
+    root.querySelector("#owner-work-request-form")?.addEventListener(
+      "submit",
+      (submitEvent) => {
+        submitEvent.preventDefault();
+        const form = new FormData(submitEvent.currentTarget);
+        submitOwnerRequest({
+          workType: form.get("workType"),
+          priority: form.get("priority"),
+          title: form.get("title"),
+          description: form.get("description"),
+          acceptanceCriteria: form.get("acceptanceCriteria"),
+        });
+      },
+    );
     root.querySelector("#workflow-dry-run-form")?.addEventListener(
       "submit",
       (submitEvent) => {
@@ -332,5 +474,6 @@ export function createWorkflowView({
     needsLoad: () => !state.loaded || Boolean(state.error),
     render: () => renderWorkflowView(state, { now: clock() }),
     submitDryRun,
+    submitOwnerRequest,
   };
 }

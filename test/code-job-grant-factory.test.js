@@ -8,7 +8,11 @@ import { createConflictPreparationBinding } from "../src/domain/conflict-prepara
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
-import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
+import {
+  CodeJobGrantFactory,
+  codeJobBrainDigest,
+  legacyCodeJobBrainDigest,
+} from "../src/services/code-job-grant-factory.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 
 function proposal(operation = "modify", roleId = "developer") {
@@ -229,7 +233,7 @@ function factory(overrides = {}) {
       developer: ["inspect", "modify", "verify"],
       tester: ["inspect", "verify"],
     },
-    brainByRole: {
+    taskBrainByRole: {
       developer: {
         provider: "ollama",
         model: "qwen3.5:9b",
@@ -249,6 +253,18 @@ function factory(overrides = {}) {
     },
     ...overrides,
   });
+}
+
+function localBrain({
+  provider = "ollama",
+  model = "qwen3.5:9b",
+  remoteData = { requirements: false, code: false, memory: false },
+} = {}) {
+  return { provider, model, remoteData };
+}
+
+function brainsByRole(brain = localBrain()) {
+  return { developer: brain, tester: brain };
 }
 
 function proposalWithAuthority(value, authority) {
@@ -280,6 +296,7 @@ test("trusted authority seals workspace, operation, profile, and brain bindings"
   const options = factory().create(proposal());
 
   assert.equal(options.grant.schemaVersion, 2);
+  assert.equal(options.grant.brainBindingSchema, 2);
   assert.equal(options.grant.inputBinding.headRefOid, "a".repeat(40));
   assert.equal(options.grant.operation, "modify");
   assert.deepEqual(options.grant.allowedActions, [
@@ -300,6 +317,60 @@ test("trusted authority seals workspace, operation, profile, and brain bindings"
   assert.equal(Object.isFrozen(options.allowedOperationsByRole), true);
 });
 
+test("task brain digests are domain-separated from historical routine brains", () => {
+  const brain = localBrain();
+  const brainProviders = {
+    ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+  };
+
+  assert.notEqual(
+    codeJobBrainDigest({
+      roleId: "developer",
+      taskBrain: brain,
+      brainProviders,
+    }),
+    legacyCodeJobBrainDigest({
+      roleId: "developer",
+      brain,
+      brainProviders,
+    }),
+  );
+});
+
+test("historical brain bindings require an explicit verify-only factory", () => {
+  const brain = localBrain();
+  const brainProviders = {
+    ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+  };
+  const { grantDigest: _grantDigest, ...currentGrant } =
+    factory().create(proposal()).grant;
+  delete currentGrant.brainBindingSchema;
+  const historicalGrant = createCodeJobGrant({
+    ...currentGrant,
+    brainDigest: legacyCodeJobBrainDigest({
+      roleId: "developer",
+      brain,
+      brainProviders,
+    }),
+  });
+  const recovery = factory({
+    taskBrainByRole: undefined,
+    legacyBrainByRole: brainsByRole(brain),
+  });
+
+  assert.deepEqual(recovery.verify(historicalGrant), historicalGrant);
+  assert.throws(
+    () => recovery.create(proposal()),
+    (error) =>
+      error?.code === "INVALID_CODE_JOB_AUTHORITY" &&
+      error.message.includes("不能创建"),
+  );
+  assert.throws(
+    () => factory().verify(historicalGrant),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+});
+
 test("conflict authority seals the full preparation and only its writable paths", () => {
   const verified = [];
   const grants = factory({
@@ -313,6 +384,7 @@ test("conflict authority seals the full preparation and only its writable paths"
   const options = grants.create(conflictProposal());
 
   assert.equal(options.grant.schemaVersion, 3);
+  assert.equal(options.grant.brainBindingSchema, 2);
   assert.equal(options.grant.inputBinding.schemaVersion, 2);
   assert.deepEqual(options.grant.writablePaths, ["src/value.js"]);
   assert.deepEqual(
@@ -510,7 +582,7 @@ test("conflict scope, capability, and configuration fail before external verifie
         return structuredClone(binding);
       },
     },
-    brainByRole: {
+    taskBrainByRole: {
       developer: {
         provider: "ollama",
         model: "qwen3.5:changed",
@@ -653,13 +725,31 @@ test("stale policy versions and revoked repository bindings fail closed", () => 
   );
 });
 
-test("brain and sandbox changes produce different sealed grants", () => {
+test("task brain and sandbox changes invalidate only their sealed bindings", () => {
   const value = proposal();
   const first = factory().create(value).grant;
-  const changedBrain = factory({
+  const changedProviderConfiguration = factory({
     brainProviders: {
       ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:22434" },
     },
+  }).create(value).grant;
+  const changedTaskBrain = factory({
+    taskBrainByRole: brainsByRole(localBrain({ model: "code-model-v2" })),
+  }).create(value).grant;
+  const changedTaskProvider = factory({
+    taskBrainByRole: brainsByRole(localBrain({ provider: "code-provider" })),
+    brainProviders: {
+      ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
+      "code-provider": {
+        kind: "ollama",
+        baseUrl: "http://127.0.0.1:11434",
+      },
+    },
+  }).create(value).grant;
+  const changedRemoteData = factory({
+    taskBrainByRole: brainsByRole(localBrain({
+      remoteData: { requirements: true, code: false, memory: false },
+    })),
   }).create(value).grant;
   const changedProfile = factory({
     executorAuthority: {
@@ -677,8 +767,22 @@ test("brain and sandbox changes produce different sealed grants", () => {
     },
   }).create(value).grant;
 
-  assert.notEqual(first.brainDigest, changedBrain.brainDigest);
-  assert.notEqual(first.grantDigest, changedBrain.grantDigest);
+  for (const changedBrain of [
+    changedProviderConfiguration,
+    changedTaskBrain,
+    changedTaskProvider,
+    changedRemoteData,
+  ]) {
+    assert.notEqual(first.brainDigest, changedBrain.brainDigest);
+    assert.notEqual(first.grantDigest, changedBrain.grantDigest);
+    assert.deepEqual(changedBrain.allowedActions, first.allowedActions);
+    assert.deepEqual(changedBrain.writablePaths, first.writablePaths);
+    assert.deepEqual(changedBrain.requiredProfiles, first.requiredProfiles);
+    assert.equal(
+      changedBrain.workspaceAuthorityDigest,
+      first.workspaceAuthorityDigest,
+    );
+  }
   assert.notEqual(first.grantDigest, changedProfile.grantDigest);
 });
 
@@ -694,6 +798,14 @@ test("execution-time verification fences every changed authority surface", () =>
       brainProviders: {
         ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:22434" },
       },
+    }),
+    factory({
+      taskBrainByRole: brainsByRole(localBrain({ model: "code-model-v2" })),
+    }),
+    factory({
+      taskBrainByRole: brainsByRole(localBrain({
+        remoteData: { requirements: true, code: false, memory: false },
+      })),
     }),
     factory({
       executorAuthority: {
@@ -736,10 +848,19 @@ test("authority, policy, and brain configuration must be complete", () => {
     () => factory({ codeActionRoles: [] }),
     (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
   );
-  assert.throws(
-    () => factory({ brainByRole: { developer: undefined } }),
-    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
-  );
+  for (const grants of [
+    factory({ taskBrainByRole: { developer: undefined, tester: localBrain() } }),
+    factory({ taskBrainByRole: { developer: null, tester: localBrain() } }),
+    factory({
+      taskBrainByRole: undefined,
+      brainByRole: brainsByRole(),
+    }),
+  ]) {
+    assert.throws(
+      () => grants.create(proposal()),
+      (error) => error?.code === "CODE_TASK_BRAIN_NOT_CONFIGURED",
+    );
+  }
 });
 
 test("PR grants require an exact Git Head workspace and a live input verifier", () => {
@@ -870,6 +991,7 @@ test("legacy grants remain readable but cannot authorize a new execution", () =>
   const current = factory().create(proposal()).grant;
   const {
     schemaVersion: _schemaVersion,
+    brainBindingSchema: _brainBindingSchema,
     inputBinding: _inputBinding,
     grantDigest: _grantDigest,
     ...legacyContent

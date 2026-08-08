@@ -96,11 +96,22 @@ test("normalizes every bounded employee intent without trusted targets", () => {
       checkAfterSeconds: 3600,
     },
     {
+      ...common("query_memory"),
+      question: "上次同类回归是如何修复的？",
+      searchQuery: "同类 回归 修复",
+      mode: "local",
+    },
+    {
       ...common("propose_github_review"),
       deliverableId: "review.primary",
       verdict: "request_changes",
       body: "空值分支会错误地发布旧状态，请先修复。",
       evidence: ["src/service.js:42"],
+    },
+    {
+      ...common("propose_github_pull_request_action"),
+      action: { type: "comment", body: "我会继续跟进这个问题。" },
+      evidence: ["thread:unanswered"],
     },
     {
       ...common("propose_code_action"),
@@ -109,6 +120,14 @@ test("normalizes every bounded employee intent without trusted targets", () => {
       objective: "修复空值分支并保持接口兼容",
       acceptanceCriteria: ["现有测试通过", "新增回归测试"],
       evidence: ["失败发生在状态转换之后"],
+    },
+    {
+      ...common("propose_configuration_change"),
+      changes: [
+        { path: ["employees", "roles", "developer", "scheduleMinutes"], value: 15 },
+        { path: ["employees", "roles", "developer", "brain", "model"], value: "qwen3.5:9b" },
+      ],
+      evidence: ["岗位巡检频率与当前负载不匹配"],
     },
     {
       ...common("handoff"),
@@ -139,6 +158,39 @@ test("normalizes every bounded employee intent without trusted targets", () => {
     ]) {
       assert.equal(serialized.includes(`\"${forbidden}\"`), false);
     }
+  }
+});
+
+test("normalizes five separately confirmed pull request action decisions", () => {
+  const evidenceId = `controlled-git-commit-${"a".repeat(64)}`;
+  const actions = [
+    { type: "comment", body: "请补充失败日志。" },
+    { type: "review", verdict: "request_changes", body: "空值分支需要修复。" },
+    { type: "update_branch" },
+    { type: "push", controlledCommitEvidenceId: evidenceId },
+    { type: "merge", method: "squash" },
+  ];
+  for (const action of actions) {
+    const intent = {
+      ...common("propose_github_pull_request_action"),
+      action,
+      evidence: ["trusted-task-context"],
+    };
+    assert.deepEqual(normalizeWorkIntent(intent), intent);
+  }
+
+  for (const action of [
+    { type: "comment", body: "" },
+    { type: "review", verdict: "merge", body: "错误 verdict" },
+    { type: "update_branch", body: "unexpected" },
+    { type: "push", controlledCommitEvidenceId: "model-invented" },
+    { type: "merge", method: "force" },
+  ]) {
+    assertInvalid({
+      ...common("propose_github_pull_request_action"),
+      action,
+      evidence: [],
+    });
   }
 });
 
@@ -247,7 +299,7 @@ test("structured brain parser accepts orchestration and delivery decisions", () 
   assert.equal(
     variants.some(({ properties }) =>
       properties?.type?.const === "orchestrate" &&
-      properties.action?.oneOf?.length === 7),
+      properties.action?.oneOf?.length === 8),
     true,
   );
   assert.equal(
@@ -288,6 +340,47 @@ test("rejects targets, capabilities, and executable details outside the contract
   }
 });
 
+test("configuration proposals reject objects, duplicate paths, credentials, and identity authority", () => {
+  const proposal = {
+    ...common("propose_configuration_change"),
+    changes: [{ path: ["refreshMinutes"], value: 15 }],
+    evidence: [],
+  };
+  assert.deepEqual(normalizeWorkIntent(proposal), proposal);
+
+  for (const changes of [
+    [],
+    [{ path: ["refreshMinutes"], value: { raw: 15 } }],
+    [{ path: ["refreshMinutes"], value: [15] }],
+    [{ path: ["refreshMinutes"], value: null }],
+    [
+      { path: ["refreshMinutes"], value: 15 },
+      { path: ["refreshMinutes"], value: 20 },
+    ],
+    [{ path: ["brainProviders", "remote", "apiKeyEnv"], value: "KEY" }],
+    [{ path: ["githubActions", "tokenEnv"], value: "TOKEN" }],
+    [{ path: ["githubActions", "networkEnv", "HTTP_PROXY"], value: "PROXY" }],
+    [{ path: ["githubActions", "actorAccountId"], value: "someone" }],
+    [{ path: ["githubLogin"], value: "someone" }],
+    [{ path: ["workCoordination", "enabled"], value: false }],
+    [{ path: ["__proto__", "enabled"], value: true }],
+    [{ path: ["employees", "roles", "developer", "mission"], value: "ghp_1234567890secret" }],
+  ]) {
+    assertInvalid({ ...proposal, changes });
+  }
+
+  for (const change of [
+    { path: ["brainProviders", "ollama", "contextTokens"], value: 8192 },
+    { path: ["employees", "roles", "developer", "brain", "model"], value: "qwen3.5:9b" },
+    { path: ["employees", "roles", "developer", "scheduleMinutes"], value: 15 },
+  ]) {
+    assert.deepEqual(
+      normalizeWorkIntent({ ...proposal, changes: [change] }).changes,
+      [change],
+    );
+  }
+});
+
 test("rejects unknown schemas, malformed variants, and oversized text", () => {
   const ask = {
     ...common("ask_user"),
@@ -303,6 +396,9 @@ test("rejects unknown schemas, malformed variants, and oversized text", () => {
     { ...common("wait_condition"), condition: { kind: "workflow_fact", fact: "ci-status", oneOf: [] }, checkAfterSeconds: 300 },
     { ...common("wait_condition"), condition: { kind: "time", notBefore: "tomorrow" }, checkAfterSeconds: 300 },
     { ...common("wait_condition"), condition: { kind: "time", notBefore: "2026-08-03T01:02:03.000Z" }, checkAfterSeconds: 1 },
+    { ...common("query_memory"), question: "查询", searchQuery: "查询", mode: "remote" },
+    { ...common("query_memory"), question: "查询", searchQuery: "x".repeat(1_025), mode: "local" },
+    { ...common("query_memory"), question: "查询", searchQuery: "查询", mode: "local", url: "https://example.com" },
     { ...common("propose_github_review"), verdict: "merge", body: "merge", evidence: [] },
     { ...common("propose_github_review"), verdict: "comment", body: "x".repeat(16 * 1024 + 1), evidence: [] },
     { ...common("propose_github_review"), deliverableId: "Review", verdict: "comment", body: "review", evidence: [] },

@@ -116,9 +116,21 @@ function normalizeProvider(value) {
   ) {
     throw new TypeError("brain provider is invalid");
   }
+  const attemptDescriptor = Object.getOwnPropertyDescriptor(
+    value,
+    "singleAttempt",
+  );
+  if (
+    attemptDescriptor &&
+    (!("value" in attemptDescriptor) ||
+      typeof attemptDescriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain provider is invalid");
+  }
   return Object.freeze({
     id,
     remote: value.remote,
+    singleAttempt: attemptDescriptor?.value === true,
     generate: value.generate.bind(value),
   });
 }
@@ -129,6 +141,7 @@ function frozenDescription(provider, brain) {
     model: brain.model,
     remote: provider.remote,
     remoteData: Object.freeze({ ...brain.remoteData }),
+    ...(provider.singleAttempt ? { singleAttempt: true } : {}),
   });
 }
 

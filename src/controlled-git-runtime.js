@@ -509,6 +509,26 @@ function lookupMirror(mirrors, repository, role) {
 }
 
 function createPorts(service, { baseMirrors, headMirrors }) {
+  const createControlledCommit = method(
+    service,
+    "createControlledCommit",
+    "ControlledGitService",
+  );
+  const findControlledCommit = method(
+    service,
+    "findControlledCommit",
+    "ControlledGitService",
+  );
+  const verifyControlledCommit = method(
+    service,
+    "verifyControlledCommit",
+    "ControlledGitService",
+  );
+  const publishControlledCommit = method(
+    service,
+    "publishControlledCommit",
+    "ControlledGitService",
+  );
   const inspectConflict = method(service, "inspectConflict", "ControlledGitService");
   const verifyConflictPreparation = method(
     service,
@@ -524,6 +544,14 @@ function createPorts(service, { baseMirrors, headMirrors }) {
   const materializer = Object.freeze({
     materialize: (request) =>
       materializeConflictPreparationForCodeJob(request),
+  });
+  const commitBuilder = Object.freeze({
+    create: (request) => createControlledCommit(request),
+    find: (request) => findControlledCommit(request),
+    verify: (request) => verifyControlledCommit(request),
+  });
+  const publisher = Object.freeze({
+    publish: (request) => publishControlledCommit(request),
   });
   const verifier = Object.freeze({
     verify: (binding) => verifyConflictPreparation({ binding }),
@@ -627,7 +655,13 @@ function createPorts(service, { baseMirrors, headMirrors }) {
       return deepFreeze(normalizedSource);
     },
   });
-  return Object.freeze({ materializer, verifier, preparer });
+  return Object.freeze({
+    commitBuilder,
+    materializer,
+    publisher,
+    verifier,
+    preparer,
+  });
 }
 
 export async function createControlledGitRuntimeBundle(
@@ -659,6 +693,11 @@ export async function createControlledGitRuntimeBundle(
     service = normalizedDependencies.controlledGitServiceFactory
       ? normalizedDependencies.controlledGitServiceFactory(serviceConfig)
       : new ControlledGitService(serviceConfig);
+    await method(
+      service,
+      "recoverControlledCommits",
+      "ControlledGitService",
+    )();
   } catch (cause) {
     if (cause instanceof ControlledGitRuntimeError) throw cause;
     throw runtimeError(

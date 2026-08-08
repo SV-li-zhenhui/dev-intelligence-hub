@@ -7,6 +7,11 @@ import {
 } from "../domain/work-intent-dispatch-binding.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
+  normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
+} from
+  "../domain/pull-request-execution-binding.js";
+import {
   boundedLedgerString,
   canonicalLedgerValue,
   cloneLedgerValue,
@@ -41,6 +46,9 @@ import {
   createPullRequestSourceRootWorkItem,
 } from "./work-ledger-records.js";
 import {
+  normalizeWorkResultAttestation,
+} from "./work-ledger-result-attestation.js";
+import {
   appendPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
@@ -52,10 +60,11 @@ import {
 } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 10;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 11;
 const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
 const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
 const PR_INPUT_BINDING_STATE_SCHEMA_VERSION = 9;
+const RESULT_ATTESTATION_STATE_SCHEMA_VERSION = 10;
 const LEGACY_PR_SOURCE_UNSTARTED_INTENT_REASON =
   "pr_source_legacy_cutover_before_dispatch";
 const LEGACY_PR_SOURCE_IDLE_STATUSES = new Set([
@@ -883,6 +892,26 @@ function normalizeTimelineEntry(value, stateRevision, limits) {
   ) {
     throw corrupted("员工工作时间线摘要或类型损坏");
   }
+  const details = canonicalStoredValue(value.details, "时间线详情损坏");
+  if (Object.hasOwn(details, "inputBinding")) {
+    if (
+      !Number.isSafeInteger(details.workItemRevision) ||
+      details.workItemRevision < 1 ||
+      typeof details.inputDigest !== "string" ||
+      !SHA256_PATTERN.test(details.inputDigest)
+    ) {
+      throw corrupted("员工工作时间线权威描述损坏");
+    }
+    if (details.inputBinding !== null) {
+      try {
+        details.inputBinding = normalizePullRequestExecutionBinding(
+          details.inputBinding,
+        );
+      } catch {
+        throw corrupted("员工工作时间线 PR 输入绑定损坏");
+      }
+    }
+  }
   const entry = {
     timelineId,
     contentDigest,
@@ -891,12 +920,123 @@ function normalizeTimelineEntry(value, stateRevision, limits) {
     type: value.type,
     at: timestamp(value.at, "timeline.at"),
     actorId: optionalString(value.actorId, "actorId", 128),
-    details: canonicalStoredValue(value.details, "时间线详情损坏"),
+    details,
   };
   if (prettySerializedLedgerBytes(entry) > limits.timelineByteBudget) {
     throw corrupted("员工工作时间线超过容量");
   }
   return entry;
+}
+
+function validateTimelineInputAuthorities(state) {
+  const itemById = new Map(state.items.map((item) => [item.itemId, item]));
+  const outboxById = new Map(
+    state.outbox.map((entry) => [entry.intentId, entry]),
+  );
+  const outboxByDownstreamRef = new Map();
+  for (const outbox of state.outbox) {
+    const downstreamRef = outbox.outcome?.details?.downstreamRef;
+    if (typeof downstreamRef !== "string") continue;
+    outboxByDownstreamRef.set(
+      downstreamRef,
+      outboxByDownstreamRef.has(downstreamRef) ? null : outbox,
+    );
+  }
+  const fields = [
+    "workKey",
+    "inputRevision",
+    "headRevision",
+    "headRefOid",
+    "eventId",
+    "eventDigest",
+    "inputDigest",
+  ];
+  for (const entry of state.timeline) {
+    if (!Object.hasOwn(entry.details, "inputBinding")) continue;
+    const item = itemById.get(entry.itemId);
+    if (item === undefined) {
+      throw corrupted("员工工作时间线找不到绑定工作项");
+    }
+    let outbox = typeof entry.details.intentId === "string"
+      ? outboxById.get(entry.details.intentId)
+      : undefined;
+    if (entry.type === "proposal_result_applied" && outbox === undefined) {
+      outbox = outboxByDownstreamRef.get(entry.details.proposalId);
+    }
+    if (entry.type === "intent_staged") {
+      validateIntentStagedTimeline(entry, outbox);
+    }
+    validateResultTimelineAttestation(entry, item, outbox);
+    const binding = entry.details.inputBinding;
+    if (binding === null) {
+      if (currentWorkItemInputBinding(item) !== null) {
+        throw corrupted("员工工作时间线缺少 PR 输入绑定");
+      }
+      continue;
+    }
+    const root = itemById.get(binding.rootItemId);
+    if (
+      root?.source?.kind !== "pull_request" ||
+      root.source.identity.repository !== binding.repository ||
+      root.source.identity.pullRequestNumber !== binding.pullRequestNumber ||
+      root.source.workKey !== binding.workKey
+    ) {
+      throw corrupted("员工工作时间线 PR 来源绑定不一致");
+    }
+    const revision = root.source.revisions[binding.inputRevision - 1];
+    if (
+      revision === undefined ||
+      revision.headRevision !== binding.headRevision ||
+      revision.headRefOid !== binding.headRefOid ||
+      revision.eventId !== binding.eventId ||
+      revision.eventDigest !== binding.eventDigest ||
+      revision.inputDigest !== binding.inputDigest ||
+      Date.parse(entry.at) < Date.parse(revision.occurredAt)
+    ) {
+      throw corrupted("员工工作时间线 PR 修订绑定不一致");
+    }
+    if (item.itemId !== root.itemId) {
+      const inherited = currentWorkItemInputBinding(item);
+      if (
+        inherited === null ||
+        fields.some((field) => inherited[field] !== binding[field]) ||
+        inherited.rootItemId !== binding.rootItemId
+      ) {
+        throw corrupted("员工工作时间线 PR 工作项绑定不一致");
+      }
+    }
+    const timelineInputDigest = item.itemId === root.itemId
+      ? binding.inputDigest
+      : item.inputDigest;
+    if (entry.details.inputDigest !== timelineInputDigest) {
+      throw corrupted("员工工作时间线 PR 工作修订绑定不一致");
+    }
+    if (
+      outbox === undefined ||
+      outbox === null ||
+      outbox.itemId !== item.itemId ||
+      outbox.inputDigest !== timelineInputDigest ||
+      !samePullRequestBinding(outbox.sourceBinding, binding) ||
+      Date.parse(entry.at) < Date.parse(outbox.createdAt)
+    ) {
+      throw corrupted("员工工作时间线 PR 意图绑定不一致");
+    }
+    const dispatchInputBinding =
+      outbox.dispatchBinding?.boundIntent?.binding?.inputBinding;
+    if (dispatchInputBinding !== undefined) {
+      let normalizedDispatchBinding;
+      try {
+        normalizedDispatchBinding = normalizePullRequestExecutionBinding(
+          dispatchInputBinding,
+        );
+      } catch {
+        throw corrupted("员工工作时间线 PR 策略绑定损坏");
+      }
+      if (!samePullRequestExecutionBinding(normalizedDispatchBinding, binding)) {
+        throw corrupted("员工工作时间线 PR 策略绑定不一致");
+      }
+    }
+  }
 }
 
 function normalizeIntent(value) {
@@ -1057,6 +1197,168 @@ function samePullRequestBinding(left, right) {
     left.eventId === right.eventId &&
     left.eventDigest === right.eventDigest &&
     left.inputDigest === right.inputDigest;
+}
+
+const PROPOSAL_RESULT_INTENT_TYPES = new Map([
+  ["github_review_proposal", "propose_github_review"],
+  [
+    "github_pull_request_action_proposal",
+    "propose_github_pull_request_action",
+  ],
+  ["code_action_proposal", "propose_code_action"],
+  ["configuration_change_proposal", "propose_configuration_change"],
+]);
+
+const RESULT_TIMELINE_TYPES = new Set([
+  "proposal_result_applied",
+  "attention_answer_applied",
+  "attention_rejection_applied",
+]);
+
+function sameLedgerValue(left, right) {
+  try {
+    return ledgerDigest(left) === ledgerDigest(right);
+  } catch {
+    return false;
+  }
+}
+
+function expectedProposalDecision(result) {
+  return createWorkDecisionContext({
+    source: "proposal",
+    referenceId: result.proposalId,
+    outcome: result.outcome,
+    value: {
+      kind: result.kind,
+      resultId: result.resultId,
+      resultDigest: result.contentDigest,
+      summary: result.summary,
+      downstreamRef: result.downstreamRef,
+      evidence: result.evidence,
+    },
+    observedAt: result.at,
+  });
+}
+
+function expectedAttentionDecision(payload) {
+  return createWorkDecisionContext({
+    source: "attention",
+    referenceId: payload.requestId,
+    outcome: payload.result.kind,
+    value: {
+      answer: payload.result.answer,
+      requestContentDigest: payload.requestContentDigest,
+      resultId: payload.result.resultId,
+      resultDigest: payload.result.contentDigest,
+    },
+    observedAt: payload.result.at,
+  });
+}
+
+function validateIntentStagedTimeline(entry, outbox) {
+  if (
+    outbox === undefined ||
+    outbox === null ||
+    entry.details.intentId !== outbox.intentId ||
+    entry.details.intentDigest !== outbox.intentDigest ||
+    entry.details.intentType !== outbox.intent.type ||
+    entry.details.inputDigest !== outbox.inputDigest ||
+    !sameLedgerValue(entry.details.requestedBy, outbox.requestedBy)
+  ) {
+    throw corrupted("员工工作意图时间线与 outbox 身份不一致");
+  }
+  if (outbox.intent.type !== "ask_user") return;
+  const consultationRequest = {
+    summary: outbox.intent.summary,
+    reason: outbox.intent.reason,
+    question: outbox.intent.question,
+    choices: outbox.intent.choices,
+  };
+  if (!sameLedgerValue(entry.details.consultationRequest, consultationRequest)) {
+    throw corrupted("员工请示时间线与 outbox 请求不一致");
+  }
+}
+
+function validateProposalResultTimeline(entry, item, outbox, attestation) {
+  const result = attestation.payload;
+  const decision = expectedProposalDecision(result);
+  const outcome = outbox.outcome;
+  if (
+    attestation.kind !== "proposal_result" ||
+    attestation.intentId !== outbox.intentId ||
+    entry.details.intentId !== outbox.intentId ||
+    attestation.decisionContentDigest !== decision.contentDigest ||
+    result.requestedBy.workItemId !== item.itemId ||
+    result.requestedBy.roleId !== outbox.requestedBy.roleId ||
+    PROPOSAL_RESULT_INTENT_TYPES.get(result.kind) !== outbox.intent.type ||
+    outcome?.status !== "delivered" ||
+    outcome.details?.downstreamRef !== result.proposalId ||
+    outcome.details?.proposalDigest !== result.proposalContentDigest ||
+    entry.details.proposalId !== result.proposalId ||
+    entry.details.resultRef !== result.resultId ||
+    entry.details.outcome !== result.outcome ||
+    entry.details.downstreamRef !== result.downstreamRef ||
+    !sameLedgerValue(entry.details.evidenceRefs, result.evidence) ||
+    !sameLedgerValue(entry.details.decision, decision)
+  ) {
+    throw corrupted("员工工作提案结果凭据不一致");
+  }
+}
+
+function validateAttentionResultTimeline(entry, item, outbox, attestation) {
+  const payload = attestation.payload;
+  const decision = expectedAttentionDecision(payload);
+  const expectedType = payload.result.kind === "rejected"
+    ? "attention_rejection_applied"
+    : "attention_answer_applied";
+  if (
+    attestation.kind !== "attention_result" ||
+    attestation.intentId !== outbox.intentId ||
+    payload.requestKey !== outbox.intentId ||
+    entry.details.intentId !== outbox.intentId ||
+    attestation.decisionContentDigest !== decision.contentDigest ||
+    payload.producer.workItemId !== item.itemId ||
+    payload.producer.roleId !== outbox.requestedBy.roleId ||
+    outbox.intent.type !== "ask_user" ||
+    outbox.outcome?.status !== "delivered" ||
+    outbox.outcome.details?.questionRef !== payload.requestId ||
+    entry.type !== expectedType ||
+    entry.details.questionRef !== payload.requestId ||
+    entry.details.resultRef !== payload.result.resultId ||
+    entry.details.outcome !== payload.result.kind ||
+    entry.details.requestContentDigest !== payload.requestContentDigest ||
+    entry.details.resultDigest !== payload.result.contentDigest ||
+    !sameLedgerValue(entry.details.answer, payload.result.answer)
+  ) {
+    throw corrupted("员工请示结果凭据不一致");
+  }
+}
+
+function validateResultTimelineAttestation(entry, item, outbox) {
+  if (!RESULT_TIMELINE_TYPES.has(entry.type)) return;
+  const marker = entry.details.resultAttestationDigest;
+  const stored = outbox?.outcome?.details?.resultAttestation;
+  if (
+    typeof marker !== "string" ||
+    !SHA256_PATTERN.test(marker) ||
+    stored === undefined
+  ) {
+    throw corrupted("员工工作结果凭据缺失");
+  }
+  let attestation;
+  try {
+    attestation = normalizeWorkResultAttestation(stored);
+  } catch {
+    throw corrupted("员工工作结果凭据损坏");
+  }
+  if (marker !== attestation.attestationDigest || outbox === undefined) {
+    throw corrupted("员工工作结果凭据摘要不一致");
+  }
+  if (entry.type === "proposal_result_applied") {
+    validateProposalResultTimeline(entry, item, outbox, attestation);
+    return;
+  }
+  validateAttentionResultTimeline(entry, item, outbox, attestation);
 }
 
 export function assertWorkLedgerCapacity(state, limits) {
@@ -1439,7 +1741,7 @@ function migrateDispatchBindingState(value, limits) {
   ];
   let migrated = {
     ...value,
-    schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+    schemaVersion: RESULT_ATTESTATION_STATE_SCHEMA_VERSION,
     items: migratedItems,
     outbox: outbox.map((entry) => ({
       ...(unstartedIntentIds.has(entry.intentId)
@@ -1482,7 +1784,11 @@ function quarantineLegacyProposalBinding(entry) {
   }
   const bound = dispatchBinding.boundIntent;
   if (
-    !["github_review_proposal", "code_action_proposal"].includes(bound.kind) ||
+    ![
+      "github_review_proposal",
+      "github_pull_request_action_proposal",
+      "code_action_proposal",
+    ].includes(bound.kind) ||
     Object.hasOwn(bound.binding, "inputBinding")
   ) {
     return entry;
@@ -1490,6 +1796,51 @@ function quarantineLegacyProposalBinding(entry) {
   return {
     ...entry,
     dispatchBinding: { status: LEGACY_UNKNOWN_WORK_INTENT_BINDING },
+  };
+}
+
+function migrateUnattestedResultTimeline(entry) {
+  if (!RESULT_TIMELINE_TYPES.has(entry.type)) return entry;
+  const content = {
+    sequence: entry.sequence,
+    itemId: entry.itemId,
+    type: "legacy_result_discarded",
+    at: entry.at,
+    actorId: entry.actorId,
+    details: {
+      source: entry.type === "proposal_result_applied"
+        ? "proposal"
+        : "attention",
+      intentId: typeof entry.details.intentId === "string"
+        ? entry.details.intentId
+        : null,
+      resultRef: typeof entry.details.resultRef === "string"
+        ? entry.details.resultRef
+        : null,
+      originalTimelineId: entry.timelineId,
+      originalType: entry.type,
+      originalContentDigest: entry.contentDigest,
+      reason: "unsealed_result_attestation_migration",
+    },
+  };
+  const contentDigest = ledgerDigest(content);
+  return {
+    timelineId: `work-timeline-${contentDigest}`,
+    contentDigest,
+    ...content,
+  };
+}
+
+function migrateResultAttestationState(value, limits) {
+  const timeline = denseLedgerArrayValues(value.timeline);
+  if (timeline === null) throw corrupted("旧版员工工作时间线损坏");
+  const normalized = timeline.map((entry) =>
+    normalizeTimelineEntry(entry, value.revision, limits)
+  );
+  return {
+    ...value,
+    schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+    timeline: normalized.map(migrateUnattestedResultTimeline),
   };
 }
 
@@ -1732,9 +2083,29 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     }
     value = {
       ...value,
-      schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+      schemaVersion: RESULT_ATTESTATION_STATE_SCHEMA_VERSION,
       outbox: schema9Outbox.map(quarantineLegacyProposalBinding),
     };
+  }
+  if (
+    hasExactLedgerKeys(value, [
+      "schemaVersion",
+      "revision",
+      "intakeCursor",
+      "sourceHighWatermark",
+      "attentionCursor",
+      "attentionHighWatermark",
+      "proposalCursor",
+      "proposalHighWatermark",
+      "timelineStartSequence",
+      "nextTimelineSequence",
+      "items",
+      "timeline",
+      "outbox",
+      "graphMemoryProjection",
+    ]) && value.schemaVersion === RESULT_ATTESTATION_STATE_SCHEMA_VERSION
+  ) {
+    value = migrateResultAttestationState(value, limits);
   }
   const hasCurrentStateFields = hasExactLedgerKeys(value, [
     "schemaVersion",
@@ -1818,6 +2189,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
   } catch {
     throw corrupted("员工工作图结构损坏");
   }
+  validateTimelineInputAuthorities(state);
   try {
     const legacyAuthorityEpochMigrated = itemValues.some(
       (item) =>

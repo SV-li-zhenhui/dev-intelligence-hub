@@ -17,7 +17,9 @@ const MAX_CANONICAL_STRING_BYTES = 32 * 1024;
 
 export const WORK_PROPOSAL_KINDS = Object.freeze([
   "github_review_proposal",
+  "github_pull_request_action_proposal",
   "code_action_proposal",
+  "configuration_change_proposal",
 ]);
 
 export const WORK_PROPOSAL_STATUSES = Object.freeze([

@@ -76,11 +76,16 @@ test("memory runtime exposes least-authority frozen ports and closes once", asyn
   assert.deepEqual(Object.keys(runtime.producer).sort(), ["append", "appendBatch"]);
   assert.deepEqual(Object.keys(runtime.lifecycleProducer).sort(), [
     "adoptGraphCheckpoint",
+    "appendAuthorityProjection",
     "appendGraphEvents",
     "appendProjectionRecords",
     "appendWorkItems",
   ]);
-  assert.deepEqual(Object.keys(runtime.authorityReader), ["getAuthorityState"]);
+  assert.deepEqual(Object.keys(runtime.authorityReader).sort(), [
+    "getAuthorityProjectionState",
+    "getAuthorityState",
+    "requiresAuthorityProjectionCheckpoint",
+  ]);
   assert.deepEqual(Object.keys(runtime.search).sort(), ["getHealth", "search"]);
   assert.deepEqual(Object.keys(runtime.contextReader), ["readRecords"]);
   assert.deepEqual(Object.keys(runtime.receiptVerifier), ["verify"]);
@@ -313,6 +318,21 @@ test("memory runtime checks the live ledger revision and graph HWM on every read
     ledgerRevision: 1,
     authorityStateDigest: local.authorityStateDigest,
   });
+  await assert.rejects(
+    runtime.search.search({}),
+    (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+  );
+  await runtime.lifecycleProducer.appendAuthorityProjection({
+    records: [],
+    projectionState: {
+      schemaVersion: 4,
+      revision: 1,
+      workLedgerRevision: 1,
+      authorityStateDigest: local.authorityStateDigest,
+      confirmationHighWatermark: 0,
+      entries: [],
+    },
+  });
   assert.equal((await runtime.search.search({})).items.length, 1);
 
   status.graph.highWatermark = 1;
@@ -321,7 +341,46 @@ test("memory runtime checks the live ledger revision and graph HWM on every read
     runtime.search.search({}),
     (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
   );
-  assert.equal(reads, 7);
+  assert.equal(reads, 8);
+  await runtime.close();
+});
+
+test("memory runtime fails closed until the confirmation projection reaches its live HWM", async () => {
+  const events = [];
+  let highWatermark = 0;
+  const runtime = await createMemoryRuntime({
+    store: store(),
+    createGuard: () => guard(events),
+    confirmationAuthoritySource: {
+      async readStatus() {
+        return { highWatermark };
+      },
+    },
+  });
+
+  assert.equal((await runtime.search.search({})).items.length, 0);
+  highWatermark = 1;
+  await assert.rejects(
+    runtime.search.search({}),
+    (error) => error.code === "MEMORY_AUTHORITY_NOT_CURRENT",
+  );
+  await runtime.lifecycleProducer.appendAuthorityProjection({
+    records: [],
+    projectionState: {
+      schemaVersion: 4,
+      revision: 1,
+      workLedgerRevision: 0,
+      authorityStateDigest:
+        runtime.authorityReader.getAuthorityState().authorityStateDigest,
+      confirmationHighWatermark: 1,
+      entries: [],
+    },
+  });
+  assert.equal((await runtime.search.search({})).items.length, 0);
+  assert.equal(
+    (await runtime.search.getHealth()).confirmationMemoryHighWatermark,
+    1,
+  );
   await runtime.close();
 });
 

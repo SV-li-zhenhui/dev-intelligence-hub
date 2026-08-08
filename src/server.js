@@ -1,13 +1,37 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import {
+  createHash,
+  createHmac,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
+import {
+  appendFileSync,
+  closeSync,
+  createReadStream,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { createApplication } from "./composition-root.js";
+import {
+  createApplication,
+  createApplicationRuntimeLifecycle,
+} from "./composition-root.js";
 import {
   normalizeUnifiedDeferredOptions,
 } from "./domain/attention-deferred-contract.js";
 import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
+import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 import { projectRoot } from "./lib/config.js";
 import {
   CONFIGURATION_CONTROL_PLANE_LIMITS,
@@ -25,6 +49,37 @@ const mimeTypes = {
   ".js": "text/javascript; charset=utf-8",
   ".svg": "image/svg+xml",
 };
+function drainParticipant(id) {
+  return Object.freeze({ id });
+}
+
+export const DRAIN_PARTICIPANTS = Object.freeze({
+  refresh: drainParticipant("refresh"),
+  workflowRouting: drainParticipant("workflowRouting.ingestSnapshot"),
+  workCoordinationIntake: drainParticipant("workCoordination.intake"),
+  prConfirmationRecovery: drainParticipant(
+    "prReviewer.recoverConfirmations",
+  ),
+  workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
+  employeeExecution: drainParticipant(
+    "employeeRegistry.runSelected/runAll/run",
+  ),
+  memoryProjection: drainParticipant("memoryProjector.runCycle"),
+  confirmationOperation: drainParticipant("confirmationOperation"),
+});
+const registeredDrainParticipants = new Set(
+  Object.values(DRAIN_PARTICIPANTS),
+);
+
+function createDrainParticipantRunner(observeDrainParticipant) {
+  return function runDrainParticipant(participant, operation) {
+    if (!registeredDrainParticipants.has(participant)) {
+      throw new TypeError("background participant is not registered for drain");
+    }
+    observeDrainParticipant(participant);
+    return operation();
+  };
+}
 const browserSecurityHeaders = {
   "content-security-policy": [
     "default-src 'self'",
@@ -62,6 +117,346 @@ const confirmationHistoryRoleId =
   /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const confirmationHistoryCursor = /^[A-Za-z0-9_-]{16,512}$/;
 const defaultConfirmationHistoryLimit = 25;
+const ownerWorkRequestId =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const ownerWorkRequestMaximumBytes = 72 * 1024;
+const managedEnvironmentKeys = Object.freeze([
+  "MYDASHBOARD_MANAGED_TOKEN",
+  "MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY",
+  "MYDASHBOARD_MANAGED_PROJECT_DIGEST",
+  "MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS",
+  "MYDASHBOARD_MANAGED_LOG_DIRECTORY",
+  "MYDASHBOARD_MANAGED_INSTANCE_ID",
+  "MYDASHBOARD_MANAGED_START_IDENTITY",
+]);
+const managedInstanceId =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const managedStartIdentity = /^[a-f0-9]{64}$/u;
+const managedProjectDigest = /^[a-f0-9]{64}$/u;
+const managedLogMaximumBytes = 5 * 1024 * 1024;
+const managedLogArchiveCount = 4;
+const managedLogMaximumRecordBytes = 64 * 1024;
+const defaultShutdownDrainTimeoutMs = 30_000;
+
+function decodeManagedToken(token) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9+/]{43}=$/u.test(token)) {
+    throw new Error("managed process token is invalid");
+  }
+  const bytes = Buffer.from(token, "base64");
+  if (bytes.length !== 32 || bytes.toString("base64") !== token) {
+    throw new Error("managed process token is not a canonical 256-bit value");
+  }
+  return bytes;
+}
+
+export function readManagedProcessEnvironment(environment = process.env) {
+  const values = Object.fromEntries(
+    managedEnvironmentKeys.map((name) => [name, environment[name]]),
+  );
+  const supplied = Object.values(values).filter((value) => value !== undefined);
+  if (supplied.length === 0) return null;
+  try {
+    if (supplied.length !== managedEnvironmentKeys.length) {
+      throw new Error("managed process environment is incomplete");
+    }
+    const tokenBytes = decodeManagedToken(values.MYDASHBOARD_MANAGED_TOKEN);
+    const runtimeDirectory = path.resolve(
+      values.MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY,
+    );
+    const logDirectory = path.resolve(
+      values.MYDASHBOARD_MANAGED_LOG_DIRECTORY,
+    );
+    const claimTimeoutMilliseconds = Number(
+      values.MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS,
+    );
+    if (
+      !path.isAbsolute(values.MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY) ||
+      !path.isAbsolute(values.MYDASHBOARD_MANAGED_LOG_DIRECTORY) ||
+      path.dirname(logDirectory) !== runtimeDirectory ||
+      path.basename(logDirectory) !== "logs" ||
+      !managedProjectDigest.test(
+        values.MYDASHBOARD_MANAGED_PROJECT_DIGEST,
+      ) ||
+      !managedInstanceId.test(values.MYDASHBOARD_MANAGED_INSTANCE_ID) ||
+      !managedStartIdentity.test(
+        values.MYDASHBOARD_MANAGED_START_IDENTITY,
+      ) ||
+      !Number.isInteger(claimTimeoutMilliseconds) ||
+      claimTimeoutMilliseconds < 4_000 ||
+      claimTimeoutMilliseconds > 120_000
+    ) {
+      throw new Error("managed process environment contains invalid identity");
+    }
+    return Object.freeze({
+      token: values.MYDASHBOARD_MANAGED_TOKEN,
+      tokenBytes,
+      runtimeDirectory,
+      logDirectory,
+      projectDigest: values.MYDASHBOARD_MANAGED_PROJECT_DIGEST,
+      instanceId: values.MYDASHBOARD_MANAGED_INSTANCE_ID,
+      startIdentity: values.MYDASHBOARD_MANAGED_START_IDENTITY,
+      claimTimeoutMilliseconds,
+    });
+  } finally {
+    for (const name of managedEnvironmentKeys) delete environment[name];
+  }
+}
+
+function boundedLogRecord(level, value) {
+  const raw = value instanceof Error
+    ? value.stack || `${value.name}: ${value.message}`
+    : String(value);
+  const prefix = `${new Date().toISOString()} ${level} `;
+  const maximumMessageBytes = managedLogMaximumRecordBytes -
+    Buffer.byteLength(prefix, "utf8") - 1;
+  let message = raw;
+  while (Buffer.byteLength(message, "utf8") > maximumMessageBytes) {
+    message = message.slice(0, Math.max(0, Math.floor(message.length * 0.9)));
+  }
+  return `${prefix}${message}\n`;
+}
+
+export function createManagedFileDiagnostics(
+  logDirectory,
+  {
+    maximumBytes = managedLogMaximumBytes,
+    archiveCount = managedLogArchiveCount,
+  } = {},
+) {
+  if (
+    !path.isAbsolute(logDirectory) ||
+    !Number.isInteger(maximumBytes) ||
+    maximumBytes < managedLogMaximumRecordBytes ||
+    !Number.isInteger(archiveCount) ||
+    archiveCount < 1 ||
+    archiveCount > managedLogArchiveCount
+  ) {
+    throw new TypeError("managed diagnostics configuration is invalid");
+  }
+  mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
+  const logPath = path.join(logDirectory, "server.log");
+  function write(level, value) {
+    const record = boundedLogRecord(level, value);
+    const recordBytes = Buffer.byteLength(record, "utf8");
+    const currentBytes = existsSync(logPath) ? statSync(logPath).size : 0;
+    if (currentBytes + recordBytes > maximumBytes) {
+      const configuredOldest = `${logPath}.${archiveCount}`;
+      rmSync(configuredOldest, { force: true });
+      for (let index = archiveCount - 1; index >= 1; index -= 1) {
+        const source = `${logPath}.${index}`;
+        if (existsSync(source)) renameSync(source, `${logPath}.${index + 1}`);
+      }
+      if (existsSync(logPath)) renameSync(logPath, `${logPath}.1`);
+    }
+    appendFileSync(logPath, record, { encoding: "utf8", mode: 0o600 });
+  }
+  return Object.freeze({
+    log: (value) => write("INFO", value),
+    reportError: (value) => write("ERROR", value),
+    logPath,
+    maximumBytes,
+    archiveCount,
+  });
+}
+
+function hmacBase64(tokenBytes, payload) {
+  return createHmac("sha256", tokenBytes)
+    .update(payload, "utf8")
+    .digest("base64");
+}
+
+function safeTokenEquals(expectedBytes, supplied) {
+  try {
+    const suppliedBytes = decodeManagedToken(supplied);
+    return timingSafeEqual(expectedBytes, suppliedBytes);
+  } catch {
+    return false;
+  }
+}
+
+function fsyncParentDirectory(directory) {
+  if (process.platform === "win32") return;
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function writeDurableJsonExclusive(filePath, value) {
+  const directory = path.dirname(filePath);
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  const text = `${JSON.stringify(value)}\n`;
+  let descriptor;
+  try {
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(descriptor, text, "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  try {
+    linkSync(temporaryPath, filePath);
+    rmSync(temporaryPath);
+    fsyncParentDirectory(directory);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+function receiptPayload(receipt) {
+  return [
+    "receipt-v1",
+    receipt.phase,
+    receipt.status,
+    String(receipt.processId),
+    receipt.instanceId,
+    receipt.startIdentity,
+    receipt.atUnixMilliseconds,
+    receipt.errorCode || "",
+  ].join("\n");
+}
+
+function createManagedProcessController(managedProcess) {
+  if (!managedProcess) return null;
+  let lifecycleState = "pending_claim";
+  let claimPromise = null;
+  let claimTimer = null;
+  let requestedReceipt = null;
+  let terminalReceipt = null;
+
+  function receiptPath(phase) {
+    return path.join(
+      managedProcess.runtimeDirectory,
+      `mydashboard-shutdown-${managedProcess.instanceId}-${phase}.json`,
+    );
+  }
+
+  function createReceipt(phase, status, errorCode = null) {
+    const receipt = {
+      schemaVersion: 1,
+      phase,
+      status,
+      processId: process.pid,
+      instanceId: managedProcess.instanceId,
+      startIdentity: managedProcess.startIdentity,
+      atUnixMilliseconds: String(Date.now()),
+      errorCode,
+      hmac: "",
+    };
+    receipt.hmac = hmacBase64(
+      managedProcess.tokenBytes,
+      receiptPayload(receipt),
+    );
+    return receipt;
+  }
+
+  function assertAuthorized(request) {
+    if (
+      !safeTokenEquals(
+        managedProcess.tokenBytes,
+        request.headers["x-mydashboard-control-token"],
+      ) ||
+      request.headers["x-mydashboard-process-id"] !== String(process.pid) ||
+      request.headers["x-mydashboard-instance-id"] !==
+        managedProcess.instanceId ||
+      request.headers["x-mydashboard-start-identity"] !==
+        managedProcess.startIdentity
+    ) {
+      throw httpError(403, "进程控制身份验证失败");
+    }
+  }
+
+  async function claim(request, activate) {
+    assertAuthorized(request);
+    if (lifecycleState === "running") return;
+    if (lifecycleState !== "pending_claim") {
+      throw httpError(409, "进程已进入关闭阶段");
+    }
+    claimPromise ||= Promise.resolve()
+      .then(activate)
+      .then(() => {
+        if (lifecycleState !== "pending_claim") {
+          throw httpError(409, "进程认领已被关闭阶段中止");
+        }
+        lifecycleState = "running";
+        if (claimTimer) clearTimeout(claimTimer);
+        claimTimer = null;
+      });
+    await claimPromise;
+  }
+
+  function prepareShutdown(request) {
+    assertAuthorized(request);
+    if (requestedReceipt) return requestedReceipt;
+    const receipt = createReceipt("requested", "unknown");
+    writeDurableJsonExclusive(receiptPath("requested"), receipt);
+    requestedReceipt = receipt;
+    lifecycleState = "stopping";
+    if (claimTimer) clearTimeout(claimTimer);
+    claimTimer = null;
+    return receipt;
+  }
+
+  function completeShutdown(error) {
+    if (terminalReceipt) return terminalReceipt;
+    const receipt = createReceipt(
+      "terminal",
+      error ? "failure" : "success",
+      error ? "LIFECYCLE_FAILURE" : null,
+    );
+    writeDurableJsonExclusive(receiptPath("terminal"), receipt);
+    terminalReceipt = receipt;
+    return receipt;
+  }
+
+  function armClaimWatchdog(
+    shutdown,
+    closeActiveConnections,
+    reportError,
+    setProcessExitCode,
+  ) {
+    if (lifecycleState !== "pending_claim" || claimTimer) return;
+    claimTimer = setTimeout(async () => {
+      if (lifecycleState !== "pending_claim") return;
+      lifecycleState = "stopping";
+      try {
+        const shutdownPromise = shutdown();
+        closeActiveConnections();
+        await shutdownPromise;
+      } catch (error) {
+        try {
+          setProcessExitCode(1);
+        } catch {
+          // The watchdog still reports the original lifecycle failure.
+        }
+        try {
+          reportError(error);
+        } catch {
+          // Diagnostics cannot make a timed-out child safe to keep running.
+        }
+      }
+    }, managedProcess.claimTimeoutMilliseconds);
+    claimTimer.unref?.();
+  }
+
+  return Object.freeze({
+    managedProcess,
+    liveIdentity: () => ({
+      managed: true,
+      instanceId: managedProcess.instanceId,
+      startIdentity: managedProcess.startIdentity,
+      lifecycleState,
+    }),
+    isPending: () => lifecycleState === "pending_claim",
+    claim,
+    prepareShutdown,
+    completeShutdown,
+    armClaimWatchdog,
+  });
+}
 
 function sendJson(response, status, value) {
   response.writeHead(status, {
@@ -334,6 +729,36 @@ function requireWorkGraphView(application) {
     throw httpError(503, "员工工作图尚未启用");
   }
   return view;
+}
+
+function requireOwnerWorkRequests(application) {
+  return requireApplicationPort(
+    application,
+    "ownerWorkRequests",
+    ["submit", "get", "list"],
+    "所有者工作请求入口尚未启用",
+  );
+}
+
+function ownerWorkRequestQueryOptions(url) {
+  const allowed = new Set(["limit", "cursor"]);
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.some(
+      (key) =>
+        !allowed.has(key) || url.searchParams.getAll(key).length !== 1,
+    )
+  ) {
+    throw httpError(400, "所有者工作请求查询参数无效");
+  }
+  return {
+    ...(url.searchParams.has("limit")
+      ? { limit: url.searchParams.get("limit") }
+      : {}),
+    ...(url.searchParams.has("cursor")
+      ? { cursor: url.searchParams.get("cursor") }
+      : {}),
+  };
 }
 
 function projectGraphContract(contract) {
@@ -749,6 +1174,34 @@ function requireApplicationPort(application, property, methods, message) {
     throw httpError(503, message);
   }
   return port;
+}
+
+function resolveOperationalAdmission(application) {
+  if (application?.operations === undefined) {
+    return Object.freeze({ run: (operation) => operation() });
+  }
+  const admission = application.operations?.admission;
+  if (!admission || typeof admission.run !== "function") {
+    throw new TypeError(
+      "application.operations.admission.run must be a function",
+    );
+  }
+  return Object.freeze({ run: admission.run.bind(admission) });
+}
+
+function requireOperationsBrowser(application, methods) {
+  const browser = application?.operations?.browser;
+  if (
+    !browser ||
+    !methods.every((method) => typeof browser[method] === "function")
+  ) {
+    throw httpError(503, "系统运维端口未启用");
+  }
+  return browser;
+}
+
+function requiresOperationalAdmission(method) {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(method);
 }
 
 function requireExactJsonFields(value, fields, message) {
@@ -1629,25 +2082,82 @@ function lifecycleFailure(results) {
   return new AggregateError(failures, "服务器关闭时发生多个错误");
 }
 
-function attachServerLifecycle(server, application, backgroundWork) {
+function shutdownTimeoutMilliseconds(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 120_000) {
+    throw new TypeError("shutdownDrainTimeoutMs must be an integer from 1 to 120000");
+  }
+  return value;
+}
+
+function lifecycleDrainTimeout(phase) {
+  return Object.assign(new Error(`Lifecycle drain timed out during ${phase}`), {
+    code: "LIFECYCLE_DRAIN_TIMEOUT",
+  });
+}
+
+async function settleBeforeDeadline(promises, deadline, phase, controller) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    const error = lifecycleDrainTimeout(phase);
+    controller.abort(error);
+    throw error;
+  }
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.allSettled(promises),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = lifecycleDrainTimeout(phase);
+          controller.abort(error);
+          reject(error);
+        }, remaining);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function attachServerLifecycle(
+  server,
+  application,
+  backgroundWork,
+  reportError = console.error,
+  writerLease = null,
+  shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
+) {
   const closeServer = server.close.bind(server);
   let shutdownPromise = null;
 
   async function performShutdown() {
+    const deadline = Date.now() + shutdownDrainTimeoutMs;
+    const controller = new AbortController();
     const stoppingBackground = backgroundWork?.stop
-      ? runLifecycleStep(() => backgroundWork.stop())
+      ? runLifecycleStep(() => backgroundWork.stop({ signal: controller.signal }))
       : Promise.resolve();
     const closingHttp = closeHttpServer(closeServer);
-    const serviceResults = await Promise.allSettled([
-      stoppingBackground,
-      closingHttp,
-    ]);
-    const applicationResults = await Promise.allSettled([
+    const serviceResults = await settleBeforeDeadline(
+      [stoppingBackground, closingHttp],
+      deadline,
+      "background services",
+      controller,
+    );
+    const serviceFailure = lifecycleFailure(serviceResults);
+    if (serviceFailure) throw serviceFailure;
+    const applicationResults = await settleBeforeDeadline([
       typeof application.close === "function"
-        ? runLifecycleStep(() => application.close())
+        ? runLifecycleStep(() => application.close({ signal: controller.signal }))
         : Promise.resolve(),
-    ]);
-    const failure = lifecycleFailure([...serviceResults, ...applicationResults]);
+    ], deadline, "application runtime", controller);
+    const runtimeFailure = lifecycleFailure(applicationResults);
+    if (runtimeFailure) throw runtimeFailure;
+    const leaseResults = await settleBeforeDeadline([
+      writerLease?.close
+        ? runLifecycleStep(() => writerLease.close())
+        : Promise.resolve(),
+    ], deadline, "writer lease", controller);
+    const failure = lifecycleFailure(leaseResults);
     if (failure) throw failure;
   }
 
@@ -1667,7 +2177,7 @@ function attachServerLifecycle(server, application, backgroundWork) {
       () => callback?.(),
       (error) => {
         if (callback) callback(error);
-        else console.error(error);
+        else reportError(error);
       },
     );
     return server;
@@ -1677,17 +2187,162 @@ function attachServerLifecycle(server, application, backgroundWork) {
 
 export function createDashboardServer(
   application,
-  { backgroundWork, reportError = console.error } = {},
+  {
+    backgroundWork,
+    reportError = console.error,
+    managedProcess = null,
+    onManagedClaim = null,
+    writerLease = null,
+    shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
+    allowUnmanagedShutdown = true,
+    setProcessExitCode = (code) => {
+      process.exitCode = code;
+    },
+  } = {},
 ) {
   if (typeof reportError !== "function") {
     throw new TypeError("reportError must be a function");
   }
+  if (typeof setProcessExitCode !== "function") {
+    throw new TypeError("setProcessExitCode must be a function");
+  }
+  if (onManagedClaim !== null && typeof onManagedClaim !== "function") {
+    throw new TypeError("onManagedClaim must be a function or null");
+  }
+  if (
+    writerLease !== null &&
+    (typeof writerLease?.acquire !== "function" ||
+      typeof writerLease?.close !== "function")
+  ) {
+    throw new TypeError("writerLease must implement acquire and close");
+  }
+  if (typeof allowUnmanagedShutdown !== "boolean") {
+    throw new TypeError("allowUnmanagedShutdown must be a boolean");
+  }
+  shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
+  const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
   const employeeRegistry = resolveEmployeeRegistry(application);
-  const server = http.createServer(async (request, response) => {
+  const operationalAdmission = resolveOperationalAdmission(application);
+  const handleRequest = async (
+    request,
+    response,
+    operationallyAdmitted = false,
+  ) => {
     try {
       assertTrustedHost(request, expectedOrigin);
       const url = new URL(request.url, expectedOrigin);
+      if (request.method === "GET" && url.pathname === "/api/live") {
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          live: true,
+          service: "mydashboard",
+          processId: process.pid,
+          ...(processController
+            ? processController.liveIdentity()
+            : { managed: false, lifecycleState: "running" }),
+        });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/system/claim") {
+        requireNoQuery(url, "进程认领请求参数无效");
+        assertTrustedMutation(request, expectedOrigin);
+        if (!processController || !onManagedClaim) {
+          throw httpError(404, "进程认领端点不可用");
+        }
+        await processController.claim(request, onManagedClaim);
+        sendJson(response, 200, { claimed: true, state: "running" });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/system/shutdown") {
+        requireNoQuery(url, "关闭服务请求参数无效");
+        assertTrustedMutation(request, expectedOrigin);
+        if (processController) {
+          processController.prepareShutdown(request);
+        } else if (!allowUnmanagedShutdown) {
+          throw httpError(403, "未托管进程不接受远程关闭");
+        }
+        response.once("finish", () => {
+          setImmediate(() => {
+            server.shutdown().then(
+              () => {
+                try {
+                  processController?.completeShutdown(null);
+                } catch (error) {
+                  try {
+                    setProcessExitCode(1);
+                  } catch {
+                    // The missing receipt remains authoritative.
+                  }
+                  try {
+                    reportError(error);
+                  } catch {
+                    // Diagnostics cannot make an unknown outcome successful.
+                  }
+                }
+              },
+              (error) => {
+                try {
+                  processController?.completeShutdown(error);
+                } catch (receiptError) {
+                  error = new AggregateError(
+                    [error, receiptError],
+                    "shutdown and receipt publication both failed",
+                  );
+                }
+                try {
+                  setProcessExitCode(1);
+                } catch {
+                  // The shutdown failure remains authoritative.
+                }
+                try {
+                  reportError(error);
+                } catch {
+                  // The shutdown was already requested; diagnostics cannot reopen it.
+                }
+              },
+            );
+          });
+        });
+        sendJson(response, 202, { accepted: true, state: "stopping" });
+        return;
+      }
+      if (processController?.isPending()) {
+        throw httpError(503, "进程尚未被管理器认领");
+      }
+      if (request.method === "GET" && url.pathname === "/api/system/status") {
+        requireNoQuery(url, "系统状态查询参数无效");
+        const operations = requireOperationsBrowser(
+          application,
+          ["readStatus"],
+        );
+        sendJson(response, 200, await operations.readStatus());
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/system/backups") {
+        requireNoQuery(url, "备份请求查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        requireExactJsonFields(
+          await readJsonBody(request),
+          [],
+          "备份请求字段无效",
+        );
+        const operations = requireOperationsBrowser(
+          application,
+          ["createBackup"],
+        );
+        sendJson(response, 201, await operations.createBackup());
+        return;
+      }
+      if (
+        !operationallyAdmitted &&
+        requiresOperationalAdmission(request.method)
+      ) {
+        await operationalAdmission.run(() =>
+          handleRequest(request, response, true),
+        );
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/health") {
         const employees = await employeeRegistry.listRoles();
         const employee =
@@ -1697,6 +2352,8 @@ export function createDashboardServer(
           : null;
         sendJson(response, 200, {
           ok: true,
+          service: "mydashboard",
+          processId: process.pid,
           refreshing: Boolean(application.refreshService.running),
           employee,
           employees,
@@ -2049,6 +2706,61 @@ export function createDashboardServer(
       }
       if (request.method === "GET" && url.pathname === "/api/employees") {
         sendJson(response, 200, { items: await employeeRegistry.listRoles() });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/work/requests") {
+        requireNoQuery(url, "所有者工作请求参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const input = requireExactJsonFields(
+          await readJsonBody(request, ownerWorkRequestMaximumBytes),
+          [
+            "schemaVersion",
+            "requestId",
+            "workType",
+            "priority",
+            "title",
+            "description",
+            "acceptanceCriteria",
+          ],
+          "所有者工作请求字段无效",
+        );
+        const result = await requireOwnerWorkRequests(application).submit(input);
+        sendJson(response, result.deduplicated ? 200 : 201, result);
+        if (!result.deduplicated) {
+          signalBackgroundAgency(
+            backgroundWork,
+            { trigger: "owner_request_created" },
+            reportError,
+          );
+        }
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/work/requests") {
+        sendJson(
+          response,
+          200,
+          await requireOwnerWorkRequests(application).list(
+            ownerWorkRequestQueryOptions(url),
+          ),
+        );
+        return;
+      }
+      const ownerWorkRequestRead = url.pathname.match(
+        /^\/api\/work\/requests\/([^/]+)$/,
+      );
+      if (request.method === "GET" && ownerWorkRequestRead) {
+        requireNoQuery(url, "所有者工作请求参数无效");
+        if (!ownerWorkRequestId.test(ownerWorkRequestRead[1])) {
+          throw httpError(400, "requestId 无效");
+        }
+        const result = await requireOwnerWorkRequests(application).get(
+          ownerWorkRequestRead[1],
+        );
+        sendJson(
+          response,
+          result ? 200 : 404,
+          result || { error: "owner_work_request_not_found" },
+        );
         return;
       }
       if (
@@ -2584,7 +3296,7 @@ export function createDashboardServer(
       const status = Number.isInteger(error.statusCode)
         ? error.statusCode
         : 500;
-      if (status >= 500) {
+      if (status >= 500 && status !== 503) {
         try {
           reportError(error);
         } catch {
@@ -2595,22 +3307,86 @@ export function createDashboardServer(
         error: status >= 500 ? internalServerErrorMessage : error.message,
       });
     }
+  };
+  const server = http.createServer(handleRequest);
+  const managedServer = attachServerLifecycle(
+    server,
+    application,
+    backgroundWork,
+    reportError,
+    writerLease,
+    shutdownDrainTimeoutMs,
+  );
+  Object.defineProperty(managedServer, "armManagedClaimWatchdog", {
+    configurable: false,
+    enumerable: false,
+    value: () => processController?.armClaimWatchdog(
+      () => managedServer.shutdown(),
+      () => managedServer.closeAllConnections?.(),
+      reportError,
+      setProcessExitCode,
+    ),
+    writable: false,
   });
-  return attachServerLifecycle(server, application, backgroundWork);
+  return managedServer;
 }
 
-function configurationSafeModeBackgroundWork(application) {
+function shutdownAbort() {
+  return Object.assign(new Error("Lifecycle shutdown requested"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+}
+
+function backgroundOperationOptions(input, signal) {
+  const options = { ...input };
+  Object.defineProperty(options, "signal", {
+    configurable: false,
+    enumerable: false,
+    value: signal,
+    writable: false,
+  });
+  return options;
+}
+
+function backgroundRefreshOptions(notify, signal) {
+  return backgroundOperationOptions({ notify }, signal);
+}
+
+async function drainBackgroundWork(operation, drainTimeoutMs) {
+  const results = await settleBeforeDeadline(
+    [runLifecycleStep(operation)],
+    Date.now() + drainTimeoutMs,
+    "background work",
+    new AbortController(),
+  );
+  const failure = lifecycleFailure(results);
+  if (failure) throw failure;
+}
+
+function configurationSafeModeBackgroundWork(
+  application,
+  operationalAdmission,
+  drainTimeoutMs,
+  runDrainParticipant,
+) {
   const skipped = Object.freeze({ skipped: "configuration_safe_mode" });
   const skip = () => Promise.resolve(skipped);
   const confirmationEnabled = Boolean(application.confirmationQueue);
   const confirmationAccess = createConfirmationAccessGate(confirmationEnabled);
   confirmationAccess.open();
+  const workController = new AbortController();
   let stopPromise = null;
   return Object.freeze({
     initialRefresh: Promise.resolve(skipped),
     timers: Object.freeze([]),
     stop() {
-      stopPromise ||= confirmationAccess.closeAndDrain();
+      if (!stopPromise) {
+        workController.abort(shutdownAbort());
+        stopPromise = drainBackgroundWork(
+          () => confirmationAccess.closeAndDrain(),
+          drainTimeoutMs,
+        );
+      }
       return stopPromise;
     },
     refresh: skip,
@@ -2618,7 +3394,12 @@ function configurationSafeModeBackgroundWork(application) {
     signalAgency: skip,
     runEmployee: skip,
     runConfirmationOperation(operation) {
-      return confirmationAccess.run(operation);
+      return operationalAdmission.run(() => confirmationAccess.run(
+        () => runDrainParticipant(
+          DRAIN_PARTICIPANTS.confirmationOperation,
+          () => operation(workController.signal),
+        ),
+      ));
     },
     confirmationReady: () =>
       confirmationEnabled && confirmationAccess.isReady(),
@@ -2631,10 +3412,22 @@ export function startApplicationBackgroundWork(
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     reportError = console.error,
+    drainTimeoutMs = defaultShutdownDrainTimeoutMs,
+    observeDrainParticipant = () => {},
   } = {},
 ) {
+  drainTimeoutMs = shutdownTimeoutMilliseconds(drainTimeoutMs);
+  const operationalAdmission = resolveOperationalAdmission(application);
+  const runDrainParticipant = createDrainParticipantRunner(
+    observeDrainParticipant,
+  );
   if (application.configuration?.status?.safeMode === true) {
-    return configurationSafeModeBackgroundWork(application);
+    return configurationSafeModeBackgroundWork(
+      application,
+      operationalAdmission,
+      drainTimeoutMs,
+      runDrainParticipant,
+    );
   }
   const employeeRegistry = resolveEmployeeRegistry(application);
   const timers = [];
@@ -2642,6 +3435,7 @@ export function startApplicationBackgroundWork(
   const confirmationAccess = createConfirmationAccessGate(
     Boolean(application.confirmationQueue),
   );
+  const workController = new AbortController();
   let stopped = false;
   let stopPromise = null;
   let backgroundTail = Promise.resolve();
@@ -2661,15 +3455,19 @@ export function startApplicationBackgroundWork(
   function runTracked(operation, { rethrow = false } = {}) {
     if (stopped) return Promise.resolve();
     let task;
-    task = (async () => {
-      if (stopped) return;
-      try {
-        return await operation();
-      } catch (error) {
-        reportBackgroundError(error);
+    task = Promise.resolve()
+      .then(() => operationalAdmission.run(async () => {
+        if (stopped) return undefined;
+        return operation(workController.signal);
+      }))
+      .catch((error) => {
+        if (!(stopped && workController.signal.aborted && error === workController.signal.reason)) {
+          reportBackgroundError(error);
+        }
         if (rethrow) throw error;
-      }
-    })().finally(() => activeTasks.delete(task));
+        return undefined;
+      })
+      .finally(() => activeTasks.delete(task));
     activeTasks.add(task);
     return task;
   }
@@ -2684,7 +3482,10 @@ export function startApplicationBackgroundWork(
     if (!application.confirmationQueue) return;
     const employee = employeeRegistry.get("pr-reviewer");
     if (typeof employee?.recoverConfirmations === "function") {
-      await employee.recoverConfirmations();
+      await runDrainParticipant(
+        DRAIN_PARTICIPANTS.prConfirmationRecovery,
+        () => employee.recoverConfirmations(),
+      );
     }
   }
 
@@ -2694,14 +3495,24 @@ export function startApplicationBackgroundWork(
     }
     const snapshot = await application.store?.read?.("snapshot", null);
     if (snapshot) {
-      await application.workflowRouting.ingestSnapshot({ snapshot });
+      await runDrainParticipant(
+        DRAIN_PARTICIPANTS.workflowRouting,
+        () => application.workflowRouting.ingestSnapshot({ snapshot }),
+      );
     }
   }
 
-  async function intakeWorkflowAssignments() {
+  async function intakeWorkflowAssignments(signal) {
+    signal.throwIfAborted();
     if (typeof application.workCoordination?.intake === "function") {
-      await application.workCoordination.intake();
+      await runDrainParticipant(
+        DRAIN_PARTICIPANTS.workCoordinationIntake,
+        () => application.workCoordination.intake(
+          backgroundOperationOptions({}, signal),
+        ),
+      );
     }
+    signal.throwIfAborted();
   }
 
   async function performAgencyCycle({
@@ -2709,7 +3520,9 @@ export function startApplicationBackgroundWork(
     includeLegacyEmployees = false,
     employeeIds = [],
     discardWhenFactsPending = false,
+    signal = workController.signal,
   }) {
+    signal.throwIfAborted();
     if (stopped) return { skipped: "stopped" };
     if (!factsReady) return { skipped: "facts_not_ready" };
     if (discardWhenFactsPending && pendingFactCycles > 0) {
@@ -2718,46 +3531,63 @@ export function startApplicationBackgroundWork(
     const failures = [];
     if (typeof application.workCoordination?.runCycle === "function") {
       try {
-        await application.workCoordination.runCycle({
-          trigger,
-          includeWork: false,
-        });
+        await runDrainParticipant(
+          DRAIN_PARTICIPANTS.workCoordinationCycle,
+          () => application.workCoordination.runCycle(
+            backgroundOperationOptions(
+              { trigger, includeWork: false },
+              signal,
+            ),
+          ),
+        );
       } catch (error) {
         failures.push(error);
       }
     }
+    signal.throwIfAborted();
     const selectedEmployeeIds = [
       ...(includeLegacyEmployees ? ["pr-reviewer"] : []),
       ...employeeIds,
     ].filter((id, index, ids) => ids.indexOf(id) === index);
     if (selectedEmployeeIds.length > 0 && !stopped) {
       try {
-        if (typeof employeeRegistry.runSelected === "function") {
-          await employeeRegistry.runSelected(selectedEmployeeIds, { trigger });
-        } else if (
-          includeLegacyEmployees &&
-          typeof employeeRegistry.runAll === "function"
-        ) {
-          await employeeRegistry.runAll({ trigger });
-        } else if (
-          selectedEmployeeIds.length === 1 &&
-          typeof employeeRegistry.run === "function"
-        ) {
-          await employeeRegistry.run(selectedEmployeeIds[0], { trigger });
-        } else {
-          await employeeRegistry.runAll({ trigger });
-        }
+        const runOptions = backgroundOperationOptions({ trigger }, signal);
+        await runDrainParticipant(
+          DRAIN_PARTICIPANTS.employeeExecution,
+          async () => {
+            if (typeof employeeRegistry.runSelected === "function") {
+              await employeeRegistry.runSelected(selectedEmployeeIds, runOptions);
+            } else if (
+              includeLegacyEmployees &&
+              typeof employeeRegistry.runAll === "function"
+            ) {
+              await employeeRegistry.runAll(runOptions);
+            } else if (
+              selectedEmployeeIds.length === 1 &&
+              typeof employeeRegistry.run === "function"
+            ) {
+              await employeeRegistry.run(selectedEmployeeIds[0], runOptions);
+            } else {
+              await employeeRegistry.runAll(runOptions);
+            }
+          },
+        );
       } catch (error) {
         failures.push(error);
       }
     }
+    signal.throwIfAborted();
     if (typeof application.memoryProjector?.runCycle === "function" && !stopped) {
       try {
-        await application.memoryProjector.runCycle();
+        await runDrainParticipant(
+          DRAIN_PARTICIPANTS.memoryProjection,
+          () => application.memoryProjector.runCycle(),
+        );
       } catch (error) {
         failures.push(error);
       }
     }
+    signal.throwIfAborted();
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) {
       throw new AggregateError(
@@ -2792,22 +3622,27 @@ export function startApplicationBackgroundWork(
     );
   }
 
-  function enqueueFactCycle(factOperation) {
+  function enqueueFactCycle(factOperation, signal = workController.signal) {
     pendingFactCycles += 1;
     const operation = async () => {
       try {
+        signal.throwIfAborted();
         if (stopped) return undefined;
         factsReady = false;
         await confirmationAccess.closeAndDrain();
         if (stopped) return undefined;
-        const result = await factOperation();
+        const result = await factOperation(signal);
+        signal.throwIfAborted();
         if (stopped) return result;
         await routeWorkflowSnapshot();
+        signal.throwIfAborted();
         if (stopped) return result;
-        await intakeWorkflowAssignments();
+        await intakeWorkflowAssignments(signal);
         if (stopped) return result;
         if (!(await hasFreshPullRequestFacts())) return result;
+        signal.throwIfAborted();
         await reconcileExternalConfirmations();
+        signal.throwIfAborted();
         if (stopped) return result;
         factsReady = true;
         if (pendingFactCycles === 1) {
@@ -2816,8 +3651,10 @@ export function startApplicationBackgroundWork(
             await performAgencyCycle({
               trigger: "refresh_completed",
               includeLegacyEmployees: true,
+              signal,
             });
           } catch (error) {
+            if (signal.aborted) throw signal.reason ?? error;
             reportBackgroundError(error);
           }
         }
@@ -2832,22 +3669,30 @@ export function startApplicationBackgroundWork(
     return result;
   }
 
-  function enqueueRefresh({ notify = false } = {}) {
+  function enqueueRefresh({ notify = false } = {}, signal = workController.signal) {
     const key = notify ? "notify" : "silent";
     return coalesceCycle(coalescedRefreshCycles, key, () =>
-      enqueueFactCycle(() => application.refreshService.refresh({ notify })),
+      enqueueFactCycle(
+        () => runDrainParticipant(
+          DRAIN_PARTICIPANTS.refresh,
+          () => application.refreshService.refresh(
+            backgroundRefreshOptions(notify, signal),
+          ),
+        ),
+        signal,
+      ),
     );
   }
 
   const initialRefresh = runTracked(
-    () => enqueueRefresh({ notify: false }),
+    (signal) => enqueueRefresh({ notify: false }, signal),
     { rethrow: true },
   );
 
   timers.push(
     setIntervalFn(
       () =>
-        runTracked(() => enqueueRefresh({ notify: false })),
+        runTracked((signal) => enqueueRefresh({ notify: false }, signal)),
       application.config.refreshMinutes * 60_000,
     ),
   );
@@ -2862,11 +3707,12 @@ export function startApplicationBackgroundWork(
     timers.push(
       setIntervalFn(
         () =>
-          runTracked(() =>
+          runTracked((signal) =>
             enqueueCoalescedAgencyCycle("coordination", {
               trigger: "scheduled",
               includeLegacyEmployees: false,
               discardWhenFactsPending: true,
+              signal,
             }),
           ),
         agencyTickSeconds * 1_000,
@@ -2877,11 +3723,12 @@ export function startApplicationBackgroundWork(
     timers.push(
       setIntervalFn(
         () =>
-          runTracked(() =>
+          runTracked((signal) =>
             enqueueCoalescedAgencyCycle(`employee:${schedule.id}`, {
               trigger: "scheduled",
               employeeIds: [schedule.id],
               discardWhenFactsPending: true,
+              signal,
             }),
           ),
         schedule.intervalMinutes * 60_000,
@@ -2894,13 +3741,14 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
+    workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
-    stopPromise = (async () => {
+    stopPromise = drainBackgroundWork(async () => {
       await confirmationAccess.closeAndDrain();
       while (activeTasks.size > 0) {
         await Promise.allSettled([...activeTasks]);
       }
-    })();
+    }, drainTimeoutMs);
     return stopPromise;
   }
 
@@ -2909,26 +3757,34 @@ export function startApplicationBackgroundWork(
     timers,
     stop,
     refresh: (options) =>
-      runTracked(() => enqueueRefresh(options), { rethrow: true }),
+      runTracked((signal) => enqueueRefresh(options, signal), { rethrow: true }),
     mutateFacts: (operation) =>
-      runTracked(() => enqueueFactCycle(operation), { rethrow: true }),
+      runTracked((signal) => enqueueFactCycle(operation, signal), { rethrow: true }),
     signalAgency: ({ trigger = "signal" } = {}) =>
-      runTracked(() =>
+      runTracked((signal) =>
         enqueueCoalescedAgencyCycle("signal", {
           trigger,
           includeLegacyEmployees: false,
+          signal,
         }),
-      ),
+      { rethrow: true }),
     runEmployee: (id, { trigger = "manual" } = {}) =>
       runTracked(
-        () =>
+        (signal) =>
           enqueueCoalescedAgencyCycle(`manual-employee:${id}`, {
             trigger,
             employeeIds: [id],
+            signal,
           }),
         { rethrow: true },
       ),
-    runConfirmationOperation: (operation) => confirmationAccess.run(operation),
+    runConfirmationOperation: (operation) =>
+      operationalAdmission.run(() => confirmationAccess.run(
+        () => runDrainParticipant(
+          DRAIN_PARTICIPANTS.confirmationOperation,
+          () => operation(workController.signal),
+        ),
+      )),
     confirmationReady: () => confirmationAccess.isReady(),
   };
 }
@@ -2944,30 +3800,155 @@ function listenForLocalConnections(server, port) {
   });
 }
 
+function createDeferredBackgroundWork(
+  application,
+  startBackgroundWorkFn,
+  reportError,
+  drainTimeoutMs,
+) {
+  let delegate = null;
+  let startPromise = null;
+  let stopPromise = null;
+  let stopped = false;
+
+  function requireDelegate() {
+    if (!delegate) {
+      throw new Error("managed background work has not been claimed");
+    }
+    return delegate;
+  }
+
+  async function start() {
+    if (stopped) throw new Error("managed background work is already stopped");
+    startPromise ||= Promise.resolve().then(() => {
+      const started = startBackgroundWorkFn(application, {
+        reportError,
+        drainTimeoutMs,
+      });
+      if (!started || typeof started !== "object") {
+        throw new TypeError("startBackgroundWorkFn must return background work");
+      }
+      delegate = started;
+      Promise.resolve(delegate.initialRefresh).catch((error) => {
+        try {
+          reportError(error);
+        } catch {
+          // A managed server remains controllable when refresh diagnostics fail.
+        }
+      });
+      return delegate;
+    });
+    await startPromise;
+  }
+
+  function stop() {
+    stopped = true;
+    stopPromise ||= Promise.resolve(startPromise)
+      .catch(() => null)
+      .then(() => delegate?.stop?.());
+    return stopPromise;
+  }
+
+  return Object.freeze({
+    get initialRefresh() {
+      return delegate?.initialRefresh || Promise.resolve({ skipped: "pending_claim" });
+    },
+    start,
+    stop,
+    refresh: (...arguments_) => requireDelegate().refresh(...arguments_),
+    mutateFacts: (...arguments_) => requireDelegate().mutateFacts(...arguments_),
+    signalAgency: (...arguments_) => requireDelegate().signalAgency(...arguments_),
+    runEmployee: (...arguments_) => requireDelegate().runEmployee(...arguments_),
+    runConfirmationOperation: (...arguments_) =>
+      requireDelegate().runConfirmationOperation(...arguments_),
+    confirmationReady: () => delegate?.confirmationReady?.() === true,
+  });
+}
+
 export async function startDashboardServer(
   {
     createApplicationFn = createApplication,
     startBackgroundWorkFn = startApplicationBackgroundWork,
     log = console.log,
+    reportError = console.error,
+    managedProcess = null,
+    writerLease = null,
+    shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
   } = {},
 ) {
-  const application = await createApplicationFn();
+  shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
+  let application = null;
   let backgroundWork = null;
   let server = null;
+  const runtimeLifecycle = createApplicationRuntimeLifecycle();
   try {
-    backgroundWork = startBackgroundWorkFn(application);
-    server = createDashboardServer(application, { backgroundWork });
+    if (writerLease !== null) await writerLease.acquire();
+    application = await createApplicationFn({ runtimeLifecycle });
+    if (managedProcess) {
+      backgroundWork = createDeferredBackgroundWork(
+        application,
+        startBackgroundWorkFn,
+        reportError,
+        shutdownDrainTimeoutMs,
+      );
+    } else {
+      backgroundWork = startBackgroundWorkFn(application, {
+        reportError,
+        drainTimeoutMs: shutdownDrainTimeoutMs,
+      });
+    }
+    server = createDashboardServer(application, {
+      backgroundWork,
+      reportError,
+      managedProcess,
+      writerLease,
+      onManagedClaim: managedProcess ? () => backgroundWork.start() : null,
+      allowUnmanagedShutdown: false,
+      shutdownDrainTimeoutMs,
+    });
     await listenForLocalConnections(server, application.config.port);
-    await backgroundWork.initialRefresh;
+    if (managedProcess) {
+      server.armManagedClaimWatchdog();
+    } else {
+      await backgroundWork.initialRefresh;
+    }
   } catch (error) {
-    try {
-      if (server) {
-        await server.shutdown();
-      } else {
-        await backgroundWork?.stop?.();
-        await application.close?.();
+    let shutdownError;
+    if (server) {
+      shutdownError = lifecycleFailure(await Promise.allSettled([
+        server.shutdown(),
+      ]));
+    } else {
+      const deadline = Date.now() + shutdownDrainTimeoutMs;
+      const controller = new AbortController();
+      try {
+        const serviceCleanup = await settleBeforeDeadline([
+          backgroundWork?.stop
+            ? runLifecycleStep(() => backgroundWork.stop({ signal: controller.signal }))
+            : Promise.resolve(),
+        ], deadline, "startup background services", controller);
+        shutdownError = lifecycleFailure(serviceCleanup);
+        if (!shutdownError) {
+          const applicationCleanup = await settleBeforeDeadline([
+            application?.close
+              ? runLifecycleStep(() => application.close({ signal: controller.signal }))
+              : runLifecycleStep(() => runtimeLifecycle.close()),
+          ], deadline, "startup application runtime", controller);
+          shutdownError = lifecycleFailure(applicationCleanup);
+        }
+        if (!shutdownError) {
+          const leaseCleanup = await settleBeforeDeadline([
+            writerLease?.close
+              ? runLifecycleStep(() => writerLease.close())
+              : Promise.resolve(),
+          ], deadline, "startup writer lease", controller);
+          shutdownError = lifecycleFailure(leaseCleanup);
+        }
+      } catch (cleanupError) {
+        shutdownError = cleanupError;
       }
-    } catch (shutdownError) {
+    }
+    if (shutdownError) {
       throw new AggregateError(
         [error, shutdownError],
         "服务器启动失败且资源释放不完整",
@@ -2986,6 +3967,35 @@ export async function startDashboardServer(
 const invokedModule = process.argv[1]
   ? pathToFileURL(path.resolve(process.argv[1])).href
   : "";
+async function runDashboardProcess(managedProcess) {
+  const diagnostics = managedProcess
+    ? createManagedFileDiagnostics(managedProcess.logDirectory)
+    : { log: console.log, reportError: console.error };
+  try {
+    const writerLease = createApplicationWriterLease({
+      projectRoot,
+      projectDigest: managedProcess?.projectDigest ?? null,
+    });
+    await startDashboardServer({
+      managedProcess,
+      writerLease,
+      log: diagnostics.log,
+      reportError: diagnostics.reportError,
+    });
+  } catch (error) {
+    diagnostics.reportError(error);
+    process.exitCode = 1;
+  }
+}
+
+export async function startManagedDashboardFromCapturedEnvironment(environment) {
+  const managedProcess = readManagedProcessEnvironment(environment);
+  if (!managedProcess) {
+    throw new Error("managed dashboard entry requires a complete environment");
+  }
+  await runDashboardProcess(managedProcess);
+}
+
 if (import.meta.url === invokedModule) {
-  await startDashboardServer();
+  await runDashboardProcess(readManagedProcessEnvironment());
 }

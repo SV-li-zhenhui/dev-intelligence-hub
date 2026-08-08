@@ -21,6 +21,8 @@ const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SAFE_GITHUB_LOGIN =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const SAFE_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const CONTROLLED_GIT_REPOSITORY =
+  /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\/([A-Za-z0-9_.-]{1,100})$/;
 const PINNED_IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SECRET_REFERENCE = /(?:Env|Ref)$/;
@@ -42,6 +44,7 @@ const TOP_LEVEL_FIELDS = Object.freeze([
   "refreshMinutes",
   "browserPollSeconds",
   "githubLogin",
+  "githubRead",
   "trackedRepositories",
   "prResponsibility",
   "codeExecutor",
@@ -78,6 +81,24 @@ const PROVIDER_FIELDS = Object.freeze([
   "contextTokens",
   "remote",
 ]);
+const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
+const SUPPORTED_PROVIDER_KINDS = new Set([
+  "ollama",
+  "openai-compatible",
+  ...CLI_PROVIDER_KINDS,
+]);
+const CLI_PROVIDER_FORBIDDEN_FIELDS = Object.freeze([
+  "baseUrl",
+  "apiKeyEnv",
+  "protocol",
+  "responseFormat",
+  "contextTokens",
+]);
+const CLI_PROVIDER_LIMITS = Object.freeze({
+  timeoutMs: Object.freeze([1_000, 3_600_000]),
+  maxResponseBytes: Object.freeze([1_024, 1024 * 1024]),
+  maxRequestBytes: Object.freeze([1_024, 1024 * 1024]),
+});
 const ROLE_FIELDS = Object.freeze([
   "name",
   "mission",
@@ -87,12 +108,16 @@ const ROLE_FIELDS = Object.freeze([
   "workerId",
   "permissions",
   "brain",
+  "taskBrain",
 ]);
 const INTENT_TYPES = new Set([
   "ask_user",
   "wait_condition",
+  "query_memory",
   "propose_github_review",
+  "propose_github_pull_request_action",
   "propose_code_action",
+  "propose_configuration_change",
   "handoff",
   "complete",
   "orchestrate",
@@ -107,6 +132,13 @@ const CAPABILITIES = new Set([
   "testing",
 ]);
 const CODE_OPERATIONS = new Set(["inspect", "modify", "verify"]);
+const GITHUB_EXTERNAL_ACTIONS = new Set([
+  "comment",
+  "review",
+  "update_branch",
+  "push",
+  "merge",
+]);
 const NETWORK_ENV_FIELDS = new Set([
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -338,6 +370,86 @@ function endpoint(value, path) {
   return { value: raw, remote: !loopback };
 }
 
+function absoluteLocalPath(value, path) {
+  const localPath = text(value, path, 4_096);
+  if (
+    !nodePath.isAbsolute(localPath) ||
+    localPath.startsWith("\\\\") ||
+    localPath.startsWith("//")
+  ) {
+    throw invalid(path, "必须是绝对本地路径");
+  }
+  return localPath;
+}
+
+function controlledGitRepository(value, path) {
+  const repository = text(value, path, 140, {
+    pattern: CONTROLLED_GIT_REPOSITORY,
+  });
+  const [, owner, name] = repository.match(CONTROLLED_GIT_REPOSITORY);
+  if (
+    owner.includes("--") ||
+    name.includes("..") ||
+    name.startsWith(".") ||
+    name.endsWith(".")
+  ) {
+    throw invalid(path);
+  }
+  return repository;
+}
+
+function normalizeConflictMirrorMap(value, path) {
+  const repositories = new Set();
+  const normalized = namedMap(
+    value,
+    path,
+    (mirrorRoot, mirrorPath, repositoryValue) => {
+      const repository = controlledGitRepository(
+        repositoryValue,
+        `${mirrorPath} repository`,
+      );
+      const portableRepository = repository.toLowerCase();
+      if (repositories.has(portableRepository)) {
+        throw invalid(path, "包含大小写重复仓库");
+      }
+      repositories.add(portableRepository);
+      return absoluteLocalPath(mirrorRoot, mirrorPath);
+    },
+    { maximum: 1_000 },
+  );
+  if (Object.keys(normalized).length === 0) {
+    throw invalid(path, "启用后不能为空");
+  }
+  return normalized;
+}
+
+function normalizeConflictPreparation(value) {
+  const path = "codeExecutor.conflictPreparation";
+  const allowed = [
+    "enabled",
+    "baseMirrorsByRepository",
+    "headMirrorsByRepository",
+  ];
+  const config = fields(value, path, allowed, ["enabled"]);
+  const enabled = boolean(config.enabled, `${path}.enabled`);
+  if (!enabled) {
+    fields(config, path, ["enabled"], ["enabled"]);
+    return { enabled: false };
+  }
+  fields(config, path, allowed, allowed);
+  return {
+    enabled: true,
+    baseMirrorsByRepository: normalizeConflictMirrorMap(
+      config.baseMirrorsByRepository,
+      `${path}.baseMirrorsByRepository`,
+    ),
+    headMirrorsByRepository: normalizeConflictMirrorMap(
+      config.headMirrorsByRepository,
+      `${path}.headMirrorsByRepository`,
+    ),
+  };
+}
+
 function normalizeLegacyBrain(value, path, { partial = false } = {}) {
   const required = partial ? [] : ["enabled", "provider", "model", "baseUrl"];
   const config = fields(value, path, LEGACY_BRAIN_FIELDS, required);
@@ -392,8 +504,35 @@ function normalizeProvider(value, path, id) {
   safeId(id, path);
   const config = fields(value, path, PROVIDER_FIELDS, ["kind"]);
   const kind = text(config.kind, `${path}.kind`, 64);
-  if (!new Set(["ollama", "openai-compatible"]).has(kind)) {
+  if (!SUPPORTED_PROVIDER_KINDS.has(kind)) {
     throw invalid(`${path}.kind`);
+  }
+  if (CLI_PROVIDER_KINDS.has(kind)) {
+    if (config.remote !== true) {
+      throw invalid(
+        `${path}.remote`,
+        "CLI 大脑必须显式标记为远程数据处理",
+      );
+    }
+    if (
+      CLI_PROVIDER_FORBIDDEN_FIELDS.some((name) =>
+        Object.hasOwn(config, name),
+      )
+    ) {
+      throw invalid(path, "CLI 大脑字段组合无效");
+    }
+    const normalized = { kind, remote: true };
+    for (const [name, [minimum, maximum]] of Object.entries(
+      CLI_PROVIDER_LIMITS,
+    )) {
+      Object.assign(
+        normalized,
+        optional(config, name, (entry) =>
+          integer(entry, `${path}.${name}`, minimum, maximum),
+        ),
+      );
+    }
+    return normalized;
   }
   if (!Object.hasOwn(config, "baseUrl")) {
     throw invalid(`${path}.baseUrl`, "缺少必需字段");
@@ -447,6 +586,8 @@ function normalizeProvider(value, path, id) {
     ...(protocol === null ? {} : { protocol }),
     ...(responseFormat === null ? {} : { responseFormat }),
   };
+  // Keep protocol-less persisted providers aligned with the adapter's bounded
+  // compatibility path. New form templates emit an explicit protocol.
   const limits = protocol === null
     ? {
         timeoutMs: [1, 2 * 1024 * 1024],
@@ -531,6 +672,9 @@ function normalizeRole(value, path, id) {
       ),
     },
     brain: normalizeAssignedBrain(config.brain, `${path}.brain`),
+    ...optional(config, "taskBrain", (entry) =>
+      normalizeAssignedBrain(entry, `${path}.taskBrain`),
+    ),
   };
 }
 
@@ -627,6 +771,7 @@ function normalizeCodeExecutor(value) {
       "docker",
       "gitCommand",
       "gitTimeoutMs",
+      "conflictPreparation",
       "workspaces",
       "profiles",
       "requiredProfilesByWorkspace",
@@ -653,6 +798,7 @@ function normalizeCodeExecutor(value) {
     ...optional(config, "gitTimeoutMs", (entry) =>
       integer(entry, `${path}.gitTimeoutMs`, 1, 60_000),
     ),
+    ...optional(config, "conflictPreparation", normalizeConflictPreparation),
   };
   if (Object.hasOwn(config, "docker")) {
     const docker = fields(
@@ -723,24 +869,37 @@ function normalizeCodeExecutor(value) {
     if (enabled && normalized.workspaces.length === 0) {
       throw invalid(`${path}.workspaces`, "启用后不能为空");
     }
-    const usesGitHeadSnapshot = normalized.workspaces.some(
-      (workspace) => workspace.gitHeadSnapshot,
+  }
+  const usesGitHeadSnapshot = normalized.workspaces?.some(
+    (workspace) => workspace.gitHeadSnapshot,
+  ) === true;
+  const usesConflictPreparation =
+    normalized.conflictPreparation?.enabled === true;
+  if (
+    (usesGitHeadSnapshot || usesConflictPreparation) &&
+    !Object.hasOwn(normalized, "gitCommand")
+  ) {
+    throw invalid(
+      `${path}.gitCommand`,
+      usesConflictPreparation
+        ? "Conflict preparation 启用后不能为空"
+        : "Git Head 快照启用后不能为空",
     );
-    if (usesGitHeadSnapshot && !Object.hasOwn(normalized, "gitCommand")) {
-      throw invalid(`${path}.gitCommand`, "Git Head 快照启用后不能为空");
-    }
-    if (usesGitHeadSnapshot && !nodePath.isAbsolute(normalized.gitCommand)) {
-      throw invalid(`${path}.gitCommand`, "Git Head 快照命令必须是绝对路径");
-    }
-    if (
-      usesGitHeadSnapshot &&
-      !isTrustedWindowsGitImplementation(normalized.gitCommand)
-    ) {
-      throw invalid(
-        `${path}.gitCommand`,
-        "Windows Git Head 快照必须直接使用 mingw64/bin/git.exe 实现",
-      );
-    }
+  }
+  if (
+    (usesGitHeadSnapshot || usesConflictPreparation) &&
+    !nodePath.isAbsolute(normalized.gitCommand)
+  ) {
+    throw invalid(`${path}.gitCommand`, "Git 命令必须是绝对路径");
+  }
+  if (
+    (usesGitHeadSnapshot || usesConflictPreparation) &&
+    !isTrustedWindowsGitImplementation(normalized.gitCommand)
+  ) {
+    throw invalid(
+      `${path}.gitCommand`,
+      "Windows Git 必须直接使用 mingw64/bin/git.exe 实现",
+    );
   }
   const profileIds = new Set();
   if (Object.hasOwn(config, "profiles")) {
@@ -862,6 +1021,7 @@ function normalizeGithubActions(value) {
     "ghCommand",
     "networkEnv",
     "timeoutMs",
+    "enabledActions",
   ];
   const config = fields(value, path, allowed, ["enabled"]);
   const enabled = boolean(config.enabled, `${path}.enabled`);
@@ -886,6 +1046,18 @@ function normalizeGithubActions(value) {
     ),
     ...optional(config, "ghCommand", (entry) =>
       text(entry, `${path}.ghCommand`, 4_096),
+    ),
+    ...optional(config, "enabledActions", (entry) =>
+      uniqueArray(
+        entry,
+        `${path}.enabledActions`,
+        GITHUB_EXTERNAL_ACTIONS.size,
+        (action, actionPath) => {
+          const normalized = text(action, actionPath, 32);
+          if (!GITHUB_EXTERNAL_ACTIONS.has(normalized)) throw invalid(actionPath);
+          return normalized;
+        },
+      ),
     ),
   };
   if (Object.hasOwn(config, "networkEnv")) {
@@ -1030,6 +1202,7 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
       "capabilityRoles",
       "githubReviewRoles",
       "codeActionRoles",
+      "configurationChangeRoles",
       "codeOperationsByRole",
       "workspaceByRepository",
     ],
@@ -1067,6 +1240,17 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
     100,
     roleReference,
   );
+  const configurationChangeRoles = Object.hasOwn(
+    policy,
+    "configurationChangeRoles",
+  )
+    ? uniqueArray(
+        policy.configurationChangeRoles,
+        `${policyPath}.configurationChangeRoles`,
+        100,
+        roleReference,
+      )
+    : null;
   const codeRoleSet = new Set(codeActionRoles);
   const codeOperationsByRole = namedMap(
     policy.codeOperationsByRole,
@@ -1101,10 +1285,36 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
     capabilityRoles,
     githubReviewRoles,
     codeActionRoles,
+    ...(configurationChangeRoles === null
+      ? {}
+      : { configurationChangeRoles }),
     codeOperationsByRole,
     workspaceByRepository,
   };
   return normalized;
+}
+
+function assertConfigurationChangeRolePolicy(document) {
+  const configured = new Set(
+    document.workCoordination.policy.configurationChangeRoles || [],
+  );
+  for (const [roleId, role] of Object.entries(document.employees.roles)) {
+    const permitted = role.permissions.allowedIntents.includes(
+      "propose_configuration_change",
+    );
+    if (configured.has(roleId) !== permitted) {
+      throw invalid(
+        `workCoordination.policy.configurationChangeRoles.${roleId}`,
+        "必须与岗位 propose_configuration_change 权限完全一致",
+      );
+    }
+  }
+  if ([...configured].some((roleId) => !Object.hasOwn(document.employees.roles, roleId))) {
+    throw invalid(
+      "workCoordination.policy.configurationChangeRoles",
+      "只能引用显式配置的岗位",
+    );
+  }
 }
 
 function normalizeDingTalk(value) {
@@ -1133,13 +1343,29 @@ function normalizeDingTalk(value) {
   };
 }
 
+function normalizeGithubRead(value) {
+  const path = "githubRead";
+  const config = fields(value, path, ["enabled"], ["enabled"]);
+  return {
+    enabled: boolean(config.enabled, `${path}.enabled`),
+  };
+}
+
 function assertProviderReferences(document) {
   const providers = new Set(Object.keys(document.brainProviders));
   const references = [
     ["brain.provider", document.brain.provider],
-    ...Object.entries(document.employees.roles).map(([id, role]) => [
-      `employees.roles.${id}.brain.provider`,
-      role.brain.provider,
+    ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
+      [
+        `employees.roles.${id}.brain.provider`,
+        role.brain.provider,
+      ],
+      ...(role.taskBrain
+        ? [[
+            `employees.roles.${id}.taskBrain.provider`,
+            role.taskBrain.provider,
+          ]]
+        : []),
     ]),
   ];
   if (document.memory.answering) {
@@ -1180,7 +1406,16 @@ function deepFreeze(value) {
 
 export function normalizeConfigurationDocument(value) {
   const source = safeDocumentClone(value);
-  fields(source, "configuration", TOP_LEVEL_FIELDS, TOP_LEVEL_FIELDS);
+  // Documents created before the explicit GitHub-read boundary intentionally
+  // retain the omitted field. Omission means the historical behavior (reads
+  // enabled), but preserving the shape also preserves every content-addressed
+  // version, draft, audit and confirmation binding already on disk.
+  fields(
+    source,
+    "configuration",
+    TOP_LEVEL_FIELDS,
+    TOP_LEVEL_FIELDS.filter((name) => name !== "githubRead"),
+  );
   const employees = normalizeEmployees(source.employees);
   const roles = new Set(Object.keys(employees.roles));
   const codeExecutor = normalizeCodeExecutor(source.codeExecutor);
@@ -1205,6 +1440,9 @@ export function normalizeConfigurationDocument(value) {
     githubLogin: text(source.githubLogin, "githubLogin", 40, {
       pattern: SAFE_GITHUB_LOGIN,
     }),
+    ...(Object.hasOwn(source, "githubRead")
+      ? { githubRead: normalizeGithubRead(source.githubRead) }
+      : {}),
     trackedRepositories: uniqueArray(
       source.trackedRepositories,
       "trackedRepositories",
@@ -1249,8 +1487,15 @@ export function normalizeConfigurationDocument(value) {
     employees,
     dingtalk: normalizeDingTalk(source.dingtalk),
   };
+  if (document.changePackages.enabled && !document.codeExecutor.enabled) {
+    throw invalid(
+      "changePackages.enabled",
+      "启用变更包前必须先启用 codeExecutor",
+    );
+  }
   assertProviderReferences(document);
   assertRoutingRoleReferences(document.workflowRouting, roles);
+  assertConfigurationChangeRolePolicy(document);
   if (Buffer.byteLength(JSON.stringify(document), "utf8") > MAX_DOCUMENT_BYTES) {
     throw invalid("configuration", "超过容量上限");
   }
@@ -1259,9 +1504,13 @@ export function normalizeConfigurationDocument(value) {
 
 export function createSafeDisabledConfiguration(value) {
   const safe = structuredClone(normalizeConfigurationDocument(value));
+  safe.githubRead = { enabled: false };
   safe.trackedRepositories = [];
   safe.brain.enabled = false;
   safe.codeExecutor.enabled = false;
+  if (safe.codeExecutor.conflictPreparation) {
+    safe.codeExecutor.conflictPreparation = { enabled: false };
+  }
   safe.changePackages.enabled = false;
   safe.githubActions.enabled = false;
   safe.workflowRouting.enabled = false;
@@ -1330,6 +1579,25 @@ function setDirection(before, after) {
 
 function authorityDirection(change) {
   const { path, before, after } = change;
+  if (path === "githubRead") {
+    const effectiveEnabled = (value, present) =>
+      present ? value?.enabled === true : true;
+    const previous = effectiveEnabled(before, before !== undefined);
+    const next = effectiveEnabled(after, after !== undefined);
+    return {
+      tightening: previous && !next,
+      expansion: !previous && next,
+    };
+  }
+  if (path === "githubActions.enabledActions") {
+    const effectiveActions = (value) =>
+      value === undefined ? ["review"] : value;
+    const direction = setDirection(
+      effectiveActions(before),
+      effectiveActions(after),
+    );
+    return { tightening: direction.removed, expansion: direction.added };
+  }
   const providerIdentity =
     path.startsWith("brainProviders.") &&
     (
@@ -1347,7 +1615,7 @@ function authorityDirection(change) {
   }
   if (
     path === "brain.provider" ||
-    /\.(?:brain|localBrain)\.provider$/.test(path)
+    /\.(?:brain|localBrain|taskBrain)\.provider$/.test(path)
   ) {
     return {
       tightening: before !== undefined && before !== after,
@@ -1358,9 +1626,15 @@ function authorityDirection(change) {
     const direction = setDirection(before, after);
     return { tightening: direction.removed, expansion: direction.added };
   }
+  if (/^employees\.roles\.[^.]+\.taskBrain$/.test(path)) {
+    return {
+      tightening: before !== undefined && before !== after,
+      expansion: after !== undefined && before !== after,
+    };
+  }
   if (
     path.includes(".remoteData.") ||
-    /^(?:githubActions|codeExecutor|changePackages)\.enabled$/.test(path) ||
+    /^(?:githubRead|githubActions|codeExecutor|changePackages)\.enabled$/.test(path) ||
     /^employees\.roles\.[^.]+\.enabled$/.test(path) ||
     path === "employees.prReviewer.allowRemoteCodeContext"
   ) {
@@ -1369,10 +1643,33 @@ function authorityDirection(change) {
       expansion: before === false && after === true,
     };
   }
+  if (path === "codeExecutor.conflictPreparation") {
+    return {
+      tightening: before?.enabled === true,
+      expansion: after?.enabled === true,
+    };
+  }
+  if (path === "codeExecutor.conflictPreparation.enabled") {
+    return {
+      tightening: before === true && after === false,
+      expansion: before === false && after === true,
+    };
+  }
+  if (
+    /^codeExecutor\.conflictPreparation\.(?:baseMirrorsByRepository|headMirrorsByRepository)(?:\.|$)/.test(
+      path,
+    )
+  ) {
+    return {
+      tightening: before !== undefined,
+      expansion: after !== undefined,
+    };
+  }
   if (
     path.endsWith(".permissions.allowedIntents") ||
     path === "workCoordination.policy.githubReviewRoles" ||
     path === "workCoordination.policy.codeActionRoles" ||
+    path === "workCoordination.policy.configurationChangeRoles" ||
     path.includes(".codeOperationsByRole.") ||
     path.endsWith(".writablePaths")
   ) {
@@ -1398,10 +1695,11 @@ function authorityDirection(change) {
   return { tightening: false, expansion: false };
 }
 
-function requiresRestart(path) {
+function requiresInfrastructureRestart(path) {
   return (
     path === "port" ||
     path === "githubLogin" ||
+    (path === "githubRead" || path === "githubRead.enabled") ||
     path.startsWith("brainProviders.") ||
     path.startsWith("codeExecutor.") ||
     path.startsWith("changePackages.") ||
@@ -1409,7 +1707,8 @@ function requiresRestart(path) {
     path.startsWith("githubActions.actorAccountId") ||
     path.startsWith("githubActions.tokenEnv") ||
     path.startsWith("githubActions.ghCommand") ||
-    path.startsWith("githubActions.networkEnv")
+    path.startsWith("githubActions.networkEnv") ||
+    path === "githubActions.enabledActions"
   );
 }
 
@@ -1426,11 +1725,18 @@ export function configurationDocumentImpact(beforeValue, afterValue) {
   };
   for (const change of collectChanges(before, after)) {
     const direction = authorityDirection(change);
-    const restart = requiresRestart(change.path);
+    const infrastructureRestart = requiresInfrastructureRestart(change.path);
     if (direction.tightening) categories.security_tightening.add(change.path);
     if (direction.expansion) categories.authority_expansion.add(change.path);
-    if (restart) categories.restart_required.add(change.path);
-    if (!direction.tightening && !direction.expansion && !restart) {
+    // The application graph is composed from one immutable startup document.
+    // Until a transactional hot-reload boundary exists, every persisted
+    // configuration change becomes effective only after a managed restart.
+    categories.restart_required.add(change.path);
+    if (
+      !direction.tightening &&
+      !direction.expansion &&
+      !infrastructureRestart
+    ) {
       categories.benign_claim_change.add(change.path);
     }
   }

@@ -2,7 +2,9 @@ import {
   createChangePackage,
   normalizeChangePackageManifest,
 } from "../domain/change-package-contract.js";
+import { normalizeChangePackageControlledCommitReceipt } from "../domain/change-package-controlled-commit.js";
 import { normalizeCodeJobChangePackageEvent } from "../domain/code-job-change-package-event.js";
+import { digestValue } from "../domain/code-executor-contract.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -259,6 +261,33 @@ function normalizeAckResult(value, event, minimumHighWatermark) {
   return { status, cursor, highWatermark };
 }
 
+function normalizeControlledCommitReceipt(value, event, manifest) {
+  let receipt;
+  try {
+    receipt = normalizeChangePackageControlledCommitReceipt(value);
+  } catch (cause) {
+    throw protocolError(
+      "CODE_JOB_CONTROLLED_COMMIT_RECEIPT_INVALID",
+      "controlled commit delivery receipt is invalid",
+      cause,
+    );
+  }
+  if (
+    receipt.eventId !== event.eventId ||
+    receipt.eventDigest !== event.eventDigest ||
+    receipt.packageId !== manifest.packageId ||
+    receipt.packageDigest !== manifest.packageDigest ||
+    receipt.executionSourceDigest !== digestValue(event.executionSource) ||
+    receipt.recordedAt !== event.recordedAt
+  ) {
+    throw protocolError(
+      "CODE_JOB_CONTROLLED_COMMIT_RECEIPT_INVALID",
+      "controlled commit delivery receipt is not bound to its source event",
+    );
+  }
+  return receipt;
+}
+
 function cycleResult({ observed, created, acknowledged, cursor, highWatermark }) {
   return Object.freeze({
     observed,
@@ -275,15 +304,21 @@ export class CodeJobChangePackageDispatcher {
   #ack;
   #export;
   #create;
+  #deliverControlledCommit;
   #inFlight = null;
 
   constructor(value = {}) {
     const error = new TypeError("code job change package dispatcher options are invalid");
-    const fields = exactObject(
-      value,
-      ["deliverySource", "completedChangeExporter", "packageProducer"],
-      error,
-    );
+    const suppliedKeys = dataEntries(value, error).map(([key]) => key);
+    const expectedKeys = [
+      "deliverySource",
+      "completedChangeExporter",
+      "packageProducer",
+      ...(suppliedKeys.includes("controlledCommitDelivery")
+        ? ["controlledCommitDelivery"]
+        : []),
+    ];
+    const fields = exactObject(value, expectedKeys, error);
     const source = bindPort(
       fields.get("deliverySource"),
       ["readBatch", "ack"],
@@ -301,6 +336,13 @@ export class CodeJobChangePackageDispatcher {
       ["create"],
       "change package producer",
     ).create;
+    this.#deliverControlledCommit = fields.has("controlledCommitDelivery")
+      ? bindPort(
+          fields.get("controlledCommitDelivery"),
+          ["deliver"],
+          "controlled commit delivery",
+        ).deliver
+      : null;
   }
 
   runCycle(value = {}) {
@@ -321,6 +363,12 @@ export class CodeJobChangePackageDispatcher {
     let created = 0;
     let acknowledged = 0;
     for (const event of batch.items) {
+      if (event.schemaVersion === 2) {
+        throw protocolError(
+          "CODE_JOB_CONTROLLED_COMMIT_EVENT_LEGACY",
+          "legacy conflict delivery events cannot forge controlled commits",
+        );
+      }
       const exported = await this.#export({ ...event.exportRequest });
       const { draft, expectedManifest } = prepareDraft(event, exported);
       const manifest = normalizeCreatedManifest(
@@ -329,6 +377,27 @@ export class CodeJobChangePackageDispatcher {
         expectedManifest,
       );
       created += 1;
+      let controlledCommit;
+      if (event.schemaVersion === 3) {
+        if (this.#deliverControlledCommit === null) {
+          throw protocolError(
+            "CODE_JOB_CONTROLLED_COMMIT_DELIVERY_UNAVAILABLE",
+            "controlled commit delivery is unavailable",
+          );
+        }
+        controlledCommit = normalizeControlledCommitReceipt(
+          await this.#deliverControlledCommit({
+            eventId: event.eventId,
+            eventDigest: event.eventDigest,
+            packageId: manifest.packageId,
+            packageDigest: manifest.packageDigest,
+            executionSource: event.executionSource,
+            recordedAt: event.recordedAt,
+          }),
+          event,
+          manifest,
+        );
+      }
       const acknowledgement = normalizeAckResult(
         await this.#ack({
           sequence: event.sequence,
@@ -338,6 +407,9 @@ export class CodeJobChangePackageDispatcher {
           sourceRecordDigest: event.job.recordDigest,
           packageId: manifest.packageId,
           packageDigest: manifest.packageDigest,
+          ...(controlledCommit === undefined
+            ? {}
+            : { controlledCommit }),
         }),
         event,
         highWatermark,

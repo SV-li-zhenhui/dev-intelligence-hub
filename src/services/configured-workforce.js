@@ -1,5 +1,8 @@
 import { OllamaStructuredProvider } from "../adapters/ollama-structured-provider.js";
 import { OpenAiCompatibleProvider } from "../adapters/openai-compatible-provider.js";
+import {
+  createProductionSupervisedCliBrainProvider,
+} from "../adapters/supervised-cli-brain-provider.js";
 import { BrainRouter } from "./brain-router.js";
 import { ConfiguredRoleEmployee } from "./configured-role-employee.js";
 
@@ -21,6 +24,13 @@ const PROVIDER_LIMIT_KEYS = Object.freeze([
   "maxResponseBytes",
   "maxRequestBytes",
 ]);
+const CLI_PROVIDER_KEYS = new Set([
+  "kind",
+  "timeoutMs",
+  "maxResponseBytes",
+  "maxRequestBytes",
+  "remote",
+]);
 const ROLE_KEYS = new Set([
   "name",
   "mission",
@@ -30,6 +40,7 @@ const ROLE_KEYS = new Set([
   "workerId",
   "permissions",
   "brain",
+  "taskBrain",
 ]);
 
 function dataEntries(value, name) {
@@ -80,14 +91,31 @@ function declaredRemote(config, name) {
 }
 
 function providerWithBoundary(provider, remote) {
+  const attemptDescriptor = Object.getOwnPropertyDescriptor(
+    provider,
+    "singleAttempt",
+  );
+  if (
+    attemptDescriptor &&
+    (!("value" in attemptDescriptor) ||
+      typeof attemptDescriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain provider singleAttempt is invalid");
+  }
   return Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
+    ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     generate: provider.generate.bind(provider),
   });
 }
 
-function providerOptions(id, value, dependencies) {
+function providerOptions(
+  id,
+  value,
+  dependencies,
+  supervisedCliProviderFactory,
+) {
   const name = `brainProviders.${id}`;
   const config = exactConfig(value, PROVIDER_KEYS, name);
   const remote = declaredRemote(config, name);
@@ -121,24 +149,84 @@ function providerOptions(id, value, dependencies) {
       remote,
     );
   }
+  if (["codex-cli", "claude-cli"].includes(config.kind)) {
+    if (Object.keys(config).some((key) => !CLI_PROVIDER_KEYS.has(key))) {
+      throw new TypeError(`${name} contains a field unsupported by CLI providers`);
+    }
+    return providerWithBoundary(
+      supervisedCliProviderFactory({
+        ...common,
+        cliKind: config.kind,
+      }),
+      remote,
+    );
+  }
   throw new TypeError(
     `brain provider kind is unsupported: ${String(config.kind)}`,
   );
 }
 
-function createProviders(value, dependencies) {
+function createProviders(value, dependencies, supervisedCliProviderFactory) {
   return dataEntries(value, "brainProviders").map(([id, config]) =>
-    providerOptions(id, config, dependencies),
+    providerOptions(
+      id,
+      config,
+      dependencies,
+      supervisedCliProviderFactory,
+    ),
   );
 }
 
-export function createConfiguredBrainRouter({
-  brainProviders = {},
-  dependencies = {},
-} = {}) {
+function configuredBrainRouter(
+  {
+    brainProviders = {},
+    dependencies = {},
+  } = {},
+  supervisedCliProviderFactory,
+) {
   return new BrainRouter({
-    providers: createProviders(brainProviders, dependencies),
+    providers: createProviders(
+      brainProviders,
+      dependencies,
+      supervisedCliProviderFactory,
+    ),
   });
+}
+
+function testCliProviderFactory(value) {
+  const dependencies = exactConfig(
+    value,
+    new Set(["supervisedCliProviderFactory"]),
+    "configured brain router test dependencies",
+  );
+  if (typeof dependencies.supervisedCliProviderFactory !== "function") {
+    throw new TypeError(
+      "configured brain router test CLI provider factory is invalid",
+    );
+  }
+  return dependencies.supervisedCliProviderFactory;
+}
+
+export function createConfiguredBrainRouter(options = {}) {
+  if (arguments.length > 1) {
+    throw new TypeError(
+      "Production configured brain routing does not accept replacement CLI provider factories",
+    );
+  }
+  return configuredBrainRouter(
+    options,
+    createProductionSupervisedCliBrainProvider,
+  );
+}
+
+export function createTestConfiguredBrainRouter(
+  options = {},
+  testDependencies = {},
+) {
+  return configuredBrainRouter(
+    options,
+    testCliProviderFactory(testDependencies),
+  );
 }
 
 function roleOptions(id, value) {
@@ -152,7 +240,7 @@ function roleOptions(id, value) {
   return config;
 }
 
-export function createConfiguredWorkforce({
+function configuredWorkforce({
   brainProviders = {},
   roles = {},
   store,
@@ -160,9 +248,9 @@ export function createConfiguredWorkforce({
   clock,
   actionAdmissionGate,
   dependencies = {},
-} = {}) {
+} = {}, brainRouterFactory) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
-  const brainRouter = createConfiguredBrainRouter({
+  const brainRouter = brainRouterFactory({
     brainProviders,
     dependencies,
   });
@@ -180,6 +268,9 @@ export function createConfiguredWorkforce({
       },
       permissions: config.permissions,
       brain: config.brain,
+      ...(Object.hasOwn(config, "taskBrain")
+        ? { taskBrain: config.taskBrain }
+        : {}),
       brainRouter,
       ...(actionAdmissionGate === undefined
         ? {}
@@ -197,4 +288,27 @@ export function createConfiguredWorkforce({
     employees: Object.freeze([...employees]),
     workers: Object.freeze([...workers]),
   });
+}
+
+export function createConfiguredWorkforce(options = {}) {
+  if (arguments.length > 1) {
+    throw new TypeError(
+      "Production configured workforce does not accept replacement CLI provider factories",
+    );
+  }
+  return configuredWorkforce(options, (routerOptions) =>
+    configuredBrainRouter(
+      routerOptions,
+      createProductionSupervisedCliBrainProvider,
+    ));
+}
+
+export function createTestConfiguredWorkforce(
+  options = {},
+  testDependencies = {},
+) {
+  const supervisedCliProviderFactory = testCliProviderFactory(testDependencies);
+  return configuredWorkforce(options, (routerOptions) =>
+    configuredBrainRouter(routerOptions, supervisedCliProviderFactory),
+  );
 }

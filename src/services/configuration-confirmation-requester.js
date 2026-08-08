@@ -4,6 +4,7 @@ import {
 
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const SHA256 = /^[a-f0-9]{64}$/;
 
 function methodDescriptor(value, name) {
   if (
@@ -39,6 +40,13 @@ function requirePort(value, methods, name) {
     port[method] = (...args) => Reflect.apply(descriptor.value, value, args);
   }
   return Object.freeze(port);
+}
+
+function optionalMethod(value, name) {
+  const descriptor = methodDescriptor(value, name);
+  return descriptor && "value" in descriptor && typeof descriptor.value === "function"
+    ? (...args) => Reflect.apply(descriptor.value, value, args)
+    : null;
 }
 
 function exactDataFields(value, names) {
@@ -149,9 +157,56 @@ function rollbackRequest(value) {
   });
 }
 
+function proposalDraftActivationRequest(value) {
+  const fields = exactDataFields(value, [
+    "proposalId",
+    "proposalContentDigest",
+  ]);
+  return Object.freeze({
+    proposalId: safeId(fields.get("proposalId"), "proposalId"),
+    proposalContentDigest: (() => {
+      const digest = safeId(
+        fields.get("proposalContentDigest"),
+        "proposalContentDigest",
+      );
+      if (!SHA256.test(digest)) {
+        throw new TypeError("proposalContentDigest is invalid");
+      }
+      return digest;
+    })(),
+  });
+}
+
+function recoveryPreparation(value) {
+  const fields = exactDataFields(value, ["prepared", "current"]);
+  if (typeof fields.get("current") !== "boolean") {
+    throw new TypeError("configuration proposal preparation is invalid");
+  }
+  return { prepared: fields.get("prepared"), current: fields.get("current") };
+}
+
+function errorCode(value) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return null;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, "code");
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
+function proposalStale() {
+  return Object.assign(new Error("configuration proposal is stale"), {
+    code: "CONFIGURATION_PROPOSAL_STALE",
+  });
+}
+
 export class ConfigurationConfirmationRequester {
   #simulator;
   #enqueue;
+  #get;
+  #invalidate;
+  #prepareProposalDraftActivation;
 
   constructor({ simulator, confirmationProducer } = {}) {
     this.#simulator = requirePort(
@@ -164,6 +219,12 @@ export class ConfigurationConfirmationRequester {
       ["enqueue"],
       "confirmation producer",
     ).enqueue;
+    this.#get = optionalMethod(confirmationProducer, "get");
+    this.#invalidate = optionalMethod(confirmationProducer, "invalidate");
+    this.#prepareProposalDraftActivation = optionalMethod(
+      simulator,
+      "prepareProposalDraftActivation",
+    );
     Object.freeze(this);
   }
 
@@ -183,6 +244,58 @@ export class ConfigurationConfirmationRequester {
 
   async requestRollback(value) {
     return this.#request("prepareRollback", rollbackRequest(value));
+  }
+
+  async requestProposalDraftActivation(value) {
+    if (
+      this.#get === null ||
+      this.#invalidate === null ||
+      this.#prepareProposalDraftActivation === null
+    ) {
+      throw new TypeError("configuration proposal recovery ports are unavailable");
+    }
+    const request = proposalDraftActivationRequest(value);
+    const recovery = recoveryPreparation(
+      await this.#prepareProposalDraftActivation(request),
+    );
+    const recoveredPlan = createConfigurationActivationConfirmationPlan(
+      recovery.prepared,
+    );
+    let existing;
+    try {
+      existing = await this.#get(recoveredPlan.id);
+    } catch (error) {
+      if (errorCode(error) !== "CONFIRMATION_NOT_FOUND") throw error;
+    }
+    if (existing !== undefined) {
+      if (
+        recovery.current ||
+        !["pending", "failed"].includes(existing.status) ||
+        (existing.status === "failed" && existing.retryable !== true)
+      ) {
+        return existing;
+      }
+      return this.#invalidate(existing.id, {
+        requestedBy: recoveredPlan.requestedBy,
+        approvalBindingDigest: existing.approvalBindingDigest,
+        reason: "configuration_authority_changed",
+      });
+    }
+    if (!recovery.current) throw proposalStale();
+    const action = recoveredPlan.action;
+    const currentPrepared = await this.#simulator.prepareDraftActivation({
+      draftId: action.draftId,
+      draftRevision: action.draftRevision,
+      expectedStateRevision: action.expectedStateRevision,
+      expectedActiveVersion: action.expectedActiveVersion,
+    });
+    const currentPlan = createConfigurationActivationConfirmationPlan(
+      currentPrepared,
+    );
+    if (JSON.stringify(currentPlan) !== JSON.stringify(recoveredPlan)) {
+      throw proposalStale();
+    }
+    return this.#enqueue(currentPlan);
   }
 
   async #request(method, request) {

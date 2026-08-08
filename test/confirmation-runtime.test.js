@@ -59,6 +59,15 @@ function queuePort(events = []) {
     readSnapshot(input) {
       return ["readSnapshot", input];
     },
+    readMemoryPage(input) {
+      return ["readMemoryPage", input];
+    },
+    readMemoryStatus() {
+      return { highWatermark: 9 };
+    },
+    readRecoveryStatus() {
+      return { kinds: ["github.pull-request-push"] };
+    },
   };
 }
 
@@ -234,18 +243,21 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "recover",
   ]);
   assert.deepEqual(Object.keys(executorOptions).sort(), [
-    "env",
+    "credentialProvider",
     "ghCommand",
     "networkEnv",
-    "token",
   ]);
-  assert.equal(executorOptions.token, TOKEN);
-  assert.equal(executorOptions.env, environment);
+  assert.deepEqual(executorOptions.credentialProvider(), {
+    token: TOKEN,
+    environment,
+  });
   assert.deepEqual(executorOptions.networkEnv, {
     HTTPS_PROXY: "http://127.0.0.1:8080",
   });
   assert.equal("actorAccountId" in executorOptions, false);
   assert.equal("tokenEnv" in executorOptions, false);
+  assert.equal("token" in executorOptions, false);
+  assert.equal("env" in executorOptions, false);
   assert.deepEqual(queueOptions, {
     store,
     executor: router,
@@ -279,16 +291,22 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "historyReader",
     "producerQueue",
     "applicationResultSource",
+    "memoryProjectionSource",
+    "recoveryStatusReader",
     "close",
   ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
   assert.equal(Object.isFrozen(runtime.historyReader), true);
   assert.equal(Object.isFrozen(runtime.producerQueue), true);
   assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
+  assert.equal(Object.isFrozen(runtime.memoryProjectionSource), true);
+  assert.equal(Object.isFrozen(runtime.recoveryStatusReader), true);
   assert.notEqual(runtime.queue, rawQueue);
   assert.notEqual(runtime.historyReader, rawQueue);
   assert.notEqual(runtime.producerQueue, rawQueue);
   assert.notEqual(runtime.applicationResultSource, rawQueue);
+  assert.notEqual(runtime.memoryProjectionSource, rawQueue);
+  assert.notEqual(runtime.recoveryStatusReader, rawQueue);
   assert.equal("recover" in runtime.queue, false);
   assert.equal("enqueue" in runtime.queue, false);
   assert.equal("invalidate" in runtime.queue, false);
@@ -333,6 +351,32 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "readSnapshot",
     { afterRevision: 8 },
   ]);
+  assert.deepEqual(Object.keys(runtime.memoryProjectionSource), [
+    "readMemoryPage",
+    "readMemoryStatus",
+  ]);
+  assert.deepEqual(
+    runtime.memoryProjectionSource.readMemoryPage({
+      cursor: 0,
+      limit: 100,
+      highWatermark: null,
+    }),
+    [
+      "readMemoryPage",
+      { cursor: 0, limit: 100, highWatermark: null },
+    ],
+  );
+  assert.deepEqual(runtime.memoryProjectionSource.readMemoryStatus(), {
+    highWatermark: 9,
+  });
+  assert.deepEqual(Object.keys(runtime.recoveryStatusReader), [
+    "readRecoveryStatus",
+  ]);
+  assert.deepEqual(runtime.recoveryStatusReader.readRecoveryStatus(), {
+    kinds: ["github.pull-request-push"],
+  });
+  assert.equal("get" in runtime.recoveryStatusReader, false);
+  assert.equal("list" in runtime.recoveryStatusReader, false);
   assert.deepEqual(runtime.producerQueue.enqueue("plan"), ["enqueue", "plan"]);
   assert.deepEqual(runtime.producerQueue.invalidate("item-1", "reason"), [
     "invalidate",
@@ -366,6 +410,150 @@ test("enabled runtime forwards the ledger authority verifier to the GitHub execu
     inputAuthorityVerifier,
   );
   await runtime.close();
+});
+
+test("explicit PR action allow-list routes only supported injected executors", async () => {
+  const externalExecutor = {
+    async execute() { return { status: "applied" }; },
+    async reconcile() { return { status: "already" }; },
+  };
+  let routed;
+  const runtime = await createConfirmationRuntime(
+    enabledConfig({
+      enabledActions: ["comment", "update_branch", "push", "merge"],
+    }),
+    runtimeDependencies({
+      pullRequestExternalActionExecutor: externalExecutor,
+      createExecutorRouter({ executors }) {
+        routed = executors;
+        return externalExecutor;
+      },
+    }),
+  );
+
+  assert.deepEqual(Object.keys(routed).sort(), [
+    "github.pull-request-comment",
+    "github.pull-request-merge",
+    "github.pull-request-push",
+    "github.pull-request-update-branch",
+  ]);
+  for (const kind of [
+    "github.pull-request-comment",
+    "github.pull-request-update-branch",
+    "github.pull-request-push",
+    "github.pull-request-merge",
+  ]) {
+    assert.strictEqual(routed[kind], externalExecutor);
+  }
+  await runtime.close();
+});
+
+test("an explicit empty PR action allow-list starts inert without credentials", async () => {
+  let githubExecutors = 0;
+  let routed;
+  const inertExecutor = { execute() {}, reconcile() {} };
+  const dependencies = runtimeDependencies({
+    createExecutor() {
+      githubExecutors += 1;
+      throw new Error("must not create a GitHub executor");
+    },
+    createExecutorRouter({ executors }) {
+      routed = executors;
+      return inertExecutor;
+    },
+  });
+  Object.defineProperty(dependencies, "env", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error("must not read credentials");
+    },
+  });
+
+  const runtime = await createConfirmationRuntime(
+    enabledConfig({ enabledActions: [] }),
+    dependencies,
+  );
+
+  assert.ok(runtime);
+  assert.equal(githubExecutors, 0);
+  assert.deepEqual(routed, {});
+  await runtime.close();
+});
+
+test("explicit Review lets the unified executor own work proposals and fences direct legacy execution", async () => {
+  let routed;
+  let legacyCalls = 0;
+  let legacyReconcileCalls = 0;
+  let unifiedCalls = 0;
+  const legacyReviewExecutor = {
+    execute() { legacyCalls += 1; },
+    reconcile() {
+      legacyReconcileCalls += 1;
+      return { status: "already" };
+    },
+  };
+  const unifiedReviewExecutor = {
+    execute() { unifiedCalls += 1; },
+    reconcile() {},
+  };
+  const runtime = await createConfirmationRuntime(
+    enabledConfig({ enabledActions: ["review"] }),
+    runtimeDependencies({
+      createExecutor: () => legacyReviewExecutor,
+      pullRequestExternalActionExecutor: unifiedReviewExecutor,
+      createExecutorRouter({ executors }) {
+        routed = executors;
+        return unifiedReviewExecutor;
+      },
+    }),
+  );
+
+  assert.deepEqual(Object.keys(routed).sort(), [
+    "github.pull-request-review",
+    "github.work-proposal-review",
+  ]);
+  await routed["github.work-proposal-review"].execute({});
+  assert.equal(unifiedCalls, 1);
+  assert.deepEqual(
+    await routed["github.pull-request-review"].execute({}),
+    { status: "stale" },
+  );
+  assert.equal(legacyCalls, 0);
+  assert.deepEqual(
+    await routed["github.pull-request-review"].reconcile({}),
+    { status: "already" },
+  );
+  assert.equal(legacyReconcileCalls, 1);
+  await runtime.close();
+});
+
+test("an enabled unified PR action fails closed without its fixed executor", async () => {
+  await assert.rejects(
+    createConfirmationRuntime(
+      enabledConfig({ enabledActions: ["comment"] }),
+      runtimeDependencies(),
+    ),
+    (error) =>
+      error.code === "INVALID_CONFIRMATION_RUNTIME_CONFIG" &&
+      /固定语义执行器/u.test(error.message),
+  );
+});
+
+test("PR action allow-list rejects duplicates and unknown capabilities", async () => {
+  for (const enabledActions of [
+    ["comment", "comment"],
+    ["delete_branch"],
+    "comment",
+  ]) {
+    await assert.rejects(
+      createConfirmationRuntime(
+        enabledConfig({ enabledActions }),
+        runtimeDependencies(),
+      ),
+      (error) => error.code === "INVALID_CONFIRMATION_RUNTIME_CONFIG",
+    );
+  }
 });
 
 test("a local-only runtime starts without reading GitHub credentials", async () => {
@@ -614,6 +802,45 @@ test("real confirmation queue never inverts its lock order with configuration cu
   await runtime.close();
 });
 
+test("an injected runtime clock governs real confirmation queue timestamps", async (t) => {
+  const timestamp = "2026-08-08T02:00:00.000Z";
+  const store = memoryStore();
+  let runtime = null;
+  t.after(() => runtime?.close());
+  runtime = await createConfirmationRuntime(
+    { githubActions: { enabled: false } },
+    runtimeDependencies({
+      clock: () => new Date(timestamp),
+      store,
+      createExecutorRouter: undefined,
+      createOperationQueue: undefined,
+      createQueue: undefined,
+      localExecutors: {
+        "local.code-job-create": {
+          async execute() {
+            return { status: "applied", receipt: { id: "unused-receipt" } };
+          },
+          async reconcile() {
+            return { status: "absent" };
+          },
+        },
+      },
+    }),
+  );
+
+  await runtime.producerQueue.enqueue(
+    localPlan(
+      "confirmation-runtime-clock",
+      "local.code-job-create",
+      "create_code_job",
+    ),
+  );
+  const [queued] = (await store.read("confirmation-state", null)).items;
+
+  assert.equal(queued.createdAt, timestamp);
+  assert.equal(queued.updatedAt, timestamp);
+});
+
 test("a change-package-only runtime never reads GitHub credentials", async () => {
   const applicationExecutor = { execute() {}, reconcile() {} };
   let routed;
@@ -784,13 +1011,18 @@ test("invalid enabled settings fail before constructing any component", async ()
     assert.equal(creations, 0);
   }
 
-  let creations = 0;
-  await assert.rejects(
-    createConfirmationRuntime(enabledConfig(), {
+  let executorOptions;
+  const runtime = await createConfirmationRuntime(
+    enabledConfig(),
+    runtimeDependencies({
       env: {},
-      createStore: () => { creations += 1; },
+      createExecutor(options) {
+        executorOptions = options;
+        return { execute() {}, reconcile() {} };
+      },
     }),
-    (error) => error.code === "INVALID_CONFIRMATION_RUNTIME_CONFIG",
   );
-  assert.equal(creations, 0);
+  assert.ok(runtime);
+  assert.equal(executorOptions.credentialProvider(), null);
+  await runtime.close();
 });

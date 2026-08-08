@@ -292,6 +292,48 @@ test("configuration-first admission creates no legacy PR employee job", async ()
   assert.equal(reviewerCalls, 0);
 });
 
+test("legacy PR work forwards shutdown and records no retry after cancellation", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  const controller = new AbortController();
+  const shutdown = Object.assign(new Error("lifecycle shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  const contextStarted = deferred();
+  let contextSignal = null;
+  let reviewerCalls = 0;
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext(_item, options) {
+        contextSignal = options.signal;
+        contextStarted.resolve();
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => reject(options.signal.reason);
+          options.signal.addEventListener("abort", onAbort, { once: true });
+          if (options.signal.aborted) onAbort();
+        });
+      },
+    },
+    reviewer: {
+      async analyze() {
+        reviewerCalls += 1;
+        return reviewResult();
+      },
+    },
+  });
+
+  const running = service.tick({ signal: controller.signal });
+  await contextStarted.promise;
+  controller.abort(shutdown);
+
+  await assert.rejects(running, (error) => error === shutdown);
+  assert.strictEqual(contextSignal, controller.signal);
+  assert.equal(reviewerCalls, 0);
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "running");
+  assert.equal(state.jobs[0].error, "");
+});
+
 test("an admitted job write releases cutover before storage settles", async () => {
   const gate = readyGate();
   const store = new BlockingStateStore(
@@ -931,7 +973,7 @@ test("a policy upgrade supersedes the old draft before creating a replacement", 
 test("an authored PR produces an internal work plan without entering approval", async () => {
   const owned = pullRequest({
     relation: "authored",
-    author: "SV-li-zhenhui",
+    author: "local-owner",
     nextAction: "fix_ci",
     actionReasons: ["需要你处理检查失败"],
   });

@@ -9,9 +9,13 @@ import {
   createWorkDecisionContext,
 } from "./work-ledger-state.js";
 import {
+  currentWorkItemExecutionBinding,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "./work-ledger-pr-source.js";
+import {
+  createProposalResultAttestation,
+} from "./work-ledger-result-attestation.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import {
   hasExactLedgerKeys,
@@ -21,7 +25,12 @@ import {
 const MAX_PROPOSAL_BATCH = 100;
 const PROPOSAL_INTENT_TYPES = new Map([
   ["github_review_proposal", "propose_github_review"],
+  [
+    "github_pull_request_action_proposal",
+    "propose_github_pull_request_action",
+  ],
   ["code_action_proposal", "propose_code_action"],
+  ["configuration_change_proposal", "propose_configuration_change"],
 ]);
 
 function invalid(message = "工作提案结果批次无效") {
@@ -215,10 +224,11 @@ export function planProposalBatchApplication({ state, input, clock }) {
 
   const now = clock();
   let items = state.items;
+  let outboxEntries = state.outbox;
   const timelineEvents = [];
   const appliedItemIds = [];
   for (const result of batch.pending) {
-    const workingState = { ...state, items };
+    const workingState = { ...state, items, outbox: outboxEntries };
     const {
       item,
       outbox,
@@ -262,9 +272,32 @@ export function planProposalBatchApplication({ state, input, clock }) {
         resultDigest: result.contentDigest,
         summary: result.summary,
         downstreamRef: result.downstreamRef,
+        evidence: result.evidence,
       },
       observedAt: result.at,
     });
+    const resultAttestation = createProposalResultAttestation({
+      result,
+      intentId: outbox.intentId,
+      decisionContentDigest: decisionContext.contentDigest,
+    });
+    const outboxResult = {
+      ...outbox,
+      revision: outbox.revision + 1,
+      outcome: {
+        ...outbox.outcome,
+        details: {
+          ...outbox.outcome.details,
+          resultAttestation,
+        },
+      },
+      updatedAt: now,
+    };
+    outboxEntries = replaceWorkLedgerRecord(
+      outboxEntries,
+      "intentId",
+      outboxResult,
+    );
     const continueForEvidence = succeeded && evidenceTarget !== null;
     let nextStatus = "blocked";
     if (succeeded) {
@@ -290,6 +323,12 @@ export function planProposalBatchApplication({ state, input, clock }) {
       at: now,
       actorId: "work-proposal-result-reconciler",
       details: {
+        inputBinding: currentWorkItemExecutionBinding(item),
+        workItemRevision: itemResult.revision,
+        inputDigest: item.inputDigest,
+        intentId: outbox.intentId,
+        resultAttestationDigest: resultAttestation.attestationDigest,
+        decision: decisionContext,
         proposalId: result.proposalId,
         resultRef: result.resultId,
         outcome: result.outcome,
@@ -301,6 +340,7 @@ export function planProposalBatchApplication({ state, input, clock }) {
   return {
     patch: {
       items,
+      outbox: outboxEntries,
       proposalCursor: batch.nextSequence,
       proposalHighWatermark: batch.highWatermark,
     },

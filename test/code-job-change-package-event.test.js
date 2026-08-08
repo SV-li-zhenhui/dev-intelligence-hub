@@ -302,7 +302,7 @@ test("v2 PR and Issue eligibility stays strict while legacy jobs remain recovery
   );
 });
 
-test("schema v3 conflict jobs produce self-contained v2 events without changing v2 events", () => {
+test("schema v3 conflict jobs produce time-bound v3 events without changing ordinary events", () => {
   const conflictJob = completedJob({ grantSchemaVersion: 3 });
   const conflictEvent = createCodeJobChangePackageEvent({
     sequence: 1,
@@ -315,7 +315,7 @@ test("schema v3 conflict jobs produce self-contained v2 events without changing 
     job: completedJob({ inputBindingVersion: 2 }),
   });
 
-  assert.equal(conflictEvent.schemaVersion, 2);
+  assert.equal(conflictEvent.schemaVersion, 3);
   assert.deepEqual(
     conflictEvent.executionSource,
     conflictJob.grant.executionSource,
@@ -324,9 +324,39 @@ test("schema v3 conflict jobs produce self-contained v2 events without changing 
     conflictEvent.executionSource,
     conflictJob.grant.executionSource,
   );
+  assert.equal(conflictEvent.recordedAt, "2026-08-02T06:01:00.000Z");
   assert.equal(ordinaryEvent.schemaVersion, 1);
   assert.equal(Object.hasOwn(ordinaryEvent, "executionSource"), false);
   assert.deepEqual(normalizeCodeJobChangePackageEvent(conflictEvent), conflictEvent);
+});
+
+test("legacy conflict events remain readable but recovery never retimes them", () => {
+  const job = completedJob({ grantSchemaVersion: 3 });
+  const current = createCodeJobChangePackageEvent({
+    sequence: 1,
+    previousDigest: null,
+    job,
+  });
+  const legacyContent = eventContent(current);
+  legacyContent.schemaVersion = 2;
+  delete legacyContent.recordedAt;
+  const eventDigest = digestValue(legacyContent);
+  const legacy = {
+    ...legacyContent,
+    eventId: `code-job-change-package-event-${eventDigest}`,
+    eventDigest,
+  };
+
+  assert.deepEqual(normalizeCodeJobChangePackageEvent(legacy), legacy);
+  assert.deepEqual(
+    reconstructCodeJobChangePackageEventForRecovery(
+      { sequence: 1, previousDigest: null, job },
+      { expectedEventDigest: legacy.eventDigest },
+    ),
+    legacy,
+  );
+  assert.notEqual(current.eventDigest, legacy.eventDigest);
+  assert.equal(current.recordedAt, "2026-08-02T06:01:00.000Z");
 });
 
 test("schema v3 event source is mandatory and covered by the event digest", () => {
@@ -348,6 +378,19 @@ test("schema v3 event source is mandatory and covered by the event digest", () =
   changed.executionSource.preparationBinding.boundaryDigest = "e".repeat(64);
   assert.throws(
     () => normalizeCodeJobChangePackageEvent(changed),
+    CodeJobChangePackageEventError,
+  );
+
+  const retimed = structuredClone(event);
+  retimed.recordedAt = "2026-08-02T06:02:00.000Z";
+  assert.throws(
+    () => normalizeCodeJobChangePackageEvent(retimed),
+    CodeJobChangePackageEventError,
+  );
+  const nonJsonTime = structuredClone(event);
+  nonJsonTime.recordedAt = new Date(event.recordedAt);
+  assert.throws(
+    () => normalizeCodeJobChangePackageEvent(nonJsonTime),
     CodeJobChangePackageEventError,
   );
 

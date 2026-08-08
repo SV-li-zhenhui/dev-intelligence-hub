@@ -166,11 +166,19 @@ function runAbortable(signal, operation) {
 }
 
 function brainDescription(value, expected, name) {
-  const fields = exact(
-    value,
-    ["provider", "model", "remote", "remoteData"],
-    name,
-  );
+  const fields = new Map(dataEntries(value, name));
+  const required = ["provider", "model", "remote", "remoteData"];
+  if (
+    required.some((key) => !fields.has(key)) ||
+    [...fields.keys()].some(
+      (key) => !required.includes(key) && key !== "singleAttempt"
+    ) ||
+    fields.size > required.length + 1 ||
+    (fields.has("singleAttempt") &&
+      typeof fields.get("singleAttempt") !== "boolean")
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
   if (
     fields.get("provider") !== expected.provider ||
     fields.get("model") !== expected.model ||
@@ -191,6 +199,9 @@ function brainDescription(value, expected, name) {
     model: fields.get("model"),
     remote: fields.get("remote"),
     remoteData: Object.freeze(Object.fromEntries(remoteData)),
+    ...(fields.get("singleAttempt") === true
+      ? { singleAttempt: true }
+      : {}),
   });
 }
 
@@ -409,7 +420,8 @@ export class MemoryAnswerService {
       { role: "user", content: JSON.stringify(promptPacket(packet)) },
     ];
     let validationFailure = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const maximumAttempts = description.singleAttempt === true ? 1 : 2;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       const admission = await runAbortable(signal, () =>
         this.#admitGenerate({
           attempt,
@@ -436,7 +448,7 @@ export class MemoryAnswerService {
     }
     throw answerError(
       "MEMORY_ANSWER_RESPONSE_INVALID",
-      "记忆大脑连续两次返回了无法验证的回答",
+      "记忆大脑返回了无法验证的回答",
       502,
       validationFailure,
     );

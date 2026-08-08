@@ -252,3 +252,46 @@ test("an admitted PR analysis can finish while its correction retry stays fenced
   );
   assert.equal(calls, 1);
 });
+
+test("external shutdown aborts the active Ollama request with the original reason", async () => {
+  const invoked = deferred();
+  const abortObserved = deferred();
+  const releaseAbort = deferred();
+  const controller = new AbortController();
+  const shutdown = Object.assign(new Error("lifecycle shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  let requestSignal = null;
+  const reviewer = new OllamaPrEmployeeReviewer({
+    timeoutMs: 10_000,
+    fetch: async (_url, options) => {
+      requestSignal = options.signal;
+      invoked.resolve();
+      return new Promise((_resolve, reject) => {
+        const onAbort = async () => {
+          abortObserved.resolve();
+          await releaseAbort.promise;
+          reject(options.signal.reason);
+        };
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        if (options.signal.aborted) void onAbort();
+      });
+    },
+  });
+
+  const analysis = reviewer.analyze(context(), { signal: controller.signal });
+  await invoked.promise;
+  controller.abort(shutdown);
+  await abortObserved.promise;
+  let analysisSettled = false;
+  void analysis.then(
+    () => { analysisSettled = true; },
+    () => { analysisSettled = true; },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(analysisSettled, false);
+  releaseAbort.resolve();
+
+  await assert.rejects(analysis, (error) => error === shutdown);
+  assert.equal(requestSignal.aborted, true);
+});

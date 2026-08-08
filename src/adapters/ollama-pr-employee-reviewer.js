@@ -1,4 +1,7 @@
+import { types as utilTypes } from "node:util";
+
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -56,6 +59,28 @@ const RESULT_SCHEMA = {
 const RESULT_FIELDS = Object.freeze(Object.keys(RESULT_SCHEMA.properties));
 
 class InvalidEmployeeResultError extends Error {}
+
+function analysisSignal(options) {
+  if (options === undefined) return null;
+  if (
+    options === null ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    utilTypes.isProxy(options) ||
+    Object.getPrototypeOf(options) !== Object.prototype
+  ) {
+    throw new TypeError("PR employee analysis options are invalid");
+  }
+  const keys = Reflect.ownKeys(options);
+  if (keys.length === 0) return null;
+  const descriptor = keys.length === 1 && keys[0] === "signal"
+    ? Object.getOwnPropertyDescriptor(options, "signal")
+    : null;
+  if (!descriptor?.enumerable || !("value" in descriptor)) {
+    throw new TypeError("PR employee analysis options are invalid");
+  }
+  return normalizeAbortSignal(descriptor.value);
+}
 
 function actionAdmissionRun(value) {
   if (!value || typeof value.run !== "function") {
@@ -308,15 +333,18 @@ export class OllamaPrEmployeeReviewer {
     this.contextTokens = positiveNumber(contextTokens, DEFAULT_CONTEXT_TOKENS);
   }
 
-  async analyze(input) {
+  async analyze(input, options) {
+    const signal = analysisSignal(options);
+    signal?.throwIfAborted();
     const context = selectContext(input);
     if (!["review", "owner"].includes(context.workMode)) {
       throw new Error("PR employee workMode must be review or owner");
     }
     let lastError = "unknown validation error";
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      signal?.throwIfAborted();
       try {
-        const response = await this.#request(context, attempt === 1);
+        const response = await this.#request(context, attempt === 1, signal);
         return parseResult(response, context);
       } catch (error) {
         if (!(error instanceof InvalidEmployeeResultError)) throw error;
@@ -326,10 +354,23 @@ export class OllamaPrEmployeeReviewer {
     throw new Error(`Invalid Ollama employee result after retry: ${lastError}`);
   }
 
-  async #request(context, isRetry) {
+  async #request(context, isRetry, signal) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let abortKind = null;
+    const onExternalAbort = () => {
+      if (abortKind !== null) return;
+      abortKind = "external";
+      controller.abort(signal?.reason);
+    };
+    signal?.addEventListener("abort", onExternalAbort, { once: true });
+    if (signal?.aborted) onExternalAbort();
+    const timeout = setTimeout(() => {
+      if (abortKind !== null) return;
+      abortKind = "timeout";
+      controller.abort();
+    }, this.timeoutMs);
     try {
+      signal?.throwIfAborted();
       const admitted = await this.admitRequest(() => ({
         response: this.fetch(`${this.baseUrl}/api/chat`, {
           method: "POST",
@@ -353,6 +394,7 @@ export class OllamaPrEmployeeReviewer {
         }),
       }));
       const response = await admittedResponse(admitted);
+      signal?.throwIfAborted();
       if (!response.ok) {
         const detail = (await response.text().catch(() => "")).trim().slice(0, 500);
         throw new Error(
@@ -360,14 +402,24 @@ export class OllamaPrEmployeeReviewer {
         );
       }
       try {
-        return await response.json();
+        const result = await response.json();
+        signal?.throwIfAborted();
+        if (abortKind === "timeout") {
+          throw new Error(
+            `Ollama employee request timed out after ${this.timeoutMs} ms`,
+          );
+        }
+        return result;
       } catch (error) {
         throw new InvalidEmployeeResultError(
           `API response is not JSON: ${error.message}`,
         );
       }
     } catch (error) {
-      if (controller.signal.aborted || error?.name === "AbortError") {
+      if (abortKind === "external") {
+        signal?.throwIfAborted();
+      }
+      if (abortKind === "timeout") {
         throw new Error(`Ollama employee request timed out after ${this.timeoutMs} ms`, {
           cause: error,
         });
@@ -375,6 +427,7 @@ export class OllamaPrEmployeeReviewer {
       throw error;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", onExternalAbort);
     }
   }
 }
