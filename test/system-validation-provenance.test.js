@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -37,14 +38,18 @@ async function createValidationFixture(t) {
     "public",
     "scripts",
     "src",
+    "src/lib",
     "test/browser",
     "test-support",
   ]) {
     await mkdir(path.join(root, directory), { recursive: true });
   }
   for (const relativePath of [
+    "scripts/system-live-validation.mjs",
     "scripts/system-validation-provenance.mjs",
     "scripts/validate-system.mjs",
+    "src/lib/repository-source-state.js",
+    "src/lib/runtime-source-identity.js",
   ]) {
     await writeFile(
       path.join(root, relativePath),
@@ -53,6 +58,43 @@ async function createValidationFixture(t) {
   }
   await writeFile(path.join(root, ".gitignore"), "validation-artifacts/\n");
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
+  await writeFile(
+    path.join(root, "scripts/validate-ui.mjs"),
+    "process.exitCode = 0;\n",
+  );
+  await writeFile(
+    path.join(root, "test-support/live-fetch-preload.mjs"),
+    [
+      "import { computeVersionedRuntimeSourceIdentity } from '../src/lib/runtime-source-identity.js';",
+      "const source = await computeVersionedRuntimeSourceIdentity(process.cwd());",
+      "globalThis.fetch = async (url) => ({",
+      "  ok: true,",
+      "  status: 200,",
+      "  async json() {",
+      "    if (String(url).endsWith('/api/live')) {",
+      "      return {",
+      "        schemaVersion: 1,",
+      "        live: true,",
+      "        service: 'mydashboard',",
+      "        processId: 2468,",
+      "        managed: true,",
+      "        lifecycleState: 'running',",
+      "        instanceId: '12345678-1234-4123-8123-123456789abc',",
+      "        startIdentity: 'd'.repeat(64),",
+      "        runtimeSource: source,",
+      "      };",
+      "    }",
+      "    return {",
+      "      ok: true,",
+      "      service: 'mydashboard',",
+      "      processId: 2468,",
+      "      runtimeSource: source,",
+      "    };",
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
   await writeFile(
     path.join(root, "test/smoke.test.js"),
     [
@@ -76,6 +118,7 @@ async function createValidationFixture(t) {
     name: "validation-fixture",
     private: true,
     type: "module",
+    files: ["scripts/", "src/"],
     scripts: { test: "node --test test/smoke.test.js" },
   }, null, 2)}\n`);
   await git(root, "add", ".");
@@ -107,14 +150,19 @@ test("captures an exact, path-free source identity from a clean Git repository",
 
   const state = await captureRepositoryState(root);
 
-  assert.deepEqual(state, {
+  assert.deepEqual({
+    ...state,
+    headLogDigest: "<verified>",
+  }, {
     schemaVersion: 1,
     headOid: expectedHeadOid,
     treeOid: expectedTreeOid,
     clean: true,
     changeCount: 0,
     statusDigest: createHash("sha256").update("").digest("hex"),
+    headLogDigest: "<verified>",
   });
+  assert.match(state.headLogDigest, /^[a-f0-9]{64}$/u);
   assert.equal(JSON.stringify(state).includes(root), false);
 });
 
@@ -142,6 +190,7 @@ test("acceptance rejects dirty or changed source state", async () => {
     clean: true,
     changeCount: 0,
     statusDigest: "3".repeat(64),
+    headLogDigest: "6".repeat(64),
   };
 
   assert.doesNotThrow(() => assertStableCleanRepository(clean, clean));
@@ -163,6 +212,27 @@ test("acceptance rejects dirty or changed source state", async () => {
   );
 });
 
+test("acceptance detects an A-to-B-to-A HEAD transition through the reflog", async (t) => {
+  const root = await createRepository(t);
+  const { assertStableCleanRepository, captureRepositoryState } =
+    await loadProvenanceModule();
+  const started = await captureRepositoryState(root);
+  await writeFile(path.join(root, "tracked.txt"), "second commit\n");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "--quiet", "-m", "second");
+  await git(root, "reset", "--hard", "--quiet", started.headOid);
+  const finished = await captureRepositoryState(root);
+
+  assert.equal(finished.headOid, started.headOid);
+  assert.equal(finished.treeOid, started.treeOid);
+  assert.equal(finished.clean, true);
+  assert.notEqual(finished.headLogDigest, started.headLogDigest);
+  assert.throws(
+    () => assertStableCleanRepository(started, finished),
+    /repository history changed during validation/u,
+  );
+});
+
 test("the system validator binds a passing report to one clean Git source state", async (t) => {
   const root = await createValidationFixture(t);
   const expectedHeadOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
@@ -180,6 +250,10 @@ test("the system validator binds a passing report to one clean Git source state"
     "utf8",
   ));
   assert.equal(report.status, "passed");
+  assert.match(
+    report.runId,
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
+  );
   assert.deepEqual(report.source.started, report.source.finished);
   assert.equal(report.source.stable, true);
   assert.equal(report.source.started.headOid, expectedHeadOid);
@@ -212,13 +286,19 @@ test("the system validator binds a passing report to one clean Git source state"
         todo: 0,
       },
       cases: [
-        { name: "fixture passes", status: "passed" },
         {
+          identity: "tap:1:fixture passes",
+          name: "fixture passes",
+          status: "passed",
+        },
+        {
+          identity: "tap:2:fixture skip",
           name: "fixture skip",
           status: "skipped",
           reason: "fixture reason",
         },
         {
+          identity: "tap:3:validation reporter options stay outside tested processes",
           name: "validation reporter options stay outside tested processes",
           status: "passed",
         },
@@ -232,6 +312,64 @@ test("the system validator binds a passing report to one clean Git source state"
     true,
   );
   assert.equal(JSON.stringify(report).includes(root), false);
+});
+
+test("live UI validation records the exact managed runtime source identity", async (t) => {
+  const root = await createValidationFixture(t);
+  const expectedHeadOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
+  const expectedTreeOid = await git(root, "rev-parse", "--verify", "HEAD^{tree}");
+  const preload = pathToFileURL(
+    path.join(root, "test-support/live-fetch-preload.mjs"),
+  ).href;
+
+  await execFileAsync(
+    process.execPath,
+    ["scripts/validate-system.mjs", "--with-live-ui"],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...validationEnvironment(),
+        NODE_OPTIONS: `--import=${preload}`,
+      },
+      windowsHide: true,
+    },
+  );
+
+  const report = JSON.parse(await readFile(
+    path.join(root, "validation-artifacts/system-validation.json"),
+    "utf8",
+  ));
+  assert.deepEqual(Object.keys(report.liveService).sort(), [
+    "instanceId",
+    "processId",
+    "runtimeSource",
+    "startIdentity",
+  ]);
+  assert.equal(report.liveService.processId, 2468);
+  assert.equal(
+    report.liveService.instanceId,
+    "12345678-1234-4123-8123-123456789abc",
+  );
+  assert.equal(report.liveService.startIdentity, "d".repeat(64));
+  assert.deepEqual(Object.keys(report.liveService.runtimeSource).sort(), [
+    "clean",
+    "headOid",
+    "runtimeByteCount",
+    "runtimeDigest",
+    "runtimeFileCount",
+    "schemaVersion",
+    "treeOid",
+  ]);
+  assert.equal(report.liveService.runtimeSource.schemaVersion, 1);
+  assert.equal(report.liveService.runtimeSource.headOid, expectedHeadOid);
+  assert.equal(report.liveService.runtimeSource.treeOid, expectedTreeOid);
+  assert.equal(report.liveService.runtimeSource.clean, true);
+  assert.match(report.liveService.runtimeSource.runtimeDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(report.liveService.runtimeSource.runtimeFileCount > 0, true);
+  assert.equal(report.liveService.runtimeSource.runtimeByteCount > 0, true);
+  assert.equal(report.source.started.headOid, expectedHeadOid);
+  assert.equal(report.source.started.treeOid, expectedTreeOid);
 });
 
 test("the system validator fails before acceptance when tracked source is dirty", async (t) => {

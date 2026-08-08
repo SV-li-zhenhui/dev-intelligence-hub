@@ -955,6 +955,7 @@ async function withServer(
     changePackageApplicationRequester,
     changePackageApplicationStatusReader,
     codeJobEvidenceReader,
+    runtimeSourceIdentity,
   } = {},
 ) {
   const calls = [];
@@ -1188,6 +1189,7 @@ async function withServer(
   }
   const server = createDashboardServer(application, {
     backgroundWork,
+    runtimeSourceIdentity,
     reportError(error) {
       reportedErrors.push(error);
     },
@@ -1199,6 +1201,28 @@ async function withServer(
     await server.shutdown();
   }
 }
+
+test("live and health freeze the startup runtime source identity", async () => {
+  const runtimeSourceIdentity = {
+    schemaVersion: 1,
+    headOid: "a".repeat(40),
+    treeOid: "b".repeat(40),
+    clean: true,
+    runtimeDigest: "c".repeat(64),
+    runtimeFileCount: 440,
+    runtimeByteCount: 1_234_567,
+  };
+  await withServer(async ({ server }) => {
+    runtimeSourceIdentity.headOid = "d".repeat(40);
+    const live = JSON.parse((await request(server, { path: "/api/live" })).body);
+    const health = JSON.parse(
+      (await request(server, { path: "/api/health" })).body,
+    );
+
+    assert.equal(live.runtimeSource.headOid, "a".repeat(40));
+    assert.deepEqual(health.runtimeSource, live.runtimeSource);
+  }, { runtimeSourceIdentity });
+});
 
 test("system operations API preserves the browser projection and validates backup requests", async (t) => {
   const privateMarker = "private-producer-token-marker";

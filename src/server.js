@@ -34,6 +34,9 @@ import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
 import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 import { projectRoot } from "./lib/config.js";
 import {
+  computeVersionedRuntimeSourceIdentity,
+} from "./lib/runtime-source-identity.js";
+import {
   CONFIGURATION_CONTROL_PLANE_LIMITS,
 } from "./services/configuration-store.js";
 import {
@@ -133,9 +136,38 @@ const managedInstanceId =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const managedStartIdentity = /^[a-f0-9]{64}$/u;
 const managedProjectDigest = /^[a-f0-9]{64}$/u;
+const sourceObjectIdentity = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const managedLogMaximumBytes = 5 * 1024 * 1024;
 const managedLogArchiveCount = 4;
 const managedLogMaximumRecordBytes = 64 * 1024;
+
+function runtimeSourceIdentity(value) {
+  if (value === null) return null;
+  const fields = Object.keys(value ?? {}).sort();
+  if (
+    fields.join("\0") !== [
+      "clean",
+      "headOid",
+      "runtimeByteCount",
+      "runtimeDigest",
+      "runtimeFileCount",
+      "schemaVersion",
+      "treeOid",
+    ].sort().join("\0") ||
+    value.schemaVersion !== 1 ||
+    !sourceObjectIdentity.test(value.headOid) ||
+    !sourceObjectIdentity.test(value.treeOid) ||
+    value.clean !== true ||
+    !managedProjectDigest.test(value.runtimeDigest) ||
+    !Number.isSafeInteger(value.runtimeFileCount) ||
+    value.runtimeFileCount <= 0 ||
+    !Number.isSafeInteger(value.runtimeByteCount) ||
+    value.runtimeByteCount <= 0
+  ) {
+    throw new TypeError("runtimeSourceIdentity is invalid");
+  }
+  return Object.freeze(structuredClone(value));
+}
 const defaultShutdownDrainTimeoutMs = 30_000;
 
 function decodeManagedToken(token) {
@@ -2195,6 +2227,7 @@ export function createDashboardServer(
     writerLease = null,
     shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
     allowUnmanagedShutdown = true,
+    runtimeSourceIdentity: runtimeSourceIdentityInput = null,
     setProcessExitCode = (code) => {
       process.exitCode = code;
     },
@@ -2219,6 +2252,7 @@ export function createDashboardServer(
   if (typeof allowUnmanagedShutdown !== "boolean") {
     throw new TypeError("allowUnmanagedShutdown must be a boolean");
   }
+  const runtimeSource = runtimeSourceIdentity(runtimeSourceIdentityInput);
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
   const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
@@ -2241,6 +2275,7 @@ export function createDashboardServer(
           ...(processController
             ? processController.liveIdentity()
             : { managed: false, lifecycleState: "running" }),
+          ...(runtimeSource ? { runtimeSource } : {}),
         });
         return;
       }
@@ -2357,6 +2392,7 @@ export function createDashboardServer(
           refreshing: Boolean(application.refreshService.running),
           employee,
           employees,
+          ...(runtimeSource ? { runtimeSource } : {}),
           ...(memory ? { memory } : {}),
         });
         return;
@@ -3874,6 +3910,7 @@ export async function startDashboardServer(
     managedProcess = null,
     writerLease = null,
     shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
+    runtimeSourceIdentity: runtimeSourceIdentityInput = null,
   } = {},
 ) {
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
@@ -3904,6 +3941,7 @@ export async function startDashboardServer(
       writerLease,
       onManagedClaim: managedProcess ? () => backgroundWork.start() : null,
       allowUnmanagedShutdown: false,
+      runtimeSourceIdentity: runtimeSourceIdentityInput,
       shutdownDrainTimeoutMs,
     });
     await listenForLocalConnections(server, application.config.port);
@@ -3972,6 +4010,9 @@ async function runDashboardProcess(managedProcess) {
     ? createManagedFileDiagnostics(managedProcess.logDirectory)
     : { log: console.log, reportError: console.error };
   try {
+    const runtimeSourceIdentity = await computeVersionedRuntimeSourceIdentity(
+      projectRoot,
+    );
     const writerLease = createApplicationWriterLease({
       projectRoot,
       projectDigest: managedProcess?.projectDigest ?? null,
@@ -3981,6 +4022,7 @@ async function runDashboardProcess(managedProcess) {
       writerLease,
       log: diagnostics.log,
       reportError: diagnostics.reportError,
+      runtimeSourceIdentity,
     });
   } catch (error) {
     diagnostics.reportError(error);

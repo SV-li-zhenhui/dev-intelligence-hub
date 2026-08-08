@@ -898,7 +898,11 @@ test("keeps the Git executable outside preparation and mirror trust boundaries",
 
 test(
   "requires a non-dangerous executable mode for Git on Unix",
-  { skip: process.platform === "win32" },
+  {
+    skip: process.platform === "win32"
+      ? "POSIX executable mode is unavailable on Windows"
+      : false,
+  },
   async (t) => {
     const nonExecutable = await fixture(t);
     await chmod(nonExecutable.gitCommand, 0o644);

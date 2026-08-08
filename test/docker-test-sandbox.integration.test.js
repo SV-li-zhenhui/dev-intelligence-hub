@@ -11,7 +11,11 @@ const image =
 
 test(
   "real Docker sandbox denies host network, secrets, and source writes",
-  { skip: !enabled },
+  {
+    skip: !enabled
+      ? "requires MYDASHBOARD_DOCKER_INTEGRATION=1"
+      : false,
+  },
   async (t) => {
     const root = await mkdtemp(path.join(tmpdir(), "docker-sandbox-live-"));
     const workspacePath = path.join(root, "workspace");

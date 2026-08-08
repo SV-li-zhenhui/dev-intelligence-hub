@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readdir, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
+import { verifyLiveDashboard } from "./system-live-validation.mjs";
 import {
   assertStableCleanRepository,
   captureRepositoryState,
@@ -23,6 +26,7 @@ if (unknownArguments.length > 0) {
 
 const report = {
   schemaVersion: 1,
+  runId: randomUUID(),
   startedAt: new Date().toISOString(),
   finishedAt: null,
   status: "running",
@@ -34,6 +38,7 @@ const report = {
     finished: null,
     stable: false,
   },
+  liveService: null,
   steps: [],
 };
 
@@ -79,6 +84,7 @@ function commandRecord(command, arguments_) {
 function run(command, arguments_, {
   name = commandLabel(command, arguments_),
   environment = process.env,
+  environmentEvidence = null,
   quiet = false,
   parseOutput = null,
 } = {}) {
@@ -109,6 +115,9 @@ function run(command, arguments_, {
         durationMs,
         exitCode: code,
         signal,
+        ...(environmentEvidence === null
+          ? {}
+          : { environment: structuredClone(environmentEvidence) }),
       };
       let outputError = null;
       if (parseOutput !== null) {
@@ -160,20 +169,24 @@ function parseNodeTestTap(output) {
     );
     const name = directiveMatch[1];
     const directive = directiveMatch[2]?.toUpperCase() ?? null;
+    const identity = `tap:${cases.length + 1}:${name}`;
     if (directive === "SKIP") {
       cases.push({
+        identity,
         name,
         status: "skipped",
         ...(directiveMatch[3] ? { reason: directiveMatch[3] } : {}),
       });
     } else if (directive === "TODO") {
       cases.push({
+        identity,
         name,
         status: "todo",
         ...(directiveMatch[3] ? { reason: directiveMatch[3] } : {}),
       });
     } else {
       cases.push({
+        identity,
         name,
         status: caseMatch[1] ? "failed" : "passed",
       });
@@ -225,13 +238,20 @@ async function checkSyntax() {
   });
 }
 
-async function requireLiveDashboard() {
-  const response = await fetch("http://127.0.0.1:4173/api/health", {
-    signal: AbortSignal.timeout(5_000),
+async function verifyCurrentLiveDashboard() {
+  const runtime = await computeRuntimeSourceIdentity(root);
+  return verifyLiveDashboard({
+    baseUrl: "http://127.0.0.1:4173",
+    expectedRuntimeSource: {
+      schemaVersion: 1,
+      headOid: report.source.started.headOid,
+      treeOid: report.source.started.treeOid,
+      clean: true,
+      runtimeDigest: runtime.digest,
+      runtimeFileCount: runtime.fileCount,
+      runtimeByteCount: runtime.byteCount,
+    },
   });
-  if (!response.ok) {
-    throw new Error(`live dashboard health returned HTTP ${response.status}`);
-  }
 }
 
 async function writeReport() {
@@ -274,10 +294,11 @@ try {
         ...process.env,
         MYDASHBOARD_DOCKER_INTEGRATION: "1",
       },
+      environmentEvidence: { MYDASHBOARD_DOCKER_INTEGRATION: "1" },
     });
   }
   if (withLiveUi) {
-    await requireLiveDashboard();
+    report.liveService = await verifyCurrentLiveDashboard();
     await run(process.execPath, ["scripts/validate-ui.mjs"], {
       name: "live desktop and mobile UI behavior",
     });
