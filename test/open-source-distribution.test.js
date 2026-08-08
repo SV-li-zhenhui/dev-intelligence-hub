@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   copyFile,
   mkdir,
@@ -214,32 +215,141 @@ async function waitUntilStopped(url, timeoutMilliseconds = 20_000) {
 
 let distributionManifest;
 let trackedFiles;
+let trackedIndexEntries;
 
-function runGit(arguments_, timeout = 60_000) {
+const trackedBlobModes = new Set(["100644", "100755", "120000"]);
+const trackedPathDecoder = new TextDecoder("utf-8", { fatal: true });
+
+function runGitIn(
+  repositoryRoot,
+  arguments_,
+  {
+    encoding = arguments_.includes("-z") ? "buffer" : "utf8",
+    input,
+    timeout = 60_000,
+    maxBuffer = 128 * 1024 * 1024,
+  } = {},
+) {
   return spawnSync("git", arguments_, {
-    cwd: root,
-    encoding: arguments_.includes("-z") ? "buffer" : "utf8",
+    cwd: repositoryRoot,
+    encoding,
+    ...(input === undefined ? {} : { input }),
     timeout,
     windowsHide: true,
-    maxBuffer: 8 * 1024 * 1024,
+    maxBuffer,
   });
+}
+
+function runGit(arguments_, timeout = 60_000) {
+  return runGitIn(root, arguments_, { timeout });
+}
+
+function invalidTrackedIndex() {
+  return new Error("invalid tracked Git index");
+}
+
+function parseTrackedIndexEntries(source) {
+  if (!Buffer.isBuffer(source)) throw invalidTrackedIndex();
+  const entries = [];
+  const seenPaths = new Set();
+  let offset = 0;
+  while (offset < source.length) {
+    const end = source.indexOf(0, offset);
+    if (end < 0 || end === offset) throw invalidTrackedIndex();
+    const record = source.subarray(offset, end);
+    const separator = record.indexOf(9);
+    if (separator <= 0 || separator === record.length - 1) {
+      throw invalidTrackedIndex();
+    }
+    const metadata = record.subarray(0, separator).toString("ascii").match(
+      /^H (100644|100755|120000|160000) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])$/u,
+    );
+    if (
+      metadata === null ||
+      metadata[3] !== "0" ||
+      !trackedBlobModes.has(metadata[1])
+    ) {
+      throw invalidTrackedIndex();
+    }
+    let filePath;
+    try {
+      filePath = trackedPathDecoder.decode(record.subarray(separator + 1));
+    } catch {
+      throw invalidTrackedIndex();
+    }
+    if (
+      filePath.length === 0 ||
+      path.posix.isAbsolute(filePath) ||
+      filePath.includes("\\") ||
+      path.posix.normalize(filePath) !== filePath ||
+      filePath === ".." ||
+      filePath.startsWith("../") ||
+      seenPaths.has(filePath)
+    ) {
+      throw invalidTrackedIndex();
+    }
+    seenPaths.add(filePath);
+    entries.push({ mode: metadata[1], oid: metadata[2], filePath });
+    offset = end + 1;
+  }
+  return entries;
+}
+
+function loadTrackedIndexEntries(repositoryRoot) {
+  const listed = runGitIn(
+    repositoryRoot,
+    ["ls-files", "--stage", "-v", "-z"],
+    { encoding: "buffer" },
+  );
+  assert.equal(listed.status, 0, "could not list tracked Git index");
+  return parseTrackedIndexEntries(listed.stdout);
+}
+
+function parseBlobBatch(source, expectedObjectIds) {
+  if (!Buffer.isBuffer(source)) throw new Error("invalid tracked Git object batch");
+  const blobs = new Map();
+  let offset = 0;
+  for (const expectedObjectId of expectedObjectIds) {
+    const headerEnd = source.indexOf(10, offset);
+    if (headerEnd < 0) throw new Error("invalid tracked Git object batch");
+    const header = source.subarray(offset, headerEnd).toString("ascii").match(
+      /^([0-9a-f]{40}|[0-9a-f]{64}) blob ([0-9]+)$/u,
+    );
+    const size = header === null ? Number.NaN : Number(header[2]);
+    const contentStart = headerEnd + 1;
+    const contentEnd = contentStart + size;
+    if (
+      header === null ||
+      header[1] !== expectedObjectId ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      contentEnd >= source.length ||
+      source[contentEnd] !== 10
+    ) {
+      throw new Error("invalid tracked Git object batch");
+    }
+    blobs.set(expectedObjectId, Buffer.from(source.subarray(contentStart, contentEnd)));
+    offset = contentEnd + 1;
+  }
+  if (offset !== source.length) throw new Error("invalid tracked Git object batch");
+  return blobs;
+}
+
+function readTrackedBlobs(repositoryRoot, entries) {
+  const objectIds = [...new Set(entries.map(({ oid }) => oid))];
+  if (objectIds.length === 0) return new Map();
+  const read = runGitIn(repositoryRoot, ["cat-file", "--batch"], {
+    encoding: "buffer",
+    input: Buffer.from(`${objectIds.join("\n")}\n`, "ascii"),
+  });
+  assert.equal(read.status, 0, "could not read tracked Git objects");
+  return parseBlobBatch(read.stdout, objectIds);
 }
 
 function loadTrackedFiles() {
   if (trackedFiles) return trackedFiles;
-  const listed = runGit(["ls-files", "-z"]);
-  assert.equal(
-    listed.status,
-    0,
-    `git ls-files failed:\n${diagnostic(listed)}`,
-  );
-  trackedFiles = new Set(
-    listed.stdout
-      .toString("utf8")
-      .split("\0")
-      .filter(Boolean)
-      .map((filePath) => filePath.replaceAll("\\", "/")),
-  );
+  trackedIndexEntries ||= loadTrackedIndexEntries(root);
+  trackedFiles = new Set(trackedIndexEntries.map(({ filePath }) => filePath));
   return trackedFiles;
 }
 
@@ -272,7 +382,7 @@ function localPath(rootDirectory, portablePath) {
   return path.join(rootDirectory, ...portablePath.split("/"));
 }
 
-const explicitFakeCredentialMarker = "PRIVACY_FAKE_CREDENTIAL_FIXTURE";
+const fakeCredentialMarkerPrefix = "PRIVACY_FAKE_CREDENTIAL_SHA256:";
 const credentialPatterns = [
   new RegExp(`\\b${["gh", "p_"].join("")}[A-Za-z0-9]{30,}\\b`, "gu"),
   new RegExp(`\\b${["github", "_pat_"].join("")}[A-Za-z0-9_]{40,}\\b`, "gu"),
@@ -355,25 +465,35 @@ async function optionalLocalPrivacyDenylist() {
   return denied;
 }
 
-function hasAdjacentFakeCredentialMarker(text, matchIndex) {
+function hasAdjacentFakeCredentialMarker(text, match, consumedMarkers) {
+  const matchIndex = match.index;
   const currentLineStart = text.lastIndexOf("\n", matchIndex) + 1;
   const beforeCurrentLine = text.slice(0, currentLineStart).trimEnd();
   const previousLineStart = beforeCurrentLine.lastIndexOf("\n") + 1;
-  return (
-    beforeCurrentLine.slice(previousLineStart).trim() ===
-    `// ${explicitFakeCredentialMarker}`
+  const marker = beforeCurrentLine.slice(previousLineStart).trim().match(
+    new RegExp(`^// ${fakeCredentialMarkerPrefix}([0-9a-f]{64})$`, "u"),
   );
+  if (!marker || consumedMarkers.has(previousLineStart)) return false;
+  const digest = createHash("sha256").update(match[0], "utf8").digest("hex");
+  if (marker[1] !== digest) return false;
+  consumedMarkers.add(previousLineStart);
+  return true;
 }
 
 function assertSafeTrackedText({ filePath, source, denied }) {
   if (source.includes(0)) return;
   const text = source.toString("utf8");
+  const consumedFakeCredentialMarkers = new Set();
 
   for (const pattern of credentialPatterns) {
     for (const match of text.matchAll(pattern)) {
       assert.equal(
         filePath.startsWith("test/") &&
-          hasAdjacentFakeCredentialMarker(text, match.index),
+          hasAdjacentFakeCredentialMarker(
+            text,
+            match,
+            consumedFakeCredentialMarkers,
+          ),
         true,
         "a tracked text file contains an unmarked credential-shaped value",
       );
@@ -398,13 +518,33 @@ function assertSafeTrackedText({ filePath, source, denied }) {
   }
 }
 
-async function assertSafeFileCollection(filePaths, denied) {
-  for (const filePath of filePaths) {
-    await assertSafeTrackedText({
-      filePath,
-      source: await readFile(localPath(root, filePath)),
-      denied,
-    });
+function assertSafeTrackedGitTree({
+  repositoryRoot,
+  denied,
+  selectedPaths = null,
+}) {
+  const clean = runGitIn(
+    repositoryRoot,
+    ["diff", "--quiet", "HEAD", "--"],
+  );
+  assert.equal(clean.status, 0, "tracked content differs from HEAD");
+
+  const entries = repositoryRoot === root && trackedIndexEntries
+    ? trackedIndexEntries
+    : loadTrackedIndexEntries(repositoryRoot);
+  if (repositoryRoot === root) trackedIndexEntries = entries;
+  const selected = selectedPaths === null ? null : new Set(selectedPaths);
+  const scannedEntries = selected === null
+    ? entries
+    : entries.filter(({ filePath }) => selected.has(filePath));
+  if (selected !== null && scannedEntries.length !== selected.size) {
+    throw new Error("tracked privacy selection is incomplete");
+  }
+  const blobs = readTrackedBlobs(repositoryRoot, scannedEntries);
+  for (const { filePath, oid } of scannedEntries) {
+    const source = blobs.get(oid);
+    if (!source) throw new Error("tracked Git object is unavailable");
+    assertSafeTrackedText({ filePath, source, denied });
   }
 }
 
@@ -471,21 +611,24 @@ test("distribution and clean-room inputs come only from the committed tree", () 
 });
 
 test("distributable text contains no high-confidence live credential or private machine path", async () => {
-  await assertSafeFileCollection(
-    loadDistributionManifest(),
-    await optionalLocalPrivacyDenylist(),
-  );
+  assertSafeTrackedGitTree({
+    repositoryRoot: root,
+    denied: await optionalLocalPrivacyDenylist(),
+    selectedPaths: loadDistributionManifest(),
+  });
 });
 
 test("whole tracked Git tree contains no private identifiers or credentials", async () => {
-  await assertSafeFileCollection(
-    loadTrackedFiles(),
-    await optionalLocalPrivacyDenylist(),
-  );
+  assertSafeTrackedGitTree({
+    repositoryRoot: root,
+    denied: await optionalLocalPrivacyDenylist(),
+  });
 });
 
 test("privacy scanner rejects unmarked synthetic credentials and permits marked test fixtures", () => {
   const syntheticCredential = ["sk", "live", "synthetic", "credential", "only", "for", "scanner"].join("-");
+  const secondSyntheticCredential = ["sk", "live", "second", "synthetic", "credential", "for", "scanner"].join("-");
+  const syntheticCredentialMarker = `${fakeCredentialMarkerPrefix}11c972c4d7167c096da8aa045a157509a7f04cf84e340ff809b230908f25e422`;
   const denied = new Set();
   assert.throws(
     () =>
@@ -500,10 +643,164 @@ test("privacy scanner rejects unmarked synthetic credentials and permits marked 
     assertSafeTrackedText({
       filePath: "test/marked-fixture.test.js",
       source: Buffer.from(
-        `// ${explicitFakeCredentialMarker}\nconst value = \"${syntheticCredential}\";`,
+        `// ${syntheticCredentialMarker}\nconst value = \"${syntheticCredential}\";`,
       ),
       denied,
     }),
+  );
+  assert.throws(
+    () =>
+      assertSafeTrackedText({
+        filePath: "test/marked-plus-unmarked-fixture.test.js",
+        source: Buffer.from(
+          `// ${syntheticCredentialMarker}\nconst first = \"${syntheticCredential}\"; const second = \"${secondSyntheticCredential}\";`,
+        ),
+        denied,
+      }),
+    /unmarked credential-shaped value/u,
+  );
+});
+
+test("tracked index parsing rejects unsafe metadata and path encoding", () => {
+  const oid = "a".repeat(40);
+  assert.deepEqual(
+    parseTrackedIndexEntries(Buffer.from(`H 100644 ${oid} 0\ttest/safe.js\0`)),
+    [{ mode: "100644", oid, filePath: "test/safe.js" }],
+  );
+
+  for (const source of [
+    Buffer.from(`H 100644 ${oid} 1\ttest/conflicted.js\0`),
+    Buffer.from(`H 160000 ${oid} 0\tunsupported-submodule\0`),
+    Buffer.from(`S 100644 ${oid} 0\tskip-worktree.js\0`),
+    Buffer.from(`h 100644 ${oid} 0\tassume-unchanged.js\0`),
+    Buffer.from(`H 100644 ${"a".repeat(39)} 0\tinvalid-object-id\0`),
+    Buffer.concat([
+      Buffer.from(`H 100644 ${oid} 0\tinvalid-`),
+      Buffer.from([0xff, 0]),
+    ]),
+  ]) {
+    assert.throws(
+      () => parseTrackedIndexEntries(source),
+      /invalid tracked Git index/u,
+    );
+  }
+});
+
+test("tracked symlink privacy scans its Git blob without reading an external target", async (context) => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "privacy-git-fixture-"));
+  const externalRoot = await mkdtemp(
+    path.join(tmpdir(), "privacy-external-fixture-"),
+  );
+  context.after(async () => {
+    assert.equal(path.dirname(fixtureRoot), path.resolve(tmpdir()));
+    assert.equal(path.dirname(externalRoot), path.resolve(tmpdir()));
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+  });
+
+  const syntheticCredential = [
+    "sk",
+    "symlink",
+    "blob",
+    "must",
+    "be",
+    "scanned",
+  ].join("-");
+  const externalFile = path.join(externalRoot, syntheticCredential);
+  const externalTarget = path.relative(fixtureRoot, externalFile)
+    .replaceAll("\\", "/");
+  await writeFile(externalFile, "safe external target content\n");
+
+  for (const arguments_ of [
+    ["init", "--quiet"],
+    ["config", "user.name", "Privacy Fixture"],
+    ["config", "user.email", "privacy-fixture@example.invalid"],
+  ]) {
+    const result = spawnSync("git", arguments_, {
+      cwd: fixtureRoot,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0, "synthetic Git fixture setup failed");
+  }
+  const stored = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+    cwd: fixtureRoot,
+    input: Buffer.from(externalTarget, "utf8"),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  assert.equal(stored.status, 0, "synthetic symlink blob creation failed");
+  const symlinkOid = stored.stdout.trim();
+  assert.match(symlinkOid, /^[0-9a-f]{40,64}$/u);
+  for (const arguments_ of [
+    ["update-index", "--add", "--cacheinfo", `120000,${symlinkOid},tracked-link`],
+    ["commit", "--quiet", "-m", "synthetic symlink fixture"],
+  ]) {
+    const result = spawnSync("git", arguments_, {
+      cwd: fixtureRoot,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0, "synthetic Git fixture setup failed");
+  }
+  const entries = loadTrackedIndexEntries(fixtureRoot);
+  const blobs = readTrackedBlobs(fixtureRoot, entries);
+  const link = entries.find(({ filePath }) => filePath === "tracked-link");
+  assert.ok(link);
+  assert.throws(
+    () =>
+      assertSafeTrackedText({
+        filePath: link.filePath,
+        source: blobs.get(link.oid),
+        denied: new Set(),
+      }),
+    /unmarked credential-shaped value/u,
+  );
+});
+
+test("whole tracked Git privacy fails closed for dirty tracked content", async (context) => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "privacy-dirty-fixture-"));
+  context.after(async () => {
+    assert.equal(path.dirname(fixtureRoot), path.resolve(tmpdir()));
+    await rm(fixtureRoot, { recursive: true, force: true });
+  });
+
+  for (const arguments_ of [
+    ["init", "--quiet"],
+    ["config", "user.name", "Privacy Fixture"],
+    ["config", "user.email", "privacy-fixture@example.invalid"],
+  ]) {
+    const result = spawnSync("git", arguments_, {
+      cwd: fixtureRoot,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0, "synthetic Git fixture setup failed");
+  }
+  await writeFile(path.join(fixtureRoot, "tracked.txt"), "safe content\n");
+  for (const arguments_ of [
+    ["add", "tracked.txt"],
+    ["commit", "--quiet", "-m", "synthetic clean fixture"],
+  ]) {
+    const result = spawnSync("git", arguments_, {
+      cwd: fixtureRoot,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 0, "synthetic Git fixture setup failed");
+  }
+  await writeFile(
+    path.join(fixtureRoot, "tracked.txt"),
+    "sk-dirty-tracked-content-must-not-bypass\n",
+  );
+
+  assert.throws(
+    () =>
+      assertSafeTrackedGitTree({
+        repositoryRoot: fixtureRoot,
+        denied: new Set(),
+      }),
+    /tracked content differs from HEAD/u,
   );
 });
 

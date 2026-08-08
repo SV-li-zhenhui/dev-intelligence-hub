@@ -144,7 +144,7 @@ test("a non-critical capacity warning stays observable without closing readiness
 test("probe errors fail closed without traps or secret leakage", async () => {
   let proxyTraps = 0;
   let timedOutSignal;
-  // PRIVACY_FAKE_CREDENTIAL_FIXTURE
+  // PRIVACY_FAKE_CREDENTIAL_SHA256:64e87c98cb5ccd709f4167e9e599a0b5391be55c96cfc1afda0bed2e89991a26
   const secret = "sk-live-never-render-this";
   const service = new ReadinessService({
     probeTimeoutMs: 20,
