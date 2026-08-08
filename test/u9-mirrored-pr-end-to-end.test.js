@@ -185,10 +185,12 @@ async function createGitFixture(t, gitCommand) {
 }
 
 class TestGuard {
+  #operations = new OperationQueue();
+
   async acquire() {}
 
   run(operation) {
-    return operation();
+    return this.#operations.enqueue(operation);
   }
 
   async close() {}
@@ -233,6 +235,22 @@ async function archiveTerminalJobs({ statePath, clock, jobIds, compactionId }) {
   assert.equal(after.archive.jobCount, jobIds.length);
   assert.equal(after.archive.digest, compacted.receipt.postArchiveDigest);
   return { compacted, after };
+}
+
+async function readMemoryRecords(journal, recordIds) {
+  const orderedIds = [...new Set(recordIds)].sort();
+  const items = [];
+  for (let index = 0; index < orderedIds.length; index += 20) {
+    items.push(...journal.readRecords({
+      recordIds: orderedIds.slice(index, index + 20),
+    }).items);
+  }
+  return items;
+}
+
+function archivedProjection(details) {
+  return details.map(({ job, changePackage }) => ({ job, changePackage }))
+    .sort((left, right) => left.job.jobId.localeCompare(right.job.jobId, "en"));
 }
 
 class FixedSandbox {
@@ -1924,9 +1942,12 @@ test(
       limit: 20,
     })).items.map(({ jobId }) => jobId);
     assert.ok(finalCodeJobIds.length > 0);
-    const finalCodeJobMemoryRecordIds = (await Promise.all(
+    const finalCodeJobDetails = await Promise.all(
       finalCodeJobIds.map((jobId) => application.codeJobReader.getDetail({ jobId })),
-    )).map(({ job }) => job.memoryProjection.recordId);
+    );
+    const finalCodeJobMemoryRecordIds = finalCodeJobDetails.map(
+      ({ job }) => job.memoryProjection.recordId,
+    );
     const selectedCitationBindings = selectedMemory.map(({ record, labels }) => ({
       recordId: record.recordId,
       contentDigest: record.contentDigest,
@@ -1937,20 +1958,33 @@ test(
       contentDigest: record.contentDigest,
       labels,
     }));
-    const sideEffectsBeforeFinalArchive = {
-      codeBrainCalls: state.brainCalls.filter(
-        ({ model }) => model === "strong-code-model",
-      ).length,
-      memoryBrainCalls: state.brainCalls.filter(
-        ({ model }) => model === "memory-model",
-      ).length,
-      sandboxRuns: sandbox.runs.length,
-      transportCalls: transport.calls.length,
-      credentialCalls: credentialCalls.length,
-      source: await readFile(
-        path.join(fixture.sourceRoot, "src", "conflict.txt"),
-        "utf8",
+    const memoryRecordIdsBeforeFinalArchive = [
+      ...selectedIds,
+      ...oldHeadIds,
+      ...finalCodeJobMemoryRecordIds,
+    ];
+    const stateBeforeFinalArchive = {
+      assignments: await application.workflowRouting.listAssignments({ limit: 50 }),
+      graph: await application.workGraphView.getSnapshot(),
+      ledger: await application.workLedgerView.listItems({ limit: 50 }),
+      confirmationHistory: await application.confirmationQueue.historyReader.list({
+        limit: 50,
+      }),
+      memoryRecords: await readMemoryRecords(
+        memoryJournal,
+        memoryRecordIdsBeforeFinalArchive,
       ),
+      codeJobs: archivedProjection(finalCodeJobDetails),
+      brainCalls: structuredClone(state.brainCalls),
+      sandboxRuns: structuredClone(sandbox.runs),
+      transportCalls: structuredClone(transport.calls),
+      credentialCalls: structuredClone(credentialCalls),
+      factCalls: structuredClone(factCalls),
+      sourceTrees: await Promise.all([
+        directorySnapshot(fixture.sourceRoot),
+        directorySnapshot(fixture.baseMirrorRoot),
+        directorySnapshot(fixture.headMirrorRoot),
+      ]),
     };
     await application.close();
     const finalCompaction = await archiveTerminalJobs({
@@ -1961,6 +1995,7 @@ test(
     });
     assert.equal(finalCompaction.after.archive.throughSequence > 0, true);
     application = await startApplication();
+    assert.deepEqual(state.brainCalls, stateBeforeFinalArchive.brainCalls);
     const archivedDetails = await Promise.all(finalCodeJobIds.map((jobId) =>
       application.codeJobReader.getDetail({ jobId })
     ));
@@ -1975,8 +2010,27 @@ test(
       true,
     );
     assert.deepEqual(
-      archivedDetails.map(({ job }) => job.memoryProjection.recordId).sort(),
-      finalCodeJobMemoryRecordIds.slice().sort(),
+      archivedProjection(archivedDetails),
+      stateBeforeFinalArchive.codeJobs,
+    );
+    const liveJobsAfterArchive = await application.codeJobReader.list({ limit: 20 });
+    assert.equal(liveJobsAfterArchive.total, 0);
+    assert.deepEqual(liveJobsAfterArchive.items, []);
+    assert.deepEqual(
+      await application.workflowRouting.listAssignments({ limit: 50 }),
+      stateBeforeFinalArchive.assignments,
+    );
+    assert.deepEqual(
+      await application.workGraphView.getSnapshot(),
+      stateBeforeFinalArchive.graph,
+    );
+    assert.deepEqual(
+      await application.workLedgerView.listItems({ limit: 50 }),
+      stateBeforeFinalArchive.ledger,
+    );
+    assert.deepEqual(
+      await application.confirmationQueue.historyReader.list({ limit: 50 }),
+      stateBeforeFinalArchive.confirmationHistory,
     );
 
     const recoveredMemoryJournal = new LocalMemoryJournal({
@@ -1984,6 +2038,13 @@ test(
       exclusiveLease: new TestGuard(),
     });
     await recoveredMemoryJournal.recover();
+    assert.deepEqual(
+      await readMemoryRecords(
+        recoveredMemoryJournal,
+        memoryRecordIdsBeforeFinalArchive,
+      ),
+      stateBeforeFinalArchive.memoryRecords,
+    );
     const recoveredSelected = recoveredMemoryJournal.readRecords({
       recordIds: selectedIds,
     }).items;
@@ -2068,24 +2129,28 @@ test(
       })),
       selectedCitationBindings,
     );
-    assert.deepEqual({
-      codeBrainCalls: state.brainCalls.filter(
-        ({ model }) => model === "strong-code-model",
-      ).length,
-      memoryBrainCalls: state.brainCalls.filter(
-        ({ model }) => model === "memory-model",
-      ).length,
-      sandboxRuns: sandbox.runs.length,
-      transportCalls: transport.calls.length,
-      credentialCalls: credentialCalls.length,
-      source: await readFile(
-        path.join(fixture.sourceRoot, "src", "conflict.txt"),
-        "utf8",
-      ),
-    }, {
-      ...sideEffectsBeforeFinalArchive,
-      memoryBrainCalls: sideEffectsBeforeFinalArchive.memoryBrainCalls + 1,
-    });
+    assert.equal(
+      state.brainCalls.length,
+      stateBeforeFinalArchive.brainCalls.length + 1,
+    );
+    assert.deepEqual(
+      state.brainCalls.slice(0, stateBeforeFinalArchive.brainCalls.length),
+      stateBeforeFinalArchive.brainCalls,
+    );
+    const originalMemoryCall = stateBeforeFinalArchive.brainCalls.findLast(
+      ({ model }) => model === "memory-model",
+    );
+    assert.ok(originalMemoryCall);
+    assert.deepEqual(state.brainCalls.at(-1), originalMemoryCall);
+    assert.deepEqual(sandbox.runs, stateBeforeFinalArchive.sandboxRuns);
+    assert.deepEqual(transport.calls, stateBeforeFinalArchive.transportCalls);
+    assert.deepEqual(credentialCalls, stateBeforeFinalArchive.credentialCalls);
+    assert.deepEqual(factCalls, stateBeforeFinalArchive.factCalls);
+    assert.deepEqual(await Promise.all([
+      directorySnapshot(fixture.sourceRoot),
+      directorySnapshot(fixture.baseMirrorRoot),
+      directorySnapshot(fixture.headMirrorRoot),
+    ]), stateBeforeFinalArchive.sourceTrees);
 
     assert.equal(
       factCalls.some(({ conclusion }) => conclusion === "FAILURE"),
