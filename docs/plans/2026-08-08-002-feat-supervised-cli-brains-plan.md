@@ -90,7 +90,7 @@ Run: `node --test test/configuration-contract.test.js test/configuration-form-su
 
 Expected: PASS.
 
-- [ ] **Step 5: Create a scoped local commit without pushing**
+- [x] **Step 5: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- src/domain/configuration-contract.js public/configuration-form-support.js public/configuration-form-schema.js test/configuration-contract.test.js test/configuration-form-support.test.js test/configuration-form-schema.test.js
@@ -158,7 +158,7 @@ Expected: PASS with no leaked child process.
 
 Re-review must confirm output-stream errors cannot crash or leak, descriptor verification obeys timeout/cancellation without spawning late, every termination path is bounded, successful direct children cannot leave descendants, local `.bin` and hoisted npm layouts resolve safely, production dependencies and locator roots are immutable, same-size executable replacement fails closed by digest, child exit 125 remains a process failure, unsupported platforms fail closed, and Codex/Claude versions stay inside the explicitly tested minor ranges.
 
-- [ ] **Step 7: Create a scoped local commit without pushing**
+- [x] **Step 7: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- src/lib/supervised-process-runner.js src/lib/known-cli-locator.js src/lib/windows-process-tree-wrapper.ps1 test/supervised-process-runner.test.js test/known-cli-locator.test.js
@@ -244,7 +244,7 @@ Expected: PASS.
 
 Re-review must confirm duplicate envelope/result keys fail closed, cleanup failures cannot be masked, post-admission `TypeError` details are redacted, final stdin sizing precedes locator/temp work, stale scanning has a total-entry bound, quarantine prevents raced-directory deletion, top-level request proxies are never read, production dependencies are not injectable, and the omitted-protocol compatibility decision is aligned across code, contract, tests, and this plan.
 
-- [ ] **Step 8: Create a scoped local commit without pushing**
+- [x] **Step 8: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- src/lib/structured-brain-request.js src/lib/strict-json.js src/adapters/supervised-cli-brain-provider.js src/adapters/openai-compatible-provider.js src/adapters/ollama-structured-provider.js test/supervised-cli-brain-provider.test.js test/structured-brain-providers.test.js
@@ -302,7 +302,7 @@ Run: `node --test test/configured-workforce.test.js test/code-job-brain-director
 
 Expected: PASS.
 
-- [ ] **Step 5: Create a scoped local commit without pushing**
+- [x] **Step 5: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- src/services/configured-workforce.js src/services/code-job-brain-directory.js src/composition-root.js test/configured-workforce.test.js test/code-job-brain-directory.test.js test/composition-root.test.js test/agent-action-parity.test.js
@@ -346,7 +346,7 @@ Run: `node test/browser/configuration-form-playwright.mjs`
 
 Expected: PASS without console/page errors, stale-draft overwrite, or overflow.
 
-- [ ] **Step 5: Create a scoped local commit without pushing**
+- [x] **Step 5: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- test/browser/configuration-form-playwright.mjs test/frontend-configuration-form-contract.test.js scripts/validate-ui.mjs
@@ -380,7 +380,7 @@ Run: `node --test test/supervised-cli-brain-end-to-end.test.js`
 
 Expected RED: missing production adapter/wiring. Expected GREEN: both vendor strategies pass using the fake local process, with zero network and zero source mutation.
 
-- [ ] **Step 4: Create a scoped local commit without pushing**
+- [x] **Step 4: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- test/fixtures/fake-structured-cli.mjs test/supervised-cli-brain-end-to-end.test.js test/code-job-end-to-end.test.js
@@ -407,7 +407,7 @@ git commit -m "test: prove supervised CLI brain lifecycle"
 
 Document supported CLI version ranges, fixed vendor credential environment names as an operator prerequisite (host CLI login profiles are not reused), UI creation/assignment, restart-required activation, remote data-class toggles, the fixed no-tools invocation flags, stable unavailable/timeout behavior, local memory ownership, and the fact that CLI model calls may incur vendor cost. Examples must contain no credential, absolute machine path, active remote authorization, or executable path.
 
-- [ ] **Step 2: Run documentation and distribution checks**
+- [x] **Step 2: Run documentation and distribution checks**
 
 Run: `node --test test/open-source-distribution.test.js test/frontend-configuration-contract.test.js`
 
@@ -415,7 +415,7 @@ Run: `node scripts/validate-ui.mjs`
 
 Expected: PASS; publishing commands remain unexecuted.
 
-- [ ] **Step 3: Create a scoped local commit without pushing**
+- [x] **Step 3: Create a scoped local commit without pushing**
 
 ```powershell
 git add -- README.md docs/ARCHITECTURE.md docs/OPERATIONS.md docs/PRIVACY.md config.example.json docs/plans/2026-08-02-001-feat-complete-command-center-plan.md .superpowers/sdd/2026-08-02-001-feat-complete-command-center-plan/progress.md
@@ -445,7 +445,7 @@ Run: `node --check` for every changed production JavaScript file.
 
 Run: `git diff --check -- <all scoped CLI files>`.
 
-- [ ] **Step 3: Run the complete local regression and browser validator**
+- [x] **Step 3: Run the complete local regression and browser validator**
 
 Run: `npm test`
 
@@ -457,11 +457,20 @@ Expected: all tests pass with only documented environment-gated skips. Do not st
 
 Review must verify one-attempt task semantics, process-tree reaping, empty-origin environment/profile isolation, fixed version-admitted npm executable resolution, stale-temp scavenging, temp-path confinement, result-file anti-symlink/hardlink checks, exact Claude success-envelope handling, output/error redaction, remote data denial before spawn, real composition/ledger/memory restart evidence, no policy/action parity regression, and no persistent sessions. Resolve every P0/P1/P2 before marking the CLI gate complete.
 
-- [ ] **Step 5: Update the authoritative ledger and create the final scoped local commit**
+- [x] **Step 5: Update the authoritative ledger and create the final scoped local commit**
 
 ```powershell
 git add -- <only reviewed CLI implementation, tests, and linked documentation>
 git commit -m "feat: complete supervised CLI brain integration"
 ```
+
+### Completion evidence (2026-08-09)
+
+- The reviewed implementation was consolidated into local checkpoint `50f816d` after the cross-layer dependencies had settled; this satisfies the scoped commit steps above without splitting mutually dependent authority, provider, UI, and recovery changes. Nothing was pushed.
+- Production discovery and version-only execution passed for Codex CLI `0.147.0` and Claude Code `2.1.222` from isolated temporary working directories. No model request was made.
+- The final CLI-focused/cross-layer suite passed 369/370 with one explicit Windows symbolic-link skip. Two independent final reviews returned Ready with no P0/P1/P2 findings.
+- The post-commit complete regression passed 2,777/2,784 with zero failures and seven documented platform/environment skips. Distribution and clean-room checks passed 14/15 with one live machine-wide process-guard skip.
+- Syntax validation passed for 435 JavaScript/ESM files. The configuration and confirmation-history Edge fixtures passed, and the desktop/mobile UI validator reported no console error, page error, or horizontal overflow.
+- No paid/remote model request, source-repository mutation, service restart, GitHub access/write, PR action, or push was performed during this acceptance.
 
 Do not push, create a PR, access real PR #23178, or perform a paid remote-model smoke without a separate owner confirmation.
