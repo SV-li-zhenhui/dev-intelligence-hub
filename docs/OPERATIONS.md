@@ -46,28 +46,39 @@ npm run validate:system -- --all
 
 Validation must start from a clean committed worktree. It fails if HEAD, the Git
 tree, or tracked/untracked source changes during the run. The command writes a
-machine-readable result to the ignored
-`validation-artifacts/system-validation.json`, including the start/end source
-identity, sanitized logical commands and exit status, and Node pass/fail/skip
-identities.
+new machine-readable result for every run and prints its ignored path:
+`validation-artifacts/runs/<runId>/system-validation.json`. The report includes
+the start/end source identity, sanitized logical commands and exit status, and
+Node pass/fail/skip identities. An `--all` run stores its structured UI result,
+real PNG screenshots, and verified receipt under the same run directory. Runs
+never overwrite one another.
 
 After `--all` and two independent final reviews have passed, bind those records
 to the same HEAD with:
 
 ```powershell
 node scripts/system-acceptance-manifest.mjs `
-  --review "security-reliability=validation-artifacts/reviews/security-reliability.md" `
-  --review "maintainability-usability=validation-artifacts/reviews/maintainability-usability.md"
+  --validation-report "validation-artifacts/runs/<runId>/system-validation.json" `
+  --review "security-reliability=validation-artifacts/runs/<runId>/reviews/security-reliability.json" `
+  --review "maintainability-usability=validation-artifacts/runs/<runId>/reviews/maintainability-usability.json"
 ```
 
-The ignored `validation-artifacts/system-acceptance-manifest.json` records the
+Each review must be machine-readable JSON produced after that validation run by
+a distinct reviewer execution. The two exact scopes are `security-reliability`
+and `maintainability-usability`. Each report binds the same run ID, HEAD, tree,
+and validation-report SHA-256; carries unique review, reviewer, and reviewer-run
+identities; declares verdict `ready`; and reports zero P0, P1, and P2 findings.
+
+The ignored
+`validation-artifacts/runs/<runId>/system-acceptance-manifest.json` records the
 validation commands and test identities and hashes the validation report, UI
-results/screenshots, and both distinct review reports. Manifest creation fails
-for a stale or dirty HEAD, a partial validation without Docker/live UI, a failed
-command, missing UI evidence, or fewer than two review reports. Treat all local
-artifacts as private operational data until reviewed and sanitized. The manifest
-does not choose a license or replace the owner-confirmed product-only live PR
-acceptance.
+results/screenshots, and both distinct review reports. It is published once and
+never overwrites an existing manifest. Manifest creation fails for a stale or
+dirty HEAD, a misplaced or partial validation report, missing Docker/live UI,
+a failed command, missing UI evidence, or invalid reviews. Treat all local
+artifacts as private operational data until reviewed and sanitized. The
+manifest does not choose a license or replace the owner-confirmed product-only
+live PR acceptance.
 
 ## Managed lifecycle
 
@@ -87,6 +98,13 @@ process whose shutdown outcome is unknown.
 returns a non-zero exit code for stopped, retained-uncertain, identity-mismatch,
 or otherwise unhealthy managed state. Treat retained control state as evidence
 to investigate; do not delete it merely to make `Start` succeed.
+
+Both `npm start` and managed startup use a bootstrap that captures the packaged
+runtime identity before importing the application and verifies it again before
+opening the service. A Git checkout must be clean and binds its real commit and
+tree. A clean npm/offline payload without `.git` receives a deterministic
+identity from its declared package files. Any source change during module load
+fails startup closed.
 
 The manager stores private process identity and bounded diagnostics outside the
 repository. On Windows the root is:

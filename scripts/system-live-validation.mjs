@@ -50,6 +50,35 @@ function assertMatchingRuntimeSource(actualValue, expected) {
   return actual;
 }
 
+function expectedLiveServiceIdentity(value, expectedRuntimeSource) {
+  if (value === undefined) return null;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join("\0") !==
+      ["instanceId", "processId", "runtimeSource", "startIdentity"]
+        .sort()
+        .join("\0") ||
+    !Number.isSafeInteger(value.processId) ||
+    value.processId <= 0 ||
+    !INSTANCE_ID.test(value.instanceId) ||
+    !SHA_256.test(value.startIdentity)
+  ) {
+    throw new Error("expected dashboard live process identity is invalid");
+  }
+  const runtimeSource = assertMatchingRuntimeSource(
+    value.runtimeSource,
+    expectedRuntimeSource,
+  );
+  return Object.freeze({
+    processId: value.processId,
+    instanceId: value.instanceId,
+    startIdentity: value.startIdentity,
+    runtimeSource,
+  });
+}
+
 function dashboardBaseUrl(value) {
   let url;
   try {
@@ -95,6 +124,7 @@ async function fetchJson(fetchFn, url, label) {
 export async function verifyLiveDashboard({
   baseUrl,
   expectedRuntimeSource,
+  expectedLiveService,
   fetchFn = fetch,
 }) {
   if (typeof fetchFn !== "function") {
@@ -102,6 +132,10 @@ export async function verifyLiveDashboard({
   }
   const origin = dashboardBaseUrl(baseUrl);
   const expected = runtimeSourceIdentity(expectedRuntimeSource);
+  const expectedService = expectedLiveServiceIdentity(
+    expectedLiveService,
+    expected,
+  );
   const live = await fetchJson(fetchFn, `${origin}/api/live`, "dashboard liveness");
   if (
     live.schemaVersion !== 1 ||
@@ -134,10 +168,19 @@ export async function verifyLiveDashboard({
   }
   assertMatchingRuntimeSource(health.runtimeSource, expected);
 
-  return Object.freeze({
+  const identity = Object.freeze({
     processId: live.processId,
     instanceId: live.instanceId,
     startIdentity: live.startIdentity,
     runtimeSource: liveRuntimeSource,
   });
+  if (
+    expectedService !== null &&
+    ["processId", "instanceId", "startIdentity"].some(
+      (field) => identity[field] !== expectedService[field],
+    )
+  ) {
+    throw new Error("dashboard live process identity does not match");
+  }
+  return identity;
 }

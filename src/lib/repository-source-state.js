@@ -30,6 +30,19 @@ function parseOid(value, label) {
   return oid;
 }
 
+async function assertRepositoryRoot(root) {
+  const canonicalRoot = path.resolve(root);
+  const output = await runGit(canonicalRoot, ["rev-parse", "--show-toplevel"]);
+  const discoveredRoot = output.trim();
+  if (
+    !path.isAbsolute(discoveredRoot) ||
+    path.relative(canonicalRoot, path.resolve(discoveredRoot)) !== ""
+  ) {
+    throw new Error("supplied root is not the Git repository root");
+  }
+  return canonicalRoot;
+}
+
 async function readHeadLogDigest(root) {
   const output = await runGit(root, [
     "rev-parse",
@@ -64,25 +77,27 @@ async function readHeadLogDigest(root) {
 }
 
 export async function captureRepositoryState(root) {
+  const canonicalRoot = await assertRepositoryRoot(root);
   const headOid = parseOid(
-    await runGit(root, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    await runGit(canonicalRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
     "HEAD",
   );
   const treeOid = parseOid(
-    await runGit(root, ["rev-parse", "--verify", `${headOid}^{tree}`]),
+    await runGit(canonicalRoot, ["rev-parse", "--verify", `${headOid}^{tree}`]),
     "tree",
   );
-  const headLogDigest = await readHeadLogDigest(root);
+  const headLogDigest = await readHeadLogDigest(canonicalRoot);
   const statusOutput = await runGit(
-    root,
+    canonicalRoot,
     ["status", "--porcelain=v1", "--untracked-files=all"],
     { binary: true },
   );
   const finishedHeadOid = parseOid(
-    await runGit(root, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    await runGit(canonicalRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
     "HEAD",
   );
-  const finishedHeadLogDigest = await readHeadLogDigest(root);
+  const finishedHeadLogDigest = await readHeadLogDigest(canonicalRoot);
+  await assertRepositoryRoot(canonicalRoot);
   if (finishedHeadOid !== headOid) {
     throw new Error("repository HEAD changed while source identity was captured");
   }

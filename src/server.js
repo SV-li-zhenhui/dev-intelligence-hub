@@ -34,9 +34,6 @@ import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
 import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 import { projectRoot } from "./lib/config.js";
 import {
-  computeVersionedRuntimeSourceIdentity,
-} from "./lib/runtime-source-identity.js";
-import {
   CONFIGURATION_CONTROL_PLANE_LIMITS,
 } from "./services/configuration-store.js";
 import {
@@ -4005,14 +4002,17 @@ export async function startDashboardServer(
 const invokedModule = process.argv[1]
   ? pathToFileURL(path.resolve(process.argv[1])).href
   : "";
-async function runDashboardProcess(managedProcess) {
+async function runDashboardProcess(managedProcess, runtimeSourceIdentityInput) {
   const diagnostics = managedProcess
     ? createManagedFileDiagnostics(managedProcess.logDirectory)
     : { log: console.log, reportError: console.error };
   try {
-    const runtimeSourceIdentity = await computeVersionedRuntimeSourceIdentity(
-      projectRoot,
+    const verifiedRuntimeSourceIdentity = runtimeSourceIdentity(
+      runtimeSourceIdentityInput,
     );
+    if (verifiedRuntimeSourceIdentity === null) {
+      throw new Error("dashboard process requires a verified startup identity");
+    }
     const writerLease = createApplicationWriterLease({
       projectRoot,
       projectDigest: managedProcess?.projectDigest ?? null,
@@ -4022,7 +4022,7 @@ async function runDashboardProcess(managedProcess) {
       writerLease,
       log: diagnostics.log,
       reportError: diagnostics.reportError,
-      runtimeSourceIdentity,
+      runtimeSourceIdentity: verifiedRuntimeSourceIdentity,
     });
   } catch (error) {
     diagnostics.reportError(error);
@@ -4030,14 +4030,24 @@ async function runDashboardProcess(managedProcess) {
   }
 }
 
-export async function startManagedDashboardFromCapturedEnvironment(environment) {
+export async function startManagedDashboardFromCapturedEnvironment(
+  environment,
+  runtimeSourceIdentityInput,
+) {
   const managedProcess = readManagedProcessEnvironment(environment);
   if (!managedProcess) {
     throw new Error("managed dashboard entry requires a complete environment");
   }
-  await runDashboardProcess(managedProcess);
+  await runDashboardProcess(managedProcess, runtimeSourceIdentityInput);
+}
+
+export async function startDashboardFromVerifiedRuntime(runtimeSourceIdentityInput) {
+  await runDashboardProcess(null, runtimeSourceIdentityInput);
 }
 
 if (import.meta.url === invokedModule) {
-  await runDashboardProcess(readManagedProcessEnvironment());
+  console.error(
+    "MyDashboard must be started through scripts/run-dashboard.mjs or the managed launcher.",
+  );
+  process.exitCode = 1;
 }

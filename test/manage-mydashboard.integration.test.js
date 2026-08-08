@@ -37,6 +37,14 @@ const powershell7Available = spawnSync(
   ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"],
   { encoding: "utf8", timeout: 10_000 },
 ).status === 0;
+const WINDOWS_MANAGER_SKIP = process.platform !== "win32"
+  ? "requires Windows PowerShell manager"
+  : false;
+const POWERSHELL_7_MANAGER_SKIP = process.platform !== "win32"
+  ? "requires Windows PowerShell manager"
+  : powershell7Available
+    ? false
+    : "requires PowerShell 7";
 
 async function availablePort() {
   const server = net.createServer();
@@ -519,7 +527,7 @@ async function createRealServerFixture(t) {
 
 test(
   "the real application server completes authenticated manager start and stop on an isolated port",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port, runtime, environment } = await createRealServerFixture(t);
     const started = invokeManager(root, "Start", 30, powershell, [], environment);
@@ -562,7 +570,7 @@ test(
 
 test(
   "PowerShell manager starts, identifies, reports, and gracefully stops only its process",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -614,7 +622,7 @@ test(
 
 test(
   "PowerShell manager permits an exact offline restore only while the service is stopped",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const callsPath = path.join(root, "restore-invocations.jsonl");
@@ -672,7 +680,7 @@ process.stdout.write(JSON.stringify({
 
 test(
   "PowerShell 7 uses the same private ACL and authenticated lifecycle",
-  { skip: process.platform !== "win32" || !powershell7Available },
+  { skip: POWERSHELL_7_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -697,7 +705,7 @@ test(
 
 test(
   "PowerShell manager refuses an unrecorded loopback listener without killing it",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const unmanaged = spawn(process.execPath, [path.join(root, "src", "server.js")], {
@@ -734,7 +742,7 @@ test(
 
 test(
   "concurrent starts serialize and retain one health-bound process",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const [first, second] = await Promise.all([
@@ -770,7 +778,7 @@ test(
 
 test(
   "a manager killed after durable control publication leaves a child that self-exits unclaimed",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t, { claimMode: "hang" });
     const runtime = readRuntimeInfo(root);
@@ -803,7 +811,7 @@ test(
 
 test(
   "exclusive launch-result failure stops only the unpublished child and preserves the colliding file",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -852,7 +860,7 @@ test(
 
 test(
   "exclusive control publication failure gracefully stops the authenticated child and preserves the owner file",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t, {
       listenDelayMilliseconds: 1_000,
@@ -889,7 +897,7 @@ test(
 
 test(
   "tampered launch-result HMAC is rejected while the unclaimed child self-exits",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -929,7 +937,7 @@ test(
 
 test(
   "tampered authenticated control fails closed without touching an unrelated Node process",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -969,7 +977,7 @@ test(
 
 test(
   "junction aliases share the real-project mutex and one control plane",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const alias = `${root}-junction`;
@@ -1004,7 +1012,7 @@ test(
 
 test(
   "a dead recorded instance cannot authorize shutdown of a new listener on its old port",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
@@ -1047,7 +1055,7 @@ test(
 
 test(
   "failure receipt retains control and prevents Restart from creating a new writer",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root, port } = await createFixture(t, { shutdownExitCode: 1 });
     const runtime = readRuntimeInfo(root);
@@ -1073,7 +1081,7 @@ test(
 
 test(
   "broad-write ACL and runtime junctions are rejected before process control",
-  { skip: process.platform !== "win32" },
+  { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const first = await createFixture(t);
     const firstRuntime = readRuntimeInfo(first.root);

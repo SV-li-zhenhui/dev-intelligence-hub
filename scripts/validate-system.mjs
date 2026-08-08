@@ -1,16 +1,23 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readdir, mkdir, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
 import { verifyLiveDashboard } from "./system-live-validation.mjs";
+import {
+  prepareValidationRunDirectory,
+  uiValidationCommandArguments,
+  verifyUiArtifactReceipt,
+} from "./system-ui-artifact-receipt.mjs";
+import {
+  createValidationSourceMaterialization,
+} from "./system-validation-materialization.mjs";
 import {
   assertStableCleanRepository,
   captureRepositoryState,
 } from "./system-validation-provenance.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const artifacts = path.join(root, "validation-artifacts");
 const argumentsSet = new Set(process.argv.slice(2));
 const all = argumentsSet.has("--all");
 const withDocker = all || argumentsSet.has("--with-docker");
@@ -39,11 +46,25 @@ const report = {
     stable: false,
   },
   liveService: null,
+  uiArtifactReceipt: null,
+  executionSource: null,
   steps: [],
 };
+const validationRunDirectory = await prepareValidationRunDirectory({
+  root,
+  runId: report.runId,
+});
+let executionSource = null;
 
 function commandLabel(command, arguments_) {
   return [command, ...arguments_].join(" ");
+}
+
+function emptyTreeObjectId(headOid) {
+  const algorithm = headOid.length === 40 ? "sha1" : "sha256";
+  return createHash(algorithm)
+    .update(Buffer.from("tree 0\0", "utf8"))
+    .digest("hex");
 }
 
 function sanitizedPathToken(value) {
@@ -87,12 +108,16 @@ function run(command, arguments_, {
   environmentEvidence = null,
   quiet = false,
   parseOutput = null,
+  outputField = "testResults",
+  workingDirectory = root,
+  recordedCommand = null,
+  executionSourceDigest = null,
 } = {}) {
   const startedAt = Date.now();
   process.stdout.write(`\n[validate] ${name}\n`);
   return new Promise((resolve, reject) => {
     const child = spawn(command, arguments_, {
-      cwd: root,
+      cwd: workingDirectory,
       env: environment,
       stdio: quiet ? ["ignore", "pipe", "pipe"] : "inherit",
       windowsHide: true,
@@ -110,19 +135,24 @@ function run(command, arguments_, {
       const stderrText = Buffer.concat(stderr).toString("utf8");
       const step = {
         name,
-        command: commandRecord(command, arguments_),
+        command: recordedCommand === null
+          ? commandRecord(command, arguments_)
+          : structuredClone(recordedCommand),
         status: code === 0 && signal === null ? "passed" : "failed",
         durationMs,
         exitCode: code,
         signal,
+        ...(executionSourceDigest === null
+          ? {}
+          : { executionSourceDigest }),
         ...(environmentEvidence === null
           ? {}
           : { environment: structuredClone(environmentEvidence) }),
       };
       let outputError = null;
-      if (parseOutput !== null) {
+      if (parseOutput !== null && code === 0 && signal === null) {
         try {
-          step.testResults = parseOutput(stdoutText);
+          step[outputField] = parseOutput(stdoutText);
         } catch (error) {
           outputError = error;
           step.status = "failed";
@@ -131,7 +161,12 @@ function run(command, arguments_, {
       report.steps.push(step);
       if (step.status === "passed") {
         process.stdout.write(`[validate] passed in ${durationMs} ms\n`);
-        resolve({ stderr: stderrText, stdout: stdoutText, step });
+        resolve({
+          parsedOutput: parseOutput === null ? null : step[outputField],
+          stderr: stderrText,
+          stdout: stdoutText,
+          step,
+        });
         return;
       }
       const diagnostic = `${stdoutText}${stderrText}`.slice(-8_000);
@@ -141,6 +176,48 @@ function run(command, arguments_, {
       ));
     });
   });
+}
+
+async function runFromExecutionSource(command, arguments_, options = {}) {
+  if (executionSource === null) {
+    throw new Error("immutable validation source is unavailable");
+  }
+  await executionSource.verify();
+  let outcome;
+  let commandError = null;
+  try {
+    outcome = await run(command, arguments_, {
+      ...options,
+      workingDirectory:
+        options.workingDirectory ?? executionSource.directory,
+      executionSourceDigest: executionSource.identity.contentDigest,
+    });
+  } catch (error) {
+    commandError = error;
+  }
+  try {
+    await executionSource.verify();
+  } catch (error) {
+    throw error;
+  }
+  if (commandError !== null) throw commandError;
+  return outcome;
+}
+
+function parseUiArtifactReceiptEnvelope(output) {
+  const lines = output.split(/\r?\n/u).filter((line) => line !== "");
+  if (lines.length !== 1) {
+    throw new Error("UI validation did not emit one artifact receipt envelope");
+  }
+  try {
+    const envelope = JSON.parse(lines[0]);
+    if (envelope === null || typeof envelope !== "object" || Array.isArray(envelope)) {
+      throw new Error("invalid envelope");
+    }
+    return envelope;
+  } catch {
+    throw new Error("UI validation emitted an invalid artifact receipt envelope");
+  }
 }
 
 function parseNodeTestTap(output) {
@@ -201,7 +278,13 @@ function parseNodeTestTap(output) {
 }
 
 async function sourceFiles(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
   const files = [];
   for (const entry of entries) {
     const entryPath = path.join(directory, entry.name);
@@ -218,14 +301,16 @@ async function checkSyntax() {
   const directories = ["src", "public", "scripts", "test", "test-support"];
   const files = (
     await Promise.all(directories.map((directory) =>
-      sourceFiles(path.join(root, directory)),
+      sourceFiles(path.join(executionSource.directory, directory))
     ))
   ).flat().sort();
   const startedAt = Date.now();
   process.stdout.write(`\n[validate] node syntax (${files.length} files)\n`);
   for (const file of files) {
-    await run(process.execPath, ["--check", file], {
-      name: `syntax:${path.relative(root, file).replaceAll("\\", "/")}`,
+    const relativePath = path.relative(executionSource.directory, file)
+      .replaceAll("\\", "/");
+    await runFromExecutionSource(process.execPath, ["--check", relativePath], {
+      name: `syntax:${relativePath}`,
       quiet: true,
     });
   }
@@ -235,6 +320,7 @@ async function checkSyntax() {
     status: "passed",
     durationMs: Date.now() - startedAt,
     fileCount: files.length,
+    executionSourceDigest: executionSource.identity.contentDigest,
   });
 }
 
@@ -256,10 +342,10 @@ async function verifyCurrentLiveDashboard() {
 
 async function writeReport() {
   report.finishedAt = new Date().toISOString();
-  await mkdir(artifacts, { recursive: true });
   await writeFile(
-    path.join(artifacts, "system-validation.json"),
+    path.join(validationRunDirectory.directory, "system-validation.json"),
     `${JSON.stringify(report, null, 2)}\n`,
+    { encoding: "utf8", flag: "wx" },
   );
 }
 
@@ -267,9 +353,21 @@ let validationError = null;
 try {
   report.source.started = await captureRepositoryState(root);
   assertStableCleanRepository(report.source.started, report.source.started);
-  await run("git", ["diff", "--check"], { name: "git diff --check" });
+  executionSource = await createValidationSourceMaterialization({
+    root,
+    headOid: report.source.started.headOid,
+    treeOid: report.source.started.treeOid,
+  });
+  report.executionSource = executionSource.identity;
+  await run("git", [
+    "diff",
+    "--check",
+    emptyTreeObjectId(report.source.started.headOid),
+    report.source.started.headOid,
+    "--",
+  ], { name: "git diff --check" });
   await checkSyntax();
-  await run(process.execPath, [
+  await runFromExecutionSource(process.execPath, [
     "--test",
     "--test-reporter=tap",
     "test/*.test.js",
@@ -278,14 +376,14 @@ try {
     quiet: true,
     parseOutput: parseNodeTestTap,
   });
-  await run(process.execPath, [
+  await runFromExecutionSource(process.execPath, [
     "test/browser/configuration-form-playwright.mjs",
   ], { name: "configuration form browser behavior" });
-  await run(process.execPath, [
+  await runFromExecutionSource(process.execPath, [
     "test/browser/confirmation-history-playwright.mjs",
   ], { name: "confirmation history browser behavior" });
   if (withDocker) {
-    await run(process.execPath, [
+    await runFromExecutionSource(process.execPath, [
       "--test",
       "test/docker-test-sandbox.integration.test.js",
     ], {
@@ -299,9 +397,35 @@ try {
   }
   if (withLiveUi) {
     report.liveService = await verifyCurrentLiveDashboard();
-    await run(process.execPath, ["scripts/validate-ui.mjs"], {
-      name: "live desktop and mobile UI behavior",
+    const uiArguments = uiValidationCommandArguments({
+      runId: report.runId,
+      liveService: report.liveService,
     });
+    const uiRun = await runFromExecutionSource(process.execPath, [
+      path.join(executionSource.directory, "scripts/validate-ui.mjs"),
+      ...uiArguments,
+    ], {
+      name: "live desktop and mobile UI behavior",
+      quiet: true,
+      parseOutput: parseUiArtifactReceiptEnvelope,
+      outputField: "artifactReceiptEnvelope",
+      workingDirectory: root,
+      recordedCommand: {
+        executable: "node",
+        arguments: ["scripts/validate-ui.mjs", ...uiArguments],
+      },
+    });
+    try {
+      report.uiArtifactReceipt = await verifyUiArtifactReceipt({
+        root,
+        envelope: uiRun.parsedOutput,
+        expectedRunId: report.runId,
+        expectedLiveService: report.liveService,
+      });
+    } catch (error) {
+      uiRun.step.status = "failed";
+      throw error;
+    }
   }
 } catch (error) {
   validationError = error;
@@ -321,6 +445,21 @@ try {
   validationError ??= error;
 }
 
+if (executionSource !== null) {
+  try {
+    await executionSource.verify();
+  } catch (error) {
+    validationError ??= error;
+  }
+  try {
+    await executionSource.cleanup();
+  } catch (error) {
+    validationError ??= new Error("immutable validation source cleanup failed", {
+      cause: error,
+    });
+  }
+}
+
 if (validationError === null) {
   report.status = "passed";
 } else {
@@ -331,6 +470,9 @@ if (validationError === null) {
   process.exitCode = 1;
 }
 await writeReport();
+process.stdout.write(
+  `\n[validate] report: ${validationRunDirectory.relativeDirectory}/system-validation.json\n`,
+);
 
 if (report.status === "passed") {
   process.stdout.write("\n[validate] whole-system validation passed\n");

@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +45,8 @@ async function createValidationFixture(t) {
     "public",
     "scripts",
     "src",
+    "src/adapters",
+    "src/domain",
     "src/lib",
     "test/browser",
     "test-support",
@@ -46,8 +55,12 @@ async function createValidationFixture(t) {
   }
   for (const relativePath of [
     "scripts/system-live-validation.mjs",
+    "scripts/system-ui-artifact-receipt.mjs",
+    "scripts/system-validation-materialization.mjs",
     "scripts/system-validation-provenance.mjs",
     "scripts/validate-system.mjs",
+    "src/adapters/git-object-snapshotter.js",
+    "src/domain/code-execution-policy.js",
     "src/lib/repository-source-state.js",
     "src/lib/runtime-source-identity.js",
   ]) {
@@ -60,34 +73,39 @@ async function createValidationFixture(t) {
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
   await writeFile(
     path.join(root, "scripts/validate-ui.mjs"),
-    "process.exitCode = 0;\n",
+    await readFile(
+      path.join(projectRoot, "test-support/system-ui-validation-fixture.mjs"),
+    ),
   );
   await writeFile(
     path.join(root, "test-support/live-fetch-preload.mjs"),
     [
       "import { computeVersionedRuntimeSourceIdentity } from '../src/lib/runtime-source-identity.js';",
       "const source = await computeVersionedRuntimeSourceIdentity(process.cwd());",
+      "let liveRequestCount = 0;",
       "globalThis.fetch = async (url) => ({",
       "  ok: true,",
       "  status: 200,",
       "  async json() {",
       "    if (String(url).endsWith('/api/live')) {",
+      "      liveRequestCount += 1;",
+      "      const replacement = process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && liveRequestCount > 1;",
       "      return {",
       "        schemaVersion: 1,",
       "        live: true,",
       "        service: 'mydashboard',",
-      "        processId: 2468,",
+      "        processId: replacement ? 9753 : 2468,",
       "        managed: true,",
       "        lifecycleState: 'running',",
-      "        instanceId: '12345678-1234-4123-8123-123456789abc',",
-      "        startIdentity: 'd'.repeat(64),",
+      "        instanceId: replacement ? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' : '12345678-1234-4123-8123-123456789abc',",
+      "        startIdentity: (replacement ? 'e' : 'd').repeat(64),",
       "        runtimeSource: source,",
       "      };",
       "    }",
       "    return {",
       "      ok: true,",
       "      service: 'mydashboard',",
-      "      processId: 2468,",
+      "      processId: process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && liveRequestCount > 1 ? 9753 : 2468,",
       "      runtimeSource: source,",
       "    };",
       "  },",
@@ -99,11 +117,15 @@ async function createValidationFixture(t) {
     path.join(root, "test/smoke.test.js"),
     [
       "import assert from 'node:assert/strict';",
+      "import { existsSync } from 'node:fs';",
       "import test from 'node:test';",
       "test('fixture passes', () => {});",
       "test('fixture skip', { skip: 'fixture reason' }, () => {});",
       "test('validation reporter options stay outside tested processes', () => {",
       "  assert.equal(process.env.NODE_OPTIONS?.includes('--test-reporter') ?? false, false);",
+      "});",
+      "test('validation commands execute from a detached materialized source', () => {",
+      "  assert.equal(existsSync('.git'), false);",
       "});",
       "",
     ].join("\n"),
@@ -132,6 +154,19 @@ function validationEnvironment() {
   };
   delete environment.NODE_TEST_CONTEXT;
   return environment;
+}
+
+async function readOnlyValidationReport(root) {
+  const runs = await readdir(path.join(root, "validation-artifacts/runs"), {
+    withFileTypes: true,
+  });
+  const runDirectories = runs.filter((entry) => entry.isDirectory());
+  assert.equal(runDirectories.length, 1);
+  const relativePath =
+    `validation-artifacts/runs/${runDirectories[0].name}/system-validation.json`;
+  const report = JSON.parse(await readFile(path.join(root, relativePath), "utf8"));
+  assert.equal(runDirectories[0].name, report.runId);
+  return { relativePath, report };
 }
 
 async function loadProvenanceModule() {
@@ -164,6 +199,18 @@ test("captures an exact, path-free source identity from a clean Git repository",
   });
   assert.match(state.headLogDigest, /^[a-f0-9]{64}$/u);
   assert.equal(JSON.stringify(state).includes(root), false);
+});
+
+test("rejects a nested directory as the repository root", async (t) => {
+  const root = await createRepository(t);
+  const nestedRoot = path.join(root, "nested-package");
+  await mkdir(nestedRoot);
+  const { captureRepositoryState } = await loadProvenanceModule();
+
+  await assert.rejects(
+    captureRepositoryState(nestedRoot),
+    /supplied root is not the Git repository root/u,
+  );
 });
 
 test("reports dirty source without exposing changed paths", async (t) => {
@@ -237,6 +284,10 @@ test("the system validator binds a passing report to one clean Git source state"
   const root = await createValidationFixture(t);
   const expectedHeadOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
   const expectedTreeOid = await git(root, "rev-parse", "--verify", "HEAD^{tree}");
+  const objectFormat = await git(root, "rev-parse", "--show-object-format");
+  const emptyTreeOid = createHash(objectFormat)
+    .update(Buffer.from("tree 0\0", "utf8"))
+    .digest("hex");
 
   await execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
     cwd: root,
@@ -245,10 +296,11 @@ test("the system validator binds a passing report to one clean Git source state"
     windowsHide: true,
   });
 
-  const report = JSON.parse(await readFile(
-    path.join(root, "validation-artifacts/system-validation.json"),
-    "utf8",
-  ));
+  const { relativePath: reportPath, report } = await readOnlyValidationReport(root);
+  assert.equal(
+    reportPath,
+    `validation-artifacts/runs/${report.runId}/system-validation.json`,
+  );
   assert.equal(report.status, "passed");
   assert.match(
     report.runId,
@@ -261,7 +313,10 @@ test("the system validator binds a passing report to one clean Git source state"
   assert.equal(report.source.started.clean, true);
   assert.deepEqual(
     report.steps.find(({ name }) => name === "git diff --check").command,
-    { executable: "git", arguments: ["diff", "--check"] },
+    {
+      executable: "git",
+      arguments: ["diff", "--check", emptyTreeOid, expectedHeadOid, "--"],
+    },
   );
   assert.deepEqual(
     report.steps.find(({ name }) => name === "syntax:src/app.js").command,
@@ -278,8 +333,8 @@ test("the system validator binds a passing report to one clean Git source state"
     report.steps.find(({ name }) => name === "complete Node test suite").testResults,
     {
       summary: {
-        tests: 3,
-        passed: 2,
+        tests: 4,
+        passed: 3,
         failed: 0,
         cancelled: 0,
         skipped: 1,
@@ -302,8 +357,33 @@ test("the system validator binds a passing report to one clean Git source state"
           name: "validation reporter options stay outside tested processes",
           status: "passed",
         },
+        {
+          identity: "tap:4:validation commands execute from a detached materialized source",
+          name: "validation commands execute from a detached materialized source",
+          status: "passed",
+        },
       ],
     },
+  );
+  assert.deepEqual(Object.keys(report.executionSource).sort(), [
+    "contentDigest",
+    "fileCount",
+    "headOid",
+    "schemaVersion",
+    "sealed",
+    "totalBytes",
+    "treeOid",
+  ]);
+  assert.equal(report.executionSource.headOid, expectedHeadOid);
+  assert.equal(report.executionSource.treeOid, expectedTreeOid);
+  assert.equal(report.executionSource.sealed, true);
+  assert.equal(
+    report.steps
+      .filter(({ name }) => name !== "git diff --check")
+      .every(({ executionSourceDigest }) =>
+        executionSourceDigest === report.executionSource.contentDigest
+      ),
+    true,
   );
   assert.equal(
     report.steps.every(({ command, exitCode, signal }) =>
@@ -312,6 +392,29 @@ test("the system validator binds a passing report to one clean Git source state"
     true,
   );
   assert.equal(JSON.stringify(report).includes(root), false);
+});
+
+test("the system validator rejects whitespace defects in committed source", async (t) => {
+  const root = await createValidationFixture(t);
+  await writeFile(
+    path.join(root, "src/committed-whitespace.js"),
+    "export const committed = true;   \n",
+  );
+  await git(root, "add", "src/committed-whitespace.js");
+  await git(root, "commit", "--quiet", "-m", "committed whitespace defect");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
+      cwd: root,
+      encoding: "utf8",
+      env: validationEnvironment(),
+      windowsHide: true,
+    }),
+  );
+
+  const { report } = await readOnlyValidationReport(root);
+  assert.equal(report.status, "failed");
+  assert.match(report.error, /git diff --check failed/u);
 });
 
 test("live UI validation records the exact managed runtime source identity", async (t) => {
@@ -336,10 +439,7 @@ test("live UI validation records the exact managed runtime source identity", asy
     },
   );
 
-  const report = JSON.parse(await readFile(
-    path.join(root, "validation-artifacts/system-validation.json"),
-    "utf8",
-  ));
+  const { report } = await readOnlyValidationReport(root);
   assert.deepEqual(Object.keys(report.liveService).sort(), [
     "instanceId",
     "processId",
@@ -370,6 +470,86 @@ test("live UI validation records the exact managed runtime source identity", asy
   assert.equal(report.liveService.runtimeSource.runtimeByteCount > 0, true);
   assert.equal(report.source.started.headOid, expectedHeadOid);
   assert.equal(report.source.started.treeOid, expectedTreeOid);
+  assert.equal(report.uiArtifactReceipt.envelope.runId, report.runId);
+  assert.equal(
+    report.uiArtifactReceipt.envelope.path,
+    `validation-artifacts/runs/${report.runId}/ui-receipt.json`,
+  );
+  assert.deepEqual(
+    report.uiArtifactReceipt.receipt.liveService,
+    report.liveService,
+  );
+  assert.deepEqual(
+    report.uiArtifactReceipt.receipt.artifacts.map(({ path: artifactPath }) =>
+      artifactPath
+    ),
+    [
+      `validation-artifacts/runs/${report.runId}/ui/results.json`,
+      `validation-artifacts/runs/${report.runId}/ui/desktop-1440.png`,
+      `validation-artifacts/runs/${report.runId}/ui/mobile-390.png`,
+    ],
+  );
+  assert.deepEqual(
+    report.steps.find(
+      ({ name }) => name === "live desktop and mobile UI behavior",
+    ).command,
+    {
+      executable: "node",
+      arguments: [
+        "scripts/validate-ui.mjs",
+        "--run-id",
+        report.runId,
+        "--process-id",
+        String(report.liveService.processId),
+        "--instance-id",
+        report.liveService.instanceId,
+        "--start-identity",
+        report.liveService.startIdentity,
+        "--head-oid",
+        report.liveService.runtimeSource.headOid,
+        "--tree-oid",
+        report.liveService.runtimeSource.treeOid,
+        "--runtime-digest",
+        report.liveService.runtimeSource.runtimeDigest,
+        "--runtime-file-count",
+        String(report.liveService.runtimeSource.runtimeFileCount),
+        "--runtime-byte-count",
+        String(report.liveService.runtimeSource.runtimeByteCount),
+      ],
+    },
+  );
+});
+
+test("live UI validation rejects service replacement during browser scenarios", async (t) => {
+  const root = await createValidationFixture(t);
+  const preload = pathToFileURL(
+    path.join(root, "test-support/live-fetch-preload.mjs"),
+  ).href;
+
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      ["scripts/validate-system.mjs", "--with-live-ui"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...validationEnvironment(),
+          MYDASHBOARD_TEST_REPLACE_LIVE: "1",
+          NODE_OPTIONS: `--import=${preload}`,
+        },
+        windowsHide: true,
+      },
+    ),
+  );
+
+  const { report } = await readOnlyValidationReport(root);
+  assert.equal(report.status, "failed");
+  assert.equal(report.uiArtifactReceipt, null);
+  assert.match(
+    report.error,
+    /live desktop and mobile UI behavior failed with exit code 1/u,
+  );
 });
 
 test("the system validator fails before acceptance when tracked source is dirty", async (t) => {
@@ -385,10 +565,7 @@ test("the system validator fails before acceptance when tracked source is dirty"
     }),
   );
 
-  const report = JSON.parse(await readFile(
-    path.join(root, "validation-artifacts/system-validation.json"),
-    "utf8",
-  ));
+  const { report } = await readOnlyValidationReport(root);
   assert.equal(report.status, "failed");
   assert.equal(report.source.started.clean, false);
   assert.match(report.error, /repository was not clean when validation started/u);

@@ -1,15 +1,101 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
+import { verifyLiveDashboard } from "./system-live-validation.mjs";
+import {
+  buildUiArtifactReceipt,
+  parseUiValidationCommandArguments,
+  prepareUiArtifactDirectory,
+  writeUiArtifactReceipt,
+} from "./system-ui-artifact-receipt.mjs";
 
 const baseUrl = "http://127.0.0.1:4173";
-const outputDirectory = path.resolve("validation-artifacts");
-await mkdir(outputDirectory, { recursive: true });
+const { outputDirectory: relativeOutputDirectory, runId, liveService } =
+  parseUiValidationCommandArguments(process.argv.slice(2));
+const preparedOutput = await prepareUiArtifactDirectory({
+  root: process.cwd(),
+  runId,
+});
+assert.equal(preparedOutput.relativeDirectory, relativeOutputDirectory);
+const outputDirectory = preparedOutput.directory;
+await verifyLiveDashboard({
+  baseUrl,
+  expectedRuntimeSource: liveService.runtimeSource,
+  expectedLiveService: liveService,
+});
 
 const browser = await chromium.launch({ channel: "msedge", headless: true });
 const results = [];
+let artifactReceiptEnvelope = null;
+
+try {
+
+async function observedPage(options) {
+  const page = await browser.newPage(options);
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  return { page, consoleErrors, pageErrors };
+}
+
+async function pageDiagnostics(observation) {
+  const { page, consoleErrors, pageErrors } = observation;
+  const diagnostics = await page.evaluate(() => {
+    const accessibilityIssues = [];
+    if (!document.documentElement.lang.trim()) {
+      accessibilityIssues.push("document language is missing");
+    }
+    if (!document.title.trim()) {
+      accessibilityIssues.push("document title is missing");
+    }
+    const ids = new Set();
+    for (const element of document.querySelectorAll("[id]")) {
+      if (ids.has(element.id)) {
+        accessibilityIssues.push(`duplicate id: ${element.id}`);
+      }
+      ids.add(element.id);
+    }
+    for (const image of document.querySelectorAll("img")) {
+      if (!image.hasAttribute("alt")) {
+        accessibilityIssues.push("image alternative text is missing");
+      }
+    }
+    for (const dialog of document.querySelectorAll("dialog[open]")) {
+      if (
+        !dialog.getAttribute("aria-label")?.trim() &&
+        !dialog.getAttribute("aria-labelledby")?.trim()
+      ) {
+        accessibilityIssues.push(`open dialog is unnamed: ${dialog.id || "unknown"}`);
+      }
+    }
+    for (const button of document.querySelectorAll("button")) {
+      if (
+        !button.textContent?.trim() &&
+        !button.getAttribute("aria-label")?.trim() &&
+        !button.getAttribute("title")?.trim()
+      ) {
+        accessibilityIssues.push("button accessible name is missing");
+      }
+    }
+    return {
+      accessibilityIssues,
+      horizontalOverflow:
+        document.documentElement.scrollWidth > window.innerWidth,
+    };
+  });
+  return {
+    consoleErrors,
+    pageErrors,
+    horizontalOverflow: diagnostics.horizontalOverflow,
+    accessibilityFailures: diagnostics.accessibilityIssues.length,
+    accessibilityIssues: diagnostics.accessibilityIssues,
+  };
+}
 
 function sectionByTitle(page, title) {
   return page.locator(".section").filter({
@@ -83,13 +169,8 @@ async function activateSystemAndReadStatus(page) {
 }
 
 async function validate(name, viewport) {
-  const page = await browser.newPage({ viewport, acceptDownloads: true });
-  const consoleErrors = [];
-  const pageErrors = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
-  });
-  page.on("pageerror", (error) => pageErrors.push(error.message));
+  const observation = await observedPage({ viewport, acceptDownloads: true });
+  const { page } = observation;
   const response = await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.locator("#content .section").first().waitFor();
   await page.screenshot({
@@ -140,9 +221,7 @@ async function validate(name, viewport) {
     .getByLabel("搜索 PR、仓库、问题或处理结论")
     .isVisible();
   const system = await activateSystemAndReadStatus(page);
-  const horizontalOverflow = await page.evaluate(
-    () => document.documentElement.scrollWidth > window.innerWidth,
-  );
+  const diagnostics = await pageDiagnostics(observation);
   results.push({
     name,
     status: response?.status(),
@@ -163,9 +242,7 @@ async function validate(name, viewport) {
     versionRows,
     newestVersionFirstNote,
     signalCount,
-    horizontalOverflow,
-    consoleErrors,
-    pageErrors,
+    ...diagnostics,
   });
   await page.close();
 }
@@ -238,7 +315,10 @@ async function validateConfirmationQueue() {
   confirmed.counts.uncertainPullRequests = 0;
   confirmed.counts.waitingOther += 1;
 
-  const page = await browser.newPage({ viewport: { width: 1100, height: 820 } });
+  const observation = await observedPage({
+    viewport: { width: 1100, height: 820 },
+  });
+  const { page } = observation;
   const requests = [];
   await page.route("**/api/dashboard", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixture) }),
@@ -261,11 +341,13 @@ async function validateConfirmationQueue() {
   const confirmedVisible = await sectionByTitle(page, "等待别人")
     .getByText("需要确认责任归属的测试 PR", { exact: true })
     .isVisible();
+  const diagnostics = await pageDiagnostics(observation);
   results.push({
     name: "confirmation-queue",
     recommendationVisible,
     confirmedVisible,
     request: requests[0],
+    ...diagnostics,
   });
   await page.close();
 }
@@ -472,15 +554,10 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     retryable: false,
   };
 
-  const page = await browser.newPage({ viewport, acceptDownloads: true });
-  const consoleErrors = [];
-  const pageErrors = [];
+  const observation = await observedPage({ viewport, acceptDownloads: true });
+  const { page, consoleErrors, pageErrors } = observation;
   const overflowChecks = [];
   const focusChecks = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
-  });
-  page.on("pageerror", (error) => pageErrors.push(error.message));
   async function recordHorizontalOverflow(stage) {
     overflowChecks.push({
       stage,
@@ -749,6 +826,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     (await page.locator("dialog[open]").count()) === 1;
   await recordDialogFocus("cancel-successor", ".dialog-close");
   await recordHorizontalOverflow("cancelled");
+  const diagnostics = await pageDiagnostics(observation);
 
   results.push({
     name: `code-job-control-package-${name}`,
@@ -765,10 +843,14 @@ async function validateCodeJobControlAndPackage(name, viewport) {
     cancellationRemovedControls,
     cancellationSingleOpenDialog,
     focusChecks,
-    horizontalOverflow: overflowChecks.some((check) => check.overflow),
+    horizontalOverflow:
+      diagnostics.horizontalOverflow ||
+      overflowChecks.some((check) => check.overflow),
     overflowChecks,
     consoleErrors,
     pageErrors,
+    accessibilityFailures: diagnostics.accessibilityFailures,
+    accessibilityIssues: diagnostics.accessibilityIssues,
     requests,
   });
   await page.close();
@@ -871,7 +953,10 @@ async function validateExternalReviewConfirmation() {
     retryable: false,
   };
 
-  const page = await browser.newPage({ viewport: { width: 1100, height: 820 } });
+  const observation = await observedPage({
+    viewport: { width: 1100, height: 820 },
+  });
+  const { page } = observation;
   const requests = [];
   let wasPublished = false;
   let confirmationPhase = "later";
@@ -980,6 +1065,7 @@ async function validateExternalReviewConfirmation() {
     .isVisible();
   await page.locator('[data-view="memory"]').click();
   await page.getByText(reviewJob.title, { exact: true }).waitFor();
+  const diagnostics = await pageDiagnostics(observation);
 
   results.push({
     name: "external-review-confirmation",
@@ -989,14 +1075,16 @@ async function validateExternalReviewConfirmation() {
     publishedVisible,
     laterRequestCount,
     request: requests.find((request) => request.phase === "approve"),
+    ...diagnostics,
   });
   await page.close();
 }
 
 async function validateSystemStatusFailureStates() {
-  const initialFailure = await browser.newPage({
+  const initialObservation = await observedPage({
     viewport: { width: 1100, height: 820 },
   });
+  const { page: initialFailure } = initialObservation;
   await initialFailure.route("**/api/system/status", (route) =>
     route.fulfill({
       status: 503,
@@ -1006,12 +1094,17 @@ async function validateSystemStatusFailureStates() {
   );
   await initialFailure.goto(baseUrl, { waitUntil: "networkidle" });
   const initial = await activateSystemAndReadStatus(initialFailure);
-  results.push({ name: "system-status-initial-error", ...initial });
+  results.push({
+    name: "system-status-initial-error",
+    ...initial,
+    ...await pageDiagnostics(initialObservation),
+  });
   await initialFailure.close();
 
-  const staleFailure = await browser.newPage({
+  const staleFailureObservation = await observedPage({
     viewport: { width: 1100, height: 820 },
   });
+  const { page: staleFailure } = staleFailureObservation;
   await staleFailure.goto(baseUrl, { waitUntil: "networkidle" });
   await activateSystemAndReadStatus(staleFailure);
   await staleFailure.locator('[data-view="memory"]').click();
@@ -1032,12 +1125,17 @@ async function validateSystemStatusFailureStates() {
   await assertPending(staleResult, "stale 503 activation must remain pending");
   staleFailureResponse.resolve();
   const stale = await staleResult;
-  results.push({ name: "system-status-stale-error", ...stale });
+  results.push({
+    name: "system-status-stale-error",
+    ...stale,
+    ...await pageDiagnostics(staleFailureObservation),
+  });
   await staleFailure.close();
 
-  const staleSuccess = await browser.newPage({
+  const staleSuccessObservation = await observedPage({
     viewport: { width: 1100, height: 820 },
   });
+  const { page: staleSuccess } = staleSuccessObservation;
   await staleSuccess.addInitScript(() => {
     const fetchWithHeldSystemStatusJson = window.fetch.bind(window);
     window.fetch = async (...args) => {
@@ -1152,19 +1250,13 @@ async function validateSystemStatusFailureStates() {
     name: "system-status-stale-success",
     expectedCheckedAt,
     ...success,
+    ...await pageDiagnostics(staleSuccessObservation),
   });
   await staleSuccess.close();
 }
 
 await validateExternalReviewConfirmation();
 await validateSystemStatusFailureStates();
-await browser.close();
-
-await writeFile(
-  path.join(outputDirectory, "results.json"),
-  `${JSON.stringify(results, null, 2)}\n`,
-  "utf8",
-);
 
 for (const result of results.filter((entry) => entry.name.includes("-"))) {
   if (["desktop-1440", "mobile-390"].includes(result.name)) {
@@ -1300,4 +1392,70 @@ for (const codeJobResult of codeJobResults) {
   });
 }
 
-console.log(JSON.stringify(results, null, 2));
+const expectedScenarios = [
+  "desktop-1440",
+  "mobile-390",
+  "confirmation-queue",
+  "code-job-control-package-desktop-1100",
+  "code-job-control-package-mobile-390",
+  "external-review-confirmation",
+  "system-status-initial-error",
+  "system-status-stale-error",
+  "system-status-stale-success",
+];
+assert.deepEqual(
+  results.map(({ name }) => name),
+  expectedScenarios,
+  "UI validation scenarios must be complete and ordered",
+);
+for (const result of results) {
+  assert.deepEqual(result.consoleErrors, [], `${result.name}: console errors`);
+  assert.deepEqual(result.pageErrors, [], `${result.name}: page errors`);
+  assert.equal(result.horizontalOverflow, false, `${result.name}: overflow`);
+  assert.equal(
+    result.accessibilityFailures,
+    0,
+    `${result.name}: accessibility ${result.accessibilityIssues.join(", ")}`,
+  );
+}
+
+await verifyLiveDashboard({
+  baseUrl,
+  expectedRuntimeSource: liveService.runtimeSource,
+  expectedLiveService: liveService,
+});
+const validationResults = {
+  schemaVersion: 1,
+  runId,
+  status: "passed",
+  liveService,
+  scenarios: results.map((result) => ({
+    name: result.name,
+    status: "passed",
+    consoleErrors: result.consoleErrors.length,
+    pageErrors: result.pageErrors.length,
+    horizontalOverflow: result.horizontalOverflow,
+    accessibilityFailures: result.accessibilityFailures,
+  })),
+  details: results,
+};
+await writeFile(
+  path.join(outputDirectory, "results.json"),
+  `${JSON.stringify(validationResults, null, 2)}\n`,
+  { encoding: "utf8", flag: "wx" },
+);
+const receipt = await buildUiArtifactReceipt({
+  root: process.cwd(),
+  runId,
+  liveService,
+  completedAt: new Date().toISOString(),
+});
+artifactReceiptEnvelope = await writeUiArtifactReceipt({
+  root: process.cwd(),
+  receipt,
+});
+} finally {
+  await browser.close();
+}
+
+process.stdout.write(`${JSON.stringify(artifactReceiptEnvelope)}\n`);

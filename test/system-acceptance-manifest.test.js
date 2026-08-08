@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -14,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { deflateSync } from "node:zlib";
 
 const execFileAsync = promisify(execFile);
 const manifestScript = path.resolve(
@@ -32,6 +34,41 @@ async function git(root, ...arguments_) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function crc32(contents) {
+  let crc = 0xffffffff;
+  for (const byte of contents) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data = Buffer.alloc(0)) {
+  const typeBytes = Buffer.from(type, "ascii");
+  const result = Buffer.alloc(12 + data.length);
+  result.writeUInt32BE(data.length, 0);
+  typeBytes.copy(result, 4);
+  data.copy(result, 8);
+  result.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])), 8 + data.length);
+  return result;
+}
+
+function png(width, height) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 0;
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.alloc((width + 1) * height))),
+    pngChunk("IEND"),
+  ]);
 }
 
 async function loadManifestModule() {
@@ -59,6 +96,10 @@ async function createFixture(t) {
   await git(root, "commit", "--quiet", "-m", "accepted source");
   const headOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
   const treeOid = await git(root, "rev-parse", "--verify", "HEAD^{tree}");
+  const objectFormat = await git(root, "rev-parse", "--show-object-format");
+  const emptyTreeOid = createHash(objectFormat)
+    .update(Buffer.from("tree 0\0", "utf8"))
+    .digest("hex");
   const headLogPath = await git(
     root,
     "rev-parse",
@@ -75,9 +116,39 @@ async function createFixture(t) {
     statusDigest: sha256(""),
     headLogDigest: sha256(await readFile(headLogPath)),
   };
+  const runtimeSource = {
+    schemaVersion: 1,
+    headOid,
+    treeOid,
+    clean: true,
+    runtimeDigest: "c".repeat(64),
+    runtimeFileCount: 3,
+    runtimeByteCount: 4_096,
+  };
+  const liveService = {
+    processId: 2468,
+    instanceId: "12345678-1234-4123-8123-123456789abc",
+    startIdentity: "d".repeat(64),
+    runtimeSource,
+  };
+  const executionSource = {
+    schemaVersion: 1,
+    headOid,
+    treeOid,
+    sealed: true,
+    contentDigest: "e".repeat(64),
+    fileCount: 3,
+    totalBytes: 4_096,
+  };
+  const runId = "11111111-1111-4111-8111-111111111111";
+  const {
+    buildUiArtifactReceipt,
+    uiValidationCommandArguments,
+    writeUiArtifactReceipt,
+  } = await import("../scripts/system-ui-artifact-receipt.mjs");
   const validation = {
     schemaVersion: 1,
-    runId: "11111111-1111-4111-8111-111111111111",
+    runId,
     startedAt: "2026-08-09T00:00:00.000Z",
     finishedAt: "2026-08-09T00:10:00.000Z",
     status: "passed",
@@ -85,10 +156,16 @@ async function createFixture(t) {
     platform: "fixture/x64",
     options: { withDocker: true, withLiveUi: true },
     source: { started: source, finished: source, stable: true },
+    executionSource,
+    liveService,
+    uiArtifactReceipt: null,
     steps: [
       {
         name: "git diff --check",
-        command: { executable: "git", arguments: ["diff", "--check"] },
+        command: {
+          executable: "git",
+          arguments: ["diff", "--check", emptyTreeOid, headOid, "--"],
+        },
         status: "passed",
         durationMs: 25,
         exitCode: 0,
@@ -182,7 +259,16 @@ async function createFixture(t) {
       },
       {
         name: "live desktop and mobile UI behavior",
-        command: { executable: "node", arguments: ["scripts/validate-ui.mjs"] },
+        command: {
+          executable: "node",
+          arguments: [
+            "scripts/validate-ui.mjs",
+            ...uiValidationCommandArguments({
+              runId,
+              liveService,
+            }),
+          ],
+        },
         status: "passed",
         durationMs: 50,
         exitCode: 0,
@@ -190,21 +276,72 @@ async function createFixture(t) {
       },
     ],
   };
+  for (const step of validation.steps) {
+    if (step.name !== "git diff --check") {
+      step.executionSourceDigest = executionSource.contentDigest;
+    }
+  }
   await mkdir(path.join(root, "validation-artifacts"), { recursive: true });
   await mkdir(path.join(root, ".review-results"), { recursive: true });
+  const uiDirectory = path.join(
+    root,
+    "validation-artifacts/runs",
+    runId,
+    "ui",
+  );
+  await mkdir(uiDirectory, { recursive: true });
+  const scenarios = [
+    "desktop-1440",
+    "mobile-390",
+    "confirmation-queue",
+    "code-job-control-package-desktop-1100",
+    "code-job-control-package-mobile-390",
+    "external-review-confirmation",
+    "system-status-initial-error",
+    "system-status-stale-error",
+    "system-status-stale-success",
+  ];
+  const results = {
+    schemaVersion: 1,
+    runId,
+    status: "passed",
+    liveService,
+    scenarios: scenarios.map((name) => ({
+      name,
+      status: "passed",
+      consoleErrors: 0,
+      pageErrors: 0,
+      horizontalOverflow: false,
+      accessibilityFailures: 0,
+    })),
+    details: scenarios.map((name) => ({ name })),
+  };
+  await writeFile(
+    path.join(uiDirectory, "results.json"),
+    `${JSON.stringify(results, null, 2)}\n`,
+  );
+  await writeFile(path.join(uiDirectory, "desktop-1440.png"), png(1440, 1000));
+  await writeFile(path.join(uiDirectory, "mobile-390.png"), png(390, 844));
+  const receipt = await buildUiArtifactReceipt({
+    root,
+    runId,
+    liveService,
+    completedAt: validation.finishedAt,
+  });
+  const envelope = await writeUiArtifactReceipt({ root, receipt });
+  validation.uiArtifactReceipt = { envelope, receipt };
+  validation.steps.at(-1).artifactReceiptEnvelope = envelope;
   const validationPath = path.join(
     root,
-    "validation-artifacts/system-validation.json",
+    "validation-artifacts/runs",
+    runId,
+    "system-validation.json",
   );
   await writeFile(validationPath, `${JSON.stringify(validation, null, 2)}\n`);
-  const artifacts = [
-    ["validation-artifacts/results.json", "{\"ui\":\"passed\"}\n"],
-    ["validation-artifacts/desktop-1440.png", "desktop fixture"],
-    ["validation-artifacts/mobile-390.png", "mobile fixture"],
-  ];
-  for (const [relativePath, contents] of artifacts) {
-    await writeFile(path.join(root, relativePath), contents);
-  }
+  const artifacts = await Promise.all(receipt.artifacts.map(async ({ path: artifactPath }) => [
+    artifactPath,
+    await readFile(path.join(root, ...artifactPath.split("/"))),
+  ]));
   const reviews = [
     { scope: "security-reliability", path: ".review-results/security.json" },
     { scope: "maintainability-usability", path: ".review-results/product.json" },
@@ -237,6 +374,20 @@ async function createFixture(t) {
   return { artifacts, root, reviews, source, validation, validationPath };
 }
 
+async function rewriteValidationAndReviewBindings(fixture, validation) {
+  await writeFile(
+    fixture.validationPath,
+    `${JSON.stringify(validation, null, 2)}\n`,
+  );
+  const reportSha256 = sha256(await readFile(fixture.validationPath));
+  for (const review of fixture.reviews) {
+    const reviewPath = path.join(fixture.root, review.path);
+    const evidence = JSON.parse(await readFile(reviewPath, "utf8"));
+    evidence.validation.reportSha256 = reportSha256;
+    await writeFile(reviewPath, `${JSON.stringify(evidence, null, 2)}\n`);
+  }
+}
+
 test("builds a sanitized manifest that binds validation, artifacts, and reviews to HEAD", async (t) => {
   const fixture = await createFixture(t);
   const { buildAcceptanceManifest } = await loadManifestModule();
@@ -252,8 +403,23 @@ test("builds a sanitized manifest that binds validation, artifacts, and reviews 
   assert.equal(manifest.status, "passed");
   assert.equal(manifest.runId, fixture.validation.runId);
   assert.deepEqual(manifest.source, fixture.source);
-  assert.equal(manifest.validation.path, "validation-artifacts/system-validation.json");
+  assert.equal(
+    manifest.validation.path,
+    `validation-artifacts/runs/${fixture.validation.runId}/system-validation.json`,
+  );
   assert.equal(manifest.validation.runId, fixture.validation.runId);
+  assert.deepEqual(
+    manifest.validation.liveService,
+    fixture.validation.liveService,
+  );
+  assert.deepEqual(
+    manifest.validation.executionSource,
+    fixture.validation.executionSource,
+  );
+  assert.deepEqual(
+    manifest.validation.uiArtifactReceipt,
+    fixture.validation.uiArtifactReceipt,
+  );
   assert.equal(
     manifest.validation.sha256,
     sha256(await readFile(fixture.validationPath)),
@@ -274,6 +440,154 @@ test("builds a sanitized manifest that binds validation, artifacts, and reviews 
     true,
   );
   assert.equal(JSON.stringify(manifest).includes(fixture.root), false);
+});
+
+test("rejects a validation report outside its run-specific artifact path", async (t) => {
+  const fixture = await createFixture(t);
+  const misplacedPath = path.join(
+    fixture.root,
+    "validation-artifacts/misplaced-system-validation.json",
+  );
+  await writeFile(misplacedPath, await readFile(fixture.validationPath));
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: misplacedPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation report path does not match its run identity/u,
+  );
+});
+
+test("rejects text files presented as UI screenshots", async (t) => {
+  const fixture = await createFixture(t);
+  const desktopPath = fixture.validation.uiArtifactReceipt.receipt.artifacts.find(
+    ({ kind }) => kind === "desktop-screenshot",
+  ).path;
+  await writeFile(
+    path.join(fixture.root, ...desktopPath.split("/")),
+    "not a PNG image\n",
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation UI artifact receipt is invalid/u,
+  );
+});
+
+test("rejects unstructured UI results even when the expected file exists", async (t) => {
+  const fixture = await createFixture(t);
+  const resultsPath = fixture.validation.uiArtifactReceipt.receipt.artifacts.find(
+    ({ kind }) => kind === "results",
+  ).path;
+  await writeFile(
+    path.join(fixture.root, ...resultsPath.split("/")),
+    "{}\n",
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation UI artifact receipt is invalid/u,
+  );
+});
+
+test("rejects UI artifacts replaced after the child receipt was published", async (t) => {
+  const fixture = await createFixture(t);
+  const mobilePath = fixture.validation.uiArtifactReceipt.receipt.artifacts.find(
+    ({ kind }) => kind === "mobile-screenshot",
+  ).path;
+  await writeFile(
+    path.join(fixture.root, ...mobilePath.split("/")),
+    png(390, 900),
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation UI artifact receipt is invalid/u,
+  );
+});
+
+test("rejects a UI receipt and command copied from a different validation run", async (t) => {
+  const fixture = await createFixture(t);
+  const forged = structuredClone(fixture.validation);
+  forged.runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const forgedPath = path.join(
+    fixture.root,
+    "validation-artifacts/runs",
+    forged.runId,
+    "system-validation.json",
+  );
+  await mkdir(path.dirname(forgedPath), { recursive: true });
+  await writeFile(
+    forgedPath,
+    `${JSON.stringify(forged, null, 2)}\n`,
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: forgedPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation UI artifact receipt is invalid/u,
+  );
+});
+
+test("rejects a UI command that omits the run-bound receipt arguments", async (t) => {
+  const fixture = await createFixture(t);
+  const forged = structuredClone(fixture.validation);
+  forged.steps.find(
+    ({ name }) => name === "live desktop and mobile UI behavior",
+  ).command.arguments = ["scripts/validate-ui.mjs"];
+  await writeFile(
+    fixture.validationPath,
+    `${JSON.stringify(forged, null, 2)}\n`,
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /mandatory validation command does not match its contract/u,
+  );
+});
+
+test("rejects malformed validation chronology even with rebound review digests", async (t) => {
+  const fixture = await createFixture(t);
+  const malformed = structuredClone(fixture.validation);
+  malformed.finishedAt = "not-a-date";
+  await rewriteValidationAndReviewBindings(fixture, malformed);
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /validation report chronology is invalid/u,
+  );
 });
 
 test("rejects a validation report that is stale or lacks two independent reviews", async (t) => {
@@ -305,6 +619,39 @@ test("rejects a validation report that is stale or lacks two independent reviews
       reviewReports: fixture.reviews.slice(0, 1),
     }),
     /at least two independent review reports are required/u,
+  );
+});
+
+test("acceptance source phase checks reject every clean-HEAD transition", async () => {
+  const source = {
+    schemaVersion: 1,
+    headOid: "1".repeat(40),
+    treeOid: "2".repeat(40),
+    clean: true,
+    changeCount: 0,
+    statusDigest: "3".repeat(64),
+    headLogDigest: "4".repeat(64),
+  };
+  const { assertAcceptanceSourceTransition } = await loadManifestModule();
+
+  assert.doesNotThrow(() =>
+    assertAcceptanceSourceTransition(source, source, "after evidence reads")
+  );
+  assert.throws(
+    () => assertAcceptanceSourceTransition(
+      source,
+      { ...source, headOid: "5".repeat(40), treeOid: "6".repeat(40) },
+      "before publication",
+    ),
+    /acceptance source changed before publication/u,
+  );
+  assert.throws(
+    () => assertAcceptanceSourceTransition(
+      source,
+      { ...source, headLogDigest: "7".repeat(64) },
+      "after publication",
+    ),
+    /acceptance source changed after publication/u,
   );
 });
 
@@ -523,6 +870,34 @@ test("rejects a test skip outside the documented allowlist", async (t) => {
   );
 });
 
+test("accepts an explicitly documented Windows-only test skip", async (t) => {
+  const fixture = await createFixture(t);
+  const validation = structuredClone(fixture.validation);
+  const results = validation.steps.find(
+    ({ name }) => name === "complete Node test suite",
+  ).testResults;
+  results.cases[0] = {
+    identity:
+      "tap:1:PowerShell manager starts, identifies, reports, and gracefully stops only its process",
+    name:
+      "PowerShell manager starts, identifies, reports, and gracefully stops only its process",
+    status: "skipped",
+    reason: "requires Windows PowerShell manager",
+  };
+  results.summary.passed = 0;
+  results.summary.skipped = 2;
+  await rewriteValidationAndReviewBindings(fixture, validation);
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  const manifest = await buildAcceptanceManifest({
+    root: fixture.root,
+    validationReportPath: fixture.validationPath,
+    reviewReports: fixture.reviews,
+  });
+
+  assert.equal(manifest.status, "passed");
+});
+
 test("rejects evidence reached through a repository junction ancestor", async (t) => {
   const fixture = await createFixture(t);
   const external = await mkdtemp(path.join(os.tmpdir(), "mydashboard-evidence-"));
@@ -600,6 +975,28 @@ test("rejects hard-linked acceptance evidence", async (t) => {
   );
 });
 
+test("bounded evidence reads reject growth without allocating appended bytes", async () => {
+  const initial = Buffer.from("safe", "utf8");
+  const appended = Buffer.alloc(8 * 1024 * 1024, 0x78);
+  const contents = Buffer.concat([initial, appended]);
+  let largestRequestedRead = 0;
+  const handle = {
+    async read(buffer, offset, length, position) {
+      largestRequestedRead = Math.max(largestRequestedRead, length);
+      const available = Math.max(0, Math.min(length, contents.length - position));
+      contents.copy(buffer, offset, position, position + available);
+      return { buffer, bytesRead: available };
+    },
+  };
+  const { readBoundedEvidenceHandle } = await loadManifestModule();
+
+  await assert.rejects(
+    readBoundedEvidenceHandle(handle, initial.length, "evidence.json"),
+    /acceptance evidence grew while it was read: evidence\.json/u,
+  );
+  assert.equal(largestRequestedRead <= 64 * 1024, true);
+});
+
 test("sanitizes acceptance evidence filesystem failures", async (t) => {
   const fixture = await createFixture(t);
   const { buildAcceptanceManifest } = await loadManifestModule();
@@ -664,6 +1061,39 @@ test("rejects manifest output through a repository junction ancestor", async (t)
   );
 });
 
+test("does not create external directories through an output junction", async (t) => {
+  const fixture = await createFixture(t);
+  const external = await mkdtemp(path.join(os.tmpdir(), "mydashboard-output-side-effect-"));
+  t.after(() => rm(external, { force: true, recursive: true }));
+  const junction = path.join(fixture.root, "validation-artifacts/publish-side-effect");
+  try {
+    await symlink(
+      external,
+      junction,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("directory links are unavailable on this host");
+      return;
+    }
+    throw error;
+  }
+  const { writeAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    writeAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+      outputPath:
+        "validation-artifacts/publish-side-effect/new/acceptance.json",
+    }),
+    /manifest output path contains a symbolic link or junction/u,
+  );
+  await assert.rejects(lstat(path.join(external, "new")), { code: "ENOENT" });
+});
+
 test("never overwrites an existing acceptance manifest", async (t) => {
   const fixture = await createFixture(t);
   const outputPath = "validation-artifacts/existing-acceptance.json";
@@ -711,11 +1141,15 @@ test("the command line writes the default manifest from two named reviews", asyn
   const fixture = await createFixture(t);
   const outputPath = path.join(
     fixture.root,
-    "validation-artifacts/system-acceptance-manifest.json",
+    "validation-artifacts/runs",
+    fixture.validation.runId,
+    "system-acceptance-manifest.json",
   );
 
   await execFileAsync(process.execPath, [
     manifestScript,
+    "--validation-report",
+    path.relative(fixture.root, fixture.validationPath).replaceAll("\\", "/"),
     "--review",
     `${fixture.reviews[0].scope}=${fixture.reviews[0].path}`,
     "--review",

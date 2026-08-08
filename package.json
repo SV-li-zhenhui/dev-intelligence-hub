@@ -16,7 +16,7 @@
   ],
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node scripts/run-dashboard.mjs",
     "refresh": "node src/cli.js refresh",
     "refresh:notify": "node src/cli.js refresh --notify",
     "test": "node --test \"test/*.test.js\"",

@@ -16,12 +16,11 @@ import {
   assertStableCleanRepository,
   captureRepositoryState,
 } from "./system-validation-provenance.mjs";
+import {
+  uiValidationCommandArguments,
+  verifyUiArtifactReceipt,
+} from "./system-ui-artifact-receipt.mjs";
 
-const REQUIRED_ARTIFACTS = new Set([
-  "validation-artifacts/desktop-1440.png",
-  "validation-artifacts/mobile-390.png",
-  "validation-artifacts/results.json",
-]);
 const MAXIMUM_EVIDENCE_BYTES = 64 * 1024 * 1024;
 const UUID_V4 =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
@@ -31,10 +30,6 @@ const REVIEW_SCOPES = new Set([
   "maintainability-usability",
 ]);
 const REQUIRED_COMMANDS = new Map([
-  [
-    "git diff --check",
-    { executable: "git", arguments: ["diff", "--check"] },
-  ],
   [
     "complete Node test suite",
     {
@@ -62,10 +57,6 @@ const REQUIRED_COMMANDS = new Map([
       executable: "node",
       arguments: ["--test", "test/docker-test-sandbox.integration.test.js"],
     },
-  ],
-  [
-    "live desktop and mobile UI behavior",
-    { executable: "node", arguments: ["scripts/validate-ui.mjs"] },
   ],
 ]);
 const execFileAsync = promisify(execFile);
@@ -101,6 +92,78 @@ const ALLOWED_TEST_SKIPS = new Map([
   [
     "runtime source identity rejects symlinks in packaged directories",
     "file symlinks are unavailable on this host",
+  ],
+  [
+    "the real application server completes authenticated manager start and stop on an isolated port",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "PowerShell manager starts, identifies, reports, and gracefully stops only its process",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "PowerShell manager permits an exact offline restore only while the service is stopped",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "PowerShell 7 uses the same private ACL and authenticated lifecycle",
+    new Set(["requires Windows PowerShell manager", "requires PowerShell 7"]),
+  ],
+  [
+    "PowerShell manager refuses an unrecorded loopback listener without killing it",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "concurrent starts serialize and retain one health-bound process",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "a manager killed after durable control publication leaves a child that self-exits unclaimed",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "exclusive launch-result failure stops only the unpublished child and preserves the colliding file",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "exclusive control publication failure gracefully stops the authenticated child and preserves the owner file",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "tampered launch-result HMAC is rejected while the unclaimed child self-exits",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "tampered authenticated control fails closed without touching an unrelated Node process",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "junction aliases share the real-project mutex and one control plane",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "a dead recorded instance cannot authorize shutdown of a new listener on its old port",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "failure receipt retains control and prevents Restart from creating a new writer",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "broad-write ACL and runtime junctions are rejected before process control",
+    "requires Windows PowerShell manager",
+  ],
+  [
+    "supervised runner contains descendants even when the direct child exits successfully",
+    "requires Windows Job Object process supervision",
+  ],
+  [
+    "a Windows child exit code of 125 is a process failure",
+    "requires Windows Job Object process supervision",
+  ],
+  [
+    "the clean payload starts, reports status, and stops through its trusted manager",
+    "requires PowerShell manager availability",
   ],
 ]);
 
@@ -226,6 +289,46 @@ async function evidenceHandleStat(handle, relativePath) {
   }
 }
 
+export async function readBoundedEvidenceHandle(
+  handle,
+  expectedBytes,
+  relativePath,
+) {
+  if (
+    !Number.isSafeInteger(expectedBytes) ||
+    expectedBytes < 0 ||
+    expectedBytes > MAXIMUM_EVIDENCE_BYTES
+  ) {
+    throw new Error(`acceptance evidence has an invalid size: ${relativePath}`);
+  }
+  const contents = Buffer.alloc(expectedBytes);
+  let offset = 0;
+  while (offset < expectedBytes) {
+    const length = Math.min(64 * 1024, expectedBytes - offset);
+    const { bytesRead } = await handle.read(
+      contents,
+      offset,
+      length,
+      offset,
+    );
+    if (bytesRead === 0) {
+      throw new Error(`acceptance evidence shrank while it was read: ${relativePath}`);
+    }
+    offset += bytesRead;
+  }
+  const probe = Buffer.alloc(1);
+  const { bytesRead: appendedBytes } = await handle.read(
+    probe,
+    0,
+    1,
+    expectedBytes,
+  );
+  if (appendedBytes !== 0) {
+    throw new Error(`acceptance evidence grew while it was read: ${relativePath}`);
+  }
+  return contents;
+}
+
 async function assertSafeOutputAncestors(root, relativePath) {
   const segments = relativePath.split("/");
   const snapshots = [];
@@ -238,6 +341,55 @@ async function assertSafeOutputAncestors(root, relativePath) {
     } catch (error) {
       if (error?.code === "ENOENT") return null;
       throw new Error(`manifest output path could not be inspected: ${relativePath}`);
+    }
+    if (metadata.isSymbolicLink()) {
+      throw new Error(
+        `manifest output path contains a symbolic link or junction: ${relativePath}`,
+      );
+    }
+    if (!metadata.isDirectory()) {
+      throw new Error(`manifest output ancestor is not a directory: ${relativePath}`);
+    }
+    snapshots.push({
+      absolutePath: ancestor,
+      metadata: metadataSnapshot(metadata),
+    });
+  }
+  return snapshots;
+}
+
+async function createSafeOutputAncestors(root, relativePath) {
+  const snapshots = [];
+  let ancestor = root;
+  for (const segment of relativePath.split("/").slice(0, -1)) {
+    ancestor = path.join(ancestor, segment);
+    for (const snapshot of snapshots) {
+      const current = await lstat(snapshot.absolutePath, { bigint: true });
+      if (
+        current.isSymbolicLink() ||
+        !current.isDirectory() ||
+        current.dev !== snapshot.metadata.device ||
+        current.ino !== snapshot.metadata.inode ||
+        current.mode !== snapshot.metadata.mode
+      ) {
+        throw new Error(
+          `manifest output path changed before directory creation: ${relativePath}`,
+        );
+      }
+    }
+    let metadata;
+    try {
+      metadata = await lstat(ancestor, { bigint: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new Error(`manifest output path could not be inspected: ${relativePath}`);
+      }
+      try {
+        await mkdir(ancestor);
+        metadata = await lstat(ancestor, { bigint: true });
+      } catch {
+        throw new Error(`manifest output directory could not be created: ${relativePath}`);
+      }
     }
     if (metadata.isSymbolicLink()) {
       throw new Error(
@@ -269,25 +421,48 @@ function sameAncestorSnapshots(left, right) {
   );
 }
 
-async function publishManifest(root, output, manifest) {
+export function assertAcceptanceSourceTransition(started, finished, phase) {
   try {
-    await mkdir(path.dirname(output.absolutePath), { recursive: true });
+    assertStableCleanRepository(started, finished);
   } catch {
-    throw new Error(`manifest output directory could not be created: ${output.relativePath}`);
+    throw new Error(`acceptance source changed ${phase}`);
   }
-  const outputAncestors = await assertSafeOutputAncestors(
+}
+
+async function removePublishedManifest(output, publishedIdentity) {
+  let current;
+  try {
+    current = await lstat(output.absolutePath, { bigint: true });
+  } catch {
+    return;
+  }
+  if (
+    !current.isFile() ||
+    current.isSymbolicLink() ||
+    current.nlink !== 1n ||
+    !sameMetadata(publishedIdentity, metadataSnapshot(current))
+  ) {
+    throw new Error("stale acceptance manifest could not be safely invalidated");
+  }
+  try {
+    await unlink(output.absolutePath);
+  } catch {
+    throw new Error("stale acceptance manifest could not be invalidated");
+  }
+}
+
+async function publishManifest(root, output, manifest) {
+  const outputAncestors = await createSafeOutputAncestors(
     root,
     output.relativePath,
   );
-  if (outputAncestors === null) {
-    throw new Error(`manifest output directory is unavailable: ${output.relativePath}`);
-  }
   const temporaryPath = path.join(
     path.dirname(output.absolutePath),
     `.${path.basename(output.absolutePath)}.${randomUUID()}.tmp`,
   );
   let handle = null;
   let temporaryExists = false;
+  let publishedIdentity = null;
   try {
     handle = await open(temporaryPath, "wx", 0o600);
     temporaryExists = true;
@@ -302,6 +477,12 @@ async function publishManifest(root, output, manifest) {
     if (!sameAncestorSnapshots(outputAncestors, beforePublish)) {
       throw new Error(`manifest output path changed before publication: ${output.relativePath}`);
     }
+    const sourceBeforePublication = await captureRepositoryState(root);
+    assertAcceptanceSourceTransition(
+      manifest.source,
+      sourceBeforePublication,
+      "before publication",
+    );
     try {
       await link(temporaryPath, output.absolutePath);
     } catch (error) {
@@ -339,6 +520,18 @@ async function publishManifest(root, output, manifest) {
     ) {
       throw new Error(`acceptance manifest publication is unsafe: ${output.relativePath}`);
     }
+    publishedIdentity = metadataSnapshot(publishedMetadata);
+    const sourceAfterPublication = await captureRepositoryState(root);
+    assertAcceptanceSourceTransition(
+      manifest.source,
+      sourceAfterPublication,
+      "after publication",
+    );
+  } catch (error) {
+    if (publishedIdentity !== null) {
+      await removePublishedManifest(output, publishedIdentity);
+    }
+    throw error;
   } finally {
     if (handle !== null) {
       await handle.close().catch(() => {});
@@ -388,8 +581,15 @@ async function evidenceFile(root, filePath) {
       );
     }
     try {
-      contents = await handle.readFile();
-    } catch {
+      contents = await readBoundedEvidenceHandle(
+        handle,
+        Number(pathMetadata.size),
+        resolved.relativePath,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("acceptance evidence ")) {
+        throw error;
+      }
       throw new Error(
         `acceptance evidence could not be read: ${resolved.relativePath}`,
       );
@@ -478,8 +678,11 @@ function validateTestResults(step) {
   }
   for (const testCase of cases) {
     if (testCase.status === "skipped") {
+      const allowedReason = ALLOWED_TEST_SKIPS.get(testCase.name);
       if (
-        ALLOWED_TEST_SKIPS.get(testCase.name) !== testCase.reason ||
+        (allowedReason instanceof Set
+          ? !allowedReason.has(testCase.reason)
+          : allowedReason !== testCase.reason) ||
         typeof testCase.reason !== "string" ||
         testCase.reason === ""
       ) {
@@ -573,6 +776,13 @@ function commandMatches(actual, expected) {
   );
 }
 
+function emptyTreeObjectId(headOid) {
+  const algorithm = headOid.length === 40 ? "sha1" : "sha256";
+  return createHash(algorithm)
+    .update(Buffer.from("tree 0\0", "utf8"))
+    .digest("hex");
+}
+
 function compareUtf8Paths(left, right) {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
@@ -637,11 +847,20 @@ async function committedSyntaxFiles(root, headOid) {
   return files;
 }
 
-function requiredStepContracts(syntaxFiles) {
+function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
   return [
     {
       name: "git diff --check",
-      command: REQUIRED_COMMANDS.get("git diff --check"),
+      command: {
+        executable: "git",
+        arguments: [
+          "diff",
+          "--check",
+          emptyTreeObjectId(headOid),
+          headOid,
+          "--",
+        ],
+      },
     },
     ...syntaxFiles.map((relativePath) => ({
       name: `syntax:${relativePath}`,
@@ -670,12 +889,51 @@ function requiredStepContracts(syntaxFiles) {
     },
     {
       name: "live desktop and mobile UI behavior",
-      command: REQUIRED_COMMANDS.get("live desktop and mobile UI behavior"),
+      command: {
+        executable: "node",
+        arguments: ["scripts/validate-ui.mjs", ...uiArguments],
+      },
     },
   ];
 }
 
-function validateReport(report, currentSource, syntaxFiles) {
+function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
+  if (
+    !hasExactKeys(report, [
+      "finishedAt",
+      "executionSource",
+      "liveService",
+      "node",
+      "options",
+      "platform",
+      "runId",
+      "schemaVersion",
+      "source",
+      "startedAt",
+      "status",
+      "steps",
+      "uiArtifactReceipt",
+    ]) ||
+    report.schemaVersion !== 1 ||
+    typeof report.node !== "string" ||
+    report.node === "" ||
+    typeof report.platform !== "string" ||
+    report.platform === "" ||
+    !hasExactKeys(report.options, ["withDocker", "withLiveUi"])
+  ) {
+    throw new Error("system validation report schema is invalid");
+  }
+  if (
+    typeof report.startedAt !== "string" ||
+    typeof report.finishedAt !== "string" ||
+    !Number.isFinite(Date.parse(report.startedAt)) ||
+    !Number.isFinite(Date.parse(report.finishedAt)) ||
+    new Date(report.startedAt).toISOString() !== report.startedAt ||
+    new Date(report.finishedAt).toISOString() !== report.finishedAt ||
+    Date.parse(report.startedAt) > Date.parse(report.finishedAt)
+  ) {
+    throw new Error("system validation report chronology is invalid");
+  }
   if (report?.status !== "passed") {
     throw new Error("system validation report is not passed");
   }
@@ -698,8 +956,65 @@ function validateReport(report, currentSource, syntaxFiles) {
   } catch {
     throw new Error("validation report does not match the current HEAD");
   }
+  if (
+    !hasExactKeys(report.executionSource, [
+      "contentDigest",
+      "fileCount",
+      "headOid",
+      "schemaVersion",
+      "sealed",
+      "totalBytes",
+      "treeOid",
+    ]) ||
+    report.executionSource.schemaVersion !== 1 ||
+    report.executionSource.headOid !== report.source.finished.headOid ||
+    report.executionSource.treeOid !== report.source.finished.treeOid ||
+    report.executionSource.sealed !== true ||
+    !SHA_256.test(report.executionSource.contentDigest) ||
+    !Number.isSafeInteger(report.executionSource.fileCount) ||
+    report.executionSource.fileCount <= 0 ||
+    !Number.isSafeInteger(report.executionSource.totalBytes) ||
+    report.executionSource.totalBytes <= 0
+  ) {
+    throw new Error("system validation execution source is invalid");
+  }
   if (!Array.isArray(report.steps) || report.steps.length === 0) {
     throw new Error("system validation report has no command steps");
+  }
+  let uiArguments;
+  try {
+    if (
+      !hasExactKeys(report.liveService, [
+        "instanceId",
+        "processId",
+        "runtimeSource",
+        "startIdentity",
+      ]) ||
+      !Number.isSafeInteger(report.liveService.processId) ||
+      report.liveService.processId <= 0 ||
+      !UUID_V4.test(report.liveService.instanceId) ||
+      !SHA_256.test(report.liveService.startIdentity)
+    ) {
+      throw new Error("invalid live service");
+    }
+    uiArguments = uiValidationCommandArguments({
+      runId: report.runId,
+      liveService: report.liveService,
+    });
+    if (
+      report.liveService.runtimeSource.headOid !== report.source.finished.headOid ||
+      report.liveService.runtimeSource.treeOid !== report.source.finished.treeOid
+    ) {
+      throw new Error("live runtime source mismatch");
+    }
+  } catch {
+    throw new Error("system validation live runtime identity is invalid");
+  }
+  if (
+    !hasExactKeys(report.uiArtifactReceipt, ["envelope", "receipt"]) ||
+    JSON.stringify(report.uiArtifactReceipt) !== JSON.stringify(verifiedUiReceipt)
+  ) {
+    throw new Error("system validation UI artifact receipt is invalid");
   }
   const stepNames = report.steps.map((step) => step?.name);
   if (
@@ -715,7 +1030,11 @@ function validateReport(report, currentSource, syntaxFiles) {
   ) {
     throw new Error("unknown aggregate validation step");
   }
-  const contracts = requiredStepContracts(syntaxFiles);
+  const contracts = requiredStepContracts(
+    syntaxFiles,
+    uiArguments,
+    currentSource.headOid,
+  );
   if (
     contracts.length !== report.steps.length ||
     contracts.some((contract, index) => contract.name !== report.steps[index].name)
@@ -747,6 +1066,14 @@ function validateReport(report, currentSource, syntaxFiles) {
     }
   }
   for (const step of report.steps) {
+    const requiresExecutionSource = step?.name !== "git diff --check";
+    if (
+      requiresExecutionSource
+        ? step?.executionSourceDigest !== report.executionSource.contentDigest
+        : step?.executionSourceDigest !== undefined
+    ) {
+      throw new Error("validation step is not bound to its immutable execution source");
+    }
     if (step?.kind === "aggregate") {
       if (step.name !== "node syntax aggregate") {
         throw new Error("unknown aggregate validation step");
@@ -786,6 +1113,12 @@ function validateReport(report, currentSource, syntaxFiles) {
   if (!testStep || !dockerStep || !uiStep) {
     throw new Error("system validation omitted a mandatory acceptance command");
   }
+  if (
+    JSON.stringify(uiStep.artifactReceiptEnvelope) !==
+    JSON.stringify(verifiedUiReceipt.envelope)
+  ) {
+    throw new Error("UI validation command did not return the accepted receipt");
+  }
   for (const [name, command] of REQUIRED_COMMANDS) {
     const step = report.steps.find((candidate) => candidate.name === name);
     if (!commandMatches(step?.command, command)) {
@@ -798,7 +1131,6 @@ function validateReport(report, currentSource, syntaxFiles) {
 export async function buildAcceptanceManifest({
   root,
   validationReportPath,
-  artifactPaths,
   reviewReports,
   generatedAt = new Date().toISOString(),
 }) {
@@ -806,9 +1138,12 @@ export async function buildAcceptanceManifest({
   if (!Array.isArray(reviewReports) || reviewReports.length !== 2) {
     throw new Error("at least two independent review reports are required");
   }
-  if (!Array.isArray(artifactPaths)) {
-    throw new Error("acceptance artifact paths are required");
-  }
+  const sourceBeforeEvidence = await captureRepositoryState(canonicalRoot);
+  assertAcceptanceSourceTransition(
+    sourceBeforeEvidence,
+    sourceBeforeEvidence,
+    "before evidence reads",
+  );
   const validationFile = await evidenceFile(canonicalRoot, validationReportPath);
   let validationReport;
   try {
@@ -816,22 +1151,46 @@ export async function buildAcceptanceManifest({
   } catch {
     throw new Error("system validation report is not valid JSON");
   }
-  const currentSource = await captureRepositoryState(canonicalRoot);
+  if (
+    UUID_V4.test(validationReport?.runId) &&
+    validationFile.path !==
+      `validation-artifacts/runs/${validationReport.runId}/system-validation.json`
+  ) {
+    throw new Error("system validation report path does not match its run identity");
+  }
   const syntaxFiles = await committedSyntaxFiles(
     canonicalRoot,
-    currentSource.headOid,
+    sourceBeforeEvidence.headOid,
   );
-  validateReport(validationReport, currentSource, syntaxFiles);
+  let verifiedUiReceipt;
+  try {
+    verifiedUiReceipt = await verifyUiArtifactReceipt({
+      root: canonicalRoot,
+      envelope: validationReport.uiArtifactReceipt?.envelope,
+      expectedRunId: validationReport.runId,
+      expectedLiveService: validationReport.liveService,
+    });
+  } catch {
+    throw new Error("system validation UI artifact receipt is invalid");
+  }
+  validateReport(
+    validationReport,
+    sourceBeforeEvidence,
+    syntaxFiles,
+    verifiedUiReceipt,
+  );
 
-  const artifacts = await Promise.all(
-    artifactPaths.map((artifactPath) => evidenceFile(canonicalRoot, artifactPath)),
-  );
-  const artifactNames = new Set(artifacts.map(({ path: artifactPath }) => artifactPath));
-  if (
-    artifactNames.size !== artifacts.length ||
-    [...REQUIRED_ARTIFACTS].some((required) => !artifactNames.has(required))
-  ) {
-    throw new Error("acceptance artifacts are incomplete or duplicated");
+  const artifacts = [];
+  for (const expected of verifiedUiReceipt.receipt.artifacts) {
+    const artifact = await evidenceFile(canonicalRoot, expected.path);
+    if (
+      artifact.path !== expected.path ||
+      artifact.bytes !== expected.bytes ||
+      artifact.sha256 !== expected.sha256
+    ) {
+      throw new Error("acceptance UI artifact no longer matches its receipt");
+    }
+    artifacts.push(artifact);
   }
 
   const scopes = new Set();
@@ -889,13 +1248,19 @@ export async function buildAcceptanceManifest({
   ) {
     throw new Error("independent review scopes do not cover the required lenses");
   }
+  const sourceAfterEvidence = await captureRepositoryState(canonicalRoot);
+  assertAcceptanceSourceTransition(
+    sourceBeforeEvidence,
+    sourceAfterEvidence,
+    "after evidence reads",
+  );
 
   return {
     schemaVersion: 1,
     runId: validationReport.runId,
     generatedAt,
     status: "passed",
-    source: currentSource,
+    source: sourceBeforeEvidence,
     validation: {
       runId: validationReport.runId,
       path: validationFile.path,
@@ -906,6 +1271,9 @@ export async function buildAcceptanceManifest({
       node: validationReport.node,
       platform: validationReport.platform,
       options: validationReport.options,
+      executionSource: structuredClone(validationReport.executionSource),
+      liveService: structuredClone(validationReport.liveService),
+      uiArtifactReceipt: structuredClone(validationReport.uiArtifactReceipt),
       steps: structuredClone(validationReport.steps),
     },
     artifacts: artifacts.map(({ contents: _contents, ...artifact }) => artifact),
@@ -913,21 +1281,33 @@ export async function buildAcceptanceManifest({
   };
 }
 
-export async function writeAcceptanceManifest({ outputPath, ...options }) {
+export async function writeAcceptanceManifest({ outputPath = null, ...options }) {
   const root = await canonicalRepositoryRoot(options.root);
-  const output = relativeFile(root, outputPath);
   const manifest = await buildAcceptanceManifest({ ...options, root });
+  const requestedOutput = outputPath ??
+    `validation-artifacts/runs/${manifest.runId}/system-acceptance-manifest.json`;
+  const output = relativeFile(root, requestedOutput);
   await assertSafeOutputAncestors(root, output.relativePath);
   await publishManifest(root, output, manifest);
   return manifest;
 }
 
-function commandLineReviews(arguments_) {
+function commandLineOptions(arguments_) {
+  let validationReportPath = null;
   const reviews = [];
   for (let index = 0; index < arguments_.length; index += 1) {
+    if (
+      arguments_[index] === "--validation-report" &&
+      index + 1 < arguments_.length &&
+      validationReportPath === null
+    ) {
+      validationReportPath = arguments_[index + 1];
+      index += 1;
+      continue;
+    }
     if (arguments_[index] !== "--review" || index + 1 >= arguments_.length) {
       throw new Error(
-        "usage: system-acceptance-manifest.mjs --review <scope>=<path> --review <scope>=<path>",
+        "usage: system-acceptance-manifest.mjs --validation-report <path> --review <scope>=<path> --review <scope>=<path>",
       );
     }
     const value = arguments_[index + 1];
@@ -941,21 +1321,24 @@ function commandLineReviews(arguments_) {
       path: value.slice(separator + 1),
     });
   }
-  return reviews;
+  if (validationReportPath === null) {
+    throw new Error("validation report path is required");
+  }
+  return { validationReportPath, reviews };
 }
 
 const isMain = process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
 if (isMain) {
+  const options = commandLineOptions(process.argv.slice(2));
   const manifest = await writeAcceptanceManifest({
     root: process.cwd(),
-    validationReportPath: "validation-artifacts/system-validation.json",
-    artifactPaths: [...REQUIRED_ARTIFACTS],
-    reviewReports: commandLineReviews(process.argv.slice(2)),
-    outputPath: "validation-artifacts/system-acceptance-manifest.json",
+    validationReportPath: options.validationReportPath,
+    reviewReports: options.reviews,
   });
   process.stdout.write(
-    `acceptance manifest written for ${manifest.source.headOid}\n`,
+    `acceptance manifest written for run ${manifest.runId} at ` +
+      `validation-artifacts/runs/${manifest.runId}/system-acceptance-manifest.json\n`,
   );
 }

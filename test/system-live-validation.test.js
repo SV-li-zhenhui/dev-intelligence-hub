@@ -123,3 +123,24 @@ test("live validation rejects missing, stale, mismatched, or unmanaged identitie
     );
   }
 });
+
+test("live validation rejects a replacement process with the same runtime source", async () => {
+  const expected = runtimeSource();
+  const fake = liveFetch(expected);
+  const { verifyLiveDashboard } = await loadLiveValidation();
+
+  await assert.rejects(
+    verifyLiveDashboard({
+      baseUrl: "http://127.0.0.1:4173",
+      expectedRuntimeSource: expected,
+      expectedLiveService: {
+        processId: 9999,
+        instanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        startIdentity: "e".repeat(64),
+        runtimeSource: expected,
+      },
+      fetchFn: fake.fetch,
+    }),
+    /dashboard live process identity does not match/u,
+  );
+});

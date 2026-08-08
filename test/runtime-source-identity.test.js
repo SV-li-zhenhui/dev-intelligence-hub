@@ -143,3 +143,19 @@ test("versioned runtime identity freezes the clean commit, tree, and package dig
   await writeFile(path.join(fixture.root, "src/app.js"), "export const dirty = true;\n");
   assert.equal(await computeVersionedRuntimeSourceIdentity(fixture.root), null);
 });
+
+test("packaged runtime identity remains deterministic without Git metadata", async (t) => {
+  const fixture = await createFixture(t);
+  const { computeVersionedRuntimeSourceIdentity } = await loadIdentityModule();
+
+  const first = await computeVersionedRuntimeSourceIdentity(fixture.root);
+  const second = await computeVersionedRuntimeSourceIdentity(fixture.root);
+
+  assert.deepEqual(first, second);
+  assert.match(first.headOid, /^[a-f0-9]{64}$/u);
+  assert.match(first.treeOid, /^[a-f0-9]{64}$/u);
+  assert.notEqual(first.headOid, first.treeOid);
+  assert.equal(first.clean, true);
+  assert.match(first.runtimeDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(first.runtimeFileCount, fixture.files.size);
+});

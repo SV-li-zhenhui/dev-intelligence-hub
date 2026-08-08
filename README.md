@@ -23,15 +23,18 @@ npm run validate:system
 npm run validate:system -- --all
 ```
 
-验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。结果只写入被 Git 忽略的 `validation-artifacts/system-validation.json`，其中记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。
+验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。每次命令都会生成新的 `runId`，并在结束时打印报告路径 `validation-artifacts/runs/<runId>/system-validation.json`；不同验收不会覆盖或误用旧报告。报告记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。`--all` 的 UI 结果、真实 PNG 截图和回执也保存在同一 run 目录。
 
 完成 `--all`、保存两份独立最终审查后，可生成同样被忽略的 HEAD 绑定清单。清单要求 Docker 与桌面/移动端 UI 步骤都已通过，并按 SHA-256 绑定验证报告、UI 结果/截图和两份不同审查报告：
 
 ```powershell
 node scripts/system-acceptance-manifest.mjs `
-  --review "security-reliability=validation-artifacts/reviews/security-reliability.md" `
-  --review "maintainability-usability=validation-artifacts/reviews/maintainability-usability.md"
+  --validation-report "validation-artifacts/runs/<runId>/system-validation.json" `
+  --review "security-reliability=validation-artifacts/runs/<runId>/reviews/security-reliability.json" `
+  --review "maintainability-usability=validation-artifacts/runs/<runId>/reviews/maintainability-usability.json"
 ```
+
+两份审查必须是独立审查器在该次验证结束后生成的机器可读 JSON：分别覆盖 `security-reliability` 与 `maintainability-usability`，绑定相同 `runId`、HEAD/tree、验证报告 SHA-256，并给出唯一 review/reviewer run 身份；只有 verdict 为 `ready` 且 P0/P1/P2 均为 0 才能发布清单。清单默认写入 `validation-artifacts/runs/<runId>/system-acceptance-manifest.json`，不会覆盖已有文件。
 
 这些本地产物可能包含运行环境或测试名称，仍应在任何对外使用前人工检查；清单不是许可证选择，也不能代替由产品自身执行的所有者确认真实 PR 验收。
 
@@ -42,6 +45,8 @@ Copy-Item config.example.json config.json
 ```
 
 然后只在 `config.json` 或 `config.local.json` 中填写首次导入所需的本机设置；密钥本身只放在环境变量中。首次导入形成活动版本后，以浏览器“配置”页面中的结构化草稿、校验、影响预览和逐项确认激活为准，后续修改启动文件不会静默覆盖活动权限。当前运行时按一个不可变活动版本组装，所以任何确认激活或回滚都会明确进入“需要重启”状态；使用受管重启后，新版本才成为岗位、路由、大脑和权限的实际运行配置。浏览器打开 `http://127.0.0.1:4173`。服务端按配置定时刷新，页面定时读取最新快照；“刷新”按钮可立即采集。
+
+`npm start` 和受管启动都先由安全 bootstrap 对发布文件计算不可变身份，再加载应用模块，并在开放服务前重新核验。Git checkout 必须干净且绑定真实 commit/tree；不含 `.git` 的 npm 或离线发布包使用同一组发布文件生成确定性身份。启动期间文件发生变化会失败关闭。
 
 完整设计、隐私边界、安全报告、运维与贡献说明分别见 [架构](docs/ARCHITECTURE.md)、[隐私](docs/PRIVACY.md)、[安全](SECURITY.md)、[运维](docs/OPERATIONS.md) 和 [贡献指南](CONTRIBUTING.md)。
 

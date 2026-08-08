@@ -12,6 +12,10 @@ import {
   SupervisedProcessRunner,
 } from "../src/lib/supervised-process-runner.js";
 
+const WINDOWS_JOB_OBJECT_SKIP = process.platform !== "win32"
+  ? "requires Windows Job Object process supervision"
+  : false;
+
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -440,7 +444,7 @@ test("supervised runner has a hard reap deadline when termination never closes t
 });
 
 test("supervised runner contains descendants even when the direct child exits successfully", {
-  skip: process.platform !== "win32",
+  skip: WINDOWS_JOB_OBJECT_SKIP,
 }, async (t) => {
   const directory = await temporaryDirectory(t, "supervised-runner-success-tree-");
   const marker = path.join(directory, "descendant-pid.txt");
@@ -475,7 +479,7 @@ test("supervised runner contains descendants even when the direct child exits su
 });
 
 test("a Windows child exit code of 125 is a process failure", {
-  skip: process.platform !== "win32",
+  skip: WINDOWS_JOB_OBJECT_SKIP,
 }, async (t) => {
   const directory = await temporaryDirectory(t, "supervised-runner-exit-125-");
 

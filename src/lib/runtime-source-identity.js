@@ -92,6 +92,37 @@ function updateFrame(hash, value) {
   hash.update("\0");
 }
 
+async function hasLocalRepositoryMetadata(root) {
+  try {
+    await lstat(path.join(path.resolve(root), ".git"));
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function packagedObjectIdentity(kind, runtime) {
+  const hash = createHash("sha256");
+  hash.update(`mydashboard-packaged-runtime-${kind}-v1\0`);
+  updateFrame(hash, runtime.digest);
+  updateFrame(hash, String(runtime.fileCount));
+  updateFrame(hash, String(runtime.byteCount));
+  return hash.digest("hex");
+}
+
+function packagedRuntimeSourceIdentity(runtime) {
+  return Object.freeze({
+    schemaVersion: 1,
+    headOid: packagedObjectIdentity("head", runtime),
+    treeOid: packagedObjectIdentity("tree", runtime),
+    clean: true,
+    runtimeDigest: runtime.digest,
+    runtimeFileCount: runtime.fileCount,
+    runtimeByteCount: runtime.byteCount,
+  });
+}
+
 export async function computeRuntimeSourceIdentity(root) {
   const canonicalRoot = path.resolve(root);
   const packagePath = path.join(canonicalRoot, "package.json");
@@ -144,11 +175,18 @@ export async function computeRuntimeSourceIdentity(root) {
 
 export async function computeVersionedRuntimeSourceIdentity(root) {
   const runtime = await computeRuntimeSourceIdentity(root);
+  const hadLocalRepositoryMetadata = await hasLocalRepositoryMetadata(root);
   let source;
   try {
     source = await captureRepositoryState(root);
   } catch {
-    return null;
+    if (
+      hadLocalRepositoryMetadata ||
+      await hasLocalRepositoryMetadata(root)
+    ) {
+      return null;
+    }
+    return packagedRuntimeSourceIdentity(runtime);
   }
   if (!source.clean) return null;
   return Object.freeze({
