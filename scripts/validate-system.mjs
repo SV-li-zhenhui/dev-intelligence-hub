@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import { readdir, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  assertStableCleanRepository,
+  captureRepositoryState,
+} from "./system-validation-provenance.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const artifacts = path.join(root, "validation-artifacts");
@@ -25,6 +29,11 @@ const report = {
   node: process.version,
   platform: `${process.platform}/${process.arch}`,
   options: { withDocker, withLiveUi },
+  source: {
+    started: null,
+    finished: null,
+    stable: false,
+  },
   steps: [],
 };
 
@@ -32,10 +41,46 @@ function commandLabel(command, arguments_) {
   return [command, ...arguments_].join(" ");
 }
 
+function sanitizedPathToken(value) {
+  if (!path.isAbsolute(value)) return value.replaceAll("\\", "/");
+  const relative = path.relative(root, value);
+  if (relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== "..") {
+    return relative.replaceAll("\\", "/");
+  }
+  return `<external:${path.basename(value)}>`;
+}
+
+function commandRecord(command, arguments_) {
+  const npmExecutable = process.env.npm_execpath;
+  if (
+    command === process.execPath &&
+    npmExecutable &&
+    arguments_[0] === npmExecutable
+  ) {
+    return {
+      executable: "npm",
+      arguments: arguments_.slice(1).map(sanitizedPathToken),
+    };
+  }
+  if (/^npm(?:\.cmd)?$/iu.test(command)) {
+    return {
+      executable: "npm",
+      arguments: arguments_.map(sanitizedPathToken),
+    };
+  }
+  return {
+    executable: command === process.execPath
+      ? "node"
+      : sanitizedPathToken(command),
+    arguments: arguments_.map(sanitizedPathToken),
+  };
+}
+
 function run(command, arguments_, {
   name = commandLabel(command, arguments_),
   environment = process.env,
   quiet = false,
+  parseOutput = null,
 } = {}) {
   const startedAt = Date.now();
   process.stdout.write(`\n[validate] ${name}\n`);
@@ -55,33 +100,91 @@ function run(command, arguments_, {
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       const durationMs = Date.now() - startedAt;
+      const stdoutText = Buffer.concat(stdout).toString("utf8");
+      const stderrText = Buffer.concat(stderr).toString("utf8");
       const step = {
         name,
+        command: commandRecord(command, arguments_),
         status: code === 0 && signal === null ? "passed" : "failed",
         durationMs,
         exitCode: code,
         signal,
       };
+      let outputError = null;
+      if (parseOutput !== null) {
+        try {
+          step.testResults = parseOutput(stdoutText);
+        } catch (error) {
+          outputError = error;
+          step.status = "failed";
+        }
+      }
       report.steps.push(step);
       if (step.status === "passed") {
         process.stdout.write(`[validate] passed in ${durationMs} ms\n`);
-        resolve();
+        resolve({ stderr: stderrText, stdout: stdoutText, step });
         return;
       }
-      const diagnostic = Buffer.concat([...stdout, ...stderr])
-        .toString("utf8")
-        .slice(-8_000);
+      const diagnostic = `${stdoutText}${stderrText}`.slice(-8_000);
       if (diagnostic) process.stderr.write(`${diagnostic}\n`);
-      reject(new Error(`${name} failed with exit code ${String(code)}`));
+      reject(outputError ?? new Error(
+        `${name} failed with exit code ${String(code)}`,
+      ));
     });
   });
 }
 
-function npmCommand(arguments_) {
-  if (process.env.npm_execpath) {
-    return [process.execPath, [process.env.npm_execpath, ...arguments_]];
+function parseNodeTestTap(output) {
+  const summary = {};
+  const cases = [];
+  const summaryNames = new Map([
+    ["tests", "tests"],
+    ["pass", "passed"],
+    ["fail", "failed"],
+    ["cancelled", "cancelled"],
+    ["skipped", "skipped"],
+    ["todo", "todo"],
+  ]);
+  for (const line of output.split(/\r?\n/u)) {
+    const summaryMatch = line.match(
+      /^# (tests|pass|fail|cancelled|skipped|todo) (\d+)$/u,
+    );
+    if (summaryMatch) {
+      summary[summaryNames.get(summaryMatch[1])] = Number(summaryMatch[2]);
+      continue;
+    }
+    const caseMatch = line.match(/^\s*(not )?ok \d+ - (.+)$/u);
+    if (!caseMatch) continue;
+    const directiveMatch = caseMatch[2].match(
+      /^(.*?)(?:\s+#\s+(SKIP|TODO)(?:\s+(.*))?)?$/iu,
+    );
+    const name = directiveMatch[1];
+    const directive = directiveMatch[2]?.toUpperCase() ?? null;
+    if (directive === "SKIP") {
+      cases.push({
+        name,
+        status: "skipped",
+        ...(directiveMatch[3] ? { reason: directiveMatch[3] } : {}),
+      });
+    } else if (directive === "TODO") {
+      cases.push({
+        name,
+        status: "todo",
+        ...(directiveMatch[3] ? { reason: directiveMatch[3] } : {}),
+      });
+    } else {
+      cases.push({
+        name,
+        status: caseMatch[1] ? "failed" : "passed",
+      });
+    }
   }
-  return [process.platform === "win32" ? "npm.cmd" : "npm", arguments_];
+  for (const field of summaryNames.values()) {
+    if (!Number.isSafeInteger(summary[field])) {
+      throw new Error(`complete Node test suite omitted TAP ${field} summary`);
+    }
+  }
+  return { summary, cases };
 }
 
 async function sourceFiles(directory) {
@@ -115,6 +218,7 @@ async function checkSyntax() {
   }
   report.steps.push({
     name: "node syntax aggregate",
+    kind: "aggregate",
     status: "passed",
     durationMs: Date.now() - startedAt,
     fileCount: files.length,
@@ -139,11 +243,21 @@ async function writeReport() {
   );
 }
 
+let validationError = null;
 try {
+  report.source.started = await captureRepositoryState(root);
+  assertStableCleanRepository(report.source.started, report.source.started);
   await run("git", ["diff", "--check"], { name: "git diff --check" });
   await checkSyntax();
-  const [npmExecutable, npmArguments] = npmCommand(["test"]);
-  await run(npmExecutable, npmArguments, { name: "complete Node test suite" });
+  await run(process.execPath, [
+    "--test",
+    "--test-reporter=tap",
+    "test/*.test.js",
+  ], {
+    name: "complete Node test suite",
+    quiet: true,
+    parseOutput: parseNodeTestTap,
+  });
   await run(process.execPath, [
     "test/browser/configuration-form-playwright.mjs",
   ], { name: "configuration form browser behavior" });
@@ -168,14 +282,34 @@ try {
       name: "live desktop and mobile UI behavior",
     });
   }
-  report.status = "passed";
 } catch (error) {
-  report.status = "failed";
-  report.error = error instanceof Error ? error.message : String(error);
-  process.exitCode = 1;
-} finally {
-  await writeReport();
+  validationError = error;
 }
+
+try {
+  report.source.finished = await captureRepositoryState(root);
+  if (report.source.started !== null) {
+    assertStableCleanRepository(
+      report.source.started,
+      report.source.finished,
+    );
+    report.source.stable = true;
+  }
+} catch (error) {
+  report.source.error = error instanceof Error ? error.message : String(error);
+  validationError ??= error;
+}
+
+if (validationError === null) {
+  report.status = "passed";
+} else {
+  report.status = "failed";
+  report.error = validationError instanceof Error
+    ? validationError.message
+    : String(validationError);
+  process.exitCode = 1;
+}
+await writeReport();
 
 if (report.status === "passed") {
   process.stdout.write("\n[validate] whole-system validation passed\n");
