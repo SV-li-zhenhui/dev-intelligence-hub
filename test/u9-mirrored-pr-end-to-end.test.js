@@ -22,7 +22,12 @@ import {
   createPullRequestReadFacts,
   createPullRequestReadIdentity,
 } from "../src/domain/pull-request-read-facts.js";
+import { OperationQueue } from "../src/lib/operation-queue.js";
 import { StateStore } from "../src/lib/state-store.js";
+import {
+  CODE_JOB_STATE_KEY,
+  CodeJobStore,
+} from "../src/services/code-job-store.js";
 import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
 import { MemoryContextRetriever } from
   "../src/services/memory-context-retriever.js";
@@ -191,6 +196,43 @@ class TestGuard {
 
 function guardFactory() {
   return new TestGuard();
+}
+
+async function archiveTerminalJobs({ statePath, clock, jobIds, compactionId }) {
+  const store = new StateStore(statePath);
+  const jobs = new CodeJobStore({
+    store,
+    exclusiveLease: new TestGuard(),
+    operationQueue: new OperationQueue(),
+    clock,
+  });
+  const recovered = await jobs.recover();
+  const before = await store.read(CODE_JOB_STATE_KEY, null);
+  assert.ok(before);
+  assert.equal(recovered.revision, before.revision);
+  assert.deepEqual(
+    new Set(before.jobs.map(({ jobId }) => jobId)),
+    new Set(jobIds),
+  );
+  assert.equal(before.jobs.every(({ status }) => status === "completed"), true);
+  const targetThroughSequence = Math.max(
+    ...before.jobs.map(({ sequence }) => sequence),
+  );
+  const compacted = await jobs.compactTerminalPrefix({
+    compactionId,
+    expectedRevision: before.revision,
+    targetThroughSequence,
+    preArchiveDigest: before.archive.digest,
+  });
+  assert.equal(compacted.status, "applied");
+  assert.equal(compacted.receipt.archived, jobIds.length);
+  assert.equal(compacted.receipt.targetThroughSequence, targetThroughSequence);
+  assert.match(compacted.receipt.postArchiveDigest, /^[a-f0-9]{64}$/u);
+  const after = await store.read(CODE_JOB_STATE_KEY, null);
+  assert.equal(after.jobs.length, 0);
+  assert.equal(after.archive.jobCount, jobIds.length);
+  assert.equal(after.archive.digest, compacted.receipt.postArchiveDigest);
+  return { compacted, after };
 }
 
 class FixedSandbox {
@@ -1877,6 +1919,173 @@ test(
       ),
       true,
     );
+
+    const finalCodeJobIds = (await application.codeJobReader.list({
+      limit: 20,
+    })).items.map(({ jobId }) => jobId);
+    assert.ok(finalCodeJobIds.length > 0);
+    const finalCodeJobMemoryRecordIds = (await Promise.all(
+      finalCodeJobIds.map((jobId) => application.codeJobReader.getDetail({ jobId })),
+    )).map(({ job }) => job.memoryProjection.recordId);
+    const selectedCitationBindings = selectedMemory.map(({ record, labels }) => ({
+      recordId: record.recordId,
+      contentDigest: record.contentDigest,
+      labels,
+    }));
+    const oldHeadCitationBindings = oldHeadExactEntries.map(({ record, labels }) => ({
+      recordId: record.recordId,
+      contentDigest: record.contentDigest,
+      labels,
+    }));
+    const sideEffectsBeforeFinalArchive = {
+      codeBrainCalls: state.brainCalls.filter(
+        ({ model }) => model === "strong-code-model",
+      ).length,
+      memoryBrainCalls: state.brainCalls.filter(
+        ({ model }) => model === "memory-model",
+      ).length,
+      sandboxRuns: sandbox.runs.length,
+      transportCalls: transport.calls.length,
+      credentialCalls: credentialCalls.length,
+      source: await readFile(
+        path.join(fixture.sourceRoot, "src", "conflict.txt"),
+        "utf8",
+      ),
+    };
+    await application.close();
+    const finalCompaction = await archiveTerminalJobs({
+      statePath: path.join(dataRoot, "state"),
+      clock,
+      jobIds: finalCodeJobIds,
+      compactionId: "u9-final-terminal-prefix",
+    });
+    assert.equal(finalCompaction.after.archive.throughSequence > 0, true);
+    application = await startApplication();
+    const archivedDetails = await Promise.all(finalCodeJobIds.map((jobId) =>
+      application.codeJobReader.getDetail({ jobId })
+    ));
+    assert.equal(
+      archivedDetails.every(({ archived }) => archived === true),
+      true,
+    );
+    assert.equal(
+      archivedDetails.every(({ historyAvailable, observations, terminalDetail }) =>
+        historyAvailable === false && observations.length === 0 && terminalDetail === null
+      ),
+      true,
+    );
+    assert.deepEqual(
+      archivedDetails.map(({ job }) => job.memoryProjection.recordId).sort(),
+      finalCodeJobMemoryRecordIds.slice().sort(),
+    );
+
+    const recoveredMemoryJournal = new LocalMemoryJournal({
+      store: application.store,
+      exclusiveLease: new TestGuard(),
+    });
+    await recoveredMemoryJournal.recover();
+    const recoveredSelected = recoveredMemoryJournal.readRecords({
+      recordIds: selectedIds,
+    }).items;
+    assert.deepEqual(
+      recoveredSelected.map(({ record, labels }) => ({
+        recordId: record.recordId,
+        contentDigest: record.contentDigest,
+        labels,
+      })),
+      selectedCitationBindings,
+    );
+    const recoveredOldHead = recoveredMemoryJournal.readRecords({
+      recordIds: oldHeadIds,
+    }).items;
+    assert.deepEqual(
+      recoveredOldHead.map(({ record, labels }) => ({
+        recordId: record.recordId,
+        contentDigest: record.contentDigest,
+        labels,
+      })),
+      oldHeadCitationBindings,
+    );
+    const recoveredObsoleteRetriever = new MemoryContextRetriever({
+      memorySearch: {
+        async search() {
+          return {
+            items: oldHeadIds.map((id) => ({ id })),
+            nextCursor: null,
+            totalMatched: oldHeadIds.length,
+            indexHealthy: true,
+          };
+        },
+      },
+      contextReader: {
+        readRecords: (value) => recoveredMemoryJournal.readRecords(value),
+      },
+      maximumRecords: 20,
+      maximumContextBytes: 112 * 1024,
+    });
+    const recoveredObsoleteContext = await recoveredObsoleteRetriever.retrieve({
+      question: "Can the old Head push still authorize a conclusion?",
+      retrieval: { kind: "query", filters: { query: "" } },
+    });
+    assert.deepEqual(recoveredObsoleteContext.citableRecordIds, []);
+    const recoveredSelectedRetriever = new MemoryContextRetriever({
+      memorySearch: {
+        async search() {
+          return {
+            items: selectedIds.map((id) => ({ id })),
+            nextCursor: null,
+            totalMatched: selectedIds.length,
+            indexHealthy: true,
+          };
+        },
+      },
+      contextReader: {
+        readRecords: (value) => recoveredMemoryJournal.readRecords(value),
+      },
+      maximumRecords: 20,
+      maximumContextBytes: 112 * 1024,
+    });
+    const recoveredSelectedContext = await recoveredSelectedRetriever.retrieve({
+      question,
+      retrieval: { kind: "query", filters: { query: "" } },
+    });
+    assert.equal(recoveredSelectedContext.contextDigest, selectedContext.contextDigest);
+    const recoveredAnswer = await application.memoryAnswer.answer({
+      schemaVersion: 1,
+      question,
+      mode: "local",
+      retrieval: {
+        kind: "context",
+        contextDigest: recoveredSelectedContext.contextDigest,
+        recordIds: recoveredSelectedContext.recordIds,
+      },
+    });
+    assert.deepEqual(
+      recoveredAnswer.citations.map(({ recordId, contentDigest, labels }) => ({
+        recordId,
+        contentDigest,
+        labels,
+      })),
+      selectedCitationBindings,
+    );
+    assert.deepEqual({
+      codeBrainCalls: state.brainCalls.filter(
+        ({ model }) => model === "strong-code-model",
+      ).length,
+      memoryBrainCalls: state.brainCalls.filter(
+        ({ model }) => model === "memory-model",
+      ).length,
+      sandboxRuns: sandbox.runs.length,
+      transportCalls: transport.calls.length,
+      credentialCalls: credentialCalls.length,
+      source: await readFile(
+        path.join(fixture.sourceRoot, "src", "conflict.txt"),
+        "utf8",
+      ),
+    }, {
+      ...sideEffectsBeforeFinalArchive,
+      memoryBrainCalls: sideEffectsBeforeFinalArchive.memoryBrainCalls + 1,
+    });
 
     assert.equal(
       factCalls.some(({ conclusion }) => conclusion === "FAILURE"),

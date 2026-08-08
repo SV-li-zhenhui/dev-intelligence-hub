@@ -14,7 +14,13 @@ import test from "node:test";
 
 import { createApplication } from "../src/composition-root.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { OperationQueue } from "../src/lib/operation-queue.js";
 import { StateStore } from "../src/lib/state-store.js";
+import {
+  CODE_JOB_STATE_KEY,
+  CodeJobStore,
+} from "../src/services/code-job-store.js";
+import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
 
 const execFile = promisify(execFileCallback);
 const PROFILE_IMAGE =
@@ -96,6 +102,43 @@ class DeterministicCodeBrain {
 
 function guardFactory() {
   return new TestGuard();
+}
+
+async function archiveTerminalJobs({ statePath, clock, jobIds, compactionId }) {
+  const store = new StateStore(statePath);
+  const jobs = new CodeJobStore({
+    store,
+    exclusiveLease: new TestGuard(),
+    operationQueue: new OperationQueue(),
+    clock,
+  });
+  const recovered = await jobs.recover();
+  const before = await store.read(CODE_JOB_STATE_KEY, null);
+  assert.ok(before);
+  assert.equal(recovered.revision, before.revision);
+  assert.deepEqual(
+    new Set(before.jobs.map(({ jobId }) => jobId)),
+    new Set(jobIds),
+  );
+  assert.equal(before.jobs.every(({ status }) => status === "completed"), true);
+  const targetThroughSequence = Math.max(
+    ...before.jobs.map(({ sequence }) => sequence),
+  );
+  const compacted = await jobs.compactTerminalPrefix({
+    compactionId,
+    expectedRevision: before.revision,
+    targetThroughSequence,
+    preArchiveDigest: before.archive.digest,
+  });
+  assert.equal(compacted.status, "applied");
+  assert.equal(compacted.receipt.archived, jobIds.length);
+  assert.equal(compacted.receipt.targetThroughSequence, targetThroughSequence);
+  assert.match(compacted.receipt.postArchiveDigest, /^[a-f0-9]{64}$/u);
+  const after = await store.read(CODE_JOB_STATE_KEY, null);
+  assert.equal(after.jobs.length, 0);
+  assert.equal(after.archive.jobCount, jobIds.length);
+  assert.equal(after.archive.digest, compacted.receipt.postArchiveDigest);
+  return { compacted, after };
 }
 
 function textResponse(value) {
@@ -978,4 +1021,130 @@ test("a production-composed Issue survives confirmation restart and closes on re
   const ledger = await application.workLedgerView.listItems({ limit: 20 });
   assert.equal(ledger.items.length, 4);
   assert.equal(ledger.items.every(({ status }) => status === "completed"), true);
+
+  const finalCodeJobIds = (await application.codeJobReader.list({
+    limit: 20,
+  })).items.map(({ jobId }) => jobId);
+  assert.equal(finalCodeJobIds.length, 3);
+  const codeJobMemoryRecordIds = jobs.items.map(
+    ({ memoryProjection }) => memoryProjection.recordId,
+  );
+  const sideEffectsBeforeFinalArchive = {
+    brainCalls: state.brainCalls.length,
+    codeBrainCalls: codeBrain.calls.length,
+    sandboxRuns: sandbox.runs.length,
+    source: await sourceText(),
+    applications: structuredClone(durableApplications.applications),
+  };
+  await application.close();
+  const finalCompaction = await archiveTerminalJobs({
+    statePath: paths.state,
+    clock,
+    jobIds: finalCodeJobIds,
+    compactionId: "u12-final-terminal-prefix",
+  });
+  assert.equal(finalCompaction.after.archive.throughSequence, 3);
+  application = await create();
+  const archivedDetails = await Promise.all(finalCodeJobIds.map((jobId) =>
+    application.codeJobReader.getDetail({ jobId })
+  ));
+  assert.equal(
+    archivedDetails.every(({ archived }) => archived === true),
+    true,
+  );
+  assert.equal(
+    archivedDetails.every(({ historyAvailable, observations, terminalDetail }) =>
+      historyAvailable === false && observations.length === 0 && terminalDetail === null
+    ),
+    true,
+  );
+  const archivedDeveloper = archivedDetails.find(
+    ({ job }) => job.jobId === developerJobId,
+  );
+  assert.equal(archivedDeveloper.changePackage.status, "ready");
+  assert.deepEqual(archivedDeveloper.changePackage.receipt, packageReceipt);
+  assert.deepEqual(
+    archivedDetails.map(({ job }) => job.memoryProjection.recordId).sort(),
+    codeJobMemoryRecordIds.slice().sort(),
+  );
+
+  const replayAfterArchive = await application.workflowRouting.ingest({ event });
+  assert.equal(replayAfterArchive.deduplicated, true);
+  const recoveredSnapshot = await application.workGraphView.getSnapshot();
+  assert.equal(
+    recoveredSnapshot.graph.tasks.every(({ status }) => status === "completed"),
+    true,
+  );
+  const recoveredLedger = await application.workLedgerView.listItems({ limit: 20 });
+  assert.equal(recoveredLedger.items.length, 4);
+  assert.equal(
+    recoveredLedger.items.every(({ status }) => status === "completed"),
+    true,
+  );
+  const recoveredApplications = await application.store.read(
+    "change-package-applications",
+    null,
+  );
+  assert.deepEqual(
+    recoveredApplications.applications,
+    sideEffectsBeforeFinalArchive.applications,
+  );
+  const recoveredManifest = await application.changePackageReader.get(
+    packageReceipt.packageId,
+  );
+  assert.equal(recoveredManifest.packageDigest, packageReceipt.packageDigest);
+  const recoveredWorkMemory = await application.memorySearch.search({
+    q: "Production Issue Code Job acceptance",
+    limit: 50,
+  });
+  assert.equal(
+    recoveredWorkMemory.items.some(
+      ({ source, event: eventType }) =>
+        source.kind === "work-item" && eventType === "work.completed",
+    ),
+    true,
+  );
+  const recoveredDeliveryMemory = await application.memorySearch.search({
+    q: "Testing",
+    eventType: "work.delivery_accepted",
+    limit: 20,
+  });
+  assert.equal(
+    recoveredDeliveryMemory.items.some(
+      ({ source }) => source.kind === "work-delivery",
+    ),
+    true,
+  );
+  const recoveredCodeMemory = await application.memorySearch.search({
+    q: "代码任务已完成",
+    limit: 20,
+  });
+  assert.equal(
+    recoveredCodeMemory.items.filter(({ source }) => source.kind === "code_job").length,
+    3,
+  );
+  const recoveredMemoryJournal = new LocalMemoryJournal({
+    store: application.store,
+    exclusiveLease: new TestGuard(),
+  });
+  await recoveredMemoryJournal.recover();
+  const recoveredCodeJobMemory = recoveredMemoryJournal.readRecords({
+    recordIds: codeJobMemoryRecordIds,
+  }).items;
+  assert.deepEqual(
+    recoveredCodeJobMemory.map(({ record }) => record.recordId).sort(),
+    codeJobMemoryRecordIds.slice().sort(),
+  );
+  assert.equal(
+    recoveredCodeJobMemory.every(({ record }) => record.source.kind === "code_job"),
+    true,
+  );
+  assert.deepEqual({
+    brainCalls: state.brainCalls.length,
+    codeBrainCalls: codeBrain.calls.length,
+    sandboxRuns: sandbox.runs.length,
+    source: await sourceText(),
+    applications: await application.store.read("change-package-applications", null)
+      .then(({ applications }) => applications),
+  }, sideEffectsBeforeFinalArchive);
 });
