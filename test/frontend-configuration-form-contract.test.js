@@ -33,7 +33,7 @@ function configurationWithLegacyCodeWorkspace() {
   configuration.codeExecutor.workspaces = [
     {
       id: "dashboard",
-      sourceRoot: "D:/claude/MyDashboard",
+      sourceRoot: "C:/workspace/dashboard",
       writablePaths: ["src", "public", "test"],
       excludePaths: [".git", "node_modules"],
     },

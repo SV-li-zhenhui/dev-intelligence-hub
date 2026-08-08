@@ -473,4 +473,4 @@ git commit -m "feat: complete supervised CLI brain integration"
 - Syntax validation passed for 435 JavaScript/ESM files. The configuration and confirmation-history Edge fixtures passed, and the desktop/mobile UI validator reported no console error, page error, or horizontal overflow.
 - No paid/remote model request, source-repository mutation, service restart, GitHub access/write, PR action, or push was performed during this acceptance.
 
-Do not push, create a PR, access real PR #23178, or perform a paid remote-model smoke without a separate owner confirmation.
+Do not push, create a PR, access the owner-only real PR target, or perform a paid remote-model smoke without a separate owner confirmation.

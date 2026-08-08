@@ -272,6 +272,142 @@ function localPath(rootDirectory, portablePath) {
   return path.join(rootDirectory, ...portablePath.split("/"));
 }
 
+const explicitFakeCredentialMarker = "PRIVACY_FAKE_CREDENTIAL_FIXTURE";
+const credentialPatterns = [
+  new RegExp(`\\b${["gh", "p_"].join("")}[A-Za-z0-9]{30,}\\b`, "gu"),
+  new RegExp(`\\b${["github", "_pat_"].join("")}[A-Za-z0-9_]{40,}\\b`, "gu"),
+  new RegExp(`\\b${["sk", "-"].join("")}[A-Za-z0-9_-]{20,}\\b`, "gu"),
+  new RegExp(`\\b${["AK", "IA"].join("")}[0-9A-Z]{16}\\b`, "gu"),
+  new RegExp(`\\b${["AI", "za"].join("")}[0-9A-Za-z_-]{30,}\\b`, "gu"),
+  new RegExp(`\\b${["xox", "b-"].join("")}[A-Za-z0-9-]{20,}\\b`, "gu"),
+];
+const userHomePatterns = [
+  /[A-Za-z]:[\\/]Users[\\/](?!<(?:user|username)>)[^\\/\s"']+/giu,
+  /\/Users\/(?!<(?:user|username)>)[^/\s"']+/giu,
+  /\/home\/(?!<(?:user|username)>)[^/\s"']+/giu,
+];
+const quotedPersonalIdentifier = /(["'`])\d{12,20}\1/gu;
+const pullRequestIdentity = /\b[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*#\d+\b/gu;
+
+function normalizedComparableText(value) {
+  return value.replaceAll("\\", "/").toLowerCase();
+}
+
+function isPortableRepositoryIdentity(value) {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/u.test(
+    value,
+  );
+}
+
+function collectCandidateIdentityStrings(value, collected = []) {
+  if (typeof value === "string") {
+    collected.push(value);
+    return collected;
+  }
+  if (value === null || typeof value !== "object") return collected;
+  for (const [key, entry] of Object.entries(value)) {
+    collected.push(key);
+    collectCandidateIdentityStrings(entry, collected);
+  }
+  return collected;
+}
+
+async function optionalLocalPrivacyDenylist() {
+  const denied = new Set([
+    normalizedComparableText(root),
+    ...[process.env.USERPROFILE, process.env.HOME]
+      .filter(Boolean)
+      .map(normalizedComparableText),
+  ]);
+
+  for (const fileName of ["config.json", "config.local.json"]) {
+    try {
+      const configuration = JSON.parse(await readFile(path.join(root, fileName), "utf8"));
+      for (const value of collectCandidateIdentityStrings(configuration)) {
+        if (path.isAbsolute(value) || isPortableRepositoryIdentity(value)) {
+          denied.add(normalizedComparableText(value));
+        }
+      }
+    } catch {
+      // Missing or invalid private configuration never weakens credential scanning.
+    }
+  }
+
+  try {
+    const ledger = await readFile(
+      path.join(
+        root,
+        ".superpowers",
+        "sdd",
+        "2026-08-02-001-feat-complete-command-center-plan",
+        "owner-acceptance-gates.local.md",
+      ),
+      "utf8",
+    );
+    for (const match of ledger.matchAll(pullRequestIdentity)) {
+      denied.add(normalizedComparableText(match[0]));
+      denied.add(normalizedComparableText(match[0].split("#", 1)[0]));
+    }
+  } catch {
+    // The owner-only local ledger is intentionally optional in public exports.
+  }
+
+  return denied;
+}
+
+function hasAdjacentFakeCredentialMarker(text, matchIndex) {
+  const currentLineStart = text.lastIndexOf("\n", matchIndex) + 1;
+  const beforeCurrentLine = text.slice(0, currentLineStart).trimEnd();
+  const previousLineStart = beforeCurrentLine.lastIndexOf("\n") + 1;
+  return (
+    beforeCurrentLine.slice(previousLineStart).trim() ===
+    `// ${explicitFakeCredentialMarker}`
+  );
+}
+
+function assertSafeTrackedText({ filePath, source, denied }) {
+  if (source.includes(0)) return;
+  const text = source.toString("utf8");
+
+  for (const pattern of credentialPatterns) {
+    for (const match of text.matchAll(pattern)) {
+      assert.equal(
+        filePath.startsWith("test/") &&
+          hasAdjacentFakeCredentialMarker(text, match.index),
+        true,
+        "a tracked text file contains an unmarked credential-shaped value",
+      );
+    }
+  }
+  for (const pattern of userHomePatterns) {
+    assert.doesNotMatch(text, pattern, "a tracked text file contains a user-home path");
+  }
+  assert.doesNotMatch(
+    text,
+    quotedPersonalIdentifier,
+    "a tracked text file contains a quoted personal identifier",
+  );
+
+  const comparableText = normalizedComparableText(text);
+  for (const identifier of denied) {
+    assert.equal(
+      comparableText.includes(identifier),
+      false,
+      "a tracked text file contains a private local identity",
+    );
+  }
+}
+
+async function assertSafeFileCollection(filePaths, denied) {
+  for (const filePath of filePaths) {
+    await assertSafeTrackedText({
+      filePath,
+      source: await readFile(localPath(root, filePath)),
+      denied,
+    });
+  }
+}
+
 test("npm distribution contains the safe bootstrap and excludes local runtime state", () => {
   const files = loadDistributionManifest();
   const included = new Set(files);
@@ -335,68 +471,40 @@ test("distribution and clean-room inputs come only from the committed tree", () 
 });
 
 test("distributable text contains no high-confidence live credential or private machine path", async () => {
-  const credentialPatterns = [
-    new RegExp(`\\b${["gh", "p_"].join("")}[A-Za-z0-9]{30,}\\b`, "gu"),
-    new RegExp(`\\b${["github", "_pat_"].join("")}[A-Za-z0-9_]{40,}\\b`, "gu"),
-    new RegExp(`\\b${["sk", "-"].join("")}[A-Za-z0-9_-]{20,}\\b`, "gu"),
-    new RegExp(`\\b${["AK", "IA"].join("")}[0-9A-Z]{16}\\b`, "gu"),
-    new RegExp(`\\b${["AI", "za"].join("")}[0-9A-Za-z_-]{30,}\\b`, "gu"),
-    new RegExp(`\\b${["xox", "b-"].join("")}[A-Za-z0-9-]{20,}\\b`, "gu"),
-  ];
-  const userHomePatterns = [
-    /[A-Za-z]:[\\/]Users[\\/](?!<(?:user|username)>)[^\\/\s"']+/giu,
-    /\/Users\/(?!<(?:user|username)>)[^/\s"']+/giu,
-    /\/home\/(?!<(?:user|username)>)[^/\s"']+/giu,
-  ];
-  const projectPaths = new Set([
-    root,
-    root.replaceAll("\\", "/"),
-    root.replaceAll("/", "\\"),
-  ].map((projectPath) => projectPath.toLowerCase()));
+  await assertSafeFileCollection(
+    loadDistributionManifest(),
+    await optionalLocalPrivacyDenylist(),
+  );
+});
 
-  for (const filePath of loadDistributionManifest()) {
-    const source = await readFile(localPath(root, filePath));
-    if (source.includes(0)) continue;
-    const text = source.toString("utf8");
-    for (const pattern of credentialPatterns) {
-      for (const match of text.matchAll(pattern)) {
-        const explicitFixture =
-          filePath.startsWith("test/") &&
-          /(?:never|not[-_]a[-_]real|must[-_]not|do[-_]not|example|fixture)/iu.test(
-            match[0],
-          );
-        assert.equal(
-          explicitFixture,
-          true,
-          `${filePath} contains a credential-shaped value`,
-        );
-      }
-    }
-    for (const pattern of userHomePatterns) {
-      assert.doesNotMatch(text, pattern, `${filePath} contains a user-home path`);
-    }
+test("whole tracked Git tree contains no private identifiers or credentials", async () => {
+  await assertSafeFileCollection(
+    loadTrackedFiles(),
+    await optionalLocalPrivacyDenylist(),
+  );
+});
 
-    if (!filePath.startsWith("test/")) {
-      const comparableText = text.toLowerCase();
-      assert.equal(
-        comparableText.includes("svisions/oct-software"),
-        false,
-        `${filePath} contains a private repository identity`,
-      );
-      assert.equal(
-        comparableText.includes("#23178"),
-        false,
-        `${filePath} contains a private pull-request identity`,
-      );
-      for (const projectPath of projectPaths) {
-        assert.equal(
-          comparableText.includes(projectPath),
-          false,
-          `${filePath} contains the source checkout path`,
-        );
-      }
-    }
-  }
+test("privacy scanner rejects unmarked synthetic credentials and permits marked test fixtures", () => {
+  const syntheticCredential = ["sk", "live", "synthetic", "credential", "only", "for", "scanner"].join("-");
+  const denied = new Set();
+  assert.throws(
+    () =>
+      assertSafeTrackedText({
+        filePath: "test/unmarked-fixture.test.js",
+        source: Buffer.from(`const value = \"${syntheticCredential}\";`),
+        denied,
+      }),
+    /unmarked credential-shaped value/u,
+  );
+  assert.doesNotThrow(() =>
+    assertSafeTrackedText({
+      filePath: "test/marked-fixture.test.js",
+      source: Buffer.from(
+        `// ${explicitFakeCredentialMarker}\nconst value = \"${syntheticCredential}\";`,
+      ),
+      denied,
+    }),
+  );
 });
 
 test(

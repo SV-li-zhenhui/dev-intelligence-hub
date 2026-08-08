@@ -69,7 +69,7 @@ function representativeConfiguration() {
         },
         {
           id: "dashboard",
-          sourceRoot: "D:/claude/MyDashboard",
+          sourceRoot: "C:/workspace/dashboard",
           writablePaths: ["public", "src", "test"],
           excludePaths: [".git", "data"],
         },
@@ -298,7 +298,7 @@ function representativeConfiguration() {
     },
     dingtalk: {
       enabled: true,
-      selfUserId: "1137300121374851",
+      selfUserId: "synthetic-self-user",
       notifyMinimumScore: 80,
       maxNotificationsPerRun: 5,
     },

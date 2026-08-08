@@ -1676,9 +1676,9 @@ test("dispatcher binds a PR intent to the active Head instead of its origin even
     occurredAt: "2026-08-02T03:00:00.000Z",
     source: { provider: "github", scopeId: "dashboard" },
     subject: {
-      id: "github:pr:acme/repo#23178",
+      id: "github:pr:acme/repo#314",
       repository: "acme/repo",
-      number: 23178,
+      number: 314,
     },
     payload: {
       title: "Resolve conflicts",

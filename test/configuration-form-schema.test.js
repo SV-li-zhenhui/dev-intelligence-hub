@@ -28,7 +28,7 @@ function extendedConfiguration() {
     workspaces: [
       {
         id: "dashboard",
-        sourceRoot: "D:/claude/MyDashboard",
+        sourceRoot: "C:/workspace/dashboard",
         gitHeadSnapshot: true,
         writablePaths: ["public"],
         excludePaths: ["node_modules"],
