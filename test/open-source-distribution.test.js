@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -218,7 +218,10 @@ let trackedFiles;
 let trackedIndexEntries;
 
 const trackedBlobModes = new Set(["100644", "100755", "120000"]);
-const trackedPathDecoder = new TextDecoder("utf-8", { fatal: true });
+const trackedPathDecoder = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: true,
+});
 
 function runGitIn(
   repositoryRoot,
@@ -468,9 +471,10 @@ async function optionalLocalPrivacyDenylist() {
 function hasAdjacentFakeCredentialMarker(text, match, consumedMarkers) {
   const matchIndex = match.index;
   const currentLineStart = text.lastIndexOf("\n", matchIndex) + 1;
-  const beforeCurrentLine = text.slice(0, currentLineStart).trimEnd();
-  const previousLineStart = beforeCurrentLine.lastIndexOf("\n") + 1;
-  const marker = beforeCurrentLine.slice(previousLineStart).trim().match(
+  if (currentLineStart === 0) return false;
+  const previousLineEnd = currentLineStart - 1;
+  const previousLineStart = text.lastIndexOf("\n", previousLineEnd - 1) + 1;
+  const marker = text.slice(previousLineStart, previousLineEnd).trim().match(
     new RegExp(`^// ${fakeCredentialMarkerPrefix}([0-9a-f]{64})$`, "u"),
   );
   if (!marker || consumedMarkers.has(previousLineStart)) return false;
@@ -545,6 +549,37 @@ function assertSafeTrackedGitTree({
     const source = blobs.get(oid);
     if (!source) throw new Error("tracked Git object is unavailable");
     assertSafeTrackedText({ filePath, source, denied });
+  }
+}
+
+async function materializeTrackedFiles({
+  repositoryRoot,
+  destinationRoot,
+  filePaths,
+}) {
+  const selected = new Set(filePaths);
+  const entries = repositoryRoot === root && trackedIndexEntries
+    ? trackedIndexEntries
+    : loadTrackedIndexEntries(repositoryRoot);
+  if (repositoryRoot === root) trackedIndexEntries = entries;
+  const selectedEntries = entries.filter(({ filePath }) =>
+    selected.has(filePath)
+  );
+  if (selectedEntries.length !== selected.size) {
+    throw new Error("clean-room tracked input selection is incomplete");
+  }
+  if (selectedEntries.some(({ mode }) => mode === "120000")) {
+    throw new Error("clean-room inputs must be regular tracked files");
+  }
+  const blobs = readTrackedBlobs(repositoryRoot, selectedEntries);
+  for (const { filePath, mode, oid } of selectedEntries) {
+    const source = blobs.get(oid);
+    if (!source) throw new Error("clean-room tracked object is unavailable");
+    const destination = localPath(destinationRoot, filePath);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, source, {
+      mode: mode === "100755" ? 0o755 : 0o644,
+    });
   }
 }
 
@@ -659,6 +694,17 @@ test("privacy scanner rejects unmarked synthetic credentials and permits marked 
       }),
     /unmarked credential-shaped value/u,
   );
+  assert.throws(
+    () =>
+      assertSafeTrackedText({
+        filePath: "test/non-adjacent-fixture.test.js",
+        source: Buffer.from(
+          `// ${syntheticCredentialMarker}\n\nconst value = \"${syntheticCredential}\";`,
+        ),
+        denied,
+      }),
+    /unmarked credential-shaped value/u,
+  );
 });
 
 test("tracked index parsing rejects unsafe metadata and path encoding", () => {
@@ -667,6 +713,14 @@ test("tracked index parsing rejects unsafe metadata and path encoding", () => {
     parseTrackedIndexEntries(Buffer.from(`H 100644 ${oid} 0\ttest/safe.js\0`)),
     [{ mode: "100644", oid, filePath: "test/safe.js" }],
   );
+  const bomPath = Buffer.concat([
+    Buffer.from(`H 100644 ${oid} 0\t`),
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from("test/not-a-test-fixture.js\0"),
+  ]);
+  const [decodedBomPath] = parseTrackedIndexEntries(bomPath);
+  assert.equal(decodedBomPath.filePath, "\ufefftest/not-a-test-fixture.js");
+  assert.equal(decodedBomPath.filePath.startsWith("test/"), false);
 
   for (const source of [
     Buffer.from(`H 100644 ${oid} 1\ttest/conflicted.js\0`),
@@ -743,6 +797,12 @@ test("tracked symlink privacy scans its Git blob without reading an external tar
     });
     assert.equal(result.status, 0, "synthetic Git fixture setup failed");
   }
+  const trackedLink = path.join(fixtureRoot, "tracked-link");
+  await symlink(
+    externalRoot,
+    trackedLink,
+    process.platform === "win32" ? "junction" : "dir",
+  );
   const entries = loadTrackedIndexEntries(fixtureRoot);
   const blobs = readTrackedBlobs(fixtureRoot, entries);
   const link = entries.find(({ filePath }) => filePath === "tracked-link");
@@ -755,6 +815,20 @@ test("tracked symlink privacy scans its Git blob without reading an external tar
         denied: new Set(),
       }),
     /unmarked credential-shaped value/u,
+  );
+  const cleanOutput = path.join(fixtureRoot, "clean-output");
+  await assert.rejects(
+    materializeTrackedFiles({
+      repositoryRoot: fixtureRoot,
+      destinationRoot: cleanOutput,
+      filePaths: ["tracked-link"],
+    }),
+    /regular tracked files/u,
+  );
+  assert.equal(existsSync(path.join(cleanOutput, "tracked-link")), false);
+  assert.equal(
+    await readFile(externalFile, "utf8"),
+    "safe external target content\n",
   );
 });
 
@@ -852,10 +926,12 @@ test(
     ]);
     for (const filePath of sourceFiles) {
       assertPortablePackagePath(filePath);
-      const destination = localPath(cleanRoot, filePath);
-      await mkdir(path.dirname(destination), { recursive: true });
-      await copyFile(localPath(root, filePath), destination);
     }
+    await materializeTrackedFiles({
+      repositoryRoot: root,
+      destinationRoot: cleanRoot,
+      filePaths: sourceFiles,
+    });
 
     assert.equal(existsSync(path.join(cleanRoot, "config.json")), false);
     assert.equal(existsSync(path.join(cleanRoot, "config.local.json")), false);
