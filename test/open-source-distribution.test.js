@@ -484,42 +484,64 @@ function hasAdjacentFakeCredentialMarker(text, match, consumedMarkers) {
   return true;
 }
 
-function assertSafeTrackedText({ filePath, source, denied }) {
-  if (source.includes(0)) return;
-  const text = source.toString("utf8");
-  const consumedFakeCredentialMarkers = new Set();
-
+function assertSafePrivacyValue({
+  value,
+  denied,
+  subject,
+  credentialMatchIsAllowed = () => false,
+}) {
   for (const pattern of credentialPatterns) {
-    for (const match of text.matchAll(pattern)) {
+    for (const match of value.matchAll(pattern)) {
       assert.equal(
-        filePath.startsWith("test/") &&
-          hasAdjacentFakeCredentialMarker(
-            text,
-            match,
-            consumedFakeCredentialMarkers,
-          ),
+        credentialMatchIsAllowed(match),
         true,
-        "a tracked text file contains an unmarked credential-shaped value",
+        `a ${subject} contains an unmarked credential-shaped value`,
       );
     }
   }
   for (const pattern of userHomePatterns) {
-    assert.doesNotMatch(text, pattern, "a tracked text file contains a user-home path");
+    assert.doesNotMatch(value, pattern, `a ${subject} contains a user-home path`);
   }
   assert.doesNotMatch(
-    text,
+    value,
     quotedPersonalIdentifier,
-    "a tracked text file contains a quoted personal identifier",
+    `a ${subject} contains a quoted personal identifier`,
   );
 
-  const comparableText = normalizedComparableText(text);
+  const comparableValue = normalizedComparableText(value);
   for (const identifier of denied) {
     assert.equal(
-      comparableText.includes(identifier),
+      comparableValue.includes(identifier),
       false,
-      "a tracked text file contains a private local identity",
+      `a ${subject} contains a private local identity`,
     );
   }
+}
+
+function assertSafeTrackedText({ filePath, source, denied }) {
+  if (source.includes(0)) {
+    throw new Error("NUL-bearing tracked Git blob cannot be privacy-scanned");
+  }
+  assertSafePrivacyValue({
+    value: filePath,
+    denied,
+    subject: "tracked path",
+  });
+
+  const text = source.toString("utf8");
+  const consumedFakeCredentialMarkers = new Set();
+  assertSafePrivacyValue({
+    value: text,
+    denied,
+    subject: "tracked text file",
+    credentialMatchIsAllowed: (match) =>
+      filePath.startsWith("test/") &&
+      hasAdjacentFakeCredentialMarker(
+        text,
+        match,
+        consumedFakeCredentialMarkers,
+      ),
+  });
 }
 
 function assertSafeTrackedGitTree({
@@ -705,6 +727,68 @@ test("privacy scanner rejects unmarked synthetic credentials and permits marked 
       }),
     /unmarked credential-shaped value/u,
   );
+});
+
+test("whole tracked privacy fails closed for NUL-bearing blobs", () => {
+  const syntheticCredential = [
+    "sk",
+    "utf16",
+    "credential",
+    "must",
+    "not",
+    "bypass",
+    "privacy",
+  ].join("-");
+
+  assert.throws(
+    () =>
+      assertSafeTrackedText({
+        filePath: "docs/encoded-credential.md",
+        source: Buffer.from(syntheticCredential, "utf16le"),
+        denied: new Set(),
+      }),
+    /NUL-bearing tracked Git blob cannot be privacy-scanned/u,
+  );
+});
+
+test("whole tracked privacy applies the same policy to tracked path names", () => {
+  const syntheticCredential = [
+    "sk",
+    "path",
+    "credential",
+    "must",
+    "not",
+    "bypass",
+    "privacy",
+  ].join("-");
+  const deniedRepositoryIdentity = [
+    "private-owner",
+    "private-repository",
+  ].join("/");
+  const fixtures = [
+    {
+      filePath: `docs/${syntheticCredential}.md`,
+      denied: new Set(),
+      expected: /tracked path contains an unmarked credential-shaped value/u,
+    },
+    {
+      filePath: `${deniedRepositoryIdentity}/notes.md`,
+      denied: new Set([deniedRepositoryIdentity]),
+      expected: /tracked path contains a private local identity/u,
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    assert.throws(
+      () =>
+        assertSafeTrackedText({
+          filePath: fixture.filePath,
+          source: Buffer.from("portable safe body\n"),
+          denied: fixture.denied,
+        }),
+      fixture.expected,
+    );
+  }
 });
 
 test("tracked index parsing rejects unsafe metadata and path encoding", () => {
