@@ -3011,6 +3011,66 @@ test("non-versioned Code Job startup adopts partial configured directory cleanup
   assert.equal(lifecycle.readStatus().complete, true);
 });
 
+test("default non-versioned Code Job validates every role before CLI acquisition", async (t) => {
+  const roleFailure = new TypeError("employees.roles.invalid-extra is invalid");
+  const invalidRole = new Proxy({}, {
+    getPrototypeOf() {
+      throw roleFailure;
+    },
+  });
+  const config = structuredClone(defaultCodeJobConfiguration());
+  config.employees.roles["invalid-extra"] = invalidRole;
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const providerIds = new WeakMap();
+  const originalIdDescriptor = Object.getOwnPropertyDescriptor(
+    SupervisedCliBrainProvider.prototype,
+    "id",
+  );
+  let cliAcquisitions = 0;
+  Object.defineProperty(SupervisedCliBrainProvider.prototype, "id", {
+    configurable: true,
+    get() {
+      return providerIds.get(this);
+    },
+    set(value) {
+      cliAcquisitions += 1;
+      providerIds.set(this, value);
+    },
+  });
+  t.after(() => {
+    if (originalIdDescriptor) {
+      Object.defineProperty(
+        SupervisedCliBrainProvider.prototype,
+        "id",
+        originalIdDescriptor,
+      );
+    } else {
+      delete SupervisedCliBrainProvider.prototype.id;
+    }
+  });
+
+  const failure = await createApplication(
+    defaultCodeJobApplicationOptions({
+      config,
+      calls,
+      closeCalls,
+      lifecycle,
+      versioned: false,
+    }),
+  ).then(
+    () => null,
+    (error) => error,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(failure, roleFailure);
+  assert.equal(cliAcquisitions, 0);
+  assert.equal(lifecycle.readStatus().pendingRuntimes, 0);
+  assert.equal(lifecycle.readStatus().complete, true);
+});
+
 test("application does not adopt stale cleanup from a reused Error identity", async () => {
   const constructionFailure = new Error("reused application construction failure");
   const cleanupFailure = new Error("prior construction cleanup failed once");

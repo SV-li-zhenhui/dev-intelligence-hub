@@ -575,3 +575,30 @@ test("configured directory rejects forged cleanup ownership before router constr
     /construction cleanup owner.*invalid/i,
   );
 });
+
+test("configured directory snapshots one-shot role input only once", async () => {
+  const repeatedRead = new Error("configured roles were read more than once");
+  const configuredRoles = roleBrain();
+  let roleReads = 0;
+  let rolesReads = 0;
+  configuredRoles.developer = new Proxy(configuredRoles.developer, {
+    ownKeys(target) {
+      roleReads += 1;
+      if (roleReads > 1) throw repeatedRead;
+      return Reflect.ownKeys(target);
+    },
+  });
+  const roles = new Proxy(configuredRoles, {
+    ownKeys(target) {
+      rolesReads += 1;
+      if (rolesReads > 1) throw repeatedRead;
+      return Reflect.ownKeys(target);
+    },
+  });
+
+  const directory = createConfiguredCodeJobBrainDirectory({ roles });
+
+  assert.equal(rolesReads, 1);
+  assert.equal(roleReads, 1);
+  await directory.close();
+});

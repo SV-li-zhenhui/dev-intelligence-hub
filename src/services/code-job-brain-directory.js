@@ -13,6 +13,7 @@ const OPERATIONS = new Set(["inspect", "modify", "verify"]);
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed"]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const CONFIGURED_DIRECTORY_SNAPSHOT = Object.freeze({});
 
 export class CodeJobBrainDirectoryError extends Error {
   constructor(code, message, statusCode = 400, options = {}) {
@@ -322,9 +323,18 @@ export class CodeJobBrainDirectory {
   #closeAttempt = null;
   #closeResult = null;
 
-  constructor({ brainRouter, roles = {} } = {}) {
-    this.#router = requireRouter(brainRouter);
-    this.#taskBrains = normalizeTaskBrains(roles);
+  constructor(
+    { brainRouter, roles = {} } = {},
+    constructionToken,
+    taskBrains,
+  ) {
+    if (constructionToken === CONFIGURED_DIRECTORY_SNAPSHOT) {
+      this.#router = brainRouter;
+      this.#taskBrains = taskBrains;
+    } else {
+      this.#router = requireRouter(brainRouter);
+      this.#taskBrains = normalizeTaskBrains(roles);
+    }
     Object.freeze(this);
   }
 
@@ -488,12 +498,15 @@ export function createConfiguredCodeJobBrainDirectory({
   dependencies = {},
   constructionCleanupOwner,
 } = {}) {
-  return new CodeJobBrainDirectory({
-    brainRouter: createConfiguredBrainRouter({
-      brainProviders,
-      dependencies,
-      constructionCleanupOwner,
-    }),
-    roles,
+  const taskBrains = normalizeTaskBrains(roles);
+  const brainRouter = createConfiguredBrainRouter({
+    brainProviders,
+    dependencies,
+    constructionCleanupOwner,
   });
+  return new CodeJobBrainDirectory(
+    { brainRouter },
+    CONFIGURED_DIRECTORY_SNAPSHOT,
+    taskBrains,
+  );
 }
