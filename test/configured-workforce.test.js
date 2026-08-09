@@ -345,10 +345,43 @@ test("production configured routing rejects every public composition-authority f
   );
 });
 
-test("ordinary adapter exports cannot mint production composition authority", async () => {
-  const adapter = await import("../src/adapters/supervised-cli-brain-provider.js");
-  assert.equal(adapter.createSupervisedCliCompositionCapability, undefined);
-  assert.equal(adapter.createCompositionSupervisedCliBrainProvider, undefined);
+test("ordinary shipped imports cannot mint, decode, or route production composition authority", async () => {
+  const shippedModules = await Promise.all([
+    import("../src/adapters/supervised-cli-brain-provider.js"),
+    import("../src/lib/private-directory-manager.js"),
+    import("../src/services/configured-workforce.js"),
+    import("../src/composition-root.js"),
+  ]);
+  for (const shipped of shippedModules) {
+    for (const name of [
+      "createSupervisedCliCompositionCapability",
+      "createCompositionSupervisedCliBrainProvider",
+      "issueSupervisedCliCompositionAuthority",
+      "readSupervisedCliCompositionAuthority",
+      "SUPERVISED_CLI_COMPOSITION_AUTHORITY",
+    ]) {
+      assert.equal(shipped[name], undefined, name);
+    }
+  }
+  const Grant = shippedModules[3].ProductionCliCompositionGrant;
+  assert.equal(typeof Grant, "function");
+  assert.equal(Object.isFrozen(Grant), true);
+  assert.equal(Object.isFrozen(Grant.prototype), true);
+  assert.throws(
+    () => new Grant(Object.freeze({}), [process.cwd()]),
+    /cannot be constructed/i,
+  );
+  const forgedGrant = Object.create(Grant.prototype);
+  assert.deepEqual(Reflect.ownKeys(forgedGrant), []);
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: { cli: { kind: "codex-cli" } },
+      dependencies: {
+        [Symbol("forged-supervised-cli-authority")]: forgedGrant,
+      },
+    }),
+    /composition authority|dependencies.*invalid/i,
+  );
 });
 
 test("configured supervised CLIs reject adapter fields and command controls", () => {

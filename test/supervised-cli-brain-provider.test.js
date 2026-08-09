@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   link,
   lstat,
@@ -19,6 +20,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -26,6 +28,7 @@ import {
   createTestSupervisedCliBrainProvider,
   SupervisedCliBrainProvider,
 } from "../src/adapters/supervised-cli-brain-provider.js";
+import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 
 const SCHEMA = Object.freeze({
@@ -118,6 +121,16 @@ function recordingRunner(handler) {
       return handler(invocation, calls.length - 1);
     },
   };
+}
+
+function nonClosingChild(processId = 424_242) {
+  const child = new EventEmitter();
+  child.pid = processId;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => false;
+  return child;
 }
 
 function cleanupFileSystem(overrides = {}) {
@@ -954,6 +967,67 @@ test("Windows production root creation rejects broad child mutation rights", asy
 
 test("Windows production root creation rejects unsupported deny ACE shapes", async (t) => {
   await assertProductionRootAclRejected(t, "deny-shape", "(D;OICI;0x2;;;BU)");
+});
+
+test("Windows production root creation binds parent ACL trust to its creation handle across ABA", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI roots are Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const container = await temporaryDirectory(t, "supervised-cli-acl-aba-");
+  const active = path.join(container, "active-parent");
+  const other = path.join(container, "other-parent");
+  const holding = path.join(container, "parent-swap-holding");
+  const root = path.join(active, "runtime");
+  await mkdir(active);
+  await mkdir(other);
+  setWindowsDirectoryAcl(
+    active,
+    "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" +
+      "(A;OICI;0x6;;;BU)",
+  );
+  setWindowsDirectoryAcl(
+    other,
+    "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+  );
+  let weakIsActive = true;
+  let weakLeafCreated = false;
+  for (let attempt = 0; attempt < 12 && !weakLeafCreated; attempt += 1) {
+    let keepSwapping = true;
+    const swapping = (async () => {
+      while (keepSwapping) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        await rename(active, holding);
+        await rename(other, active);
+        await rename(holding, other);
+        weakIsActive = !weakIsActive;
+      }
+    })();
+    await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+      directory: root,
+      signal: AbortSignal.timeout(5_000),
+      validateLocation: async () => {},
+    }).catch(() => {});
+    keepSwapping = false;
+    await swapping;
+    if (!weakIsActive) {
+      await rename(active, holding);
+      await rename(other, active);
+      await rename(holding, other);
+      weakIsActive = true;
+    }
+    try {
+      weakLeafCreated = (await lstat(root)).isDirectory();
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const trustedLeaf = path.join(other, "runtime");
+    await rm(trustedLeaf, { recursive: true, force: true });
+  }
+
+  assert.equal(weakLeafCreated, false);
+  await assert.rejects(lstat(root), { code: "ENOENT" });
 });
 
 test("root creation rejects a changed trusted parent before mutating the leaf", async () => {
@@ -1941,6 +2015,76 @@ test("Windows production cleanup cancellation settles after native handles close
   assert.equal(await readFile(moved, "utf8"), "private");
 });
 
+test("provider cancellation after native READY retains the root lease until handles close", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI cleanup is Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-native-ready-cancel-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const controller = new AbortController();
+  let checkedFile = null;
+  const runner = recordingRunner(async (invocation) => {
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async prepareCleanupTrees(roots, options) {
+          const session = await managerModule.prepareCleanupTreesByIdentity(
+            roots,
+            options,
+          );
+          checkedFile = path.join(roots[0].path, "last-message.json");
+          controller.abort();
+          return session;
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest({ signal: controller.signal })),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+  );
+  assert.equal(typeof checkedFile, "string");
+  const moved = `${checkedFile}.after-close`;
+  await assert.rejects(rename(checkedFile, moved), (error) =>
+    ["EPERM", "EACCES", "EBUSY"].includes(error?.code));
+
+  let secondPreflights = 0;
+  const secondLocator = recordingLocator(testDescriptor("claude-cli"));
+  const second = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: secondLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async prepareCleanupTrees(roots, options) {
+          secondPreflights += 1;
+          return managerModule.prepareCleanupTreesByIdentity(roots, options);
+        },
+      }),
+    },
+  );
+  await second.generate(brainRequest()).catch(() => {});
+  assert.equal(secondPreflights, 0);
+  assert.equal(secondLocator.calls.length, 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await rename(checkedFile, moved);
+});
+
 test("Windows production cleanup preflights every stale tree before deleting any", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
@@ -2003,6 +2147,60 @@ test("an unprovable process reap remains visible when the total deadline expires
     code: "STRUCTURED_PROVIDER_REAP_FAILED",
   });
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
+});
+
+test("provider returns at its total deadline while the real runner reaps a non-closing child", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-real-runner-deadline-");
+  const temporaryRoot = path.join(parent, "runtime");
+  let clockReads = 0;
+  let spawnCalls = 0;
+  const runner = createTestSupervisedProcessRunner({
+    descriptorMaterializer: async (descriptor) => descriptor,
+    spawnImpl() {
+      spawnCalls += 1;
+      return nonClosingChild();
+    },
+    treeTerminator: async () => {},
+    platform: "win32",
+    terminationTimeoutMs: 100,
+    windowsPowerShell: process.execPath,
+    windowsWrapperPath: path.join(parent, "contained-wrapper.ps1"),
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+    },
+  );
+  const startedAt = performance.now();
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(spawnCalls, 1);
+  assert.ok(elapsedMs >= 60, elapsedMs);
+  assert.ok(elapsedMs < 250, elapsedMs);
+
+  const nextLocator = recordingLocator(testDescriptor("claude-cli"));
+  const next = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: nextLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  await assert.rejects(next.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(nextLocator.calls.length, 0);
+  await new Promise((resolve) => setTimeout(resolve, 350));
 });
 
 test("a reap failure blocks every CLI kind sharing the root before discovery", async (t) => {

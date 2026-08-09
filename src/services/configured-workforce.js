@@ -6,9 +6,7 @@ import {
   createProductionSupervisedCliBrainProvider,
   SupervisedCliBrainProvider,
 } from "../adapters/supervised-cli-brain-provider.js";
-import {
-  SUPERVISED_CLI_COMPOSITION_AUTHORITY,
-} from "../lib/private-directory-manager.js";
+import { ProductionCliCompositionGrant } from "../composition-root.js";
 import { BrainRouter } from "./brain-router.js";
 import { ConfiguredRoleEmployee } from "./configured-role-employee.js";
 
@@ -111,7 +109,17 @@ function productionSupervisedCliCapability(dependencies) {
       "Production configured routing does not accept public composition authority",
     );
   }
-  return dependencies[SUPERVISED_CLI_COMPOSITION_AUTHORITY] ?? null;
+  const symbols = Object.getOwnPropertySymbols(dependencies);
+  if (symbols.length === 0) return null;
+  if (
+    symbols.length !== 1 ||
+    !ProductionCliCompositionGrant.is(dependencies[symbols[0]])
+  ) {
+    throw new TypeError(
+      "Production supervised CLI composition authority is invalid",
+    );
+  }
+  return dependencies[symbols[0]];
 }
 
 function productionSupervisedCliProviderFactory(options, capability) {

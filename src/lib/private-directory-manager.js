@@ -10,10 +10,6 @@ import { gzipSync } from "node:zlib";
 
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
-const SUPERVISED_CLI_COMPOSITION_ROOTS = new WeakMap();
-export const SUPERVISED_CLI_COMPOSITION_AUTHORITY = Symbol(
-  "supervisedCliCompositionAuthority",
-);
 const WINDOWS_PARENT_DANGEROUS_RIGHTS =
   2n | 4n | 16n | 64n | 256n | 65_536n | 262_144n | 524_288n |
   268_435_456n | 1_073_741_824n;
@@ -36,22 +32,6 @@ export function productionSupervisedCliPlatformSupported(
   architecture = process.arch,
 ) {
   return platform === "win32" && architecture === "x64";
-}
-
-export function issueSupervisedCliCompositionAuthority(protectedRoots) {
-  if (!Array.isArray(protectedRoots)) {
-    throw new TypeError("supervised CLI composition roots are invalid");
-  }
-  const authority = Object.freeze({});
-  SUPERVISED_CLI_COMPOSITION_ROOTS.set(
-    authority,
-    Object.freeze([...protectedRoots]),
-  );
-  return authority;
-}
-
-export function readSupervisedCliCompositionAuthority(authority) {
-  return SUPERVISED_CLI_COMPOSITION_ROOTS.get(authority) ?? null;
 }
 
 function throwIfAborted(signal) {
@@ -172,6 +152,8 @@ $source = @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 public static class MyDashboardPrivateDirectory {
   [StructLayout(LayoutKind.Sequential)]
@@ -225,6 +207,21 @@ public static class MyDashboardPrivateDirectory {
     Microsoft.Win32.SafeHandles.SafeFileHandle handle,
     out BY_HANDLE_FILE_INFORMATION information);
 
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint GetSecurityInfo(
+    IntPtr handle,
+    int objectType,
+    uint securityInformation,
+    out IntPtr owner,
+    out IntPtr group,
+    out IntPtr dacl,
+    out IntPtr sacl,
+    out IntPtr securityDescriptor);
+
+  [DllImport("advapi32.dll")]
+  private static extern uint GetSecurityDescriptorLength(
+    IntPtr securityDescriptor);
+
   [DllImport("ntdll.dll")]
   private static extern int NtCreateFile(
     out Microsoft.Win32.SafeHandles.SafeFileHandle fileHandle,
@@ -245,10 +242,78 @@ public static class MyDashboardPrivateDirectory {
   [DllImport("kernel32.dll")]
   private static extern IntPtr LocalFree(IntPtr memory);
 
+  private static bool AllowedParentSid(SecurityIdentifier value, string currentSid) {
+    string sid = value == null ? null : value.Value;
+    return sid == currentSid || sid == "S-1-5-18" || sid == "S-1-5-32-544";
+  }
+
+  private static void ValidateParentTrust(
+    Microsoft.Win32.SafeHandles.SafeFileHandle handle,
+    string currentSid) {
+    const int SE_FILE_OBJECT = 1;
+    const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    const uint DACL_SECURITY_INFORMATION = 0x00000004;
+    const uint DANGEROUS_RIGHTS =
+      0x00000002 | 0x00000004 | 0x00000010 | 0x00000040 |
+      0x00000100 | 0x00010000 | 0x00040000 | 0x00080000 |
+      0x10000000 | 0x40000000;
+    IntPtr owner;
+    IntPtr group;
+    IntPtr dacl;
+    IntPtr sacl;
+    IntPtr descriptor;
+    uint status = GetSecurityInfo(
+      handle.DangerousGetHandle(),
+      SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      out owner,
+      out group,
+      out dacl,
+      out sacl,
+      out descriptor);
+    if (status != 0) throw new Win32Exception((int)status);
+    try {
+      SecurityIdentifier ownerSid = new SecurityIdentifier(owner);
+      if (!AllowedParentSid(ownerSid, currentSid)) {
+        throw new InvalidOperationException("parent owner is not trusted");
+      }
+      uint descriptorLength = GetSecurityDescriptorLength(descriptor);
+      if (descriptorLength == 0 || descriptorLength > 65536) {
+        throw new InvalidOperationException("parent DACL is invalid");
+      }
+      byte[] bytes = new byte[descriptorLength];
+      Marshal.Copy(descriptor, bytes, 0, checked((int)descriptorLength));
+      RawSecurityDescriptor raw = new RawSecurityDescriptor(bytes, 0);
+      if (raw.DiscretionaryAcl == null) {
+        throw new InvalidOperationException("parent DACL is absent");
+      }
+      foreach (GenericAce generic in raw.DiscretionaryAcl) {
+        CommonAce ace = generic as CommonAce;
+        if (
+          ace == null || ace.IsCallback ||
+          ace.AceQualifier != AceQualifier.AccessAllowed ||
+          ace.SecurityIdentifier == null
+        ) {
+          throw new InvalidOperationException("parent ACE is unsupported");
+        }
+        uint rights = unchecked((uint)ace.AccessMask);
+        if (
+          !AllowedParentSid(ace.SecurityIdentifier, currentSid) &&
+          (rights & DANGEROUS_RIGHTS) != 0
+        ) {
+          throw new InvalidOperationException("parent ACE can mutate children");
+        }
+      }
+    } finally {
+      LocalFree(descriptor);
+    }
+  }
+
   public static void Create(
     string parent, string leaf, string sid,
     ulong expectedDevice, ulong expectedInode) {
     const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    const uint READ_CONTROL = 0x00020000;
     const uint SHARE_READ_WRITE = 0x00000003;
     const uint OPEN_EXISTING = 3;
     const uint OPEN_REPARSE_POINT = 0x00200000;
@@ -266,7 +331,7 @@ public static class MyDashboardPrivateDirectory {
     try {
       using (Microsoft.Win32.SafeHandles.SafeFileHandle parentHandle = CreateFile(
         parent,
-        FILE_READ_ATTRIBUTES,
+        FILE_READ_ATTRIBUTES | READ_CONTROL,
         SHARE_READ_WRITE,
         IntPtr.Zero,
         OPEN_EXISTING,
@@ -289,6 +354,7 @@ public static class MyDashboardPrivateDirectory {
         ) {
           throw new InvalidOperationException("parent identity changed");
         }
+        ValidateParentTrust(parentHandle, sid);
         if (
           String.IsNullOrEmpty(leaf) ||
           leaf == "." || leaf == ".." ||
@@ -1033,10 +1099,17 @@ export async function prepareCleanupTreesByIdentity(roots, options = {}) {
         await closedPromise;
         throw error;
       }
+      await closedPromise;
       if (options.signal.aborted) {
-        await closedPromise;
         throwIfAborted(options.signal);
       }
+    },
+    async close() {
+      if (!committed) {
+        committed = true;
+        child.stdin.end();
+      }
+      await closedPromise;
     },
   });
 }

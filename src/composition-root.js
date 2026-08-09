@@ -19,10 +19,6 @@ import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { createOperationsRuntime } from "./operations-runtime.js";
 import {
-  issueSupervisedCliCompositionAuthority,
-  SUPERVISED_CLI_COMPOSITION_AUTHORITY,
-} from "./lib/private-directory-manager.js";
-import {
   createLazyOwnerWorkRequestRuntime,
   createOwnerWorkRequestRuntime,
 } from "./owner-work-request-runtime.js";
@@ -79,8 +75,53 @@ const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
 const CODE_ACTION_PROPOSAL_RUNNER_ID = "code-action-runner";
 const CONFIGURATION_CHANGE_PROPOSAL_RUNNER_ID = "configuration-change-runner";
 const PR_ENGINEER_FACTS_GUARD_NAME = "mydashboard-pr-engineer-read-facts-v1";
+const SUPERVISED_CLI_COMPOSITION_SECRET = Object.freeze({});
+const SUPERVISED_CLI_COMPOSITION_GRANT = Symbol("supervisedCliCompositionGrant");
 const defaultPrEngineerExclusiveGuardFactory = (options) =>
   new ProcessExclusiveGuard(options);
+const defaultVersionedCodeJobAuthorityFactory = (options) =>
+  new VersionedCodeJobAuthority(options);
+
+export class ProductionCliCompositionGrant {
+  #consumer = null;
+  #protectedRoots;
+
+  constructor(secret, protectedRoots) {
+    if (secret !== SUPERVISED_CLI_COMPOSITION_SECRET) {
+      throw new TypeError(
+        "Production CLI composition grants cannot be constructed",
+      );
+    }
+    this.#protectedRoots = distinctAbsolutePaths(protectedRoots);
+    Object.freeze(this);
+  }
+
+  static is(value) {
+    return value !== null &&
+      typeof value === "object" &&
+      #protectedRoots in value;
+  }
+
+  consume(consumer) {
+    if (typeof consumer !== "function") {
+      throw new TypeError("Production CLI composition consumer is invalid");
+    }
+    this.#consumer ??= consumer;
+    if (this.#consumer !== consumer) {
+      throw new TypeError("Production CLI composition grant is opaque");
+    }
+    return consumer(this.#protectedRoots);
+  }
+}
+Object.freeze(ProductionCliCompositionGrant.prototype);
+Object.freeze(ProductionCliCompositionGrant);
+
+function issueProductionCliCompositionGrant(protectedRoots) {
+  return new ProductionCliCompositionGrant(
+    SUPERVISED_CLI_COMPOSITION_SECRET,
+    protectedRoots,
+  );
+}
 
 function scopedRuntimeDependencies(dependencies, createGuard) {
   if (
@@ -460,8 +501,7 @@ export async function createApplication({
   pullRequestExternalActionDependencies = {},
   codeJobGrantFactory = (options) => new CodeJobGrantFactory(options),
   codeJobBrainDirectoryFactory = createConfiguredCodeJobBrainDirectory,
-  versionedCodeJobAuthorityFactory = (options) =>
-    new VersionedCodeJobAuthority(options),
+  versionedCodeJobAuthorityFactory = defaultVersionedCodeJobAuthorityFactory,
   codeActionProposalRunnerFactory =
     createCodeActionProposalRunnerService,
   configurationChangeProposalRunnerFactory =
@@ -635,12 +675,14 @@ export async function createApplication({
     codeExecutorRuntime,
     config,
   });
-  let cliCompositionCapability = issueSupervisedCliCompositionAuthority(
+  let cliCompositionCapability = issueProductionCliCompositionGrant(
     cliProtectedRoots,
   );
-  const brainDependencies = (dependencies) => ({
+  const brainDependencies = (dependencies, trustedProductionFactory) => ({
     ...dependencies,
-    [SUPERVISED_CLI_COMPOSITION_AUTHORITY]: cliCompositionCapability,
+    ...(trustedProductionFactory
+      ? { [SUPERVISED_CLI_COMPOSITION_GRANT]: cliCompositionCapability }
+      : {}),
   });
   const applicationAuthorityVerifier = Object.freeze({
     verify: (manifest) => verifyChangePackageApplicationAuthority({
@@ -692,7 +734,7 @@ export async function createApplication({
       codeExecutorRuntime,
       config,
     });
-    cliCompositionCapability = issueSupervisedCliCompositionAuthority(
+    cliCompositionCapability = issueProductionCliCompositionGrant(
       cliProtectedRoots,
     );
     const controlledConflictPorts = conflictPreparationPorts(
@@ -932,6 +974,7 @@ export async function createApplication({
         brainProviders: config.brainProviders || {},
         dependencies: brainDependencies(
           memoryAnswerDependencies.brainDependencies || {},
+          memoryBrainRouterFactory === createConfiguredBrainRouter,
         ),
       });
       const contextRetriever = memoryContextRetrieverFactory({
@@ -1021,6 +1064,10 @@ export async function createApplication({
           startupConfiguration: config,
           brainDependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
+            versionedCodeJobAuthorityFactory ===
+                defaultVersionedCodeJobAuthorityFactory &&
+              codeJobBrainDirectoryFactory ===
+                createConfiguredCodeJobBrainDirectory,
           ),
           actionAdmissionGate: ordinaryActionAdmissionGate,
           inputAuthorityVerifier,
@@ -1060,6 +1107,8 @@ export async function createApplication({
           roles: config.employees?.roles || {},
           dependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
+            codeJobBrainDirectoryFactory ===
+              createConfiguredCodeJobBrainDirectory,
           ),
         });
       }
@@ -1594,6 +1643,7 @@ export async function createApplication({
             : {}),
           dependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
+            configuredWorkforceFactory === createConfiguredWorkforce,
           ),
           ...(ordinaryActionAdmissionGate === null
             ? {}

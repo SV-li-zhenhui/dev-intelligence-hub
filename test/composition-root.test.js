@@ -1606,7 +1606,7 @@ test("enabled unified memory exposes search only and projects the existing work 
   await application.close();
 });
 
-test("cited memory answering wires only trusted retrieval and configured brain ports", async () => {
+test("cited memory answering wires trusted ports without exposing CLI composition authority", async () => {
   const configuredBrain = {
     provider: "ollama",
     model: "configured-model",
@@ -1682,11 +1682,7 @@ test("cited memory answering wires only trusted retrieval and configured brain p
   const compositionSymbols = Object.getOwnPropertySymbols(
     calls.router.dependencies,
   );
-  assert.equal(compositionSymbols.length, 1);
-  assert.deepEqual(
-    Reflect.ownKeys(calls.router.dependencies[compositionSymbols[0]]),
-    [],
-  );
+  assert.equal(compositionSymbols.length, 0);
   assert.equal(Object.isFrozen(calls.retriever.memorySearch), true);
   assert.deepEqual(Object.keys(calls.retriever.memorySearch), ["search"]);
   assert.equal(Object.isFrozen(calls.retriever.contextReader), true);
@@ -3304,7 +3300,7 @@ test("local code execution fails closed when unified memory is disabled", async 
   ]);
 });
 
-test("local code composition binds authority, both proposal runners, and one safe reader", async () => {
+test("local code composition keeps CLI authority private from injected factories", async () => {
   const calls = {};
   const closeCalls = [];
   const workspaceRoot = path.join(process.cwd(), "workspace-acme");
@@ -3537,16 +3533,8 @@ test("local code composition binds authority, both proposal runners, and one saf
   const directorySymbols = Object.getOwnPropertySymbols(
     calls.codeBrainDirectory.dependencies,
   );
-  assert.equal(workforceSymbols.length, 1);
-  assert.equal(directorySymbols.length, 1);
-  assert.strictEqual(
-    calls.workforce.dependencies[workforceSymbols[0]],
-    calls.codeBrainDirectory.dependencies[directorySymbols[0]],
-  );
-  assert.deepEqual(
-    Reflect.ownKeys(calls.workforce.dependencies[workforceSymbols[0]]),
-    [],
-  );
+  assert.equal(workforceSymbols.length, 0);
+  assert.equal(directorySymbols.length, 0);
   assert.strictEqual(calls.githubRunner.runner, githubRunnerPort);
   assert.strictEqual(calls.codeRunner.runner, codeRunnerPort);
   assert.strictEqual(

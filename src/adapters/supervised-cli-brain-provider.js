@@ -20,11 +20,11 @@ import { types as utilTypes } from "node:util";
 import { canonicalJsonStringify } from "../lib/canonical-json-digest.js";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
+import { ProductionCliCompositionGrant } from "../composition-root.js";
 import {
   prepareCleanupTreesByIdentity,
   PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
   productionSupervisedCliPlatformSupported,
-  readSupervisedCliCompositionAuthority,
 } from "../lib/private-directory-manager.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import {
@@ -446,11 +446,8 @@ function productionDependencies(additionalProtectedRoots = []) {
 }
 
 function providerDependencies(constructionToken, rawDependencies) {
-  const protectedRoots = readSupervisedCliCompositionAuthority(
-    constructionToken,
-  );
-  if (protectedRoots) {
-    return productionDependencies(protectedRoots);
+  if (ProductionCliCompositionGrant.is(constructionToken)) {
+    return constructionToken.consume(productionDependencies);
   }
   if (constructionToken !== TEST_CONSTRUCTION_TOKEN) {
     return productionDependencies();
@@ -998,14 +995,28 @@ async function removeVerifiedInvocations(
   if (invocations.length === 0) return;
   if (typeof fileSystem.prepareCleanupTrees === "function") {
     for (const invocation of invocations) recordResidue(rootState, invocation);
-    const session = await cleanupStep(signal, () =>
-      fileSystem.prepareCleanupTrees(invocations, {
+    throwIfRequestAborted(signal);
+    const session = await fileSystem.prepareCleanupTrees(invocations, {
         maximumEntries: MAX_CLEANUP_ENTRIES,
         maximumDepth: MAX_CLEANUP_DEPTH,
         maximumBytes: Number(MAX_CLEANUP_REGULAR_BYTES),
         signal,
-      }));
-    await cleanupStep(signal, () => session.commit());
+      });
+    if (
+      typeof session?.commit !== "function" ||
+      typeof session?.close !== "function"
+    ) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    let committed = false;
+    try {
+      throwIfRequestAborted(signal);
+      await session.commit();
+      committed = true;
+      throwIfRequestAborted(signal);
+    } finally {
+      if (!committed) await session.close();
+    }
     for (const invocation of invocations) {
       rootState.residues.delete(canonicalPath(invocation.path));
     }
@@ -1634,6 +1645,33 @@ async function runRootOperation(
   });
 }
 
+async function runConcurrentRootActivity(
+  rootState,
+  deadline,
+  operation,
+  { blocking = false } = {},
+) {
+  return deadline.run(({ signal }) => {
+    const attempt = Promise.resolve().then(async () => {
+      throwIfRequestAborted(signal);
+      return operation(signal);
+    });
+    rootState.leaseTail = Promise.allSettled([
+      rootState.leaseTail,
+      attempt,
+    ]).then(() => {});
+    rootState.pending.add(attempt);
+    if (blocking) rootState.blockingPending.add(attempt);
+    const settled = () => {
+      rootState.pending.delete(attempt);
+      rootState.blockingPending.delete(attempt);
+      releaseRootIfClean(rootState);
+    };
+    void attempt.then(settled, settled);
+    return attempt;
+  });
+}
+
 async function verifiedResidue(
   residue,
   root,
@@ -1684,7 +1722,7 @@ export class SupervisedCliBrainProvider {
     if (
       arguments.length > 1 &&
       constructionToken !== TEST_CONSTRUCTION_TOKEN &&
-      readSupervisedCliCompositionAuthority(constructionToken) === null
+      !ProductionCliCompositionGrant.is(constructionToken)
     ) {
       throw new TypeError(
         "Production supervised CLI providers do not accept replacement dependencies",
@@ -1825,6 +1863,25 @@ export class SupervisedCliBrainProvider {
     return this.#descriptorValue;
   }
 
+  async #runProcess(invocation, deadline, options) {
+    return runConcurrentRootActivity(
+      this.#rootState,
+      deadline,
+      (signal) => Promise.resolve(this.#processRunner.run({
+        ...options,
+        signal,
+        timeoutMs: deadline.remainingMs(),
+      })).catch((error) => {
+        if (error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
+          recordResidue(this.#rootState, invocation);
+          this.#rootState.unprovable = true;
+        }
+        throw error;
+      }),
+      { blocking: true },
+    );
+  }
+
   async #invoke({
     request,
     wireInput,
@@ -1869,7 +1926,7 @@ export class SupervisedCliBrainProvider {
           ));
         const resultIdentity = await deadline.run(({ signal }) =>
           writeNewFile(resultFile, Buffer.alloc(0), signal));
-        await this.#processRunner.run({
+        await this.#runProcess(invocation, deadline, {
           executable: descriptor,
           args: codexArguments({
             request,
@@ -1880,8 +1937,6 @@ export class SupervisedCliBrainProvider {
           cwd: invocation.path,
           env: environment,
           input: wireInput,
-          signal: deadline.signal,
-          timeoutMs: deadline.remainingMs(),
           maxStdoutBytes: this.#maxResponseBytes,
           maxStderrBytes: this.#maxResponseBytes,
         });
@@ -1895,14 +1950,12 @@ export class SupervisedCliBrainProvider {
           ),
         );
       } else {
-        const processResult = await this.#processRunner.run({
+        const processResult = await this.#runProcess(invocation, deadline, {
           executable: descriptor,
           args: claudeArguments(request),
           cwd: invocation.path,
           env: environment,
           input: wireInput,
-          signal: deadline.signal,
-          timeoutMs: deadline.remainingMs(),
           maxStdoutBytes: this.#maxResponseBytes,
           maxStderrBytes: this.#maxResponseBytes,
         });
