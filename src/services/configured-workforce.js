@@ -4,7 +4,6 @@ import { OllamaStructuredProvider } from "../adapters/ollama-structured-provider
 import { OpenAiCompatibleProvider } from "../adapters/openai-compatible-provider.js";
 import {
   createProductionSupervisedCliBrainProvider,
-  SupervisedCliBrainProvider,
 } from "../adapters/supervised-cli-brain-provider.js";
 import { ProductionCliCompositionGrant } from "../composition-root.js";
 import { BrainRouter } from "./brain-router.js";
@@ -110,7 +109,6 @@ function productionSupervisedCliCapability(dependencies) {
     );
   }
   const symbols = Object.getOwnPropertySymbols(dependencies);
-  if (symbols.length === 0) return null;
   if (
     symbols.length !== 1 ||
     !ProductionCliCompositionGrant.is(dependencies[symbols[0]])
@@ -123,9 +121,7 @@ function productionSupervisedCliCapability(dependencies) {
 }
 
 function productionSupervisedCliProviderFactory(options, capability) {
-  return capability === null
-    ? createProductionSupervisedCliBrainProvider(options)
-    : new SupervisedCliBrainProvider(options, capability);
+  return createProductionSupervisedCliBrainProvider(options, capability);
 }
 
 function declaredRemote(config, name) {
@@ -152,6 +148,9 @@ function providerWithBoundary(provider, remote) {
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     generate: provider.generate.bind(provider),
+    ...(typeof provider.close === "function"
+      ? { close: provider.close.bind(provider) }
+      : {}),
   });
 }
 
@@ -203,7 +202,7 @@ function providerOptions(
       supervisedCliProviderFactory({
         ...common,
         cliKind: config.kind,
-      }, cliRuntimeFacts),
+      }, cliRuntimeFacts(dependencies)),
       remote,
     );
   }
@@ -237,13 +236,48 @@ function configuredBrainRouter(
   supervisedCliProviderFactory,
   cliRuntimeFacts,
 ) {
-  return new BrainRouter({
-    providers: createProviders(
-      brainProviders,
-      dependencies,
-      supervisedCliProviderFactory,
-      cliRuntimeFacts(dependencies),
-    ),
+  const providers = createProviders(
+    brainProviders,
+    dependencies,
+    supervisedCliProviderFactory,
+    cliRuntimeFacts,
+  );
+  const router = new BrainRouter({ providers });
+  const runtimes = providers
+    .filter((provider) => typeof provider.close === "function")
+    .map((provider) => ({ close: provider.close, closed: false }));
+  let closeAttempt = null;
+  const close = () => {
+    if (closeAttempt) return closeAttempt;
+    const attempt = (async () => {
+      let firstFailure = null;
+      for (let index = runtimes.length - 1; index >= 0; index -= 1) {
+        const runtime = runtimes[index];
+        if (runtime.closed) continue;
+        try {
+          await runtime.close();
+          runtime.closed = true;
+        } catch (error) {
+          firstFailure ||= error;
+        }
+      }
+      if (firstFailure) throw firstFailure;
+    })();
+    closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+    );
+    return attempt;
+  };
+  return Object.freeze({
+    generate: router.generate.bind(router),
+    describe: router.describe.bind(router),
+    close,
   });
 }
 
@@ -343,6 +377,7 @@ function configuredWorkforce({
   return Object.freeze({
     employees: Object.freeze([...employees]),
     workers: Object.freeze([...workers]),
+    close: brainRouter.close,
   });
 }
 

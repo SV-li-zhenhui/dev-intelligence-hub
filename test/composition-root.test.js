@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
+import {
+  createTestSupervisedCliBrainProvider,
+} from "../src/adapters/supervised-cli-brain-provider.js";
 import {
   createBrain,
   createApplication,
@@ -11,6 +16,10 @@ import {
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import {
+  createConfiguredWorkforce,
+  createTestConfiguredWorkforce,
+} from "../src/services/configured-workforce.js";
 import {
   createWorkProposalResult,
   normalizeBoundWorkProposal,
@@ -450,6 +459,23 @@ function memoryStore() {
     },
     async write() {},
   };
+}
+
+async function within(milliseconds, promise) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("operation exceeded its test bound")),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function invalidationPendingEmployeeState() {
@@ -3298,6 +3324,139 @@ test("local code execution fails closed when unified memory is disabled", async 
     "workflow",
     "code-executor",
   ]);
+});
+
+test("an injected application factory cannot delegate grant-free CLI construction to the shipped workforce", async () => {
+  const config = workCoordinationConfig({ externalActions: false });
+  config.brainProviders = { cli: { kind: "codex-cli" } };
+  config.employees = { ...config.employees, roles: {} };
+  const calls = {};
+  const closeCalls = [];
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  const { configuredWorkforceFactory: _injectedWorkforce, ...runtimeStubs } = stubs;
+  let receivedSymbolCount = null;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      versionedConfiguration: false,
+      externalActions: false,
+      ...runtimeStubs,
+      configuredWorkforceFactory(options) {
+        receivedSymbolCount = Object.getOwnPropertySymbols(
+          options.dependencies,
+        ).length;
+        return createConfiguredWorkforce(options);
+      },
+      operationsRuntimeFactory: () => Object.freeze({}),
+    }),
+    /composition grant|composition authority/i,
+  );
+  assert.equal(receivedSymbolCount, 0);
+});
+
+test("default application composition supplies lexical authority for configured CLI providers", async () => {
+  const config = workCoordinationConfig({ externalActions: false });
+  config.brainProviders = { cli: { kind: "codex-cli" } };
+  config.employees = { ...config.employees, roles: {} };
+  const calls = {};
+  const closeCalls = [];
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  const { configuredWorkforceFactory: _injectedWorkforce, ...runtimeStubs } = stubs;
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    versionedConfiguration: false,
+    externalActions: false,
+    ...runtimeStubs,
+    operationsRuntimeFactory: () => Object.freeze({}),
+  });
+
+  await application.close();
+});
+
+test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "supervised-cli-application-close-"),
+  );
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  let clockReads = 0;
+  let processStarted;
+  const started = new Promise((resolve) => { processStarted = resolve; });
+  const provider = createTestSupervisedCliBrainProvider(
+    {
+      id: "cli",
+      cliKind: "codex-cli",
+      timeoutMs: 1_000,
+      maxResponseBytes: 128 * 1024,
+      maxRequestBytes: 256 * 1024,
+    },
+    {
+      processRunner: {
+        async run() {
+          processStarted();
+          return new Promise(() => {});
+        },
+      },
+      commandLocator: {
+        async resolve() {
+          return Object.freeze({
+            command: path.join(path.parse(process.cwd()).root, "fixture.exe"),
+            prefixArgs: Object.freeze([]),
+          });
+        },
+      },
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+    },
+  );
+  const request = assert.rejects(
+    provider.generate({
+      model: "bounded-model",
+      messages: [{ role: "user", content: "return JSON" }],
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["ok"],
+        properties: { ok: { type: "boolean" } },
+      },
+    }),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+  );
+  await started;
+  await within(500, request);
+
+  const config = workCoordinationConfig({ externalActions: false });
+  config.brainProviders = { cli: { kind: "codex-cli" } };
+  config.employees = { ...config.employees, roles: {} };
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    versionedConfiguration: false,
+    externalActions: false,
+    ...localCoordinationStubs({ calls, closeCalls, runners: {} }),
+    configuredWorkforceFactory: (options) => createTestConfiguredWorkforce(
+      options,
+      { supervisedCliProviderFactory: () => provider },
+    ),
+    operationsRuntimeFactory: () => Object.freeze({}),
+    runtimeLifecycle: lifecycle,
+  });
+  const closeFailure = await within(250, application.close()).then(
+    () => null,
+    (error) => error,
+  );
+
+  assert.equal(closeFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  const status = lifecycle.readStatus();
+  assert.equal(status.complete, false);
+  assert.ok(status.pendingRuntimes >= 1, status.pendingRuntimes);
+  assert.strictEqual(status.failure, closeFailure);
 });
 
 test("local code composition keeps CLI authority private from injected factories", async () => {

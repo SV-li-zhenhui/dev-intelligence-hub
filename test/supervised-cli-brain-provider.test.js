@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { EventEmitter } from "node:events";
 import {
   link,
   lstat,
@@ -20,7 +19,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -123,16 +121,6 @@ function recordingRunner(handler) {
   };
 }
 
-function nonClosingChild(processId = 424_242) {
-  const child = new EventEmitter();
-  child.pid = processId;
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
-  child.kill = () => false;
-  return child;
-}
-
 function cleanupFileSystem(overrides = {}) {
   return Object.freeze({
     lstat,
@@ -172,7 +160,7 @@ test("production supervised CLI policy rejects every platform except Windows x64
   }
 });
 
-test("production construction rejects an unsupported platform before materializing request context", async (t) => {
+test("production construction requires lexical composition authority before platform or request access", async (t) => {
   const profile = await temporaryDirectory(t, "supervised-cli-unsupported-");
   const script = `
     const module = await import('./src/adapters/supervised-cli-brain-provider.js');
@@ -183,13 +171,17 @@ test("production construction rejects an unsupported platform before materializi
       get() { reads += 1; return undefined; },
       ownKeys() { reads += 1; return []; },
     });
-    const provider = module.createProductionSupervisedCliBrainProvider({
-      id: 'unsupported',
-      cliKind: 'codex-cli',
-    });
-    let code = null;
-    try { await provider.generate(request); } catch (error) { code = error?.code; }
-    process.stdout.write(JSON.stringify({ code, reads }));
+    let message = null;
+    try {
+      const provider = module.createProductionSupervisedCliBrainProvider({
+        id: 'unsupported',
+        cliKind: 'codex-cli',
+      });
+      await provider.generate(request);
+    } catch (error) {
+      message = error?.message;
+    }
+    process.stdout.write(JSON.stringify({ message, reads }));
   `;
   const child = spawnSync(
     process.execPath,
@@ -206,10 +198,9 @@ test("production construction rejects an unsupported platform before materializi
     },
   );
   assert.equal(child.status, 0, child.stderr);
-  assert.deepEqual(JSON.parse(child.stdout), {
-    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
-    reads: 0,
-  });
+  const result = JSON.parse(child.stdout);
+  assert.match(result.message, /composition grant|composition authority/i);
+  assert.equal(result.reads, 0);
   await assert.rejects(
     lstat(path.join(profile, ".mydashboard-supervised-cli-v1")),
     { code: "ENOENT" },
@@ -977,56 +968,46 @@ test("Windows production root creation binds parent ACL trust to its creation ha
   const managerModule = await privateDirectoryManagerModule();
   const container = await temporaryDirectory(t, "supervised-cli-acl-aba-");
   const active = path.join(container, "active-parent");
-  const other = path.join(container, "other-parent");
+  const trusted = path.join(container, "trusted-parent");
   const holding = path.join(container, "parent-swap-holding");
+  const nativePhase = path.join(container, "native-parent-opened.txt");
   const root = path.join(active, "runtime");
   await mkdir(active);
-  await mkdir(other);
+  await mkdir(trusted);
   setWindowsDirectoryAcl(
     active,
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" +
       "(A;OICI;0x6;;;BU)",
   );
   setWindowsDirectoryAcl(
-    other,
+    trusted,
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
   );
-  let weakIsActive = true;
-  let weakLeafCreated = false;
-  for (let attempt = 0; attempt < 12 && !weakLeafCreated; attempt += 1) {
-    let keepSwapping = true;
-    const swapping = (async () => {
-      while (keepSwapping) {
-        await new Promise((resolve) => setTimeout(resolve, 2));
-        await rename(active, holding);
-        await rename(other, active);
-        await rename(holding, other);
-        weakIsActive = !weakIsActive;
-      }
-    })();
-    await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
-      directory: root,
-      signal: AbortSignal.timeout(5_000),
-      validateLocation: async () => {},
-    }).catch(() => {});
-    keepSwapping = false;
-    await swapping;
-    if (!weakIsActive) {
+  let trustInspections = 0;
+  const manager = managerModule.createTestSynchronizedWindowsPrivateDirectoryManager({
+    async beforeParentTrustInspection() {
+      trustInspections += 1;
       await rename(active, holding);
-      await rename(other, active);
-      await rename(holding, other);
-      weakIsActive = true;
-    }
-    try {
-      weakLeafCreated = (await lstat(root)).isDirectory();
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    const trustedLeaf = path.join(other, "runtime");
-    await rm(trustedLeaf, { recursive: true, force: true });
-  }
+      await rename(trusted, active);
+    },
+    async afterParentTrustInspection() {
+      await rename(active, trusted);
+      await rename(holding, active);
+    },
+    nativeParentOpenedSignal: nativePhase,
+  });
 
-  assert.equal(weakLeafCreated, false);
+  await assert.rejects(
+    manager.prepare({
+      directory: root,
+      signal: AbortSignal.timeout(30_000),
+      validateLocation: async () => {},
+    }),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+
+  assert.equal(trustInspections, 1);
+  assert.equal(await readFile(nativePhase, "utf8"), "parent-opened");
   await assert.rejects(lstat(root), { code: "ENOENT" });
 });
 
@@ -2149,31 +2130,56 @@ test("an unprovable process reap remains visible when the total deadline expires
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
 });
 
-test("provider returns at its total deadline while the real runner reaps a non-closing child", async (t) => {
+test("provider returns at its total deadline while the real Windows runner settles a local child", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("the production containment path is Windows x64 only");
+    return;
+  }
   const parent = await temporaryDirectory(t, "supervised-cli-real-runner-deadline-");
   const temporaryRoot = path.join(parent, "runtime");
-  let clockReads = 0;
-  let spawnCalls = 0;
-  const runner = createTestSupervisedProcessRunner({
-    descriptorMaterializer: async (descriptor) => descriptor,
-    spawnImpl() {
-      spawnCalls += 1;
-      return nonClosingChild();
-    },
-    treeTerminator: async () => {},
-    platform: "win32",
-    terminationTimeoutMs: 100,
-    windowsPowerShell: process.execPath,
-    windowsWrapperPath: path.join(parent, "contained-wrapper.ps1"),
+  const childStarted = path.join(parent, "real-child-started.txt");
+  const descriptor = Object.freeze({
+    command: process.execPath,
+    prefixArgs: Object.freeze([
+      "-e",
+      "require('node:fs').writeFileSync(process.argv[1], 'started');" +
+        "setInterval(() => {}, 1000)",
+      childStarted,
+    ]),
   });
+  const actualRunner = createTestSupervisedProcessRunner({
+    descriptorMaterializer: async (descriptor) => descriptor,
+    platform: "win32",
+    terminationTimeoutMs: 1_000,
+  });
+  let runnerSettled = false;
+  let resolveRunnerSettled;
+  const runnerSettlement = new Promise((resolve) => {
+    resolveRunnerSettled = resolve;
+  });
+  const runner = {
+    run(options) {
+      const result = actualRunner.run(options);
+      void result.then(
+        () => {
+          runnerSettled = true;
+          resolveRunnerSettled();
+        },
+        () => {
+          runnerSettled = true;
+          resolveRunnerSettled();
+        },
+      );
+      return result;
+    },
+  };
   const provider = createTestSupervisedCliBrainProvider(
-    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
+    { ...providerOptions("codex-cli"), timeoutMs: 4_000 },
     {
       processRunner: runner,
-      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      commandLocator: recordingLocator(descriptor),
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
-      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
     },
   );
   const startedAt = performance.now();
@@ -2182,15 +2188,19 @@ test("provider returns at its total deadline while the real runner reaps a non-c
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
   });
   const elapsedMs = performance.now() - startedAt;
-  assert.equal(spawnCalls, 1);
-  assert.ok(elapsedMs >= 60, elapsedMs);
-  assert.ok(elapsedMs < 250, elapsedMs);
+  assert.equal(await readFile(childStarted, "utf8"), "started");
+  assert.ok(elapsedMs >= 3_000, elapsedMs);
+  assert.ok(elapsedMs < 4_750, elapsedMs);
+  assert.equal(runnerSettled, false);
 
   const nextLocator = recordingLocator(testDescriptor("claude-cli"));
+  const nextRunner = recordingRunner(async () => successfulProcess(
+    Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))),
+  ));
   const next = createTestSupervisedCliBrainProvider(
     providerOptions("claude-cli"),
     {
-      processRunner: recordingRunner(async () => successfulProcess()),
+      processRunner: nextRunner,
       commandLocator: nextLocator,
       environment: { ANTHROPIC_API_KEY: "credential" },
       temporaryRoot,
@@ -2200,7 +2210,70 @@ test("provider returns at its total deadline while the real runner reaps a non-c
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
   });
   assert.equal(nextLocator.calls.length, 0);
-  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  await within(5_000, runnerSettlement);
+  assert.equal(runnerSettled, true);
+  assert.equal(await next.generate(brainRequest()), '{"ok":true}');
+  assert.equal(nextLocator.calls.length, 1);
+  assert.equal(nextRunner.calls.length, 1);
+});
+
+test("a never-settling process stays handled and permanently blocks close and cross-kind routing", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-never-settles-");
+  const temporaryRoot = path.join(parent, "runtime");
+  let clockReads = 0;
+  let processStarted;
+  const started = new Promise((resolve) => { processStarted = resolve; });
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  t.after(() => process.off("unhandledRejection", onUnhandled));
+  const provider = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
+    {
+      processRunner: recordingRunner(async () => {
+        processStarted();
+        return new Promise(() => {});
+      }),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+    },
+  );
+  const publicResult = assert.rejects(
+    provider.generate(brainRequest()),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+  );
+  await started;
+  await within(500, publicResult);
+
+  await assert.rejects(
+    within(250, provider.close()),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+  );
+  const nextLocator = recordingLocator(testDescriptor("claude-cli"));
+  const nextRunner = recordingRunner(async () => successfulProcess(
+    Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))),
+  ));
+  const next = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: nextRunner,
+      commandLocator: nextLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(next.generate(brainRequest()), {
+      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(nextLocator.calls.length, 0);
+  assert.equal(nextRunner.calls.length, 0);
+  assert.deepEqual(unhandled, []);
 });
 
 test("a reap failure blocks every CLI kind sharing the root before discovery", async (t) => {
@@ -2309,35 +2382,25 @@ test("cancellation bounds an unresolved Codex result read and retains the invoca
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
 });
 
-test("production provider construction has no dependency replacement seam", () => {
+test("production provider construction requires a lexical grant and has no replacement seam", () => {
+  assert.throws(
+    () => new SupervisedCliBrainProvider(providerOptions("codex-cli")),
+    /composition grant|composition authority/i,
+  );
+  assert.throws(
+    () => createProductionSupervisedCliBrainProvider(
+      providerOptions("codex-cli"),
+    ),
+    /composition grant|composition authority/i,
+  );
   assert.throws(
     () => new SupervisedCliBrainProvider(
       providerOptions("codex-cli"),
       {},
       { processRunner: {}, commandLocator: {} },
     ),
-    /Production supervised CLI providers.*replacement dependencies/,
+    /Production supervised CLI providers.*replacement dependencies|composition grant/i,
   );
-  assert.throws(
-    () => createProductionSupervisedCliBrainProvider({
-      ...providerOptions("codex-cli"),
-      processRunner: {},
-    }),
-    /options are invalid/,
-  );
-  for (const forbidden of [
-    { temporaryRoot: path.join(process.cwd(), "replacement-root") },
-    { protectedRoots: [process.cwd()] },
-    { dependencies: {} },
-  ]) {
-    assert.throws(
-      () => createProductionSupervisedCliBrainProvider({
-        ...providerOptions("codex-cli"),
-        ...forbidden,
-      }),
-      /options are invalid/,
-    );
-  }
 });
 
 test("the first use scavenges only stale verified residues and concurrent calls stay unique", async (t) => {
@@ -2399,6 +2462,59 @@ test("the first use scavenges only stale verified residues and concurrent calls 
   assert.equal(remaining.includes("invocation-codex-cli-live001"), true);
   assert.equal(remaining.includes("invocation-codex-cli-fresh01"), true);
   assert.equal(remaining.includes("invocation-codex-cli-unknown1"), true);
+});
+
+test("a staggered provider reaches its isolated runner while the first process remains healthy", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-staggered-concurrency-");
+  const temporaryRoot = path.join(parent, "runtime");
+  let releaseProcesses;
+  const released = new Promise((resolve) => { releaseProcesses = resolve; });
+  let firstStarted;
+  const firstAtRunner = new Promise((resolve) => { firstStarted = resolve; });
+  let secondStarted;
+  const secondAtRunner = new Promise((resolve) => { secondStarted = resolve; });
+  const invocationDirectories = [];
+  const createProvider = (onStart) => createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async (invocation) => {
+        invocationDirectories.push(invocation.cwd);
+        const resultFile = argumentValue(invocation.args, "--output-last-message");
+        await writeFile(resultFile, '{"ok":true}', "utf8");
+        onStart();
+        await released;
+        return successfulProcess();
+      }),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  const firstProvider = createProvider(firstStarted);
+  const secondProvider = createProvider(secondStarted);
+  const first = firstProvider.generate(brainRequest());
+  await firstAtRunner;
+  const second = secondProvider.generate(brainRequest());
+  const secondReachedBeforeRelease = await Promise.race([
+    secondAtRunner.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 300)),
+  ]);
+  releaseProcesses();
+  const outcomes = await within(3_000, Promise.allSettled([first, second]));
+
+  assert.equal(secondReachedBeforeRelease, true);
+  assert.deepEqual(outcomes.map(({ status }) => status), [
+    "fulfilled",
+    "fulfilled",
+  ]);
+  assert.deepEqual(outcomes.map(({ value }) => value), [
+    '{"ok":true}',
+    '{"ok":true}',
+  ]);
+  assert.equal(new Set(invocationDirectories).size, 2);
+  for (const directory of invocationDirectories) {
+    await assert.rejects(lstat(directory), { code: "ENOENT" });
+  }
 });
 
 test("stale recovery validates the complete bounded plan before removing evidence", async (t) => {

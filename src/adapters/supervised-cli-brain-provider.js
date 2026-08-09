@@ -450,7 +450,9 @@ function providerDependencies(constructionToken, rawDependencies) {
     return constructionToken.consume(productionDependencies);
   }
   if (constructionToken !== TEST_CONSTRUCTION_TOKEN) {
-    return productionDependencies();
+    throw new TypeError(
+      "Production supervised CLI providers require a lexical composition grant",
+    );
   }
   const dependencies = exactDataObject(
     rawDependencies,
@@ -1651,25 +1653,29 @@ async function runConcurrentRootActivity(
   operation,
   { blocking = false } = {},
 ) {
-  return deadline.run(({ signal }) => {
-    const attempt = Promise.resolve().then(async () => {
-      throwIfRequestAborted(signal);
-      return operation(signal);
+  let attempt = null;
+  try {
+    return await deadline.run(({ signal }) => {
+      attempt = Promise.resolve().then(async () => {
+        throwIfRequestAborted(signal);
+        return operation(signal);
+      });
+      rootState.pending.add(attempt);
+      if (blocking) rootState.blockingPending.add(attempt);
+      const settled = () => {
+        rootState.pending.delete(attempt);
+        rootState.blockingPending.delete(attempt);
+        releaseRootIfClean(rootState);
+      };
+      void attempt.then(settled, settled);
+      return attempt;
     });
-    rootState.leaseTail = Promise.allSettled([
-      rootState.leaseTail,
-      attempt,
-    ]).then(() => {});
-    rootState.pending.add(attempt);
-    if (blocking) rootState.blockingPending.add(attempt);
-    const settled = () => {
-      rootState.pending.delete(attempt);
-      rootState.blockingPending.delete(attempt);
-      releaseRootIfClean(rootState);
-    };
-    void attempt.then(settled, settled);
-    return attempt;
-  });
+  } catch (error) {
+    if (attempt !== null && rootState.pending.has(attempt)) {
+      rootState.blocked = true;
+    }
+    throw error;
+  }
 }
 
 async function verifiedResidue(
@@ -1717,15 +1723,16 @@ export class SupervisedCliBrainProvider {
   #rootIdentity = null;
   #rootState = null;
   #descriptorValue = null;
+  #closed = false;
+  #closeAttempt = null;
 
   constructor(rawOptions, constructionToken, rawDependencies) {
     if (
-      arguments.length > 1 &&
       constructionToken !== TEST_CONSTRUCTION_TOKEN &&
       !ProductionCliCompositionGrant.is(constructionToken)
     ) {
       throw new TypeError(
-        "Production supervised CLI providers do not accept replacement dependencies",
+        "Production supervised CLI providers require a lexical composition grant",
       );
     }
     const options = providerOptions(rawOptions);
@@ -1983,6 +1990,9 @@ export class SupervisedCliBrainProvider {
   }
 
   async generate(rawRequest = {}) {
+    if (this.#closed) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
     if (!this.#productionPlatformSupported) {
       throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
     }
@@ -2047,10 +2057,43 @@ export class SupervisedCliBrainProvider {
       deadline.dispose();
     }
   }
+
+  close() {
+    if (this.#closed) return Promise.resolve();
+    if (this.#closeAttempt) return this.#closeAttempt;
+    const attempt = this.#closeProvider();
+    this.#closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (this.#closeAttempt === attempt) this.#closeAttempt = null;
+      },
+      () => {
+        if (this.#closeAttempt === attempt) this.#closeAttempt = null;
+      },
+    );
+    return attempt;
+  }
+
+  async #closeProvider() {
+    const state = this.#rootState;
+    if (state === null) {
+      this.#closed = true;
+      return;
+    }
+    if (state.pending.size > 0) {
+      state.blocked = true;
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    releaseRootIfClean(state);
+    if (state.blocked || state.unprovable || state.residues.size > 0) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    this.#closed = true;
+  }
 }
 
-export function createProductionSupervisedCliBrainProvider(options) {
-  return new SupervisedCliBrainProvider(options);
+export function createProductionSupervisedCliBrainProvider(options, grant) {
+  return new SupervisedCliBrainProvider(options, grant);
 }
 
 export function createTestSupervisedCliBrainProvider(options, dependencies) {

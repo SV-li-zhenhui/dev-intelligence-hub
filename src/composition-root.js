@@ -970,13 +970,13 @@ export async function createApplication({
       if (!memoryRuntime) {
         throw new Error("记忆问答需要启用统一记忆运行时");
       }
-      const memoryBrainRouter = memoryBrainRouterFactory({
+      const memoryBrainRouter = trackRuntime(memoryBrainRouterFactory({
         brainProviders: config.brainProviders || {},
         dependencies: brainDependencies(
           memoryAnswerDependencies.brainDependencies || {},
           memoryBrainRouterFactory === createConfiguredBrainRouter,
         ),
-      });
+      }));
       const contextRetriever = memoryContextRetrieverFactory({
         memorySearch: frozenPort(
           memoryRuntime.search,
@@ -1634,7 +1634,7 @@ export async function createApplication({
     if (confirmationRuntime) await prEmployee.recoverConfirmations();
     let workCoordination = null;
     const configuredWorkforce = coordinationEnabled
-      ? configuredWorkforceFactory({
+      ? trackRuntime(configuredWorkforceFactory({
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},
           store,
@@ -1661,7 +1661,7 @@ export async function createApplication({
               ...(signal === null ? {} : { signal }),
             });
           },
-        })
+        }))
       : { employees: [], workers: [] };
     const employeeRegistry = createEmployeeRegistry([
       prEmployee,

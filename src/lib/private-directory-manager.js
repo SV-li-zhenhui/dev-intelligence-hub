@@ -354,6 +354,13 @@ public static class MyDashboardPrivateDirectory {
         ) {
           throw new InvalidOperationException("parent identity changed");
         }
+        string testSignal = Environment.GetEnvironmentVariable(
+          "MYDASHBOARD_TEST_NATIVE_PARENT_OPENED");
+        if (!String.IsNullOrEmpty(testSignal)) {
+          string signalPath = System.Text.Encoding.UTF8.GetString(
+            Convert.FromBase64String(testSignal));
+          System.IO.File.WriteAllText(signalPath, "parent-opened");
+        }
         ValidateParentTrust(parentHandle, sid);
         if (
           String.IsNullOrEmpty(leaf) ||
@@ -937,6 +944,7 @@ async function createWindowsDirectoryAt({
   leafName,
   parentIdentity,
   signal,
+  nativeParentOpenedSignal = null,
 }) {
   if (
     path.basename(directory) !== leafName ||
@@ -945,6 +953,15 @@ async function createWindowsDirectoryAt({
     throw unavailable();
   }
   if (!productionSupervisedCliPlatformSupported()) throw unavailable();
+  if (
+    nativeParentOpenedSignal !== null &&
+    (
+      typeof nativeParentOpenedSignal !== "string" ||
+      !path.isAbsolute(nativeParentOpenedSignal)
+    )
+  ) {
+    throw new TypeError("native parent-opened signal is invalid");
+  }
   await runPowerShell(
     WINDOWS_CREATE_SCRIPT,
     {
@@ -953,9 +970,56 @@ async function createWindowsDirectoryAt({
       MYDASHBOARD_PRIVATE_LEAF: Buffer.from(leafName, "utf8").toString("base64"),
       MYDASHBOARD_PRIVATE_PARENT_DEVICE: parentIdentity.device,
       MYDASHBOARD_PRIVATE_PARENT_INODE: parentIdentity.inode,
+      ...(nativeParentOpenedSignal === null
+        ? {}
+        : {
+            MYDASHBOARD_TEST_NATIVE_PARENT_OPENED: Buffer.from(
+              nativeParentOpenedSignal,
+              "utf8",
+            ).toString("base64"),
+          }),
     },
     signal,
   );
+}
+
+export function createTestSynchronizedWindowsPrivateDirectoryManager({
+  beforeParentTrustInspection,
+  afterParentTrustInspection,
+  nativeParentOpenedSignal,
+} = {}) {
+  if (
+    typeof beforeParentTrustInspection !== "function" ||
+    typeof afterParentTrustInspection !== "function" ||
+    typeof nativeParentOpenedSignal !== "string" ||
+    !path.isAbsolute(nativeParentOpenedSignal)
+  ) {
+    throw new TypeError("Windows private-directory test synchronization is invalid");
+  }
+  if (!productionSupervisedCliPlatformSupported()) throw unavailable();
+  return createPrivateDirectoryManager({
+    async inspectDirectoryTrust(directory, details, context) {
+      if (context.privateLeaf) {
+        return inspectWindowsTrust(directory, context);
+      }
+      await beforeParentTrustInspection();
+      try {
+        return await inspectWindowsTrust(directory, context);
+      } finally {
+        await afterParentTrustInspection();
+      }
+    },
+    async createDirectoryAt(options) {
+      try {
+        await createWindowsDirectoryAt({
+          ...options,
+          nativeParentOpenedSignal,
+        });
+      } catch {
+        throw unavailable();
+      }
+    },
+  });
 }
 
 const WINDOWS_PRIVATE_DIRECTORY_MANAGER = createPrivateDirectoryManager();

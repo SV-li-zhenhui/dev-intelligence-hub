@@ -254,11 +254,23 @@ test("provider options are isolated by adapter kind", () => {
 
 test("configured supervised CLIs stay remote and declare one process attempt", async () => {
   for (const kind of ["codex-cli", "claude-cli"]) {
-    const router = createConfiguredBrainRouter({
-      brainProviders: {
-        cli: { kind, remote: false },
+    const router = createTestConfiguredBrainRouter(
+      {
+        brainProviders: {
+          cli: { kind, remote: false },
+        },
       },
-    });
+      {
+        supervisedCliProviderFactory(options) {
+          return {
+            id: options.id,
+            remote: true,
+            singleAttempt: true,
+            async generate() { return '{"ok":true}'; },
+          };
+        },
+      },
+    );
     const configuredBrain = {
       provider: "cli",
       model: kind === "codex-cli" ? "gpt-5.6-codex" : "claude-opus-4-6",
@@ -280,6 +292,17 @@ test("configured supervised CLIs stay remote and declare one process attempt", a
         dataClasses: ["requirements"],
       }),
       (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
+    );
+  }
+});
+
+test("production configured CLI routing fails closed without lexical composition authority", () => {
+  for (const kind of ["codex-cli", "claude-cli"]) {
+    assert.throws(
+      () => createConfiguredBrainRouter({
+        brainProviders: { cli: { kind } },
+      }),
+      /composition grant|composition authority/i,
     );
   }
 });
