@@ -1,5 +1,6 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import {
   normalizeWorkCoordinationTiming,
   WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
@@ -272,40 +273,9 @@ function stableFailureCode(error) {
   return "ROLE_DECISION_FAILED";
 }
 
-const OWNER_BRAIN_ATTENTION = new Map([
-  [
-    "ROLE_TASK_BRAIN_NOT_CONFIGURED",
-    {
-      summary: "岗位任务大脑尚未配置",
-      action: "在配置中心为该岗位添加并激活 taskBrain",
-    },
-  ],
-  [
-    "BRAIN_PROVIDER_NOT_CONFIGURED",
-    {
-      summary: "岗位任务大脑 Provider 不可用",
-      action: "在配置中心修正并激活 taskBrain 的 Provider",
-    },
-  ],
-  [
-    "BRAIN_CREDENTIAL_UNAVAILABLE",
-    {
-      summary: "岗位任务大脑凭据不可用",
-      action: "提供配置中引用的凭据环境变量，并在需要时重启服务",
-    },
-  ],
-  [
-    "REMOTE_DATA_NOT_AUTHORIZED",
-    {
-      summary: "岗位任务大脑缺少远程数据授权",
-      action: "在配置中心检查 taskBrain 的远程 requirements/code 数据授权并激活",
-    },
-  ],
-]);
-
 function ownerBrainAttentionDecision(error, roleId) {
   const code = stableFailureCode(error);
-  const attention = OWNER_BRAIN_ATTENTION.get(code);
+  const attention = brainFailureOwnerAttention(code);
   if (!attention) return null;
   const summary = `${attention.summary}（${roleId}）`;
   return {
@@ -316,8 +286,8 @@ function ownerBrainAttentionDecision(error, roleId) {
       schemaVersion: 1,
       type: "ask_user",
       summary,
-      reason: `真实任务不得回退到例行大脑；系统已在调用 Provider 前停止（${code}）`,
-      question: `${attention.action}。完成后请选择“已配置，重试”；若不再继续该任务，请拒绝本次请示。`,
+      reason: `真实任务不得回退到例行大脑；系统已安全停止（${attention.code}）`,
+      question: `${attention.remediation}。完成后请选择“已配置，重试”；若不再继续该任务，请拒绝本次请示。`,
       choices: [
         {
           id: "configured-retry",
@@ -1031,14 +1001,42 @@ export class ProactiveWorkLoop {
     graphBlocked,
   }) {
     throwIfLoopAborted(options.signal);
-    let packet = await this.#assembleContext(item, worker, options);
+    let packet;
     let decision;
-    ({ decision, packet } = await this.#decideWithMemory(
-      item,
-      worker,
-      options,
-      packet,
-    ));
+    try {
+      packet = await this.#assembleContext(item, worker, options);
+      ({ decision, packet } = await this.#decideWithMemory(
+        item,
+        worker,
+        options,
+        packet,
+      ));
+    } catch (error) {
+      throwIfLoopAborted(options.signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
+        throw error;
+      }
+      const attention = ownerBrainAttentionDecision(error, worker.roleId);
+      if (attention === null) throw error;
+      const claim = await this.#claim(item, worker, options);
+      if (!claim.item) {
+        return {
+          claimAttempted: true,
+          claimed: false,
+          outcome: { status: claim.status },
+        };
+      }
+      return {
+        claimAttempted: true,
+        claimed: true,
+        outcome: await this.#stageDecision(
+          claim.item,
+          worker,
+          options,
+          attention,
+        ),
+      };
+    }
     throwIfLoopAborted(options.signal);
     if (decision.intent.type === "orchestrate") {
       throwIfLoopAborted(options.signal);

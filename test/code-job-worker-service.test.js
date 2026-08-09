@@ -2750,13 +2750,25 @@ test("deterministic context overflow fails once instead of retrying forever", as
 test("stable brain configuration failures pause instead of spinning forever", async (t) => {
   for (const code of [
     "BRAIN_CREDENTIAL_UNAVAILABLE",
+    "BRAIN_PROVIDER_NOT_CONFIGURED",
     "CODE_BRAIN_ROLE_NOT_CONFIGURED",
     "CODE_TASK_BRAIN_NOT_CONFIGURED",
     "CODE_BRAIN_PATH_INVALID",
     "CODE_BRAIN_COMPLETION_NOT_READY",
     "REMOTE_DATA_NOT_AUTHORIZED",
+    "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
     "STRUCTURED_PROVIDER_UNAVAILABLE",
+    "STRUCTURED_PROVIDER_CANCELLED",
     "STRUCTURED_PROVIDER_TIMEOUT",
+    "STRUCTURED_PROVIDER_OUTPUT_LIMIT",
+    "STRUCTURED_PROVIDER_PROCESS_FAILED",
+    "STRUCTURED_PROVIDER_REAP_FAILED",
+    "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE",
+    "STRUCTURED_PROVIDER_REQUEST_FAILED",
+    "STRUCTURED_PROVIDER_HTTP_FAILED",
+    "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
+    "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
   ]) {
     await t.test(code, async () => {
       const initial = job({
@@ -2796,6 +2808,42 @@ test("stable brain configuration failures pause instead of spinning forever", as
       assert.equal(brainCalls.length, 1);
     });
   }
+});
+
+test("proactive-only task-brain setup failure does not broaden Code Job pause policy", async () => {
+  const initial = job({
+    status: "active",
+    revision: 3,
+    execution: {
+      sessionId: job().jobId,
+      workspaceRevision: REVISION_A,
+      turn: 0,
+      pendingAction: null,
+      actionAdmission: null,
+      observations: [],
+      result: null,
+      pause: null,
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const brainCalls = [];
+  const failure = Object.assign(new Error("role task brain is unavailable"), {
+    code: "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+  });
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([failure], brainCalls),
+    grantVerifier: verifier([]),
+  });
+
+  const cycle = await worker.runCycle();
+
+  assert.equal(cycle.outcomes[0].status, "retry");
+  assert.equal(cycle.outcomes[0].code, "ROLE_TASK_BRAIN_NOT_CONFIGURED");
+  assert.equal((await store.getForWorker(initial.jobId)).status, "active");
+  assert.equal(brainCalls.length, 1);
 });
 
 test("two locally invalid model responses pause once without another cycle call", async () => {

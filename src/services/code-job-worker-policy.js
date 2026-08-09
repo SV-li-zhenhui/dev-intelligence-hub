@@ -1,5 +1,6 @@
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
+import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -37,8 +38,6 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
   "CODE_BRAIN_CONTEXT_UNFIT",
 ]);
 const OPERATOR_PAUSE_CODES = new Set([
-  "BRAIN_CREDENTIAL_UNAVAILABLE",
-  "BRAIN_PROVIDER_NOT_CONFIGURED",
   "CODE_BRAIN_ACTION_NOT_PERMITTED",
   "CODE_BRAIN_CHECKS_ALREADY_PASSED",
   "CODE_BRAIN_COMPLETION_NOT_READY",
@@ -47,7 +46,6 @@ const OPERATOR_PAUSE_CODES = new Set([
   "CODE_TASK_BRAIN_NOT_CONFIGURED",
   "CODE_BRAIN_RESPONSE_INVALID",
   "CODE_BRAIN_WRITE_NOT_PERMITTED",
-  "REMOTE_DATA_NOT_AUTHORIZED",
 ]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 
@@ -144,7 +142,7 @@ export function safeErrorCode(error, fallback = "CODE_JOB_WORKER_FAILED") {
 }
 
 export function requiresOperatorPause(code) {
-  return OPERATOR_PAUSE_CODES.has(code) || code.startsWith("STRUCTURED_PROVIDER_");
+  return OPERATOR_PAUSE_CODES.has(code) || requiresBrainOperatorPause(code);
 }
 
 export function isAuthorityErrorCode(code) {
