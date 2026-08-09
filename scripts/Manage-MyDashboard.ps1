@@ -635,29 +635,60 @@ function Get-ManagedProcess {
 
 function Test-LoopbackTcpListener {
     param([Parameter(Mandatory = $true)][int]$Port)
-    $client = New-Object System.Net.Sockets.TcpClient
-    $operation = $null
-    $waitHandle = $null
+    $probeSource = @'
+const net = require("node:net");
+const port = Number(process.argv[2]);
+let settled = false;
+let timer;
+let verifier;
+const client = net.createConnection({ host: "127.0.0.1", port });
+function finish(code) {
+  if (settled) return;
+  settled = true;
+  clearTimeout(timer);
+  client.destroy();
+  process.exit(code);
+}
+client.once("connect", () => finish(2));
+client.once("error", (error) => {
+  if (error?.code !== "ECONNREFUSED") return finish(2);
+  verifier = net.createServer();
+  verifier.once("error", () => finish(2));
+  verifier.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+    verifier.close((closeError) => finish(closeError ? 2 : 61));
+  });
+});
+timer = setTimeout(() => finish(2), 500);
+'@
+    $probe = $null
     try {
-        $operation = $client.BeginConnect(
-            [System.Net.IPAddress]::Loopback,
-            $Port,
-            $null,
-            $null
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $nodePath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.EnvironmentVariables.Remove("NODE_OPTIONS")
+        $encodedProbe = [Convert]::ToBase64String(
+            [System.Text.Encoding]::UTF8.GetBytes($probeSource)
         )
-        $waitHandle = $operation.AsyncWaitHandle
-        if (-not $waitHandle.WaitOne(500)) {
-            return $false
+        $startInfo.Arguments = '-e "eval(Buffer.from(process.argv[1],''base64'').toString(''utf8''))" "' + `
+            $encodedProbe + '" "' + [string]$Port + '"'
+        $probe = [System.Diagnostics.Process]::Start($startInfo)
+        if ($null -eq $probe -or -not $probe.WaitForExit(2000)) {
+            if ($null -ne $probe -and -not $probe.HasExited) {
+                $probe.Kill()
+                [void]$probe.WaitForExit(500)
+            }
+            return $true
         }
-        $client.EndConnect($operation)
-        return $client.Connected
+        return $probe.ExitCode -ne 61
     } catch {
-        return $false
+        return $true
     } finally {
-        if ($null -ne $waitHandle) {
-            $waitHandle.Dispose()
+        if ($null -ne $probe) {
+            $probe.Dispose()
         }
-        $client.Dispose()
     }
 }
 

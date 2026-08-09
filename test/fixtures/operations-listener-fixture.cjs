@@ -4,7 +4,7 @@ const net = require("node:net");
 const mode = process.argv[2];
 const port = Number(process.argv[3]);
 if (
-  !new Set(["raw", "not-found", "malformed", "hang"]).has(mode) ||
+  !new Set(["raw", "not-found", "malformed", "hang", "saturated"]).has(mode) ||
   !Number.isInteger(port) ||
   port < 1 ||
   port > 65_535
@@ -20,7 +20,7 @@ function track(socket) {
   socket.once("close", () => sockets.delete(socket));
 }
 
-const server = mode === "raw"
+const server = mode === "raw" || mode === "saturated"
   ? net.createServer((socket) => {
       process.send?.({ type: "connection" });
     })
@@ -58,4 +58,17 @@ process.on("message", (message) => {
   if (message?.type === "close") close();
 });
 process.on("disconnect", close);
-server.listen(port, "127.0.0.1", () => process.send?.({ type: "ready" }));
+const listenOptions = {
+  host: "127.0.0.1",
+  port,
+  ...(mode === "saturated" ? { backlog: 1 } : {}),
+};
+server.listen(listenOptions, () => {
+  if (mode !== "saturated") {
+    process.send?.({ type: "ready" });
+    return;
+  }
+  process.send?.({ type: "ready" }, () => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+  });
+});

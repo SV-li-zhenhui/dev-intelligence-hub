@@ -191,6 +191,18 @@ async function startForeignListener(t, { mode, port }) {
   return { child, messages };
 }
 
+async function fillOwnedListenerBacklog(t, port) {
+  const clients = Array.from({ length: 256 }, () => {
+    const client = net.createConnection({ host: "127.0.0.1", port });
+    client.on("error", () => {});
+    return client;
+  });
+  t.after(() => {
+    for (const client of clients) client.destroy();
+  });
+  await new Promise((resolve) => setTimeout(resolve, 750));
+}
+
 async function assertTcpListenerAlive(child, port) {
   assert.equal(child.exitCode, null);
   assert.equal(child.signalCode, null);
@@ -880,6 +892,91 @@ for (const scenario of [
     },
   );
 }
+
+test(
+  "saturated listener keeps offline Restore fenced when TCP occupancy is indeterminate",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const { root, port } = await createFixture(t);
+    const runtime = readRuntimeInfo(root);
+    const markerPath = path.join(root, "restore-helper-invoked.marker");
+    await installRestoreRecorder(root, markerPath);
+    const foreign = await startForeignListener(t, { mode: "saturated", port });
+    await fillOwnedListenerBacklog(t, port);
+    const backupId = `backup-${"c".repeat(64)}`;
+
+    const startedAt = Date.now();
+    const restored = invokeManager(
+      root,
+      "Restore",
+      5,
+      powershell,
+      ["-BackupId", backupId],
+    );
+    const restoreElapsedMilliseconds = Date.now() - startedAt;
+
+    const statusStartedAt = Date.now();
+    const status = invokeManager(root, "Status");
+    const statusElapsedMilliseconds = Date.now() - statusStartedAt;
+
+    const startStartedAt = Date.now();
+    const started = invokeManager(root, "Start");
+    const startElapsedMilliseconds = Date.now() - startStartedAt;
+
+    assert.equal(restored.error, undefined);
+    assert.equal(status.error, undefined);
+    assert.equal(started.error, undefined);
+    const childLaunchMarker = await fileExists(path.join(
+      runtime.runtimeDirectory,
+      "fixture-child-started.marker",
+    ));
+    const controlRequests = foreign.messages.filter((message) =>
+      message.type === "request"
+    ).length;
+    assert.deepEqual(
+      {
+        restoreRefused: restored.status !== 0,
+        helperTouched: await fileExists(markerPath),
+        statusCode: status.status,
+        startRefused: started.status !== 0,
+        childLaunchMarker,
+        controlRequests,
+        listenerProcessAlive: foreign.child.exitCode === null &&
+          foreign.child.signalCode === null,
+        timeoutBranchObserved: restoreElapsedMilliseconds >= 500 &&
+          statusElapsedMilliseconds >= 500 &&
+          startElapsedMilliseconds >= 500,
+        bounded: restoreElapsedMilliseconds < 5_000 &&
+          statusElapsedMilliseconds < 5_000 &&
+          startElapsedMilliseconds < 8_000,
+      },
+      {
+        restoreRefused: true,
+        helperTouched: false,
+        statusCode: 4,
+        startRefused: true,
+        childLaunchMarker: false,
+        controlRequests: 0,
+        listenerProcessAlive: true,
+        timeoutBranchObserved: true,
+        bounded: true,
+      },
+      [
+        restored.stderr,
+        restored.stdout,
+        status.stderr,
+        status.stdout,
+        started.stderr,
+        started.stdout,
+        `elapsed=${JSON.stringify({
+          restore: restoreElapsedMilliseconds,
+          status: statusElapsedMilliseconds,
+          start: startElapsedMilliseconds,
+        })}ms`,
+      ].join("\n"),
+    );
+  },
+);
 
 test(
   "PowerShell manager permits an exact offline restore only while the service is stopped",
