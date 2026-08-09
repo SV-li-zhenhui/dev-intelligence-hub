@@ -5,6 +5,7 @@ import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
   createTestConfiguredBrainRouter,
+  createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
 
 const SCHEMA = Object.freeze({
@@ -400,6 +401,161 @@ test("configured router close preserves every provider failure and retries only 
     third: 2,
   });
 });
+
+test("configured router and workforce close each shared provider owner once", async () => {
+  const subjects = [
+    (options, dependencies) =>
+      createTestConfiguredBrainRouter(options, dependencies),
+    (options, dependencies) =>
+      createTestConfiguredWorkforce(
+        { ...options, roles: {}, store: new MemoryStore() },
+        dependencies,
+      ),
+  ];
+
+  for (const createSubject of subjects) {
+    let closeCalls = 0;
+    const sharedOwner = {
+      id: "unset",
+      remote: true,
+      singleAttempt: true,
+      async generate() {
+        return '{"ok":true}';
+      },
+      async close() {
+        closeCalls += 1;
+      },
+    };
+    const ownerWithoutClose = {
+      id: "unset",
+      remote: true,
+      singleAttempt: true,
+      async generate() {
+        return '{"ok":true}';
+      },
+    };
+    const subject = createSubject(
+      {
+        brainProviders: {
+          "shared-first": { kind: "codex-cli" },
+          "shared-second": { kind: "claude-cli" },
+          "no-close": { kind: "codex-cli" },
+        },
+      },
+      {
+        supervisedCliProviderFactory(options) {
+          const owner = options.id === "no-close"
+            ? ownerWithoutClose
+            : sharedOwner;
+          owner.id = options.id;
+          return owner;
+        },
+      },
+    );
+
+    const firstClose = subject.close();
+    assert.strictEqual(subject.close(), firstClose);
+    await firstClose;
+    await subject.close();
+    assert.equal(closeCalls, 1);
+  }
+});
+
+test("configured router retries failed unique owners and aggregates distinct failures", async () => {
+  const sharedFailure = new Error("shared owner close failed");
+  const distinctFailure = new Error("distinct owner close failed");
+  const attempts = new Map();
+  const sharedOwner = providerOwner("shared", sharedFailure, attempts);
+  const successfulOwner = providerOwner("successful", null, attempts);
+  const distinctOwner = providerOwner("distinct", distinctFailure, attempts);
+  const router = createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        "shared-first": { kind: "codex-cli" },
+        successful: { kind: "codex-cli" },
+        "shared-second": { kind: "claude-cli" },
+        distinct: { kind: "claude-cli" },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        const owner = options.id.startsWith("shared-")
+          ? sharedOwner
+          : options.id === "successful"
+            ? successfulOwner
+            : distinctOwner;
+        owner.id = options.id;
+        return owner;
+      },
+    },
+  );
+
+  const aggregate = await router.close().then(
+    () => null,
+    (error) => error,
+  );
+  assert.ok(aggregate instanceof AggregateError);
+  assert.deepEqual(
+    new Set(aggregate.errors),
+    new Set([sharedFailure, distinctFailure]),
+  );
+  assert.deepEqual(Object.fromEntries(attempts), {
+    distinct: 1,
+    shared: 1,
+    successful: 1,
+  });
+
+  const retry = router.close();
+  assert.strictEqual(router.close(), retry);
+  await retry;
+  await router.close();
+  assert.deepEqual(Object.fromEntries(attempts), {
+    distinct: 2,
+    shared: 2,
+    successful: 1,
+  });
+});
+
+test("configured router preserves a shared owner's single raw close failure", async () => {
+  const closeFailure = new Error("one shared owner close failed");
+  const attempts = new Map();
+  const sharedOwner = providerOwner("shared", closeFailure, attempts);
+  const router = createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        "shared-first": { kind: "codex-cli" },
+        "shared-second": { kind: "claude-cli" },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        sharedOwner.id = options.id;
+        return sharedOwner;
+      },
+    },
+  );
+
+  await assert.rejects(router.close(), (error) => error === closeFailure);
+  assert.equal(attempts.get("shared"), 1);
+  await router.close();
+  assert.equal(attempts.get("shared"), 2);
+});
+
+function providerOwner(key, firstFailure, attempts) {
+  return {
+    id: "unset",
+    remote: true,
+    singleAttempt: true,
+    async generate() {
+      return '{"ok":true}';
+    },
+    async close() {
+      const count = (attempts.get(key) ?? 0) + 1;
+      attempts.set(key, count);
+      if (count === 1 && firstFailure) throw firstFailure;
+    },
+  };
+}
 
 test("production configured routing rejects a caller-supplied protected-root field", () => {
   assert.throws(

@@ -45,6 +45,7 @@ const ROLE_KEYS = new Set([
   "brain",
   "taskBrain",
 ]);
+const PROVIDER_OWNERS = new WeakMap();
 
 function dataEntries(value, name) {
   if (
@@ -143,7 +144,7 @@ function providerWithBoundary(provider, remote) {
   ) {
     throw new TypeError("brain provider singleAttempt is invalid");
   }
-  return Object.freeze({
+  const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
@@ -152,6 +153,8 @@ function providerWithBoundary(provider, remote) {
       ? { close: provider.close.bind(provider) }
       : {}),
   });
+  PROVIDER_OWNERS.set(boundary, provider);
+  return boundary;
 }
 
 function providerOptions(
@@ -243,9 +246,19 @@ function configuredBrainRouter(
     cliRuntimeFacts,
   );
   const router = new BrainRouter({ providers });
-  const runtimes = providers
-    .filter((provider) => typeof provider.close === "function")
-    .map((provider) => ({ close: provider.close, closed: false }));
+  const runtimeOwners = new Set();
+  const runtimes = [];
+  for (const provider of providers) {
+    const owner = PROVIDER_OWNERS.get(provider);
+    if (
+      typeof owner?.close !== "function" ||
+      runtimeOwners.has(owner)
+    ) {
+      continue;
+    }
+    runtimeOwners.add(owner);
+    runtimes.push({ close: owner.close.bind(owner), closed: false });
+  }
   let closeAttempt = null;
   const close = () => {
     if (closeAttempt) return closeAttempt;

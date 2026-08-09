@@ -1,11 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
+  SupervisedCliBrainProvider,
   createTestSupervisedCliBrainProvider,
 } from "../src/adapters/supervised-cli-brain-provider.js";
 import {
@@ -17,16 +28,38 @@ import {
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import {
+  KnownCliLocator,
+  materializeVerifiedCliDescriptor,
+} from "../src/lib/known-cli-locator.js";
+import {
+  configurationDocumentDigest,
+  normalizeConfigurationDocument,
+} from "../src/domain/configuration-contract.js";
+import {
   createConfiguredWorkforce,
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
 import {
   CodeJobBrainDirectory,
 } from "../src/services/code-job-brain-directory.js";
+import { codeJobBrainDigest } from "../src/services/code-job-grant-factory.js";
+import {
+  VersionedCodeJobAuthority,
+} from "../src/services/versioned-code-job-authority.js";
 import {
   createWorkProposalResult,
   normalizeBoundWorkProposal,
 } from "../src/domain/work-proposal-contract.js";
+
+const execFileAsync = promisify(execFile);
+const OFFLINE_CODEX_SOURCE = path.join(
+  import.meta.dirname,
+  "fixtures",
+  "offline-bounded-codex.cs",
+);
+const COMMITTED_CONFIGURATION = JSON.parse(
+  await readFile(path.join(import.meta.dirname, "..", "config.example.json"), "utf8"),
+);
 
 function applicationConfig(codeExecutor = { enabled: false }) {
   return {
@@ -479,6 +512,398 @@ async function within(milliseconds, promise) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function createOfflineProductionCliFixture(t, name) {
+  const root = await mkdtemp(path.join(tmpdir(), `${name}-`));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeRoot = path.join(root, "home");
+  const nodeModulesRoot = path.join(root, "node_modules");
+  const packageRoot = path.join(nodeModulesRoot, "@openai", "codex");
+  const nativeRoot = path.join(
+    packageRoot,
+    "node_modules",
+    "@openai",
+    "codex-win32-x64",
+  );
+  const executable = path.join(
+    nativeRoot,
+    "vendor",
+    "x86_64-pc-windows-msvc",
+    "bin",
+    "codex.exe",
+  );
+  const binarySearchRoot = path.join(nodeModulesRoot, ".bin");
+  await mkdir(homeRoot, { recursive: true });
+  await mkdir(path.dirname(executable), { recursive: true });
+  await mkdir(binarySearchRoot, { recursive: true });
+  await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "Add-Type -Path $env:MYDASHBOARD_FIXTURE_SOURCE -OutputAssembly $env:MYDASHBOARD_FIXTURE_OUTPUT -OutputType ConsoleApplication",
+    ],
+    {
+      windowsHide: true,
+      env: {
+        ...process.env,
+        MYDASHBOARD_FIXTURE_SOURCE: OFFLINE_CODEX_SOURCE,
+        MYDASHBOARD_FIXTURE_OUTPUT: executable,
+      },
+    },
+  );
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@openai/codex",
+      version: "0.147.0",
+      bin: { codex: "bin/codex.js" },
+      optionalDependencies: {
+        "@openai/codex-win32-x64":
+          "npm:@openai/codex@0.147.0-win32-x64",
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    path.join(nativeRoot, "package.json"),
+    JSON.stringify({
+      name: "@openai/codex",
+      version: "0.147.0-win32-x64",
+      os: ["win32"],
+      cpu: ["x64"],
+    }),
+    "utf8",
+  );
+
+  await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      [
+        "$ErrorActionPreference = 'Stop'",
+        "$target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MYDASHBOARD_FIXTURE_HOME))",
+        "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$sddl = ('O:{0}G:{0}D:P' -f $sid) + ('(A;OICI;FA;;;{0})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' -f $sid)",
+        "$security = [Security.AccessControl.DirectorySecurity]::new()",
+        "$sections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group",
+        "$security.SetSecurityDescriptorSddlForm($sddl, $sections)",
+        "[System.IO.Directory]::SetAccessControl($target, $security)",
+      ].join("\n"),
+    ],
+    {
+      windowsHide: true,
+      env: {
+        ...process.env,
+        MYDASHBOARD_FIXTURE_HOME:
+          Buffer.from(homeRoot, "utf8").toString("base64"),
+      },
+    },
+  );
+
+  const originalPath = process.env.PATH;
+  const originalCredential = process.env.OPENAI_API_KEY;
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  process.env.PATH = binarySearchRoot;
+  process.env.OPENAI_API_KEY = "fixed-offline-fixture-credential";
+  process.env.HOME = homeRoot;
+  process.env.USERPROFILE = homeRoot;
+  t.after(async () => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalCredential === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalCredential;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+  });
+  const descriptor = await new KnownCliLocator().resolve("codex-cli");
+  await materializeVerifiedCliDescriptor(descriptor);
+
+  const runtimeRoot = path.join(
+    homedir(),
+    ".mydashboard-supervised-cli-v1",
+  );
+  const invocationNames = async () => {
+    try {
+      return new Set(
+        (await readdir(runtimeRoot, { withFileTypes: true }))
+          .filter((entry) =>
+            entry.isDirectory() &&
+            entry.name.startsWith("invocation-codex-cli-"))
+          .map((entry) => entry.name),
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") return new Set();
+      throw error;
+    }
+  };
+  return Object.freeze({
+    invocationNames,
+    async waitForStart(previousNames) {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        for (const name of await invocationNames()) {
+          if (previousNames.has(name)) continue;
+          const invocation = path.join(runtimeRoot, name);
+          try {
+            await access(path.join(invocation, "offline-cli-started"));
+            return invocation;
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("offline CLI fixture did not start within its test bound");
+    },
+    release(invocation) {
+      return writeFile(
+        path.join(invocation, "offline-cli-release"),
+        "release",
+        "utf8",
+      );
+    },
+  });
+}
+
+function defaultCodeJobConfiguration() {
+  const value = structuredClone(COMMITTED_CONFIGURATION);
+  value.trackedRepositories = ["acme/repo"];
+  value.codeExecutor = {
+    enabled: true,
+    gitCommand: "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    docker: {
+      executable: "docker",
+      host: "npipe:////./pipe/docker_engine",
+    },
+    workspaces: [{
+      id: "dashboard",
+      sourceRoot: ".",
+      writablePaths: ["src", "test"],
+      excludePaths: [],
+    }],
+    profiles: {
+      "node-tests": {
+        kind: "node-test",
+        image:
+          "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32",
+        timeoutMs: 30_000,
+      },
+    },
+    requiredProfilesByWorkspace: { dashboard: ["node-tests"] },
+    brokerLimits: { maxFiles: 1_000, maxWriteBytes: 1_000_000 },
+    executorLimits: { maxSessions: 4, maxActionsPerSession: 100 },
+    maxArtifactBytes: 16_777_216,
+  };
+  value.changePackages = { enabled: false };
+  value.githubActions = { enabled: false, enabledActions: [] };
+  value.memory.enabled = true;
+  value.memory.answering = { enabled: false };
+  value.brainProviders = {
+    ollama: {
+      kind: "ollama",
+      baseUrl: "http://127.0.0.1:11434",
+      remote: false,
+    },
+    "offline-cli": {
+      kind: "codex-cli",
+      remote: true,
+      timeoutMs: 30_000,
+      maxResponseBytes: 128 * 1024,
+      maxRequestBytes: 256 * 1024,
+    },
+  };
+  for (const role of Object.values(value.employees.roles)) {
+    role.taskBrain = structuredClone(role.brain);
+  }
+  value.employees.roles.developer.taskBrain = {
+    provider: "offline-cli",
+    model: "fixed-offline-model",
+    remoteData: { requirements: true, code: true, memory: false },
+  };
+  value.workCoordination.enabled = true;
+  value.workCoordination.policy = {
+    ...value.workCoordination.policy,
+    version: 7,
+    codeActionRoles: ["developer"],
+    codeOperationsByRole: {
+      developer: ["inspect", "modify", "verify"],
+    },
+    workspaceByRepository: { "acme/repo": "dashboard" },
+  };
+  return normalizeConfigurationDocument(value);
+}
+
+function defaultExecutorAuthority() {
+  return {
+    workspaces: [{
+      id: "dashboard",
+      capabilities: ["git_head_snapshot"],
+      writablePaths: ["src", "test"],
+      excludePaths: [],
+      requiredProfiles: [
+        { id: "node-tests", configDigest: "a".repeat(64) },
+      ],
+      authorityDigest: "d".repeat(64),
+    }],
+  };
+}
+
+function defaultCodeDecisionInput() {
+  return {
+    roleId: "developer",
+    task: {
+      operation: "modify",
+      repository: "acme/repo",
+      objective: "Prove bounded default Code Job shutdown.",
+      acceptanceCriteria: ["The real offline CLI lifecycle is closed."],
+      evidence: ["The fixed fixture remains unsettled until released."],
+    },
+    capabilities: {
+      allowedActions: ["read_text"],
+      writablePaths: ["src"],
+      requiredProfilesRemaining: 1,
+    },
+    turn: 1,
+    observations: [],
+  };
+}
+
+function configurationRuntimeFactory(config, closeCalls) {
+  const configurationDigest = configurationDocumentDigest(config);
+  const version = {
+    version: 1,
+    configurationDigest,
+    configuration: config,
+  };
+  const emptyPort = (names) => Object.fromEntries(
+    names.map((name) => [name, async () => {}]),
+  );
+  return async (_candidate, dependencies) => {
+    dependencies.actionAdmissionGate.bindEffective({
+      version: 1,
+      configurationDigest,
+    });
+    return {
+      startupConfiguration: config,
+      status: {
+        safeMode: false,
+        activeVersion: 1,
+        stateRevision: 1,
+        migrationError: null,
+      },
+      reader: {
+        async readActive() { return version; },
+        async readSnapshot() { return { versions: [version] }; },
+        ...emptyPort([
+          "readActivationReconciliationSnapshot",
+          "readVersion",
+          "readDraft",
+          "readProjectionBatch",
+        ]),
+      },
+      draftManager: emptyPort([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      simulator: emptyPort([
+        "prepareInitialization",
+        "prepareDraftActivation",
+        "prepareRollback",
+      ]),
+      activationExecutor: emptyPort([
+        "activateInitialization",
+        "activateDraft",
+        "activateRollback",
+      ]),
+      proposalPort: emptyPort([
+        "createDraft",
+        "createInitializationDraft",
+        "reviseDraft",
+      ]),
+      async close() { closeCalls.push("configuration"); },
+    };
+  };
+}
+
+function defaultCodeJobApplicationOptions({
+  config,
+  calls,
+  closeCalls,
+  lifecycle,
+  versioned,
+  codeJobRuntimeStarted,
+  memoryRuntimeFactory,
+  confirmationRuntimeFactory,
+}) {
+  const runners = {
+    "code-action-runner": { async claim() {}, async advance() {} },
+  };
+  return {
+    config,
+    versionedConfiguration: versioned,
+    externalActions: true,
+    store: memoryStore(),
+    runtimeLifecycle: lifecycle,
+    ...(versioned
+      ? { configurationRuntimeFactory: configurationRuntimeFactory(config, closeCalls) }
+      : {}),
+    codeExecutorRuntimeFactory: async () => ({
+      authority: defaultExecutorAuthority(),
+      executor: controlledCodeExecutorPort(),
+      async close() { closeCalls.push("code-executor"); },
+    }),
+    ...localCoordinationStubs({ calls, closeCalls, runners }),
+    ...(memoryRuntimeFactory === undefined ? {} : { memoryRuntimeFactory }),
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      await codeJobRuntimeStarted?.(options);
+      return {
+        confirmationExecutor: { async execute() {}, async reconcile() {} },
+        reader: {
+          async get() {},
+          async getDetail() {},
+          async list() {},
+          async listNewest() {},
+        },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
+        async close() { closeCalls.push("code-job"); },
+      };
+    },
+    codeJobMemoryProjectorFactory: () => ({ async runCycle() {} }),
+    codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: (runnersToGroup) =>
+      runnersToGroup[0] || null,
+    confirmationRuntimeFactory: confirmationRuntimeFactory ?? (async () => ({
+      queue: confirmationQueuePort(),
+      memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() { closeCalls.push("confirmation"); },
+    })),
+    operationsRuntimeFactory: () => Object.freeze({}),
+  };
+}
+
+function observeClose(t, prototype, label, calls) {
+  const original = prototype.close;
+  return t.mock.method(prototype, "close", function (...arguments_) {
+    calls.push({ label, owner: this });
+    return Reflect.apply(original, this, arguments_);
+  });
 }
 
 function invalidationPendingEmployeeState() {
@@ -3630,6 +4055,239 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
   );
   assert.equal(closeFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
   assert.equal(lifecycle.readStatus().complete, false);
+});
+
+async function assertDefaultCodeJobLifecycle(t, { versioned }) {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI composition is Windows x64 only");
+    return;
+  }
+  const fixture = await createOfflineProductionCliFixture(
+    t,
+    versioned
+      ? "versioned-default-code-job-cli"
+      : "default-code-job-cli",
+  );
+  const config = defaultCodeJobConfiguration();
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const observedCloses = [];
+  observeClose(
+    t,
+    SupervisedCliBrainProvider.prototype,
+    "provider",
+    observedCloses,
+  );
+  observeClose(
+    t,
+    CodeJobBrainDirectory.prototype,
+    "directory",
+    observedCloses,
+  );
+  observeClose(
+    t,
+    VersionedCodeJobAuthority.prototype,
+    "authority",
+    observedCloses,
+  );
+  const application = await createApplication(
+    defaultCodeJobApplicationOptions({
+      config,
+      calls,
+      closeCalls,
+      lifecycle,
+      versioned,
+    }),
+  );
+  const previousInvocations = await fixture.invocationNames();
+  const brainDigest = codeJobBrainDigest({
+    roleId: "developer",
+    taskBrain: config.employees.roles.developer.taskBrain,
+    brainProviders: config.brainProviders,
+  });
+  const decisionOutcome = calls.codeJobRuntime.brainDirectory.decide(
+    defaultCodeDecisionInput(),
+    {
+      beforeGenerate: async () => {},
+      brainDigest,
+    },
+  ).then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error }),
+  );
+  const admission = await Promise.race([
+    fixture.waitForStart(previousInvocations).then((invocation) => ({
+      invocation,
+      outcome: null,
+    })),
+    decisionOutcome.then((outcome) => ({ invocation: null, outcome })),
+  ]);
+  assert.ok(admission.invocation, admission.outcome?.error?.stack);
+  const invocation = admission.invocation;
+
+  const firstClose = application.close();
+  assert.strictEqual(application.close(), firstClose);
+  const firstFailure = await within(1_000, firstClose).then(
+    () => null,
+    (error) => error,
+  );
+  assert.equal(firstFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  assert.equal(lifecycle.readStatus().complete, false);
+  assert.deepEqual(
+    observedCloses.map(({ label }) => label),
+    versioned
+      ? ["authority", "directory", "provider"]
+      : ["directory", "provider"],
+  );
+
+  await fixture.release(invocation);
+  const decision = await within(10_000, decisionOutcome);
+  if (versioned) {
+    assert.equal(decision.error?.code, "INVALID_CODE_JOB_AUTHORITY");
+  } else {
+    assert.deepEqual(decision.value?.action, {
+      type: "read_text",
+      path: "src/app.js",
+    });
+  }
+
+  const retry = application.close();
+  assert.strictEqual(application.close(), retry);
+  await within(1_000, retry);
+  const countsAfterRecovery = observedCloses.length;
+  await application.close();
+  assert.equal(observedCloses.length, countsAfterRecovery);
+  for (const label of [
+    "provider",
+    "directory",
+    ...(versioned ? ["authority"] : []),
+  ]) {
+    const callsForOwner = observedCloses.filter((entry) => entry.label === label);
+    assert.equal(callsForOwner.length, 2, label);
+    assert.equal(new Set(callsForOwner.map(({ owner }) => owner)).size, 1, label);
+  }
+  assert.equal(lifecycle.readStatus().complete, true);
+}
+
+test("default non-versioned Code Job owns one real offline CLI lifecycle", async (t) => {
+  await assertDefaultCodeJobLifecycle(t, { versioned: false });
+});
+
+test("default versioned Code Job owns one lazy real offline CLI lifecycle", async (t) => {
+  await assertDefaultCodeJobLifecycle(t, { versioned: true });
+});
+
+test("default Code Job startup failure preserves reverse cleanup evidence", async (t) => {
+  for (const versioned of [false, true]) {
+    const config = defaultCodeJobConfiguration();
+    const calls = {};
+    const closeCalls = [];
+    const observedCloses = [];
+    const lifecycle = createApplicationRuntimeLifecycle();
+    const startupFailure = new Error(
+      versioned
+        ? "versioned startup failed after owner acquisition"
+        : "startup failed after owner acquisition",
+    );
+    const cleanupFailure = new Error("memory cleanup failed once");
+    const acquisitionStop = new Error("stop after lazy owner acquisition");
+    let memoryCloseAttempts = 0;
+    observeClose(
+      t,
+      SupervisedCliBrainProvider.prototype,
+      versioned ? "versioned-provider" : "provider",
+      observedCloses,
+    );
+    observeClose(
+      t,
+      CodeJobBrainDirectory.prototype,
+      versioned ? "versioned-directory" : "directory",
+      observedCloses,
+    );
+    if (versioned) {
+      observeClose(
+        t,
+        VersionedCodeJobAuthority.prototype,
+        "authority",
+        observedCloses,
+      );
+    }
+    const construction = createApplication(defaultCodeJobApplicationOptions({
+      config,
+      calls,
+      closeCalls,
+      lifecycle,
+      versioned,
+      codeJobRuntimeStarted: versioned
+        ? async ({ brainDirectory }) => {
+            const brainDigest = codeJobBrainDigest({
+              roleId: "developer",
+              taskBrain: config.employees.roles.developer.taskBrain,
+              brainProviders: config.brainProviders,
+            });
+            await assert.rejects(
+              brainDirectory.decide(defaultCodeDecisionInput(), {
+                beforeGenerate: async () => { throw acquisitionStop; },
+                brainDigest,
+              }),
+              (error) => error === acquisitionStop,
+            );
+          }
+        : undefined,
+      memoryRuntimeFactory: async () => ({
+        producer: { async append() {}, async appendBatch() {} },
+        lifecycleProducer: {
+          async appendWorkItems() {},
+          async appendGraphEvents() {},
+          async appendProjectionRecords() {},
+          async appendAuthorityProjection() {},
+          async adoptGraphCheckpoint() {},
+        },
+        authorityReader: {
+          async getAuthorityState() {},
+          async getAuthorityProjectionState() {},
+          requiresAuthorityProjectionCheckpoint() { return false; },
+        },
+        search: { async search() {}, async getHealth() {} },
+        contextReader: { async readRecords() {} },
+        receiptVerifier: { async verify(value) { return value; } },
+        async close() {
+          memoryCloseAttempts += 1;
+          closeCalls.push("memory");
+          if (memoryCloseAttempts === 1) throw cleanupFailure;
+        },
+      }),
+      confirmationRuntimeFactory: async () => { throw startupFailure; },
+    }));
+    await assert.rejects(construction, (error) => error === startupFailure);
+    await assert.rejects(lifecycle.close(), (error) => error === cleanupFailure);
+    const failedStatus = lifecycle.readStatus();
+    assert.strictEqual(failedStatus.failure, cleanupFailure);
+    assert.deepEqual(failedStatus.failures, [cleanupFailure]);
+    assert.equal(failedStatus.complete, false);
+    await lifecycle.close();
+    assert.equal(lifecycle.readStatus().complete, true);
+    assert.equal(memoryCloseAttempts, 2);
+    assert.deepEqual(
+      observedCloses.map(({ label }) => label),
+      versioned
+        ? ["authority", "versioned-directory", "versioned-provider"]
+        : ["directory", "provider"],
+    );
+    assert.deepEqual(closeCalls, [
+      "code-job",
+      "memory",
+      "proposals",
+      "attention",
+      "ledger",
+      "workflow",
+      "code-executor",
+      ...(versioned ? ["configuration"] : []),
+      "memory",
+    ]);
+    t.mock.restoreAll();
+  }
 });
 
 test("local code composition keeps CLI authority private from injected factories", async () => {
