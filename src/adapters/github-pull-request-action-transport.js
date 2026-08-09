@@ -533,6 +533,10 @@ function mergeProofBody(input, mergeCommitOid) {
   return `MyDashboard controlled merge proof\n\n${input.marker}\n\n${proof}`;
 }
 
+function expectedReviewEvent(input) {
+  return input.actionType === "comment" ? "COMMENT" : input.action.reviewEvent;
+}
+
 function processFailureCode(error) {
   if (!(error instanceof ManagedProcessError)) return "GITHUB_UNAVAILABLE";
   return {
@@ -695,9 +699,7 @@ class GitHubPullRequestActionTransport {
     ) {
       throw transportError("GITHUB_TARGET_STALE", "absent");
     }
-    if (input.actionType === "comment") {
-      await this.#postComment(input, environment);
-    } else if (input.actionType === "review") {
+    if (["comment", "review"].includes(input.actionType)) {
       await this.#postReview(input, environment);
     } else if (input.actionType === "update_branch") {
       await this.#updateBranch(input, environment);
@@ -829,13 +831,7 @@ class GitHubPullRequestActionTransport {
   }
 
   async #actionEvidence(input, facts, environment, trust) {
-    if (input.actionType === "comment") {
-      return Object.freeze({
-        kind: "marker_records",
-        records: await this.#commentMarkerRecords(input, environment, trust),
-      });
-    }
-    if (input.actionType === "review") {
+    if (["comment", "review"].includes(input.actionType)) {
       return Object.freeze({
         kind: "marker_records",
         records: await this.#reviewMarkerRecords(input, environment, trust),
@@ -878,46 +874,6 @@ class GitHubPullRequestActionTransport {
     throw transportError("GITHUB_PAGINATION_LIMIT", trust);
   }
 
-  async #commentMarkerRecords(input, environment, trust) {
-    const records = await this.#pages(
-      `repos/${input.repository}/issues/${input.pullRequestNumber}/comments`,
-      environment,
-      trust,
-    );
-    const candidates = records.filter(
-      (record) =>
-        typeof record?.body === "string" && record.body.includes(input.marker),
-    );
-    if (candidates.length > MAX_MARKER_RECORDS) {
-      throw transportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown");
-    }
-    const expectedBody = `${input.action.body}\n\n${input.marker}`;
-    try {
-      return Object.freeze(candidates.map((record) => {
-        const actorAccountId = githubLogin(record?.user?.login);
-        if (
-          record.body !== expectedBody ||
-          actorAccountId.toLowerCase() !== input.actorAccountId.toLowerCase()
-        ) {
-          throw transportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown");
-        }
-        return Object.freeze({
-          marker: input.marker,
-          actorAccountId,
-          body: input.action.body,
-          receipt: markerReceipt(
-            record,
-            input,
-            "issuecomment",
-            "created_at",
-          ),
-        });
-      }));
-    } catch {
-      throw transportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown");
-    }
-  }
-
   async #reviewMarkerRecords(input, environment, trust) {
     const records = await this.#pages(
       `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews`,
@@ -932,13 +888,14 @@ class GitHubPullRequestActionTransport {
       throw transportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown");
     }
     const expectedBody = `${input.action.body}\n\n${input.marker}`;
+    const reviewEvent = expectedReviewEvent(input);
     try {
       return Object.freeze(candidates.map((record) => {
         const actorAccountId = githubLogin(record?.user?.login);
         if (
           record.body !== expectedBody ||
           actorAccountId.toLowerCase() !== input.actorAccountId.toLowerCase() ||
-          record.state !== REVIEW_STATES[input.action.reviewEvent] ||
+          record.state !== REVIEW_STATES[reviewEvent] ||
           record.commit_id !== input.action.inputBinding.gitTarget.headRefOid
         ) {
           throw transportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown");
@@ -947,7 +904,7 @@ class GitHubPullRequestActionTransport {
           marker: input.marker,
           actorAccountId,
           body: input.action.body,
-          reviewEvent: input.action.reviewEvent,
+          reviewEvent,
           headOid: record.commit_id,
           receipt: markerReceipt(
             record,
@@ -1049,35 +1006,9 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #postComment(input, environment) {
-    const body = `${input.action.body}\n\n${input.marker}`;
-    const record = await this.#runJson(
-      [
-        "api",
-        "--method",
-        "POST",
-        `repos/${input.repository}/issues/${input.pullRequestNumber}/comments`,
-        "--input",
-        "-",
-      ],
-      { environment, input: JSON.stringify({ body }), trust: "unknown" },
-    );
-    try {
-      if (
-        record?.body !== body ||
-        githubLogin(record?.user?.login).toLowerCase() !==
-          input.actorAccountId.toLowerCase()
-      ) {
-        throw transportError("GITHUB_PROTOCOL_ERROR", "unknown");
-      }
-      markerReceipt(record, input, "issuecomment", "created_at");
-    } catch (error) {
-      throw errorAtTrust(error, "unknown");
-    }
-  }
-
   async #postReview(input, environment) {
     const body = `${input.action.body}\n\n${input.marker}`;
+    const reviewEvent = expectedReviewEvent(input);
     const record = await this.#runJson(
       [
         "api",
@@ -1090,7 +1021,7 @@ class GitHubPullRequestActionTransport {
       {
         environment,
         input: JSON.stringify({
-          event: input.action.reviewEvent,
+          event: reviewEvent,
           body,
           commit_id: input.action.inputBinding.gitTarget.headRefOid,
         }),
@@ -1100,7 +1031,7 @@ class GitHubPullRequestActionTransport {
     try {
       if (
         record?.body !== body ||
-        record?.state !== REVIEW_STATES[input.action.reviewEvent] ||
+        record?.state !== REVIEW_STATES[reviewEvent] ||
         record?.commit_id !== input.action.inputBinding.gitTarget.headRefOid ||
         githubLogin(record?.user?.login).toLowerCase() !==
           input.actorAccountId.toLowerCase()

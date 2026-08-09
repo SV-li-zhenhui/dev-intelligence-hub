@@ -26,6 +26,10 @@ const REVIEW_STATE = Object.freeze({
   COMMENT: "COMMENTED",
 });
 
+function expectedReviewEvent(input) {
+  return input.actionType === "comment" ? "COMMENT" : input.action.reviewEvent;
+}
+
 function proposalAction(type, binding) {
   return {
     comment: { type, body: "Please add a regression test." },
@@ -39,9 +43,13 @@ function proposalAction(type, binding) {
   }[type];
 }
 
-function transportInput(type, binding = pullRequestExternalActionBinding()) {
+function transportInput(
+  type,
+  binding = pullRequestExternalActionBinding(),
+  action = proposalAction(type, binding),
+) {
   const envelope = pullRequestExternalActionEnvelope(
-    pullRequestExternalActionPlan(proposalAction(type, binding), { binding }),
+    pullRequestExternalActionPlan(action, { binding }),
   );
   return {
     credential: CREDENTIAL,
@@ -222,9 +230,11 @@ test("satisfies the executor transport contract through a complete comment cycle
     ),
   );
   const completedRecord = markerRecord(directInput, {
-    kind: "comment",
+    kind: "review",
     id: 91,
     body: `${directInput.action.body}\n\n${directInput.marker}`,
+    state: REVIEW_STATE.COMMENT,
+    commitId: directInput.action.inputBinding.gitTarget.headRefOid,
   });
   const runner = new FakeRunner([
     actorRecord(directInput),
@@ -267,15 +277,13 @@ test("observes exact comment and review marker receipts without exposing URL fra
   for (const type of ["comment", "review"]) {
     const input = transportInput(type);
     const body = `${input.action.body}\n\n${input.marker}`;
-    const isReview = type === "review";
+    const reviewEvent = expectedReviewEvent(input);
     const record = markerRecord(input, {
-      kind: type,
-      id: isReview ? 202 : 101,
+      kind: "review",
+      id: type === "review" ? 202 : 101,
       body,
-      state: isReview ? REVIEW_STATE[input.action.reviewEvent] : undefined,
-      commitId: isReview
-        ? input.action.inputBinding.gitTarget.headRefOid
-        : undefined,
+      state: REVIEW_STATE[reviewEvent],
+      commitId: input.action.inputBinding.gitTarget.headRefOid,
     });
     const runner = new FakeRunner([
       actorRecord(input),
@@ -296,13 +304,11 @@ test("observes exact comment and review marker receipts without exposing URL fra
       `https://github.com/${input.repository}/pull/${input.pullRequestNumber}`,
     );
     assert.equal(evidence.receipt.createdAt, CREATED_AT);
-    if (isReview) {
-      assert.equal(evidence.reviewEvent, input.action.reviewEvent);
-      assert.equal(
-        evidence.headOid,
-        input.action.inputBinding.gitTarget.headRefOid,
-      );
-    }
+    assert.equal(evidence.reviewEvent, reviewEvent);
+    assert.equal(
+      evidence.headOid,
+      input.action.inputBinding.gitTarget.headRefOid,
+    );
   }
 });
 
@@ -377,19 +383,27 @@ test("observes a merge only with matching actor, head, marker, method and receip
   });
 });
 
-test("posts comments and reviews only through fixed endpoints with bodies on stdin", async () => {
-  for (const type of ["comment", "review"]) {
-    const input = transportInput(type);
+test("posts comments and all explicit reviews as exact Head-bound reviews with bodies on stdin", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const inputs = [
+    transportInput("comment", binding),
+    ...[
+      ["approve", "Approve this change."],
+      ["request_changes", "Please revise this change."],
+      ["comment", "This is an explicit review comment."],
+    ].map(([verdict, body]) =>
+      transportInput("review", binding, { type: "review", verdict, body })
+    ),
+  ];
+  for (const input of inputs) {
     const body = `${input.action.body}\n\n${input.marker}`;
-    const isReview = type === "review";
+    const reviewEvent = expectedReviewEvent(input);
     const response = markerRecord(input, {
-      kind: type,
-      id: isReview ? 502 : 501,
+      kind: "review",
+      id: input.actionType === "review" ? 502 : 501,
       body,
-      state: isReview ? REVIEW_STATE[input.action.reviewEvent] : undefined,
-      commitId: isReview
-        ? input.action.inputBinding.gitTarget.headRefOid
-        : undefined,
+      state: REVIEW_STATE[reviewEvent],
+      commitId: input.action.inputBinding.gitTarget.headRefOid,
     });
     const runner = new FakeRunner([
       actorRecord(input),
@@ -405,14 +419,133 @@ test("posts comments and reviews only through fixed endpoints with bodies on std
     assert.equal(mutation.args.includes("POST"), true);
     assert.equal(mutation.args.includes("--input"), true);
     assert.equal(mutation.args.includes(body), false);
-    assert.deepEqual(JSON.parse(mutation.input), isReview
-      ? {
-          event: input.action.reviewEvent,
-          body,
-          commit_id: input.action.inputBinding.gitTarget.headRefOid,
-        }
-      : { body });
+    assert.equal(
+      mutation.args.includes(
+        `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews`,
+      ),
+      true,
+    );
+    assert.equal(
+      mutation.args.includes(
+        `repos/${input.repository}/issues/${input.pullRequestNumber}/comments`,
+      ),
+      false,
+    );
+    assert.deepEqual(JSON.parse(mutation.input), {
+      event: reviewEvent,
+      body,
+      commit_id: input.action.inputBinding.gitTarget.headRefOid,
+    });
+    assert.equal(
+      input.action.type,
+      input.actionType === "comment"
+        ? "pull_request_comment"
+        : "pull_request_review",
+    );
     assertSafeGhCalls(runner.calls);
+  }
+});
+
+test("binds a comment to confirmed H1 when Head changes after the final preflight", async () => {
+  const input = transportInput("comment");
+  const confirmedHead = input.action.inputBinding.gitTarget.headRefOid;
+  const nextHead = externalActionOid("9");
+  const body = `${input.action.body}\n\n${input.marker}`;
+  let currentHead = confirmedHead;
+  const runner = new FakeRunner([
+    actorRecord(input),
+    () => {
+      const preflight = pullRequestRecord(input, { headOid: currentHead });
+      currentHead = nextHead;
+      return preflight;
+    },
+    (call) => {
+      const usesReviewEndpoint = call.args.includes(
+        `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews`,
+      );
+      return markerRecord(input, {
+        kind: usesReviewEndpoint ? "review" : "comment",
+        id: 503,
+        body,
+        state: usesReviewEndpoint ? REVIEW_STATE.COMMENT : undefined,
+        commitId: usesReviewEndpoint ? confirmedHead : undefined,
+      });
+    },
+  ]);
+
+  assert.deepEqual(await actionTransport(runner).perform(input), {
+    accepted: true,
+  });
+
+  assert.equal(currentHead, nextHead);
+  const mutation = runner.calls.at(-1);
+  assert.equal(
+    mutation.args.includes(
+      `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews`,
+    ),
+    true,
+  );
+  assert.equal(
+    runner.calls.some((call) =>
+      call.args.includes(
+        `repos/${input.repository}/issues/${input.pullRequestNumber}/comments`,
+      )
+    ),
+    false,
+  );
+  assert.deepEqual(JSON.parse(mutation.input), {
+    event: "COMMENT",
+    body,
+    commit_id: confirmedHead,
+  });
+});
+
+test("never accepts issue-comment, Head-less, wrong-event, or wrong-Head comment evidence", async () => {
+  const input = transportInput("comment");
+  const body = `${input.action.body}\n\n${input.marker}`;
+  const records = [
+    markerRecord(input, { kind: "comment", id: 801, body }),
+    markerRecord(input, {
+      kind: "review",
+      id: 802,
+      body,
+      state: REVIEW_STATE.COMMENT,
+    }),
+    markerRecord(input, {
+      kind: "review",
+      id: 803,
+      body,
+      state: REVIEW_STATE.APPROVE,
+      commitId: input.action.inputBinding.gitTarget.headRefOid,
+    }),
+    markerRecord(input, {
+      kind: "review",
+      id: 804,
+      body,
+      state: REVIEW_STATE.COMMENT,
+      commitId: externalActionOid("9"),
+    }),
+  ];
+
+  for (const record of records) {
+    const runner = new FakeRunner([
+      actorRecord(input),
+      pullRequestRecord(input),
+      [record],
+    ]);
+
+    await assert.rejects(
+      actionTransport(runner).observe(input),
+      assertTransportError("GITHUB_COMPLETION_PROOF_CONFLICT", "unknown"),
+    );
+    assert.equal(
+      runner.calls.at(-1).args.some((argument) =>
+        argument.startsWith(
+          `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews?`,
+        )
+      ),
+      true,
+    );
   }
 });
 
@@ -731,9 +864,11 @@ test("treats malformed or conflicting marker evidence as unknown, never absent",
     actorRecord(input),
     pullRequestRecord(input),
     [markerRecord(input, {
-      kind: "comment",
+      kind: "review",
       id: 700,
       body: `different body\n\n${input.marker}`,
+      state: REVIEW_STATE.COMMENT,
+      commitId: input.action.inputBinding.gitTarget.headRefOid,
     })],
   ]);
 

@@ -26,6 +26,7 @@ const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const STABLE_CODE = /^[A-Z][A-Z0-9_]{2,63}$/u;
 const CREDENTIAL = /^[^\s\u0000-\u001f\u007f]{1,4096}$/u;
 const MARKER = /^<!-- mydashboard-action:v1:[a-f0-9]{64} -->$/u;
+const REVIEW_EVENTS = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
 
 export class PullRequestExternalActionTransportError extends Error {
   constructor(code = "GITHUB_UNAVAILABLE", trust = "unknown", options) {
@@ -126,26 +127,24 @@ function normalizeReceipt(value) {
   }
 }
 
-function normalizeMarkerRecord(value, actionType, oidLength) {
-  const review = actionType === "pull_request_review";
+function normalizeMarkerRecord(value, oidLength) {
   exact(
     value,
-    review
-      ? [
-          "marker",
-          "actorAccountId",
-          "body",
-          "reviewEvent",
-          "headOid",
-          "receipt",
-        ]
-      : ["marker", "actorAccountId", "body", "receipt"],
+    [
+      "marker",
+      "actorAccountId",
+      "body",
+      "reviewEvent",
+      "headOid",
+      "receipt",
+    ],
     "marker record",
   );
   if (
     typeof value.marker !== "string" ||
     !MARKER.test(value.marker) ||
-    typeof value.body !== "string"
+    typeof value.body !== "string" ||
+    !REVIEW_EVENTS.has(value.reviewEvent)
   ) {
     throw new PullRequestExternalActionTransportError(
       "GITHUB_PROTOCOL_ERROR",
@@ -156,12 +155,8 @@ function normalizeMarkerRecord(value, actionType, oidLength) {
     marker: value.marker,
     actorAccountId: githubLogin(value.actorAccountId),
     body: value.body,
-    ...(review
-      ? {
-          reviewEvent: value.reviewEvent,
-          headOid: gitOid(value.headOid, oidLength),
-        }
-      : {}),
+    reviewEvent: value.reviewEvent,
+    headOid: gitOid(value.headOid, oidLength),
     receipt: normalizeReceipt(value.receipt),
   };
 }
@@ -179,7 +174,7 @@ function normalizeActionEvidence(value, envelope, oidLength) {
     return {
       kind: "marker_records",
       records: denseArray(value.records, 10, "actionEvidence.records").map(
-        (record) => normalizeMarkerRecord(record, actionType, oidLength),
+        (record) => normalizeMarkerRecord(record, oidLength),
       ),
     };
   }
@@ -336,13 +331,15 @@ function markerRecordResult(envelope, observation, marker) {
   const records = observation.actionEvidence.records;
   if (records.length === 0) return null;
   const expected = envelope.action;
+  const reviewEvent = expected.type === "pull_request_comment"
+    ? "COMMENT"
+    : expected.reviewEvent;
   const matches = records.filter((record) =>
     record.marker === marker &&
     record.actorAccountId.toLowerCase() === envelope.actor.accountId.toLowerCase() &&
     record.body === expected.body &&
-    (expected.type !== "pull_request_review" ||
-      (record.reviewEvent === expected.reviewEvent &&
-        record.headOid === expected.inputBinding.gitTarget.headRefOid))
+    record.reviewEvent === reviewEvent &&
+    record.headOid === expected.inputBinding.gitTarget.headRefOid
   );
   if (records.length !== 1 || matches.length !== 1) {
     return errorResult(

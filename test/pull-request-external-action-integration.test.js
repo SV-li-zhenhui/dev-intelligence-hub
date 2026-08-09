@@ -76,6 +76,8 @@ function completedObservation(input) {
       marker: input.marker,
       actorAccountId: input.actorAccountId,
       body: action.body,
+      reviewEvent: "COMMENT",
+      headOid: action.inputBinding.gitTarget.headRefOid,
       receipt: { id: "comment-42" },
     }];
   } else if (action.type === "pull_request_review") {
@@ -110,7 +112,11 @@ function completedObservation(input) {
   return observation;
 }
 
-function fakeTransport({ loseResponseFor = [] } = {}) {
+function fakeTransport({
+  loseResponseFor = [],
+  advanceHeadAfterMutationFor = [],
+  afterMutation = () => {},
+} = {}) {
   const observations = new Map();
   const lost = new Set();
   const calls = [];
@@ -124,7 +130,12 @@ function fakeTransport({ loseResponseFor = [] } = {}) {
     },
     async perform(input) {
       calls.push({ method: "perform", input: structuredClone(input) });
-      observations.set(input.marker, completedObservation(input));
+      const completed = completedObservation(input);
+      if (advanceHeadAfterMutationFor.includes(input.actionType)) {
+        completed.gitTarget.headRefOid = externalActionOid("9");
+      }
+      observations.set(input.marker, completed);
+      afterMutation(structuredClone(input));
       if (loseResponseFor.includes(input.actionType) && !lost.has(input.marker)) {
         lost.add(input.marker);
         throw new PullRequestExternalActionTransportError(
@@ -137,7 +148,7 @@ function fakeTransport({ loseResponseFor = [] } = {}) {
   };
 }
 
-function executorFor(binding, evidence, transport) {
+function executorFor(binding, evidence, transport, overrides = {}) {
   return createPullRequestExternalActionExecutor({
     enabledActions: ACTIONS,
     credentialProvider: () => "fake-runtime-secret",
@@ -151,6 +162,7 @@ function executorFor(binding, evidence, transport) {
         return structuredClone(evidence);
       },
     },
+    ...overrides,
   });
 }
 
@@ -191,9 +203,20 @@ test("five PR actions are displayed and approved one at a time", async () => {
   for (const plan of plans) await queue.enqueue(plan);
 
   const seen = new Set();
+  const seenActionTypes = new Set();
+  const seenKinds = new Set();
   for (let index = 0; index < plans.length; index += 1) {
     const next = await queue.next();
     assert.ok(next.item);
+    const displayedActionType = next.item.display.payload.action.type;
+    seenActionTypes.add(displayedActionType);
+    seenKinds.add(next.item.kind);
+    if (displayedActionType === "pull_request_comment") {
+      assert.equal(next.item.kind, "github.pull-request-comment");
+    }
+    if (displayedActionType === "pull_request_review") {
+      assert.equal(next.item.kind, "github.work-proposal-review");
+    }
     assert.equal(seen.has(next.item.id), false);
     assert.deepEqual(
       Object.keys(next.item.display.payload).sort(),
@@ -212,17 +235,36 @@ test("five PR actions are displayed and approved one at a time", async () => {
 
   assert.equal((await queue.next()).item, null);
   assert.equal(seen.size, 5);
+  assert.equal(seenActionTypes.has("pull_request_comment"), true);
+  assert.equal(seenActionTypes.has("pull_request_review"), true);
+  assert.equal(seenKinds.has("github.pull-request-comment"), true);
   assert.equal(
     transport.calls.filter(({ method }) => method === "perform").length,
     5,
   );
 });
 
-test("lost mutation response is recovered after restart without replay", async () => {
+test("lost H1-bound comment response is recovered at H2 without replay", async () => {
   const binding = pullRequestExternalActionBinding();
   const evidence = externalActionControlledCommit(binding);
-  const transport = fakeTransport({ loseResponseFor: ["comment"] });
-  const executor = executorFor(binding, evidence, transport);
+  let authorityCurrent = true;
+  let authorityChecks = 0;
+  const transport = fakeTransport({
+    loseResponseFor: ["comment"],
+    advanceHeadAfterMutationFor: ["comment"],
+    afterMutation() {
+      authorityCurrent = false;
+    },
+  });
+  const executor = executorFor(binding, evidence, transport, {
+    inputAuthorityVerifier: {
+      async verify() {
+        authorityChecks += 1;
+        if (!authorityCurrent) throw new Error("H1 authority revoked at H2");
+        return structuredClone(binding);
+      },
+    },
+  });
   const store = new MemoryStore();
   const firstQueue = await readyQueue(store, executor);
   await firstQueue.enqueue(pullRequestExternalActionQueuePlan(
@@ -236,13 +278,20 @@ test("lost mutation response is recovered after restart without replay", async (
   assert.equal(unknown.failure.outcome, "unknown");
   assert.equal(unknown.retryable, false);
   assert.equal((await firstQueue.next()).item, null);
+  const checksBeforeRecovery = authorityChecks;
 
   const recoveredQueue = await readyQueue(store, executor);
   const recovered = await recoveredQueue.get(unknown.id);
   assert.equal(recovered.status, "completed");
   assert.equal(recovered.receipt.id, "comment-42");
+  assert.equal(authorityChecks, checksBeforeRecovery);
   assert.equal(
     transport.calls.filter(({ method }) => method === "perform").length,
     1,
+  );
+  const [mutation] = transport.calls.filter(({ method }) => method === "perform");
+  assert.equal(
+    mutation.input.action.inputBinding.gitTarget.headRefOid,
+    binding.gitTarget.headRefOid,
   );
 });

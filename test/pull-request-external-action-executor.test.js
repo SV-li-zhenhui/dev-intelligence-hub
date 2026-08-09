@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { pullRequestExternalActionMarker } from "../src/domain/pull-request-external-action.js";
 import {
   PullRequestExternalActionTransportError,
   createPullRequestExternalActionExecutor,
@@ -69,6 +70,8 @@ function completedObservation(envelope, marker) {
       marker,
       actorAccountId: envelope.actor.accountId,
       body: envelope.action.body,
+      reviewEvent: "COMMENT",
+      headOid: envelope.action.inputBinding.gitTarget.headRefOid,
       receipt: receipt("101", "pull/42"),
     }];
     return current;
@@ -110,7 +113,10 @@ function completedObservation(envelope, marker) {
   return current;
 }
 
-function mutableTransport(envelope, { loseResponse = false } = {}) {
+function mutableTransport(
+  envelope,
+  { loseResponse = false, headAfterMutation = null } = {},
+) {
   let observation = observationFor(envelope);
   const calls = [];
   return {
@@ -125,6 +131,9 @@ function mutableTransport(envelope, { loseResponse = false } = {}) {
     async perform(input) {
       calls.push({ method: "perform", input: structuredClone(input) });
       observation = completedObservation(envelope, input.marker);
+      if (headAfterMutation !== null) {
+        observation.gitTarget.headRefOid = headAfterMutation;
+      }
       if (loseResponse) {
         throw new PullRequestExternalActionTransportError(
           "GITHUB_RESPONSE_LOST",
@@ -239,6 +248,85 @@ test("a lost mutation response is unknown until reconciliation proves already", 
       type,
     );
   }
+});
+
+test("a lost H1 comment acknowledgement reconciles at H2 without replay", async () => {
+  const envelope = envelopeFor("comment");
+  const confirmedHead = envelope.action.inputBinding.gitTarget.headRefOid;
+  const nextHead = externalActionOid("9");
+  const transport = mutableTransport(envelope, {
+    loseResponse: true,
+    headAfterMutation: nextHead,
+  });
+  let revoked = false;
+  let authorityChecks = 0;
+  const executor = executorFor(envelope, transport, {
+    inputAuthorityVerifier: {
+      async verify() {
+        authorityChecks += 1;
+        if (revoked) throw new Error("H1 authority was revoked at H2");
+        return structuredClone(envelope.action.inputBinding);
+      },
+    },
+  });
+
+  assert.deepEqual(await executor.execute(envelope), {
+    status: "error",
+    error: { code: "GITHUB_RESPONSE_LOST", trust: "unknown" },
+  });
+  revoked = true;
+  const checksBeforeRecovery = authorityChecks;
+
+  assert.equal((await executor.reconcile(envelope)).status, "already");
+  assert.equal((await executor.reconcile(envelope)).status, "already");
+  assert.equal(authorityChecks, checksBeforeRecovery);
+  const mutations = transport.calls.filter(({ method }) => method === "perform");
+  assert.equal(mutations.length, 1);
+  assert.equal(
+    mutations[0].input.action.inputBinding.gitTarget.headRefOid,
+    confirmedHead,
+  );
+});
+
+test("issue-comment-shaped or Head-less marker evidence cannot complete a comment", async () => {
+  const envelope = envelopeFor("comment");
+  const marker = pullRequestExternalActionMarker(envelope);
+  const transport = mutableTransport(envelope);
+  const headless = completedObservation(envelope, marker);
+  delete headless.actionEvidence.records[0].reviewEvent;
+  delete headless.actionEvidence.records[0].headOid;
+  headless.actionEvidence.records[0].receipt.id = "issue-comment-101";
+  transport.setObservation(headless);
+
+  assert.deepEqual(await executorFor(envelope, transport).reconcile(envelope), {
+    status: "error",
+    error: { code: "GITHUB_PROTOCOL_ERROR", trust: "unknown" },
+  });
+  assert.equal(transport.calls.some(({ method }) => method === "perform"), false);
+});
+
+test("H1 review evidence cannot establish H2 comment authority", async () => {
+  const h1 = externalActionOid("2");
+  const h2 = externalActionOid("9");
+  const binding = pullRequestExternalActionBinding({
+    headRefOid: h2,
+    gitTarget: { headRefOid: h2 },
+  });
+  const envelope = envelopeFor("comment", binding);
+  const marker = pullRequestExternalActionMarker(envelope);
+  const transport = mutableTransport(envelope);
+  const mismatched = completedObservation(envelope, marker);
+  mismatched.actionEvidence.records[0].headOid = h1;
+  transport.setObservation(mismatched);
+
+  assert.deepEqual(await executorFor(envelope, transport).reconcile(envelope), {
+    status: "error",
+    error: {
+      code: "GITHUB_COMPLETION_PROOF_CONFLICT",
+      trust: "unknown",
+    },
+  });
+  assert.equal(transport.calls.some(({ method }) => method === "perform"), false);
 });
 
 test("stale target or authority never performs an external action", async () => {
