@@ -835,6 +835,8 @@ function completedObservation(input) {
       marker: input.marker,
       actorAccountId: input.actorAccountId,
       body: action.body,
+      reviewEvent: "COMMENT",
+      headOid: action.inputBinding.gitTarget.headRefOid,
       receipt: { id: "comment-mirror-42" },
     }];
   } else if (action.type === "pull_request_review") {
