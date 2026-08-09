@@ -442,7 +442,7 @@ function orchestratorDecision(context, state) {
       return decompose(context, {
         childKey: "head-two-stale-push",
         title: "Reject old controlled commit",
-        capability: "development",
+        capability: "pr-review",
         acceptanceContract: actionContract(),
       });
     }
@@ -462,7 +462,7 @@ function orchestratorDecision(context, state) {
       return decompose(context, {
         childKey: "head-two-merge",
         title: "Merge verified Head 2",
-        capability: "development",
+        capability: "pr-review",
         acceptanceContract: actionContract(),
       });
     }
@@ -518,7 +518,7 @@ function orchestratorDecision(context, state) {
     return decompose(context, {
       childKey: "forged-push",
       title: "Reject forged controlled commit",
-      capability: "development",
+      capability: "pr-review",
       dependsOn: [verification],
       acceptanceContract: actionContract(),
     });
@@ -528,7 +528,7 @@ function orchestratorDecision(context, state) {
       return decompose(context, {
         childKey: `external-${action}`,
         title,
-        capability: "development",
+        capability: "pr-review",
         dependsOn: [verification],
         acceptanceContract: actionContract(),
       });
@@ -611,6 +611,13 @@ function roleDecision(model, context, state) {
     }
     return codeAction("verify", "Verify the fixed PR Head with the sealed profile.");
   }
+  if (model === "routine-developer") {
+    assert.equal(title, "Resolve mirrored conflict");
+    if (context.code?.decisionContext?.source === "proposal") {
+      return submitDelivery(context, "implementation", "change-package");
+    }
+    return codeAction("modify", "Resolve only the prepared conflict path.");
+  }
   assert.equal(model, "routine-pr-engineer");
   if (context.requirements.currentTask.parentTaskId === null) {
     return workDecision({
@@ -622,12 +629,6 @@ function roleDecision(model, context, state) {
       brief: "Plan and coordinate the mirrored conflict through verified delivery.",
       evidence: ["exact PR source binding admitted by the PR engineer"],
     });
-  }
-  if (title === "Resolve mirrored conflict") {
-    if (context.code?.decisionContext?.source === "proposal") {
-      return submitDelivery(context, "implementation", "change-package");
-    }
-    return codeAction("modify", "Resolve only the prepared conflict path.");
   }
   if (title === "Reject forged controlled commit") {
     return externalAction(
@@ -787,7 +788,7 @@ function createBrainFetch(state) {
       context: structuredClone(userContext),
     });
     let response;
-    if (body.model === "strong-code-model") {
+    if (body.model.startsWith("strong-")) {
       response = userContext.requirements
         ? roleDecision(
             `routine-${userContext.requirements.roleId}`,
@@ -943,7 +944,7 @@ function role({ model, intents, taskBrain = false, workerId }) {
       ? {
           taskBrain: {
             provider: "strong",
-            model: "strong-code-model",
+            model: `strong-${model}`,
             remoteData: { requirements: true, code: true, memory: false },
           },
         }
@@ -994,13 +995,14 @@ function applicationConfig(fixture, gitCommand) {
         version: 2,
         capabilityRoles: {
           coordination: "orchestrator",
-          development: "pr-engineer",
+          development: "developer",
           testing: "tester",
+          "pr-review": "pr-engineer",
         },
         githubReviewRoles: ["pr-engineer"],
-        codeActionRoles: ["pr-engineer", "tester"],
+        codeActionRoles: ["developer", "tester"],
         codeOperationsByRole: {
-          "pr-engineer": ["modify"],
+          developer: ["modify"],
           tester: ["verify"],
         },
         workspaceByRepository: {
@@ -1091,11 +1093,19 @@ function applicationConfig(fixture, gitCommand) {
             "complete",
           ],
           taskBrain: true,
+          workerId: "employee-pr-engineer",
+        }),
+        developer: role({
+          model: "routine-developer",
+          intents: ["propose_code_action", "submit_delivery", "complete"],
+          taskBrain: true,
+          workerId: "employee-developer",
         }),
         tester: role({
           model: "routine-tester",
           intents: ["propose_code_action", "submit_delivery", "complete"],
           taskBrain: true,
+          workerId: "employee-tester",
         }),
       },
     },
@@ -1232,6 +1242,29 @@ test(
       now += 60_000;
     };
     const config = applicationConfig(fixture, gitCommand);
+    assert.equal(
+      config.workCoordination.policy.capabilityRoles.development,
+      "developer",
+    );
+    assert.equal(
+      config.workCoordination.policy.capabilityRoles["pr-review"],
+      "pr-engineer",
+    );
+    const developerRole = config.employees.roles.developer;
+    const prEngineerRole = config.employees.roles["pr-engineer"];
+    const testerRole = config.employees.roles.tester;
+    assert.ok(developerRole);
+    assert.notEqual(developerRole.workerId, prEngineerRole.workerId);
+    assert.notEqual(developerRole.taskBrain.model, prEngineerRole.taskBrain.model);
+    assert.notEqual(developerRole.workerId, testerRole.workerId);
+    assert.notEqual(developerRole.taskBrain.model, testerRole.taskBrain.model);
+    assert.deepEqual(config.workCoordination.policy.githubReviewRoles, [
+      "pr-engineer",
+    ]);
+    assert.deepEqual(config.workCoordination.policy.codeActionRoles, [
+      "developer",
+      "tester",
+    ]);
     const brainFetch = createBrainFetch(state);
     let application = null;
     let proposalRuntime = null;
@@ -1355,7 +1388,7 @@ test(
     await runRole("orchestrator");
     const headOneConsultation = await answerOwnerConsultation(fixture.headOne);
     await runRole("orchestrator");
-    await runRole("pr-engineer");
+    await runRole("developer");
     await runHousekeeping();
     let next = await application.confirmationQueue.next();
     assert.equal(next.pendingCount, 1);
@@ -1396,20 +1429,20 @@ test(
     );
     assert.equal(
       state.brainCalls
-        .filter(({ model }) => model === "strong-code-model")
+        .filter(({ model }) => model.startsWith("strong-"))
         .every(({ url }) =>
           url === "https://ark.example/api/coding/v3/chat/completions"),
       true,
     );
     assert.equal(
       state.brainCalls.some(({ model, context }) =>
-        model === "strong-code-model" &&
-        context.requirements?.roleId === "pr-engineer"),
+        model === "strong-routine-developer" &&
+        context.requirements?.roleId === "developer"),
       true,
     );
     assert.equal(sandbox.runs.length, 1);
 
-    await runRole("pr-engineer");
+    await runRole("developer");
     await runRole("orchestrator");
     await runRole("orchestrator");
     await runRole("tester");
@@ -1969,6 +2002,7 @@ test(
       assignments: await application.workflowRouting.listAssignments({ limit: 50 }),
       graph: await application.workGraphView.getSnapshot(),
       ledger: await application.workLedgerView.listItems({ limit: 50 }),
+      timeline: await application.workLedgerView.listTimeline({ limit: 200 }),
       confirmationHistory: await application.confirmationQueue.historyReader.list({
         limit: 50,
       }),
@@ -1988,6 +2022,100 @@ test(
         directorySnapshot(fixture.headMirrorRoot),
       ]),
     };
+    const graphTaskByTitle = (title) => {
+      const taskState = stateBeforeFinalArchive.graph.taskStates.find(
+        ({ work }) => work.title === title,
+      );
+      assert.ok(taskState, `missing persisted graph task state for ${title}`);
+      const task = stateBeforeFinalArchive.graph.graph.tasks.find(
+        ({ taskId }) => taskId === taskState.taskId,
+      );
+      assert.ok(task, `missing persisted graph task for ${title}`);
+      return { task, taskState };
+    };
+    const rootTask = graphTaskByTitle("Resolve the mirrored conflict");
+    const resolvedConflict = graphTaskByTitle("Resolve mirrored conflict");
+    const verifiedResolution = graphTaskByTitle("Verify mirrored resolution");
+    assert.deepEqual(rootTask.task.responsibility, {
+      type: "role",
+      id: "orchestrator",
+    });
+    assert.deepEqual(resolvedConflict.task.responsibility, {
+      type: "role",
+      id: "developer",
+    });
+    assert.deepEqual(
+      resolvedConflict.task.deliveries.map(({ status }) => status),
+      ["submitted", "accepted"],
+    );
+    assert.deepEqual(verifiedResolution.task.responsibility, {
+      type: "role",
+      id: "tester",
+    });
+    assert.deepEqual(verifiedResolution.task.dependsOn, [
+      resolvedConflict.task.taskId,
+    ]);
+    assert.deepEqual(
+      verifiedResolution.task.deliveries.map(({ status }) => status),
+      ["submitted", "accepted"],
+    );
+    for (const title of [
+      "Reject forged controlled commit",
+      ...ACTION_TITLES.map(([actionTitle]) => actionTitle),
+      "Reject old controlled commit",
+      "Merge verified Head 2",
+    ]) {
+      assert.deepEqual(graphTaskByTitle(title).task.responsibility, {
+        type: "role",
+        id: "pr-engineer",
+      });
+    }
+    assert.equal(resolvedConflict.taskState.statusReason, "pr_head_superseded");
+    assert.equal(verifiedResolution.taskState.statusReason, "pr_head_superseded");
+    const timelineFor = (taskId) => stateBeforeFinalArchive.timeline.items
+      .filter((entry) => entry.itemId === taskId);
+    const initialHandoff = timelineFor(rootTask.task.taskId).find(
+      ({ type }) => type === "handed_off",
+    );
+    assert.deepEqual(initialHandoff.details.fromTarget, {
+      type: "role",
+      id: "pr-engineer",
+    });
+    assert.deepEqual(initialHandoff.details.toTarget, {
+      type: "role",
+      id: "orchestrator",
+    });
+    for (const { task, expectedActorId } of [
+      { task: resolvedConflict.task, expectedActorId: "employee-developer" },
+      { task: verifiedResolution.task, expectedActorId: "employee-tester" },
+    ]) {
+      const taskTimeline = timelineFor(task.taskId);
+      assert.equal(
+        taskTimeline.some(({ type, actorId }) =>
+          type === "claimed" && actorId === expectedActorId),
+        true,
+      );
+      assert.equal(
+        taskTimeline.some(({ type }) => type === "graph_delivery_submitted"),
+        true,
+      );
+      assert.equal(
+        taskTimeline.some(({ type, actorId }) =>
+          type === "graph_delivery_accepted" &&
+          actorId === "employee-orchestrator"),
+        true,
+      );
+    }
+    assert.equal(
+      new Set(stateBeforeFinalArchive.confirmationHistory.items.map(
+        ({ id }) => id,
+      )).size,
+      stateBeforeFinalArchive.confirmationHistory.items.length,
+    );
+    assert.deepEqual(
+      stateBeforeFinalArchive.confirmationHistory.roleIdFacets,
+      ["developer", "pr-engineer", "tester"],
+    );
     await application.close();
     const finalCompaction = await archiveTerminalJobs({
       statePath: path.join(dataRoot, "state"),
@@ -2029,6 +2157,10 @@ test(
     assert.deepEqual(
       await application.workLedgerView.listItems({ limit: 50 }),
       stateBeforeFinalArchive.ledger,
+    );
+    assert.deepEqual(
+      await application.workLedgerView.listTimeline({ limit: 200 }),
+      stateBeforeFinalArchive.timeline,
     );
     assert.deepEqual(
       await application.confirmationQueue.historyReader.list({ limit: 50 }),
@@ -2164,7 +2296,7 @@ test(
     );
     const prContexts = state.brainCalls
       .filter(({ model, context }) =>
-        model === "strong-code-model" &&
+        model === "strong-routine-pr-engineer" &&
         context.requirements?.roleId === "pr-engineer")
       .map(({ context }) => context.code?.pullRequest)
       .filter(Boolean);
