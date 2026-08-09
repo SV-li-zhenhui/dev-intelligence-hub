@@ -11,7 +11,6 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -56,11 +55,14 @@ async function createValidationFixture(t) {
   for (const relativePath of [
     "scripts/system-live-validation.mjs",
     "scripts/system-ui-artifact-receipt.mjs",
+    "scripts/system-validation-command.mjs",
     "scripts/system-validation-materialization.mjs",
     "scripts/system-validation-provenance.mjs",
     "scripts/validate-system.mjs",
     "src/adapters/git-object-snapshotter.js",
     "src/domain/code-execution-policy.js",
+    "src/lib/line-buffer.js",
+    "src/lib/managed-process.js",
     "src/lib/repository-source-state.js",
     "src/lib/runtime-source-identity.js",
   ]) {
@@ -69,6 +71,33 @@ async function createValidationFixture(t) {
       await readFile(path.join(projectRoot, relativePath)),
     );
   }
+  await writeFile(
+    path.join(root, "scripts/system-live-validation.mjs"),
+    [
+      "import { computeVersionedRuntimeSourceIdentity } from '../src/lib/runtime-source-identity.js';",
+      "let verificationCount = 0;",
+      "function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }",
+      "export async function verifyLiveDashboard({ expectedRuntimeSource, expectedLiveService = null }) {",
+      "  verificationCount += 1;",
+      "  const runtimeSource = await computeVersionedRuntimeSourceIdentity(process.cwd());",
+      "  if (!same(runtimeSource, expectedRuntimeSource)) throw new Error('fixture runtime source mismatch');",
+      "  const service = {",
+      "    processId: 2468,",
+      "    instanceId: '12345678-1234-4123-8123-123456789abc',",
+      "    startIdentity: 'd'.repeat(64),",
+      "    runtimeSource,",
+      "  };",
+      "  if (expectedLiveService !== null && !same(service, expectedLiveService)) {",
+      "    throw new Error('fixture live service mismatch');",
+      "  }",
+      "  if (process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && expectedLiveService !== null && verificationCount > 1) {",
+      "    throw new Error('live dashboard process identity changed during UI validation');",
+      "  }",
+      "  return service;",
+      "}",
+      "",
+    ].join("\n"),
+  );
   await writeFile(path.join(root, ".gitignore"), "validation-artifacts/\n");
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
   await writeFile(
@@ -76,42 +105,6 @@ async function createValidationFixture(t) {
     await readFile(
       path.join(projectRoot, "test-support/system-ui-validation-fixture.mjs"),
     ),
-  );
-  await writeFile(
-    path.join(root, "test-support/live-fetch-preload.mjs"),
-    [
-      "import { computeVersionedRuntimeSourceIdentity } from '../src/lib/runtime-source-identity.js';",
-      "const source = await computeVersionedRuntimeSourceIdentity(process.cwd());",
-      "let liveRequestCount = 0;",
-      "globalThis.fetch = async (url) => ({",
-      "  ok: true,",
-      "  status: 200,",
-      "  async json() {",
-      "    if (String(url).endsWith('/api/live')) {",
-      "      liveRequestCount += 1;",
-      "      const replacement = process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && liveRequestCount > 1;",
-      "      return {",
-      "        schemaVersion: 1,",
-      "        live: true,",
-      "        service: 'mydashboard',",
-      "        processId: replacement ? 9753 : 2468,",
-      "        managed: true,",
-      "        lifecycleState: 'running',",
-      "        instanceId: replacement ? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' : '12345678-1234-4123-8123-123456789abc',",
-      "        startIdentity: (replacement ? 'e' : 'd').repeat(64),",
-      "        runtimeSource: source,",
-      "      };",
-      "    }",
-      "    return {",
-      "      ok: true,",
-      "      service: 'mydashboard',",
-      "      processId: process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && liveRequestCount > 1 ? 9753 : 2468,",
-      "      runtimeSource: source,",
-      "    };",
-      "  },",
-      "});",
-      "",
-    ].join("\n"),
   );
   await writeFile(
     path.join(root, "test/smoke.test.js"),
@@ -122,7 +115,8 @@ async function createValidationFixture(t) {
       "test('fixture passes', () => {});",
       "test('fixture skip', { skip: 'fixture reason' }, () => {});",
       "test('validation reporter options stay outside tested processes', () => {",
-      "  assert.equal(process.env.NODE_OPTIONS?.includes('--test-reporter') ?? false, false);",
+      "  assert.equal(process.env.NODE_OPTIONS, undefined);",
+      "  assert.equal(process.env.NODE_PATH, undefined);",
       "});",
       "test('validation commands execute from a detached materialized source', () => {",
       "  assert.equal(existsSync('.git'), false);",
@@ -142,6 +136,14 @@ async function createValidationFixture(t) {
     type: "module",
     files: ["scripts/", "src/"],
     scripts: { test: "node --test test/smoke.test.js" },
+  }, null, 2)}\n`);
+  await writeFile(path.join(root, "package-lock.json"), `${JSON.stringify({
+    name: "validation-fixture",
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      "": { name: "validation-fixture" },
+    },
   }, null, 2)}\n`);
   await git(root, "add", ".");
   await git(root, "commit", "--quiet", "-m", "validation fixture");
@@ -280,6 +282,28 @@ test("acceptance detects an A-to-B-to-A HEAD transition through the reflog", asy
   );
 });
 
+test("the system validator rejects inherited Node execution hooks", async (t) => {
+  const root = await createValidationFixture(t);
+
+  await assert.rejects(
+    execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...validationEnvironment(),
+        NODE_PATH: root,
+      },
+      windowsHide: true,
+    }),
+  );
+
+  const { report } = await readOnlyValidationReport(root);
+  assert.equal(report.status, "failed");
+  assert.deepEqual(report.environment.inheritedForbiddenVariables, ["NODE_PATH"]);
+  assert.match(report.error, /forbidden Node execution environment: NODE_PATH/u);
+  assert.deepEqual(report.steps, []);
+});
+
 test("the system validator binds a passing report to one clean Git source state", async (t) => {
   const root = await createValidationFixture(t);
   const expectedHeadOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
@@ -311,6 +335,12 @@ test("the system validator binds a passing report to one clean Git source state"
   assert.equal(report.source.started.headOid, expectedHeadOid);
   assert.equal(report.source.started.treeOid, expectedTreeOid);
   assert.equal(report.source.started.clean, true);
+  assert.deepEqual(report.environment, {
+    schemaVersion: 1,
+    policy: "scrubbed-node-execution-v1",
+    forbiddenVariables: ["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"],
+    inheritedForbiddenVariables: [],
+  });
   assert.deepEqual(
     report.steps.find(({ name }) => name === "git diff --check").command,
     {
@@ -326,7 +356,12 @@ test("the system validator binds a passing report to one clean Git source state"
     report.steps.find(({ name }) => name === "complete Node test suite").command,
     {
       executable: "node",
-      arguments: ["--test", "--test-reporter=tap", "test/*.test.js"],
+      arguments: [
+        "--test",
+        "--test-concurrency=4",
+        "--test-reporter=tap",
+        "test/*.test.js",
+      ],
     },
   );
   assert.deepEqual(
@@ -367,6 +402,8 @@ test("the system validator binds a passing report to one clean Git source state"
   );
   assert.deepEqual(Object.keys(report.executionSource).sort(), [
     "contentDigest",
+    "dependencyInstallation",
+    "dependencyLockDigest",
     "fileCount",
     "headOid",
     "schemaVersion",
@@ -417,13 +454,50 @@ test("the system validator rejects whitespace defects in committed source", asyn
   assert.match(report.error, /git diff --check failed/u);
 });
 
+test("the system validator records structured failed test identities", async (t) => {
+  const root = await createValidationFixture(t);
+  await writeFile(
+    path.join(root, "test/smoke.test.js"),
+    [
+      "import assert from 'node:assert/strict';",
+      "import test from 'node:test';",
+      "test('fixture failure identity', () => assert.equal(true, false));",
+      "",
+    ].join("\n"),
+  );
+  await git(root, "add", "test/smoke.test.js");
+  await git(root, "commit", "--quiet", "-m", "failing fixture test");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
+      cwd: root,
+      encoding: "utf8",
+      env: validationEnvironment(),
+      windowsHide: true,
+    }),
+  );
+
+  const { report } = await readOnlyValidationReport(root);
+  const testStep = report.steps.find(
+    ({ name }) => name === "complete Node test suite",
+  );
+  assert.equal(report.status, "failed");
+  assert.equal(testStep.status, "failed");
+  assert.equal(testStep.testResults.summary.failed, 1);
+  assert.deepEqual(
+    testStep.testResults.cases.filter(({ status }) => status === "failed"),
+    [{
+      identity: "tap:1:fixture failure identity",
+      name: "fixture failure identity",
+      status: "failed",
+    }],
+  );
+});
+
 test("live UI validation records the exact managed runtime source identity", async (t) => {
   const root = await createValidationFixture(t);
   const expectedHeadOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
   const expectedTreeOid = await git(root, "rev-parse", "--verify", "HEAD^{tree}");
-  const preload = pathToFileURL(
-    path.join(root, "test-support/live-fetch-preload.mjs"),
-  ).href;
 
   await execFileAsync(
     process.execPath,
@@ -431,10 +505,7 @@ test("live UI validation records the exact managed runtime source identity", asy
     {
       cwd: root,
       encoding: "utf8",
-      env: {
-        ...validationEnvironment(),
-        NODE_OPTIONS: `--import=${preload}`,
-      },
+      env: validationEnvironment(),
       windowsHide: true,
     },
   );
@@ -522,9 +593,6 @@ test("live UI validation records the exact managed runtime source identity", asy
 
 test("live UI validation rejects service replacement during browser scenarios", async (t) => {
   const root = await createValidationFixture(t);
-  const preload = pathToFileURL(
-    path.join(root, "test-support/live-fetch-preload.mjs"),
-  ).href;
 
   await assert.rejects(
     execFileAsync(
@@ -536,7 +604,6 @@ test("live UI validation rejects service replacement during browser scenarios", 
         env: {
           ...validationEnvironment(),
           MYDASHBOARD_TEST_REPLACE_LIVE: "1",
-          NODE_OPTIONS: `--import=${preload}`,
         },
         windowsHide: true,
       },

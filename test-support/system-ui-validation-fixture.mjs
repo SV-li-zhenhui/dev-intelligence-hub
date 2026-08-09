@@ -1,9 +1,11 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
 import {
   buildUiArtifactReceipt,
   parseUiValidationCommandArguments,
+  prepareUiArtifactDirectory,
   writeUiArtifactReceipt,
 } from "../scripts/system-ui-artifact-receipt.mjs";
 import { verifyLiveDashboard } from "../scripts/system-live-validation.mjs";
@@ -60,13 +62,17 @@ function png(width, height) {
 
 const { outputDirectory, runId, liveService } =
   parseUiValidationCommandArguments(process.argv.slice(2));
+const preparedOutput = await prepareUiArtifactDirectory({
+  root: process.cwd(),
+  runId,
+});
+assert.equal(preparedOutput.relativeDirectory, outputDirectory);
 await verifyLiveDashboard({
   baseUrl: "http://127.0.0.1:4173",
   expectedRuntimeSource: liveService.runtimeSource,
   expectedLiveService: liveService,
 });
-const absoluteOutput = path.resolve(outputDirectory);
-await mkdir(absoluteOutput, { recursive: true });
+const absoluteOutput = preparedOutput.directory;
 const results = {
   schemaVersion: 1,
   runId,

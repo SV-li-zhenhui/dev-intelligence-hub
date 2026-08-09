@@ -494,7 +494,12 @@ async function createRealServerFixture(t) {
   );
   await writeFile(
     path.join(root, "package.json"),
-    `${JSON.stringify({ type: "module" })}\n`,
+    `${JSON.stringify({
+      name: "mydashboard-real-manager-fixture",
+      private: true,
+      type: "module",
+      files: ["config.example.json", "public/", "scripts/", "src/"],
+    }, null, 2)}\n`,
     "utf8",
   );
   const environment = isolatedRealServerEnvironment();
@@ -550,6 +555,12 @@ test(
     assert.equal(live.processId, state.processId);
     assert.equal(live.instanceId, state.instanceId);
     assert.equal(live.lifecycleState, "running");
+    assert.equal(live.runtimeSource.clean, true);
+    assert.match(live.runtimeSource.headOid, /^[a-f0-9]{64}$/u);
+    assert.match(live.runtimeSource.treeOid, /^[a-f0-9]{64}$/u);
+    assert.match(live.runtimeSource.runtimeDigest, /^[a-f0-9]{64}$/u);
+    assert.equal(live.runtimeSource.runtimeFileCount > 0, true);
+    assert.equal(live.runtimeSource.runtimeByteCount > 0, true);
     const health = await fetch(`http://127.0.0.1:${port}/api/health`);
     assert.equal(health.status, 200);
 

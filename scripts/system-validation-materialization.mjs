@@ -2,27 +2,31 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
-  cp,
   lstat,
   mkdtemp,
-  mkdir,
   open,
   readdir,
   realpath,
   rm,
+  rmdir,
+  unlink,
+  writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { GitObjectSnapshotter } from "../src/adapters/git-object-snapshotter.js";
+import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
 
 const execFileAsync = promisify(execFile);
 const OBJECT_IDENTITY = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const MAXIMUM_FILES = 25_000;
 const MAXIMUM_TOTAL_BYTES = 300 * 1024 * 1024;
-const VALIDATION_DEPENDENCIES = Object.freeze([
-  "playwright",
-  "playwright-core",
+const DEPENDENCY_INSTALLATION = "npm-ci-offline-ignore-scripts-v1";
+const NODE_INJECTION_ENVIRONMENT = Object.freeze([
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_V8_COVERAGE",
 ]);
 
 function updateFrame(hash, value) {
@@ -145,6 +149,15 @@ async function readStableFile(file, relativePath) {
   }
 }
 
+async function readOptionalStableFile(file, relativePath) {
+  try {
+    return await readStableFile(file, relativePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 async function scan(directory, { requireSealed = false } = {}) {
   const files = [];
   async function visit(current, relativeDirectory = "") {
@@ -200,29 +213,169 @@ async function scan(directory, { requireSealed = false } = {}) {
   });
 }
 
-async function copyValidationDependencies(root, target) {
-  const sourceModules = path.join(root, "node_modules");
-  for (const dependency of VALIDATION_DEPENDENCIES) {
-    const source = path.join(sourceModules, dependency);
-    let metadata;
+async function npmCliPath() {
+  const candidates = [
+    path.join(
+      path.dirname(process.execPath),
+      "node_modules",
+      "npm",
+      "bin",
+      "npm-cli.js",
+    ),
+    ...(path.isAbsolute(process.env.npm_execpath ?? "")
+      ? [process.env.npm_execpath]
+      : []),
+  ];
+  try {
+    const located = process.platform === "win32"
+      ? await execFileAsync("where.exe", ["npm.cmd"], {
+          encoding: "utf8",
+          windowsHide: true,
+        })
+      : await execFileAsync("which", ["npm"], { encoding: "utf8" });
+    for (const line of located.stdout.split(/\r?\n/u).filter(Boolean)) {
+      if (!path.isAbsolute(line)) continue;
+      candidates.push(line);
+      if (process.platform === "win32") {
+        candidates.push(path.join(
+          path.dirname(line),
+          "node_modules",
+          "npm",
+          "bin",
+          "npm-cli.js",
+        ));
+      }
+    }
+  } catch {
+    // The trusted Node-adjacent and npm_execpath candidates remain available.
+  }
+  for (const candidate of [...new Set(candidates)]) {
     try {
-      metadata = await lstat(source);
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      throw error;
+      const canonical = await realpath(candidate);
+      const metadata = await lstat(canonical);
+      if (metadata.isFile() && !metadata.isSymbolicLink()) return canonical;
+    } catch {
+      // Try the next deterministic candidate.
     }
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-      throw new Error("validation dependency is unavailable or unsafe");
+  }
+  throw new Error("trusted npm is unavailable for validation materialization");
+}
+
+async function removeNpmBinaryDirectory(target) {
+  const binaryDirectory = path.join(target, "node_modules", ".bin");
+  let entries;
+  try {
+    entries = await readdir(binaryDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  for (const entry of entries) {
+    const entryPath = path.join(binaryDirectory, entry.name);
+    const metadata = await lstat(entryPath);
+    if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+      throw new Error("validation dependency binary directory is unsafe");
     }
-    const destination = path.join(target, "node_modules", dependency);
-    await mkdir(path.dirname(destination), { recursive: true });
-    await cp(source, destination, {
-      errorOnExist: true,
-      force: false,
-      recursive: true,
-      verbatimSymlinks: true,
+    await unlink(entryPath);
+  }
+  await rmdir(binaryDirectory);
+}
+
+async function installValidationDependencies(target) {
+  const lockPath = path.join(target, "package-lock.json");
+  const lock = await readStableFile(lockPath, "package-lock.json");
+  const publishedLock = await readOptionalStableFile(
+    path.join(target, "npm-shrinkwrap.json"),
+    "npm-shrinkwrap.json",
+  );
+  if (
+    publishedLock !== null &&
+    !publishedLock.contents.equals(lock.contents)
+  ) {
+    throw new Error("published dependency lock differs from the checkout lock");
+  }
+  const installationLock = publishedLock ?? lock;
+  const dependencyLockDigest = createHash("sha256")
+    .update(installationLock.contents)
+    .digest("hex");
+  const npmCli = await npmCliPath();
+  const configDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "mydashboard-validation-npm-"),
+  );
+  let installationError = null;
+  try {
+    const userConfig = path.join(configDirectory, "user.npmrc");
+    const globalConfig = path.join(configDirectory, "global.npmrc");
+    await writeFile(userConfig, "ignore-scripts=true\noffline=true\n", {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await writeFile(globalConfig, "", { flag: "wx", mode: 0o600 });
+    const environment = {
+      ...process.env,
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1",
+    };
+    for (const name of NODE_INJECTION_ENVIRONMENT) delete environment[name];
+    await execFileAsync(process.execPath, [
+      npmCli,
+      "ci",
+      "--ignore-scripts",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      `--userconfig=${userConfig}`,
+      `--globalconfig=${globalConfig}`,
+    ], {
+      cwd: target,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 180_000,
+      windowsHide: true,
+    });
+    await removeNpmBinaryDirectory(target);
+    const installedCheckoutLock = await readStableFile(
+      lockPath,
+      "package-lock.json",
+    );
+    const installedPublishedLock = await readOptionalStableFile(
+      path.join(target, "npm-shrinkwrap.json"),
+      "npm-shrinkwrap.json",
+    );
+    if (
+      !installedCheckoutLock.contents.equals(lock.contents) ||
+      (publishedLock === null) !== (installedPublishedLock === null) ||
+      (
+        publishedLock !== null &&
+        !installedPublishedLock.contents.equals(publishedLock.contents)
+      )
+    ) {
+      throw new Error("committed dependency lock changed during installation");
+    }
+  } catch (error) {
+    installationError = new Error(
+      "committed validation dependencies could not be installed offline",
+      { cause: error },
+    );
+  }
+  try {
+    await rm(configDirectory, { force: true, recursive: true });
+  } catch (cleanupError) {
+    if (installationError !== null) {
+      throw new AggregateError(
+        [installationError, cleanupError],
+        "validation dependency installation and cleanup failed",
+      );
+    }
+    throw new Error("validation npm configuration cleanup failed", {
+      cause: cleanupError,
     });
   }
+  if (installationError !== null) throw installationError;
+  return Object.freeze({
+    dependencyInstallation: DEPENDENCY_INSTALLATION,
+    dependencyLockDigest,
+  });
 }
 
 async function seal(directory) {
@@ -272,11 +425,7 @@ async function unsealAndRemove(directory) {
   await rm(directory, { force: true, recursive: true });
 }
 
-export async function createValidationSourceMaterialization({
-  root,
-  headOid,
-  treeOid,
-}) {
+function assertMaterializationRequest({ root, headOid, treeOid }) {
   if (
     typeof root !== "string" ||
     !path.isAbsolute(root) ||
@@ -286,27 +435,77 @@ export async function createValidationSourceMaterialization({
   ) {
     throw new Error("validation materialization request is invalid");
   }
+}
+
+async function materializeCommittedTree({ root, headOid }, target) {
   const canonicalRoot = await realpath(root);
+  const { boundary, snapshotter } = await trustedSnapshotter(canonicalRoot);
+  await snapshotter.materialize({
+    sourceRoot: canonicalRoot,
+    targetRoot: target,
+    headOid,
+    excludePaths: [],
+    expectedBoundaryDigest: boundary.boundaryDigest,
+    expectedGitCommand: boundary.gitCommand,
+    expectedGitExecutableSha256: boundary.gitExecutableSha256,
+    expectedGitExecutableBytes: boundary.gitExecutableBytes,
+    expectedGitExecutableMode: boundary.gitExecutableMode,
+    expectedGitExecutableUid: boundary.gitExecutableUid,
+    expectedGitExecutableGid: boundary.gitExecutableGid,
+  });
+}
+
+export async function deriveCommittedRuntimeSourceIdentity(request) {
+  assertMaterializationRequest(request);
+  const target = await mkdtemp(
+    path.join(os.tmpdir(), "mydashboard-runtime-source-"),
+  );
+  let identity;
+  try {
+    await materializeCommittedTree(request, target);
+    await seal(target);
+    const runtime = await computeRuntimeSourceIdentity(target);
+    identity = Object.freeze({
+      schemaVersion: 1,
+      headOid: request.headOid,
+      treeOid: request.treeOid,
+      clean: true,
+      runtimeDigest: runtime.digest,
+      runtimeFileCount: runtime.fileCount,
+      runtimeByteCount: runtime.byteCount,
+    });
+  } catch (error) {
+    try {
+      await unsealAndRemove(target);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "committed runtime source derivation and cleanup failed",
+      );
+    }
+    throw error;
+  }
+  try {
+    await unsealAndRemove(target);
+  } catch (error) {
+    throw new Error("committed runtime source cleanup failed", { cause: error });
+  }
+  return identity;
+}
+
+export async function createValidationSourceMaterialization({
+  root,
+  headOid,
+  treeOid,
+}) {
+  const request = { root, headOid, treeOid };
+  assertMaterializationRequest(request);
   const target = await mkdtemp(
     path.join(os.tmpdir(), "mydashboard-validation-source-"),
   );
-  let completed = false;
   try {
-    const { boundary, snapshotter } = await trustedSnapshotter(canonicalRoot);
-    await snapshotter.materialize({
-      sourceRoot: canonicalRoot,
-      targetRoot: target,
-      headOid,
-      excludePaths: [],
-      expectedBoundaryDigest: boundary.boundaryDigest,
-      expectedGitCommand: boundary.gitCommand,
-      expectedGitExecutableSha256: boundary.gitExecutableSha256,
-      expectedGitExecutableBytes: boundary.gitExecutableBytes,
-      expectedGitExecutableMode: boundary.gitExecutableMode,
-      expectedGitExecutableUid: boundary.gitExecutableUid,
-      expectedGitExecutableGid: boundary.gitExecutableGid,
-    });
-    await copyValidationDependencies(canonicalRoot, target);
+    await materializeCommittedTree(request, target);
+    const dependencyIdentity = await installValidationDependencies(target);
     await seal(target);
     const scanned = await scan(target, { requireSealed: true });
     const identity = Object.freeze({
@@ -314,10 +513,10 @@ export async function createValidationSourceMaterialization({
       headOid,
       treeOid,
       sealed: true,
+      ...dependencyIdentity,
       ...scanned,
     });
     let cleaned = false;
-    completed = true;
     return Object.freeze({
       directory: target,
       identity,
@@ -342,7 +541,15 @@ export async function createValidationSourceMaterialization({
         await unsealAndRemove(target);
       },
     });
-  } finally {
-    if (!completed) await unsealAndRemove(target).catch(() => {});
+  } catch (error) {
+    try {
+      await unsealAndRemove(target);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "validation source materialization and cleanup failed",
+      );
+    }
+    throw error;
   }
 }

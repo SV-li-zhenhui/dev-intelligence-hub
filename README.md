@@ -34,7 +34,7 @@ node scripts/system-acceptance-manifest.mjs `
   --review "maintainability-usability=validation-artifacts/runs/<runId>/reviews/maintainability-usability.json"
 ```
 
-两份审查必须是独立审查器在该次验证结束后生成的机器可读 JSON：分别覆盖 `security-reliability` 与 `maintainability-usability`，绑定相同 `runId`、HEAD/tree、验证报告 SHA-256，并给出唯一 review/reviewer run 身份；只有 verdict 为 `ready` 且 P0/P1/P2 均为 0 才能发布清单。清单默认写入 `validation-artifacts/runs/<runId>/system-acceptance-manifest.json`，不会覆盖已有文件。
+两份 JSON 是发布负责人对两次独立审查结果的机器可读记录：分别覆盖 `security-reliability` 与 `maintainability-usability`，绑定相同 `runId`、HEAD/tree、验证报告 SHA-256，并给出唯一 review/reviewer run 身份；只有 verdict 为 `ready` 且 P0/P1/P2 均为 0 才能发布清单。清单能验证内容绑定、时间顺序和声明身份不同，但不能认证审查器本人或单独证明两次执行确实独立；发布负责人必须另行保留可信编排器的原始运行记录。清单默认写入 `validation-artifacts/runs/<runId>/system-acceptance-manifest.json`，不会覆盖已有文件。
 
 这些本地产物可能包含运行环境或测试名称，仍应在任何对外使用前人工检查；清单不是许可证选择，也不能代替由产品自身执行的所有者确认真实 PR 验收。
 

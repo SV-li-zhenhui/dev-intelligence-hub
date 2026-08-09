@@ -23,6 +23,11 @@ npm test
 npm start
 ```
 
+The source checkout uses `package-lock.json`; the published/offline payload
+uses `npm-shrinkwrap.json`. Dependency updates must regenerate the checkout
+lock and then copy it byte-for-byte to the shrinkwrap. Distribution acceptance
+rejects either an uncommitted lock or any divergence between them.
+
 No private configuration is required for this safe start. Copy
 `config.example.json` to `config.json` only when you are ready to customize it.
 The example binds only to loopback, has no repositories or personal

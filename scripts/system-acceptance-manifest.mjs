@@ -20,6 +20,9 @@ import {
   uiValidationCommandArguments,
   verifyUiArtifactReceipt,
 } from "./system-ui-artifact-receipt.mjs";
+import {
+  deriveCommittedRuntimeSourceIdentity,
+} from "./system-validation-materialization.mjs";
 
 const MAXIMUM_EVIDENCE_BYTES = 64 * 1024 * 1024;
 const UUID_V4 =
@@ -29,12 +32,24 @@ const REVIEW_SCOPES = new Set([
   "security-reliability",
   "maintainability-usability",
 ]);
+const REVIEW_EVIDENCE_POLICY =
+  "release-owner-attested-distinct-scopes-v1";
+const DEFAULT_VALIDATION_LIMITS = Object.freeze({
+  timeoutMs: 120_000,
+  maxStdoutBytes: 4 * 1024 * 1024,
+  maxStderrBytes: 4 * 1024 * 1024,
+});
 const REQUIRED_COMMANDS = new Map([
   [
     "complete Node test suite",
     {
       executable: "node",
-      arguments: ["--test", "--test-reporter=tap", "test/*.test.js"],
+      arguments: [
+        "--test",
+        "--test-concurrency=4",
+        "--test-reporter=tap",
+        "test/*.test.js",
+      ],
     },
   ],
   [
@@ -446,8 +461,27 @@ async function removePublishedManifest(output, publishedIdentity) {
   }
   try {
     await unlink(output.absolutePath);
+    await syncOutputDirectory(path.dirname(output.absolutePath));
   } catch {
     throw new Error("stale acceptance manifest could not be invalidated");
+  }
+}
+
+async function syncOutputDirectory(directory) {
+  let handle = null;
+  try {
+    handle = await open(directory, fileConstants.O_RDONLY);
+    await handle.sync();
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      ["EACCES", "EINVAL", "EISDIR", "ENOTSUP", "EPERM"].includes(error?.code)
+    ) {
+      return;
+    }
+    throw new Error("acceptance manifest directory could not be synchronized");
+  } finally {
+    if (handle !== null) await handle.close().catch(() => {});
   }
 }
 
@@ -463,10 +497,11 @@ async function publishManifest(root, output, manifest) {
   let handle = null;
   let temporaryExists = false;
   let publishedIdentity = null;
+  const contents = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   try {
     handle = await open(temporaryPath, "wx", 0o600);
     temporaryExists = true;
-    await handle.writeFile(`${JSON.stringify(manifest, null, 2)}\n`);
+    await handle.writeFile(contents);
     await handle.sync();
     await handle.close();
     handle = null;
@@ -521,6 +556,16 @@ async function publishManifest(root, output, manifest) {
       throw new Error(`acceptance manifest publication is unsafe: ${output.relativePath}`);
     }
     publishedIdentity = metadataSnapshot(publishedMetadata);
+    const published = await evidenceFile(root, output.relativePath);
+    if (
+      published.bytes !== contents.length ||
+      !published.contents.equals(contents)
+    ) {
+      throw new Error(
+        `acceptance manifest publication bytes changed: ${output.relativePath}`,
+      );
+    }
+    await syncOutputDirectory(path.dirname(output.absolutePath));
     const sourceAfterPublication = await captureRepositoryState(root);
     assertAcceptanceSourceTransition(
       manifest.source,
@@ -703,13 +748,26 @@ function hasExactKeys(value, keys) {
   );
 }
 
+function isCanonicalTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) &&
+    new Date(milliseconds).toISOString() === value;
+}
+
 function invalidReview() {
   throw new Error(
     "independent review report must be machine-readable Ready evidence",
   );
 }
 
-function validatedReview(file, declaredScope, validationReport, validationFile) {
+function validatedReview(
+  file,
+  declaredScope,
+  validationReport,
+  validationFile,
+  generatedAt,
+) {
   if (!file.path.endsWith(".json")) return invalidReview();
   let review;
   try {
@@ -741,6 +799,7 @@ function validatedReview(file, declaredScope, validationReport, validationFile) 
     !Number.isFinite(Date.parse(review.reviewedAt)) ||
     new Date(review.reviewedAt).toISOString() !== review.reviewedAt ||
     Date.parse(review.reviewedAt) < Date.parse(validationReport.finishedAt) ||
+    Date.parse(review.reviewedAt) > Date.parse(generatedAt) ||
     !hasExactKeys(review.validation, [
       "headOid",
       "reportSha256",
@@ -785,6 +844,34 @@ function emptyTreeObjectId(headOid) {
 
 function compareUtf8Paths(left, right) {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function validationCommandLimits(name) {
+  if (name === "complete Node test suite") {
+    return {
+      timeoutMs: 15 * 60_000,
+      maxStdoutBytes: 32 * 1024 * 1024,
+      maxStderrBytes: 8 * 1024 * 1024,
+    };
+  }
+  if (name === "live desktop and mobile UI behavior") {
+    return {
+      timeoutMs: 10 * 60_000,
+      maxStdoutBytes: 1024 * 1024,
+      maxStderrBytes: DEFAULT_VALIDATION_LIMITS.maxStderrBytes,
+    };
+  }
+  if (
+    name === "configuration form browser behavior" ||
+    name === "confirmation history browser behavior" ||
+    name === "real Docker sandbox boundary"
+  ) {
+    return {
+      ...DEFAULT_VALIDATION_LIMITS,
+      timeoutMs: 10 * 60_000,
+    };
+  }
+  return { ...DEFAULT_VALIDATION_LIMITS };
 }
 
 async function committedSyntaxFiles(root, headOid) {
@@ -851,6 +938,7 @@ function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
   return [
     {
       name: "git diff --check",
+      limits: validationCommandLimits("git diff --check"),
       command: {
         executable: "git",
         arguments: [
@@ -864,6 +952,7 @@ function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
     },
     ...syntaxFiles.map((relativePath) => ({
       name: `syntax:${relativePath}`,
+      limits: validationCommandLimits(`syntax:${relativePath}`),
       command: {
         executable: "node",
         arguments: ["--check", relativePath],
@@ -872,23 +961,28 @@ function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
     { name: "node syntax aggregate", kind: "aggregate" },
     {
       name: "complete Node test suite",
+      limits: validationCommandLimits("complete Node test suite"),
       command: REQUIRED_COMMANDS.get("complete Node test suite"),
     },
     {
       name: "configuration form browser behavior",
+      limits: validationCommandLimits("configuration form browser behavior"),
       command: REQUIRED_COMMANDS.get("configuration form browser behavior"),
     },
     {
       name: "confirmation history browser behavior",
+      limits: validationCommandLimits("confirmation history browser behavior"),
       command: REQUIRED_COMMANDS.get("confirmation history browser behavior"),
     },
     {
       name: "real Docker sandbox boundary",
+      limits: validationCommandLimits("real Docker sandbox boundary"),
       command: REQUIRED_COMMANDS.get("real Docker sandbox boundary"),
       environment: { MYDASHBOARD_DOCKER_INTEGRATION: "1" },
     },
     {
       name: "live desktop and mobile UI behavior",
+      limits: validationCommandLimits("live desktop and mobile UI behavior"),
       command: {
         executable: "node",
         arguments: ["scripts/validate-ui.mjs", ...uiArguments],
@@ -897,10 +991,17 @@ function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
   ];
 }
 
-function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
+function validateReport(
+  report,
+  currentSource,
+  committedRuntimeSource,
+  syntaxFiles,
+  verifiedUiReceipt,
+) {
   if (
     !hasExactKeys(report, [
       "finishedAt",
+      "environment",
       "executionSource",
       "liveService",
       "node",
@@ -922,6 +1023,22 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
     !hasExactKeys(report.options, ["withDocker", "withLiveUi"])
   ) {
     throw new Error("system validation report schema is invalid");
+  }
+  if (
+    !hasExactKeys(report.environment, [
+      "forbiddenVariables",
+      "inheritedForbiddenVariables",
+      "policy",
+      "schemaVersion",
+    ]) ||
+    report.environment.schemaVersion !== 1 ||
+    report.environment.policy !== "scrubbed-node-execution-v1" ||
+    JSON.stringify(report.environment.forbiddenVariables) !==
+      JSON.stringify(["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"]) ||
+    !Array.isArray(report.environment.inheritedForbiddenVariables) ||
+    report.environment.inheritedForbiddenVariables.length !== 0
+  ) {
+    throw new Error("system validation environment contract is invalid");
   }
   if (
     typeof report.startedAt !== "string" ||
@@ -959,6 +1076,8 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
   if (
     !hasExactKeys(report.executionSource, [
       "contentDigest",
+      "dependencyInstallation",
+      "dependencyLockDigest",
       "fileCount",
       "headOid",
       "schemaVersion",
@@ -970,6 +1089,9 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
     report.executionSource.headOid !== report.source.finished.headOid ||
     report.executionSource.treeOid !== report.source.finished.treeOid ||
     report.executionSource.sealed !== true ||
+    report.executionSource.dependencyInstallation !==
+      "npm-ci-offline-ignore-scripts-v1" ||
+    !SHA_256.test(report.executionSource.dependencyLockDigest) ||
     !SHA_256.test(report.executionSource.contentDigest) ||
     !Number.isSafeInteger(report.executionSource.fileCount) ||
     report.executionSource.fileCount <= 0 ||
@@ -1001,9 +1123,18 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
       runId: report.runId,
       liveService: report.liveService,
     });
+    const runtimeSource = report.liveService.runtimeSource;
     if (
-      report.liveService.runtimeSource.headOid !== report.source.finished.headOid ||
-      report.liveService.runtimeSource.treeOid !== report.source.finished.treeOid
+      runtimeSource.headOid !== report.source.finished.headOid ||
+      runtimeSource.treeOid !== report.source.finished.treeOid ||
+      runtimeSource.schemaVersion !== committedRuntimeSource.schemaVersion ||
+      runtimeSource.headOid !== committedRuntimeSource.headOid ||
+      runtimeSource.treeOid !== committedRuntimeSource.treeOid ||
+      runtimeSource.clean !== committedRuntimeSource.clean ||
+      runtimeSource.runtimeDigest !== committedRuntimeSource.runtimeDigest ||
+      runtimeSource.runtimeFileCount !==
+        committedRuntimeSource.runtimeFileCount ||
+      runtimeSource.runtimeByteCount !== committedRuntimeSource.runtimeByteCount
     ) {
       throw new Error("live runtime source mismatch");
     }
@@ -1015,6 +1146,13 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
     JSON.stringify(report.uiArtifactReceipt) !== JSON.stringify(verifiedUiReceipt)
   ) {
     throw new Error("system validation UI artifact receipt is invalid");
+  }
+  const uiCompletedAt = verifiedUiReceipt.receipt.completedAt;
+  if (
+    Date.parse(uiCompletedAt) < Date.parse(report.startedAt) ||
+    Date.parse(uiCompletedAt) > Date.parse(report.finishedAt)
+  ) {
+    throw new Error("system validation UI completion chronology is invalid");
   }
   const stepNames = report.steps.map((step) => step?.name);
   if (
@@ -1063,6 +1201,24 @@ function validateReport(report, currentSource, syntaxFiles, verifiedUiReceipt) {
           actualEnvironment.MYDASHBOARD_DOCKER_INTEGRATION !== "1"
     ) {
       throw new Error("Docker validation environment does not match its contract");
+    }
+    if (contract.kind !== "aggregate") {
+      const expectedLimits = contract.limits;
+      if (
+        !hasExactKeys(step.limits, [
+          "maxStderrBytes",
+          "maxStdoutBytes",
+          "timeoutMs",
+        ]) ||
+        step.limits.timeoutMs !== expectedLimits.timeoutMs ||
+        step.limits.maxStdoutBytes !== expectedLimits.maxStdoutBytes ||
+        step.limits.maxStderrBytes !== expectedLimits.maxStderrBytes ||
+        step.lifecycleErrorCode !== undefined
+      ) {
+        throw new Error(
+          "validation command limits do not match their contract",
+        );
+      }
     }
   }
   for (const step of report.steps) {
@@ -1135,6 +1291,9 @@ export async function buildAcceptanceManifest({
   generatedAt = new Date().toISOString(),
 }) {
   const canonicalRoot = await canonicalRepositoryRoot(root);
+  if (!isCanonicalTimestamp(generatedAt)) {
+    throw new Error("acceptance manifest generation time is invalid");
+  }
   if (!Array.isArray(reviewReports) || reviewReports.length !== 2) {
     throw new Error("at least two independent review reports are required");
   }
@@ -1151,6 +1310,11 @@ export async function buildAcceptanceManifest({
   } catch {
     throw new Error("system validation report is not valid JSON");
   }
+  const committedRuntimeSource = await deriveCommittedRuntimeSourceIdentity({
+    root: canonicalRoot,
+    headOid: sourceBeforeEvidence.headOid,
+    treeOid: sourceBeforeEvidence.treeOid,
+  });
   if (
     UUID_V4.test(validationReport?.runId) &&
     validationFile.path !==
@@ -1176,9 +1340,13 @@ export async function buildAcceptanceManifest({
   validateReport(
     validationReport,
     sourceBeforeEvidence,
+    committedRuntimeSource,
     syntaxFiles,
     verifiedUiReceipt,
   );
+  if (Date.parse(generatedAt) < Date.parse(validationReport.finishedAt)) {
+    throw new Error("acceptance manifest chronology is invalid");
+  }
 
   const artifacts = [];
   for (const expected of verifiedUiReceipt.receipt.artifacts) {
@@ -1216,6 +1384,7 @@ export async function buildAcceptanceManifest({
       review.scope,
       validationReport,
       validationFile,
+      generatedAt,
     );
     if (
       reviewIds.has(evidence.reviewId) ||
@@ -1260,6 +1429,7 @@ export async function buildAcceptanceManifest({
     runId: validationReport.runId,
     generatedAt,
     status: "passed",
+    reviewEvidencePolicy: REVIEW_EVIDENCE_POLICY,
     source: sourceBeforeEvidence,
     validation: {
       runId: validationReport.runId,
@@ -1270,6 +1440,7 @@ export async function buildAcceptanceManifest({
       finishedAt: validationReport.finishedAt,
       node: validationReport.node,
       platform: validationReport.platform,
+      environment: structuredClone(validationReport.environment),
       options: validationReport.options,
       executionSource: structuredClone(validationReport.executionSource),
       liveService: structuredClone(validationReport.liveService),

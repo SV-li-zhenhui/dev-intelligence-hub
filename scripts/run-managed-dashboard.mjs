@@ -1,8 +1,4 @@
 import path from "node:path";
-import {
-  captureRuntimeStartupIdentity,
-  verifyRuntimeStartupIdentity,
-} from "../src/lib/runtime-startup-identity.js";
 
 const managedEnvironmentKeys = [
   "MYDASHBOARD_MANAGED_TOKEN",
@@ -20,6 +16,10 @@ const capturedEnvironment = Object.fromEntries(
 for (const name of managedEnvironmentKeys) delete process.env[name];
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
+const {
+  captureRuntimeStartupIdentity,
+  verifyRuntimeStartupIdentity,
+} = await import("../src/lib/runtime-startup-identity.js");
 const runtimeSourceIdentity = await captureRuntimeStartupIdentity(projectRoot);
 const { startManagedDashboardFromCapturedEnvironment } = await import(
   "../src/server.js"
@@ -28,4 +28,5 @@ await verifyRuntimeStartupIdentity(projectRoot, runtimeSourceIdentity);
 await startManagedDashboardFromCapturedEnvironment(
   capturedEnvironment,
   runtimeSourceIdentity,
+  () => verifyRuntimeStartupIdentity(projectRoot, runtimeSourceIdentity),
 );

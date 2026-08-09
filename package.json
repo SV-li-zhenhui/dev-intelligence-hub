@@ -10,6 +10,7 @@
     "docs/ARCHITECTURE.md",
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
+    "npm-shrinkwrap.json",
     "public/",
     "scripts/",
     "src/"
@@ -19,7 +20,7 @@
     "start": "node scripts/run-dashboard.mjs",
     "refresh": "node src/cli.js refresh",
     "refresh:notify": "node src/cli.js refresh --notify",
-    "test": "node --test \"test/*.test.js\"",
+    "test": "node --test --test-concurrency=4 \"test/*.test.js\"",
     "validate:system": "node scripts/validate-system.mjs"
   },
   "engines": {

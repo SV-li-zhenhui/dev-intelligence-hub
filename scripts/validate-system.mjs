@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -13,6 +12,9 @@ import {
   createValidationSourceMaterialization,
 } from "./system-validation-materialization.mjs";
 import {
+  runBoundedValidationCommand,
+} from "./system-validation-command.mjs";
+import {
   assertStableCleanRepository,
   captureRepositoryState,
 } from "./system-validation-provenance.mjs";
@@ -26,6 +28,24 @@ const knownArguments = new Set(["--all", "--with-docker", "--with-live-ui"]);
 const unknownArguments = [...argumentsSet].filter(
   (argument) => !knownArguments.has(argument),
 );
+const forbiddenNodeEnvironmentVariables = Object.freeze([
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_V8_COVERAGE",
+]);
+const inheritedForbiddenNodeEnvironmentVariables =
+  forbiddenNodeEnvironmentVariables.filter((name) =>
+    Object.hasOwn(process.env, name)
+  );
+const validationEnvironment = { ...process.env };
+for (const name of forbiddenNodeEnvironmentVariables) {
+  delete validationEnvironment[name];
+}
+const defaultCommandLimits = Object.freeze({
+  timeoutMs: 120_000,
+  maxStdoutBytes: 4 * 1024 * 1024,
+  maxStderrBytes: 4 * 1024 * 1024,
+});
 
 if (unknownArguments.length > 0) {
   throw new Error(`unknown validation option: ${unknownArguments.join(", ")}`);
@@ -39,6 +59,14 @@ const report = {
   status: "running",
   node: process.version,
   platform: `${process.platform}/${process.arch}`,
+  environment: {
+    schemaVersion: 1,
+    policy: "scrubbed-node-execution-v1",
+    forbiddenVariables: [...forbiddenNodeEnvironmentVariables],
+    inheritedForbiddenVariables: [
+      ...inheritedForbiddenNodeEnvironmentVariables,
+    ],
+  },
   options: { withDocker, withLiveUi },
   source: {
     started: null,
@@ -102,80 +130,99 @@ function commandRecord(command, arguments_) {
   };
 }
 
-function run(command, arguments_, {
+async function run(command, arguments_, {
   name = commandLabel(command, arguments_),
-  environment = process.env,
+  environment = validationEnvironment,
   environmentEvidence = null,
   quiet = false,
   parseOutput = null,
+  parseOutputOnFailure = false,
   outputField = "testResults",
   workingDirectory = root,
   recordedCommand = null,
   executionSourceDigest = null,
+  timeoutMs = defaultCommandLimits.timeoutMs,
+  maxStdoutBytes = defaultCommandLimits.maxStdoutBytes,
+  maxStderrBytes = defaultCommandLimits.maxStderrBytes,
 } = {}) {
   const startedAt = Date.now();
   process.stdout.write(`\n[validate] ${name}\n`);
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, arguments_, {
+  let commandResult;
+  let lifecycleError = null;
+  try {
+    commandResult = await runBoundedValidationCommand(command, arguments_, {
       cwd: workingDirectory,
       env: environment,
-      stdio: quiet ? ["ignore", "pipe", "pipe"] : "inherit",
-      windowsHide: true,
+      timeoutMs,
+      maxStdoutBytes,
+      maxStderrBytes,
     });
-    const stdout = [];
-    const stderr = [];
-    if (quiet) {
-      child.stdout.on("data", (chunk) => stdout.push(chunk));
-      child.stderr.on("data", (chunk) => stderr.push(chunk));
+  } catch (error) {
+    lifecycleError = error;
+    commandResult = {
+      exitCode: error?.exitCode ?? null,
+      signal: error?.signal ?? null,
+      stderr: error?.stderr ?? "",
+      stdout: error?.stdout ?? "",
+    };
+  }
+  const durationMs = Date.now() - startedAt;
+  const { exitCode, signal, stderr: stderrText, stdout: stdoutText } =
+    commandResult;
+  if (!quiet) {
+    if (stdoutText) process.stdout.write(stdoutText);
+    if (stderrText) process.stderr.write(stderrText);
+  }
+  const commandSucceeded = lifecycleError === null &&
+    exitCode === 0 && signal === null;
+  const step = {
+    name,
+    command: recordedCommand === null
+      ? commandRecord(command, arguments_)
+      : structuredClone(recordedCommand),
+    status: commandSucceeded ? "passed" : "failed",
+    durationMs,
+    exitCode,
+    signal,
+    limits: { timeoutMs, maxStdoutBytes, maxStderrBytes },
+    ...(lifecycleError?.code
+      ? { lifecycleErrorCode: lifecycleError.code }
+      : {}),
+    ...(executionSourceDigest === null
+      ? {}
+      : { executionSourceDigest }),
+    ...(environmentEvidence === null
+      ? {}
+      : { environment: structuredClone(environmentEvidence) }),
+  };
+  let outputError = null;
+  if (parseOutput !== null && (commandSucceeded || parseOutputOnFailure)) {
+    try {
+      step[outputField] = parseOutput(stdoutText);
+    } catch (error) {
+      if (commandSucceeded) {
+        outputError = error;
+        step.status = "failed";
+      }
     }
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      const durationMs = Date.now() - startedAt;
-      const stdoutText = Buffer.concat(stdout).toString("utf8");
-      const stderrText = Buffer.concat(stderr).toString("utf8");
-      const step = {
-        name,
-        command: recordedCommand === null
-          ? commandRecord(command, arguments_)
-          : structuredClone(recordedCommand),
-        status: code === 0 && signal === null ? "passed" : "failed",
-        durationMs,
-        exitCode: code,
-        signal,
-        ...(executionSourceDigest === null
-          ? {}
-          : { executionSourceDigest }),
-        ...(environmentEvidence === null
-          ? {}
-          : { environment: structuredClone(environmentEvidence) }),
-      };
-      let outputError = null;
-      if (parseOutput !== null && code === 0 && signal === null) {
-        try {
-          step[outputField] = parseOutput(stdoutText);
-        } catch (error) {
-          outputError = error;
-          step.status = "failed";
-        }
-      }
-      report.steps.push(step);
-      if (step.status === "passed") {
-        process.stdout.write(`[validate] passed in ${durationMs} ms\n`);
-        resolve({
-          parsedOutput: parseOutput === null ? null : step[outputField],
-          stderr: stderrText,
-          stdout: stdoutText,
-          step,
-        });
-        return;
-      }
-      const diagnostic = `${stdoutText}${stderrText}`.slice(-8_000);
-      if (diagnostic) process.stderr.write(`${diagnostic}\n`);
-      reject(outputError ?? new Error(
-        `${name} failed with exit code ${String(code)}`,
-      ));
-    });
-  });
+  }
+  report.steps.push(step);
+  if (step.status === "passed") {
+    process.stdout.write(`[validate] passed in ${durationMs} ms\n`);
+    return {
+      parsedOutput: parseOutput === null ? null : step[outputField],
+      stderr: stderrText,
+      stdout: stdoutText,
+      step,
+    };
+  }
+  if (quiet) {
+    const diagnostic = `${stdoutText}${stderrText}`.slice(-8_000);
+    if (diagnostic) process.stderr.write(`${diagnostic}\n`);
+  }
+  throw outputError ?? lifecycleError ?? new Error(
+    `${name} failed with exit code ${String(exitCode)}`,
+  );
 }
 
 async function runFromExecutionSource(command, arguments_, options = {}) {
@@ -306,14 +353,24 @@ async function checkSyntax() {
   ).flat().sort();
   const startedAt = Date.now();
   process.stdout.write(`\n[validate] node syntax (${files.length} files)\n`);
-  for (const file of files) {
-    const relativePath = path.relative(executionSource.directory, file)
-      .replaceAll("\\", "/");
-    await runFromExecutionSource(process.execPath, ["--check", relativePath], {
-      name: `syntax:${relativePath}`,
-      quiet: true,
-    });
+  await executionSource.verify();
+  let syntaxError = null;
+  try {
+    for (const file of files) {
+      const relativePath = path.relative(executionSource.directory, file)
+        .replaceAll("\\", "/");
+      await run(process.execPath, ["--check", relativePath], {
+        name: `syntax:${relativePath}`,
+        quiet: true,
+        workingDirectory: executionSource.directory,
+        executionSourceDigest: executionSource.identity.contentDigest,
+      });
+    }
+  } catch (error) {
+    syntaxError = error;
   }
+  await executionSource.verify();
+  if (syntaxError !== null) throw syntaxError;
   report.steps.push({
     name: "node syntax aggregate",
     kind: "aggregate",
@@ -325,7 +382,10 @@ async function checkSyntax() {
 }
 
 async function verifyCurrentLiveDashboard() {
-  const runtime = await computeRuntimeSourceIdentity(root);
+  if (executionSource === null) {
+    throw new Error("immutable validation source is unavailable");
+  }
+  const runtime = await computeRuntimeSourceIdentity(executionSource.directory);
   return verifyLiveDashboard({
     baseUrl: "http://127.0.0.1:4173",
     expectedRuntimeSource: {
@@ -351,6 +411,12 @@ async function writeReport() {
 
 let validationError = null;
 try {
+  if (inheritedForbiddenNodeEnvironmentVariables.length > 0) {
+    throw new Error(
+      "forbidden Node execution environment: " +
+        inheritedForbiddenNodeEnvironmentVariables.join(", "),
+    );
+  }
   report.source.started = await captureRepositoryState(root);
   assertStableCleanRepository(report.source.started, report.source.started);
   executionSource = await createValidationSourceMaterialization({
@@ -369,19 +435,30 @@ try {
   await checkSyntax();
   await runFromExecutionSource(process.execPath, [
     "--test",
+    "--test-concurrency=4",
     "--test-reporter=tap",
     "test/*.test.js",
   ], {
     name: "complete Node test suite",
     quiet: true,
     parseOutput: parseNodeTestTap,
+    parseOutputOnFailure: true,
+    timeoutMs: 15 * 60_000,
+    maxStdoutBytes: 32 * 1024 * 1024,
+    maxStderrBytes: 8 * 1024 * 1024,
   });
   await runFromExecutionSource(process.execPath, [
     "test/browser/configuration-form-playwright.mjs",
-  ], { name: "configuration form browser behavior" });
+  ], {
+    name: "configuration form browser behavior",
+    timeoutMs: 10 * 60_000,
+  });
   await runFromExecutionSource(process.execPath, [
     "test/browser/confirmation-history-playwright.mjs",
-  ], { name: "confirmation history browser behavior" });
+  ], {
+    name: "confirmation history browser behavior",
+    timeoutMs: 10 * 60_000,
+  });
   if (withDocker) {
     await runFromExecutionSource(process.execPath, [
       "--test",
@@ -389,10 +466,11 @@ try {
     ], {
       name: "real Docker sandbox boundary",
       environment: {
-        ...process.env,
+        ...validationEnvironment,
         MYDASHBOARD_DOCKER_INTEGRATION: "1",
       },
       environmentEvidence: { MYDASHBOARD_DOCKER_INTEGRATION: "1" },
+      timeoutMs: 10 * 60_000,
     });
   }
   if (withLiveUi) {
@@ -409,6 +487,8 @@ try {
       quiet: true,
       parseOutput: parseUiArtifactReceiptEnvelope,
       outputField: "artifactReceiptEnvelope",
+      timeoutMs: 10 * 60_000,
+      maxStdoutBytes: 1024 * 1024,
       workingDirectory: root,
       recordedCommand: {
         executable: "node",

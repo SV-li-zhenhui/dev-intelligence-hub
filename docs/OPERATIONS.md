@@ -51,7 +51,9 @@ new machine-readable result for every run and prints its ignored path:
 the start/end source identity, sanitized logical commands and exit status, and
 Node pass/fail/skip identities. An `--all` run stores its structured UI result,
 real PNG screenshots, and verified receipt under the same run directory. Runs
-never overwrite one another.
+never overwrite one another. The complete Node suite uses a fixed concurrency
+of four test files so process-lifecycle and timeout checks remain reproducible
+under host load.
 
 After `--all` and two independent final reviews have passed, bind those records
 to the same HEAD with:
@@ -63,11 +65,15 @@ node scripts/system-acceptance-manifest.mjs `
   --review "maintainability-usability=validation-artifacts/runs/<runId>/reviews/maintainability-usability.json"
 ```
 
-Each review must be machine-readable JSON produced after that validation run by
-a distinct reviewer execution. The two exact scopes are `security-reliability`
-and `maintainability-usability`. Each report binds the same run ID, HEAD, tree,
-and validation-report SHA-256; carries unique review, reviewer, and reviewer-run
-identities; declares verdict `ready`; and reports zero P0, P1, and P2 findings.
+Each review file is a release-owner attestation recording the result of a
+distinct reviewer execution after that validation run. The two exact scopes are
+`security-reliability` and `maintainability-usability`. Each report binds the
+same run ID, HEAD, tree, and validation-report SHA-256; carries unique review,
+reviewer, and reviewer-run identities; declares verdict `ready`; and reports
+zero P0, P1, and P2 findings. The manifest validates those bindings,
+chronology, and uniqueness claims; it does not authenticate a reviewer or prove
+execution independence. Retain the trusted orchestrator's original run records
+and have the release owner verify them before creating the attestations.
 
 The ignored
 `validation-artifacts/runs/<runId>/system-acceptance-manifest.json` records the
@@ -79,6 +85,11 @@ a failed command, missing UI evidence, or invalid reviews. Treat all local
 artifacts as private operational data until reviewed and sanitized. The
 manifest does not choose a license or replace the owner-confirmed product-only
 live PR acceptance.
+
+The current-tree privacy gate does not erase sensitive data from earlier Git
+commits. Before the first public source release, review the complete history or
+publish a verified, squashed source export into a new public repository. Never
+push this private development history merely because the current tree passes.
 
 ## Managed lifecycle
 

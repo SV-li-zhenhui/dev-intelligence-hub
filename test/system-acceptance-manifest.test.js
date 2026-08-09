@@ -22,6 +22,39 @@ const manifestScript = path.resolve(
   import.meta.dirname,
   "../scripts/system-acceptance-manifest.mjs",
 );
+const defaultValidationLimits = Object.freeze({
+  timeoutMs: 120_000,
+  maxStdoutBytes: 4 * 1024 * 1024,
+  maxStderrBytes: 4 * 1024 * 1024,
+});
+
+function validationLimits(name) {
+  if (name === "complete Node test suite") {
+    return {
+      timeoutMs: 15 * 60_000,
+      maxStdoutBytes: 32 * 1024 * 1024,
+      maxStderrBytes: 8 * 1024 * 1024,
+    };
+  }
+  if (name === "live desktop and mobile UI behavior") {
+    return {
+      timeoutMs: 10 * 60_000,
+      maxStdoutBytes: 1024 * 1024,
+      maxStderrBytes: defaultValidationLimits.maxStderrBytes,
+    };
+  }
+  if (
+    name === "configuration form browser behavior" ||
+    name === "confirmation history browser behavior" ||
+    name === "real Docker sandbox boundary"
+  ) {
+    return {
+      ...defaultValidationLimits,
+      timeoutMs: 10 * 60_000,
+    };
+  }
+  return { ...defaultValidationLimits };
+}
 
 async function git(root, ...arguments_) {
   const { stdout } = await execFileAsync("git", arguments_, {
@@ -79,7 +112,10 @@ async function loadManifestModule() {
   }
 }
 
-async function createFixture(t) {
+async function createFixture(t, {
+  runtimeSourceMutator = (value) => value,
+  uiCompletedAt = "2026-08-09T00:10:00.000Z",
+} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-manifest-"));
   t.after(() => rm(root, { force: true, recursive: true }));
   await git(root, "init", "--quiet");
@@ -92,6 +128,20 @@ async function createFixture(t) {
   await mkdir(path.join(root, "src"), { recursive: true });
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
   await writeFile(path.join(root, "source.txt"), "accepted source\n");
+  await writeFile(path.join(root, "package.json"), `${JSON.stringify({
+    name: "acceptance-manifest-fixture",
+    private: true,
+    type: "module",
+    files: ["src/", "source.txt"],
+  }, null, 2)}\n`);
+  await writeFile(path.join(root, "package-lock.json"), `${JSON.stringify({
+    name: "acceptance-manifest-fixture",
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      "": { name: "acceptance-manifest-fixture" },
+    },
+  }, null, 2)}\n`);
   await git(root, "add", ".");
   await git(root, "commit", "--quiet", "-m", "accepted source");
   const headOid = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
@@ -116,15 +166,22 @@ async function createFixture(t) {
     statusDigest: sha256(""),
     headLogDigest: sha256(await readFile(headLogPath)),
   };
-  const runtimeSource = {
+  const { computeRuntimeSourceIdentity } = await import(
+    "../src/lib/runtime-source-identity.js"
+  );
+  const runtime = await computeRuntimeSourceIdentity(root);
+  const committedRuntimeSource = {
     schemaVersion: 1,
     headOid,
     treeOid,
     clean: true,
-    runtimeDigest: "c".repeat(64),
-    runtimeFileCount: 3,
-    runtimeByteCount: 4_096,
+    runtimeDigest: runtime.digest,
+    runtimeFileCount: runtime.fileCount,
+    runtimeByteCount: runtime.byteCount,
   };
+  const runtimeSource = runtimeSourceMutator(
+    structuredClone(committedRuntimeSource),
+  );
   const liveService = {
     processId: 2468,
     instanceId: "12345678-1234-4123-8123-123456789abc",
@@ -136,6 +193,8 @@ async function createFixture(t) {
     headOid,
     treeOid,
     sealed: true,
+    dependencyInstallation: "npm-ci-offline-ignore-scripts-v1",
+    dependencyLockDigest: "9".repeat(64),
     contentDigest: "e".repeat(64),
     fileCount: 3,
     totalBytes: 4_096,
@@ -154,6 +213,12 @@ async function createFixture(t) {
     status: "passed",
     node: "v24.0.0",
     platform: "fixture/x64",
+    environment: {
+      schemaVersion: 1,
+      policy: "scrubbed-node-execution-v1",
+      forbiddenVariables: ["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"],
+      inheritedForbiddenVariables: [],
+    },
     options: { withDocker: true, withLiveUi: true },
     source: { started: source, finished: source, stable: true },
     executionSource,
@@ -193,7 +258,12 @@ async function createFixture(t) {
         name: "complete Node test suite",
         command: {
           executable: "node",
-          arguments: ["--test", "--test-reporter=tap", "test/*.test.js"],
+          arguments: [
+            "--test",
+            "--test-concurrency=4",
+            "--test-reporter=tap",
+            "test/*.test.js",
+          ],
         },
         status: "passed",
         durationMs: 100,
@@ -277,6 +347,7 @@ async function createFixture(t) {
     ],
   };
   for (const step of validation.steps) {
+    if (step.kind !== "aggregate") step.limits = validationLimits(step.name);
     if (step.name !== "git diff --check") {
       step.executionSourceDigest = executionSource.contentDigest;
     }
@@ -326,7 +397,7 @@ async function createFixture(t) {
     root,
     runId,
     liveService,
-    completedAt: validation.finishedAt,
+    completedAt: uiCompletedAt,
   });
   const envelope = await writeUiArtifactReceipt({ root, receipt });
   validation.uiArtifactReceipt = { envelope, receipt };
@@ -371,7 +442,15 @@ async function createFixture(t) {
       `${JSON.stringify(evidence, null, 2)}\n`,
     );
   }
-  return { artifacts, root, reviews, source, validation, validationPath };
+  return {
+    artifacts,
+    committedRuntimeSource,
+    root,
+    reviews,
+    source,
+    validation,
+    validationPath,
+  };
 }
 
 async function rewriteValidationAndReviewBindings(fixture, validation) {
@@ -401,6 +480,10 @@ test("builds a sanitized manifest that binds validation, artifacts, and reviews 
   });
 
   assert.equal(manifest.status, "passed");
+  assert.equal(
+    manifest.reviewEvidencePolicy,
+    "release-owner-attested-distinct-scopes-v1",
+  );
   assert.equal(manifest.runId, fixture.validation.runId);
   assert.deepEqual(manifest.source, fixture.source);
   assert.equal(
@@ -459,6 +542,71 @@ test("rejects a validation report outside its run-specific artifact path", async
     }),
     /system validation report path does not match its run identity/u,
   );
+});
+
+test("rejects a self-consistent live runtime digest not derived from HEAD", async (t) => {
+  const fixture = await createFixture(t, {
+    runtimeSourceMutator: (runtimeSource) => ({
+      ...runtimeSource,
+      runtimeDigest: "f".repeat(64),
+    }),
+  });
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    }),
+    /system validation live runtime identity is invalid/u,
+  );
+});
+
+test("rejects incomplete acceptance chronology", async (t) => {
+  await t.test("UI completion predates validation", async (t) => {
+    const fixture = await createFixture(t, {
+      uiCompletedAt: "2026-08-08T23:59:59.000Z",
+    });
+    const { buildAcceptanceManifest } = await loadManifestModule();
+    await assert.rejects(
+      buildAcceptanceManifest({
+        root: fixture.root,
+        validationReportPath: fixture.validationPath,
+        reviewReports: fixture.reviews,
+        generatedAt: "2026-08-09T00:11:00.000Z",
+      }),
+      /system validation UI completion chronology is invalid/u,
+    );
+  });
+
+  await t.test("a review postdates generation", async (t) => {
+    const fixture = await createFixture(t);
+    const { buildAcceptanceManifest } = await loadManifestModule();
+    await assert.rejects(
+      buildAcceptanceManifest({
+        root: fixture.root,
+        validationReportPath: fixture.validationPath,
+        reviewReports: fixture.reviews,
+        generatedAt: "2026-08-09T00:10:01.500Z",
+      }),
+      /machine-readable Ready evidence/u,
+    );
+  });
+
+  await t.test("generation is not canonical", async (t) => {
+    const fixture = await createFixture(t);
+    const { buildAcceptanceManifest } = await loadManifestModule();
+    await assert.rejects(
+      buildAcceptanceManifest({
+        root: fixture.root,
+        validationReportPath: fixture.validationPath,
+        reviewReports: fixture.reviews,
+        generatedAt: "not-a-timestamp",
+      }),
+      /acceptance manifest generation time is invalid/u,
+    );
+  });
 });
 
 test("rejects text files presented as UI screenshots", async (t) => {
@@ -557,10 +705,7 @@ test("rejects a UI command that omits the run-bound receipt arguments", async (t
   forged.steps.find(
     ({ name }) => name === "live desktop and mobile UI behavior",
   ).command.arguments = ["scripts/validate-ui.mjs"];
-  await writeFile(
-    fixture.validationPath,
-    `${JSON.stringify(forged, null, 2)}\n`,
-  );
+  await rewriteValidationAndReviewBindings(fixture, forged);
   const { buildAcceptanceManifest } = await loadManifestModule();
 
   await assert.rejects(
@@ -792,6 +937,26 @@ test("rejects Docker validation without the exact integration environment", asyn
       reviewReports: fixture.reviews,
     }),
     /Docker validation environment does not match its contract/u,
+  );
+});
+
+test("rejects validation commands without the exact lifecycle limits", async (t) => {
+  const fixture = await createFixture(t);
+  const forged = structuredClone(fixture.validation);
+  forged.steps.find(
+    ({ name }) => name === "complete Node test suite",
+  ).limits.timeoutMs += 1;
+  await rewriteValidationAndReviewBindings(fixture, forged);
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      artifactPaths: fixture.artifacts.map(([relativePath]) => relativePath),
+      reviewReports: fixture.reviews,
+    }),
+    /validation command limits do not match their contract/u,
   );
 });
 

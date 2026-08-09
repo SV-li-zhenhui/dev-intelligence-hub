@@ -5765,6 +5765,30 @@ test("the application writer lease covers recovery through final runtime close",
   ]);
 });
 
+test("runtime source is reverified after composition and immediately before listen", async () => {
+  const port = await availablePort();
+  const application = startupApplication({ port });
+  let verificationCount = 0;
+
+  const server = await startDashboardServer({
+    createApplicationFn: async () => application,
+    verifyRuntimeSourceFn: async () => {
+      verificationCount += 1;
+      await assert.rejects(fetch(`http://127.0.0.1:${port}/api/live`, {
+        signal: AbortSignal.timeout(100),
+      }));
+    },
+    log() {},
+  });
+
+  try {
+    assert.equal(verificationCount, 1);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/live`)).status, 200);
+  } finally {
+    await server.shutdown();
+  }
+});
+
 test("a failed runtime close retains the writer lease fail-closed", async () => {
   const closeFailure = new Error("runtime writer may still be active");
   let leaseCloses = 0;

@@ -35,6 +35,16 @@ async function fixture(t) {
     type: "module",
     files: ["src/"],
   }, null, 2)}\n`);
+  await writeFile(path.join(root, "package-lock.json"), `${JSON.stringify({
+    name: "validation-materialization-fixture",
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      "": {
+        name: "validation-materialization-fixture",
+      },
+    },
+  }, null, 2)}\n`);
   await git(root, "init", "--quiet");
   await git(root, "config", "user.email", "materialization@example.invalid");
   await git(root, "config", "user.name", "Materialization Fixture");
@@ -73,6 +83,8 @@ test("materializes and seals the exact committed validation source", async (t) =
     Object.keys(materialization.identity).sort(),
     [
       "contentDigest",
+      "dependencyInstallation",
+      "dependencyLockDigest",
       "fileCount",
       "headOid",
       "schemaVersion",
@@ -91,6 +103,67 @@ test("materializes and seals the exact committed validation source", async (t) =
   await materialization.verify();
 });
 
+test("dependency materialization ignores untracked host node_modules", async (t) => {
+  const setup = await fixture(t);
+  const hostDependency = path.join(
+    setup.root,
+    "node_modules/playwright/host-only.txt",
+  );
+  await mkdir(path.dirname(hostDependency), { recursive: true });
+  await writeFile(hostDependency, "untrusted host dependency\n");
+  const { createValidationSourceMaterialization } = await loadMaterialization();
+  const materialization = await createValidationSourceMaterialization(setup);
+  t.after(() => materialization.cleanup());
+
+  await assert.rejects(
+    readFile(path.join(
+      materialization.directory,
+      "node_modules/playwright/host-only.txt",
+    )),
+    { code: "ENOENT" },
+  );
+  assert.equal(
+    materialization.identity.dependencyInstallation,
+    "npm-ci-offline-ignore-scripts-v1",
+  );
+  assert.match(
+    materialization.identity.dependencyLockDigest,
+    /^[a-f0-9]{64}$/u,
+  );
+});
+
+test("rejects a published shrinkwrap that differs from the checkout lock", async (t) => {
+  const setup = await fixture(t);
+  const lock = JSON.parse(
+    await readFile(path.join(setup.root, "package-lock.json"), "utf8"),
+  );
+  lock.packages[""].name = "different-published-dependencies";
+  await writeFile(
+    path.join(setup.root, "npm-shrinkwrap.json"),
+    `${JSON.stringify(lock, null, 2)}\n`,
+  );
+  await git(setup.root, "add", "npm-shrinkwrap.json");
+  await git(setup.root, "commit", "--quiet", "-m", "divergent shrinkwrap");
+  setup.headOid = await git(
+    setup.root,
+    "rev-parse",
+    "--verify",
+    "HEAD^{commit}",
+  );
+  setup.treeOid = await git(
+    setup.root,
+    "rev-parse",
+    "--verify",
+    "HEAD^{tree}",
+  );
+  const { createValidationSourceMaterialization } = await loadMaterialization();
+
+  await assert.rejects(
+    createValidationSourceMaterialization(setup),
+    /published dependency lock differs from the checkout lock/u,
+  );
+});
+
 test("detects a validation source changed after sealing", async (t) => {
   const setup = await fixture(t);
   const { createValidationSourceMaterialization } = await loadMaterialization();
@@ -103,5 +176,32 @@ test("detects a validation source changed after sealing", async (t) => {
   await assert.rejects(
     materialization.verify(),
     /immutable validation source changed/u,
+  );
+});
+
+test("derives packaged runtime identity from committed bytes", async (t) => {
+  const setup = await fixture(t);
+  const { computeRuntimeSourceIdentity } = await import(
+    "../src/lib/runtime-source-identity.js"
+  );
+  const expected = await computeRuntimeSourceIdentity(setup.root);
+  await writeFile(
+    path.join(setup.root, "src/app.js"),
+    "export const value = 'dirty worktree';\n",
+  );
+  const { deriveCommittedRuntimeSourceIdentity } =
+    await loadMaterialization();
+
+  assert.deepEqual(
+    await deriveCommittedRuntimeSourceIdentity(setup),
+    {
+      schemaVersion: 1,
+      headOid: setup.headOid,
+      treeOid: setup.treeOid,
+      clean: true,
+      runtimeDigest: expected.digest,
+      runtimeFileCount: expected.fileCount,
+      runtimeByteCount: expected.byteCount,
+    },
   );
 });

@@ -9,7 +9,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -617,6 +617,7 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "docs/ARCHITECTURE.md",
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
+    "npm-shrinkwrap.json",
     "package.json",
     "README.md",
     "src/lib/config.js",
@@ -649,21 +650,32 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
 });
 
 test("distribution and clean-room inputs come only from the committed tree", () => {
-  const sourceFiles = new Set([
-    ...loadDistributionManifest(),
-    ".gitignore",
-    "package-lock.json",
-  ]);
+  const sourceFiles = new Set(loadDistributionManifest());
   const tracked = loadTrackedFiles();
   for (const filePath of sourceFiles) {
     assert.equal(tracked.has(filePath), true, `untracked release input ${filePath}`);
   }
+  assert.equal(tracked.has("package-lock.json"), true);
 
-  const dirty = runGit(["diff", "--quiet", "HEAD", "--", ...sourceFiles]);
+  const dirty = runGit([
+    "diff",
+    "--quiet",
+    "HEAD",
+    "--",
+    ...sourceFiles,
+    "package-lock.json",
+  ]);
   assert.equal(
     dirty.status,
     0,
     "release inputs differ from HEAD; commit them before clean-room acceptance",
+  );
+  assert.equal(
+    readFileSync(path.join(root, "npm-shrinkwrap.json")).equals(
+      readFileSync(path.join(root, "package-lock.json")),
+    ),
+    true,
+    "published shrinkwrap differs from the source-checkout lock",
   );
 });
 
@@ -1000,14 +1012,7 @@ test(
       await rm(cleanRoot, { recursive: true, force: true });
     });
 
-    const sourceFiles = new Set([
-      ...loadDistributionManifest(),
-      // npm intentionally omits lockfiles from tarballs; a clean source checkout
-      // includes these files and therefore supports npm ci and ignore-boundary
-      // verification without copying any ignored private configuration.
-      ".gitignore",
-      "package-lock.json",
-    ]);
+    const sourceFiles = new Set(loadDistributionManifest());
     for (const filePath of sourceFiles) {
       assertPortablePackagePath(filePath);
     }

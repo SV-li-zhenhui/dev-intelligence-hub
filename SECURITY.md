@@ -8,10 +8,12 @@ release notes.
 
 ## Reporting a vulnerability
 
-Do not open a public issue for a suspected vulnerability. After the repository
-is published, use GitHub's private vulnerability reporting feature for that
-repository. If that feature is unavailable, contact the repository owner
-privately and request a secure reporting channel before sharing details.
+Do not open a public issue for a suspected vulnerability. Before the first
+public release, the repository owner must enable and test GitHub private
+vulnerability reporting. If that feature cannot be enabled, the owner must add
+a monitored confidential contact to this file before publication. Until one of
+those channels exists, the distribution is not security-reporting-ready; do
+not send vulnerability details through a public issue or discussion.
 
 Include affected versions, impact, reproduction steps, and a minimal proof of
 concept. Remove API keys, tokens, private source, personal messages, and local

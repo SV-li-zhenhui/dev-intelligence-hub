@@ -3908,9 +3908,13 @@ export async function startDashboardServer(
     writerLease = null,
     shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
     runtimeSourceIdentity: runtimeSourceIdentityInput = null,
+    verifyRuntimeSourceFn = null,
   } = {},
 ) {
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
+  if (verifyRuntimeSourceFn !== null && typeof verifyRuntimeSourceFn !== "function") {
+    throw new TypeError("verifyRuntimeSourceFn must be a function");
+  }
   let application = null;
   let backgroundWork = null;
   let server = null;
@@ -3941,6 +3945,7 @@ export async function startDashboardServer(
       runtimeSourceIdentity: runtimeSourceIdentityInput,
       shutdownDrainTimeoutMs,
     });
+    if (verifyRuntimeSourceFn !== null) await verifyRuntimeSourceFn();
     await listenForLocalConnections(server, application.config.port);
     if (managedProcess) {
       server.armManagedClaimWatchdog();
@@ -4002,7 +4007,11 @@ export async function startDashboardServer(
 const invokedModule = process.argv[1]
   ? pathToFileURL(path.resolve(process.argv[1])).href
   : "";
-async function runDashboardProcess(managedProcess, runtimeSourceIdentityInput) {
+async function runDashboardProcess(
+  managedProcess,
+  runtimeSourceIdentityInput,
+  verifyRuntimeSourceFn,
+) {
   const diagnostics = managedProcess
     ? createManagedFileDiagnostics(managedProcess.logDirectory)
     : { log: console.log, reportError: console.error };
@@ -4012,6 +4021,9 @@ async function runDashboardProcess(managedProcess, runtimeSourceIdentityInput) {
     );
     if (verifiedRuntimeSourceIdentity === null) {
       throw new Error("dashboard process requires a verified startup identity");
+    }
+    if (typeof verifyRuntimeSourceFn !== "function") {
+      throw new Error("dashboard process requires a final runtime source verifier");
     }
     const writerLease = createApplicationWriterLease({
       projectRoot,
@@ -4023,6 +4035,7 @@ async function runDashboardProcess(managedProcess, runtimeSourceIdentityInput) {
       log: diagnostics.log,
       reportError: diagnostics.reportError,
       runtimeSourceIdentity: verifiedRuntimeSourceIdentity,
+      verifyRuntimeSourceFn,
     });
   } catch (error) {
     diagnostics.reportError(error);
@@ -4033,16 +4046,28 @@ async function runDashboardProcess(managedProcess, runtimeSourceIdentityInput) {
 export async function startManagedDashboardFromCapturedEnvironment(
   environment,
   runtimeSourceIdentityInput,
+  verifyRuntimeSourceFn,
 ) {
   const managedProcess = readManagedProcessEnvironment(environment);
   if (!managedProcess) {
     throw new Error("managed dashboard entry requires a complete environment");
   }
-  await runDashboardProcess(managedProcess, runtimeSourceIdentityInput);
+  await runDashboardProcess(
+    managedProcess,
+    runtimeSourceIdentityInput,
+    verifyRuntimeSourceFn,
+  );
 }
 
-export async function startDashboardFromVerifiedRuntime(runtimeSourceIdentityInput) {
-  await runDashboardProcess(null, runtimeSourceIdentityInput);
+export async function startDashboardFromVerifiedRuntime(
+  runtimeSourceIdentityInput,
+  verifyRuntimeSourceFn,
+) {
+  await runDashboardProcess(
+    null,
+    runtimeSourceIdentityInput,
+    verifyRuntimeSourceFn,
+  );
 }
 
 if (import.meta.url === invokedModule) {

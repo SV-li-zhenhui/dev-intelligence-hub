@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -72,5 +79,59 @@ test("startup identity rejects source changed while application modules load", a
   await assert.rejects(
     verifyRuntimeStartupIdentity(root, captured),
     /runtime source changed while application modules loaded/u,
+  );
+});
+
+test("managed bootstrap erases control secrets before importing project code", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-managed-bootstrap-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await mkdir(path.join(root, "src/lib"), { recursive: true });
+  await copyFile(
+    path.resolve(import.meta.dirname, "../scripts/run-managed-dashboard.mjs"),
+    path.join(root, "scripts/run-managed-dashboard.mjs"),
+  );
+  await writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify({ type: "module" })}\n`,
+  );
+  const observationPath = path.join(root, "observed-environment.json");
+  const managedNames = [
+    "MYDASHBOARD_MANAGED_TOKEN",
+    "MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY",
+    "MYDASHBOARD_MANAGED_PROJECT_DIGEST",
+    "MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS",
+    "MYDASHBOARD_MANAGED_LOG_DIRECTORY",
+    "MYDASHBOARD_MANAGED_INSTANCE_ID",
+    "MYDASHBOARD_MANAGED_START_IDENTITY",
+  ];
+  await writeFile(
+    path.join(root, "src/lib/runtime-startup-identity.js"),
+    [
+      "import { writeFile } from 'node:fs/promises';",
+      `const names = ${JSON.stringify(managedNames)};`,
+      "await writeFile(process.env.MYDASHBOARD_TEST_OBSERVATION, JSON.stringify(Object.fromEntries(names.map((name) => [name, process.env[name] ?? null]))));",
+      "export async function captureRuntimeStartupIdentity() { throw new Error('fixture stop'); }",
+      "export async function verifyRuntimeStartupIdentity() { throw new Error('unexpected verify'); }",
+      "",
+    ].join("\n"),
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, ["scripts/run-managed-dashboard.mjs"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        MYDASHBOARD_TEST_OBSERVATION: observationPath,
+        ...Object.fromEntries(managedNames.map((name) => [name, `${name}-value`])),
+      },
+      windowsHide: true,
+    }),
+    /fixture stop/u,
+  );
+
+  assert.deepEqual(
+    JSON.parse(await readFile(observationPath, "utf8")),
+    Object.fromEntries(managedNames.map((name) => [name, null])),
   );
 });
