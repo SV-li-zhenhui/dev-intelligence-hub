@@ -96,7 +96,8 @@ function createCloseLifecycle(failureMessage) {
 
   return Object.freeze({
     admit(owner) {
-      if (owners.has(owner)) return owners.get(owner);
+      const existingRuntime = owners.get(owner);
+      if (existingRuntime) return existingRuntime;
       const closeCapability = owner?.close;
       const runtime = typeof closeCapability === "function"
         ? Object.freeze({
@@ -123,22 +124,48 @@ function createCloseLifecycle(failureMessage) {
   });
 }
 
-function retainConfiguredConstructionCleanup(error, lifecycle) {
+function retainConfiguredConstructionCleanup(
+  constructionCleanupOwner,
+  lifecycle,
+) {
   if (lifecycle.readStatus().acquiredRuntimes === 0) return;
   const cleanup = Object.freeze({
     close: lifecycle.close,
     readStatus: lifecycle.readStatus,
   });
-  if (hasObjectIdentity(error)) {
-    CONFIGURED_CONSTRUCTION_CLEANUPS.set(error, cleanup);
+  if (constructionCleanupOwner) {
+    const pendingCleanups = CONFIGURED_CONSTRUCTION_CLEANUPS.get(
+      constructionCleanupOwner,
+    );
+    if (pendingCleanups) pendingCleanups.push(cleanup);
+    else CONFIGURED_CONSTRUCTION_CLEANUPS.set(
+      constructionCleanupOwner,
+      [cleanup],
+    );
   }
   const cleanupAttempt = lifecycle.close();
   void cleanupAttempt.catch(() => {});
 }
 
-export function readConfiguredConstructionCleanup(error) {
-  if (!hasObjectIdentity(error)) return null;
-  return CONFIGURED_CONSTRUCTION_CLEANUPS.get(error) ?? null;
+export function readConfiguredConstructionCleanup(constructionCleanupOwner) {
+  if (!hasObjectIdentity(constructionCleanupOwner)) return null;
+  const pendingCleanups = CONFIGURED_CONSTRUCTION_CLEANUPS.get(
+    constructionCleanupOwner,
+  );
+  if (!pendingCleanups) return null;
+  const cleanup = pendingCleanups.shift() ?? null;
+  if (pendingCleanups.length === 0) {
+    CONFIGURED_CONSTRUCTION_CLEANUPS.delete(constructionCleanupOwner);
+  }
+  return cleanup;
+}
+
+function configuredConstructionCleanupOwner(value) {
+  if (value === undefined) return null;
+  if (!hasObjectIdentity(value)) {
+    throw new TypeError("configured construction cleanup owner is invalid");
+  }
+  return value;
 }
 
 function dataEntries(value, name) {
@@ -227,6 +254,7 @@ function declaredRemote(config, name) {
 }
 
 function providerWithBoundary(provider, remote, lifecycle) {
+  const runtime = lifecycle.admit(provider);
   const attemptDescriptor = Object.getOwnPropertyDescriptor(
     provider,
     "singleAttempt",
@@ -238,7 +266,6 @@ function providerWithBoundary(provider, remote, lifecycle) {
   ) {
     throw new TypeError("brain provider singleAttempt is invalid");
   }
-  const runtime = lifecycle.admit(provider);
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
@@ -333,10 +360,14 @@ function configuredBrainRouter(
   {
     brainProviders = {},
     dependencies = {},
+    constructionCleanupOwner: rawConstructionCleanupOwner,
   } = {},
   supervisedCliProviderFactory,
   cliRuntimeFacts,
 ) {
+  const constructionCleanupOwner = configuredConstructionCleanupOwner(
+    rawConstructionCleanupOwner,
+  );
   const lifecycle = createCloseLifecycle(
     "Configured brain provider cleanup failed",
   );
@@ -355,7 +386,7 @@ function configuredBrainRouter(
       close: lifecycle.close,
     });
   } catch (error) {
-    retainConfiguredConstructionCleanup(error, lifecycle);
+    retainConfiguredConstructionCleanup(constructionCleanupOwner, lifecycle);
     throw error;
   }
 }
@@ -417,13 +448,20 @@ function configuredWorkforce({
   clock,
   actionAdmissionGate,
   dependencies = {},
+  constructionCleanupOwner: rawConstructionCleanupOwner,
 } = {}, brainRouterFactory) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
+  const constructionCleanupOwner = configuredConstructionCleanupOwner(
+    rawConstructionCleanupOwner,
+  );
   let brainRouter = null;
   try {
     brainRouter = brainRouterFactory({
       brainProviders,
       dependencies,
+      ...(constructionCleanupOwner === null
+        ? {}
+        : { constructionCleanupOwner }),
     });
     const employees = [];
     const workers = [];
@@ -466,7 +504,7 @@ function configuredWorkforce({
         "Configured workforce cleanup failed",
       );
       lifecycle.admit(brainRouter);
-      retainConfiguredConstructionCleanup(error, lifecycle);
+      retainConfiguredConstructionCleanup(constructionCleanupOwner, lifecycle);
     }
     throw error;
   }

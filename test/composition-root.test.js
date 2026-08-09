@@ -39,6 +39,7 @@ import {
 } from "../src/domain/configuration-contract.js";
 import {
   createConfiguredWorkforce,
+  readConfiguredConstructionCleanup,
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
 import {
@@ -2937,6 +2938,85 @@ test("application adopts retryable configured-workforce construction cleanup", a
   await lifecycle.close();
   assert.equal(cleanupAttempts, 2);
   assert.equal(lifecycle.readStatus().complete, true);
+});
+
+test("application does not adopt stale cleanup from a reused Error identity", async () => {
+  const constructionFailure = new Error("reused application construction failure");
+  const cleanupFailure = new Error("prior construction cleanup failed once");
+  const priorConstructionOwner = Object.freeze({});
+  const invalidRole = new Proxy({}, {
+    ownKeys() {
+      throw constructionFailure;
+    },
+  });
+  let cleanupAttempts = 0;
+  let priorFailure = null;
+  try {
+    createTestConfiguredWorkforce(
+      {
+        constructionCleanupOwner: priorConstructionOwner,
+        brainProviders: { cli: { kind: "codex-cli" } },
+        roles: { developer: invalidRole },
+        store: memoryStore(),
+      },
+      {
+        supervisedCliProviderFactory(providerOptions) {
+          return {
+            id: providerOptions.id,
+            remote: true,
+            singleAttempt: true,
+            async generate() {
+              return '{"ok":true}';
+            },
+            async close() {
+              cleanupAttempts += 1;
+              if (cleanupAttempts === 1) throw cleanupFailure;
+            },
+          };
+        },
+      },
+    );
+  } catch (error) {
+    priorFailure = error;
+  }
+  assert.strictEqual(priorFailure, constructionFailure);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cleanupAttempts, 1);
+
+  const config = workCoordinationConfig({ externalActions: false });
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      versionedConfiguration: false,
+      externalActions: false,
+      ...stubs,
+      configuredWorkforceFactory() {
+        throw constructionFailure;
+      },
+      operationsRuntimeFactory: () => Object.freeze({}),
+      runtimeLifecycle: lifecycle,
+    }),
+    (error) => error === constructionFailure,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cleanupAttempts, 1);
+  assert.equal(lifecycle.readStatus().complete, true);
+  assert.equal(lifecycle.readStatus().failure, null);
+  assert.deepEqual(lifecycle.readStatus().failures, []);
+  const priorCleanup = readConfiguredConstructionCleanup(
+    priorConstructionOwner,
+  );
+  assert.ok(priorCleanup, "prior construction cleanup ownership was lost");
+  assert.strictEqual(priorCleanup.readStatus().failure, cleanupFailure);
+  await priorCleanup.close();
+  assert.equal(cleanupAttempts, 2);
+  assert.equal(priorCleanup.readStatus().complete, true);
 });
 
 test("external confirmation runtime requires both action authorization gates", async () => {

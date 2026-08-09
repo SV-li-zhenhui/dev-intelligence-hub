@@ -599,6 +599,7 @@ export async function createApplication({
     ["track", "close", "readStatus"],
     "runtimeLifecycle",
   );
+  const configuredConstructionCleanupOwner = Object.freeze({});
   const actionAdmissionGate = versionedConfiguration
     ? frozenPort(
         actionAdmissionGateFactory(),
@@ -978,6 +979,7 @@ export async function createApplication({
         throw new Error("记忆问答需要启用统一记忆运行时");
       }
       const memoryBrainRouter = trackRuntime(memoryBrainRouterFactory({
+        constructionCleanupOwner: configuredConstructionCleanupOwner,
         brainProviders: config.brainProviders || {},
         dependencies: brainDependencies(
           memoryAnswerDependencies.brainDependencies || {},
@@ -1643,6 +1645,7 @@ export async function createApplication({
     let workCoordination = null;
     const configuredWorkforce = coordinationEnabled
       ? trackRuntime(configuredWorkforceFactory({
+          constructionCleanupOwner: configuredConstructionCleanupOwner,
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},
           store,
@@ -2144,8 +2147,15 @@ export async function createApplication({
       close,
     };
   } catch (error) {
-    const constructionCleanup = readConfiguredConstructionCleanup(error);
-    if (constructionCleanup) trackRuntime(constructionCleanup);
+    let constructionCleanup = readConfiguredConstructionCleanup(
+      configuredConstructionCleanupOwner,
+    );
+    while (constructionCleanup) {
+      trackRuntime(constructionCleanup);
+      constructionCleanup = readConfiguredConstructionCleanup(
+        configuredConstructionCleanupOwner,
+      );
+    }
     try {
       const cleanupAttempt = Promise.resolve(runtimeLifecycle.close());
       if (ownsRuntimeLifecycle) {
