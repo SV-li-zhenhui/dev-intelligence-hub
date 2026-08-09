@@ -1,7 +1,9 @@
+import path from "node:path";
+
 import { OllamaStructuredProvider } from "../adapters/ollama-structured-provider.js";
 import { OpenAiCompatibleProvider } from "../adapters/openai-compatible-provider.js";
 import {
-  createProductionSupervisedCliBrainProvider,
+  createRuntimeSupervisedCliBrainProvider,
 } from "../adapters/supervised-cli-brain-provider.js";
 import { BrainRouter } from "./brain-router.js";
 import { ConfiguredRoleEmployee } from "./configured-role-employee.js";
@@ -83,6 +85,19 @@ function selectOptions(config, keys) {
   );
 }
 
+function supervisedCliRuntimeFacts(dependencies) {
+  const protectedRoots = dependencies.supervisedCliProtectedRoots ?? [];
+  if (
+    !Array.isArray(protectedRoots) ||
+    protectedRoots.some(
+      (entry) => typeof entry !== "string" || !path.isAbsolute(entry),
+    )
+  ) {
+    throw new TypeError("supervised CLI protected roots are invalid");
+  }
+  return Object.freeze({ protectedRoots: Object.freeze([...protectedRoots]) });
+}
+
 function declaredRemote(config, name) {
   if (config.remote !== undefined && typeof config.remote !== "boolean") {
     throw new TypeError(`${name}.remote is invalid`);
@@ -115,6 +130,7 @@ function providerOptions(
   value,
   dependencies,
   supervisedCliProviderFactory,
+  cliRuntimeFacts,
 ) {
   const name = `brainProviders.${id}`;
   const config = exactConfig(value, PROVIDER_KEYS, name);
@@ -157,7 +173,7 @@ function providerOptions(
       supervisedCliProviderFactory({
         ...common,
         cliKind: config.kind,
-      }),
+      }, cliRuntimeFacts),
       remote,
     );
   }
@@ -167,12 +183,14 @@ function providerOptions(
 }
 
 function createProviders(value, dependencies, supervisedCliProviderFactory) {
+  const cliRuntimeFacts = supervisedCliRuntimeFacts(dependencies);
   return dataEntries(value, "brainProviders").map(([id, config]) =>
     providerOptions(
       id,
       config,
       dependencies,
       supervisedCliProviderFactory,
+      cliRuntimeFacts,
     ),
   );
 }
@@ -215,7 +233,7 @@ export function createConfiguredBrainRouter(options = {}) {
   }
   return configuredBrainRouter(
     options,
-    createProductionSupervisedCliBrainProvider,
+    createRuntimeSupervisedCliBrainProvider,
   );
 }
 
@@ -299,7 +317,7 @@ export function createConfiguredWorkforce(options = {}) {
   return configuredWorkforce(options, (routerOptions) =>
     configuredBrainRouter(
       routerOptions,
-      createProductionSupervisedCliBrainProvider,
+      createRuntimeSupervisedCliBrainProvider,
     ));
 }
 

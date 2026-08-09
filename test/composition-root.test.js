@@ -1675,7 +1675,14 @@ test("cited memory answering wires only trusted retrieval and configured brain p
 
   assert.deepEqual(calls.router, {
     brainProviders: config.brainProviders,
-    dependencies: { fetch: "injected-fetch" },
+    dependencies: {
+      fetch: "injected-fetch",
+      supervisedCliProtectedRoots: [
+        process.cwd(),
+        path.join(process.cwd(), "data"),
+        path.join(process.cwd(), "backups"),
+      ],
+    },
   });
   assert.equal(Object.isFrozen(calls.retriever.memorySearch), true);
   assert.deepEqual(Object.keys(calls.retriever.memorySearch), ["search"]);
@@ -3297,6 +3304,7 @@ test("local code execution fails closed when unified memory is disabled", async 
 test("local code composition binds authority, both proposal runners, and one safe reader", async () => {
   const calls = {};
   const closeCalls = [];
+  const workspaceRoot = path.join(process.cwd(), "workspace-acme");
   const config = localCodeCoordinationConfig();
   config.codeExecutor = {
     ...config.codeExecutor,
@@ -3342,6 +3350,10 @@ test("local code composition binds authority, both proposal runners, and one saf
     codeExecutorRuntimeFactory: async () => ({
       authority: executorAuthority,
       executor: controlledCodeExecutorPort(),
+      changePackageTargets: [{
+        workspaceId: "acme-workspace",
+        sourceRoot: workspaceRoot,
+      }],
       conflictPreparationVerifier,
       conflictExecutionSourcePreparer,
       async close() {
@@ -3387,6 +3399,10 @@ test("local code composition binds authority, both proposal runners, and one saf
     codeJobGrantFactory: (options) => {
       calls.grantFactory = options;
       return { async create() {}, verify(value) { return value; } };
+    },
+    codeJobBrainDirectoryFactory: (options) => {
+      calls.codeBrainDirectory = options;
+      return { async decide() {} };
     },
     githubReviewProposalRunnerFactory: (options) => {
       calls.githubRunner = options;
@@ -3496,6 +3512,29 @@ test("local code composition binds authority, both proposal runners, and one saf
     calls.grantFactory.brainProviders,
     localCodeCoordinationConfig().brainProviders,
   );
+  for (const protectedRoot of [
+    process.cwd(),
+    path.join(process.cwd(), "data"),
+    path.join(process.cwd(), "backups"),
+    workspaceRoot,
+    "D:\\mirrors\\base.git",
+    "D:\\mirrors\\head.git",
+  ]) {
+    assert.equal(
+      calls.workforce.dependencies.supervisedCliProtectedRoots.includes(
+        protectedRoot,
+      ),
+      true,
+      protectedRoot,
+    );
+    assert.equal(
+      calls.codeBrainDirectory.dependencies.supervisedCliProtectedRoots.includes(
+        protectedRoot,
+      ),
+      true,
+      protectedRoot,
+    );
+  }
   assert.strictEqual(calls.githubRunner.runner, githubRunnerPort);
   assert.strictEqual(calls.codeRunner.runner, codeRunnerPort);
   assert.strictEqual(

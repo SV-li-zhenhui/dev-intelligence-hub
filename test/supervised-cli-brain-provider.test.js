@@ -4,11 +4,16 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  opendir,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
+  rmdir,
   symlink,
+  truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -82,6 +87,18 @@ function recordingRunner(handler) {
       return handler(invocation, calls.length - 1);
     },
   };
+}
+
+function cleanupFileSystem(overrides = {}) {
+  return Object.freeze({
+    lstat,
+    opendir,
+    realpath,
+    rename,
+    rmdir,
+    unlink,
+    ...overrides,
+  });
 }
 
 async function within(milliseconds, promise) {
@@ -613,6 +630,139 @@ test("CLI discovery and initialization consume the runner's one total deadline",
   assert.equal(runner.calls.length, 1);
 });
 
+test("protected roots reject equality and both ancestor directions before discovery or spawn", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-protected-roots-");
+  const protectedRoot = path.join(parent, "protected");
+  const nestedRoot = path.join(protectedRoot, "nested");
+  const protectedDescendant = path.join(nestedRoot, "runtime");
+  await mkdir(nestedRoot, { recursive: true });
+  const protectedMode = (await lstat(protectedRoot)).mode & 0o777;
+
+  for (const temporaryRoot of [
+    protectedRoot,
+    protectedDescendant,
+    parent,
+  ]) {
+    const locator = recordingLocator(testDescriptor("codex-cli"));
+    const runner = recordingRunner(async () => successfulProcess());
+    const provider = createTestSupervisedCliBrainProvider(
+      providerOptions("codex-cli"),
+      {
+        processRunner: runner,
+        commandLocator: locator,
+        environment: { OPENAI_API_KEY: "credential" },
+        temporaryRoot,
+        protectedRoots: [protectedRoot],
+      },
+    );
+
+    await assert.rejects(
+      provider.generate(brainRequest()),
+      (error) =>
+        error?.code === "STRUCTURED_PROVIDER_UNAVAILABLE" &&
+        !error.message.includes(parent),
+    );
+    assert.equal(locator.calls.length, 0);
+    assert.equal(runner.calls.length, 0);
+  }
+  await assert.rejects(lstat(protectedDescendant), { code: "ENOENT" });
+  if (process.platform !== "win32") {
+    assert.equal((await lstat(protectedRoot)).mode & 0o777, protectedMode);
+  }
+});
+
+test("protected-root real-path aliases are rejected before discovery or spawn", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-protected-alias-");
+  const protectedRoot = path.join(parent, "protected");
+  const protectedAlias = path.join(parent, "protected-alias");
+  await mkdir(protectedRoot);
+  try {
+    await symlink(protectedRoot, protectedAlias, "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error?.code)) {
+      t.skip("directory symlinks require Windows Developer Mode or elevated privilege");
+      return;
+    }
+    throw error;
+  }
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot: path.join(protectedRoot, "runtime"),
+      protectedRoots: [protectedAlias],
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+  });
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("a replaced validated root fails before a second discovery or spawn", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-root-replaced-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const replacedRoot = path.join(parent, "runtime-original");
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async (invocation) => {
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
+  await rename(temporaryRoot, replacedRoot);
+  await mkdir(temporaryRoot);
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+  });
+  assert.equal(locator.calls.length, 1);
+  assert.equal(runner.calls.length, 1);
+});
+
+test("Git metadata in an invocation-root ancestor fails closed before discovery or spawn", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-git-ancestor-");
+  const temporaryRoot = path.join(parent, "runtime", "isolated");
+  await writeFile(path.join(parent, ".git"), "gitdir: private-host-path", "utf8");
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest()),
+    (error) =>
+      error?.code === "STRUCTURED_PROVIDER_UNAVAILABLE" &&
+      !error.message.includes(parent) &&
+      !JSON.stringify(error).includes(parent),
+  );
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+});
+
 test("remote data denial reaches neither supervised CLI locator nor runner", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-routing-denial-");
   for (const kind of ["codex-cli", "claude-cli"]) {
@@ -817,7 +967,7 @@ async function assertCodexResultLinkRejected(t, attack) {
   );
   await assert.rejects(
     provider.generate(brainRequest()),
-    { code: "STRUCTURED_PROVIDER_RESPONSE_INVALID" },
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
     attack,
   );
   assert.equal(await readFile(victim, "utf8"), '{"private":true}');
@@ -998,6 +1148,230 @@ test("cleanup failure takes precedence over an earlier process failure", async (
   );
 });
 
+test("cleanup retains an invocation whose entry count exceeds the fixed bound", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-count-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const runner = recordingRunner(async (invocation) => {
+    for (let index = 0; index < 257; index += 1) {
+      await writeFile(
+        path.join(invocation.cwd, `entry-${String(index).padStart(3, "0")}`),
+        "",
+      );
+    }
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) => name.startsWith(".cleanup-")),
+    true,
+  );
+});
+
+test("cleanup retains an invocation whose directory depth exceeds the fixed bound", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-depth-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const runner = recordingRunner(async (invocation) => {
+    let directory = invocation.cwd;
+    for (let depth = 0; depth < 17; depth += 1) {
+      directory = path.join(directory, `depth-${String(depth).padStart(2, "0")}`);
+      await mkdir(directory);
+    }
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) => name.startsWith(".cleanup-")),
+    true,
+  );
+});
+
+test("cleanup retains an invocation whose aggregate regular-file bytes exceed the fixed bound", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-bytes-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const runner = recordingRunner(async (invocation) => {
+    const oversized = path.join(invocation.cwd, "oversized.bin");
+    await writeFile(oversized, "");
+    await truncate(oversized, 16 * 1024 * 1024 + 1);
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) => name.startsWith(".cleanup-")),
+    true,
+  );
+});
+
+test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-hang-");
+  const temporaryRoot = path.join(parent, "runtime");
+  let invocationDirectory;
+  const firstRunner = recordingRunner(async (invocation) => {
+    invocationDirectory = invocation.cwd;
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const first = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
+    {
+      processRunner: firstRunner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async unlink() {
+          return new Promise(() => {});
+        },
+      }),
+    },
+  );
+
+  await within(
+    3_000,
+    assert.rejects(first.generate(brainRequest()), {
+      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    }),
+  );
+  await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) => name.startsWith(".cleanup-")),
+    true,
+  );
+
+  const secondLocator = recordingLocator(testDescriptor("codex-cli"));
+  const secondRunner = recordingRunner(async () => successfulProcess());
+  const second = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: secondRunner,
+      commandLocator: secondLocator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  await assert.rejects(second.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(secondLocator.calls.length, 0);
+  assert.equal(secondRunner.calls.length, 0);
+});
+
+test("cancellation with no cleanup budget retains the invocation and reports cleanup failure", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-cancel-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const controller = new AbortController();
+  let invocationDirectory;
+  const runner = recordingRunner(async (invocation) => {
+    invocationDirectory = invocation.cwd;
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    controller.abort(new Error("private cancellation"));
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest({ signal: controller.signal })),
+    (error) =>
+      error?.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED" &&
+      !error.message.includes("private cancellation") &&
+      !error.message.includes(temporaryRoot),
+  );
+  assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
+});
+
+test("cleanup rejects hard-linked and symbolic-link entries without touching their targets", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-links-");
+  const victim = path.join(parent, "victim.txt");
+  await writeFile(victim, "retain-me", "utf8");
+
+  for (const attack of ["hardlink", "symlink"]) {
+    if (attack === "symlink") {
+      const probe = path.join(parent, "symlink-probe");
+      try {
+        await symlink(victim, probe, "file");
+        await unlink(probe);
+      } catch (error) {
+        if (["EPERM", "EACCES"].includes(error?.code)) continue;
+        throw error;
+      }
+    }
+    const temporaryRoot = path.join(parent, `runtime-${attack}`);
+    const runner = recordingRunner(async (invocation) => {
+      const entry = path.join(invocation.cwd, `untrusted-${attack}`);
+      if (attack === "hardlink") await link(victim, entry);
+      else await symlink(victim, entry, "file");
+      const resultFile = argumentValue(invocation.args, "--output-last-message");
+      await writeFile(resultFile, '{"ok":true}', "utf8");
+      return successfulProcess();
+    });
+    const provider = createTestSupervisedCliBrainProvider(
+      providerOptions("codex-cli"),
+      {
+        processRunner: runner,
+        commandLocator: recordingLocator(testDescriptor("codex-cli")),
+        environment: { OPENAI_API_KEY: "credential" },
+        temporaryRoot,
+      },
+    );
+
+    await assert.rejects(provider.generate(brainRequest()), {
+      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    });
+    assert.equal(await readFile(victim, "utf8"), "retain-me");
+  }
+});
+
 test("an unprovable process reap remains visible when the total deadline expires", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-reap-deadline-");
   let monotonicTime = 50_000;
@@ -1053,7 +1427,7 @@ test("a critical stale-cleanup failure is not hidden by the total deadline", asy
   assert.equal(runner.calls.length, 0);
 });
 
-test("cancellation bounds an unresolved Codex result read and cleans the invocation", async (t) => {
+test("cancellation bounds an unresolved Codex result read and retains the invocation", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-result-cancel-");
   const temporaryRoot = path.join(parent, "runtime");
   let invocationDirectory;
@@ -1081,14 +1455,14 @@ test("cancellation bounds an unresolved Codex result read and cleans the invocat
   const controller = new AbortController();
   const cancelled = assert.rejects(
     provider.generate(brainRequest({ signal: controller.signal })),
-    { code: "STRUCTURED_PROVIDER_CANCELLED" },
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
   await started;
   controller.abort();
 
   await within(2_000, cancelled);
   assert.equal(readerSignal?.aborted, true);
-  await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
+  assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
 });
 
 test("production provider construction has no dependency replacement seam", () => {
@@ -1107,6 +1481,19 @@ test("production provider construction has no dependency replacement seam", () =
     }),
     /options are invalid/,
   );
+  for (const forbidden of [
+    { temporaryRoot: path.join(process.cwd(), "replacement-root") },
+    { protectedRoots: [process.cwd()] },
+    { dependencies: {} },
+  ]) {
+    assert.throws(
+      () => createProductionSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        ...forbidden,
+      }),
+      /options are invalid/,
+    );
+  }
 });
 
 test("the first use scavenges only stale verified residues and concurrent calls stay unique", async (t) => {
@@ -1170,7 +1557,7 @@ test("the first use scavenges only stale verified residues and concurrent calls 
   assert.equal(remaining.includes("invocation-codex-cli-unknown1"), true);
 });
 
-test("stale scavenging inspects at most 128 total directory entries", async (t) => {
+test("stale scavenging fails closed before mutation when the root exceeds 128 entries", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-scavenge-bound-");
   const temporaryRoot = path.join(parent, "runtime");
   await mkdir(temporaryRoot, { recursive: true });
@@ -1214,12 +1601,15 @@ test("stale scavenging inspects at most 128 total directory entries", async (t) 
     },
   );
 
-  assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
-  assert.equal(processChecks, 128);
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(runner.calls.length, 0);
+  assert.equal(processChecks, 0);
   assert.equal(
     (await readdir(temporaryRoot)).filter((name) =>
       name.startsWith("invocation-codex-cli-bounded")
     ).length,
-    1,
+    129,
   );
 });

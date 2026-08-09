@@ -9,7 +9,8 @@ import {
   opendir,
   realpath,
   rename,
-  rm,
+  rmdir,
+  unlink,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ import { performance } from "node:perf_hooks";
 import { types as utilTypes } from "node:util";
 
 import { canonicalJsonStringify } from "../lib/canonical-json-digest.js";
+import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import {
@@ -27,6 +29,7 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
+const PRODUCTION_COMPOSITION_TOKEN = Object.freeze({});
 const CLI_KINDS = new Set(["codex-cli", "claude-cli"]);
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_CLI_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
@@ -40,7 +43,19 @@ const MAX_RESULT_DEPTH = 64;
 const MAX_RESULT_NODES = 20_000;
 const MAX_RESULT_KEYS = 20_000;
 const MAX_LOCAL_IO_SETTLEMENT_MS = 1_000;
+const MAX_CLEANUP_ENTRIES = 256;
+const MAX_CLEANUP_DEPTH = 16;
+const MAX_CLEANUP_REGULAR_BYTES = 16n * 1024n * 1024n;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const SHARED_ROOT_STATES = new Map();
+const PRODUCTION_CLEANUP_FILE_SYSTEM = Object.freeze({
+  lstat,
+  opendir,
+  realpath,
+  rename,
+  rmdir,
+  unlink,
+});
 const INSTRUCTION =
   "Return exactly one JSON object that matches the supplied schema. " +
   "Do not call tools or perform actions. The object has no action authority.";
@@ -348,6 +363,33 @@ function temporaryRootPath(value) {
   return path.resolve(value);
 }
 
+function protectedRootPaths(value) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1
+  ) {
+    throw new TypeError("protectedRoots are invalid");
+  }
+  const roots = value.map((entry) => temporaryRootPath(entry));
+  return Object.freeze([...new Set(roots.map(canonicalPath))]);
+}
+
+function cleanupFileSystem(value) {
+  const methods = ["lstat", "opendir", "realpath", "rename", "rmdir", "unlink"];
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    methods.some((name) => typeof value[name] !== "function")
+  ) {
+    throw new TypeError("cleanupFileSystem is invalid");
+  }
+  return Object.freeze(
+    Object.fromEntries(methods.map((name) => [name, value[name].bind(value)])),
+  );
+}
+
 function defaultProcessAlive(processId) {
   try {
     process.kill(processId, 0);
@@ -357,20 +399,35 @@ function defaultProcessAlive(processId) {
   }
 }
 
+function productionDependencies(additionalProtectedRoots = []) {
+  return Object.freeze({
+    processRunner: new SupervisedProcessRunner(),
+    commandLocator: new KnownCliLocator(),
+    environment: process.env,
+    temporaryRoot: path.join(tmpdir(), "mydashboard-supervised-cli-v1"),
+    protectedRoots: protectedRootPaths([projectRoot, ...additionalProtectedRoots]),
+    cleanupFileSystem: PRODUCTION_CLEANUP_FILE_SYSTEM,
+    clock: Date.now,
+    monotonicClock: () => performance.now(),
+    processId: process.pid,
+    isProcessAlive: defaultProcessAlive,
+    staleInvocationScavenger: scavengeStaleInvocations,
+    codexResultReader: readCodexResult,
+  });
+}
+
 function providerDependencies(constructionToken, rawDependencies) {
+  if (constructionToken === PRODUCTION_COMPOSITION_TOKEN) {
+    const runtimeFacts = exactDataObject(
+      rawDependencies,
+      ["protectedRoots"],
+      ["protectedRoots"],
+      "Supervised CLI provider runtime facts are invalid",
+    );
+    return productionDependencies(protectedRootPaths(runtimeFacts.protectedRoots));
+  }
   if (constructionToken !== TEST_CONSTRUCTION_TOKEN) {
-    return Object.freeze({
-      processRunner: new SupervisedProcessRunner(),
-      commandLocator: new KnownCliLocator(),
-      environment: process.env,
-      temporaryRoot: path.join(tmpdir(), "mydashboard-supervised-cli-v1"),
-      clock: Date.now,
-      monotonicClock: () => performance.now(),
-      processId: process.pid,
-      isProcessAlive: defaultProcessAlive,
-      staleInvocationScavenger: scavengeStaleInvocations,
-      codexResultReader: readCodexResult,
-    });
+    return productionDependencies();
   }
   const dependencies = exactDataObject(
     rawDependencies,
@@ -385,12 +442,18 @@ function providerDependencies(constructionToken, rawDependencies) {
       "isProcessAlive",
       "staleInvocationScavenger",
       "codexResultReader",
+      "protectedRoots",
+      "cleanupFileSystem",
     ],
     ["processRunner", "commandLocator", "environment", "temporaryRoot"],
     "Supervised CLI provider test dependencies are invalid",
   );
   return Object.freeze({
     ...dependencies,
+    protectedRoots: protectedRootPaths(dependencies.protectedRoots ?? []),
+    cleanupFileSystem: cleanupFileSystem(
+      dependencies.cleanupFileSystem ?? PRODUCTION_CLEANUP_FILE_SYSTEM,
+    ),
     clock: dependencies.clock ?? Date.now,
     monotonicClock: dependencies.monotonicClock ?? (() => performance.now()),
     processId: dependencies.processId ?? process.pid,
@@ -413,6 +476,8 @@ function validateDependencies(dependencies) {
     typeof dependencies.isProcessAlive !== "function" ||
     typeof dependencies.staleInvocationScavenger !== "function" ||
     typeof dependencies.codexResultReader !== "function" ||
+    !Array.isArray(dependencies.protectedRoots) ||
+    typeof dependencies.cleanupFileSystem?.unlink !== "function" ||
     !Number.isSafeInteger(dependencies.processId) ||
     dependencies.processId < 1
   ) {
@@ -458,11 +523,33 @@ function inside(root, candidate) {
   );
 }
 
-async function trustedDirectory(directory, expectedRoot = null, signal = null) {
+function pathsOverlap(left, right) {
+  return canonicalPath(left) === canonicalPath(right) ||
+    inside(left, right) ||
+    inside(right, left);
+}
+
+function privateDirectory(details) {
+  if (process.platform === "win32") return true;
+  if ((details.mode & 0o077n) !== 0n) return false;
+  return typeof process.getuid !== "function" ||
+    details.uid === BigInt(process.getuid());
+}
+
+async function trustedDirectory(
+  directory,
+  expectedRoot = null,
+  signal = null,
+  { requirePrivate = false } = {},
+) {
   throwIfRequestAborted(signal);
   const details = await lstat(directory, { bigint: true });
   throwIfRequestAborted(signal);
-  if (!details.isDirectory() || details.isSymbolicLink()) {
+  if (
+    !details.isDirectory() ||
+    details.isSymbolicLink() ||
+    (requirePrivate && !privateDirectory(details))
+  ) {
     throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
   }
   const resolved = await realpath(directory);
@@ -473,11 +560,123 @@ async function trustedDirectory(directory, expectedRoot = null, signal = null) {
   if (expectedRoot && !inside(expectedRoot, resolved)) {
     throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
   }
-  return Object.freeze({
-    path: resolved,
+  const finalDetails = await lstat(resolved, { bigint: true });
+  throwIfRequestAborted(signal);
+  if (!sameDirectoryIdentity({
     device: details.dev.toString(),
     inode: details.ino.toString(),
+  }, finalDetails)) {
+    throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+  }
+  return Object.freeze({
+    path: resolved,
+    device: finalDetails.dev.toString(),
+    inode: finalDetails.ino.toString(),
   });
+}
+
+async function canonicalProtectedPath(value, signal) {
+  const unresolved = [];
+  let candidate = path.resolve(value);
+  for (;;) {
+    throwIfRequestAborted(signal);
+    try {
+      const resolved = await realpath(candidate);
+      throwIfRequestAborted(signal);
+      return canonicalPath(path.join(resolved, ...unresolved.reverse()));
+    } catch (error) {
+      throwIfRequestAborted(signal);
+      if (!["ENOENT", "ENOTDIR"].includes(error?.code)) throw error;
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return canonicalPath(value);
+      unresolved.push(path.basename(candidate));
+      candidate = parent;
+    }
+  }
+}
+
+async function assertNoGitAncestor(directory, signal) {
+  let current = directory;
+  for (;;) {
+    throwIfRequestAborted(signal);
+    try {
+      await lstat(path.join(current, ".git"), { bigint: true });
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    } catch (error) {
+      if (error instanceof SupervisedCliBrainProviderError) throw error;
+      if (error?.code !== "ENOENT") {
+        throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+      }
+    }
+    throwIfRequestAborted(signal);
+    const parent = path.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+async function assertIsolationRootLocation(directory, protectedRoots, signal) {
+  let canonicalDirectory;
+  try {
+    canonicalDirectory = await canonicalProtectedPath(directory, signal);
+  } catch {
+    throwIfRequestAborted(signal);
+    throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+  }
+  for (const protectedRoot of protectedRoots) {
+    let canonical;
+    try {
+      canonical = await canonicalProtectedPath(protectedRoot, signal);
+    } catch {
+      throwIfRequestAborted(signal);
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+    if (pathsOverlap(canonicalDirectory, canonical)) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+  }
+  await assertNoGitAncestor(canonicalDirectory, signal);
+}
+
+async function validatedIsolationRoot(directory, protectedRoots, signal) {
+  await assertIsolationRootLocation(directory, protectedRoots, signal);
+  const initial = await trustedDirectory(directory, null, signal, {
+    requirePrivate: true,
+  });
+  const final = await trustedDirectory(directory, null, signal, {
+    requirePrivate: true,
+  });
+  if (
+    initial.device !== final.device ||
+    initial.inode !== final.inode
+  ) {
+    throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+  }
+  return final;
+}
+
+function sharedRootState(identity) {
+  const key = canonicalPath(identity.path);
+  const existing = SHARED_ROOT_STATES.get(key);
+  if (existing) {
+    if (
+      existing.identity.device !== identity.device ||
+      existing.identity.inode !== identity.inode
+    ) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+    return existing;
+  }
+  const state = {
+    identity,
+    blocked: false,
+    unprovable: false,
+    pending: new Set(),
+    residues: new Map(),
+    scavengeAttempts: new Map(),
+  };
+  SHARED_ROOT_STATES.set(key, state);
+  return state;
 }
 
 async function writeNewFile(file, bytes, signal = null) {
@@ -511,25 +710,198 @@ function sameDirectoryIdentity(invocation, details) {
   );
 }
 
-async function removeVerifiedInvocation(invocation, root) {
-  const quarantine = path.join(root, `.cleanup-${randomUUID()}`);
-  try {
-    await rename(invocation.path, quarantine);
-    const details = await lstat(quarantine, { bigint: true });
-    if (!sameDirectoryIdentity(invocation, details)) {
-      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
-    }
-    const resolved = await realpath(quarantine);
-    if (
-      canonicalPath(resolved) !== canonicalPath(quarantine) ||
-      !inside(root, resolved)
-    ) {
-      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
-    }
-    await rm(quarantine, { recursive: true, force: false });
-  } catch {
+function residueIdentity(invocation, filePath) {
+  return Object.freeze({
+    path: filePath,
+    device: invocation.device,
+    inode: invocation.inode,
+  });
+}
+
+function recordResidue(rootState, invocation) {
+  rootState.blocked = true;
+  rootState.residues.set(canonicalPath(invocation.path), invocation);
+}
+
+function releaseRootIfClean(rootState) {
+  if (
+    !rootState.unprovable &&
+    rootState.pending.size === 0 &&
+    rootState.residues.size === 0
+  ) {
+    rootState.blocked = false;
+  }
+}
+
+async function cleanupStep(signal, operation) {
+  throwIfRequestAborted(signal);
+  const value = await operation();
+  throwIfRequestAborted(signal);
+  return value;
+}
+
+function cleanupNode(details, nodePath, depth) {
+  return Object.freeze({
+    path: nodePath,
+    depth,
+    device: details.dev.toString(),
+    inode: details.ino.toString(),
+    size: details.size,
+    links: details.nlink,
+    directory: details.isDirectory(),
+    file: details.isFile(),
+  });
+}
+
+function sameCleanupNode(node, details) {
+  if (
+    details.isSymbolicLink() ||
+    details.dev.toString() !== node.device ||
+    details.ino.toString() !== node.inode ||
+    details.isDirectory() !== node.directory ||
+    details.isFile() !== node.file
+  ) {
+    return false;
+  }
+  return node.directory ||
+    (details.nlink === node.links && details.size === node.size);
+}
+
+async function closeDirectoryHandle(handle, signal) {
+  if (signal?.aborted) return;
+  await cleanupStep(signal, () => handle.close());
+}
+
+async function boundedCleanupInventory(target, signal, fileSystem) {
+  const rootDetails = await cleanupStep(
+    signal,
+    () => fileSystem.lstat(target.path, { bigint: true }),
+  );
+  if (!sameDirectoryIdentity(target, rootDetails)) {
     throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
   }
+  const rootResolved = await cleanupStep(
+    signal,
+    () => fileSystem.realpath(target.path),
+  );
+  if (canonicalPath(rootResolved) !== canonicalPath(target.path)) {
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  }
+  const nodes = [cleanupNode(rootDetails, target.path, 0)];
+  const pendingDirectories = [{ path: target.path, depth: 0 }];
+  let totalBytes = 0n;
+
+  while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.pop();
+    const handle = await cleanupStep(
+      signal,
+      () => fileSystem.opendir(directory.path),
+    );
+    try {
+      for (;;) {
+        const entry = await cleanupStep(signal, () => handle.read());
+        if (entry === null) break;
+        const depth = directory.depth + 1;
+        if (depth > MAX_CLEANUP_DEPTH || nodes.length >= MAX_CLEANUP_ENTRIES) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        const entryPath = path.join(directory.path, entry.name);
+        if (!inside(target.path, entryPath)) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        const details = await cleanupStep(
+          signal,
+          () => fileSystem.lstat(entryPath, { bigint: true }),
+        );
+        if (
+          details.isSymbolicLink() ||
+          details.dev !== rootDetails.dev
+        ) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        const node = cleanupNode(details, entryPath, depth);
+        if (node.file) {
+          if (node.links !== 1n) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+          totalBytes += node.size;
+          if (totalBytes > MAX_CLEANUP_REGULAR_BYTES) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+        } else if (node.directory) {
+          const resolved = await cleanupStep(
+            signal,
+            () => fileSystem.realpath(entryPath),
+          );
+          if (
+            canonicalPath(resolved) !== canonicalPath(entryPath) ||
+            !inside(target.path, resolved)
+          ) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+          pendingDirectories.push({ path: entryPath, depth });
+        } else {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        nodes.push(node);
+      }
+    } finally {
+      await closeDirectoryHandle(handle, signal);
+    }
+  }
+  return nodes;
+}
+
+async function deleteCleanupInventory(nodes, signal, fileSystem) {
+  const descending = [...nodes].sort((left, right) =>
+    right.depth - left.depth || right.path.localeCompare(left.path));
+  for (const node of descending.filter((entry) => entry.file)) {
+    const details = await cleanupStep(
+      signal,
+      () => fileSystem.lstat(node.path, { bigint: true }),
+    );
+    if (!sameCleanupNode(node, details)) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    await cleanupStep(signal, () => fileSystem.unlink(node.path));
+  }
+  for (const node of descending.filter((entry) => entry.directory)) {
+    const details = await cleanupStep(
+      signal,
+      () => fileSystem.lstat(node.path, { bigint: true }),
+    );
+    if (!sameCleanupNode(node, details)) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    await cleanupStep(signal, () => fileSystem.rmdir(node.path));
+  }
+}
+
+async function removeVerifiedInvocation(
+  invocation,
+  root,
+  signal,
+  fileSystem,
+  rootState,
+) {
+  let target = invocation;
+  const alreadyQuarantined = path.basename(invocation.path).startsWith(
+    ".cleanup-",
+  );
+  if (!alreadyQuarantined) {
+    const quarantine = path.join(root, `.cleanup-${randomUUID()}`);
+    const quarantined = residueIdentity(invocation, quarantine);
+    recordResidue(rootState, quarantined);
+    await cleanupStep(
+      signal,
+      () => fileSystem.rename(invocation.path, quarantine),
+    );
+    rootState.residues.delete(canonicalPath(invocation.path));
+    target = quarantined;
+  }
+  const inventory = await boundedCleanupInventory(target, signal, fileSystem);
+  await deleteCleanupInventory(inventory, signal, fileSystem);
+  rootState.residues.delete(canonicalPath(target.path));
 }
 
 function markerValue(value, cliKind) {
@@ -585,7 +957,7 @@ async function readSmallRegularFile(file, maximumBytes, signal = null) {
   } catch {
     return null;
   } finally {
-    await handle?.close();
+    if (!signal?.aborted) await handle?.close();
   }
 }
 
@@ -607,11 +979,15 @@ async function scavengeStaleInvocations({
   clock,
   isProcessAlive,
   signal = null,
+  cleanupFileSystem: fileSystem = PRODUCTION_CLEANUP_FILE_SYSTEM,
+  rootState = null,
 }) {
   throwIfRequestAborted(signal);
   const prefix = invocationPrefix(cliKind);
   const directoryHandle = await opendir(root);
   try {
+    const entries = [];
+    let rootExhausted = false;
     for (
       let inspected = 0;
       inspected < MAX_SCAVENGE_ENTRIES;
@@ -620,13 +996,27 @@ async function scavengeStaleInvocations({
       throwIfRequestAborted(signal);
       const entry = await directoryHandle.read();
       throwIfRequestAborted(signal);
-      if (entry === null) break;
+      if (entry === null) {
+        rootExhausted = true;
+        break;
+      }
+      entries.push(entry);
+    }
+    if (!rootExhausted) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    for (const entry of entries) {
+      const invocationEntry = entry.name.startsWith(prefix);
+      const cleanupEntry = entry.name.startsWith(".cleanup-");
       if (
-        !entry.name.startsWith(prefix) ||
+        (!invocationEntry && !cleanupEntry) ||
         !/^[a-z0-9._-]+$/i.test(entry.name) ||
         !entry.isDirectory() ||
         entry.isSymbolicLink()
       ) {
+        if (cleanupEntry) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
         continue;
       }
       const directory = path.join(root, entry.name);
@@ -638,35 +1028,77 @@ async function scavengeStaleInvocations({
           signal,
         );
         throwIfRequestAborted(signal);
-        if (!markerBytes) continue;
+        if (!markerBytes) {
+          if (cleanupEntry) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+          continue;
+        }
         let parsed;
         try {
           parsed = parseJsonWithUniqueKeys(fatalUtf8(markerBytes));
         } catch {
+          if (cleanupEntry) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
           continue;
         }
         const marker = markerValue(parsed, cliKind);
-        if (!marker || clock() - marker.createdAtMs < STALE_AFTER_MS) continue;
+        if (!marker || clock() - marker.createdAtMs < STALE_AFTER_MS) {
+          if (cleanupEntry) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+          continue;
+        }
         let alive = true;
         try {
           alive = Boolean(isProcessAlive(marker.ownerPid));
         } catch {
           alive = true;
         }
-        if (alive) continue;
+        if (alive) {
+          if (cleanupEntry) {
+            throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+          continue;
+        }
         throwIfRequestAborted(signal);
-        await removeVerifiedInvocation(identity, root);
-      } catch {
+        if (!rootState) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        recordResidue(rootState, identity);
+        await removeVerifiedInvocation(
+          identity,
+          root,
+          signal,
+          fileSystem,
+          rootState,
+        );
+        releaseRootIfClean(rootState);
+      } catch (error) {
         throwIfRequestAborted(signal);
+        if (cleanupEntry || error?.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED") {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
         // Unknown, live, raced, or untrusted entries are deliberately retained.
       }
     }
   } finally {
-    await directoryHandle.close().catch(() => {});
+    if (!signal?.aborted) {
+      await cleanupStep(signal, () => directoryHandle.close()).catch(() => {});
+    }
   }
 }
 
-async function createInvocation({ root, cliKind, processId, clock, signal }) {
+async function createInvocation({
+  root,
+  cliKind,
+  processId,
+  clock,
+  signal,
+  cleanupFileSystem: fileSystem,
+  rootState,
+}) {
   throwIfRequestAborted(signal);
   const directory = await mkdtemp(path.join(root, invocationPrefix(cliKind)));
   let identity = null;
@@ -704,12 +1136,29 @@ async function createInvocation({ root, cliKind, processId, clock, signal }) {
     throwIfRequestAborted(signal);
     return Object.freeze({ ...identity, profiles: Object.freeze(profiles) });
   } catch (failure) {
+    rootState.blocked = true;
+    let cleanupAttempt = null;
     try {
-      const cleanupIdentity = identity ??
-        await trustedDirectory(directory, root);
-      await removeVerifiedInvocation(cleanupIdentity, root);
+      cleanupAttempt = (async () => {
+        const cleanupIdentity = identity ??
+          await trustedDirectory(directory, root, signal);
+        recordResidue(rootState, cleanupIdentity);
+        await removeVerifiedInvocation(
+          cleanupIdentity,
+          root,
+          signal,
+          fileSystem,
+          rootState,
+        );
+      })();
+      rootState.pending.add(cleanupAttempt);
+      await cleanupAttempt;
     } catch {
+      if (identity === null) rootState.unprovable = true;
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    } finally {
+      if (cleanupAttempt) rootState.pending.delete(cleanupAttempt);
+      releaseRootIfClean(rootState);
     }
     throw failure;
   }
@@ -1019,6 +1468,59 @@ async function readCodexResult(
   }
 }
 
+async function runDeadlineCleanup(rootState, deadline, operation) {
+  rootState.blocked = true;
+  try {
+    await deadline.run(({ signal }) => {
+      const attempt = Promise.resolve().then(() => operation(signal));
+      rootState.pending.add(attempt);
+      void attempt.then(
+        () => {
+          rootState.pending.delete(attempt);
+          releaseRootIfClean(rootState);
+        },
+        () => {
+          rootState.pending.delete(attempt);
+        },
+      );
+      return attempt;
+    });
+    releaseRootIfClean(rootState);
+  } catch {
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  }
+}
+
+async function recoverResidue(
+  residue,
+  root,
+  signal,
+  fileSystem,
+  rootState,
+) {
+  let details;
+  try {
+    details = await cleanupStep(
+      signal,
+      () => fileSystem.lstat(residue.path, { bigint: true }),
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    rootState.residues.delete(canonicalPath(residue.path));
+    return;
+  }
+  if (!sameDirectoryIdentity(residue, details)) {
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  }
+  await removeVerifiedInvocation(
+    residue,
+    root,
+    signal,
+    fileSystem,
+    rootState,
+  );
+}
+
 export class SupervisedCliBrainProvider {
   #timeoutMs;
   #maxResponseBytes;
@@ -1033,12 +1535,18 @@ export class SupervisedCliBrainProvider {
   #isProcessAlive;
   #staleInvocationScavenger;
   #codexResultReader;
-  #rootPath = null;
-  #scavenged = false;
+  #protectedRoots;
+  #cleanupFileSystem;
+  #rootIdentity = null;
+  #rootState = null;
   #descriptorValue = null;
 
   constructor(rawOptions, constructionToken, rawDependencies) {
-    if (arguments.length > 1 && constructionToken !== TEST_CONSTRUCTION_TOKEN) {
+    if (
+      arguments.length > 1 &&
+      constructionToken !== TEST_CONSTRUCTION_TOKEN &&
+      constructionToken !== PRODUCTION_COMPOSITION_TOKEN
+    ) {
       throw new TypeError(
         "Production supervised CLI providers do not accept replacement dependencies",
       );
@@ -1064,32 +1572,118 @@ export class SupervisedCliBrainProvider {
     this.#staleInvocationScavenger =
       dependencies.staleInvocationScavenger;
     this.#codexResultReader = dependencies.codexResultReader;
+    this.#protectedRoots = dependencies.protectedRoots;
+    this.#cleanupFileSystem = dependencies.cleanupFileSystem;
     Object.freeze(this);
   }
 
   async #root(signal) {
-    if (this.#rootPath) return this.#rootPath;
     throwIfRequestAborted(signal);
+    await assertIsolationRootLocation(
+      this.#temporaryRoot,
+      this.#protectedRoots,
+      signal,
+    );
     await mkdir(this.#temporaryRoot, { recursive: true, mode: 0o700 });
-    const identity = await trustedDirectory(this.#temporaryRoot, null, signal);
-    if (process.platform !== "win32") await chmod(identity.path, 0o700);
     throwIfRequestAborted(signal);
-    this.#rootPath ??= identity.path;
-    return this.#rootPath;
+    if (this.#rootIdentity === null && process.platform !== "win32") {
+      await chmod(this.#temporaryRoot, 0o700);
+      throwIfRequestAborted(signal);
+    }
+    const identity = await validatedIsolationRoot(
+      this.#temporaryRoot,
+      this.#protectedRoots,
+      signal,
+    );
+    if (
+      this.#rootIdentity !== null &&
+      (
+        this.#rootIdentity.device !== identity.device ||
+        this.#rootIdentity.inode !== identity.inode
+      )
+    ) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+    this.#rootIdentity ??= identity;
+    this.#rootState ??= sharedRootState(identity);
+    return identity;
   }
 
   async #scavenge(root, signal) {
-    if (this.#scavenged) return;
     throwIfRequestAborted(signal);
-    await this.#staleInvocationScavenger({
-      root,
-      cliKind: this.kind,
-      clock: this.#clock,
-      isProcessAlive: this.#isProcessAlive,
-      signal,
+    const state = this.#rootState;
+    let activeAttempt = state.scavengeAttempts.get(this.kind);
+    if (!activeAttempt) {
+      activeAttempt = Promise.resolve(this.#staleInvocationScavenger({
+        root: root.path,
+        cliKind: this.kind,
+        clock: this.#clock,
+        isProcessAlive: this.#isProcessAlive,
+        signal,
+        cleanupFileSystem: this.#cleanupFileSystem,
+        rootState: state,
+      }));
+      state.scavengeAttempts.set(this.kind, activeAttempt);
+      const releaseAttempt = () => {
+        if (state.scavengeAttempts.get(this.kind) === activeAttempt) {
+          state.scavengeAttempts.delete(this.kind);
+        }
+        signal?.removeEventListener("abort", releaseAttempt);
+      };
+      signal?.addEventListener("abort", releaseAttempt, { once: true });
+      void activeAttempt.then(
+        releaseAttempt,
+        releaseAttempt,
+      );
+    }
+    await activeAttempt;
+    throwIfRequestAborted(signal);
+    if (this.#rootState.blocked) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+  }
+
+  async #recover(root, deadline) {
+    const state = this.#rootState;
+    if (!state.blocked && state.residues.size === 0) return;
+    if (state.unprovable || state.pending.size > 0) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    for (const residue of [...state.residues.values()]) {
+      await runDeadlineCleanup(state, deadline, (signal) =>
+        recoverResidue(
+          residue,
+          root.path,
+          signal,
+          this.#cleanupFileSystem,
+          state,
+        ));
+    }
+    releaseRootIfClean(state);
+    if (state.blocked) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+  }
+
+  async #cleanup(invocation, expectedRoot, deadline) {
+    const state = this.#rootState;
+    recordResidue(state, invocation);
+    await runDeadlineCleanup(state, deadline, async (signal) => {
+      const currentRoot = await this.#root(signal);
+      if (
+        currentRoot.device !== expectedRoot.device ||
+        currentRoot.inode !== expectedRoot.inode
+      ) {
+        throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      }
+      await removeVerifiedInvocation(
+        invocation,
+        currentRoot.path,
+        signal,
+        this.#cleanupFileSystem,
+        state,
+      );
     });
-    throwIfRequestAborted(signal);
-    this.#scavenged = true;
   }
 
   async #descriptor(deadline) {
@@ -1107,16 +1701,25 @@ export class SupervisedCliBrainProvider {
     deadline,
     configuredCredential,
     descriptor,
+    expectedRoot,
   }) {
     const root = await deadline.run(({ signal }) => this.#root(signal));
-    await deadline.run(({ signal }) => this.#scavenge(root, signal));
+    if (
+      root.device !== expectedRoot.device ||
+      root.inode !== expectedRoot.inode
+    ) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+    await this.#recover(root, deadline);
     const invocation = await deadline.run(
       ({ signal }) => createInvocation({
-        root,
+        root: root.path,
         cliKind: this.kind,
         processId: this.#processId,
         clock: this.#clock,
         signal,
+        cleanupFileSystem: this.#cleanupFileSystem,
+        rootState: this.#rootState,
       }),
       { settlementTimeoutMs: MAX_LOCAL_IO_SETTLEMENT_MS },
     );
@@ -1187,7 +1790,7 @@ export class SupervisedCliBrainProvider {
 
     if (failure?.code !== "STRUCTURED_PROVIDER_REAP_FAILED") {
       try {
-        await removeVerifiedInvocation(invocation, root);
+        await this.#cleanup(invocation, root, deadline);
       } catch (cleanupError) {
         failure = cleanupError;
       }
@@ -1230,6 +1833,9 @@ export class SupervisedCliBrainProvider {
     });
     try {
       const configuredCredential = credential(this.#environment, this.kind);
+      const root = await deadline.run(({ signal }) => this.#root(signal));
+      await this.#recover(root, deadline);
+      await deadline.run(({ signal }) => this.#scavenge(root, signal));
       const descriptor = await this.#descriptor(deadline);
       const result = await this.#invoke({
         request: admitted.request,
@@ -1237,6 +1843,7 @@ export class SupervisedCliBrainProvider {
         deadline,
         configuredCredential,
         descriptor,
+        expectedRoot: root,
       });
       deadline.throwIfExpired();
       return result;
@@ -1258,6 +1865,17 @@ export class SupervisedCliBrainProvider {
 
 export function createProductionSupervisedCliBrainProvider(options) {
   return new SupervisedCliBrainProvider(options);
+}
+
+export function createRuntimeSupervisedCliBrainProvider(
+  options,
+  { protectedRoots },
+) {
+  return new SupervisedCliBrainProvider(
+    options,
+    PRODUCTION_COMPOSITION_TOKEN,
+    { protectedRoots },
+  );
 }
 
 export function createTestSupervisedCliBrainProvider(options, dependencies) {

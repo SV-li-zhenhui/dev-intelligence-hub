@@ -111,6 +111,59 @@ function environmentCredentialProvider(environment, name) {
   };
 }
 
+function distinctAbsolutePaths(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (typeof value !== "string" || !path.isAbsolute(value)) continue;
+    const resolved = path.resolve(value);
+    const key = process.platform === "win32"
+      ? resolved.toLowerCase()
+      : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(resolved);
+  }
+  return Object.freeze(result);
+}
+
+function configuredRepositoryRoots(config) {
+  const conflict = config.codeExecutor?.conflictPreparation;
+  return [
+    ...Object.values(conflict?.baseMirrorsByRepository || {}),
+    ...Object.values(conflict?.headMirrorsByRepository || {}),
+  ];
+}
+
+function supervisedCliProtectedRoots({
+  storeDataDirectory,
+  operationsDataDirectory,
+  backupDirectory,
+  codeExecutorRuntime,
+  config,
+}) {
+  const runtimeWorkspaceRoots = Array.isArray(
+    codeExecutorRuntime?.changePackageTargets,
+  )
+    ? codeExecutorRuntime.changePackageTargets.map((target) => target?.sourceRoot)
+    : [];
+  const configuredWorkspaceRoots = runtimeWorkspaceRoots.length > 0
+    ? []
+    : (config.codeExecutor?.workspaces || []).map((workspace) =>
+        typeof workspace?.sourceRoot === "string"
+          ? path.resolve(projectRoot, workspace.sourceRoot)
+          : null);
+  return distinctAbsolutePaths([
+    projectRoot,
+    storeDataDirectory,
+    operationsDataDirectory,
+    backupDirectory,
+    ...runtimeWorkspaceRoots,
+    ...configuredWorkspaceRoots,
+    ...configuredRepositoryRoots(config),
+  ]);
+}
+
 export function createApplicationRuntimeLifecycle() {
   const runtimes = [];
   const failures = [];
@@ -519,6 +572,28 @@ export async function createApplication({
       };
   let config = bootstrap.candidate ?? bootstrap.fallbackConfiguration;
   const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
+  const configuredOperations =
+    operationsOptions &&
+    typeof operationsOptions === "object" &&
+    !Array.isArray(operationsOptions)
+      ? operationsOptions
+      : {};
+  const storeDataDirectory =
+    typeof store.dataDirectory === "string" &&
+      path.isAbsolute(store.dataDirectory)
+      ? store.dataDirectory
+      : path.join(projectRoot, "data");
+  const dataDirectory = typeof configuredOperations.dataDirectory === "string"
+    ? configuredOperations.dataDirectory
+    : store instanceof StateStore &&
+        typeof store.dataDirectory === "string" &&
+        path.isAbsolute(store.dataDirectory)
+      ? store.dataDirectory
+      : path.join(projectRoot, "data");
+  const backupDirectory =
+    typeof configuredOperations.backupDirectory === "string"
+      ? configuredOperations.backupDirectory
+      : path.join(projectRoot, "backups");
   const operationQueue = new OperationQueue();
   const trackRuntime = runtimeLifecycle.track;
   let configurationRuntime = null;
@@ -550,6 +625,17 @@ export async function createApplication({
   let changePackageApplicationResultBarrier = null;
   let changePackageApplicationRequester = null;
   let grantFactory = null;
+  let cliProtectedRoots = supervisedCliProtectedRoots({
+    storeDataDirectory,
+    operationsDataDirectory: dataDirectory,
+    backupDirectory,
+    codeExecutorRuntime,
+    config,
+  });
+  const brainDependencies = (dependencies) => ({
+    ...dependencies,
+    supervisedCliProtectedRoots: cliProtectedRoots,
+  });
   const applicationAuthorityVerifier = Object.freeze({
     verify: (manifest) => verifyChangePackageApplicationAuthority({
       manifest,
@@ -593,6 +679,13 @@ export async function createApplication({
         store,
       }),
     );
+    cliProtectedRoots = supervisedCliProtectedRoots({
+      storeDataDirectory,
+      operationsDataDirectory: dataDirectory,
+      backupDirectory,
+      codeExecutorRuntime,
+      config,
+    });
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
       codeExecutorRuntime,
@@ -828,7 +921,9 @@ export async function createApplication({
       }
       const memoryBrainRouter = memoryBrainRouterFactory({
         brainProviders: config.brainProviders || {},
-        dependencies: memoryAnswerDependencies.brainDependencies || {},
+        dependencies: brainDependencies(
+          memoryAnswerDependencies.brainDependencies || {},
+        ),
       });
       const contextRetriever = memoryContextRetrieverFactory({
         memorySearch: frozenPort(
@@ -915,8 +1010,9 @@ export async function createApplication({
           configurationReader: configurationRuntime.reader,
           executorAuthority: codeExecutorRuntime.authority,
           startupConfiguration: config,
-          brainDependencies:
+          brainDependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
+          ),
           actionAdmissionGate: ordinaryActionAdmissionGate,
           inputAuthorityVerifier,
           ...(controlledConflictPorts.verifier === null
@@ -953,7 +1049,9 @@ export async function createApplication({
         codeJobBrainDirectory = codeJobBrainDirectoryFactory({
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},
-          dependencies: workCoordinationDependencies.brainDependencies || {},
+          dependencies: brainDependencies(
+            workCoordinationDependencies.brainDependencies || {},
+          ),
         });
       }
       activeCodeJobOptions = {
@@ -1485,7 +1583,9 @@ export async function createApplication({
           ...(workCoordinationDependencies.clock
             ? { clock: workCoordinationDependencies.clock }
             : {}),
-          dependencies: workCoordinationDependencies.brainDependencies || {},
+          dependencies: brainDependencies(
+            workCoordinationDependencies.brainDependencies || {},
+          ),
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -1916,26 +2016,10 @@ export async function createApplication({
       config,
       operationQueue,
     });
-    const configuredOperations =
-      operationsOptions &&
-      typeof operationsOptions === "object" &&
-      !Array.isArray(operationsOptions)
-        ? operationsOptions
-        : {};
-    const dataDirectory = typeof configuredOperations.dataDirectory === "string"
-      ? configuredOperations.dataDirectory
-      : store instanceof StateStore &&
-          typeof store.dataDirectory === "string" &&
-          path.isAbsolute(store.dataDirectory)
-        ? store.dataDirectory
-        : path.join(projectRoot, "data");
     const operations = operationsRuntimeFactory(
       {
         dataDirectory,
-        backupDirectory:
-          typeof configuredOperations.backupDirectory === "string"
-            ? configuredOperations.backupDirectory
-            : path.join(projectRoot, "backups"),
+        backupDirectory,
         ...(configuredOperations.probeTimeoutMs === undefined
           ? {}
           : { probeTimeoutMs: configuredOperations.probeTimeoutMs }),

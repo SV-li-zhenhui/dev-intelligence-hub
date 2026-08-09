@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
+  createTestConfiguredBrainRouter,
 } from "../src/services/configured-workforce.js";
 
 const SCHEMA = Object.freeze({
@@ -280,6 +282,37 @@ test("configured supervised CLIs stay remote and declare one process attempt", a
       (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
     );
   }
+});
+
+test("configured routing forwards only code-owned protected roots to supervised CLI construction", () => {
+  const protectedRoots = [
+    path.join(process.cwd(), "data"),
+    path.join(process.cwd(), "workspace"),
+  ];
+  let receivedRuntimeFacts = null;
+  createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        cli: { kind: "codex-cli" },
+      },
+      dependencies: { supervisedCliProtectedRoots: protectedRoots },
+    },
+    {
+      supervisedCliProviderFactory(options, runtimeFacts) {
+        receivedRuntimeFacts = runtimeFacts;
+        return {
+          id: options.id,
+          remote: true,
+          singleAttempt: true,
+          async generate() {
+            return '{"ok":true}';
+          },
+        };
+      },
+    },
+  );
+
+  assert.deepEqual(receivedRuntimeFacts, { protectedRoots });
 });
 
 test("configured supervised CLIs reject adapter fields and command controls", () => {
