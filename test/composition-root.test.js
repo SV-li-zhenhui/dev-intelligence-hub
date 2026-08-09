@@ -1673,17 +1673,17 @@ test("cited memory answering wires only trusted retrieval and configured brain p
     },
   });
 
-  assert.deepEqual(calls.router, {
-    brainProviders: config.brainProviders,
-    dependencies: {
-      fetch: "injected-fetch",
-      supervisedCliProtectedRoots: [
-        process.cwd(),
-        path.join(process.cwd(), "data"),
-        path.join(process.cwd(), "backups"),
-      ],
-    },
-  });
+  assert.deepEqual(calls.router.brainProviders, config.brainProviders);
+  assert.equal(calls.router.dependencies.fetch, "injected-fetch");
+  assert.deepEqual(
+    calls.router.dependencies.supervisedCliCompositionCapability.protectedRoots
+      .map((root) => root.toLowerCase()),
+    [
+      process.cwd(),
+      path.join(process.cwd(), "data"),
+      path.join(process.cwd(), "backups"),
+    ].map((root) => root.toLowerCase()),
+  );
   assert.equal(Object.isFrozen(calls.retriever.memorySearch), true);
   assert.deepEqual(Object.keys(calls.retriever.memorySearch), ["search"]);
   assert.equal(Object.isFrozen(calls.retriever.contextReader), true);
@@ -3305,9 +3305,17 @@ test("local code composition binds authority, both proposal runners, and one saf
   const calls = {};
   const closeCalls = [];
   const workspaceRoot = path.join(process.cwd(), "workspace-acme");
+  const configuredWorkspaceRoot = path.join(
+    process.cwd(),
+    "workspace-configured-only",
+  );
   const config = localCodeCoordinationConfig();
   config.codeExecutor = {
     ...config.codeExecutor,
+    workspaces: [{
+      id: "configured-only",
+      sourceRoot: configuredWorkspaceRoot,
+    }],
     conflictPreparation: {
       enabled: true,
       baseMirrorsByRepository: { "acme/repo": "D:\\mirrors\\base.git" },
@@ -3517,20 +3525,22 @@ test("local code composition binds authority, both proposal runners, and one saf
     path.join(process.cwd(), "data"),
     path.join(process.cwd(), "backups"),
     workspaceRoot,
+    configuredWorkspaceRoot,
     "D:\\mirrors\\base.git",
     "D:\\mirrors\\head.git",
   ]) {
+    const canonicalProtectedRoot = process.platform === "win32"
+      ? protectedRoot.toLowerCase()
+      : protectedRoot;
     assert.equal(
-      calls.workforce.dependencies.supervisedCliProtectedRoots.includes(
-        protectedRoot,
-      ),
+      calls.workforce.dependencies.supervisedCliCompositionCapability
+        .protectedRoots.includes(canonicalProtectedRoot),
       true,
       protectedRoot,
     );
     assert.equal(
-      calls.codeBrainDirectory.dependencies.supervisedCliProtectedRoots.includes(
-        protectedRoot,
-      ),
+      calls.codeBrainDirectory.dependencies.supervisedCliCompositionCapability
+        .protectedRoots.includes(canonicalProtectedRoot),
       true,
       protectedRoot,
     );

@@ -101,6 +101,10 @@ function cleanupFileSystem(overrides = {}) {
   });
 }
 
+async function privateDirectoryManagerModule() {
+  return import("../src/lib/private-directory-manager.js").catch(() => null);
+}
+
 async function within(milliseconds, promise) {
   let timer;
   try {
@@ -553,7 +557,9 @@ test("cancellation bounds stale scanning and does not poison later use", async (
   let scavengeCalls = 0;
   let scavengeSignal = null;
   let scavengeStarted;
+  let releaseScavenge;
   const started = new Promise((resolve) => { scavengeStarted = resolve; });
+  const released = new Promise((resolve) => { releaseScavenge = resolve; });
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
     await writeFile(resultFile, '{"ok":true}', "utf8");
@@ -571,7 +577,7 @@ test("cancellation bounds stale scanning and does not poison later use", async (
         scavengeSignal = signal;
         if (scavengeCalls === 1) {
           scavengeStarted();
-          return new Promise(() => {});
+          await released;
         }
       },
     },
@@ -587,8 +593,69 @@ test("cancellation bounds stale scanning and does not poison later use", async (
   await within(1_000, cancelled);
   assert.equal(scavengeSignal?.aborted, true);
   assert.equal(runner.calls.length, 0);
+  releaseScavenge();
   assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
   assert.equal(scavengeCalls, 2);
+});
+
+test("an unsettled stale scan holds one cross-kind root lease after cancellation", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cross-kind-lease-");
+  const temporaryRoot = path.join(parent, "runtime");
+  let firstStarted;
+  let releaseFirst;
+  const started = new Promise((resolve) => { firstStarted = resolve; });
+  const released = new Promise((resolve) => { releaseFirst = resolve; });
+  const first = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      staleInvocationScavenger: async () => {
+        firstStarted();
+        await released;
+      },
+    },
+  );
+  const firstController = new AbortController();
+  const firstRequest = assert.rejects(
+    first.generate(brainRequest({ signal: firstController.signal })),
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
+  );
+  await started;
+  firstController.abort();
+  await within(1_000, firstRequest);
+
+  let secondScans = 0;
+  const secondLocator = recordingLocator(testDescriptor("claude-cli"));
+  const secondRunner = recordingRunner(async () =>
+    successfulProcess(Buffer.from(JSON.stringify(claudeEnvelope()))));
+  const second = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: secondRunner,
+      commandLocator: secondLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+      staleInvocationScavenger: async () => {
+        secondScans += 1;
+      },
+    },
+  );
+  const secondController = new AbortController();
+  const secondRequest = assert.rejects(
+    second.generate(brainRequest({ signal: secondController.signal })),
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  secondController.abort();
+  await within(1_000, secondRequest);
+
+  assert.equal(secondScans, 0);
+  assert.equal(secondLocator.calls.length, 0);
+  assert.equal(secondRunner.calls.length, 0);
+  releaseFirst();
 });
 
 test("CLI discovery and initialization consume the runner's one total deadline", async (t) => {
@@ -630,6 +697,31 @@ test("CLI discovery and initialization consume the runner's one total deadline",
   assert.equal(runner.calls.length, 1);
 });
 
+test("unsettled invocation setup cannot add settlement time beyond the total deadline", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-setup-deadline-");
+  const startedAt = performance.now();
+  const provider = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot: path.join(parent, "runtime"),
+      clock: () => Number.NaN,
+      cleanupFileSystem: cleanupFileSystem({
+        async rename() { return new Promise(() => {}); },
+      }),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_TIMEOUT",
+  });
+  const elapsedMs = performance.now() - startedAt;
+  assert.ok(elapsedMs >= 850, elapsedMs);
+  assert.ok(elapsedMs < 1_350, elapsedMs);
+});
+
 test("protected roots reject equality and both ancestor directions before discovery or spawn", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-protected-roots-");
   const protectedRoot = path.join(parent, "protected");
@@ -669,6 +761,123 @@ test("protected roots reject equality and both ancestor directions before discov
   if (process.platform !== "win32") {
     assert.equal((await lstat(protectedRoot)).mode & 0o777, protectedMode);
   }
+});
+
+test("Windows rejects a weak owner or DACL before CLI discovery", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows owner and DACL semantics are platform-specific");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "private directory manager is required");
+  const parent = await temporaryDirectory(t, "supervised-cli-windows-acl-");
+  const temporaryRoot = path.join(parent, "runtime");
+  await mkdir(temporaryRoot);
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      rootDirectoryManager: managerModule.createPrivateDirectoryManager(),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+  });
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("root creation rejects a changed trusted parent before mutating the leaf", async () => {
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "private directory manager is required");
+  const parent = path.join(path.parse(process.cwd()).root, "trusted-parent");
+  const temporaryRoot = path.join(parent, "runtime");
+  let parentChecks = 0;
+  let mkdirCalls = 0;
+  const directoryDetails = (inode) => ({
+    dev: 7n,
+    ino: BigInt(inode),
+    mode: 0o40700n,
+    uid: 1n,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  });
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  const manager = managerModule.createPrivateDirectoryManager({
+    fileSystem: {
+      async lstat(directory) {
+        if (path.resolve(directory) === path.resolve(temporaryRoot)) throw missing;
+        parentChecks += 1;
+        return directoryDetails(parentChecks === 1 ? 11 : 12);
+      },
+      async realpath(directory) { return directory; },
+      async mkdir() { mkdirCalls += 1; },
+      async chmod() {},
+    },
+    inspectDirectoryTrust: async () => true,
+  });
+
+  await assert.rejects(
+    manager.prepare({
+      directory: temporaryRoot,
+      signal: null,
+      validateLocation: async () => {},
+    }),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+  assert.equal(mkdirCalls, 0);
+});
+
+test("root creation delegates mutation through the pinned parent identity", async () => {
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "private directory manager is required");
+  const parent = path.join(path.parse(process.cwd()).root, "trusted-parent");
+  const temporaryRoot = path.join(parent, "runtime");
+  let created = false;
+  let pinnedCreation = null;
+  const directoryDetails = (inode) => ({
+    dev: 7n,
+    ino: BigInt(inode),
+    mode: 0o40700n,
+    uid: 1n,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  });
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  const manager = managerModule.createPrivateDirectoryManager({
+    fileSystem: {
+      async lstat(directory) {
+        if (path.resolve(directory) === path.resolve(temporaryRoot)) {
+          if (!created) throw missing;
+          return directoryDetails(22);
+        }
+        return directoryDetails(11);
+      },
+      async realpath(directory) { return directory; },
+      async mkdir() { throw new Error("mutable pathname creation forbidden"); },
+      async chmod() {},
+    },
+    inspectDirectoryTrust: async () => true,
+    async createDirectoryAt({ parentIdentity, leafName }) {
+      pinnedCreation = { parentIdentity, leafName };
+      created = true;
+    },
+  });
+
+  await manager.prepare({
+    directory: temporaryRoot,
+    signal: null,
+    validateLocation: async () => {},
+  });
+  assert.equal(pinnedCreation.parentIdentity.device, "7");
+  assert.equal(pinnedCreation.parentIdentity.inode, "11");
+  assert.equal(pinnedCreation.leafName, "runtime");
 });
 
 test("protected-root real-path aliases are rejected before discovery or spawn", async (t) => {
@@ -1330,46 +1539,266 @@ test("cancellation with no cleanup budget retains the invocation and reports cle
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
 });
 
-test("cleanup rejects hard-linked and symbolic-link entries without touching their targets", async (t) => {
+async function assertCleanupLinkRejected(t, attack) {
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-links-");
   const victim = path.join(parent, "victim.txt");
   await writeFile(victim, "retain-me", "utf8");
+  const temporaryRoot = path.join(parent, `runtime-${attack}`);
+  const runner = recordingRunner(async (invocation) => {
+    const entry = path.join(invocation.cwd, `untrusted-${attack}`);
+    if (attack === "hardlink") await link(victim, entry);
+    else await symlink(victim, entry, "file");
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
 
-  for (const attack of ["hardlink", "symlink"]) {
-    if (attack === "symlink") {
-      const probe = path.join(parent, "symlink-probe");
-      try {
-        await symlink(victim, probe, "file");
-        await unlink(probe);
-      } catch (error) {
-        if (["EPERM", "EACCES"].includes(error?.code)) continue;
-        throw error;
-      }
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(await readFile(victim, "utf8"), "retain-me");
+}
+
+test("cleanup rejects a hard-linked entry without touching its target", async (t) => {
+  await assertCleanupLinkRejected(t, "hardlink");
+});
+
+test("cleanup rejects a symbolic-link entry without touching its target", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-symlink-probe-");
+  const victim = path.join(parent, "victim.txt");
+  const probe = path.join(parent, "symlink-probe");
+  await writeFile(victim, "retain-me", "utf8");
+  try {
+    await symlink(victim, probe, "file");
+    await unlink(probe);
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error?.code)) {
+      t.skip("file symlinks require Windows Developer Mode or elevated privilege");
+      return;
     }
-    const temporaryRoot = path.join(parent, `runtime-${attack}`);
-    const runner = recordingRunner(async (invocation) => {
-      const entry = path.join(invocation.cwd, `untrusted-${attack}`);
-      if (attack === "hardlink") await link(victim, entry);
-      else await symlink(victim, entry, "file");
-      const resultFile = argumentValue(invocation.args, "--output-last-message");
-      await writeFile(resultFile, '{"ok":true}', "utf8");
-      return successfulProcess();
-    });
-    const provider = createTestSupervisedCliBrainProvider(
-      providerOptions("codex-cli"),
-      {
-        processRunner: runner,
-        commandLocator: recordingLocator(testDescriptor("codex-cli")),
-        environment: { OPENAI_API_KEY: "credential" },
-        temporaryRoot,
-      },
-    );
-
-    await assert.rejects(provider.generate(brainRequest()), {
-      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
-    });
-    assert.equal(await readFile(victim, "utf8"), "retain-me");
+    throw error;
   }
+  await assertCleanupLinkRejected(t, "symlink");
+});
+
+test("cleanup rejects a queued-directory swap before reading outside the quarantine", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-dir-swap-");
+  const victimDirectory = path.join(parent, "victim");
+  const victimFile = path.join(victimDirectory, "outside.txt");
+  const probe = path.join(parent, "junction-probe");
+  await mkdir(victimDirectory);
+  await writeFile(victimFile, "retain-me", "utf8");
+  try {
+    await symlink(victimDirectory, probe, "junction");
+    await unlink(probe);
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error?.code)) {
+      t.skip("directory junctions are unavailable on this Windows host");
+      return;
+    }
+    throw error;
+  }
+  const temporaryRoot = path.join(parent, "runtime");
+  let nestedDirectory;
+  let swapped = false;
+  const runner = recordingRunner(async (invocation) => {
+    nestedDirectory = path.join(invocation.cwd, "nested");
+    await mkdir(nestedDirectory);
+    await writeFile(path.join(nestedDirectory, "inside.txt"), "inside", "utf8");
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async opendir(directory) {
+          if (
+            !swapped &&
+            path.basename(directory) === "nested" &&
+            path.basename(path.dirname(directory)).startsWith(".cleanup-")
+          ) {
+            swapped = true;
+            nestedDirectory = directory;
+            await rename(nestedDirectory, `${nestedDirectory}-original`);
+            await symlink(victimDirectory, nestedDirectory, "junction");
+          }
+          return opendir(directory);
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(await readFile(victimFile, "utf8"), "retain-me");
+});
+
+test("cleanup rejects a parent swap after a file check without deleting the replacement", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-delete-swap-");
+  const victimDirectory = path.join(parent, "victim");
+  const victimFile = path.join(victimDirectory, "attack.txt");
+  const probe = path.join(parent, "junction-probe");
+  await mkdir(victimDirectory);
+  await writeFile(victimFile, "retain-me", "utf8");
+  try {
+    await symlink(victimDirectory, probe, "junction");
+    await unlink(probe);
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error?.code)) {
+      t.skip("directory junctions are unavailable on this Windows host");
+      return;
+    }
+    throw error;
+  }
+  const temporaryRoot = path.join(parent, "runtime");
+  let nestedDirectory;
+  let attackFile;
+  let attackStats = 0;
+  const runner = recordingRunner(async (invocation) => {
+    nestedDirectory = path.join(invocation.cwd, "nested");
+    attackFile = path.join(nestedDirectory, "attack.txt");
+    await mkdir(nestedDirectory);
+    await writeFile(attackFile, "inside", "utf8");
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async lstat(file, options) {
+          const details = await lstat(file, options);
+          if (
+            path.basename(file) === "attack.txt" &&
+            path.basename(path.dirname(file)) === "nested" &&
+            path.basename(path.dirname(path.dirname(file))).startsWith(".cleanup-")
+          ) {
+            attackFile = file;
+            nestedDirectory = path.dirname(file);
+            attackStats += 1;
+            if (attackStats === 2) {
+              await rename(nestedDirectory, `${nestedDirectory}-original`);
+              await symlink(victimDirectory, nestedDirectory, "junction");
+            }
+          }
+          return details;
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(await readFile(victimFile, "utf8"), "retain-me");
+});
+
+test("the production identity deleter refuses a replaced final entry", async (t) => {
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "identity-bound cleanup helper is required");
+  const parent = await temporaryDirectory(t, "supervised-cli-identity-delete-");
+  const target = path.join(parent, "target.txt");
+  const original = path.join(parent, "target-original.txt");
+  await writeFile(target, "original", "utf8");
+  const parentDetails = await lstat(parent, { bigint: true });
+  const targetDetails = await lstat(target, { bigint: true });
+  const parentIdentity = {
+    path: parent,
+    device: parentDetails.dev.toString(),
+    inode: parentDetails.ino.toString(),
+    directory: true,
+    file: false,
+    parent: null,
+  };
+  const targetIdentity = {
+    path: target,
+    device: targetDetails.dev.toString(),
+    inode: targetDetails.ino.toString(),
+    size: targetDetails.size,
+    links: targetDetails.nlink,
+    directory: false,
+    file: true,
+    parent: parentIdentity,
+  };
+  await rename(target, original);
+  await writeFile(target, "replacement", "utf8");
+
+  await assert.rejects(
+    managerModule.deleteInventoryByIdentity(
+      [targetIdentity],
+      new AbortController().signal,
+    ),
+  );
+  assert.equal(await readFile(target, "utf8"), "replacement");
+  assert.equal(await readFile(original, "utf8"), "original");
+});
+
+test("the production identity deleter refuses a hard link added after inventory", async (t) => {
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "identity-bound cleanup helper is required");
+  const parent = await temporaryDirectory(t, "supervised-cli-identity-link-");
+  const target = path.join(parent, "target.txt");
+  const alias = path.join(parent, "alias.txt");
+  await writeFile(target, "private", "utf8");
+  const parentDetails = await lstat(parent, { bigint: true });
+  const targetDetails = await lstat(target, { bigint: true });
+  const parentIdentity = {
+    path: parent,
+    device: parentDetails.dev.toString(),
+    inode: parentDetails.ino.toString(),
+    directory: true,
+    file: false,
+    parent: null,
+  };
+  const targetIdentity = {
+    path: target,
+    device: targetDetails.dev.toString(),
+    inode: targetDetails.ino.toString(),
+    size: targetDetails.size,
+    links: targetDetails.nlink,
+    directory: false,
+    file: true,
+    parent: parentIdentity,
+  };
+  try {
+    await link(target, alias);
+  } catch (error) {
+    if (error?.code === "EPERM" || error?.code === "EACCES") {
+      t.skip(`hard links unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+
+  await assert.rejects(
+    managerModule.deleteInventoryByIdentity(
+      [targetIdentity],
+      new AbortController().signal,
+    ),
+  );
+  assert.equal(await readFile(target, "utf8"), "private");
+  assert.equal(await readFile(alias, "utf8"), "private");
 });
 
 test("an unprovable process reap remains visible when the total deadline expires", async (t) => {
@@ -1398,6 +1827,47 @@ test("an unprovable process reap remains visible when the total deadline expires
     code: "STRUCTURED_PROVIDER_REAP_FAILED",
   });
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
+});
+
+test("a reap failure blocks every CLI kind sharing the root before discovery", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-reap-shared-root-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const failedRunner = recordingRunner(async () => {
+    const error = new Error("private process identity");
+    error.code = "STRUCTURED_PROVIDER_REAP_FAILED";
+    throw error;
+  });
+  const failed = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: failedRunner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(failed.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_REAP_FAILED",
+  });
+
+  const nextLocator = recordingLocator(testDescriptor("claude-cli"));
+  const nextRunner = recordingRunner(async () => successfulProcess());
+  const next = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: nextRunner,
+      commandLocator: nextLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(next.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(nextLocator.calls.length, 0);
+  assert.equal(nextRunner.calls.length, 0);
 });
 
 test("a critical stale-cleanup failure is not hidden by the total deadline", async (t) => {
@@ -1555,6 +2025,146 @@ test("the first use scavenges only stale verified residues and concurrent calls 
   assert.equal(remaining.includes("invocation-codex-cli-live001"), true);
   assert.equal(remaining.includes("invocation-codex-cli-fresh01"), true);
   assert.equal(remaining.includes("invocation-codex-cli-unknown1"), true);
+});
+
+test("stale recovery validates the complete bounded plan before removing evidence", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-stale-plan-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const staleDirectory = path.join(
+    temporaryRoot,
+    "invocation-codex-cli-stale-plan",
+  );
+  const unsafeCleanup = path.join(temporaryRoot, ".cleanup-unsafe-plan");
+  await mkdir(staleDirectory, { recursive: true });
+  await writeFile(
+    path.join(staleDirectory, ".mydashboard-invocation.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "codex-cli",
+      ownerPid: 42_424,
+      createdAt: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString(),
+    }),
+    "utf8",
+  );
+  await mkdir(unsafeCleanup);
+  await writeFile(path.join(unsafeCleanup, "malformed.txt"), "retain", "utf8");
+  const rootHandle = await opendir(temporaryRoot);
+  const rootEntries = [];
+  for await (const entry of rootHandle) rootEntries.push(entry);
+  rootEntries.sort((left) => left.name === path.basename(staleDirectory) ? -1 : 1);
+  let rootOpenCalls = 0;
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      isProcessAlive: () => false,
+      cleanupFileSystem: cleanupFileSystem({
+        async opendir(directory) {
+          if (path.resolve(directory) !== path.resolve(temporaryRoot)) {
+            return opendir(directory);
+          }
+          rootOpenCalls += 1;
+          let index = 0;
+          return {
+            async read() {
+              return rootEntries[index++] ?? null;
+            },
+            async close() {},
+          };
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal((await lstat(staleDirectory)).isDirectory(), true);
+  assert.equal(await readFile(path.join(unsafeCleanup, "malformed.txt"), "utf8"), "retain");
+  assert.equal(rootOpenCalls, 1);
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("a stale-scan directory-close failure blocks the root before discovery", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-stale-close-");
+  const temporaryRoot = path.join(parent, "runtime");
+  await mkdir(temporaryRoot);
+  const staleDirectory = path.join(
+    temporaryRoot,
+    "invocation-codex-cli-close-failure",
+  );
+  await mkdir(staleDirectory);
+  await writeFile(
+    path.join(staleDirectory, ".mydashboard-invocation.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "codex-cli",
+      ownerPid: 83_333,
+      createdAt: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString(),
+    }),
+    "utf8",
+  );
+  const rootHandle = await opendir(temporaryRoot);
+  const rootEntries = [];
+  for await (const entry of rootHandle) rootEntries.push(entry);
+  let rootEntryIndex = 0;
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      isProcessAlive: () => false,
+      cleanupFileSystem: cleanupFileSystem({
+        async opendir(directory) {
+          if (path.resolve(directory) !== path.resolve(temporaryRoot)) {
+            return opendir(directory);
+          }
+          return {
+            async read() { return rootEntries[rootEntryIndex++] ?? null; },
+            async close() { throw new Error("private close failure"); },
+          };
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest()),
+    (error) =>
+      error?.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED" &&
+      !error.message.includes("private close failure") &&
+      !error.message.includes(temporaryRoot),
+  );
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+  assert.equal((await lstat(staleDirectory)).isDirectory(), true);
+
+  const nextLocator = recordingLocator(testDescriptor("claude-cli"));
+  const nextRunner = recordingRunner(async () => successfulProcess());
+  const next = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: nextRunner,
+      commandLocator: nextLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  await assert.rejects(next.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(nextLocator.calls.length, 0);
+  assert.equal(nextRunner.calls.length, 0);
 });
 
 test("stale scavenging fails closed before mutation when the root exceeds 128 entries", async (t) => {

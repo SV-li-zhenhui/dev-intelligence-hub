@@ -3,7 +3,8 @@ import path from "node:path";
 import { OllamaStructuredProvider } from "../adapters/ollama-structured-provider.js";
 import { OpenAiCompatibleProvider } from "../adapters/openai-compatible-provider.js";
 import {
-  createRuntimeSupervisedCliBrainProvider,
+  createCompositionSupervisedCliBrainProvider,
+  createProductionSupervisedCliBrainProvider,
 } from "../adapters/supervised-cli-brain-provider.js";
 import { BrainRouter } from "./brain-router.js";
 import { ConfiguredRoleEmployee } from "./configured-role-employee.js";
@@ -85,7 +86,7 @@ function selectOptions(config, keys) {
   );
 }
 
-function supervisedCliRuntimeFacts(dependencies) {
+function testSupervisedCliRuntimeFacts(dependencies) {
   const protectedRoots = dependencies.supervisedCliProtectedRoots ?? [];
   if (
     !Array.isArray(protectedRoots) ||
@@ -96,6 +97,19 @@ function supervisedCliRuntimeFacts(dependencies) {
     throw new TypeError("supervised CLI protected roots are invalid");
   }
   return Object.freeze({ protectedRoots: Object.freeze([...protectedRoots]) });
+}
+
+function productionSupervisedCliCapability(dependencies) {
+  if (Object.hasOwn(dependencies, "supervisedCliProtectedRoots")) {
+    throw new TypeError("production supervised CLI protected roots are invalid");
+  }
+  return dependencies.supervisedCliCompositionCapability ?? null;
+}
+
+function productionSupervisedCliProviderFactory(options, capability) {
+  return capability === null
+    ? createProductionSupervisedCliBrainProvider(options)
+    : createCompositionSupervisedCliBrainProvider(options, capability);
 }
 
 function declaredRemote(config, name) {
@@ -182,8 +196,12 @@ function providerOptions(
   );
 }
 
-function createProviders(value, dependencies, supervisedCliProviderFactory) {
-  const cliRuntimeFacts = supervisedCliRuntimeFacts(dependencies);
+function createProviders(
+  value,
+  dependencies,
+  supervisedCliProviderFactory,
+  cliRuntimeFacts,
+) {
   return dataEntries(value, "brainProviders").map(([id, config]) =>
     providerOptions(
       id,
@@ -201,12 +219,14 @@ function configuredBrainRouter(
     dependencies = {},
   } = {},
   supervisedCliProviderFactory,
+  cliRuntimeFacts,
 ) {
   return new BrainRouter({
     providers: createProviders(
       brainProviders,
       dependencies,
       supervisedCliProviderFactory,
+      cliRuntimeFacts(dependencies),
     ),
   });
 }
@@ -233,7 +253,8 @@ export function createConfiguredBrainRouter(options = {}) {
   }
   return configuredBrainRouter(
     options,
-    createRuntimeSupervisedCliBrainProvider,
+    productionSupervisedCliProviderFactory,
+    productionSupervisedCliCapability,
   );
 }
 
@@ -244,6 +265,7 @@ export function createTestConfiguredBrainRouter(
   return configuredBrainRouter(
     options,
     testCliProviderFactory(testDependencies),
+    testSupervisedCliRuntimeFacts,
   );
 }
 
@@ -317,7 +339,8 @@ export function createConfiguredWorkforce(options = {}) {
   return configuredWorkforce(options, (routerOptions) =>
     configuredBrainRouter(
       routerOptions,
-      createRuntimeSupervisedCliBrainProvider,
+      productionSupervisedCliProviderFactory,
+      productionSupervisedCliCapability,
     ));
 }
 
@@ -327,6 +350,10 @@ export function createTestConfiguredWorkforce(
 ) {
   const supervisedCliProviderFactory = testCliProviderFactory(testDependencies);
   return configuredWorkforce(options, (routerOptions) =>
-    configuredBrainRouter(routerOptions, supervisedCliProviderFactory),
+    configuredBrainRouter(
+      routerOptions,
+      supervisedCliProviderFactory,
+      testSupervisedCliRuntimeFacts,
+    ),
   );
 }

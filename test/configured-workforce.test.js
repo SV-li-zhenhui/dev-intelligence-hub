@@ -315,6 +315,20 @@ test("configured routing forwards only code-owned protected roots to supervised 
   assert.deepEqual(receivedRuntimeFacts, { protectedRoots });
 });
 
+test("production configured routing rejects a caller-supplied protected-root field", () => {
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: {
+        cli: { kind: "codex-cli" },
+      },
+      dependencies: {
+        supervisedCliProtectedRoots: [path.join(process.cwd(), "replacement")],
+      },
+    }),
+    /protected roots|dependencies.*invalid/i,
+  );
+});
+
 test("configured supervised CLIs reject adapter fields and command controls", () => {
   assert.throws(
     () => createConfiguredBrainRouter({

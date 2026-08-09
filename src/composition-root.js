@@ -19,6 +19,9 @@ import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { createOperationsRuntime } from "./operations-runtime.js";
 import {
+  createSupervisedCliCompositionCapability,
+} from "./adapters/supervised-cli-brain-provider.js";
+import {
   createLazyOwnerWorkRequestRuntime,
   createOwnerWorkRequestRuntime,
 } from "./owner-work-request-runtime.js";
@@ -147,12 +150,11 @@ function supervisedCliProtectedRoots({
   )
     ? codeExecutorRuntime.changePackageTargets.map((target) => target?.sourceRoot)
     : [];
-  const configuredWorkspaceRoots = runtimeWorkspaceRoots.length > 0
-    ? []
-    : (config.codeExecutor?.workspaces || []).map((workspace) =>
-        typeof workspace?.sourceRoot === "string"
-          ? path.resolve(projectRoot, workspace.sourceRoot)
-          : null);
+  const configuredWorkspaceRoots = (config.codeExecutor?.workspaces || [])
+    .map((workspace) =>
+      typeof workspace?.sourceRoot === "string"
+        ? path.resolve(projectRoot, workspace.sourceRoot)
+        : null);
   return distinctAbsolutePaths([
     projectRoot,
     storeDataDirectory,
@@ -632,9 +634,12 @@ export async function createApplication({
     codeExecutorRuntime,
     config,
   });
+  let cliCompositionCapability = createSupervisedCliCompositionCapability(
+    cliProtectedRoots,
+  );
   const brainDependencies = (dependencies) => ({
     ...dependencies,
-    supervisedCliProtectedRoots: cliProtectedRoots,
+    supervisedCliCompositionCapability: cliCompositionCapability,
   });
   const applicationAuthorityVerifier = Object.freeze({
     verify: (manifest) => verifyChangePackageApplicationAuthority({
@@ -686,6 +691,9 @@ export async function createApplication({
       codeExecutorRuntime,
       config,
     });
+    cliCompositionCapability = createSupervisedCliCompositionCapability(
+      cliProtectedRoots,
+    );
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
       codeExecutorRuntime,
