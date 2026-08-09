@@ -21,8 +21,10 @@ import { canonicalJsonStringify } from "../lib/canonical-json-digest.js";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import {
-  deleteInventoryByIdentity,
+  prepareCleanupTreesByIdentity,
   PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
+  productionSupervisedCliPlatformSupported,
+  readSupervisedCliCompositionAuthority,
 } from "../lib/private-directory-manager.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import {
@@ -33,8 +35,6 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
-const PRODUCTION_COMPOSITION_TOKEN = Object.freeze({});
-const PRODUCTION_COMPOSITION_CAPABILITIES = new WeakMap();
 const CLI_KINDS = new Set(["codex-cli", "claude-cli"]);
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_CLI_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
@@ -59,7 +59,7 @@ const PRODUCTION_CLEANUP_FILE_SYSTEM = Object.freeze({
   rename,
   rmdir,
   unlink,
-  deleteInventory: deleteInventoryByIdentity,
+  prepareCleanupTrees: prepareCleanupTreesByIdentity,
 });
 const TEST_CLEANUP_FILE_SYSTEM = Object.freeze({
   lstat,
@@ -387,6 +387,9 @@ function cleanupFileSystem(value) {
     ...(typeof value.deleteInventory === "function"
       ? { deleteInventory: value.deleteInventory.bind(value) }
       : {}),
+    ...(typeof value.prepareCleanupTrees === "function"
+      ? { prepareCleanupTrees: value.prepareCleanupTrees.bind(value) }
+      : {}),
   });
 }
 
@@ -432,6 +435,7 @@ function productionDependencies(additionalProtectedRoots = []) {
     protectedRoots: protectedRootPaths([projectRoot, ...additionalProtectedRoots]),
     cleanupFileSystem: PRODUCTION_CLEANUP_FILE_SYSTEM,
     rootDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
+    productionPlatformSupported: productionSupervisedCliPlatformSupported(),
     clock: Date.now,
     monotonicClock: () => performance.now(),
     processId: process.pid,
@@ -442,13 +446,10 @@ function productionDependencies(additionalProtectedRoots = []) {
 }
 
 function providerDependencies(constructionToken, rawDependencies) {
-  if (constructionToken === PRODUCTION_COMPOSITION_TOKEN) {
-    const protectedRoots = PRODUCTION_COMPOSITION_CAPABILITIES.get(
-      rawDependencies,
-    );
-    if (!protectedRoots) {
-      throw new TypeError("Supervised CLI composition capability is invalid");
-    }
+  const protectedRoots = readSupervisedCliCompositionAuthority(
+    constructionToken,
+  );
+  if (protectedRoots) {
     return productionDependencies(protectedRoots);
   }
   if (constructionToken !== TEST_CONSTRUCTION_TOKEN) {
@@ -483,6 +484,7 @@ function providerDependencies(constructionToken, rawDependencies) {
     rootDirectoryManager: rootDirectoryManager(
       dependencies.rootDirectoryManager ?? testRootDirectoryManager(),
     ),
+    productionPlatformSupported: true,
     clock: dependencies.clock ?? Date.now,
     monotonicClock: dependencies.monotonicClock ?? (() => performance.now()),
     processId: dependencies.processId ?? process.pid,
@@ -508,6 +510,7 @@ function validateDependencies(dependencies) {
     !Array.isArray(dependencies.protectedRoots) ||
     typeof dependencies.cleanupFileSystem?.unlink !== "function" ||
     typeof dependencies.rootDirectoryManager?.prepare !== "function" ||
+    typeof dependencies.productionPlatformSupported !== "boolean" ||
     !Number.isSafeInteger(dependencies.processId) ||
     dependencies.processId < 1
   ) {
@@ -985,6 +988,41 @@ async function removeVerifiedInvocation(
   rootState.residues.delete(canonicalPath(target.path));
 }
 
+async function removeVerifiedInvocations(
+  invocations,
+  root,
+  signal,
+  fileSystem,
+  rootState,
+) {
+  if (invocations.length === 0) return;
+  if (typeof fileSystem.prepareCleanupTrees === "function") {
+    for (const invocation of invocations) recordResidue(rootState, invocation);
+    const session = await cleanupStep(signal, () =>
+      fileSystem.prepareCleanupTrees(invocations, {
+        maximumEntries: MAX_CLEANUP_ENTRIES,
+        maximumDepth: MAX_CLEANUP_DEPTH,
+        maximumBytes: Number(MAX_CLEANUP_REGULAR_BYTES),
+        signal,
+      }));
+    await cleanupStep(signal, () => session.commit());
+    for (const invocation of invocations) {
+      rootState.residues.delete(canonicalPath(invocation.path));
+    }
+    return;
+  }
+  for (const invocation of invocations) {
+    recordResidue(rootState, invocation);
+    await removeVerifiedInvocation(
+      invocation,
+      root,
+      signal,
+      fileSystem,
+      rootState,
+    );
+  }
+}
+
 function markerValue(value, cliKind) {
   if (
     value === null ||
@@ -1173,17 +1211,14 @@ async function scavengeStaleInvocations({
       }
     }
   }
-  for (const identity of staleInvocations) {
-    recordResidue(rootState, identity);
-    await removeVerifiedInvocation(
-      identity,
-      root,
-      signal,
-      fileSystem,
-      rootState,
-    );
-    releaseRootIfClean(rootState);
-  }
+  await removeVerifiedInvocations(
+    staleInvocations,
+    root,
+    signal,
+    fileSystem,
+    rootState,
+  );
+  releaseRootIfClean(rootState);
 }
 
 async function createInvocation({
@@ -1238,9 +1273,8 @@ async function createInvocation({
       cleanupAttempt = (async () => {
         const cleanupIdentity = identity ??
           await trustedDirectory(directory, root, signal);
-        recordResidue(rootState, cleanupIdentity);
-        await removeVerifiedInvocation(
-          cleanupIdentity,
+        await removeVerifiedInvocations(
+          [cleanupIdentity],
           root,
           signal,
           fileSystem,
@@ -1600,7 +1634,7 @@ async function runRootOperation(
   });
 }
 
-async function recoverResidue(
+async function verifiedResidue(
   residue,
   root,
   signal,
@@ -1616,18 +1650,12 @@ async function recoverResidue(
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     rootState.residues.delete(canonicalPath(residue.path));
-    return;
+    return null;
   }
   if (!sameDirectoryIdentity(residue, details)) {
     throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
   }
-  await removeVerifiedInvocation(
-    residue,
-    root,
-    signal,
-    fileSystem,
-    rootState,
-  );
+  return residue;
 }
 
 export class SupervisedCliBrainProvider {
@@ -1647,6 +1675,7 @@ export class SupervisedCliBrainProvider {
   #protectedRoots;
   #cleanupFileSystem;
   #rootDirectoryManager;
+  #productionPlatformSupported;
   #rootIdentity = null;
   #rootState = null;
   #descriptorValue = null;
@@ -1655,7 +1684,7 @@ export class SupervisedCliBrainProvider {
     if (
       arguments.length > 1 &&
       constructionToken !== TEST_CONSTRUCTION_TOKEN &&
-      constructionToken !== PRODUCTION_COMPOSITION_TOKEN
+      readSupervisedCliCompositionAuthority(constructionToken) === null
     ) {
       throw new TypeError(
         "Production supervised CLI providers do not accept replacement dependencies",
@@ -1685,6 +1714,7 @@ export class SupervisedCliBrainProvider {
     this.#protectedRoots = dependencies.protectedRoots;
     this.#cleanupFileSystem = dependencies.cleanupFileSystem;
     this.#rootDirectoryManager = dependencies.rootDirectoryManager;
+    this.#productionPlatformSupported = dependencies.productionPlatformSupported;
     Object.freeze(this);
   }
 
@@ -1740,15 +1770,24 @@ export class SupervisedCliBrainProvider {
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
     await runDeadlineCleanup(state, deadline, async (signal) => {
+      const verified = [];
       for (const residue of [...state.residues.values()]) {
-        await recoverResidue(
+        const current = await verifiedResidue(
           residue,
           root.path,
           signal,
           this.#cleanupFileSystem,
           state,
         );
+        if (current) verified.push(current);
       }
+      await removeVerifiedInvocations(
+        verified,
+        root.path,
+        signal,
+        this.#cleanupFileSystem,
+        state,
+      );
     });
     releaseRootIfClean(state);
     if (state.blocked) {
@@ -1767,8 +1806,8 @@ export class SupervisedCliBrainProvider {
       ) {
         throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
       }
-      await removeVerifiedInvocation(
-        invocation,
+      await removeVerifiedInvocations(
+        [invocation],
         currentRoot.path,
         signal,
         this.#cleanupFileSystem,
@@ -1891,6 +1930,9 @@ export class SupervisedCliBrainProvider {
   }
 
   async generate(rawRequest = {}) {
+    if (!this.#productionPlatformSupported) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
     const startedAt = this.#monotonicClock();
     let admitted;
     try {
@@ -1956,24 +1998,6 @@ export class SupervisedCliBrainProvider {
 
 export function createProductionSupervisedCliBrainProvider(options) {
   return new SupervisedCliBrainProvider(options);
-}
-
-export function createSupervisedCliCompositionCapability(protectedRoots) {
-  const roots = protectedRootPaths(protectedRoots);
-  const capability = Object.freeze({ protectedRoots: roots });
-  PRODUCTION_COMPOSITION_CAPABILITIES.set(capability, roots);
-  return capability;
-}
-
-export function createCompositionSupervisedCliBrainProvider(
-  options,
-  capability,
-) {
-  return new SupervisedCliBrainProvider(
-    options,
-    PRODUCTION_COMPOSITION_TOKEN,
-    capability,
-  );
 }
 
 export function createTestSupervisedCliBrainProvider(options, dependencies) {

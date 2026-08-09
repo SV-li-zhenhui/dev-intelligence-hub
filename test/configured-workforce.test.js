@@ -329,6 +329,28 @@ test("production configured routing rejects a caller-supplied protected-root fie
   );
 });
 
+test("production configured routing rejects every public composition-authority field", () => {
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: {
+        cli: { kind: "codex-cli" },
+      },
+      dependencies: {
+        supervisedCliCompositionCapability: Object.freeze({
+          protectedRoots: Object.freeze([process.cwd()]),
+        }),
+      },
+    }),
+    /production configured routing does not accept public composition authority/i,
+  );
+});
+
+test("ordinary adapter exports cannot mint production composition authority", async () => {
+  const adapter = await import("../src/adapters/supervised-cli-brain-provider.js");
+  assert.equal(adapter.createSupervisedCliCompositionCapability, undefined);
+  assert.equal(adapter.createCompositionSupervisedCliBrainProvider, undefined);
+});
+
 test("configured supervised CLIs reject adapter fields and command controls", () => {
   assert.throws(
     () => createConfiguredBrainRouter({

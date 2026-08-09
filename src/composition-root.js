@@ -19,8 +19,9 @@ import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { createOperationsRuntime } from "./operations-runtime.js";
 import {
-  createSupervisedCliCompositionCapability,
-} from "./adapters/supervised-cli-brain-provider.js";
+  issueSupervisedCliCompositionAuthority,
+  SUPERVISED_CLI_COMPOSITION_AUTHORITY,
+} from "./lib/private-directory-manager.js";
 import {
   createLazyOwnerWorkRequestRuntime,
   createOwnerWorkRequestRuntime,
@@ -634,12 +635,12 @@ export async function createApplication({
     codeExecutorRuntime,
     config,
   });
-  let cliCompositionCapability = createSupervisedCliCompositionCapability(
+  let cliCompositionCapability = issueSupervisedCliCompositionAuthority(
     cliProtectedRoots,
   );
   const brainDependencies = (dependencies) => ({
     ...dependencies,
-    supervisedCliCompositionCapability: cliCompositionCapability,
+    [SUPERVISED_CLI_COMPOSITION_AUTHORITY]: cliCompositionCapability,
   });
   const applicationAuthorityVerifier = Object.freeze({
     verify: (manifest) => verifyChangePackageApplicationAuthority({
@@ -691,7 +692,7 @@ export async function createApplication({
       codeExecutorRuntime,
       config,
     });
-    cliCompositionCapability = createSupervisedCliCompositionCapability(
+    cliCompositionCapability = issueSupervisedCliCompositionAuthority(
       cliProtectedRoots,
     );
     const controlledConflictPorts = conflictPreparationPorts(

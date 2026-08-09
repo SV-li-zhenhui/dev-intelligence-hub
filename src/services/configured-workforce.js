@@ -3,9 +3,12 @@ import path from "node:path";
 import { OllamaStructuredProvider } from "../adapters/ollama-structured-provider.js";
 import { OpenAiCompatibleProvider } from "../adapters/openai-compatible-provider.js";
 import {
-  createCompositionSupervisedCliBrainProvider,
   createProductionSupervisedCliBrainProvider,
+  SupervisedCliBrainProvider,
 } from "../adapters/supervised-cli-brain-provider.js";
+import {
+  SUPERVISED_CLI_COMPOSITION_AUTHORITY,
+} from "../lib/private-directory-manager.js";
 import { BrainRouter } from "./brain-router.js";
 import { ConfiguredRoleEmployee } from "./configured-role-employee.js";
 
@@ -103,13 +106,18 @@ function productionSupervisedCliCapability(dependencies) {
   if (Object.hasOwn(dependencies, "supervisedCliProtectedRoots")) {
     throw new TypeError("production supervised CLI protected roots are invalid");
   }
-  return dependencies.supervisedCliCompositionCapability ?? null;
+  if (Object.hasOwn(dependencies, "supervisedCliCompositionCapability")) {
+    throw new TypeError(
+      "Production configured routing does not accept public composition authority",
+    );
+  }
+  return dependencies[SUPERVISED_CLI_COMPOSITION_AUTHORITY] ?? null;
 }
 
 function productionSupervisedCliProviderFactory(options, capability) {
   return capability === null
     ? createProductionSupervisedCliBrainProvider(options)
-    : createCompositionSupervisedCliBrainProvider(options, capability);
+    : new SupervisedCliBrainProvider(options, capability);
 }
 
 function declaredRemote(config, name) {

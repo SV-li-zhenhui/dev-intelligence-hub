@@ -1,25 +1,57 @@
-import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { execFile, spawn } from "node:child_process";
 import {
   chmod,
   lstat,
   mkdir,
-  open,
   realpath,
-  rmdir,
-  unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
+const SUPERVISED_CLI_COMPOSITION_ROOTS = new WeakMap();
+export const SUPERVISED_CLI_COMPOSITION_AUTHORITY = Symbol(
+  "supervisedCliCompositionAuthority",
+);
 const WINDOWS_PARENT_DANGEROUS_RIGHTS =
-  64n | 65_536n | 262_144n | 524_288n;
+  2n | 4n | 16n | 64n | 256n | 65_536n | 262_144n | 524_288n |
+  268_435_456n | 1_073_741_824n;
+const WINDOWS_FULL_CONTROL = 2_032_127n;
 
 function unavailable() {
   return Object.assign(new Error("Private directory trust is unavailable"), {
     code: "STRUCTURED_PROVIDER_UNAVAILABLE",
   });
+}
+
+function cleanupFailed() {
+  return Object.assign(new Error("Private cleanup could not be proven"), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+}
+
+export function productionSupervisedCliPlatformSupported(
+  platform = process.platform,
+  architecture = process.arch,
+) {
+  return platform === "win32" && architecture === "x64";
+}
+
+export function issueSupervisedCliCompositionAuthority(protectedRoots) {
+  if (!Array.isArray(protectedRoots)) {
+    throw new TypeError("supervised CLI composition roots are invalid");
+  }
+  const authority = Object.freeze({});
+  SUPERVISED_CLI_COMPOSITION_ROOTS.set(
+    authority,
+    Object.freeze([...protectedRoots]),
+  );
+  return authority;
+}
+
+export function readSupervisedCliCompositionAuthority(authority) {
+  return SUPERVISED_CLI_COMPOSITION_ROOTS.get(authority) ?? null;
 }
 
 function throwIfAborted(signal) {
@@ -96,15 +128,24 @@ try {
 } catch {
   $ownerSid = ([Security.Principal.SecurityIdentifier]$acl.Owner).Value
 }
-$rules = @($acl.GetAccessRules(
-  $true,
-  $true,
-  [Security.Principal.SecurityIdentifier]
-) | ForEach-Object {
+$raw = [Security.AccessControl.RawSecurityDescriptor]::new(
+  $acl.GetSecurityDescriptorSddlForm(
+    [Security.AccessControl.AccessControlSections]::All
+  )
+)
+$rules = @($raw.DiscretionaryAcl | ForEach-Object {
+  $common = $_ -is [Security.AccessControl.CommonAce]
   [pscustomobject]@{
-    sid = $_.IdentityReference.Value
-    rights = [int64]$_.FileSystemRights
-    type = $_.AccessControlType.ToString()
+    common = $common
+    sid = if ($_ -is [Security.AccessControl.KnownAce]) {
+      $_.SecurityIdentifier.Value
+    } else { $null }
+    rights = if ($_ -is [Security.AccessControl.KnownAce]) {
+      [int64]$_.AccessMask
+    } else { 0 }
+    qualifier = if ($common) { $_.AceQualifier.ToString() } else { $null }
+    callback = if ($common) { $_.IsCallback } else { $false }
+    flags = $_.AceFlags.ToString()
   }
 })
 [pscustomobject]@{
@@ -123,6 +164,9 @@ $target = [Text.Encoding]::UTF8.GetString(
 $parent = [Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String($env:MYDASHBOARD_PRIVATE_PARENT)
 )
+$leaf = [Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String($env:MYDASHBOARD_PRIVATE_LEAF)
+)
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $source = @'
 using System;
@@ -131,18 +175,31 @@ using System.Runtime.InteropServices;
 
 public static class MyDashboardPrivateDirectory {
   [StructLayout(LayoutKind.Sequential)]
-  private struct SECURITY_ATTRIBUTES {
-    public int nLength;
-    public IntPtr lpSecurityDescriptor;
-    [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+  private struct UNICODE_STRING {
+    public ushort Length;
+    public ushort MaximumLength;
+    public IntPtr Buffer;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct OBJECT_ATTRIBUTES {
+    public int Length;
+    public IntPtr RootDirectory;
+    public IntPtr ObjectName;
+    public uint Attributes;
+    public IntPtr SecurityDescriptor;
+    public IntPtr SecurityQualityOfService;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct IO_STATUS_BLOCK {
+    public IntPtr Status;
+    public IntPtr Information;
   }
 
   [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
     string descriptor, uint revision, out IntPtr securityDescriptor, out uint size);
-
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  private static extern bool CreateDirectory(string path, ref SECURITY_ATTRIBUTES attributes);
 
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(
@@ -168,11 +225,28 @@ public static class MyDashboardPrivateDirectory {
     Microsoft.Win32.SafeHandles.SafeFileHandle handle,
     out BY_HANDLE_FILE_INFORMATION information);
 
+  [DllImport("ntdll.dll")]
+  private static extern int NtCreateFile(
+    out Microsoft.Win32.SafeHandles.SafeFileHandle fileHandle,
+    uint desiredAccess,
+    ref OBJECT_ATTRIBUTES objectAttributes,
+    ref IO_STATUS_BLOCK ioStatusBlock,
+    IntPtr allocationSize,
+    uint fileAttributes,
+    uint shareAccess,
+    uint createDisposition,
+    uint createOptions,
+    IntPtr eaBuffer,
+    uint eaLength);
+
+  [DllImport("ntdll.dll")]
+  private static extern uint RtlNtStatusToDosError(int status);
+
   [DllImport("kernel32.dll")]
   private static extern IntPtr LocalFree(IntPtr memory);
 
   public static void Create(
-    string path, string parent, string sid,
+    string parent, string leaf, string sid,
     ulong expectedDevice, ulong expectedInode) {
     const uint FILE_READ_ATTRIBUTES = 0x00000080;
     const uint SHARE_READ_WRITE = 0x00000003;
@@ -215,13 +289,53 @@ public static class MyDashboardPrivateDirectory {
         ) {
           throw new InvalidOperationException("parent identity changed");
         }
-        SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES {
-          nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)),
-          lpSecurityDescriptor = securityDescriptor,
-          bInheritHandle = false
-        };
-        if (!CreateDirectory(path, ref attributes)) {
-          throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (
+          String.IsNullOrEmpty(leaf) ||
+          leaf == "." || leaf == ".." ||
+          leaf.IndexOfAny(new char[] {'\\', '/'}) >= 0
+        ) {
+          throw new InvalidOperationException("invalid relative leaf");
+        }
+        IntPtr leafBuffer = Marshal.StringToHGlobalUni(leaf);
+        IntPtr unicodePointer = IntPtr.Zero;
+        try {
+          UNICODE_STRING unicode = new UNICODE_STRING {
+            Length = checked((ushort)(leaf.Length * 2)),
+            MaximumLength = checked((ushort)((leaf.Length + 1) * 2)),
+            Buffer = leafBuffer
+          };
+          unicodePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+          Marshal.StructureToPtr(unicode, unicodePointer, false);
+          OBJECT_ATTRIBUTES objectAttributes = new OBJECT_ATTRIBUTES {
+            Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+            RootDirectory = parentHandle.DangerousGetHandle(),
+            ObjectName = unicodePointer,
+            Attributes = 0x00000040,
+            SecurityDescriptor = securityDescriptor,
+            SecurityQualityOfService = IntPtr.Zero
+          };
+          IO_STATUS_BLOCK ioStatus = new IO_STATUS_BLOCK();
+          Microsoft.Win32.SafeHandles.SafeFileHandle created;
+          int status = NtCreateFile(
+            out created,
+            0x001F01FF,
+            ref objectAttributes,
+            ref ioStatus,
+            IntPtr.Zero,
+            0x00000080,
+            0x00000007,
+            2,
+            0x00200021,
+            IntPtr.Zero,
+            0);
+          using (created) {
+            if (status < 0) {
+              throw new Win32Exception((int)RtlNtStatusToDosError(status));
+            }
+          }
+        } finally {
+          if (unicodePointer != IntPtr.Zero) Marshal.FreeHGlobal(unicodePointer);
+          Marshal.FreeHGlobal(leafBuffer);
         }
       }
     } finally {
@@ -232,26 +346,39 @@ public static class MyDashboardPrivateDirectory {
 '@
 Add-Type -TypeDefinition $source -Language CSharp
 [MyDashboardPrivateDirectory]::Create(
-  $target,
   $parent,
+  $leaf,
   $sid,
   [uint64]$env:MYDASHBOARD_PRIVATE_PARENT_DEVICE,
   [uint64]$env:MYDASHBOARD_PRIVATE_PARENT_INODE
 )
 `;
 
-const WINDOWS_DELETE_SCRIPT = String.raw`
+const WINDOWS_CLEANUP_SESSION_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$node = [Text.Encoding]::UTF8.GetString(
-  [Convert]::FromBase64String($env:MYDASHBOARD_CLEANUP_NODE)
+$plan = [Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String($env:MYDASHBOARD_CLEANUP_PLAN)
 ) | ConvertFrom-Json
 $source = @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public static class MyDashboardIdentityDelete {
+public sealed class MyDashboardExpectedRoot {
+  public string Path;
+  public ulong Device;
+  public ulong Inode;
+}
+
+public sealed class MyDashboardCleanupSession : IDisposable {
+  private sealed class Node {
+    public SafeFileHandle Handle;
+    public bool Directory;
+    public int Depth;
+  }
+
   [StructLayout(LayoutKind.Sequential)]
   private struct BY_HANDLE_FILE_INFORMATION {
     public uint FileAttributes;
@@ -264,6 +391,29 @@ public static class MyDashboardIdentityDelete {
     public uint NumberOfLinks;
     public uint FileIndexHigh;
     public uint FileIndexLow;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct UNICODE_STRING {
+    public ushort Length;
+    public ushort MaximumLength;
+    public IntPtr Buffer;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct OBJECT_ATTRIBUTES {
+    public int Length;
+    public IntPtr RootDirectory;
+    public IntPtr ObjectName;
+    public uint Attributes;
+    public IntPtr SecurityDescriptor;
+    public IntPtr SecurityQualityOfService;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct IO_STATUS_BLOCK {
+    public IntPtr Status;
+    public IntPtr Information;
   }
 
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -279,68 +429,338 @@ public static class MyDashboardIdentityDelete {
   private static extern bool SetFileInformationByHandle(
     SafeFileHandle handle, int informationClass, IntPtr information, uint size);
 
-  public static void Delete(
-    string path, ulong expectedDevice, ulong expectedInode,
-    ulong expectedLinks, ulong expectedSize, bool directory) {
-    const uint DELETE = 0x00010000;
-    const uint FILE_READ_ATTRIBUTES = 0x00000080;
-    const uint SHARE_ALL = 0x00000007;
-    const uint OPEN_EXISTING = 3;
-    const uint OPEN_REPARSE_POINT = 0x00200000;
-    const uint BACKUP_SEMANTICS = 0x02000000;
-    const uint DIRECTORY_ATTRIBUTE = 0x00000010;
-    const uint REPARSE_ATTRIBUTE = 0x00000400;
-    using (SafeFileHandle handle = CreateFile(
-      path,
-      DELETE | FILE_READ_ATTRIBUTES,
-      SHARE_ALL,
+  [DllImport("ntdll.dll")]
+  private static extern int NtCreateFile(
+    out SafeFileHandle fileHandle,
+    uint desiredAccess,
+    ref OBJECT_ATTRIBUTES objectAttributes,
+    ref IO_STATUS_BLOCK ioStatusBlock,
+    IntPtr allocationSize,
+    uint fileAttributes,
+    uint shareAccess,
+    uint createDisposition,
+    uint createOptions,
+    IntPtr eaBuffer,
+    uint eaLength);
+
+  [DllImport("ntdll.dll")]
+  private static extern int NtQueryDirectoryFile(
+    SafeFileHandle fileHandle,
+    IntPtr eventHandle,
+    IntPtr apcRoutine,
+    IntPtr apcContext,
+    ref IO_STATUS_BLOCK ioStatusBlock,
+    IntPtr fileInformation,
+    uint length,
+    int fileInformationClass,
+    [MarshalAs(UnmanagedType.Bool)] bool returnSingleEntry,
+    IntPtr fileName,
+    [MarshalAs(UnmanagedType.Bool)] bool restartScan);
+
+  [DllImport("ntdll.dll")]
+  private static extern uint RtlNtStatusToDosError(int status);
+
+  private const uint DELETE = 0x00010000;
+  private const uint FILE_LIST_DIRECTORY = 0x00000001;
+  private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+  private const uint SYNCHRONIZE = 0x00100000;
+  private const uint SHARE_READ = 0x00000001;
+  private const uint OPEN_EXISTING = 3;
+  private const uint OPEN_REPARSE_POINT = 0x00200000;
+  private const uint BACKUP_SEMANTICS = 0x02000000;
+  private const uint DIRECTORY_ATTRIBUTE = 0x00000010;
+  private const uint REPARSE_ATTRIBUTE = 0x00000400;
+  private const uint FILE_OPEN = 1;
+  private const uint FILE_DIRECTORY_FILE = 0x00000001;
+  private const uint FILE_NON_DIRECTORY_FILE = 0x00000040;
+  private const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
+  private const uint FILE_OPEN_REPARSE_POINT = 0x00200000;
+  private const int FILE_ID_BOTH_DIRECTORY_INFORMATION = 37;
+  private const int STATUS_NO_MORE_FILES = unchecked((int)0x80000006);
+
+  private readonly List<Node> nodes = new List<Node>();
+  private readonly int maximumEntries;
+  private readonly int maximumDepth;
+  private readonly ulong maximumBytes;
+  private ulong totalBytes;
+  private bool committed;
+
+  private MyDashboardCleanupSession(
+    int maximumEntries, int maximumDepth, ulong maximumBytes) {
+    this.maximumEntries = maximumEntries;
+    this.maximumDepth = maximumDepth;
+    this.maximumBytes = maximumBytes;
+  }
+
+  private static ulong Inode(BY_HANDLE_FILE_INFORMATION information) {
+    return ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+  }
+
+  private static ulong Size(BY_HANDLE_FILE_INFORMATION information) {
+    return ((ulong)information.FileSizeHigh << 32) | information.FileSizeLow;
+  }
+
+  private static BY_HANDLE_FILE_INFORMATION Information(SafeFileHandle handle) {
+    BY_HANDLE_FILE_INFORMATION information;
+    if (!GetFileInformationByHandle(handle, out information)) {
+      throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    return information;
+  }
+
+  private static void ValidateType(
+    BY_HANDLE_FILE_INFORMATION information, bool directory) {
+    bool actualDirectory =
+      (information.FileAttributes & DIRECTORY_ATTRIBUTE) != 0;
+    if (
+      actualDirectory != directory ||
+      (information.FileAttributes & REPARSE_ATTRIBUTE) != 0
+    ) {
+      throw new InvalidOperationException("unsupported filesystem entry");
+    }
+  }
+
+  private SafeFileHandle OpenRoot(MyDashboardExpectedRoot expected) {
+    SafeFileHandle handle = CreateFile(
+      expected.Path,
+      DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      SHARE_READ,
       IntPtr.Zero,
       OPEN_EXISTING,
       OPEN_REPARSE_POINT | BACKUP_SEMANTICS,
-      IntPtr.Zero)) {
-      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-      BY_HANDLE_FILE_INFORMATION information;
-      if (!GetFileInformationByHandle(handle, out information)) {
-        throw new Win32Exception(Marshal.GetLastWin32Error());
+      IntPtr.Zero);
+    if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+    BY_HANDLE_FILE_INFORMATION information = Information(handle);
+    ValidateType(information, true);
+    if (
+      information.VolumeSerialNumber != expected.Device ||
+      Inode(information) != expected.Inode
+    ) {
+      handle.Dispose();
+      throw new InvalidOperationException("root identity changed");
+    }
+    return handle;
+  }
+
+  private static SafeFileHandle OpenRelative(
+    SafeFileHandle parent, string name, bool directory) {
+    if (
+      String.IsNullOrEmpty(name) || name == "." || name == ".." ||
+      name.IndexOfAny(new char[] {'\\', '/'}) >= 0
+    ) {
+      throw new InvalidOperationException("invalid child name");
+    }
+    IntPtr nameBuffer = Marshal.StringToHGlobalUni(name);
+    IntPtr unicodePointer = IntPtr.Zero;
+    try {
+      UNICODE_STRING unicode = new UNICODE_STRING {
+        Length = checked((ushort)(name.Length * 2)),
+        MaximumLength = checked((ushort)((name.Length + 1) * 2)),
+        Buffer = nameBuffer
+      };
+      unicodePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+      Marshal.StructureToPtr(unicode, unicodePointer, false);
+      OBJECT_ATTRIBUTES attributes = new OBJECT_ATTRIBUTES {
+        Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+        RootDirectory = parent.DangerousGetHandle(),
+        ObjectName = unicodePointer,
+        Attributes = 0x00000040,
+        SecurityDescriptor = IntPtr.Zero,
+        SecurityQualityOfService = IntPtr.Zero
+      };
+      IO_STATUS_BLOCK ioStatus = new IO_STATUS_BLOCK();
+      SafeFileHandle child;
+      int status = NtCreateFile(
+        out child,
+        DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        ref attributes,
+        ref ioStatus,
+        IntPtr.Zero,
+        0,
+        SHARE_READ,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT |
+          (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE),
+        IntPtr.Zero,
+        0);
+      if (status < 0) {
+        if (child != null) child.Dispose();
+        throw new Win32Exception((int)RtlNtStatusToDosError(status));
       }
-      ulong inode = ((ulong)information.FileIndexHigh << 32) |
-        information.FileIndexLow;
-      ulong size = ((ulong)information.FileSizeHigh << 32) |
-        information.FileSizeLow;
-      bool actualDirectory =
-        (information.FileAttributes & DIRECTORY_ATTRIBUTE) != 0;
-      if (
-        information.VolumeSerialNumber != expectedDevice ||
-        inode != expectedInode ||
-        actualDirectory != directory ||
-        (!directory && (
-          information.NumberOfLinks != expectedLinks || size != expectedSize)) ||
-        (information.FileAttributes & REPARSE_ATTRIBUTE) != 0
-      ) {
-        throw new InvalidOperationException("filesystem identity changed");
+      return child;
+    } finally {
+      if (unicodePointer != IntPtr.Zero) Marshal.FreeHGlobal(unicodePointer);
+      Marshal.FreeHGlobal(nameBuffer);
+    }
+  }
+
+  private void AddNode(SafeFileHandle handle, bool directory, int depth) {
+    if (depth > maximumDepth || nodes.Count >= maximumEntries) {
+      handle.Dispose();
+      throw new InvalidOperationException("cleanup bound exceeded");
+    }
+    BY_HANDLE_FILE_INFORMATION information = Information(handle);
+    ValidateType(information, directory);
+    if (!directory) {
+      if (information.NumberOfLinks != 1) {
+        handle.Dispose();
+        throw new InvalidOperationException("hard link rejected");
       }
-      IntPtr disposition = Marshal.AllocHGlobal(1);
-      try {
-        Marshal.WriteByte(disposition, 1);
-        if (!SetFileInformationByHandle(handle, 4, disposition, 1)) {
-          throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
-      } finally {
-        Marshal.FreeHGlobal(disposition);
+      totalBytes = checked(totalBytes + Size(information));
+      if (totalBytes > maximumBytes) {
+        handle.Dispose();
+        throw new InvalidOperationException("cleanup byte bound exceeded");
       }
     }
+    nodes.Add(new Node { Handle = handle, Directory = directory, Depth = depth });
+  }
+
+  private void Enumerate(Node directory, uint expectedDevice) {
+    const int bufferSize = 64 * 1024;
+    IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+    try {
+      bool restart = true;
+      while (true) {
+        IO_STATUS_BLOCK ioStatus = new IO_STATUS_BLOCK();
+        int status = NtQueryDirectoryFile(
+          directory.Handle,
+          IntPtr.Zero,
+          IntPtr.Zero,
+          IntPtr.Zero,
+          ref ioStatus,
+          buffer,
+          bufferSize,
+          FILE_ID_BOTH_DIRECTORY_INFORMATION,
+          false,
+          IntPtr.Zero,
+          restart);
+        restart = false;
+        if (status == STATUS_NO_MORE_FILES) break;
+        if (status < 0) {
+          throw new Win32Exception((int)RtlNtStatusToDosError(status));
+        }
+        int offset = 0;
+        while (true) {
+          IntPtr entry = IntPtr.Add(buffer, offset);
+          uint nextOffset = unchecked((uint)Marshal.ReadInt32(entry, 0));
+          uint attributes = unchecked((uint)Marshal.ReadInt32(entry, 56));
+          int nameLength = Marshal.ReadInt32(entry, 60);
+          string name = Marshal.PtrToStringUni(IntPtr.Add(entry, 104), nameLength / 2);
+          if (name != "." && name != "..") {
+            if ((attributes & REPARSE_ATTRIBUTE) != 0) {
+              throw new InvalidOperationException("reparse entry rejected");
+            }
+            bool childDirectory = (attributes & DIRECTORY_ATTRIBUTE) != 0;
+            SafeFileHandle child = OpenRelative(directory.Handle, name, childDirectory);
+            BY_HANDLE_FILE_INFORMATION information = Information(child);
+            if (information.VolumeSerialNumber != expectedDevice) {
+              child.Dispose();
+              throw new InvalidOperationException("cross-volume entry rejected");
+            }
+            AddNode(child, childDirectory, directory.Depth + 1);
+          }
+          if (nextOffset == 0) break;
+          offset = checked(offset + (int)nextOffset);
+        }
+      }
+    } finally {
+      Marshal.FreeHGlobal(buffer);
+    }
+  }
+
+  private void PreflightRoot(MyDashboardExpectedRoot expected) {
+    SafeFileHandle root = OpenRoot(expected);
+    AddNode(root, true, 0);
+    int cursor = nodes.Count - 1;
+    while (cursor < nodes.Count) {
+      Node node = nodes[cursor++];
+      if (node.Directory) Enumerate(node, checked((uint)expected.Device));
+    }
+  }
+
+  public static MyDashboardCleanupSession Prepare(
+    MyDashboardExpectedRoot[] roots,
+    int maximumEntries,
+    int maximumDepth,
+    ulong maximumBytes) {
+    if (
+      roots == null || roots.Length == 0 ||
+      maximumEntries < 1 || maximumDepth < 0
+    ) {
+      throw new ArgumentException("cleanup plan is invalid");
+    }
+    MyDashboardCleanupSession session = new MyDashboardCleanupSession(
+      maximumEntries, maximumDepth, maximumBytes);
+    try {
+      foreach (MyDashboardExpectedRoot root in roots) session.PreflightRoot(root);
+      return session;
+    } catch {
+      session.Dispose();
+      throw;
+    }
+  }
+
+  private static void MarkDelete(SafeFileHandle handle) {
+    IntPtr disposition = Marshal.AllocHGlobal(1);
+    try {
+      Marshal.WriteByte(disposition, 1);
+      if (!SetFileInformationByHandle(handle, 4, disposition, 1)) {
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      }
+    } finally {
+      Marshal.FreeHGlobal(disposition);
+    }
+  }
+
+  public void Commit() {
+    if (committed) throw new InvalidOperationException("cleanup already committed");
+    committed = true;
+    nodes.Sort(delegate(Node left, Node right) {
+      int depth = right.Depth.CompareTo(left.Depth);
+      if (depth != 0) return depth;
+      return left.Directory.CompareTo(right.Directory);
+    });
+    foreach (Node node in nodes) {
+      MarkDelete(node.Handle);
+      node.Handle.Dispose();
+    }
+    nodes.Clear();
+  }
+
+  public void Dispose() {
+    foreach (Node node in nodes) node.Handle.Dispose();
+    nodes.Clear();
   }
 }
 '@
 Add-Type -TypeDefinition $source -Language CSharp
-[MyDashboardIdentityDelete]::Delete(
-  [string]$node.path,
-  [uint64]$node.device,
-  [uint64]$node.inode,
-  [uint64]$node.links,
-  [uint64]$node.size,
-  [bool]$node.directory
-)
+$roots = New-Object 'MyDashboardExpectedRoot[]' @($plan.roots).Count
+for ($index = 0; $index -lt @($plan.roots).Count; $index += 1) {
+  $value = @($plan.roots)[$index]
+  $root = [MyDashboardExpectedRoot]::new()
+  $root.Path = [string]$value.path
+  $root.Device = [uint64]$value.device
+  $root.Inode = [uint64]$value.inode
+  $roots[$index] = $root
+}
+$session = $null
+try {
+  $session = [MyDashboardCleanupSession]::Prepare(
+    $roots,
+    [int]$plan.maximumEntries,
+    [int]$plan.maximumDepth,
+    [uint64]$plan.maximumBytes
+  )
+  [Console]::Out.WriteLine('READY')
+  [Console]::Out.Flush()
+  $command = [Console]::In.ReadLine()
+  if ($command -ne 'COMMIT') { throw 'cleanup commit was not authorized' }
+  $session.Commit()
+  [Console]::Out.WriteLine('DONE')
+  [Console]::Out.Flush()
+} finally {
+  if ($null -ne $session) { $session.Dispose() }
+}
 `;
 
 async function inspectWindowsTrust(directory, { privateLeaf, signal }) {
@@ -357,27 +777,25 @@ async function inspectWindowsTrust(directory, { privateLeaf, signal }) {
     WINDOWS_SYSTEM_SID,
     WINDOWS_ADMINISTRATORS_SID,
   ]);
+  const supportedRule = (rule) =>
+    rule.common === true &&
+    rule.callback === false &&
+    rule.qualifier === "AccessAllowed" &&
+    typeof rule.sid === "string" &&
+    typeof rule.flags === "string";
   if (privateLeaf) {
     return acl.ownerSid === acl.currentSid &&
       acl.protected === true &&
-      acl.rules.some((rule) =>
-        rule.sid === acl.currentSid &&
-        rule.type === "Allow" &&
-        (BigInt(rule.rights) & 2_032_127n) === 2_032_127n) &&
-      acl.rules.every((rule) =>
-        rule.type !== "Allow" || allowed.has(rule.sid));
+      acl.rules.length === allowed.size &&
+      [...allowed].every((sid) => acl.rules.some((rule) =>
+        supportedRule(rule) &&
+        rule.sid === sid &&
+        BigInt(rule.rights) === WINDOWS_FULL_CONTROL));
   }
   return allowed.has(acl.ownerSid) && acl.rules.every((rule) =>
-    rule.type !== "Allow" ||
-    allowed.has(rule.sid) ||
-    (BigInt(rule.rights) & WINDOWS_PARENT_DANGEROUS_RIGHTS) === 0n);
-}
-
-function inspectPosixTrust(details, { privateLeaf }) {
-  if (typeof process.getuid !== "function") return false;
-  if (details.uid !== BigInt(process.getuid())) return false;
-  const forbidden = privateLeaf ? 0o077n : 0o022n;
-  return (details.mode & forbidden) === 0n;
+    supportedRule(rule) &&
+    (allowed.has(rule.sid) ||
+      (BigInt(rule.rights) & WINDOWS_PARENT_DANGEROUS_RIGHTS) === 0n));
 }
 
 export function createPrivateDirectoryManager(options = {}) {
@@ -385,10 +803,10 @@ export function createPrivateDirectoryManager(options = {}) {
   const inspectDirectoryTrust = options.inspectDirectoryTrust ??
     (process.platform === "win32"
       ? (directory, details, context) => inspectWindowsTrust(directory, context)
-      : (_directory, details, context) => inspectPosixTrust(details, context));
+      : async () => false);
   const createDirectoryAt = options.createDirectoryAt ??
     (options.fileSystem === undefined
-      ? createProductionDirectoryAt
+      ? createWindowsDirectoryAt
       : async ({ directory, signal }) => {
           await fileSystem.mkdir(directory, { recursive: false, mode: 0o700 });
           throwIfAborted(signal);
@@ -448,7 +866,7 @@ export function createPrivateDirectoryManager(options = {}) {
   });
 }
 
-async function createProductionDirectoryAt({
+async function createWindowsDirectoryAt({
   directory,
   leafName,
   parentIdentity,
@@ -460,107 +878,165 @@ async function createProductionDirectoryAt({
   ) {
     throw unavailable();
   }
-  if (process.platform === "win32") {
-    await runPowerShell(
-      WINDOWS_CREATE_SCRIPT,
-      {
-        MYDASHBOARD_PRIVATE_PATH: Buffer.from(directory, "utf8").toString("base64"),
-        MYDASHBOARD_PRIVATE_PARENT: Buffer.from(parentIdentity.path, "utf8").toString("base64"),
-        MYDASHBOARD_PRIVATE_PARENT_DEVICE: parentIdentity.device,
-        MYDASHBOARD_PRIVATE_PARENT_INODE: parentIdentity.inode,
-      },
-      signal,
-    );
-    return;
-  }
-  const parentHandle = await open(
-    parentIdentity.path,
-    constants.O_RDONLY |
-      (constants.O_DIRECTORY ?? 0) |
-      (constants.O_NOFOLLOW ?? 0),
-  );
-  try {
-    throwIfAborted(signal);
-    const details = await parentHandle.stat({ bigint: true });
-    if (!sameIdentity(parentIdentity, details)) throw unavailable();
-    const descriptorRoot = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
-    const anchoredPath = path.join(descriptorRoot, String(parentHandle.fd), leafName);
-    await mkdir(anchoredPath, { recursive: false, mode: 0o700 });
-    throwIfAborted(signal);
-  } finally {
-    if (!signal?.aborted) await parentHandle.close();
-  }
-}
-
-export const PRODUCTION_PRIVATE_DIRECTORY_MANAGER =
-  createPrivateDirectoryManager();
-
-function sameNodeIdentity(node, details) {
-  const identityMatches = !details.isSymbolicLink() &&
-    details.dev.toString() === node.device &&
-    details.ino.toString() === node.inode &&
-    details.isDirectory() === node.directory &&
-    details.isFile() === node.file;
-  return identityMatches &&
-    (node.directory ||
-      (details.nlink.toString() === node.links.toString() &&
-        details.size.toString() === node.size.toString()));
-}
-
-async function deleteWindowsNode(node, signal) {
-  throwIfAborted(signal);
+  if (!productionSupervisedCliPlatformSupported()) throw unavailable();
   await runPowerShell(
-    WINDOWS_DELETE_SCRIPT,
+    WINDOWS_CREATE_SCRIPT,
     {
-      MYDASHBOARD_CLEANUP_NODE: Buffer.from(JSON.stringify({
-        path: node.path,
-        device: node.device,
-        inode: node.inode,
-        links: node.links.toString(),
-        size: node.size.toString(),
-        directory: node.directory,
-      }), "utf8").toString("base64"),
+      MYDASHBOARD_PRIVATE_PATH: Buffer.from(directory, "utf8").toString("base64"),
+      MYDASHBOARD_PRIVATE_PARENT: Buffer.from(parentIdentity.path, "utf8").toString("base64"),
+      MYDASHBOARD_PRIVATE_LEAF: Buffer.from(leafName, "utf8").toString("base64"),
+      MYDASHBOARD_PRIVATE_PARENT_DEVICE: parentIdentity.device,
+      MYDASHBOARD_PRIVATE_PARENT_INODE: parentIdentity.inode,
     },
     signal,
   );
-  throwIfAborted(signal);
 }
 
-async function deletePosixNode(node, signal) {
-  if (node.parent === null) throw unavailable();
-  throwIfAborted(signal);
-  const parentHandle = await open(
-    node.parent.path,
-    constants.O_RDONLY |
-      (constants.O_DIRECTORY ?? 0) |
-      (constants.O_NOFOLLOW ?? 0),
+const WINDOWS_PRIVATE_DIRECTORY_MANAGER = createPrivateDirectoryManager();
+
+export const PRODUCTION_PRIVATE_DIRECTORY_MANAGER = Object.freeze({
+  prepare(options) {
+    if (!productionSupervisedCliPlatformSupported()) throw unavailable();
+    return WINDOWS_PRIVATE_DIRECTORY_MANAGER.prepare(options);
+  },
+});
+
+export async function prepareCleanupTreesByIdentity(roots, options = {}) {
+  if (!productionSupervisedCliPlatformSupported()) throw unavailable();
+  if (
+    !Array.isArray(roots) || roots.length === 0 ||
+    roots.some((root) =>
+      root === null ||
+      typeof root !== "object" ||
+      typeof root.path !== "string" ||
+      typeof root.device !== "string" ||
+      typeof root.inode !== "string") ||
+    !Number.isSafeInteger(options.maximumEntries) ||
+    options.maximumEntries < 1 ||
+    !Number.isSafeInteger(options.maximumDepth) ||
+    options.maximumDepth < 0 ||
+    !Number.isSafeInteger(options.maximumBytes) ||
+    options.maximumBytes < 0 ||
+    !(options.signal instanceof AbortSignal)
+  ) {
+    throw new TypeError("cleanup plan is invalid");
+  }
+  throwIfAborted(options.signal);
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const executable = path.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
   );
+  const compressedScript = gzipSync(
+    Buffer.from(WINDOWS_CLEANUP_SESSION_SCRIPT, "utf8"),
+  ).toString("base64");
+  const encodedPlan = Buffer.from(JSON.stringify({
+    roots,
+    maximumEntries: options.maximumEntries,
+    maximumDepth: options.maximumDepth,
+    maximumBytes: options.maximumBytes,
+  }), "utf8").toString("base64");
+  const child = spawn(
+    executable,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$b=[Convert]::FromBase64String($env:MYDASHBOARD_CLEANUP_SCRIPT);" +
+        "$m=[IO.MemoryStream]::new($b);" +
+        "$g=[IO.Compression.GzipStream]::new($m,[IO.Compression.CompressionMode]::Decompress);" +
+        "$r=[IO.StreamReader]::new($g,[Text.Encoding]::UTF8);iex $r.ReadToEnd()",
+    ],
+    {
+      windowsHide: true,
+      signal: options.signal,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        MYDASHBOARD_CLEANUP_SCRIPT: compressedScript,
+        MYDASHBOARD_CLEANUP_PLAN: encodedPlan,
+      },
+    },
+  );
+  let output = "";
+  let ready = false;
+  let done = false;
+  let committed = false;
+  let resolveReady;
+  let rejectReady;
+  let resolveDone;
+  let rejectDone;
+  let resolveClosed;
+  const readyPromise = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const donePromise = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+  void donePromise.catch(() => {});
+  const closedPromise = new Promise((resolve) => {
+    resolveClosed = resolve;
+  });
+  const rejectSession = () => {
+    const failure = cleanupFailed();
+    if (!ready) rejectReady(failure);
+    if (!done) rejectDone(failure);
+  };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    output = `${output}${chunk}`.slice(-1_024);
+    if (!ready && output.includes("READY")) {
+      ready = true;
+      resolveReady();
+    }
+    if (!done && output.includes("DONE")) {
+      done = true;
+      resolveDone();
+    }
+  });
+  child.stderr.resume();
+  child.stdin.on("error", rejectSession);
+  child.on("error", rejectSession);
+  child.on("exit", (code) => {
+    if (code !== 0 || !done) rejectSession();
+  });
+  child.on("close", resolveClosed);
   try {
-    throwIfAborted(signal);
-    const parentDetails = await parentHandle.stat({ bigint: true });
-    if (!sameIdentity(node.parent, parentDetails)) throw unavailable();
-    throwIfAborted(signal);
-    const descriptorRoot = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
-    const anchoredPath = path.join(
-      descriptorRoot,
-      String(parentHandle.fd),
-      path.basename(node.path),
-    );
-    const details = await lstat(anchoredPath, { bigint: true });
-    if (!sameNodeIdentity(node, details)) throw unavailable();
-    throwIfAborted(signal);
-    if (node.file) await unlink(anchoredPath);
-    else await rmdir(anchoredPath);
-    throwIfAborted(signal);
-  } finally {
-    if (!signal?.aborted) await parentHandle.close();
+    await readyPromise;
+  } catch (error) {
+    await closedPromise;
+    throw error;
   }
-}
-
-export async function deleteInventoryByIdentity(nodes, signal = null) {
-  for (const node of nodes) {
-    throwIfAborted(signal);
-    if (process.platform === "win32") await deleteWindowsNode(node, signal);
-    else await deletePosixNode(node, signal);
+  if (options.signal.aborted) {
+    await closedPromise;
+    throwIfAborted(options.signal);
   }
+  return Object.freeze({
+    async commit() {
+      if (committed) throw cleanupFailed();
+      committed = true;
+      if (options.signal.aborted) {
+        await closedPromise;
+        throwIfAborted(options.signal);
+      }
+      child.stdin.end("COMMIT\n");
+      try {
+        await donePromise;
+      } catch (error) {
+        await closedPromise;
+        throw error;
+      }
+      if (options.signal.aborted) {
+        await closedPromise;
+        throwIfAborted(options.signal);
+      }
+    },
+  });
 }

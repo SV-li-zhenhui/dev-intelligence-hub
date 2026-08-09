@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   link,
   lstat,
@@ -42,6 +43,36 @@ async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
   t.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
+}
+
+function setWindowsDirectoryAcl(directory, dacl) {
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $target = [Text.Encoding]::UTF8.GetString(
+      [Convert]::FromBase64String($env:MYDASHBOARD_TEST_ACL_PATH)
+    )
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sddl = ('O:{0}G:{0}D:P' -f $sid) + $env:MYDASHBOARD_TEST_DACL.Replace('{SID}', $sid)
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $sections = [Security.AccessControl.AccessControlSections]::Access -bor
+      [Security.AccessControl.AccessControlSections]::Owner -bor
+      [Security.AccessControl.AccessControlSections]::Group
+    $security.SetSecurityDescriptorSddlForm($sddl, $sections)
+    [System.IO.Directory]::SetAccessControl($target, $security)
+  `;
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        MYDASHBOARD_TEST_ACL_PATH: Buffer.from(directory, "utf8").toString("base64"),
+        MYDASHBOARD_TEST_DACL: dacl,
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
 }
 
 function brainRequest(overrides = {}) {
@@ -105,6 +136,73 @@ async function privateDirectoryManagerModule() {
   return import("../src/lib/private-directory-manager.js").catch(() => null);
 }
 
+test("production supervised CLI policy rejects every platform except Windows x64", async () => {
+  const managerModule = await privateDirectoryManagerModule();
+  assert.ok(managerModule, "private directory manager is required");
+  assert.equal(
+    managerModule.productionSupervisedCliPlatformSupported("win32", "x64"),
+    true,
+  );
+  for (const [platform, architecture] of [
+    ["linux", "x64"],
+    ["darwin", "arm64"],
+    ["win32", "arm64"],
+    ["win32", "ia32"],
+  ]) {
+    assert.equal(
+      managerModule.productionSupervisedCliPlatformSupported(
+        platform,
+        architecture,
+      ),
+      false,
+    );
+  }
+});
+
+test("production construction rejects an unsupported platform before materializing request context", async (t) => {
+  const profile = await temporaryDirectory(t, "supervised-cli-unsupported-");
+  const script = `
+    const module = await import('./src/adapters/supervised-cli-brain-provider.js');
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    Object.defineProperty(process, 'arch', { value: 'x64' });
+    let reads = 0;
+    const request = new Proxy({}, {
+      get() { reads += 1; return undefined; },
+      ownKeys() { reads += 1; return []; },
+    });
+    const provider = module.createProductionSupervisedCliBrainProvider({
+      id: 'unsupported',
+      cliKind: 'codex-cli',
+    });
+    let code = null;
+    try { await provider.generate(request); } catch (error) { code = error?.code; }
+    process.stdout.write(JSON.stringify({ code, reads }));
+  `;
+  const child = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", script],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: profile,
+        USERPROFILE: profile,
+        OPENAI_API_KEY: "test-only-credential",
+      },
+    },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+    reads: 0,
+  });
+  await assert.rejects(
+    lstat(path.join(profile, ".mydashboard-supervised-cli-v1")),
+    { code: "ENOENT" },
+  );
+});
+
 async function within(milliseconds, promise) {
   let timer;
   try {
@@ -132,6 +230,15 @@ function successfulProcess(stdoutBytes = Buffer.alloc(0)) {
     stdoutBytes: bytes,
     stderrBytes: Buffer.alloc(0),
   };
+}
+
+async function directoryIdentity(directory) {
+  const details = await lstat(directory, { bigint: true });
+  return Object.freeze({
+    path: directory,
+    device: details.dev.toString(),
+    inode: details.ino.toString(),
+  });
 }
 
 function argumentValue(args, flag) {
@@ -791,6 +898,62 @@ test("Windows rejects a weak owner or DACL before CLI discovery", async (t) => {
   });
   assert.equal(locator.calls.length, 0);
   assert.equal(runner.calls.length, 0);
+});
+
+test("Windows production root creation allows only supported non-mutating broad ACEs", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI roots are Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-acl-allowed-");
+  const root = path.join(parent, "runtime");
+  setWindowsDirectoryAcl(
+    parent,
+    "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" +
+      "(A;OICI;0x1200A9;;;BU)",
+  );
+
+  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+    directory: root,
+    signal: new AbortController().signal,
+    validateLocation: async () => {},
+  });
+
+  assert.equal(path.resolve(identity.path), path.resolve(root));
+  assert.equal((await lstat(root)).isDirectory(), true);
+});
+
+async function assertProductionRootAclRejected(t, name, extraAce) {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI roots are Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, `supervised-cli-acl-${name}-`);
+  const root = path.join(parent, "runtime");
+  setWindowsDirectoryAcl(
+    parent,
+    "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" + extraAce,
+  );
+
+  await assert.rejects(
+    managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+      directory: root,
+      signal: AbortSignal.timeout(30_000),
+      validateLocation: async () => {},
+    }),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+  await assert.rejects(lstat(root), { code: "ENOENT" });
+}
+
+test("Windows production root creation rejects broad child mutation rights", async (t) => {
+  await assertProductionRootAclRejected(t, "child-create", "(A;OICI;0x6;;;BU)");
+});
+
+test("Windows production root creation rejects unsupported deny ACE shapes", async (t) => {
+  await assertProductionRootAclRejected(t, "deny-shape", "(D;OICI;0x2;;;BU)");
 });
 
 test("root creation rejects a changed trusted parent before mutating the leaf", async () => {
@@ -1714,91 +1877,104 @@ test("cleanup rejects a parent swap after a file check without deleting the repl
   assert.equal(await readFile(victimFile, "utf8"), "retain-me");
 });
 
-test("the production identity deleter refuses a replaced final entry", async (t) => {
+test("Windows production cleanup pins checked entries until same-handle deletion", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI cleanup is Windows x64 only");
+    return;
+  }
   const managerModule = await privateDirectoryManagerModule();
-  assert.ok(managerModule, "identity-bound cleanup helper is required");
-  const parent = await temporaryDirectory(t, "supervised-cli-identity-delete-");
-  const target = path.join(parent, "target.txt");
-  const original = path.join(parent, "target-original.txt");
-  await writeFile(target, "original", "utf8");
-  const parentDetails = await lstat(parent, { bigint: true });
-  const targetDetails = await lstat(target, { bigint: true });
-  const parentIdentity = {
-    path: parent,
-    device: parentDetails.dev.toString(),
-    inode: parentDetails.ino.toString(),
-    directory: true,
-    file: false,
-    parent: null,
-  };
-  const targetIdentity = {
-    path: target,
-    device: targetDetails.dev.toString(),
-    inode: targetDetails.ino.toString(),
-    size: targetDetails.size,
-    links: targetDetails.nlink,
-    directory: false,
-    file: true,
-    parent: parentIdentity,
-  };
-  await rename(target, original);
-  await writeFile(target, "replacement", "utf8");
+  const parent = await temporaryDirectory(t, "supervised-cli-native-cleanup-race-");
+  const tree = path.join(parent, "tree");
+  const checked = path.join(tree, "checked.txt");
+  const moved = path.join(tree, "checked-original.txt");
+  const victim = path.join(parent, "victim.txt");
+  await mkdir(tree);
+  await writeFile(checked, "private", "utf8");
+  await writeFile(victim, "retain-me", "utf8");
 
-  await assert.rejects(
-    managerModule.deleteInventoryByIdentity(
-      [targetIdentity],
-      new AbortController().signal,
-    ),
+  const session = await managerModule.prepareCleanupTreesByIdentity(
+    [await directoryIdentity(tree)],
+    {
+      maximumEntries: 256,
+      maximumDepth: 16,
+      maximumBytes: 16 * 1024 * 1024,
+      signal: AbortSignal.timeout(30_000),
+    },
   );
-  assert.equal(await readFile(target, "utf8"), "replacement");
-  assert.equal(await readFile(original, "utf8"), "original");
+  await assert.rejects(rename(checked, moved), (error) =>
+    ["EPERM", "EACCES", "EBUSY"].includes(error?.code));
+  await assert.rejects(writeFile(checked, "mutated", "utf8"), (error) =>
+    ["EPERM", "EACCES", "EBUSY"].includes(error?.code));
+  assert.equal(await readFile(victim, "utf8"), "retain-me");
+
+  await session.commit();
+  await assert.rejects(lstat(tree), { code: "ENOENT" });
+  assert.equal(await readFile(victim, "utf8"), "retain-me");
 });
 
-test("the production identity deleter refuses a hard link added after inventory", async (t) => {
-  const managerModule = await privateDirectoryManagerModule();
-  assert.ok(managerModule, "identity-bound cleanup helper is required");
-  const parent = await temporaryDirectory(t, "supervised-cli-identity-link-");
-  const target = path.join(parent, "target.txt");
-  const alias = path.join(parent, "alias.txt");
-  await writeFile(target, "private", "utf8");
-  const parentDetails = await lstat(parent, { bigint: true });
-  const targetDetails = await lstat(target, { bigint: true });
-  const parentIdentity = {
-    path: parent,
-    device: parentDetails.dev.toString(),
-    inode: parentDetails.ino.toString(),
-    directory: true,
-    file: false,
-    parent: null,
-  };
-  const targetIdentity = {
-    path: target,
-    device: targetDetails.dev.toString(),
-    inode: targetDetails.ino.toString(),
-    size: targetDetails.size,
-    links: targetDetails.nlink,
-    directory: false,
-    file: true,
-    parent: parentIdentity,
-  };
-  try {
-    await link(target, alias);
-  } catch (error) {
-    if (error?.code === "EPERM" || error?.code === "EACCES") {
-      t.skip(`hard links unavailable: ${error.code}`);
-      return;
-    }
-    throw error;
+test("Windows production cleanup cancellation settles after native handles close", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI cleanup is Windows x64 only");
+    return;
   }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-native-cleanup-cancel-");
+  const tree = path.join(parent, "tree");
+  const checked = path.join(tree, "checked.txt");
+  const moved = path.join(tree, "checked-after-cancel.txt");
+  await mkdir(tree);
+  await writeFile(checked, "private", "utf8");
+  const controller = new AbortController();
+  const session = await managerModule.prepareCleanupTreesByIdentity(
+    [await directoryIdentity(tree)],
+    {
+      maximumEntries: 256,
+      maximumDepth: 16,
+      maximumBytes: 16 * 1024 * 1024,
+      signal: controller.signal,
+    },
+  );
+
+  controller.abort();
+  await assert.rejects(session.commit());
+  await rename(checked, moved);
+  assert.equal(await readFile(moved, "utf8"), "private");
+});
+
+test("Windows production cleanup preflights every stale tree before deleting any", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI cleanup is Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-native-stale-plan-");
+  const safeTree = path.join(parent, "safe-stale");
+  const unsafeTree = path.join(parent, "unsafe-stale");
+  const victim = path.join(parent, "victim.txt");
+  await mkdir(safeTree);
+  await mkdir(unsafeTree);
+  await writeFile(path.join(safeTree, "evidence.txt"), "retain-safe", "utf8");
+  await writeFile(victim, "retain-victim", "utf8");
+  await link(victim, path.join(unsafeTree, "untrusted-hardlink.txt"));
 
   await assert.rejects(
-    managerModule.deleteInventoryByIdentity(
-      [targetIdentity],
-      new AbortController().signal,
+    managerModule.prepareCleanupTreesByIdentity(
+      [
+        await directoryIdentity(safeTree),
+        await directoryIdentity(unsafeTree),
+      ],
+      {
+        maximumEntries: 256,
+        maximumDepth: 16,
+        maximumBytes: 16 * 1024 * 1024,
+        signal: AbortSignal.timeout(30_000),
+      },
     ),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  assert.equal(await readFile(target, "utf8"), "private");
-  assert.equal(await readFile(alias, "utf8"), "private");
+  assert.equal(await readFile(path.join(safeTree, "evidence.txt"), "utf8"), "retain-safe");
+  assert.equal(await readFile(victim, "utf8"), "retain-victim");
+  assert.equal((await lstat(unsafeTree)).isDirectory(), true);
 });
 
 test("an unprovable process reap remains visible when the total deadline expires", async (t) => {
@@ -2087,6 +2263,72 @@ test("stale recovery validates the complete bounded plan before removing evidenc
   assert.equal((await lstat(staleDirectory)).isDirectory(), true);
   assert.equal(await readFile(path.join(unsafeCleanup, "malformed.txt"), "utf8"), "retain");
   assert.equal(rootOpenCalls, 1);
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+});
+
+test("stale recovery uses one production preflight for every complete tree before mutation", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI cleanup is Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-stale-native-plan-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const safeDirectory = path.join(
+    temporaryRoot,
+    "invocation-codex-cli-aaa-safe",
+  );
+  const unsafeDirectory = path.join(
+    temporaryRoot,
+    "invocation-codex-cli-zzz-unsafe",
+  );
+  const victim = path.join(parent, "victim.txt");
+  await mkdir(safeDirectory, { recursive: true });
+  await mkdir(unsafeDirectory);
+  await writeFile(path.join(safeDirectory, "evidence.txt"), "retain-safe", "utf8");
+  await writeFile(victim, "retain-victim", "utf8");
+  await link(victim, path.join(unsafeDirectory, "untrusted-hardlink.txt"));
+  const marker = (ownerPid) => JSON.stringify({
+    schemaVersion: 1,
+    kind: "codex-cli",
+    ownerPid,
+    createdAt: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString(),
+  });
+  await writeFile(
+    path.join(safeDirectory, ".mydashboard-invocation.json"),
+    marker(91_001),
+    "utf8",
+  );
+  await writeFile(
+    path.join(unsafeDirectory, ".mydashboard-invocation.json"),
+    marker(91_002),
+    "utf8",
+  );
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      isProcessAlive: () => false,
+      cleanupFileSystem: cleanupFileSystem({
+        prepareCleanupTrees: managerModule.prepareCleanupTreesByIdentity,
+      }),
+    },
+  );
+
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  assert.equal(
+    await readFile(path.join(safeDirectory, "evidence.txt"), "utf8"),
+    "retain-safe",
+  );
+  assert.equal(await readFile(victim, "utf8"), "retain-victim");
   assert.equal(locator.calls.length, 0);
   assert.equal(runner.calls.length, 0);
 });

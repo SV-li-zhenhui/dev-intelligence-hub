@@ -1675,14 +1675,17 @@ test("cited memory answering wires only trusted retrieval and configured brain p
 
   assert.deepEqual(calls.router.brainProviders, config.brainProviders);
   assert.equal(calls.router.dependencies.fetch, "injected-fetch");
+  assert.equal(
+    calls.router.dependencies.supervisedCliCompositionCapability,
+    undefined,
+  );
+  const compositionSymbols = Object.getOwnPropertySymbols(
+    calls.router.dependencies,
+  );
+  assert.equal(compositionSymbols.length, 1);
   assert.deepEqual(
-    calls.router.dependencies.supervisedCliCompositionCapability.protectedRoots
-      .map((root) => root.toLowerCase()),
-    [
-      process.cwd(),
-      path.join(process.cwd(), "data"),
-      path.join(process.cwd(), "backups"),
-    ].map((root) => root.toLowerCase()),
+    Reflect.ownKeys(calls.router.dependencies[compositionSymbols[0]]),
+    [],
   );
   assert.equal(Object.isFrozen(calls.retriever.memorySearch), true);
   assert.deepEqual(Object.keys(calls.retriever.memorySearch), ["search"]);
@@ -3520,31 +3523,30 @@ test("local code composition binds authority, both proposal runners, and one saf
     calls.grantFactory.brainProviders,
     localCodeCoordinationConfig().brainProviders,
   );
-  for (const protectedRoot of [
-    process.cwd(),
-    path.join(process.cwd(), "data"),
-    path.join(process.cwd(), "backups"),
-    workspaceRoot,
-    configuredWorkspaceRoot,
-    "D:\\mirrors\\base.git",
-    "D:\\mirrors\\head.git",
-  ]) {
-    const canonicalProtectedRoot = process.platform === "win32"
-      ? protectedRoot.toLowerCase()
-      : protectedRoot;
-    assert.equal(
-      calls.workforce.dependencies.supervisedCliCompositionCapability
-        .protectedRoots.includes(canonicalProtectedRoot),
-      true,
-      protectedRoot,
-    );
-    assert.equal(
-      calls.codeBrainDirectory.dependencies.supervisedCliCompositionCapability
-        .protectedRoots.includes(canonicalProtectedRoot),
-      true,
-      protectedRoot,
-    );
-  }
+  assert.equal(
+    calls.workforce.dependencies.supervisedCliCompositionCapability,
+    undefined,
+  );
+  assert.equal(
+    calls.codeBrainDirectory.dependencies.supervisedCliCompositionCapability,
+    undefined,
+  );
+  const workforceSymbols = Object.getOwnPropertySymbols(
+    calls.workforce.dependencies,
+  );
+  const directorySymbols = Object.getOwnPropertySymbols(
+    calls.codeBrainDirectory.dependencies,
+  );
+  assert.equal(workforceSymbols.length, 1);
+  assert.equal(directorySymbols.length, 1);
+  assert.strictEqual(
+    calls.workforce.dependencies[workforceSymbols[0]],
+    calls.codeBrainDirectory.dependencies[directorySymbols[0]],
+  );
+  assert.deepEqual(
+    Reflect.ownKeys(calls.workforce.dependencies[workforceSymbols[0]]),
+    [],
+  );
   assert.strictEqual(calls.githubRunner.runner, githubRunnerPort);
   assert.strictEqual(calls.codeRunner.runner, codeRunnerPort);
   assert.strictEqual(
