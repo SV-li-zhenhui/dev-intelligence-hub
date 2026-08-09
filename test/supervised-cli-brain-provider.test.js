@@ -224,6 +224,14 @@ async function within(milliseconds, promise) {
   }
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function successfulProcess(stdoutBytes = Buffer.alloc(0)) {
   const bytes = Buffer.from(stdoutBytes);
   return {
@@ -2274,6 +2282,185 @@ test("a never-settling process stays handled and permanently blocks close and cr
   assert.equal(nextLocator.calls.length, 0);
   assert.equal(nextRunner.calls.length, 0);
   assert.deepEqual(unhandled, []);
+});
+
+test("close fences a generation paused before root admission and retries after it settles", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-pre-root-close-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const rootPreparationStarted = deferred();
+  const releaseRootPreparation = deferred();
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const runner = recordingRunner(async () => {
+    const error = new Error("runner must stay fenced");
+    error.code = "STRUCTURED_PROVIDER_PROCESS_FAILED";
+    throw error;
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      rootDirectoryManager: {
+        async prepare({ directory, validateLocation }) {
+          await validateLocation();
+          rootPreparationStarted.resolve();
+          await releaseRootPreparation.promise;
+          await mkdir(directory, { recursive: true });
+          return directoryIdentity(directory);
+        },
+      },
+    },
+  );
+  const generationOutcome = provider.generate(brainRequest()).then(
+    () => null,
+    (error) => error,
+  );
+  await rootPreparationStarted.promise;
+
+  const firstClose = provider.close();
+  const concurrentClose = provider.close();
+  const closeOutcome = within(250, firstClose).then(
+    () => null,
+    (error) => error,
+  );
+  const closeFailure = await closeOutcome;
+  releaseRootPreparation.resolve();
+  const generationFailure = await within(2_000, generationOutcome);
+
+  assert.strictEqual(concurrentClose, firstClose);
+  assert.equal(closeFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  assert.equal(generationFailure?.code, "STRUCTURED_PROVIDER_UNAVAILABLE");
+  assert.equal(locator.calls.length, 0);
+  assert.equal(runner.calls.length, 0);
+
+  await within(250, provider.close());
+  await assert.rejects(provider.generate(brainRequest()), {
+    code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+  });
+});
+
+test("a sibling blocked after final recovery reaches neither locator nor runner", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-atomic-root-admission-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const firstRunnerStarted = deferred();
+  const firstRunnerSettlement = deferred();
+  const firstController = new AbortController();
+  const firstProvider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async () => {
+        firstRunnerStarted.resolve();
+        return firstRunnerSettlement.promise;
+      }),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+    },
+  );
+  const firstOutcome = firstProvider.generate(
+    brainRequest({ signal: firstController.signal }),
+  ).then(
+    () => null,
+    (error) => error,
+  );
+  await firstRunnerStarted.promise;
+
+  const finalRootBoundaryReached = deferred();
+  const releaseFinalRootBoundary = deferred();
+  let rootPreparations = 0;
+  const nextLocator = recordingLocator(testDescriptor("codex-cli"));
+  const nextRunner = recordingRunner(async (invocation) => {
+    const resultFile = argumentValue(
+      invocation.args,
+      "--output-last-message",
+    );
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const nextProvider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: nextRunner,
+      commandLocator: nextLocator,
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      rootDirectoryManager: {
+        async prepare({ directory, validateLocation }) {
+          await validateLocation();
+          await mkdir(directory, { recursive: true });
+          const identity = await directoryIdentity(directory);
+          rootPreparations += 1;
+          if (rootPreparations === 2) {
+            finalRootBoundaryReached.resolve();
+            await releaseFinalRootBoundary.promise;
+          }
+          return identity;
+        },
+      },
+    },
+  );
+  const blockedOutcome = nextProvider.generate(brainRequest()).then(
+    () => null,
+    (error) => error,
+  );
+  await finalRootBoundaryReached.promise;
+
+  const leaseStarted = deferred();
+  const releaseLease = deferred();
+  const leaseLocator = recordingLocator(testDescriptor("claude-cli"));
+  const leaseRunner = recordingRunner(async () => successfulProcess(
+    Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))),
+  ));
+  const leaseProvider = createTestSupervisedCliBrainProvider(
+    providerOptions("claude-cli"),
+    {
+      processRunner: leaseRunner,
+      commandLocator: leaseLocator,
+      environment: { ANTHROPIC_API_KEY: "credential" },
+      temporaryRoot,
+      staleInvocationScavenger: async () => {
+        leaseStarted.resolve();
+        await releaseLease.promise;
+      },
+    },
+  );
+  const leaseOutcome = leaseProvider.generate(brainRequest()).then(
+    () => null,
+    (error) => error,
+  );
+  await leaseStarted.promise;
+  releaseFinalRootBoundary.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  firstController.abort();
+  assert.equal(
+    (await within(2_000, firstOutcome))?.code,
+    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  );
+  releaseLease.resolve();
+  assert.equal(
+    (await within(2_000, blockedOutcome))?.code,
+    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  );
+  assert.equal(
+    (await within(2_000, leaseOutcome))?.code,
+    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  );
+  assert.equal(nextLocator.calls.length, 0);
+  assert.equal(nextRunner.calls.length, 0);
+  assert.equal(leaseLocator.calls.length, 0);
+  assert.equal(leaseRunner.calls.length, 0);
+
+  firstRunnerSettlement.resolve(successfulProcess());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await nextProvider.generate(brainRequest()), '{"ok":true}');
+  assert.equal(nextLocator.calls.length, 1);
+  assert.equal(nextRunner.calls.length, 1);
+  await firstProvider.close();
+  await nextProvider.close();
+  await leaseProvider.close();
 });
 
 test("a reap failure blocks every CLI kind sharing the root before discovery", async (t) => {

@@ -699,26 +699,36 @@ function sharedRootState(identity) {
   return state;
 }
 
-async function writeNewFile(file, bytes, signal = null) {
+async function writeNewFile(file, bytes, signal = null, assertSafe = null) {
   let handle;
   try {
     throwIfRequestAborted(signal);
+    assertSafe?.();
     handle = await open(
       file,
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
       0o600,
     );
     throwIfRequestAborted(signal);
+    assertSafe?.();
     await handle.writeFile(bytes);
     throwIfRequestAborted(signal);
+    assertSafe?.();
     await handle.sync();
     throwIfRequestAborted(signal);
+    assertSafe?.();
   } finally {
     await handle?.close();
   }
-  if (process.platform !== "win32") await chmod(file, 0o600);
+  assertSafe?.();
+  if (process.platform !== "win32") {
+    await chmod(file, 0o600);
+    assertSafe?.();
+  }
   throwIfRequestAborted(signal);
-  return lstat(file, { bigint: true });
+  const details = await lstat(file, { bigint: true });
+  assertSafe?.();
+  return details;
 }
 
 function sameDirectoryIdentity(invocation, details) {
@@ -750,6 +760,17 @@ function releaseRootIfClean(rootState) {
     rootState.residues.size === 0
   ) {
     rootState.blocked = false;
+  }
+}
+
+function assertRootAdmissionSafe(rootState) {
+  if (
+    !rootState ||
+    rootState.blocked ||
+    rootState.unprovable ||
+    rootState.residues.size > 0
+  ) {
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
   }
 }
 
@@ -1248,9 +1269,14 @@ async function createInvocation({
   let identity = null;
   try {
     throwIfRequestAborted(signal);
-    if (process.platform !== "win32") await chmod(directory, 0o700);
+    assertRootAdmissionSafe(rootState);
+    if (process.platform !== "win32") {
+      await chmod(directory, 0o700);
+      assertRootAdmissionSafe(rootState);
+    }
     throwIfRequestAborted(signal);
     identity = await trustedDirectory(directory, root, signal);
+    assertRootAdmissionSafe(rootState);
     const marker = {
       schemaVersion: 1,
       kind: cliKind,
@@ -1261,6 +1287,7 @@ async function createInvocation({
       path.join(directory, INVOCATION_MARKER),
       Buffer.from(JSON.stringify(marker), "utf8"),
       signal,
+      () => assertRootAdmissionSafe(rootState),
     );
     const profiles = {
       home: path.join(directory, "profile", "home"),
@@ -1273,9 +1300,14 @@ async function createInvocation({
     };
     for (const profile of Object.values(profiles)) {
       throwIfRequestAborted(signal);
+      assertRootAdmissionSafe(rootState);
       await mkdir(profile, { recursive: true, mode: 0o700 });
       throwIfRequestAborted(signal);
-      if (process.platform !== "win32") await chmod(profile, 0o700);
+      assertRootAdmissionSafe(rootState);
+      if (process.platform !== "win32") {
+        await chmod(profile, 0o700);
+        assertRootAdmissionSafe(rootState);
+      }
     }
     throwIfRequestAborted(signal);
     return Object.freeze({ ...identity, profiles: Object.freeze(profiles) });
@@ -1627,11 +1659,12 @@ async function runRootOperation(
   rootState,
   deadline,
   operation,
-  { blocking = false } = {},
+  { blocking = false, requireSafe = false } = {},
 ) {
   return deadline.run(({ signal }) => {
     const attempt = rootState.leaseTail.then(async () => {
       throwIfRequestAborted(signal);
+      if (requireSafe) assertRootAdmissionSafe(rootState);
       return operation(signal);
     });
     rootState.leaseTail = attempt.catch(() => {});
@@ -1651,13 +1684,14 @@ async function runConcurrentRootActivity(
   rootState,
   deadline,
   operation,
-  { blocking = false } = {},
+  { blocking = false, requireSafe = false } = {},
 ) {
   let attempt = null;
   try {
     return await deadline.run(({ signal }) => {
       attempt = Promise.resolve().then(async () => {
         throwIfRequestAborted(signal);
+        if (requireSafe) assertRootAdmissionSafe(rootState);
         return operation(signal);
       });
       rootState.pending.add(attempt);
@@ -1724,7 +1758,9 @@ export class SupervisedCliBrainProvider {
   #rootState = null;
   #descriptorValue = null;
   #closed = false;
+  #activeGenerations = 0;
   #closeAttempt = null;
+  #closeResult = null;
 
   constructor(rawOptions, constructionToken, rawDependencies) {
     if (
@@ -1862,10 +1898,14 @@ export class SupervisedCliBrainProvider {
   }
 
   async #descriptor(deadline) {
+    this.#assertRunnable();
     if (this.#descriptorValue) return this.#descriptorValue;
-    const descriptor = await deadline.run(({ signal }) =>
-      this.#commandLocator.resolve(this.kind, { signal }));
+    const descriptor = await deadline.run(({ signal }) => {
+      this.#assertRunnable();
+      return this.#commandLocator.resolve(this.kind, { signal });
+    });
     deadline.throwIfExpired();
+    this.#assertRunnable();
     this.#descriptorValue ??= descriptor;
     return this.#descriptorValue;
   }
@@ -1874,18 +1914,21 @@ export class SupervisedCliBrainProvider {
     return runConcurrentRootActivity(
       this.#rootState,
       deadline,
-      (signal) => Promise.resolve(this.#processRunner.run({
-        ...options,
-        signal,
-        timeoutMs: deadline.remainingMs(),
-      })).catch((error) => {
-        if (error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
-          recordResidue(this.#rootState, invocation);
-          this.#rootState.unprovable = true;
-        }
-        throw error;
-      }),
-      { blocking: true },
+      (signal) => {
+        this.#assertRunnable();
+        return Promise.resolve(this.#processRunner.run({
+          ...options,
+          signal,
+          timeoutMs: deadline.remainingMs(),
+        })).catch((error) => {
+          if (error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
+            recordResidue(this.#rootState, invocation);
+            this.#rootState.unprovable = true;
+          }
+          throw error;
+        });
+      },
+      { blocking: true, requireSafe: true },
     );
   }
 
@@ -1894,10 +1937,10 @@ export class SupervisedCliBrainProvider {
     wireInput,
     deadline,
     configuredCredential,
-    descriptor,
     expectedRoot,
   }) {
     const root = await deadline.run(({ signal }) => this.#root(signal));
+    this.#assertOpen();
     if (
       root.device !== expectedRoot.device ||
       root.inode !== expectedRoot.inode
@@ -1905,23 +1948,35 @@ export class SupervisedCliBrainProvider {
       throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
     }
     await this.#recover(root, deadline);
-    const invocation = await runRootOperation(
+    this.#assertRunnable();
+    await runRootOperation(
       this.#rootState,
       deadline,
-      (signal) => createInvocation({
-        root: root.path,
-        cliKind: this.kind,
-        processId: this.#processId,
-        clock: this.#clock,
-        signal,
-        cleanupFileSystem: this.#cleanupFileSystem,
-        rootState: this.#rootState,
-      }),
-      { blocking: true },
+      () => undefined,
+      { requireSafe: true },
     );
+    this.#assertRunnable();
+    const descriptor = await this.#descriptor(deadline);
+    this.#assertRunnable();
+    let invocation = null;
     let result;
     let failure = null;
     try {
+      invocation = await runRootOperation(
+        this.#rootState,
+        deadline,
+        (signal) => createInvocation({
+          root: root.path,
+          cliKind: this.kind,
+          processId: this.#processId,
+          clock: this.#clock,
+          signal,
+          cleanupFileSystem: this.#cleanupFileSystem,
+          rootState: this.#rootState,
+        }),
+        { blocking: true, requireSafe: true },
+      );
+      this.#assertRunnable();
       const environment = childEnvironment(invocation, configuredCredential);
       if (this.kind === "codex-cli") {
         const schemaFile = path.join(invocation.path, "output-schema.json");
@@ -1930,9 +1985,17 @@ export class SupervisedCliBrainProvider {
             schemaFile,
             Buffer.from(canonicalJsonStringify(request.schema), "utf8"),
             signal,
+            () => this.#assertRunnable(),
           ));
+        this.#assertRunnable();
         const resultIdentity = await deadline.run(({ signal }) =>
-          writeNewFile(resultFile, Buffer.alloc(0), signal));
+          writeNewFile(
+            resultFile,
+            Buffer.alloc(0),
+            signal,
+            () => this.#assertRunnable(),
+          ));
+        this.#assertRunnable();
         await this.#runProcess(invocation, deadline, {
           executable: descriptor,
           args: codexArguments({
@@ -1975,6 +2038,10 @@ export class SupervisedCliBrainProvider {
       failure = error;
     }
 
+    if (invocation === null) {
+      if (failure) throw failure;
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
     if (failure?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
       recordResidue(this.#rootState, invocation);
       this.#rootState.unprovable = true;
@@ -1990,9 +2057,7 @@ export class SupervisedCliBrainProvider {
   }
 
   async generate(rawRequest = {}) {
-    if (this.#closed) {
-      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
-    }
+    this.#assertOpen();
     if (!this.#productionPlatformSupported) {
       throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
     }
@@ -2027,18 +2092,20 @@ export class SupervisedCliBrainProvider {
       monotonicClock: this.#monotonicClock,
       startedAt,
     });
+    this.#activeGenerations += 1;
     try {
       const configuredCredential = credential(this.#environment, this.kind);
       const root = await deadline.run(({ signal }) => this.#root(signal));
+      this.#assertOpen();
       await this.#recover(root, deadline);
+      this.#assertRunnable();
       await this.#scavenge(root, deadline);
-      const descriptor = await this.#descriptor(deadline);
+      this.#assertRunnable();
       const result = await this.#invoke({
         request: admitted.request,
         wireInput: admitted.wireInput,
         deadline,
         configuredCredential,
-        descriptor,
         expectedRoot: root,
       });
       deadline.throwIfExpired();
@@ -2054,18 +2121,22 @@ export class SupervisedCliBrainProvider {
       }
       throw sanitizeRuntimeFailure(error);
     } finally {
+      this.#activeGenerations -= 1;
       deadline.dispose();
     }
   }
 
   close() {
-    if (this.#closed) return Promise.resolve();
     if (this.#closeAttempt) return this.#closeAttempt;
+    if (this.#closeResult) return this.#closeResult;
+    this.#closed = true;
     const attempt = this.#closeProvider();
     this.#closeAttempt = attempt;
     void attempt.then(
       () => {
-        if (this.#closeAttempt === attempt) this.#closeAttempt = null;
+        if (this.#closeAttempt !== attempt) return;
+        this.#closeResult = attempt;
+        this.#closeAttempt = null;
       },
       () => {
         if (this.#closeAttempt === attempt) this.#closeAttempt = null;
@@ -2075,11 +2146,11 @@ export class SupervisedCliBrainProvider {
   }
 
   async #closeProvider() {
-    const state = this.#rootState;
-    if (state === null) {
-      this.#closed = true;
-      return;
+    if (this.#activeGenerations > 0) {
+      throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
+    const state = this.#rootState;
+    if (state === null) return;
     if (state.pending.size > 0) {
       state.blocked = true;
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
@@ -2088,7 +2159,17 @@ export class SupervisedCliBrainProvider {
     if (state.blocked || state.unprovable || state.residues.size > 0) {
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
-    this.#closed = true;
+  }
+
+  #assertOpen() {
+    if (this.#closed) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+  }
+
+  #assertRunnable() {
+    this.#assertOpen();
+    assertRootAdmissionSafe(this.#rootState);
   }
 }
 

@@ -513,3 +513,55 @@ test("describe returns a detached provider view for the configured role", () => 
   first.model = "changed";
   assert.equal(directory.describe("developer").model, "code-model");
 });
+
+test("directory close fences decisions, coalesces, and retries only an unresolved router", async () => {
+  const closeFailure = new Error("router close failed once");
+  let rejectFirstClose;
+  const firstRouterClose = new Promise((_, reject) => {
+    rejectFirstClose = reject;
+  });
+  let closeAttempts = 0;
+  let generateCalls = 0;
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: {
+      async generate() {
+        generateCalls += 1;
+        return decision();
+      },
+      describe(brain) {
+        return {
+          provider: brain.provider,
+          model: brain.model,
+          remote: false,
+          remoteData: brain.remoteData,
+        };
+      },
+      close() {
+        closeAttempts += 1;
+        return closeAttempts === 1 ? firstRouterClose : Promise.resolve();
+      },
+    },
+    roles: roleBrain(),
+  });
+
+  const firstClose = directory.close();
+  assert.strictEqual(directory.close(), firstClose);
+  await assert.rejects(
+    directory.decide(input(), authorized()),
+    (error) => error?.code === "CODE_BRAIN_DIRECTORY_CLOSED",
+  );
+  assert.equal(generateCalls, 0);
+
+  const observedFailure = assert.rejects(
+    firstClose,
+    (error) => error === closeFailure,
+  );
+  rejectFirstClose(closeFailure);
+  await observedFailure;
+
+  const retry = directory.close();
+  assert.strictEqual(directory.close(), retry);
+  await retry;
+  await directory.close();
+  assert.equal(closeAttempts, 2);
+});

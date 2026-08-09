@@ -666,6 +666,10 @@ export class VersionedCodeJobAuthority {
   #conflictPreparationVerifier;
   #cache;
   #contexts;
+  #directoryRuntimes;
+  #closed = false;
+  #closeAttempt = null;
+  #closeResult = null;
 
   constructor({
     configurationReader,
@@ -737,12 +741,15 @@ export class VersionedCodeJobAuthority {
     this.#brainDirectoryFactory = brainDirectoryFactory;
     this.#cache = null;
     this.#contexts = new Map();
+    this.#directoryRuntimes = new Map();
     Object.freeze(this);
   }
 
   async create(value) {
+    this.#assertOpen();
     const context = await this.#current();
     const result = await context.grants.create(value);
+    this.#assertOpen();
     const repository = result?.grant?.repository;
     if (typeof repository !== "string") {
       throw invalid("代码任务授权创建器返回了无效结果");
@@ -752,6 +759,7 @@ export class VersionedCodeJobAuthority {
   }
 
   async verify(value) {
+    this.#assertOpen();
     const grant = prepareCodeJobGrantVerification(value);
     const current = await this.#current();
     requireTrackedRepository(current.configuration, grant.repository);
@@ -851,6 +859,7 @@ export class VersionedCodeJobAuthority {
   }
 
   async decide(value, authorization) {
+    this.#assertOpen();
     const { beforeGenerate, brainDigest } = decisionAuthorization(authorization);
     const roleId = decisionRoleId(value);
     const current = await this.#current();
@@ -864,9 +873,10 @@ export class VersionedCodeJobAuthority {
       throw invalid("岗位大脑封印已不受当前活动配置授权");
     }
     const directory = this.#directory(context);
-    return directory.decide(value, {
+    const result = await directory.decide(value, {
       beforeGenerate: async () => {
         await beforeGenerate();
+        this.#assertOpen();
         const latest = await this.#current();
         if (
           latest.roleAuthorityDigest(roleId) !==
@@ -878,10 +888,14 @@ export class VersionedCodeJobAuthority {
       brainDigest,
       admitGenerate: this.#actionAdmission,
     });
+    this.#assertOpen();
+    return result;
   }
 
   async #current() {
+    this.#assertOpen();
     const active = activeConfiguration(await this.#readActive());
+    this.#assertOpen();
     if (
       this.#cache?.version === active.version &&
       this.#cache.digest === active.digest
@@ -889,6 +903,7 @@ export class VersionedCodeJobAuthority {
       return this.#cache;
     }
     const versions = configurationHistory(await this.#readSnapshot(), active);
+    this.#assertOpen();
     const history = new AuthorityHistory(versions, this.#executorAuthority);
     this.#contexts.clear();
     this.#cache = this.#context(active, history, versions.length - 1, {
@@ -903,6 +918,7 @@ export class VersionedCodeJobAuthority {
     historyIndex,
     { requireStartupBoundary = false } = {},
   ) {
+    this.#assertOpen();
     const contextKey = `${active.version}:${active.digest}`;
     const cached = this.#contexts.get(contextKey);
     if (cached) return cached;
@@ -1039,11 +1055,13 @@ export class VersionedCodeJobAuthority {
   }
 
   async #verifyWithContext(value, context, current) {
+    this.#assertOpen();
     const verifier = ![2, 3].includes(value.schemaVersion) ||
         grantBrainBindingSchema(value) === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
       ? context.grants
       : this.#legacyScopedGrants(context);
     const grant = await verifier.verify(value);
+    this.#assertOpen();
     if (!grant || typeof grant.repository !== "string") {
       throw invalid("代码任务授权校验器返回了无效结果");
     }
@@ -1087,7 +1105,9 @@ export class VersionedCodeJobAuthority {
   }
 
   async #verifyLegacy(value, context, current) {
+    this.#assertOpen();
     const grant = await context.grants.verify(value);
+    this.#assertOpen();
     if (!grant || typeof grant.repository !== "string") {
       throw invalid("旧版代码任务授权校验器返回了无效结果");
     }
@@ -1102,6 +1122,7 @@ export class VersionedCodeJobAuthority {
   }
 
   #directory(context) {
+    this.#assertOpen();
     if (context.directory) return context.directory;
     const directory = this.#brainDirectoryFactory({
       brainProviders: context.configuration.brainProviders,
@@ -1109,7 +1130,67 @@ export class VersionedCodeJobAuthority {
       dependencies: this.#brainDependencies,
     });
     method(directory, "decide", "versioned code job brain directory");
+    if (
+      typeof directory.close === "function" &&
+      !this.#directoryRuntimes.has(directory)
+    ) {
+      this.#directoryRuntimes.set(directory, {
+        close: method(
+          directory,
+          "close",
+          "versioned code job brain directory",
+        ),
+        closed: false,
+      });
+    }
     context.directory = directory;
     return directory;
+  }
+
+  close() {
+    if (this.#closeAttempt) return this.#closeAttempt;
+    if (this.#closeResult) return this.#closeResult;
+    this.#closed = true;
+    const attempt = this.#closeDirectories();
+    this.#closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (this.#closeAttempt !== attempt) return;
+        this.#closeResult = attempt;
+        this.#closeAttempt = null;
+      },
+      () => {
+        if (this.#closeAttempt === attempt) this.#closeAttempt = null;
+      },
+    );
+    return attempt;
+  }
+
+  async #closeDirectories() {
+    const failures = [];
+    const runtimes = [...this.#directoryRuntimes.values()];
+    for (let index = runtimes.length - 1; index >= 0; index -= 1) {
+      const runtime = runtimes[index];
+      if (runtime.closed) continue;
+      try {
+        await runtime.close();
+        runtime.closed = true;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        "Versioned code job brain directory cleanup failed",
+      );
+    }
+  }
+
+  #assertOpen() {
+    if (this.#closed) {
+      throw invalid("代码任务大脑授权已关闭");
+    }
   }
 }

@@ -210,6 +210,7 @@ function supervisedCliProtectedRoots({
 
 export function createApplicationRuntimeLifecycle() {
   const runtimes = [];
+  const runtimeOwners = new Set();
   const failures = [];
   let closeAttempt = null;
   let lastFailure = null;
@@ -246,7 +247,12 @@ export function createApplicationRuntimeLifecycle() {
 
   return Object.freeze({
     track(runtime) {
-      if (runtime && typeof runtime.close === "function") {
+      if (
+        runtime &&
+        typeof runtime.close === "function" &&
+        !runtimeOwners.has(runtime)
+      ) {
+        runtimeOwners.add(runtime);
         runtimes.push({ close: runtime.close.bind(runtime), closed: false });
       }
       return runtime;
@@ -1112,6 +1118,7 @@ export async function createApplication({
           ),
         });
       }
+      codeJobBrainDirectory = trackRuntime(codeJobBrainDirectory);
       activeCodeJobOptions = {
         grantVerifier: frozenPort(
           grantFactory,

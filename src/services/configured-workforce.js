@@ -250,7 +250,7 @@ function configuredBrainRouter(
   const close = () => {
     if (closeAttempt) return closeAttempt;
     const attempt = (async () => {
-      let firstFailure = null;
+      const failures = [];
       for (let index = runtimes.length - 1; index >= 0; index -= 1) {
         const runtime = runtimes[index];
         if (runtime.closed) continue;
@@ -258,10 +258,16 @@ function configuredBrainRouter(
           await runtime.close();
           runtime.closed = true;
         } catch (error) {
-          firstFailure ||= error;
+          failures.push(error);
         }
       }
-      if (firstFailure) throw firstFailure;
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(
+          failures,
+          "Configured brain provider cleanup failed",
+        );
+      }
     })();
     closeAttempt = attempt;
     void attempt.then(

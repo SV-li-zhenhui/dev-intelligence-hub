@@ -259,6 +259,10 @@ function requireRouter(value) {
   return Object.freeze({
     generate: value.generate.bind(value),
     describe: value.describe.bind(value),
+    close:
+      typeof value.close === "function"
+        ? value.close.bind(value)
+        : () => Promise.resolve(),
   });
 }
 
@@ -314,6 +318,9 @@ function systemPrompt() {
 export class CodeJobBrainDirectory {
   #router;
   #taskBrains;
+  #closed = false;
+  #closeAttempt = null;
+  #closeResult = null;
 
   constructor({ brainRouter, roles = {} } = {}) {
     this.#router = requireRouter(brainRouter);
@@ -322,6 +329,7 @@ export class CodeJobBrainDirectory {
   }
 
   async decide(value, authorization) {
+    this.#assertOpen();
     const { roleId, context } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate } =
       requireDecisionAuthorization(authorization);
@@ -346,9 +354,12 @@ export class CodeJobBrainDirectory {
     ];
     const maximumAttempts = isSingleAttemptBrain(this.#router, brain) ? 1 : 2;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      this.#assertOpen();
       const admitted = exactData(
         await admitGenerate(async () => {
+          this.#assertOpen();
           await beforeGenerate();
+          this.#assertOpen();
           return {
             response: this.#router.generate({
               brain,
@@ -439,6 +450,35 @@ export class CodeJobBrainDirectory {
       );
     }
     return structuredClone(this.#router.describe(brain));
+  }
+
+  close() {
+    if (this.#closeAttempt) return this.#closeAttempt;
+    if (this.#closeResult) return this.#closeResult;
+    this.#closed = true;
+    const attempt = Promise.resolve().then(() => this.#router.close());
+    this.#closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (this.#closeAttempt !== attempt) return;
+        this.#closeResult = attempt;
+        this.#closeAttempt = null;
+      },
+      () => {
+        if (this.#closeAttempt === attempt) this.#closeAttempt = null;
+      },
+    );
+    return attempt;
+  }
+
+  #assertOpen() {
+    if (this.#closed) {
+      throw directoryError(
+        "CODE_BRAIN_DIRECTORY_CLOSED",
+        "Code job brain directory is closed",
+        503,
+      );
+    }
   }
 }
 

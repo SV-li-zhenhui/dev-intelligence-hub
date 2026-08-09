@@ -1414,3 +1414,139 @@ test("a benign model change affects new claims while old work keeps its sealed b
     context.startup.employees.roles.developer.taskBrain.model,
   ]);
 });
+
+test("close retains every unique directory across context replacement and retries only failures", async () => {
+  const firstFailure = new Error("first directory close failed");
+  const thirdFailure = new Error("third directory close failed");
+  const resources = [];
+  let factoryCalls = 0;
+  const context = fixture({
+    brainDirectoryFactory: () => {
+      factoryCalls += 1;
+      if (factoryCalls === 4) return resources[0].directory;
+      const index = resources.length;
+      const resource = {
+        attempts: 0,
+        failure: index === 0
+          ? firstFailure
+          : index === 2
+            ? thirdFailure
+            : null,
+        directory: null,
+      };
+      resource.directory = {
+        async decide(_value, authorization) {
+          await authorization.beforeGenerate();
+          return { action: { type: "complete" } };
+        },
+        async close() {
+          resource.attempts += 1;
+          if (resource.attempts === 1 && resource.failure) {
+            throw resource.failure;
+          }
+        },
+      };
+      resources.push(resource);
+      return resource.directory;
+    },
+  });
+  let currentConfiguration = context.startup;
+  for (let version = 1; version <= 4; version += 1) {
+    if (version > 1) {
+      currentConfiguration = structuredClone(context.startup);
+      currentConfiguration.employees.roles.developer.taskBrain.model =
+        `replacement-model-${version}`;
+      currentConfiguration.browserPollSeconds += version;
+      context.activate(currentConfiguration);
+    }
+    const grant = (
+      await context.authority.create(proposal(currentConfiguration))
+    ).grant;
+    await context.authority.decide(
+      { roleId: "developer" },
+      {
+        beforeGenerate: async () => {},
+        brainDigest: grant.brainDigest,
+      },
+    );
+  }
+  assert.equal(factoryCalls, 4);
+  assert.equal(resources.length, 3);
+
+  const firstClose = context.authority.close();
+  assert.strictEqual(context.authority.close(), firstClose);
+  const aggregate = await firstClose.then(
+    () => null,
+    (error) => error,
+  );
+  assert.ok(aggregate instanceof AggregateError);
+  assert.deepEqual(new Set(aggregate.errors), new Set([
+    firstFailure,
+    thirdFailure,
+  ]));
+  assert.deepEqual(resources.map(({ attempts }) => attempts), [1, 1, 1]);
+
+  await assert.rejects(
+    context.authority.create(proposal(currentConfiguration)),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+  await assert.rejects(
+    context.authority.decide(
+      { roleId: "developer" },
+      { beforeGenerate: async () => {}, brainDigest: "a".repeat(64) },
+    ),
+    (error) => error?.code === "INVALID_CODE_JOB_AUTHORITY",
+  );
+
+  const retry = context.authority.close();
+  assert.strictEqual(context.authority.close(), retry);
+  await retry;
+  await context.authority.close();
+  assert.deepEqual(resources.map(({ attempts }) => attempts), [2, 1, 2]);
+});
+
+test("close fences an in-flight active read before it can create a context", async () => {
+  const startup = configuration();
+  const activeReadStarted = deferred();
+  const releaseActiveRead = deferred();
+  let snapshotReads = 0;
+  let directoryCreations = 0;
+  const authority = new VersionedCodeJobAuthority({
+    configurationReader: {
+      async readActive() {
+        activeReadStarted.resolve();
+        await releaseActiveRead.promise;
+        return active(startup);
+      },
+      async readSnapshot() {
+        snapshotReads += 1;
+        return { versions: [active(startup)] };
+      },
+    },
+    executorAuthority: executorAuthority(),
+    startupConfiguration: startup,
+    actionAdmissionGate: { async run(operation) { return operation(); } },
+    inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+    brainDirectoryFactory: () => {
+      directoryCreations += 1;
+      return { async decide() {} };
+    },
+  });
+  const creationOutcome = authority.create(proposal(startup)).then(
+    () => null,
+    (error) => error,
+  );
+  await activeReadStarted.promise;
+
+  const closeAttempt = typeof authority.close === "function"
+    ? authority.close()
+    : null;
+  releaseActiveRead.resolve();
+  if (closeAttempt) await closeAttempt;
+  const creationFailure = await creationOutcome;
+
+  assert.equal(typeof authority.close, "function");
+  assert.equal(creationFailure?.code, "INVALID_CODE_JOB_AUTHORITY");
+  assert.equal(snapshotReads, 0);
+  assert.equal(directoryCreations, 0);
+});

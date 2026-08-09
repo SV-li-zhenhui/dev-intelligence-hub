@@ -21,6 +21,9 @@ import {
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
 import {
+  CodeJobBrainDirectory,
+} from "../src/services/code-job-brain-directory.js";
+import {
   createWorkProposalResult,
   normalizeBoundWorkProposal,
 } from "../src/domain/work-proposal-contract.js";
@@ -2105,6 +2108,23 @@ test("runtime lifecycle preserves every ordered failure event after recovery", a
   assert.equal(Object.isFrozen(recoveredStatus.failures), true);
 });
 
+test("runtime lifecycle tracks the same close owner only once", async () => {
+  const lifecycle = createApplicationRuntimeLifecycle();
+  let closeCalls = 0;
+  const runtime = {
+    async close() {
+      closeCalls += 1;
+    },
+  };
+
+  assert.strictEqual(lifecycle.track(runtime), runtime);
+  assert.strictEqual(lifecycle.track(runtime), runtime);
+  await lifecycle.close();
+
+  assert.equal(closeCalls, 1);
+  assert.equal(lifecycle.readStatus().acquiredRuntimes, 1);
+});
+
 test("explicit null runtime lifecycle is rejected instead of internally orphaned", async () => {
   let application = null;
   const failure = await createApplication({
@@ -3459,6 +3479,159 @@ test("application close stays bounded and incomplete while a configured provider
   assert.strictEqual(status.failure, closeFailure);
 });
 
+test("application close stays bounded when a non-versioned Code Job CLI never settles", async (t) => {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "supervised-cli-code-job-close-"),
+  );
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  let clockReads = 0;
+  let processStarted;
+  const started = new Promise((resolve) => { processStarted = resolve; });
+  const provider = createTestSupervisedCliBrainProvider(
+    {
+      id: "cli",
+      cliKind: "codex-cli",
+      timeoutMs: 1_000,
+      maxResponseBytes: 128 * 1024,
+      maxRequestBytes: 256 * 1024,
+    },
+    {
+      processRunner: {
+        async run() {
+          processStarted();
+          return new Promise(() => {});
+        },
+      },
+      commandLocator: {
+        async resolve() {
+          return Object.freeze({
+            command: path.join(path.parse(process.cwd()).root, "fixture.exe"),
+            prefixArgs: Object.freeze([]),
+          });
+        },
+      },
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+    },
+  );
+  const config = localCodeCoordinationConfig({ githubActions: false });
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: {
+      generate({ brain, messages, schema, signal = null }) {
+        return provider.generate({
+          model: brain.model,
+          messages,
+          schema,
+          ...(signal === null ? {} : { signal }),
+        });
+      },
+      describe(brain) {
+        return {
+          provider: brain.provider,
+          model: brain.model,
+          remote: true,
+          remoteData: structuredClone(brain.remoteData),
+          singleAttempt: true,
+        };
+      },
+      close: provider.close.bind(provider),
+    },
+    roles: config.employees.roles,
+  });
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const application = await createApplication({
+    config,
+    versionedConfiguration: false,
+    externalActions: true,
+    store: memoryStore(),
+    runtimeLifecycle: lifecycle,
+    codeExecutorRuntimeFactory: async () => ({
+      authority: { workspaces: [] },
+      executor: controlledCodeExecutorPort(),
+      async close() { closeCalls.push("code-executor"); },
+    }),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "code-action-runner": { async claim() {}, async advance() {} },
+      },
+    }),
+    codeJobGrantFactory: () => ({
+      async create() {},
+      verify(value) { return value; },
+    }),
+    codeJobBrainDirectoryFactory: () => directory,
+    codeJobRuntimeFactory: async (options) => {
+      calls.codeJobRuntime = options;
+      return {
+        confirmationExecutor: { async execute() {}, async reconcile() {} },
+        reader: {
+          async get() {},
+          async getDetail() {},
+          async list() {},
+          async listNewest() {},
+        },
+        control: codeJobControlPort(),
+        worker: codeJobWorkerPort(),
+        projectionSource: codeJobProjectionSourcePort(),
+        async close() { closeCalls.push("code-job"); },
+      };
+    },
+    codeJobMemoryProjectorFactory: () => ({ async runCycle() {} }),
+    codeActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(),
+      memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() { closeCalls.push("confirmation"); },
+    }),
+    operationsRuntimeFactory: () => Object.freeze({}),
+  });
+  const decisionOutcome = calls.codeJobRuntime.brainDirectory.decide(
+    {
+      roleId: "developer",
+      task: {
+        operation: "modify",
+        repository: "acme/repo",
+        objective: "Prove bounded shutdown.",
+        acceptanceCriteria: ["Application close remains bounded."],
+        evidence: ["The local CLI process does not settle."],
+      },
+      capabilities: {
+        allowedActions: ["read_text"],
+        writablePaths: ["src"],
+        requiredProfilesRemaining: 1,
+      },
+      turn: 1,
+      observations: [],
+    },
+    { beforeGenerate: async () => {} },
+  ).then(
+    () => null,
+    (error) => error,
+  );
+  const admission = await within(2_000, Promise.race([
+    started.then(() => ({ started: true, error: null })),
+    decisionOutcome.then((error) => ({ started: false, error })),
+  ]));
+  assert.equal(admission.started, true, admission.error?.stack);
+  assert.equal(
+    (await within(500, decisionOutcome))?.code,
+    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  );
+
+  const closeFailure = await within(250, application.close()).then(
+    () => null,
+    (error) => error,
+  );
+  assert.equal(closeFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  assert.equal(lifecycle.readStatus().complete, false);
+});
+
 test("local code composition keeps CLI authority private from injected factories", async () => {
   const calls = {};
   const closeCalls = [];
@@ -3568,7 +3741,12 @@ test("local code composition keeps CLI authority private from injected factories
     },
     codeJobBrainDirectoryFactory: (options) => {
       calls.codeBrainDirectory = options;
-      return { async decide() {} };
+      return {
+        async decide() {},
+        async close() {
+          closeCalls.push("code-brain");
+        },
+      };
     },
     githubReviewProposalRunnerFactory: (options) => {
       calls.githubRunner = options;
@@ -3772,6 +3950,7 @@ test("local code composition keeps CLI authority private from injected factories
   assert.deepEqual(closeCalls, [
     "confirmation",
     "code-job",
+    "code-brain",
     "memory",
     "proposals",
     "attention",
@@ -4389,6 +4568,9 @@ test("versioned local code shares one gate and reads Active authority", async ()
       return value;
     },
     async decide() {},
+    async close() {
+      closeCalls.push("versioned-code-brain");
+    },
   };
   const localExecutor = { async execute() {}, async reconcile() {} };
   const conflictPreparationVerifier = { async verify(value) { return value; } };
@@ -4624,4 +4806,8 @@ test("versioned local code shares one gate and reads Active authority", async ()
   );
 
   await application.close();
+  assert.equal(
+    closeCalls.filter((entry) => entry === "versioned-code-brain").length,
+    1,
+  );
 });

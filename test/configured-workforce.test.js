@@ -338,6 +338,69 @@ test("configured routing forwards only code-owned protected roots to supervised 
   assert.deepEqual(receivedRuntimeFacts, { protectedRoots });
 });
 
+test("configured router close preserves every provider failure and retries only unresolved providers", async () => {
+  const failures = new Map([
+    ["first", new Error("first provider close failed")],
+    ["third", new Error("third provider close failed")],
+  ]);
+  const attempts = new Map();
+  const router = createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        first: { kind: "codex-cli" },
+        second: { kind: "codex-cli" },
+        third: { kind: "codex-cli" },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        return {
+          id: options.id,
+          remote: true,
+          singleAttempt: true,
+          async generate() {
+            return '{"ok":true}';
+          },
+          async close() {
+            const count = (attempts.get(options.id) ?? 0) + 1;
+            attempts.set(options.id, count);
+            if (count === 1 && failures.has(options.id)) {
+              throw failures.get(options.id);
+            }
+          },
+        };
+      },
+    },
+  );
+
+  const firstClose = router.close();
+  assert.strictEqual(router.close(), firstClose);
+  const aggregate = await firstClose.then(
+    () => null,
+    (error) => error,
+  );
+  assert.ok(aggregate instanceof AggregateError);
+  assert.deepEqual(
+    new Set(aggregate.errors),
+    new Set(failures.values()),
+  );
+  assert.deepEqual(Object.fromEntries(attempts), {
+    first: 1,
+    second: 1,
+    third: 1,
+  });
+
+  const retry = router.close();
+  assert.strictEqual(router.close(), retry);
+  await retry;
+  await router.close();
+  assert.deepEqual(Object.fromEntries(attempts), {
+    first: 2,
+    second: 1,
+    third: 2,
+  });
+});
+
 test("production configured routing rejects a caller-supplied protected-root field", () => {
   assert.throws(
     () => createConfiguredBrainRouter({
