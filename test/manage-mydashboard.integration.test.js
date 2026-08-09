@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
+  chmod,
   copyFile,
   cp,
   mkdir,
@@ -45,6 +46,11 @@ const POWERSHELL_7_MANAGER_SKIP = process.platform !== "win32"
   : powershell7Available
     ? false
     : "requires PowerShell 7";
+
+async function copyWritableFixtureFile(source, destination) {
+  await copyFile(source, destination);
+  await chmod(destination, 0o644);
+}
 
 async function availablePort() {
   const server = net.createServer();
@@ -221,11 +227,11 @@ async function createFixture(
   await mkdir(path.join(root, "scripts"), { recursive: true });
   await mkdir(path.join(root, "src"), { recursive: true });
   const port = await availablePort();
-  await copyFile(
+  await copyWritableFixtureFile(
     path.join(projectRoot, "scripts", "Manage-MyDashboard.ps1"),
     path.join(root, "scripts", "Manage-MyDashboard.ps1"),
   );
-  await copyFile(
+  await copyWritableFixtureFile(
     path.join(projectRoot, "scripts", "launch-mydashboard-process.mjs"),
     path.join(root, "scripts", "launch-mydashboard-process.mjs"),
   );
@@ -458,6 +464,7 @@ async function createRealServerFixture(t) {
     recursive: true,
   });
   const guardPath = path.join(root, "src", "lib", "process-exclusive-guard.js");
+  await chmod(guardPath, 0o644);
   const guardSource = await readFile(guardPath, "utf8");
   const fixtureGuardPrefix = `fixture-${randomBytes(8).toString("hex")}`;
   await writeFile(
@@ -477,7 +484,7 @@ async function createRealServerFixture(t) {
     "launch-mydashboard-process.mjs",
     "run-managed-dashboard.mjs",
   ]) {
-    await copyFile(
+    await copyWritableFixtureFile(
       path.join(projectRoot, "scripts", name),
       path.join(root, "scripts", name),
     );

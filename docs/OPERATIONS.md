@@ -29,7 +29,7 @@ npm test
 ```
 
 For a repeatable release or upgrade acceptance, run the core validation from a
-committed tree. It checks the complete Node suite, JavaScript syntax, and the
+committed tree. It checks every committed Node test, JavaScript syntax, and the
 configuration and confirmation browser fixtures:
 
 ```powershell
@@ -45,15 +45,21 @@ npm run validate:system -- --all
 ```
 
 Validation must start from a clean committed worktree. It fails if HEAD, the Git
-tree, or tracked/untracked source changes during the run. The command writes a
-new machine-readable result for every run and prints its ignored path:
+tree, or tracked/untracked source changes during the run. Ordinary Node tests
+run from a read-only materialization of the exact commit without `.git`. The
+open-source distribution suite, which must inspect the Git index, current tree,
+and package payload, runs separately from the repository after clean
+commit/tree verification before and after the command. Both suites are
+mandatory and together cover every committed top-level Node test. The command
+writes a new machine-readable result for every run and prints its ignored path:
 `validation-artifacts/runs/<runId>/system-validation.json`. The report includes
 the start/end source identity, sanitized logical commands and exit status, and
 Node pass/fail/skip identities. An `--all` run stores its structured UI result,
 real PNG screenshots, and verified receipt under the same run directory. Runs
-never overwrite one another. The complete Node suite uses a fixed concurrency
+never overwrite one another. The immutable Node suite uses a fixed concurrency
 of four test files so process-lifecycle and timeout checks remain reproducible
-under host load.
+under host load; the Git-context distribution suite runs alone with concurrency
+one.
 
 After `--all` and two independent final reviews have passed, bind those records
 to the same HEAD with:

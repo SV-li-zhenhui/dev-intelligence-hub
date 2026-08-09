@@ -119,7 +119,19 @@ async function createValidationFixture(t) {
       "  assert.equal(process.env.NODE_PATH, undefined);",
       "});",
       "test('validation commands execute from a detached materialized source', () => {",
-      "  assert.equal(existsSync('.git'), false);",
+      `  assert.notEqual(process.cwd().toLowerCase(), ${JSON.stringify(root.toLowerCase())});`,
+      "});",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    path.join(root, "test/open-source-distribution.test.js"),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { existsSync } from 'node:fs';",
+      "import test from 'node:test';",
+      "test('distribution validation retains its clean Git source context', () => {",
+      "  assert.equal(existsSync('.git'), true);",
       "});",
       "",
     ].join("\n"),
@@ -360,7 +372,21 @@ test("the system validator binds a passing report to one clean Git source state"
         "--test",
         "--test-concurrency=4",
         "--test-reporter=tap",
-        "test/*.test.js",
+        "test/smoke.test.js",
+      ],
+    },
+  );
+  assert.deepEqual(
+    report.steps.find(
+      ({ name }) => name === "open-source distribution suite",
+    ).command,
+    {
+      executable: "node",
+      arguments: [
+        "--test",
+        "--test-concurrency=1",
+        "--test-reporter=tap",
+        "test/open-source-distribution.test.js",
       ],
     },
   );
@@ -400,6 +426,28 @@ test("the system validator binds a passing report to one clean Git source state"
       ],
     },
   );
+  const distributionStep = report.steps.find(
+    ({ name }) => name === "open-source distribution suite",
+  );
+  assert.deepEqual(distributionStep.testResults, {
+    summary: {
+      tests: 1,
+      passed: 1,
+      failed: 0,
+      cancelled: 0,
+      skipped: 0,
+      todo: 0,
+    },
+    cases: [{
+      identity: "tap:1:distribution validation retains its clean Git source context",
+      name: "distribution validation retains its clean Git source context",
+      status: "passed",
+    }],
+  });
+  assert.deepEqual(distributionStep.repositorySource, {
+    headOid: expectedHeadOid,
+    treeOid: expectedTreeOid,
+  });
   assert.deepEqual(Object.keys(report.executionSource).sort(), [
     "contentDigest",
     "dependencyInstallation",
@@ -416,12 +464,16 @@ test("the system validator binds a passing report to one clean Git source state"
   assert.equal(report.executionSource.sealed, true);
   assert.equal(
     report.steps
-      .filter(({ name }) => name !== "git diff --check")
+      .filter(({ name }) =>
+        name !== "git diff --check" &&
+        name !== "open-source distribution suite"
+      )
       .every(({ executionSourceDigest }) =>
         executionSourceDigest === report.executionSource.contentDigest
       ),
     true,
   );
+  assert.equal(distributionStep.executionSourceDigest, undefined);
   assert.equal(
     report.steps.every(({ command, exitCode, signal }) =>
       command === undefined || (exitCode === 0 && signal === null)

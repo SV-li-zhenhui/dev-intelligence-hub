@@ -16,14 +16,14 @@ npm test
 npm start
 ```
 
-发布或升级前可运行可重复的整体验收。基础命令执行完整 Node 回归、全部 JavaScript 语法检查和两组真实浏览器行为测试；`--all` 还要求 Docker Desktop 可用，并要求已经由受管生命周期启动且健康的 `127.0.0.1:4173` 服务完成桌面/移动端验收：
+发布或升级前可运行可重复的整体验收。基础命令执行提交中的完整 Node 回归、全部 JavaScript 语法检查和两组真实浏览器行为测试；`--all` 还要求 Docker Desktop 可用，并要求已经由受管生命周期启动且健康的 `127.0.0.1:4173` 服务完成桌面/移动端验收：
 
 ```powershell
 npm run validate:system
 npm run validate:system -- --all
 ```
 
-验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。每次命令都会生成新的 `runId`，并在结束时打印报告路径 `validation-artifacts/runs/<runId>/system-validation.json`；不同验收不会覆盖或误用旧报告。报告记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。`--all` 的 UI 结果、真实 PNG 截图和回执也保存在同一 run 目录。
+验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。普通 Node 测试在只读、无 `.git` 的精确提交物化中执行；必须核对 Git 索引、当前树和发布载荷的开源分发测试，则在前后均核验为同一干净 commit/tree 的仓库中单独执行。两组结果共同构成完整回归，不能省略或互相替代。每次命令都会生成新的 `runId`，并在结束时打印报告路径 `validation-artifacts/runs/<runId>/system-validation.json`；不同验收不会覆盖或误用旧报告。报告记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。`--all` 的 UI 结果、真实 PNG 截图和回执也保存在同一 run 目录。
 
 完成 `--all`、保存两份独立最终审查后，可生成同样被忽略的 HEAD 绑定清单。清单要求 Docker 与桌面/移动端 UI 步骤都已通过，并按 SHA-256 绑定验证报告、UI 结果/截图和两份不同审查报告：
 

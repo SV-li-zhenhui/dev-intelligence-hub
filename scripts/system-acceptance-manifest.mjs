@@ -41,14 +41,14 @@ const DEFAULT_VALIDATION_LIMITS = Object.freeze({
 });
 const REQUIRED_COMMANDS = new Map([
   [
-    "complete Node test suite",
+    "open-source distribution suite",
     {
       executable: "node",
       arguments: [
         "--test",
-        "--test-concurrency=4",
+        "--test-concurrency=1",
         "--test-reporter=tap",
-        "test/*.test.js",
+        "test/open-source-distribution.test.js",
       ],
     },
   ],
@@ -861,6 +861,13 @@ function validationCommandLimits(name) {
       maxStderrBytes: DEFAULT_VALIDATION_LIMITS.maxStderrBytes,
     };
   }
+  if (name === "open-source distribution suite") {
+    return {
+      timeoutMs: 10 * 60_000,
+      maxStdoutBytes: 8 * 1024 * 1024,
+      maxStderrBytes: DEFAULT_VALIDATION_LIMITS.maxStderrBytes,
+    };
+  }
   if (
     name === "configuration form browser behavior" ||
     name === "confirmation history browser behavior" ||
@@ -872,6 +879,27 @@ function validationCommandLimits(name) {
     };
   }
   return { ...DEFAULT_VALIDATION_LIMITS };
+}
+
+function committedNodeTestFiles(syntaxFiles) {
+  const testFiles = syntaxFiles.filter((relativePath) =>
+    /^test\/[^/]+\.test\.js$/u.test(relativePath)
+  );
+  const distributionTest = "test/open-source-distribution.test.js";
+  if (!testFiles.includes(distributionTest)) {
+    throw new Error("committed distribution test contract is unavailable");
+  }
+  const immutableFiles = testFiles.filter(
+    (relativePath) => relativePath !== distributionTest,
+  );
+  const argumentBytes = immutableFiles.reduce(
+    (total, relativePath) => total + Buffer.byteLength(relativePath) + 1,
+    0,
+  );
+  if (immutableFiles.length === 0 || argumentBytes > 24 * 1024) {
+    throw new Error("committed Node test contract is invalid or too large");
+  }
+  return immutableFiles;
 }
 
 async function committedSyntaxFiles(root, headOid) {
@@ -935,6 +963,7 @@ async function committedSyntaxFiles(root, headOid) {
 }
 
 function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
+  const nodeTestFiles = committedNodeTestFiles(syntaxFiles);
   return [
     {
       name: "git diff --check",
@@ -962,7 +991,20 @@ function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
     {
       name: "complete Node test suite",
       limits: validationCommandLimits("complete Node test suite"),
-      command: REQUIRED_COMMANDS.get("complete Node test suite"),
+      command: {
+        executable: "node",
+        arguments: [
+          "--test",
+          "--test-concurrency=4",
+          "--test-reporter=tap",
+          ...nodeTestFiles,
+        ],
+      },
+    },
+    {
+      name: "open-source distribution suite",
+      limits: validationCommandLimits("open-source distribution suite"),
+      command: REQUIRED_COMMANDS.get("open-source distribution suite"),
     },
     {
       name: "configuration form browser behavior",
@@ -1222,13 +1264,25 @@ function validateReport(
     }
   }
   for (const step of report.steps) {
-    const requiresExecutionSource = step?.name !== "git diff --check";
+    const usesRepositorySource =
+      step?.name === "open-source distribution suite";
+    const requiresExecutionSource =
+      step?.name !== "git diff --check" && !usesRepositorySource;
     if (
       requiresExecutionSource
         ? step?.executionSourceDigest !== report.executionSource.contentDigest
         : step?.executionSourceDigest !== undefined
     ) {
       throw new Error("validation step is not bound to its immutable execution source");
+    }
+    if (
+      usesRepositorySource
+        ? !hasExactKeys(step.repositorySource, ["headOid", "treeOid"]) ||
+          step.repositorySource.headOid !== currentSource.headOid ||
+          step.repositorySource.treeOid !== currentSource.treeOid
+        : step?.repositorySource !== undefined
+    ) {
+      throw new Error("validation step is not bound to its clean repository source");
     }
     if (step?.kind === "aggregate") {
       if (step.name !== "node syntax aggregate") {
@@ -1260,13 +1314,16 @@ function validateReport(
   const testStep = report.steps.find(
     ({ name }) => name === "complete Node test suite",
   );
+  const distributionStep = report.steps.find(
+    ({ name }) => name === "open-source distribution suite",
+  );
   const dockerStep = report.steps.find(
     ({ name }) => name === "real Docker sandbox boundary",
   );
   const uiStep = report.steps.find(
     ({ name }) => name === "live desktop and mobile UI behavior",
   );
-  if (!testStep || !dockerStep || !uiStep) {
+  if (!testStep || !distributionStep || !dockerStep || !uiStep) {
     throw new Error("system validation omitted a mandatory acceptance command");
   }
   if (
@@ -1282,6 +1339,7 @@ function validateReport(
     }
   }
   validateTestResults(testStep);
+  validateTestResults(distributionStep);
 }
 
 export async function buildAcceptanceManifest({

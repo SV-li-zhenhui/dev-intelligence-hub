@@ -43,6 +43,13 @@ function validationLimits(name) {
       maxStderrBytes: defaultValidationLimits.maxStderrBytes,
     };
   }
+  if (name === "open-source distribution suite") {
+    return {
+      timeoutMs: 10 * 60_000,
+      maxStdoutBytes: 8 * 1024 * 1024,
+      maxStderrBytes: defaultValidationLimits.maxStderrBytes,
+    };
+  }
   if (
     name === "configuration form browser behavior" ||
     name === "confirmation history browser behavior" ||
@@ -126,7 +133,16 @@ async function createFixture(t, {
     "validation-artifacts/\n.review-results/\n",
   );
   await mkdir(path.join(root, "src"), { recursive: true });
+  await mkdir(path.join(root, "test"), { recursive: true });
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
+  await writeFile(
+    path.join(root, "test/open-source-distribution.test.js"),
+    "export const distributionTest = true;\n",
+  );
+  await writeFile(
+    path.join(root, "test/smoke.test.js"),
+    "export const smokeTest = true;\n",
+  );
   await writeFile(path.join(root, "source.txt"), "accepted source\n");
   await writeFile(path.join(root, "package.json"), `${JSON.stringify({
     name: "acceptance-manifest-fixture",
@@ -248,11 +264,33 @@ async function createFixture(t, {
         signal: null,
       },
       {
+        name: "syntax:test/open-source-distribution.test.js",
+        command: {
+          executable: "node",
+          arguments: ["--check", "test/open-source-distribution.test.js"],
+        },
+        status: "passed",
+        durationMs: 25,
+        exitCode: 0,
+        signal: null,
+      },
+      {
+        name: "syntax:test/smoke.test.js",
+        command: {
+          executable: "node",
+          arguments: ["--check", "test/smoke.test.js"],
+        },
+        status: "passed",
+        durationMs: 25,
+        exitCode: 0,
+        signal: null,
+      },
+      {
         name: "node syntax aggregate",
         kind: "aggregate",
         status: "passed",
         durationMs: 75,
-        fileCount: 1,
+        fileCount: 3,
       },
       {
         name: "complete Node test suite",
@@ -262,7 +300,7 @@ async function createFixture(t, {
             "--test",
             "--test-concurrency=4",
             "--test-reporter=tap",
-            "test/*.test.js",
+            "test/smoke.test.js",
           ],
         },
         status: "passed",
@@ -291,6 +329,38 @@ async function createFixture(t, {
               reason: "requires MYDASHBOARD_DOCKER_INTEGRATION=1",
             },
           ],
+        },
+      },
+      {
+        name: "open-source distribution suite",
+        command: {
+          executable: "node",
+          arguments: [
+            "--test",
+            "--test-concurrency=1",
+            "--test-reporter=tap",
+            "test/open-source-distribution.test.js",
+          ],
+        },
+        status: "passed",
+        durationMs: 50,
+        exitCode: 0,
+        signal: null,
+        repositorySource: { headOid, treeOid },
+        testResults: {
+          summary: {
+            tests: 1,
+            passed: 1,
+            failed: 0,
+            cancelled: 0,
+            skipped: 0,
+            todo: 0,
+          },
+          cases: [{
+            identity: "tap:1:accepted distribution behavior",
+            name: "accepted distribution behavior",
+            status: "passed",
+          }],
         },
       },
       {
@@ -348,7 +418,10 @@ async function createFixture(t, {
   };
   for (const step of validation.steps) {
     if (step.kind !== "aggregate") step.limits = validationLimits(step.name);
-    if (step.name !== "git diff --check") {
+    if (
+      step.name !== "git diff --check" &&
+      step.name !== "open-source distribution suite"
+    ) {
       step.executionSourceDigest = executionSource.contentDigest;
     }
   }

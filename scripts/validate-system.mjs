@@ -46,6 +46,8 @@ const defaultCommandLimits = Object.freeze({
   maxStdoutBytes: 4 * 1024 * 1024,
   maxStderrBytes: 4 * 1024 * 1024,
 });
+const distributionTestPath = "test/open-source-distribution.test.js";
+const maximumNodeTestArgumentBytes = 24 * 1024;
 
 if (unknownArguments.length > 0) {
   throw new Error(`unknown validation option: ${unknownArguments.join(", ")}`);
@@ -141,6 +143,7 @@ async function run(command, arguments_, {
   workingDirectory = root,
   recordedCommand = null,
   executionSourceDigest = null,
+  repositorySource = null,
   timeoutMs = defaultCommandLimits.timeoutMs,
   maxStdoutBytes = defaultCommandLimits.maxStdoutBytes,
   maxStderrBytes = defaultCommandLimits.maxStderrBytes,
@@ -191,6 +194,9 @@ async function run(command, arguments_, {
     ...(executionSourceDigest === null
       ? {}
       : { executionSourceDigest }),
+    ...(repositorySource === null
+      ? {}
+      : { repositorySource: structuredClone(repositorySource) }),
     ...(environmentEvidence === null
       ? {}
       : { environment: structuredClone(environmentEvidence) }),
@@ -247,6 +253,34 @@ async function runFromExecutionSource(command, arguments_, options = {}) {
   } catch (error) {
     throw error;
   }
+  if (commandError !== null) throw commandError;
+  return outcome;
+}
+
+async function runFromRepositorySource(command, arguments_, options = {}) {
+  if (report.source.started === null) {
+    throw new Error("repository validation source is unavailable");
+  }
+  const verifyRepositorySource = async () => {
+    const current = await captureRepositoryState(root);
+    assertStableCleanRepository(report.source.started, current);
+  };
+  await verifyRepositorySource();
+  let outcome;
+  let commandError = null;
+  try {
+    outcome = await run(command, arguments_, {
+      ...options,
+      workingDirectory: root,
+      repositorySource: {
+        headOid: report.source.started.headOid,
+        treeOid: report.source.started.treeOid,
+      },
+    });
+  } catch (error) {
+    commandError = error;
+  }
+  await verifyRepositorySource();
   if (commandError !== null) throw commandError;
   return outcome;
 }
@@ -344,6 +378,35 @@ async function sourceFiles(directory) {
   return files;
 }
 
+async function immutableNodeTestFiles(directory) {
+  const entries = await readdir(path.join(directory, "test"), {
+    withFileTypes: true,
+  });
+  const testFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.js"))
+    .map((entry) => `test/${entry.name}`)
+    .sort((left, right) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
+    );
+  if (!testFiles.includes(distributionTestPath)) {
+    throw new Error("committed distribution test is unavailable");
+  }
+  const immutableFiles = testFiles.filter(
+    (relativePath) => relativePath !== distributionTestPath,
+  );
+  const argumentBytes = immutableFiles.reduce(
+    (total, relativePath) => total + Buffer.byteLength(relativePath) + 1,
+    0,
+  );
+  if (
+    immutableFiles.length === 0 ||
+    argumentBytes > maximumNodeTestArgumentBytes
+  ) {
+    throw new Error("immutable Node test file set is invalid or too large");
+  }
+  return immutableFiles;
+}
+
 async function checkSyntax() {
   const directories = ["src", "public", "scripts", "test", "test-support"];
   const files = (
@@ -433,11 +496,12 @@ try {
     "--",
   ], { name: "git diff --check" });
   await checkSyntax();
+  const nodeTestFiles = await immutableNodeTestFiles(executionSource.directory);
   await runFromExecutionSource(process.execPath, [
     "--test",
     "--test-concurrency=4",
     "--test-reporter=tap",
-    "test/*.test.js",
+    ...nodeTestFiles,
   ], {
     name: "complete Node test suite",
     quiet: true,
@@ -446,6 +510,19 @@ try {
     timeoutMs: 15 * 60_000,
     maxStdoutBytes: 32 * 1024 * 1024,
     maxStderrBytes: 8 * 1024 * 1024,
+  });
+  await runFromRepositorySource(process.execPath, [
+    "--test",
+    "--test-concurrency=1",
+    "--test-reporter=tap",
+    distributionTestPath,
+  ], {
+    name: "open-source distribution suite",
+    quiet: true,
+    parseOutput: parseNodeTestTap,
+    parseOutputOnFailure: true,
+    timeoutMs: 10 * 60_000,
+    maxStdoutBytes: 8 * 1024 * 1024,
   });
   await runFromExecutionSource(process.execPath, [
     "test/browser/configuration-form-playwright.mjs",
