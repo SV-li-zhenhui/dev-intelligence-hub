@@ -32,6 +32,7 @@ import { EmployeeRegistry } from "./services/employee-registry.js";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
+  readConfiguredConstructionCleanup,
 } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
@@ -2143,6 +2144,8 @@ export async function createApplication({
       close,
     };
   } catch (error) {
+    const constructionCleanup = readConfiguredConstructionCleanup(error);
+    if (constructionCleanup) trackRuntime(constructionCleanup);
     try {
       const cleanupAttempt = Promise.resolve(runtimeLifecycle.close());
       if (ownsRuntimeLifecycle) {

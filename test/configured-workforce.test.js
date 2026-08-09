@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
+  readConfiguredConstructionCleanup,
   createTestConfiguredBrainRouter,
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
@@ -339,6 +340,215 @@ test("configured routing forwards only code-owned protected roots to supervised 
   assert.deepEqual(receivedRuntimeFacts, { protectedRoots });
 });
 
+test("configured router captures a shared owner's one-shot close accessor once", async () => {
+  let closeReads = 0;
+  let closeCalls = 0;
+  const sharedOwner = {
+    id: "unset",
+    remote: true,
+    singleAttempt: true,
+    async generate() {
+      return '{"ok":true}';
+    },
+    get close() {
+      closeReads += 1;
+      if (closeReads > 1) {
+        throw new Error("shared owner close accessor was read again");
+      }
+      return async function closeSharedOwner() {
+        assert.strictEqual(this, sharedOwner);
+        closeCalls += 1;
+      };
+    },
+  };
+  const router = createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        "shared-first": { kind: "codex-cli" },
+        "shared-second": { kind: "claude-cli" },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        sharedOwner.id = options.id;
+        return sharedOwner;
+      },
+    },
+  );
+
+  await router.close();
+
+  assert.equal(closeReads, 1);
+  assert.equal(closeCalls, 1);
+});
+
+test("configured router cleanup survives a later factory deleting an acquired close", async () => {
+  const closeSequence = [];
+  const firstOwner = providerOwner("first", null, new Map(), closeSequence);
+  const ownerWithoutClose = {
+    id: "second",
+    remote: true,
+    singleAttempt: true,
+    async generate() {
+      return '{"ok":true}';
+    },
+  };
+  const router = createTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        first: { kind: "codex-cli" },
+        second: { kind: "claude-cli" },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        if (options.id === "first") {
+          firstOwner.id = options.id;
+          return firstOwner;
+        }
+        delete firstOwner.close;
+        return ownerWithoutClose;
+      },
+    },
+  );
+
+  await router.close();
+
+  assert.deepEqual(closeSequence, ["first"]);
+});
+
+function constructionCleanupFor(error) {
+  const cleanup = readConfiguredConstructionCleanup(error);
+  assert.ok(cleanup, "configured construction cleanup lifecycle is missing");
+  return cleanup;
+}
+
+test("configured router retains retryable cleanup when a later provider factory fails", async () => {
+  const constructionFailure = new Error("later provider factory failed");
+  const cleanupFailure = new Error("first owner cleanup failed once");
+  const attempts = new Map();
+  const closeSequence = [];
+  const firstOwner = providerOwner(
+    "first",
+    cleanupFailure,
+    attempts,
+    closeSequence,
+  );
+  let failure = null;
+
+  try {
+    createTestConfiguredBrainRouter(
+      {
+        brainProviders: {
+          first: { kind: "codex-cli" },
+          second: { kind: "claude-cli" },
+        },
+      },
+      {
+        supervisedCliProviderFactory(options) {
+          if (options.id === "second") throw constructionFailure;
+          firstOwner.id = options.id;
+          return firstOwner;
+        },
+      },
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.strictEqual(failure, constructionFailure);
+  const cleanup = constructionCleanupFor(failure);
+  await assert.rejects(cleanup.close(), (error) => error === cleanupFailure);
+  assert.deepEqual(closeSequence, ["first"]);
+  assert.strictEqual(cleanup.readStatus().failure, cleanupFailure);
+  await cleanup.close();
+  assert.deepEqual(closeSequence, ["first", "first"]);
+  assert.equal(cleanup.readStatus().complete, true);
+});
+
+test("configured router retains reverse retryable cleanup when router construction fails", async () => {
+  const constructionFailurePattern = /brain provider is duplicated/u;
+  const cleanupFailure = new Error("second owner cleanup failed once");
+  const attempts = new Map();
+  const closeSequence = [];
+  const firstOwner = providerOwner("first", null, attempts, closeSequence);
+  const secondOwner = providerOwner(
+    "second",
+    cleanupFailure,
+    attempts,
+    closeSequence,
+  );
+  let failure = null;
+
+  try {
+    createTestConfiguredBrainRouter(
+      {
+        brainProviders: {
+          first: { kind: "codex-cli" },
+          second: { kind: "claude-cli" },
+        },
+      },
+      {
+        supervisedCliProviderFactory(options) {
+          const owner = options.id === "first" ? firstOwner : secondOwner;
+          owner.id = "duplicate";
+          return owner;
+        },
+      },
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.match(failure?.message, constructionFailurePattern);
+  const cleanup = constructionCleanupFor(failure);
+  await assert.rejects(cleanup.close(), (error) => error === cleanupFailure);
+  assert.deepEqual(closeSequence, ["second", "first"]);
+  await cleanup.close();
+  assert.deepEqual(closeSequence, ["second", "first", "second"]);
+  assert.equal(cleanup.readStatus().complete, true);
+});
+
+test("configured workforce retains router cleanup when role construction fails", async () => {
+  const constructionFailure = new Error("role construction failed");
+  const cleanupFailure = new Error("workforce owner cleanup failed once");
+  const attempts = new Map();
+  const closeSequence = [];
+  const owner = providerOwner("provider", cleanupFailure, attempts, closeSequence);
+  const invalidRole = new Proxy({}, {
+    ownKeys() {
+      throw constructionFailure;
+    },
+  });
+  let failure = null;
+
+  try {
+    createTestConfiguredWorkforce(
+      {
+        brainProviders: { cli: { kind: "codex-cli" } },
+        roles: { developer: invalidRole },
+        store: new MemoryStore(),
+      },
+      {
+        supervisedCliProviderFactory(options) {
+          owner.id = options.id;
+          return owner;
+        },
+      },
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.strictEqual(failure, constructionFailure);
+  const cleanup = constructionCleanupFor(failure);
+  await assert.rejects(cleanup.close(), (error) => error === cleanupFailure);
+  assert.deepEqual(closeSequence, ["provider"]);
+  await cleanup.close();
+  assert.deepEqual(closeSequence, ["provider", "provider"]);
+  assert.equal(cleanup.readStatus().complete, true);
+});
+
 test("configured router close preserves every provider failure and retries only unresolved providers", async () => {
   const failures = new Map([
     ["first", new Error("first provider close failed")],
@@ -465,9 +675,25 @@ test("configured router retries failed unique owners and aggregates distinct fai
   const sharedFailure = new Error("shared owner close failed");
   const distinctFailure = new Error("distinct owner close failed");
   const attempts = new Map();
-  const sharedOwner = providerOwner("shared", sharedFailure, attempts);
-  const successfulOwner = providerOwner("successful", null, attempts);
-  const distinctOwner = providerOwner("distinct", distinctFailure, attempts);
+  const closeSequence = [];
+  const sharedOwner = providerOwner(
+    "shared",
+    sharedFailure,
+    attempts,
+    closeSequence,
+  );
+  const successfulOwner = providerOwner(
+    "successful",
+    null,
+    attempts,
+    closeSequence,
+  );
+  const distinctOwner = providerOwner(
+    "distinct",
+    distinctFailure,
+    attempts,
+    closeSequence,
+  );
   const router = createTestConfiguredBrainRouter(
     {
       brainProviders: {
@@ -504,6 +730,7 @@ test("configured router retries failed unique owners and aggregates distinct fai
     shared: 1,
     successful: 1,
   });
+  assert.deepEqual(closeSequence, ["distinct", "successful", "shared"]);
 
   const retry = router.close();
   assert.strictEqual(router.close(), retry);
@@ -514,6 +741,13 @@ test("configured router retries failed unique owners and aggregates distinct fai
     shared: 2,
     successful: 1,
   });
+  assert.deepEqual(closeSequence, [
+    "distinct",
+    "successful",
+    "shared",
+    "distinct",
+    "shared",
+  ]);
 });
 
 test("configured router preserves a shared owner's single raw close failure", async () => {
@@ -541,7 +775,7 @@ test("configured router preserves a shared owner's single raw close failure", as
   assert.equal(attempts.get("shared"), 2);
 });
 
-function providerOwner(key, firstFailure, attempts) {
+function providerOwner(key, firstFailure, attempts, closeSequence = null) {
   return {
     id: "unset",
     remote: true,
@@ -550,6 +784,7 @@ function providerOwner(key, firstFailure, attempts) {
       return '{"ok":true}';
     },
     async close() {
+      closeSequence?.push(key);
       const count = (attempts.get(key) ?? 0) + 1;
       attempts.set(key, count);
       if (count === 1 && firstFailure) throw firstFailure;

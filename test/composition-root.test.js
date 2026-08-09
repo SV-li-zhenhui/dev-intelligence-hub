@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import {
   access,
   mkdir,
@@ -12,7 +11,9 @@ import {
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { promisify } from "node:util";
+import {
+  runBoundedValidationCommand,
+} from "../scripts/system-validation-command.mjs";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
@@ -31,6 +32,7 @@ import {
   KnownCliLocator,
   materializeVerifiedCliDescriptor,
 } from "../src/lib/known-cli-locator.js";
+import { terminateProcessTree } from "../src/lib/managed-process.js";
 import {
   configurationDocumentDigest,
   normalizeConfigurationDocument,
@@ -51,7 +53,6 @@ import {
   normalizeBoundWorkProposal,
 } from "../src/domain/work-proposal-contract.js";
 
-const execFileAsync = promisify(execFile);
 const OFFLINE_CODEX_SOURCE = path.join(
   import.meta.dirname,
   "fixtures",
@@ -59,6 +60,15 @@ const OFFLINE_CODEX_SOURCE = path.join(
 );
 const COMMITTED_CONFIGURATION = JSON.parse(
   await readFile(path.join(import.meta.dirname, "..", "config.example.json"), "utf8"),
+);
+const OFFLINE_FIXTURE_COMMAND_TIMEOUT_MS = 30_000;
+const OFFLINE_FIXTURE_COMMAND_OUTPUT_BYTES = 1024 * 1024;
+const POWERSHELL_EXE = path.join(
+  process.env.SystemRoot || process.env.WINDIR || "C:\\Windows",
+  "System32",
+  "WindowsPowerShell",
+  "v1.0",
+  "powershell.exe",
 );
 
 function applicationConfig(codeExecutor = { enabled: false }) {
@@ -514,9 +524,176 @@ async function within(milliseconds, promise) {
   }
 }
 
+async function runOfflineFixtureCommand(command, arguments_, {
+  cwd,
+  env,
+  timeoutMs = OFFLINE_FIXTURE_COMMAND_TIMEOUT_MS,
+} = {}) {
+  const result = await runBoundedValidationCommand(command, arguments_, {
+    cwd,
+    env,
+    timeoutMs,
+    maxStdoutBytes: OFFLINE_FIXTURE_COMMAND_OUTPUT_BYTES,
+    maxStderrBytes: OFFLINE_FIXTURE_COMMAND_OUTPUT_BYTES,
+  });
+  if (result.exitCode !== 0 || result.signal !== null) {
+    throw Object.assign(
+      new Error("offline fixture command failed"),
+      { code: "OFFLINE_FIXTURE_COMMAND_FAILED", ...result },
+    );
+  }
+  return result;
+}
+
+async function waitForProcessMarker(marker) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      return JSON.parse(await readFile(marker, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error("offline fixture helper did not publish its process marker");
+}
+
+function processExists(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+test(
+  "offline fixture setup reaps a timed-out descendant before its root is removed",
+  { timeout: 15_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "offline-fixture-setup-bound-"));
+    const marker = path.join(root, "processes.json");
+    let processIds = [];
+    t.after(async () => {
+      for (const processId of processIds) {
+        if (!processExists(processId)) continue;
+        await terminateProcessTree(processId, {
+          force: true,
+          timeoutMs: 5_000,
+        }).catch(() => {});
+      }
+      await rm(root, { recursive: true, force: true });
+    });
+    const descendantScript = "setInterval(() => {}, 1000)";
+    const parentScript = [
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      `const descendant = spawn(${JSON.stringify(process.execPath)}, ["-e", ${JSON.stringify(descendantScript)}], { stdio: "ignore", windowsHide: true });`,
+      `writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ parent: process.pid, descendant: descendant.pid }));`,
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const startedAt = Date.now();
+    const running = runOfflineFixtureCommand(
+      process.execPath,
+      ["-e", parentScript],
+      {
+        cwd: root,
+        env: { ...process.env },
+        timeoutMs: 500,
+      },
+    );
+    const markerValue = await waitForProcessMarker(marker);
+    processIds = [markerValue.parent, markerValue.descendant];
+    const settled = running.then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    );
+    const testDeadline = Symbol("fixture setup remained pending");
+    const outcome = await Promise.race([
+      settled,
+      new Promise((resolve) => setTimeout(() => resolve(testDeadline), 2_000)),
+    ]);
+    if (outcome === testDeadline) {
+      await terminateProcessTree(markerValue.parent, {
+        force: true,
+        timeoutMs: 5_000,
+      });
+      await settled;
+    }
+
+    assert.notStrictEqual(
+      outcome,
+      testDeadline,
+      "offline fixture setup ignored its required timeout bound",
+    );
+    assert.equal(outcome.error?.code, "VALIDATION_COMMAND_TIMEOUT");
+    assert.ok(Date.now() - startedAt < 5_000, "fixture setup timeout was unbounded");
+    assert.equal(processExists(markerValue.parent), false);
+    assert.equal(processExists(markerValue.descendant), false);
+    await rm(root, { recursive: true });
+    await assert.rejects(access(root), { code: "ENOENT" });
+  },
+);
+
 async function createOfflineProductionCliFixture(t, name) {
   const root = await mkdtemp(path.join(tmpdir(), `${name}-`));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalEnvironment = {
+    path: process.env.PATH,
+    credential: process.env.OPENAI_API_KEY,
+    home: process.env.HOME,
+    userProfile: process.env.USERPROFILE,
+  };
+  let environmentChanged = false;
+  let runtimeTeardown = null;
+  let closeAttempt = null;
+  let closeResult = null;
+  const restoreEnvironment = () => {
+    if (!environmentChanged) return;
+    if (originalEnvironment.path === undefined) delete process.env.PATH;
+    else process.env.PATH = originalEnvironment.path;
+    if (originalEnvironment.credential === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = originalEnvironment.credential;
+    }
+    if (originalEnvironment.home === undefined) delete process.env.HOME;
+    else process.env.HOME = originalEnvironment.home;
+    if (originalEnvironment.userProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = originalEnvironment.userProfile;
+    }
+    environmentChanged = false;
+  };
+  const close = () => {
+    if (closeAttempt) return closeAttempt;
+    if (closeResult) return closeResult;
+    const attempt = (async () => {
+      let teardownFailure = null;
+      try {
+        await runtimeTeardown?.();
+      } catch (error) {
+        teardownFailure = error;
+      } finally {
+        restoreEnvironment();
+      }
+      if (teardownFailure) throw teardownFailure;
+      await rm(root, { recursive: true, force: true });
+    })();
+    closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (closeAttempt !== attempt) return;
+        closeResult = attempt;
+        closeAttempt = null;
+      },
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+    );
+    return attempt;
+  };
+  t.after(close);
   const homeRoot = path.join(root, "home");
   const nodeModulesRoot = path.join(root, "node_modules");
   const packageRoot = path.join(nodeModulesRoot, "@openai", "codex");
@@ -537,8 +714,8 @@ async function createOfflineProductionCliFixture(t, name) {
   await mkdir(homeRoot, { recursive: true });
   await mkdir(path.dirname(executable), { recursive: true });
   await mkdir(binarySearchRoot, { recursive: true });
-  await execFileAsync(
-    "powershell.exe",
+  await runOfflineFixtureCommand(
+    POWERSHELL_EXE,
     [
       "-NoLogo",
       "-NoProfile",
@@ -549,7 +726,6 @@ async function createOfflineProductionCliFixture(t, name) {
       "Add-Type -Path $env:MYDASHBOARD_FIXTURE_SOURCE -OutputAssembly $env:MYDASHBOARD_FIXTURE_OUTPUT -OutputType ConsoleApplication",
     ],
     {
-      windowsHide: true,
       env: {
         ...process.env,
         MYDASHBOARD_FIXTURE_SOURCE: OFFLINE_CODEX_SOURCE,
@@ -581,8 +757,8 @@ async function createOfflineProductionCliFixture(t, name) {
     "utf8",
   );
 
-  await execFileAsync(
-    "powershell.exe",
+  await runOfflineFixtureCommand(
+    POWERSHELL_EXE,
     [
       "-NoLogo",
       "-NoProfile",
@@ -600,7 +776,6 @@ async function createOfflineProductionCliFixture(t, name) {
       ].join("\n"),
     ],
     {
-      windowsHide: true,
       env: {
         ...process.env,
         MYDASHBOARD_FIXTURE_HOME:
@@ -609,24 +784,11 @@ async function createOfflineProductionCliFixture(t, name) {
     },
   );
 
-  const originalPath = process.env.PATH;
-  const originalCredential = process.env.OPENAI_API_KEY;
-  const originalHome = process.env.HOME;
-  const originalUserProfile = process.env.USERPROFILE;
   process.env.PATH = binarySearchRoot;
   process.env.OPENAI_API_KEY = "fixed-offline-fixture-credential";
   process.env.HOME = homeRoot;
   process.env.USERPROFILE = homeRoot;
-  t.after(async () => {
-    if (originalPath === undefined) delete process.env.PATH;
-    else process.env.PATH = originalPath;
-    if (originalCredential === undefined) delete process.env.OPENAI_API_KEY;
-    else process.env.OPENAI_API_KEY = originalCredential;
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = originalUserProfile;
-  });
+  environmentChanged = true;
   const descriptor = await new KnownCliLocator().resolve("codex-cli");
   await materializeVerifiedCliDescriptor(descriptor);
 
@@ -649,7 +811,46 @@ async function createOfflineProductionCliFixture(t, name) {
     }
   };
   return Object.freeze({
+    root,
+    close,
     invocationNames,
+    registerTeardown(teardown) {
+      if (typeof teardown !== "function") {
+        throw new TypeError("offline fixture teardown is invalid");
+      }
+      if (runtimeTeardown !== null) {
+        throw new Error("offline fixture teardown is already registered");
+      }
+      runtimeTeardown = teardown;
+    },
+    async runningProcessIds() {
+      const result = await runOfflineFixtureCommand(
+        POWERSHELL_EXE,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MYDASHBOARD_FIXTURE_EXECUTABLE))",
+            "Get-Process -Name 'codex' -ErrorAction SilentlyContinue | Where-Object { try { [String]::Equals($_.Path, $target, [StringComparison]::OrdinalIgnoreCase) } catch { $false } } | ForEach-Object { [Console]::Out.WriteLine($_.Id) }",
+          ].join("\n"),
+        ],
+        {
+          env: {
+            ...process.env,
+            MYDASHBOARD_FIXTURE_EXECUTABLE:
+              Buffer.from(executable, "utf8").toString("base64"),
+          },
+          timeoutMs: 5_000,
+        },
+      );
+      return result.stdout
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map(Number)
+        .filter((value) => Number.isSafeInteger(value) && value > 0);
+    },
     async waitForStart(previousNames) {
       const deadline = Date.now() + 10_000;
       while (Date.now() < deadline) {
@@ -2676,6 +2877,68 @@ test("work coordination startup preserves its error while closing every acquired
   assert.deepEqual(closeCalls, ["ledger", "workflow", "code-executor"]);
 });
 
+test("application adopts retryable configured-workforce construction cleanup", async () => {
+  const constructionFailure = new Error("configured role construction failed");
+  const cleanupFailure = new Error("configured provider cleanup failed once");
+  const invalidRole = new Proxy({}, {
+    ownKeys() {
+      throw constructionFailure;
+    },
+  });
+  const config = workCoordinationConfig({ externalActions: false });
+  config.brainProviders = { cli: { kind: "codex-cli" } };
+  config.employees = {
+    ...config.employees,
+    roles: { developer: invalidRole },
+  };
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  let cleanupAttempts = 0;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      versionedConfiguration: false,
+      externalActions: false,
+      ...stubs,
+      configuredWorkforceFactory: (options) => createTestConfiguredWorkforce(
+        options,
+        {
+          supervisedCliProviderFactory(providerOptions) {
+            return {
+              id: providerOptions.id,
+              remote: true,
+              singleAttempt: true,
+              async generate() {
+                return '{"ok":true}';
+              },
+              async close() {
+                cleanupAttempts += 1;
+                if (cleanupAttempts === 1) throw cleanupFailure;
+              },
+            };
+          },
+        },
+      ),
+      operationsRuntimeFactory: () => Object.freeze({}),
+      runtimeLifecycle: lifecycle,
+    }),
+    (error) => error === constructionFailure,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const failedStatus = lifecycle.readStatus();
+  assert.strictEqual(failedStatus.failure, cleanupFailure);
+  assert.deepEqual(failedStatus.failures, [cleanupFailure]);
+  assert.equal(failedStatus.complete, false);
+  await lifecycle.close();
+  assert.equal(cleanupAttempts, 2);
+  assert.equal(lifecycle.readStatus().complete, true);
+});
+
 test("external confirmation runtime requires both action authorization gates", async () => {
   let calls = 0;
   const createConfirmation = async () => {
@@ -4057,10 +4320,16 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
   assert.equal(lifecycle.readStatus().complete, false);
 });
 
-async function assertDefaultCodeJobLifecycle(t, { versioned }) {
+async function assertDefaultCodeJobLifecycle(t, {
+  versioned,
+  postStart = async () => {},
+}) {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI composition is Windows x64 only");
     return;
+  }
+  if (typeof postStart !== "function") {
+    throw new TypeError("postStart is invalid");
   }
   const fixture = await createOfflineProductionCliFixture(
     t,
@@ -4073,101 +4342,179 @@ async function assertDefaultCodeJobLifecycle(t, { versioned }) {
   const closeCalls = [];
   const lifecycle = createApplicationRuntimeLifecycle();
   const observedCloses = [];
-  observeClose(
-    t,
-    SupervisedCliBrainProvider.prototype,
-    "provider",
-    observedCloses,
-  );
-  observeClose(
-    t,
-    CodeJobBrainDirectory.prototype,
-    "directory",
-    observedCloses,
-  );
-  observeClose(
-    t,
-    VersionedCodeJobAuthority.prototype,
-    "authority",
-    observedCloses,
-  );
-  const application = await createApplication(
-    defaultCodeJobApplicationOptions({
-      config,
-      calls,
-      closeCalls,
-      lifecycle,
-      versioned,
-    }),
-  );
-  const previousInvocations = await fixture.invocationNames();
-  const brainDigest = codeJobBrainDigest({
-    roleId: "developer",
-    taskBrain: config.employees.roles.developer.taskBrain,
-    brainProviders: config.brainProviders,
+  let application = null;
+  let decisionOutcome = null;
+  let invocation = null;
+  let released = false;
+  fixture.registerTeardown(async () => {
+    let teardownFailure = null;
+    const attempt = async (operation) => {
+      try {
+        await operation();
+      } catch (error) {
+        teardownFailure ??= error;
+      }
+    };
+    try {
+      if (invocation !== null && !released) {
+        await attempt(async () => {
+          await fixture.release(invocation);
+          released = true;
+        });
+      }
+      if (decisionOutcome !== null) {
+        await attempt(() => within(10_000, decisionOutcome));
+      }
+      if (application !== null) {
+        let applicationCleanupFailure = null;
+        for (
+          let closeAttempt = 0;
+          closeAttempt < 3 && !lifecycle.readStatus().complete;
+          closeAttempt += 1
+        ) {
+          applicationCleanupFailure = await within(
+            5_000,
+            application.close(),
+          ).then(
+            () => null,
+            (error) => error,
+          );
+        }
+        if (!lifecycle.readStatus().complete) {
+          teardownFailure ??= applicationCleanupFailure ??
+            new Error("offline fixture application cleanup remained incomplete");
+        }
+      }
+    } finally {
+      t.mock.restoreAll();
+    }
+    if (teardownFailure) throw teardownFailure;
   });
-  const decisionOutcome = calls.codeJobRuntime.brainDirectory.decide(
-    defaultCodeDecisionInput(),
-    {
-      beforeGenerate: async () => {},
-      brainDigest,
-    },
-  ).then(
-    (value) => ({ value, error: null }),
-    (error) => ({ value: null, error }),
-  );
-  const admission = await Promise.race([
-    fixture.waitForStart(previousInvocations).then((invocation) => ({
-      invocation,
-      outcome: null,
-    })),
-    decisionOutcome.then((outcome) => ({ invocation: null, outcome })),
-  ]);
-  assert.ok(admission.invocation, admission.outcome?.error?.stack);
-  const invocation = admission.invocation;
 
-  const firstClose = application.close();
-  assert.strictEqual(application.close(), firstClose);
-  const firstFailure = await within(1_000, firstClose).then(
-    () => null,
-    (error) => error,
-  );
-  assert.equal(firstFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
-  assert.equal(lifecycle.readStatus().complete, false);
-  assert.deepEqual(
-    observedCloses.map(({ label }) => label),
-    versioned
-      ? ["authority", "directory", "provider"]
-      : ["directory", "provider"],
-  );
-
-  await fixture.release(invocation);
-  const decision = await within(10_000, decisionOutcome);
-  if (versioned) {
-    assert.equal(decision.error?.code, "INVALID_CODE_JOB_AUTHORITY");
-  } else {
-    assert.deepEqual(decision.value?.action, {
-      type: "read_text",
-      path: "src/app.js",
+  let operationFailure = null;
+  try {
+    observeClose(
+      t,
+      SupervisedCliBrainProvider.prototype,
+      "provider",
+      observedCloses,
+    );
+    observeClose(
+      t,
+      CodeJobBrainDirectory.prototype,
+      "directory",
+      observedCloses,
+    );
+    observeClose(
+      t,
+      VersionedCodeJobAuthority.prototype,
+      "authority",
+      observedCloses,
+    );
+    application = await createApplication(
+      defaultCodeJobApplicationOptions({
+        config,
+        calls,
+        closeCalls,
+        lifecycle,
+        versioned,
+      }),
+    );
+    const previousInvocations = await fixture.invocationNames();
+    const brainDigest = codeJobBrainDigest({
+      roleId: "developer",
+      taskBrain: config.employees.roles.developer.taskBrain,
+      brainProviders: config.brainProviders,
     });
+    decisionOutcome = calls.codeJobRuntime.brainDirectory.decide(
+      defaultCodeDecisionInput(),
+      {
+        beforeGenerate: async () => {},
+        brainDigest,
+      },
+    ).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    );
+    const admission = await Promise.race([
+      fixture.waitForStart(previousInvocations).then((startedInvocation) => ({
+        invocation: startedInvocation,
+        outcome: null,
+      })),
+      decisionOutcome.then((outcome) => ({ invocation: null, outcome })),
+    ]);
+    invocation = admission.invocation;
+    if (invocation !== null) {
+      await postStart({
+        application,
+        decisionOutcome,
+        fixture,
+        invocation,
+        lifecycle,
+      });
+    }
+    assert.ok(invocation, admission.outcome?.error?.stack);
+
+    const firstClose = application.close();
+    assert.strictEqual(application.close(), firstClose);
+    const firstFailure = await within(1_000, firstClose).then(
+      () => null,
+      (error) => error,
+    );
+    assert.equal(firstFailure?.code, "STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    assert.equal(lifecycle.readStatus().complete, false);
+    assert.deepEqual(
+      observedCloses.map(({ label }) => label),
+      versioned
+        ? ["authority", "directory", "provider"]
+        : ["directory", "provider"],
+    );
+
+    await fixture.release(invocation);
+    released = true;
+    const decision = await within(10_000, decisionOutcome);
+    if (versioned) {
+      assert.equal(decision.error?.code, "INVALID_CODE_JOB_AUTHORITY");
+    } else {
+      assert.deepEqual(decision.value?.action, {
+        type: "read_text",
+        path: "src/app.js",
+      });
+    }
+
+    const retry = application.close();
+    assert.strictEqual(application.close(), retry);
+    await within(1_000, retry);
+    const countsAfterRecovery = observedCloses.length;
+    await application.close();
+    assert.equal(observedCloses.length, countsAfterRecovery);
+    for (const label of [
+      "provider",
+      "directory",
+      ...(versioned ? ["authority"] : []),
+    ]) {
+      const callsForOwner = observedCloses
+        .filter((entry) => entry.label === label);
+      assert.equal(callsForOwner.length, 2, label);
+      assert.equal(
+        new Set(callsForOwner.map(({ owner }) => owner)).size,
+        1,
+        label,
+      );
+    }
+    assert.equal(lifecycle.readStatus().complete, true);
+  } catch (error) {
+    operationFailure = error;
   }
 
-  const retry = application.close();
-  assert.strictEqual(application.close(), retry);
-  await within(1_000, retry);
-  const countsAfterRecovery = observedCloses.length;
-  await application.close();
-  assert.equal(observedCloses.length, countsAfterRecovery);
-  for (const label of [
-    "provider",
-    "directory",
-    ...(versioned ? ["authority"] : []),
-  ]) {
-    const callsForOwner = observedCloses.filter((entry) => entry.label === label);
-    assert.equal(callsForOwner.length, 2, label);
-    assert.equal(new Set(callsForOwner.map(({ owner }) => owner)).size, 1, label);
+  let teardownFailure = null;
+  try {
+    await fixture.close();
+  } catch (error) {
+    teardownFailure = error;
   }
-  assert.equal(lifecycle.readStatus().complete, true);
+  if (operationFailure) throw operationFailure;
+  if (teardownFailure) throw teardownFailure;
 }
 
 test("default non-versioned Code Job owns one real offline CLI lifecycle", async (t) => {
@@ -4176,6 +4523,74 @@ test("default non-versioned Code Job owns one real offline CLI lifecycle", async
 
 test("default versioned Code Job owns one lazy real offline CLI lifecycle", async (t) => {
   await assertDefaultCodeJobLifecycle(t, { versioned: true });
+});
+
+test("real offline CLI teardown survives an injected post-start failure", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI composition is Windows x64 only");
+    return;
+  }
+  const injectedFailure = new Error("injected post-start assertion failure");
+  const environmentBefore = {
+    path: process.env.PATH,
+    credential: process.env.OPENAI_API_KEY,
+    home: process.env.HOME,
+    userProfile: process.env.USERPROFILE,
+  };
+  const originalProviderClose = SupervisedCliBrainProvider.prototype.close;
+  const originalDirectoryClose = CodeJobBrainDirectory.prototype.close;
+  const originalAuthorityClose = VersionedCodeJobAuthority.prototype.close;
+  let fixtureRoot = null;
+  let invocation = null;
+  let processIds = [];
+  let decisionOutcome = null;
+  let lifecycle = null;
+
+  const failure = await assertDefaultCodeJobLifecycle(t, {
+    versioned: false,
+    async postStart(context) {
+      fixtureRoot = context.fixture.root;
+      invocation = context.invocation;
+      decisionOutcome = context.decisionOutcome;
+      lifecycle = context.lifecycle;
+      processIds = await context.fixture.runningProcessIds();
+      assert.ok(processIds.length > 0, "the real fixture process was not observed");
+      throw injectedFailure;
+    },
+  }).then(
+    () => null,
+    (error) => error,
+  );
+
+  assert.strictEqual(failure, injectedFailure);
+  assert.notEqual(fixtureRoot, null);
+  assert.notEqual(invocation, null);
+  for (const processId of processIds) {
+    assert.equal(processExists(processId), false, processId);
+  }
+  assert.equal(lifecycle.readStatus().complete, true);
+  assert.deepEqual((await within(100, decisionOutcome)).value?.action, {
+    type: "read_text",
+    path: "src/app.js",
+  });
+  assert.strictEqual(
+    SupervisedCliBrainProvider.prototype.close,
+    originalProviderClose,
+  );
+  assert.strictEqual(
+    CodeJobBrainDirectory.prototype.close,
+    originalDirectoryClose,
+  );
+  assert.strictEqual(
+    VersionedCodeJobAuthority.prototype.close,
+    originalAuthorityClose,
+  );
+  assert.equal(process.env.PATH, environmentBefore.path);
+  assert.equal(process.env.OPENAI_API_KEY, environmentBefore.credential);
+  assert.equal(process.env.HOME, environmentBefore.home);
+  assert.equal(process.env.USERPROFILE, environmentBefore.userProfile);
+  await assert.rejects(access(invocation), { code: "ENOENT" });
+  await assert.rejects(access(fixtureRoot), { code: "ENOENT" });
 });
 
 test("default Code Job startup failure preserves reverse cleanup evidence", async (t) => {

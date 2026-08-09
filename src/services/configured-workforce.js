@@ -45,7 +45,101 @@ const ROLE_KEYS = new Set([
   "brain",
   "taskBrain",
 ]);
-const PROVIDER_OWNERS = new WeakMap();
+const CONFIGURED_CONSTRUCTION_CLEANUPS = new WeakMap();
+
+function hasObjectIdentity(value) {
+  return value !== null &&
+    (typeof value === "object" || typeof value === "function");
+}
+
+function createCloseLifecycle(failureMessage) {
+  const owners = new Map();
+  const runtimes = [];
+  const closedRuntimes = new Set();
+  const failures = [];
+  let closeAttempt = null;
+  let lastFailure = null;
+
+  const close = () => {
+    if (closeAttempt) return closeAttempt;
+    const attempt = (async () => {
+      const attemptFailures = [];
+      for (let index = runtimes.length - 1; index >= 0; index -= 1) {
+        const runtime = runtimes[index];
+        if (closedRuntimes.has(runtime)) continue;
+        try {
+          await runtime.close();
+          closedRuntimes.add(runtime);
+        } catch (error) {
+          failures.push(error);
+          attemptFailures.push(error);
+        }
+      }
+      lastFailure = attemptFailures.length === 1
+        ? attemptFailures[0]
+        : attemptFailures.length > 1
+          ? new AggregateError(attemptFailures, failureMessage)
+          : null;
+      if (lastFailure) throw lastFailure;
+    })();
+    closeAttempt = attempt;
+    void attempt.then(
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+      () => {
+        if (closeAttempt === attempt) closeAttempt = null;
+      },
+    );
+    return attempt;
+  };
+
+  return Object.freeze({
+    admit(owner) {
+      if (owners.has(owner)) return owners.get(owner);
+      const closeCapability = owner?.close;
+      const runtime = typeof closeCapability === "function"
+        ? Object.freeze({
+            owner,
+            close: closeCapability.bind(owner),
+          })
+        : null;
+      owners.set(owner, runtime);
+      if (runtime) runtimes.push(runtime);
+      return runtime;
+    },
+    close,
+    readStatus() {
+      const pendingRuntimes = runtimes
+        .filter((runtime) => !closedRuntimes.has(runtime)).length;
+      return Object.freeze({
+        acquiredRuntimes: runtimes.length,
+        pendingRuntimes,
+        complete: pendingRuntimes === 0,
+        failure: lastFailure,
+        failures: Object.freeze([...failures]),
+      });
+    },
+  });
+}
+
+function retainConfiguredConstructionCleanup(error, lifecycle) {
+  if (lifecycle.readStatus().acquiredRuntimes === 0) return;
+  const cleanup = Object.freeze({
+    close: lifecycle.close,
+    readStatus: lifecycle.readStatus,
+  });
+  if (hasObjectIdentity(error)) {
+    CONFIGURED_CONSTRUCTION_CLEANUPS.set(error, cleanup);
+  }
+  const cleanupAttempt = lifecycle.close();
+  void cleanupAttempt.catch(() => {});
+}
+
+export function readConfiguredConstructionCleanup(error) {
+  if (!hasObjectIdentity(error)) return null;
+  return CONFIGURED_CONSTRUCTION_CLEANUPS.get(error) ?? null;
+}
 
 function dataEntries(value, name) {
   if (
@@ -132,7 +226,7 @@ function declaredRemote(config, name) {
   return config.remote === true;
 }
 
-function providerWithBoundary(provider, remote) {
+function providerWithBoundary(provider, remote, lifecycle) {
   const attemptDescriptor = Object.getOwnPropertyDescriptor(
     provider,
     "singleAttempt",
@@ -144,16 +238,14 @@ function providerWithBoundary(provider, remote) {
   ) {
     throw new TypeError("brain provider singleAttempt is invalid");
   }
+  const runtime = lifecycle.admit(provider);
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     generate: provider.generate.bind(provider),
-    ...(typeof provider.close === "function"
-      ? { close: provider.close.bind(provider) }
-      : {}),
+    ...(runtime ? { close: runtime.close } : {}),
   });
-  PROVIDER_OWNERS.set(boundary, provider);
   return boundary;
 }
 
@@ -163,6 +255,7 @@ function providerOptions(
   dependencies,
   supervisedCliProviderFactory,
   cliRuntimeFacts,
+  lifecycle,
 ) {
   const name = `brainProviders.${id}`;
   const config = exactConfig(value, PROVIDER_KEYS, name);
@@ -179,6 +272,7 @@ function providerOptions(
         ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       }),
       remote,
+      lifecycle,
     );
   }
   if (config.kind === "openai-compatible") {
@@ -195,6 +289,7 @@ function providerOptions(
         ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       }),
       remote,
+      lifecycle,
     );
   }
   if (["codex-cli", "claude-cli"].includes(config.kind)) {
@@ -207,6 +302,7 @@ function providerOptions(
         cliKind: config.kind,
       }, cliRuntimeFacts(dependencies)),
       remote,
+      lifecycle,
     );
   }
   throw new TypeError(
@@ -219,6 +315,7 @@ function createProviders(
   dependencies,
   supervisedCliProviderFactory,
   cliRuntimeFacts,
+  lifecycle,
 ) {
   return dataEntries(value, "brainProviders").map(([id, config]) =>
     providerOptions(
@@ -227,6 +324,7 @@ function createProviders(
       dependencies,
       supervisedCliProviderFactory,
       cliRuntimeFacts,
+      lifecycle,
     ),
   );
 }
@@ -239,65 +337,27 @@ function configuredBrainRouter(
   supervisedCliProviderFactory,
   cliRuntimeFacts,
 ) {
-  const providers = createProviders(
-    brainProviders,
-    dependencies,
-    supervisedCliProviderFactory,
-    cliRuntimeFacts,
+  const lifecycle = createCloseLifecycle(
+    "Configured brain provider cleanup failed",
   );
-  const router = new BrainRouter({ providers });
-  const runtimeOwners = new Set();
-  const runtimes = [];
-  for (const provider of providers) {
-    const owner = PROVIDER_OWNERS.get(provider);
-    if (
-      typeof owner?.close !== "function" ||
-      runtimeOwners.has(owner)
-    ) {
-      continue;
-    }
-    runtimeOwners.add(owner);
-    runtimes.push({ close: owner.close.bind(owner), closed: false });
-  }
-  let closeAttempt = null;
-  const close = () => {
-    if (closeAttempt) return closeAttempt;
-    const attempt = (async () => {
-      const failures = [];
-      for (let index = runtimes.length - 1; index >= 0; index -= 1) {
-        const runtime = runtimes[index];
-        if (runtime.closed) continue;
-        try {
-          await runtime.close();
-          runtime.closed = true;
-        } catch (error) {
-          failures.push(error);
-        }
-      }
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) {
-        throw new AggregateError(
-          failures,
-          "Configured brain provider cleanup failed",
-        );
-      }
-    })();
-    closeAttempt = attempt;
-    void attempt.then(
-      () => {
-        if (closeAttempt === attempt) closeAttempt = null;
-      },
-      () => {
-        if (closeAttempt === attempt) closeAttempt = null;
-      },
+  try {
+    const providers = createProviders(
+      brainProviders,
+      dependencies,
+      supervisedCliProviderFactory,
+      cliRuntimeFacts,
+      lifecycle,
     );
-    return attempt;
-  };
-  return Object.freeze({
-    generate: router.generate.bind(router),
-    describe: router.describe.bind(router),
-    close,
-  });
+    const router = new BrainRouter({ providers });
+    return Object.freeze({
+      generate: router.generate.bind(router),
+      describe: router.describe.bind(router),
+      close: lifecycle.close,
+    });
+  } catch (error) {
+    retainConfiguredConstructionCleanup(error, lifecycle);
+    throw error;
+  }
 }
 
 function testCliProviderFactory(value) {
@@ -359,45 +419,57 @@ function configuredWorkforce({
   dependencies = {},
 } = {}, brainRouterFactory) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
-  const brainRouter = brainRouterFactory({
-    brainProviders,
-    dependencies,
-  });
-  const employees = [];
-  const workers = [];
-  for (const [id, rawConfig] of dataEntries(roles, "employees.roles")) {
-    const config = roleOptions(id, rawConfig);
-    const employee = new ConfiguredRoleEmployee({
-      definition: {
-        id,
-        name: config.name,
-        mission: config.mission,
-        enabled: config.enabled,
-        scheduleMinutes: config.scheduleMinutes,
-      },
-      permissions: config.permissions,
-      brain: config.brain,
-      ...(Object.hasOwn(config, "taskBrain")
-        ? { taskBrain: config.taskBrain }
-        : {}),
-      brainRouter,
-      ...(actionAdmissionGate === undefined
-        ? {}
-        : { actionAdmissionGate }),
-      store,
-      initialPaused: config.initialPaused,
-      ...(config.workerId ? { workerId: config.workerId } : {}),
-      ...(clock ? { clock } : {}),
-      onRun: (input) => onRun(input),
+  let brainRouter = null;
+  try {
+    brainRouter = brainRouterFactory({
+      brainProviders,
+      dependencies,
     });
-    employees.push(employee);
-    workers.push(employee.asRoleWorker());
+    const employees = [];
+    const workers = [];
+    for (const [id, rawConfig] of dataEntries(roles, "employees.roles")) {
+      const config = roleOptions(id, rawConfig);
+      const employee = new ConfiguredRoleEmployee({
+        definition: {
+          id,
+          name: config.name,
+          mission: config.mission,
+          enabled: config.enabled,
+          scheduleMinutes: config.scheduleMinutes,
+        },
+        permissions: config.permissions,
+        brain: config.brain,
+        ...(Object.hasOwn(config, "taskBrain")
+          ? { taskBrain: config.taskBrain }
+          : {}),
+        brainRouter,
+        ...(actionAdmissionGate === undefined
+          ? {}
+          : { actionAdmissionGate }),
+        store,
+        initialPaused: config.initialPaused,
+        ...(config.workerId ? { workerId: config.workerId } : {}),
+        ...(clock ? { clock } : {}),
+        onRun: (input) => onRun(input),
+      });
+      employees.push(employee);
+      workers.push(employee.asRoleWorker());
+    }
+    return Object.freeze({
+      employees: Object.freeze([...employees]),
+      workers: Object.freeze([...workers]),
+      close: brainRouter.close,
+    });
+  } catch (error) {
+    if (brainRouter !== null) {
+      const lifecycle = createCloseLifecycle(
+        "Configured workforce cleanup failed",
+      );
+      lifecycle.admit(brainRouter);
+      retainConfiguredConstructionCleanup(error, lifecycle);
+    }
+    throw error;
   }
-  return Object.freeze({
-    employees: Object.freeze([...employees]),
-    workers: Object.freeze([...workers]),
-    close: brainRouter.close,
-  });
 }
 
 export function createConfiguredWorkforce(options = {}) {
