@@ -38,8 +38,10 @@ import {
   normalizeConfigurationDocument,
 } from "../src/domain/configuration-contract.js";
 import {
+  createConfiguredConstructionCleanupOwner,
   createConfiguredWorkforce,
   readConfiguredConstructionCleanup,
+  createTestConfiguredBrainRouter,
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
 import {
@@ -2940,10 +2942,79 @@ test("application adopts retryable configured-workforce construction cleanup", a
   assert.equal(lifecycle.readStatus().complete, true);
 });
 
+test("non-versioned Code Job startup adopts partial configured directory cleanup", async () => {
+  const constructionFailure = new Error("configured code directory failed");
+  const cleanupFailure = new Error("configured code provider cleanup failed once");
+  const config = defaultCodeJobConfiguration();
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  let constructionCleanupOwner;
+  let dependencySymbolCount = null;
+  let cleanupAttempts = 0;
+
+  await assert.rejects(
+    createApplication({
+      ...defaultCodeJobApplicationOptions({
+        config,
+        calls,
+        closeCalls,
+        lifecycle,
+        versioned: false,
+      }),
+      codeJobBrainDirectoryFactory(options) {
+        constructionCleanupOwner = options.constructionCleanupOwner;
+        dependencySymbolCount = Object.getOwnPropertySymbols(
+          options.dependencies,
+        ).length;
+        return createTestConfiguredBrainRouter(
+          {
+            constructionCleanupOwner,
+            brainProviders: {
+              acquired: { kind: "codex-cli" },
+              failing: { kind: "claude-cli" },
+            },
+          },
+          {
+            supervisedCliProviderFactory(providerOptions) {
+              if (providerOptions.id === "failing") {
+                throw constructionFailure;
+              }
+              return {
+                id: providerOptions.id,
+                remote: true,
+                singleAttempt: true,
+                async generate() { return '{"ok":true}'; },
+                async close() {
+                  cleanupAttempts += 1;
+                  if (cleanupAttempts === 1) throw cleanupFailure;
+                },
+              };
+            },
+          },
+        );
+      },
+    }),
+    (error) => error === constructionFailure,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(constructionCleanupOwner);
+  assert.equal(Object.isFrozen(constructionCleanupOwner), true);
+  assert.equal(dependencySymbolCount, 0);
+  assert.equal(cleanupAttempts, 1);
+  assert.strictEqual(lifecycle.readStatus().failure, cleanupFailure);
+  assert.equal(lifecycle.readStatus().complete, false);
+
+  await lifecycle.close();
+  assert.equal(cleanupAttempts, 2);
+  assert.equal(lifecycle.readStatus().complete, true);
+});
+
 test("application does not adopt stale cleanup from a reused Error identity", async () => {
   const constructionFailure = new Error("reused application construction failure");
   const cleanupFailure = new Error("prior construction cleanup failed once");
-  const priorConstructionOwner = Object.freeze({});
+  const priorConstructionOwner = createConfiguredConstructionCleanupOwner();
   const invalidRole = new Proxy({}, {
     ownKeys() {
       throw constructionFailure;

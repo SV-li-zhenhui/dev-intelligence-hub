@@ -30,6 +30,7 @@ import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js
 import { NotificationService } from "./services/notification-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import {
+  createConfiguredConstructionCleanupOwner,
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
   readConfiguredConstructionCleanup,
@@ -599,7 +600,8 @@ export async function createApplication({
     ["track", "close", "readStatus"],
     "runtimeLifecycle",
   );
-  const configuredConstructionCleanupOwner = Object.freeze({});
+  const configuredConstructionCleanupOwner =
+    createConfiguredConstructionCleanupOwner();
   const actionAdmissionGate = versionedConfiguration
     ? frozenPort(
         actionAdmissionGateFactory(),
@@ -1114,6 +1116,7 @@ export async function createApplication({
         codeJobBrainDirectory = codeJobBrainDirectoryFactory({
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},
+          constructionCleanupOwner: configuredConstructionCleanupOwner,
           dependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
             codeJobBrainDirectoryFactory ===

@@ -46,6 +46,7 @@ const ROLE_KEYS = new Set([
   "taskBrain",
 ]);
 const CONFIGURED_CONSTRUCTION_CLEANUPS = new WeakMap();
+const CONFIGURED_CONSTRUCTION_CLEANUP_OWNERS = new WeakSet();
 
 function hasObjectIdentity(value) {
   return value !== null &&
@@ -148,7 +149,12 @@ function retainConfiguredConstructionCleanup(
 }
 
 export function readConfiguredConstructionCleanup(constructionCleanupOwner) {
-  if (!hasObjectIdentity(constructionCleanupOwner)) return null;
+  if (
+    !hasObjectIdentity(constructionCleanupOwner) ||
+    !CONFIGURED_CONSTRUCTION_CLEANUP_OWNERS.has(constructionCleanupOwner)
+  ) {
+    return null;
+  }
   const pendingCleanups = CONFIGURED_CONSTRUCTION_CLEANUPS.get(
     constructionCleanupOwner,
   );
@@ -160,9 +166,18 @@ export function readConfiguredConstructionCleanup(constructionCleanupOwner) {
   return cleanup;
 }
 
+export function createConfiguredConstructionCleanupOwner() {
+  const owner = Object.freeze({});
+  CONFIGURED_CONSTRUCTION_CLEANUP_OWNERS.add(owner);
+  return owner;
+}
+
 function configuredConstructionCleanupOwner(value) {
   if (value === undefined) return null;
-  if (!hasObjectIdentity(value)) {
+  if (
+    !hasObjectIdentity(value) ||
+    !CONFIGURED_CONSTRUCTION_CLEANUP_OWNERS.has(value)
+  ) {
     throw new TypeError("configured construction cleanup owner is invalid");
   }
   return value;
@@ -206,6 +221,29 @@ function selectOptions(config, keys) {
       .filter((key) => config[key] !== undefined)
       .map((key) => [key, config[key]]),
   );
+}
+
+function configuredProvidersCanAcquireCleanup(value) {
+  let canAcquireCleanup = false;
+  for (const [id, rawConfig] of dataEntries(value, "brainProviders")) {
+    const name = `brainProviders.${id}`;
+    const config = exactConfig(rawConfig, PROVIDER_KEYS, name);
+    declaredRemote(config, name);
+    if (["ollama", "openai-compatible"].includes(config.kind)) continue;
+    if (["codex-cli", "claude-cli"].includes(config.kind)) {
+      if (Object.keys(config).some((key) => !CLI_PROVIDER_KEYS.has(key))) {
+        throw new TypeError(
+          `${name} contains a field unsupported by CLI providers`,
+        );
+      }
+      canAcquireCleanup = true;
+      continue;
+    }
+    throw new TypeError(
+      `brain provider kind is unsupported: ${String(config.kind)}`,
+    );
+  }
+  return canAcquireCleanup;
 }
 
 function testSupervisedCliRuntimeFacts(dependencies) {
@@ -364,10 +402,20 @@ function configuredBrainRouter(
   } = {},
   supervisedCliProviderFactory,
   cliRuntimeFacts,
+  { requireConstructionCleanupOwner = false } = {},
 ) {
   const constructionCleanupOwner = configuredConstructionCleanupOwner(
     rawConstructionCleanupOwner,
   );
+  if (
+    requireConstructionCleanupOwner &&
+    constructionCleanupOwner === null &&
+    configuredProvidersCanAcquireCleanup(brainProviders)
+  ) {
+    throw new TypeError(
+      "Configured CLI construction requires a construction cleanup owner",
+    );
+  }
   const lifecycle = createCloseLifecycle(
     "Configured brain provider cleanup failed",
   );
@@ -415,6 +463,7 @@ export function createConfiguredBrainRouter(options = {}) {
     options,
     productionSupervisedCliProviderFactory,
     productionSupervisedCliCapability,
+    { requireConstructionCleanupOwner: true },
   );
 }
 
@@ -521,6 +570,7 @@ export function createConfiguredWorkforce(options = {}) {
       routerOptions,
       productionSupervisedCliProviderFactory,
       productionSupervisedCliCapability,
+      { requireConstructionCleanupOwner: true },
     ));
 }
 

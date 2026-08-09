@@ -11,6 +11,10 @@ import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-directory.js";
 import {
+  createConfiguredConstructionCleanupOwner,
+  readConfiguredConstructionCleanup,
+} from "./configured-workforce.js";
+import {
   codeJobBrainDigest,
   CodeJobGrantFactory,
   legacyCodeJobBrainDigest,
@@ -37,6 +41,23 @@ function method(value, name, owner) {
     current = Object.getPrototypeOf(current);
   }
   throw new TypeError(`${owner} is invalid`);
+}
+
+function optionalMethod(value, name) {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) {
+    return null;
+  }
+  let current = value;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor) {
+      return "value" in descriptor && typeof descriptor.value === "function"
+        ? descriptor.value.bind(value)
+        : null;
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return null;
 }
 
 function activeConfiguration(value) {
@@ -1124,27 +1145,42 @@ export class VersionedCodeJobAuthority {
   #directory(context) {
     this.#assertOpen();
     if (context.directory) return context.directory;
-    const directory = this.#brainDirectoryFactory({
-      brainProviders: context.configuration.brainProviders,
-      roles: context.configuration.employees.roles,
-      dependencies: this.#brainDependencies,
-    });
-    method(directory, "decide", "versioned code job brain directory");
-    if (
-      typeof directory.close === "function" &&
-      !this.#directoryRuntimes.has(directory)
-    ) {
-      this.#directoryRuntimes.set(directory, {
-        close: method(
-          directory,
-          "close",
-          "versioned code job brain directory",
-        ),
-        closed: false,
+    const constructionCleanupOwner =
+      createConfiguredConstructionCleanupOwner();
+    try {
+      const directory = this.#brainDirectoryFactory({
+        brainProviders: context.configuration.brainProviders,
+        roles: context.configuration.employees.roles,
+        dependencies: this.#brainDependencies,
+        constructionCleanupOwner,
       });
+      this.#drainConstructionCleanups(constructionCleanupOwner);
+      const close = optionalMethod(directory, "close");
+      if (close) this.#retainDirectoryRuntime(directory, close);
+      method(directory, "decide", "versioned code job brain directory");
+      context.directory = directory;
+      return directory;
+    } catch (error) {
+      this.#drainConstructionCleanups(constructionCleanupOwner);
+      throw error;
     }
-    context.directory = directory;
-    return directory;
+  }
+
+  #drainConstructionCleanups(constructionCleanupOwner) {
+    let cleanup = readConfiguredConstructionCleanup(
+      constructionCleanupOwner,
+    );
+    while (cleanup) {
+      this.#retainDirectoryRuntime(cleanup, cleanup.close);
+      cleanup = readConfiguredConstructionCleanup(
+        constructionCleanupOwner,
+      );
+    }
+  }
+
+  #retainDirectoryRuntime(owner, close) {
+    if (this.#directoryRuntimes.has(owner)) return;
+    this.#directoryRuntimes.set(owner, { close, closed: false });
   }
 
   close() {

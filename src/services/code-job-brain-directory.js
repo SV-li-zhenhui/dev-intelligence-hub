@@ -486,11 +486,13 @@ export function createConfiguredCodeJobBrainDirectory({
   brainProviders = {},
   roles = {},
   dependencies = {},
+  constructionCleanupOwner,
 } = {}) {
   return new CodeJobBrainDirectory({
     brainRouter: createConfiguredBrainRouter({
       brainProviders,
       dependencies,
+      constructionCleanupOwner,
     }),
     roles,
   });

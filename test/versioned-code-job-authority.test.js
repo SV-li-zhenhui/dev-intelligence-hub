@@ -25,6 +25,9 @@ import {
   codeJobAuthorityScopeCacheIdentity,
   VersionedCodeJobAuthority,
 } from "../src/services/versioned-code-job-authority.js";
+import {
+  createTestConfiguredBrainRouter,
+} from "../src/services/configured-workforce.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedConfiguration = JSON.parse(
@@ -1503,6 +1506,100 @@ test("close retains every unique directory across context replacement and retrie
   await retry;
   await context.authority.close();
   assert.deepEqual(resources.map(({ attempts }) => attempts), [2, 1, 2]);
+});
+
+test("lazy configured construction isolates attempt tokens and retains partial cleanup", async () => {
+  const constructionFailure = new Error("lazy configured directory failed");
+  const cleanupFailures = [
+    new Error("first lazy provider cleanup failed once"),
+    new Error("second lazy provider cleanup failed once"),
+  ];
+  const constructionOwners = [];
+  const cleanupAttempts = [0, 0];
+  const closeSequence = [];
+  let factoryAttempt = 0;
+  const context = fixture({
+    brainDirectoryFactory(options) {
+      const attempt = factoryAttempt;
+      factoryAttempt += 1;
+      constructionOwners.push(options.constructionCleanupOwner);
+      return createTestConfiguredBrainRouter(
+        {
+          constructionCleanupOwner: options.constructionCleanupOwner,
+          brainProviders: {
+            acquired: { kind: "codex-cli" },
+            failing: { kind: "claude-cli" },
+          },
+        },
+        {
+          supervisedCliProviderFactory(providerOptions) {
+            if (providerOptions.id === "failing") throw constructionFailure;
+            return {
+              id: providerOptions.id,
+              remote: true,
+              singleAttempt: true,
+              async generate() { return '{"ok":true}'; },
+              async close() {
+                cleanupAttempts[attempt] += 1;
+                closeSequence.push(attempt);
+                if (cleanupAttempts[attempt] === 1) {
+                  throw cleanupFailures[attempt];
+                }
+              },
+            };
+          },
+        },
+      );
+    },
+  });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+  const decide = () => context.authority.decide(
+    { roleId: "developer" },
+    {
+      beforeGenerate: async () => {},
+      brainDigest: grant.brainDigest,
+    },
+  );
+
+  await assert.rejects(decide(), (error) => error === constructionFailure);
+  await assert.rejects(decide(), (error) => error === constructionFailure);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(constructionOwners.length, 2);
+  assert.ok(constructionOwners.every((owner) => owner !== undefined));
+  assert.notStrictEqual(constructionOwners[0], constructionOwners[1]);
+  assert.deepEqual(cleanupAttempts, [1, 1]);
+  assert.deepEqual(closeSequence, [0, 1]);
+
+  await context.authority.close();
+  assert.deepEqual(cleanupAttempts, [2, 2]);
+  assert.deepEqual(closeSequence, [0, 1, 1, 0]);
+});
+
+test("lazy directory validation retains a returned callable close", async () => {
+  let closeAttempts = 0;
+  const context = fixture({
+    brainDirectoryFactory: () => ({
+      async close() {
+        closeAttempts += 1;
+      },
+    }),
+  });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+
+  await assert.rejects(
+    context.authority.decide(
+      { roleId: "developer" },
+      {
+        beforeGenerate: async () => {},
+        brainDigest: grant.brainDigest,
+      },
+    ),
+    /versioned code job brain directory is invalid/,
+  );
+  await context.authority.close();
+
+  assert.equal(closeAttempts, 1);
 });
 
 test("close fences an in-flight active read before it can create a context", async () => {

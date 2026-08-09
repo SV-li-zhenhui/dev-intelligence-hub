@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   CodeJobBrainDirectory,
   CodeJobBrainDirectoryError,
+  createConfiguredCodeJobBrainDirectory,
 } from "../src/services/code-job-brain-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 
@@ -564,4 +565,13 @@ test("directory close fences decisions, coalesces, and retries only an unresolve
   await retry;
   await directory.close();
   assert.equal(closeAttempts, 2);
+});
+
+test("configured directory rejects forged cleanup ownership before router construction", () => {
+  assert.throws(
+    () => createConfiguredCodeJobBrainDirectory({
+      constructionCleanupOwner: Object.freeze({}),
+    }),
+    /construction cleanup owner.*invalid/i,
+  );
 });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
+import * as configuredWorkforceApi from "../src/services/configured-workforce.js";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
@@ -8,6 +9,30 @@ import {
   createTestConfiguredBrainRouter,
   createTestConfiguredWorkforce,
 } from "../src/services/configured-workforce.js";
+
+function issueConstructionCleanupOwner() {
+  const issue = configuredWorkforceApi.createConfiguredConstructionCleanupOwner;
+  assert.equal(
+    typeof issue,
+    "function",
+    "configured cleanup ownership must have a public issuer",
+  );
+  return issue();
+}
+
+function createOwnedTestConfiguredBrainRouter(options, dependencies) {
+  return createTestConfiguredBrainRouter({
+    constructionCleanupOwner: issueConstructionCleanupOwner(),
+    ...options,
+  }, dependencies);
+}
+
+function createOwnedTestConfiguredWorkforce(options, dependencies) {
+  return createTestConfiguredWorkforce({
+    constructionCleanupOwner: issueConstructionCleanupOwner(),
+    ...options,
+  }, dependencies);
+}
 
 const SCHEMA = Object.freeze({
   type: "object",
@@ -256,7 +281,7 @@ test("provider options are isolated by adapter kind", () => {
 
 test("configured supervised CLIs stay remote and declare one process attempt", async () => {
   for (const kind of ["codex-cli", "claude-cli"]) {
-    const router = createTestConfiguredBrainRouter(
+    const router = createOwnedTestConfiguredBrainRouter(
       {
         brainProviders: {
           cli: { kind, remote: false },
@@ -302,6 +327,7 @@ test("production configured CLI routing fails closed without lexical composition
   for (const kind of ["codex-cli", "claude-cli"]) {
     assert.throws(
       () => createConfiguredBrainRouter({
+        constructionCleanupOwner: issueConstructionCleanupOwner(),
         brainProviders: { cli: { kind } },
       }),
       /composition grant|composition authority/i,
@@ -315,7 +341,7 @@ test("configured routing forwards only code-owned protected roots to supervised 
     path.join(process.cwd(), "workspace"),
   ];
   let receivedRuntimeFacts = null;
-  createTestConfiguredBrainRouter(
+  createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         cli: { kind: "codex-cli" },
@@ -340,6 +366,77 @@ test("configured routing forwards only code-owned protected roots to supervised 
   assert.deepEqual(receivedRuntimeFacts, { protectedRoots });
 });
 
+test("configured router fails closed before a CLI owner is acquired without a cleanup token", () => {
+  let dependencyReads = 0;
+  const dependencies = new Proxy({}, {
+    getOwnPropertyDescriptor() {
+      dependencyReads += 1;
+      return undefined;
+    },
+    ownKeys() {
+      dependencyReads += 1;
+      return [];
+    },
+  });
+
+  assert.throws(
+    () => createConfiguredBrainRouter({
+      brainProviders: { cli: { kind: "codex-cli" } },
+      dependencies,
+    }),
+    /construction cleanup owner/i,
+  );
+  assert.equal(dependencyReads, 0);
+});
+
+test("configured workforce fails closed before a CLI owner is acquired without a cleanup token", () => {
+  let dependencyReads = 0;
+  const dependencies = new Proxy({}, {
+    getOwnPropertyDescriptor() {
+      dependencyReads += 1;
+      return undefined;
+    },
+    ownKeys() {
+      dependencyReads += 1;
+      return [];
+    },
+  });
+
+  assert.throws(
+    () => createConfiguredWorkforce({
+      brainProviders: { cli: { kind: "codex-cli" } },
+      roles: {},
+      store: new MemoryStore(),
+      dependencies,
+    }),
+    /construction cleanup owner/i,
+  );
+  assert.equal(dependencyReads, 0);
+});
+
+test("configured cleanup ownership rejects a forged token before acquisition", () => {
+  const issuedOwner = issueConstructionCleanupOwner();
+  assert.equal(Object.isFrozen(issuedOwner), true);
+  let factoryCalls = 0;
+
+  assert.throws(
+    () => createTestConfiguredBrainRouter(
+      {
+        constructionCleanupOwner: Object.freeze({}),
+        brainProviders: { cli: { kind: "codex-cli" } },
+      },
+      {
+        supervisedCliProviderFactory() {
+          factoryCalls += 1;
+          throw new Error("factory must not run");
+        },
+      },
+    ),
+    /construction cleanup owner.*invalid/i,
+  );
+  assert.equal(factoryCalls, 0);
+});
+
 test("configured router captures a shared owner's one-shot close accessor once", async () => {
   let closeReads = 0;
   let closeCalls = 0;
@@ -361,7 +458,7 @@ test("configured router captures a shared owner's one-shot close accessor once",
       };
     },
   };
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         "shared-first": { kind: "codex-cli" },
@@ -393,7 +490,7 @@ test("configured router cleanup survives a later factory deleting an acquired cl
       return '{"ok":true}';
     },
   };
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         first: { kind: "codex-cli" },
@@ -420,7 +517,7 @@ test("configured router cleanup survives a later factory deleting an acquired cl
 test("configured router retains primitive-failure cleanup by construction ownership", async () => {
   const constructionFailure = Symbol("primitive construction failure");
   const cleanupFailure = new Error("primitive failure owner cleanup failed once");
-  const constructionCleanupOwner = Object.freeze({});
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   const attempts = new Map();
   const closeSequence = [];
   const firstOwner = providerOwner(
@@ -432,7 +529,7 @@ test("configured router retains primitive-failure cleanup by construction owners
   let failure = null;
 
   try {
-    createTestConfiguredBrainRouter(
+    createOwnedTestConfiguredBrainRouter(
       {
         constructionCleanupOwner,
         brainProviders: {
@@ -472,6 +569,7 @@ test("configured router queues distinct cleanups when one Error identity is reus
   const attempts = new Map();
   const closeSequence = [];
 
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   for (const [index, key] of ["first", "second"].entries()) {
     const owner = providerOwner(
       key,
@@ -481,9 +579,9 @@ test("configured router queues distinct cleanups when one Error identity is reus
     );
     let failure = null;
     try {
-      createTestConfiguredBrainRouter(
+      createOwnedTestConfiguredBrainRouter(
         {
-          constructionCleanupOwner: constructionFailure,
+          constructionCleanupOwner,
           brainProviders: {
             acquired: { kind: "codex-cli" },
             failing: { kind: "claude-cli" },
@@ -504,9 +602,9 @@ test("configured router queues distinct cleanups when one Error identity is reus
   }
   await new Promise((resolve) => setImmediate(resolve));
 
-  const firstCleanup = constructionCleanupFor(constructionFailure);
-  const secondCleanup = constructionCleanupFor(constructionFailure);
-  assert.equal(readConfiguredConstructionCleanup(constructionFailure), null);
+  const firstCleanup = constructionCleanupFor(constructionCleanupOwner);
+  const secondCleanup = constructionCleanupFor(constructionCleanupOwner);
+  assert.equal(readConfiguredConstructionCleanup(constructionCleanupOwner), null);
   assert.strictEqual(firstCleanup.readStatus().failure, cleanupFailures[0]);
   assert.deepEqual(firstCleanup.readStatus().failures, [cleanupFailures[0]]);
   assert.strictEqual(secondCleanup.readStatus().failure, cleanupFailures[1]);
@@ -520,9 +618,62 @@ test("configured router queues distinct cleanups when one Error identity is reus
   assert.equal(secondCleanup.readStatus().complete, true);
 });
 
+test("reused Error failures retain cleanup under independent issued owners", async () => {
+  const constructionFailure = new Error("shared construction failure identity");
+  const constructionCleanupOwners = [
+    issueConstructionCleanupOwner(),
+    issueConstructionCleanupOwner(),
+  ];
+  const cleanupFailures = [
+    new Error("first independent cleanup failed once"),
+    new Error("second independent cleanup failed once"),
+  ];
+  const attempts = [0, 0];
+
+  for (const [index, constructionCleanupOwner] of
+    constructionCleanupOwners.entries()) {
+    assert.throws(
+      () => createOwnedTestConfiguredBrainRouter(
+        {
+          constructionCleanupOwner,
+          brainProviders: {
+            acquired: { kind: "codex-cli" },
+            failing: { kind: "claude-cli" },
+          },
+        },
+        {
+          supervisedCliProviderFactory(options) {
+            if (options.id === "failing") throw constructionFailure;
+            return {
+              id: options.id,
+              remote: true,
+              singleAttempt: true,
+              async generate() { return '{"ok":true}'; },
+              async close() {
+                attempts[index] += 1;
+                if (attempts[index] === 1) throw cleanupFailures[index];
+              },
+            };
+          },
+        },
+      ),
+      (error) => error === constructionFailure,
+    );
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const cleanups = constructionCleanupOwners.map(constructionCleanupFor);
+  assert.notStrictEqual(cleanups[0], cleanups[1]);
+  assert.strictEqual(cleanups[0].readStatus().failure, cleanupFailures[0]);
+  assert.strictEqual(cleanups[1].readStatus().failure, cleanupFailures[1]);
+  await cleanups[1].close();
+  await cleanups[0].close();
+  assert.deepEqual(attempts, [2, 2]);
+});
+
 test("configured router admits a closable provider before singleAttempt validation", async () => {
   const cleanupFailure = new Error("invalid provider cleanup failed once");
-  const constructionCleanupOwner = Object.freeze({});
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   const attempts = new Map();
   const closeSequence = [];
   const owner = providerOwner(
@@ -541,7 +692,7 @@ test("configured router admits a closable provider before singleAttempt validati
   let failure = null;
 
   try {
-    createTestConfiguredBrainRouter(
+    createOwnedTestConfiguredBrainRouter(
       {
         constructionCleanupOwner,
         brainProviders: { invalid: { kind: "codex-cli" } },
@@ -585,7 +736,7 @@ test("configured router captures the first later callable close once", async () 
       return closeCapability;
     },
   };
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         "before-close": { kind: "codex-cli" },
@@ -626,7 +777,7 @@ function constructionCleanupFor(constructionCleanupOwner) {
 test("configured router retains retryable cleanup when a later provider factory fails", async () => {
   const constructionFailure = new Error("later provider factory failed");
   const cleanupFailure = new Error("first owner cleanup failed once");
-  const constructionCleanupOwner = Object.freeze({});
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   const attempts = new Map();
   const closeSequence = [];
   const firstOwner = providerOwner(
@@ -638,7 +789,7 @@ test("configured router retains retryable cleanup when a later provider factory 
   let failure = null;
 
   try {
-    createTestConfiguredBrainRouter(
+    createOwnedTestConfiguredBrainRouter(
       {
         constructionCleanupOwner,
         brainProviders: {
@@ -671,7 +822,7 @@ test("configured router retains retryable cleanup when a later provider factory 
 test("configured router retains reverse retryable cleanup when router construction fails", async () => {
   const constructionFailurePattern = /brain provider is duplicated/u;
   const cleanupFailure = new Error("second owner cleanup failed once");
-  const constructionCleanupOwner = Object.freeze({});
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   const attempts = new Map();
   const closeSequence = [];
   const firstOwner = providerOwner("first", null, attempts, closeSequence);
@@ -684,7 +835,7 @@ test("configured router retains reverse retryable cleanup when router constructi
   let failure = null;
 
   try {
-    createTestConfiguredBrainRouter(
+    createOwnedTestConfiguredBrainRouter(
       {
         constructionCleanupOwner,
         brainProviders: {
@@ -716,7 +867,7 @@ test("configured router retains reverse retryable cleanup when router constructi
 test("configured workforce retains router cleanup when role construction fails", async () => {
   const constructionFailure = new Error("role construction failed");
   const cleanupFailure = new Error("workforce owner cleanup failed once");
-  const constructionCleanupOwner = Object.freeze({});
+  const constructionCleanupOwner = issueConstructionCleanupOwner();
   const attempts = new Map();
   const closeSequence = [];
   const owner = providerOwner("provider", cleanupFailure, attempts, closeSequence);
@@ -728,7 +879,7 @@ test("configured workforce retains router cleanup when role construction fails",
   let failure = null;
 
   try {
-    createTestConfiguredWorkforce(
+    createOwnedTestConfiguredWorkforce(
       {
         constructionCleanupOwner,
         brainProviders: { cli: { kind: "codex-cli" } },
@@ -761,7 +912,7 @@ test("configured router close preserves every provider failure and retries only 
     ["third", new Error("third provider close failed")],
   ]);
   const attempts = new Map();
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         first: { kind: "codex-cli" },
@@ -821,9 +972,9 @@ test("configured router close preserves every provider failure and retries only 
 test("configured router and workforce close each shared provider owner once", async () => {
   const subjects = [
     (options, dependencies) =>
-      createTestConfiguredBrainRouter(options, dependencies),
+      createOwnedTestConfiguredBrainRouter(options, dependencies),
     (options, dependencies) =>
-      createTestConfiguredWorkforce(
+      createOwnedTestConfiguredWorkforce(
         { ...options, roles: {}, store: new MemoryStore() },
         dependencies,
       ),
@@ -900,7 +1051,7 @@ test("configured router retries failed unique owners and aggregates distinct fai
     attempts,
     closeSequence,
   );
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         "shared-first": { kind: "codex-cli" },
@@ -960,7 +1111,7 @@ test("configured router preserves a shared owner's single raw close failure", as
   const closeFailure = new Error("one shared owner close failed");
   const attempts = new Map();
   const sharedOwner = providerOwner("shared", closeFailure, attempts);
-  const router = createTestConfiguredBrainRouter(
+  const router = createOwnedTestConfiguredBrainRouter(
     {
       brainProviders: {
         "shared-first": { kind: "codex-cli" },
@@ -1001,6 +1152,7 @@ function providerOwner(key, firstFailure, attempts, closeSequence = null) {
 test("production configured routing rejects a caller-supplied protected-root field", () => {
   assert.throws(
     () => createConfiguredBrainRouter({
+      constructionCleanupOwner: issueConstructionCleanupOwner(),
       brainProviders: {
         cli: { kind: "codex-cli" },
       },
@@ -1015,6 +1167,7 @@ test("production configured routing rejects a caller-supplied protected-root fie
 test("production configured routing rejects every public composition-authority field", () => {
   assert.throws(
     () => createConfiguredBrainRouter({
+      constructionCleanupOwner: issueConstructionCleanupOwner(),
       brainProviders: {
         cli: { kind: "codex-cli" },
       },
@@ -1058,6 +1211,7 @@ test("ordinary shipped imports cannot mint, decode, or route production composit
   assert.deepEqual(Reflect.ownKeys(forgedGrant), []);
   assert.throws(
     () => createConfiguredBrainRouter({
+      constructionCleanupOwner: issueConstructionCleanupOwner(),
       brainProviders: { cli: { kind: "codex-cli" } },
       dependencies: {
         [Symbol("forged-supervised-cli-authority")]: forgedGrant,
