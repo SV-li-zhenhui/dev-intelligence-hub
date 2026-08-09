@@ -46,6 +46,13 @@ const POWERSHELL_7_MANAGER_SKIP = process.platform !== "win32"
   : powershell7Available
     ? false
     : "requires PowerShell 7";
+const READINESS_PRIVATE_MARKERS = Object.freeze({
+  blocker: "PRIVATE_READINESS_BLOCKER",
+  path: "C:\\private\\readiness-state.json",
+  credential: "sk-private-readiness-credential",
+});
+const READINESS_SAFE_MESSAGE =
+  "MyDashboard is running but readiness could not be confirmed safely.";
 
 async function copyWritableFixtureFile(source, destination) {
   await copyFile(source, destination);
@@ -117,6 +124,107 @@ function removeFixtureTree(target) {
     maxRetries: 10,
     retryDelay: 100,
   });
+}
+
+async function fileExists(filePath) {
+  try {
+    await readFile(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function stopOwnedFixtureProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  if (child.connected) child.send({ type: "close" });
+  const stoppedGracefully = await Promise.race([
+    exited.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 1_000)),
+  ]);
+  if (stoppedGracefully || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  child.kill();
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`fixture process ${child.pid} did not exit`)),
+      5_000,
+    )),
+  ]);
+}
+
+async function startForeignListener(t, { mode, port }) {
+  const child = spawn(process.execPath, [
+    path.join(projectRoot, "test", "fixtures", "operations-listener-fixture.cjs"),
+    mode,
+    String(port),
+  ], {
+    cwd: projectRoot,
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  t.after(() => stopOwnedFixtureProcess(child));
+  const [ready] = await Promise.race([
+    once(child, "message"),
+    once(child, "exit").then(([status, signal]) => {
+      throw new Error(
+        `foreign listener exited before ready (${status}/${signal}): ${stderr}`,
+      );
+    }),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`foreign listener did not bind port ${port}`)),
+      5_000,
+    )),
+  ]);
+  assert.deepEqual(ready, { type: "ready" });
+  const messages = [];
+  child.on("message", (message) => messages.push(message));
+  return { child, messages };
+}
+
+async function assertTcpListenerAlive(child, port) {
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+  assert.doesNotThrow(() => process.kill(child.pid, 0));
+  const socket = net.createConnection({ host: "127.0.0.1", port });
+  try {
+    await Promise.race([
+      once(socket, "connect"),
+      once(socket, "error").then(([error]) => { throw error; }),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error(`listener on port ${port} did not accept TCP`)),
+        1_000,
+      )),
+    ]);
+  } finally {
+    socket.destroy();
+  }
+}
+
+async function installRestoreRecorder(root, markerPath) {
+  await writeFile(
+    path.join(root, "scripts", "manage-offline-restore.mjs"),
+    `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(markerPath)}, "restore helper invoked\\n", "utf8");
+const backupId = process.argv.at(-1);
+process.stdout.write(JSON.stringify({
+  schemaVersion: 1,
+  ok: true,
+  action: "activate",
+  result: { status: "activated", backupId },
+}) + "\\n");
+`,
+    "utf8",
+  );
 }
 
 function invokeManagerAsync(root, action) {
@@ -221,6 +329,7 @@ async function createFixture(
     shutdownExitCode = 0,
     claimMode = "normal",
     listenDelayMilliseconds = 0,
+    readinessMode = "ready",
   } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "mydashboard-manager-"));
@@ -264,7 +373,10 @@ for (const name of names) delete process.env[name];
 const managed = Boolean(environment.MYDASHBOARD_MANAGED_TOKEN);
 const tokenBytes = managed ? Buffer.from(environment.MYDASHBOARD_MANAGED_TOKEN, "base64") : null;
 let lifecycleState = managed ? "pending_claim" : "running";
+let livenessStartIdentity = environment.MYDASHBOARD_MANAGED_START_IDENTITY;
 let watchdog = null;
+const readinessMode = ${JSON.stringify(readinessMode)};
+const readinessPrivateMarkers = ${JSON.stringify(READINESS_PRIVATE_MARKERS)};
 if (managed) {
   writeFileSync(
     path.join(environment.MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY, "fixture-child-started.marker"),
@@ -325,10 +437,63 @@ const server = http.createServer((request, response) => {
       lifecycleState,
       ...(managed ? {
         instanceId: environment.MYDASHBOARD_MANAGED_INSTANCE_ID,
-        startIdentity: environment.MYDASHBOARD_MANAGED_START_IDENTITY,
+        startIdentity: livenessStartIdentity,
       } : {}),
     }));
     return;
+  }
+  if (request.method === "GET" && request.url === "/api/system/status") {
+    if (readinessMode === "hang") return;
+    if (readinessMode === "malformed") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        '{"readiness":{"ready":false},"credential":"' +
+          readinessPrivateMarkers.credential + '"',
+      );
+      return;
+    }
+    if (readinessMode === "oversized") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        schemaVersion: 1,
+        readiness: { ready: true },
+        private: readinessPrivateMarkers,
+        padding: "x".repeat(128 * 1024),
+      }));
+      return;
+    }
+    if (readinessMode !== "missing") {
+      const ready = readinessMode !== "not-ready";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        schemaVersion: 1,
+        liveness: { schemaVersion: 1, live: true },
+        readiness: {
+          schemaVersion: 1,
+          ready,
+          recoveryBlockers: ready ? [] : [{
+            probeId: "recovery_state",
+            code: readinessPrivateMarkers.blocker,
+            path: readinessPrivateMarkers.path,
+            credential: readinessPrivateMarkers.credential,
+          }],
+          unknownExternalActions: [],
+          storageWarnings: [],
+          probeFailures: [],
+        },
+        maintenance: { mode: "open", activeOperations: 0 },
+        backups: {
+          available: true,
+          items: [],
+          incompleteCount: 0,
+          unrecognizedCount: 0,
+        },
+      }));
+      if (readinessMode === "identity-race") {
+        livenessStartIdentity = "0".repeat(64);
+      }
+      return;
+    }
   }
   if (
     request.method === "POST" &&
@@ -638,6 +803,84 @@ test(
   },
 );
 
+for (const scenario of [
+  { mode: "ready", label: "explicit readiness" },
+  { mode: "not-ready", label: "explicit non-readiness" },
+  { mode: "malformed", label: "malformed readiness JSON" },
+  { mode: "hang", label: "hanging readiness" },
+  { mode: "missing", label: "a missing readiness route" },
+  { mode: "oversized", label: "an oversized readiness body" },
+  { mode: "identity-race", label: "a post-readiness identity race" },
+]) {
+  test(
+    `managed Status reports ${scenario.label} safely`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const { root, port } = await createFixture(t, {
+        readinessMode: scenario.mode,
+      });
+      const runtime = readRuntimeInfo(root);
+      const started = invokeManager(root, "Start");
+      assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+      const state = JSON.parse(await readFile(path.join(
+        runtime.runtimeDirectory,
+        "mydashboard-server-process.json",
+      ), "utf8"));
+
+      const statusStartedAt = performance.now();
+      const status = invokeManager(root, "Status");
+      const statusDurationMilliseconds = performance.now() - statusStartedAt;
+      assert.equal(status.error, undefined);
+      const output = `${status.stdout}\n${status.stderr}`;
+      const leakedValues = [
+        ...Object.values(READINESS_PRIVATE_MARKERS),
+        state.controlToken,
+        root,
+      ].filter((value) => output.includes(value));
+
+      if (scenario.mode === "ready") {
+        assert.deepEqual(
+          {
+            exitCode: status.status,
+            reportsManagedProcess: new RegExp(
+              `running at http://127\\.0\\.0\\.1:${port} \\(PID ${state.processId}\\)`,
+              "u",
+            ).test(status.stdout),
+            bounded: statusDurationMilliseconds < 7_000,
+            leakedValues,
+          },
+          {
+            exitCode: 0,
+            reportsManagedProcess: true,
+            bounded: true,
+            leakedValues: [],
+          },
+          output,
+        );
+        return;
+      }
+
+      assert.deepEqual(
+        {
+          exitCode: status.status,
+          stdout: status.stdout.trim(),
+          stderr: status.stderr.trim(),
+          bounded: statusDurationMilliseconds < 7_000,
+          leakedValues,
+        },
+        {
+          exitCode: 5,
+          stdout: READINESS_SAFE_MESSAGE,
+          stderr: "",
+          bounded: true,
+          leakedValues: [],
+        },
+        output,
+      );
+    },
+  );
+}
+
 test(
   "PowerShell manager permits an exact offline restore only while the service is stopped",
   { skip: WINDOWS_MANAGER_SKIP },
@@ -696,6 +939,115 @@ process.stdout.write(JSON.stringify({
   },
 );
 
+for (const scenario of [
+  { mode: "raw", label: "a raw TCP listener" },
+  { mode: "not-found", label: "an HTTP 404 listener" },
+  { mode: "malformed", label: "malformed liveness JSON" },
+  { mode: "hang", label: "an accept-but-hang listener" },
+]) {
+  test(
+    `offline Restore rejects ${scenario.label} before invoking its helper`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const { root, port } = await createFixture(t);
+      const markerPath = path.join(root, "restore-helper-invoked.marker");
+      await installRestoreRecorder(root, markerPath);
+      const foreign = await startForeignListener(t, {
+        mode: scenario.mode,
+        port,
+      });
+      const backupId = `backup-${"b".repeat(64)}`;
+
+      const restored = invokeManager(
+        root,
+        "Restore",
+        5,
+        powershell,
+        ["-BackupId", backupId],
+      );
+      assert.equal(restored.error, undefined);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const helperTouched = await fileExists(markerPath);
+      await assertTcpListenerAlive(foreign.child, port);
+      const shutdownRequests = foreign.messages.filter((message) =>
+        message.type === "request" &&
+        message.method === "POST" &&
+        message.url === "/api/system/shutdown"
+      ).length;
+      const output = `${restored.stderr}\n${restored.stdout}`;
+
+      assert.deepEqual(
+        {
+          refused: restored.status !== 0,
+          helperTouched,
+          foreignListenerAlive: true,
+          shutdownRequests,
+          genericListenerRefusal: /configured port.*listener|port.*occupied/iu.test(
+            output,
+          ),
+        },
+        {
+          refused: true,
+          helperTouched: false,
+          foreignListenerAlive: true,
+          shutdownRequests: 0,
+          genericListenerRefusal: true,
+        },
+        output,
+      );
+    },
+  );
+}
+
+test(
+  "Start and state-free Status fence an HTTP 404 listener without controlling it",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const { root, port } = await createFixture(t);
+    const runtime = readRuntimeInfo(root);
+    const foreign = await startForeignListener(t, { mode: "not-found", port });
+
+    const status = invokeManager(root, "Status");
+    const started = invokeManager(root, "Start");
+    assert.equal(status.error, undefined);
+    assert.equal(started.error, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const childLaunchMarker = await fileExists(path.join(
+      runtime.runtimeDirectory,
+      "fixture-child-started.marker",
+    ));
+    await assertTcpListenerAlive(foreign.child, port);
+    const shutdownRequests = foreign.messages.filter((message) =>
+      message.type === "request" &&
+      message.method === "POST" &&
+      message.url === "/api/system/shutdown"
+    ).length;
+    const startOutput = `${started.stderr}\n${started.stdout}`;
+
+    assert.deepEqual(
+      {
+        statusCode: status.status,
+        startRefused: started.status !== 0,
+        childLaunchMarker,
+        shutdownRequests,
+        foreignListenerAlive: true,
+        genericListenerRefusal: /unmanaged listener|port.*occupied/iu.test(
+          startOutput,
+        ),
+      },
+      {
+        statusCode: 4,
+        startRefused: true,
+        childLaunchMarker: false,
+        shutdownRequests: 0,
+        foreignListenerAlive: true,
+        genericListenerRefusal: true,
+      },
+      `${status.stderr}\n${status.stdout}\n${startOutput}`,
+    );
+  },
+);
+
 test(
   "PowerShell 7 uses the same private ACL and authenticated lifecycle",
   { skip: POWERSHELL_7_MANAGER_SKIP },
@@ -703,7 +1055,24 @@ test(
     const { root, port } = await createFixture(t);
     const runtime = readRuntimeInfo(root);
     const started = invokeManager(root, "Start", 10, powershell7);
-    assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+    const failedStartLiveness = started.status === 0
+      ? null
+      : await fetch(`http://127.0.0.1:${port}/api/live`, {
+          signal: AbortSignal.timeout(1_000),
+        }).then(async (response) => {
+          const value = await response.json();
+          return {
+            status: response.status,
+            service: value.service,
+            processId: value.processId,
+            lifecycleState: value.lifecycleState,
+          };
+        }).catch((error) => ({ error: error.name }));
+    assert.equal(
+      started.status,
+      0,
+      `${started.stderr}\n${started.stdout}\n${JSON.stringify(failedStartLiveness)}`,
+    );
     const state = JSON.parse(await readFile(path.join(
       runtime.runtimeDirectory,
       "mydashboard-server-process.json",

@@ -633,6 +633,133 @@ function Get-ManagedProcess {
     return $process
 }
 
+function Test-LoopbackTcpListener {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $client = New-Object System.Net.Sockets.TcpClient
+    $operation = $null
+    $waitHandle = $null
+    try {
+        $operation = $client.BeginConnect(
+            [System.Net.IPAddress]::Loopback,
+            $Port,
+            $null,
+            $null
+        )
+        $waitHandle = $operation.AsyncWaitHandle
+        if (-not $waitHandle.WaitOne(500)) {
+            return $false
+        }
+        $client.EndConnect($operation)
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $waitHandle) {
+            $waitHandle.Dispose()
+        }
+        $client.Dispose()
+    }
+}
+
+function Wait-ForBoundedAsyncOperation {
+    param(
+        [Parameter(Mandatory = $true)][System.IAsyncResult]$Operation,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline
+    )
+    $remaining = [int][Math]::Ceiling(
+        ($Deadline - [DateTime]::UtcNow).TotalMilliseconds
+    )
+    if ($remaining -le 0 -or -not $Operation.AsyncWaitHandle.WaitOne($remaining)) {
+        throw "The loopback HTTP request exceeded its fixed deadline."
+    }
+}
+
+function Invoke-BoundedLoopbackJsonGet {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateRange(100, 10000)][int]$TimeoutMilliseconds,
+        [ValidateRange(1, 1048576)][int]$MaximumBytes
+    )
+    if ($Path -notmatch '^/[a-z0-9/-]+$') {
+        throw "The loopback HTTP path is invalid."
+    }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $uri = New-Object System.Uri("http://127.0.0.1:$Port$Path")
+    $request = [System.Net.HttpWebRequest]::CreateHttp($uri)
+    $request.Method = "GET"
+    $request.Accept = "application/json"
+    $request.AllowAutoRedirect = $false
+    $request.AutomaticDecompression = [System.Net.DecompressionMethods]::None
+    $request.Credentials = $null
+    $request.KeepAlive = $false
+    $request.MaximumResponseHeadersLength = 16
+    $request.PreAuthenticate = $false
+    $request.Proxy = $null
+    $request.ReadWriteTimeout = $TimeoutMilliseconds
+    $request.Timeout = $TimeoutMilliseconds
+    $response = $null
+    $stream = $null
+    try {
+        $responseOperation = $request.BeginGetResponse($null, $null)
+        try {
+            Wait-ForBoundedAsyncOperation `
+                -Operation $responseOperation `
+                -Deadline $deadline
+            $response = $request.EndGetResponse($responseOperation)
+        } finally {
+            $responseOperation.AsyncWaitHandle.Dispose()
+        }
+        if (
+            [int]$response.StatusCode -ne 200 -or
+            [string]$response.ContentType -notmatch `
+                '^\s*application/json(?:\s*;|\s*$)' -or
+            $response.ContentLength -gt $MaximumBytes
+        ) {
+            throw "The loopback HTTP response is not an accepted bounded JSON response."
+        }
+        $stream = $response.GetResponseStream()
+        $bytes = New-Object byte[] ($MaximumBytes + 1)
+        $total = 0
+        while ($true) {
+            $readOperation = $stream.BeginRead(
+                $bytes,
+                $total,
+                $bytes.Length - $total,
+                $null,
+                $null
+            )
+            try {
+                Wait-ForBoundedAsyncOperation `
+                    -Operation $readOperation `
+                    -Deadline $deadline
+                $read = $stream.EndRead($readOperation)
+            } finally {
+                $readOperation.AsyncWaitHandle.Dispose()
+            }
+            if ($read -eq 0) {
+                break
+            }
+            $total += $read
+            if ($total -gt $MaximumBytes) {
+                throw "The loopback HTTP response exceeded its size limit."
+            }
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        return ConvertFrom-ExactJson -Json $utf8.GetString($bytes, 0, $total)
+    } catch {
+        $request.Abort()
+        throw
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+    }
+}
+
 function Get-Liveness {
     param([Parameter(Mandatory = $true)][int]$Port)
     try {
@@ -665,6 +792,54 @@ function Test-MatchingLiveness {
         [string]::IsNullOrEmpty($LifecycleState) -or
         [string]$Liveness.lifecycleState -eq $LifecycleState
     )
+}
+
+function Test-ReadySystemStatus {
+    param([AllowNull()][Parameter(Mandatory = $true)]$Value)
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) {
+        return $false
+    }
+    $schemaVersion = $Value.PSObject.Properties["schemaVersion"]
+    $readiness = $Value.PSObject.Properties["readiness"]
+    if (
+        $null -eq $schemaVersion -or
+        (
+            $schemaVersion.Value -isnot [int] -and
+            $schemaVersion.Value -isnot [long]
+        ) -or
+        [long]$schemaVersion.Value -ne 1 -or
+        $null -eq $readiness -or
+        $readiness.Value -isnot [pscustomobject]
+    ) {
+        return $false
+    }
+    $ready = $readiness.Value.PSObject.Properties["ready"]
+    return (
+        $null -ne $ready -and
+        $ready.Value -is [bool] -and
+        $ready.Value -eq $true
+    )
+}
+
+function Test-ManagedReadiness {
+    param([Parameter(Mandatory = $true)]$State)
+    try {
+        $status = Invoke-BoundedLoopbackJsonGet `
+            -Port ([int]$State.port) `
+            -Path "/api/system/status" `
+            -TimeoutMilliseconds 3000 `
+            -MaximumBytes 65536
+        if (-not (Test-ReadySystemStatus -Value $status)) {
+            return $false
+        }
+        if ($null -eq (Get-ManagedProcess -State $State)) {
+            return $false
+        }
+        $liveness = Get-Liveness -Port ([int]$State.port)
+        return Test-MatchingLiveness -Liveness $liveness -State $State
+    } catch {
+        return $false
+    }
 }
 
 function Wait-ForMatchingLiveness {
@@ -872,8 +1047,8 @@ function Assert-OfflineRestoreAllowed {
         }
     }
     $port = Get-ConfiguredPort
-    if ($null -ne (Get-Liveness -Port $port)) {
-        throw "The configured port has a live listener; refusing offline restore."
+    if (Test-LoopbackTcpListener -Port $port) {
+        throw "The configured port has a listener; refusing offline restore."
     }
 }
 
@@ -1052,8 +1227,7 @@ function Start-ManagedServer {
         }
     }
 
-    $existingLiveness = Get-Liveness -Port $port
-    if ($null -ne $existingLiveness) {
+    if (Test-LoopbackTcpListener -Port $port) {
         throw "Port $port already has an unmanaged listener; refusing to replace it."
     }
 
@@ -1200,8 +1374,7 @@ function Show-ManagedStatus {
     $state = Read-ControlState
     if ($null -eq $state) {
         $port = Get-ConfiguredPort
-        $liveness = Get-Liveness -Port $port
-        if ($null -ne $liveness) {
+        if (Test-LoopbackTcpListener -Port $port) {
             return [pscustomobject]@{
                 Code = 4
                 Message = "MyDashboard has an unmanaged listener at http://127.0.0.1:$port."
@@ -1223,6 +1396,12 @@ function Show-ManagedStatus {
         return [pscustomobject]@{
             Code = 5
             Message = "MyDashboard process exists but its authenticated identity does not match."
+        }
+    }
+    if (-not (Test-ManagedReadiness -State $state)) {
+        return [pscustomobject]@{
+            Code = 5
+            Message = "MyDashboard is running but readiness could not be confirmed safely."
         }
     }
     return [pscustomobject]@{
