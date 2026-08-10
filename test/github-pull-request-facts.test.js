@@ -194,7 +194,12 @@ function graphResponse(overrides = {}) {
   return { data: { repository: { pullRequest } } };
 }
 
-function fakeRun({ graph = graphResponse(), finalTarget, finalAccount } = {}) {
+function fakeRun({
+  graph = graphResponse(),
+  initialTarget,
+  finalTarget,
+  finalAccount,
+} = {}) {
   const calls = [];
   let targetReads = 0;
   let accountReads = 0;
@@ -210,6 +215,7 @@ function fakeRun({ graph = graphResponse(), finalTarget, finalAccount } = {}) {
     }
     if (args[0] === "pr" && args[1] === "view") {
       targetReads += 1;
+      if (targetReads === 1 && initialTarget) return initialTarget;
       return targetReads === 2 && finalTarget
         ? finalTarget
         : viewTargetResponse();
@@ -218,6 +224,23 @@ function fakeRun({ graph = graphResponse(), finalTarget, finalAccount } = {}) {
   };
   return { calls, run };
 }
+
+test("minimal CLI owner identity is accepted at both target reads", async () => {
+  const owner = { login: "contributor" };
+  const fake = fakeRun({
+    initialTarget: viewTargetResponse({ headRepositoryOwner: owner }),
+    finalTarget: viewTargetResponse({ headRepositoryOwner: owner }),
+  });
+  const adapter = new GitHubAdapter({ run: fake.run });
+
+  const facts = await adapter.loadPullRequestFacts(readRequest());
+
+  assert.equal(facts.reviewDecision, "CHANGES_REQUESTED");
+  assert.equal(
+    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    2,
+  );
+});
 
 test("the bounded GraphQL read returns detailed facts without changing summaries", async () => {
   const fake = fakeRun();

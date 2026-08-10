@@ -113,6 +113,7 @@ const VIEW_TARGET_KEYS = Object.freeze([
   "headRepository",
   "headRepositoryOwner",
 ]);
+const VIEW_OWNER_KEYS = Object.freeze(["id", "name", "login"]);
 const CONNECTION_KEYS = Object.freeze(["nodes", "pageInfo"]);
 const PAGE_INFO_KEYS = Object.freeze(["hasPreviousPage", "hasNextPage"]);
 const COMMENT_KEYS = Object.freeze([
@@ -694,11 +695,16 @@ export function githubViewPullRequestTarget(response, identity) {
     ["id", "name"],
     "PR target response.headRepository",
   );
-  const headRepositoryOwner = exactDataMap(
+  const headRepositoryOwner = dataMap(
     fields.get("headRepositoryOwner"),
-    ["id", "name", "login"],
     "PR target response.headRepositoryOwner",
   );
+  if (
+    !headRepositoryOwner.has("login") ||
+    [...headRepositoryOwner.keys()].some((key) => !VIEW_OWNER_KEYS.includes(key))
+  ) {
+    throw invalid("PR target response.headRepositoryOwner is invalid");
+  }
   return targetFromFields(
     fields,
     {
