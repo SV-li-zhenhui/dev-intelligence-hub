@@ -382,6 +382,57 @@ test("owner retry rejects accessor-backed and custom-prototype projection shapes
   assert.equal(getterCalls, 0);
 });
 
+test("owner retry rejects accessor-backed top-level work item collections", async () => {
+  let getterCalls = 0;
+  const items = [];
+  Object.defineProperty(items, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return eligibleOwnerRetryItem();
+    },
+  });
+  const pureHtml = renderWorkView(workProjectionState(items));
+  const calls = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === "/api/work/items?limit=50&order=newest") {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { items };
+          },
+        };
+      }
+      if (options.method === "POST") return response({ requeued: true });
+      return workProjectionResponse(url, []);
+    },
+  });
+  await view.load();
+
+  const controllerHtml = view.render();
+  await view.retryDecisionExhaustion("work-item-owner-retry");
+
+  assert.deepEqual({
+    getterCalls,
+    pureButtons: (
+      pureHtml.match(/data-owner-decision-retry-item-id=/g) || []
+    ).length,
+    controllerButtons: (
+      controllerHtml.match(/data-owner-decision-retry-item-id=/g) || []
+    ).length,
+    posts: calls.filter(({ options }) => options.method === "POST").length,
+  }, {
+    getterCalls: 0,
+    pureButtons: 0,
+    controllerButtons: 0,
+    posts: 0,
+  });
+});
+
 test("owner retry cannot be enabled by a self-replacing row accessor", async () => {
   const item = eligibleOwnerRetryItem();
   let getterCalls = 0;

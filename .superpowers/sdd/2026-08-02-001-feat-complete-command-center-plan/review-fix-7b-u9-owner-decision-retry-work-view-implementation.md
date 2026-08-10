@@ -193,3 +193,65 @@ receipt arguments were invented or bypassed.
 - The browser guard intentionally duplicates the approved backend eligibility
   invariants as a presentation safeguard. The backend service remains the sole
   mutation authority if the public projection contract changes.
+
+## Round 3 review closure
+
+- Hardened `ownerRetryArrayValues` into the only entry point for work-item
+  collection values on the owner-retry rendering and controller paths. It now
+  inspects the own `length` data descriptor, bounds that value, requires the
+  exact plain-array prototype and key set, and copies only own enumerable data
+  descriptor values. Accessor indices, sparse arrays, extra string or symbol
+  keys, custom prototypes, contradictory lengths, and inspection failures are
+  rejected without reading an element.
+- `renderWorkView`, `itemRows`, `unambiguousOwnerRetryBindings`, and the
+  immediate pre-mutation `currentOwnerRetryBinding` lookup operate only on a
+  validated values snapshot. Invalid collections render as an empty work list
+  and cannot contribute a retry authority. Ordinary rows from valid projection
+  arrays retain their existing rendering.
+
+Round 3 RED against committed HEAD
+`7e7c2ebe33cacbac57187c0d1f7511b0776d875c`:
+
+```text
+node --test --test-concurrency=1 test/frontend-work-view.test.js
+tests 39; pass 38; fail 1
+accessor getter calls: expected 0; observed 8
+pure-render retry controls: expected 0; observed 1
+controller-render retry controls: expected 0; observed 1
+POST requests after programmatic retry: expected 0; observed 1
+```
+
+The synthetic fixture is a real Array whose enumerable index `0` is an
+accessor returning an otherwise eligible row. It is passed directly to pure
+rendering and returned without cloning to `createWorkView`; the controller is
+then rendered before `retryDecisionExhaustion(itemId)` is called. Production
+changed only after this complete RED result was captured.
+
+Round 3 GREEN:
+
+```text
+node --test --test-concurrency=1 test/frontend-work-view.test.js
+tests 39; pass 39; fail 0
+getter calls 0; pure controls 0; controller controls 0; POST requests 0
+
+node --test --test-concurrency=1 test/frontend-work-view.test.js test/frontend-work-graph-view.test.js
+tests 48; pass 48; fail 0
+
+node --check public/work-view.js
+exit 0
+
+node --check test/frontend-work-view.test.js
+exit 0
+
+git diff --check
+exit 0
+
+git diff 1dcc080 --check
+exit 0
+```
+
+The live UI validator remained intentionally unrun for round 3. Its required
+runtime/receipt inputs were not supplied, and no runtime, arguments, or bypass
+were invented under this task's explicit boundaries. The validated work-items
+array is bounded at 10,000 entries as a browser-side fail-closed guard; the
+current work projection endpoint is already limited to 50 rows.

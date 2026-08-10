@@ -57,6 +57,7 @@ function subjectLabel(item) {
 
 const OWNER_RETRY_SHA256 = /^[a-f0-9]{64}$/;
 const OWNER_RETRY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const OWNER_RETRY_MAX_ARRAY_LENGTH = 10_000;
 const OWNER_RETRY_REQUIRED_ITEM_FIELDS = Object.freeze([
   "itemId",
   "revision",
@@ -100,20 +101,43 @@ function ownerRetryDataFields(value) {
 }
 
 function ownerRetryArrayValues(value) {
-  if (
-    !Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Array.prototype ||
-    Reflect.ownKeys(value).length !== value.length + 1
-  ) {
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      return null;
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      !lengthDescriptor ||
+      !("value" in lengthDescriptor) ||
+      lengthDescriptor.enumerable !== false ||
+      lengthDescriptor.configurable !== false ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0 ||
+      lengthDescriptor.value > OWNER_RETRY_MAX_ARRAY_LENGTH
+    ) {
+      return null;
+    }
+    const length = lengthDescriptor.value;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== length + 1) return null;
+    const keySet = new Set(keys);
+    if (!keySet.has("length")) return null;
+
+    const values = [];
+    for (let index = 0; index < length; index += 1) {
+      const key = String(index);
+      if (!keySet.has(key)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+      values.push(descriptor.value);
+    }
+    return values;
+  } catch {
     return null;
   }
-  const values = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor?.enumerable || !("value" in descriptor)) return null;
-    values.push(descriptor.value);
-  }
-  return values;
 }
 
 function boundedOwnerRetryId(value) {
@@ -242,8 +266,10 @@ function readableOwnerRetryItemId(value) {
 }
 
 function unambiguousOwnerRetryBindings(items) {
+  const values = ownerRetryArrayValues(items);
+  if (!values) return [];
   const itemIdCounts = new Map();
-  for (const item of items) {
+  for (const item of values) {
     const itemId = readableOwnerRetryItemId(item);
     if (!itemId) continue;
     itemIdCounts.set(
@@ -251,7 +277,7 @@ function unambiguousOwnerRetryBindings(items) {
       (itemIdCounts.get(itemId) || 0) + 1,
     );
   }
-  const bindings = items.map((item) => ownerDecisionRetryBinding(item));
+  const bindings = values.map((item) => ownerDecisionRetryBinding(item));
   return bindings.map((binding) => (
     binding && itemIdCounts.get(binding.itemId) === 1 ? binding : null
   ));
@@ -331,11 +357,12 @@ function workRowProjection(value) {
 }
 
 function itemRows(items, now, state) {
-  if (!items.length) {
+  const values = ownerRetryArrayValues(items);
+  if (!values?.length) {
     return '<div class="empty">尚无工作项；新的路由分派会可靠进入这里。</div>';
   }
-  const bindings = unambiguousOwnerRetryBindings(items);
-  const rows = items.map((item, index) => ({
+  const bindings = unambiguousOwnerRetryBindings(values);
+  const rows = values.map((item, index) => ({
     binding: bindings[index],
     item: workRowProjection(item),
   }));
@@ -936,6 +963,8 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       <div class="empty">${escapeWorkHtml(state.error)}。请刷新页面后重试。</div>
     </section>`;
   }
+  const items = ownerRetryArrayValues(state.items) || [];
+  const renderedItemRows = itemRows(items, now, state);
   const summary = state.summary || {};
   const waiting =
     count(summary, "waiting_user") +
@@ -965,8 +994,8 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
     }, { now })}
     <div class="work-columns">
       <section class="section work-panel">
-        <div class="section-heading"><h2>最近工作</h2><span>${state.items.length} ITEMS · 最新在前</span></div>
-        ${itemRows(state.items, now, state)}
+        <div class="section-heading"><h2>最近工作</h2><span>${items.length} ITEMS · 最新在前</span></div>
+        ${renderedItemRows}
       </section>
       <section class="section work-panel">
         <div class="section-heading"><h2>审计时间线</h2><span>${state.timeline.length} EVENTS · 最新在前</span></div>
@@ -1282,8 +1311,10 @@ export function createWorkView({
   }
 
   function currentOwnerRetryBinding(itemId) {
-    if (typeof itemId !== "string" || !Array.isArray(state.items)) return null;
-    return unambiguousOwnerRetryBindings(state.items)
+    if (typeof itemId !== "string") return null;
+    const items = ownerRetryArrayValues(state.items);
+    if (!items) return null;
+    return unambiguousOwnerRetryBindings(items)
       .find((binding) => binding?.itemId === itemId) || null;
   }
 
