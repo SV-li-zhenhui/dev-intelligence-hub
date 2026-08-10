@@ -1,6 +1,8 @@
-import { spawn } from "node:child_process";
 import { globSync } from "node:fs";
 import path from "node:path";
+import { run } from "node:test";
+import { tap } from "node:test/reporters";
+import { finished } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const PRIORITY_TEST_FILE = "u9-mirrored-pr-end-to-end.test.js";
@@ -37,23 +39,15 @@ export function orderTestFiles(discovered) {
   ];
 }
 
-export function testRunnerArguments(orderedFiles) {
-  return ["--test", "--test-concurrency=4", ...orderedFiles];
-}
-
-export function waitForExit(child) {
-  return new Promise((resolve, reject) => {
-    const onError = (error) => {
-      child.removeListener("exit", onExit);
-      reject(error);
-    };
-    const onExit = (code, signal) => {
-      child.removeListener("error", onError);
-      resolve({ code, signal });
-    };
-    child.once("error", onError);
-    child.once("exit", onExit);
-  });
+export function testRunnerOptions(orderedFiles, testDirectory) {
+  const cwd = path.dirname(testDirectory);
+  return {
+    concurrency: 4,
+    cwd,
+    files: orderedFiles.map((file) =>
+      path.relative(cwd, path.join(testDirectory, file))
+    ),
+  };
 }
 
 export function applyTestRunnerResult(result, targetProcess = process) {
@@ -65,20 +59,21 @@ export function applyTestRunnerResult(result, targetProcess = process) {
 }
 
 export async function runTestSuite({
-  spawnProcess = spawn,
+  output = process.stdout,
+  runTests = run,
   testDirectory = defaultTestDirectory,
 } = {}) {
-  const projectDirectory = path.dirname(testDirectory);
   const discovered = discoverTestFiles(testDirectory);
-  const ordered = orderTestFiles(discovered).map((file) =>
-    path.join(testDirectory, file)
-  );
-  const child = spawnProcess(process.execPath, testRunnerArguments(ordered), {
-    cwd: projectDirectory,
-    stdio: "inherit",
-    windowsHide: true,
+  const ordered = orderTestFiles(discovered);
+  const testStream = runTests(testRunnerOptions(ordered, testDirectory));
+  let code = 0;
+  testStream.on("test:fail", () => {
+    code = 1;
   });
-  return waitForExit(child);
+  const reporterStream = testStream.compose(tap);
+  reporterStream.pipe(output, { end: false });
+  await finished(reporterStream);
+  return { code, signal: null };
 }
 
 const invokedDirectly = process.argv[1] !== undefined &&
