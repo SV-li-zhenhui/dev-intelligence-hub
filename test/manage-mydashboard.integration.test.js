@@ -49,6 +49,7 @@ const POWERSHELL_7_MANAGER_SKIP = process.platform !== "win32"
 const READINESS_PRIVATE_MARKERS = Object.freeze({
   blocker: "PRIVATE_READINESS_BLOCKER",
   path: "C:\\private\\readiness-state.json",
+  // PRIVACY_FAKE_CREDENTIAL_SHA256:cf7833d45898bb2331f8ca5dd15cba6d393fb541cd900f41610257bf6ba04cf0
   credential: "sk-private-readiness-credential",
 });
 const READINESS_SAFE_MESSAGE =

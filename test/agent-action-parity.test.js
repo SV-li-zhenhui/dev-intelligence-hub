@@ -616,6 +616,10 @@ function completedCommentObservation(input) {
     marker: input.marker,
     actorAccountId: input.actorAccountId,
     body: input.action.body,
+    reviewEvent: input.action.type === "pull_request_comment"
+      ? "COMMENT"
+      : input.action.reviewEvent,
+    headOid: input.action.inputBinding.gitTarget.headRefOid,
     receipt: { id: "comment-u12-parity" },
   }];
   return observation;

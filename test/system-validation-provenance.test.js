@@ -26,6 +26,12 @@ async function git(root, ...arguments_) {
   return stdout.trim();
 }
 
+async function projectFixtureText(relativePath) {
+  return (await readFile(path.join(projectRoot, relativePath), "utf8"))
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n");
+}
+
 async function createRepository(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-validation-"));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -68,7 +74,7 @@ async function createValidationFixture(t) {
   ]) {
     await writeFile(
       path.join(root, relativePath),
-      await readFile(path.join(projectRoot, relativePath)),
+      await projectFixtureText(relativePath),
     );
   }
   await writeFile(
@@ -102,9 +108,7 @@ async function createValidationFixture(t) {
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
   await writeFile(
     path.join(root, "scripts/validate-ui.mjs"),
-    await readFile(
-      path.join(projectRoot, "test-support/system-ui-validation-fixture.mjs"),
-    ),
+    await projectFixtureText("test-support/system-ui-validation-fixture.mjs"),
   );
   await writeFile(
     path.join(root, "test/smoke.test.js"),
