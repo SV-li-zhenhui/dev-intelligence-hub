@@ -22,7 +22,7 @@
     "start": "node scripts/run-dashboard.mjs",
     "refresh": "node src/cli.js refresh",
     "refresh:notify": "node src/cli.js refresh --notify",
-    "test": "node test/run-test-suite.mjs",
+    "test": "node --test --test-concurrency=4 --test-reporter=tap test/00-u9-priority.mjs \"test/*.test.js\"",
     "validate:system": "node scripts/validate-system.mjs"
   },
   "engines": {
