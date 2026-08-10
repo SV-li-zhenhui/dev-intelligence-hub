@@ -3908,20 +3908,22 @@ test("owner decision retry HTTP boundary is exact, fail-closed, and signals agen
   const calls = [];
   const agencySignals = [];
   let failure = null;
+  const successfulProjection = () => ({
+    itemId,
+    inputDigest,
+    status: "queued",
+    statusReason: "owner_retry_decision_exhaustion",
+    revision: 8,
+    attempt: 3,
+    ownerId: null,
+    privateMarker: "generic-ledger-authority-must-not-leak",
+  });
+  let projection = successfulProjection();
   const ownerWorkRetry = {
     async retryDecisionExhaustion(input) {
       calls.push(structuredClone(input));
       if (failure) throw failure;
-      return {
-        itemId,
-        inputDigest,
-        status: "queued",
-        statusReason: "owner_retry_decision_exhaustion",
-        revision: 8,
-        attempt: 3,
-        ownerId: null,
-        privateMarker: "generic-ledger-authority-must-not-leak",
-      };
+      return projection;
     },
   };
   const backgroundWork = {
@@ -3942,45 +3944,131 @@ test("owner decision retry HTTP boundary is exact, fail-closed, and signals agen
   await withServer(
     async ({ server }) => {
       const path = `/api/work/items/${itemId}/retry-decision-exhaustion`;
-      const rejected = [
-        await request(server, {
-          method: "POST",
-          path,
+      const rejectedRequests = [
+        {
+          name: "missing same-origin headers",
+          expectedStatus: 403,
           headers: { "content-type": "application/json" },
           body,
-        }),
-        await request(server, {
-          method: "POST",
-          path,
+        },
+        {
+          name: "cross-origin request",
+          expectedStatus: 403,
           headers: { ...trustedHeaders, origin: "http://example.test" },
           body,
-        }),
-        await request(server, {
-          method: "POST",
-          path,
+        },
+        {
+          name: "non-JSON content type",
+          expectedStatus: 415,
           headers: { ...trustedHeaders, "content-type": "text/plain" },
           body,
-        }),
-        await request(server, {
-          method: "POST",
-          path,
+        },
+        {
+          name: "extra authority field",
+          expectedStatus: 400,
           headers: trustedHeaders,
           body: JSON.stringify({
             expectedRevision: 7,
             expectedInputDigest: inputDigest,
             actorId: "attacker",
           }),
-        }),
-        await request(server, {
-          method: "POST",
+        },
+        {
+          name: "query parameter",
+          expectedStatus: 400,
           path: `${path}?force=1`,
           headers: trustedHeaders,
           body,
-        }),
+        },
+        {
+          name: "whitespace item ID",
+          expectedStatus: 400,
+          path: "/api/work/items/%20/retry-decision-exhaustion",
+          headers: trustedHeaders,
+          body,
+        },
+        {
+          name: "control-character item ID",
+          expectedStatus: 400,
+          path: "/api/work/items/%00/retry-decision-exhaustion",
+          headers: trustedHeaders,
+          body,
+        },
+        {
+          name: "malformed encoded item ID",
+          expectedStatus: 400,
+          path: "/api/work/items/%E0%A4%A/retry-decision-exhaustion",
+          headers: trustedHeaders,
+          body,
+        },
+        {
+          name: "overlong item ID",
+          expectedStatus: 400,
+          path: `/api/work/items/${"x".repeat(193)}/retry-decision-exhaustion`,
+          headers: trustedHeaders,
+          body,
+        },
+        {
+          name: "missing expected revision",
+          expectedStatus: 400,
+          headers: trustedHeaders,
+          body: JSON.stringify({ expectedInputDigest: inputDigest }),
+        },
+        {
+          name: "missing expected input digest",
+          expectedStatus: 400,
+          headers: trustedHeaders,
+          body: JSON.stringify({ expectedRevision: 7 }),
+        },
+        ...[0, -1, 1.5, "7", null].map((expectedRevision) => ({
+          name: `invalid expected revision ${JSON.stringify(expectedRevision)}`,
+          expectedStatus: 400,
+          headers: trustedHeaders,
+          body: JSON.stringify({ expectedRevision, expectedInputDigest: inputDigest }),
+        })),
+        ...[
+          inputDigest.toUpperCase(),
+          "a".repeat(63),
+          "a".repeat(65),
+          7,
+          null,
+        ].map((expectedInputDigest) => ({
+          name: `invalid expected input digest ${JSON.stringify(expectedInputDigest)}`,
+          expectedStatus: 400,
+          headers: trustedHeaders,
+          body: JSON.stringify({ expectedRevision: 7, expectedInputDigest }),
+        })),
+        ...[
+          ["null JSON", "null"],
+          ["array JSON", "[]"],
+          ["string JSON", '"retry"'],
+          ["number JSON", "7"],
+          ["boolean JSON", "true"],
+          ["malformed JSON", "{"],
+          ["empty body", ""],
+        ].map(([name, invalidBody]) => ({
+          name,
+          expectedStatus: 400,
+          headers: trustedHeaders,
+          body: invalidBody,
+        })),
       ];
-      assert.deepEqual(rejected.map(({ status }) => status), [403, 403, 415, 400, 400]);
-      assert.equal(calls.length, 0);
-      assert.equal(agencySignals.length, 0);
+      for (const rejected of rejectedRequests) {
+        const response = await request(server, {
+          method: "POST",
+          path: rejected.path || path,
+          headers: rejected.headers,
+          body: rejected.body,
+        });
+        assert.equal(response.status, rejected.expectedStatus, rejected.name);
+        assert.equal(calls.length, 0, `${rejected.name}: retry port call`);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(
+          agencySignals.length,
+          0,
+          `${rejected.name}: agency signal`,
+        );
+      }
 
       failure = Object.assign(new Error("工作项已变化"), {
         code: "OWNER_WORK_RETRY_STALE",
@@ -3996,6 +4084,65 @@ test("owner decision retry HTTP boundary is exact, fail-closed, and signals agen
       assert.equal(agencySignals.length, 0);
 
       failure = null;
+      const invalidProjections = [
+        { name: "null projection", value: null },
+        {
+          name: "array projection",
+          value: Object.assign([], successfulProjection()),
+        },
+        {
+          name: "wrong item ID",
+          value: { ...successfulProjection(), itemId: "work-item-other" },
+        },
+        {
+          name: "wrong input digest",
+          value: { ...successfulProjection(), inputDigest: "b".repeat(64) },
+        },
+        {
+          name: "wrong status",
+          value: { ...successfulProjection(), status: "blocked" },
+        },
+        {
+          name: "stale result revision",
+          value: { ...successfulProjection(), revision: 7 },
+        },
+        {
+          name: "skipped result revision",
+          value: { ...successfulProjection(), revision: 9 },
+        },
+        {
+          name: "negative attempt",
+          value: { ...successfulProjection(), attempt: -1 },
+        },
+        {
+          name: "fractional attempt",
+          value: { ...successfulProjection(), attempt: 1.5 },
+        },
+        {
+          name: "string attempt",
+          value: { ...successfulProjection(), attempt: "3" },
+        },
+      ];
+      for (const invalid of invalidProjections) {
+        projection = invalid.value;
+        const callsBefore = calls.length;
+        const response = await request(server, {
+          method: "POST",
+          path,
+          headers: trustedHeaders,
+          body,
+        });
+        assert.equal(response.status, 500, invalid.name);
+        assert.equal(calls.length, callsBefore + 1, invalid.name);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(
+          agencySignals.length,
+          0,
+          `${invalid.name}: agency signal`,
+        );
+      }
+
+      projection = successfulProjection();
       const retried = await request(server, {
         method: "POST",
         path,
@@ -4010,10 +4157,13 @@ test("owner decision retry HTTP boundary is exact, fail-closed, and signals agen
         revision: 8,
         attempt: 3,
       });
-      assert.deepEqual(calls, [
-        { itemId, expectedRevision: 7, expectedInputDigest: inputDigest },
-        { itemId, expectedRevision: 7, expectedInputDigest: inputDigest },
-      ]);
+      for (const input of calls) {
+        assert.deepEqual(input, {
+          itemId,
+          expectedRevision: 7,
+          expectedInputDigest: inputDigest,
+        });
+      }
       await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(agencySignals, [{
         trigger: "owner_retry_decision_exhaustion",

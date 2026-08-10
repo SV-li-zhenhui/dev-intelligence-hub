@@ -1286,6 +1286,7 @@ function projectOwnerRetryResult(value, expected) {
   if (
     !value ||
     typeof value !== "object" ||
+    Array.isArray(value) ||
     value.itemId !== expected.itemId ||
     value.inputDigest !== expected.expectedInputDigest ||
     value.status !== "queued" ||

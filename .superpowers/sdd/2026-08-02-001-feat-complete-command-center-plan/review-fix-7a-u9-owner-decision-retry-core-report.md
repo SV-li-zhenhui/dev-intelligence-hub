@@ -166,3 +166,67 @@ whitespace errors.
 - `test/composition-root.test.js`
 - `test/server.test.js`
 - `.superpowers/sdd/2026-08-02-001-feat-complete-command-center-plan/review-fix-7a-u9-owner-decision-retry-core-report.md`
+
+## Round 1 review fix — HTTP boundary gaps
+
+Independent review identified missing HTTP coverage for malformed item IDs,
+invalid or missing revisions and digests, non-object JSON bodies, and invalid
+service projections.
+
+### Round 1 RED
+
+The owner HTTP test was expanded first with table-driven cases. Malformed
+requests assert their exact 400/403/415 status, zero retry-port calls, and zero
+agency signals. Invalid service projections assert HTTP 500, exactly one port
+call needed to obtain the projection, and zero agency signals.
+
+Command:
+
+```powershell
+node --test --test-concurrency=1 --test-name-pattern="owner decision retry HTTP boundary" test/server.test.js
+```
+
+Observed result against the existing implementation:
+
+```text
+Exit code: 1
+tests 1
+pass 0
+fail 1
+AssertionError [ERR_ASSERTION]: array projection
+200 !== 500
+```
+
+This exposed a real fail-closed defect: `projectOwnerRetryResult` accepted an
+array carrying valid-looking named fields. The minimum production fix added an
+`Array.isArray` rejection to that projector.
+
+### Round 1 GREEN
+
+```text
+node --test --test-concurrency=1 --test-name-pattern="owner decision retry HTTP boundary" test/server.test.js
+Exit code: 0; tests 1; pass 1; fail 0
+
+node --test --test-concurrency=1 test/server.test.js test/composition-root.test.js
+Exit code: 0; tests 178; pass 178; fail 0
+
+node --check test/server.test.js
+Exit code: 0
+
+node --check src/server.js
+Exit code: 0
+
+git diff --check
+Exit code: 0
+```
+
+The first server/composition group run reached 177/178 and timed out only in
+the unrelated offline CLI fixture `default non-versioned Code Job owns one real
+offline CLI lifecycle`. No unrelated code was changed; the exact command was
+rerun and passed 178/178.
+
+Round 1 changed only:
+
+- `src/server.js`
+- `test/server.test.js`
+- this report
