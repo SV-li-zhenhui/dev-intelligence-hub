@@ -1874,6 +1874,51 @@ test("supervised CLI providers round-trip through the structured form", () => {
   }
 });
 
+test("CLI credential mode is added structurally without rewriting legacy providers", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  configuration.brainProviders["legacy-cli"] = {
+    kind: "codex-cli",
+    remote: true,
+    timeoutMs: 300_000,
+    maxResponseBytes: 131_072,
+    maxRequestBytes: 262_144,
+  };
+  const initial = createConfigurationFormState(configuration);
+  assert.equal(
+    Object.hasOwn(initial.baseDocument.brainProviders["legacy-cli"], "credentialMode"),
+    false,
+  );
+
+  const state = applyConfigurationStructureOperation(initial, {
+    operation: "add",
+    path: ["brainProviders", "legacy-cli", "credentialMode"],
+    value: "api-key",
+  });
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.equal(result.configuration.brainProviders["legacy-cli"].credentialMode, "api-key");
+
+  for (const [kind, credentialMode] of [
+    ["codex-cli", "unsupported"],
+    ["claude-cli", "codex-login"],
+    ["ollama", "api-key"],
+  ]) {
+    const invalid = structuredClone(configuration);
+    invalid.brainProviders["legacy-cli"] = {
+      kind,
+      ...(kind === "ollama"
+        ? { baseUrl: "http://127.0.0.1:11434", remote: false }
+        : { remote: true }),
+      credentialMode,
+    };
+    assert.throws(
+      () => createConfigurationFormState(invalid),
+      (error) => error?.code === "UNSUPPORTED_CONFIGURATION_SCHEMA",
+      `${kind}.${credentialMode}`,
+    );
+  }
+});
+
 test("each invalid supervised CLI numeric field produces one form issue", () => {
   for (const [providerId, field, value] of [
     ["invalid-cli-timeout", "timeoutMs", 999],

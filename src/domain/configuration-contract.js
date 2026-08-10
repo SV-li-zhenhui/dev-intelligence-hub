@@ -75,6 +75,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "apiKeyEnv",
   "protocol",
   "responseFormat",
+  "credentialMode",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -82,6 +83,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "remote",
 ]);
 const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
+const CLI_CREDENTIAL_MODES = new Set(["api-key", "codex-login"]);
 const SUPPORTED_PROVIDER_KINDS = new Set([
   "ollama",
   "openai-compatible",
@@ -522,6 +524,16 @@ function normalizeProvider(value, path, id) {
       throw invalid(path, "CLI 大脑字段组合无效");
     }
     const normalized = { kind, remote: true };
+    if (Object.hasOwn(config, "credentialMode")) {
+      const credentialMode = text(config.credentialMode, `${path}.credentialMode`, 32);
+      if (
+        !CLI_CREDENTIAL_MODES.has(credentialMode) ||
+        (kind === "claude-cli" && credentialMode !== "api-key")
+      ) {
+        throw invalid(`${path}.credentialMode`, "CLI 大脑认证方式无效");
+      }
+      normalized.credentialMode = credentialMode;
+    }
     for (const [name, [minimum, maximum]] of Object.entries(
       CLI_PROVIDER_LIMITS,
     )) {
@@ -533,6 +545,9 @@ function normalizeProvider(value, path, id) {
       );
     }
     return normalized;
+  }
+  if (Object.hasOwn(config, "credentialMode")) {
+    throw invalid(`${path}.credentialMode`, "仅 CLI 大脑支持认证方式");
   }
   if (!Object.hasOwn(config, "baseUrl")) {
     throw invalid(`${path}.baseUrl`, "缺少必需字段");
@@ -1601,7 +1616,7 @@ function authorityDirection(change) {
   const providerIdentity =
     path.startsWith("brainProviders.") &&
     (
-      /\.(?:kind|baseUrl|apiKeyEnv|protocol|responseFormat|remote)$/.test(
+      /\.(?:kind|baseUrl|apiKeyEnv|protocol|responseFormat|credentialMode|remote)$/.test(
         path,
       ) ||
       before?.kind !== undefined ||

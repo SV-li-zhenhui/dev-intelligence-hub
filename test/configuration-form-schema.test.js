@@ -396,11 +396,15 @@ test("provider variants expose fixed supervised Codex and Claude CLI forms", () 
   assert.equal(variants.get("codex-cli"), "Codex CLI（单任务受监管）");
   assert.equal(variants.get("claude-cli"), "Claude CLI（单任务受监管）");
 
-  for (const kind of ["codex-cli", "claude-cli"]) {
+  for (const [kind, credentialMode] of [
+    ["codex-cli", "codex-login"],
+    ["claude-cli", "api-key"],
+  ]) {
     const template = configurationStructureTemplate(["brainProviders"], kind);
     assert.equal(template.key, kind);
     assert.deepEqual(template.value, {
       kind,
+      credentialMode,
       remote: true,
       timeoutMs: 300_000,
       maxResponseBytes: 131_072,
@@ -418,6 +422,29 @@ test("provider variants expose fixed supervised Codex and Claude CLI forms", () 
       assert.equal(Object.hasOwn(template.value, field), false, `${kind}.${field}`);
     }
   }
+
+  const descriptor = configurationFieldDescriptor(
+    ["brainProviders", "codex-cli", "credentialMode"],
+    "codex-login",
+    { providerKind: "codex-cli" },
+  );
+  assert.deepEqual(descriptor.options, ["codex-login", "api-key"]);
+  assert.equal(descriptor.optionLabels["codex-login"], "Codex 当前登录（受管代理，推荐）");
+  assert.equal(descriptor.optionLabels["api-key"], "环境变量 API Key");
+
+  const legacySlot = configurationSlotDescriptor(
+    ["brainProviders", "legacy-cli", "credentialMode"],
+    { providerKind: "codex-cli" },
+  );
+  assert.equal(legacySlot.optional, true);
+  assert.equal(legacySlot.template, "provider-credential-mode");
+  assert.equal(
+    configurationSlotDescriptor(
+      ["brainProviders", "remote", "credentialMode"],
+      { providerKind: "openai-compatible" },
+    ),
+    null,
+  );
 });
 
 test("CLI provider field descriptors expose their exact bounded ranges", () => {

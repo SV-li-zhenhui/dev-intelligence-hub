@@ -257,7 +257,9 @@ test("settings skeleton overlays valid edits and preserves invalid raw input", (
 });
 
 test("CLI provider controls and templates render exact process limits", () => {
-  const state = createConfigurationFormState(configurationWithCliProvider());
+  const configured = configurationWithCliProvider();
+  configured.brainProviders["employee-cli"].credentialMode = "codex-login";
+  const state = createConfigurationFormState(configured);
   const markup = renderConfigurationSettingsSkeleton({ state });
 
   const timeout = controlForPath(markup, [
@@ -285,6 +287,25 @@ test("CLI provider controls and templates render exact process limits", () => {
   ]);
   assert.match(templateTimeout, / min="1000"/);
   assert.match(templateTimeout, / max="3600000"/);
+
+  assert.match(markup, /<option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option>/);
+  assert.match(markup, /<option value="api-key">环境变量 API Key<\/option>/);
+  assert.match(
+    markup,
+    /data-configuration-template-field="\[&quot;brainProviders&quot;,&quot;codex-cli&quot;,&quot;credentialMode&quot;\]" data-configuration-edit-kind="text"><option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option><option value="api-key">环境变量 API Key<\/option>/,
+  );
+
+  const legacy = configurationWithCliProvider();
+  legacy.brainProviders["employee-cli"].credentialMode = undefined;
+  delete legacy.brainProviders["employee-cli"].credentialMode;
+  const legacyMarkup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(legacy),
+  });
+  assert.match(legacyMarkup, /新增认证方式/);
+  assert.doesNotMatch(
+    legacyMarkup,
+    /data-configuration-field="\[&quot;brainProviders&quot;,&quot;employee-cli&quot;,&quot;credentialMode&quot;\]"/,
+  );
 });
 
 test("credential controls render only environment variable names and explain the boundary", () => {

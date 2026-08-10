@@ -730,6 +730,54 @@ test("supervised CLI providers are closed remote-only brain identities", () => {
   }
 });
 
+test("CLI provider credential modes remain optional legacy configuration and classify authority", () => {
+  const legacy = document();
+  legacy.brainProviders.cli = { kind: "codex-cli", remote: true };
+  assert.equal(
+    Object.hasOwn(normalizeConfigurationDocument(legacy).brainProviders.cli, "credentialMode"),
+    false,
+  );
+
+  for (const credentialMode of ["api-key", "codex-login"]) {
+    const configured = structuredClone(legacy);
+    configured.brainProviders.cli.credentialMode = credentialMode;
+    assert.equal(
+      normalizeConfigurationDocument(configured).brainProviders.cli.credentialMode,
+      credentialMode,
+    );
+  }
+
+  const login = structuredClone(legacy);
+  login.brainProviders.cli.credentialMode = "codex-login";
+  assert.deepEqual(configurationDocumentImpact(legacy, login).authority_expansion, [
+    "brainProviders.cli.credentialMode",
+  ]);
+  assert.deepEqual(configurationDocumentImpact(legacy, login).restart_required, [
+    "brainProviders.cli.credentialMode",
+  ]);
+
+  const claude = structuredClone(legacy);
+  claude.brainProviders.cli = { kind: "claude-cli", remote: true, credentialMode: "codex-login" };
+  assertInvalid(claude);
+
+  for (const provider of ["ollama", "openai-compatible"]) {
+    const nonCli = document();
+    const providerId = provider === "ollama" ? "ollama" : "openai";
+    if (provider === "openai-compatible") {
+      nonCli.brainProviders[providerId] = {
+        kind: provider,
+        baseUrl: "https://models.example/v1",
+        apiKeyEnv: "OPENAI_API_KEY",
+        remote: true,
+        credentialMode: "api-key",
+      };
+    } else {
+      nonCli.brainProviders[providerId].credentialMode = "api-key";
+    }
+    assertInvalid(nonCli);
+  }
+});
+
 test("supervised CLI provider configuration cannot widen process authority", () => {
   const cases = [
     {

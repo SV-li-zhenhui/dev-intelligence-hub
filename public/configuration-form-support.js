@@ -308,6 +308,7 @@ function assertProvider(value, path) {
       "kind",
       "baseUrl",
       "apiKeyEnv",
+      "credentialMode",
       "protocol",
       "responseFormat",
       "timeoutMs",
@@ -347,8 +348,21 @@ function assertProvider(value, path) {
         `${path}.${forbidden}`,
       );
     }
-    return;
   }
+  const isCli = CLI_PROVIDER_KINDS.has(value.kind);
+  const credentialMode = value.credentialMode ?? "api-key";
+  const invalidCredentialMode =
+    !["api-key", "codex-login"].includes(credentialMode) ||
+    (value.kind === "claude-cli" && credentialMode !== "api-key") ||
+    (!isCli && Object.hasOwn(value, "credentialMode"));
+  if (invalidCredentialMode) {
+    throw formError(
+      "UNSUPPORTED_CONFIGURATION_SCHEMA",
+      `${path}.credentialMode is unavailable for this provider`,
+      `${path}.credentialMode`,
+    );
+  }
+  if (isCli) return;
   const required = ["baseUrl"];
   if (required.some((name) => !Object.hasOwn(value, name))) {
     throw formError(
@@ -1217,6 +1231,11 @@ function providerConfigurationIssues(configuration) {
     const hasCredentialReference = Object.hasOwn(provider, "apiKeyEnv");
     const hasProtocol = Object.hasOwn(provider, "protocol");
     const hasResponseFormat = Object.hasOwn(provider, "responseFormat");
+    const credentialMode = provider.credentialMode ?? "api-key";
+    const invalidCredentialMode =
+      !["api-key", "codex-login"].includes(credentialMode) ||
+      (provider.kind === "claude-cli" && credentialMode !== "api-key") ||
+      (!isCli && Object.hasOwn(provider, "credentialMode"));
     if (
       (isCli && provider.remote !== true) ||
       (isCli && CLI_PROVIDER_FORBIDDEN_FIELDS.some((name) => Object.hasOwn(provider, name))) ||
@@ -1227,7 +1246,8 @@ function providerConfigurationIssues(configuration) {
       (!isCli && provider.kind === "ollama" && hasResponseFormat) ||
       (!isCli && hasProtocol && !["chat-completions", "responses"].includes(provider.protocol)) ||
       (!isCli && hasResponseFormat && !["json-schema", "json-object"].includes(provider.responseFormat)) ||
-      (!isCli && provider.protocol === "responses" && provider.responseFormat === "json-object")
+      (!isCli && provider.protocol === "responses" && provider.responseFormat === "json-object") ||
+      invalidCredentialMode
     ) {
       issues.push(issue(path, "INVALID_PROVIDER_CONFIGURATION", "Provider 字段组合无效。"));
     }
@@ -1283,6 +1303,12 @@ function providerConfigurationIssues(configuration) {
     }
   }
   return issues;
+}
+
+function providerContext(document, path) {
+  if (path[0] !== "brainProviders" || path.length < 3) return null;
+  const provider = document.brainProviders[path[1]];
+  return provider ? { providerKind: provider.kind } : null;
 }
 
 function conditionConfigurationIssues(condition, path, context, depth = 1) {
@@ -1823,7 +1849,7 @@ function assertNoCredentialValues(value, path = "operation.value", field = "") {
   }
 }
 
-function normalizeStructureOperation(value, seenOperations, index) {
+function normalizeStructureOperation(value, seenOperations, index, document = null) {
   if (Object.hasOwn(value, "kind") || Object.hasOwn(value, "id")) {
     return normalizeLegacyEntityOperation(value, seenOperations, index);
   }
@@ -1843,7 +1869,9 @@ function normalizeStructureOperation(value, seenOperations, index) {
   }
   const path = normalizeEditPath(value.path);
   const collection = configurationCollectionDescriptor(path);
-  const slot = collection ? null : configurationSlotDescriptor(path);
+  const slot = collection
+    ? null
+    : configurationSlotDescriptor(path, document ? providerContext(document, path) : null);
   if (!collection && !slot) {
     throw formError(
       "INVALID_ENTITY_OPERATION",
@@ -1986,7 +2014,10 @@ function applyStructureOperation(document, operation) {
   }
   const target = structureTarget(document, operation);
   if (!target) {
-    const slot = configurationSlotDescriptor(operation.path);
+    const slot = configurationSlotDescriptor(
+      operation.path,
+      providerContext(document, operation.path),
+    );
     if (!slot) {
       throw formError(
         "INVALID_ENTITY_OPERATION",
@@ -2136,7 +2167,12 @@ function normalizeFormState(state) {
   const seenOperations = new Set();
   const structureDocument = cloneConfiguration(baseDocument);
   const entityOperations = clonedOperations.map((operation, index) => {
-    const normalized = normalizeStructureOperation(operation, seenOperations, index);
+    const normalized = normalizeStructureOperation(
+      operation,
+      seenOperations,
+      index,
+      structureDocument,
+    );
     applyStructureOperation(structureDocument, normalized);
     return normalized;
   });
@@ -2251,14 +2287,15 @@ export function applyConfigurationStructureOperation(state, input) {
     ["operation", "path", "key", "index", "value"],
     ["operation", "path"],
   );
+  const document = documentWithStructureOperations(
+    snapshot.baseDocument,
+    snapshot.entityOperations,
+  );
   const operation = normalizeStructureOperation(
     operationInput,
     new Set(),
     snapshot.entityOperations.length,
-  );
-  const document = documentWithStructureOperations(
-    snapshot.baseDocument,
-    snapshot.entityOperations,
+    document,
   );
   applyStructureOperation(document, operation);
   cloneConfiguration(document);

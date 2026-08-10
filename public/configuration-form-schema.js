@@ -192,6 +192,7 @@ const LABELS = deepFreeze({
   remote: "远程端点",
   baseUrl: "服务地址",
   apiKeyEnv: "API 凭据环境变量",
+  credentialMode: "认证方式",
   responseFormat: "结构化输出模式",
   maxResponseBytes: "最大响应字节数",
   maxRequestBytes: "最大请求字节数",
@@ -319,6 +320,20 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["**", "remoteData", "code"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "remoteData", "memory"], control: "checkbox", kind: "boolean" },
   { pattern: ["brainProviders", "*", "apiKeyEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
+  {
+    pattern: ["brainProviders", "*", "credentialMode"],
+    control: "select",
+    kind: "text",
+    providerKinds: ["codex-cli", "claude-cli"],
+    optionsByProviderKind: {
+      "codex-cli": ["codex-login", "api-key"],
+      "claude-cli": ["api-key"],
+    },
+    optionLabels: {
+      "codex-login": "Codex 当前登录（受管代理，推荐）",
+      "api-key": "环境变量 API Key",
+    },
+  },
   { pattern: ["githubActions", "tokenEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
   { pattern: ["brainProviders", "*", "kind"], control: "text", kind: "text", readOnly: true },
   { pattern: ["brainProviders", "*", "protocol"], control: "select", kind: "text", options: ["chat-completions", "responses"] },
@@ -458,6 +473,14 @@ const COLLECTIONS = deepFreeze([
 
 const SLOTS = deepFreeze([
   {
+    pattern: ["brainProviders", "*", "credentialMode"],
+    label: "认证方式",
+    template: "provider-credential-mode",
+    providerKinds: ["codex-cli", "claude-cli"],
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
     pattern: ["employees", "roles", "*", "taskBrain"],
     label: "任务大脑",
     template: "task-brain",
@@ -531,6 +554,7 @@ const TEMPLATES = deepFreeze({
   },
   "provider-codex-cli": {
     kind: "codex-cli",
+    credentialMode: "codex-login",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -538,6 +562,7 @@ const TEMPLATES = deepFreeze({
   },
   "provider-claude-cli": {
     kind: "claude-cli",
+    credentialMode: "api-key",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -561,6 +586,7 @@ const TEMPLATES = deepFreeze({
     model: "qwen3.5:9b",
     remoteData: { requirements: false, code: false, memory: false },
   },
+  "provider-credential-mode": "api-key",
   intent: "ask_user",
   "github-pr-action": "review",
   "retry-minute": 5,
@@ -714,6 +740,11 @@ export function configurationFieldDescriptor(path, value, context = null) {
   const integerRule = matchingRule(INTEGER_FIELDS, normalized);
   const fieldRule = matchingRule(FIELD_RULES, normalized);
   const normalizedContext = fieldContext(context);
+  const contextualFieldRule =
+    fieldRule?.providerKinds &&
+    !fieldRule.providerKinds.includes(normalizedContext?.providerKind)
+      ? null
+      : fieldRule;
   const contextualLimits = normalizedContext && integerRule
     ? integerRule.limitsByProviderKind?.[normalizedContext.providerKind]
     : null;
@@ -728,7 +759,10 @@ export function configurationFieldDescriptor(path, value, context = null) {
           ...(contextualLimits || {}),
         }
       : {}),
-    ...(fieldRule || {}),
+    ...(contextualFieldRule || {}),
+    ...(contextualFieldRule?.optionsByProviderKind
+      ? { options: contextualFieldRule.optionsByProviderKind[normalizedContext.providerKind] }
+      : {}),
     path: normalized,
   });
 }
@@ -774,10 +808,18 @@ export function configurationCollectionDescriptor(path, value) {
   return deepFreeze({ ...descriptor, path: normalized, operations: STRUCTURE_OPERATIONS });
 }
 
-export function configurationSlotDescriptor(path) {
+export function configurationSlotDescriptor(path, context = null) {
   const normalized = normalizePath(path);
   const descriptor = matchingRule(SLOTS, normalized);
-  return descriptor ? deepFreeze({ ...descriptor, path: normalized }) : null;
+  const normalizedContext = fieldContext(context);
+  if (
+    !descriptor ||
+    (descriptor.providerKinds &&
+      !descriptor.providerKinds.includes(normalizedContext?.providerKind))
+  ) {
+    return null;
+  }
+  return deepFreeze({ ...descriptor, path: normalized });
 }
 
 function cloneTemplate(value) {

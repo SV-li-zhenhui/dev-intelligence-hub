@@ -57,15 +57,20 @@ function scalarEditKind(value) {
   return valueType === "string" ? "text" : valueType === "null" ? "scalar" : valueType;
 }
 
-function resolvedFieldDescriptor(path, value, context) {
+function resolvedProviderContext(path, context) {
   const providerKind =
-    path[0] === "brainProviders" && path.length >= 3
+    path[0] === "brainProviders" && path.length >= 2
       ? context?.providerKinds?.[path[1]]
       : null;
+  return providerKind ? { providerKind } : null;
+}
+
+function resolvedFieldDescriptor(path, value, context) {
+  const providerContext = resolvedProviderContext(path, context);
   const descriptor = configurationFieldDescriptor(
     path,
     value,
-    providerKind ? { providerKind } : null,
+    providerContext,
   );
   if (descriptor.optionsFrom === undefined) return descriptor;
   if (descriptor.optionsFrom !== "brainProviders") {
@@ -85,7 +90,7 @@ function selectControl(path, descriptor, value, attributes) {
   const options = descriptor.options
     .map((option) => {
       const selected = Object.is(option, value) ? " selected" : "";
-      const label = option === null ? "无条件" : `${option}`;
+      const label = option === null ? "无条件" : descriptor.optionLabels?.[option] || `${option}`;
       return `<option value="${escapeHtml(optionValue(option))}"${selected}>${escapeHtml(label)}</option>`;
     })
     .join("");
@@ -172,7 +177,10 @@ function renderField(path, value, context, { template = false } = {}) {
     }
     if (descriptor.control === "select") {
       const options = descriptor.options
-        .map((option) => `<option value="${escapeHtml(optionValue(option))}"${Object.is(option, value) ? " selected" : ""}>${escapeHtml(optionValue(option))}</option>`)
+        .map((option) => {
+          const label = descriptor.optionLabels?.[option] || optionValue(option);
+          return `<option value="${escapeHtml(optionValue(option))}"${Object.is(option, value) ? " selected" : ""}>${escapeHtml(label)}</option>`;
+        })
         .join("");
       return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><select data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(descriptor.kind)}">${options}</select></label>`;
     }
@@ -357,13 +365,16 @@ function optionalSlots(path, value, context) {
       ) {
         return false;
       }
-      return configurationSlotDescriptor([...path, field]) !== null;
+      return configurationSlotDescriptor(
+        [...path, field],
+        resolvedProviderContext(path, context),
+      ) !== null;
     })
     .map((descriptor) => {
       const childPath = [...path, descriptor.pattern.at(-1)];
       return renderSlotTemplate(
         childPath,
-        configurationSlotDescriptor(childPath),
+        configurationSlotDescriptor(childPath, resolvedProviderContext(path, context)),
         "add",
         context,
       );
@@ -372,7 +383,7 @@ function optionalSlots(path, value, context) {
 }
 
 function slotActions(path, value, context) {
-  const slot = configurationSlotDescriptor(path);
+  const slot = configurationSlotDescriptor(path, resolvedProviderContext(path, context));
   if (!slot) return "";
   const actions = [];
   if (slot.nullable && value === null) {
