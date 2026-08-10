@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { globSync, readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   applyTestRunnerResult,
@@ -57,7 +58,11 @@ test("the complete suite refuses an ambiguous or missing priority target", () =>
 });
 
 test("the scheduler includes every discovered test exactly once and invokes concurrency four", async () => {
-  const independentlyDiscovered = globSync("*.test.js", { cwd: testDirectory });
+  const independentlyDiscovered = readdirSync(testDirectory, {
+    withFileTypes: true,
+  })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.js"))
+    .map((entry) => entry.name);
   const discovered = discoverTestFiles(testDirectory);
   const ordered = orderTestFiles(discovered);
   const represented = ordered.map((file) =>
@@ -71,6 +76,7 @@ test("the scheduler includes every discovered test exactly once and invokes conc
     ),
   );
   assert.equal(ordered[0], PRIORITY_TEST_ENTRY_FILE);
+  assert.equal(discovered.includes("test-suite-runner.test.js"), true);
   assert.equal(ordered.includes(PRIORITY_TEST_FILE), false);
   assert.equal(
     represented.filter((file) => file === PRIORITY_TEST_FILE).length,
@@ -156,4 +162,40 @@ test("the scheduler propagates child errors, exit codes, and signals", async () 
   applyTestRunnerResult({ code: null, signal: "SIGTERM" }, signalTarget);
   assert.equal(signalTarget.exitCode, undefined);
   assert.deepEqual(signalCalls, [{ pid: 42, signal: "SIGTERM" }]);
+});
+
+test("the scheduler exposes child exit and signal failures through a real process", () => {
+  const schedulerUrl = pathToFileURL(
+    path.join(testDirectory, "run-test-suite.mjs"),
+  ).href;
+  const runResultProcess = (result) => {
+    const source = [
+      `import { applyTestRunnerResult } from ${JSON.stringify(schedulerUrl)};`,
+      `applyTestRunnerResult(${JSON.stringify(result)});`,
+    ].join("\n");
+    return spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", source],
+      { encoding: "utf8", windowsHide: true },
+    );
+  };
+
+  const failed = runResultProcess({ code: 23, signal: null });
+  assert.equal(failed.error, undefined);
+  assert.equal(failed.status, 23);
+  assert.equal(failed.signal, null);
+  assert.equal(failed.stdout, "");
+  assert.equal(failed.stderr, "");
+
+  const signalled = runResultProcess({ code: null, signal: "SIGTERM" });
+  assert.equal(signalled.error, undefined);
+  assert.equal(signalled.stdout, "");
+  assert.equal(signalled.stderr, "");
+  if (process.platform === "win32") {
+    assert.equal(signalled.status, 1);
+    assert.equal(signalled.signal, null);
+  } else {
+    assert.equal(signalled.status, null);
+    assert.equal(signalled.signal, "SIGTERM");
+  }
 });
