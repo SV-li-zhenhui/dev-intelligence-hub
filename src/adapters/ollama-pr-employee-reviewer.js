@@ -10,7 +10,15 @@ const DEFAULT_CONTEXT_TOKENS = 8_192;
 const MAX_OUTPUT_TOKENS = 1_024;
 const CHAT_TEMPLATE_ALLOWANCE_TOKENS = 512;
 const MAX_PROMPT_BYTES = 64 * 1_024;
-const MIN_PATCH_EVIDENCE_BYTES = 256;
+const PATCH_EVIDENCE_WEIGHT = 6;
+const TITLE_EVIDENCE_WEIGHT = 1;
+const FILE_EVIDENCE_WEIGHT = 1;
+const DESCRIPTION_EVIDENCE_WEIGHT = 2;
+const TOTAL_EVIDENCE_WEIGHT =
+  PATCH_EVIDENCE_WEIGHT +
+  TITLE_EVIDENCE_WEIGHT +
+  FILE_EVIDENCE_WEIGHT +
+  DESCRIPTION_EVIDENCE_WEIGHT;
 const MAX_TITLE_CODE_POINTS = 500;
 const MAX_DESCRIPTION_CODE_POINTS = 4_000;
 const MAX_FILE_PATH_CODE_POINTS = 500;
@@ -74,6 +82,11 @@ const OLLAMA_GENERATION_SCHEMA = {
 const RESULT_FIELDS = Object.freeze(Object.keys(RESULT_SCHEMA.properties));
 
 class InvalidEmployeeResultError extends Error {}
+class EmployeeTransportError extends Error {
+  constructor() {
+    super("Ollama employee transport request failed");
+  }
+}
 
 function analysisSignal(options) {
   if (options === undefined) return null;
@@ -121,6 +134,18 @@ function admittedResponse(value) {
     throw new TypeError("admitted PR employee response is invalid");
   }
   return response.value;
+}
+
+function transportResponse(fetchImpl, url, options) {
+  let response;
+  try {
+    response = fetchImpl(url, options);
+  } catch {
+    throw new EmployeeTransportError();
+  }
+  return Promise.resolve(response).catch(() => {
+    throw new EmployeeTransportError();
+  });
 }
 
 function positiveNumber(value, fallback) {
@@ -220,16 +245,20 @@ function userMessageBytes(context) {
 }
 
 function jsonStringPrefix(value, maximumEncodedBytes) {
-  if (maximumEncodedBytes < 2) return "";
+  if (maximumEncodedBytes < 2) {
+    return { text: "", truncated: value.length > 0 };
+  }
   const characters = [];
   let encodedBytes = 2;
   for (const character of value) {
     const characterBytes = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
-    if (encodedBytes + characterBytes > maximumEncodedBytes) break;
+    if (encodedBytes + characterBytes > maximumEncodedBytes) {
+      return { text: characters.join(""), truncated: true };
+    }
     characters.push(character);
     encodedBytes += characterBytes;
   }
-  return characters.join("");
+  return { text: characters.join(""), truncated: false };
 }
 
 function fitStringEvidence(
@@ -245,9 +274,10 @@ function fitStringEvidence(
     maximumEncodedBytes,
     maximumUserBytes - fixedBytes,
   );
+  const prefix = jsonStringPrefix(source, availableBytes);
   return {
-    ...withoutValue,
-    [field]: jsonStringPrefix(source, availableBytes),
+    context: { ...withoutValue, [field]: prefix.text },
+    truncated: prefix.truncated,
   };
 }
 
@@ -265,17 +295,24 @@ function fitFileEvidence(context, sourceFiles, maximumUserBytes) {
       files: [...files, { ...sourceFile, path: "" }],
     };
     const fixedBytes = userMessageBytes(withoutPath) - 2;
-    const path = jsonStringPrefix(
+    const prefix = jsonStringPrefix(
       sourceFile.path,
       maximumUserBytes - fixedBytes,
     );
-    if (path || sourceFile.path === "") {
-      const partial = { ...withoutPath, files: [...files, { ...sourceFile, path }] };
+    if (prefix.text || sourceFile.path === "") {
+      const partial = {
+        ...withoutPath,
+        files: [...files, { ...sourceFile, path: prefix.text }],
+      };
       if (userMessageBytes(partial) <= maximumUserBytes) files = partial.files;
     }
-    break;
+    return { context: { ...context, files }, truncated: true };
   }
-  return { ...context, files };
+  return { context: { ...context, files }, truncated: false };
+}
+
+function weightedEvidenceBytes(totalBytes, weight) {
+  return Math.floor((totalBytes * weight) / TOTAL_EVIDENCE_WEIGHT);
 }
 
 function contextTooSmallError() {
@@ -299,8 +336,6 @@ function fitContext(context, contextTokens) {
     ),
   );
   if (maximumUserBytes < 0) throw contextTooSmallError();
-  if (userMessageBytes(context) <= maximumUserBytes) return context;
-
   let fitted = {
     ...context,
     title: "",
@@ -313,32 +348,77 @@ function fitContext(context, contextTokens) {
     throw contextTooSmallError();
   }
 
+  const fixedBytes = userMessageBytes(fitted);
+  const evidenceBytes = maximumUserBytes - fixedBytes;
+  const patchQuota = weightedEvidenceBytes(
+    evidenceBytes,
+    PATCH_EVIDENCE_WEIGHT,
+  );
+  const titleQuota = weightedEvidenceBytes(
+    evidenceBytes,
+    TITLE_EVIDENCE_WEIGHT,
+  );
+  const fileQuota = weightedEvidenceBytes(
+    evidenceBytes,
+    FILE_EVIDENCE_WEIGHT,
+  );
+  const descriptionQuota =
+    evidenceBytes - patchQuota - titleQuota - fileQuota;
+
   fitted = fitStringEvidence(
     fitted,
     "patch",
     context.patch,
-    maximumUserBytes,
-    MIN_PATCH_EVIDENCE_BYTES + 2,
-  );
+    fixedBytes + patchQuota,
+  ).context;
   fitted = fitStringEvidence(
+    fitted,
+    "title",
+    context.title,
+    userMessageBytes(fitted) + titleQuota,
+  ).context;
+  fitted = fitFileEvidence(
+    fitted,
+    context.files,
+    userMessageBytes(fitted) + fileQuota,
+  ).context;
+  fitted = fitStringEvidence(
+    fitted,
+    "description",
+    context.description,
+    userMessageBytes(fitted) + descriptionQuota,
+  ).context;
+
+  const patch = fitStringEvidence(
+    fitted,
+    "patch",
+    context.patch,
+    maximumUserBytes,
+  );
+  fitted = patch.context;
+  const title = fitStringEvidence(
     fitted,
     "title",
     context.title,
     maximumUserBytes,
   );
-  fitted = fitStringEvidence(
+  fitted = title.context;
+  const files = fitFileEvidence(fitted, context.files, maximumUserBytes);
+  fitted = files.context;
+  const description = fitStringEvidence(
     fitted,
     "description",
     context.description,
     maximumUserBytes,
   );
-  fitted = fitFileEvidence(fitted, context.files, maximumUserBytes);
-  return fitStringEvidence(
-    fitted,
-    "patch",
-    context.patch,
-    maximumUserBytes,
-  );
+  fitted = description.context;
+  fitted.patchTruncated =
+    context.patchTruncated ||
+    patch.truncated ||
+    title.truncated ||
+    files.truncated ||
+    description.truncated;
+  return fitted;
 }
 
 function systemPrompt(mode, isRetry) {
@@ -536,7 +616,7 @@ export class OllamaPrEmployeeReviewer {
     try {
       signal?.throwIfAborted();
       const admitted = await this.admitRequest(() => ({
-        response: this.fetch(`${this.baseUrl}/api/chat`, {
+        response: transportResponse(this.fetch, `${this.baseUrl}/api/chat`, {
           method: "POST",
           redirect: "error",
           headers: { "content-type": "application/json" },
@@ -588,9 +668,9 @@ export class OllamaPrEmployeeReviewer {
         signal?.throwIfAborted();
       }
       if (abortKind === "timeout") {
-        throw new Error(`Ollama employee request timed out after ${this.timeoutMs} ms`, {
-          cause: error,
-        });
+        throw new Error(
+          `Ollama employee request timed out after ${this.timeoutMs} ms`,
+        );
       }
       throw error;
     } finally {

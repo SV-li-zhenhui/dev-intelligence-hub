@@ -47,9 +47,53 @@ exit 0
 All fixtures were synthetic. No network, GitHub, Ollama, MyDashboard runtime,
 credentials, private configuration, or real pull request was accessed.
 
+## Round 1 independent review closure
+
+- Replaced the 256-byte patch reservation with deterministic evidence growth
+  weights: 60% patch, 10% title, 10% files, and 20% description. Unused space
+  is reclaimed in patch-first order. The default-context fixture now retains a
+  unified-diff hunk, a changed line after 42 context lines, and file evidence.
+- Removed the raw-context size serialization. Patch prefixes are measured and
+  bounded incrementally by JSON-encoded UTF-8 bytes before any complete context
+  is serialized; the 8 MiB synthetic probe observes no serialized context with
+  a patch above the 64 KiB absolute ceiling.
+- Added trusted transport translation for synchronous and asynchronous `fetch`
+  rejection and removed timeout causes. External abort still returns the exact
+  abort reason, while action-admission failures remain untranslated.
+
+Round 1 RED against committed HEAD `ae3e51b`:
+
+```text
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js
+tests 25; pass 19; fail 6
+```
+
+The failures showed the changed diff line was omitted, the full 8 MiB patch was
+serialized during preprocessing, both transport markers were returned, and a
+timeout exposed hostile nested causes. After the packing-only change, 21 tests
+passed and only the four transport/timeout checks remained RED.
+
+Round 1 GREEN:
+
+```text
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js
+tests 25; pass 25; fail 0
+
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js test/proactive-pr-employee.test.js test/proactive-pr-confirmation-integration.test.js
+tests 86; pass 86; fail 0
+
+node --check src/adapters/ollama-pr-employee-reviewer.js
+exit 0
+
+node --check test/ollama-pr-employee-reviewer.test.js
+exit 0
+```
+
 ## Residual concern
 
 The byte-per-token bound is intentionally conservative, so multilingual or
 heavily escaped evidence may be omitted earlier than a tokenizer-specific
 estimate would require. This is the safety tradeoff required to prevent prompt
-prefix truncation without calling a model tokenizer.
+prefix truncation without calling a model tokenizer. Patch retention remains
+prefix-based rather than semantic diff parsing, so later hunks can still be
+omitted when a patch exceeds its bounded allocation.

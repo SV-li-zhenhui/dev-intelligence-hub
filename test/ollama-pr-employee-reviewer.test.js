@@ -148,6 +148,17 @@ function hasLoneSurrogate(value) {
   return false;
 }
 
+function errorChainIncludes(error, marker) {
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if (String(current.message || "").includes(marker)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
 function readyAdmissionGate() {
   const gate = new ActionAdmissionGate();
   gate.bindEffective(CONFIGURATION_V1);
@@ -240,6 +251,88 @@ test("reserves output and template capacity while reusing fitted facts on retry"
   assert.ok(
     calls[1].messages[0].content.length > calls[0].messages[0].content.length,
   );
+});
+
+test("default packing retains a unified-diff hunk, changed line, and file evidence", async () => {
+  const hunk = [
+    "diff --git a/src/review-boundary.js b/src/review-boundary.js",
+    "index 1111111..2222222 100644",
+    "--- a/src/review-boundary.js",
+    "+++ b/src/review-boundary.js",
+    "@@ -120,45 +120,46 @@ function reviewInput(raw) {",
+    ...Array.from(
+      { length: 42 },
+      (_, index) => ` context line ${String(index).padStart(2, "0")} keeps surrounding evidence stable`,
+    ),
+    "+const reviewBoundary = enforceTrustedInput(raw);",
+    " return reviewBoundary;",
+  ].join("\n");
+  let request;
+  const reviewer = new OllamaPrEmployeeReviewer({
+    fetch: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return response(reviewDraft());
+    },
+  });
+
+  await reviewer.analyze(context({
+    title: "Large review boundary refactor ".repeat(100),
+    description: "Detailed architectural explanation. ".repeat(500),
+    files: Array.from({ length: 20 }, (_, index) => ({
+      path: `src/review-${index}.js`,
+      additions: index + 1,
+      deletions: index,
+    })),
+    patch: `${hunk}\n${" trailing patch evidence".repeat(1_000)}`,
+  }));
+
+  assertFitsContext(request, 8_192);
+  const facts = JSON.parse(request.messages[1].content);
+  assert.match(facts.patch, /@@ -120,45 \+120,46 @@/);
+  assert.match(
+    facts.patch,
+    /\+const reviewBoundary = enforceTrustedInput\(raw\);/,
+  );
+  assert.equal(facts.files.some(({ path }) => path === "src/review-0.js"), true);
+});
+
+test("bounds raw patch preprocessing before serializing a complete context", async () => {
+  const rawPatch = "x".repeat(8 * 1_024 * 1_024);
+  const originalStringify = JSON.stringify;
+  let largestSerializedPatch = 0;
+  let request;
+  JSON.stringify = function instrumentedStringify(value, ...parameters) {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      typeof value.patch === "string"
+    ) {
+      largestSerializedPatch = Math.max(
+        largestSerializedPatch,
+        value.patch.length,
+      );
+    }
+    return originalStringify(value, ...parameters);
+  };
+
+  try {
+    const reviewer = new OllamaPrEmployeeReviewer({
+      fetch: async (_url, options) => {
+        request = JSON.parse(options.body);
+        return response(reviewDraft());
+      },
+    });
+    await reviewer.analyze(context({ patch: rawPatch }));
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+
+  assert.ok(largestSerializedPatch <= MAX_PROMPT_BYTES);
+  assertFitsContext(request, 8_192);
+  const facts = JSON.parse(request.messages[1].content);
+  assert.equal(facts.patchTruncated, true);
+  assert.ok(facts.patch.length < rawPatch.length);
 });
 
 test("deterministically packs escaped multilingual evidence on code-point boundaries", async () => {
@@ -466,6 +559,71 @@ test("does not reflect untrusted provider or model text in errors", async (t) =>
       return true;
     });
     assert.equal(calls, 1);
+  });
+});
+
+test("sanitizes synchronous and asynchronous transport rejections", async (t) => {
+  for (const scenario of [
+    {
+      name: "synchronous rejection",
+      marker: "HOSTILE_SYNC_TRANSPORT",
+      fetch() {
+        throw new Error(this.marker);
+      },
+    },
+    {
+      name: "asynchronous rejection",
+      marker: "HOSTILE_ASYNC_TRANSPORT",
+      async fetch() {
+        throw new Error(this.marker);
+      },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      let calls = 0;
+      const reviewer = new OllamaPrEmployeeReviewer({
+        fetch(...parameters) {
+          calls += 1;
+          return scenario.fetch(...parameters);
+        },
+      });
+
+      await assert.rejects(reviewer.analyze(context()), (error) => {
+        assert.match(error.message, /Ollama employee transport request failed/);
+        assert.equal(errorChainIncludes(error, scenario.marker), false);
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+test("timeout errors discard hostile nested transport causes", async () => {
+  const outerMarker = "HOSTILE_TIMEOUT_TRANSPORT";
+  const innerMarker = "HOSTILE_NESTED_CAUSE";
+  const reviewer = new OllamaPrEmployeeReviewer({
+    timeoutMs: 10,
+    fetch: async (_url, options) =>
+      new Promise((_resolve, reject) => {
+        const rejectOnAbort = () => {
+          reject(
+            new Error(outerMarker, {
+              cause: new Error(innerMarker),
+            }),
+          );
+        };
+        options.signal.addEventListener("abort", rejectOnAbort, { once: true });
+        if (options.signal.aborted) rejectOnAbort();
+      }),
+  });
+
+  await assert.rejects(reviewer.analyze(context()), (error) => {
+    assert.match(error.message, /timed out after 10 ms/);
+    assert.equal(errorChainIncludes(error, outerMarker), false);
+    assert.equal(errorChainIncludes(error, innerMarker), false);
+    assert.equal(error.cause, undefined);
+    return true;
   });
 });
 
