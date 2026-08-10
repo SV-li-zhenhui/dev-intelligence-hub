@@ -232,6 +232,24 @@ function deferred() {
   return { promise, resolve };
 }
 
+async function waitForCausalOutcome(outcomes, probe, description) {
+  let settled = null;
+  for (const [name, promise] of outcomes) {
+    void Promise.resolve(promise).then(
+      (value) => { settled ??= { name, value, error: null }; },
+      (error) => { settled ??= { name, value: null, error }; },
+    );
+  }
+  for (let attempt = 0; attempt < 10_000 && settled === null; attempt += 1) {
+    await probe();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  if (settled === null) {
+    throw new Error(`${description} did not occur within its causal poll bound`);
+  }
+  return settled;
+}
+
 function successfulProcess(stdoutBytes = Buffer.alloc(0)) {
   const bytes = Buffer.from(stdoutBytes);
   return {
@@ -778,6 +796,7 @@ test("an unsettled stale scan holds one cross-kind root lease after cancellation
 });
 
 test("CLI discovery and initialization consume the runner's one total deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const parent = await temporaryDirectory(t, "supervised-cli-total-deadline-");
   const temporaryRoot = path.join(parent, "runtime");
   let monotonicTime = 10_000;
@@ -810,7 +829,11 @@ test("CLI discovery and initialization consume the runner's one total deadline",
     },
   );
 
-  assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
+  try {
+    assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
+  } finally {
+    t.mock.timers.reset();
+  }
   assert.equal(discoverySignal instanceof AbortSignal, true);
   assert.equal(scavengeSignal, discoverySignal);
   assert.equal(runner.calls.length, 1);
@@ -2227,10 +2250,11 @@ test("provider returns at its total deadline while the real Windows runner settl
 });
 
 test("a never-settling process stays handled and permanently blocks close and cross-kind routing", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const parent = await temporaryDirectory(t, "supervised-cli-never-settles-");
   const temporaryRoot = path.join(parent, "runtime");
   let clockReads = 0;
-  let processStarted = false;
+  const processStarted = deferred();
   const unhandled = [];
   const onUnhandled = (error) => unhandled.push(error);
   process.on("unhandledRejection", onUnhandled);
@@ -2239,7 +2263,7 @@ test("a never-settling process stays handled and permanently blocks close and cr
     { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
     {
       processRunner: recordingRunner(async () => {
-        processStarted = true;
+        processStarted.resolve();
         return new Promise(() => {});
       }),
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
@@ -2252,8 +2276,28 @@ test("a never-settling process stays handled and permanently blocks close and cr
     provider.generate(brainRequest()),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  await publicResult;
-  assert.equal(processStarted, true);
+  try {
+    const admission = await waitForCausalOutcome(
+      [
+        ["process-started", processStarted.promise],
+        ["public-result", publicResult],
+      ],
+      async () => {
+        try {
+          await lstat(temporaryRoot);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      },
+      "never-settling runner admission",
+    );
+    if (admission.error) throw admission.error;
+    assert.equal(admission.name, "process-started");
+    t.mock.timers.runAll();
+  } finally {
+    t.mock.timers.reset();
+  }
+  await within(250, publicResult);
 
   await assert.rejects(
     within(250, provider.close()),
@@ -2681,14 +2725,24 @@ test("a staggered provider reaches its isolated runner while the first process r
   const first = firstProvider.generate(brainRequest());
   await firstAtRunner;
   const second = secondProvider.generate(brainRequest());
-  const secondReachedBeforeRelease = await Promise.race([
-    secondAtRunner.then(() => true),
-    new Promise((resolve) => setTimeout(() => resolve(false), 300)),
-  ]);
-  releaseProcesses();
-  const outcomes = await within(3_000, Promise.allSettled([first, second]));
+  const settled = Promise.allSettled([first, second]);
+  let secondAdmission;
+  try {
+    secondAdmission = await waitForCausalOutcome(
+      [
+        ["process-started", secondAtRunner],
+        ["public-result", second],
+      ],
+      () => lstat(temporaryRoot),
+      "staggered provider runner admission",
+    );
+  } finally {
+    releaseProcesses();
+  }
+  if (secondAdmission.error) throw secondAdmission.error;
+  const outcomes = await within(3_000, settled);
 
-  assert.equal(secondReachedBeforeRelease, true);
+  assert.equal(secondAdmission.name, "process-started");
   assert.deepEqual(outcomes.map(({ status }) => status), [
     "fulfilled",
     "fulfilled",

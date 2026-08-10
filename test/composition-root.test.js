@@ -539,6 +539,24 @@ async function within(milliseconds, promise) {
   }
 }
 
+async function waitForCausalOutcome(outcomes, probe, description) {
+  let settled = null;
+  for (const [name, promise] of outcomes) {
+    void Promise.resolve(promise).then(
+      (value) => { settled ??= { name, value, error: null }; },
+      (error) => { settled ??= { name, value: null, error }; },
+    );
+  }
+  for (let attempt = 0; attempt < 10_000 && settled === null; attempt += 1) {
+    await probe();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  if (settled === null) {
+    throw new Error(`${description} did not occur within its causal poll bound`);
+  }
+  return settled;
+}
+
 async function runOfflineFixtureCommand(command, arguments_, {
   cwd,
   env,
@@ -867,7 +885,7 @@ async function createOfflineProductionCliFixture(t, name) {
         .filter((value) => Number.isSafeInteger(value) && value > 0);
     },
     async waitForStart(previousNames, signal) {
-      while (!signal?.aborted) {
+      for (let attempt = 0; attempt < 2_000 && !signal?.aborted; attempt += 1) {
         for (const name of await invocationNames()) {
           if (previousNames.has(name)) continue;
           const invocation = path.join(runtimeRoot, name);
@@ -880,7 +898,8 @@ async function createOfflineProductionCliFixture(t, name) {
         }
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      return null;
+      if (signal?.aborted) return null;
+      throw new Error("offline CLI did not publish its start marker within its causal poll bound");
     },
     release(invocation) {
       return writeFile(
@@ -4378,6 +4397,7 @@ test("application close stays bounded and incomplete while a configured provider
       monotonicClock: () => clockReads++ === 0 ? 0 : 600,
     },
   );
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const request = assert.rejects(
     provider.generate({
       model: "bounded-model",
@@ -4391,8 +4411,22 @@ test("application close stays bounded and incomplete while a configured provider
     }),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  await within(500, started);
-  await within(500, request);
+  try {
+    const admission = await waitForCausalOutcome(
+      [
+        ["process-started", started],
+        ["public-result", request],
+      ],
+      () => access(temporaryRoot),
+      "configured provider runner admission",
+    );
+    if (admission.error) throw admission.error;
+    assert.equal(admission.name, "process-started");
+    t.mock.timers.runAll();
+  } finally {
+    t.mock.timers.reset();
+  }
+  await within(250, request);
 
   const config = workCoordinationConfig({ externalActions: false });
   config.brainProviders = { cli: { kind: "codex-cli" } };
@@ -4537,6 +4571,7 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
     }),
     operationsRuntimeFactory: () => Object.freeze({}),
   });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const decisionOutcome = calls.codeJobRuntime.brainDirectory.decide(
     {
       roleId: "developer",
@@ -4560,11 +4595,25 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
     () => null,
     (error) => error,
   );
-  const admission = await within(2_000, Promise.race([
-    started.then(() => ({ started: true, error: null })),
-    decisionOutcome.then((error) => ({ started: false, error })),
-  ]));
-  assert.equal(admission.started, true, admission.error?.stack);
+  try {
+    const admission = await waitForCausalOutcome(
+      [
+        ["process-started", started],
+        ["decision-outcome", decisionOutcome],
+      ],
+      () => access(temporaryRoot),
+      "non-versioned Code Job runner admission",
+    );
+    if (admission.error) throw admission.error;
+    assert.equal(
+      admission.name,
+      "process-started",
+      admission.value?.stack,
+    );
+    t.mock.timers.runAll();
+  } finally {
+    t.mock.timers.reset();
+  }
   assert.equal(
     (await within(500, decisionOutcome))?.code,
     "STRUCTURED_PROVIDER_CLEANUP_FAILED",
