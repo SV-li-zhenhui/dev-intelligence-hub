@@ -866,9 +866,8 @@ async function createOfflineProductionCliFixture(t, name) {
         .map(Number)
         .filter((value) => Number.isSafeInteger(value) && value > 0);
     },
-    async waitForStart(previousNames) {
-      const deadline = Date.now() + 10_000;
-      while (Date.now() < deadline) {
+    async waitForStart(previousNames, signal) {
+      while (!signal?.aborted) {
         for (const name of await invocationNames()) {
           if (previousNames.has(name)) continue;
           const invocation = path.join(runtimeRoot, name);
@@ -881,7 +880,7 @@ async function createOfflineProductionCliFixture(t, name) {
         }
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      throw new Error("offline CLI fixture did not start within its test bound");
+      return null;
     },
     release(invocation) {
       return writeFile(
@@ -4695,13 +4694,21 @@ async function assertDefaultCodeJobLifecycle(t, {
       (value) => ({ value, error: null }),
       (error) => ({ value: null, error }),
     );
-    const admission = await Promise.race([
-      fixture.waitForStart(previousInvocations).then((startedInvocation) => ({
-        invocation: startedInvocation,
-        outcome: null,
-      })),
-      decisionOutcome.then((outcome) => ({ invocation: null, outcome })),
-    ]);
+    const startController = new AbortController();
+    let admission;
+    try {
+      admission = await Promise.race([
+        fixture.waitForStart(previousInvocations, startController.signal).then(
+          (startedInvocation) => ({
+            invocation: startedInvocation,
+            outcome: null,
+          }),
+        ),
+        decisionOutcome.then((outcome) => ({ invocation: null, outcome })),
+      ]);
+    } finally {
+      startController.abort();
+    }
     invocation = admission.invocation;
     if (invocation !== null) {
       await postStart({

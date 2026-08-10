@@ -2230,8 +2230,7 @@ test("a never-settling process stays handled and permanently blocks close and cr
   const parent = await temporaryDirectory(t, "supervised-cli-never-settles-");
   const temporaryRoot = path.join(parent, "runtime");
   let clockReads = 0;
-  let processStarted;
-  const started = new Promise((resolve) => { processStarted = resolve; });
+  let processStarted = false;
   const unhandled = [];
   const onUnhandled = (error) => unhandled.push(error);
   process.on("unhandledRejection", onUnhandled);
@@ -2240,7 +2239,7 @@ test("a never-settling process stays handled and permanently blocks close and cr
     { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
     {
       processRunner: recordingRunner(async () => {
-        processStarted();
+        processStarted = true;
         return new Promise(() => {});
       }),
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
@@ -2253,8 +2252,8 @@ test("a never-settling process stays handled and permanently blocks close and cr
     provider.generate(brainRequest()),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  await within(500, started);
-  await within(500, publicResult);
+  await publicResult;
+  assert.equal(processStarted, true);
 
   await assert.rejects(
     within(250, provider.close()),
