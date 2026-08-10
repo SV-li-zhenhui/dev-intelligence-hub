@@ -11,6 +11,52 @@ const CONFIGURATION_V2 = Object.freeze({
   version: 2,
   configurationDigest: "2".repeat(64),
 });
+const MAX_OUTPUT_TOKENS = 1_024;
+const CHAT_TEMPLATE_ALLOWANCE_TOKENS = 512;
+const MAX_PROMPT_BYTES = 64 * 1_024;
+const EXPECTED_GENERATION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "workType",
+    "summary",
+    "confidence",
+    "evidence",
+    "steps",
+    "questions",
+    "reviewVerdict",
+    "reviewBody",
+    "requiresApproval",
+  ],
+  properties: {
+    workType: { type: "string", enum: ["review_draft", "owner_plan"] },
+    summary: { type: "string", minLength: 1, maxLength: 1_000 },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    evidence: {
+      type: "array",
+      minItems: 1,
+      maxItems: 12,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    steps: {
+      type: "array",
+      minItems: 1,
+      maxItems: 8,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    questions: {
+      type: "array",
+      maxItems: 5,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    reviewVerdict: {
+      type: "string",
+      enum: ["approve", "comment", "request_changes", "none"],
+    },
+    reviewBody: { type: "string" },
+    requiresApproval: { type: "boolean" },
+  },
+};
 
 function response(result, { ok = true, status = 200 } = {}) {
   return {
@@ -68,6 +114,40 @@ function deferred() {
   return { promise, resolve };
 }
 
+function assertFitsContext(request, contextTokens) {
+  const messageBytes = request.messages.reduce(
+    (total, message) => total + Buffer.byteLength(message.content, "utf8"),
+    0,
+  );
+  assert.ok(
+    messageBytes + CHAT_TEMPLATE_ALLOWANCE_TOKENS + MAX_OUTPUT_TOKENS <=
+      contextTokens,
+    `request used ${messageBytes} message bytes with a ${contextTokens}-token context`,
+  );
+  return messageBytes;
+}
+
+function hasLoneSurrogate(value) {
+  if (typeof value === "string") {
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(index + 1);
+        if (next < 0xdc00 || next > 0xdfff) return true;
+        index += 1;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (Array.isArray(value)) return value.some(hasLoneSurrogate);
+  if (value && typeof value === "object") {
+    return Object.values(value).some(hasLoneSurrogate);
+  }
+  return false;
+}
+
 function readyAdmissionGate() {
   const gate = new ActionAdmissionGate();
   gate.bindEffective(CONFIGURATION_V1);
@@ -102,6 +182,291 @@ test("creates a schema-constrained review draft from untrusted PR context", asyn
   const facts = JSON.parse(calls[0].request.messages[1].content);
   assert.equal(facts.patch, context().patch);
   assert.equal(facts.url, undefined);
+});
+
+test("uses an Ollama generation schema without weakening review-body validation", async () => {
+  const calls = [];
+  const reviewer = new OllamaPrEmployeeReviewer({
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return response(reviewDraft({ reviewBody: "审".repeat(8_001) }));
+    },
+  });
+
+  await assert.rejects(
+    reviewer.analyze(context()),
+    /invalid Ollama employee result.*reviewBody.*8,?000/i,
+  );
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.deepEqual(call.format, EXPECTED_GENERATION_SCHEMA);
+    assert.equal(
+      call.messages[0].content.includes(JSON.stringify(EXPECTED_GENERATION_SCHEMA)),
+      true,
+    );
+  }
+});
+
+test("reserves output and template capacity while reusing fitted facts on retry", async () => {
+  const contextTokens = 5_500;
+  const calls = [];
+  const reviewer = new OllamaPrEmployeeReviewer({
+    contextTokens,
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return response(
+        calls.length === 1
+          ? reviewDraft({
+              workType: "owner_plan",
+              reviewVerdict: "none",
+              reviewBody: "",
+              requiresApproval: false,
+            })
+          : reviewDraft(),
+      );
+    },
+  });
+
+  await reviewer.analyze(context({ patch: "large patch\n".repeat(4_000) }));
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.options.num_ctx, contextTokens);
+    assert.equal(call.options.num_predict, MAX_OUTPUT_TOKENS);
+    assertFitsContext(call, contextTokens);
+  }
+  assert.equal(calls[0].messages[1].content, calls[1].messages[1].content);
+  assert.ok(
+    calls[1].messages[0].content.length > calls[0].messages[0].content.length,
+  );
+});
+
+test("deterministically packs escaped multilingual evidence on code-point boundaries", async () => {
+  const contextTokens = 1_000_000;
+  const mixed = `ASCII中文😀"\\\n`;
+  const oversized = context({
+    title: `${"t".repeat(499)}😀${mixed.repeat(500)}`,
+    description: `${"d".repeat(3_999)}😀${mixed.repeat(500)}`,
+    files: Array.from({ length: 220 }, (_, index) => ({
+      path: `${index}-${"p".repeat(496)}😀${mixed.repeat(10)}`,
+      additions: index + 1,
+      deletions: index,
+    })),
+    patch: mixed.repeat(20_000),
+  });
+
+  async function capturePackedRequest() {
+    let request;
+    const reviewer = new OllamaPrEmployeeReviewer({
+      contextTokens,
+      fetch: async (_url, options) => {
+        request = JSON.parse(options.body);
+        return response(reviewDraft());
+      },
+    });
+    await reviewer.analyze(oversized);
+    return request;
+  }
+
+  const first = await capturePackedRequest();
+  const second = await capturePackedRequest();
+  const packed = JSON.parse(first.messages[1].content);
+
+  const messageBytes = assertFitsContext(first, contextTokens);
+  assert.ok(messageBytes <= MAX_PROMPT_BYTES);
+  assert.equal(first.messages[1].content, second.messages[1].content);
+  assert.equal(hasLoneSurrogate(packed), false);
+  assert.equal(packed.patchTruncated, true);
+  assert.ok(packed.patch.length > 0);
+  assert.ok(packed.patch.length < oversized.patch.length);
+});
+
+test("preserves fixed facts and rejects approval when evidence fitting truncates", async () => {
+  const calls = [];
+  const reviewer = new OllamaPrEmployeeReviewer({
+    contextTokens: 4_800,
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return response(reviewDraft({ reviewVerdict: "approve" }));
+    },
+  });
+  const input = context({
+    id: "github:pr:fixed/repo#77",
+    repo: "fixed/repo",
+    number: 77,
+    relation: "team_review_requested",
+    gitTargetAvailable: false,
+    githubAccount: "account-fixed",
+    baseRepository: "fixed/base",
+    baseRefName: "main",
+    baseRefOid: "base-fixed",
+    headRepository: "fixed/head",
+    headRefName: "feature/fixed",
+    headRefOid: "head-fixed",
+    ciStatus: "FAILURE",
+    mergeStateStatus: "BLOCKED",
+    requestedAction: "review",
+    workMode: "review",
+    title: "title evidence ".repeat(1_000),
+    description: "description evidence ".repeat(1_000),
+    patch: "patch evidence\n".repeat(10_000),
+  });
+
+  await assert.rejects(
+    reviewer.analyze(input),
+    /invalid Ollama employee result.*truncated patch/i,
+  );
+
+  assert.equal(calls.length, 2);
+  const facts = JSON.parse(calls[0].messages[1].content);
+  assert.deepEqual(
+    {
+      id: facts.id,
+      repository: facts.repository,
+      number: facts.number,
+      relation: facts.relation,
+      gitTargetAvailable: facts.gitTargetAvailable,
+      githubAccount: facts.githubAccount,
+      baseRepository: facts.baseRepository,
+      baseRefName: facts.baseRefName,
+      baseRefOid: facts.baseRefOid,
+      headRepository: facts.headRepository,
+      headRefName: facts.headRefName,
+      headRefOid: facts.headRefOid,
+      ciStatus: facts.ciStatus,
+      mergeStateStatus: facts.mergeStateStatus,
+      requestedAction: facts.requestedAction,
+      workMode: facts.workMode,
+    },
+    {
+      id: "github:pr:fixed/repo#77",
+      repository: "fixed/repo",
+      number: 77,
+      relation: "team_review_requested",
+      gitTargetAvailable: false,
+      githubAccount: "account-fixed",
+      baseRepository: "fixed/base",
+      baseRefName: "main",
+      baseRefOid: "base-fixed",
+      headRepository: "fixed/head",
+      headRefName: "feature/fixed",
+      headRefOid: "head-fixed",
+      ciStatus: "FAILURE",
+      mergeStateStatus: "BLOCKED",
+      requestedAction: "review",
+      workMode: "review",
+    },
+  );
+  assert.equal(facts.patchTruncated, true);
+  assert.ok(facts.patch.length > 0);
+  assert.equal(calls[0].messages[1].content, calls[1].messages[1].content);
+});
+
+test("rejects a context too small for fixed facts before admission or fetch", async () => {
+  let admissions = 0;
+  let fetches = 0;
+  const reviewer = new OllamaPrEmployeeReviewer({
+    contextTokens: 1_024,
+    actionAdmissionGate: {
+      run(operation) {
+        admissions += 1;
+        return operation();
+      },
+    },
+    fetch: async () => {
+      fetches += 1;
+      return response(reviewDraft());
+    },
+  });
+
+  await assert.rejects(
+    reviewer.analyze(context()),
+    /configured context.*too small/i,
+  );
+  assert.equal(admissions, 0);
+  assert.equal(fetches, 0);
+});
+
+test("does not reflect untrusted provider or model text in errors", async (t) => {
+  const cases = [
+    {
+      name: "Markdown model prose",
+      marker: "BADPROSE",
+      makeResponse(marker) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { message: { content: `${marker}\n\`\`\`json\n{}\n\`\`\`` } };
+          },
+        };
+      },
+    },
+    {
+      name: "invalid API JSON",
+      marker: "HOSTILE_API_JSON",
+      makeResponse(marker) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            throw new Error(marker);
+          },
+        };
+      },
+    },
+    {
+      name: "unexpected property name",
+      marker: "HOSTILE_PROPERTY_NAME",
+      makeResponse(marker) {
+        return response(reviewDraft({ [marker]: true }));
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      let calls = 0;
+      const reviewer = new OllamaPrEmployeeReviewer({
+        fetch: async () => {
+          calls += 1;
+          return scenario.makeResponse(scenario.marker);
+        },
+      });
+
+      await assert.rejects(reviewer.analyze(context()), (error) => {
+        assert.match(error.message, /invalid Ollama employee result/i);
+        assert.equal(error.message.includes(scenario.marker), false);
+        return true;
+      });
+      assert.equal(calls, 2);
+    });
+  }
+
+  await t.test("hostile HTTP body", async () => {
+    const marker = "HOSTILE_HTTP_BODY";
+    let calls = 0;
+    const reviewer = new OllamaPrEmployeeReviewer({
+      fetch: async () => {
+        calls += 1;
+        return {
+          ok: false,
+          status: 503,
+          async text() {
+            return marker;
+          },
+        };
+      },
+    });
+
+    await assert.rejects(reviewer.analyze(context()), (error) => {
+      assert.match(error.message, /HTTP 503/);
+      assert.equal(error.message.includes(marker), false);
+      return true;
+    });
+    assert.equal(calls, 1);
+  });
 });
 
 test("owner work produces an internal plan that never enters approval", async () => {

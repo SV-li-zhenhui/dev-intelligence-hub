@@ -7,6 +7,14 @@ const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
+const MAX_OUTPUT_TOKENS = 1_024;
+const CHAT_TEMPLATE_ALLOWANCE_TOKENS = 512;
+const MAX_PROMPT_BYTES = 64 * 1_024;
+const MIN_PATCH_EVIDENCE_BYTES = 256;
+const MAX_TITLE_CODE_POINTS = 500;
+const MAX_DESCRIPTION_CODE_POINTS = 4_000;
+const MAX_FILE_PATH_CODE_POINTS = 500;
+const MAX_FILES = 200;
 const DIRECT_ACTION_ADMISSION = Object.freeze({
   run(operation) {
     return operation();
@@ -53,6 +61,13 @@ const RESULT_SCHEMA = {
     reviewVerdict: { type: "string", enum: REVIEW_VERDICTS },
     reviewBody: { type: "string", maxLength: 8_000 },
     requiresApproval: { type: "boolean" },
+  },
+};
+const OLLAMA_GENERATION_SCHEMA = {
+  ...RESULT_SCHEMA,
+  properties: {
+    ...RESULT_SCHEMA.properties,
+    reviewBody: { type: "string" },
   },
 };
 
@@ -120,6 +135,17 @@ function safeGitTarget(value) {
   }
 }
 
+function boundedCodePoints(value, maximumCodePoints) {
+  const source = String(value || "");
+  const characters = [];
+  for (const character of source) {
+    if (characters.length === maximumCodePoints) break;
+    characters.push(character);
+  }
+  const text = characters.join("");
+  return { text, truncated: text.length < source.length };
+}
+
 function normalizeBaseUrl(value, allowRemoteCodeContext) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol)) {
@@ -143,12 +169,29 @@ function normalizeBaseUrl(value, allowRemoteCodeContext) {
 
 function selectContext(context) {
   const gitTarget = safeGitTarget(context.gitTarget);
+  const title = boundedCodePoints(context.title, MAX_TITLE_CODE_POINTS);
+  const description = boundedCodePoints(
+    context.description,
+    MAX_DESCRIPTION_CODE_POINTS,
+  );
+  const sourceFiles = Array.isArray(context.files) ? context.files : [];
+  let evidenceTruncated =
+    title.truncated || description.truncated || sourceFiles.length > MAX_FILES;
+  const files = sourceFiles.slice(0, MAX_FILES).map((file) => {
+    const path = boundedCodePoints(file.path, MAX_FILE_PATH_CODE_POINTS);
+    evidenceTruncated ||= path.truncated;
+    return {
+      path: path.text,
+      additions: Number(file.additions) || 0,
+      deletions: Number(file.deletions) || 0,
+    };
+  });
   return {
     id: context.id || "",
     repository: context.repo || "",
     number: context.number ?? null,
-    title: String(context.title || "").slice(0, 500),
-    description: String(context.description || "").slice(0, 4_000),
+    title: title.text,
+    description: description.text,
     relation: context.relation || "",
     gitTargetAvailable:
       context.gitTargetAvailable === true && gitTarget !== null,
@@ -166,16 +209,136 @@ function selectContext(context) {
     mergeStateStatus: context.mergeStateStatus || "",
     requestedAction: context.requestedAction || "",
     workMode: context.workMode || "",
-    files: (Array.isArray(context.files) ? context.files : [])
-      .slice(0, 200)
-      .map((file) => ({
-        path: String(file.path || "").slice(0, 500),
-        additions: Number(file.additions) || 0,
-        deletions: Number(file.deletions) || 0,
-      })),
+    files,
     patch: String(context.patch || ""),
-    patchTruncated: Boolean(context.patchTruncated),
+    patchTruncated: Boolean(context.patchTruncated) || evidenceTruncated,
   };
+}
+
+function userMessageBytes(context) {
+  return Buffer.byteLength(JSON.stringify(context), "utf8");
+}
+
+function jsonStringPrefix(value, maximumEncodedBytes) {
+  if (maximumEncodedBytes < 2) return "";
+  const characters = [];
+  let encodedBytes = 2;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
+    if (encodedBytes + characterBytes > maximumEncodedBytes) break;
+    characters.push(character);
+    encodedBytes += characterBytes;
+  }
+  return characters.join("");
+}
+
+function fitStringEvidence(
+  context,
+  field,
+  source,
+  maximumUserBytes,
+  maximumEncodedBytes = Number.POSITIVE_INFINITY,
+) {
+  const withoutValue = { ...context, [field]: "" };
+  const fixedBytes = userMessageBytes(withoutValue) - 2;
+  const availableBytes = Math.min(
+    maximumEncodedBytes,
+    maximumUserBytes - fixedBytes,
+  );
+  return {
+    ...withoutValue,
+    [field]: jsonStringPrefix(source, availableBytes),
+  };
+}
+
+function fitFileEvidence(context, sourceFiles, maximumUserBytes) {
+  let files = [];
+  for (const sourceFile of sourceFiles) {
+    const complete = { ...context, files: [...files, sourceFile] };
+    if (userMessageBytes(complete) <= maximumUserBytes) {
+      files = complete.files;
+      continue;
+    }
+
+    const withoutPath = {
+      ...context,
+      files: [...files, { ...sourceFile, path: "" }],
+    };
+    const fixedBytes = userMessageBytes(withoutPath) - 2;
+    const path = jsonStringPrefix(
+      sourceFile.path,
+      maximumUserBytes - fixedBytes,
+    );
+    if (path || sourceFile.path === "") {
+      const partial = { ...withoutPath, files: [...files, { ...sourceFile, path }] };
+      if (userMessageBytes(partial) <= maximumUserBytes) files = partial.files;
+    }
+    break;
+  }
+  return { ...context, files };
+}
+
+function contextTooSmallError() {
+  return new Error(
+    "Ollama employee configured context is too small for trusted fixed facts",
+  );
+}
+
+function fitContext(context, contextTokens) {
+  const retrySystemBytes = Buffer.byteLength(
+    systemPrompt(context.workMode, true),
+    "utf8",
+  );
+  const maximumUserBytes = Math.floor(
+    Math.min(
+      contextTokens -
+        CHAT_TEMPLATE_ALLOWANCE_TOKENS -
+        MAX_OUTPUT_TOKENS -
+        retrySystemBytes,
+      MAX_PROMPT_BYTES - retrySystemBytes,
+    ),
+  );
+  if (maximumUserBytes < 0) throw contextTooSmallError();
+  if (userMessageBytes(context) <= maximumUserBytes) return context;
+
+  let fitted = {
+    ...context,
+    title: "",
+    description: "",
+    files: [],
+    patch: "",
+    patchTruncated: true,
+  };
+  if (userMessageBytes(fitted) > maximumUserBytes) {
+    throw contextTooSmallError();
+  }
+
+  fitted = fitStringEvidence(
+    fitted,
+    "patch",
+    context.patch,
+    maximumUserBytes,
+    MIN_PATCH_EVIDENCE_BYTES + 2,
+  );
+  fitted = fitStringEvidence(
+    fitted,
+    "title",
+    context.title,
+    maximumUserBytes,
+  );
+  fitted = fitStringEvidence(
+    fitted,
+    "description",
+    context.description,
+    maximumUserBytes,
+  );
+  fitted = fitFileEvidence(fitted, context.files, maximumUserBytes);
+  return fitStringEvidence(
+    fitted,
+    "patch",
+    context.patch,
+    maximumUserBytes,
+  );
 }
 
 function systemPrompt(mode, isRetry) {
@@ -194,7 +357,7 @@ function systemPrompt(mode, isRetry) {
     "If patchTruncated is true, never choose approve.",
     modeInstruction,
     retry,
-    `Return exactly one JSON object satisfying this JSON Schema: ${JSON.stringify(RESULT_SCHEMA)}`,
+    `Return exactly one JSON object satisfying this JSON Schema: ${JSON.stringify(OLLAMA_GENERATION_SCHEMA)}`,
   ]
     .filter(Boolean)
     .join(" ");
@@ -287,7 +450,7 @@ function validateResult(value, context) {
   const unexpected = Object.keys(value).filter(
     (field) => !RESULT_FIELDS.includes(field),
   );
-  if (unexpected.length) issues.push(`unexpected fields: ${unexpected.join(", ")}`);
+  if (unexpected.length) issues.push("result contains unexpected fields");
   const missing = RESULT_FIELDS.filter((field) => !Object.hasOwn(value, field));
   if (missing.length) issues.push(`missing fields: ${missing.join(", ")}`);
   return issues;
@@ -301,8 +464,8 @@ function parseResult(response, context) {
   let value;
   try {
     value = JSON.parse(content);
-  } catch (error) {
-    throw new InvalidEmployeeResultError(`invalid JSON: ${error.message}`);
+  } catch {
+    throw new InvalidEmployeeResultError("message.content is not valid JSON");
   }
   const issues = validateResult(value, context);
   if (issues.length) throw new InvalidEmployeeResultError(issues.join("; "));
@@ -336,10 +499,11 @@ export class OllamaPrEmployeeReviewer {
   async analyze(input, options) {
     const signal = analysisSignal(options);
     signal?.throwIfAborted();
-    const context = selectContext(input);
-    if (!["review", "owner"].includes(context.workMode)) {
+    const selectedContext = selectContext(input);
+    if (!["review", "owner"].includes(selectedContext.workMode)) {
       throw new Error("PR employee workMode must be review or owner");
     }
+    const context = fitContext(selectedContext, this.contextTokens);
     let lastError = "unknown validation error";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       signal?.throwIfAborted();
@@ -380,8 +544,12 @@ export class OllamaPrEmployeeReviewer {
             model: this.model,
             stream: false,
             think: false,
-            format: RESULT_SCHEMA,
-            options: { temperature: 0, num_ctx: this.contextTokens },
+            format: OLLAMA_GENERATION_SCHEMA,
+            options: {
+              temperature: 0,
+              num_ctx: this.contextTokens,
+              num_predict: MAX_OUTPUT_TOKENS,
+            },
             messages: [
               {
                 role: "system",
@@ -396,25 +564,25 @@ export class OllamaPrEmployeeReviewer {
       const response = await admittedResponse(admitted);
       signal?.throwIfAborted();
       if (!response.ok) {
-        const detail = (await response.text().catch(() => "")).trim().slice(0, 500);
         throw new Error(
-          `Ollama employee request failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
+          `Ollama employee request failed with HTTP ${response.status}`,
         );
       }
+      let result;
       try {
-        const result = await response.json();
-        signal?.throwIfAborted();
-        if (abortKind === "timeout") {
-          throw new Error(
-            `Ollama employee request timed out after ${this.timeoutMs} ms`,
-          );
-        }
-        return result;
-      } catch (error) {
+        result = await response.json();
+      } catch {
         throw new InvalidEmployeeResultError(
-          `API response is not JSON: ${error.message}`,
+          "API response is not valid JSON",
         );
       }
+      signal?.throwIfAborted();
+      if (abortKind === "timeout") {
+        throw new Error(
+          `Ollama employee request timed out after ${this.timeoutMs} ms`,
+        );
+      }
+      return result;
     } catch (error) {
       if (abortKind === "external") {
         signal?.throwIfAborted();
