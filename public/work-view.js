@@ -222,8 +222,22 @@ function ownerDecisionRetryBinding(value) {
   }
 }
 
-function ownerDecisionRetryMarkup(item, state) {
-  const binding = ownerDecisionRetryBinding(item);
+function unambiguousOwnerRetryBindings(items) {
+  const bindings = items.map((item) => ownerDecisionRetryBinding(item));
+  const itemIdCounts = new Map();
+  for (const binding of bindings) {
+    if (!binding) continue;
+    itemIdCounts.set(
+      binding.itemId,
+      (itemIdCounts.get(binding.itemId) || 0) + 1,
+    );
+  }
+  return bindings.map((binding) => (
+    binding && itemIdCounts.get(binding.itemId) === 1 ? binding : null
+  ));
+}
+
+function ownerDecisionRetryMarkup(binding, state) {
   if (!binding) return "";
   const pendingItemId = state.ownerRetryPendingItemId || null;
   const pending = pendingItemId !== null;
@@ -238,11 +252,25 @@ function ownerDecisionRetryMarkup(item, state) {
       ${error ? `<p class="code-job-action-error" role="alert">${escapeWorkHtml(error)}</p>` : ""}`;
 }
 
+function workRowProjection(value) {
+  try {
+    const fields = ownerRetryDataFields(value);
+    return fields ? Object.fromEntries(fields) : {};
+  } catch {
+    return {};
+  }
+}
+
 function itemRows(items, now, state) {
   if (!items.length) {
     return '<div class="empty">尚无工作项；新的路由分派会可靠进入这里。</div>';
   }
-  return `<div class="work-list">${items.map((item) => `
+  const bindings = unambiguousOwnerRetryBindings(items);
+  const rows = items.map((item, index) => ({
+    binding: bindings[index],
+    item: workRowProjection(item),
+  }));
+  return `<div class="work-list">${rows.map(({ binding, item }) => `
     <article class="work-row">
       <div class="work-row-heading">
         <strong>${escapeWorkHtml(subjectLabel(item))}</strong>
@@ -252,7 +280,7 @@ function itemRows(items, now, state) {
       <span>${escapeWorkHtml(item.event?.eventType || item.kind || "unknown")} · 尝试 ${escapeWorkHtml(item.attempt ?? 0)} 次 · ${relativeTime(item.updatedAt, now)}</span>
       ${item.statusReason ? `<small>${escapeWorkHtml(item.statusReason)}</small>` : ""}
       ${item.decisionContext ? `<small>已绑定继续处理上下文 · ${escapeWorkHtml(item.decisionContext.kind || "context")}</small>` : ""}
-      ${ownerDecisionRetryMarkup(item, state)}
+      ${ownerDecisionRetryMarkup(binding, state)}
     </article>`).join("")}</div>`;
 }
 
@@ -1186,11 +1214,8 @@ export function createWorkView({
 
   function currentOwnerRetryBinding(itemId) {
     if (typeof itemId !== "string" || !Array.isArray(state.items)) return null;
-    for (const item of state.items) {
-      const binding = ownerDecisionRetryBinding(item);
-      if (binding?.itemId === itemId) return binding;
-    }
-    return null;
+    return unambiguousOwnerRetryBindings(state.items)
+      .find((binding) => binding?.itemId === itemId) || null;
   }
 
   function boundedOwnerRetryError(error) {

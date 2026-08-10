@@ -382,6 +382,53 @@ test("owner retry rejects accessor-backed and custom-prototype projection shapes
   assert.equal(getterCalls, 0);
 });
 
+test("owner retry cannot be enabled by a self-replacing row accessor", async () => {
+  const item = eligibleOwnerRetryItem();
+  let getterCalls = 0;
+  Object.defineProperty(item, "status", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      Object.defineProperty(item, "status", {
+        configurable: true,
+        enumerable: true,
+        value: "blocked",
+        writable: true,
+      });
+      return "blocked";
+    },
+  });
+  const calls = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === "/api/work/items?limit=50&order=newest") {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { items: [item] };
+          },
+        };
+      }
+      if (options.method === "POST") return response({ requeued: true });
+      return workProjectionResponse(url, []);
+    },
+  });
+  await view.load();
+
+  const html = view.render();
+  await view.retryDecisionExhaustion("work-item-owner-retry");
+
+  assert.equal(getterCalls, 0);
+  assert.doesNotMatch(html, /data-owner-decision-retry-item-id=/);
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    0,
+  );
+});
+
 test("owner retry binds the button and submits only current in-memory authority", async () => {
   const itemId = "work/item ?#";
   let currentItems = [eligibleOwnerRetryItem({
@@ -446,6 +493,50 @@ test("owner retry binds the button and submits only current in-memory authority"
   assert.equal(
     calls.filter(({ options }) => options.method === "POST").length,
     1,
+  );
+});
+
+test("owner retry rejects ambiguous duplicate item IDs", async () => {
+  const itemId = "work-item-ambiguous-owner-retry";
+  const items = [
+    eligibleOwnerRetryItem({
+      assignmentId: "ambiguous-row-a",
+      itemId,
+    }),
+    eligibleOwnerRetryItem({
+      assignmentId: "ambiguous-row-b",
+      itemId,
+      revision: 8,
+      inputDigest: "b".repeat(64),
+      source: {
+        ...eligibleOwnerRetryItem().source,
+        current: {
+          ...eligibleOwnerRetryItem().source.current,
+          inputDigest: "b".repeat(64),
+        },
+      },
+    }),
+  ];
+  const calls = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (options.method === "POST") return response({ requeued: true });
+      return workProjectionResponse(url, items);
+    },
+  });
+  await view.load();
+
+  const html = view.render();
+  await view.retryDecisionExhaustion(itemId);
+
+  assert.equal(
+    (html.match(/data-owner-decision-retry-item-id=/g) || []).length,
+    0,
+  );
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    0,
   );
 });
 
