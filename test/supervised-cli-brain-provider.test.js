@@ -2246,14 +2246,14 @@ test("a never-settling process stays handled and permanently blocks close and cr
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
-      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 600,
     },
   );
   const publicResult = assert.rejects(
     provider.generate(brainRequest()),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  await started;
+  await within(500, started);
   await within(500, publicResult);
 
   await assert.rejects(

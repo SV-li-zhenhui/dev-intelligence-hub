@@ -4376,7 +4376,7 @@ test("application close stays bounded and incomplete while a configured provider
       },
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
-      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 600,
     },
   );
   const request = assert.rejects(
@@ -4392,7 +4392,7 @@ test("application close stays bounded and incomplete while a configured provider
     }),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
-  await started;
+  await within(500, started);
   await within(500, request);
 
   const config = workCoordinationConfig({ externalActions: false });
@@ -4459,7 +4459,7 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
       },
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
-      monotonicClock: () => clockReads++ === 0 ? 0 : 900,
+      monotonicClock: () => clockReads++ === 0 ? 0 : 600,
     },
   );
   const config = localCodeCoordinationConfig({ githubActions: false });
