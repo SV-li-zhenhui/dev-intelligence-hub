@@ -14,7 +14,9 @@ source state:
 3. Obtain the two required scoped reviews after that validation run.
 4. Publish the acceptance manifest that binds the validation report, UI
    artifacts, runtime identity, and review receipts to the same source state.
-5. Complete the owner-only license and product-run external acceptance gates.
+5. Complete the product-run external acceptance gate. The owner-only license
+   gate was resolved with Apache-2.0 on 2026-08-10; its U11 distribution-
+   identity slice is complete.
 
 The machine-readable report is authoritative. A prose summary must not replace
 it and must not claim a skipped, stale, simulated, or unauthorized check as a

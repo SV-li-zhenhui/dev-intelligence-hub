@@ -5,6 +5,9 @@ welcome when they preserve its core trust boundaries: model output is
 untrusted, source workspaces are not mutated implicitly, and every external or
 irreversible action requires explicit owner confirmation.
 
+Contributions intentionally submitted for inclusion are provided under
+Apache-2.0 unless explicitly stated otherwise.
+
 ## Development setup
 
 Requirements:

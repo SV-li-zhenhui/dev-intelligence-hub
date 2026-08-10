@@ -2,9 +2,11 @@
   "name": "my-dashboard",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "Local-first engineering command center with autonomous roles, cited memory, controlled execution, and owner-confirmed actions.",
   "files": [
     "CONTRIBUTING.md",
+    "LICENSE",
     "SECURITY.md",
     "config.example.json",
     "docs/ARCHITECTURE.md",

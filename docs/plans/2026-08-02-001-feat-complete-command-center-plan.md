@@ -419,7 +419,7 @@ flowchart TB
 - **Patterns to follow:** Current local-only README guidance and ignored private configuration conventions.
 - **Test scenarios:** Fresh checkout setup uses examples without secrets; private config remains ignored; package metadata and license agree; docs explain Ollama and remote providers, confirmations, backup, and account selection; repository scan finds no token or private machine path; publishing commands are not executed.
 - **Verification:** A clean temporary checkout can install, start in disabled-safe mode, and reach liveness/readiness using only documented steps.
-- **Current validation note (2026-08-09):** Safe examples, contributor/security/privacy/architecture/operations documentation, secret/private-path scans, committed-tree packaging, and clean-room install/composition passed. `LICENSE` and matching package metadata remain intentionally absent because the required owner SPDX choice has not been made; U11 therefore remains legally incomplete even though its non-legal distribution gates pass.
+- **Current validation note (2026-08-10):** Safe examples, contributor/security/privacy/architecture/operations documentation, secret/private-path scans, committed-tree packaging, and clean-room install/composition passed. The owner selected `Apache-2.0`; the canonical `LICENSE`, aligned package and lock metadata, npm payload coverage, contribution terms, and deterministic distribution test complete this U11 license slice. This does not complete U12, Docker, browser, CLI login-profile work, or product-run live-PR acceptance.
 
 ### U12. Pass whole-system acceptance
 
@@ -470,6 +470,6 @@ flowchart TB
 
 ## Deferred / Open Questions
 
-### Owner decision gate before U11
+### Owner decision gate before U11 (resolved 2026-08-10)
 
-- **Open-source license:** The owner must explicitly confirm one SPDX license identifier before U11 writes `LICENSE` or matching package/contribution metadata. Until then, local implementation and verification may continue, but the repository cannot be declared open-source-ready.
+- **Open-source license:** The owner explicitly selected `Apache-2.0`. U11 may write matching `LICENSE`, package, and contribution metadata; this decision does not authorize publication or resolve any U12 acceptance gate.

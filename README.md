@@ -270,3 +270,7 @@ PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对�
 任务切换后不再调用 Claude CLI；`ClaudePRChatDigest` 的数据源和增量通知语义已内建于本项目。
 
 `npm run refresh` 是服务停止时使用的独立维护命令；常驻服务运行期间请使用页面“刷新”或本地 `/api/refresh`，保持单写者。
+
+## 许可证
+
+MyDashboard 使用 [Apache-2.0](LICENSE) 许可证。

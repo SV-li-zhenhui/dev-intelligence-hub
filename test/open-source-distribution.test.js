@@ -649,6 +649,62 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
   }
 });
 
+test("Apache-2.0 distribution identity rejects missing, corrupt, inconsistent, or unpackaged license artifacts", () => {
+  const licensePath = path.join(root, "LICENSE");
+  assert.equal(existsSync(licensePath), true, "missing root LICENSE");
+
+  const license = Buffer.from(
+    readFileSync(licensePath, "utf8")
+      .replaceAll("\r\n", "\n")
+      .replaceAll("\r", "\n"),
+    "utf8",
+  );
+  assert.equal(
+    license.length,
+    11_358,
+    "root LICENSE has an unexpected byte length",
+  );
+  assert.equal(
+    createHash("sha256").update(license).digest("hex"),
+    "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "root LICENSE differs from the canonical Apache License 2.0 text",
+  );
+
+  const packageManifest = JSON.parse(
+    readFileSync(path.join(root, "package.json"), "utf8"),
+  );
+  const packageLock = JSON.parse(
+    readFileSync(path.join(root, "package-lock.json"), "utf8"),
+  );
+  const shrinkwrap = JSON.parse(
+    readFileSync(path.join(root, "npm-shrinkwrap.json"), "utf8"),
+  );
+  for (const [artifact, manifest] of [
+    ["package.json", packageManifest],
+    ["package-lock.json", packageLock.packages[""]],
+    ["npm-shrinkwrap.json", shrinkwrap.packages[""]],
+  ]) {
+    assert.equal(
+      manifest.license,
+      "Apache-2.0",
+      `${artifact} has the wrong SPDX license`,
+    );
+  }
+
+  assert.equal(
+    readFileSync(path.join(root, "package-lock.json")).equals(
+      readFileSync(path.join(root, "npm-shrinkwrap.json")),
+    ),
+    true,
+    "published shrinkwrap differs from the source-checkout lock",
+  );
+  assert.equal(
+    new Set(loadDistributionManifest()).has("LICENSE"),
+    true,
+    "npm payload omits LICENSE",
+  );
+});
+
 test("distribution and clean-room inputs come only from the committed tree", () => {
   const sourceFiles = new Set(loadDistributionManifest());
   const tracked = loadTrackedFiles();
