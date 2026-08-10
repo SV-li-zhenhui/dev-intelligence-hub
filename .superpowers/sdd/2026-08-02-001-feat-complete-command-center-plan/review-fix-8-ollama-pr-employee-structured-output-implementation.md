@@ -89,6 +89,43 @@ node --check test/ollama-pr-employee-reviewer.test.js
 exit 0
 ```
 
+## Round 2 retry-boundary closure
+
+The fixed-context baseline now uses the selected context's actual
+`patchTruncated` value. When a complete result can still end in `false`, the
+fitter budgets that one-byte-longer JSON literal; when upstream evidence is
+already truncated, the immutable shorter `true` representation remains exact.
+
+Round 2 RED against committed HEAD `d18ddce`:
+
+```text
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js
+tests 26; pass 25; fail 1
+```
+
+The retry request measured 1,484 system bytes and 426 user bytes, so its exact
+conservative total was `1,484 + 426 + 512 + 1,024 = 3,446`, exceeding
+`contextTokens=3,445` by one.
+
+Round 2 GREEN uses the same effective user facts on both attempts:
+
+```text
+ordinary: 1,378 + 424 + 512 + 1,024 = 3,338 <= 3,445
+retry:    1,484 + 424 + 512 + 1,024 = 3,444 <= 3,445
+
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js
+tests 26; pass 26; fail 0
+
+node --test --test-concurrency=1 test/ollama-pr-employee-reviewer.test.js test/proactive-pr-employee.test.js test/proactive-pr-confirmation-integration.test.js
+tests 87; pass 87; fail 0
+
+node --check src/adapters/ollama-pr-employee-reviewer.js
+exit 0
+
+node --check test/ollama-pr-employee-reviewer.test.js
+exit 0
+```
+
 ## Residual concern
 
 The byte-per-token bound is intentionally conservative, so multilingual or

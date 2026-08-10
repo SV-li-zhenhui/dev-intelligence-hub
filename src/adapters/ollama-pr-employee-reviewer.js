@@ -342,7 +342,7 @@ function fitContext(context, contextTokens) {
     description: "",
     files: [],
     patch: "",
-    patchTruncated: true,
+    patchTruncated: context.patchTruncated,
   };
   if (userMessageBytes(fitted) > maximumUserBytes) {
     throw contextTooSmallError();

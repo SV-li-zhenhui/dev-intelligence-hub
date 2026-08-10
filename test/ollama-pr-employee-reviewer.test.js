@@ -253,6 +253,48 @@ test("reserves output and template capacity while reusing fitted facts on retry"
   );
 });
 
+test("seals the exact retry boundary when input evidence starts complete", async () => {
+  const contextTokens = 3_445;
+  const calls = [];
+  const reviewer = new OllamaPrEmployeeReviewer({
+    contextTokens,
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return response(
+        calls.length === 1
+          ? reviewDraft({
+              workType: "owner_plan",
+              reviewVerdict: "none",
+              reviewBody: "",
+              requiresApproval: false,
+            })
+          : reviewDraft(),
+      );
+    },
+  });
+
+  await reviewer.analyze({
+    id: "github:pr:a/r#1",
+    repo: "a/r",
+    number: 1,
+    title: "",
+    description: "x".repeat(15),
+    relation: "review_requested",
+    headRefOid: "h",
+    ciStatus: "SUCCESS",
+    mergeStateStatus: "CLEAN",
+    requestedAction: "review",
+    workMode: "review",
+    files: [],
+    patch: "",
+    patchTruncated: false,
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].messages[1].content, calls[1].messages[1].content);
+  for (const call of calls) assertFitsContext(call, contextTokens);
+});
+
 test("default packing retains a unified-diff hunk, changed line, and file evidence", async () => {
   const hunk = [
     "diff --git a/src/review-boundary.js b/src/review-boundary.js",
