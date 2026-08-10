@@ -248,6 +248,20 @@ async function readMemoryRecords(journal, recordIds) {
   return items;
 }
 
+async function readCompleteWorkLedgerTimeline(workLedgerView) {
+  const items = [];
+  let cursor;
+  do {
+    const page = await workLedgerView.listTimeline({
+      limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
+    items.push(...page.items);
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  return items;
+}
+
 function archivedProjection(details) {
   return details.map(({ job, changePackage }) => ({ job, changePackage }))
     .sort((left, right) => left.job.jobId.localeCompare(right.job.jobId, "en"));
@@ -2002,7 +2016,7 @@ test(
       assignments: await application.workflowRouting.listAssignments({ limit: 50 }),
       graph: await application.workGraphView.getSnapshot(),
       ledger: await application.workLedgerView.listItems({ limit: 50 }),
-      timeline: await application.workLedgerView.listTimeline({ limit: 200 }),
+      timeline: await readCompleteWorkLedgerTimeline(application.workLedgerView),
       confirmationHistory: await application.confirmationQueue.historyReader.list({
         limit: 50,
       }),
@@ -2036,6 +2050,25 @@ test(
     const rootTask = graphTaskByTitle("Resolve the mirrored conflict");
     const resolvedConflict = graphTaskByTitle("Resolve mirrored conflict");
     const verifiedResolution = graphTaskByTitle("Verify mirrored resolution");
+    const prTaskTitlesByHead = [
+      {
+        headRevision: 1,
+        headRefOid: fixture.headOne,
+        titles: [
+          "Reject forged controlled commit",
+          ...ACTION_TITLES.map(([actionTitle]) => actionTitle),
+        ],
+      },
+      {
+        headRevision: 2,
+        headRefOid: fixture.headTwo,
+        titles: ["Reject old controlled commit", "Merge verified Head 2"],
+      },
+    ];
+    const prTasksByHead = prTaskTitlesByHead.map(({ titles, ...head }) => ({
+      ...head,
+      tasks: titles.map((title) => graphTaskByTitle(title).task),
+    }));
     assert.deepEqual(rootTask.task.responsibility, {
       type: "role",
       id: "orchestrator",
@@ -2044,10 +2077,6 @@ test(
       type: "role",
       id: "developer",
     });
-    assert.deepEqual(
-      resolvedConflict.task.deliveries.map(({ status }) => status),
-      ["submitted", "accepted"],
-    );
     assert.deepEqual(verifiedResolution.task.responsibility, {
       type: "role",
       id: "tester",
@@ -2055,28 +2084,33 @@ test(
     assert.deepEqual(verifiedResolution.task.dependsOn, [
       resolvedConflict.task.taskId,
     ]);
-    assert.deepEqual(
-      verifiedResolution.task.deliveries.map(({ status }) => status),
-      ["submitted", "accepted"],
-    );
-    for (const title of [
-      "Reject forged controlled commit",
-      ...ACTION_TITLES.map(([actionTitle]) => actionTitle),
-      "Reject old controlled commit",
-      "Merge verified Head 2",
-    ]) {
-      assert.deepEqual(graphTaskByTitle(title).task.responsibility, {
-        type: "role",
-        id: "pr-engineer",
-      });
+    for (const { tasks } of prTasksByHead) {
+      for (const task of tasks) {
+        assert.deepEqual(task.responsibility, {
+          type: "role",
+          id: "pr-engineer",
+        });
+      }
     }
     assert.equal(resolvedConflict.taskState.statusReason, "pr_head_superseded");
     assert.equal(verifiedResolution.taskState.statusReason, "pr_head_superseded");
-    const timelineFor = (taskId) => stateBeforeFinalArchive.timeline.items
+    const timelineFor = (taskId) => stateBeforeFinalArchive.timeline
       .filter((entry) => entry.itemId === taskId);
-    const initialHandoff = timelineFor(rootTask.task.taskId).find(
-      ({ type }) => type === "handed_off",
-    );
+    const timelineEntries = (task, type) => timelineFor(task.taskId)
+      .filter((entry) => entry.type === type);
+    const assertExclusiveTimelineActor = (task, type, expectedActorId) => {
+      const entries = timelineEntries(task, type);
+      assert.ok(entries.length > 0, `${task.taskId} has no ${type} history`);
+      assert.deepEqual(
+        entries.map(({ actorId }) => actorId),
+        Array(entries.length).fill(expectedActorId),
+      );
+      return entries;
+    };
+    const initialHandoffs = timelineEntries(rootTask.task, "handed_off");
+    assert.equal(initialHandoffs.length, 1);
+    const [initialHandoff] = initialHandoffs;
+    assert.equal(initialHandoff.actorId, "work-intent-dispatcher");
     assert.deepEqual(initialHandoff.details.fromTarget, {
       type: "role",
       id: "pr-engineer",
@@ -2085,36 +2119,251 @@ test(
       type: "role",
       id: "orchestrator",
     });
-    for (const { task, expectedActorId } of [
-      { task: resolvedConflict.task, expectedActorId: "employee-developer" },
-      { task: verifiedResolution.task, expectedActorId: "employee-tester" },
-    ]) {
-      const taskTimeline = timelineFor(task.taskId);
-      assert.equal(
-        taskTimeline.some(({ type, actorId }) =>
-          type === "claimed" && actorId === expectedActorId),
-        true,
-      );
-      assert.equal(
-        taskTimeline.some(({ type }) => type === "graph_delivery_submitted"),
-        true,
-      );
-      assert.equal(
-        taskTimeline.some(({ type, actorId }) =>
-          type === "graph_delivery_accepted" &&
-          actorId === "employee-orchestrator"),
-        true,
-      );
-    }
-    assert.equal(
-      new Set(stateBeforeFinalArchive.confirmationHistory.items.map(
-        ({ id }) => id,
-      )).size,
-      stateBeforeFinalArchive.confirmationHistory.items.length,
+    const initialPrClaims = timelineEntries(rootTask.task, "claimed").filter(
+      ({ sequence }) => sequence < initialHandoff.sequence,
     );
     assert.deepEqual(
-      stateBeforeFinalArchive.confirmationHistory.roleIdFacets,
-      ["developer", "pr-engineer", "tester"],
+      initialPrClaims.map(({ actorId }) => actorId),
+      ["employee-pr-engineer"],
+    );
+    const initialPrHandoffs = timelineEntries(rootTask.task, "intent_staged")
+      .filter(({ sequence, details }) =>
+        sequence < initialHandoff.sequence && details.intentType === "handoff"
+      );
+    assert.equal(initialPrHandoffs.length, 1);
+    assert.equal(initialPrClaims[0].sequence < initialPrHandoffs[0].sequence, true);
+    assert.deepEqual(initialPrHandoffs[0].details.requestedBy, {
+      roleId: "pr-engineer",
+      workerId: "employee-pr-engineer",
+    });
+
+    const deliveryHistory = (task) => task.deliveries.map((delivery) => ({
+      deliverableId: delivery.deliverableId,
+      revision: delivery.revision,
+      contractRevision: delivery.contractRevision,
+      status: delivery.status,
+    }));
+    for (const proof of [
+      {
+        task: resolvedConflict.task,
+        actorId: "employee-developer",
+        submission: {
+          contractRevision: 1,
+          deliverableId: "implementation",
+          deliveryRevision: 1,
+        },
+        history: [
+          {
+            deliverableId: "implementation",
+            revision: 1,
+            contractRevision: 1,
+            status: "submitted",
+          },
+          {
+            deliverableId: "implementation",
+            revision: 2,
+            contractRevision: 1,
+            status: "accepted",
+          },
+        ],
+      },
+      {
+        task: verifiedResolution.task,
+        actorId: "employee-tester",
+        submission: {
+          contractRevision: 1,
+          deliverableId: "verification",
+          deliveryRevision: 1,
+        },
+        history: [
+          {
+            deliverableId: "verification",
+            revision: 1,
+            contractRevision: 1,
+            status: "submitted",
+          },
+          {
+            deliverableId: "verification",
+            revision: 2,
+            contractRevision: 1,
+            status: "accepted",
+          },
+        ],
+      },
+    ]) {
+      assertExclusiveTimelineActor(proof.task, "claimed", proof.actorId);
+      const submissions = assertExclusiveTimelineActor(
+        proof.task,
+        "graph_delivery_submitted",
+        proof.actorId,
+      );
+      assert.deepEqual(submissions.map(({ details }) => details), [
+        proof.submission,
+      ]);
+      assert.equal(
+        assertExclusiveTimelineActor(
+          proof.task,
+          "graph_delivery_accepted",
+          "employee-orchestrator",
+        ).length,
+        1,
+      );
+      assert.deepEqual(deliveryHistory(proof.task), proof.history);
+    }
+    const [resolutionSubmitted, resolutionAccepted] =
+      resolvedConflict.task.deliveries;
+    assert.equal(resolutionDetail.job.jobId, createdResolution.receipt.id);
+    assert.deepEqual(resolutionDetail.job.requestedBy, {
+      roleId: "developer",
+      workItemId: resolvedConflict.task.taskId,
+    });
+    assert.equal(
+      resolutionDetail.changePackage.receipt.packageId,
+      `change-package-${resolutionDetail.changePackage.receipt.packageDigest}`,
+    );
+    assert.equal(
+      resolutionDetail.changePackage.receipt.controlledCommit.evidenceId,
+      state.controlledCommitEvidenceId,
+    );
+    const submittedChangePackageEvidence = resolutionSubmitted.evidence.filter(
+      ({ kind }) => kind === "change-package",
+    );
+    assert.deepEqual(submittedChangePackageEvidence, [{
+      kind: "change-package",
+      referenceId: resolutionDetail.changePackage.receipt.packageId,
+      contentDigest: resolutionDetail.changePackage.receipt.packageDigest,
+    }]);
+    assert.deepEqual(resolutionAccepted.evidence, resolutionSubmitted.evidence);
+
+    const [verificationSubmitted, verificationAccepted] =
+      verifiedResolution.task.deliveries;
+    assert.equal(verificationDetail.job.jobId, createdVerification.receipt.id);
+    assert.deepEqual(verificationDetail.job.requestedBy, {
+      roleId: "tester",
+      workItemId: verifiedResolution.task.taskId,
+    });
+    assert.match(
+      verificationDetail.job.memoryProjection.recordId,
+      /^memory-[a-f0-9]{64}$/u,
+    );
+    const submittedTestReportEvidence = verificationSubmitted.evidence.filter(
+      ({ kind }) => kind === "test-report",
+    );
+    assert.deepEqual(submittedTestReportEvidence, [{
+      kind: "test-report",
+      referenceId: verificationDetail.job.jobId,
+      contentDigest: verificationDetail.job.memoryProjection.recordId.slice(
+        "memory-".length,
+      ),
+    }]);
+    assert.deepEqual(verificationAccepted.evidence, verificationSubmitted.evidence);
+
+    const allDeliverySubmissions = stateBeforeFinalArchive.timeline.filter(
+      ({ type }) => type === "graph_delivery_submitted",
+    );
+    assert.deepEqual(
+      allDeliverySubmissions.map(({ itemId }) => itemId).sort(),
+      [resolvedConflict.task.taskId, verifiedResolution.task.taskId].sort(),
+    );
+    const [testerAcceptance] = timelineEntries(
+      verifiedResolution.task,
+      "graph_delivery_accepted",
+    );
+    const prReevaluationRecords = [];
+    for (const { headRevision, headRefOid, tasks } of prTasksByHead) {
+      for (const task of tasks) {
+        const claims = assertExclusiveTimelineActor(
+          task,
+          "claimed",
+          "employee-pr-engineer",
+        );
+        const staged = assertExclusiveTimelineActor(
+          task,
+          "intent_staged",
+          "employee-pr-engineer",
+        );
+        assert.equal(claims.length, staged.length);
+        for (let index = 0; index < claims.length; index += 1) {
+          assert.equal(claims[index].sequence < staged[index].sequence, true);
+        }
+        assert.equal(
+          [...claims, ...staged].every(
+            ({ sequence }) => sequence > testerAcceptance.sequence,
+          ),
+          true,
+        );
+        assert.deepEqual(
+          staged.map(({ details }) => details.requestedBy),
+          Array(staged.length).fill({
+            roleId: "pr-engineer",
+            workerId: "employee-pr-engineer",
+          }),
+        );
+        assert.deepEqual(
+          staged.map(({ details }) => ({
+            headRevision: details.inputBinding.headRevision,
+            headRefOid: details.inputBinding.headRefOid,
+          })),
+          Array(staged.length).fill({ headRevision, headRefOid }),
+        );
+        prReevaluationRecords.push(...claims, ...staged);
+      }
+    }
+    prReevaluationRecords.sort((left, right) => left.sequence - right.sequence);
+    assert.deepEqual(
+      new Set(prReevaluationRecords
+        .filter(({ type }) => type === "intent_staged")
+        .map(({ details }) => details.inputBinding.headRevision)),
+      new Set([1, 2]),
+    );
+
+    const confirmationBinding = ([title, roleId, kind, status]) => ({
+      kind,
+      status,
+      requestedBy: {
+        roleId,
+        workItemId: graphTaskByTitle(title).task.taskId,
+      },
+    });
+    const expectedConfirmationBindings = [
+      ["Resolve mirrored conflict", "developer", "local.code-job-create", "completed"],
+      ["Verify mirrored resolution", "tester", "local.code-job-create", "completed"],
+      ["External comment", "pr-engineer", "github.pull-request-comment", "completed"],
+      ["External review", "pr-engineer", "github.work-proposal-review", "completed"],
+      ["External branch update", "pr-engineer", "github.pull-request-update-branch", "completed"],
+      ["External controlled push", "pr-engineer", "github.pull-request-push", "completed"],
+      ["External merge", "pr-engineer", "github.pull-request-merge", "stale"],
+      ["Merge verified Head 2", "pr-engineer", "github.pull-request-merge", "completed"],
+    ].map(confirmationBinding).toSorted((left, right) =>
+      left.requestedBy.workItemId.localeCompare(right.requestedBy.workItemId, "en")
+    );
+    const confirmationItems = stateBeforeFinalArchive.confirmationHistory.items;
+    assert.deepEqual(
+      confirmationItems.map(({ kind, status, requestedBy }) => ({
+        kind,
+        status,
+        requestedBy,
+      })).toSorted((left, right) =>
+        left.requestedBy.workItemId.localeCompare(
+          right.requestedBy.workItemId,
+          "en",
+        )
+      ),
+      expectedConfirmationBindings,
+    );
+    const confirmationByTaskId = new Map(
+      confirmationItems.map((item) => [item.requestedBy.workItemId, item]),
+    );
+    assert.equal(
+      confirmationByTaskId.get(resolvedConflict.task.taskId).id,
+      createdResolution.id,
+    );
+    assert.equal(
+      confirmationByTaskId.get(verifiedResolution.task.taskId).id,
+      createdVerification.id,
+    );
+    const prReevaluationTimelineIds = new Set(
+      prReevaluationRecords.map(({ timelineId }) => timelineId),
     );
     await application.close();
     const finalCompaction = await archiveTerminalJobs({
@@ -2158,9 +2407,15 @@ test(
       await application.workLedgerView.listItems({ limit: 50 }),
       stateBeforeFinalArchive.ledger,
     );
+    const recoveredTimeline = await readCompleteWorkLedgerTimeline(
+      application.workLedgerView,
+    );
+    assert.deepEqual(recoveredTimeline, stateBeforeFinalArchive.timeline);
     assert.deepEqual(
-      await application.workLedgerView.listTimeline({ limit: 200 }),
-      stateBeforeFinalArchive.timeline,
+      recoveredTimeline.filter(({ timelineId }) =>
+        prReevaluationTimelineIds.has(timelineId)
+      ),
+      prReevaluationRecords,
     );
     assert.deepEqual(
       await application.confirmationQueue.historyReader.list({ limit: 50 }),
