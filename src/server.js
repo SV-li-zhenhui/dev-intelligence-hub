@@ -1265,6 +1265,45 @@ function requirePositiveRevision(value, name) {
   return value;
 }
 
+function ownerRetryItemId(value) {
+  let itemId;
+  try {
+    itemId = decodeURIComponent(value);
+  } catch {
+    throw httpError(400, "itemId 无效");
+  }
+  if (
+    !itemId.trim() ||
+    /[\u0000-\u001f\u007f]/.test(itemId) ||
+    Buffer.byteLength(itemId, "utf8") > 192
+  ) {
+    throw httpError(400, "itemId 无效");
+  }
+  return itemId;
+}
+
+function projectOwnerRetryResult(value, expected) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value.itemId !== expected.itemId ||
+    value.inputDigest !== expected.expectedInputDigest ||
+    value.status !== "queued" ||
+    value.revision !== expected.expectedRevision + 1 ||
+    !Number.isSafeInteger(value.attempt) ||
+    value.attempt < 0
+  ) {
+    throw httpError(500, "所有者决策重试结果无效");
+  }
+  return {
+    itemId: value.itemId,
+    inputDigest: value.inputDigest,
+    status: value.status,
+    revision: value.revision,
+    attempt: value.attempt,
+  };
+}
+
 function configurationRevisionQuery(url) {
   const keys = [...url.searchParams.keys()];
   if (
@@ -2820,6 +2859,47 @@ export function createDashboardServer(
           response,
           200,
           projectWorkGraphHttpSnapshot(snapshot),
+        );
+        return;
+      }
+      const ownerDecisionRetry = url.pathname.match(
+        /^\/api\/work\/items\/([^/]+)\/retry-decision-exhaustion$/,
+      );
+      if (request.method === "POST" && ownerDecisionRetry) {
+        requireNoQuery(url, "所有者决策重试查询参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const itemId = ownerRetryItemId(ownerDecisionRetry[1]);
+        const body = requireExactJsonFields(
+          await readJsonBody(request),
+          ["expectedRevision", "expectedInputDigest"],
+          "所有者决策重试字段无效",
+        );
+        const input = {
+          itemId,
+          expectedRevision: requirePositiveRevision(
+            body.expectedRevision,
+            "expectedRevision",
+          ),
+          expectedInputDigest: body.expectedInputDigest,
+        };
+        if (!sha256Pattern.test(input.expectedInputDigest || "")) {
+          throw httpError(400, "expectedInputDigest 无效");
+        }
+        const retry = requireApplicationPort(
+          application,
+          "ownerWorkRetry",
+          ["retryDecisionExhaustion"],
+          "所有者决策重试端口未启用",
+        );
+        const result = projectOwnerRetryResult(
+          await retry.retryDecisionExhaustion(input),
+          input,
+        );
+        sendJson(response, 200, result);
+        signalBackgroundAgency(
+          backgroundWork,
+          { trigger: "owner_retry_decision_exhaustion" },
+          reportError,
         );
         return;
       }

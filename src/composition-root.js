@@ -28,6 +28,7 @@ import { ConfigurationActivationExecutor } from "./services/configuration-activa
 import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
 import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js";
 import { NotificationService } from "./services/notification-service.js";
+import { OwnerWorkRetryService } from "./services/owner-work-retry-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
 import {
   createConfiguredConstructionCleanupOwner,
@@ -462,6 +463,8 @@ export async function createApplication({
   ownerWorkRequestDependencies = {},
   workLedgerRuntimeFactory = createWorkLedgerRuntime,
   workLedgerDependencies = {},
+  ownerWorkRetryServiceFactory = (options) =>
+    new OwnerWorkRetryService(options),
   attentionInboxRuntimeFactory = createAttentionInboxRuntime,
   attentionInboxDependencies = {},
   workProposalRuntimeFactory = createWorkProposalRuntime,
@@ -655,6 +658,7 @@ export async function createApplication({
   let changePackageRuntime = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  let ownerWorkRetry = null;
   let ownerWorkRequests = null;
   let attentionInboxRuntime = null;
   let workProposalRuntime = null;
@@ -879,6 +883,17 @@ export async function createApplication({
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
         }),
+      );
+      ownerWorkRetry = frozenPort(
+        ownerWorkRetryServiceFactory({
+          ledger: frozenPort(
+            workLedgerRuntime,
+            ["readItemForReconciliation", "transition"],
+            "owner work retry ledger",
+          ),
+        }),
+        ["retryDecisionExhaustion"],
+        "owner work retry service",
       );
       attentionInboxRuntime = trackRuntime(
         await attentionInboxRuntimeFactory({
@@ -2140,6 +2155,7 @@ export async function createApplication({
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      ownerWorkRetry,
       ownerWorkRequests,
       deliveryEvidence,
       memorySearch,

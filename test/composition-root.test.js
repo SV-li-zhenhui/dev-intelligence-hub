@@ -348,6 +348,17 @@ function memoryAuthoritySourcePort() {
   };
 }
 
+function ownerRetryLedgerMethods() {
+  return {
+    async readItemForReconciliation() {
+      return null;
+    },
+    async transition() {
+      throw new Error("unexpected owner retry transition");
+    },
+  };
+}
+
 function workProposalRuntimePort(overrides = {}) {
   const runner = { async claim() {}, async advance() {} };
   return {
@@ -395,6 +406,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     async getSummary() {},
     async listItems() { return { items: [], nextCursor: null }; },
     async listTimeline() { return { items: [], nextCursor: null }; },
+    ...ownerRetryLedgerMethods(),
     verifyPullRequestExecutionBinding(binding) {
       return structuredClone(binding);
     },
@@ -1332,6 +1344,12 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     async listTimeline(options) {
       return { items: [options], nextCursor: null };
     },
+    async readItemForReconciliation(input) {
+      return { input };
+    },
+    async transition(input) {
+      return { input };
+    },
     async close() {
       closeCalls.push("ledger");
     },
@@ -1395,6 +1413,18 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       runtimeOrder.push("ledger");
       calls.ledger = options;
       return ledgerRuntime;
+    },
+    ownerWorkRetryServiceFactory: (options) => {
+      serviceOrder.push("owner-work-retry");
+      calls.ownerWorkRetry = options;
+      return {
+        async retryDecisionExhaustion(input) {
+          return { retried: input };
+        },
+        async transition() {
+          throw new Error("generic transition must remain private");
+        },
+      };
     },
     attentionInboxRuntimeFactory: async (options) => {
       runtimeOrder.push("attention");
@@ -1526,6 +1556,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "confirmation",
   ]);
   assert.deepEqual(serviceOrder, [
+    "owner-work-retry",
     "policy",
     "directory",
     "pr-facts-guard",
@@ -1544,6 +1575,12 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   assert.strictEqual(calls.ledger.store, store);
   assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
+  assert.notStrictEqual(calls.ownerWorkRetry.ledger, ledgerRuntime);
+  assert.deepEqual(Object.keys(calls.ownerWorkRetry.ledger).sort(), [
+    "readItemForReconciliation",
+    "transition",
+  ]);
+  assert.equal(Object.isFrozen(calls.ownerWorkRetry.ledger), true);
   assert.equal("actionAdmissionGate" in calls.ledger, false);
   assert.equal("actionAdmissionGate" in calls.proposals, false);
   assert.equal("actionAdmissionGate" in calls.dispatcher, false);
@@ -1704,12 +1741,17 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "intake",
     "runCycle",
   ]);
+  assert.deepEqual(Object.keys(application.ownerWorkRetry), [
+    "retryDecisionExhaustion",
+  ]);
+  assert.equal("transition" in application.ownerWorkRetry, false);
   for (const port of [
     application.workLedgerView,
     application.workGraphView,
     application.attentionBrowser,
     application.attentionCoordinator,
     application.workCoordination,
+    application.ownerWorkRetry,
   ]) {
     assert.equal(Object.isFrozen(port), true);
   }
@@ -1739,6 +1781,10 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     tasks: [],
   });
   assert.equal(await application.workCoordination.intake(), "intake-result");
+  assert.deepEqual(
+    await application.ownerWorkRetry.retryDecisionExhaustion({ itemId: "work-1" }),
+    { retried: { itemId: "work-1" } },
+  );
   assert.equal(
     await application.attentionCoordinator.next(),
     "coordinated-attention",
@@ -2172,6 +2218,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
       async listTimeline() { return { items: [], nextCursor: null }; },
+      ...ownerRetryLedgerMethods(),
       async close() {},
     }),
     attentionInboxRuntimeFactory: async () => ({
@@ -2866,6 +2913,7 @@ test("work coordination startup preserves its error while closing every acquired
         },
       }),
       workLedgerRuntimeFactory: async () => ({
+        ...ownerRetryLedgerMethods(),
         async close() {
           closeCalls.push("ledger");
           throw cleanupFailure;

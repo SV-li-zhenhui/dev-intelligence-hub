@@ -944,6 +944,7 @@ async function withServer(
     workLedgerView,
     workGraphView,
     ownerWorkRequests,
+    ownerWorkRetry,
     attentionCoordinator,
     attentionBrowser,
     memorySearch,
@@ -1166,6 +1167,7 @@ async function withServer(
   if (workLedgerView) application.workLedgerView = workLedgerView;
   if (workGraphView) application.workGraphView = workGraphView;
   if (ownerWorkRequests) application.ownerWorkRequests = ownerWorkRequests;
+  if (ownerWorkRetry) application.ownerWorkRetry = ownerWorkRetry;
   if (attentionCoordinator) {
     application.attentionCoordinator = attentionCoordinator;
   }
@@ -3898,6 +3900,137 @@ test("owner work request HTTP limit accepts the largest canonical contract and r
     },
     { ownerWorkRequests },
   );
+});
+
+test("owner decision retry HTTP boundary is exact, fail-closed, and signals agency only after success", async () => {
+  const itemId = "work-item-owner-retry";
+  const inputDigest = "a".repeat(64);
+  const calls = [];
+  const agencySignals = [];
+  let failure = null;
+  const ownerWorkRetry = {
+    async retryDecisionExhaustion(input) {
+      calls.push(structuredClone(input));
+      if (failure) throw failure;
+      return {
+        itemId,
+        inputDigest,
+        status: "queued",
+        statusReason: "owner_retry_decision_exhaustion",
+        revision: 8,
+        attempt: 3,
+        ownerId: null,
+        privateMarker: "generic-ledger-authority-must-not-leak",
+      };
+    },
+  };
+  const backgroundWork = {
+    async signalAgency(options) {
+      agencySignals.push(structuredClone(options));
+    },
+  };
+  const trustedHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "x-mydashboard-action": "1",
+    "content-type": "application/json; charset=utf-8",
+  };
+  const body = JSON.stringify({
+    expectedRevision: 7,
+    expectedInputDigest: inputDigest,
+  });
+
+  await withServer(
+    async ({ server }) => {
+      const path = `/api/work/items/${itemId}/retry-decision-exhaustion`;
+      const rejected = [
+        await request(server, {
+          method: "POST",
+          path,
+          headers: { "content-type": "application/json" },
+          body,
+        }),
+        await request(server, {
+          method: "POST",
+          path,
+          headers: { ...trustedHeaders, origin: "http://example.test" },
+          body,
+        }),
+        await request(server, {
+          method: "POST",
+          path,
+          headers: { ...trustedHeaders, "content-type": "text/plain" },
+          body,
+        }),
+        await request(server, {
+          method: "POST",
+          path,
+          headers: trustedHeaders,
+          body: JSON.stringify({
+            expectedRevision: 7,
+            expectedInputDigest: inputDigest,
+            actorId: "attacker",
+          }),
+        }),
+        await request(server, {
+          method: "POST",
+          path: `${path}?force=1`,
+          headers: trustedHeaders,
+          body,
+        }),
+      ];
+      assert.deepEqual(rejected.map(({ status }) => status), [403, 403, 415, 400, 400]);
+      assert.equal(calls.length, 0);
+      assert.equal(agencySignals.length, 0);
+
+      failure = Object.assign(new Error("工作项已变化"), {
+        code: "OWNER_WORK_RETRY_STALE",
+        statusCode: 409,
+      });
+      const stale = await request(server, {
+        method: "POST",
+        path,
+        headers: trustedHeaders,
+        body,
+      });
+      assert.equal(stale.status, 409);
+      assert.equal(agencySignals.length, 0);
+
+      failure = null;
+      const retried = await request(server, {
+        method: "POST",
+        path,
+        headers: trustedHeaders,
+        body,
+      });
+      assert.equal(retried.status, 200);
+      assert.deepEqual(JSON.parse(retried.body), {
+        itemId,
+        inputDigest,
+        status: "queued",
+        revision: 8,
+        attempt: 3,
+      });
+      assert.deepEqual(calls, [
+        { itemId, expectedRevision: 7, expectedInputDigest: inputDigest },
+        { itemId, expectedRevision: 7, expectedInputDigest: inputDigest },
+      ]);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(agencySignals, [{
+        trigger: "owner_retry_decision_exhaustion",
+      }]);
+    },
+    { ownerWorkRetry, backgroundWork },
+  );
+
+  await withServer(async ({ server }) => {
+    const unavailable = await request(server, {
+      method: "POST",
+      path: `/api/work/items/${itemId}/retry-decision-exhaustion`,
+      headers: trustedHeaders,
+      body,
+    });
+    assert.equal(unavailable.status, 503);
+  });
 });
 
 test("work APIs expose only newest-first ledger projections", async () => {
