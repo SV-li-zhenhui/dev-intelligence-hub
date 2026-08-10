@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
 import { verifyLiveDashboard } from "./system-live-validation.mjs";
@@ -50,6 +50,10 @@ const distributionTestPath = "test/open-source-distribution.test.js";
 const u9PriorityTestPath = "test/00-u9-priority.mjs";
 const u9ImplementationTestPath = "test/u9-mirrored-pr-end-to-end.mjs";
 const legacyU9TestPath = "test/u9-mirrored-pr-end-to-end.test.js";
+const canonicalU9PriorityTestSource = Buffer.from(
+  'import "./u9-mirrored-pr-end-to-end.mjs";\n',
+  "utf8",
+);
 const maximumNodeTestArgumentBytes = 24 * 1024;
 
 if (unknownArguments.length > 0) {
@@ -401,6 +405,12 @@ async function immutableNodeTestFiles(directory) {
   }
   if (directFiles.has(legacyU9TestPath)) {
     throw new Error("legacy direct U9 test path is ambiguous");
+  }
+  const u9PriorityTestSource = await readFile(
+    path.join(directory, u9PriorityTestPath),
+  );
+  if (!u9PriorityTestSource.equals(canonicalU9PriorityTestSource)) {
+    throw new Error("committed U9 priority test contents are invalid");
   }
   const regularTestFiles = [...directFiles]
     .filter((relativePath) =>

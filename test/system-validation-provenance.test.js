@@ -120,7 +120,7 @@ async function createValidationFixture(t) {
   );
   await writeFile(
     path.join(root, "test/00-u9-priority.mjs"),
-    "import './u9-mirrored-pr-end-to-end.mjs';\n",
+    "import \"./u9-mirrored-pr-end-to-end.mjs\";\n",
   );
   await writeFile(
     path.join(root, "test/smoke.test.js"),
@@ -531,6 +531,26 @@ for (const discoveryFailure of [
         "import './u9-mirrored-pr-end-to-end.mjs';\n",
       ),
     expectedError: /legacy direct U9 test path is ambiguous/u,
+  },
+  {
+    name: "the priority entry is empty",
+    prepare: (root) =>
+      writeFile(path.join(root, "test/00-u9-priority.mjs"), ""),
+    expectedError: /committed U9 priority test contents are invalid/u,
+  },
+  {
+    name: "the priority entry imports the wrong implementation",
+    prepare: async (root) => {
+      await writeFile(
+        path.join(root, "test/not-u9.mjs"),
+        "export const unrelated = true;\n",
+      );
+      await writeFile(
+        path.join(root, "test/00-u9-priority.mjs"),
+        "import \"./not-u9.mjs\";\n",
+      );
+    },
+    expectedError: /committed U9 priority test contents are invalid/u,
   },
 ]) {
   test(`the system validator fails closed before test execution when ${discoveryFailure.name}`, async (t) => {
