@@ -130,6 +130,61 @@ exit 0
 The live UI validator remained intentionally unrun for round 1; no runtime or
 receipt arguments were invented or bypassed.
 
+## Round 2 review closure
+
+- Replaced the shallow row copy with an explicit descriptor-based presentation
+  projection. Only the string/finite-number primitives used by the row are
+  copied into new plain nested objects for subject, event, current target, and
+  decision context. Accessor-backed or custom nested shapes contribute no
+  display fields and are never invoked.
+- Split identity ambiguity from eligibility. Every bounded own data-descriptor
+  `itemId` is counted first, including queued and custom-prototype rows. The
+  separately recomputed eligible binding survives only when that readable ID
+  occurs exactly once. Rendering and the immediate pre-mutation controller
+  lookup continue to use the same fresh pass.
+
+Round 2 RED against committed HEAD `30c8c21`:
+
+```text
+node --test --test-concurrency=1 test/frontend-work-view.test.js
+tests 35; pass 34; fail 1
+nested decisionContext.kind getter calls: expected 0; observed 1
+
+node --test --test-concurrency=1 test/frontend-work-view.test.js
+tests 38; pass 35; fail 3
+queued duplicate controls: expected 0; observed 1
+custom-prototype duplicate controls: expected 0; observed 1
+```
+
+Each regression renders first, then invokes `retryDecisionExhaustion(itemId)`,
+and requires zero POST requests. Production changed only after each respective
+RED run.
+
+Round 2 GREEN:
+
+```text
+node --test --test-concurrency=1 test/frontend-work-view.test.js
+tests 38; pass 38; fail 0
+
+node --test --test-concurrency=1 test/frontend-work-view.test.js test/frontend-work-graph-view.test.js
+tests 47; pass 47; fail 0
+
+node --check public/work-view.js
+exit 0
+
+node --check test/frontend-work-view.test.js
+exit 0
+
+git diff --check
+exit 0
+
+git diff 1dcc080 --check
+exit 0
+```
+
+The live UI validator remained intentionally unrun for round 2; no runtime or
+receipt arguments were invented or bypassed.
+
 ## Residual concerns
 
 - Browser-level visual validation was not available under the no-runtime

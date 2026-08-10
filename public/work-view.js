@@ -222,16 +222,36 @@ function ownerDecisionRetryBinding(value) {
   }
 }
 
+function readableOwnerRetryItemId(value) {
+  try {
+    if (
+      value === null ||
+      !["object", "function"].includes(typeof value)
+    ) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, "itemId");
+    return descriptor &&
+      "value" in descriptor &&
+      boundedOwnerRetryId(descriptor.value)
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function unambiguousOwnerRetryBindings(items) {
-  const bindings = items.map((item) => ownerDecisionRetryBinding(item));
   const itemIdCounts = new Map();
-  for (const binding of bindings) {
-    if (!binding) continue;
+  for (const item of items) {
+    const itemId = readableOwnerRetryItemId(item);
+    if (!itemId) continue;
     itemIdCounts.set(
-      binding.itemId,
-      (itemIdCounts.get(binding.itemId) || 0) + 1,
+      itemId,
+      (itemIdCounts.get(itemId) || 0) + 1,
     );
   }
+  const bindings = items.map((item) => ownerDecisionRetryBinding(item));
   return bindings.map((binding) => (
     binding && itemIdCounts.get(binding.itemId) === 1 ? binding : null
   ));
@@ -252,10 +272,59 @@ function ownerDecisionRetryMarkup(binding, state) {
       ${error ? `<p class="code-job-action-error" role="alert">${escapeWorkHtml(error)}</p>` : ""}`;
 }
 
+function workRowPrimitive(fields, name) {
+  const value = fields?.get(name);
+  return typeof value === "string" ||
+    (typeof value === "number" && Number.isFinite(value))
+    ? value
+    : undefined;
+}
+
+function workRowObjectFields(fields, name) {
+  try {
+    return ownerRetryDataFields(fields?.get(name));
+  } catch {
+    return null;
+  }
+}
+
 function workRowProjection(value) {
   try {
     const fields = ownerRetryDataFields(value);
-    return fields ? Object.fromEntries(fields) : {};
+    if (!fields) return {};
+    const event = workRowObjectFields(fields, "event");
+    const subject = workRowObjectFields(event, "subject");
+    const currentTarget = workRowObjectFields(fields, "currentTarget");
+    const decisionContext = workRowObjectFields(fields, "decisionContext");
+    return {
+      assignmentId: workRowPrimitive(fields, "assignmentId"),
+      status: workRowPrimitive(fields, "status"),
+      kind: workRowPrimitive(fields, "kind"),
+      attempt: workRowPrimitive(fields, "attempt"),
+      updatedAt: workRowPrimitive(fields, "updatedAt"),
+      statusReason: workRowPrimitive(fields, "statusReason"),
+      event: event
+        ? {
+            eventType: workRowPrimitive(event, "eventType"),
+            subject: subject
+              ? {
+                  repository: workRowPrimitive(subject, "repository"),
+                  number: workRowPrimitive(subject, "number"),
+                  id: workRowPrimitive(subject, "id"),
+                }
+              : undefined,
+          }
+        : undefined,
+      currentTarget: currentTarget
+        ? {
+            type: workRowPrimitive(currentTarget, "type"),
+            id: workRowPrimitive(currentTarget, "id"),
+          }
+        : undefined,
+      decisionContext: decisionContext
+        ? { kind: workRowPrimitive(decisionContext, "kind") }
+        : undefined,
+    };
   } catch {
     return {};
   }
