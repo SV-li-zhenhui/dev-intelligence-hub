@@ -122,6 +122,13 @@ async function loadManifestModule() {
 async function createFixture(t, {
   runtimeSourceMutator = (value) => value,
   uiCompletedAt = "2026-08-09T00:10:00.000Z",
+  u9ImplementationSource = [
+    "import test from 'node:test';",
+    "test('accepted U9 behavior', () => {});",
+    "",
+  ].join("\n"),
+  u9PrioritySource = 'import "./u9-mirrored-pr-end-to-end.mjs";\n',
+  legacyU9Source = null,
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-manifest-"));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -143,6 +150,24 @@ async function createFixture(t, {
     path.join(root, "test/smoke.test.js"),
     "export const smokeTest = true;\n",
   );
+  if (u9ImplementationSource !== null) {
+    await writeFile(
+      path.join(root, "test/u9-mirrored-pr-end-to-end.mjs"),
+      u9ImplementationSource,
+    );
+  }
+  if (u9PrioritySource !== null) {
+    await writeFile(
+      path.join(root, "test/00-u9-priority.mjs"),
+      u9PrioritySource,
+    );
+  }
+  if (legacyU9Source !== null) {
+    await writeFile(
+      path.join(root, "test/u9-mirrored-pr-end-to-end.test.js"),
+      legacyU9Source,
+    );
+  }
   await writeFile(path.join(root, "source.txt"), "accepted source\n");
   await writeFile(path.join(root, "package.json"), `${JSON.stringify({
     name: "acceptance-manifest-fixture",
@@ -264,6 +289,17 @@ async function createFixture(t, {
         signal: null,
       },
       {
+        name: "syntax:test/00-u9-priority.mjs",
+        command: {
+          executable: "node",
+          arguments: ["--check", "test/00-u9-priority.mjs"],
+        },
+        status: "passed",
+        durationMs: 25,
+        exitCode: 0,
+        signal: null,
+      },
+      {
         name: "syntax:test/open-source-distribution.test.js",
         command: {
           executable: "node",
@@ -286,11 +322,22 @@ async function createFixture(t, {
         signal: null,
       },
       {
+        name: "syntax:test/u9-mirrored-pr-end-to-end.mjs",
+        command: {
+          executable: "node",
+          arguments: ["--check", "test/u9-mirrored-pr-end-to-end.mjs"],
+        },
+        status: "passed",
+        durationMs: 25,
+        exitCode: 0,
+        signal: null,
+      },
+      {
         name: "node syntax aggregate",
         kind: "aggregate",
         status: "passed",
-        durationMs: 75,
-        fileCount: 3,
+        durationMs: 125,
+        fileCount: 5,
       },
       {
         name: "complete Node test suite",
@@ -300,6 +347,7 @@ async function createFixture(t, {
             "--test",
             "--test-concurrency=4",
             "--test-reporter=tap",
+            "test/00-u9-priority.mjs",
             "test/smoke.test.js",
           ],
         },
@@ -309,8 +357,8 @@ async function createFixture(t, {
         signal: null,
         testResults: {
           summary: {
-            tests: 2,
-            passed: 1,
+            tests: 3,
+            passed: 2,
             failed: 0,
             cancelled: 0,
             skipped: 1,
@@ -318,12 +366,17 @@ async function createFixture(t, {
           },
           cases: [
             {
-              identity: "tap:1:accepted behavior",
+              identity: "tap:1:accepted U9 behavior",
+              name: "accepted U9 behavior",
+              status: "passed",
+            },
+            {
+              identity: "tap:2:accepted behavior",
               name: "accepted behavior",
               status: "passed",
             },
             {
-              identity: "tap:2:real Docker sandbox denies host network, secrets, and source writes",
+              identity: "tap:3:real Docker sandbox denies host network, secrets, and source writes",
               name: "real Docker sandbox denies host network, secrets, and source writes",
               status: "skipped",
               reason: "requires MYDASHBOARD_DOCKER_INTEGRATION=1",
@@ -582,6 +635,18 @@ test("builds a sanitized manifest that binds validation, artifacts, and reviews 
   );
   assert.deepEqual(manifest.validation.steps, fixture.validation.steps);
   assert.deepEqual(
+    manifest.validation.steps.find(
+      ({ name }) => name === "complete Node test suite",
+    ).command.arguments,
+    [
+      "--test",
+      "--test-concurrency=4",
+      "--test-reporter=tap",
+      "test/00-u9-priority.mjs",
+      "test/smoke.test.js",
+    ],
+  );
+  assert.deepEqual(
     manifest.artifacts.map(({ path: artifactPath }) => artifactPath),
     fixture.artifacts.map(([relativePath]) => relativePath),
   );
@@ -597,6 +662,51 @@ test("builds a sanitized manifest that binds validation, artifacts, and reviews 
   );
   assert.equal(JSON.stringify(manifest).includes(fixture.root), false);
 });
+
+for (const u9ContractFailure of [
+  {
+    name: "the priority entry is missing",
+    fixtureOptions: { u9PrioritySource: null },
+    expectedError: /committed U9 priority test is unavailable/u,
+  },
+  {
+    name: "the mirrored implementation is missing",
+    fixtureOptions: { u9ImplementationSource: null },
+    expectedError: /committed U9 implementation test is unavailable/u,
+  },
+  {
+    name: "the legacy direct path is present",
+    fixtureOptions: {
+      legacyU9Source: 'import "./u9-mirrored-pr-end-to-end.mjs";\n',
+    },
+    expectedError: /legacy direct U9 test path is ambiguous/u,
+  },
+  {
+    name: "the priority entry is empty",
+    fixtureOptions: { u9PrioritySource: "" },
+    expectedError: /committed U9 priority test contents are invalid/u,
+  },
+  {
+    name: "the priority entry imports another module",
+    fixtureOptions: { u9PrioritySource: 'import "./smoke.test.js";\n' },
+    expectedError: /committed U9 priority test contents are invalid/u,
+  },
+]) {
+  test(`rejects a committed U9 test contract when ${u9ContractFailure.name}`, async (t) => {
+    const fixture = await createFixture(t, u9ContractFailure.fixtureOptions);
+    const { buildAcceptanceManifest } = await loadManifestModule();
+
+    await assert.rejects(
+      buildAcceptanceManifest({
+        root: fixture.root,
+        validationReportPath: fixture.validationPath,
+        artifactPaths: fixture.artifacts.map(([relativePath]) => relativePath),
+        reviewReports: fixture.reviews,
+      }),
+      u9ContractFailure.expectedError,
+    );
+  });
+}
 
 test("rejects a validation report outside its run-specific artifact path", async (t) => {
   const fixture = await createFixture(t);
@@ -1089,7 +1199,7 @@ test("rejects a test skip outside the documented allowlist", async (t) => {
   ).testResults;
   results.cases[0].status = "skipped";
   results.cases[0].reason = "unexpected environment gap";
-  results.summary.passed = 0;
+  results.summary.passed = 1;
   results.summary.skipped = 2;
   await writeFile(
     fixture.validationPath,
@@ -1122,7 +1232,7 @@ test("accepts an explicitly documented Windows-only test skip", async (t) => {
     status: "skipped",
     reason: "requires Windows PowerShell manager",
   };
-  results.summary.passed = 0;
+  results.summary.passed = 1;
   results.summary.skipped = 2;
   await rewriteValidationAndReviewBindings(fixture, validation);
   const { buildAcceptanceManifest } = await loadManifestModule();

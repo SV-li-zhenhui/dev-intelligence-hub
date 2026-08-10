@@ -60,6 +60,7 @@ async function createValidationFixture(t) {
   }
   for (const relativePath of [
     "scripts/system-live-validation.mjs",
+    "scripts/system-node-test-contract.mjs",
     "scripts/system-ui-artifact-receipt.mjs",
     "scripts/system-validation-command.mjs",
     "scripts/system-validation-materialization.mjs",

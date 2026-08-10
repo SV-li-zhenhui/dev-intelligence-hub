@@ -23,6 +23,10 @@ import {
 import {
   deriveCommittedRuntimeSourceIdentity,
 } from "./system-validation-materialization.mjs";
+import {
+  selectCommittedNodeTestFiles,
+  u9PriorityTestPath,
+} from "./system-node-test-contract.mjs";
 
 const MAXIMUM_EVIDENCE_BYTES = 64 * 1024 * 1024;
 const UUID_V4 =
@@ -881,25 +885,28 @@ function validationCommandLimits(name) {
   return { ...DEFAULT_VALIDATION_LIMITS };
 }
 
-function committedNodeTestFiles(syntaxFiles) {
-  const testFiles = syntaxFiles.filter((relativePath) =>
-    /^test\/[^/]+\.test\.js$/u.test(relativePath)
+async function committedNodeTestFiles(root, headOid, syntaxFiles) {
+  const directFiles = syntaxFiles.filter((relativePath) =>
+    /^test\/[^/]+$/u.test(relativePath)
   );
-  const distributionTest = "test/open-source-distribution.test.js";
-  if (!testFiles.includes(distributionTest)) {
-    throw new Error("committed distribution test contract is unavailable");
+  let u9PrioritySource = Buffer.alloc(0);
+  if (directFiles.includes(u9PriorityTestPath)) {
+    try {
+      ({ stdout: u9PrioritySource } = await execFileAsync(
+        "git",
+        ["cat-file", "blob", `${headOid}:${u9PriorityTestPath}`],
+        {
+          cwd: root,
+          encoding: "buffer",
+          maxBuffer: 1024,
+          windowsHide: true,
+        },
+      ));
+    } catch {
+      throw new Error("committed U9 priority test contents are invalid");
+    }
   }
-  const immutableFiles = testFiles.filter(
-    (relativePath) => relativePath !== distributionTest,
-  );
-  const argumentBytes = immutableFiles.reduce(
-    (total, relativePath) => total + Buffer.byteLength(relativePath) + 1,
-    0,
-  );
-  if (immutableFiles.length === 0 || argumentBytes > 24 * 1024) {
-    throw new Error("committed Node test contract is invalid or too large");
-  }
-  return immutableFiles;
+  return selectCommittedNodeTestFiles({ directFiles, u9PrioritySource });
 }
 
 async function committedSyntaxFiles(root, headOid) {
@@ -962,8 +969,12 @@ async function committedSyntaxFiles(root, headOid) {
   return files;
 }
 
-function requiredStepContracts(syntaxFiles, uiArguments, headOid) {
-  const nodeTestFiles = committedNodeTestFiles(syntaxFiles);
+function requiredStepContracts(
+  syntaxFiles,
+  nodeTestFiles,
+  uiArguments,
+  headOid,
+) {
   return [
     {
       name: "git diff --check",
@@ -1038,6 +1049,7 @@ function validateReport(
   currentSource,
   committedRuntimeSource,
   syntaxFiles,
+  nodeTestFiles,
   verifiedUiReceipt,
 ) {
   if (
@@ -1212,6 +1224,7 @@ function validateReport(
   }
   const contracts = requiredStepContracts(
     syntaxFiles,
+    nodeTestFiles,
     uiArguments,
     currentSource.headOid,
   );
@@ -1384,6 +1397,11 @@ export async function buildAcceptanceManifest({
     canonicalRoot,
     sourceBeforeEvidence.headOid,
   );
+  const nodeTestFiles = await committedNodeTestFiles(
+    canonicalRoot,
+    sourceBeforeEvidence.headOid,
+    syntaxFiles,
+  );
   let verifiedUiReceipt;
   try {
     verifiedUiReceipt = await verifyUiArtifactReceipt({
@@ -1400,6 +1418,7 @@ export async function buildAcceptanceManifest({
     sourceBeforeEvidence,
     committedRuntimeSource,
     syntaxFiles,
+    nodeTestFiles,
     verifiedUiReceipt,
   );
   if (Date.parse(generatedAt) < Date.parse(validationReport.finishedAt)) {
