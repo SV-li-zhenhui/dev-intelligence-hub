@@ -22,7 +22,7 @@
     "start": "node scripts/run-dashboard.mjs",
     "refresh": "node src/cli.js refresh",
     "refresh:notify": "node src/cli.js refresh --notify",
-    "test": "node --test --test-concurrency=4 \"test/*.test.js\"",
+    "test": "node test/run-test-suite.mjs",
     "validate:system": "node scripts/validate-system.mjs"
   },
   "engines": {

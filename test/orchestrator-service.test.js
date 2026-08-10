@@ -1463,10 +1463,11 @@ test("fails closed on unverifiable caller evidence before obtaining a deliverer"
     assert.equal(fakes.calls.delivery.length, 1);
   });
 
-  await t.test("verification timeout preserves a mutation margin inside the work lease", async () => {
+  await t.test("verification timeout preserves a mutation margin inside the work lease", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     const fixture = specialistFixture();
     const now = Date.parse("2026-08-03T08:00:00.000Z");
-    fixture.item.leaseUntil = new Date(now + 1_010).toISOString();
+    fixture.item.leaseUntil = new Date(now + 30_000).toISOString();
     let verificationSignal;
     const fakes = fakePorts({
       packet: fixture.packet,
@@ -1478,12 +1479,12 @@ test("fails closed on unverifiable caller evidence before obtaining a deliverer"
     });
     const service = new OrchestratorService({
       ...fakes.ports,
-      evidenceVerificationTimeoutMs: 10_000,
-      evidenceMutationMarginMs: 1_000,
+      evidenceVerificationTimeoutMs: 60_000,
+      evidenceMutationMarginMs: 20_000,
       clock: () => new Date(now),
     });
 
-    await assert.rejects(
+    const execution = assert.rejects(
       service.execute({
         worker: { roleId: "developer", workerId: "employee-developer" },
         item: fixture.item,
@@ -1495,8 +1496,28 @@ test("fails closed on unverifiable caller evidence before obtaining a deliverer"
         error.code === "ORCHESTRATOR_EVIDENCE_VERIFIER_UNAVAILABLE",
     );
 
-    assert.equal(verificationSignal instanceof AbortSignal, true);
-    assert.equal(verificationSignal.aborted, true);
+    try {
+      for (
+        let attempt = 0;
+        verificationSignal === undefined && attempt < 100;
+        attempt += 1
+      ) {
+        await Promise.resolve();
+      }
+      assert.equal(verificationSignal instanceof AbortSignal, true);
+
+      t.mock.timers.tick(8_000);
+      await Promise.resolve();
+      assert.equal(verificationSignal.aborted, false);
+
+      t.mock.timers.tick(3_000);
+      await Promise.resolve();
+      assert.equal(verificationSignal.aborted, true);
+      await execution;
+    } finally {
+      t.mock.timers.runAll();
+      t.mock.timers.reset();
+    }
     assertNoTrustedMutation(fakes.calls);
   });
 
