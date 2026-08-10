@@ -47,6 +47,9 @@ const defaultCommandLimits = Object.freeze({
   maxStderrBytes: 4 * 1024 * 1024,
 });
 const distributionTestPath = "test/open-source-distribution.test.js";
+const u9PriorityTestPath = "test/00-u9-priority.mjs";
+const u9ImplementationTestPath = "test/u9-mirrored-pr-end-to-end.mjs";
+const legacyU9TestPath = "test/u9-mirrored-pr-end-to-end.test.js";
 const maximumNodeTestArgumentBytes = 24 * 1024;
 
 if (unknownArguments.length > 0) {
@@ -382,18 +385,32 @@ async function immutableNodeTestFiles(directory) {
   const entries = await readdir(path.join(directory, "test"), {
     withFileTypes: true,
   });
-  const testFiles = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.js"))
-    .map((entry) => `test/${entry.name}`)
+  const directFiles = new Set(
+    entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => `test/${entry.name}`),
+  );
+  if (!directFiles.has(u9PriorityTestPath)) {
+    throw new Error("committed U9 priority test is unavailable");
+  }
+  if (!directFiles.has(u9ImplementationTestPath)) {
+    throw new Error("committed U9 implementation test is unavailable");
+  }
+  if (!directFiles.has(distributionTestPath)) {
+    throw new Error("committed distribution test is unavailable");
+  }
+  if (directFiles.has(legacyU9TestPath)) {
+    throw new Error("legacy direct U9 test path is ambiguous");
+  }
+  const regularTestFiles = [...directFiles]
+    .filter((relativePath) =>
+      relativePath.endsWith(".test.js") &&
+      relativePath !== distributionTestPath
+    )
     .sort((left, right) =>
       Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
     );
-  if (!testFiles.includes(distributionTestPath)) {
-    throw new Error("committed distribution test is unavailable");
-  }
-  const immutableFiles = testFiles.filter(
-    (relativePath) => relativePath !== distributionTestPath,
-  );
+  const immutableFiles = [u9PriorityTestPath, ...regularTestFiles];
   const argumentBytes = immutableFiles.reduce(
     (total, relativePath) => total + Buffer.byteLength(relativePath) + 1,
     0,

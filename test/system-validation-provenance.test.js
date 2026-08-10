@@ -111,6 +111,18 @@ async function createValidationFixture(t) {
     await projectFixtureText("test-support/system-ui-validation-fixture.mjs"),
   );
   await writeFile(
+    path.join(root, "test/u9-mirrored-pr-end-to-end.mjs"),
+    [
+      "import test from 'node:test';",
+      "test('fixture U9 mirrored PR validation', () => {});",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    path.join(root, "test/00-u9-priority.mjs"),
+    "import './u9-mirrored-pr-end-to-end.mjs';\n",
+  );
+  await writeFile(
     path.join(root, "test/smoke.test.js"),
     [
       "import assert from 'node:assert/strict';",
@@ -376,6 +388,7 @@ test("the system validator binds a passing report to one clean Git source state"
         "--test",
         "--test-concurrency=4",
         "--test-reporter=tap",
+        "test/00-u9-priority.mjs",
         "test/smoke.test.js",
       ],
     },
@@ -398,8 +411,8 @@ test("the system validator binds a passing report to one clean Git source state"
     report.steps.find(({ name }) => name === "complete Node test suite").testResults,
     {
       summary: {
-        tests: 4,
-        passed: 3,
+        tests: 5,
+        passed: 4,
         failed: 0,
         cancelled: 0,
         skipped: 1,
@@ -407,23 +420,28 @@ test("the system validator binds a passing report to one clean Git source state"
       },
       cases: [
         {
-          identity: "tap:1:fixture passes",
+          identity: "tap:1:fixture U9 mirrored PR validation",
+          name: "fixture U9 mirrored PR validation",
+          status: "passed",
+        },
+        {
+          identity: "tap:2:fixture passes",
           name: "fixture passes",
           status: "passed",
         },
         {
-          identity: "tap:2:fixture skip",
+          identity: "tap:3:fixture skip",
           name: "fixture skip",
           status: "skipped",
           reason: "fixture reason",
         },
         {
-          identity: "tap:3:validation reporter options stay outside tested processes",
+          identity: "tap:4:validation reporter options stay outside tested processes",
           name: "validation reporter options stay outside tested processes",
           status: "passed",
         },
         {
-          identity: "tap:4:validation commands execute from a detached materialized source",
+          identity: "tap:5:validation commands execute from a detached materialized source",
           name: "validation commands execute from a detached materialized source",
           status: "passed",
         },
@@ -487,6 +505,59 @@ test("the system validator binds a passing report to one clean Git source state"
   assert.equal(JSON.stringify(report).includes(root), false);
 });
 
+for (const discoveryFailure of [
+  {
+    name: "the priority entry is missing",
+    prepare: (root) => rm(path.join(root, "test/00-u9-priority.mjs")),
+    expectedError: /committed U9 priority test is unavailable/u,
+  },
+  {
+    name: "the mirrored U9 implementation is missing",
+    prepare: (root) =>
+      rm(path.join(root, "test/u9-mirrored-pr-end-to-end.mjs")),
+    expectedError: /committed U9 implementation test is unavailable/u,
+  },
+  {
+    name: "the distribution test is missing",
+    prepare: (root) =>
+      rm(path.join(root, "test/open-source-distribution.test.js")),
+    expectedError: /committed distribution test is unavailable/u,
+  },
+  {
+    name: "the legacy direct U9 path is present",
+    prepare: (root) =>
+      writeFile(
+        path.join(root, "test/u9-mirrored-pr-end-to-end.test.js"),
+        "import './u9-mirrored-pr-end-to-end.mjs';\n",
+      ),
+    expectedError: /legacy direct U9 test path is ambiguous/u,
+  },
+]) {
+  test(`the system validator fails closed before test execution when ${discoveryFailure.name}`, async (t) => {
+    const root = await createValidationFixture(t);
+    await discoveryFailure.prepare(root);
+    await git(root, "add", "--all");
+    await git(root, "commit", "--quiet", "-m", "invalid test discovery fixture");
+
+    await assert.rejects(
+      execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
+        cwd: root,
+        encoding: "utf8",
+        env: validationEnvironment(),
+        windowsHide: true,
+      }),
+    );
+
+    const { report } = await readOnlyValidationReport(root);
+    assert.equal(report.status, "failed");
+    assert.match(report.error, discoveryFailure.expectedError);
+    assert.equal(
+      report.steps.some(({ name }) => name === "complete Node test suite"),
+      false,
+    );
+  });
+}
+
 test("the system validator rejects whitespace defects in committed source", async (t) => {
   const root = await createValidationFixture(t);
   await writeFile(
@@ -543,7 +614,7 @@ test("the system validator records structured failed test identities", async (t)
   assert.deepEqual(
     testStep.testResults.cases.filter(({ status }) => status === "failed"),
     [{
-      identity: "tap:1:fixture failure identity",
+      identity: "tap:2:fixture failure identity",
       name: "fixture failure identity",
       status: "failed",
     }],
