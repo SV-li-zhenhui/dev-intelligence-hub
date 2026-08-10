@@ -18,6 +18,9 @@ function initialState() {
     graphLoading: false,
     graphSnapshot: null,
     graphError: "",
+    ownerRetryPendingItemId: null,
+    ownerRetryErrorItemId: null,
+    ownerRetryError: "",
   };
 }
 
@@ -52,7 +55,190 @@ function subjectLabel(item) {
   return subject.repository || subject.id || item.assignmentId || "本地工作项";
 }
 
-function itemRows(items, now) {
+const OWNER_RETRY_SHA256 = /^[a-f0-9]{64}$/;
+const OWNER_RETRY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const OWNER_RETRY_REQUIRED_ITEM_FIELDS = Object.freeze([
+  "itemId",
+  "revision",
+  "inputDigest",
+  "attempt",
+  "kind",
+  "status",
+  "statusReason",
+  "ownerId",
+  "leaseId",
+  "leaseUntil",
+  "activeIntentId",
+  "decisionContext",
+  "sourceQuarantine",
+  "source",
+]);
+const ownerRetryTextEncoder = new TextEncoder();
+
+function ownerRetryDataFields(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+  const fields = new Map();
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !descriptor?.enumerable ||
+      !("value" in descriptor)
+    ) {
+      return null;
+    }
+    fields.set(key, descriptor.value);
+  }
+  return fields;
+}
+
+function ownerRetryArrayValues(value) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1
+  ) {
+    return null;
+  }
+  const values = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+    values.push(descriptor.value);
+  }
+  return values;
+}
+
+function boundedOwnerRetryId(value) {
+  return Boolean(
+    typeof value === "string" &&
+      value.trim() &&
+      !OWNER_RETRY_CONTROL_CHARACTERS.test(value) &&
+      ownerRetryTextEncoder.encode(value).length <= 192,
+  );
+}
+
+function ownerDecisionRetryBinding(value) {
+  try {
+    const item = ownerRetryDataFields(value);
+    if (
+      !item ||
+      OWNER_RETRY_REQUIRED_ITEM_FIELDS.some((field) => !item.has(field))
+    ) {
+      return null;
+    }
+    const itemId = item.get("itemId");
+    const revision = item.get("revision");
+    const inputDigest = item.get("inputDigest");
+    const attempt = item.get("attempt");
+    if (
+      !boundedOwnerRetryId(itemId) ||
+      !Number.isSafeInteger(revision) ||
+      revision < 1 ||
+      typeof inputDigest !== "string" ||
+      !OWNER_RETRY_SHA256.test(inputDigest) ||
+      !Number.isSafeInteger(attempt) ||
+      attempt < 0 ||
+      item.get("kind") !== "source_root" ||
+      item.get("status") !== "blocked" ||
+      item.get("statusReason") !== "decision_attempts_exhausted" ||
+      item.get("ownerId") !== null ||
+      item.get("leaseId") !== null ||
+      item.get("leaseUntil") !== null ||
+      item.get("activeIntentId") !== null ||
+      item.get("decisionContext") !== null ||
+      item.get("sourceQuarantine") !== null
+    ) {
+      return null;
+    }
+
+    const source = ownerRetryDataFields(item.get("source"));
+    if (!source) return null;
+    const sourceFields = [
+      "kind",
+      "inputRevision",
+      "activeRevision",
+      "pendingRevision",
+      "pending",
+      "current",
+      "bindings",
+    ];
+    if (sourceFields.some((field) => !source.has(field))) return null;
+    const inputRevision = source.get("inputRevision");
+    const activeRevision = source.get("activeRevision");
+    if (
+      source.get("kind") !== "pull_request" ||
+      !Number.isSafeInteger(inputRevision) ||
+      inputRevision < 1 ||
+      activeRevision !== inputRevision ||
+      source.get("pendingRevision") !== null ||
+      source.get("pending") !== null
+    ) {
+      return null;
+    }
+
+    const current = ownerRetryDataFields(source.get("current"));
+    if (
+      !current ||
+      !current.has("eventId") ||
+      !current.has("inputDigest") ||
+      !current.has("event")
+    ) {
+      return null;
+    }
+    const eventId = current.get("eventId");
+    if (
+      !boundedOwnerRetryId(eventId) ||
+      current.get("inputDigest") !== inputDigest
+    ) {
+      return null;
+    }
+    const event = ownerRetryDataFields(current.get("event"));
+    if (!event?.has("eventId") || event.get("eventId") !== eventId) return null;
+
+    const bindings = ownerRetryArrayValues(source.get("bindings"));
+    if (!bindings) return null;
+    const currentlyBound = bindings.some((value) => {
+      const binding = ownerRetryDataFields(value);
+      return Boolean(
+        binding?.has("eventId") &&
+          binding.has("inputRevision") &&
+          binding.get("eventId") === eventId &&
+          binding.get("inputRevision") === activeRevision,
+      );
+    });
+    return currentlyBound
+      ? { itemId, expectedRevision: revision, expectedInputDigest: inputDigest }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function ownerDecisionRetryMarkup(item, state) {
+  const binding = ownerDecisionRetryBinding(item);
+  if (!binding) return "";
+  const pendingItemId = state.ownerRetryPendingItemId || null;
+  const pending = pendingItemId !== null;
+  const label = pendingItemId === binding.itemId
+    ? "正在重新排队…"
+    : "重新排队一次";
+  const error =
+    state.ownerRetryErrorItemId === binding.itemId
+      ? state.ownerRetryError
+      : "";
+  return `<button type="button" class="secondary-action" data-owner-decision-retry-item-id="${escapeWorkHtml(binding.itemId)}"${pending ? " disabled" : ""}>${label}</button>
+      ${error ? `<p class="code-job-action-error" role="alert">${escapeWorkHtml(error)}</p>` : ""}`;
+}
+
+function itemRows(items, now, state) {
   if (!items.length) {
     return '<div class="empty">尚无工作项；新的路由分派会可靠进入这里。</div>';
   }
@@ -66,6 +252,7 @@ function itemRows(items, now) {
       <span>${escapeWorkHtml(item.event?.eventType || item.kind || "unknown")} · 尝试 ${escapeWorkHtml(item.attempt ?? 0)} 次 · ${relativeTime(item.updatedAt, now)}</span>
       ${item.statusReason ? `<small>${escapeWorkHtml(item.statusReason)}</small>` : ""}
       ${item.decisionContext ? `<small>已绑定继续处理上下文 · ${escapeWorkHtml(item.decisionContext.kind || "context")}</small>` : ""}
+      ${ownerDecisionRetryMarkup(item, state)}
     </article>`).join("")}</div>`;
 }
 
@@ -682,7 +869,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
     <div class="work-columns">
       <section class="section work-panel">
         <div class="section-heading"><h2>最近工作</h2><span>${state.items.length} ITEMS · 最新在前</span></div>
-        ${itemRows(state.items, now)}
+        ${itemRows(state.items, now, state)}
       </section>
       <section class="section work-panel">
         <div class="section-heading"><h2>审计时间线</h2><span>${state.timeline.length} EVENTS · 最新在前</span></div>
@@ -727,6 +914,8 @@ export function createWorkView({
   let detailState = null;
   let detailRequestSequence = 0;
   let loadRequestSequence = 0;
+  let ownerRetryRequestSequence = 0;
+  let ownerRetryInFlight = false;
 
   function change(patch) {
     state = { ...state, ...patch };
@@ -995,7 +1184,79 @@ export function createWorkView({
     }
   }
 
-  async function load() {
+  function currentOwnerRetryBinding(itemId) {
+    if (typeof itemId !== "string" || !Array.isArray(state.items)) return null;
+    for (const item of state.items) {
+      const binding = ownerDecisionRetryBinding(item);
+      if (binding?.itemId === itemId) return binding;
+    }
+    return null;
+  }
+
+  function boundedOwnerRetryError(error) {
+    const message = errorMessage(error).trim();
+    return message && ownerRetryTextEncoder.encode(message).length <= 512
+      ? message
+      : "重新排队失败，请稍后重试";
+  }
+
+  async function retryDecisionExhaustion(itemId) {
+    if (ownerRetryInFlight) return;
+    const binding = currentOwnerRetryBinding(itemId);
+    if (!binding) return;
+    const sequence = ++ownerRetryRequestSequence;
+    ownerRetryInFlight = true;
+    change({
+      ownerRetryPendingItemId: binding.itemId,
+      ownerRetryErrorItemId: null,
+      ownerRetryError: "",
+    });
+    try {
+      const response = await fetchImpl(
+        `/api/work/items/${encodeURIComponent(binding.itemId)}/retry-decision-exhaustion`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-mydashboard-action": "1",
+          },
+          body: JSON.stringify({
+            expectedRevision: binding.expectedRevision,
+            expectedInputDigest: binding.expectedInputDigest,
+          }),
+        },
+      );
+      if (sequence !== ownerRetryRequestSequence) return;
+      if (response.status === 409) {
+        change({ ownerRetryPendingItemId: null });
+        await loadWorkProjection();
+        if (sequence === ownerRetryRequestSequence) {
+          onNotice("工作项状态已经变化，请查看最新状态。");
+        }
+        return;
+      }
+      await responseJson(response, "重新排队工作项");
+      if (sequence !== ownerRetryRequestSequence) return;
+      await loadWorkProjection();
+      if (sequence !== ownerRetryRequestSequence) return;
+      change({ ownerRetryPendingItemId: null });
+      onNotice("工作项已重新排队，交由系统继续处理。");
+    } catch (error) {
+      if (sequence !== ownerRetryRequestSequence) return;
+      change({
+        ownerRetryPendingItemId: null,
+        ownerRetryErrorItemId: binding.itemId,
+        ownerRetryError: boundedOwnerRetryError(error),
+      });
+    } finally {
+      ownerRetryInFlight = false;
+      if (state.ownerRetryPendingItemId === binding.itemId) {
+        change({ ownerRetryPendingItemId: null });
+      }
+    }
+  }
+
+  async function loadWorkProjection() {
     const sequence = ++loadRequestSequence;
     change({
       loading: true,
@@ -1043,10 +1304,23 @@ export function createWorkView({
     });
   }
 
+  async function load() {
+    ownerRetryRequestSequence += 1;
+    change({
+      ownerRetryErrorItemId: null,
+      ownerRetryError: "",
+    });
+    await loadWorkProjection();
+  }
+
   return {
     bind(root) {
       root.querySelectorAll("[data-code-job-id]").forEach((button) => {
         button.addEventListener("click", () => openCodeJob(button.dataset.codeJobId));
+      });
+      root.querySelectorAll("[data-owner-decision-retry-item-id]").forEach((button) => {
+        button.addEventListener("click", () =>
+          retryDecisionExhaustion(button.dataset.ownerDecisionRetryItemId));
       });
     },
     closeDetail,
@@ -1059,5 +1333,6 @@ export function createWorkView({
     openCodeJob,
     render: () => renderWorkView(state, { now: clock() }),
     requestCodeJobChangePackageApply,
+    retryDecisionExhaustion,
   };
 }

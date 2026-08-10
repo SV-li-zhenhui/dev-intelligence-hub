@@ -24,6 +24,86 @@ function deferred() {
   return { promise, resolve };
 }
 
+const OWNER_RETRY_DIGEST = "a".repeat(64);
+
+function eligibleOwnerRetryItem(overrides = {}) {
+  return Object.assign({
+    itemId: "work-item-owner-retry",
+    assignmentId: "owner-retry-row",
+    kind: "source_root",
+    inputDigest: OWNER_RETRY_DIGEST,
+    status: "blocked",
+    statusReason: "decision_attempts_exhausted",
+    revision: 7,
+    ownerId: null,
+    leaseId: null,
+    leaseUntil: null,
+    activeIntentId: null,
+    decisionContext: null,
+    sourceQuarantine: null,
+    attempt: 3,
+    source: {
+      kind: "pull_request",
+      inputRevision: 4,
+      activeRevision: 4,
+      pendingRevision: null,
+      pending: null,
+      current: {
+        eventId: "event-4",
+        inputDigest: OWNER_RETRY_DIGEST,
+        event: { eventId: "event-4" },
+      },
+      bindings: [{ eventId: "event-4", inputRevision: 4 }],
+    },
+  }, overrides);
+}
+
+function workProjectionState(items, overrides = {}) {
+  return {
+    loaded: true,
+    loading: false,
+    error: "",
+    summary: { itemCounts: {}, safeguards: {} },
+    items,
+    timeline: [],
+    codeJobsEnabled: false,
+    codeJobs: [],
+    codeJobsError: "",
+    graphLoading: false,
+    graphSnapshot: null,
+    graphError: "",
+    ...overrides,
+  };
+}
+
+function workProjectionResponse(url, items) {
+  if (url === "/api/work/summary") {
+    return response({ itemCounts: {}, safeguards: {} });
+  }
+  if (url === "/api/work/items?limit=50&order=newest") {
+    return response({ items });
+  }
+  if (url === "/api/work/timeline?limit=50&order=newest") {
+    return response({ items: [] });
+  }
+  if (url === "/api/code/jobs?limit=50&order=newest") {
+    return response({ enabled: false, items: [] });
+  }
+  if (url === "/api/work/graph") {
+    return response({
+      schemaVersion: 1,
+      graph: {
+        schemaVersion: 1,
+        graphId: "work-ledger",
+        revision: 0,
+        tasks: [],
+      },
+      taskStates: [],
+    });
+  }
+  throw new Error(`unexpected request: ${url}`);
+}
+
 function applicationDetailState(application, {
   manifest = { packageId: `change-package-${"a".repeat(64)}` },
   packageStatus = "ready",
@@ -173,6 +253,350 @@ test("work view escapes records and clearly displays safety posture", () => {
   assert.match(html, /终态：已完成/);
   assert.doesNotMatch(html, /PRIVATE EXECUTOR RESULT/);
   assert.equal(escapeWorkHtml('"<&'), "&quot;&lt;&amp;");
+});
+
+test("owner retry renders only for the exact fail-closed public projection", () => {
+  const eligibleHtml = renderWorkView(
+    workProjectionState([eligibleOwnerRetryItem()]),
+  );
+  assert.equal(
+    (eligibleHtml.match(/data-owner-decision-retry-item-id=/g) || []).length,
+    1,
+  );
+  assert.match(
+    eligibleHtml,
+    /<button type="button" class="secondary-action" data-owner-decision-retry-item-id="work-item-owner-retry">重新排队一次<\/button>/,
+  );
+  assert.doesNotMatch(
+    eligibleHtml,
+    /data-(?:revision|digest|source|actor|reason|status)=/,
+  );
+
+  const source = () => eligibleOwnerRetryItem().source;
+  const cases = [
+    ["wrong status", { status: "queued" }],
+    ["wrong reason", { statusReason: "decision_failed" }],
+    ["wrong item kind", { kind: "assignment" }],
+    ["wrong source kind", { source: { ...source(), kind: "issue" } }],
+    ["missing source binding", { source: { ...source(), bindings: [] } }],
+    ["wrong binding event", {
+      source: { ...source(), bindings: [{ eventId: "event-3", inputRevision: 4 }] },
+    }],
+    ["wrong binding revision", {
+      source: { ...source(), bindings: [{ eventId: "event-4", inputRevision: 3 }] },
+    }],
+    ["pending source revision", { source: { ...source(), pendingRevision: 5 } }],
+    ["pending source", { source: { ...source(), pending: { eventId: "event-5" } } }],
+    ["occupied owner", { ownerId: "employee-pr-engineer" }],
+    ["occupied lease", { leaseId: "lease-1" }],
+    ["occupied lease time", { leaseUntil: "2026-08-02T02:00:00.000Z" }],
+    ["active intent", { activeIntentId: "intent-1" }],
+    ["decision context", { decisionContext: { kind: "proposal" } }],
+    ["source quarantine", { sourceQuarantine: { reason: "cutover" } }],
+    ["zero revision", { revision: 0 }],
+    ["fractional revision", { revision: 1.5 }],
+    ["upper-case digest", { inputDigest: OWNER_RETRY_DIGEST.toUpperCase() }],
+    ["short digest", { inputDigest: "a".repeat(63) }],
+    ["negative attempt", { attempt: -1 }],
+    ["fractional attempt", { attempt: 1.5 }],
+    ["empty item ID", { itemId: "" }],
+    ["oversized item ID", { itemId: "x".repeat(193) }],
+    ["zero input revision", { source: { ...source(), inputRevision: 0 } }],
+    ["inactive input revision", { source: { ...source(), activeRevision: 3 } }],
+    ["empty current event ID", {
+      source: { ...source(), current: { ...source().current, eventId: "" } },
+    }],
+    ["oversized current event ID", {
+      source: { ...source(), current: { ...source().current, eventId: "x".repeat(193) } },
+    }],
+    ["contradictory embedded event", {
+      source: {
+        ...source(),
+        current: { ...source().current, event: { eventId: "event-3" } },
+      },
+    }],
+    ["contradictory current digest", {
+      source: {
+        ...source(),
+        current: { ...source().current, inputDigest: "b".repeat(64) },
+      },
+    }],
+    ["missing eligibility field", { sourceQuarantine: undefined }],
+  ];
+
+  for (const [label, overrides] of cases) {
+    const item = eligibleOwnerRetryItem(overrides);
+    if (label === "missing eligibility field") delete item.sourceQuarantine;
+    assert.doesNotMatch(
+      renderWorkView(workProjectionState([item])),
+      /data-owner-decision-retry-item-id=/,
+      label,
+    );
+  }
+});
+
+test("owner retry rejects accessor-backed and custom-prototype projection shapes", () => {
+  assert.match(
+    renderWorkView(workProjectionState([eligibleOwnerRetryItem()])),
+    /data-owner-decision-retry-item-id=/,
+  );
+  let getterCalls = 0;
+  const accessorItem = eligibleOwnerRetryItem();
+  Object.defineProperty(accessorItem, "revision", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 7;
+    },
+  });
+  const accessorSource = eligibleOwnerRetryItem();
+  Object.defineProperty(accessorSource.source.current, "eventId", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "event-4";
+    },
+  });
+  const customItem = Object.assign(
+    Object.create({ inherited: true }),
+    eligibleOwnerRetryItem(),
+  );
+  const customSourceItem = eligibleOwnerRetryItem({
+    source: Object.assign(Object.create(null), eligibleOwnerRetryItem().source),
+  });
+  const extraBindingArrayItem = eligibleOwnerRetryItem();
+  extraBindingArrayItem.source.bindings.extra = true;
+
+  for (const item of [
+    accessorItem,
+    accessorSource,
+    customItem,
+    customSourceItem,
+    extraBindingArrayItem,
+  ]) {
+    assert.doesNotMatch(
+      renderWorkView(workProjectionState([item])),
+      /data-owner-decision-retry-item-id=/,
+    );
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test("owner retry binds the button and submits only current in-memory authority", async () => {
+  const itemId = "work/item ?#";
+  let currentItems = [eligibleOwnerRetryItem({
+    itemId,
+    revision: 9,
+    inputDigest: "b".repeat(64),
+    source: {
+      ...eligibleOwnerRetryItem().source,
+      current: {
+        ...eligibleOwnerRetryItem().source.current,
+        inputDigest: "b".repeat(64),
+      },
+    },
+  })];
+  const calls = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (options.method === "POST") return response({ requeued: true });
+      return workProjectionResponse(url, currentItems);
+    },
+  });
+  await view.load();
+
+  let click;
+  const button = {
+    dataset: { ownerDecisionRetryItemId: itemId },
+    addEventListener(event, listener) {
+      assert.equal(event, "click");
+      click = listener;
+    },
+  };
+  view.bind({
+    querySelectorAll(selector) {
+      return selector === "[data-owner-decision-retry-item-id]" ? [button] : [];
+    },
+  });
+  assert.deepEqual(Object.keys(button.dataset), ["ownerDecisionRetryItemId"]);
+  await click();
+
+  const mutation = calls.find(({ options }) => options.method === "POST");
+  assert.equal(
+    mutation.url,
+    "/api/work/items/work%2Fitem%20%3F%23/retry-decision-exhaustion",
+  );
+  assert.deepEqual(mutation.options.headers, {
+    "content-type": "application/json",
+    "x-mydashboard-action": "1",
+  });
+  assert.deepEqual(JSON.parse(mutation.options.body), {
+    expectedRevision: 9,
+    expectedInputDigest: "b".repeat(64),
+  });
+
+  currentItems = [eligibleOwnerRetryItem({ itemId, status: "queued" })];
+  await view.load();
+  await view.retryDecisionExhaustion(itemId, {
+    expectedRevision: 999,
+    expectedInputDigest: "f".repeat(64),
+    actorId: "attacker",
+  });
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    1,
+  );
+});
+
+test("owner retry permits one pending request and disables every eligible control", async () => {
+  const pendingResponse = deferred();
+  const items = [
+    eligibleOwnerRetryItem({ itemId: "owner-retry-a" }),
+    eligibleOwnerRetryItem({ itemId: "owner-retry-b" }),
+  ];
+  const calls = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (options.method === "POST") return pendingResponse.promise;
+      return workProjectionResponse(url, items);
+    },
+  });
+  await view.load();
+
+  const pending = view.retryDecisionExhaustion("owner-retry-a");
+  await view.retryDecisionExhaustion("owner-retry-a");
+  await view.retryDecisionExhaustion("owner-retry-b");
+
+  const pendingHtml = view.render();
+  assert.match(
+    pendingHtml,
+    /data-owner-decision-retry-item-id="owner-retry-a" disabled>正在重新排队…<\/button>/,
+  );
+  assert.match(
+    pendingHtml,
+    /data-owner-decision-retry-item-id="owner-retry-b" disabled>重新排队一次<\/button>/,
+  );
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    1,
+  );
+
+  pendingResponse.resolve(response({ requeued: true }));
+  await pending;
+});
+
+test("owner retry reloads and notices on success or conflict, and escapes row errors", async (t) => {
+  for (const scenario of [
+    {
+      name: "success",
+      mutation: response({ requeued: true }),
+      notice: /重新排队.*系统/,
+      reloads: 2,
+    },
+    {
+      name: "conflict",
+      mutation: response({ error: "stale" }, false, 409),
+      notice: /工作项.*变化/,
+      reloads: 2,
+    },
+    {
+      name: "bounded error",
+      mutation: response({ error: "<img src=x onerror=alert(1)>" }, false, 503),
+      notice: null,
+      reloads: 1,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const calls = [];
+      const notices = [];
+      const items = [eligibleOwnerRetryItem()];
+      const view = createWorkView({
+        fetchImpl: async (url, options = {}) => {
+          calls.push({ url, options });
+          if (options.method === "POST") return scenario.mutation;
+          return workProjectionResponse(url, items);
+        },
+        onNotice: (message) => notices.push(message),
+      });
+      await view.load();
+      await view.retryDecisionExhaustion("work-item-owner-retry");
+
+      assert.equal(
+        calls.filter(({ url }) => url === "/api/work/summary").length,
+        scenario.reloads,
+      );
+      if (scenario.notice) {
+        assert.equal(notices.length, 1);
+        assert.match(notices[0], scenario.notice);
+      } else {
+        assert.deepEqual(notices, []);
+        assert.match(
+          view.render(),
+          /role="alert"[^>]*>[^<]*&lt;img src=x onerror=alert\(1\)&gt;/,
+        );
+        assert.doesNotMatch(view.render(), /<img src=x/);
+
+        const nextAttempt = view.retryDecisionExhaustion("work-item-owner-retry");
+        assert.doesNotMatch(view.render(), /role="alert"/);
+        await nextAttempt;
+        await view.load();
+        assert.doesNotMatch(view.render(), /role="alert"/);
+      }
+    });
+  }
+});
+
+test("a late owner retry response cannot overwrite a newer Work load", async () => {
+  const pendingResponse = deferred();
+  let currentItems = [eligibleOwnerRetryItem()];
+  const calls = [];
+  const notices = [];
+  const view = createWorkView({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (options.method === "POST") return pendingResponse.promise;
+      return workProjectionResponse(url, currentItems);
+    },
+    onNotice: (message) => notices.push(message),
+  });
+  await view.load();
+  const pending = view.retryDecisionExhaustion("work-item-owner-retry");
+
+  currentItems = [eligibleOwnerRetryItem({
+    assignmentId: "newer-local-state",
+    revision: 8,
+    inputDigest: "b".repeat(64),
+    source: {
+      ...eligibleOwnerRetryItem().source,
+      current: {
+        ...eligibleOwnerRetryItem().source.current,
+        inputDigest: "b".repeat(64),
+      },
+    },
+  })];
+  await view.load();
+  const duplicateAfterLoad = view.retryDecisionExhaustion(
+    "work-item-owner-retry",
+  );
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    1,
+  );
+  assert.match(view.render(), /正在重新排队…/);
+  pendingResponse.resolve(
+    response({ error: "<script>late failure</script>" }, false, 503),
+  );
+  await Promise.all([pending, duplicateAfterLoad]);
+
+  assert.match(view.render(), /newer-local-state/);
+  assert.doesNotMatch(view.render(), /role="alert"|late failure|正在重新排队/);
+  assert.deepEqual(notices, []);
+  assert.equal(
+    calls.filter(({ options }) => options.method === "POST").length,
+    1,
+  );
 });
 
 test("code jobs render every safe lifecycle state from browser projections", () => {
