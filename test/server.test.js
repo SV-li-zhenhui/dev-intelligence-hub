@@ -6131,7 +6131,6 @@ test("shutdown aborts cooperative background work before bounded draining", asyn
 
 test("shutdown reaps an active external refresh command before completing", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "server-command-drain-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
   const marker = path.join(directory, "pid.txt");
   let observedSignal = null;
   const application = startupApplication({
@@ -6144,7 +6143,7 @@ test("shutdown reaps an active external refresh command before completing", asyn
             "-e",
             `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1000)`,
           ],
-          { timeoutMs: 10_000, signal },
+          { timeoutMs: 30_000, signal },
         );
       } catch (error) {
         signal?.throwIfAborted();
@@ -6155,8 +6154,14 @@ test("shutdown reaps an active external refresh command before completing", asyn
   const backgroundWork = startApplicationBackgroundWork(application, {
     drainTimeoutMs: 2_000,
   });
+  t.after(async () => {
+    await Promise.allSettled([backgroundWork.stop()]);
+    await Promise.allSettled([backgroundWork.initialRefresh]);
+    await rm(directory, { recursive: true, force: true });
+  });
   let processId = null;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  const startupDeadline = performance.now() + 20_000;
+  while (performance.now() < startupDeadline) {
     try {
       processId = Number(await readFile(marker, "utf8"));
       break;
