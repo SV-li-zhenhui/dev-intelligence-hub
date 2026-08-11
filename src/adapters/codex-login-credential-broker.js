@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, opendir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { types as utilTypes } from "node:util";
 
@@ -13,6 +14,7 @@ import {
   prepareCleanupTreesByIdentity,
   PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
 } from "../lib/private-directory-manager.js";
+import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
@@ -23,6 +25,11 @@ const CLEANUP_TIMEOUT_MS = 10_000;
 const CLEANUP_MAXIMUM_ENTRIES = 128;
 const CLEANUP_MAXIMUM_DEPTH = 16;
 const CLEANUP_MAXIMUM_BYTES = 16 * 1024 * 1024;
+const INVOCATION_MARKER = ".mydashboard-invocation.json";
+const PROBE_KIND = "codex-login-probe";
+const STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+const MAX_SCAVENGE_ENTRIES = 128;
+const MAX_MARKER_BYTES = 4 * 1024;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const STATUS_STATES = new Set([
   "available",
@@ -43,6 +50,10 @@ const ERROR_DEFINITIONS = Object.freeze({
   STRUCTURED_PROVIDER_CANCELLED: Object.freeze({
     message: "Structured CLI provider request was cancelled",
     statusCode: 499,
+  }),
+  STRUCTURED_PROVIDER_TIMEOUT: Object.freeze({
+    message: "Structured CLI provider request timed out",
+    statusCode: 504,
   }),
   STRUCTURED_PROVIDER_CLEANUP_FAILED: Object.freeze({
     message: "Structured CLI provider cleanup failed",
@@ -237,9 +248,13 @@ function mapTaskFailure(error, signal) {
   if (
     code === "CODEX_LOGIN_FILE_UNAVAILABLE" ||
     code === "CODEX_LOGIN_SOURCE_UNSAFE" ||
-    code === "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE"
+    code === "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" ||
+    code === "STRUCTURED_PROVIDER_PROCESS_FAILED"
   ) {
     return brokerError("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE");
+  }
+  if (code === "STRUCTURED_PROVIDER_TIMEOUT") {
+    return brokerError("STRUCTURED_PROVIDER_TIMEOUT");
   }
   if (code === "STRUCTURED_PROVIDER_CANCELLED") {
     return brokerError("STRUCTURED_PROVIDER_CANCELLED");
@@ -258,6 +273,13 @@ function statusProjection(state) {
 }
 
 function statusStateFor(error, signal) {
+  if (
+    failureCode(error) === "CODEX_LOGIN_BROKER_BLOCKED" ||
+    failureCode(error) === "STRUCTURED_PROVIDER_CLEANUP_FAILED" ||
+    failureCode(error) === "STRUCTURED_PROVIDER_REAP_FAILED"
+  ) {
+    return "broker_blocked";
+  }
   if (signal?.aborted || failureCode(error) === "ABORT_ERR") {
     throw brokerError("STRUCTURED_PROVIDER_CANCELLED");
   }
@@ -268,6 +290,7 @@ function statusStateFor(error, signal) {
     case "CODEX_LOGIN_SOURCE_UNSAFE":
       return "unsafe_source";
     case "STRUCTURED_PROVIDER_UNAVAILABLE":
+    case "STRUCTURED_PROVIDER_TIMEOUT":
       return "cli_unavailable";
     default:
       return "broker_blocked";
@@ -290,7 +313,10 @@ function brokerDependencies(rawDependencies) {
     "privateDirectoryManager",
     "prepareCleanupTrees",
     "randomUUID",
-  ]);
+  ], ["clock", "processId", "isProcessAlive"]);
+  const clock = dependencies.clock ?? (() => Date.now());
+  const processId = dependencies.processId ?? process.pid;
+  const isProcessAlive = dependencies.isProcessAlive ?? defaultProcessAlive;
   const requiredOperations = [
     [dependencies.store, ["beginTask", "stageTask", "captureTask", "stageProbe"]],
     [dependencies.commandLocator, ["resolve"]],
@@ -301,11 +327,29 @@ function brokerDependencies(rawDependencies) {
     requiredOperations.some(([port, operations]) =>
       !operationPort(port) || operations.some((name) => typeof port[name] !== "function")) ||
     typeof dependencies.prepareCleanupTrees !== "function" ||
-    typeof dependencies.randomUUID !== "function"
+    typeof dependencies.randomUUID !== "function" ||
+    typeof clock !== "function" ||
+    !Number.isSafeInteger(processId) ||
+    processId < 1 ||
+    typeof isProcessAlive !== "function"
   ) {
     throw new TypeError("Codex login broker test dependencies are invalid");
   }
-  return Object.freeze(dependencies);
+  return Object.freeze({
+    ...dependencies,
+    clock,
+    processId,
+    isProcessAlive,
+  });
+}
+
+function defaultProcessAlive(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
 }
 
 function productionBrokerDependencies(protectedRoots) {
@@ -322,6 +366,9 @@ function productionBrokerDependencies(protectedRoots) {
       privateDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
       prepareCleanupTrees: prepareCleanupTreesByIdentity,
       randomUUID,
+      clock: () => Date.now(),
+      processId: process.pid,
+      isProcessAlive: defaultProcessAlive,
     }),
   });
 }
@@ -489,50 +536,149 @@ function createBroker(rawOptions, rawDependencies) {
     });
   }
 
-  async function prepareProbeInvocation(signal) {
-    const probeRoot = await prepareProbeRoot(signal);
-    await verifyDirectoryIdentity(probeRoot);
-    const uuid = dependencies.randomUUID();
-    if (typeof uuid !== "string" || !SAFE_UUID.test(uuid)) {
+  function probeMarker() {
+    const milliseconds = dependencies.clock();
+    if (!Number.isFinite(milliseconds)) {
       throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
-    const directory = path.join(probeRoot.path, `probe-${uuid}`);
-    const invocation = await dependencies.privateDirectoryManager.prepare({
-      directory,
-      signal,
-      async validateLocation() {
-        await verifyDirectoryIdentity(probeRoot);
-        if (path.dirname(directory) !== probeRoot.path) {
-          throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
-        }
-      },
+    const createdAt = new Date(milliseconds).toISOString();
+    return Object.freeze({
+      schemaVersion: 1,
+      kind: PROBE_KIND,
+      ownerPid: dependencies.processId,
+      createdAt,
     });
+  }
+
+  async function writeProbeMarker(invocation, signal) {
+    await verifyDirectoryIdentity(invocation);
+    throwIfCancelled(signal);
+    const markerPath = path.join(invocation.path, INVOCATION_MARKER);
+    const bytes = Buffer.from(JSON.stringify(probeMarker()), "utf8");
+    if (bytes.length > MAX_MARKER_BYTES) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    let handle = null;
+    try {
+      handle = await open(
+        markerPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+        0o600,
+      );
+      throwIfCancelled(signal);
+      await handle.writeFile(bytes);
+      await handle.sync();
+      throwIfCancelled(signal);
+    } catch (error) {
+      if (error instanceof CodexLoginCredentialBrokerError) throw error;
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    } finally {
+      try {
+        await handle?.close();
+      } catch {
+        throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      }
+    }
+    const details = await lstat(markerPath, { bigint: true });
+    if (
+      !details.isFile() ||
+      details.isSymbolicLink() ||
+      details.nlink !== 1n ||
+      details.size !== BigInt(bytes.length)
+    ) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    await verifyDirectoryIdentity(invocation);
+  }
+
+  async function probeIdentity(directory, probeRoot) {
     await verifyDirectoryIdentity(probeRoot);
-    return verifyDirectoryIdentity(invocation);
-  }
-
-  async function prepareCodexHome(invocation, signal) {
-    const verifiedInvocation = await verifyDirectoryIdentity(invocation);
-    const directory = path.join(verifiedInvocation.path, "codex-home");
-    const codexHome = await dependencies.privateDirectoryManager.prepare({
-      directory,
-      signal,
-      async validateLocation() {
-        await verifyDirectoryIdentity(verifiedInvocation);
-        if (path.dirname(directory) !== verifiedInvocation.path) {
-          throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
-        }
-      },
+    if (path.dirname(directory) !== probeRoot.path) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    const resolved = await realpath(directory);
+    const details = await lstat(resolved, { bigint: true });
+    await verifyDirectoryIdentity(probeRoot);
+    if (
+      resolved !== directory ||
+      !details.isDirectory() ||
+      details.isSymbolicLink()
+    ) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    return Object.freeze({
+      path: resolved,
+      device: details.dev.toString(),
+      inode: details.ino.toString(),
     });
-    await verifyDirectoryIdentity(verifiedInvocation);
-    return verifyDirectoryIdentity(codexHome);
   }
 
-  async function cleanupProbe(invocation) {
+  async function readProbeMarker(invocation, signal) {
+    const markerPath = path.join(invocation.path, INVOCATION_MARKER);
+    let handle = null;
+    try {
+      throwIfCancelled(signal);
+      handle = await open(
+        markerPath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+      );
+      const details = await handle.stat({ bigint: true });
+      if (
+        !details.isFile() ||
+        details.isSymbolicLink() ||
+        details.nlink !== 1n ||
+        details.size < 1n ||
+        details.size > BigInt(MAX_MARKER_BYTES)
+      ) {
+        return null;
+      }
+      const bytes = await handle.readFile();
+      throwIfCancelled(signal);
+      if (bytes.length > MAX_MARKER_BYTES) return null;
+      let marker;
+      try {
+        marker = exactRecord(
+          parseJsonWithUniqueKeys(bytes.toString("utf8")),
+          ["schemaVersion", "kind", "ownerPid", "createdAt"],
+        );
+      } catch {
+        return null;
+      }
+      const createdAtMs = Date.parse(marker.createdAt);
+      if (
+        marker.schemaVersion !== 1 ||
+        marker.kind !== PROBE_KIND ||
+        !Number.isSafeInteger(marker.ownerPid) ||
+        marker.ownerPid < 1 ||
+        typeof marker.createdAt !== "string" ||
+        !Number.isFinite(createdAtMs) ||
+        new Date(createdAtMs).toISOString() !== marker.createdAt
+      ) {
+        return null;
+      }
+      return Object.freeze({
+        ownerPid: marker.ownerPid,
+        createdAtMs,
+      });
+    } catch (error) {
+      if (failureCode(error) === "ENOENT") return null;
+      if (error instanceof CodexLoginCredentialBrokerError) throw error;
+      return null;
+    } finally {
+      try {
+        await handle?.close();
+      } catch {
+        throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      }
+    }
+  }
+
+  async function cleanupProbes(invocations) {
+    if (invocations.length === 0) return;
     const cleanupSignal = AbortSignal.timeout(CLEANUP_TIMEOUT_MS);
     let session = null;
     try {
-      session = await dependencies.prepareCleanupTrees([invocation], {
+      session = await dependencies.prepareCleanupTrees(invocations, {
         maximumEntries: CLEANUP_MAXIMUM_ENTRIES,
         maximumDepth: CLEANUP_MAXIMUM_DEPTH,
         maximumBytes: CLEANUP_MAXIMUM_BYTES,
@@ -557,13 +703,145 @@ function createBroker(rawOptions, rawDependencies) {
     }
   }
 
+  async function scavengeStaleProbes(probeRoot, signal) {
+    throwIfCancelled(signal);
+    await verifyDirectoryIdentity(probeRoot);
+    let directoryHandle = null;
+    const entries = [];
+    try {
+      directoryHandle = await opendir(probeRoot.path);
+      let exhausted = false;
+      for (let index = 0; index < MAX_SCAVENGE_ENTRIES; index += 1) {
+        throwIfCancelled(signal);
+        const entry = await directoryHandle.read();
+        if (entry === null) {
+          exhausted = true;
+          break;
+        }
+        entries.push(entry);
+      }
+      if (!exhausted) {
+        throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      }
+    } catch (error) {
+      if (error instanceof CodexLoginCredentialBrokerError) throw error;
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    } finally {
+      try {
+        await directoryHandle?.close();
+      } catch {
+        throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      }
+    }
+    const stale = [];
+    for (const entry of entries) {
+      throwIfCancelled(signal);
+      if (
+        !entry.isDirectory() ||
+        entry.isSymbolicLink() ||
+        !/^probe-[0-9a-f-]{36}$/u.test(entry.name)
+      ) {
+        continue;
+      }
+      try {
+        const invocation = await probeIdentity(
+          path.join(probeRoot.path, entry.name),
+          probeRoot,
+        );
+        const marker = await readProbeMarker(invocation, signal);
+        if (
+          marker === null ||
+          dependencies.clock() - marker.createdAtMs < STALE_AFTER_MS
+        ) {
+          continue;
+        }
+        let alive = true;
+        try {
+          alive = Boolean(dependencies.isProcessAlive(marker.ownerPid));
+        } catch {
+          alive = true;
+        }
+        if (!alive) stale.push(invocation);
+      } catch (error) {
+        if (error instanceof CodexLoginCredentialBrokerError) throw error;
+        // Unknown, raced, or untrusted entries are retained.
+      }
+    }
+    throwIfCancelled(signal);
+    await cleanupProbes(stale);
+    throwIfCancelled(signal);
+  }
+
+  async function prepareProbeInvocation(signal) {
+    const probeRoot = await prepareProbeRoot(signal);
+    await verifyDirectoryIdentity(probeRoot);
+    await scavengeStaleProbes(probeRoot, signal);
+    const uuid = dependencies.randomUUID();
+    if (typeof uuid !== "string" || !SAFE_UUID.test(uuid)) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
+    const directory = path.join(probeRoot.path, `probe-${uuid}`);
+    let invocation = null;
+    try {
+      invocation = await dependencies.privateDirectoryManager.prepare({
+        directory,
+        signal,
+        async validateLocation() {
+          await verifyDirectoryIdentity(probeRoot);
+          if (path.dirname(directory) !== probeRoot.path) {
+            throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+        },
+      });
+      await verifyDirectoryIdentity(probeRoot);
+      invocation = await verifyDirectoryIdentity(invocation);
+      await writeProbeMarker(invocation, signal);
+      return invocation;
+    } catch (error) {
+      try {
+        invocation ??= await probeIdentity(directory, probeRoot);
+      } catch (identityError) {
+        if (failureCode(identityError) !== "ENOENT") {
+          throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+      }
+      if (invocation !== null) await cleanupProbes([invocation]);
+      throw error;
+    }
+  }
+
+  async function prepareCodexHome(invocation, signal) {
+    const verifiedInvocation = await verifyDirectoryIdentity(invocation);
+    const directory = path.join(verifiedInvocation.path, "codex-home");
+    const codexHome = await dependencies.privateDirectoryManager.prepare({
+      directory,
+      signal,
+      async validateLocation() {
+        await verifyDirectoryIdentity(verifiedInvocation);
+        if (path.dirname(directory) !== verifiedInvocation.path) {
+          throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+      },
+    });
+    await verifyDirectoryIdentity(verifiedInvocation);
+    return verifyDirectoryIdentity(codexHome);
+  }
+
+  async function cleanupProbe(invocation) {
+    await cleanupProbes([invocation]);
+  }
+
   async function runStatus(invocation, codexHomePath, signal) {
     throwIfCancelled(signal);
     let descriptor;
     try {
       descriptor = await dependencies.commandLocator.resolve("codex-cli", { signal });
     } catch (error) {
-      throw mapTaskFailure(error, signal);
+      return Object.freeze({
+        processAttempted: false,
+        reapConfirmed: true,
+        failure: mapTaskFailure(error, signal),
+      });
     }
     let result;
     try {
@@ -579,14 +857,27 @@ function createBroker(rawOptions, rawDependencies) {
         maxStderrBytes: STATUS_OUTPUT_LIMIT,
       });
     } catch (error) {
-      throw mapTaskFailure(error, signal);
+      return Object.freeze({
+        processAttempted: true,
+        reapConfirmed: failureCode(error) !== "STRUCTURED_PROVIDER_REAP_FAILED",
+        failure: mapTaskFailure(error, signal),
+      });
     }
     const stdout = typeof result?.stdout === "string"
       ? result.stdout.replace(/\r\n?/gu, "\n").trim()
       : "";
     if (result?.exitCode !== 0 || result?.signal !== null || stdout !== STATUS_TEXT) {
-      throw brokerError("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE");
+      return Object.freeze({
+        processAttempted: true,
+        reapConfirmed: true,
+        failure: brokerError("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE"),
+      });
     }
+    return Object.freeze({
+      processAttempted: true,
+      reapConfirmed: true,
+      failure: null,
+    });
   }
 
   function createLease(token, snapshot) {
@@ -679,24 +970,36 @@ function createBroker(rawOptions, rawDependencies) {
     let state = "broker_blocked";
     let failure = null;
     let lifecycleSafe = true;
+    let cleanupAllowed = true;
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
-      signal = normalizeSignal(request.signal, { optional: true });
+      signal = normalizeSignal(request.signal, { optional: true }) ??
+        AbortSignal.timeout(STATUS_TIMEOUT_MS * 2);
       token = await queue.enter(signal);
       invocation = await prepareProbeInvocation(signal);
       const codexHome = await prepareCodexHome(invocation, signal);
-      await dependencies.store.stageProbe({ codexHome, signal: signal ?? AbortSignal.timeout(STATUS_TIMEOUT_MS) });
-      await runStatus(invocation, codexHome.path, signal);
-      state = "available";
+      await dependencies.store.stageProbe({ codexHome, signal });
+      const outcome = await runStatus(invocation, codexHome.path, signal);
+      if (!outcome.reapConfirmed) {
+        lifecycleSafe = false;
+        cleanupAllowed = false;
+        failure = brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      } else if (outcome.failure !== null) {
+        throw outcome.failure;
+      } else {
+        state = "available";
+      }
     } catch (error) {
-      try {
-        state = statusStateFor(error, signal);
-        if (state === "broker_blocked") lifecycleSafe = false;
-      } catch (statusFailure) {
-        failure = statusFailure;
+      if (failure === null) {
+        try {
+          state = statusStateFor(error, signal);
+          if (state === "broker_blocked") lifecycleSafe = false;
+        } catch (statusFailure) {
+          failure = statusFailure;
+        }
       }
     } finally {
-      if (invocation !== null) {
+      if (invocation !== null && cleanupAllowed) {
         try {
           await cleanupProbe(invocation);
         } catch {
@@ -717,6 +1020,7 @@ function createBroker(rawOptions, rawDependencies) {
     let invocation = null;
     let failure = null;
     let cleanupSafe = true;
+    let cleanupAllowed = true;
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
       signal = normalizeSignal(request.signal, { optional: true }) ??
@@ -724,15 +1028,35 @@ function createBroker(rawOptions, rawDependencies) {
       lease = await acquire({ signal });
       invocation = await prepareProbeInvocation(signal);
       const staged = await lease.stage({ invocation, signal });
-      await runStatus(invocation, staged.codexHome, signal);
-      await lease.capture({ signal });
-    } catch (error) {
-      failure = mapTaskFailure(error, signal);
-      if (failure.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED") {
+      const outcome = await runStatus(invocation, staged.codexHome, signal);
+      if (!outcome.reapConfirmed) {
         cleanupSafe = false;
+        cleanupAllowed = false;
+        failure = brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      } else {
+        if (outcome.processAttempted) {
+          try {
+            await lease.capture({
+              signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS),
+            });
+          } catch {
+            cleanupSafe = false;
+            failure = brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          }
+        }
+        if (failure === null && outcome.failure !== null) {
+          failure = outcome.failure;
+        }
+      }
+    } catch (error) {
+      if (failure === null) {
+        failure = mapTaskFailure(error, signal);
+        if (failure.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED") {
+          cleanupSafe = false;
+        }
       }
     } finally {
-      if (invocation !== null) {
+      if (invocation !== null && cleanupAllowed) {
         try {
           await cleanupProbe(invocation);
         } catch {

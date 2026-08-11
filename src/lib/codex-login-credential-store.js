@@ -811,29 +811,43 @@ function createStore(configurationOptions, dependencyOptions) {
       return await runExclusive(coordinator, async () => {
         throwIfAborted(signal);
         const codexHome = exactDirectoryIdentity(values.codexHome);
+        let source;
         let sourceDigest;
         try {
-          sourceDigest = sha256(await readSource(signal, { capture: true }));
-        } catch {
+          source = await readSource(signal);
+          sourceDigest = sha256(source);
+        } catch (error) {
           revokeGeneration();
-          throw blocked();
+          if (failureCode(error) === "CODEX_LOGIN_FILE_UNAVAILABLE") {
+            const privateState = await preparePrivate(signal);
+            const existing = await readMirror(privateState, signal, false);
+            if (existing !== null) {
+              await dependencies.filePort.removePrivate({
+                directory: privateState.mirrorDirectory,
+                name: ENVELOPE_NAME,
+                signal,
+              });
+            }
+          }
+          throw error;
+        }
+        if (
+          !coordinator.generationRevoked &&
+          coordinator.activeSourceDigest !== sourceDigest
+        ) {
+          revokeGeneration();
         }
         const privateState = await preparePrivate(signal);
         const existing = await readMirror(privateState, signal, false);
-        if (existing === null) throw unavailable();
-        if (
-          coordinator.generationRevoked ||
-          coordinator.activeSourceDigest !== sourceDigest ||
-          existing.sourceDigest !== sourceDigest
-        ) {
-          revokeGeneration();
-          throw blocked();
-        }
+        const credential = existing !== null &&
+            existing.sourceDigest === sourceDigest
+          ? existing.credential
+          : source;
         await validateSourceGeneration(sourceDigest, signal);
         await dependencies.filePort.writeNewPrivate({
           directory: codexHome,
           name: AUTH_NAME,
-          bytes: credentialBytes(existing.credential),
+          bytes: credentialBytes(credential),
           signal,
         });
         try {

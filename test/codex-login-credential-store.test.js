@@ -839,12 +839,14 @@ test("missing, unsafe, and changed sources revoke probe and stale-snapshot crede
         );
       } else {
         current.setSource(Buffer.from("fictional-source-generation-two"));
-        await assert.rejects(
-          store.stageProbe({ codexHome: probeHome, signal: AbortSignal.timeout(30_000) }),
-          { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+        await store.stageProbe({
+          codexHome: probeHome,
+          signal: AbortSignal.timeout(30_000),
+        });
+        assert.deepEqual(
+          current.privateBytes(probeHome),
+          Buffer.from("fictional-source-generation-two"),
         );
-        assert.equal(current.privateBytes(probeHome), undefined);
-        await store.beginTask({ signal: AbortSignal.timeout(30_000) });
       }
 
       if (transition !== "changed") {
@@ -860,7 +862,14 @@ test("missing, unsafe, and changed sources revoke probe and stale-snapshot crede
         }),
         { code: "CODEX_LOGIN_BROKER_BLOCKED" },
       );
-      assert.equal(current.privateBytes(probeHome), undefined);
+      if (transition === "changed") {
+        assert.deepEqual(
+          current.privateBytes(probeHome),
+          Buffer.from("fictional-source-generation-two"),
+        );
+      } else {
+        assert.equal(current.privateBytes(probeHome), undefined);
+      }
       assert.equal(current.privateBytes(taskHome), undefined);
     });
   }
@@ -1052,6 +1061,54 @@ test("stageProbe uses only a valid current mirror and task staging creates only 
     [...current.privateFiles.keys()].filter((key) => key.startsWith(`${taskHome.path}\n`)),
     [`${taskHome.path}\nauth.json`],
   );
+});
+
+test("a fresh probe stages validated host login without publishing a mirror", async () => {
+  const source = Buffer.from("fictional-fresh-probe-source");
+  const current = createHarness(
+    path.resolve("D:/fictional-task3-fresh-probe"),
+    source,
+  );
+  const store = current.createStore();
+  const probeHome = directoryIdentity(
+    path.join(current.locations.probeRoot, "fresh"),
+    83,
+  );
+
+  await store.stageProbe({
+    codexHome: probeHome,
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  assert.deepEqual(current.privateBytes(probeHome), source);
+  assert.equal(current.envelopeBytes(), undefined);
+});
+
+test("probe preserves missing and unsafe host-source classifications", async (t) => {
+  for (const [sourceCode, expectedCode] of [
+    ["ENOENT", "CODEX_LOGIN_FILE_UNAVAILABLE"],
+    ["CODEX_CREDENTIAL_SOURCE_UNSAFE", "CODEX_LOGIN_SOURCE_UNSAFE"],
+  ]) {
+    await t.test(expectedCode, async () => {
+      const current = createHarness(
+        path.resolve(`D:/fictional-task3-probe-${expectedCode.toLowerCase()}`),
+      );
+      current.failSource(sourceCode);
+      const probeHome = directoryIdentity(
+        path.join(current.locations.probeRoot, expectedCode.toLowerCase()),
+        84,
+      );
+
+      await assert.rejects(
+        current.createStore().stageProbe({
+          codexHome: probeHome,
+          signal: AbortSignal.timeout(30_000),
+        }),
+        { code: expectedCode },
+      );
+      assert.equal(current.privateBytes(probeHome), undefined);
+    });
+  }
 });
 
 test("capture publishes refresh only while the host source remains the snapshot generation", async () => {

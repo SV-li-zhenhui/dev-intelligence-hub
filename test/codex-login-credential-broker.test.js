@@ -6,6 +6,7 @@ import {
   readFile,
   realpath,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,6 +16,9 @@ import {
   createProductionCodexLoginCredentialBroker,
   createTestCodexLoginCredentialBroker,
 } from "../src/adapters/codex-login-credential-broker.js";
+import {
+  createTestCodexLoginCredentialStore,
+} from "../src/lib/codex-login-credential-store.js";
 
 function brokerFailure(code) {
   return Object.assign(new Error(`fictional ${code} private detail`), { code });
@@ -40,14 +44,31 @@ async function directoryIdentity(directory) {
   });
 }
 
+async function fixtureCleanupSession(roots) {
+  let closed = false;
+  return Object.freeze({
+    async commit() {
+      assert.equal(closed, false);
+      closed = true;
+      for (const identity of roots) {
+        assert.deepEqual(await directoryIdentity(identity.path), identity);
+        await rm(identity.path, { recursive: true, force: false });
+      }
+    },
+    async close() { closed = true; },
+  });
+}
+
 async function fixture(t, overrides = {}) {
-  const root = await mkdtemp(path.join(tmpdir(), "mydashboard-codex-broker-"));
+  const root = overrides.root ??
+    await mkdtemp(path.join(tmpdir(), "mydashboard-codex-broker-"));
+  await mkdir(root, { recursive: true });
   t.after(() => rm(root, { recursive: true, force: true }));
   const probeRoot = path.join(root, "probe-root");
   const protectedRoot = path.join(root, "protected-root");
   const invocationPath = path.join(root, "provider-invocation");
-  await mkdir(protectedRoot);
-  await mkdir(invocationPath);
+  await mkdir(protectedRoot, { recursive: true });
+  await mkdir(invocationPath, { recursive: true });
   const calls = {
     beginTask: [],
     stageTask: [],
@@ -59,7 +80,8 @@ async function fixture(t, overrides = {}) {
     cleanup: [],
   };
   let snapshotSequence = 0;
-  const store = overrides.store ?? {
+  const store = overrides.storeFactory?.({ root, probeRoot, protectedRoot }) ??
+    overrides.store ?? {
     async beginTask(options) {
       calls.beginTask.push(options);
       snapshotSequence += 1;
@@ -122,7 +144,7 @@ async function fixture(t, overrides = {}) {
       async close() { closed = true; },
     });
   });
-  let uuidSequence = 0;
+  let uuidSequence = overrides.uuidSequenceStart ?? 0;
   const broker = createTestCodexLoginCredentialBroker({
     probeRoot,
     protectedRoots: [protectedRoot],
@@ -136,6 +158,11 @@ async function fixture(t, overrides = {}) {
       uuidSequence += 1;
       return `00000000-0000-4000-8000-${String(uuidSequence).padStart(12, "0")}`;
     },
+    ...(overrides.clock ? { clock: overrides.clock } : {}),
+    ...(overrides.processId ? { processId: overrides.processId } : {}),
+    ...(overrides.isProcessAlive
+      ? { isProcessAlive: overrides.isProcessAlive }
+      : {}),
   });
   return {
     broker,
@@ -144,6 +171,91 @@ async function fixture(t, overrides = {}) {
     invocation: await directoryIdentity(invocationPath),
     probeRoot,
     root,
+  };
+}
+
+function realStoreHarness({ root, probeRoot, protectedRoot }) {
+  const locations = {
+    sourceFile: path.join(root, "host-codex", "auth.json"),
+    mirrorRoot: path.join(root, "credential-mirror"),
+    mirrorDirectory: path.join(root, "credential-mirror", "codex-login"),
+    probeRoot,
+  };
+  const privateFiles = new Map();
+  let source = Buffer.from("fictional-integrated-host-login-v1");
+  let sourceFailure = null;
+  const key = (directory, name) => {
+    const directoryPath = typeof directory === "string"
+      ? directory
+      : directory.path;
+    return `${directoryPath}\n${name}`;
+  };
+  const privateDirectoryManager = {
+    async prepare({ directory, signal, validateLocation }) {
+      if (signal.aborted) throw Object.assign(new Error("aborted"), { code: "ABORT_ERR" });
+      await validateLocation();
+      await mkdir(directory, { recursive: true });
+      await validateLocation();
+      return directoryIdentity(directory);
+    },
+  };
+  const filePort = {
+    async readSource() {
+      if (sourceFailure !== null) throw sourceFailure;
+      return Buffer.from(source);
+    },
+    async readPrivate({ directory, name, required }) {
+      const value = privateFiles.get(key(directory, name));
+      if (value === undefined && required) {
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      }
+      return value === undefined ? null : Buffer.from(value);
+    },
+    async writeNewPrivate({ directory, name, bytes }) {
+      const fileKey = key(directory, name);
+      if (privateFiles.has(fileKey)) throw new Error("target exists");
+      privateFiles.set(fileKey, Buffer.from(bytes));
+    },
+    async replacePrivate({ directory, name, bytes }) {
+      const fileKey = key(directory, name);
+      if (!privateFiles.has(fileKey)) throw new Error("target missing");
+      privateFiles.set(fileKey, Buffer.from(bytes));
+    },
+    async removePrivate({ directory, name }) {
+      privateFiles.delete(key(directory, name));
+    },
+  };
+  const createStore = () => createTestCodexLoginCredentialStore({
+    locations,
+    protectedRoots: [protectedRoot],
+    now: () => new Date("2026-08-11T08:30:00.000Z"),
+  }, {
+    async canonicalizePath(candidate) { return path.resolve(candidate); },
+    filePort,
+    privateDirectoryManager,
+  });
+  return {
+    createStore,
+    sourceBytes() { return Buffer.from(source); },
+    setSource(bytes) {
+      source = Buffer.from(bytes);
+      sourceFailure = null;
+    },
+    failSource(code) {
+      sourceFailure = Object.assign(new Error("fictional private source failure"), {
+        code,
+      });
+    },
+    privateBytes(directory, name = "auth.json") {
+      const value = privateFiles.get(key(directory, name));
+      return value === undefined ? undefined : Buffer.from(value);
+    },
+    setPrivate(directory, bytes, name = "auth.json") {
+      privateFiles.set(key(directory, name), Buffer.from(bytes));
+    },
+    mirrorBytes() {
+      return this.privateBytes(locations.mirrorDirectory, "credential.json");
+    },
   };
 }
 
@@ -475,6 +587,275 @@ test("cleanup failure takes precedence over cancellation and fences the broker",
     current.broker.acquire({ signal: new AbortController().signal }),
     { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
   );
+  await current.broker.close();
+});
+
+test("abort plus reap failure never captures or cleans and permanently fences admission", async (t) => {
+  for (const operation of ["readStatus", "checkAvailability"]) {
+    await t.test(operation, async (child) => {
+      const processStarted = deferred();
+      const current = await fixture(child, {
+        processRunner: {
+          async run({ signal }) {
+            processStarted.resolve();
+            await new Promise((resolve) => {
+              signal.addEventListener("abort", resolve, { once: true });
+            });
+            throw brokerFailure("STRUCTURED_PROVIDER_REAP_FAILED");
+          },
+        },
+      });
+      const controller = new AbortController();
+      const result = current.broker[operation]({ signal: controller.signal });
+      await processStarted.promise;
+      controller.abort();
+
+      if (operation === "readStatus") {
+        await assert.rejects(result, {
+          code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+        });
+      } else {
+        await assert.rejects(result, {
+          code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+        });
+      }
+      assert.equal(current.calls.captureTask.length, 0);
+      assert.equal(current.calls.cleanup.length, 0);
+      await assert.rejects(
+        current.broker.acquire({ signal: new AbortController().signal }),
+        { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+      );
+      await current.broker.close();
+    });
+  }
+});
+
+test("availability captures every safely reaped status attempt before reporting failure", async (t) => {
+  for (const [name, processRunner, expectedCode] of [
+    [
+      "nonzero production-shaped rejection",
+      { async run() { throw brokerFailure("STRUCTURED_PROVIDER_PROCESS_FAILED"); } },
+      "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+    ],
+    [
+      "timeout production-shaped rejection",
+      { async run() { throw brokerFailure("STRUCTURED_PROVIDER_TIMEOUT"); } },
+      "STRUCTURED_PROVIDER_TIMEOUT",
+    ],
+    [
+      "wrong status text",
+      {
+        async run() {
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: "Not logged in",
+            stderr: "",
+          };
+        },
+      },
+      "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+    ],
+  ]) {
+    await t.test(name, async (child) => {
+      const events = [];
+      const current = await fixture(child, {
+        store: {
+          async beginTask() {
+            events.push("begin");
+            return Object.freeze(Object.create(null));
+          },
+          async stageTask() { events.push("stage"); },
+          async captureTask() { events.push("capture"); },
+          async stageProbe() {},
+        },
+        processRunner: {
+          async run(options) {
+            events.push("run");
+            return processRunner.run(options);
+          },
+        },
+        async prepareCleanupTrees(roots, options) {
+          events.push("cleanup");
+          return fixtureCleanupSession(roots, options);
+        },
+      });
+
+      await assert.rejects(
+        current.broker.checkAvailability({
+          signal: new AbortController().signal,
+        }),
+        { code: expectedCode },
+      );
+      assert.deepEqual(events, ["begin", "stage", "run", "capture", "cleanup"]);
+      const next = await current.broker.acquire({
+        signal: new AbortController().signal,
+      });
+      next.release({ safe: true });
+      await current.broker.close();
+    });
+  }
+});
+
+test("broker composes with the real store across fresh, restart, logout, unsafe, and changed sources", async (t) => {
+  let credentials;
+  let refreshOnNextStatus = null;
+  const observedCredentials = [];
+  const processRunner = {
+    async run({ env }) {
+      const staged = credentials.privateBytes(env.CODEX_HOME);
+      observedCredentials.push(staged);
+      if (refreshOnNextStatus !== null) {
+        credentials.setPrivate(env.CODEX_HOME, refreshOnNextStatus);
+        refreshOnNextStatus = null;
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        stdout: "Logged in using ChatGPT\n",
+        stderr: "",
+      };
+    },
+  };
+  const first = await fixture(t, {
+    storeFactory(locations) {
+      credentials = realStoreHarness(locations);
+      return credentials.createStore();
+    },
+    processRunner,
+  });
+
+  const fresh = await first.broker.readStatus();
+  assert.equal(fresh.state, "available");
+  assert.deepEqual(observedCredentials.at(-1), credentials.sourceBytes());
+  assert.equal(credentials.mirrorBytes(), undefined);
+
+  const refreshed = Buffer.from("fictional-integrated-refreshed-login-v2");
+  refreshOnNextStatus = refreshed;
+  await first.broker.checkAvailability({
+    signal: new AbortController().signal,
+  });
+  assert.notEqual(credentials.mirrorBytes(), undefined);
+  await first.broker.close();
+
+  const restarted = await fixture(t, {
+    root: first.root,
+    store: credentials.createStore(),
+    processRunner,
+    uuidSequenceStart: 100,
+  });
+  assert.equal((await restarted.broker.readStatus()).state, "available");
+  assert.deepEqual(observedCredentials.at(-1), refreshed);
+
+  credentials.failSource("ENOENT");
+  assert.equal(
+    (await restarted.broker.readStatus()).state,
+    "file_login_unavailable",
+  );
+  credentials.setSource(Buffer.from("fictional-integrated-host-login-v1"));
+  assert.equal((await restarted.broker.readStatus()).state, "available");
+
+  credentials.failSource("CODEX_CREDENTIAL_SOURCE_UNSAFE");
+  assert.equal((await restarted.broker.readStatus()).state, "unsafe_source");
+
+  const changed = Buffer.from("fictional-integrated-host-login-v3");
+  credentials.setSource(changed);
+  assert.equal((await restarted.broker.readStatus()).state, "available");
+  assert.deepEqual(observedCredentials.at(-1), changed);
+  assert.equal(
+    JSON.stringify(await restarted.broker.readStatus()).includes("fictional"),
+    false,
+  );
+  await restarted.broker.close();
+});
+
+test("every probe has an owner marker before credentials reach the child", async (t) => {
+  let marker;
+  const current = await fixture(t, {
+    processId: 4242,
+    clock: () => Date.parse("2026-08-11T08:30:00.000Z"),
+    processRunner: {
+      async run({ cwd }) {
+        marker = JSON.parse(await readFile(
+          path.join(cwd, ".mydashboard-invocation.json"),
+          "utf8",
+        ));
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: "Logged in using ChatGPT\n",
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  await current.broker.readStatus();
+
+  assert.deepEqual(marker, {
+    schemaVersion: 1,
+    kind: "codex-login-probe",
+    ownerPid: 4242,
+    createdAt: "2026-08-11T08:30:00.000Z",
+  });
+  await current.broker.close();
+});
+
+test("partial probe creation is rolled back before admission remains usable", async (t) => {
+  let failedDirectory = null;
+  let failOnce = true;
+  const manager = {
+    async prepare({ directory, signal, validateLocation }) {
+      await validateLocation();
+      await mkdir(directory, { recursive: true });
+      await validateLocation();
+      if (failOnce && /^probe-[0-9a-f]/u.test(path.basename(directory))) {
+        failOnce = false;
+        failedDirectory = directory;
+        throw brokerFailure("STRUCTURED_PROVIDER_UNAVAILABLE");
+      }
+      return directoryIdentity(directory);
+    },
+  };
+  const current = await fixture(t, { privateDirectoryManager: manager });
+
+  assert.equal((await current.broker.readStatus()).state, "cli_unavailable");
+  await assert.rejects(lstat(failedDirectory), { code: "ENOENT" });
+  const lease = await current.broker.acquire({
+    signal: new AbortController().signal,
+  });
+  lease.release({ safe: true });
+  await current.broker.close();
+});
+
+test("a restarted broker scavenges only a stale dead-owner probe", async (t) => {
+  const now = Date.parse("2026-08-11T08:30:00.000Z");
+  const current = await fixture(t, {
+    clock: () => now,
+    processId: 2222,
+    isProcessAlive: (pid) => pid !== 1111,
+  });
+  await mkdir(current.probeRoot, { recursive: true });
+  const stale = path.join(
+    current.probeRoot,
+    "probe-00000000-0000-4000-8000-000000000999",
+  );
+  await mkdir(stale);
+  await writeFile(
+    path.join(stale, ".mydashboard-invocation.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "codex-login-probe",
+      ownerPid: 1111,
+      createdAt: "2026-08-09T08:29:59.000Z",
+    }),
+    "utf8",
+  );
+  await writeFile(path.join(stale, "auth.json"), "fictional stale login", "utf8");
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+
+  await assert.rejects(lstat(stale), { code: "ENOENT" });
   await current.broker.close();
 });
 
