@@ -114,12 +114,14 @@ function exactDataRecord(value, expectedKeys) {
   }
   if (prototype !== Object.prototype && prototype !== null) throw blocked();
   const expected = [...expectedKeys].sort();
-  const keys = Object.keys(descriptors).sort();
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string")) throw blocked();
+  keys.sort();
   if (
     keys.length !== expected.length ||
     keys.some((key, index) => key !== expected[index]) ||
     keys.some((key) =>
-      !("value" in descriptors[key]) || descriptors[key].enumerable !== true)
+      !Object.hasOwn(descriptors[key], "value") || descriptors[key].enumerable !== true)
   ) {
     throw blocked();
   }
@@ -191,7 +193,8 @@ function exactStringArray(value) {
   }
   const lengthDescriptor = descriptors.length;
   if (
-    !("value" in lengthDescriptor) ||
+    lengthDescriptor === undefined ||
+    !Object.hasOwn(lengthDescriptor, "value") ||
     !Number.isSafeInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 1
   ) {
@@ -206,7 +209,8 @@ function exactStringArray(value) {
   for (let index = 0; index < lengthDescriptor.value; index += 1) {
     const descriptor = descriptors[String(index)];
     if (
-      !("value" in descriptor) ||
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
       descriptor.enumerable !== true ||
       typeof descriptor.value !== "string"
     ) {
@@ -397,8 +401,13 @@ function envelopeBytes(sourceDigest, credential, now) {
 }
 
 function pathContains(left, right) {
+  if (path.parse(left).root !== path.parse(right).root) return false;
   const relative = path.relative(left, right);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  return relative === "" || (
+    !path.isAbsolute(relative) &&
+    !relative.startsWith(`..${path.sep}`) &&
+    relative !== ".."
+  );
 }
 
 function normalizedForComparison(value) {
