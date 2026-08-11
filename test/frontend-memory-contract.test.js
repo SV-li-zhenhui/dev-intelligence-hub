@@ -28,8 +28,14 @@ test("memory view searches the unified local journal with all supported filters"
 });
 
 test("memory search never asks a model or exposes a write endpoint", () => {
+  const memorySearchSource =
+    /async function loadMemories[\s\S]*?(?=function memoryAnswerRequest)/
+      .exec(appSource)?.[0] || "";
+
+  assert.notEqual(memorySearchSource, "");
   assert.doesNotMatch(appSource, /\/api\/memory\/(append|create|rebuild)/);
-  assert.doesNotMatch(appSource, /\/api\/brain/);
+  assert.doesNotMatch(memorySearchSource, /\/api\/brain/);
+  assert.doesNotMatch(memorySearchSource, /method:\s*"POST"/);
 });
 
 test("memory questions use the bounded cited-answer contract", () => {
