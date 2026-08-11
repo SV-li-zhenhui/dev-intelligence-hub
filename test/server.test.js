@@ -1000,6 +1000,15 @@ async function withServer(
       calls.push({ operation: "employee_decide", id, decision, ...options });
       return this.view();
     },
+    async resolveBlockedJob(id, action, options) {
+      calls.push({
+        operation: "employee_resolve_blocked",
+        id,
+        action,
+        ...options,
+      });
+      return this.view();
+    },
     async searchMemory(query, limit) {
       calls.push({ operation: "memory_search", query, limit });
       return [{ id: "memory-1", title: "Checkout review" }];
@@ -6952,7 +6961,7 @@ test("employee discovery and dynamic routes work for every registered role", asy
   });
 });
 
-test("employee control, manual run, and draft decisions use trusted local mutations", async () => {
+test("employee control, manual run, draft decisions, and blocked recovery use trusted local mutations", async () => {
   await withServer(async ({ server, calls }) => {
     const headers = {
       origin: "http://127.0.0.1:4173",
@@ -6984,10 +6993,35 @@ test("employee control, manual run, and draft decisions use trusted local mutati
         expectedRevision: 4,
       }),
     });
+    const retryBlocked = await request(server, {
+      method: "POST",
+      path: "/api/pr-review-jobs/resolve",
+      headers,
+      body: JSON.stringify({
+        id: "pr-work-blocked",
+        action: "retry",
+        headRefOid: "head-blocked",
+        expectedRevision: 4,
+      }),
+    });
+    const expansiveBlocked = await request(server, {
+      method: "POST",
+      path: "/api/pr-review-jobs/resolve",
+      headers,
+      body: JSON.stringify({
+        id: "pr-work-blocked",
+        action: "dismiss",
+        headRefOid: "head-blocked",
+        expectedRevision: 4,
+        targetRoleId: "pr-engineer",
+      }),
+    });
 
     assert.equal(control.status, 200);
     assert.equal(run.status, 200);
     assert.equal(decide.status, 200);
+    assert.equal(retryBlocked.status, 200);
+    assert.equal(expansiveBlocked.status, 400);
     assert.deepEqual(
       calls.filter((call) => call.operation.startsWith("employee_")),
       [
@@ -7000,8 +7034,83 @@ test("employee control, manual run, and draft decisions use trusted local mutati
           headRefOid: "head-1",
           expectedRevision: 4,
         },
+        {
+          operation: "employee_resolve_blocked",
+          id: "pr-work-blocked",
+          action: "retry",
+          headRefOid: "head-blocked",
+          expectedRevision: 4,
+        },
       ],
     );
+  });
+});
+
+test("retrying a blocked PR job signals only the legacy employee after persistence", async () => {
+  const signalled = deferred();
+  await withServer(async ({ server }) => {
+    const response = await request(server, {
+      method: "POST",
+      path: "/api/pr-review-jobs/resolve",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "pr-work-blocked",
+        action: "retry",
+        headRefOid: "head-blocked",
+        expectedRevision: 4,
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    const signal = await Promise.race([
+      signalled.promise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 250)),
+    ]);
+    assert.deepEqual(signal, {
+      id: "pr-reviewer",
+      options: { trigger: "blocked_job_retry" },
+    });
+  }, {
+    backgroundWork: {
+      async runEmployee(id, options) {
+        signalled.resolve({ id, options });
+      },
+    },
+  });
+});
+
+test("dismissing a blocked PR job never wakes the employee", async () => {
+  let signalCount = 0;
+  await withServer(async ({ server }) => {
+    const response = await request(server, {
+      method: "POST",
+      path: "/api/pr-review-jobs/resolve",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "pr-work-blocked",
+        action: "dismiss",
+        headRefOid: "head-blocked",
+        expectedRevision: 4,
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signalCount, 0);
+  }, {
+    backgroundWork: {
+      async runEmployee() {
+        signalCount += 1;
+      },
+    },
   });
 });
 

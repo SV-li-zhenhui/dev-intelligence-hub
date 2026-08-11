@@ -2122,6 +2122,24 @@ function signalBackgroundAgency(backgroundWork, options, reportError) {
     });
 }
 
+function signalBackgroundEmployee(
+  backgroundWork,
+  id,
+  options,
+  reportError,
+) {
+  if (typeof backgroundWork?.runEmployee !== "function") return;
+  Promise.resolve()
+    .then(() => backgroundWork.runEmployee(id, options))
+    .catch((error) => {
+      try {
+        reportError(error);
+      } catch {
+        // Background diagnostics must never change the persisted recovery action.
+      }
+    });
+}
+
 function closeHttpServer(closeServer) {
   return new Promise((resolve, reject) => {
     closeServer((error) => {
@@ -3287,6 +3305,38 @@ export function createDashboardServer(
           200,
           await readDashboard(application, employeeRegistry),
         );
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/api/pr-review-jobs/resolve"
+      ) {
+        requireNoQuery(url, "PR 失败作业恢复参数无效");
+        assertTrustedMutation(request, expectedOrigin, { json: true });
+        const { id, action, headRefOid, expectedRevision } =
+          requireExactJsonFields(
+            await readJsonBody(request),
+            ["id", "action", "headRefOid", "expectedRevision"],
+            "PR 失败作业恢复字段无效",
+          );
+        await requirePrEmployee(employeeRegistry).resolveBlockedJob(
+          id,
+          action,
+          { headRefOid, expectedRevision },
+        );
+        sendJson(
+          response,
+          200,
+          await readDashboard(application, employeeRegistry),
+        );
+        if (action === "retry") {
+          signalBackgroundEmployee(
+            backgroundWork,
+            "pr-reviewer",
+            { trigger: "blocked_job_retry" },
+            reportError,
+          );
+        }
         return;
       }
       if (

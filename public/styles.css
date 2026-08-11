@@ -552,6 +552,23 @@ h1 {
   font-size: 12px;
 }
 
+.employee-job-recovery {
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--amber-soft);
+}
+
+.employee-job-recovery h3,
+.employee-job-recovery p {
+  margin-top: 0;
+}
+
+.employee-job-recovery .confirmation-actions {
+  margin-top: 12px;
+}
+
 .confirmation-center-grid {
   display: grid;
   grid-template-columns: minmax(250px, 0.8fr) minmax(0, 1.4fr);

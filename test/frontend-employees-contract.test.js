@@ -117,3 +117,16 @@ test("role mutations bind responses to their request-time dashboard sequence", (
     );
   }
 });
+
+test("blocked-job recovery submits the immutable dialog intent", () => {
+  const source = functionSource("handleBlockedJobResolution");
+
+  assert.match(appSource, /data-expected-revision=/);
+  assert.match(source, /isPrEmployeeRecoveryIntentCurrent/);
+  assert.match(source, /expectedRevision: Number\(container\?\.dataset\.expectedRevision\)/);
+  assert.match(source, /body: JSON\.stringify\(recoveryRequest\)/);
+  assert.match(source, /closeBlockedJobDialog\(container\)/);
+  assert.doesNotMatch(source, /closeDetailDialog\(\)/);
+  assert.doesNotMatch(source, /expectedRevision: dashboard\.employee\.role\.revision/);
+  assert.doesNotMatch(source, /并已触发岗位运行/);
+});

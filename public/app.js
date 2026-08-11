@@ -15,6 +15,11 @@ import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
+import {
+  createPrEmployeeRecoveryIntent,
+  isPrEmployeeRecoveryIntentCurrent,
+  prEmployeeBlockedActions,
+} from "./pr-employee-job-support.js";
 
 const configurationFetch = createConfigurationFetch({ timeoutMs: 45_000 });
 const configurationActivationActions = Object.freeze({
@@ -311,6 +316,7 @@ function jobStateLabel(value) {
     accepted: "你已接受",
     rejected: "你已驳回",
     blocked: "处理受阻",
+    dismissed: "已关闭",
     superseded: "已被新状态替代",
   }[value] || value || "未知";
 }
@@ -2104,6 +2110,22 @@ function showEmployeeJob(job) {
         <pre>${escapeHtml(job.reviewBody)}</pre>
       </section>`
     : "";
+  const recoveryIntent = createPrEmployeeRecoveryIntent(
+    job,
+    dashboard?.employee?.role?.revision,
+  );
+  const recoveryActions = recoveryIntent
+    ? prEmployeeBlockedActions(job)
+    : [];
+  const recovery = recoveryActions.length
+    ? `<section class="employee-job-recovery">
+        <h3>失败恢复</h3>
+        <p>重新分析会再次核对当前 PR 与 Head；关闭只忽略当前这一次失败，不会影响新 Head。</p>
+        <div class="confirmation-actions" data-pr-job-recovery="${escapeHtml(recoveryIntent.id)}" data-head-ref-oid="${escapeHtml(recoveryIntent.headRefOid)}" data-expected-revision="${escapeHtml(recoveryIntent.expectedRevision)}">
+          ${recoveryActions.map((action, index) => `<button class="${index === 0 ? "" : "secondary"}" data-pr-job-action="${escapeHtml(action.id)}">${escapeHtml(action.label)}</button>`).join("")}
+        </div>
+      </section>`
+    : "";
   dialogContent.innerHTML = `
     <article class="detail employee-detail">
       <p class="eyebrow">PR EMPLOYEE / ${escapeHtml(jobStateLabel(job.status))}</p>
@@ -2120,9 +2142,83 @@ function showEmployeeJob(job) {
         <dt>岗位大脑</dt><dd>${escapeHtml(job.brain?.provider || "")} / ${escapeHtml(job.brain?.model || "未记录")}</dd>
         <dt>状态</dt><dd>${escapeHtml(jobStateLabel(job.status))}</dd>
       </dl>
+      ${recovery}
       ${job.url ? `<a href="${escapeHtml(job.url)}" target="_blank" rel="noreferrer">在 GitHub 中打开 →</a>` : ""}
     </article>`;
+  dialogContent
+    .querySelector("[data-pr-job-recovery]")
+    ?.addEventListener("click", handleBlockedJobResolution);
   dialog.showModal();
+}
+
+function closeBlockedJobDialog(container) {
+  if (container?.isConnected) closeDetailDialog();
+}
+
+async function handleBlockedJobResolution(event) {
+  const button = event.target.closest("[data-pr-job-action]");
+  if (!button) return;
+  const container = button.closest("[data-pr-job-recovery]");
+  const recoveryIntent = {
+    id: container?.dataset.prJobRecovery || "",
+    headRefOid: container?.dataset.headRefOid || "",
+    expectedRevision: Number(container?.dataset.expectedRevision),
+  };
+  const job = jobIndex.get(recoveryIntent.id);
+  const action = button.dataset.prJobAction;
+  const actionIsCurrent = prEmployeeBlockedActions(job).some(
+    (candidate) => candidate.id === action,
+  );
+  if (
+    !actionIsCurrent ||
+    !isPrEmployeeRecoveryIntentCurrent(
+      recoveryIntent,
+      job,
+      dashboard?.employee?.role?.revision,
+    )
+  ) {
+    closeBlockedJobDialog(container);
+    statusBanner.hidden = false;
+    statusBanner.textContent = "该失败作业已变化，请打开最新状态后再操作。";
+    return;
+  }
+  container.querySelectorAll("button").forEach((control) => {
+    control.disabled = true;
+  });
+  const sequence = ++requestSequence;
+  const recoveryRequest = { ...recoveryIntent, action };
+  try {
+    const response = await fetch("/api/pr-review-jobs/resolve", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-mydashboard-action": "1",
+      },
+      body: JSON.stringify(recoveryRequest),
+    });
+    if (response.status === 409) {
+      const nextDashboard = await fetchDashboard();
+      if (nextDashboard) applyDashboard(nextDashboard, sequence);
+      closeBlockedJobDialog(container);
+      statusBanner.hidden = false;
+      statusBanner.textContent = "该失败作业对应的 PR 已变化，请查看最新状态。";
+      return;
+    }
+    if (!response.ok) throw new Error(`失败作业恢复失败（${response.status}）`);
+    applyDashboard(await response.json(), sequence);
+    closeBlockedJobDialog(container);
+    statusBanner.hidden = false;
+    statusBanner.textContent = action === "retry"
+      ? "已重新加入分析队列；岗位会按调度尽快处理。"
+      : "已关闭当前失败；同一 PR 出现新 Head 或新动作时仍会重新处理。";
+    void loadEmployeeRoles();
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = error.message;
+    container.querySelectorAll("button").forEach((control) => {
+      control.disabled = false;
+    });
+  }
 }
 
 function applyDashboard(

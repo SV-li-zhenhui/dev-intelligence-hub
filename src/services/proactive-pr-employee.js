@@ -62,6 +62,7 @@ const WORK_POLICY_BY_ACTION = Object.freeze({
   },
 });
 const DECISIONS = new Set(["accept", "reject"]);
+const BLOCKED_JOB_ACTIONS = new Set(["retry", "dismiss"]);
 const DIRECT_ACTION_ADMISSION = Object.freeze({
   run: (operation) => operation(),
 });
@@ -182,6 +183,14 @@ function jobMatchesCurrentCandidate(job, item, policyVersion) {
       item.nextAction === job.nextAction &&
       item.relation === job.relation &&
       job.policyVersion === policyVersion,
+  );
+}
+
+function isAnalysisBlocked(job) {
+  return Boolean(
+    job?.status === "blocked" &&
+      !job.confirmationId &&
+      !job.confirmationFailure,
   );
 }
 
@@ -425,6 +434,11 @@ export class ProactivePrEmployeeService {
 
   decide(id, decision, options = {}) {
     return this.controller.enqueue(() => this.#decide(id, decision, options));
+  }
+
+  resolveBlockedJob(id, action, options = {}) {
+    return this.controller.enqueue(() =>
+      this.#resolveBlockedJob(id, action, options));
   }
 
   recoverConfirmations() {
@@ -979,6 +993,94 @@ export class ProactivePrEmployeeService {
     return this.controller.project(state);
   }
 
+  async #resolveBlockedJob(
+    id,
+    action,
+    { headRefOid, expectedRevision } = {},
+  ) {
+    if (typeof id !== "string" || !id.trim()) {
+      throw serviceError(400, "作业 id 不能为空");
+    }
+    if (!BLOCKED_JOB_ACTIONS.has(action)) {
+      throw serviceError(400, "blocked job action 只能是 retry 或 dismiss");
+    }
+    let state = await this.controller.readState();
+    this.controller.assertRevision(state, expectedRevision);
+    const index = state.jobs.findIndex((job) => job.id === id.trim());
+    if (index < 0) throw serviceError(404, "找不到这条 PR 员工作业");
+    const job = state.jobs[index];
+    if (!isAnalysisBlocked(job)) {
+      throw serviceError(409, "该作业不是可恢复的分析失败");
+    }
+    if (job.headRefOid !== headRefOid) {
+      throw serviceError(409, "PR head 已变化，请查看最新作业");
+    }
+
+    const snapshot = await this.store.read("snapshot", null);
+    if (snapshot?.sourceStatus?.githubPullRequests?.ok !== true) {
+      throw serviceError(
+        503,
+        "GitHub PR 事实尚未健康刷新，失败作业保持不变",
+      );
+    }
+    const current = snapshot?.items?.find(
+      (item) => item.id === job.subjectId,
+    );
+    if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
+      const completedAt = this.clock().toISOString();
+      state.jobs[index] = {
+        ...job,
+        status: "superseded",
+        updatedAt: completedAt,
+        completedAt,
+      };
+      state.lastError = "";
+      await this.controller.writeState(state);
+      throw serviceError(409, "PR 状态或 head 已变化，旧失败作业已失效");
+    }
+
+    const updatedAt = this.clock().toISOString();
+    if (action === "retry") {
+      state.jobs[index] = {
+        ...job,
+        status: "queued",
+        attempts: 0,
+        error: "",
+        startedAt: null,
+        leaseUntil: null,
+        nextAttemptAt: null,
+        retryRequestedAt: updatedAt,
+        updatedAt,
+      };
+      state.lastError = "";
+      state = this.#queueMemory(
+        state,
+        state.jobs[index],
+        "analysis_retry_requested",
+      );
+    } else {
+      state.jobs[index] = {
+        ...job,
+        status: "dismissed",
+        decision: "dismiss",
+        error: "",
+        leaseUntil: null,
+        nextAttemptAt: null,
+        updatedAt,
+        completedAt: updatedAt,
+      };
+      state.lastError = "";
+      state = this.#queueMemory(
+        state,
+        state.jobs[index],
+        "analysis_dismissed",
+      );
+    }
+    state = await this.controller.writeState(state);
+    state = await this.#flushMemoryOutbox(state);
+    return this.controller.project(state);
+  }
+
   async #performTick(trigger, state, signal = null) {
     signal?.throwIfAborted();
     state = await this.#flushMemoryOutbox(state);
@@ -1073,7 +1175,10 @@ export class ProactivePrEmployeeService {
         .map((job) => job.subjectId),
     );
     const activeIds = state.jobs
-      .filter((job) => ACTIVE_JOB_STATES.has(job.status))
+      .filter(
+        (job) =>
+          ACTIVE_JOB_STATES.has(job.status) || isAnalysisBlocked(job),
+      )
       .map((job) => job.id);
     for (const id of activeIds) {
       signal?.throwIfAborted();

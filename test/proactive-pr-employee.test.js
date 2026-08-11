@@ -1295,3 +1295,251 @@ test("a prolonged memory outage keeps the outbox bounded", async () => {
   assert.equal(state.memoryOutbox.length, 2);
   assert.equal(state.memoryOutboxDropped, 1);
 });
+
+test("a healthy patrol retires a stale analysis failure and restores role health", async () => {
+  const failedItem = pullRequest({ headRefOid: HEAD_OLD });
+  const store = new MemoryStore({
+    snapshot: snapshot([]),
+    "pr-employee-state": queuedState(failedItem, {
+      status: "blocked",
+      attempts: 3,
+      error: "Invalid Ollama employee result after retry",
+    }),
+  });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext() {
+        throw new Error("stale blocked work must not reload PR context");
+      },
+    },
+    reviewer: {
+      async analyze() {
+        throw new Error("stale blocked work must not reach the brain");
+      },
+    },
+  });
+
+  const result = await service.tick({ trigger: "scheduled" });
+
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].status, "superseded");
+  assert.equal(result.role.state, "observing");
+  assert.equal(result.role.lastError, "");
+});
+
+test("the owner can retry a current analysis failure without bypassing identity checks", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item, {
+      status: "blocked",
+      attempts: 3,
+      error: "Invalid Ollama employee result after retry",
+    }),
+  });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext(candidate) {
+        return { ...candidate, patch: "diff", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: { async analyze() { return reviewResult(); } },
+  });
+
+  const queued = await service.resolveBlockedJob("pr-work-existing", "retry", {
+    headRefOid: item.headRefOid,
+    expectedRevision: 3,
+  });
+
+  assert.equal(queued.jobs[0].status, "queued");
+  assert.equal(queued.jobs[0].attempts, 0);
+  assert.equal(queued.jobs[0].error, "");
+  const completed = await service.tick({ trigger: "manual_retry" });
+  assert.equal(completed.jobs[0].status, "ready_for_human");
+  assert.equal(completed.jobs[0].attempts, 1);
+});
+
+test("an unhealthy GitHub snapshot cannot retire or retry an analysis failure", async () => {
+  const item = pullRequest();
+  const initialState = queuedState(item, {
+    status: "blocked",
+    attempts: 3,
+    error: "Invalid Ollama employee result after retry",
+  });
+  const store = new MemoryStore({
+    snapshot: snapshot([item], {
+      sourceStatus: { githubPullRequests: { ok: false, stale: true } },
+    }),
+    "pr-employee-state": initialState,
+  });
+  const service = createService({ store });
+
+  await assert.rejects(
+    service.resolveBlockedJob("pr-work-existing", "retry", {
+      headRefOid: item.headRefOid,
+      expectedRevision: 3,
+    }),
+    { statusCode: 503 },
+  );
+
+  assert.deepEqual(await store.read("pr-employee-state"), initialState);
+});
+
+test("analysis-failure recovery rejects stale owner intent before changing the job", async () => {
+  const item = pullRequest();
+  const initialState = queuedState(item, {
+    status: "blocked",
+    attempts: 3,
+    error: "Invalid Ollama employee result after retry",
+  });
+
+  for (const options of [
+    { headRefOid: item.headRefOid, expectedRevision: 2 },
+    { headRefOid: HEAD_OLD, expectedRevision: 3 },
+  ]) {
+    const store = new MemoryStore({
+      snapshot: snapshot([item]),
+      "pr-employee-state": initialState,
+    });
+    const service = createService({ store });
+
+    await assert.rejects(
+      service.resolveBlockedJob("pr-work-existing", "retry", options),
+      { statusCode: 409 },
+    );
+    assert.deepEqual(await store.read("pr-employee-state"), initialState);
+  }
+});
+
+test("a healthy identity mismatch retires the old analysis failure", async () => {
+  const item = pullRequest();
+  const changed = pullRequest({ headRefOid: HEAD_OLD });
+  const store = new MemoryStore({
+    snapshot: snapshot([changed]),
+    "pr-employee-state": queuedState(item, {
+      status: "blocked",
+      attempts: 3,
+      error: "Invalid Ollama employee result after retry",
+    }),
+  });
+  const service = createService({ store });
+
+  await assert.rejects(
+    service.resolveBlockedJob("pr-work-existing", "retry", {
+      headRefOid: item.headRefOid,
+      expectedRevision: 3,
+    }),
+    { statusCode: 409 },
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "superseded");
+  assert.equal(state.revision, 4);
+});
+
+test("a policy change retires an analysis failure created under the old policy", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item, {
+      status: "blocked",
+      attempts: 3,
+      error: "Invalid Ollama employee result after retry",
+    }),
+  });
+  const service = createService({ store, config: { policyVersion: 2 } });
+
+  await assert.rejects(
+    service.resolveBlockedJob("pr-work-existing", "dismiss", {
+      headRefOid: item.headRefOid,
+      expectedRevision: 3,
+    }),
+    { statusCode: 409 },
+  );
+
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "superseded");
+});
+
+test("the owner can dismiss one current analysis failure without creating it again", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({
+    snapshot: snapshot([item]),
+    "pr-employee-state": queuedState(item, {
+      status: "blocked",
+      attempts: 3,
+      error: "Invalid Ollama employee result after retry",
+    }),
+  });
+  const service = createService({
+    store,
+    github: {
+      async loadReviewContext() {
+        throw new Error("dismissed work must not reload PR context");
+      },
+    },
+    reviewer: {
+      async analyze() {
+        throw new Error("dismissed work must not reach the brain");
+      },
+    },
+  });
+
+  const dismissed = await service.resolveBlockedJob(
+    "pr-work-existing",
+    "dismiss",
+    {
+      headRefOid: item.headRefOid,
+      expectedRevision: 3,
+    },
+  );
+
+  assert.equal(dismissed.jobs[0].status, "dismissed");
+  assert.equal(dismissed.jobs[0].decision, "dismiss");
+  assert.equal(dismissed.role.state, "observing");
+  assert.equal(dismissed.role.lastError, "");
+  const next = await service.tick({ trigger: "scheduled" });
+  assert.equal(next.jobs.length, 1);
+  assert.equal(next.jobs[0].status, "dismissed");
+  assert.equal(next.role.lastRun.newJobs, 0);
+});
+
+test("either unknown-external-outcome marker blocks analysis-failure recovery", async () => {
+  const item = pullRequest();
+  for (const marker of [
+    { confirmationId: "confirmation-review-42" },
+    {
+      confirmationFailure: {
+        code: "UNKNOWN",
+        message: "outcome unknown",
+        outcome: "unknown",
+        retryable: false,
+      },
+    },
+  ]) {
+    const blocked = queuedState(item, {
+      status: "blocked",
+      attempts: 1,
+      error: "外部动作结果无法确认：UNKNOWN",
+      ...marker,
+    });
+    const store = new MemoryStore({
+      snapshot: snapshot([item]),
+      "pr-employee-state": blocked,
+    });
+    const service = createService({ store });
+
+    await assert.rejects(
+      service.resolveBlockedJob("pr-work-existing", "retry", {
+        headRefOid: item.headRefOid,
+        expectedRevision: 3,
+      }),
+      { statusCode: 409 },
+    );
+    const unchanged = await service.view();
+    assert.equal(unchanged.jobs[0].status, "blocked");
+    assert.equal(unchanged.role.state, "degraded");
+  }
+});
