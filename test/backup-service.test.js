@@ -462,6 +462,57 @@ test("restore remains available when the active data directory was lost", async 
   );
 });
 
+test("backup and restore exclude the external Codex login mirror from all recovery evidence", async (t) => {
+  const current = await fixture(t);
+  const sourceMachineHome = path.join(current.root, "source-machine-home");
+  const mirrorDirectory = path.join(
+    sourceMachineHome,
+    ".mydashboard-cli-credentials-v1",
+    "codex-login",
+  );
+  const sentinelName = "fictional-codex-mirror-sentinel.json";
+  const sentinelBytes = Buffer.from("fictional-codex-mirror-bytes-never-backed-up");
+  await mkdir(mirrorDirectory, { recursive: true });
+  await writeFile(path.join(mirrorDirectory, sentinelName), sentinelBytes);
+
+  const created = await current.service.createBackup();
+  const payloadFiles = await readdir(path.join(created.path, "payload"), { recursive: true });
+  const payloadBytes = Buffer.concat([
+    await readFile(path.join(created.path, "payload", "state", "work-ledger.json")),
+    await readFile(path.join(created.path, "payload", "artifacts", "package-a", "blob")),
+  ]).toString("utf8");
+  const catalog = await current.service.listBackups();
+  const recoveryEvidence = JSON.stringify({
+    manifest: created.manifest,
+    payloadFiles,
+    catalog,
+  });
+  assert.equal(recoveryEvidence.includes(sentinelName), false);
+  assert.equal(recoveryEvidence.includes(sentinelBytes.toString("utf8")), false);
+  assert.equal(recoveryEvidence.includes(mirrorDirectory), false);
+  assert.equal(payloadBytes.includes(sentinelBytes.toString("utf8")), false);
+
+  const destinationMachineHome = path.join(current.root, "destination-machine-home");
+  await mkdir(destinationMachineHome);
+  const restoredData = path.join(destinationMachineHome, "data");
+  const restored = await current.service.restore({
+    backupId: created.manifest.backupId,
+    destinationDirectory: restoredData,
+  });
+  const restoredInventory = await readdir(restored.path, { recursive: true });
+  const restoredBytes = Buffer.concat([
+    await readFile(path.join(restored.path, "state", "work-ledger.json")),
+    await readFile(path.join(restored.path, "artifacts", "package-a", "blob")),
+  ]).toString("utf8");
+  assert.equal(JSON.stringify(restoredInventory).includes(sentinelName), false);
+  assert.equal(restoredBytes.includes(sentinelBytes.toString("utf8")), false);
+  await assert.rejects(
+    lstat(path.join(destinationMachineHome, ".mydashboard-cli-credentials-v1")),
+    { code: "ENOENT" },
+  );
+  assert.deepEqual(await readFile(path.join(mirrorDirectory, sentinelName)), sentinelBytes);
+});
+
 test("failed migration or reconciliation leaves no activated destination", async (t) => {
   for (const [port, code] of [
     [

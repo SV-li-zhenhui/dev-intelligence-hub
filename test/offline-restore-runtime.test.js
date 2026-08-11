@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  lstat,
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -178,4 +180,41 @@ test("offline runtime rejects active options and invalid factory ports", () => {
     }),
     /plain data record/u,
   );
+});
+
+test("offline restore orchestration never inventories or creates a Codex login mirror", async (t) => {
+  const machineRoot = await mkdtemp(
+    path.join(os.tmpdir(), "mydashboard-offline-codex-exclusion-"),
+  );
+  t.after(() => rm(machineRoot, { recursive: true, force: true }));
+  const sourceHome = path.join(machineRoot, "source-home");
+  const sourceMirror = path.join(
+    sourceHome,
+    ".mydashboard-cli-credentials-v1",
+    "codex-login",
+  );
+  const sentinelName = "fictional-offline-mirror-sentinel.json";
+  const sentinelBytes = "fictional-offline-mirror-bytes-never-restored";
+  await mkdir(sourceMirror, { recursive: true });
+  await writeFile(path.join(sourceMirror, sentinelName), sentinelBytes);
+
+  const destinationHome = path.join(machineRoot, "destination-home");
+  const calls = { gate: 0, order: [], migrationOrder: [] };
+  const runtime = createOfflineRestoreRuntime({
+    activeDirectory: path.join(destinationHome, "data"),
+    backupDirectory: path.join(machineRoot, "backups"),
+    controlDirectory: path.join(machineRoot, "restore-control"),
+  }, factories(calls));
+
+  const status = await runtime.listBackups();
+  await runtime.activate({ backupId: `backup-${"b".repeat(64)}` });
+  const evidence = JSON.stringify({ calls, status });
+  assert.equal(evidence.includes(sentinelName), false);
+  assert.equal(evidence.includes(sentinelBytes), false);
+  assert.equal(evidence.includes(sourceMirror), false);
+  await assert.rejects(
+    lstat(path.join(destinationHome, ".mydashboard-cli-credentials-v1")),
+    { code: "ENOENT" },
+  );
+  assert.equal(await readFile(path.join(sourceMirror, sentinelName), "utf8"), sentinelBytes);
 });
