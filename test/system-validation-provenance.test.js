@@ -471,6 +471,7 @@ test("the system validator binds a passing report to one clean Git source state"
     },
   );
   for (const name of [
+    "open-source distribution suite",
     "configuration form browser behavior",
     "confirmation history browser behavior",
   ]) {

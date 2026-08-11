@@ -423,6 +423,7 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
+        environment: { APPDATA: "null-device" },
         repositorySource: { headOid, treeOid },
         testResults: {
           summary: {

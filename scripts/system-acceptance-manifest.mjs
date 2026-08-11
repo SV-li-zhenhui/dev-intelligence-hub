@@ -1037,6 +1037,7 @@ function requiredStepContracts(
       name: "open-source distribution suite",
       limits: validationCommandLimits("open-source distribution suite"),
       command: REQUIRED_COMMANDS.get("open-source distribution suite"),
+      environment: { APPDATA: "null-device" },
     },
     {
       name: "configuration form browser behavior",

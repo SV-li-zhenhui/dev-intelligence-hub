@@ -89,7 +89,7 @@ const report = {
   executionSource: null,
   steps: [],
 };
-const browserEnvironmentEvidence = Object.freeze({ APPDATA: "null-device" });
+const nullAppDataEnvironmentEvidence = Object.freeze({ APPDATA: "null-device" });
 const validationRunDirectory = await prepareValidationRunDirectory({
   root,
   runId: report.runId,
@@ -460,7 +460,7 @@ async function verifyCurrentLiveDashboard() {
   });
 }
 
-function validationBrowserEnvironment() {
+function validationNullAppDataEnvironment() {
   if (validationEnvironment === null) {
     throw new Error("isolated validation environment is unavailable");
   }
@@ -541,6 +541,8 @@ try {
     distributionTestPath,
   ], {
     name: "open-source distribution suite",
+    environment: validationNullAppDataEnvironment(),
+    environmentEvidence: nullAppDataEnvironmentEvidence,
     quiet: true,
     parseOutput: parseNodeTestTap,
     parseOutputOnFailure: true,
@@ -551,16 +553,16 @@ try {
     "test/browser/configuration-form-playwright.mjs",
   ], {
     name: "configuration form browser behavior",
-    environment: validationBrowserEnvironment(),
-    environmentEvidence: browserEnvironmentEvidence,
+    environment: validationNullAppDataEnvironment(),
+    environmentEvidence: nullAppDataEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   await runFromExecutionSource(process.execPath, [
     "test/browser/confirmation-history-playwright.mjs",
   ], {
     name: "confirmation history browser behavior",
-    environment: validationBrowserEnvironment(),
-    environmentEvidence: browserEnvironmentEvidence,
+    environment: validationNullAppDataEnvironment(),
+    environmentEvidence: nullAppDataEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   if (withDocker) {
@@ -588,8 +590,8 @@ try {
       ...uiArguments,
     ], {
       name: "live desktop and mobile UI behavior",
-      environment: validationBrowserEnvironment(),
-      environmentEvidence: browserEnvironmentEvidence,
+      environment: validationNullAppDataEnvironment(),
+      environmentEvidence: nullAppDataEnvironmentEvidence,
       quiet: true,
       parseOutput: parseUiArtifactReceiptEnvelope,
       outputField: "artifactReceiptEnvelope",
