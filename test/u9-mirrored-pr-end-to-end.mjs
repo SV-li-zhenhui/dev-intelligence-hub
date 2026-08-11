@@ -70,7 +70,7 @@ function locateGit() {
 }
 
 async function git(gitCommand, cwd, args) {
-  return execFile(gitCommand, args, {
+  return execFile(gitCommand, ["-c", "core.longpaths=true", ...args], {
     cwd,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,

@@ -254,6 +254,9 @@ test("seals a both-modified conflict behind fixed Git commands and a content man
   assert.equal(allArguments.includes("update-ref"), false);
   for (const call of setup.processRunner.calls) {
     assert.equal(call.command, path.resolve(setup.root, process.platform === "win32" ? "mingw64/bin/git.exe" : "bin/git"));
+    const longPathsConfig = call.args.indexOf("core.longpaths=true");
+    assert.notEqual(longPathsConfig, -1);
+    assert.equal(call.args[longPathsConfig - 1], "-c");
     assert.equal(call.env.GIT_TERMINAL_PROMPT, "0");
     assert.equal(call.env.GIT_NO_LAZY_FETCH, "1");
     assert.ok(call.env.GIT_OBJECT_DIRECTORY.startsWith(setup.preparationRoot));

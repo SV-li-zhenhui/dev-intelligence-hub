@@ -111,6 +111,8 @@ const SAFE_GIT_PREFIX = Object.freeze([
   "--no-lazy-fetch",
   "--no-pager",
   "--no-replace-objects",
+  "-c",
+  "core.longpaths=true",
 ]);
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const CODE_JOB_PATH_POLICY = new CodeExecutionPolicy();
