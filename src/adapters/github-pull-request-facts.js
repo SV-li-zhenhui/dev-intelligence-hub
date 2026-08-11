@@ -113,6 +113,7 @@ const VIEW_TARGET_KEYS = Object.freeze([
   "headRepository",
   "headRepositoryOwner",
 ]);
+const VIEW_REPOSITORY_KEYS = Object.freeze(["id", "name", "nameWithOwner"]);
 const VIEW_OWNER_KEYS = Object.freeze(["id", "name", "login"]);
 const CONNECTION_KEYS = Object.freeze(["nodes", "pageInfo"]);
 const PAGE_INFO_KEYS = Object.freeze(["hasPreviousPage", "hasNextPage"]);
@@ -687,24 +688,51 @@ export function githubGraphPullRequestTarget(response, identity) {
   );
 }
 
-export function githubViewPullRequestTarget(response, identity) {
-  const fields = exactDataMap(response, VIEW_TARGET_KEYS, "PR target response");
-  const binding = identity.executionBinding;
-  const headRepository = exactDataMap(
-    fields.get("headRepository"),
-    ["id", "name"],
+function viewHeadRepositoryName(repositoryValue, ownerValue) {
+  const headRepository = dataMap(
+    repositoryValue,
     "PR target response.headRepository",
   );
   const headRepositoryOwner = dataMap(
-    fields.get("headRepositoryOwner"),
+    ownerValue,
     "PR target response.headRepositoryOwner",
   );
   if (
+    !headRepository.has("id") ||
+    !headRepository.has("name") ||
+    [...headRepository.keys()].some(
+      (key) => !VIEW_REPOSITORY_KEYS.includes(key),
+    ) ||
     !headRepositoryOwner.has("login") ||
     [...headRepositoryOwner.keys()].some((key) => !VIEW_OWNER_KEYS.includes(key))
   ) {
-    throw invalid("PR target response.headRepositoryOwner is invalid");
+    throw invalid("PR target response repository identity is invalid");
   }
+  const repositoryName = headRepository.get("name");
+  const ownerLogin = headRepositoryOwner.get("login");
+  if (typeof repositoryName !== "string" || typeof ownerLogin !== "string") {
+    throw invalid("PR target response repository identity is invalid");
+  }
+  const nameWithOwner = `${ownerLogin}/${repositoryName}`;
+  const claimedNameWithOwner = headRepository.get("nameWithOwner");
+  if (
+    headRepository.has("nameWithOwner") &&
+    (typeof claimedNameWithOwner !== "string" ||
+      (claimedNameWithOwner.length > 0 &&
+        claimedNameWithOwner.toLowerCase() !== nameWithOwner.toLowerCase()))
+  ) {
+    throw invalid("PR target response repository identity is contradictory");
+  }
+  return nameWithOwner;
+}
+
+export function githubViewPullRequestTarget(response, identity) {
+  const fields = exactDataMap(response, VIEW_TARGET_KEYS, "PR target response");
+  const binding = identity.executionBinding;
+  const headRepositoryName = viewHeadRepositoryName(
+    fields.get("headRepository"),
+    fields.get("headRepositoryOwner"),
+  );
   return targetFromFields(
     fields,
     {
@@ -712,7 +740,7 @@ export function githubViewPullRequestTarget(response, identity) {
       sourceAccountId: binding.gitTarget.sourceAccountId,
     },
     "PR target response",
-    `${headRepositoryOwner.get("login")}/${headRepository.get("name")}`,
+    headRepositoryName,
   );
 }
 

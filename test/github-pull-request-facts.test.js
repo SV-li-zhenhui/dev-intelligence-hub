@@ -242,6 +242,51 @@ test("minimal CLI owner identity is accepted at both target reads", async () => 
   );
 });
 
+test("current gh CLI head repository identity is accepted at both target reads", async () => {
+  const headRepository = {
+    id: "R_kgDOExample",
+    name: "repo",
+    nameWithOwner: "",
+  };
+  const fake = fakeRun({
+    initialTarget: viewTargetResponse({ headRepository }),
+    finalTarget: viewTargetResponse({ headRepository }),
+  });
+  const adapter = new GitHubAdapter({ run: fake.run });
+
+  const facts = await adapter.loadPullRequestFacts(readRequest());
+
+  assert.equal(facts.reviewDecision, "CHANGES_REQUESTED");
+  assert.equal(
+    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    2,
+  );
+});
+
+test("contradictory gh CLI head repository identity is rejected", async () => {
+  const fake = fakeRun({
+    initialTarget: viewTargetResponse({
+      headRepository: {
+        id: "R_kgDOExample",
+        name: "repo",
+        nameWithOwner: "other/repo",
+      },
+    }),
+  });
+  const adapter = new GitHubAdapter({ run: fake.run });
+
+  await assert.rejects(
+    adapter.loadPullRequestFacts(readRequest()),
+    (error) => error.code === "GITHUB_PULL_REQUEST_FACTS_INVALID",
+  );
+  assert.equal(
+    fake.calls.filter(
+      ({ args }) => args[0] === "api" && args[1] === "graphql",
+    ).length,
+    0,
+  );
+});
+
 test("the bounded GraphQL read returns detailed facts without changing summaries", async () => {
   const fake = fakeRun();
   const adapter = new GitHubAdapter({
