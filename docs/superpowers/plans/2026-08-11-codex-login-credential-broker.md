@@ -261,9 +261,15 @@ git commit -m "feat: define Codex login credential mode"
 - Consumes: fixed Windows PowerShell location pattern and private identity records used by `private-directory-manager.js`.
 - Produces: `createProductionCodexCredentialFilePort()` and `createTestCodexCredentialFilePort({ invoke })` with the exact methods in Stable Interfaces.
 
+**Independent bounds:**
+
+- `MAXIMUM_CREDENTIAL_BYTES = 65_536`: actual credential/source bytes remain `1..65_536`, including host `auth.json` and Task 3 staged/captured credential semantics.
+- `MAXIMUM_PRIVATE_FILE_BYTES = 192 * 1024`: generic private files, including the canonical mirror envelope, are `1..192 KiB`.
+- `MAXIMUM_PACKET_BYTES = 384 * 1024`: helper JSON request and response packets are `1..384 KiB`; helper stderr remains `4096` bytes and its text is discarded.
+
 - [ ] **Step 1: Write failing protocol and redaction tests**
 
-Use an injected `invoke(request)` to prove exact request/response keys, `1..65536` bounds, safe direct-child names, abort propagation, Base64 validation, and generic public errors:
+Use an injected `invoke(request)` to prove exact request/response keys, source `1..65536` bounds, generic private-file `1..192 * 1024` bounds, safe direct-child names, abort propagation, Base64 validation, and generic public errors:
 
 ```js
 const port = createTestCodexCredentialFilePort({
@@ -328,7 +334,7 @@ const HELPER_REQUEST_KEYS = Object.freeze({
 });
 ```
 
-Cap request and response packets at `192 * 1024` bytes and helper stderr at `4096` bytes; discard stderr text.
+Cap request and response packets at `384 * 1024` bytes and helper stderr at `4096` bytes; discard stderr text. Keep source reads independently capped at `65536` bytes and generic private reads/writes independently capped at `192 * 1024` bytes in JavaScript, PowerShell, and native C#.
 
 - [ ] **Step 5: Implement handle and ACL admission in the helper**
 
@@ -349,7 +355,7 @@ For every other trustee named by an allow ACE, use effective ACL rights and reje
 
 - [ ] **Step 6: Implement relative private-file operations and atomic replace**
 
-Open the supplied directory by its expected device/inode identity and only then open the validated direct-child `name`. `write-new-private` uses create-new semantics and `FlushFileBuffers`. `replace-private` writes a unique `state.tmp.<pid>.<32-hex>` sibling, flushes and revalidates it, publishes with `ReplaceFileW` or `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, and reopens the final file to verify exact bytes. Scan at most 32 direct children and 256 KiB while deleting only matching owned temporary names; reject directories and links.
+Open the supplied directory by its expected device/inode identity and only then open the validated direct-child `name`. Generic private-file reads, create-new writes, and replacements admit only `1..192 * 1024` bytes. `write-new-private` uses create-new semantics and `FlushFileBuffers`. `replace-private` writes a unique `state.tmp.<pid>.<32-hex>` sibling, flushes and revalidates it, publishes with `ReplaceFileW` or `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, and reopens the final file to verify exact bytes. Scan at most 32 direct children and 256 KiB while deleting only matching owned temporary names; reject directories and links.
 
 - [ ] **Step 7: Run native and distribution tests to GREEN**
 
@@ -445,7 +451,7 @@ Resolve production locations from startup environment/homedir without I/O at mod
 
 - [ ] **Step 6: Implement exact envelope parsing and publication**
 
-Use `canonicalJsonStringify()` plus a final newline, SHA-256 over opaque bytes, strict Base64 round-trip, a 192 KiB envelope cap, and the Task 2 atomic replace port. Validate exact own enumerable data properties and reject proxies, accessors, duplicate JSON keys, unknown versions, mismatched digests, empty credentials, and credentials above 65536 bytes.
+Use `canonicalJsonStringify()` plus a final newline, SHA-256 over opaque bytes, strict Base64 round-trip, a 192 KiB envelope cap, and the Task 2 atomic replace port. Validate exact own enumerable data properties and reject proxies, accessors, duplicate JSON keys, unknown versions, mismatched digests, and empty credentials. Independently reject decoded actual credentials above 65536 bytes even though the generic private-file port admits the larger envelope.
 
 ```js
 function envelope(sourceDigest, credentialBytes, now) {

@@ -3,7 +3,8 @@ import path from "node:path";
 
 const SCHEMA_VERSION = 1;
 const MAXIMUM_CREDENTIAL_BYTES = 65_536;
-const MAXIMUM_PACKET_BYTES = 192 * 1024;
+const MAXIMUM_PRIVATE_FILE_BYTES = 192 * 1024;
+const MAXIMUM_PACKET_BYTES = 384 * 1024;
 const MAXIMUM_STDERR_BYTES = 4_096;
 const MAXIMUM_NAME_BYTES = 128;
 const PUBLIC_FAILURE = Symbol("public credential file failure");
@@ -116,7 +117,7 @@ function sourceMaximum(value) {
 }
 
 function privateMaximum(value) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAXIMUM_CREDENTIAL_BYTES) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAXIMUM_PRIVATE_FILE_BYTES) {
     throw operationFailed();
   }
   return value;
@@ -174,11 +175,11 @@ function directChildName(value) {
   return value;
 }
 
-function opaqueBytes(value) {
+function privateBytes(value) {
   if (
     !Buffer.isBuffer(value) ||
     value.length < 1 ||
-    value.length > MAXIMUM_CREDENTIAL_BYTES
+    value.length > MAXIMUM_PRIVATE_FILE_BYTES
   ) {
     throw operationFailed();
   }
@@ -379,7 +380,7 @@ function createPort(invoke, { waitForAbortCleanup = false } = {}) {
         operation,
         directory: exactDirectoryIdentity(values.directory),
         name: directChildName(values.name),
-        bytesBase64: opaqueBytes(values.bytes).toString("base64"),
+        bytesBase64: privateBytes(values.bytes).toString("base64"),
       };
       await execute(signal, request, voidResponse);
     } catch (error) {

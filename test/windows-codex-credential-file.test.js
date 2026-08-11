@@ -22,8 +22,9 @@ import {
   createTestCodexCredentialFilePort,
 } from "../src/lib/windows-codex-credential-file.js";
 
-const PACKET_LIMIT = 192 * 1024;
 const CREDENTIAL_LIMIT = 65_536;
+const PRIVATE_FILE_LIMIT = 192 * 1024;
+const PACKET_LIMIT = 384 * 1024;
 const WINDOWS_NATIVE_SUPPORTED = process.platform === "win32" && process.arch === "x64";
 
 function ok(bytes = null) {
@@ -268,24 +269,60 @@ function invokeNativeHelper(
   return JSON.parse(result.stdout);
 }
 
-async function makeNativeReadPrivateLimitHarness(root) {
+async function makeNativeBoundHarness(root) {
   const helperPath = path.resolve("src/lib/windows-codex-credential-helper.ps1");
-  const source = (await readFile(helperPath, "utf8")).replaceAll("\r\n", "\n");
-  const guardedSelector = [
-    "    'read-private' {",
-    "      $directory = Read-Directory $request.directory",
-    "      $name = Read-Name $request.name",
-    "      $maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes",
-  ].join("\n");
-  const widenedSelector = guardedSelector.replace(
-    "$MaximumCredentialBytes",
-    "$MaximumPacketBytes",
+  let harnessSource = (await readFile(helperPath, "utf8")).replaceAll("\r\n", "\n");
+  harnessSource = harnessSource.replace(
+    "$MaximumPacketBytes = 192 * 1024",
+    "$MaximumPacketBytes = 384 * 1024",
   );
-  const harnessSource = source.replace(guardedSelector, widenedSelector);
-  if (harnessSource === source || harnessSource.includes(guardedSelector)) {
-    throw new Error("native limit harness could not isolate the read-private selector");
+  const selectors = [
+    {
+      operation: "read-source",
+      candidates: [
+        "$maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes",
+      ],
+    },
+    {
+      operation: "read-private",
+      candidates: [
+        "$maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes",
+        "$maximum = Read-Maximum $request.maximumBytes $MaximumPrivateFileBytes",
+      ],
+    },
+    {
+      operation: "write-new-private",
+      candidates: [
+        "$bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes",
+        "$bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPrivateFileBytes",
+      ],
+    },
+    {
+      operation: "replace-private",
+      candidates: [
+        "$bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes",
+        "$bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPrivateFileBytes",
+      ],
+    },
+  ];
+  for (const { operation, candidates } of selectors) {
+    const start = harnessSource.lastIndexOf(`    '${operation}' {`);
+    const end = harnessSource.indexOf("\n    '", start + 1);
+    if (start < 0 || end < 0) {
+      throw new Error(`native bound harness could not isolate ${operation}`);
+    }
+    const block = harnessSource.slice(start, end);
+    const matches = candidates.filter((candidate) => block.includes(candidate));
+    if (matches.length !== 1) {
+      throw new Error(`native bound harness found an unexpected ${operation} selector`);
+    }
+    const widenedBlock = block.replace(matches[0], matches[0].replace(
+      /\$Maximum(?:Credential|PrivateFile)Bytes/u,
+      "(384 * 1024)",
+    ));
+    harnessSource = harnessSource.slice(0, start) + widenedBlock + harnessSource.slice(end);
   }
-  const harnessPath = path.join(root, "native-read-private-limit-harness.ps1");
+  const harnessPath = path.join(root, "native-bound-harness.ps1");
   await writeFile(harnessPath, harnessSource, { encoding: "utf8", flag: "wx" });
   return harnessPath;
 }
@@ -581,7 +618,7 @@ test("source bounds and private direct-child names fail before helper invocation
   assert.equal(invocations, 3);
 });
 
-test("private payloads enforce the raw 65,536-byte boundary before invocation", async () => {
+test("generic private payloads enforce the raw 192 KiB boundary before invocation", async () => {
   const requests = [];
   const port = createTestCodexCredentialFilePort({
     async invoke(request) {
@@ -591,13 +628,13 @@ test("private payloads enforce the raw 65,536-byte boundary before invocation", 
   });
   const directory = Object.freeze({ path: "D:\\fictional", device: "1", inode: "2" });
   const signal = AbortSignal.timeout(30_000);
-  const maximumPayload = Buffer.alloc(CREDENTIAL_LIMIT, 0x61);
+  const maximumPayload = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x61);
 
   assert.deepEqual(
     await port.readPrivate({
       directory,
       name: "state.json",
-      maximumBytes: CREDENTIAL_LIMIT,
+      maximumBytes: PRIVATE_FILE_LIMIT,
       required: true,
       signal,
     }),
@@ -616,29 +653,71 @@ test("private payloads enforce the raw 65,536-byte boundary before invocation", 
     signal,
   });
 
-  await assert.rejects(
-    port.readPrivate({
-      directory,
-      name: "state.json",
-      maximumBytes: CREDENTIAL_LIMIT + 1,
-      required: true,
-      signal,
-    }),
-    { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
-  );
-  for (const operation of ["writeNewPrivate", "replacePrivate"]) {
+  for (const maximumBytes of [0, PRIVATE_FILE_LIMIT + 1]) {
     await assert.rejects(
-      port[operation]({
+      port.readPrivate({
         directory,
         name: "state.json",
-        bytes: Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x62),
+        maximumBytes,
+        required: true,
         signal,
       }),
       { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
-      operation,
     );
   }
+  for (const operation of ["writeNewPrivate", "replacePrivate"]) {
+    for (const bytes of [Buffer.alloc(0), Buffer.alloc(PRIVATE_FILE_LIMIT + 1, 0x62)]) {
+      await assert.rejects(
+        port[operation]({
+          directory,
+          name: "state.json",
+          bytes,
+          signal,
+        }),
+        { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+        operation,
+      );
+    }
+  }
   assert.equal(requests.length, 3);
+});
+
+test("production transport carries 192 KiB private files within 384 KiB packets", async () => {
+  const payload = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x65);
+  const directory = Object.freeze({
+    path: "D:\\fictional-private-envelope",
+    device: "17",
+    inode: "29",
+  });
+  const signal = AbortSignal.timeout(30_000);
+  const writer = createControlledProcessPort(
+    "process.stdin.resume();process.stdin.once('end',()=>process.stdout.write('{\"schemaVersion\":1,\"status\":\"ok\"}'));",
+  );
+  await writer.port.writeNewPrivate({
+    directory,
+    name: "state.json",
+    bytes: payload,
+    signal,
+  });
+  assert.equal(writer.capture.stdin.length > 192 * 1024, true);
+  assert.equal(writer.capture.stdin.length <= PACKET_LIMIT, true);
+  assert.deepEqual(
+    Buffer.from(JSON.parse(writer.capture.stdin.toString("utf8")).bytesBase64, "base64"),
+    payload,
+  );
+
+  const responseScript = `process.stdin.resume();process.stdin.once("end",()=>process.stdout.write(JSON.stringify({schemaVersion:1,status:"ok",bytesBase64:Buffer.alloc(${PRIVATE_FILE_LIMIT},0x65).toString("base64")})));`;
+  const reader = createControlledProcessPort(responseScript);
+  assert.deepEqual(
+    await reader.port.readPrivate({
+      directory,
+      name: "state.json",
+      maximumBytes: PRIVATE_FILE_LIMIT,
+      required: true,
+      signal,
+    }),
+    payload,
+  );
 });
 
 test("production transport uses fixed spawn metadata and bounded stdin", async () => {
@@ -691,14 +770,16 @@ test("production transport uses fixed spawn metadata and bounded stdin", async (
 
 test("production transport rejects oversized requests before spawning", async () => {
   let spawnCount = 0;
+  const marker = "FICTIONAL_OVERSIZED_PACKET_PRIVATE";
   const port = createTestCodexCredentialFilePort({
     spawnProcess() {
       spawnCount += 1;
       throw new Error("must not spawn");
     },
   });
+  const pathPrefix = `D:\\${marker}\\`;
   const directory = Object.freeze({
-    path: `D:\\${"\u0001".repeat(32_764)}`,
+    path: pathPrefix + "\u0001".repeat(32_767 - pathPrefix.length),
     device: "1",
     inode: "2",
   });
@@ -706,10 +787,14 @@ test("production transport rejects oversized requests before spawning", async ()
     port.writeNewPrivate({
       directory,
       name: "state.json",
-      bytes: Buffer.from("x"),
+      bytes: Buffer.alloc(PRIVATE_FILE_LIMIT, 0x70),
       signal: AbortSignal.timeout(30_000),
     }),
-    { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+    (error) => isRedactedFailure(
+      error,
+      "CODEX_CREDENTIAL_FILE_OPERATION_FAILED",
+      [marker, process.cwd()],
+    ),
   );
   assert.equal(spawnCount, 0);
 });
@@ -718,7 +803,7 @@ test("production transport bounds output streams and rejects nonzero exits", asy
   const marker = "FICTIONAL_PROCESS_OUTPUT_PRIVATE";
   const cases = [
     {
-      name: "stdout exceeds 192 KiB",
+      name: "stdout exceeds 384 KiB",
       script: `process.stdin.resume();process.stdin.once("end",()=>{process.stdout.write("${marker}"+"x".repeat(${PACKET_LIMIT}));setInterval(()=>{},1000);});`,
     },
     {
@@ -965,11 +1050,17 @@ test("Windows source admission is handle-bound across size, link, owner, ACL, an
   const port = createProductionCodexCredentialFilePort();
   const signal = AbortSignal.timeout(120_000);
   const normal = path.join(root, "normal.json");
+  const maximum = path.join(root, "maximum.json");
   await writeFile(normal, Buffer.from("fictional-normal-auth"));
+  await writeFile(maximum, Buffer.alloc(CREDENTIAL_LIMIT, 0x6d));
 
   assert.deepEqual(
     await port.readSource({ file: normal, maximumBytes: 65_536, signal }),
     Buffer.from("fictional-normal-auth"),
+  );
+  assert.deepEqual(
+    await port.readSource({ file: maximum, maximumBytes: CREDENTIAL_LIMIT, signal }),
+    Buffer.alloc(CREDENTIAL_LIMIT, 0x6d),
   );
   await assert.rejects(
     port.readSource({
@@ -1139,24 +1230,57 @@ test("Windows private ACL admission permits only user, SYSTEM, and Administrator
   );
 });
 
-test("native helper independently enforces packet and 65,536-byte credential bounds", {
+test("native PowerShell enforces 192 KiB private and 384 KiB packet bounds", {
   skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
 }, async (t) => {
   const root = await makeNativeRoot(t, "native-bounds");
   const directory = await frozenDirectory(root);
-  const oversized = Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x62);
+  const oversized = Buffer.alloc(PRIVATE_FILE_LIMIT + 1, 0x62);
   const oversizedRead = path.join(root, "oversized-read.json");
   await writeFile(oversizedRead, oversized);
 
-  await t.test("read-private rejects a maximum above the credential limit", () => {
+  await t.test("accepts a 192 KiB private file through normal PowerShell packets", async () => {
+    const maximum = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x61);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name: "maximum.json",
+      bytesBase64: maximum.toString("base64"),
+    }), { schemaVersion: 1, status: "ok" });
+    const response = invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-private",
+      directory,
+      name: "maximum.json",
+      maximumBytes: PRIVATE_FILE_LIMIT,
+      required: true,
+    });
+    assert.equal(response.status, "ok");
+    assert.deepEqual(Buffer.from(response.bytesBase64, "base64"), maximum);
+  });
+
+  await t.test("read-private rejects a maximum above the private-file limit", () => {
     assert.deepEqual(invokeNativeHelper({
       schemaVersion: 1,
       operation: "read-private",
       directory,
       name: "oversized-read.json",
-      maximumBytes: CREDENTIAL_LIMIT + 1,
+      maximumBytes: PRIVATE_FILE_LIMIT + 1,
       required: true,
     }), { schemaVersion: 1, status: "failed" });
+  });
+
+  await t.test("write-new-private rejects zero raw bytes", async () => {
+    const target = path.join(root, "empty-new.json");
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name: "empty-new.json",
+      bytesBase64: "",
+    }), { schemaVersion: 1, status: "failed" });
+    await assert.rejects(lstat(target), { code: "ENOENT" });
   });
 
   await t.test("write-new-private rejects oversized raw bytes", async () => {
@@ -1185,7 +1309,7 @@ test("native helper independently enforces packet and 65,536-byte credential bou
     assert.deepEqual(await readFile(state), initial);
   });
 
-  await t.test("request packets above 192 KiB are rejected before parsing", () => {
+  await t.test("request packets above 384 KiB are rejected before parsing", () => {
     const missing = path.join(root, "packet-cap-missing.json");
     const request = JSON.stringify({
       schemaVersion: 1,
@@ -1198,55 +1322,112 @@ test("native helper independently enforces packet and 65,536-byte credential bou
   });
 });
 
-test("native ReadPrivate independently rejects maximumBytes above 65,536", {
+test("native C# independently separates credential and private-file bounds", {
   skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
 }, async (t) => {
-  const root = await makeNativeRoot(t, "native-read-limit");
+  const root = await makeNativeRoot(t, "native-independent-bounds");
   const directory = await frozenDirectory(root);
-  const helperPath = await makeNativeReadPrivateLimitHarness(root);
-  const cases = [
-    { maximumBytes: 1, name: "lower.json", bytes: Buffer.from("x") },
-    {
-      maximumBytes: CREDENTIAL_LIMIT,
-      name: "upper.json",
-      bytes: Buffer.alloc(CREDENTIAL_LIMIT, 0x75),
-    },
-  ];
+  const helperPath = await makeNativeBoundHarness(root);
 
-  for (const boundary of cases) {
-    await writeFile(path.join(root, boundary.name), boundary.bytes);
-    const response = invokeNativeHelper({
+  await t.test("ReadPrivate accepts 192 KiB and rejects the next byte", async () => {
+    const maximum = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x75);
+    const maximumName = "private-maximum.json";
+    await writeFile(path.join(root, maximumName), maximum);
+    const accepted = invokeNativeHelper({
       schemaVersion: 1,
       operation: "read-private",
       directory,
-      name: boundary.name,
-      maximumBytes: boundary.maximumBytes,
+      name: maximumName,
+      maximumBytes: PRIVATE_FILE_LIMIT,
       required: true,
     }, helperPath);
-    assert.equal(response.status, "ok");
-    assert.deepEqual(Buffer.from(response.bytesBase64, "base64"), boundary.bytes);
-  }
+    assert.equal(accepted.status, "ok");
+    assert.deepEqual(Buffer.from(accepted.bytesBase64, "base64"), maximum);
 
-  const privateMarker = "fictional-native-over-limit-private-marker";
-  const oversized = Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x78);
-  oversized.set(Buffer.from(privateMarker));
-  const oversizedName = "over-limit.json";
-  const oversizedPath = path.join(root, oversizedName);
-  await writeFile(oversizedPath, oversized);
-  const response = invokeNativeHelper({
-    schemaVersion: 1,
-    operation: "read-private",
-    directory,
-    name: oversizedName,
-    maximumBytes: CREDENTIAL_LIMIT + 1,
-    required: true,
-  }, helperPath);
+    const privateMarker = "fictional-native-over-limit-private-marker";
+    const oversized = Buffer.alloc(PRIVATE_FILE_LIMIT + 1, 0x78);
+    oversized.set(Buffer.from(privateMarker));
+    const oversizedName = "private-over-limit.json";
+    const oversizedPath = path.join(root, oversizedName);
+    await writeFile(oversizedPath, oversized);
+    const rejected = invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-private",
+      directory,
+      name: oversizedName,
+      maximumBytes: PRIVATE_FILE_LIMIT + 1,
+      required: true,
+    }, helperPath);
+    assert.deepEqual(rejected, { schemaVersion: 1, status: "failed" });
+    const serialized = JSON.stringify(rejected);
+    assert.equal(serialized.includes(privateMarker), false);
+    assert.equal(serialized.includes(oversizedPath), false);
+  });
 
-  assert.equal(response.status, "failed");
-  assert.deepEqual(Object.keys(response).sort(), ["schemaVersion", "status"]);
-  const serialized = JSON.stringify(response);
-  assert.equal(serialized.includes(privateMarker), false);
-  assert.equal(serialized.includes(oversizedPath), false);
+  await t.test("ReadSource remains independently capped at 65,536 bytes", async () => {
+    const maximum = Buffer.alloc(CREDENTIAL_LIMIT, 0x73);
+    const maximumPath = path.join(root, "source-maximum.json");
+    await writeFile(maximumPath, maximum);
+    const accepted = invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-source",
+      fileBase64: Buffer.from(maximumPath).toString("base64"),
+      maximumBytes: CREDENTIAL_LIMIT,
+    }, helperPath);
+    assert.equal(accepted.status, "ok");
+    assert.deepEqual(Buffer.from(accepted.bytesBase64, "base64"), maximum);
+
+    const oversizedPath = path.join(root, "source-over-limit.json");
+    await writeFile(oversizedPath, Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x74));
+    const rejected = invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-source",
+      fileBase64: Buffer.from(oversizedPath).toString("base64"),
+      maximumBytes: CREDENTIAL_LIMIT + 1,
+    }, helperPath);
+    assert.equal(rejected.status, "source-unsafe");
+    assert.deepEqual(Object.keys(rejected).sort(), ["schemaVersion", "status"]);
+  });
+
+  await t.test("private writes accept 192 KiB and reject the next byte", async () => {
+    const maximum = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x77);
+    const oversized = Buffer.alloc(PRIVATE_FILE_LIMIT + 1, 0x78);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name: "new-maximum.json",
+      bytesBase64: maximum.toString("base64"),
+    }, helperPath), { schemaVersion: 1, status: "ok" });
+    assert.deepEqual(await readFile(path.join(root, "new-maximum.json")), maximum);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name: "new-over-limit.json",
+      bytesBase64: oversized.toString("base64"),
+    }, helperPath), { schemaVersion: 1, status: "failed" });
+    await assert.rejects(lstat(path.join(root, "new-over-limit.json")), { code: "ENOENT" });
+
+    const state = path.join(root, "replace-state.json");
+    await writeFile(state, Buffer.from("fictional-before-native-bound-replace"));
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "replace-private",
+      directory,
+      name: "replace-state.json",
+      bytesBase64: maximum.toString("base64"),
+    }, helperPath), { schemaVersion: 1, status: "ok" });
+    assert.deepEqual(await readFile(state), maximum);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "replace-private",
+      directory,
+      name: "replace-state.json",
+      bytesBase64: oversized.toString("base64"),
+    }, helperPath), { schemaVersion: 1, status: "failed" });
+    assert.deepEqual(await readFile(state), maximum);
+  });
 });
 
 test("Windows private operations use a pinned directory and atomic verified replacement", {

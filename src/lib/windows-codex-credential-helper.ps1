@@ -1,8 +1,9 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$MaximumPacketBytes = 192 * 1024
+$MaximumPacketBytes = 384 * 1024
 $MaximumCredentialBytes = 65536
+$MaximumPrivateFileBytes = 192 * 1024
 $MaximumNameBytes = 128
 $Utf8 = [Text.UTF8Encoding]::new($false, $true)
 [Console]::InputEncoding = $Utf8
@@ -246,6 +247,7 @@ public static class MyDashboardCodexCredentialFile {
   private const int MAXIMUM_TEMPORARY_ENTRIES = 32;
   private const long MAXIMUM_TEMPORARY_BYTES = 256 * 1024;
   private const int MAXIMUM_CREDENTIAL_BYTES = 65536;
+  private const int MAXIMUM_PRIVATE_FILE_BYTES = 192 * 1024;
   private const int MUTATION_LOCK_TIMEOUT_MILLISECONDS = 30000;
 
   private static readonly string SystemSid = "S-1-5-18";
@@ -807,6 +809,9 @@ public static class MyDashboardCodexCredentialFile {
   }
 
   public static byte[] ReadSource(string filePath, int maximumBytes) {
+    if (maximumBytes < 1 || maximumBytes > MAXIMUM_CREDENTIAL_BYTES) {
+      throw new CodexSourceUnsafeException();
+    }
     List<OpenedPath> ancestors = null;
     try {
       ancestors = OpenAncestors(filePath);
@@ -996,7 +1001,7 @@ public static class MyDashboardCodexCredentialFile {
     string name,
     int maximumBytes,
     bool required) {
-    if (maximumBytes < 1 || maximumBytes > MAXIMUM_CREDENTIAL_BYTES) {
+    if (maximumBytes < 1 || maximumBytes > MAXIMUM_PRIVATE_FILE_BYTES) {
       throw new CodexPrivateFileException();
     }
     try {
@@ -1216,7 +1221,7 @@ public static class MyDashboardCodexCredentialFile {
     string name,
     byte[] bytes) {
     try {
-      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_CREDENTIAL_BYTES) {
+      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_PRIVATE_FILE_BYTES) {
         throw new InvalidOperationException("private bytes are invalid");
       }
       using (OpenedPath directory = OpenPrivateDirectory(
@@ -1371,7 +1376,7 @@ public static class MyDashboardCodexCredentialFile {
       FILE_OPEN,
       out missing)) {
       if (missing || child == null) return false;
-      ValidatePrivateFile(child, MAXIMUM_CREDENTIAL_BYTES);
+      ValidatePrivateFile(child, MAXIMUM_PRIVATE_FILE_BYTES);
       return true;
     }
   }
@@ -1403,7 +1408,7 @@ public static class MyDashboardCodexCredentialFile {
     string temporaryName = null;
     bool published = false;
     try {
-      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_CREDENTIAL_BYTES) {
+      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_PRIVATE_FILE_BYTES) {
         throw new InvalidOperationException("private bytes are invalid");
       }
       using (OpenedPath directory = OpenPrivateDirectory(
@@ -1471,7 +1476,7 @@ public static class MyDashboardCodexCredentialFile {
             FILE_OPEN,
             out missing)) {
             if (!missing && child != null) {
-              ValidatePrivateFile(child, MAXIMUM_CREDENTIAL_BYTES);
+              ValidatePrivateFile(child, MAXIMUM_PRIVATE_FILE_BYTES);
               MarkDelete(child);
             }
           }
@@ -1535,7 +1540,7 @@ try {
     'read-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes
+      $maximum = Read-Maximum $request.maximumBytes $MaximumPrivateFileBytes
       if ($request.required -isnot [bool]) { throw 'required is invalid' }
       try {
         $bytes = [MyDashboardCodexCredentialFile]::ReadPrivate(
@@ -1554,7 +1559,7 @@ try {
     'write-new-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes
+      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPrivateFileBytes
       try {
         [MyDashboardCodexCredentialFile]::WriteNewPrivate(
           $directory.Path,
@@ -1571,7 +1576,7 @@ try {
     'replace-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes
+      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPrivateFileBytes
       try {
         [MyDashboardCodexCredentialFile]::ReplacePrivate(
           $directory.Path,

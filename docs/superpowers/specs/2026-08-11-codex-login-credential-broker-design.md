@@ -224,7 +224,7 @@ CLI provider 增加显式字段：
 
 ### 8.2 单文件原子状态
 
-镜像以一个受限大小的原子 envelope 保存：
+镜像以一个最大 `192 KiB` 的原子 envelope 保存：
 
 ```json
 {
@@ -235,6 +235,13 @@ CLI provider 增加显式字段：
   "updatedAt": "<timestamp>"
 }
 ```
+
+三个大小边界彼此独立：`MAXIMUM_CREDENTIAL_BYTES = 65536` 约束宿主 `auth.json`
+以及暂存或捕获的实际凭据语义；`MAXIMUM_PRIVATE_FILE_BYTES = 192 * 1024` 约束
+Task 2 通用私有文件（包括镜像 envelope）；`MAXIMUM_PACKET_BYTES = 384 * 1024`
+约束承载 Base64 和固定协议元数据的 helper JSON 请求与响应封包。helper 的 stderr
+仍限于 `4096` 字节并丢弃其文本。Task 3 在应用 `192 KiB` envelope 上限的同时，
+必须独立拒绝解码后为空或超过 `65536` 字节的实际凭据。
 
 envelope 只存在于私有目录。更新流程是：在同一已验证目录中新建唯一临时文件、完整
 写入并同步、重新验证目录与文件身份，再以原子替换发布。崩溃前保留旧完整版本，
