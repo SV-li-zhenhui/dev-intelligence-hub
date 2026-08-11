@@ -1260,6 +1260,27 @@ test("native PowerShell enforces 192 KiB private and 384 KiB packet bounds", {
     assert.deepEqual(Buffer.from(response.bytesBase64, "base64"), maximum);
   });
 
+  await t.test("replace-private accepts exactly 192 KiB through the normal PowerShell selector", async () => {
+    const name = "maximum-replacement.json";
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name,
+      bytesBase64: Buffer.from("fictional-before-maximum-replacement").toString("base64"),
+    }), { schemaVersion: 1, status: "ok" });
+
+    const maximum = Buffer.alloc(PRIVATE_FILE_LIMIT, 0x63);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "replace-private",
+      directory,
+      name,
+      bytesBase64: maximum.toString("base64"),
+    }), { schemaVersion: 1, status: "ok" });
+    assert.deepEqual(await readFile(path.join(root, name)), maximum);
+  });
+
   await t.test("read-private rejects a maximum above the private-file limit", () => {
     assert.deepEqual(invokeNativeHelper({
       schemaVersion: 1,
