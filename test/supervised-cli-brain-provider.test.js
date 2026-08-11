@@ -1450,15 +1450,11 @@ test("protected-root real-path aliases are rejected before discovery or spawn", 
   const protectedRoot = path.join(parent, "protected");
   const protectedAlias = path.join(parent, "protected-alias");
   await mkdir(protectedRoot);
-  try {
-    await symlink(protectedRoot, protectedAlias, "dir");
-  } catch (error) {
-    if (["EPERM", "EACCES"].includes(error?.code)) {
-      t.skip("directory symlinks require Windows Developer Mode or elevated privilege");
-      return;
-    }
-    throw error;
-  }
+  await symlink(
+    protectedRoot,
+    protectedAlias,
+    process.platform === "win32" ? "junction" : "dir",
+  );
   const locator = recordingLocator(testDescriptor("codex-cli"));
   const runner = recordingRunner(async () => successfulProcess());
   const provider = createTestSupervisedCliBrainProvider(

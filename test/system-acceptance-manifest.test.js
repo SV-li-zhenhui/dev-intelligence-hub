@@ -1246,6 +1246,47 @@ test("accepts an explicitly documented Windows-only test skip", async (t) => {
   assert.equal(manifest.status, "passed");
 });
 
+for (const [name, reason] of [
+  [
+    "cleanup rejects a symbolic-link entry without touching its target",
+    "file symlinks require Windows Developer Mode or elevated privilege",
+  ],
+  ...["EPERM", "EACCES", "UNKNOWN"].map((errorCode) => [
+    "rejects a symbolic-link source when link creation is available",
+    `Windows symbolic-link fixture capability unavailable: ${errorCode}`,
+  ]),
+  [
+    "rejects a wrong-owner source when owner reassignment is available",
+    "Windows wrong-owner fixture capability unavailable: Set-Acl owner reassignment denied",
+  ],
+]) {
+  test(`accepts the documented host-capability skip: ${name} (${reason})`, async (t) => {
+    const fixture = await createFixture(t);
+    const validation = structuredClone(fixture.validation);
+    const results = validation.steps.find(
+      ({ name: stepName }) => stepName === "complete Node test suite",
+    ).testResults;
+    results.cases[0] = {
+      identity: `tap:1:${name}`,
+      name,
+      status: "skipped",
+      reason,
+    };
+    results.summary.passed = 1;
+    results.summary.skipped = 2;
+    await rewriteValidationAndReviewBindings(fixture, validation);
+    const { buildAcceptanceManifest } = await loadManifestModule();
+
+    const manifest = await buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      reviewReports: fixture.reviews,
+    });
+
+    assert.equal(manifest.status, "passed");
+  });
+}
+
 test("rejects evidence reached through a repository junction ancestor", async (t) => {
   const fixture = await createFixture(t);
   const external = await mkdtemp(path.join(os.tmpdir(), "mydashboard-evidence-"));

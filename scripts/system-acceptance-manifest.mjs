@@ -109,6 +109,22 @@ const ALLOWED_TEST_SKIPS = new Map([
     "file symlinks require Windows Developer Mode or elevated privilege",
   ],
   [
+    "cleanup rejects a symbolic-link entry without touching its target",
+    "file symlinks require Windows Developer Mode or elevated privilege",
+  ],
+  [
+    "rejects a symbolic-link source when link creation is available",
+    new Set([
+      "Windows symbolic-link fixture capability unavailable: EPERM",
+      "Windows symbolic-link fixture capability unavailable: EACCES",
+      "Windows symbolic-link fixture capability unavailable: UNKNOWN",
+    ]),
+  ],
+  [
+    "rejects a wrong-owner source when owner reassignment is available",
+    "Windows wrong-owner fixture capability unavailable: Set-Acl owner reassignment denied",
+  ],
+  [
     "runtime source identity rejects symlinks in packaged directories",
     "file symlinks are unavailable on this host",
   ],
