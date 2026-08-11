@@ -144,6 +144,44 @@ test("external confirmation renders the exact authorization context", async () =
   );
 });
 
+test("all five PR action kinds have exact browser approval routes and details", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const routerStart = app.indexOf("function showExternalActionConfirmation");
+  const routerEnd = app.indexOf("\nfunction showInternalAttention", routerStart);
+  const router = app.slice(routerStart, routerEnd);
+  const rendererStart = app.indexOf("function pullRequestConfirmationActionType");
+  const rendererEnd = app.indexOf("\nfunction codeOperationLabel", rendererStart);
+  const renderer = app.slice(rendererStart, rendererEnd);
+
+  assert.ok(routerStart >= 0 && routerEnd > routerStart);
+  assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
+  for (const [kind, actionType, label] of [
+    ["github.pull-request-comment", "pull_request_comment", "PR 评论"],
+    ["github.work-proposal-review", "pull_request_review", "PR Review"],
+    ["github.pull-request-update-branch", "pull_request_update_branch", "更新 PR 分支"],
+    ["github.pull-request-push", "pull_request_push", "推送受控 commit"],
+    ["github.pull-request-merge", "pull_request_merge", "合并 PR"],
+  ]) {
+    assert.equal(app.includes(kind), true, kind);
+    assert.equal(app.includes(actionType), true, actionType);
+    assert.equal(renderer.includes(label), true, label);
+  }
+  assert.match(router, /pullRequestConfirmationActionType/);
+  assert.match(renderer, /action\.type !== expectedActionType/);
+  for (const visibleLabel of [
+    "动作",
+    "预期 Base",
+    "目标分支",
+    "受控 commit",
+    "合并方式",
+  ]) {
+    assert.equal(renderer.includes(visibleLabel), true, visibleLabel);
+  }
+  assert.match(renderer, /data-external-operation="\$\{operation\}"/);
+  assert.match(renderer, /data-external-operation="reject"/);
+  assert.match(renderer, /data-external-operation="later"/);
+});
+
 test("code authorization uses local-only wording and an exact kind branch", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
 

@@ -116,12 +116,24 @@ const confirmationHistoryStatuses = Object.freeze([
 ]);
 const confirmationHistoryKinds = Object.freeze([
   ["", "全部类型"],
-  ["github.pull-request-review", "GitHub PR Review"],
-  ["github.work-proposal-review", "GitHub 工作提案"],
+  ["github.pull-request-comment", "GitHub PR 评论"],
+  ["github.work-proposal-review", "GitHub PR Review"],
+  ["github.pull-request-update-branch", "GitHub PR 分支更新"],
+  ["github.pull-request-push", "GitHub PR 受控推送"],
+  ["github.pull-request-merge", "GitHub PR 合并"],
+  ["github.pull-request-review", "GitHub PR Review（旧队列）"],
   ["local.code-job-create", "本地代码任务"],
   ["local.change-package-apply", "本地变更包应用"],
   ["local.configuration-activate", "本地配置切换"],
 ]);
+const pullRequestConfirmationActionTypes = Object.freeze({
+  "github.pull-request-comment": "pull_request_comment",
+  "github.work-proposal-review": "pull_request_review",
+  "github.pull-request-update-branch": "pull_request_update_branch",
+  "github.pull-request-push": "pull_request_push",
+  "github.pull-request-merge": "pull_request_merge",
+  "github.pull-request-review": "pull_request_review",
+});
 let confirmationHistoryFilters = { status: "", kind: "", roleId: "" };
 let confirmationHistoryItems = [];
 let confirmationHistoryRoleIdFacets = [];
@@ -477,11 +489,21 @@ function employeePanel({ expanded = false } = {}) {
     </section>`;
 }
 
-function roleBrainLabel(role) {
-  const brain = role?.brain;
-  if (!brain?.provider) return "未配置大脑";
+function assignedBrainLabel(brain, missingLabel) {
+  if (!brain?.provider) return missingLabel;
   const location = brain.remote === true ? "第三方" : "本地";
   return `${brain.provider} / ${brain.model || "默认模型"} · ${location}`;
+}
+
+function roleBrainLabel(role) {
+  return assignedBrainLabel(role?.brain, "未配置日常大脑");
+}
+
+function roleTaskBrainLabel(role) {
+  return assignedBrainLabel(
+    role?.taskBrain,
+    "未配置（高风险任务将等待）",
+  );
 }
 
 function employeeRoleCard(role) {
@@ -494,7 +516,8 @@ function employeeRoleCard(role) {
     </div>
     <p>${escapeHtml(role.mission || "尚未配置岗位使命")}</p>
     <dl class="employee-role-meta">
-      <div><dt>大脑</dt><dd>${escapeHtml(roleBrainLabel(role))}</dd></div>
+      <div><dt>日常大脑</dt><dd>${escapeHtml(roleBrainLabel(role))}</dd></div>
+      <div><dt>任务大脑</dt><dd>${escapeHtml(roleTaskBrainLabel(role))}</dd></div>
       <div><dt>最近行动</dt><dd>${lastRun?.at ? `${relativeTime(lastRun.at)} · ${escapeHtml(lastRun.trigger || "主动循环")}` : "尚未运行"}</dd></div>
       <div><dt>权限</dt><dd>${escapeHtml(permissions.length ? permissions.join(" · ") : "岗位专用能力")}</dd></div>
     </dl>
@@ -3202,14 +3225,82 @@ function reviewEventLabel(value) {
   }[value] || value || "未知动作";
 }
 
+function pullRequestConfirmationActionType(kind) {
+  return typeof kind === "string" &&
+      Object.hasOwn(pullRequestConfirmationActionTypes, kind)
+    ? pullRequestConfirmationActionTypes[kind]
+    : null;
+}
+
+function pullRequestActionLabel(type) {
+  return {
+    pull_request_comment: "PR 评论",
+    pull_request_review: "PR Review",
+    pull_request_update_branch: "更新 PR 分支",
+    pull_request_push: "推送受控 commit",
+    pull_request_merge: "合并 PR",
+  }[type] || "未知 PR 动作";
+}
+
+function mergeMethodLabel(value) {
+  return {
+    merge: "Merge commit",
+    squash: "Squash and merge",
+    rebase: "Rebase and merge",
+  }[value] || value || "未知方式";
+}
+
+function pullRequestActionDetailRows(action) {
+  const rows = [
+    `<dt>动作</dt><dd>${escapeHtml(pullRequestActionLabel(action.type))}</dd>`,
+  ];
+  if (action.type === "pull_request_review") {
+    rows.push(
+      `<dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}</dd>`,
+    );
+  } else if (action.type === "pull_request_update_branch") {
+    rows.push(
+      `<dt>预期 Head</dt><dd><code>${escapeHtml(action.expectedHeadOid || "未知")}</code></dd>`,
+      `<dt>预期 Base</dt><dd><code>${escapeHtml(action.expectedBaseOid || "未知")}</code></dd>`,
+    );
+  } else if (action.type === "pull_request_push") {
+    rows.push(
+      `<dt>当前远端 Head</dt><dd><code>${escapeHtml(action.expectedOldOid || "未知")}</code></dd>`,
+      `<dt>目标分支</dt><dd>${escapeHtml(action.remote?.repository || "未知")} · <code>${escapeHtml(action.remote?.refName || "未知")}</code></dd>`,
+      `<dt>受控 commit</dt><dd><code>${escapeHtml(action.controlledCommitEvidence?.commit?.oid || "未知")}</code></dd>`,
+    );
+  } else if (action.type === "pull_request_merge") {
+    rows.push(
+      `<dt>合并方式</dt><dd>${escapeHtml(mergeMethodLabel(action.method))}</dd>`,
+      `<dt>预期 Head</dt><dd><code>${escapeHtml(action.expectedHeadOid || "未知")}</code></dd>`,
+    );
+  }
+  return rows.join("");
+}
+
+function pullRequestActionBodyMarkup(action) {
+  if (!["pull_request_comment", "pull_request_review"].includes(action.type)) {
+    return "";
+  }
+  return `<div class="review-preview">
+    <strong>将发布的完整正文</strong>
+    <pre>${escapeHtml(action.body || "没有正文")}</pre>
+  </div>`;
+}
+
 function showGitHubActionConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
-  activeInternalAttention = null;
-  activeExternalConfirmation = item;
   const payload = item.display?.payload || {};
   const actor = payload.actor || item.actor || {};
   const target = payload.target || item.target || {};
   const action = payload.action || {};
+  const expectedActionType = pullRequestConfirmationActionType(item.kind);
+  if (expectedActionType === null || action.type !== expectedActionType) {
+    showUnsupportedExternalConfirmation(entry, remaining);
+    return;
+  }
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
   const operation = item.retryable ? "retry" : "approve";
   const actionLabel = item.retryable
     ? "确认并重试发布到 GitHub"
@@ -3223,12 +3314,9 @@ function showGitHubActionConfirmation(entry, remaining) {
         <dt>执行账号</dt><dd>${escapeHtml(actor.accountId || "未指定")}</dd>
         <dt>目标</dt><dd>${escapeHtml(target.resourceId || "未知")}</dd>
         <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
-        <dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}</dd>
+        ${pullRequestActionDetailRows(action)}
       </dl>
-      <div class="review-preview">
-        <strong>将发布的完整正文</strong>
-        <pre>${escapeHtml(action.body || "没有正文")}</pre>
-      </div>
+      ${pullRequestActionBodyMarkup(action)}
       <p class="confirmation-reason"><strong>依据</strong></p>
       ${listMarkup(item.display?.evidence)}
       <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
@@ -3236,7 +3324,7 @@ function showGitHubActionConfirmation(entry, remaining) {
         <button class="secondary" data-external-operation="reject">驳回，不发布</button>
         <button class="secondary wide" data-external-operation="later">稍后再看</button>
       </div>
-      <p class="confirmation-note">只有点击“${escapeHtml(actionLabel)}”才会写入 GitHub；动作、账号和 Head 均与本次展示内容绑定。</p>
+      <p class="confirmation-note">只有点击“${escapeHtml(actionLabel)}”才会执行当前这一项 GitHub 写入；动作、账号和 Head 均与本次展示内容绑定。</p>
     </article>`;
   confirmationContent
     .querySelector(".confirmation-actions")
@@ -3444,10 +3532,7 @@ function showExternalActionConfirmation(entry, remaining) {
     showChangePackageApplicationConfirmation(entry, remaining);
     return;
   }
-  if (
-    entry.item?.kind === "github.pull-request-review" ||
-    entry.item?.kind === "github.work-proposal-review"
-  ) {
+  if (pullRequestConfirmationActionType(entry.item?.kind) !== null) {
     showGitHubActionConfirmation(entry, remaining);
     return;
   }

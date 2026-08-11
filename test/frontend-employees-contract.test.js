@@ -40,6 +40,9 @@ test("employee view loads every configured role and exposes independent controls
 test("employee cards display their assigned model, mission, and permissions", () => {
   for (const value of [
     "roleBrainLabel(role)",
+    "roleTaskBrainLabel(role)",
+    "日常大脑",
+    "任务大脑",
     "role.mission",
     "permissions.join",
     "role.lastErrorCode",

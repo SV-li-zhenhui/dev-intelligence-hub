@@ -9,6 +9,7 @@ const publicDirectory = path.resolve("public");
 const historyDelayMs = 120;
 let appendFailuresRemaining = 1;
 let confirmationEnabled = false;
+let confirmationFixtureName = "active";
 let historyMutation = 0;
 let queueRevision = 1;
 let historyRequestCount = 0;
@@ -112,10 +113,76 @@ async function historyResponse(url, response) {
   });
 }
 
-function confirmationItem() {
-  return {
-    id: "confirmation-active",
+const confirmationFixtures = Object.freeze({
+  active: Object.freeze({
     kind: "github.pull-request-review",
+    title: "Fixture confirmation",
+    actionLabel: "Approve fixture",
+    action: Object.freeze({
+      type: "pull_request_review",
+      reviewEvent: "APPROVE",
+      body: "Fixture review",
+    }),
+  }),
+  comment: Object.freeze({
+    kind: "github.pull-request-comment",
+    title: "Fixture PR 评论",
+    actionLabel: "确认并发布评论",
+    action: Object.freeze({
+      type: "pull_request_comment",
+      body: "Fixture PR comment",
+    }),
+  }),
+  review: Object.freeze({
+    kind: "github.work-proposal-review",
+    title: "Fixture PR Review",
+    actionLabel: "确认并发布 Review",
+    action: Object.freeze({
+      type: "pull_request_review",
+      reviewEvent: "REQUEST_CHANGES",
+      body: "Fixture review request",
+    }),
+  }),
+  update: Object.freeze({
+    kind: "github.pull-request-update-branch",
+    title: "Fixture 更新 PR 分支",
+    actionLabel: "确认并更新分支",
+    action: Object.freeze({
+      type: "pull_request_update_branch",
+      expectedHeadOid: "c".repeat(40),
+      expectedBaseOid: "d".repeat(40),
+    }),
+  }),
+  push: Object.freeze({
+    kind: "github.pull-request-push",
+    title: "Fixture 推送受控 commit",
+    actionLabel: "确认并推送 commit",
+    action: Object.freeze({
+      type: "pull_request_push",
+      expectedOldOid: "e".repeat(40),
+      remote: Object.freeze({ repository: "fixture/head", refName: "feature" }),
+      controlledCommitEvidence: Object.freeze({
+        commit: Object.freeze({ oid: "f".repeat(40) }),
+      }),
+    }),
+  }),
+  merge: Object.freeze({
+    kind: "github.pull-request-merge",
+    title: "Fixture 合并 PR",
+    actionLabel: "确认并合并 PR",
+    action: Object.freeze({
+      type: "pull_request_merge",
+      method: "squash",
+      expectedHeadOid: "1".repeat(40),
+    }),
+  }),
+});
+
+function confirmationItem() {
+  const fixture = confirmationFixtures[confirmationFixtureName];
+  return {
+    id: `confirmation-${confirmationFixtureName}`,
+    kind: fixture.kind,
     queueRevision: 7,
     itemRevision: 3,
     displayedPayloadDigest: "a".repeat(64),
@@ -123,13 +190,13 @@ function confirmationItem() {
     retryable: false,
     requestedBy: { roleId: "pr-reviewer", workItemId: "work-active" },
     display: {
-      title: "Fixture confirmation",
+      title: fixture.title,
       summary: "Approve this fixture action",
-      actionLabel: "Approve fixture",
+      actionLabel: fixture.actionLabel,
       payload: {
         actor: { accountId: "fixture" },
         target: { resourceId: "fixture/pr", version: "abcdef" },
-        action: { reviewEvent: "APPROVE", body: "Fixture review" },
+        action: structuredClone(fixture.action),
       },
     },
   };
@@ -169,10 +236,16 @@ function createFixtureServer() {
         return;
       }
       if (url.pathname === "/fixture/enable-confirmation") {
+        const requestedFixture = url.searchParams.get("fixture") || "active";
+        if (!Object.hasOwn(confirmationFixtures, requestedFixture)) {
+          json(response, 400, { error: "unknown fixture" });
+          return;
+        }
+        confirmationFixtureName = requestedFixture;
         if (!confirmationEnabled) {
           confirmationEnabled = true;
-          queueRevision += 1;
         }
+        queueRevision += 1;
         json(response, 200, { ok: true });
         return;
       }
@@ -200,7 +273,7 @@ function createFixtureServer() {
       }
       if (
         request.method === "POST" &&
-        /^\/api\/confirmations\/confirmation-active\/(approve|retry|reject)$/.test(
+        /^\/api\/confirmations\/confirmation-[a-z]+\/(approve|retry|reject)$/.test(
           url.pathname,
         )
       ) {
@@ -352,8 +425,29 @@ try {
   assert.equal(await page.evaluate(() => document.activeElement?.id), "confirmation-history-load-more");
   assert.equal(await page.locator("#confirmation-history-load-more").getAttribute("aria-disabled"), "true");
 
+  for (const fixture of [
+    ["comment", /PR 评论.*将发布的完整正文/s, "确认并发布评论"],
+    ["review", /PR Review.*Review 类型.*将发布的完整正文/s, "确认并发布 Review"],
+    ["update", /更新 PR 分支.*预期 Head.*预期 Base/s, "确认并更新分支"],
+    ["push", /推送受控 commit.*目标分支.*受控 commit/s, "确认并推送 commit"],
+    ["merge", /合并 PR.*合并方式.*预期 Head/s, "确认并合并 PR"],
+  ]) {
+    await page.evaluate(
+      (name) => fetch(`/fixture/enable-confirmation?fixture=${name}`, { method: "POST" }),
+      fixture[0],
+    );
+    await page.locator("#refresh-button").click();
+    await page.locator("#confirmation-dialog[open]").waitFor();
+    assert.match(await page.locator("#confirmation-dialog").textContent(), fixture[1]);
+    await page.getByRole("button", { name: fixture[2] }).waitFor();
+    await page.getByRole("button", { name: "稍后再看" }).click();
+    await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  }
+
   await page.selectOption("#confirmation-history-status", "stale");
-  await page.evaluate(() => fetch("/fixture/enable-confirmation", { method: "POST" }));
+  await page.evaluate(() =>
+    fetch("/fixture/enable-confirmation?fixture=active", { method: "POST" })
+  );
   await page.locator("#refresh-button").click();
   await page.locator("#confirmation-dialog[open]").waitFor();
   assert.equal(await stableIdentity(page, form, "#confirmation-history-filter"), true);
