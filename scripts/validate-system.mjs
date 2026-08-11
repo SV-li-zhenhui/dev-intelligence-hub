@@ -89,7 +89,15 @@ const report = {
   executionSource: null,
   steps: [],
 };
-const nullAppDataEnvironmentEvidence = Object.freeze({ APPDATA: "null-device" });
+const hostIntegratedEnvironmentEvidence = Object.freeze(
+  process.platform === "win32"
+    ? {
+        APPDATA: "null-device",
+        HOME: "null-device",
+        USERPROFILE: "null-device",
+      }
+    : { APPDATA: "null-device" },
+);
 const validationRunDirectory = await prepareValidationRunDirectory({
   root,
   runId: report.runId,
@@ -460,14 +468,19 @@ async function verifyCurrentLiveDashboard() {
   });
 }
 
-function validationNullAppDataEnvironment() {
+function validationHostIntegratedEnvironment() {
   if (validationEnvironment === null) {
     throw new Error("isolated validation environment is unavailable");
   }
-  return Object.freeze({
+  const environment = {
     ...validationEnvironment,
     APPDATA: process.platform === "win32" ? "NUL" : "/dev/null",
-  });
+  };
+  if (process.platform === "win32") {
+    environment.HOME = "C:\\NUL";
+    environment.USERPROFILE = "C:\\NUL";
+  }
+  return Object.freeze(environment);
 }
 
 async function writeReport() {
@@ -527,8 +540,8 @@ try {
     ...nodeTestFiles,
   ], {
     name: "complete Node test suite",
-    environment: validationNullAppDataEnvironment(),
-    environmentEvidence: nullAppDataEnvironmentEvidence,
+    environment: validationHostIntegratedEnvironment(),
+    environmentEvidence: hostIntegratedEnvironmentEvidence,
     quiet: true,
     parseOutput: parseNodeTestTap,
     parseOutputOnFailure: true,
@@ -543,8 +556,8 @@ try {
     distributionTestPath,
   ], {
     name: "open-source distribution suite",
-    environment: validationNullAppDataEnvironment(),
-    environmentEvidence: nullAppDataEnvironmentEvidence,
+    environment: validationHostIntegratedEnvironment(),
+    environmentEvidence: hostIntegratedEnvironmentEvidence,
     quiet: true,
     parseOutput: parseNodeTestTap,
     parseOutputOnFailure: true,
@@ -555,16 +568,16 @@ try {
     "test/browser/configuration-form-playwright.mjs",
   ], {
     name: "configuration form browser behavior",
-    environment: validationNullAppDataEnvironment(),
-    environmentEvidence: nullAppDataEnvironmentEvidence,
+    environment: validationHostIntegratedEnvironment(),
+    environmentEvidence: hostIntegratedEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   await runFromExecutionSource(process.execPath, [
     "test/browser/confirmation-history-playwright.mjs",
   ], {
     name: "confirmation history browser behavior",
-    environment: validationNullAppDataEnvironment(),
-    environmentEvidence: nullAppDataEnvironmentEvidence,
+    environment: validationHostIntegratedEnvironment(),
+    environmentEvidence: hostIntegratedEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   if (withDocker) {
@@ -592,8 +605,8 @@ try {
       ...uiArguments,
     ], {
       name: "live desktop and mobile UI behavior",
-      environment: validationNullAppDataEnvironment(),
-      environmentEvidence: nullAppDataEnvironmentEvidence,
+      environment: validationHostIntegratedEnvironment(),
+      environmentEvidence: hostIntegratedEnvironmentEvidence,
       quiet: true,
       parseOutput: parseUiArtifactReceiptEnvelope,
       outputField: "artifactReceiptEnvelope",

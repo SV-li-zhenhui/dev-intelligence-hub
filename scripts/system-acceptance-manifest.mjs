@@ -995,7 +995,15 @@ function requiredStepContracts(
   nodeTestFiles,
   uiArguments,
   headOid,
+  platform,
 ) {
+  const hostIntegratedEnvironment = platform.startsWith("win32/")
+    ? {
+        APPDATA: "null-device",
+        HOME: "null-device",
+        USERPROFILE: "null-device",
+      }
+    : { APPDATA: "null-device" };
   return [
     {
       name: "git diff --check",
@@ -1032,25 +1040,25 @@ function requiredStepContracts(
           ...nodeTestFiles,
         ],
       },
-      environment: { APPDATA: "null-device" },
+      environment: hostIntegratedEnvironment,
     },
     {
       name: "open-source distribution suite",
       limits: validationCommandLimits("open-source distribution suite"),
       command: REQUIRED_COMMANDS.get("open-source distribution suite"),
-      environment: { APPDATA: "null-device" },
+      environment: hostIntegratedEnvironment,
     },
     {
       name: "configuration form browser behavior",
       limits: validationCommandLimits("configuration form browser behavior"),
       command: REQUIRED_COMMANDS.get("configuration form browser behavior"),
-      environment: { APPDATA: "null-device" },
+      environment: hostIntegratedEnvironment,
     },
     {
       name: "confirmation history browser behavior",
       limits: validationCommandLimits("confirmation history browser behavior"),
       command: REQUIRED_COMMANDS.get("confirmation history browser behavior"),
-      environment: { APPDATA: "null-device" },
+      environment: hostIntegratedEnvironment,
     },
     {
       name: "real Docker sandbox boundary",
@@ -1065,7 +1073,7 @@ function requiredStepContracts(
         executable: "node",
         arguments: ["scripts/validate-ui.mjs", ...uiArguments],
       },
-      environment: { APPDATA: "null-device" },
+      environment: hostIntegratedEnvironment,
     },
   ];
 }
@@ -1272,6 +1280,7 @@ function validateReport(
     nodeTestFiles,
     uiArguments,
     currentSource.headOid,
+    report.platform,
   );
   if (
     contracts.length !== report.steps.length ||

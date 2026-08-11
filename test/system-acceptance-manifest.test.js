@@ -253,7 +253,7 @@ async function createFixture(t, {
     finishedAt: "2026-08-09T00:10:00.000Z",
     status: "passed",
     node: "v24.0.0",
-    platform: "fixture/x64",
+    platform: "win32/x64",
     environment: {
       schemaVersion: 2,
       policy: "isolated-profile-allowlist-v2",
@@ -379,7 +379,11 @@ async function createFixture(t, {
         durationMs: 100,
         exitCode: 0,
         signal: null,
-        environment: { APPDATA: "null-device" },
+        environment: {
+          APPDATA: "null-device",
+          HOME: "null-device",
+          USERPROFILE: "null-device",
+        },
         testResults: {
           summary: {
             tests: 3,
@@ -424,7 +428,11 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
-        environment: { APPDATA: "null-device" },
+        environment: {
+          APPDATA: "null-device",
+          HOME: "null-device",
+          USERPROFILE: "null-device",
+        },
         repositorySource: { headOid, treeOid },
         testResults: {
           summary: {
@@ -452,7 +460,11 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
-        environment: { APPDATA: "null-device" },
+        environment: {
+          APPDATA: "null-device",
+          HOME: "null-device",
+          USERPROFILE: "null-device",
+        },
       },
       {
         name: "confirmation history browser behavior",
@@ -464,7 +476,11 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
-        environment: { APPDATA: "null-device" },
+        environment: {
+          APPDATA: "null-device",
+          HOME: "null-device",
+          USERPROFILE: "null-device",
+        },
       },
       {
         name: "real Docker sandbox boundary",
@@ -494,7 +510,11 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
-        environment: { APPDATA: "null-device" },
+        environment: {
+          APPDATA: "null-device",
+          HOME: "null-device",
+          USERPROFILE: "null-device",
+        },
       },
     ],
   };
@@ -1152,12 +1172,12 @@ test("rejects Docker validation without the exact integration environment", asyn
   );
 });
 
-test("rejects browser validation without the null-device profile boundary", async (t) => {
+test("rejects browser validation without the null-device host profile boundary", async (t) => {
   const fixture = await createFixture(t);
   const forged = structuredClone(fixture.validation);
   delete forged.steps.find(
     ({ name }) => name === "configuration form browser behavior",
-  ).environment;
+  ).environment.USERPROFILE;
   await writeFile(
     fixture.validationPath,
     `${JSON.stringify(forged, null, 2)}\n`,

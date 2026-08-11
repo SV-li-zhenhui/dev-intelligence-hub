@@ -140,7 +140,13 @@ async function createValidationFixture(t) {
       "  for (const name of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'NPM_TOKEN', 'MYDASHBOARD_TEST_SECRET']) {",
       "    assert.equal(process.env[name], undefined, name);",
       "  }",
-      "  assert.equal(process.env.HOME, process.env.USERPROFILE);",
+      "  assert.equal(process.env.APPDATA, process.platform === 'win32' ? 'NUL' : '/dev/null');",
+      "  if (process.platform === 'win32') {",
+      "    assert.equal(process.env.HOME, 'C:\\\\NUL');",
+      "    assert.equal(process.env.USERPROFILE, 'C:\\\\NUL');",
+      "  } else {",
+      "    assert.equal(process.env.HOME, process.env.USERPROFILE);",
+      "  }",
       "  assert.equal(process.env.GIT_CONFIG_NOSYSTEM, '1');",
       "  assert.equal(process.env.GIT_TERMINAL_PROMPT, '0');",
       "});",
@@ -168,7 +174,13 @@ async function createValidationFixture(t) {
       "  assert.equal(existsSync('.git'), true);",
       "  assert.equal(process.env.GH_TOKEN, undefined);",
       "  assert.equal(process.env.OPENAI_API_KEY, undefined);",
-      "  assert.equal(process.env.HOME, process.env.USERPROFILE);",
+      "  assert.equal(process.env.APPDATA, process.platform === 'win32' ? 'NUL' : '/dev/null');",
+      "  if (process.platform === 'win32') {",
+      "    assert.equal(process.env.HOME, 'C:\\\\NUL');",
+      "    assert.equal(process.env.USERPROFILE, 'C:\\\\NUL');",
+      "  } else {",
+      "    assert.equal(process.env.HOME, process.env.USERPROFILE);",
+      "  }",
       "});",
       "",
     ].join("\n"),
@@ -177,7 +189,20 @@ async function createValidationFixture(t) {
     "configuration-form-playwright.mjs",
     "confirmation-history-playwright.mjs",
   ]) {
-    await writeFile(path.join(root, "test/browser", fixture), "process.exitCode = 0;\n");
+    await writeFile(
+      path.join(root, "test/browser", fixture),
+      [
+        "import assert from 'node:assert/strict';",
+        "assert.equal(process.env.APPDATA, process.platform === 'win32' ? 'NUL' : '/dev/null');",
+        "if (process.platform === 'win32') {",
+        "  assert.equal(process.env.HOME, 'C:\\\\NUL');",
+        "  assert.equal(process.env.USERPROFILE, 'C:\\\\NUL');",
+        "} else {",
+        "  assert.equal(process.env.HOME, process.env.USERPROFILE);",
+        "}",
+        "",
+      ].join("\n"),
+    );
   }
   await writeFile(path.join(root, "package.json"), `${JSON.stringify({
     name: "validation-fixture",
@@ -478,7 +503,13 @@ test("the system validator binds a passing report to one clean Git source state"
   ]) {
     assert.deepEqual(
       report.steps.find((step) => step.name === name).environment,
-      { APPDATA: "null-device" },
+      process.platform === "win32"
+        ? {
+            APPDATA: "null-device",
+            HOME: "null-device",
+            USERPROFILE: "null-device",
+          }
+        : { APPDATA: "null-device" },
     );
   }
   assert.deepEqual(
