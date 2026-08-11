@@ -1011,7 +1011,13 @@ function createBroker(rawOptions, rawDependencies) {
     const stdout = typeof result?.stdout === "string"
       ? result.stdout.replace(/\r\n?/gu, "\n").trim()
       : "";
-    if (result?.exitCode !== 0 || result?.signal !== null || stdout !== STATUS_TEXT) {
+    const stderr = typeof result?.stderr === "string"
+      ? result.stderr.replace(/\r\n?/gu, "\n").trim()
+      : "";
+    const exactStatus =
+      (stdout === STATUS_TEXT && stderr === "") ||
+      (stderr === STATUS_TEXT && stdout === "");
+    if (result?.exitCode !== 0 || result?.signal !== null || !exactStatus) {
       return Object.freeze({
         processAttempted: true,
         reapConfirmed: true,

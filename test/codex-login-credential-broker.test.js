@@ -466,6 +466,47 @@ test("readStatus runs only a bounded no-model login probe and removes its tree",
   await current.broker.close();
 });
 
+test("readStatus accepts the exact Codex login status on stderr only", async (t) => {
+  const current = await fixture(t, {
+    processRunner: {
+      async run() {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: "",
+          stderr: "Logged in using ChatGPT\r\n",
+        };
+      },
+    },
+  });
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+  await current.broker.close();
+});
+
+test("readStatus rejects otherwise valid status with additional stream output", async (t) => {
+  for (const [stdout, stderr] of [
+    ["Logged in using ChatGPT\n", "unexpected warning\n"],
+    ["unexpected warning\n", "Logged in using ChatGPT\n"],
+  ]) {
+    await t.test(`${stdout.startsWith("Logged") ? "stderr" : "stdout"} extra`, async (child) => {
+      const current = await fixture(child, {
+        processRunner: {
+          async run() {
+            return { exitCode: 0, signal: null, stdout, stderr };
+          },
+        },
+      });
+
+      assert.equal(
+        (await current.broker.readStatus()).state,
+        "file_login_unavailable",
+      );
+      await current.broker.close();
+    });
+  }
+});
+
 test("readStatus maps credential and CLI failures without leaking their detail", async (t) => {
   for (const [sourceCode, expectedState, locatorCalls] of [
     ["CODEX_LOGIN_FILE_UNAVAILABLE", "file_login_unavailable", 0],
