@@ -470,6 +470,15 @@ test("the system validator binds a passing report to one clean Git source state"
       ],
     },
   );
+  for (const name of [
+    "configuration form browser behavior",
+    "confirmation history browser behavior",
+  ]) {
+    assert.deepEqual(
+      report.steps.find((step) => step.name === name).environment,
+      { APPDATA: "null-device" },
+    );
+  }
   assert.deepEqual(
     report.steps.find(({ name }) => name === "complete Node test suite").testResults,
     {

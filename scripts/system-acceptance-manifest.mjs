@@ -1042,11 +1042,13 @@ function requiredStepContracts(
       name: "configuration form browser behavior",
       limits: validationCommandLimits("configuration form browser behavior"),
       command: REQUIRED_COMMANDS.get("configuration form browser behavior"),
+      environment: { APPDATA: "null-device" },
     },
     {
       name: "confirmation history browser behavior",
       limits: validationCommandLimits("confirmation history browser behavior"),
       command: REQUIRED_COMMANDS.get("confirmation history browser behavior"),
+      environment: { APPDATA: "null-device" },
     },
     {
       name: "real Docker sandbox boundary",
@@ -1061,6 +1063,7 @@ function requiredStepContracts(
         executable: "node",
         arguments: ["scripts/validate-ui.mjs", ...uiArguments],
       },
+      environment: { APPDATA: "null-device" },
     },
   ];
 }
@@ -1289,13 +1292,12 @@ function validateReport(
     if (
       expectedEnvironment === undefined
         ? actualEnvironment !== undefined
-        : actualEnvironment === null ||
-          typeof actualEnvironment !== "object" ||
-          Array.isArray(actualEnvironment) ||
-          Object.keys(actualEnvironment).length !== 1 ||
-          actualEnvironment.MYDASHBOARD_DOCKER_INTEGRATION !== "1"
+        : !hasExactKeys(actualEnvironment, Object.keys(expectedEnvironment)) ||
+          Object.entries(expectedEnvironment).some(
+            ([name, value]) => actualEnvironment[name] !== value,
+          )
     ) {
-      throw new Error("Docker validation environment does not match its contract");
+      throw new Error("validation step environment does not match its contract");
     }
     if (contract.kind !== "aggregate") {
       const expectedLimits = contract.limits;

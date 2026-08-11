@@ -89,6 +89,7 @@ const report = {
   executionSource: null,
   steps: [],
 };
+const browserEnvironmentEvidence = Object.freeze({ APPDATA: "null-device" });
 const validationRunDirectory = await prepareValidationRunDirectory({
   root,
   runId: report.runId,
@@ -459,6 +460,16 @@ async function verifyCurrentLiveDashboard() {
   });
 }
 
+function validationBrowserEnvironment() {
+  if (validationEnvironment === null) {
+    throw new Error("isolated validation environment is unavailable");
+  }
+  return Object.freeze({
+    ...validationEnvironment,
+    APPDATA: process.platform === "win32" ? "NUL" : "/dev/null",
+  });
+}
+
 async function writeReport() {
   report.finishedAt = new Date().toISOString();
   await writeFile(
@@ -540,12 +551,16 @@ try {
     "test/browser/configuration-form-playwright.mjs",
   ], {
     name: "configuration form browser behavior",
+    environment: validationBrowserEnvironment(),
+    environmentEvidence: browserEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   await runFromExecutionSource(process.execPath, [
     "test/browser/confirmation-history-playwright.mjs",
   ], {
     name: "confirmation history browser behavior",
+    environment: validationBrowserEnvironment(),
+    environmentEvidence: browserEnvironmentEvidence,
     timeoutMs: 10 * 60_000,
   });
   if (withDocker) {
@@ -573,6 +588,8 @@ try {
       ...uiArguments,
     ], {
       name: "live desktop and mobile UI behavior",
+      environment: validationBrowserEnvironment(),
+      environmentEvidence: browserEnvironmentEvidence,
       quiet: true,
       parseOutput: parseUiArtifactReceiptEnvelope,
       outputField: "artifactReceiptEnvelope",

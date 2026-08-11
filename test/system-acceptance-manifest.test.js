@@ -450,6 +450,7 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
+        environment: { APPDATA: "null-device" },
       },
       {
         name: "confirmation history browser behavior",
@@ -461,6 +462,7 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
+        environment: { APPDATA: "null-device" },
       },
       {
         name: "real Docker sandbox boundary",
@@ -490,6 +492,7 @@ async function createFixture(t, {
         durationMs: 50,
         exitCode: 0,
         signal: null,
+        environment: { APPDATA: "null-device" },
       },
     ],
   };
@@ -1143,7 +1146,30 @@ test("rejects Docker validation without the exact integration environment", asyn
       artifactPaths: fixture.artifacts.map(([relativePath]) => relativePath),
       reviewReports: fixture.reviews,
     }),
-    /Docker validation environment does not match its contract/u,
+    /validation step environment does not match its contract/u,
+  );
+});
+
+test("rejects browser validation without the null-device profile boundary", async (t) => {
+  const fixture = await createFixture(t);
+  const forged = structuredClone(fixture.validation);
+  delete forged.steps.find(
+    ({ name }) => name === "configuration form browser behavior",
+  ).environment;
+  await writeFile(
+    fixture.validationPath,
+    `${JSON.stringify(forged, null, 2)}\n`,
+  );
+  const { buildAcceptanceManifest } = await loadManifestModule();
+
+  await assert.rejects(
+    buildAcceptanceManifest({
+      root: fixture.root,
+      validationReportPath: fixture.validationPath,
+      artifactPaths: fixture.artifacts.map(([relativePath]) => relativePath),
+      reviewReports: fixture.reviews,
+    }),
+    /validation step environment does not match its contract/u,
   );
 });
 
