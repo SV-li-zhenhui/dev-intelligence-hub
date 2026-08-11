@@ -112,6 +112,10 @@ button {
   gap: 4px;
 }
 
+.nav-scroll-hint {
+  display: none;
+}
+
 .nav-item {
   display: flex;
   align-items: center;
@@ -2146,6 +2150,13 @@ h1 {
   border-color: #6c9c83;
 }
 
+.system-status-summary-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .system-status-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2180,6 +2191,27 @@ h1 {
 
 .system-status-card h3 {
   margin: 0 0 12px;
+}
+
+.system-status-issue {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.system-status-issue span,
+.system-status-issue code {
+  overflow-wrap: anywhere;
+}
+
+.system-status-issue span {
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.system-status-issue code {
+  color: var(--ink-soft);
+  font-size: 0.78rem;
 }
 
 .system-status-card ul,
@@ -3141,11 +3173,42 @@ dialog::backdrop {
 
   .nav {
     display: flex;
+    gap: 6px;
     overflow-x: auto;
+    padding-bottom: 8px;
+    overscroll-behavior-inline: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-color: #6f7c76 transparent;
   }
 
   .nav-item {
     min-width: max-content;
+    min-height: 44px;
+    padding: 11px 14px;
+    font-size: 0.875rem;
+    scroll-snap-align: start;
+  }
+
+  .nav-item kbd {
+    display: none;
+  }
+
+  .nav-scroll-hint {
+    display: block;
+    margin: 0 0 7px;
+    color: var(--sidebar-muted);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+
+  button {
+    min-height: 44px;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    font-size: 16px;
   }
 
   .source-health {
@@ -3180,6 +3243,11 @@ dialog::backdrop {
 
   .system-status-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .system-status-summary-actions {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .workflow-columns {

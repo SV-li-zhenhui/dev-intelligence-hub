@@ -46,16 +46,25 @@ test("system status presents every API blocker without inventing controls", () =
   for (const value of [
     "Liveness",
     "Readiness",
+    "恢复流程尚未完成",
+    "保持岗位暂停",
     "STORE_RECOVERY_PENDING",
+    "合并 PR",
+    "不要手动重试",
     "github.pull-request-merge",
+    "数据卷",
+    "立即释放空间",
     "data_volume",
     "98.9%",
+    "健康检查超时",
     "PROBE_TIMEOUT",
     "backup-safe",
+    "重新检查",
     "创建备份",
   ]) {
     assert.equal(markup.includes(value), true, value);
   }
+  assert.match(markup, /class="system-status-issue"/u);
   assert.doesNotMatch(markup, /data-system-backup-restore|data-system-restart/u);
 });
 

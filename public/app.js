@@ -4464,6 +4464,16 @@ function activateView(view, { focusHeading = true } = {}) {
   const button = document.querySelector(`.nav-item[data-view="${view}"]`);
   button?.classList.add("active");
   button?.setAttribute("aria-current", "page");
+  const navigation = button?.closest(".nav");
+  if (button && navigation?.scrollWidth > navigation.clientWidth) {
+    const navigationBounds = navigation.getBoundingClientRect();
+    const buttonBounds = button.getBoundingClientRect();
+    navigation.scrollTo({
+      left: navigation.scrollLeft + buttonBounds.left - navigationBounds.left -
+        (navigationBounds.width - buttonBounds.width) / 2,
+      behavior: "auto",
+    });
+  }
   currentView = view;
   render();
   if (focusHeading) pageTitle.focus({ preventScroll: true });

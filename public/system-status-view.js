@@ -1,5 +1,45 @@
 import { escapeHtml } from "./view-format.js";
 
+const RECOVERY_PRESENTATION = Object.freeze({
+  MAINTENANCE_ACTIVE: Object.freeze({
+    title: "维护操作仍在进行",
+    guidance: "等待备份或恢复完成后重新检查；不要重启服务或重复提交操作。",
+  }),
+});
+const EXTERNAL_ACTION_LABELS = Object.freeze({
+  "github.pull-request-comment": "PR 评论",
+  "github.work-proposal-review": "PR Review",
+  "github.pull-request-review": "PR Review",
+  "github.pull-request-update-branch": "更新 PR 分支",
+  "github.pull-request-push": "推送受控提交",
+  "github.pull-request-merge": "合并 PR",
+});
+const PROBE_FAILURE_PRESENTATION = Object.freeze({
+  OUTPUT_LIMIT_EXCEEDED: Object.freeze({
+    title: "健康检查结果超出安全上限",
+    guidance: "保持岗位暂停并保留服务日志；确认异常记录数量后再重新检查。",
+  }),
+  PROBE_FAILED: Object.freeze({
+    title: "健康检查执行失败",
+    guidance: "保持岗位暂停，查看受管服务日志定位该探针，再重新检查。",
+  }),
+  PROBE_MISSING: Object.freeze({
+    title: "必要健康检查缺失",
+    guidance: "核对当前运行版本与配置，使用受管重启加载完整运行时后重新检查。",
+  }),
+  PROBE_RESULT_INVALID: Object.freeze({
+    title: "健康检查返回无效结果",
+    guidance: "保持岗位暂停并保留服务日志；不要绕过该检查继续接收工作。",
+  }),
+  PROBE_TIMEOUT: Object.freeze({
+    title: "健康检查超时",
+    guidance: "先重新检查一次；若持续超时，保持岗位暂停并查看受管服务日志。",
+  }),
+});
+const RESOURCE_LABELS = Object.freeze({
+  data_volume: "数据卷",
+});
+
 function list(items, render, emptyText) {
   return items.length > 0
     ? `<ul>${items.map((item) => `<li>${render(item)}</li>`).join("")}</ul>`
@@ -14,6 +54,65 @@ function finitePercent(value) {
   return typeof value === "number" && Number.isFinite(value)
     ? `${Math.max(0, Math.min(100, value))}%`
     : "未知";
+}
+
+function issue({ title, guidance, diagnostic }) {
+  return `<div class="system-status-issue">
+    <strong>${escapeHtml(title)}</strong>
+    <span>${escapeHtml(guidance)}</span>
+    <code>诊断：${escapeHtml(diagnostic)}</code>
+  </div>`;
+}
+
+function recoveryIssue(item) {
+  const presentation = Object.hasOwn(RECOVERY_PRESENTATION, item.code)
+    ? RECOVERY_PRESENTATION[item.code]
+    : {
+        title: "恢复流程尚未完成",
+        guidance: "保持岗位暂停，按恢复与备份运维流程核对状态；不要直接编辑数据文件。",
+      };
+  return issue({
+    ...presentation,
+    diagnostic: `${item.probeId} · ${item.code}`,
+  });
+}
+
+function externalActionIssue(item) {
+  const label = Object.hasOwn(EXTERNAL_ACTION_LABELS, item.actionType)
+    ? EXTERNAL_ACTION_LABELS[item.actionType]
+    : "外部动作";
+  return issue({
+    title: `${label}结果尚未确认`,
+    guidance: "不要手动重试。保持相关岗位暂停，等待系统只读对账；持续存在时保留日志与动作证据。",
+    diagnostic: `${item.probeId} · ${item.actionType}`,
+  });
+}
+
+function capacityIssue(item) {
+  const resource = Object.hasOwn(RESOURCE_LABELS, item.resource)
+    ? RESOURCE_LABELS[item.resource]
+    : "存储资源";
+  const critical = item.severity === "critical";
+  return issue({
+    title: `${resource}已使用 ${finitePercent(item.usedPercent)}`,
+    guidance: critical
+      ? "立即释放空间后重新检查；优先转移已验证备份，不要递归删除项目、数据或恢复目录。"
+      : "尽快安排释放空间；先验证备份副本，再删除精确指定的旧文件。",
+    diagnostic: `${item.probeId} · ${item.resource} · ${item.severity}`,
+  });
+}
+
+function probeFailureIssue(item) {
+  const presentation = Object.hasOwn(PROBE_FAILURE_PRESENTATION, item.code)
+    ? PROBE_FAILURE_PRESENTATION[item.code]
+    : {
+        title: "健康检查异常",
+        guidance: "保持岗位暂停并查看受管服务日志，确认原因后再重新检查。",
+      };
+  return issue({
+    ...presentation,
+    diagnostic: `${item.probeId} · ${item.code}`,
+  });
 }
 
 export function renderSystemStatus({
@@ -56,7 +155,10 @@ export function renderSystemStatus({
     <section class="system-status-summary status-${statusTone(ready)}" aria-labelledby="system-status-summary-title">
       <div class="section-heading">
         <h2 id="system-status-summary-title">运行与恢复状态</h2>
-        <span>${ready ? "可接收工作" : "暂不接收新工作"}</span>
+        <div class="system-status-summary-actions">
+          <span>${ready ? "可接收工作" : "暂不接收新工作"}</span>
+          <button type="button" class="secondary-button" data-system-status-reload ${loading ? "disabled" : ""}>${loading ? "检查中…" : "重新检查"}</button>
+        </div>
       </div>
       <dl class="system-status-metrics">
         <div><dt>Liveness</dt><dd>${liveness.live === true ? "在线" : "离线"}</dd></div>
@@ -71,7 +173,7 @@ export function renderSystemStatus({
         <h3>恢复阻断</h3>
         ${list(
           recoveryBlockers,
-          (item) => `<code>${escapeHtml(item.probeId)}</code> · ${escapeHtml(item.code)}`,
+          recoveryIssue,
           "没有恢复阻断。",
         )}
       </section>
@@ -79,7 +181,7 @@ export function renderSystemStatus({
         <h3>结果未知的外部动作</h3>
         ${list(
           unknownActions,
-          (item) => `<code>${escapeHtml(item.probeId)}</code> · ${escapeHtml(item.actionType)}`,
+          externalActionIssue,
           "没有结果未知的外部动作。",
         )}
       </section>
@@ -87,7 +189,7 @@ export function renderSystemStatus({
         <h3>容量告警</h3>
         ${list(
           capacityWarnings,
-          (item) => `${escapeHtml(item.resource)} · ${escapeHtml(item.severity)} · ${escapeHtml(finitePercent(item.usedPercent))}`,
+          capacityIssue,
           "没有容量告警。",
         )}
       </section>
@@ -95,7 +197,7 @@ export function renderSystemStatus({
         <h3>探针故障</h3>
         ${list(
           probeFailures,
-          (item) => `<code>${escapeHtml(item.probeId)}</code> · ${escapeHtml(item.code)}`,
+          probeFailureIssue,
           "所有探针均已返回。",
         )}
       </section>

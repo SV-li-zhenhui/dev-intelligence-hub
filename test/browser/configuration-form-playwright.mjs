@@ -231,6 +231,24 @@ function createFixtureServer() {
         });
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/system/status") {
+        json(response, 200, {
+          liveness: { schemaVersion: 1, live: true },
+          readiness: {
+            schemaVersion: 1,
+            checkedAt: "2026-08-12T00:00:00.000Z",
+            ready: true,
+            recoveryBlockers: [],
+            unknownExternalActions: [],
+            capacityWarnings: [],
+            probeFailures: [],
+            probeSummary: { total: 3, succeeded: 3, failed: 0, timedOut: 0 },
+          },
+          maintenance: { mode: "open", activeOperations: 0 },
+          backups: { available: true, items: [] },
+        });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/attention/next") {
         if (attentionAvailable) {
           attentionAvailable = false;
@@ -1130,16 +1148,51 @@ try {
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } });
   const mobileErrors = captureBrowserErrors(mobile);
   await mobile.goto(origin, { waitUntil: "networkidle" });
-  await mobile.locator('[data-view="configuration"]').click();
+  const mobileNavigation = await mobile.evaluate(() => {
+    const nav = document.querySelector(".nav");
+    const items = [...document.querySelectorAll(".nav-item")];
+    const hint = document.querySelector(".nav-scroll-hint");
+    return {
+      hintVisible: hint !== null && getComputedStyle(hint).display !== "none",
+      horizontallyScrollable: nav.scrollWidth > nav.clientWidth,
+      itemHeights: items.map((item) => item.getBoundingClientRect().height),
+      itemFontSizes: items.map((item) => parseFloat(getComputedStyle(item).fontSize)),
+      shortcutDisplays: items.map((item) => getComputedStyle(item.querySelector("kbd")).display),
+    };
+  });
+  assert.equal(mobileNavigation.hintVisible, true);
+  assert.equal(mobileNavigation.horizontallyScrollable, true);
+  assert.equal(mobileNavigation.itemHeights.every((height) => height >= 44), true);
+  assert.equal(mobileNavigation.itemFontSizes.every((size) => size >= 14), true);
+  assert.equal(mobileNavigation.shortcutDisplays.every((value) => value === "none"), true);
+
+  await mobile.keyboard.press("s");
+  await mobile.locator('.nav-item[data-view="system"][aria-current="page"]').waitFor();
+  await mobile.waitForFunction(() => {
+    const nav = document.querySelector(".nav").getBoundingClientRect();
+    const active = document.querySelector('.nav-item[data-view="system"]')
+      .getBoundingClientRect();
+    return active.left >= nav.left && active.right <= nav.right;
+  });
+  assert.ok(
+    await mobile.locator(".nav").evaluate((nav) => nav.scrollLeft > 0),
+    "keyboard-selected mobile navigation item was not scrolled into view",
+  );
+
+  await mobile.keyboard.press("0");
   await mobile.locator("[data-configuration-structured-form]").waitFor();
   await openDetailsBySummary(mobile, "新增大脑 Provider");
   const overflow = await mobile.evaluate(() => ({
     document: document.documentElement.scrollWidth - window.innerWidth,
     form: document.querySelector("[data-configuration-structured-form]").scrollWidth -
       document.querySelector("[data-configuration-structured-form]").clientWidth,
+    inputFontSize: parseFloat(getComputedStyle(
+      document.querySelector("[data-configuration-structured-form] input:not([type=checkbox])"),
+    ).fontSize),
   }));
   assert.ok(overflow.document <= 0, `mobile document overflowed by ${overflow.document}px`);
   assert.ok(overflow.form <= 0, `mobile form overflowed by ${overflow.form}px`);
+  assert.ok(overflow.inputFontSize >= 16, `mobile input font is ${overflow.inputFontSize}px`);
   assert.equal(await mobile.locator(".configuration-editor textarea").count(), 0);
   assert.equal(mobileErrors.length, 0, mobileErrors.join("\n"));
   await mobile.close();
