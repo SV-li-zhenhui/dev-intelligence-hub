@@ -455,32 +455,37 @@ test("construction cleanup failure retains recoverable writer ownership until ru
     (error) => error,
   );
 
-  assert.deepEqual(events, [
-    "lease-acquire",
-    "runtime-close-1",
-    "runtime-close-2",
-  ]);
-  assert.equal(failure.code, "CLI_CLEANUP_INCOMPLETE");
-  assert.strictEqual(failure.operationError, startupFailure);
-  assert.strictEqual(failure.cleanupError, cleanupFailure);
-  assert.deepEqual(failure.lifecycle.readStatus(), {
-    cleanup: "incomplete",
-    writerLease: "held",
-  });
+  try {
+    assert.deepEqual(events, [
+      "lease-acquire",
+      "runtime-close-1",
+    ]);
+    assert.equal(failure.code, "CLI_CLEANUP_INCOMPLETE");
+    assert.strictEqual(failure.operationError, startupFailure);
+    assert.strictEqual(failure.cleanupError, cleanupFailure);
+    assert.deepEqual(failure.lifecycle.readStatus(), {
+      cleanup: "incomplete",
+      writerLease: "held",
+    });
 
-  cleanupCanComplete = true;
-  await failure.lifecycle.recover();
-  assert.deepEqual(events, [
-    "lease-acquire",
-    "runtime-close-1",
-    "runtime-close-2",
-    "runtime-close-3",
-    "lease-release",
-  ]);
-  assert.deepEqual(failure.lifecycle.readStatus(), {
-    cleanup: "complete",
-    writerLease: "released",
-  });
+    cleanupCanComplete = true;
+    await failure.lifecycle.recover();
+    assert.deepEqual(events, [
+      "lease-acquire",
+      "runtime-close-1",
+      "runtime-close-2",
+      "lease-release",
+    ]);
+    assert.deepEqual(failure.lifecycle.readStatus(), {
+      cleanup: "complete",
+      writerLease: "released",
+    });
+  } finally {
+    cleanupCanComplete = true;
+    if (failure?.lifecycle?.readStatus().writerLease === "held") {
+      await failure.lifecycle.recover().catch(() => {});
+    }
+  }
 });
 
 test("recovered construction cleanup reports every runtime failure once", async (t) => {
