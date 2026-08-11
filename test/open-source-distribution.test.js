@@ -93,7 +93,7 @@ async function availablePort() {
   return port;
 }
 
-function cleanManagerEnvironment(cleanRoot) {
+function cleanManagerEnvironment(environmentRoot) {
   const environment = {};
   const replacedNames = new Set([
     "home",
@@ -116,10 +116,10 @@ function cleanManagerEnvironment(cleanRoot) {
     }
     environment[name] = value;
   }
-  const home = path.join(cleanRoot, "clean-home");
-  const localAppData = path.join(cleanRoot, "clean-local-app-data");
-  const temporary = path.join(cleanRoot, "clean-temp");
-  const runtime = path.join(cleanRoot, "clean-runtime");
+  const home = path.join(environmentRoot, "clean-home");
+  const localAppData = path.join(environmentRoot, "clean-local-app-data");
+  const temporary = path.join(environmentRoot, "clean-temp");
+  const runtime = path.join(environmentRoot, "clean-runtime");
   Object.assign(environment, {
     HOME: home,
     LOCALAPPDATA: localAppData,
@@ -1050,9 +1050,11 @@ test("whole tracked Git privacy fails closed for dirty tracked content", async (
 test(
   "a clean source payload installs and composes without private config.json",
   async (context) => {
-    const cleanRoot = await mkdtemp(
+    const fixtureRoot = await mkdtemp(
       path.join(tmpdir(), "mydashboard-clean-source-"),
     );
+    const cleanRoot = path.join(fixtureRoot, "source");
+    const environmentRoot = path.join(fixtureRoot, "environment");
     let fallbackStop = null;
     let managedProcessId = null;
     let managedLiveUrl = null;
@@ -1072,8 +1074,8 @@ test(
           }
         }
       }
-      assert.equal(path.dirname(cleanRoot), path.resolve(tmpdir()));
-      await rm(cleanRoot, { recursive: true, force: true });
+      assert.equal(path.dirname(fixtureRoot), path.resolve(tmpdir()));
+      await rm(fixtureRoot, { recursive: true, force: true });
     });
 
     const sourceFiles = new Set(loadDistributionManifest());
@@ -1159,7 +1161,9 @@ test(
         example.port = port;
         await writeFile(examplePath, `${JSON.stringify(example, null, 2)}\n`);
 
-        const { environment, directories } = cleanManagerEnvironment(cleanRoot);
+        const { environment, directories } = cleanManagerEnvironment(
+          environmentRoot,
+        );
         for (const directory of directories) {
           await mkdir(directory, { recursive: true, mode: 0o700 });
         }

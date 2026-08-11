@@ -1118,19 +1118,19 @@ test("a restarted broker safely handles missing and partial owner markers", asyn
     `probe-${pid}-${createdAt}-00000000-0000-4000-8000-${suffix}`;
   const staleMissing = path.join(
     current.probeRoot,
-    encodedName(1111, staleAt, "000000000101"),
+    encodedName(1111, staleAt, "00000000010a"),
   );
   const stalePartial = path.join(
     current.probeRoot,
-    encodedName(1111, staleAt, "000000000102"),
+    encodedName(1111, staleAt, "00000000010b"),
   );
   const staleLive = path.join(
     current.probeRoot,
-    encodedName(2222, staleAt, "000000000103"),
+    encodedName(2222, staleAt, "00000000010c"),
   );
   const youngDead = path.join(
     current.probeRoot,
-    encodedName(3333, youngAt, "000000000104"),
+    encodedName(3333, youngAt, "00000000010d"),
   );
   for (const directory of [staleMissing, stalePartial, staleLive, youngDead]) {
     await mkdir(directory);
