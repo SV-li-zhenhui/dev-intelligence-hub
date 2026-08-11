@@ -21,6 +21,11 @@ function publicFailure(code, message, name = "Error") {
   const error = new Error(message);
   error.name = name;
   error.code = code;
+  Object.defineProperty(error, "stack", {
+    configurable: true,
+    value: `${name}: ${message}`,
+    writable: true,
+  });
   Object.defineProperty(error, PUBLIC_FAILURE, { value: true });
   return error;
 }
@@ -111,7 +116,7 @@ function sourceMaximum(value) {
 }
 
 function privateMaximum(value) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAXIMUM_PACKET_BYTES) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAXIMUM_CREDENTIAL_BYTES) {
     throw operationFailed();
   }
   return value;
@@ -170,7 +175,13 @@ function directChildName(value) {
 }
 
 function opaqueBytes(value) {
-  if (!Buffer.isBuffer(value) || value.length < 1) throw operationFailed();
+  if (
+    !Buffer.isBuffer(value) ||
+    value.length < 1 ||
+    value.length > MAXIMUM_CREDENTIAL_BYTES
+  ) {
+    throw operationFailed();
+  }
   return value;
 }
 
@@ -378,104 +389,115 @@ function createPort(invoke, { waitForAbortCleanup = false } = {}) {
   }
 }
 
-function productionInvoke(request, { signal }) {
-  const packet = requestPacket(request);
-  const systemRoot = process.env.SystemRoot || process.env.WINDIR;
-  if (
-    typeof systemRoot !== "string" ||
-    !/^[A-Za-z]:\\/u.test(systemRoot) ||
-    systemRoot.includes("\0")
-  ) {
-    throw operationFailed();
-  }
-  const executable = path.win32.join(
-    systemRoot,
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe",
-  );
-  const helper = path.join(import.meta.dirname, "windows-codex-credential-helper.ps1");
-
-  return new Promise((resolve, reject) => {
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let failed = false;
-    const stdout = [];
-    let child;
-    try {
-      child = spawn(
-        executable,
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          helper,
-        ],
-        {
-          windowsHide: true,
-          signal,
-          stdio: ["pipe", "pipe", "pipe"],
-          env: { SystemRoot: systemRoot, WINDIR: systemRoot },
-        },
-      );
-    } catch {
-      reject(operationFailed());
-      return;
+function createProcessInvoke(spawnProcess, systemRoot) {
+  return function processInvoke(request, { signal }) {
+    const packet = requestPacket(request);
+    if (
+      typeof systemRoot !== "string" ||
+      !/^[A-Za-z]:\\/u.test(systemRoot) ||
+      systemRoot.includes("\0")
+    ) {
+      throw operationFailed();
     }
+    const executable = path.win32.join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    const helper = path.join(import.meta.dirname, "windows-codex-credential-helper.ps1");
 
-    const failAndStop = () => {
-      failed = true;
-      child.kill();
-    };
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAXIMUM_PACKET_BYTES) {
-        failAndStop();
-        return;
-      }
-      stdout.push(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderrBytes += chunk.length;
-      if (stderrBytes > MAXIMUM_STDERR_BYTES) failAndStop();
-    });
-    child.stdin.on("error", failAndStop);
-    child.on("error", () => {
-      failed = true;
-    });
-    child.on("close", (code) => {
-      if (signal.aborted) {
-        reject(aborted());
-        return;
-      }
-      if (failed || code !== 0 || stdoutBytes < 1) {
-        reject(operationFailed());
-        return;
-      }
+    return new Promise((resolve, reject) => {
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let failed = false;
+      const stdout = [];
+      let child;
       try {
-        const text = UTF8_DECODER.decode(Buffer.concat(stdout, stdoutBytes));
-        if (text !== text.trim()) throw operationFailed();
-        resolve(JSON.parse(text));
+        child = spawnProcess(
+          executable,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            helper,
+          ],
+          {
+            windowsHide: true,
+            signal,
+            stdio: ["pipe", "pipe", "pipe"],
+            env: { SystemRoot: systemRoot, WINDIR: systemRoot },
+          },
+        );
       } catch {
         reject(operationFailed());
+        return;
       }
+
+      const failAndStop = () => {
+        failed = true;
+        child.kill();
+      };
+      child.stdout.on("data", (chunk) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAXIMUM_PACKET_BYTES) {
+          failAndStop();
+          return;
+        }
+        stdout.push(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderrBytes += chunk.length;
+        if (stderrBytes > MAXIMUM_STDERR_BYTES) failAndStop();
+      });
+      child.stdin.on("error", failAndStop);
+      child.on("error", () => {
+        failed = true;
+      });
+      child.on("close", (code) => {
+        if (signal.aborted) {
+          reject(aborted());
+          return;
+        }
+        if (failed || code !== 0 || stdoutBytes < 1) {
+          reject(operationFailed());
+          return;
+        }
+        try {
+          const text = UTF8_DECODER.decode(Buffer.concat(stdout, stdoutBytes));
+          if (text !== text.trim()) throw operationFailed();
+          resolve(JSON.parse(text));
+        } catch {
+          reject(operationFailed());
+        }
+      });
+      child.stdin.end(packet);
     });
-    child.stdin.end(packet);
-  });
+  };
 }
 
-export function createTestCodexCredentialFilePort({ invoke } = {}) {
-  if (typeof invoke !== "function") throw new TypeError("invoke is required");
-  return createPort(invoke);
+export function createTestCodexCredentialFilePort({ invoke, spawnProcess } = {}) {
+  if ((typeof invoke === "function") === (typeof spawnProcess === "function")) {
+    throw new TypeError("exactly one test transport is required");
+  }
+  if (typeof invoke === "function") return createPort(invoke);
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return createPort(
+    createProcessInvoke(spawnProcess, systemRoot),
+    { waitForAbortCleanup: true },
+  );
 }
 
 export function createProductionCodexCredentialFilePort() {
   if (process.platform !== "win32" || process.arch !== "x64") {
     throw operationFailed();
   }
-  return createPort(productionInvoke, { waitForAbortCleanup: true });
+  return createPort(
+    createProcessInvoke(spawn, process.env.SystemRoot || process.env.WINDIR),
+    { waitForAbortCleanup: true },
+  );
 }

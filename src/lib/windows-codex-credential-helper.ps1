@@ -162,12 +162,15 @@ $source = @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class CodexSourceMissingException : Exception {
@@ -212,6 +215,7 @@ public static class MyDashboardCodexCredentialFile {
   private const uint DANGEROUS_RIGHTS =
     FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
     FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+  private const uint PRIVATE_RIGHTS = FILE_ALL_ACCESS;
   private const uint FILE_SHARE_READ = 0x00000001;
   private const uint FILE_SHARE_WRITE = 0x00000002;
   private const uint OPEN_EXISTING = 3;
@@ -222,6 +226,7 @@ public static class MyDashboardCodexCredentialFile {
   private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
   private const uint FILE_TYPE_DISK = 0x00000001;
   private const int FILE_ATTRIBUTE_TAG_INFO_CLASS = 9;
+  private const int FILE_ID_INFO_CLASS = 18;
   private const int SE_FILE_OBJECT = 1;
   private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
   private const uint DACL_SECURITY_INFORMATION = 0x00000004;
@@ -240,6 +245,8 @@ public static class MyDashboardCodexCredentialFile {
   private const int ERROR_PATH_NOT_FOUND = 3;
   private const int MAXIMUM_TEMPORARY_ENTRIES = 32;
   private const long MAXIMUM_TEMPORARY_BYTES = 256 * 1024;
+  private const int MAXIMUM_CREDENTIAL_BYTES = 65536;
+  private const int MUTATION_LOCK_TIMEOUT_MILLISECONDS = 30000;
 
   private static readonly string SystemSid = "S-1-5-18";
   private static readonly string AdministratorsSid = "S-1-5-32-544";
@@ -267,6 +274,13 @@ public static class MyDashboardCodexCredentialFile {
   private struct FILE_ATTRIBUTE_TAG_INFO {
     public uint FileAttributes;
     public uint ReparseTag;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FILE_ID_INFO {
+    public ulong VolumeSerialNumber;
+    public ulong FileIdLow;
+    public ulong FileIdHigh;
   }
 
   [StructLayout(LayoutKind.Sequential)]
@@ -299,6 +313,30 @@ public static class MyDashboardCodexCredentialFile {
     public ulong Index;
     public ulong Size;
     public uint Links;
+    public ulong StableVolume;
+    public ulong StableIdLow;
+    public ulong StableIdHigh;
+  }
+
+  private sealed class MutationLock : IDisposable {
+    private Mutex mutex;
+    private bool held;
+
+    public MutationLock(Mutex value, bool acquired) {
+      mutex = value;
+      held = acquired;
+    }
+
+    public void Dispose() {
+      if (mutex == null) return;
+      try {
+        if (held) mutex.ReleaseMutex();
+      } finally {
+        held = false;
+        mutex.Dispose();
+        mutex = null;
+      }
+    }
   }
 
   private sealed class OpenedPath : IDisposable {
@@ -336,6 +374,13 @@ public static class MyDashboardCodexCredentialFile {
     SafeFileHandle handle,
     int informationClass,
     out FILE_ATTRIBUTE_TAG_INFO information,
+    uint bufferSize);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool GetFileInformationByHandleEx(
+    SafeFileHandle handle,
+    int informationClass,
+    out FILE_ID_INFO information,
     uint bufferSize);
 
   [DllImport("kernel32.dll", SetLastError = true)]
@@ -453,18 +498,33 @@ public static class MyDashboardCodexCredentialFile {
       (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO)))) {
       throw NativeError();
     }
+    FILE_ID_INFO stable;
+    if (!GetFileInformationByHandleEx(
+      handle,
+      FILE_ID_INFO_CLASS,
+      out stable,
+      (uint)Marshal.SizeOf(typeof(FILE_ID_INFO)))) {
+      throw NativeError();
+    }
     return new Snapshot {
       Attributes = information.FileAttributes,
       ReparseTag = tag.ReparseTag,
       Volume = information.VolumeSerialNumber,
       Index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow,
       Size = ((ulong)information.FileSizeHigh << 32) | information.FileSizeLow,
-      Links = information.NumberOfLinks
+      Links = information.NumberOfLinks,
+      StableVolume = stable.VolumeSerialNumber,
+      StableIdLow = stable.FileIdLow,
+      StableIdHigh = stable.FileIdHigh
     };
   }
 
   private static bool SameIdentity(Snapshot left, Snapshot right) {
-    return left.Volume == right.Volume && left.Index == right.Index;
+    return left.Volume == right.Volume &&
+      left.Index == right.Index &&
+      left.StableVolume == right.StableVolume &&
+      left.StableIdLow == right.StableIdLow &&
+      left.StableIdHigh == right.StableIdHigh;
   }
 
   private static bool SameFileState(Snapshot left, Snapshot right) {
@@ -616,7 +676,7 @@ public static class MyDashboardCodexCredentialFile {
     return granted;
   }
 
-  private static void ValidateSecurity(SafeFileHandle handle) {
+  private static void ValidateSecurity(SafeFileHandle handle, bool strictPrivate) {
     IntPtr owner;
     IntPtr group;
     IntPtr daclPointer;
@@ -662,21 +722,38 @@ public static class MyDashboardCodexCredentialFile {
         }
         if (
           ace.AceQualifier == AceQualifier.AccessAllowed &&
-          (ace.AceFlags & AceFlags.InheritOnly) == 0 &&
           ace.SecurityIdentifier != null &&
           !AllowedDangerousSid(ace.SecurityIdentifier.Value, currentSid)
         ) {
-          trustees.Add(ace.SecurityIdentifier.Value);
+          if (
+            strictPrivate &&
+            (MapGenericRights(unchecked((uint)ace.AccessMask)) & PRIVATE_RIGHTS) != 0
+          ) {
+            throw new InvalidOperationException("private ACL permits an unauthorized principal");
+          }
+          if (!strictPrivate && (ace.AceFlags & AceFlags.InheritOnly) == 0) {
+            trustees.Add(ace.SecurityIdentifier.Value);
+          }
         }
       }
-      foreach (string trustee in trustees) {
-        if (EffectiveDangerousRights(raw.DiscretionaryAcl, trustee) != 0) {
-          throw new InvalidOperationException("effective file rights are unsafe");
+      if (!strictPrivate) {
+        foreach (string trustee in trustees) {
+          if (EffectiveDangerousRights(raw.DiscretionaryAcl, trustee) != 0) {
+            throw new InvalidOperationException("effective file rights are unsafe");
+          }
         }
       }
     } finally {
       LocalFree(descriptor);
     }
+  }
+
+  private static void ValidateSourceSecurity(SafeFileHandle handle) {
+    ValidateSecurity(handle, false);
+  }
+
+  private static void ValidatePrivateSecurity(SafeFileHandle handle) {
+    ValidateSecurity(handle, true);
   }
 
   private static byte[] ReadExact(
@@ -741,7 +818,7 @@ public static class MyDashboardCodexCredentialFile {
         if (source.Initial.Links != 1) {
           throw new InvalidOperationException("source has multiple links");
         }
-        ValidateSecurity(source.Handle);
+        ValidateSourceSecurity(source.Handle);
         byte[] bytes = ReadExact(source.Handle, source.Initial, maximumBytes);
         Snapshot after = Information(source.Handle);
         ValidateType(after, false);
@@ -757,7 +834,7 @@ public static class MyDashboardCodexCredentialFile {
           if (!SameFileState(source.Initial, reopened.Initial)) {
             throw new InvalidOperationException("source path identity changed");
           }
-          ValidateSecurity(reopened.Handle);
+          ValidateSourceSecurity(reopened.Handle);
         }
         return bytes;
       }
@@ -850,7 +927,7 @@ public static class MyDashboardCodexCredentialFile {
       ) {
         throw new InvalidOperationException("private directory identity changed");
       }
-      ValidateSecurity(directory.Handle);
+      ValidatePrivateSecurity(directory.Handle);
       return directory;
     } catch {
       directory.Dispose();
@@ -872,7 +949,7 @@ public static class MyDashboardCodexCredentialFile {
     ) {
       throw new InvalidOperationException("private directory changed");
     }
-    ValidateSecurity(directory.Handle);
+    ValidatePrivateSecurity(directory.Handle);
     using (OpenedPath reopened = OpenPrivateDirectory(
       directory.Path,
       expectedDevice,
@@ -895,7 +972,7 @@ public static class MyDashboardCodexCredentialFile {
     ) {
       throw new InvalidOperationException("private file state is unsafe");
     }
-    ValidateSecurity(handle);
+    ValidatePrivateSecurity(handle);
     return snapshot;
   }
 
@@ -1020,6 +1097,95 @@ public static class MyDashboardCodexCredentialFile {
     return difference == 0;
   }
 
+  private static string MutationMutexName(Snapshot directory, string name) {
+    string identity = String.Format(
+      CultureInfo.InvariantCulture,
+      "{0:X16}:{1:X16}:{2:X16}",
+      directory.StableVolume,
+      directory.StableIdLow,
+      directory.StableIdHigh);
+    byte[] material = Encoding.UTF8.GetBytes(identity + "\n" + name.ToUpperInvariant());
+    byte[] digest;
+    using (SHA256 algorithm = SHA256.Create()) {
+      digest = algorithm.ComputeHash(material);
+    }
+    char[] hex = new char[digest.Length * 2];
+    const string digits = "0123456789abcdef";
+    for (int index = 0; index < digest.Length; index += 1) {
+      hex[index * 2] = digits[digest[index] >> 4];
+      hex[index * 2 + 1] = digits[digest[index] & 15];
+    }
+    return "Local\\MyDashboard.CodexCredential." + new string(hex);
+  }
+
+  private static MutexSecurity StrictMutationMutexSecurity(string currentSid) {
+    MutexSecurity security = new MutexSecurity();
+    SecurityIdentifier current = new SecurityIdentifier(currentSid);
+    security.SetOwner(current);
+    security.SetAccessRuleProtection(true, false);
+    foreach (string sid in new string[] { currentSid, SystemSid, AdministratorsSid }) {
+      security.AddAccessRule(new MutexAccessRule(
+        new SecurityIdentifier(sid),
+        MutexRights.FullControl,
+        AccessControlType.Allow));
+    }
+    return security;
+  }
+
+  private static void ValidateMutationMutexSecurity(Mutex mutex, string currentSid) {
+    MutexSecurity security = mutex.GetAccessControl();
+    SecurityIdentifier owner = (SecurityIdentifier)security.GetOwner(
+      typeof(SecurityIdentifier));
+    if (owner == null || owner.Value != currentSid) {
+      throw new InvalidOperationException("mutation mutex owner is unsafe");
+    }
+    AuthorizationRuleCollection rules = security.GetAccessRules(
+      true,
+      true,
+      typeof(SecurityIdentifier));
+    foreach (AuthorizationRule authorization in rules) {
+      MutexAccessRule rule = authorization as MutexAccessRule;
+      if (rule == null) {
+        throw new InvalidOperationException("mutation mutex rule is unsupported");
+      }
+      SecurityIdentifier sid = rule.IdentityReference as SecurityIdentifier;
+      if (
+        rule.AccessControlType == AccessControlType.Allow &&
+        (sid == null || !AllowedDangerousSid(sid.Value, currentSid)) &&
+        rule.MutexRights != 0
+      ) {
+        throw new InvalidOperationException("mutation mutex permits an unauthorized principal");
+      }
+    }
+  }
+
+  private static MutationLock AcquireMutationLock(Snapshot directory, string name) {
+    string currentSid = WindowsIdentity.GetCurrent().User.Value;
+    bool created;
+    Mutex mutex = new Mutex(
+      false,
+      MutationMutexName(directory, name),
+      out created,
+      StrictMutationMutexSecurity(currentSid));
+    bool acquired = false;
+    try {
+      ValidateMutationMutexSecurity(mutex, currentSid);
+      try {
+        acquired = mutex.WaitOne(MUTATION_LOCK_TIMEOUT_MILLISECONDS);
+      } catch (AbandonedMutexException) {
+        acquired = true;
+      }
+      if (!acquired) {
+        throw new TimeoutException("private mutation lock timed out");
+      }
+      return new MutationLock(mutex, true);
+    } catch {
+      if (acquired) mutex.ReleaseMutex();
+      mutex.Dispose();
+      throw;
+    }
+  }
+
   private static void VerifyRelativeBytes(
     SafeFileHandle directory,
     string name,
@@ -1047,16 +1213,18 @@ public static class MyDashboardCodexCredentialFile {
     string name,
     byte[] bytes) {
     try {
-      if (bytes == null || bytes.Length < 1 || bytes.Length > 192 * 1024) {
+      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_CREDENTIAL_BYTES) {
         throw new InvalidOperationException("private bytes are invalid");
       }
       using (OpenedPath directory = OpenPrivateDirectory(
         directoryPath,
         expectedDevice,
         expectedInode)) {
-        CreateAndWrite(directory.Handle, name, bytes);
-        VerifyRelativeBytes(directory.Handle, name, bytes);
-        VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
+        using (MutationLock mutation = AcquireMutationLock(directory.Initial, name)) {
+          CreateAndWrite(directory.Handle, name, bytes);
+          VerifyRelativeBytes(directory.Handle, name, bytes);
+          VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
+        }
       }
     } catch {
       throw new CodexPrivateFileException();
@@ -1177,8 +1345,8 @@ public static class MyDashboardCodexCredentialFile {
         if (snapshot.Links != 1) {
           throw new InvalidOperationException("private directory contains a hard link");
         }
+        ValidatePrivateSecurity(child);
         if (!temporary) continue;
-        ValidateSecurity(child);
         bytes = checked(bytes + (long)snapshot.Size);
         if (bytes > MAXIMUM_TEMPORARY_BYTES) {
           throw new InvalidOperationException("temporary byte bound exceeded");
@@ -1200,7 +1368,7 @@ public static class MyDashboardCodexCredentialFile {
       FILE_OPEN,
       out missing)) {
       if (missing || child == null) return false;
-      ValidatePrivateFile(child, 192 * 1024);
+      ValidatePrivateFile(child, MAXIMUM_CREDENTIAL_BYTES);
       return true;
     }
   }
@@ -1232,44 +1400,46 @@ public static class MyDashboardCodexCredentialFile {
     string temporaryName = null;
     bool published = false;
     try {
-      if (bytes == null || bytes.Length < 1 || bytes.Length > 192 * 1024) {
+      if (bytes == null || bytes.Length < 1 || bytes.Length > MAXIMUM_CREDENTIAL_BYTES) {
         throw new InvalidOperationException("private bytes are invalid");
       }
       using (OpenedPath directory = OpenPrivateDirectory(
         directoryPath,
         expectedDevice,
         expectedInode)) {
-        try {
-          CleanupTemporaries(directory.Handle);
-          temporaryName = UniqueTemporaryName();
-          string temporaryPath = Path.Combine(directoryPath, temporaryName);
-          string finalPath = Path.Combine(directoryPath, name);
-          CreateAndWrite(directory.Handle, temporaryName, bytes);
-          VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
-          bool existing = RelativeFileExistsAndSafe(directory.Handle, name);
-          bool moved = false;
-          if (existing) {
-            moved = ReplaceFileW(
-              finalPath,
-              temporaryPath,
-              null,
-              0,
-              IntPtr.Zero,
-              IntPtr.Zero);
-          }
-          if (!moved) {
-            moved = MoveFileExW(
-              temporaryPath,
-              finalPath,
-              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-          }
-          if (!moved) throw NativeError();
-          published = true;
-          VerifyRelativeBytes(directory.Handle, name, bytes);
-          VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
-        } finally {
-          if (!published && temporaryName != null) {
-            try { DeleteOwnedTemporary(directory.Handle, temporaryName); } catch {}
+        using (MutationLock mutation = AcquireMutationLock(directory.Initial, name)) {
+          try {
+            CleanupTemporaries(directory.Handle);
+            temporaryName = UniqueTemporaryName();
+            string temporaryPath = Path.Combine(directoryPath, temporaryName);
+            string finalPath = Path.Combine(directoryPath, name);
+            CreateAndWrite(directory.Handle, temporaryName, bytes);
+            VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
+            bool existing = RelativeFileExistsAndSafe(directory.Handle, name);
+            bool moved = false;
+            if (existing) {
+              moved = ReplaceFileW(
+                finalPath,
+                temporaryPath,
+                null,
+                0,
+                IntPtr.Zero,
+                IntPtr.Zero);
+            }
+            if (!moved) {
+              moved = MoveFileExW(
+                temporaryPath,
+                finalPath,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            }
+            if (!moved) throw NativeError();
+            published = true;
+            VerifyRelativeBytes(directory.Handle, name, bytes);
+            VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
+          } finally {
+            if (!published && temporaryName != null) {
+              try { DeleteOwnedTemporary(directory.Handle, temporaryName); } catch {}
+            }
           }
         }
       }
@@ -1288,32 +1458,34 @@ public static class MyDashboardCodexCredentialFile {
         directoryPath,
         expectedDevice,
         expectedInode)) {
-        bool missing;
-        using (SafeFileHandle child = OpenRelative(
-          directory.Handle,
-          name,
-          FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE,
-          FILE_SHARE_READ,
-          FILE_OPEN,
-          out missing)) {
-          if (!missing && child != null) {
-            ValidatePrivateFile(child, 192 * 1024);
-            MarkDelete(child);
+        using (MutationLock mutation = AcquireMutationLock(directory.Initial, name)) {
+          bool missing;
+          using (SafeFileHandle child = OpenRelative(
+            directory.Handle,
+            name,
+            FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            out missing)) {
+            if (!missing && child != null) {
+              ValidatePrivateFile(child, MAXIMUM_CREDENTIAL_BYTES);
+              MarkDelete(child);
+            }
           }
-        }
-        bool finalMissing;
-        using (SafeFileHandle final = OpenRelative(
-          directory.Handle,
-          name,
-          FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-          FILE_SHARE_READ,
-          FILE_OPEN,
-          out finalMissing)) {
-          if (!finalMissing || final != null) {
-            throw new InvalidOperationException("private file remains after removal");
+          bool finalMissing;
+          using (SafeFileHandle final = OpenRelative(
+            directory.Handle,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            out finalMissing)) {
+            if (!finalMissing || final != null) {
+              throw new InvalidOperationException("private file remains after removal");
+            }
           }
+          VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
         }
-        VerifyPrivateDirectory(directory, expectedDevice, expectedInode);
       }
     } catch {
       throw new CodexPrivateFileException();
@@ -1360,7 +1532,7 @@ try {
     'read-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $maximum = Read-Maximum $request.maximumBytes $MaximumPacketBytes
+      $maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes
       if ($request.required -isnot [bool]) { throw 'required is invalid' }
       try {
         $bytes = [MyDashboardCodexCredentialFile]::ReadPrivate(
@@ -1379,7 +1551,7 @@ try {
     'write-new-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPacketBytes
+      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes
       try {
         [MyDashboardCodexCredentialFile]::WriteNewPrivate(
           $directory.Path,
@@ -1396,7 +1568,7 @@ try {
     'replace-private' {
       $directory = Read-Directory $request.directory
       $name = Read-Name $request.name
-      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumPacketBytes
+      $bytes = Decode-CanonicalBase64 $request.bytesBase64 $MaximumCredentialBytes
       try {
         [MyDashboardCodexCredentialFile]::ReplacePrivate(
           $directory.Path,

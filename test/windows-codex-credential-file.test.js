@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   link,
   lstat,
@@ -13,6 +14,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import {
@@ -21,6 +23,7 @@ import {
 } from "../src/lib/windows-codex-credential-file.js";
 
 const PACKET_LIMIT = 192 * 1024;
+const CREDENTIAL_LIMIT = 65_536;
 const WINDOWS_NATIVE_SUPPORTED = process.platform === "win32" && process.arch === "x64";
 
 function ok(bytes = null) {
@@ -49,6 +52,52 @@ function serializedError(error) {
     stack: error?.stack,
     fields: Object.fromEntries(Object.entries(error || {})),
   });
+}
+
+function createControlledProcessPort(script) {
+  const capture = {
+    args: null,
+    closed: false,
+    env: null,
+    executable: null,
+    killCount: 0,
+    options: null,
+    stdin: null,
+  };
+  let spawnedResolve;
+  const spawned = new Promise((resolve) => {
+    spawnedResolve = resolve;
+  });
+  const port = createTestCodexCredentialFilePort({
+    spawnProcess(executable, args, options) {
+      capture.executable = executable;
+      capture.args = args;
+      capture.options = options;
+      capture.env = options.env;
+      const child = spawn(process.execPath, ["-e", script], {
+        env: options.env,
+        signal: options.signal,
+        stdio: options.stdio,
+        windowsHide: options.windowsHide,
+      });
+      const originalEnd = child.stdin.end.bind(child.stdin);
+      child.stdin.end = (chunk, ...rest) => {
+        capture.stdin = Buffer.from(chunk);
+        return originalEnd(chunk, ...rest);
+      };
+      const originalKill = child.kill.bind(child);
+      child.kill = (...args) => {
+        capture.killCount += 1;
+        return originalKill(...args);
+      };
+      child.once("close", () => {
+        capture.closed = true;
+      });
+      spawnedResolve(child);
+      return child;
+    },
+  });
+  return { capture, port, spawned };
 }
 
 function isRedactedFailure(error, expectedCode, markers = []) {
@@ -152,7 +201,233 @@ $sections = [Security.AccessControl.AccessControlSections]::Access -bor [Securit
 $acl = $file.GetAccessControl($sections)
 $acl.SetOwner($administrators)
 $file.SetAccessControl($acl)
+  `);
+}
+
+function ownerFixturePrivilegeDenied(result) {
+  if (result.status === 0 || result.error) return false;
+  const output = `${result.stdout || ""}\n${result.stderr || ""}`
+    .replace(/_x[0-9a-f]{4}_/giu, "")
+    .replace(/<[^>]*>/gu, "")
+    .replace(/\s+/gu, " ");
+  return /(?:UnauthorizedAccessException|PrivilegeNotHeldException|Access is denied|privilege is not held|unauthorized operation|security identifier is not allowed to be the owner of this object)/iu.test(output);
+}
+
+function addWorldAllowAce(targetPath, right) {
+  const target = decodedPathExpression(targetPath);
+  requireFixturePowerShell(String.raw`
+$ErrorActionPreference = 'Stop'
+$target = ${target}
+$world = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$item = Get-Item -LiteralPath $target
+$acl = $item.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+$rights = [Security.AccessControl.FileSystemRights]::${right}
+$rule = [Security.AccessControl.FileSystemAccessRule]::new($world, $rights, [Security.AccessControl.AccessControlType]::Allow)
+[void]$acl.AddAccessRule($rule)
+$item.SetAccessControl($acl)
+`, `add fictional world ${right} ACE`);
+}
+
+function invokeNativeHelper(packet) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const executable = path.win32.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const result = spawnSync(
+    executable,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      path.resolve("src/lib/windows-codex-credential-helper.ps1"),
+    ],
+    {
+      encoding: "utf8",
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot },
+      input: typeof packet === "string" ? packet : JSON.stringify(packet),
+      maxBuffer: 512 * 1024,
+      timeout: 120_000,
+      windowsHide: true,
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    [result.error?.message, result.stderr].filter(Boolean).join("\n"),
+  );
+  return JSON.parse(result.stdout);
+}
+
+function queryStableFileIdentity(file) {
+  const target = decodedPathExpression(file);
+  const result = fixturePowerShell(String.raw`
+$ErrorActionPreference = 'Stop'
+$target = ${target}
+$source = @'
+using System;
+using System.ComponentModel;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class MyDashboardTestFileId {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FILE_ID_INFO {
+    public ulong VolumeSerialNumber;
+    public ulong FileIdLow;
+    public ulong FileIdHigh;
+  }
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern SafeFileHandle CreateFileW(
+    string name, uint access, uint share, IntPtr security,
+    uint creation, uint flags, IntPtr template);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool GetFileInformationByHandleEx(
+    SafeFileHandle handle, int informationClass,
+    out FILE_ID_INFO information, uint bufferSize);
+
+  public static string Read(string path) {
+    using (SafeFileHandle handle = CreateFileW(
+      path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+      FILE_ID_INFO information;
+      if (!GetFileInformationByHandleEx(
+        handle, 18, out information, (uint)Marshal.SizeOf(typeof(FILE_ID_INFO)))) {
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      }
+      return String.Format(
+        CultureInfo.InvariantCulture,
+        "{0:X16}:{1:X16}:{2:X16}",
+        information.VolumeSerialNumber,
+        information.FileIdLow,
+        information.FileIdHigh);
+    }
+  }
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp
+[Console]::Out.Write([MyDashboardTestFileId]::Read($target))
 `);
+  assert.equal(
+    result.status,
+    0,
+    `FILE_ID_INFO fixture unavailable: ${[
+      result.error?.message,
+      result.stdout,
+      result.stderr,
+    ].filter(Boolean).join("\n")}`,
+  );
+  assert.match(result.stdout, /^[0-9A-F]{16}(?::[0-9A-F]{16}){2}$/u);
+  return result.stdout;
+}
+
+function mutationMutexName(stableIdentity, name) {
+  const digest = createHash("sha256")
+    .update(`${stableIdentity}\n${name.toUpperCase()}`, "utf8")
+    .digest("hex");
+  return `Local\\MyDashboard.CodexCredential.${digest}`;
+}
+
+function startMutexHolder(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const executable = path.win32.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const encodedName = Buffer.from(name, "utf8").toString("base64");
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedName}'))
+$current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$security = [Security.AccessControl.MutexSecurity]::new()
+$security.SetOwner($current)
+$security.SetAccessRuleProtection($true, $false)
+foreach ($sid in @(
+  $current,
+  [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+  [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+)) {
+  $rule = [Security.AccessControl.MutexAccessRule]::new(
+    $sid,
+    [Security.AccessControl.MutexRights]::FullControl,
+    [Security.AccessControl.AccessControlType]::Allow
+  )
+  [void]$security.AddAccessRule($rule)
+}
+[bool]$created = $false
+$mutex = [Threading.Mutex]::new($false, $name, [ref]$created, $security)
+$acquired = $false
+try {
+  $acquired = $mutex.WaitOne(30000)
+  if (-not $acquired) { throw 'test mutex acquisition timed out' }
+  [Console]::Out.WriteLine('ready')
+  [Console]::Out.Flush()
+  [void][Console]::In.ReadLine()
+} finally {
+  if ($acquired) { $mutex.ReleaseMutex() }
+  $mutex.Dispose()
+}
+`;
+  const child = spawn(
+    executable,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64"),
+    ],
+    {
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const ready = new Promise((resolve, reject) => {
+    const checkReady = () => {
+      if (stdout.includes("ready")) resolve();
+    };
+    child.stdout.on("data", checkReady);
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (!stdout.includes("ready")) {
+        reject(new Error(`mutex holder exited ${code}: ${stderr}`));
+      }
+    });
+  });
+  const close = new Promise((resolve) => child.once("close", resolve));
+  return {
+    child,
+    close,
+    ready,
+    release() {
+      child.stdin.end("release\n");
+    },
+  };
 }
 
 async function makeNativeRoot(t, suffix) {
@@ -279,6 +554,220 @@ test("source bounds and private direct-child names fail before helper invocation
   }
   await port.removePrivate({ directory, name: "a".repeat(128), signal });
   assert.equal(invocations, 3);
+});
+
+test("private payloads enforce the raw 65,536-byte boundary before invocation", async () => {
+  const requests = [];
+  const port = createTestCodexCredentialFilePort({
+    async invoke(request) {
+      requests.push(request);
+      return request.operation === "read-private" ? ok("x") : ok();
+    },
+  });
+  const directory = Object.freeze({ path: "D:\\fictional", device: "1", inode: "2" });
+  const signal = AbortSignal.timeout(30_000);
+  const maximumPayload = Buffer.alloc(CREDENTIAL_LIMIT, 0x61);
+
+  assert.deepEqual(
+    await port.readPrivate({
+      directory,
+      name: "state.json",
+      maximumBytes: CREDENTIAL_LIMIT,
+      required: true,
+      signal,
+    }),
+    Buffer.from("x"),
+  );
+  await port.writeNewPrivate({
+    directory,
+    name: "auth.json",
+    bytes: maximumPayload,
+    signal,
+  });
+  await port.replacePrivate({
+    directory,
+    name: "state.json",
+    bytes: maximumPayload,
+    signal,
+  });
+
+  await assert.rejects(
+    port.readPrivate({
+      directory,
+      name: "state.json",
+      maximumBytes: CREDENTIAL_LIMIT + 1,
+      required: true,
+      signal,
+    }),
+    { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+  );
+  for (const operation of ["writeNewPrivate", "replacePrivate"]) {
+    await assert.rejects(
+      port[operation]({
+        directory,
+        name: "state.json",
+        bytes: Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x62),
+        signal,
+      }),
+      { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+      operation,
+    );
+  }
+  assert.equal(requests.length, 3);
+});
+
+test("production transport uses fixed spawn metadata and bounded stdin", async () => {
+  const source = "D:\\FICTIONAL_PROCESS_PRIVATE\\auth.json";
+  const response = JSON.stringify({
+    schemaVersion: 1,
+    status: "ok",
+    bytesBase64: Buffer.from("fictional-process-ok").toString("base64"),
+  });
+  const script = `process.stdin.resume();process.stdin.once("end",()=>process.stdout.write(${JSON.stringify(response)}));`;
+  const { capture, port } = createControlledProcessPort(script);
+  const signal = AbortSignal.timeout(30_000);
+
+  assert.deepEqual(
+    await port.readSource({ file: source, maximumBytes: CREDENTIAL_LIMIT, signal }),
+    Buffer.from("fictional-process-ok"),
+  );
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  assert.equal(
+    capture.executable,
+    path.win32.join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    ),
+  );
+  assert.deepEqual(capture.args, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    path.resolve("src/lib/windows-codex-credential-helper.ps1"),
+  ]);
+  assert.deepEqual(capture.env, { SystemRoot: systemRoot, WINDIR: systemRoot });
+  assert.equal(capture.options.windowsHide, true);
+  assert.deepEqual(capture.options.stdio, ["pipe", "pipe", "pipe"]);
+  assert.equal(capture.options.signal, signal);
+  assert.equal(JSON.stringify([capture.args, capture.env]).includes(source), false);
+  assert.deepEqual(JSON.parse(capture.stdin.toString("utf8")), {
+    schemaVersion: 1,
+    operation: "read-source",
+    fileBase64: Buffer.from(source).toString("base64"),
+    maximumBytes: CREDENTIAL_LIMIT,
+  });
+});
+
+test("production transport rejects oversized requests before spawning", async () => {
+  let spawnCount = 0;
+  const port = createTestCodexCredentialFilePort({
+    spawnProcess() {
+      spawnCount += 1;
+      throw new Error("must not spawn");
+    },
+  });
+  const directory = Object.freeze({
+    path: `D:\\${"\u0001".repeat(32_764)}`,
+    device: "1",
+    inode: "2",
+  });
+  await assert.rejects(
+    port.writeNewPrivate({
+      directory,
+      name: "state.json",
+      bytes: Buffer.from("x"),
+      signal: AbortSignal.timeout(30_000),
+    }),
+    { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+  );
+  assert.equal(spawnCount, 0);
+});
+
+test("production transport bounds output streams and rejects nonzero exits", async (t) => {
+  const marker = "FICTIONAL_PROCESS_OUTPUT_PRIVATE";
+  const cases = [
+    {
+      name: "stdout exceeds 192 KiB",
+      script: `process.stdin.resume();process.stdin.once("end",()=>{process.stdout.write("${marker}"+"x".repeat(${PACKET_LIMIT}));setInterval(()=>{},1000);});`,
+    },
+    {
+      name: "stderr exceeds 4,096 bytes",
+      script: `process.stdin.resume();process.stdin.once("end",()=>{process.stderr.write("${marker}"+"x".repeat(4096));setInterval(()=>{},1000);});`,
+    },
+    {
+      name: "nonzero exit rejects otherwise valid stdout",
+      script: `process.stdin.resume();process.stdin.once("end",()=>{process.stdout.write('{"schemaVersion":1,"status":"missing"}');process.exitCode=7;});`,
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const { capture, port } = createControlledProcessPort(fixture.script);
+      await assert.rejects(
+        port.readSource({
+          file: "D:\\fictional\\auth.json",
+          maximumBytes: CREDENTIAL_LIMIT,
+          signal: AbortSignal.timeout(30_000),
+        }),
+        (error) => isRedactedFailure(
+          error,
+          "CODEX_CREDENTIAL_FILE_OPERATION_FAILED",
+          [marker],
+        ),
+      );
+      assert.equal(capture.closed, true);
+    });
+  }
+});
+
+test("production abort kills and reaps the controlled helper before rejecting", async () => {
+  const marker = "FICTIONAL_PROCESS_ABORT_PRIVATE";
+  const script = "process.stdin.resume();process.stdin.once('end',()=>setInterval(()=>{},1000));";
+  const { capture, port, spawned } = createControlledProcessPort(script);
+  const controller = new AbortController();
+  const pending = port.readSource({
+    file: `D:\\${marker}\\auth.json`,
+    maximumBytes: CREDENTIAL_LIMIT,
+    signal: controller.signal,
+  });
+  await spawned;
+  controller.abort(new Error(marker));
+  await assert.rejects(
+    pending,
+    (error) => isRedactedFailure(error, "ABORT_ERR", [marker]),
+  );
+  assert.equal(capture.killCount > 0, true);
+  assert.equal(capture.closed, true);
+});
+
+test("public errors have constant path-free stacks", async () => {
+  const marker = "FICTIONAL_CALLER_PATH_PRIVATE";
+  const port = createTestCodexCredentialFilePort({
+    async invoke() {
+      throw new Error(marker);
+    },
+  });
+  await assert.rejects(
+    port.readSource({
+      file: `D:\\${marker}\\auth.json`,
+      maximumBytes: CREDENTIAL_LIMIT,
+      signal: AbortSignal.timeout(30_000),
+    }),
+    (error) => {
+      assert.equal(error.stack, "Error: Codex credential file operation failed");
+      return isRedactedFailure(
+        error,
+        "CODEX_CREDENTIAL_FILE_OPERATION_FAILED",
+        [marker, process.cwd(), "windows-codex-credential-file.js"],
+      );
+    },
+  );
 });
 
 test("helper responses require exact keys and canonical bounded Base64", async () => {
@@ -418,6 +907,31 @@ test("aborts cancel invocation and never retain an abort reason", async () => {
   );
 });
 
+test("wrong-owner fixtures skip only explicitly recognized privilege denials", () => {
+  assert.equal(ownerFixturePrivilegeDenied({
+    status: 1,
+    stdout: "",
+    stderr: "FullyQualifiedErrorId : UnauthorizedAccessException",
+  }), true);
+  assert.equal(ownerFixturePrivilegeDenied({
+    status: 1,
+    stdout: "",
+    stderr: "A required privilege is not held by the client",
+  }), true);
+  assert.equal(ownerFixturePrivilegeDenied({
+    status: 1,
+    stdout: "",
+    stderr: "The security identifier is not allowed to be the owner of t_x000D__x000A_</S><S S=\"Error\">his object.",
+  }), true);
+  for (const result of [
+    { status: 1, stdout: "", stderr: "ParserError: unexpected token" },
+    { status: 1, stdout: "", stderr: "TypeNotFound: broken fixture API" },
+    { status: null, error: new Error("fixture timed out"), stdout: "", stderr: "" },
+  ]) {
+    assert.equal(ownerFixturePrivilegeDenied(result), false);
+  }
+});
+
 test("Windows source admission is handle-bound across size, link, owner, ACL, and replacement cases", {
   skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
 }, async (t) => {
@@ -488,6 +1002,15 @@ test("Windows source admission is handle-bound across size, link, owner, ACL, an
     await writeFile(wrongOwner, Buffer.from("fictional-wrong-owner"));
     const ownership = trySetAdministratorsOwner(wrongOwner);
     if (ownership.status !== 0) {
+      assert.equal(
+        ownerFixturePrivilegeDenied(ownership),
+        true,
+        `wrong-owner fixture failed for a non-privilege reason: ${[
+          ownership.error?.message,
+          ownership.stdout,
+          ownership.stderr,
+        ].filter(Boolean).join("\n")}`,
+      );
       t.skip("Windows wrong-owner fixture capability unavailable: Set-Acl owner reassignment denied");
       return;
     }
@@ -536,6 +1059,117 @@ test("Windows source admission is handle-bound across size, link, owner, ACL, an
         true,
       );
     }
+  });
+});
+
+test("Windows private ACL admission permits only user, SYSTEM, and Administrators", {
+  skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
+}, async (t) => {
+  const root = await makeNativeRoot(t, "private-acl");
+  const directory = await frozenDirectory(root);
+  const port = createProductionCodexCredentialFilePort();
+  const signal = AbortSignal.timeout(120_000);
+
+  for (const right of [
+    "ReadData",
+    "Traverse",
+    "DeleteSubdirectoriesAndFiles",
+    "WriteData",
+    "Delete",
+    "ChangePermissions",
+    "TakeOwnership",
+  ]) {
+    addWorldAllowAce(root, right);
+    await assert.rejects(
+      port.readPrivate({
+        directory,
+        name: "missing.json",
+        maximumBytes: CREDENTIAL_LIMIT,
+        required: false,
+        signal,
+      }),
+      { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+      `private directory admitted World ${right}`,
+    );
+    protectFixtureDirectory(root);
+  }
+
+  await port.writeNewPrivate({
+    directory,
+    name: "state.json",
+    bytes: Buffer.from("fictional-private-acl"),
+    signal,
+  });
+  addWorldAllowAce(path.join(root, "state.json"), "ReadData");
+  await assert.rejects(
+    port.readPrivate({
+      directory,
+      name: "state.json",
+      maximumBytes: CREDENTIAL_LIMIT,
+      required: true,
+      signal,
+    }),
+    { code: "CODEX_CREDENTIAL_FILE_OPERATION_FAILED" },
+    "private file admitted World ReadData",
+  );
+});
+
+test("native helper independently enforces packet and 65,536-byte credential bounds", {
+  skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
+}, async (t) => {
+  const root = await makeNativeRoot(t, "native-bounds");
+  const directory = await frozenDirectory(root);
+  const oversized = Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x62);
+  const oversizedRead = path.join(root, "oversized-read.json");
+  await writeFile(oversizedRead, oversized);
+
+  await t.test("read-private rejects a maximum above the credential limit", () => {
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-private",
+      directory,
+      name: "oversized-read.json",
+      maximumBytes: CREDENTIAL_LIMIT + 1,
+      required: true,
+    }), { schemaVersion: 1, status: "failed" });
+  });
+
+  await t.test("write-new-private rejects oversized raw bytes", async () => {
+    const target = path.join(root, "oversized-new.json");
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "write-new-private",
+      directory,
+      name: "oversized-new.json",
+      bytesBase64: oversized.toString("base64"),
+    }), { schemaVersion: 1, status: "failed" });
+    await assert.rejects(lstat(target), { code: "ENOENT" });
+  });
+
+  await t.test("replace-private rejects oversized raw bytes without mutation", async () => {
+    const state = path.join(root, "state.json");
+    const initial = Buffer.from("fictional-before-oversized-replace");
+    await writeFile(state, initial);
+    assert.deepEqual(invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "replace-private",
+      directory,
+      name: "state.json",
+      bytesBase64: oversized.toString("base64"),
+    }), { schemaVersion: 1, status: "failed" });
+    assert.deepEqual(await readFile(state), initial);
+  });
+
+  await t.test("request packets above 192 KiB are rejected before parsing", () => {
+    const missing = path.join(root, "packet-cap-missing.json");
+    const request = JSON.stringify({
+      schemaVersion: 1,
+      operation: "read-source",
+      fileBase64: Buffer.from(missing).toString("base64"),
+      maximumBytes: CREDENTIAL_LIMIT,
+    });
+    const packet = request + " ".repeat(PACKET_LIMIT + 1 - Buffer.byteLength(request));
+    assert.deepEqual(invokeNativeHelper(packet), { schemaVersion: 1, status: "failed" });
   });
 });
 
@@ -603,4 +1237,107 @@ test("Windows private operations use a pinned directory and atomic verified repl
   await port.removePrivate({ directory, name: "state.json", signal });
   await assert.rejects(lstat(state), { code: "ENOENT" });
   await port.removePrivate({ directory, name: "state.json", signal });
+});
+
+test("two replacement helpers wait on the FILE_ID_INFO and name-bound mutex", {
+  skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
+  timeout: 120_000,
+}, async (t) => {
+  const root = await makeNativeRoot(t, "private-mutex");
+  const directory = await frozenDirectory(root);
+  const name = "state.json";
+  const stableIdentity = queryStableFileIdentity(root);
+  const signal = AbortSignal.timeout(110_000);
+  const setupPort = createProductionCodexCredentialFilePort();
+  await setupPort.writeNewPrivate({
+    directory,
+    name,
+    bytes: Buffer.from("fictional-mutex-initial"),
+    signal,
+  });
+  const holder = startMutexHolder(mutationMutexName(stableIdentity, name));
+  let released = false;
+  t.after(async () => {
+    if (!released) holder.release();
+    await holder.close;
+  });
+  await holder.ready;
+  const payloads = [
+    Buffer.alloc(CREDENTIAL_LIMIT, 0x61),
+    Buffer.alloc(CREDENTIAL_LIMIT, 0x62),
+  ];
+  const replacements = Promise.allSettled(payloads.map((bytes) =>
+    createProductionCodexCredentialFilePort().replacePrivate({
+      directory,
+      name,
+      bytes,
+      signal,
+    })));
+  const settledWhileLocked = await Promise.race([
+    replacements.then(() => true),
+    delay(4_000, false),
+  ]);
+  assert.equal(settledWhileLocked, false, "replacement bypassed the identity/name lock");
+
+  holder.release();
+  released = true;
+  await holder.close;
+  const results = await replacements;
+  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled"]);
+  const final = await readFile(path.join(root, name));
+  assert.equal(payloads.some((bytes) => bytes.equals(final)), true);
+});
+
+test("concurrent Windows replacement helpers serialize through final verification", {
+  skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
+  timeout: 180_000,
+}, async (t) => {
+  const root = await makeNativeRoot(t, "private-concurrent");
+  const directory = await frozenDirectory(root);
+  const signal = AbortSignal.timeout(170_000);
+  const setupPort = createProductionCodexCredentialFilePort();
+  await setupPort.writeNewPrivate({
+    directory,
+    name: "state.json",
+    bytes: Buffer.alloc(CREDENTIAL_LIMIT, 0x30),
+    signal,
+  });
+
+  for (let round = 0; round < 2; round += 1) {
+    await Promise.all(Array.from({ length: 24 }, (_, index) =>
+      writeFile(
+        path.join(
+          root,
+          `state.tmp.${1_000 + round}.${index.toString(16).padStart(32, "0")}`,
+        ),
+        Buffer.alloc(8 * 1024, index),
+      )));
+    const payloads = Array.from(
+      { length: 8 },
+      (_, index) => Buffer.alloc(CREDENTIAL_LIMIT, 0x41 + round * 8 + index),
+    );
+    const results = await Promise.allSettled(payloads.map((bytes) =>
+      createProductionCodexCredentialFilePort().replacePrivate({
+        directory,
+        name: "state.json",
+        bytes,
+        signal,
+      })));
+    assert.deepEqual(
+      results.map((result) => result.status),
+      Array.from({ length: payloads.length }, () => "fulfilled"),
+      `replacement round ${round + 1}`,
+    );
+    const final = await readFile(path.join(root, "state.json"));
+    assert.equal(
+      payloads.some((bytes) => bytes.equals(final)),
+      true,
+      `replacement round ${round + 1} left unverified bytes`,
+    );
+    assert.equal(
+      (await readdir(root)).some((entry) => entry.startsWith("state.tmp.")),
+      false,
+      `replacement round ${round + 1} left temporary files`,
+    );
+  }
 });
