@@ -289,9 +289,9 @@ function readRuntimeInfo(root) {
   return JSON.parse(result.stdout);
 }
 
-async function waitForHealth(port, processId) {
+async function waitForHealth(port, processId, maxAttempts = 100) {
   let lastError;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/live`);
       const body = await response.json();
@@ -1275,11 +1275,11 @@ test(
     manager.stdout.resume();
     manager.stderr.resume();
     const state = JSON.parse(await waitForPath(controlPath));
-    await waitForHealth(port, state.processId);
     const managerExited = once(manager, "exit");
     assert.equal(manager.kill(), true);
     await managerExited;
 
+    await waitForHealth(port, state.processId, 500);
     await waitForProcessExit(state.processId, 8_000);
     await assertPortUnavailable(port);
     const status = invokeManager(root, "Status");
