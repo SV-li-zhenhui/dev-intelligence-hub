@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   opendir,
   readFile,
   readdir,
@@ -124,6 +125,7 @@ function recordingRunner(handler) {
 function cleanupFileSystem(overrides = {}) {
   return Object.freeze({
     lstat,
+    open,
     opendir,
     realpath,
     rename,
@@ -1082,6 +1084,149 @@ test("cancellation bounds stale scanning and does not poison later use", async (
   releaseScavenge();
   assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
   assert.equal(scavengeCalls, 2);
+});
+
+test("stale scanning closes its root directory handle after cancellation", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-stale-root-close-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const controller = new AbortController();
+  let closeCalls = 0;
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async opendir(directory) {
+          if (path.resolve(directory) !== path.resolve(temporaryRoot)) {
+            return opendir(directory);
+          }
+          return {
+            async read() {
+              controller.abort();
+              return null;
+            },
+            async close() {
+              closeCalls += 1;
+            },
+          };
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest({ signal: controller.signal })),
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
+  );
+  assert.equal(closeCalls, 1);
+});
+
+test("stale marker inspection closes its file handle after cancellation", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-stale-marker-close-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const staleDirectory = path.join(
+    temporaryRoot,
+    "invocation-codex-cli-stale-marker-close",
+  );
+  await mkdir(staleDirectory, { recursive: true });
+  await writeFile(
+    path.join(staleDirectory, ".mydashboard-invocation.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "codex-cli",
+      ownerPid: 72_001,
+      createdAt: new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString(),
+    }),
+    "utf8",
+  );
+  const controller = new AbortController();
+  let closeCalls = 0;
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      isProcessAlive: () => false,
+      cleanupFileSystem: cleanupFileSystem({
+        async open(file, flags, mode) {
+          const handle = await open(file, flags, mode);
+          if (path.basename(file) === ".mydashboard-invocation.json") {
+            controller.abort();
+          }
+          return {
+            stat: (...args) => handle.stat(...args),
+            readFile: (...args) => handle.readFile(...args),
+            async close() {
+              closeCalls += 1;
+              await handle.close();
+            },
+          };
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest({ signal: controller.signal })),
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
+  );
+  assert.equal(closeCalls, 1);
+});
+
+test("cleanup inventory closes its directory handle after cancellation", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-inventory-close-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const controller = new AbortController();
+  let closeCalls = 0;
+  let cleanupHandle = null;
+  t.after(async () => cleanupHandle?.close().catch(() => {}));
+  const runner = recordingRunner(async (invocation) => {
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "credential" },
+      temporaryRoot,
+      cleanupFileSystem: cleanupFileSystem({
+        async opendir(directory) {
+          const handle = await opendir(directory);
+          if (!path.basename(directory).startsWith(".cleanup-")) return handle;
+          cleanupHandle = handle;
+          let cancelled = false;
+          return {
+            async read() {
+              const entry = await handle.read();
+              if (!cancelled) {
+                cancelled = true;
+                controller.abort();
+              }
+              return entry;
+            },
+            async close() {
+              closeCalls += 1;
+              await handle.close();
+            },
+          };
+        },
+      }),
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest({ signal: controller.signal })),
+    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+  );
+  assert.equal(closeCalls, 1);
 });
 
 test("an unsettled stale scan holds one cross-kind root lease after cancellation", async (t) => {

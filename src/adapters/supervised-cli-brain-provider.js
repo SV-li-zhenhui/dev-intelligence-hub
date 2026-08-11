@@ -54,6 +54,7 @@ const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SHARED_ROOT_STATES = new Map();
 const PRODUCTION_CLEANUP_FILE_SYSTEM = Object.freeze({
   lstat,
+  open,
   opendir,
   realpath,
   rename,
@@ -63,6 +64,7 @@ const PRODUCTION_CLEANUP_FILE_SYSTEM = Object.freeze({
 });
 const TEST_CLEANUP_FILE_SYSTEM = Object.freeze({
   lstat,
+  open,
   opendir,
   realpath,
   rename,
@@ -385,7 +387,15 @@ function protectedRootPaths(value) {
 }
 
 function cleanupFileSystem(value) {
-  const methods = ["lstat", "opendir", "realpath", "rename", "rmdir", "unlink"];
+  const methods = [
+    "lstat",
+    "open",
+    "opendir",
+    "realpath",
+    "rename",
+    "rmdir",
+    "unlink",
+  ];
   if (
     value === null ||
     typeof value !== "object" ||
@@ -864,9 +874,17 @@ function sameCleanupNode(node, details) {
     (details.nlink === node.links && details.size === node.size);
 }
 
-async function closeDirectoryHandle(handle, signal) {
-  if (signal?.aborted) return;
-  await cleanupStep(signal, () => handle.close());
+async function closeCleanupHandle(handle, rootState = null) {
+  if (!handle) return;
+  try {
+    await handle.close();
+  } catch {
+    if (rootState) {
+      rootState.blocked = true;
+      rootState.unprovable = true;
+    }
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  }
 }
 
 async function boundedCleanupInventory(
@@ -874,6 +892,7 @@ async function boundedCleanupInventory(
   parentIdentity,
   signal,
   fileSystem,
+  rootState,
 ) {
   const rootDetails = await cleanupStep(
     signal,
@@ -970,7 +989,7 @@ async function boundedCleanupInventory(
         nodes.push(node);
       }
     } finally {
-      await closeDirectoryHandle(handle, signal);
+      await closeCleanupHandle(handle, rootState);
     }
   }
   return nodes;
@@ -1041,6 +1060,7 @@ async function removeVerifiedInvocation(
     rootState.identity,
     signal,
     fileSystem,
+    rootState,
   );
   await deleteCleanupInventory(inventory, signal, fileSystem);
   rootState.residues.delete(canonicalPath(target.path));
@@ -1123,11 +1143,17 @@ function markerValue(value, cliKind) {
   return Object.freeze({ ...value, createdAtMs: createdAt });
 }
 
-async function readSmallRegularFile(file, maximumBytes, signal = null) {
+async function readSmallRegularFile(
+  file,
+  maximumBytes,
+  signal = null,
+  fileSystem = PRODUCTION_CLEANUP_FILE_SYSTEM,
+  rootState = null,
+) {
   let handle;
   try {
     throwIfRequestAborted(signal);
-    handle = await open(
+    handle = await fileSystem.open(
       file,
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
@@ -1148,7 +1174,7 @@ async function readSmallRegularFile(file, maximumBytes, signal = null) {
   } catch {
     return null;
   } finally {
-    if (!signal?.aborted) await handle?.close();
+    await closeCleanupHandle(handle, rootState);
   }
 }
 
@@ -1221,6 +1247,8 @@ async function scavengeStaleInvocations({
           path.join(directory, INVOCATION_MARKER),
           MAX_MARKER_BYTES,
           signal,
+          fileSystem,
+          rootState,
         );
         throwIfRequestAborted(signal);
         if (!markerBytes) {
@@ -1271,17 +1299,7 @@ async function scavengeStaleInvocations({
       }
     }
   } finally {
-    if (!signal?.aborted) {
-      try {
-        await cleanupStep(signal, () => directoryHandle.close());
-      } catch {
-        if (rootState) {
-          rootState.blocked = true;
-          rootState.unprovable = true;
-        }
-        throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
-      }
-    }
+    await closeCleanupHandle(directoryHandle, rootState);
   }
   await removeVerifiedInvocations(
     staleInvocations,
