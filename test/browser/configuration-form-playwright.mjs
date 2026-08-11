@@ -219,6 +219,18 @@ function createFixtureServer() {
         json(response, 200, { items: [] });
         return;
       }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/brain-providers/status"
+      ) {
+        json(response, 200, {
+          schemaVersion: 1,
+          state: "available",
+          cliAvailable: true,
+          fileLoginAvailable: true,
+        });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/attention/next") {
         if (attentionAvailable) {
           attentionAvailable = false;
@@ -987,6 +999,7 @@ try {
   };
   expectedConfiguration.brainProviders["codex.local-cli"] = {
     kind: "codex-cli",
+    credentialMode: "codex-login",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
@@ -994,6 +1007,7 @@ try {
   };
   expectedConfiguration.brainProviders["claude.local-cli"] = {
     kind: "claude-cli",
+    credentialMode: "api-key",
     remote: true,
     timeoutMs: 300_000,
     maxResponseBytes: 131_072,
