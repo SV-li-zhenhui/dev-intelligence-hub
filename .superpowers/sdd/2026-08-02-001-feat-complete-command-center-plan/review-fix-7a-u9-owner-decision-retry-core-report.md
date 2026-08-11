@@ -23,7 +23,7 @@ Observed result before the service existed:
 ```text
 Exit code: 1
 Error [ERR_MODULE_NOT_FOUND]: Cannot find module
-'D:\claude\MyDashboard\src\services\owner-work-retry-service.js'
+'src\services\owner-work-retry-service.js'
 tests 1
 pass 0
 fail 1
