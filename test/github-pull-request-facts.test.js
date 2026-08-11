@@ -339,6 +339,32 @@ test("the bounded GraphQL read returns detailed facts without changing summaries
   );
 });
 
+test("insecure check links are omitted without discarding check facts", async () => {
+  const graph = graphResponse({
+    commits: {
+      nodes: [
+        {
+          commit: {
+            statusCheckRollup: {
+              contexts: page([
+                statusContext({ targetUrl: "http://ci.example.test/build/1" }),
+              ]),
+            },
+          },
+        },
+      ],
+    },
+  });
+  const adapter = new GitHubAdapter({ run: fakeRun({ graph }).run });
+
+  const facts = await adapter.loadPullRequestFacts(readRequest());
+
+  assert.equal(facts.checks.length, 1);
+  assert.equal(facts.checks[0].name, "license");
+  assert.equal(facts.checks[0].status, "PENDING");
+  assert.equal(facts.checks[0].url, "");
+});
+
 test("unknown GitHub enums and nullable facts are explicit and fail-safe", async () => {
   const graph = graphResponse({
     reviewDecision: "FUTURE_DECISION",

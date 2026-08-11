@@ -343,6 +343,15 @@ function optionalUrl(value, name) {
   return parsed.href;
 }
 
+function safeCheckUrl(value, name) {
+  try {
+    return optionalUrl(value, name);
+  } catch (error) {
+    if (error instanceof GitHubPullRequestFactsError) return "";
+    throw error;
+  }
+}
+
 function boolean(value, name) {
   if (typeof value !== "boolean") throw invalid(`${name} is invalid`);
   return value;
@@ -531,7 +540,7 @@ function projectCheckRun(fields, name) {
     conclusion: enumOrUnknown(fields.get("conclusion"), CHECK_CONCLUSIONS, {
       empty: "NONE",
     }),
-    url: optionalUrl(fields.get("detailsUrl"), `${name}.detailsUrl`),
+    url: safeCheckUrl(fields.get("detailsUrl"), `${name}.detailsUrl`),
     startedAt: nullableTimestamp(fields.get("startedAt"), `${name}.startedAt`),
     completedAt: nullableTimestamp(
       fields.get("completedAt"),
@@ -564,7 +573,7 @@ function projectStatusContext(fields, name) {
     name: checkName,
     status: statusContextLifecycle(state),
     conclusion: statusContextConclusion(state),
-    url: optionalUrl(fields.get("targetUrl"), `${name}.targetUrl`),
+    url: safeCheckUrl(fields.get("targetUrl"), `${name}.targetUrl`),
     startedAt: nullableTimestamp(fields.get("createdAt"), `${name}.createdAt`),
     completedAt: null,
     requirement: checkRequirement(fields.get("isRequired"), name),
