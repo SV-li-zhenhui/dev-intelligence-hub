@@ -12,6 +12,11 @@ import {
   createValidationSourceMaterialization,
 } from "./system-validation-materialization.mjs";
 import {
+  prepareIsolatedValidationEnvironment,
+  VALIDATION_CONTROLLED_VARIABLES,
+  VALIDATION_ISOLATED_VARIABLES,
+} from "./system-validation-environment.mjs";
+import {
   distributionTestPath,
   selectCommittedNodeTestFiles,
   u9PriorityTestPath,
@@ -42,10 +47,7 @@ const inheritedForbiddenNodeEnvironmentVariables =
   forbiddenNodeEnvironmentVariables.filter((name) =>
     Object.hasOwn(process.env, name)
   );
-const validationEnvironment = { ...process.env };
-for (const name of forbiddenNodeEnvironmentVariables) {
-  delete validationEnvironment[name];
-}
+let validationEnvironment = null;
 const defaultCommandLimits = Object.freeze({
   timeoutMs: 120_000,
   maxStdoutBytes: 4 * 1024 * 1024,
@@ -64,8 +66,13 @@ const report = {
   node: process.version,
   platform: `${process.platform}/${process.arch}`,
   environment: {
-    schemaVersion: 1,
-    policy: "scrubbed-node-execution-v1",
+    schemaVersion: 2,
+    policy: "isolated-profile-allowlist-v2",
+    inheritedVariables: [],
+    isolatedVariables: [...VALIDATION_ISOLATED_VARIABLES],
+    controlledVariables: [...VALIDATION_CONTROLLED_VARIABLES],
+    credentialVariablesInherited: false,
+    dependencyInstallationNetwork: "offline",
     forbiddenVariables: [...forbiddenNodeEnvironmentVariables],
     inheritedForbiddenVariables: [
       ...inheritedForbiddenNodeEnvironmentVariables,
@@ -87,6 +94,7 @@ const validationRunDirectory = await prepareValidationRunDirectory({
   runId: report.runId,
 });
 let executionSource = null;
+let validationEnvironmentContext = null;
 
 function commandLabel(command, arguments_) {
   return [command, ...arguments_].join(" ");
@@ -264,7 +272,9 @@ async function runFromRepositorySource(command, arguments_, options = {}) {
     throw new Error("repository validation source is unavailable");
   }
   const verifyRepositorySource = async () => {
-    const current = await captureRepositoryState(root);
+    const current = await captureRepositoryState(root, {
+      environment: validationEnvironment,
+    });
     assertStableCleanRepository(report.source.started, current);
   };
   await verifyRepositorySource();
@@ -466,12 +476,26 @@ try {
         inheritedForbiddenNodeEnvironmentVariables.join(", "),
     );
   }
-  report.source.started = await captureRepositoryState(root);
+  validationEnvironmentContext = await prepareIsolatedValidationEnvironment();
+  validationEnvironment = validationEnvironmentContext.environment;
+  report.environment = {
+    ...validationEnvironmentContext.evidence,
+    forbiddenVariables: [...forbiddenNodeEnvironmentVariables],
+    inheritedForbiddenVariables: [
+      ...inheritedForbiddenNodeEnvironmentVariables,
+    ],
+  };
+  report.source.started = await captureRepositoryState(root, {
+    environment: validationEnvironment,
+  });
   assertStableCleanRepository(report.source.started, report.source.started);
   executionSource = await createValidationSourceMaterialization({
     root,
     headOid: report.source.started.headOid,
     treeOid: report.source.started.treeOid,
+    environment: validationEnvironment,
+    dependencyCacheDirectory:
+      validationEnvironmentContext.dependencyCacheDirectory,
   });
   report.executionSource = executionSource.identity;
   await run("git", [
@@ -575,7 +599,9 @@ try {
 }
 
 try {
-  report.source.finished = await captureRepositoryState(root);
+  report.source.finished = await captureRepositoryState(root, {
+    environment: validationEnvironment ?? undefined,
+  });
   if (report.source.started !== null) {
     assertStableCleanRepository(
       report.source.started,
@@ -598,6 +624,16 @@ if (executionSource !== null) {
     await executionSource.cleanup();
   } catch (error) {
     validationError ??= new Error("immutable validation source cleanup failed", {
+      cause: error,
+    });
+  }
+}
+
+if (validationEnvironmentContext !== null) {
+  try {
+    await validationEnvironmentContext.cleanup();
+  } catch (error) {
+    validationError ??= new Error("isolated validation environment cleanup failed", {
       cause: error,
     });
   }

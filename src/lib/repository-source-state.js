@@ -7,12 +7,17 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const OID_PATTERN = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 
-async function runGit(root, arguments_, { binary = false } = {}) {
+async function runGit(
+  root,
+  arguments_,
+  { binary = false, environment = undefined } = {},
+) {
   const options = {
     cwd: path.resolve(root),
     encoding: binary ? "buffer" : "utf8",
     maxBuffer: 16 * 1024 * 1024,
     windowsHide: true,
+    ...(environment === undefined ? {} : { env: environment }),
   };
   try {
     const { stdout } = await execFileAsync("git", arguments_, options);
@@ -30,9 +35,13 @@ function parseOid(value, label) {
   return oid;
 }
 
-async function assertRepositoryRoot(root) {
+async function assertRepositoryRoot(root, environment) {
   const canonicalRoot = path.resolve(root);
-  const output = await runGit(canonicalRoot, ["rev-parse", "--show-toplevel"]);
+  const output = await runGit(
+    canonicalRoot,
+    ["rev-parse", "--show-toplevel"],
+    { environment },
+  );
   const discoveredRoot = output.trim();
   if (
     !path.isAbsolute(discoveredRoot) ||
@@ -43,13 +52,13 @@ async function assertRepositoryRoot(root) {
   return canonicalRoot;
 }
 
-async function readHeadLogDigest(root) {
+async function readHeadLogDigest(root, environment) {
   const output = await runGit(root, [
     "rev-parse",
     "--path-format=absolute",
     "--git-path",
     "logs/HEAD",
-  ]);
+  ], { environment });
   const logPath = output.trim();
   if (!path.isAbsolute(logPath)) {
     throw new Error("Git returned an invalid HEAD log path");
@@ -76,28 +85,43 @@ async function readHeadLogDigest(root) {
   }
 }
 
-export async function captureRepositoryState(root) {
-  const canonicalRoot = await assertRepositoryRoot(root);
+export async function captureRepositoryState(root, { environment } = {}) {
+  const canonicalRoot = await assertRepositoryRoot(root, environment);
   const headOid = parseOid(
-    await runGit(canonicalRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    await runGit(
+      canonicalRoot,
+      ["rev-parse", "--verify", "HEAD^{commit}"],
+      { environment },
+    ),
     "HEAD",
   );
   const treeOid = parseOid(
-    await runGit(canonicalRoot, ["rev-parse", "--verify", `${headOid}^{tree}`]),
+    await runGit(
+      canonicalRoot,
+      ["rev-parse", "--verify", `${headOid}^{tree}`],
+      { environment },
+    ),
     "tree",
   );
-  const headLogDigest = await readHeadLogDigest(canonicalRoot);
+  const headLogDigest = await readHeadLogDigest(canonicalRoot, environment);
   const statusOutput = await runGit(
     canonicalRoot,
     ["status", "--porcelain=v1", "--untracked-files=all"],
-    { binary: true },
+    { binary: true, environment },
   );
   const finishedHeadOid = parseOid(
-    await runGit(canonicalRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    await runGit(
+      canonicalRoot,
+      ["rev-parse", "--verify", "HEAD^{commit}"],
+      { environment },
+    ),
     "HEAD",
   );
-  const finishedHeadLogDigest = await readHeadLogDigest(canonicalRoot);
-  await assertRepositoryRoot(canonicalRoot);
+  const finishedHeadLogDigest = await readHeadLogDigest(
+    canonicalRoot,
+    environment,
+  );
+  await assertRepositoryRoot(canonicalRoot, environment);
   if (finishedHeadOid !== headOid) {
     throw new Error("repository HEAD changed while source identity was captured");
   }

@@ -17,6 +17,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { GitObjectSnapshotter } from "../src/adapters/git-object-snapshotter.js";
 import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
+import {
+  allowlistedValidationToolEnvironment,
+} from "./system-validation-environment.mjs";
 
 const execFileAsync = promisify(execFile);
 const OBJECT_IDENTITY = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
@@ -37,15 +40,19 @@ function updateFrame(hash, value) {
   hash.update("\0");
 }
 
-async function commandCandidates() {
+async function commandCandidates(environment) {
   let output;
   try {
     const located = process.platform === "win32"
       ? await execFileAsync("where.exe", ["git"], {
           encoding: "utf8",
+          env: environment,
           windowsHide: true,
         })
-      : await execFileAsync("which", ["git"], { encoding: "utf8" });
+      : await execFileAsync("which", ["git"], {
+          encoding: "utf8",
+          env: environment,
+        });
     output = located.stdout;
   } catch {
     throw new Error("trusted Git is unavailable for validation materialization");
@@ -65,8 +72,8 @@ async function commandCandidates() {
     );
 }
 
-async function trustedSnapshotter(root) {
-  for (const candidate of await commandCandidates()) {
+async function trustedSnapshotter(root, environment) {
+  for (const candidate of await commandCandidates(environment)) {
     try {
       const canonical = await realpath(candidate);
       const snapshotter = new GitObjectSnapshotter({ gitCommand: canonical });
@@ -213,7 +220,7 @@ async function scan(directory, { requireSealed = false } = {}) {
   });
 }
 
-async function npmCliPath() {
+async function npmCliPath(environment) {
   const candidates = [
     path.join(
       path.dirname(process.execPath),
@@ -222,17 +229,21 @@ async function npmCliPath() {
       "bin",
       "npm-cli.js",
     ),
-    ...(path.isAbsolute(process.env.npm_execpath ?? "")
-      ? [process.env.npm_execpath]
+    ...(path.isAbsolute(environment.npm_execpath ?? "")
+      ? [environment.npm_execpath]
       : []),
   ];
   try {
     const located = process.platform === "win32"
       ? await execFileAsync("where.exe", ["npm.cmd"], {
           encoding: "utf8",
+          env: environment,
           windowsHide: true,
         })
-      : await execFileAsync("which", ["npm"], { encoding: "utf8" });
+      : await execFileAsync("which", ["npm"], {
+          encoding: "utf8",
+          env: environment,
+        });
     for (const line of located.stdout.split(/\r?\n/u).filter(Boolean)) {
       if (!path.isAbsolute(line)) continue;
       candidates.push(line);
@@ -281,7 +292,10 @@ async function removeNpmBinaryDirectory(target) {
   await rmdir(binaryDirectory);
 }
 
-async function installValidationDependencies(target) {
+async function installValidationDependencies(
+  target,
+  { environment: baseEnvironment, dependencyCacheDirectory },
+) {
   const lockPath = path.join(target, "package-lock.json");
   const lock = await readStableFile(lockPath, "package-lock.json");
   const publishedLock = await readOptionalStableFile(
@@ -298,7 +312,7 @@ async function installValidationDependencies(target) {
   const dependencyLockDigest = createHash("sha256")
     .update(installationLock.contents)
     .digest("hex");
-  const npmCli = await npmCliPath();
+  const npmCli = await npmCliPath(baseEnvironment);
   const configDirectory = await mkdtemp(
     path.join(os.tmpdir(), "mydashboard-validation-npm-"),
   );
@@ -312,8 +326,11 @@ async function installValidationDependencies(target) {
     });
     await writeFile(globalConfig, "", { flag: "wx", mode: 0o600 });
     const environment = {
-      ...process.env,
+      ...baseEnvironment,
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1",
+      ...(dependencyCacheDirectory === null
+        ? {}
+        : { NPM_CONFIG_CACHE: dependencyCacheDirectory }),
     };
     for (const name of NODE_INJECTION_ENVIRONMENT) delete environment[name];
     await execFileAsync(process.execPath, [
@@ -437,9 +454,16 @@ function assertMaterializationRequest({ root, headOid, treeOid }) {
   }
 }
 
-async function materializeCommittedTree({ root, headOid }, target) {
+async function materializeCommittedTree(
+  { root, headOid },
+  target,
+  environment,
+) {
   const canonicalRoot = await realpath(root);
-  const { boundary, snapshotter } = await trustedSnapshotter(canonicalRoot);
+  const { boundary, snapshotter } = await trustedSnapshotter(
+    canonicalRoot,
+    environment,
+  );
   await snapshotter.materialize({
     sourceRoot: canonicalRoot,
     targetRoot: target,
@@ -455,14 +479,17 @@ async function materializeCommittedTree({ root, headOid }, target) {
   });
 }
 
-export async function deriveCommittedRuntimeSourceIdentity(request) {
+export async function deriveCommittedRuntimeSourceIdentity(
+  request,
+  { environment = allowlistedValidationToolEnvironment() } = {},
+) {
   assertMaterializationRequest(request);
   const target = await mkdtemp(
     path.join(os.tmpdir(), "mydashboard-runtime-source-"),
   );
   let identity;
   try {
-    await materializeCommittedTree(request, target);
+    await materializeCommittedTree(request, target, environment);
     await seal(target);
     const runtime = await computeRuntimeSourceIdentity(target);
     identity = Object.freeze({
@@ -497,15 +524,34 @@ export async function createValidationSourceMaterialization({
   root,
   headOid,
   treeOid,
+  environment = null,
+  dependencyCacheDirectory = null,
 }) {
   const request = { root, headOid, treeOid };
   assertMaterializationRequest(request);
+  if (
+    environment === null ||
+    typeof environment !== "object" ||
+    Array.isArray(environment) ||
+    (
+      dependencyCacheDirectory !== null &&
+      (
+        typeof dependencyCacheDirectory !== "string" ||
+        !path.isAbsolute(dependencyCacheDirectory)
+      )
+    )
+  ) {
+    throw new Error("validation materialization environment is invalid");
+  }
   const target = await mkdtemp(
     path.join(os.tmpdir(), "mydashboard-validation-source-"),
   );
   try {
-    await materializeCommittedTree(request, target);
-    const dependencyIdentity = await installValidationDependencies(target);
+    await materializeCommittedTree(request, target, environment);
+    const dependencyIdentity = await installValidationDependencies(target, {
+      environment,
+      dependencyCacheDirectory,
+    });
     await seal(target);
     const scanned = await scan(target, { requireSealed: true });
     const identity = Object.freeze({

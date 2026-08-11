@@ -24,6 +24,11 @@ import {
   deriveCommittedRuntimeSourceIdentity,
 } from "./system-validation-materialization.mjs";
 import {
+  VALIDATION_CONTROLLED_VARIABLES,
+  VALIDATION_INHERITED_VARIABLES,
+  VALIDATION_ISOLATED_VARIABLES,
+} from "./system-validation-environment.mjs";
+import {
   selectCommittedNodeTestFiles,
   u9PriorityTestPath,
 } from "./system-node-test-contract.mjs";
@@ -1096,17 +1101,36 @@ function validateReport(
   }
   if (
     !hasExactKeys(report.environment, [
+      "controlledVariables",
+      "credentialVariablesInherited",
+      "dependencyInstallationNetwork",
       "forbiddenVariables",
       "inheritedForbiddenVariables",
+      "inheritedVariables",
+      "isolatedVariables",
       "policy",
       "schemaVersion",
     ]) ||
-    report.environment.schemaVersion !== 1 ||
-    report.environment.policy !== "scrubbed-node-execution-v1" ||
+    report.environment.schemaVersion !== 2 ||
+    report.environment.policy !== "isolated-profile-allowlist-v2" ||
     JSON.stringify(report.environment.forbiddenVariables) !==
       JSON.stringify(["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"]) ||
     !Array.isArray(report.environment.inheritedForbiddenVariables) ||
-    report.environment.inheritedForbiddenVariables.length !== 0
+    report.environment.inheritedForbiddenVariables.length !== 0 ||
+    !Array.isArray(report.environment.inheritedVariables) ||
+    new Set(report.environment.inheritedVariables).size !==
+      report.environment.inheritedVariables.length ||
+    report.environment.inheritedVariables.some(
+      (name) => !VALIDATION_INHERITED_VARIABLES.includes(name),
+    ) ||
+    JSON.stringify([...report.environment.inheritedVariables].sort()) !==
+      JSON.stringify(report.environment.inheritedVariables) ||
+    JSON.stringify(report.environment.isolatedVariables) !==
+      JSON.stringify(VALIDATION_ISOLATED_VARIABLES) ||
+    JSON.stringify(report.environment.controlledVariables) !==
+      JSON.stringify(VALIDATION_CONTROLLED_VARIABLES) ||
+    report.environment.credentialVariablesInherited !== false ||
+    report.environment.dependencyInstallationNetwork !== "offline"
   ) {
     throw new Error("system validation environment contract is invalid");
   }

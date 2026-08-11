@@ -63,6 +63,7 @@ async function createValidationFixture(t) {
     "scripts/system-node-test-contract.mjs",
     "scripts/system-ui-artifact-receipt.mjs",
     "scripts/system-validation-command.mjs",
+    "scripts/system-validation-environment.mjs",
     "scripts/system-validation-materialization.mjs",
     "scripts/system-validation-provenance.mjs",
     "scripts/validate-system.mjs",
@@ -135,6 +136,14 @@ async function createValidationFixture(t) {
       "  assert.equal(process.env.NODE_OPTIONS, undefined);",
       "  assert.equal(process.env.NODE_PATH, undefined);",
       "});",
+      "test('validation children inherit no host credentials or profiles', () => {",
+      "  for (const name of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'NPM_TOKEN', 'MYDASHBOARD_TEST_SECRET']) {",
+      "    assert.equal(process.env[name], undefined, name);",
+      "  }",
+      "  assert.equal(process.env.HOME, process.env.USERPROFILE);",
+      "  assert.equal(process.env.GIT_CONFIG_NOSYSTEM, '1');",
+      "  assert.equal(process.env.GIT_TERMINAL_PROMPT, '0');",
+      "});",
       "test('validation commands execute from a detached materialized source', () => {",
       `  assert.notEqual(process.cwd().toLowerCase(), ${JSON.stringify(root.toLowerCase())});`,
       "});",
@@ -149,6 +158,9 @@ async function createValidationFixture(t) {
       "import test from 'node:test';",
       "test('distribution validation retains its clean Git source context', () => {",
       "  assert.equal(existsSync('.git'), true);",
+      "  assert.equal(process.env.GH_TOKEN, undefined);",
+      "  assert.equal(process.env.OPENAI_API_KEY, undefined);",
+      "  assert.equal(process.env.HOME, process.env.USERPROFILE);",
       "});",
       "",
     ].join("\n"),
@@ -345,7 +357,15 @@ test("the system validator binds a passing report to one clean Git source state"
   await execFileAsync(process.execPath, ["scripts/validate-system.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: validationEnvironment(),
+    env: {
+      ...validationEnvironment(),
+      OPENAI_API_KEY: "must-not-enter-validation",
+      ANTHROPIC_API_KEY: "must-not-enter-validation",
+      GH_TOKEN: "must-not-enter-validation",
+      GITHUB_TOKEN: "must-not-enter-validation",
+      NPM_TOKEN: "must-not-enter-validation",
+      MYDASHBOARD_TEST_SECRET: "must-not-enter-validation",
+    },
     windowsHide: true,
   });
 
@@ -364,12 +384,44 @@ test("the system validator binds a passing report to one clean Git source state"
   assert.equal(report.source.started.headOid, expectedHeadOid);
   assert.equal(report.source.started.treeOid, expectedTreeOid);
   assert.equal(report.source.started.clean, true);
-  assert.deepEqual(report.environment, {
-    schemaVersion: 1,
-    policy: "scrubbed-node-execution-v1",
-    forbiddenVariables: ["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"],
-    inheritedForbiddenVariables: [],
-  });
+  assert.equal(report.environment.schemaVersion, 2);
+  assert.equal(
+    report.environment.policy,
+    "isolated-profile-allowlist-v2",
+  );
+  assert.deepEqual(
+    report.environment.forbiddenVariables,
+    ["NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE"],
+  );
+  assert.deepEqual(report.environment.inheritedForbiddenVariables, []);
+  assert.equal(report.environment.credentialVariablesInherited, false);
+  assert.equal(report.environment.dependencyInstallationNetwork, "offline");
+  assert.deepEqual(report.environment.isolatedVariables, [
+    "APPDATA",
+    "HOME",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+  ]);
+  assert.deepEqual(report.environment.controlledVariables, [
+    "GCM_INTERACTIVE",
+    "GH_PROMPT_DISABLED",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_TERMINAL_PROMPT",
+    "NO_COLOR",
+  ]);
+  assert.equal(
+    report.environment.inheritedVariables.some((name) =>
+      /token|key|secret|credential|profile|home|appdata|proxy/iu.test(name)
+    ),
+    false,
+  );
   assert.deepEqual(
     report.steps.find(({ name }) => name === "git diff --check").command,
     {
@@ -412,8 +464,8 @@ test("the system validator binds a passing report to one clean Git source state"
     report.steps.find(({ name }) => name === "complete Node test suite").testResults,
     {
       summary: {
-        tests: 5,
-        passed: 4,
+        tests: 6,
+        passed: 5,
         failed: 0,
         cancelled: 0,
         skipped: 1,
@@ -442,7 +494,12 @@ test("the system validator binds a passing report to one clean Git source state"
           status: "passed",
         },
         {
-          identity: "tap:5:validation commands execute from a detached materialized source",
+          identity: "tap:5:validation children inherit no host credentials or profiles",
+          name: "validation children inherit no host credentials or profiles",
+          status: "passed",
+        },
+        {
+          identity: "tap:6:validation commands execute from a detached materialized source",
           name: "validation commands execute from a detached materialized source",
           status: "passed",
         },
@@ -741,6 +798,22 @@ test("live UI validation records the exact managed runtime source identity", asy
 
 test("live UI validation rejects service replacement during browser scenarios", async (t) => {
   const root = await createValidationFixture(t);
+  const liveValidationPath = path.join(
+    root,
+    "scripts/system-live-validation.mjs",
+  );
+  const liveValidation = await readFile(liveValidationPath, "utf8");
+  const replacementSimulation = liveValidation.replace(
+    "if (process.env.MYDASHBOARD_TEST_REPLACE_LIVE === '1' && expectedLiveService !== null && verificationCount > 1) {",
+    "if (expectedLiveService !== null && verificationCount > 1) {",
+  );
+  assert.notEqual(replacementSimulation, liveValidation);
+  await writeFile(
+    liveValidationPath,
+    replacementSimulation,
+  );
+  await git(root, "add", "scripts/system-live-validation.mjs");
+  await git(root, "commit", "--quiet", "-m", "simulate live replacement");
 
   await assert.rejects(
     execFileAsync(
@@ -749,10 +822,7 @@ test("live UI validation rejects service replacement during browser scenarios", 
       {
         cwd: root,
         encoding: "utf8",
-        env: {
-          ...validationEnvironment(),
-          MYDASHBOARD_TEST_REPLACE_LIVE: "1",
-        },
+        env: validationEnvironment(),
         windowsHide: true,
       },
     ),

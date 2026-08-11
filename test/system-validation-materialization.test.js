@@ -65,6 +65,18 @@ async function loadMaterialization() {
   }
 }
 
+async function isolatedEnvironment(t) {
+  const { prepareIsolatedValidationEnvironment } = await import(
+    "../scripts/system-validation-environment.mjs"
+  );
+  const context = await prepareIsolatedValidationEnvironment();
+  t.after(() => context.cleanup());
+  return {
+    environment: context.environment,
+    dependencyCacheDirectory: context.dependencyCacheDirectory,
+  };
+}
+
 test("materializes and seals the exact committed validation source", async (t) => {
   const setup = await fixture(t);
   await writeFile(
@@ -72,7 +84,10 @@ test("materializes and seals the exact committed validation source", async (t) =
     "export const value = 'transient worktree';\n",
   );
   const { createValidationSourceMaterialization } = await loadMaterialization();
-  const materialization = await createValidationSourceMaterialization(setup);
+  const materialization = await createValidationSourceMaterialization({
+    ...setup,
+    ...await isolatedEnvironment(t),
+  });
   t.after(() => materialization.cleanup());
 
   assert.equal(
@@ -112,7 +127,10 @@ test("dependency materialization ignores untracked host node_modules", async (t)
   await mkdir(path.dirname(hostDependency), { recursive: true });
   await writeFile(hostDependency, "untrusted host dependency\n");
   const { createValidationSourceMaterialization } = await loadMaterialization();
-  const materialization = await createValidationSourceMaterialization(setup);
+  const materialization = await createValidationSourceMaterialization({
+    ...setup,
+    ...await isolatedEnvironment(t),
+  });
   t.after(() => materialization.cleanup());
 
   await assert.rejects(
@@ -159,7 +177,10 @@ test("rejects a published shrinkwrap that differs from the checkout lock", async
   const { createValidationSourceMaterialization } = await loadMaterialization();
 
   await assert.rejects(
-    createValidationSourceMaterialization(setup),
+    createValidationSourceMaterialization({
+      ...setup,
+      ...await isolatedEnvironment(t),
+    }),
     /published dependency lock differs from the checkout lock/u,
   );
 });
@@ -167,7 +188,10 @@ test("rejects a published shrinkwrap that differs from the checkout lock", async
 test("detects a validation source changed after sealing", async (t) => {
   const setup = await fixture(t);
   const { createValidationSourceMaterialization } = await loadMaterialization();
-  const materialization = await createValidationSourceMaterialization(setup);
+  const materialization = await createValidationSourceMaterialization({
+    ...setup,
+    ...await isolatedEnvironment(t),
+  });
   t.after(() => materialization.cleanup());
   const file = path.join(materialization.directory, "src/app.js");
   await chmod(file, 0o644);
