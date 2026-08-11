@@ -105,13 +105,16 @@ Copy-Item config.example.json config.json
 
 首版运行平台和经过验证的版本范围是 Windows x64、Codex CLI `0.147.x`（`>=0.147.0 <0.148.0`）及 Claude CLI `>=2.1.222 <2.2.0`。CLI 必须以官方 npm 包安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统会核对包清单、平台包、版本、真实路径、文件身份与摘要，不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
 
-CLI 不复用宿主机已经登录的 Codex/Claude 个人配置、OAuth 会话、插件、MCP 或规则。启动 MyDashboard 前，分别通过服务进程环境提供固定名称 `OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`；密钥不能写入配置。一个安全但尚未分配、尚未授权出机的 Provider 示例是：
+Codex 有两种明确且不自动切换的认证方式。推荐的 `codex-login` 受管代理读取“运行 MyDashboard 的同一 Windows 用户”的文件式 Codex 登录；宿主根只来自服务启动时已有的 `CODEX_HOME`，否则固定为该用户的 `.codex`，页面和配置都不能提供路径。代理不挂载完整宿主 profile，只在每个任务边界校验直接子文件 `auth.json` 的普通文件身份、owner、ACL、硬链接数和大小，再通过 MyDashboard 私有镜像把认证材料放入一次性 profile。旧配置及显式 `api-key` 模式仍只读取服务环境的 `OPENAI_API_KEY`，不会静默改用 ChatGPT 登录或改变计费路径。
+
+Claude CLI 首版只支持 `api-key`，从服务环境读取 `ANTHROPIC_API_KEY`；Claude 登录 profile 和 OS keyring 均不受支持。任何 API key 都不能写入配置。一个安全但尚未分配、尚未授权出机的 Provider 示例是：
 
 ```json
 {
   "brainProviders": {
     "codex-local-cli": {
       "kind": "codex-cli",
+      "credentialMode": "codex-login",
       "remote": true,
       "timeoutMs": 300000,
       "maxResponseBytes": 131072,
@@ -119,6 +122,7 @@ CLI 不复用宿主机已经登录的 Codex/Claude 个人配置、OAuth 会话�
     },
     "claude-local-cli": {
       "kind": "claude-cli",
+      "credentialMode": "api-key",
       "remote": true,
       "timeoutMs": 300000,
       "maxResponseBytes": 131072,
@@ -128,9 +132,13 @@ CLI 不复用宿主机已经登录的 Codex/Claude 个人配置、OAuth 会话�
 }
 ```
 
-在“配置”页面选择“Codex CLI（单任务受监管）”或“Claude CLI（单任务受监管）”创建 Provider，再把 Provider 和模型分配给岗位的日常大脑或任务大脑。CLI 始终视为远程推理；任务包含需求、代码或记忆时，必须分别打开该岗位对应的 `remoteData` 授权。保存草稿、查看影响并逐项确认激活后，使用受管重启使新版本生效。
+在“配置”页面选择“Codex CLI（单任务受监管）”或“Claude CLI（单任务受监管）”创建 Provider。新 Codex Provider 默认显示“Codex 当前登录（受管代理，推荐）”，也可显式选择“环境变量 API Key”；Claude 只能选择 API Key。再把 Provider 和模型分配给岗位的日常大脑或任务大脑。CLI 始终视为远程推理；任务包含需求、代码或记忆时，必须分别打开该岗位对应的 `remoteData` 授权。保存草稿、查看影响并逐项确认激活后，使用受管重启使新版本生效。
 
-每次调用都使用空白临时 profile 和独立工作目录，不继承 `PATH`、Git/GitHub/SSH 凭据或宿主仓库，也不允许工具、插件、浏览器、MCP、持久会话或直接动作。CLI 只返回不可信判断；代码修改、GitHub 写入等请求仍必须经过原有策略、隔离执行器和逐项确认。超时、取消、输出越界、异常退出或无效结果都不会在同一任务修订上自动再次调用 CLI。远程模型调用可能产生供应商费用；具体计费和数据保留规则由供应商决定。
+配置页的“Codex CLI 大脑能力”卡片只显示脱敏状态：`available`、`file_login_unavailable`、`unsafe_source`、`broker_blocked` 或 `cli_unavailable`。也可在受管服务启动后运行 `node scripts/verify-codex-login-readiness.mjs --origin http://127.0.0.1:4173`；该命令只请求固定本机状态接口，不调用模型、不访问 PR，成功时只打印状态名。
+
+每次调用都使用空白临时 profile 和独立工作目录；`codex-login` 只额外获得私有镜像中的认证文件。子进程不继承 `PATH`、宿主其他 Codex 配置、Git/GitHub/SSH 凭据或宿主仓库，也不允许工具、插件、浏览器、MCP、持久会话或直接动作。所有 `codex-login` Provider 对同一服务用户串行运行，避免刷新令牌竞争；重新执行 `codex login`、切换账号或 `codex logout` 后，下一任务边界自动重新检测。刷新结果只写 MyDashboard 私有镜像，不写回宿主登录文件；镜像不进入项目数据、备份、恢复或 npm/开源分发。
+
+CLI 只返回不可信判断；选择登录模式不会增加岗位、代码或 GitHub 权限。代码修改、GitHub 写入等请求仍必须经过原有策略、隔离执行器和逐项确认。超时、取消、输出越界、异常退出或无效结果都不会在同一任务修订上自动再次调用 CLI。远程模型调用可能产生供应商费用；具体计费和数据保留规则由供应商决定。
 
 每个岗位的 `brain` 负责日常巡查、摘要和低风险判断；可选的 `taskBrain` 专门处理已分派的 PR、代码或其他高风险任务。真实 PR 的冲突处理、代码修改、Review 和 CI 诊断会选择岗位明确配置的高能力 `taskBrain`；缺少该配置、凭据引用或代码出机授权时，任务等待所有者处理，不会偷偷降级到日常 Ollama。更换任一大脑只改变推理质量，不会增加岗位、代码或 GitHub 权限。
 

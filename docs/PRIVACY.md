@@ -36,19 +36,32 @@ variables and are not stored in application configuration or responses.
 Codex CLI and Claude CLI are also remote providers even though MyDashboard
 starts a local executable. The executable sends the authorized prompt to its
 vendor. These providers therefore require the same explicit `requirements`,
-`code`, and `memory` grants as an HTTPS provider. MyDashboard uses only the
-fixed `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` from the service environment; it
-does not reuse host login profiles, OAuth sessions, `CLAUDE_CODE_OAUTH_TOKEN`,
-plugins, MCP servers, or browser state.
+`code`, and `memory` grants as an HTTPS provider. Claude CLI and Codex's
+backward-compatible API-key mode use only the fixed `ANTHROPIC_API_KEY` or
+`OPENAI_API_KEY` from the service environment. Claude login profiles,
+`CLAUDE_CODE_OAUTH_TOKEN`, and OS-keyring login export are not supported.
+
+Codex may instead use `credentialMode: "codex-login"`. The source is fixed to
+the service startup `CODEX_HOME` or the same Windows user's default file login;
+the page cannot choose a path or view credentials. MyDashboard validates the
+source's file identity, owner, ACL, links, and size, then stores an opaque atomic
+mirror in a private location outside the repository, application data, backup,
+restore, and package roots. It copies only the authentication file into each
+disposable profile, never exposes the full host profile, and never writes a
+refreshed credential back to the host source. Login, account switch, or logout
+is detected at the next serialized task boundary. Account identity, token,
+source path, timestamps, and digests are not returned by the status API or UI.
 
 Every CLI call receives a fresh temporary home/config/cache tree and no
 inherited Git, GitHub, SSH, proxy, or general host environment. The child is not
 started in the source repository and its tools and persistent sessions are
 disabled. MyDashboard validates its bounded structured response as untrusted
 data, deletes the verified invocation directory, and stores only the normal
-local ledger, memory, audit evidence, and bounded failure record. Persistent
-cross-task context remains local to MyDashboard. A vendor may still retain or
-bill for an authorized request according to its own policy.
+local ledger, memory, audit evidence, bounded failure record, and—only for
+Codex login mode—the separately protected credential mirror. That mirror is
+excluded from application backup and recovery and from npm/open-source
+distribution. Persistent task context remains local to MyDashboard. A vendor
+may still retain or bill for an authorized request according to its own policy.
 
 Authorization limits transmission but cannot control what a third-party model
 provider does after receiving an allowed request. Review that provider's terms,

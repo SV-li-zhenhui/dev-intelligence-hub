@@ -56,11 +56,26 @@ Codex CLI and Claude CLI are remote reasoning providers behind the same brain
 router and data-class admission gate as HTTPS providers. The trusted controller
 remains deterministic MyDashboard code. For each admitted task revision it
 locates one version-admitted official Windows x64 npm binary, creates a fresh
-private invocation directory and empty profile roots, supplies only the fixed
-vendor API-key environment variable, and starts one bounded child-process tree.
-The child has no inherited `PATH`, host profile, Git/GitHub/SSH environment,
-repository working directory, plugin, MCP, browser, shell tool, or persistent
-session.
+private invocation directory and empty profile roots, and starts one bounded
+child-process tree. Claude uses only its fixed API-key environment variable.
+Codex either uses the backward-compatible API-key mode or a brokered
+`credentialMode: "codex-login"`; missing mode remains API-key for legacy
+configurations.
+
+The login broker derives the source only from startup `CODEX_HOME` or the
+current Windows user's default Codex directory. It handle-validates the one
+file login source, synchronizes an atomic private mirror outside project/data/
+backup roots, and stages only the authentication file into the disposable
+profile. It never mounts the full host profile or writes back to the host login
+source. All login-mode providers for one service user share a FIFO lease across
+source synchronization, the model process, refreshed-credential capture, and
+cleanup. Login, account switch, and logout changes are therefore observed only
+at a task boundary without concurrent refresh overwrite.
+
+The child has no inherited `PATH`, host configuration beyond that isolated
+authentication file, Git/GitHub/SSH environment, repository working directory,
+plugin, MCP, browser, shell tool, or persistent session. The private credential
+mirror is not part of backup, restore, packaging, or open-source distribution.
 
 The vendor strategies use fixed no-authority flags and accept only bounded,
 strict structured output. Output is untrusted: it returns to the existing

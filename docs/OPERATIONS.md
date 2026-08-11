@@ -145,17 +145,35 @@ API-key name, plugin, or MCP server. Production discovery accepts only the
 tested official npm package shape and native executable. An unsupported,
 missing, replaced, linked, or unverifiable binary remains unavailable.
 
-Supply credentials to the managed service before `Start` or `Restart`:
+Choose one explicit credential mode before `Start` or `Restart`:
 
-- Codex CLI reads only `OPENAI_API_KEY`.
-- Claude CLI reads only `ANTHROPIC_API_KEY`.
+- Recommended Codex `credentialMode: "codex-login"` proxies the current
+  service user's file login. If `CODEX_HOME` existed when the service started,
+  that absolute directory is the fixed source root; otherwise the source is the
+  same Windows user's default Codex directory. Configuration and browser input
+  cannot select or override this path.
+- Backward-compatible Codex `credentialMode: "api-key"` reads only
+  `OPENAI_API_KEY`. A missing mode remains API-key so an old configuration never
+  silently changes account or billing path.
+- Claude CLI supports only `credentialMode: "api-key"` and reads only
+  `ANTHROPIC_API_KEY`. Claude login profiles, `CLAUDE_CODE_OAUTH_TOKEN`, and OS
+  keyring export are not supported in the first release.
 
-Host CLI login profiles and `CLAUDE_CODE_OAUTH_TOKEN` are deliberately not
-reused. Keep keys in the operating-system or service environment, not in
+Keep API keys in the operating-system or service environment, not in
 `config.json`, the configuration UI, scripts, logs, or command history. The
 managed service must inherit the vendor package's npm binary directory in its
 `PATH`, but each model child receives an empty-origin environment and does not
 inherit that `PATH`.
+
+Login mode requires an existing regular `auth.json` owned by the same Windows
+user, with one link, a bounded size, no linked ancestor, and no unauthorized
+write/delete/owner/ACL rights. MyDashboard does not change the host file or its
+ACL. It copies only the validated authentication bytes into a private atomic
+mirror outside project, data, backup, restore, and code-workspace roots. The
+mirror is never logged, backed up, restored, or packaged. All login-mode Codex
+calls for that service user are serial. Running `codex login`, switching the
+account, or `codex logout` is detected at the next task boundary; refreshed
+credentials stay in the private mirror and are never written back to the host.
 
 In **配置**, add a CLI Provider, assign it and an explicit model to a role's
 routine brain or task brain, and authorize each required remote data class
@@ -168,6 +186,31 @@ confirm activation one item at a time. The active runtime is immutable, so use:
 ```
 
 after activation. Resume only the intended role after readiness returns.
+
+Run the fixed no-model readiness check against the managed loopback service:
+
+```powershell
+node scripts/verify-codex-login-readiness.mjs --origin http://127.0.0.1:4173
+```
+
+The command performs one bounded GET to the sanitized status endpoint. It does
+not invoke a model, inspect a repository or PR, accept credentials/headers, or
+print response details. Success prints exactly one of these states:
+
+- `available`: the supported CLI and safe file login are usable;
+- `file_login_unavailable`: no supported file login is available (logged out or
+  first-release-unsupported keyring storage);
+- `unsafe_source`: the login file identity, owner, ACL, links, or size is unsafe;
+- `broker_blocked`: private mirror publication, integrity, or cleanup is blocked;
+- `cli_unavailable`: the fixed supported Codex CLI package is unavailable.
+
+For `file_login_unavailable`, run `codex login` under the same Windows user and
+select file credential storage. For `unsafe_source`, inspect and intentionally
+repair ownership/ACLs outside MyDashboard; the service will not weaken them for
+you. For `broker_blocked`, retain the private runtime evidence and investigate
+before retrying. For `cli_unavailable`, install a supported official npm version
+in the managed service account's `PATH`. Restart only when configuration state
+says a confirmed active version is pending restart.
 
 Each claimed task starts at most one vendor process. It runs in a fresh private
 directory with tools, plugins, browser integration, MCP, slash commands, host

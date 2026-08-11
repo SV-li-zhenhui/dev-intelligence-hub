@@ -93,9 +93,10 @@ async function availablePort() {
   return port;
 }
 
-function cleanManagerEnvironment(environmentRoot) {
+function cleanManagerEnvironment(environmentRoot, sourceEnvironment = process.env) {
   const environment = {};
   const replacedNames = new Set([
+    "codex_home",
     "home",
     "localappdata",
     "path",
@@ -106,7 +107,7 @@ function cleanManagerEnvironment(environmentRoot) {
   ]);
   const sensitiveName =
     /(?:token|secret|password|credential|cookie|api[_-]?key|auth|proxy|github|openai|doubao|ark)/iu;
-  for (const [name, value] of Object.entries(process.env)) {
+  for (const [name, value] of Object.entries(sourceEnvironment)) {
     if (
       replacedNames.has(name.toLowerCase()) ||
       name.startsWith("MYDASHBOARD_") ||
@@ -612,6 +613,20 @@ async function materializeTrackedFiles({
   }
 }
 
+test("clean manager environment excludes every spelling of the host Codex login root", () => {
+  const { environment } = cleanManagerEnvironment("C:\\clean-room", {
+    CODEX_HOME: "C:\\Users\\private-owner\\.codex",
+    CoDeX_HoMe: "C:\\Users\\second-private-owner\\.codex",
+    SAFE_PORTABLE_VALUE: "preserved",
+  });
+
+  assert.equal(
+    Object.keys(environment).some((name) => name.toLowerCase() === "codex_home"),
+    false,
+  );
+  assert.equal(environment.SAFE_PORTABLE_VALUE, "preserved");
+});
+
 test("npm distribution contains the safe bootstrap and excludes local runtime state", () => {
   const files = loadDistributionManifest();
   const included = new Set(files);
@@ -627,11 +642,20 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "npm-shrinkwrap.json",
     "package.json",
     "README.md",
+    "scripts/verify-codex-login-readiness.mjs",
     "src/lib/config.js",
     "src/lib/windows-codex-credential-helper.ps1",
     "src/server.js",
   ]) {
     assert.equal(included.has(required), true, `missing ${required}`);
+  }
+
+  for (const filePath of files) {
+    assert.doesNotMatch(
+      filePath,
+      /(?:^|\/)(?:auth\.json|\.codex|\.mydashboard-cli-credentials-v1)(?:\/|$)/u,
+      `packaged Codex credential material ${filePath}`,
+    );
   }
 
   for (const forbidden of [
@@ -655,6 +679,69 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
       /^(?:data|logs|backups|restore-control|validation-artifacts|node_modules|\.review-runs|playwright-report|test-results|test|test-support|docs\/(?:plans|reviews))(?:\/|$)/u,
     );
   }
+});
+
+test("brokered Codex login examples and public guidance agree with the runtime", () => {
+  const example = JSON.parse(
+    readFileSync(path.join(root, "config.example.json"), "utf8"),
+  );
+  assert.equal(
+    example.brainProviders["codex-local-cli"].credentialMode,
+    "codex-login",
+  );
+  assert.equal(
+    example.brainProviders["claude-local-cli"].credentialMode,
+    "api-key",
+  );
+
+  const documents = Object.fromEntries(
+    [
+      "README.md",
+      "SECURITY.md",
+      "docs/ARCHITECTURE.md",
+      "docs/OPERATIONS.md",
+      "docs/PRIVACY.md",
+    ].map((filePath) => [
+      filePath,
+      readFileSync(path.join(root, filePath), "utf8"),
+    ]),
+  );
+  const guidance = Object.values(documents).join("\n");
+  for (const [filePath, contents] of Object.entries(documents)) {
+    assert.match(contents, /codex-login/u, `${filePath} omits brokered login`);
+  }
+  assert.match(
+    documents["docs/OPERATIONS.md"],
+    /node scripts\/verify-codex-login-readiness\.mjs --origin http:\/\/127\.0\.0\.1:4173/u,
+  );
+  for (const expected of [
+    /credentialMode.*codex-login/isu,
+    /same Windows user|同一 Windows 用户/iu,
+    /file_login_unavailable/u,
+    /unsafe_source/u,
+    /broker_blocked/u,
+    /cli_unavailable/u,
+    /serial|串行/iu,
+    /keyring/iu,
+    /logout|退出登录/iu,
+    /API-key|API Key/iu,
+    /backup|备份/iu,
+    /restart|重启/iu,
+  ]) {
+    assert.match(guidance, expected);
+  }
+  assert.doesNotMatch(
+    documents["README.md"],
+    /CLI 不复用宿主机已经登录的 Codex\/Claude/iu,
+  );
+  assert.doesNotMatch(
+    documents["docs/OPERATIONS.md"],
+    /Codex CLI reads only `OPENAI_API_KEY`/u,
+  );
+  assert.doesNotMatch(
+    documents["docs/PRIVACY.md"],
+    /MyDashboard uses only the\s+fixed `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`/u,
+  );
 });
 
 test("Apache-2.0 distribution identity rejects missing, corrupt, inconsistent, or unpackaged license artifacts", () => {
@@ -1208,6 +1295,18 @@ test(
         assert.equal(status.body.maintenance.mode, "open");
         assert.equal(Array.isArray(status.body.backups.items), true);
 
+        const brainStatus = await pollJson(
+          `http://127.0.0.1:${port}/api/brain-providers/status`,
+        );
+        assert.equal(brainStatus.body.schemaVersion, 1);
+        assert.equal(
+          brainStatus.body.state,
+          process.platform === "win32"
+            ? "file_login_unavailable"
+            : "cli_unavailable",
+        );
+        assert.equal(brainStatus.body.fileLoginAvailable, false);
+
         const dashboard = await pollJson(
           `http://127.0.0.1:${port}/api/dashboard`,
         );
@@ -1222,7 +1321,7 @@ test(
         );
         assert.match(managedStatus.stdout, new RegExp(`PID ${managedProcessId}`));
 
-        const responseText = `${live.text}\n${status.text}\n${dashboard.text}`.toLowerCase();
+        const responseText = `${live.text}\n${status.text}\n${dashboard.text}\n${brainStatus.text}`.toLowerCase();
         for (const privatePath of [
           cleanRoot,
           root,

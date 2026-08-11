@@ -53,6 +53,22 @@ binding, and recovery-before-retry for uncertain external results.
 - Keep backups and the active data directory on trusted local storage with
   user-only permissions.
 - Treat logs, backups, memory records, and confirmation history as sensitive.
+- For brokered Codex login, run MyDashboard under the same Windows user that
+  owns the file login. Never place an authentication file, private credential
+  mirror, or account identifier in configuration, project data, backup, logs,
+  tests, or a distribution archive.
+- Do not make a linked, shared-writable, wrong-owner, oversized, or otherwise
+  unsafe Codex login source pass by disabling checks. MyDashboard reports
+  `unsafe_source` and never changes the host file or ACL automatically.
+
+`credentialMode: "codex-login"` changes only how a Codex model request
+authenticates. The broker selects a fixed same-user file source, stages only its
+validated authentication bytes into a disposable profile, serializes calls for
+that login identity, captures refreshes into a private mirror, and excludes the
+mirror from backup, restore, npm packaging, and open-source distribution. It
+does not expose the full host profile, support OS keyring export, or grant Git,
+GitHub, repository, code-execution, plugin, MCP, shell, or browser authority.
+Claude login brokering is not implemented; Claude remains API-key only.
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) and
 [docs/OPERATIONS.md](docs/OPERATIONS.md) for the complete data and operational

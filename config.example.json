@@ -132,6 +132,7 @@
     },
     "codex-local-cli": {
       "kind": "codex-cli",
+      "credentialMode": "codex-login",
       "remote": true,
       "timeoutMs": 300000,
       "maxResponseBytes": 131072,
@@ -139,6 +140,7 @@
     },
     "claude-local-cli": {
       "kind": "claude-cli",
+      "credentialMode": "api-key",
       "remote": true,
       "timeoutMs": 300000,
       "maxResponseBytes": 131072,
