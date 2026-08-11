@@ -181,7 +181,11 @@ function managedRuntimeInfo(rootDirectory, environment) {
   return JSON.parse(result.stdout);
 }
 
-async function pollJson(url, timeoutMilliseconds = 45_000) {
+async function pollJson(
+  url,
+  timeoutMilliseconds = 45_000,
+  accept = () => true,
+) {
   const deadline = Date.now() + timeoutMilliseconds;
   let lastFailure = "no response";
   while (Date.now() < deadline) {
@@ -189,9 +193,12 @@ async function pollJson(url, timeoutMilliseconds = 45_000) {
       const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
       const text = await response.text();
       if (response.status === 200) {
-        return { body: JSON.parse(text), text };
+        const body = JSON.parse(text);
+        if (accept(body)) return { body, text };
+        lastFailure = "HTTP 200 response has not reached the required state";
+      } else {
+        lastFailure = `HTTP ${response.status}`;
       }
-      lastFailure = `HTTP ${response.status}`;
     } catch (error) {
       lastFailure = error?.name || "request failed";
     }
@@ -1189,6 +1196,8 @@ test(
 
         const status = await pollJson(
           `http://127.0.0.1:${port}/api/system/status`,
+          45_000,
+          (body) => body?.readiness?.ready === true,
         );
         assert.equal(status.body.liveness.live, true);
         assert.equal(status.body.readiness.schemaVersion, 1);
