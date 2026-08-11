@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { types as utilTypes } from "node:util";
@@ -16,6 +17,7 @@ const ENVELOPE_NAME = "credential.json";
 const AUTH_NAME = "auth.json";
 const PUBLIC_FAILURE = Symbol("public Codex login broker failure");
 const SNAPSHOT_STATE = new WeakMap();
+const STORE_COORDINATORS = new Map();
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const ENVELOPE_KEYS = Object.freeze([
   "schemaVersion",
@@ -97,8 +99,8 @@ function exactDataRecord(value, expectedKeys) {
   if (
     value === null ||
     typeof value !== "object" ||
-    Array.isArray(value) ||
-    utilTypes.isProxy(value)
+    utilTypes.isProxy(value) ||
+    Array.isArray(value)
   ) {
     throw blocked();
   }
@@ -125,6 +127,9 @@ function exactDataRecord(value, expectedKeys) {
 }
 
 function signalValue(value) {
+  if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) {
+    throw blocked();
+  }
   if (!(value instanceof AbortSignal)) throw blocked();
   return value;
 }
@@ -142,8 +147,8 @@ function absolutePath(value) {
 }
 
 function exactDirectoryIdentity(value) {
-  if (!Object.isFrozen(value)) throw blocked();
   const identity = exactDataRecord(value, ["path", "device", "inode"]);
+  if (!Object.isFrozen(value)) throw blocked();
   const resolvedPath = absolutePath(identity.path);
   if (
     resolvedPath !== identity.path ||
@@ -159,14 +164,57 @@ function exactDirectoryIdentity(value) {
 
 function credentialBytes(value, source = false) {
   if (
-    !Buffer.isBuffer(value) ||
     utilTypes.isProxy(value) ||
+    !Buffer.isBuffer(value) ||
     value.length < 1 ||
     value.length > CREDENTIAL_LIMIT
   ) {
     throw source ? sourceUnsafe() : blocked();
   }
   return Buffer.from(value);
+}
+
+function exactStringArray(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    !Array.isArray(value)
+  ) {
+    throw blocked();
+  }
+  let descriptors;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw blocked();
+  }
+  const lengthDescriptor = descriptors.length;
+  if (
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 1
+  ) {
+    throw blocked();
+  }
+  if (Object.getOwnPropertySymbols(descriptors).length !== 0) throw blocked();
+  const keys = Object.keys(descriptors).sort();
+  if (keys.length !== lengthDescriptor.value + 1 || !keys.includes("length")) {
+    throw blocked();
+  }
+  const result = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      !("value" in descriptor) ||
+      descriptor.enumerable !== true ||
+      typeof descriptor.value !== "string"
+    ) {
+      throw blocked();
+    }
+    result.push(descriptor.value);
+  }
+  return result;
 }
 
 function sha256(bytes) {
@@ -193,6 +241,105 @@ function isoTimestamp(value) {
   return value;
 }
 
+function jsonHasDuplicateKeys(text) {
+  let index = 0;
+  let duplicate = false;
+
+  function skipWhitespace() {
+    while (/\s/u.test(text[index] ?? "")) index += 1;
+  }
+
+  function parseString() {
+    const start = index;
+    if (text[index] !== '"') throw blocked();
+    index += 1;
+    while (index < text.length) {
+      if (text[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (text[index] === '"') {
+        index += 1;
+        return JSON.parse(text.slice(start, index));
+      }
+      index += 1;
+    }
+    throw blocked();
+  }
+
+  function parseValue() {
+    skipWhitespace();
+    if (text[index] === "{") {
+      parseObject();
+      return;
+    }
+    if (text[index] === "[") {
+      parseArray();
+      return;
+    }
+    if (text[index] === '"') {
+      parseString();
+      return;
+    }
+    const start = index;
+    while (index < text.length && !/[\s,}\]]/u.test(text[index])) index += 1;
+    JSON.parse(text.slice(start, index));
+  }
+
+  function parseObject() {
+    index += 1;
+    skipWhitespace();
+    const keys = new Set();
+    if (text[index] === "}") {
+      index += 1;
+      return;
+    }
+    while (index < text.length) {
+      const key = parseString();
+      if (keys.has(key)) duplicate = true;
+      keys.add(key);
+      skipWhitespace();
+      if (text[index] !== ":") throw blocked();
+      index += 1;
+      parseValue();
+      skipWhitespace();
+      if (text[index] === "}") {
+        index += 1;
+        return;
+      }
+      if (text[index] !== ",") throw blocked();
+      index += 1;
+      skipWhitespace();
+    }
+    throw blocked();
+  }
+
+  function parseArray() {
+    index += 1;
+    skipWhitespace();
+    if (text[index] === "]") {
+      index += 1;
+      return;
+    }
+    while (index < text.length) {
+      parseValue();
+      skipWhitespace();
+      if (text[index] === "]") {
+        index += 1;
+        return;
+      }
+      if (text[index] !== ",") throw blocked();
+      index += 1;
+    }
+    throw blocked();
+  }
+
+  parseValue();
+  skipWhitespace();
+  if (index !== text.length) throw blocked();
+  return duplicate;
+}
+
 function parseEnvelope(bytes) {
   if (
     !Buffer.isBuffer(bytes) ||
@@ -204,13 +351,17 @@ function parseEnvelope(bytes) {
   }
   let text;
   let parsed;
+  let duplicateKeys;
   try {
     text = UTF8_DECODER.decode(bytes);
     if (!text.endsWith("\n")) throw blocked();
-    parsed = JSON.parse(text.slice(0, -1));
+    const json = text.slice(0, -1);
+    duplicateKeys = jsonHasDuplicateKeys(json);
+    parsed = JSON.parse(json);
   } catch {
     throw blocked();
   }
+  if (duplicateKeys) throw blocked();
   const envelope = exactDataRecord(parsed, ENVELOPE_KEYS);
   if (
     envelope.schemaVersion !== 1 ||
@@ -224,7 +375,7 @@ function parseEnvelope(bytes) {
   const credential = canonicalBase64(envelope.credentialBase64);
   if (sha256(credential) !== envelope.credentialDigest) throw blocked();
   isoTimestamp(envelope.updatedAt);
-  if (`${canonicalJsonStringify(envelope)}\n` !== text) throw blocked();
+  if (!duplicateKeys && `${canonicalJsonStringify(envelope)}\n` !== text) throw blocked();
   return Object.freeze({
     sourceDigest: envelope.sourceDigest,
     credentialDigest: envelope.credentialDigest,
@@ -255,6 +406,33 @@ function normalizedForComparison(value) {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
+function storeCoordinator(mirrorDirectory) {
+  const key = normalizedForComparison(mirrorDirectory);
+  let coordinator = STORE_COORDINATORS.get(key);
+  if (coordinator === undefined) {
+    coordinator = {
+      activeSourceDigest: null,
+      generationEpoch: 0,
+      generationRevoked: true,
+      tail: Promise.resolve(),
+    };
+    STORE_COORDINATORS.set(key, coordinator);
+  }
+  return coordinator;
+}
+
+async function runExclusive(coordinator, operation) {
+  const predecessor = coordinator.tail;
+  let release;
+  coordinator.tail = new Promise((resolve) => { release = resolve; });
+  await predecessor;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 function validatedConfiguration(options) {
   const values = exactDataRecord(options, ["locations", "protectedRoots", "now"]);
   const locations = exactDataRecord(values.locations, [
@@ -275,16 +453,8 @@ function validatedConfiguration(options) {
   ) {
     throw blocked();
   }
-  if (
-    !Array.isArray(values.protectedRoots) ||
-    utilTypes.isProxy(values.protectedRoots) ||
-    values.protectedRoots.length < 1 ||
-    values.protectedRoots.some((root) => typeof root !== "string") ||
-    typeof values.now !== "function"
-  ) {
-    throw blocked();
-  }
-  const protectedRoots = Object.freeze(values.protectedRoots.map(absolutePath));
+  if (typeof values.now !== "function") throw blocked();
+  const protectedRoots = Object.freeze(exactStringArray(values.protectedRoots).map(absolutePath));
   return Object.freeze({
     locations: resolved,
     protectedRoots,
@@ -292,14 +462,30 @@ function validatedConfiguration(options) {
   });
 }
 
-function validateNonOverlap(configuration) {
+async function validateNonOverlap(configuration, dependencies, prepared = {}) {
   const { locations, protectedRoots } = configuration;
-  const isolatedRoots = [
+  const candidates = [
     path.dirname(locations.sourceFile),
-    locations.mirrorRoot,
+    prepared.mirrorRoot?.path ?? locations.mirrorRoot,
+    prepared.mirrorDirectory?.path ?? locations.mirrorDirectory,
     locations.probeRoot,
     ...protectedRoots,
-  ].map(normalizedForComparison);
+  ];
+  const canonical = [];
+  for (const candidate of candidates) {
+    canonical.push(normalizedForComparison(absolutePath(
+      await dependencies.canonicalizePath(candidate),
+    )));
+  }
+  const [
+    sourceRoot,
+    mirrorRoot,
+    mirrorDirectory,
+    probeRoot,
+    ...canonicalProtectedRoots
+  ] = canonical;
+  if (!pathContains(mirrorRoot, mirrorDirectory)) throw blocked();
+  const isolatedRoots = [sourceRoot, mirrorRoot, probeRoot, ...canonicalProtectedRoots];
   for (let left = 0; left < isolatedRoots.length; left += 1) {
     for (let right = left + 1; right < isolatedRoots.length; right += 1) {
       if (
@@ -310,10 +496,19 @@ function validateNonOverlap(configuration) {
       }
     }
   }
+  for (const root of [sourceRoot, probeRoot, ...canonicalProtectedRoots]) {
+    if (pathContains(root, mirrorDirectory) || pathContains(mirrorDirectory, root)) {
+      throw blocked();
+    }
+  }
 }
 
 function validatedDependencies(dependencies) {
-  const values = exactDataRecord(dependencies, ["filePort", "privateDirectoryManager"]);
+  const values = exactDataRecord(
+    dependencies,
+    ["canonicalizePath", "filePort", "privateDirectoryManager"],
+  );
+  if (typeof values.canonicalizePath !== "function") throw blocked();
   const filePort = exactDataRecord(values.filePort, [
     "readSource",
     "readPrivate",
@@ -327,6 +522,7 @@ function validatedDependencies(dependencies) {
   const manager = exactDataRecord(values.privateDirectoryManager, ["prepare"]);
   if (typeof manager.prepare !== "function") throw blocked();
   return Object.freeze({
+    canonicalizePath: values.canonicalizePath,
     filePort: values.filePort,
     privateDirectoryManager: values.privateDirectoryManager,
   });
@@ -342,27 +538,53 @@ function createStore(configurationOptions, dependencyOptions) {
     configuration = null;
     dependencies = null;
   }
+  const coordinator = configuration === null
+    ? { activeSourceDigest: null, generationEpoch: 0, generationRevoked: true, tail: Promise.resolve() }
+    : storeCoordinator(configuration.locations.mirrorDirectory);
   const snapshots = new WeakSet();
   let privateStatePromise = null;
 
+  function revokeGeneration() {
+    coordinator.generationEpoch += 1;
+    coordinator.activeSourceDigest = null;
+    coordinator.generationRevoked = true;
+  }
+
+  function activateGeneration(sourceDigest) {
+    if (
+      coordinator.generationRevoked ||
+      coordinator.activeSourceDigest !== sourceDigest
+    ) {
+      coordinator.generationEpoch += 1;
+    }
+    coordinator.activeSourceDigest = sourceDigest;
+    coordinator.generationRevoked = false;
+    return coordinator.generationEpoch;
+  }
+
   async function preparePrivate(signal) {
     if (configuration === null || dependencies === null) throw blocked();
-    validateNonOverlap(configuration);
+    await validateNonOverlap(configuration, dependencies);
     if (privateStatePromise === null) {
       privateStatePromise = (async () => {
-        const validateLocation = async () => validateNonOverlap(configuration);
+        let prepared = {};
+        const validateLocation = async () => {
+          await validateNonOverlap(configuration, dependencies, prepared);
+        };
         const mirrorRoot = await dependencies.privateDirectoryManager.prepare({
           directory: configuration.locations.mirrorRoot,
           signal,
           validateLocation,
         });
-        validateNonOverlap(configuration);
+        prepared = { mirrorRoot };
+        await validateNonOverlap(configuration, dependencies, prepared);
         const mirrorDirectory = await dependencies.privateDirectoryManager.prepare({
           directory: configuration.locations.mirrorDirectory,
           signal,
           validateLocation,
         });
-        validateNonOverlap(configuration);
+        prepared = { mirrorRoot, mirrorDirectory };
+        await validateNonOverlap(configuration, dependencies, prepared);
         return Object.freeze({ mirrorRoot, mirrorDirectory });
       })();
       void privateStatePromise.catch(() => {
@@ -415,7 +637,11 @@ function createStore(configurationOptions, dependencyOptions) {
 
   function createSnapshot(sourceDigest, credential) {
     const snapshot = Object.freeze(Object.create(null));
-    const state = Object.freeze({ sourceDigest, credential: Buffer.from(credential) });
+    const state = Object.freeze({
+      sourceDigest,
+      credential: Buffer.from(credential),
+      generationEpoch: activateGeneration(sourceDigest),
+    });
     snapshots.add(snapshot);
     SNAPSHOT_STATE.set(snapshot, state);
     return snapshot;
@@ -431,8 +657,25 @@ function createStore(configurationOptions, dependencyOptions) {
       throw blocked();
     }
     const state = SNAPSHOT_STATE.get(snapshot);
-    if (state === undefined) throw blocked();
+    if (
+      state === undefined ||
+      coordinator.generationRevoked ||
+      state.generationEpoch !== coordinator.generationEpoch ||
+      state.sourceDigest !== coordinator.activeSourceDigest
+    ) {
+      throw blocked();
+    }
     return state;
+  }
+
+  async function validateSourceGeneration(sourceDigest, signal) {
+    try {
+      const currentSource = await readSource(signal, { capture: true });
+      if (sha256(currentSource) !== sourceDigest) throw blocked();
+    } catch {
+      revokeGeneration();
+      throw blocked();
+    }
   }
 
   async function beginTask(options) {
@@ -440,36 +683,47 @@ function createStore(configurationOptions, dependencyOptions) {
     try {
       const values = exactDataRecord(options, ["signal"]);
       signal = signalValue(values.signal);
-      throwIfAborted(signal);
-      if (configuration === null || dependencies === null) throw blocked();
-      validateNonOverlap(configuration);
-      let source;
-      try {
-        source = await readSource(signal);
-      } catch (error) {
-        if (error?.code !== "CODEX_LOGIN_FILE_UNAVAILABLE") throw error;
+      return await runExclusive(coordinator, async () => {
+        throwIfAborted(signal);
+        if (configuration === null || dependencies === null) throw blocked();
+        await validateNonOverlap(configuration, dependencies);
+        let source;
+        try {
+          source = await readSource(signal);
+        } catch (error) {
+          revokeGeneration();
+          if (error?.code !== "CODEX_LOGIN_FILE_UNAVAILABLE") throw error;
+          const privateState = await preparePrivate(signal);
+          const existing = await readMirror(privateState, signal, false);
+          if (existing !== null) {
+            await dependencies.filePort.removePrivate({
+              directory: privateState.mirrorDirectory,
+              name: ENVELOPE_NAME,
+              signal,
+            });
+          }
+          throw unavailable();
+        }
+        const sourceDigest = sha256(source);
+        if (
+          !coordinator.generationRevoked &&
+          coordinator.activeSourceDigest !== sourceDigest
+        ) {
+          revokeGeneration();
+        }
         const privateState = await preparePrivate(signal);
         const existing = await readMirror(privateState, signal, false);
-        if (existing !== null) {
-          await dependencies.filePort.removePrivate({
-            directory: privateState.mirrorDirectory,
-            name: ENVELOPE_NAME,
-            signal,
-          });
+        let credential;
+        if (existing === null || existing.sourceDigest !== sourceDigest) {
+          credential = source;
+          await validateSourceGeneration(sourceDigest, signal);
+          await publish(privateState, existing, sourceDigest, credential, signal);
+        } else {
+          credential = existing.credential;
         }
-        throw unavailable();
-      }
-      const sourceDigest = sha256(source);
-      const privateState = await preparePrivate(signal);
-      const existing = await readMirror(privateState, signal, false);
-      let credential;
-      if (existing === null || existing.sourceDigest !== sourceDigest) {
-        credential = source;
-        await publish(privateState, existing, sourceDigest, credential, signal);
-      } else {
-        credential = existing.credential;
-      }
-      return createSnapshot(sourceDigest, credential);
+        await validateSourceGeneration(sourceDigest, signal);
+        return createSnapshot(sourceDigest, credential);
+      });
     } catch (error) {
       throw sanitize(error, signal);
     }
@@ -480,14 +734,31 @@ function createStore(configurationOptions, dependencyOptions) {
     try {
       const values = exactDataRecord(options, ["snapshot", "codexHome", "signal"]);
       signal = signalValue(values.signal);
-      throwIfAborted(signal);
-      const state = snapshotState(values.snapshot);
-      const codexHome = exactDirectoryIdentity(values.codexHome);
-      await dependencies.filePort.writeNewPrivate({
-        directory: codexHome,
-        name: AUTH_NAME,
-        bytes: credentialBytes(state.credential),
-        signal,
+      return await runExclusive(coordinator, async () => {
+        throwIfAborted(signal);
+        const state = snapshotState(values.snapshot);
+        const codexHome = exactDirectoryIdentity(values.codexHome);
+        await validateSourceGeneration(state.sourceDigest, signal);
+        await dependencies.filePort.writeNewPrivate({
+          directory: codexHome,
+          name: AUTH_NAME,
+          bytes: credentialBytes(state.credential),
+          signal,
+        });
+        try {
+          await validateSourceGeneration(state.sourceDigest, signal);
+        } catch {
+          try {
+            await dependencies.filePort.removePrivate({
+              directory: codexHome,
+              name: AUTH_NAME,
+              signal,
+            });
+          } catch {
+            // Invocation cleanup remains the caller's fail-closed responsibility.
+          }
+          throw blocked();
+        }
       });
     } catch (error) {
       throw sanitize(error, signal);
@@ -499,22 +770,25 @@ function createStore(configurationOptions, dependencyOptions) {
     try {
       const values = exactDataRecord(options, ["snapshot", "codexHome", "signal"]);
       signal = signalValue(values.signal);
-      throwIfAborted(signal);
-      const state = snapshotState(values.snapshot);
-      const codexHome = exactDirectoryIdentity(values.codexHome);
-      const credential = credentialBytes(await dependencies.filePort.readPrivate({
-        directory: codexHome,
-        name: AUTH_NAME,
-        maximumBytes: CREDENTIAL_LIMIT,
-        required: true,
-        signal,
-      }));
-      const currentSource = await readSource(signal, { capture: true });
-      if (sha256(currentSource) !== state.sourceDigest) throw blocked();
-      const privateState = await preparePrivate(signal);
-      const existing = await readMirror(privateState, signal, true);
-      if (existing.sourceDigest !== state.sourceDigest) throw blocked();
-      await publish(privateState, existing, state.sourceDigest, credential, signal);
+      return await runExclusive(coordinator, async () => {
+        throwIfAborted(signal);
+        const state = snapshotState(values.snapshot);
+        const codexHome = exactDirectoryIdentity(values.codexHome);
+        const credential = credentialBytes(await dependencies.filePort.readPrivate({
+          directory: codexHome,
+          name: AUTH_NAME,
+          maximumBytes: CREDENTIAL_LIMIT,
+          required: true,
+          signal,
+        }));
+        await validateSourceGeneration(state.sourceDigest, signal);
+        const privateState = await preparePrivate(signal);
+        const existing = await readMirror(privateState, signal, true);
+        if (existing.sourceDigest !== state.sourceDigest) throw blocked();
+        await validateSourceGeneration(state.sourceDigest, signal);
+        await publish(privateState, existing, state.sourceDigest, credential, signal);
+        await validateSourceGeneration(state.sourceDigest, signal);
+      });
     } catch (error) {
       throw sanitize(error, signal);
     }
@@ -525,16 +799,48 @@ function createStore(configurationOptions, dependencyOptions) {
     try {
       const values = exactDataRecord(options, ["codexHome", "signal"]);
       signal = signalValue(values.signal);
-      throwIfAborted(signal);
-      const codexHome = exactDirectoryIdentity(values.codexHome);
-      const privateState = await preparePrivate(signal);
-      const existing = await readMirror(privateState, signal, false);
-      if (existing === null) throw unavailable();
-      await dependencies.filePort.writeNewPrivate({
-        directory: codexHome,
-        name: AUTH_NAME,
-        bytes: credentialBytes(existing.credential),
-        signal,
+      return await runExclusive(coordinator, async () => {
+        throwIfAborted(signal);
+        const codexHome = exactDirectoryIdentity(values.codexHome);
+        let sourceDigest;
+        try {
+          sourceDigest = sha256(await readSource(signal, { capture: true }));
+        } catch {
+          revokeGeneration();
+          throw blocked();
+        }
+        const privateState = await preparePrivate(signal);
+        const existing = await readMirror(privateState, signal, false);
+        if (existing === null) throw unavailable();
+        if (
+          coordinator.generationRevoked ||
+          coordinator.activeSourceDigest !== sourceDigest ||
+          existing.sourceDigest !== sourceDigest
+        ) {
+          revokeGeneration();
+          throw blocked();
+        }
+        await validateSourceGeneration(sourceDigest, signal);
+        await dependencies.filePort.writeNewPrivate({
+          directory: codexHome,
+          name: AUTH_NAME,
+          bytes: credentialBytes(existing.credential),
+          signal,
+        });
+        try {
+          await validateSourceGeneration(sourceDigest, signal);
+        } catch {
+          try {
+            await dependencies.filePort.removePrivate({
+              directory: codexHome,
+              name: AUTH_NAME,
+              signal,
+            });
+          } catch {
+            // Invocation cleanup remains the caller's fail-closed responsibility.
+          }
+          throw blocked();
+        }
       });
     } catch (error) {
       throw sanitize(error, signal);
@@ -587,6 +893,21 @@ export function createProductionCodexLoginCredentialStore(options) {
       now: () => new Date(),
     },
     {
+      async canonicalizePath(candidate) {
+        let existing = path.resolve(candidate);
+        const suffix = [];
+        while (true) {
+          try {
+            return path.join(await realpath(existing), ...suffix);
+          } catch (error) {
+            if (failureCode(error) !== "ENOENT") throw blocked();
+            const parent = path.dirname(existing);
+            if (parent === existing) throw blocked();
+            suffix.unshift(path.basename(existing));
+            existing = parent;
+          }
+        }
+      },
       filePort: createProductionCodexCredentialFilePort(),
       privateDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
     },

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,6 +51,7 @@ function createHarness(root, source = Buffer.from("fictional-source-generation-o
   let sourceBytes = Buffer.from(source);
   let sourceFailure = null;
   let nextFailure = null;
+  let nextHold = null;
   const identities = new Map();
   const manager = {
     prepareCalls: [],
@@ -76,6 +77,14 @@ function createHarness(root, source = Buffer.from("fictional-source-generation-o
     const selected = nextFailure;
     nextFailure = null;
     return selected;
+  }
+
+  async function waitAtHold(method) {
+    if (nextHold?.method !== method) return;
+    const selected = nextHold;
+    nextHold = null;
+    selected.enteredResolve();
+    await selected.released;
   }
 
   const filePort = {
@@ -107,6 +116,7 @@ function createHarness(root, source = Buffer.from("fictional-source-generation-o
     },
     async replacePrivate(options) {
       calls.push(["replacePrivate", options.directory.path, options.name, options.bytes.length]);
+      await waitAtHold("replacePrivate");
       const selected = failure("replacePrivate");
       const key = privateKey(options.directory, options.name);
       if (selected?.commit) privateFiles.set(key, Buffer.from(options.bytes));
@@ -122,7 +132,11 @@ function createHarness(root, source = Buffer.from("fictional-source-generation-o
     },
   };
 
-  const dependencies = { filePort, privateDirectoryManager };
+  const dependencies = {
+    async canonicalizePath(candidate) { return path.resolve(candidate); },
+    filePort,
+    privateDirectoryManager,
+  };
   const options = {
     locations,
     protectedRoots: [path.join(root, "repository"), path.join(root, "data")],
@@ -166,6 +180,14 @@ function createHarness(root, source = Buffer.from("fictional-source-generation-o
           path: locations.mirrorDirectory,
         }),
       };
+    },
+    holdNext(method) {
+      let enteredResolve;
+      let releaseResolve;
+      const entered = new Promise((resolve) => { enteredResolve = resolve; });
+      const released = new Promise((resolve) => { releaseResolve = resolve; });
+      nextHold = { method, enteredResolve, released };
+      return { entered, release: releaseResolve };
     },
   };
 }
@@ -266,6 +288,83 @@ test("every protected/source/mirror/probe overlap fails before private directory
   }
 });
 
+test("canonicalized aliases cannot bypass protected/source/isolated root separation", async () => {
+  const root = path.resolve("D:/fictional-task3-canonical-overlap");
+  const current = createHarness(root);
+  const aliasProtected = path.join(root, "alias-to-source-root");
+  let canonicalizationCalls = 0;
+  const dependencies = {
+    ...current.dependencies,
+    async canonicalizePath(candidate) {
+      canonicalizationCalls += 1;
+      return candidate === aliasProtected
+        ? path.dirname(current.locations.sourceFile)
+        : path.resolve(candidate);
+    },
+  };
+  const store = createTestCodexLoginCredentialStore({
+    ...current.options,
+    protectedRoots: [aliasProtected],
+  }, dependencies);
+
+  await assert.rejects(
+    store.beginTask({ signal: AbortSignal.timeout(30_000) }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+  assert.equal(canonicalizationCalls >= 4, true);
+  assert.equal(current.manager.prepareCalls.length, 0);
+});
+
+test("real filesystem aliases cannot bypass store root separation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-codex-store-alias-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const current = createHarness(root);
+  const sourceRoot = path.dirname(current.locations.sourceFile);
+  const aliasProtected = path.join(root, "source-root-alias");
+  await mkdir(sourceRoot, { recursive: true });
+  await mkdir(path.dirname(current.locations.mirrorRoot), { recursive: true });
+  try {
+    await symlink(sourceRoot, aliasProtected, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "UNKNOWN"].includes(error?.code)) {
+      t.skip(`filesystem alias capability unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  let canonicalizationCalls = 0;
+  const dependencies = {
+    ...current.dependencies,
+    async canonicalizePath(candidate) {
+      canonicalizationCalls += 1;
+      let existing = path.resolve(candidate);
+      const suffix = [];
+      while (true) {
+        try {
+          return path.join(await realpath(existing), ...suffix);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          const parent = path.dirname(existing);
+          if (parent === existing) throw error;
+          suffix.unshift(path.basename(existing));
+          existing = parent;
+        }
+      }
+    },
+  };
+  const store = createTestCodexLoginCredentialStore({
+    ...current.options,
+    protectedRoots: [aliasProtected],
+  }, dependencies);
+
+  await assert.rejects(
+    store.beginTask({ signal: AbortSignal.timeout(30_000) }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+  assert.equal(canonicalizationCalls >= 4, true);
+  assert.equal(current.manager.prepareCalls.length, 0);
+});
+
 test("accessor and proxy option records are rejected without executing traps", async () => {
   const current = createHarness(path.resolve("D:/fictional-task3-traps"));
   let traps = 0;
@@ -329,6 +428,66 @@ test("accessor and proxy option records are rejected without executing traps", a
     { code: "CODEX_LOGIN_BROKER_BLOCKED" },
   );
   assert.equal(traps, 0);
+});
+
+test("directory identities and protected-root arrays reject proxies and accessors with zero traps", async () => {
+  const current = createHarness(path.resolve("D:/fictional-task3-deep-traps"));
+  const store = current.createStore();
+  const snapshot = await store.beginTask({ signal: AbortSignal.timeout(30_000) });
+  let identityTraps = 0;
+  const proxyIdentity = new Proxy(
+    directoryIdentity(path.join(current.locations.probeRoot, "proxy-identity"), 131),
+    {
+      isExtensible() {
+        identityTraps += 1;
+        throw new Error("FICTIONAL_IDENTITY_TRAP_PRIVATE");
+      },
+    },
+  );
+  await assert.rejects(
+    store.stageTask({
+      snapshot,
+      codexHome: proxyIdentity,
+      signal: AbortSignal.timeout(30_000),
+    }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+  assert.equal(identityTraps, 0);
+
+  let collectionTraps = 0;
+  const proxyRoots = new Proxy([path.join(current.locations.probeRoot, "proxy-root")], {
+    get() {
+      collectionTraps += 1;
+      throw new Error("FICTIONAL_ROOT_COLLECTION_TRAP_PRIVATE");
+    },
+  });
+  const proxyRootStore = createTestCodexLoginCredentialStore(
+    { ...current.options, protectedRoots: proxyRoots },
+    current.dependencies,
+  );
+  await assert.rejects(
+    proxyRootStore.beginTask({ signal: AbortSignal.timeout(30_000) }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+
+  const accessorRoots = [];
+  Object.defineProperty(accessorRoots, "0", {
+    enumerable: true,
+    get() {
+      collectionTraps += 1;
+      throw new Error("FICTIONAL_ROOT_ENTRY_TRAP_PRIVATE");
+    },
+  });
+  accessorRoots.length = 1;
+  const accessorRootStore = createTestCodexLoginCredentialStore(
+    { ...current.options, protectedRoots: accessorRoots },
+    current.dependencies,
+  );
+  await assert.rejects(
+    accessorRootStore.beginTask({ signal: AbortSignal.timeout(30_000) }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+  assert.equal(collectionTraps, 0);
 });
 
 test("first source publishes one exact canonical envelope and an opaque owned snapshot", async () => {
@@ -459,6 +618,56 @@ test("logout removes a valid mirror while an unsafe source preserves but never u
   assert.deepEqual(unsafe.envelopeBytes(), retained);
 });
 
+test("missing, unsafe, and changed sources revoke probe and stale-snapshot credential use", async (t) => {
+  for (const transition of ["missing", "unsafe", "changed"]) {
+    await t.test(transition, async () => {
+      const current = createHarness(path.resolve(`D:/fictional-task3-revoke-${transition}`));
+      const store = current.createStore();
+      const staleSnapshot = await store.beginTask({ signal: AbortSignal.timeout(30_000) });
+      const probeHome = directoryIdentity(path.join(current.locations.probeRoot, `${transition}-probe`), 111);
+      const taskHome = directoryIdentity(path.join(current.locations.probeRoot, `${transition}-task`), 112);
+
+      if (transition === "missing") {
+        current.failSource("ENOENT");
+        await assert.rejects(
+          store.beginTask({ signal: AbortSignal.timeout(30_000) }),
+          { code: "CODEX_LOGIN_FILE_UNAVAILABLE" },
+        );
+      } else if (transition === "unsafe") {
+        current.failSource("CODEX_CREDENTIAL_SOURCE_UNSAFE");
+        await assert.rejects(
+          store.beginTask({ signal: AbortSignal.timeout(30_000) }),
+          { code: "CODEX_LOGIN_SOURCE_UNSAFE" },
+        );
+      } else {
+        current.setSource(Buffer.from("fictional-source-generation-two"));
+        await assert.rejects(
+          store.stageProbe({ codexHome: probeHome, signal: AbortSignal.timeout(30_000) }),
+          { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+        );
+        assert.equal(current.privateBytes(probeHome), undefined);
+        await store.beginTask({ signal: AbortSignal.timeout(30_000) });
+      }
+
+      if (transition !== "changed") {
+        await assert.rejects(
+          store.stageProbe({ codexHome: probeHome, signal: AbortSignal.timeout(30_000) }),
+        );
+      }
+      await assert.rejects(
+        store.stageTask({
+          snapshot: staleSnapshot,
+          codexHome: taskHome,
+          signal: AbortSignal.timeout(30_000),
+        }),
+        { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+      );
+      assert.equal(current.privateBytes(probeHome), undefined);
+      assert.equal(current.privateBytes(taskHome), undefined);
+    });
+  }
+});
+
 test("a restored machine with no source remains unavailable and creates no mirror envelope", async () => {
   const current = createHarness(path.resolve("D:/fictional-task3-restored-machine"));
   current.failSource("ENOENT", "FICTIONAL_RESTORED_MACHINE_NO_SOURCE");
@@ -473,7 +682,7 @@ test("a restored machine with no source remains unavailable and creates no mirro
   ]);
 });
 
-test("corrupt, noncanonical, duplicate-key, Base64, digest, and credential-bound envelopes block", async () => {
+test("corrupt, Base64, digest, and credential-bound envelopes block", async () => {
   const current = createHarness(path.resolve("D:/fictional-task3-corrupt"));
   const store = current.createStore();
   await store.beginTask({ signal: AbortSignal.timeout(30_000) });
@@ -482,7 +691,6 @@ test("corrupt, noncanonical, duplicate-key, Base64, digest, and credential-bound
   const key = privateKey(identity, ENVELOPE_NAME);
   const cases = [
     Buffer.from(JSON.stringify(valid), "utf8"),
-    Buffer.from(`{"schemaVersion":1,"schemaVersion":1}\n`, "utf8"),
     Buffer.from(`${JSON.stringify({ ...valid, schemaVersion: 2 })}\n`, "utf8"),
     Buffer.from(`${JSON.stringify({ ...valid, extra: "unknown" })}\n`, "utf8"),
     Buffer.from(`${JSON.stringify({ ...valid, credentialBase64: "eA" })}\n`, "utf8"),
@@ -496,6 +704,48 @@ test("corrupt, noncanonical, duplicate-key, Base64, digest, and credential-bound
 
   for (const bytes of cases) {
     current.privateFiles.set(key, bytes);
+    await assert.rejects(
+      current.createStore().beginTask({ signal: AbortSignal.timeout(30_000) }),
+      { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+    );
+  }
+});
+
+test("an otherwise-valid envelope with a duplicate key is rejected", async () => {
+  const current = createHarness(path.resolve("D:/fictional-task3-duplicate-envelope"));
+  await current.createStore().beginTask({ signal: AbortSignal.timeout(30_000) });
+  const identity = directoryIdentity(current.locations.mirrorDirectory, 2);
+  const key = privateKey(identity, ENVELOPE_NAME);
+  const canonical = current.envelopeBytes().toString("utf8");
+  const duplicate = canonical.replace(
+    /^\{"credentialBase64":"([^"]+)",/u,
+    `{"credentialBase64":"$1","credentialBase64":"$1",`,
+  );
+  current.privateFiles.set(key, Buffer.from(duplicate, "utf8"));
+
+  await assert.rejects(
+    current.createStore().beginTask({ signal: AbortSignal.timeout(30_000) }),
+    { code: "CODEX_LOGIN_BROKER_BLOCKED" },
+  );
+});
+
+test("otherwise-valid reordered and whitespace-bearing envelopes are noncanonical", async () => {
+  const current = createHarness(path.resolve("D:/fictional-task3-noncanonical-envelope"));
+  await current.createStore().beginTask({ signal: AbortSignal.timeout(30_000) });
+  const identity = directoryIdentity(current.locations.mirrorDirectory, 2);
+  const key = privateKey(identity, ENVELOPE_NAME);
+  const envelope = parseEnvelope(current.envelopeBytes());
+  const reordered = `${JSON.stringify({
+    schemaVersion: envelope.schemaVersion,
+    sourceDigest: envelope.sourceDigest,
+    credentialDigest: envelope.credentialDigest,
+    credentialBase64: envelope.credentialBase64,
+    updatedAt: envelope.updatedAt,
+  })}\n`;
+  const whitespace = current.envelopeBytes().toString("utf8").replace("{", "{ ");
+
+  for (const text of [reordered, whitespace]) {
+    current.privateFiles.set(key, Buffer.from(text, "utf8"));
     await assert.rejects(
       current.createStore().beginTask({ signal: AbortSignal.timeout(30_000) }),
       { code: "CODEX_LOGIN_BROKER_BLOCKED" },
@@ -562,6 +812,42 @@ test("capture publishes refresh only while the host source remains the snapshot 
   assert.deepEqual(current.envelopeBytes(), before);
 });
 
+test("a deferred obsolete capture cannot overwrite a newer source generation across stores", async () => {
+  const oldSource = Buffer.from("fictional-raced-source-generation-one");
+  const newSource = Buffer.from("fictional-raced-source-generation-two");
+  const refreshed = Buffer.from("fictional-raced-refresh-from-old-generation");
+  const current = createHarness(path.resolve("D:/fictional-task3-publication-race"), oldSource);
+  const oldStore = current.createStore();
+  const newStore = current.createStore();
+  const snapshot = await oldStore.beginTask({ signal: AbortSignal.timeout(30_000) });
+  const codexHome = directoryIdentity(path.join(current.locations.probeRoot, "publication-race"), 121);
+  await oldStore.stageTask({ snapshot, codexHome, signal: AbortSignal.timeout(30_000) });
+  current.setPrivate(codexHome, refreshed);
+
+  const publication = current.holdNext("replacePrivate");
+  const obsoleteCapture = oldStore.captureTask({
+    snapshot,
+    codexHome,
+    signal: AbortSignal.timeout(30_000),
+  });
+  await publication.entered;
+  current.setSource(newSource);
+  const newerBegin = newStore.beginTask({ signal: AbortSignal.timeout(30_000) });
+  publication.release();
+
+  await assert.rejects(obsoleteCapture, { code: "CODEX_LOGIN_BROKER_BLOCKED" });
+  const newerSnapshot = await newerBegin;
+  const newerHome = directoryIdentity(path.join(current.locations.probeRoot, "publication-race-new"), 122);
+  await newStore.stageTask({
+    snapshot: newerSnapshot,
+    codexHome: newerHome,
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.deepEqual(current.privateBytes(newerHome), newSource);
+  assert.equal(parseEnvelope(current.envelopeBytes()).sourceDigest, sha256(newSource));
+  assert.equal(parseEnvelope(current.envelopeBytes()).credentialDigest, sha256(newSource));
+});
+
 test("all port failure phases fail closed, redact private data, and leave one usable generation", async () => {
   const phases = [
     ["readSource", "SOURCE_READ", false],
@@ -618,6 +904,7 @@ test("all port failure phases fail closed, redact private data, and leave one us
         sha256(initial),
         initial.toString("base64"),
         refreshed.toString("base64"),
+        `FICTIONAL_${phase}_PRIVATE`,
       ],
     ));
 
