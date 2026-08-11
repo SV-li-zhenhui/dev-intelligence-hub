@@ -43,6 +43,7 @@ export const VALIDATION_CONTROLLED_VARIABLES = Object.freeze([
   "GIT_CONFIG_NOSYSTEM",
   "GIT_TERMINAL_PROMPT",
   "NO_COLOR",
+  "PLAYWRIGHT_BROWSERS_PATH",
 ]);
 
 function sourceValue(source, requestedName) {
@@ -123,13 +124,17 @@ async function createDirectories(directory) {
 export async function prepareIsolatedValidationEnvironment({
   sourceEnvironment = process.env,
   temporaryRoot = os.tmpdir(),
+  playwrightBrowsersPath,
 } = {}) {
   if (
     sourceEnvironment === null ||
     typeof sourceEnvironment !== "object" ||
     Array.isArray(sourceEnvironment) ||
     typeof temporaryRoot !== "string" ||
-    !path.isAbsolute(temporaryRoot)
+    !path.isAbsolute(temporaryRoot) ||
+    (playwrightBrowsersPath !== undefined &&
+      (typeof playwrightBrowsersPath !== "string" ||
+        !path.isAbsolute(playwrightBrowsersPath)))
   ) {
     throw new TypeError("validation environment request is invalid");
   }
@@ -143,6 +148,12 @@ export async function prepareIsolatedValidationEnvironment({
     );
     const isolated = await createDirectories(directory);
     Object.assign(environment, isolated);
+    const browserDirectory = playwrightBrowsersPath === undefined
+      ? path.join(directory, "playwright-browsers")
+      : path.resolve(playwrightBrowsersPath);
+    if (playwrightBrowsersPath === undefined) {
+      await mkdir(browserDirectory, { recursive: true, mode: 0o700 });
+    }
     const gitConfig = path.join(directory, "gitconfig");
     await writeFile(gitConfig, "", { flag: "wx", mode: 0o600 });
     Object.assign(environment, {
@@ -152,6 +163,7 @@ export async function prepareIsolatedValidationEnvironment({
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
       NO_COLOR: "1",
+      PLAYWRIGHT_BROWSERS_PATH: browserDirectory,
     });
     const evidence = Object.freeze({
       schemaVersion: 2,

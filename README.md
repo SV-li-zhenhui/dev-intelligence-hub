@@ -21,9 +21,12 @@ npm test
 发布或升级前可运行可重复的整体验收。基础命令执行提交中的完整 Node 回归、全部 JavaScript 语法检查和两组真实浏览器行为测试；`--all` 还要求 Docker Desktop 可用，并要求已经由受管生命周期启动且健康的 `127.0.0.1:4173` 服务完成桌面/移动端验收：
 
 ```powershell
+npm run setup:validation-browser
 npm run validate:system
 npm run validate:system -- --all
 ```
+
+浏览器安装只需在首次安装或 Playwright 升级后执行；它把匹配版本的无窗口 Chromium 存入被 Git 忽略的 `data/playwright-browsers/`。整体验收固定使用该 headless shell，不加载系统浏览器 profile 或宿主输入法，验证本身不会临时联网下载浏览器。
 
 验收必须从干净且已提交的工作树开始；运行期间 HEAD、Git tree 或受跟踪/未跟踪文件发生变化都会使验收失败。普通 Node 测试在只读、无 `.git` 的精确提交物化中执行；必须核对 Git 索引、当前树和发布载荷的开源分发测试，则在前后均核验为同一干净 commit/tree 的仓库中单独执行。两组结果共同构成完整回归，不能省略或互相替代。每次命令都会生成新的 `runId`，并在结束时打印报告路径 `validation-artifacts/runs/<runId>/system-validation.json`；不同验收不会覆盖或误用旧报告。报告记录开始/结束源码身份、经过脱敏的实际命令、退出状态，以及 Node 测试的通过/失败/跳过身份。`--all` 的 UI 结果、真实 PNG 截图和回执也保存在同一 run 目录。
 

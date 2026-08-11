@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -372,16 +371,7 @@ function createFixtureServer() {
 }
 
 async function launchBrowser() {
-  if (process.platform === "win32") {
-    return chromium.launch(validationBrowserLaunchOptions({
-      channel: "msedge",
-      headless: true,
-    }));
-  }
-  if (existsSync(chromium.executablePath())) {
-    return chromium.launch(validationBrowserLaunchOptions({ headless: true }));
-  }
-  throw new Error("Install a Playwright Chromium browser before running this fixture");
+  return chromium.launch(validationBrowserLaunchOptions({ headless: true }));
 }
 
 function attributeLocator(page, attribute, pathValue) {
@@ -1217,4 +1207,4 @@ try {
   await new Promise((resolve) => server.close(resolve));
 }
 
-console.log("configuration form Edge Playwright fixture passed");
+console.log("configuration form Playwright fixture passed");

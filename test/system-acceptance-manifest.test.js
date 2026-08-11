@@ -277,6 +277,7 @@ async function createFixture(t, {
         "GIT_CONFIG_NOSYSTEM",
         "GIT_TERMINAL_PROMPT",
         "NO_COLOR",
+        "PLAYWRIGHT_BROWSERS_PATH",
       ],
       credentialVariablesInherited: false,
       dependencyInstallationNetwork: "offline",

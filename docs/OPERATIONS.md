@@ -33,8 +33,14 @@ committed tree. It checks every committed Node test, JavaScript syntax, and the
 configuration and confirmation browser fixtures:
 
 ```powershell
+npm run setup:validation-browser
 npm run validate:system
 ```
+
+The setup command is required only after the first install or a Playwright
+upgrade. It stores the matching Chromium headless shell under the ignored
+`data/playwright-browsers/` directory. Validation never falls back to a host
+browser profile or downloads a browser during an acceptance run.
 
 The complete host gate additionally requires Docker Desktop and a healthy
 managed service already listening on `127.0.0.1:4173`:

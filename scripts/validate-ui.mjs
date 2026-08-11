@@ -30,7 +30,6 @@ await verifyLiveDashboard({
 });
 
 const browser = await chromium.launch(validationBrowserLaunchOptions({
-  channel: "msedge",
   headless: true,
 }));
 const results = [];

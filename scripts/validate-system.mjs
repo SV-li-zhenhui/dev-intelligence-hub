@@ -476,7 +476,9 @@ try {
         inheritedForbiddenNodeEnvironmentVariables.join(", "),
     );
   }
-  validationEnvironmentContext = await prepareIsolatedValidationEnvironment();
+  validationEnvironmentContext = await prepareIsolatedValidationEnvironment({
+    playwrightBrowsersPath: path.join(root, "data", "playwright-browsers"),
+  });
   validationEnvironment = validationEnvironmentContext.environment;
   report.environment = {
     ...validationEnvironmentContext.evidence,

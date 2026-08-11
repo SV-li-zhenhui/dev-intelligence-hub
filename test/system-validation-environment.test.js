@@ -13,8 +13,10 @@ import {
 test("validation children receive only allowlisted system values and empty profiles", async (t) => {
   const parent = await mkdtemp(path.join(os.tmpdir(), "validation-env-parent-"));
   t.after(() => rm(parent, { force: true, recursive: true }));
+  const playwrightBrowsersPath = path.join(parent, "playwright-browsers");
   const context = await prepareIsolatedValidationEnvironment({
     temporaryRoot: parent,
+    playwrightBrowsersPath,
     sourceEnvironment: {
       Path: "C:\\trusted-tools",
       SystemRoot: "C:\\Windows",
@@ -75,6 +77,7 @@ test("validation children receive only allowlisted system values and empty profi
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
       NO_COLOR: "1",
+      PLAYWRIGHT_BROWSERS_PATH: playwrightBrowsersPath,
     },
   );
   assert.deepEqual(context.evidence, {

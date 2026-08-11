@@ -423,6 +423,7 @@ test("the system validator binds a passing report to one clean Git source state"
     "GIT_CONFIG_NOSYSTEM",
     "GIT_TERMINAL_PROMPT",
     "NO_COLOR",
+    "PLAYWRIGHT_BROWSERS_PATH",
   ]);
   assert.equal(
     report.environment.inheritedVariables.some((name) =>
