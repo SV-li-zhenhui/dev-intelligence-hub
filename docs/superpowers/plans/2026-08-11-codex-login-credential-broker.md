@@ -58,7 +58,7 @@ This is one vertical security feature rather than independent subprojects: the s
 - `src/composition-root.js` — construct and track one capability-gated broker before all configured routers, include credential roots in isolation, and expose only its sanitized status port.
 - `src/server.js`, `public/app.js`, `public/styles.css` — serve and display the read-only status without changing operational readiness or action admission.
 - `test/fixtures/fake-structured-cli.mjs`, `test/supervised-cli-brain-provider.test.js`, `test/supervised-cli-brain-end-to-end.test.js`, `test/configured-workforce.test.js`, `test/brain-router.test.js`, `test/configured-role-employee.test.js`, `test/role-worker-directory.test.js`, `test/proactive-work-loop.test.js`, `test/composition-root.test.js`, `test/server.test.js`, `test/browser/configuration-form-playwright.mjs` — cross-layer behavior and authority evidence.
-- `test/backup-service.test.js`, `test/offline-restore-runtime.test.js`, `test/open-source-distribution.test.js` — prove the mirror is absent from backup, restore, clean-room, and npm payloads.
+- `test/backup-service.test.js`, `test/offline-restore-runtime.test.js`, `test/open-source-distribution.test.mjs` — prove the mirror is absent from backup, restore, clean-room, and npm payloads.
 - `config.example.json`, `README.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `docs/PRIVACY.md`, `SECURITY.md` — safe configuration and operations guidance.
 - `validation-notes.md`, `docs/plans/2026-08-02-001-feat-complete-command-center-plan.md` — record only final sanitized acceptance evidence.
 
@@ -255,7 +255,7 @@ git commit -m "feat: define Codex login credential mode"
 - Create: `src/lib/windows-codex-credential-file.js`
 - Create: `src/lib/windows-codex-credential-helper.ps1`
 - Create: `test/windows-codex-credential-file.test.js`
-- Modify: `test/open-source-distribution.test.js` only for packaged helper identity coverage
+- Modify: `test/open-source-distribution.test.mjs` only for packaged helper identity coverage
 
 **Interfaces:**
 - Consumes: fixed Windows PowerShell location pattern and private identity records used by `private-directory-manager.js`.
@@ -362,7 +362,7 @@ Open the supplied directory by its expected device/inode identity and only then 
 Run:
 
 ```powershell
-node --test test/windows-codex-credential-file.test.js test/open-source-distribution.test.js
+node --test test/windows-codex-credential-file.test.js test/open-source-distribution.test.mjs
 ```
 
 Expected: PASS; only privilege-specific symlink/owner cases may be explicitly skipped, and `npm pack --dry-run --json` includes the fixed helper under `src/lib/`.
@@ -370,7 +370,7 @@ Expected: PASS; only privilege-specific symlink/owner cases may be explicitly sk
 - [ ] **Step 8: Commit the file-security slice**
 
 ```powershell
-git add -- src/lib/windows-codex-credential-file.js src/lib/windows-codex-credential-helper.ps1 test/windows-codex-credential-file.test.js test/open-source-distribution.test.js
+git add -- src/lib/windows-codex-credential-file.js src/lib/windows-codex-credential-helper.ps1 test/windows-codex-credential-file.test.js test/open-source-distribution.test.mjs
 git commit -m "feat: secure Codex credential file operations"
 ```
 
@@ -862,7 +862,7 @@ git commit -m "feat: expose sanitized Codex login readiness"
 - Modify: `test/browser/configuration-form-playwright.mjs`
 - Create: `scripts/verify-codex-login-readiness.mjs`
 - Create: `test/codex-login-readiness-command.test.js`
-- Modify: `test/open-source-distribution.test.js`
+- Modify: `test/open-source-distribution.test.mjs`
 - Modify: `config.example.json`
 - Modify: `README.md`
 - Modify: `docs/ARCHITECTURE.md`
@@ -902,7 +902,7 @@ Run:
 
 ```powershell
 node test/browser/configuration-form-playwright.mjs
-node --test test/codex-login-readiness-command.test.js test/open-source-distribution.test.js
+node --test test/codex-login-readiness-command.test.js test/open-source-distribution.test.mjs
 ```
 
 Expected: FAIL on the missing command, old browser template expectations, and old docs/privacy assertions.
@@ -930,7 +930,7 @@ Expected: PASS with no console/page error, no horizontal overflow in the existin
 - [ ] **Step 8: Commit UX and operations guidance**
 
 ```powershell
-git add -- test/browser/configuration-form-playwright.mjs scripts/verify-codex-login-readiness.mjs test/codex-login-readiness-command.test.js test/open-source-distribution.test.js config.example.json README.md docs/ARCHITECTURE.md docs/OPERATIONS.md docs/PRIVACY.md SECURITY.md
+git add -- test/browser/configuration-form-playwright.mjs scripts/verify-codex-login-readiness.mjs test/codex-login-readiness-command.test.js test/open-source-distribution.test.mjs config.example.json README.md docs/ARCHITECTURE.md docs/OPERATIONS.md docs/PRIVACY.md SECURITY.md
 git commit -m "docs: operate brokered Codex login safely"
 ```
 
@@ -948,7 +948,7 @@ git commit -m "docs: operate brokered Codex login safely"
 - [ ] **Step 1: Run all focused Codex-login and affected cross-layer tests**
 
 ```powershell
-node --test test/windows-codex-credential-file.test.js test/codex-login-credential-store.test.js test/codex-login-credential-broker.test.js test/supervised-cli-brain-provider.test.js test/supervised-cli-brain-end-to-end.test.js test/configuration-contract.test.js test/configuration-form-schema.test.js test/configuration-form-support.test.js test/configured-workforce.test.js test/brain-router.test.js test/configured-role-employee.test.js test/role-worker-directory.test.js test/proactive-work-loop.test.js test/composition-root.test.js test/server.test.js test/frontend-brain-provider-status-contract.test.js test/backup-service.test.js test/offline-restore-runtime.test.js test/open-source-distribution.test.js test/codex-login-readiness-command.test.js
+node --test test/windows-codex-credential-file.test.js test/codex-login-credential-store.test.js test/codex-login-credential-broker.test.js test/supervised-cli-brain-provider.test.js test/supervised-cli-brain-end-to-end.test.js test/configuration-contract.test.js test/configuration-form-schema.test.js test/configuration-form-support.test.js test/configured-workforce.test.js test/brain-router.test.js test/configured-role-employee.test.js test/role-worker-directory.test.js test/proactive-work-loop.test.js test/composition-root.test.js test/server.test.js test/frontend-brain-provider-status-contract.test.js test/backup-service.test.js test/offline-restore-runtime.test.js test/open-source-distribution.test.mjs test/codex-login-readiness-command.test.js
 ```
 
 Expected: zero failures; only explicitly justified Windows privilege cases may skip.

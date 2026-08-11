@@ -1,4 +1,4 @@
-export const distributionTestPath = "test/open-source-distribution.test.js";
+export const distributionTestPath = "test/open-source-distribution.test.mjs";
 export const u9PriorityTestPath = "test/00-u9-priority.mjs";
 const u9ImplementationTestPath = "test/u9-mirrored-pr-end-to-end.mjs";
 const legacyU9TestPath = "test/u9-mirrored-pr-end-to-end.test.js";

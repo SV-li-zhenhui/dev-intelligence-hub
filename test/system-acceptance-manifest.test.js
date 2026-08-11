@@ -143,7 +143,7 @@ async function createFixture(t, {
   await mkdir(path.join(root, "test"), { recursive: true });
   await writeFile(path.join(root, "src/app.js"), "export const ready = true;\n");
   await writeFile(
-    path.join(root, "test/open-source-distribution.test.js"),
+    path.join(root, "test/open-source-distribution.test.mjs"),
     "export const distributionTest = true;\n",
   );
   await writeFile(
@@ -300,10 +300,10 @@ async function createFixture(t, {
         signal: null,
       },
       {
-        name: "syntax:test/open-source-distribution.test.js",
+        name: "syntax:test/open-source-distribution.test.mjs",
         command: {
           executable: "node",
-          arguments: ["--check", "test/open-source-distribution.test.js"],
+          arguments: ["--check", "test/open-source-distribution.test.mjs"],
         },
         status: "passed",
         durationMs: 25,
@@ -392,7 +392,7 @@ async function createFixture(t, {
             "--test",
             "--test-concurrency=1",
             "--test-reporter=tap",
-            "test/open-source-distribution.test.js",
+            "test/open-source-distribution.test.mjs",
           ],
         },
         status: "passed",

@@ -52,7 +52,7 @@ const REQUIRED_COMMANDS = new Map([
         "--test",
         "--test-concurrency=1",
         "--test-reporter=tap",
-        "test/open-source-distribution.test.js",
+        "test/open-source-distribution.test.mjs",
       ],
     },
   ],

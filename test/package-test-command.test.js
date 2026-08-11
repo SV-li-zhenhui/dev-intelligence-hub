@@ -119,6 +119,29 @@ test("the package script admits its priority entry before a deep direct-test glo
       ].join("\n"),
     );
   }
+  const expectedCoreDone = [
+    "priority.done",
+    ...ordinaryFiles.map(({ logicalName }) => `${logicalName}.done`),
+  ].sort((left, right) => left.localeCompare(right, "en"));
+  writeFileSync(
+    path.join(controlledTestDirectory, "open-source-distribution.test.mjs"),
+    [
+      'import assert from "node:assert/strict";',
+      'import { readdirSync, writeFileSync } from "node:fs";',
+      'import path from "node:path";',
+      'import test from "node:test";',
+      '',
+      'const stateDirectory = process.env.U11_PACKAGE_STATE_DIRECTORY;',
+      'test("distribution runs after the concurrent core suite", () => {',
+      '  const completed = readdirSync(stateDirectory)',
+      '    .filter((name) => name.endsWith(".done"))',
+      '    .sort((left, right) => left.localeCompare(right, "en"));',
+      `  assert.deepEqual(completed, ${JSON.stringify(expectedCoreDone)});`,
+      '  writeFileSync(path.join(stateDirectory, "distribution.done"), "", { flag: "wx" });',
+      '});',
+      '',
+    ].join("\n"),
+  );
 
   const npmExecutable = process.platform === "win32"
     ? process.env.ComSpec ?? "cmd.exe"
@@ -154,6 +177,7 @@ test("the package script admits its priority entry before a deep direct-test glo
       .filter((name) => name.endsWith(".done"))
       .sort((left, right) => left.localeCompare(right, "en")),
     [
+      "distribution.done",
       "priority.done",
       ...ordinaryFiles.map(({ logicalName }) => `${logicalName}.done`),
     ].sort((left, right) => left.localeCompare(right, "en")),

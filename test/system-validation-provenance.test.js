@@ -142,7 +142,7 @@ async function createValidationFixture(t) {
     ].join("\n"),
   );
   await writeFile(
-    path.join(root, "test/open-source-distribution.test.js"),
+    path.join(root, "test/open-source-distribution.test.mjs"),
     [
       "import assert from 'node:assert/strict';",
       "import { existsSync } from 'node:fs';",
@@ -404,7 +404,7 @@ test("the system validator binds a passing report to one clean Git source state"
         "--test",
         "--test-concurrency=1",
         "--test-reporter=tap",
-        "test/open-source-distribution.test.js",
+        "test/open-source-distribution.test.mjs",
       ],
     },
   );
@@ -521,7 +521,7 @@ for (const discoveryFailure of [
   {
     name: "the distribution test is missing",
     prepare: (root) =>
-      rm(path.join(root, "test/open-source-distribution.test.js")),
+      rm(path.join(root, "test/open-source-distribution.test.mjs")),
     expectedError: /committed distribution test is unavailable/u,
   },
   {

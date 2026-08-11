@@ -413,7 +413,7 @@ flowchart TB
 - **Goal:** Make the repository legally and operationally ready for publication without pushing it.
 - **Requirements:** R1, R7, R22; KTD1–KTD6.
 - **Dependencies:** U8–U10.
-- **Files:** `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `README.md`, `docs/PRIVACY.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `config.example.json`, `package.json`, `.gitignore`, `test/open-source-distribution.test.js`.
+- **Files:** `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `README.md`, `docs/PRIVACY.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `config.example.json`, `package.json`, `.gitignore`, `test/open-source-distribution.test.mjs`.
 - **Approach:** Choose and document an explicit open-source license, separate safe examples from machine-local configuration, document trust and privacy boundaries, and add automated checks for secrets, absolute private paths, required files, and reproducible setup.
 - **Execution note:** This is packaging and documentation; prefer install/config/runtime smoke evidence plus deterministic repository checks. Before creating `LICENSE` or changing package license metadata, stop at the owner-decision gate below and obtain an explicit SPDX license choice; do not infer a legal commitment.
 - **Patterns to follow:** Current local-only README guidance and ignored private configuration conventions.

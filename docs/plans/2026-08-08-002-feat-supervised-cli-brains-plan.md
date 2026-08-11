@@ -409,7 +409,7 @@ Document supported CLI version ranges, fixed vendor credential environment names
 
 - [x] **Step 2: Run documentation and distribution checks**
 
-Run: `node --test test/open-source-distribution.test.js test/frontend-configuration-contract.test.js`
+Run: `node --test test/open-source-distribution.test.mjs test/frontend-configuration-contract.test.js`
 
 Run: `node scripts/validate-ui.mjs`
 
