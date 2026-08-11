@@ -1032,6 +1032,7 @@ function requiredStepContracts(
           ...nodeTestFiles,
         ],
       },
+      environment: { APPDATA: "null-device" },
     },
     {
       name: "open-source distribution suite",

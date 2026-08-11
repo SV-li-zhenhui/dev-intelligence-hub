@@ -379,6 +379,7 @@ async function createFixture(t, {
         durationMs: 100,
         exitCode: 0,
         signal: null,
+        environment: { APPDATA: "null-device" },
         testResults: {
           summary: {
             tests: 3,

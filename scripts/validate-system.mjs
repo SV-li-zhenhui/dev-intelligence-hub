@@ -527,6 +527,8 @@ try {
     ...nodeTestFiles,
   ], {
     name: "complete Node test suite",
+    environment: validationNullAppDataEnvironment(),
+    environmentEvidence: nullAppDataEnvironmentEvidence,
     quiet: true,
     parseOutput: parseNodeTestTap,
     parseOutputOnFailure: true,
