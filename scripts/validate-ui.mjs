@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { verifyLiveDashboard } from "./system-live-validation.mjs";
+import { partitionBrowserFailures } from "./ui-validation-diagnostics.mjs";
 import {
   buildUiArtifactReceipt,
   parseUiValidationCommandArguments,
@@ -35,16 +36,37 @@ try {
 async function observedPage(options) {
   const page = await browser.newPage(options);
   const consoleErrors = [];
+  const httpErrors = [];
   const pageErrors = [];
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    if (message.type() === "error") {
+      consoleErrors.push({
+        text: message.text(),
+        location: message.location(),
+      });
+    }
+  });
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+    httpErrors.push({
+      method: response.request().method(),
+      url: response.url(),
+      status: response.status(),
+    });
   });
   page.on("pageerror", (error) => pageErrors.push(error.message));
-  return { page, consoleErrors, pageErrors };
+  return { page, consoleErrors, httpErrors, pageErrors };
 }
 
-async function pageDiagnostics(observation) {
-  const { page, consoleErrors, pageErrors } = observation;
+async function pageDiagnostics(
+  observation,
+  { expectedHttpFailures = [] } = {},
+) {
+  const { page, consoleErrors, httpErrors, pageErrors } = observation;
+  const partitionedFailures = partitionBrowserFailures(
+    { consoleErrors, httpErrors },
+    expectedHttpFailures,
+  );
   const diagnostics = await page.evaluate(() => {
     const accessibilityIssues = [];
     if (!document.documentElement.lang.trim()) {
@@ -89,7 +111,7 @@ async function pageDiagnostics(observation) {
     };
   });
   return {
-    consoleErrors,
+    ...partitionedFailures,
     pageErrors,
     horizontalOverflow: diagnostics.horizontalOverflow,
     accessibilityFailures: diagnostics.accessibilityIssues.length,
@@ -101,6 +123,23 @@ function sectionByTitle(page, title) {
   return page.locator(".section").filter({
     has: page.locator("h2", { hasText: title }),
   });
+}
+
+async function routeEmptyAttentionQueue(page) {
+  await page.route("**/api/attention/next**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        available: false,
+        source: null,
+        pendingCount: 0,
+        externalEnabled: true,
+        externalQueueRevision: 0,
+        item: null,
+      }),
+    }),
+  );
 }
 
 function deferred() {
@@ -171,6 +210,7 @@ async function activateSystemAndReadStatus(page) {
 async function validate(name, viewport) {
   const observation = await observedPage({ viewport, acceptDownloads: true });
   const { page } = observation;
+  await routeEmptyAttentionQueue(page);
   const response = await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.locator("#content .section").first().waitFor();
   await page.screenshot({
@@ -320,6 +360,7 @@ async function validateConfirmationQueue() {
   });
   const { page } = observation;
   const requests = [];
+  await routeEmptyAttentionQueue(page);
   await page.route("**/api/dashboard", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixture) }),
   );
@@ -555,7 +596,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
   };
 
   const observation = await observedPage({ viewport, acceptDownloads: true });
-  const { page, consoleErrors, pageErrors } = observation;
+  const { page, consoleErrors, httpErrors, pageErrors } = observation;
   const overflowChecks = [];
   const focusChecks = [];
   async function recordHorizontalOverflow(stage) {
@@ -848,6 +889,7 @@ async function validateCodeJobControlAndPackage(name, viewport) {
       overflowChecks.some((check) => check.overflow),
     overflowChecks,
     consoleErrors,
+    httpErrors,
     pageErrors,
     accessibilityFailures: diagnostics.accessibilityFailures,
     accessibilityIssues: diagnostics.accessibilityIssues,
@@ -984,6 +1026,25 @@ async function validateExternalReviewConfirmation() {
   await page.route("**/api/confirmations/**", async (route) => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (
+      request.method() === "GET" &&
+      pathname === "/api/confirmations/history"
+    ) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          available: true,
+          queueRevision: wasPublished ? 10 : 8,
+          filters: {},
+          limit: 20,
+          roleIdFacets: ["pr-reviewer"],
+          items: [],
+          nextCursor: null,
+        }),
+      });
+      return;
+    }
     if (request.method() === "POST") {
       requests.push({
         phase: confirmationPhase,
@@ -1081,10 +1142,16 @@ async function validateExternalReviewConfirmation() {
 }
 
 async function validateSystemStatusFailureStates() {
+  const expectedSystemStatusFailure = Object.freeze({
+    method: "GET",
+    url: `${baseUrl}/api/system/status`,
+    status: 503,
+  });
   const initialObservation = await observedPage({
     viewport: { width: 1100, height: 820 },
   });
   const { page: initialFailure } = initialObservation;
+  await routeEmptyAttentionQueue(initialFailure);
   await initialFailure.route("**/api/system/status", (route) =>
     route.fulfill({
       status: 503,
@@ -1097,7 +1164,9 @@ async function validateSystemStatusFailureStates() {
   results.push({
     name: "system-status-initial-error",
     ...initial,
-    ...await pageDiagnostics(initialObservation),
+    ...await pageDiagnostics(initialObservation, {
+      expectedHttpFailures: [expectedSystemStatusFailure],
+    }),
   });
   await initialFailure.close();
 
@@ -1105,6 +1174,7 @@ async function validateSystemStatusFailureStates() {
     viewport: { width: 1100, height: 820 },
   });
   const { page: staleFailure } = staleFailureObservation;
+  await routeEmptyAttentionQueue(staleFailure);
   await staleFailure.goto(baseUrl, { waitUntil: "networkidle" });
   await activateSystemAndReadStatus(staleFailure);
   await staleFailure.locator('[data-view="memory"]').click();
@@ -1128,7 +1198,9 @@ async function validateSystemStatusFailureStates() {
   results.push({
     name: "system-status-stale-error",
     ...stale,
-    ...await pageDiagnostics(staleFailureObservation),
+    ...await pageDiagnostics(staleFailureObservation, {
+      expectedHttpFailures: [expectedSystemStatusFailure],
+    }),
   });
   await staleFailure.close();
 
@@ -1136,6 +1208,7 @@ async function validateSystemStatusFailureStates() {
     viewport: { width: 1100, height: 820 },
   });
   const { page: staleSuccess } = staleSuccessObservation;
+  await routeEmptyAttentionQueue(staleSuccess);
   await staleSuccess.addInitScript(() => {
     const fetchWithHeldSystemStatusJson = window.fetch.bind(window);
     window.fetch = async (...args) => {
@@ -1262,6 +1335,7 @@ for (const result of results.filter((entry) => entry.name.includes("-"))) {
   if (["desktop-1440", "mobile-390"].includes(result.name)) {
     assert.equal(result.status, 200, `${result.name}: page must load`);
     assert.deepEqual(result.consoleErrors, [], `${result.name}: console errors`);
+    assert.deepEqual(result.httpErrors, [], `${result.name}: HTTP errors`);
     assert.deepEqual(result.pageErrors, [], `${result.name}: page errors`);
     assert.equal(result.horizontalOverflow, false, `${result.name}: overflow`);
     assert.equal(result.memorySearchVisible, true, `${result.name}: memory search`);
@@ -1367,6 +1441,7 @@ for (const codeJobResult of codeJobResults) {
   assert.equal(codeJobResult.cancellationSingleOpenDialog, true, codeJobResult.name);
   assert.equal(codeJobResult.horizontalOverflow, false, codeJobResult.name);
   assert.deepEqual(codeJobResult.consoleErrors, [], `${codeJobResult.name}: console errors`);
+  assert.deepEqual(codeJobResult.httpErrors, [], `${codeJobResult.name}: HTTP errors`);
   assert.deepEqual(codeJobResult.pageErrors, [], `${codeJobResult.name}: page errors`);
   assert.equal(
     codeJobResult.focusChecks.every((check) => check.inside),
@@ -1410,6 +1485,7 @@ assert.deepEqual(
 );
 for (const result of results) {
   assert.deepEqual(result.consoleErrors, [], `${result.name}: console errors`);
+  assert.deepEqual(result.httpErrors, [], `${result.name}: HTTP errors`);
   assert.deepEqual(result.pageErrors, [], `${result.name}: page errors`);
   assert.equal(result.horizontalOverflow, false, `${result.name}: overflow`);
   assert.equal(

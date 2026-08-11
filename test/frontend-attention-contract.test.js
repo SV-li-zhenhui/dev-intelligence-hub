@@ -18,6 +18,14 @@ test("all attention sources share one dialog and one unified next endpoint", asy
   const { html, app } = await sources();
 
   assert.equal((html.match(/<dialog\b/g) || []).length, 2);
+  assert.match(
+    html,
+    /<dialog id="detail-dialog" aria-label="详情">/,
+  );
+  assert.match(
+    html,
+    /<dialog id="confirmation-dialog" aria-label="待确认操作">/,
+  );
   assert.equal((html.match(/id="confirmation-dialog"/g) || []).length, 1);
   assert.match(app, /fetch\(attentionNextUrl\(\)/);
   assert.doesNotMatch(app, /fetch\("\/api\/confirmations\/next"/);
