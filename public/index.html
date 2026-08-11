@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#main-content">跳到主内容</a>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
@@ -64,11 +65,11 @@
         </div>
       </aside>
 
-      <main class="main">
+      <main class="main" id="main-content" tabindex="-1">
         <header class="topbar">
           <div>
             <p class="eyebrow">MY WORKSPACE / TODAY</p>
-            <h1 id="page-title">今天需要你推动什么</h1>
+            <h1 id="page-title" tabindex="-1">今天需要你推动什么</h1>
           </div>
           <div class="topbar-actions">
             <span id="last-updated" class="last-updated">尚未刷新</span>

@@ -217,6 +217,14 @@ async function validate(name, viewport) {
     path: path.join(outputDirectory, `${name}.png`),
     fullPage: true,
   });
+  await page.keyboard.press("Tab");
+  const skipLinkFocused = await page.evaluate(
+    () => document.activeElement?.matches?.(".skip-link") === true,
+  );
+  await page.keyboard.press("Enter");
+  const skipTargetFocused = await page.evaluate(
+    () => document.activeElement?.id === "main-content",
+  );
 
   const actionNowCount = await sectionByTitle(
     page,
@@ -238,6 +246,11 @@ async function validate(name, viewport) {
     await page.getByRole("button", { name: "关闭详情" }).click();
   }
   await page.locator('[data-view="prs"]').click();
+  const { viewTitleUpdated, viewHeadingFocused } = await page.evaluate(() => ({
+    viewTitleUpdated: document.title === "Pull Requests · MyDashboard",
+    viewHeadingFocused:
+      document.activeElement === document.querySelector("#page-title"),
+  }));
   const prSectionTitles = await page.locator(".section-heading h2").allTextContents();
   await page.locator('[data-view="versions"]').click();
   const versionRows = await page.locator(".version-row").count();
@@ -278,6 +291,10 @@ async function validate(name, viewport) {
     systemErrorVisible: system.systemErrorVisible,
     systemErrorText: system.systemErrorText,
     detailHasResponsibility,
+    skipLinkFocused,
+    skipTargetFocused,
+    viewTitleUpdated,
+    viewHeadingFocused,
     prSectionTitles,
     versionRows,
     newestVersionFirstNote,
@@ -1339,6 +1356,10 @@ for (const result of results.filter((entry) => entry.name.includes("-"))) {
     assert.deepEqual(result.pageErrors, [], `${result.name}: page errors`);
     assert.equal(result.horizontalOverflow, false, `${result.name}: overflow`);
     assert.equal(result.memorySearchVisible, true, `${result.name}: memory search`);
+    assert.equal(result.skipLinkFocused, true, `${result.name}: skip link focus`);
+    assert.equal(result.skipTargetFocused, true, `${result.name}: skip target focus`);
+    assert.equal(result.viewTitleUpdated, true, `${result.name}: document title`);
+    assert.equal(result.viewHeadingFocused, true, `${result.name}: heading focus`);
     assert.equal(result.systemStatusVisible, true, `${result.name}: system status`);
     assert.equal(result.systemBackupVisible, true, `${result.name}: system backup`);
     assert.equal(

@@ -1357,14 +1357,14 @@ function bindConfirmationHistoryView() {
 }
 
 function render() {
+  pageTitle.textContent = viewTitles[currentView];
+  document.title = `${viewTitles[currentView]} · MyDashboard`;
   if (!["configuration", "system"].includes(currentView) && !dashboard) {
-    pageTitle.textContent = viewTitles[currentView];
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
   }
   itemIndex = new Map();
   jobIndex = new Map();
-  pageTitle.textContent = viewTitles[currentView];
   const views = {
     overview: overviewView,
     prs: () => {
@@ -4130,7 +4130,7 @@ function applyConfigurationState(
     configurationStatus().safeMode === true
   ) {
     configurationAutoSelected = true;
-    activateView("configuration");
+    activateView("configuration", { focusHeading: false });
   } else if (renderView && currentView === "configuration") {
     render();
   }
@@ -4340,7 +4340,7 @@ async function refresh() {
   }
 }
 
-function activateView(view) {
+function activateView(view, { focusHeading = true } = {}) {
   if (!Object.hasOwn(viewTitles, view)) return;
   document.querySelector(".nav-item.active")?.classList.remove("active");
   document.querySelector(".nav-item[aria-current=page]")?.removeAttribute(
@@ -4351,6 +4351,7 @@ function activateView(view) {
   button?.setAttribute("aria-current", "page");
   currentView = view;
   render();
+  if (focusHeading) pageTitle.focus({ preventScroll: true });
   if (currentView === "configuration") {
     void loadConfiguration();
     void loadBrainProviderStatus();

@@ -1,7 +1,7 @@
 :root {
   --ink: #17201d;
-  --muted: #68726e;
-  --faint: #929b97;
+  --muted: #555f5b;
+  --faint: #5f6965;
   --paper: #f4f2ec;
   --surface: #fffdf8;
   --line: #d9d7cf;
@@ -29,6 +29,23 @@ body {
   min-width: 320px;
   color: var(--ink);
   background: var(--paper);
+}
+
+.skip-link {
+  position: fixed;
+  inset-block-start: 12px;
+  inset-inline-start: -999px;
+  z-index: 100;
+  padding: 9px 13px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 2px solid var(--green);
+  border-radius: 6px;
+}
+
+.skip-link:focus-visible {
+  inset-inline-start: 12px;
+  outline-offset: 3px;
 }
 
 button {
@@ -165,6 +182,12 @@ kbd {
 .main {
   width: min(1180px, 100%);
   padding: 34px 42px 70px;
+  scroll-margin-top: 16px;
+}
+
+#main-content:focus-visible,
+#page-title:focus-visible {
+  outline-offset: 4px;
 }
 
 .topbar {
@@ -300,7 +323,7 @@ h1 {
 
 .section-heading span {
   color: var(--faint);
-  font: 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
 .employee-panel {
@@ -608,7 +631,7 @@ h1 {
 .confirmation-pending-item small,
 .confirmation-history-item small {
   color: var(--faint);
-  font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   overflow-wrap: anywhere;
 }
 
@@ -1296,7 +1319,7 @@ h1 {
 .work-graph-card-heading > div > span {
   margin-bottom: 4px;
   color: var(--faint);
-  font: 9px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
   text-transform: uppercase;
 }
 
@@ -1531,13 +1554,13 @@ h1 {
 .work-graph-evidence small {
   overflow-wrap: anywhere;
   color: var(--faint);
-  font: 8px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
 .work-graph-overflow-note {
   grid-column: 1 / -1;
   color: var(--faint);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.45;
 }
 
