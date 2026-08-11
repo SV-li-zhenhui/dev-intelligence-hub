@@ -996,6 +996,9 @@ public static class MyDashboardCodexCredentialFile {
     string name,
     int maximumBytes,
     bool required) {
+    if (maximumBytes < 1 || maximumBytes > MAXIMUM_CREDENTIAL_BYTES) {
+      throw new CodexPrivateFileException();
+    }
     try {
       using (OpenedPath directory = OpenPrivateDirectory(
         directoryPath,

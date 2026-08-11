@@ -228,7 +228,10 @@ $item.SetAccessControl($acl)
 `, `add fictional world ${right} ACE`);
 }
 
-function invokeNativeHelper(packet) {
+function invokeNativeHelper(
+  packet,
+  helperPath = path.resolve("src/lib/windows-codex-credential-helper.ps1"),
+) {
   const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
   const executable = path.win32.join(
     systemRoot,
@@ -246,7 +249,7 @@ function invokeNativeHelper(packet) {
       "-ExecutionPolicy",
       "Bypass",
       "-File",
-      path.resolve("src/lib/windows-codex-credential-helper.ps1"),
+      helperPath,
     ],
     {
       encoding: "utf8",
@@ -263,6 +266,28 @@ function invokeNativeHelper(packet) {
     [result.error?.message, result.stderr].filter(Boolean).join("\n"),
   );
   return JSON.parse(result.stdout);
+}
+
+async function makeNativeReadPrivateLimitHarness(root) {
+  const helperPath = path.resolve("src/lib/windows-codex-credential-helper.ps1");
+  const source = (await readFile(helperPath, "utf8")).replaceAll("\r\n", "\n");
+  const guardedSelector = [
+    "    'read-private' {",
+    "      $directory = Read-Directory $request.directory",
+    "      $name = Read-Name $request.name",
+    "      $maximum = Read-Maximum $request.maximumBytes $MaximumCredentialBytes",
+  ].join("\n");
+  const widenedSelector = guardedSelector.replace(
+    "$MaximumCredentialBytes",
+    "$MaximumPacketBytes",
+  );
+  const harnessSource = source.replace(guardedSelector, widenedSelector);
+  if (harnessSource === source || harnessSource.includes(guardedSelector)) {
+    throw new Error("native limit harness could not isolate the read-private selector");
+  }
+  const harnessPath = path.join(root, "native-read-private-limit-harness.ps1");
+  await writeFile(harnessPath, harnessSource, { encoding: "utf8", flag: "wx" });
+  return harnessPath;
 }
 
 function queryStableFileIdentity(file) {
@@ -1171,6 +1196,57 @@ test("native helper independently enforces packet and 65,536-byte credential bou
     const packet = request + " ".repeat(PACKET_LIMIT + 1 - Buffer.byteLength(request));
     assert.deepEqual(invokeNativeHelper(packet), { schemaVersion: 1, status: "failed" });
   });
+});
+
+test("native ReadPrivate independently rejects maximumBytes above 65,536", {
+  skip: WINDOWS_NATIVE_SUPPORTED ? false : "requires Windows x64 native file-security APIs",
+}, async (t) => {
+  const root = await makeNativeRoot(t, "native-read-limit");
+  const directory = await frozenDirectory(root);
+  const helperPath = await makeNativeReadPrivateLimitHarness(root);
+  const cases = [
+    { maximumBytes: 1, name: "lower.json", bytes: Buffer.from("x") },
+    {
+      maximumBytes: CREDENTIAL_LIMIT,
+      name: "upper.json",
+      bytes: Buffer.alloc(CREDENTIAL_LIMIT, 0x75),
+    },
+  ];
+
+  for (const boundary of cases) {
+    await writeFile(path.join(root, boundary.name), boundary.bytes);
+    const response = invokeNativeHelper({
+      schemaVersion: 1,
+      operation: "read-private",
+      directory,
+      name: boundary.name,
+      maximumBytes: boundary.maximumBytes,
+      required: true,
+    }, helperPath);
+    assert.equal(response.status, "ok");
+    assert.deepEqual(Buffer.from(response.bytesBase64, "base64"), boundary.bytes);
+  }
+
+  const privateMarker = "fictional-native-over-limit-private-marker";
+  const oversized = Buffer.alloc(CREDENTIAL_LIMIT + 1, 0x78);
+  oversized.set(Buffer.from(privateMarker));
+  const oversizedName = "over-limit.json";
+  const oversizedPath = path.join(root, oversizedName);
+  await writeFile(oversizedPath, oversized);
+  const response = invokeNativeHelper({
+    schemaVersion: 1,
+    operation: "read-private",
+    directory,
+    name: oversizedName,
+    maximumBytes: CREDENTIAL_LIMIT + 1,
+    required: true,
+  }, helperPath);
+
+  assert.equal(response.status, "failed");
+  assert.deepEqual(Object.keys(response).sort(), ["schemaVersion", "status"]);
+  const serialized = JSON.stringify(response);
+  assert.equal(serialized.includes(privateMarker), false);
+  assert.equal(serialized.includes(oversizedPath), false);
 });
 
 test("Windows private operations use a pinned directory and atomic verified replacement", {
