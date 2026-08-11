@@ -509,6 +509,23 @@ function roleDecision(model, context, state) {
   });
 }
 
+function issueMemoryDecision(context) {
+  return {
+    schemaVersion: 1,
+    status: "answered",
+    claims: context.records
+      .filter(({ recordId, labels }) =>
+        labels.authority === "raw" &&
+        labels.lifecycle === "current" &&
+        context.citableRecordIds.includes(recordId)
+      )
+      .map(({ recordId, title }) => ({
+        statement: `${title} is authoritative Issue lifecycle evidence.`,
+        citationIds: [recordId],
+      })),
+  };
+}
+
 function createBrainFetch(state) {
   return async (url, options) => {
     const body = JSON.parse(options.body);
@@ -518,8 +535,11 @@ function createBrainFetch(state) {
       model: body.model,
       context: structuredClone(context),
     });
+    const result = body.model === "issue-memory"
+      ? issueMemoryDecision(context)
+      : roleDecision(body.model, context, state);
     return textResponse({
-      message: { content: JSON.stringify(roleDecision(body.model, context, state)) },
+      message: { content: JSON.stringify(result) },
     });
   };
 }
@@ -613,6 +633,22 @@ function applicationConfig(sourceRoot, git) {
       enabled: true,
       maximumRecords: 2_000,
       maximumStateBytes: 16 * 1024 * 1024,
+      answering: {
+        enabled: true,
+        brain: {
+          provider: "fixture-local",
+          model: "issue-memory",
+          remoteData: { requirements: false, code: false, memory: false },
+        },
+        localBrain: {
+          provider: "fixture-local",
+          model: "issue-memory",
+          remoteData: { requirements: false, code: false, memory: false },
+        },
+        maximumRecords: 20,
+        maximumContextBytes: 112 * 1024,
+        maximumConcurrent: 1,
+      },
     },
     codeExecutor: {
       enabled: true,
@@ -798,6 +834,9 @@ test("a production-composed Issue survives confirmation restart and closes on re
     attentionInboxDependencies: { createGuard: guardFactory, clock },
     workProposalDependencies: { createGuard: guardFactory, clock },
     memoryRuntimeDependencies: { createGuard: guardFactory },
+    memoryAnswerDependencies: {
+      brainDependencies: { fetch: createBrainFetch(state) },
+    },
     workCoordinationDependencies: {
       clock,
       brainDependencies: { fetch: createBrainFetch(state) },
@@ -1217,5 +1256,72 @@ test("a production-composed Issue survives confirmation restart and closes on re
     await application.store.read("change-package-applications", null)
       .then(({ applications }) => applications),
     stateBeforeFinalArchive.applications,
+  );
+  const answerFilters = {
+    query: "Production Issue Code Job acceptance",
+    eventType: "work.completed",
+  };
+  const expectedAnswerSearch = await application.memorySearch.search({
+    q: answerFilters.query,
+    eventType: answerFilters.eventType,
+    limit: 20,
+  });
+  assert.equal(expectedAnswerSearch.items.length > 0, true);
+  const expectedAnswerContext = recoveredMemoryJournal.readRecords({
+    recordIds: expectedAnswerSearch.items.map(({ id }) => id),
+  });
+  const expectedRecordIds = expectedAnswerContext.items.map(
+    ({ record }) => record.recordId,
+  );
+  const expectedCitableIds = expectedAnswerContext.items
+    .filter(({ labels }) =>
+      labels.authority === "raw" && labels.lifecycle === "current"
+    )
+    .map(({ record }) => record.recordId);
+  assert.equal(expectedCitableIds.length > 0, true);
+  assert.deepEqual(expectedCitableIds, expectedRecordIds);
+  const recoveredAnswer = await application.memoryAnswer.answer({
+    schemaVersion: 1,
+    question: "What evidence completed the production Issue lifecycle?",
+    mode: "local",
+    retrieval: {
+      kind: "query",
+      filters: answerFilters,
+    },
+  });
+  assert.equal(recoveredAnswer.status, "answered");
+  const actualCitationIds = recoveredAnswer.citations.map(
+    ({ recordId }) => recordId,
+  );
+  assert.equal(actualCitationIds.length, expectedCitableIds.length);
+  assert.equal(new Set(actualCitationIds).size, actualCitationIds.length);
+  assert.deepEqual(
+    new Set(actualCitationIds),
+    new Set(expectedCitableIds),
+  );
+  assert.equal(
+    recoveredAnswer.citations.every(({ labels }) =>
+      labels.authority === "raw" && labels.lifecycle === "current"
+    ),
+    true,
+  );
+  assert.deepEqual(recoveredAnswer.context.recordIds, expectedRecordIds);
+  assert.deepEqual(
+    recoveredAnswer.context.citableRecordIds,
+    expectedCitableIds,
+  );
+  assert.equal(
+    state.brainCalls.length,
+    stateBeforeFinalArchive.brainCalls.length + 1,
+  );
+  const memoryCall = state.brainCalls.at(-1);
+  assert.equal(memoryCall.model, "issue-memory");
+  assert.deepEqual(memoryCall.context.citableRecordIds, expectedCitableIds);
+  assert.deepEqual(
+    memoryCall.context.records.map(({ recordId, labels }) => ({ recordId, labels })),
+    expectedAnswerContext.items.map(({ record, labels }) => ({
+      recordId: record.recordId,
+      labels,
+    })),
   );
 });
