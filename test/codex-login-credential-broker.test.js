@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import {
   lstat,
   mkdir,
@@ -10,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -19,6 +21,12 @@ import {
 import {
   createTestCodexLoginCredentialStore,
 } from "../src/lib/codex-login-credential-store.js";
+import {
+  createTestSupervisedProcessRunner,
+} from "../src/lib/supervised-process-runner.js";
+import {
+  prepareCleanupTreesByIdentity,
+} from "../src/lib/private-directory-manager.js";
 
 function brokerFailure(code) {
   return Object.assign(new Error(`fictional ${code} private detail`), { code });
@@ -32,6 +40,13 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function waitForAbort(signal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", resolve, { once: true });
+  });
 }
 
 async function directoryIdentity(directory) {
@@ -162,6 +177,12 @@ async function fixture(t, overrides = {}) {
     ...(overrides.processId ? { processId: overrides.processId } : {}),
     ...(overrides.isProcessAlive
       ? { isProcessAlive: overrides.isProcessAlive }
+      : {}),
+    ...(overrides.statusTimeoutMs
+      ? { statusTimeoutMs: overrides.statusTimeoutMs }
+      : {}),
+    ...(overrides.operationTimeoutMs
+      ? { operationTimeoutMs: overrides.operationTimeoutMs }
       : {}),
   });
   return {
@@ -633,9 +654,14 @@ test("abort plus reap failure never captures or cleans and permanently fences ad
 test("availability captures every safely reaped status attempt before reporting failure", async (t) => {
   for (const [name, processRunner, expectedCode] of [
     [
-      "nonzero production-shaped rejection",
-      { async run() { throw brokerFailure("STRUCTURED_PROVIDER_PROCESS_FAILED"); } },
+      "clean nonzero production-shaped rejection",
+      { async run() { throw brokerFailure("STRUCTURED_PROVIDER_PROCESS_EXITED"); } },
       "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+    ],
+    [
+      "generic supervised process failure",
+      { async run() { throw brokerFailure("STRUCTURED_PROVIDER_PROCESS_FAILED"); } },
+      "STRUCTURED_PROVIDER_UNAVAILABLE",
     ],
     [
       "timeout production-shaped rejection",
@@ -695,6 +721,184 @@ test("availability captures every safely reaped status attempt before reporting 
       await current.broker.close();
     });
   }
+});
+
+test("real supervised runner distinguishes a clean nonzero status from stream failure", async (t) => {
+  const descriptor = Object.freeze({
+    command: process.execPath,
+    prefixArgs: Object.freeze([]),
+  });
+  const directRunner = createTestSupervisedProcessRunner({
+    descriptorMaterializer: async (value) => value,
+    platform: process.platform,
+  });
+  const cleanNonzero = await fixture(t, {
+    commandLocator: { async resolve() { return descriptor; } },
+    processRunner: directRunner,
+  });
+  assert.equal(
+    (await cleanNonzero.broker.readStatus()).state,
+    "file_login_unavailable",
+  );
+  await cleanNonzero.broker.close();
+
+  const privateCanary = "private-stream-failure-must-not-escape";
+  const streamRunner = createTestSupervisedProcessRunner({
+    descriptorMaterializer: async (value) => value,
+    platform: "linux",
+    treeTerminator: async () => ({ status: "completed" }),
+    spawnImpl() {
+      const child = new EventEmitter();
+      child.pid = 424_242;
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      child.stdout.on("error", () => {});
+      queueMicrotask(() => {
+        child.stdout.emit("error", new Error(privateCanary));
+        child.emit("close", 0, null);
+      });
+      return child;
+    },
+  });
+  const streamFailure = await fixture(t, {
+    commandLocator: { async resolve() { return descriptor; } },
+    processRunner: streamRunner,
+  });
+  const status = await streamFailure.broker.readStatus();
+  assert.equal(status.state, "cli_unavailable");
+  assert.equal(JSON.stringify(status).includes(privateCanary), false);
+  await streamFailure.broker.close();
+});
+
+test("internal broker deadline is a timeout while caller abort remains cancellation", async (t) => {
+  const statusStarted = deferred();
+  const statusFixture = await fixture(t, {
+    statusTimeoutMs: 5,
+    operationTimeoutMs: 2_000,
+    processRunner: {
+      async run({ signal }) {
+        statusStarted.resolve();
+        await waitForAbort(signal);
+        throw brokerFailure("STRUCTURED_PROVIDER_CANCELLED");
+      },
+    },
+  });
+  const statusResult = statusFixture.broker.readStatus();
+  await statusStarted.promise;
+  assert.equal((await statusResult).state, "cli_unavailable");
+  await statusFixture.broker.close();
+
+  const started = deferred();
+  const current = await fixture(t, {
+    statusTimeoutMs: 5,
+    operationTimeoutMs: 2_000,
+    processRunner: {
+      async run({ signal }) {
+        started.resolve();
+        await waitForAbort(signal);
+        throw brokerFailure("STRUCTURED_PROVIDER_CANCELLED");
+      },
+    },
+  });
+
+  const internalDeadline = current.broker.checkAvailability();
+  await started.promise;
+  await assert.rejects(internalDeadline, {
+    code: "STRUCTURED_PROVIDER_TIMEOUT",
+  });
+  const afterTimeout = await current.broker.acquire({
+    signal: new AbortController().signal,
+  });
+  afterTimeout.release({ safe: true });
+  await current.broker.close();
+
+  const callerStarted = deferred();
+  const caller = await fixture(t, {
+    statusTimeoutMs: 5,
+    operationTimeoutMs: 5_000,
+    processRunner: {
+      async run({ signal }) {
+        callerStarted.resolve();
+        await waitForAbort(signal);
+        throw brokerFailure("STRUCTURED_PROVIDER_CANCELLED");
+      },
+    },
+  });
+  const controller = new AbortController();
+  const cancelled = caller.broker.checkAvailability({ signal: controller.signal });
+  await callerStarted.promise;
+  controller.abort();
+  await assert.rejects(cancelled, {
+    code: "STRUCTURED_PROVIDER_CANCELLED",
+  });
+  await caller.broker.close();
+});
+
+test("an operation deadline reached during credential capture cannot become success", async (t) => {
+  const captureStarted = deferred();
+  const releaseCapture = deferred();
+  let operationSignal = null;
+  const store = {
+    async beginTask({ signal }) {
+      operationSignal = signal;
+      return Object.freeze({ sequence: 1 });
+    },
+    async stageTask() {},
+    async captureTask() {
+      captureStarted.resolve();
+      await releaseCapture.promise;
+    },
+    async stageProbe() {},
+  };
+  const current = await fixture(t, {
+    store,
+    statusTimeoutMs: 5,
+    operationTimeoutMs: 2_000,
+  });
+
+  const availability = current.broker.checkAvailability();
+  await captureStarted.promise;
+  await waitForAbort(operationSignal);
+  releaseCapture.resolve();
+  await assert.rejects(availability, {
+    code: "STRUCTURED_PROVIDER_TIMEOUT",
+  });
+  await current.broker.close();
+});
+
+test("caller cancellation reached during mandatory cleanup cannot become success", async (t) => {
+  const cleanupStarted = deferred();
+  const releaseCleanup = deferred();
+  const current = await fixture(t, {
+    prepareCleanupTrees: async (roots) => {
+      let closed = false;
+      return Object.freeze({
+        async commit() {
+          assert.equal(closed, false);
+          cleanupStarted.resolve();
+          await releaseCleanup.promise;
+          closed = true;
+          for (const identity of roots) {
+            assert.deepEqual(await directoryIdentity(identity.path), identity);
+            await rm(identity.path, { recursive: true, force: false });
+          }
+        },
+        async close() { closed = true; },
+      });
+    },
+  });
+  const controller = new AbortController();
+
+  const status = current.broker.readStatus({ signal: controller.signal });
+  await cleanupStarted.promise;
+  controller.abort();
+  releaseCleanup.resolve();
+  await assert.rejects(status, {
+    code: "STRUCTURED_PROVIDER_CANCELLED",
+  });
+  await current.broker.close();
 });
 
 test("broker composes with the real store across fresh, restart, logout, unsafe, and changed sources", async (t) => {
@@ -857,6 +1061,149 @@ test("a restarted broker scavenges only a stale dead-owner probe", async (t) => 
 
   await assert.rejects(lstat(stale), { code: "ENOENT" });
   await current.broker.close();
+});
+
+test("a restarted broker safely handles missing and partial owner markers", async (t) => {
+  const now = Date.parse("2026-08-11T08:30:00.000Z");
+  const staleAt = Date.parse("2026-08-09T08:29:59.000Z");
+  const youngAt = Date.parse("2026-08-11T08:29:59.000Z");
+  const current = await fixture(t, {
+    clock: () => now,
+    processId: 4444,
+    isProcessAlive: (pid) => pid === 2222,
+  });
+  await mkdir(current.probeRoot, { recursive: true });
+  const encodedName = (pid, createdAt, suffix) =>
+    `probe-${pid}-${createdAt}-00000000-0000-4000-8000-${suffix}`;
+  const staleMissing = path.join(
+    current.probeRoot,
+    encodedName(1111, staleAt, "000000000101"),
+  );
+  const stalePartial = path.join(
+    current.probeRoot,
+    encodedName(1111, staleAt, "000000000102"),
+  );
+  const staleLive = path.join(
+    current.probeRoot,
+    encodedName(2222, staleAt, "000000000103"),
+  );
+  const youngDead = path.join(
+    current.probeRoot,
+    encodedName(3333, youngAt, "000000000104"),
+  );
+  for (const directory of [staleMissing, stalePartial, staleLive, youngDead]) {
+    await mkdir(directory);
+  }
+  await writeFile(
+    path.join(stalePartial, ".mydashboard-invocation.json"),
+    "{\"schemaVersion\":",
+    "utf8",
+  );
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+  await assert.rejects(lstat(staleMissing), { code: "ENOENT" });
+  await assert.rejects(lstat(stalePartial), { code: "ENOENT" });
+  assert.equal((await lstat(staleLive)).isDirectory(), true);
+  assert.equal((await lstat(youngDead)).isDirectory(), true);
+  await current.broker.close();
+});
+
+test("probe scavenging accepts and batches the 128 and 129 entry boundaries", async (t) => {
+  const now = Date.parse("2026-08-11T08:30:00.000Z");
+  for (const count of [128, 129]) {
+    await t.test(`${count} stale probes`, async (child) => {
+      const current = await fixture(child, {
+        clock: () => now,
+        processId: 4444,
+        isProcessAlive: () => false,
+        uuidSequenceStart: count + 1,
+        prepareCleanupTrees: async (roots, options) => {
+          assert.equal(options.maximumEntriesPerRoot, 128);
+          assert.ok(options.maximumEntries >= roots.length * 2);
+          return fixtureCleanupSession(roots);
+        },
+      });
+      await mkdir(current.probeRoot, { recursive: true });
+      for (let index = 1; index <= count; index += 1) {
+        const directory = path.join(
+          current.probeRoot,
+          `probe-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        );
+        await mkdir(directory);
+        await writeFile(
+          path.join(directory, ".mydashboard-invocation.json"),
+          JSON.stringify({
+            schemaVersion: 1,
+            kind: "codex-login-probe",
+            ownerPid: 1111,
+            createdAt: "2026-08-09T08:29:59.000Z",
+          }),
+          "utf8",
+        );
+      }
+
+      assert.equal((await current.broker.readStatus()).state, "available");
+      for (let index = 1; index <= count; index += 1) {
+        await assert.rejects(
+          lstat(path.join(
+            current.probeRoot,
+            `probe-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          )),
+          { code: "ENOENT" },
+        );
+      }
+      await current.broker.close();
+    });
+  }
+});
+
+test("production cleanup accepts the 128 and 129 stale-probe boundaries", {
+  skip: process.platform !== "win32" || process.arch !== "x64"
+    ? "production cleanup is Windows x64 only"
+    : false,
+}, async (t) => {
+  const now = Date.parse("2026-08-11T08:30:00.000Z");
+  for (const count of [128, 129]) {
+    await t.test(`${count} production-cleaned probes`, async (child) => {
+      const current = await fixture(child, {
+        clock: () => now,
+        processId: 4444,
+        isProcessAlive: () => false,
+        uuidSequenceStart: count + 1,
+        prepareCleanupTrees: prepareCleanupTreesByIdentity,
+      });
+      await mkdir(current.probeRoot, { recursive: true });
+      for (let index = 1; index <= count; index += 1) {
+        const directory = path.join(
+          current.probeRoot,
+          `probe-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        );
+        await mkdir(directory);
+        await writeFile(
+          path.join(directory, ".mydashboard-invocation.json"),
+          JSON.stringify({
+            schemaVersion: 1,
+            kind: "codex-login-probe",
+            ownerPid: 1111,
+            createdAt: "2026-08-09T08:29:59.000Z",
+          }),
+          "utf8",
+        );
+      }
+
+      assert.equal((await current.broker.readStatus()).state, "available");
+      for (let index = 1; index <= count; index += 1) {
+        await assert.rejects(
+          lstat(path.join(
+            current.probeRoot,
+            `probe-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          )),
+          { code: "ENOENT" },
+        );
+      }
+      await current.broker.close();
+    });
+  }
 });
 
 test("test construction accepts production-shaped class ports", async (t) => {

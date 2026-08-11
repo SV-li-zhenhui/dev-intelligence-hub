@@ -28,9 +28,14 @@ const CLEANUP_MAXIMUM_BYTES = 16 * 1024 * 1024;
 const INVOCATION_MARKER = ".mydashboard-invocation.json";
 const PROBE_KIND = "codex-login-probe";
 const STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
-const MAX_SCAVENGE_ENTRIES = 128;
+const STATUS_OPERATION_TIMEOUT_MS =
+  STATUS_TIMEOUT_MS + (2 * CLEANUP_TIMEOUT_MS);
+const MAX_SCAVENGE_ENTRIES = 1_024;
 const MAX_MARKER_BYTES = 4 * 1024;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const LEGACY_PROBE_NAME = /^probe-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u;
+const OWNED_PROBE_NAME = /^probe-([1-9][0-9]{0,15})-([0-9]{1,16})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u;
+const OPERATION_SIGNALS = new WeakMap();
 const STATUS_STATES = new Set([
   "available",
   "file_login_unavailable",
@@ -89,6 +94,60 @@ function failureCode(error) {
   } catch {
     return null;
   }
+}
+
+function boundedTimeout(value, fallback, name) {
+  const timeout = value ?? fallback;
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  return timeout;
+}
+
+function createOperationSignal(callerSignal, timeoutMs) {
+  const controller = new AbortController();
+  let source = null;
+  const abort = (nextSource) => {
+    if (source !== null) return;
+    source = nextSource;
+    controller.abort();
+  };
+  const onCallerAbort = () => abort("caller");
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  if (callerSignal?.aborted) onCallerAbort();
+  const timer = setTimeout(() => abort("deadline"), timeoutMs);
+  timer.unref?.();
+  OPERATION_SIGNALS.set(controller.signal, {
+    readSource: () => source,
+  });
+  return Object.freeze({
+    signal: controller.signal,
+    close() {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  });
+}
+
+function abortSource(signal) {
+  const tracked = signal && OPERATION_SIGNALS.get(signal);
+  if (tracked) return tracked.readSource();
+  return signal?.aborted ? "caller" : null;
+}
+
+function operationAbortFailure(signal) {
+  switch (abortSource(signal)) {
+    case "deadline":
+      return brokerError("STRUCTURED_PROVIDER_TIMEOUT");
+    case "caller":
+      return brokerError("STRUCTURED_PROVIDER_CANCELLED");
+    default:
+      return null;
+  }
+}
+
+function cleanupFailureOwnsResult(error) {
+  return failureCode(error) === "STRUCTURED_PROVIDER_CLEANUP_FAILED";
 }
 
 function plainRecord(value) {
@@ -242,14 +301,18 @@ function mapTaskFailure(error, signal) {
   ) {
     return brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
   }
-  if (signal?.aborted || code === "ABORT_ERR") {
+  const source = abortSource(signal);
+  if (source === "deadline") {
+    return brokerError("STRUCTURED_PROVIDER_TIMEOUT");
+  }
+  if (source === "caller" || code === "ABORT_ERR") {
     return brokerError("STRUCTURED_PROVIDER_CANCELLED");
   }
   if (
     code === "CODEX_LOGIN_FILE_UNAVAILABLE" ||
     code === "CODEX_LOGIN_SOURCE_UNSAFE" ||
     code === "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" ||
-    code === "STRUCTURED_PROVIDER_PROCESS_FAILED"
+    code === "STRUCTURED_PROVIDER_PROCESS_EXITED"
   ) {
     return brokerError("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE");
   }
@@ -280,17 +343,21 @@ function statusStateFor(error, signal) {
   ) {
     return "broker_blocked";
   }
-  if (signal?.aborted || failureCode(error) === "ABORT_ERR") {
+  const source = abortSource(signal);
+  if (source === "deadline") return "cli_unavailable";
+  if (source === "caller" || failureCode(error) === "ABORT_ERR") {
     throw brokerError("STRUCTURED_PROVIDER_CANCELLED");
   }
   switch (failureCode(error)) {
     case "CODEX_LOGIN_FILE_UNAVAILABLE":
     case "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE":
+    case "STRUCTURED_PROVIDER_PROCESS_EXITED":
       return "file_login_unavailable";
     case "CODEX_LOGIN_SOURCE_UNSAFE":
       return "unsafe_source";
     case "STRUCTURED_PROVIDER_UNAVAILABLE":
     case "STRUCTURED_PROVIDER_TIMEOUT":
+    case "STRUCTURED_PROVIDER_PROCESS_FAILED":
       return "cli_unavailable";
     default:
       return "broker_blocked";
@@ -313,10 +380,26 @@ function brokerDependencies(rawDependencies) {
     "privateDirectoryManager",
     "prepareCleanupTrees",
     "randomUUID",
-  ], ["clock", "processId", "isProcessAlive"]);
+  ], [
+    "clock",
+    "processId",
+    "isProcessAlive",
+    "statusTimeoutMs",
+    "operationTimeoutMs",
+  ]);
   const clock = dependencies.clock ?? (() => Date.now());
   const processId = dependencies.processId ?? process.pid;
   const isProcessAlive = dependencies.isProcessAlive ?? defaultProcessAlive;
+  const statusTimeoutMs = boundedTimeout(
+    dependencies.statusTimeoutMs,
+    STATUS_TIMEOUT_MS,
+    "statusTimeoutMs",
+  );
+  const operationTimeoutMs = boundedTimeout(
+    dependencies.operationTimeoutMs,
+    STATUS_OPERATION_TIMEOUT_MS,
+    "operationTimeoutMs",
+  );
   const requiredOperations = [
     [dependencies.store, ["beginTask", "stageTask", "captureTask", "stageProbe"]],
     [dependencies.commandLocator, ["resolve"]],
@@ -331,7 +414,8 @@ function brokerDependencies(rawDependencies) {
     typeof clock !== "function" ||
     !Number.isSafeInteger(processId) ||
     processId < 1 ||
-    typeof isProcessAlive !== "function"
+    typeof isProcessAlive !== "function" ||
+    operationTimeoutMs <= statusTimeoutMs
   ) {
     throw new TypeError("Codex login broker test dependencies are invalid");
   }
@@ -340,6 +424,8 @@ function brokerDependencies(rawDependencies) {
     clock,
     processId,
     isProcessAlive,
+    statusTimeoutMs,
+    operationTimeoutMs,
   });
 }
 
@@ -536,25 +622,36 @@ function createBroker(rawOptions, rawDependencies) {
     });
   }
 
-  function probeMarker() {
-    const milliseconds = dependencies.clock();
-    if (!Number.isFinite(milliseconds)) {
+  function probeOwner() {
+    const createdAtMs = dependencies.clock();
+    if (
+      !Number.isSafeInteger(createdAtMs) ||
+      createdAtMs < 0
+    ) {
       throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
-    const createdAt = new Date(milliseconds).toISOString();
+    const createdAt = new Date(createdAtMs).toISOString();
     return Object.freeze({
-      schemaVersion: 1,
-      kind: PROBE_KIND,
       ownerPid: dependencies.processId,
+      createdAtMs,
       createdAt,
     });
   }
 
-  async function writeProbeMarker(invocation, signal) {
+  function probeMarker(owner) {
+    return Object.freeze({
+      schemaVersion: 1,
+      kind: PROBE_KIND,
+      ownerPid: owner.ownerPid,
+      createdAt: owner.createdAt,
+    });
+  }
+
+  async function writeProbeMarker(invocation, owner, signal) {
     await verifyDirectoryIdentity(invocation);
     throwIfCancelled(signal);
     const markerPath = path.join(invocation.path, INVOCATION_MARKER);
-    const bytes = Buffer.from(JSON.stringify(probeMarker()), "utf8");
+    const bytes = Buffer.from(JSON.stringify(probeMarker(owner)), "utf8");
     if (bytes.length > MAX_MARKER_BYTES) {
       throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
@@ -673,13 +770,37 @@ function createBroker(rawOptions, rawDependencies) {
     }
   }
 
+  function probeNameMetadata(name) {
+    const owned = OWNED_PROBE_NAME.exec(name);
+    if (owned) {
+      const ownerPid = Number(owned[1]);
+      const createdAtMs = Number(owned[2]);
+      if (
+        !Number.isSafeInteger(ownerPid) ||
+        ownerPid < 1 ||
+        !Number.isSafeInteger(createdAtMs) ||
+        createdAtMs < 0 ||
+        !SAFE_UUID.test(owned[3])
+      ) {
+        return null;
+      }
+      return Object.freeze({
+        owner: Object.freeze({ ownerPid, createdAtMs }),
+      });
+    }
+    const legacy = LEGACY_PROBE_NAME.exec(name);
+    if (!legacy || !SAFE_UUID.test(legacy[1])) return null;
+    return Object.freeze({ owner: null });
+  }
+
   async function cleanupProbes(invocations) {
     if (invocations.length === 0) return;
     const cleanupSignal = AbortSignal.timeout(CLEANUP_TIMEOUT_MS);
     let session = null;
     try {
       session = await dependencies.prepareCleanupTrees(invocations, {
-        maximumEntries: CLEANUP_MAXIMUM_ENTRIES,
+        maximumEntries: CLEANUP_MAXIMUM_ENTRIES * invocations.length,
+        maximumEntriesPerRoot: CLEANUP_MAXIMUM_ENTRIES,
         maximumDepth: CLEANUP_MAXIMUM_DEPTH,
         maximumBytes: CLEANUP_MAXIMUM_BYTES,
         signal: cleanupSignal,
@@ -710,18 +831,16 @@ function createBroker(rawOptions, rawDependencies) {
     const entries = [];
     try {
       directoryHandle = await opendir(probeRoot.path);
-      let exhausted = false;
-      for (let index = 0; index < MAX_SCAVENGE_ENTRIES; index += 1) {
+      while (true) {
         throwIfCancelled(signal);
         const entry = await directoryHandle.read();
         if (entry === null) {
-          exhausted = true;
           break;
         }
+        if (entries.length >= MAX_SCAVENGE_ENTRIES) {
+          throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
         entries.push(entry);
-      }
-      if (!exhausted) {
-        throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
       }
     } catch (error) {
       if (error instanceof CodexLoginCredentialBrokerError) throw error;
@@ -734,12 +853,17 @@ function createBroker(rawOptions, rawDependencies) {
       }
     }
     const stale = [];
+    const now = dependencies.clock();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    }
     for (const entry of entries) {
       throwIfCancelled(signal);
+      const metadata = probeNameMetadata(entry.name);
       if (
         !entry.isDirectory() ||
         entry.isSymbolicLink() ||
-        !/^probe-[0-9a-f-]{36}$/u.test(entry.name)
+        metadata === null
       ) {
         continue;
       }
@@ -750,18 +874,34 @@ function createBroker(rawOptions, rawDependencies) {
         );
         const marker = await readProbeMarker(invocation, signal);
         if (
-          marker === null ||
-          dependencies.clock() - marker.createdAtMs < STALE_AFTER_MS
+          marker !== null &&
+          metadata.owner !== null &&
+          (
+            marker.ownerPid !== metadata.owner.ownerPid ||
+            marker.createdAtMs !== metadata.owner.createdAtMs
+          )
+        ) {
+          continue;
+        }
+        const owner = marker ?? metadata.owner;
+        if (
+          owner === null ||
+          now - owner.createdAtMs < STALE_AFTER_MS
         ) {
           continue;
         }
         let alive = true;
         try {
-          alive = Boolean(dependencies.isProcessAlive(marker.ownerPid));
+          alive = Boolean(dependencies.isProcessAlive(owner.ownerPid));
         } catch {
           alive = true;
         }
-        if (!alive) stale.push(invocation);
+        if (!alive) {
+          stale.push(invocation);
+          if (stale.length === CLEANUP_MAXIMUM_ENTRIES) {
+            await cleanupProbes(stale.splice(0));
+          }
+        }
       } catch (error) {
         if (error instanceof CodexLoginCredentialBrokerError) throw error;
         // Unknown, raced, or untrusted entries are retained.
@@ -780,7 +920,11 @@ function createBroker(rawOptions, rawDependencies) {
     if (typeof uuid !== "string" || !SAFE_UUID.test(uuid)) {
       throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
-    const directory = path.join(probeRoot.path, `probe-${uuid}`);
+    const owner = probeOwner();
+    const directory = path.join(
+      probeRoot.path,
+      `probe-${owner.ownerPid}-${owner.createdAtMs}-${uuid}`,
+    );
     let invocation = null;
     try {
       invocation = await dependencies.privateDirectoryManager.prepare({
@@ -795,7 +939,7 @@ function createBroker(rawOptions, rawDependencies) {
       });
       await verifyDirectoryIdentity(probeRoot);
       invocation = await verifyDirectoryIdentity(invocation);
-      await writeProbeMarker(invocation, signal);
+      await writeProbeMarker(invocation, owner, signal);
       return invocation;
     } catch (error) {
       try {
@@ -852,7 +996,7 @@ function createBroker(rawOptions, rawDependencies) {
         env: profileEnvironment(invocation, codexHomePath),
         input: Buffer.alloc(0),
         signal,
-        timeoutMs: STATUS_TIMEOUT_MS,
+        timeoutMs: dependencies.statusTimeoutMs,
         maxStdoutBytes: STATUS_OUTPUT_LIMIT,
         maxStderrBytes: STATUS_OUTPUT_LIMIT,
       });
@@ -964,6 +1108,7 @@ function createBroker(rawOptions, rawDependencies) {
   }
 
   async function readStatus(rawRequest = {}) {
+    let operation = null;
     let signal = null;
     let token = null;
     let invocation = null;
@@ -973,8 +1118,12 @@ function createBroker(rawOptions, rawDependencies) {
     let cleanupAllowed = true;
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
-      signal = normalizeSignal(request.signal, { optional: true }) ??
-        AbortSignal.timeout(STATUS_TIMEOUT_MS * 2);
+      const callerSignal = normalizeSignal(request.signal, { optional: true });
+      operation = createOperationSignal(
+        callerSignal,
+        dependencies.operationTimeoutMs,
+      );
+      signal = operation.signal;
       token = await queue.enter(signal);
       invocation = await prepareProbeInvocation(signal);
       const codexHome = await prepareCodexHome(invocation, signal);
@@ -1009,12 +1158,23 @@ function createBroker(rawOptions, rawDependencies) {
         }
       }
       if (token !== null) queue.leave(token, { safe: lifecycleSafe });
+      const abortFailure = operationAbortFailure(signal);
+      if (abortFailure && !cleanupFailureOwnsResult(failure)) {
+        if (abortFailure.code === "STRUCTURED_PROVIDER_TIMEOUT") {
+          state = "cli_unavailable";
+          failure = null;
+        } else {
+          failure = abortFailure;
+        }
+      }
+      operation?.close();
     }
     if (failure !== null) throw failure;
     return statusProjection(state);
   }
 
   async function checkAvailability(rawRequest = {}) {
+    let operation = null;
     let signal = null;
     let lease = null;
     let invocation = null;
@@ -1023,8 +1183,12 @@ function createBroker(rawOptions, rawDependencies) {
     let cleanupAllowed = true;
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
-      signal = normalizeSignal(request.signal, { optional: true }) ??
-        AbortSignal.timeout(STATUS_TIMEOUT_MS);
+      const callerSignal = normalizeSignal(request.signal, { optional: true });
+      operation = createOperationSignal(
+        callerSignal,
+        dependencies.operationTimeoutMs,
+      );
+      signal = operation.signal;
       lease = await acquire({ signal });
       invocation = await prepareProbeInvocation(signal);
       const staged = await lease.stage({ invocation, signal });
@@ -1068,9 +1232,20 @@ function createBroker(rawOptions, rawDependencies) {
         try {
           lease.release({ safe: cleanupSafe });
         } catch (error) {
-          failure = mapTaskFailure(error, signal);
+          const releaseFailure = mapTaskFailure(error, signal);
+          if (
+            !cleanupFailureOwnsResult(failure) ||
+            cleanupFailureOwnsResult(releaseFailure)
+          ) {
+            failure = releaseFailure;
+          }
         }
       }
+      const abortFailure = operationAbortFailure(signal);
+      if (abortFailure && !cleanupFailureOwnsResult(failure)) {
+        failure = abortFailure;
+      }
+      operation?.close();
     }
     if (failure !== null) throw failure;
   }

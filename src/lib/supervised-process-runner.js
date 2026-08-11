@@ -76,6 +76,14 @@ function failedError() {
   );
 }
 
+function exitedError() {
+  return processError(
+    "STRUCTURED_PROVIDER_PROCESS_EXITED",
+    "Structured CLI provider process exited unsuccessfully",
+    502,
+  );
+}
+
 function reapFailedError() {
   return processError(
     "STRUCTURED_PROVIDER_REAP_FAILED",
@@ -702,12 +710,19 @@ export class SupervisedProcessRunner {
           }
         }
         if (settled || terminalError) return;
-        if (platform === "win32" && closeResult.exitCode === 125) {
-          settle(reject, unavailableError());
+        if (
+          platform === "win32" &&
+          [124, 125].includes(closeResult.exitCode)
+        ) {
+          settle(reject, failedError());
           return;
         }
-        if (closeResult.exitCode !== 0 || closeResult.signal !== null) {
+        if (closeResult.signal !== null) {
           settle(reject, failedError());
+          return;
+        }
+        if (closeResult.exitCode !== 0) {
+          settle(reject, exitedError());
           return;
         }
         const stdoutBytes = Buffer.concat(stdout.chunks);

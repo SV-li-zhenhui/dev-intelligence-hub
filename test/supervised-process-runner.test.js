@@ -353,18 +353,21 @@ test("supervised runner enforces stdout and stderr byte limits", async (t) => {
   }
 });
 
-test("supervised runner redacts nonzero stderr and unavailable-command details", async (t) => {
+test("supervised runner distinguishes and redacts a clean nonzero exit", async (t) => {
   const directory = await temporaryDirectory(t, "supervised-runner-redaction-");
-  const runner = testRunner();
-  const secret = "stderr-secret-must-not-escape";
+  const runner = testRunner({
+    platform: "linux",
+    treeTerminator: async () => ({ status: "completed" }),
+  });
+  const secret = "nonzero-secret-must-not-escape";
 
   await assert.rejects(
     runner.run(request(
       directory,
-      `process.stderr.write(${JSON.stringify(secret)}); process.exit(7);`,
+      `const privateValue = ${JSON.stringify(secret)}; process.exit(privateValue ? 7 : 0);`,
     )),
     (error) =>
-      error?.code === "STRUCTURED_PROVIDER_PROCESS_FAILED" &&
+      error?.code === "STRUCTURED_PROVIDER_PROCESS_EXITED" &&
       !error.message.includes(secret) &&
       !JSON.stringify(error).includes(secret),
   );

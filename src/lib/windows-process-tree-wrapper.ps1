@@ -624,9 +624,14 @@ try {
     if ($exitCode -eq 0) {
         exit 0
     }
+    if ($exitCode -eq 125) {
+        # Preserve the target's reserved failure family without exposing its
+        # raw exit code. The Node supervisor maps 124 to PROCESS_FAILED.
+        exit 124
+    }
     # The wrapper reserves 125 for its own control-plane failure. Every target
     # non-zero exit is intentionally collapsed because the caller exposes only
-    # STRUCTURED_PROVIDER_PROCESS_FAILED, never the target's raw exit code.
+    # a stable failure family, never the target's raw exit code.
     exit 1
 }
 catch {

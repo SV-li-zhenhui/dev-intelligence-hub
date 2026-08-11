@@ -553,14 +553,20 @@ public sealed class MyDashboardCleanupSession : IDisposable {
 
   private readonly List<Node> nodes = new List<Node>();
   private readonly int maximumEntries;
+  private readonly int maximumEntriesPerRoot;
   private readonly int maximumDepth;
   private readonly ulong maximumBytes;
   private ulong totalBytes;
+  private int currentRootEntries;
   private bool committed;
 
   private MyDashboardCleanupSession(
-    int maximumEntries, int maximumDepth, ulong maximumBytes) {
+    int maximumEntries,
+    int maximumEntriesPerRoot,
+    int maximumDepth,
+    ulong maximumBytes) {
     this.maximumEntries = maximumEntries;
+    this.maximumEntriesPerRoot = maximumEntriesPerRoot;
     this.maximumDepth = maximumDepth;
     this.maximumBytes = maximumBytes;
   }
@@ -668,7 +674,11 @@ public sealed class MyDashboardCleanupSession : IDisposable {
   }
 
   private void AddNode(SafeFileHandle handle, bool directory, int depth) {
-    if (depth > maximumDepth || nodes.Count >= maximumEntries) {
+    if (
+      depth > maximumDepth ||
+      nodes.Count >= maximumEntries ||
+      currentRootEntries >= maximumEntriesPerRoot
+    ) {
       handle.Dispose();
       throw new InvalidOperationException("cleanup bound exceeded");
     }
@@ -686,6 +696,7 @@ public sealed class MyDashboardCleanupSession : IDisposable {
       }
     }
     nodes.Add(new Node { Handle = handle, Directory = directory, Depth = depth });
+    currentRootEntries = checked(currentRootEntries + 1);
   }
 
   private void Enumerate(Node directory, uint expectedDevice) {
@@ -742,6 +753,7 @@ public sealed class MyDashboardCleanupSession : IDisposable {
   }
 
   private void PreflightRoot(MyDashboardExpectedRoot expected) {
+    currentRootEntries = 0;
     SafeFileHandle root = OpenRoot(expected);
     AddNode(root, true, 0);
     int cursor = nodes.Count - 1;
@@ -754,16 +766,23 @@ public sealed class MyDashboardCleanupSession : IDisposable {
   public static MyDashboardCleanupSession Prepare(
     MyDashboardExpectedRoot[] roots,
     int maximumEntries,
+    int maximumEntriesPerRoot,
     int maximumDepth,
     ulong maximumBytes) {
     if (
       roots == null || roots.Length == 0 ||
-      maximumEntries < 1 || maximumDepth < 0
+      maximumEntries < 1 ||
+      maximumEntriesPerRoot < 1 ||
+      maximumEntriesPerRoot > maximumEntries ||
+      maximumDepth < 0
     ) {
       throw new ArgumentException("cleanup plan is invalid");
     }
     MyDashboardCleanupSession session = new MyDashboardCleanupSession(
-      maximumEntries, maximumDepth, maximumBytes);
+      maximumEntries,
+      maximumEntriesPerRoot,
+      maximumDepth,
+      maximumBytes);
     try {
       foreach (MyDashboardExpectedRoot root in roots) session.PreflightRoot(root);
       return session;
@@ -821,6 +840,7 @@ try {
   $session = [MyDashboardCleanupSession]::Prepare(
     $roots,
     [int]$plan.maximumEntries,
+    [int]$plan.maximumEntriesPerRoot,
     [int]$plan.maximumDepth,
     [uint64]$plan.maximumBytes
   )
@@ -1032,6 +1052,8 @@ export const PRODUCTION_PRIVATE_DIRECTORY_MANAGER = Object.freeze({
 });
 
 export async function prepareCleanupTreesByIdentity(roots, options = {}) {
+  const maximumEntriesPerRoot =
+    options.maximumEntriesPerRoot ?? options.maximumEntries;
   if (!productionSupervisedCliPlatformSupported()) throw unavailable();
   if (
     !Array.isArray(roots) || roots.length === 0 ||
@@ -1043,6 +1065,9 @@ export async function prepareCleanupTreesByIdentity(roots, options = {}) {
       typeof root.inode !== "string") ||
     !Number.isSafeInteger(options.maximumEntries) ||
     options.maximumEntries < 1 ||
+    !Number.isSafeInteger(maximumEntriesPerRoot) ||
+    maximumEntriesPerRoot < 1 ||
+    maximumEntriesPerRoot > options.maximumEntries ||
     !Number.isSafeInteger(options.maximumDepth) ||
     options.maximumDepth < 0 ||
     !Number.isSafeInteger(options.maximumBytes) ||
@@ -1066,6 +1091,7 @@ export async function prepareCleanupTreesByIdentity(roots, options = {}) {
   const encodedPlan = Buffer.from(JSON.stringify({
     roots,
     maximumEntries: options.maximumEntries,
+    maximumEntriesPerRoot,
     maximumDepth: options.maximumDepth,
     maximumBytes: options.maximumBytes,
   }), "utf8").toString("base64");

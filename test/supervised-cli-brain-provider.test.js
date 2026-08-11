@@ -1907,6 +1907,34 @@ test("provider failures are redacted and clean only their verified invocation", 
   await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
 });
 
+test("provider keeps the runner's clean nonzero exit inside the public process-failure family", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-nonzero-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const runner = recordingRunner(async () => {
+    throw Object.assign(new Error("private nonzero detail"), {
+      code: "STRUCTURED_PROVIDER_PROCESS_EXITED",
+      statusCode: 502,
+    });
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: { OPENAI_API_KEY: "private-credential" },
+      temporaryRoot,
+    },
+  );
+
+  await assert.rejects(
+    provider.generate(brainRequest()),
+    (error) =>
+      error?.code === "STRUCTURED_PROVIDER_PROCESS_FAILED" &&
+      !error.message.includes("private nonzero detail"),
+  );
+  await provider.close();
+});
+
 test("cleanup failure takes precedence over an earlier process failure", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-failure-");
   const temporaryRoot = path.join(parent, "runtime");

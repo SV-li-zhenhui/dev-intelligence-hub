@@ -185,9 +185,12 @@ function sanitizeInputFailure(error) {
 
 function sanitizeRuntimeFailure(error) {
   const code = typeof error?.code === "string" ? error.code : null;
+  const publicCode = code === "STRUCTURED_PROVIDER_PROCESS_EXITED"
+    ? "STRUCTURED_PROVIDER_PROCESS_FAILED"
+    : code;
   return providerError(
-    Object.hasOwn(FAILURE_DEFINITIONS, code)
-      ? code
+    Object.hasOwn(FAILURE_DEFINITIONS, publicCode)
+      ? publicCode
       : "STRUCTURED_PROVIDER_UNAVAILABLE",
   );
 }
