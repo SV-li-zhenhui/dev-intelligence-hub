@@ -151,7 +151,15 @@ async function createValidationFixture(t) {
     ].join("\n"),
   );
   await writeFile(
-    path.join(root, "test/open-source-distribution.test.mjs"),
+    path.join(root, "test/smoke-module.test.mjs"),
+    [
+      "import test from 'node:test';",
+      "test('fixture module passes', () => {});",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    path.join(root, "test/open-source-distribution.mjs"),
     [
       "import assert from 'node:assert/strict';",
       "import { existsSync } from 'node:fs';",
@@ -442,6 +450,7 @@ test("the system validator binds a passing report to one clean Git source state"
         "--test-concurrency=4",
         "--test-reporter=tap",
         "test/00-u9-priority.mjs",
+        "test/smoke-module.test.mjs",
         "test/smoke.test.js",
       ],
     },
@@ -456,7 +465,7 @@ test("the system validator binds a passing report to one clean Git source state"
         "--test",
         "--test-concurrency=1",
         "--test-reporter=tap",
-        "test/open-source-distribution.test.mjs",
+        "test/open-source-distribution.mjs",
       ],
     },
   );
@@ -464,8 +473,8 @@ test("the system validator binds a passing report to one clean Git source state"
     report.steps.find(({ name }) => name === "complete Node test suite").testResults,
     {
       summary: {
-        tests: 6,
-        passed: 5,
+        tests: 7,
+        passed: 6,
         failed: 0,
         cancelled: 0,
         skipped: 1,
@@ -478,28 +487,33 @@ test("the system validator binds a passing report to one clean Git source state"
           status: "passed",
         },
         {
-          identity: "tap:2:fixture passes",
+          identity: "tap:2:fixture module passes",
+          name: "fixture module passes",
+          status: "passed",
+        },
+        {
+          identity: "tap:3:fixture passes",
           name: "fixture passes",
           status: "passed",
         },
         {
-          identity: "tap:3:fixture skip",
+          identity: "tap:4:fixture skip",
           name: "fixture skip",
           status: "skipped",
           reason: "fixture reason",
         },
         {
-          identity: "tap:4:validation reporter options stay outside tested processes",
+          identity: "tap:5:validation reporter options stay outside tested processes",
           name: "validation reporter options stay outside tested processes",
           status: "passed",
         },
         {
-          identity: "tap:5:validation children inherit no host credentials or profiles",
+          identity: "tap:6:validation children inherit no host credentials or profiles",
           name: "validation children inherit no host credentials or profiles",
           status: "passed",
         },
         {
-          identity: "tap:6:validation commands execute from a detached materialized source",
+          identity: "tap:7:validation commands execute from a detached materialized source",
           name: "validation commands execute from a detached materialized source",
           status: "passed",
         },
@@ -578,7 +592,7 @@ for (const discoveryFailure of [
   {
     name: "the distribution test is missing",
     prepare: (root) =>
-      rm(path.join(root, "test/open-source-distribution.test.mjs")),
+      rm(path.join(root, "test/open-source-distribution.mjs")),
     expectedError: /committed distribution test is unavailable/u,
   },
   {
@@ -692,7 +706,7 @@ test("the system validator records structured failed test identities", async (t)
   assert.deepEqual(
     testStep.testResults.cases.filter(({ status }) => status === "failed"),
     [{
-      identity: "tap:2:fixture failure identity",
+      identity: "tap:3:fixture failure identity",
       name: "fixture failure identity",
       status: "failed",
     }],

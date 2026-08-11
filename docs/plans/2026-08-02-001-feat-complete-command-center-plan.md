@@ -413,7 +413,7 @@ flowchart TB
 - **Goal:** Make the repository legally and operationally ready for publication without pushing it.
 - **Requirements:** R1, R7, R22; KTD1–KTD6.
 - **Dependencies:** U8–U10.
-- **Files:** `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `README.md`, `docs/PRIVACY.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `config.example.json`, `package.json`, `.gitignore`, `test/open-source-distribution.test.mjs`.
+- **Files:** `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `README.md`, `docs/PRIVACY.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `config.example.json`, `package.json`, `.gitignore`, `test/open-source-distribution.mjs`.
 - **Approach:** Choose and document an explicit open-source license, separate safe examples from machine-local configuration, document trust and privacy boundaries, and add automated checks for secrets, absolute private paths, required files, and reproducible setup.
 - **Execution note:** This is packaging and documentation; prefer install/config/runtime smoke evidence plus deterministic repository checks. Before creating `LICENSE` or changing package license metadata, stop at the owner-decision gate below and obtain an explicit SPDX license choice; do not infer a legal commitment.
 - **Patterns to follow:** Current local-only README guidance and ignored private configuration conventions.
@@ -441,7 +441,7 @@ flowchart TB
 
 | Gate | Applies to | Required evidence |
 |---|---|---|
-| Focused Node tests | Every behavior-bearing U-ID | The unit's named `test/*.test.js` files pass with failure, edge, and integration coverage appropriate to the seam. |
+| Focused Node tests | Every behavior-bearing U-ID | The unit's named `test/*.test.js` and `test/*.test.mjs` files pass with failure, edge, and integration coverage appropriate to the seam. |
 | Complete regression | Every local commit and final acceptance | `npm test` passes with only explicitly documented opt-in real integrations skipped. |
 | Syntax and diff quality | Every unit | Changed JavaScript passes `node --check`; `git diff --check` is clean. |
 | Static UI contract | U3, U5, U7–U9, U12 | `node scripts/validate-ui.mjs` and frontend contract tests pass. |

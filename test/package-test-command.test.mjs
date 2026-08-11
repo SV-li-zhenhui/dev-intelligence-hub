@@ -119,12 +119,34 @@ test("the package script admits its priority entry before a deep direct-test glo
       ].join("\n"),
     );
   }
+  writeFileSync(
+    path.join(controlledTestDirectory, "ordinary-module.test.mjs"),
+    [
+      'import { existsSync, writeFileSync } from "node:fs";',
+      'import path from "node:path";',
+      'import test from "node:test";',
+      'import { setTimeout as delay } from "node:timers/promises";',
+      '',
+      'const stateDirectory = process.env.U11_PACKAGE_STATE_DIRECTORY;',
+      'const latchPath = path.join(stateDirectory, "priority.latch");',
+      'test("ordinary module test", async () => {',
+      '  const deadline = Date.now() + 15_000;',
+      '  while (!existsSync(latchPath)) {',
+      '    if (Date.now() >= deadline) throw new Error("priority latch unavailable");',
+      '    await delay(10);',
+      '  }',
+      '  writeFileSync(path.join(stateDirectory, "ordinary-module.done"), "", { flag: "wx" });',
+      '});',
+      '',
+    ].join("\n"),
+  );
   const expectedCoreDone = [
+    "ordinary-module.done",
     "priority.done",
     ...ordinaryFiles.map(({ logicalName }) => `${logicalName}.done`),
   ].sort((left, right) => left.localeCompare(right, "en"));
   writeFileSync(
-    path.join(controlledTestDirectory, "open-source-distribution.test.mjs"),
+    path.join(controlledTestDirectory, "open-source-distribution.mjs"),
     [
       'import assert from "node:assert/strict";',
       'import { readdirSync, writeFileSync } from "node:fs";',
@@ -178,6 +200,7 @@ test("the package script admits its priority entry before a deep direct-test glo
       .sort((left, right) => left.localeCompare(right, "en")),
     [
       "distribution.done",
+      "ordinary-module.done",
       "priority.done",
       ...ordinaryFiles.map(({ logicalName }) => `${logicalName}.done`),
     ].sort((left, right) => left.localeCompare(right, "en")),

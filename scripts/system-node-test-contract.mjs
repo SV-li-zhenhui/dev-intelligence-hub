@@ -1,4 +1,4 @@
-export const distributionTestPath = "test/open-source-distribution.test.mjs";
+export const distributionTestPath = "test/open-source-distribution.mjs";
 export const u9PriorityTestPath = "test/00-u9-priority.mjs";
 const u9ImplementationTestPath = "test/u9-mirrored-pr-end-to-end.mjs";
 const legacyU9TestPath = "test/u9-mirrored-pr-end-to-end.test.js";
@@ -36,8 +36,8 @@ export function selectCommittedNodeTestFiles({
   }
   const regularTestFiles = [...files]
     .filter((relativePath) =>
-      relativePath.endsWith(".test.js") &&
-      relativePath !== distributionTestPath
+      relativePath.endsWith(".test.js") ||
+      relativePath.endsWith(".test.mjs")
     )
     .sort(compareUtf8Paths);
   const immutableFiles = [u9PriorityTestPath, ...regularTestFiles];
