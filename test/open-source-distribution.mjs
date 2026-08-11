@@ -1189,11 +1189,17 @@ test("whole tracked Git privacy fails closed for dirty tracked content", async (
 test(
   "a clean source payload installs and composes without private config.json",
   async (context) => {
-    const fixtureRoot = await mkdtemp(
-      path.join(tmpdir(), "mydashboard-clean-source-"),
+    const environmentFixtureRoot = await mkdtemp(
+      path.join(tmpdir(), "mydashboard-clean-environment-"),
     );
-    const cleanRoot = path.join(fixtureRoot, "source");
-    const environmentRoot = path.join(fixtureRoot, "environment");
+    const sourceFixtureRoot = await mkdtemp(
+      path.join(path.dirname(root), ".mydashboard-clean-source-"),
+    );
+    const cleanRoot = path.join(sourceFixtureRoot, "source");
+    const environmentRoot = path.join(
+      environmentFixtureRoot,
+      "environment",
+    );
     let fallbackStop = null;
     let managedProcessId = null;
     let managedLiveUrl = null;
@@ -1213,8 +1219,15 @@ test(
           }
         }
       }
-      assert.equal(path.dirname(fixtureRoot), path.resolve(tmpdir()));
-      await rm(fixtureRoot, { recursive: true, force: true });
+      assert.equal(
+        path.dirname(environmentFixtureRoot),
+        path.resolve(tmpdir()),
+      );
+      assert.equal(path.dirname(sourceFixtureRoot), path.dirname(root));
+      await Promise.all([
+        rm(environmentFixtureRoot, { recursive: true, force: true }),
+        rm(sourceFixtureRoot, { recursive: true, force: true }),
+      ]);
     });
 
     const sourceFiles = new Set(loadDistributionManifest());
