@@ -1070,6 +1070,14 @@ test("Windows source admission is handle-bound across size, link, owner, ACL, an
     }),
     { code: "ENOENT" },
   );
+  await assert.rejects(
+    port.readSource({
+      file: path.join(root, "missing-parent", "auth.json"),
+      maximumBytes: 65_536,
+      signal,
+    }),
+    { code: "ENOENT" },
+  );
 
   const empty = path.join(root, "empty.json");
   const oversized = path.join(root, "oversized.json");

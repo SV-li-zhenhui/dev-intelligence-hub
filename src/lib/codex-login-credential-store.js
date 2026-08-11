@@ -494,12 +494,22 @@ async function validateNonOverlap(configuration, dependencies, prepared = {}) {
     ...canonicalProtectedRoots
   ] = canonical;
   if (!pathContains(mirrorRoot, mirrorDirectory)) throw blocked();
-  const isolatedRoots = [sourceRoot, mirrorRoot, probeRoot, ...canonicalProtectedRoots];
-  for (let left = 0; left < isolatedRoots.length; left += 1) {
-    for (let right = left + 1; right < isolatedRoots.length; right += 1) {
+  const credentialRoots = [sourceRoot, mirrorRoot, probeRoot];
+  for (let left = 0; left < credentialRoots.length; left += 1) {
+    for (let right = left + 1; right < credentialRoots.length; right += 1) {
       if (
-        pathContains(isolatedRoots[left], isolatedRoots[right]) ||
-        pathContains(isolatedRoots[right], isolatedRoots[left])
+        pathContains(credentialRoots[left], credentialRoots[right]) ||
+        pathContains(credentialRoots[right], credentialRoots[left])
+      ) {
+        throw blocked();
+      }
+    }
+  }
+  for (const credentialRoot of credentialRoots) {
+    for (const protectedRoot of canonicalProtectedRoots) {
+      if (
+        pathContains(credentialRoot, protectedRoot) ||
+        pathContains(protectedRoot, credentialRoot)
       ) {
         throw blocked();
       }

@@ -80,6 +80,52 @@ function managerPowerShell() {
   return located.status === 0 ? located.stdout.trim() : null;
 }
 
+function protectWindowsFixtureDirectory(directory, powershell) {
+  if (process.platform !== "win32") return;
+  const encodedDirectory = Buffer.from(directory, "utf8").toString("base64");
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedDirectory}'))
+$current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true, $false)
+$inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagation = [Security.AccessControl.PropagationFlags]::None
+$allow = [Security.AccessControl.AccessControlType]::Allow
+foreach ($sid in @($current, $system, $administrators)) {
+  $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow)
+  [void]$acl.AddAccessRule($rule)
+}
+[IO.DirectoryInfo]::new($target).SetAccessControl($acl)
+`;
+  const result = spawnSync(
+    powershell,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+    ],
+    {
+      encoding: "utf8",
+      timeout: 30_000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    `clean environment ACL setup failed:\n${diagnostic(result)}`,
+  );
+}
+
 async function availablePort() {
   const server = net.createServer();
   await new Promise((resolve, reject) => {
@@ -186,17 +232,23 @@ async function pollJson(
   url,
   timeoutMilliseconds = 45_000,
   accept = () => true,
+  describeRejected = () => "",
+  requestTimeoutMilliseconds = 2_000,
 ) {
   const deadline = Date.now() + timeoutMilliseconds;
   let lastFailure = "no response";
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(requestTimeoutMilliseconds),
+      });
       const text = await response.text();
       if (response.status === 200) {
         const body = JSON.parse(text);
         if (accept(body)) return { body, text };
-        lastFailure = "HTTP 200 response has not reached the required state";
+        const description = describeRejected(body);
+        lastFailure = "HTTP 200 response has not reached the required state" +
+          (description ? `: ${description}` : "");
       } else {
         lastFailure = `HTTP ${response.status}`;
       }
@@ -1251,6 +1303,8 @@ test(
         const { environment, directories } = cleanManagerEnvironment(
           environmentRoot,
         );
+        await mkdir(environmentRoot, { recursive: true, mode: 0o700 });
+        protectWindowsFixtureDirectory(environmentRoot, powershell);
         for (const directory of directories) {
           await mkdir(directory, { recursive: true, mode: 0o700 });
         }
@@ -1289,6 +1343,14 @@ test(
           `http://127.0.0.1:${port}/api/system/status`,
           45_000,
           (body) => body?.readiness?.ready === true,
+          (body) => JSON.stringify({
+            ready: body?.readiness?.ready,
+            recoveryBlockers: body?.readiness?.recoveryBlockers,
+            unknownExternalActions: body?.readiness?.unknownExternalActions,
+            capacityWarnings: body?.readiness?.capacityWarnings,
+            probeFailures: body?.readiness?.probeFailures,
+            probeSummary: body?.readiness?.probeSummary,
+          }),
         );
         assert.equal(status.body.liveness.live, true);
         assert.equal(status.body.readiness.schemaVersion, 1);
@@ -1297,6 +1359,10 @@ test(
 
         const brainStatus = await pollJson(
           `http://127.0.0.1:${port}/api/brain-providers/status`,
+          45_000,
+          () => true,
+          () => "",
+          15_000,
         );
         assert.equal(brainStatus.body.schemaVersion, 1);
         assert.equal(

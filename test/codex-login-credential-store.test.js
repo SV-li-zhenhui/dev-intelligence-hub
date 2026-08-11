@@ -345,6 +345,30 @@ test("every protected/source/mirror/probe overlap fails before private directory
   }
 });
 
+test("nested protected roots remain valid when every credential root is outside them", async () => {
+  const root = path.resolve("D:/fictional-task3-nested-protected-roots");
+  const current = createHarness(root);
+  const repository = path.join(root, "repository");
+  const store = current.createStore({
+    protectedRoots: [
+      repository,
+      path.join(repository, "data"),
+      path.join(repository, "backups"),
+      path.join(repository, "workspaces", "primary"),
+    ],
+  });
+
+  const snapshot = await store.beginTask({
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.deepEqual(current.manager.prepareCalls, [
+    current.locations.mirrorRoot,
+    current.locations.mirrorDirectory,
+  ]);
+});
+
 test("different Windows volumes and UNC shares are isolated while same roots still overlap", {
   skip: process.platform === "win32" ? false : "requires Windows path-root semantics",
 }, async (t) => {
