@@ -43,6 +43,25 @@ test("session deferrals are bounded and sent as exact source bindings", async ()
   assert.match(app, /async function refreshAfterDeferral/);
 });
 
+test("deferred confirmations have a visible retry control with failure-safe recovery", async () => {
+  const { app } = await sources();
+
+  assert.match(app, /id="confirmation-deferred-restore"/);
+  assert.match(app, /重新查看稍后项/);
+  assert.match(app, /deferredConfirmations\.size/);
+  assert.match(app, /async function restoreDeferredConfirmations/);
+  const start = app.indexOf("async function restoreDeferredConfirmations");
+  const end = app.indexOf("\nasync function refreshAfterDeferral", start);
+  const restore = app.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.ok(
+    restore.indexOf("deferredConfirmations.clear()") <
+      restore.indexOf("await refreshConfirmationQueue"),
+  );
+  assert.match(restore, /catch \(error\)[\s\S]*rememberDeferredConfirmation/);
+  assert.match(restore, /queueMicrotask\(showNextConfirmation\)/);
+});
+
 test("internal renderer cannot manufacture an external action control", async () => {
   const { app } = await sources();
   const start = app.indexOf("function showInternalAttention");

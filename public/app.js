@@ -595,6 +595,14 @@ function confirmationPendingMarkup() {
   </article>`;
 }
 
+function deferredConfirmationMarkup() {
+  if (deferredConfirmations.size === 0) return "";
+  return `<div class="confirmation-deferred-controls">
+    <button class="secondary-button" id="confirmation-deferred-restore" type="button">重新查看稍后项（${deferredConfirmations.size}）</button>
+    <small>仅恢复本页会话中选择“稍后”的事项，不会批准或执行任何动作。</small>
+  </div>`;
+}
+
 function confirmationHistoryItemMarkup(item) {
   const roleId = item.requestedBy?.roleId || "未标注岗位";
   const workItemId = item.requestedBy?.workItemId || "未标注工作项";
@@ -684,6 +692,7 @@ function confirmationCenterView() {
           <span>${confirmationQueueState.pendingCount || 0} ITEMS</span>
         </div>
         ${confirmationPendingMarkup()}
+        ${deferredConfirmationMarkup()}
         <p class="confirmation-center-note">系统仍按现有优先级逐条弹框确认；此处只显示下一项，不在列表中授权。</p>
       </section>
       <section class="confirmation-center-panel" id="confirmation-history-panel" aria-labelledby="confirmation-history-title" aria-busy="${confirmationHistoryLoading}">
@@ -1367,6 +1376,11 @@ function restoreConfirmationHistoryPanel(preservedPanel) {
 }
 
 function bindConfirmationHistoryView() {
+  const restoreDeferred = content.querySelector("#confirmation-deferred-restore");
+  if (restoreDeferred && !restoreDeferred.dataset.confirmationDeferredBound) {
+    restoreDeferred.dataset.confirmationDeferredBound = "true";
+    restoreDeferred.addEventListener("click", restoreDeferredConfirmations);
+  }
   const filter = content.querySelector("#confirmation-history-filter");
   if (filter && !filter.dataset.confirmationHistoryBound) {
     filter.dataset.confirmationHistoryBound = "true";
@@ -4322,6 +4336,22 @@ async function refreshConfirmationQueue({
   if (applied) refreshLoadedConfirmationHistory();
   if (showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
+}
+
+async function restoreDeferredConfirmations() {
+  const deferred = [...deferredConfirmations];
+  if (deferred.length === 0) return;
+  deferredConfirmations.clear();
+  try {
+    await refreshConfirmationQueue({ showConfirmation: false });
+  } catch (error) {
+    for (const key of deferred) rememberDeferredConfirmation(key);
+    if (dashboard && currentView === "employees") render();
+    statusBanner.hidden = false;
+    statusBanner.textContent = `${error.message}。稍后项仍保留，可再次尝试。`;
+    return;
+  }
+  queueMicrotask(showNextConfirmation);
 }
 
 async function refreshAfterDeferral() {

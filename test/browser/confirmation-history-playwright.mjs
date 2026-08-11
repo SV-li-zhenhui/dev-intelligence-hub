@@ -442,6 +442,19 @@ try {
     await page.getByRole("button", { name: fixture[2] }).waitFor();
     await page.getByRole("button", { name: "稍后再看" }).click();
     await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+    if (fixture[0] === "comment") {
+      const restore = page.locator("#confirmation-deferred-restore");
+      await restore.waitFor();
+      assert.match(await restore.textContent(), /重新查看稍后项（1）/);
+      await restore.click();
+      await page.locator("#confirmation-dialog[open]").waitFor();
+      assert.match(
+        await page.locator("#confirmation-dialog").textContent(),
+        /Fixture PR 评论.*Fixture PR comment/s,
+      );
+      await page.getByRole("button", { name: "稍后再看" }).click();
+      await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+    }
   }
 
   await page.selectOption("#confirmation-history-status", "stale");
