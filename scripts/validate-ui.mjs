@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
+import { validationBrowserLaunchOptions } from
+  "./playwright-validation-options.mjs";
 import { verifyLiveDashboard } from "./system-live-validation.mjs";
 import { partitionBrowserFailures } from "./ui-validation-diagnostics.mjs";
 import {
@@ -27,7 +29,10 @@ await verifyLiveDashboard({
   expectedLiveService: liveService,
 });
 
-const browser = await chromium.launch({ channel: "msedge", headless: true });
+const browser = await chromium.launch(validationBrowserLaunchOptions({
+  channel: "msedge",
+  headless: true,
+}));
 const results = [];
 let artifactReceiptEnvelope = null;
 

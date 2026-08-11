@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { chromium } from "playwright";
+import { validationBrowserLaunchOptions } from
+  "../../scripts/playwright-validation-options.mjs";
 
 const publicDirectory = path.resolve("public");
 const historyDelayMs = 120;
@@ -312,10 +314,13 @@ function createFixtureServer() {
 
 async function launchBrowser() {
   if (existsSync(chromium.executablePath())) {
-    return chromium.launch({ headless: true });
+    return chromium.launch(validationBrowserLaunchOptions({ headless: true }));
   }
   if (process.platform === "win32") {
-    return chromium.launch({ channel: "msedge", headless: true });
+    return chromium.launch(validationBrowserLaunchOptions({
+      channel: "msedge",
+      headless: true,
+    }));
   }
   throw new Error("Install a Playwright Chromium browser before running this fixture");
 }
