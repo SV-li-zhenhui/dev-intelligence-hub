@@ -1,4 +1,7 @@
 import path from "node:path";
+import {
+  createProductionCodexLoginCredentialBroker,
+} from "./adapters/codex-login-credential-broker.js";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
@@ -10,6 +13,9 @@ import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
 import { createConfigurationRuntime } from "./configuration-runtime.js";
+import {
+  productionCodexLoginLocations,
+} from "./lib/codex-login-credential-store.js";
 import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
@@ -87,22 +93,22 @@ const defaultVersionedCodeJobAuthorityFactory = (options) =>
 
 export class ProductionCliCompositionGrant {
   #consumer = null;
-  #protectedRoots;
+  #runtimeFacts;
 
-  constructor(secret, protectedRoots) {
+  constructor(secret, runtimeFacts) {
     if (secret !== SUPERVISED_CLI_COMPOSITION_SECRET) {
       throw new TypeError(
         "Production CLI composition grants cannot be constructed",
       );
     }
-    this.#protectedRoots = distinctAbsolutePaths(protectedRoots);
+    this.#runtimeFacts = productionCliRuntimeFacts(runtimeFacts);
     Object.freeze(this);
   }
 
   static is(value) {
     return value !== null &&
       typeof value === "object" &&
-      #protectedRoots in value;
+      #runtimeFacts in value;
   }
 
   consume(consumer) {
@@ -113,16 +119,16 @@ export class ProductionCliCompositionGrant {
     if (this.#consumer !== consumer) {
       throw new TypeError("Production CLI composition grant is opaque");
     }
-    return consumer(this.#protectedRoots);
+    return consumer(this.#runtimeFacts);
   }
 }
 Object.freeze(ProductionCliCompositionGrant.prototype);
 Object.freeze(ProductionCliCompositionGrant);
 
-function issueProductionCliCompositionGrant(protectedRoots) {
+function issueProductionCliCompositionGrant(runtimeFacts) {
   return new ProductionCliCompositionGrant(
     SUPERVISED_CLI_COMPOSITION_SECRET,
-    protectedRoots,
+    runtimeFacts,
   );
 }
 
@@ -173,6 +179,94 @@ function distinctAbsolutePaths(values) {
     result.push(resolved);
   }
   return Object.freeze(result);
+}
+
+function productionCliRuntimeFacts(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw new TypeError("Production CLI runtime facts are invalid");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  const allowed = new Set([
+    "protectedRoots",
+    "codexLoginCredentialBroker",
+  ]);
+  if (
+    !Object.hasOwn(descriptors, "protectedRoots") ||
+    keys.length < 1 ||
+    keys.length > 2 ||
+    keys.some(
+      (key) =>
+        typeof key !== "string" ||
+        !allowed.has(key) ||
+        !descriptors[key]?.enumerable ||
+        !("value" in descriptors[key]),
+    )
+  ) {
+    throw new TypeError("Production CLI runtime facts are invalid");
+  }
+  const protectedRoots = descriptors.protectedRoots.value;
+  if (
+    !Array.isArray(protectedRoots) ||
+    protectedRoots.some(
+      (entry) => typeof entry !== "string" || !path.isAbsolute(entry),
+    )
+  ) {
+    throw new TypeError("Production CLI runtime facts are invalid");
+  }
+  const broker = descriptors.codexLoginCredentialBroker?.value;
+  if (
+    broker !== undefined &&
+    (
+      broker === null ||
+      typeof broker !== "object" ||
+      ["acquire", "checkAvailability", "readStatus", "close"].some(
+        (method) => typeof broker[method] !== "function",
+      )
+    )
+  ) {
+    throw new TypeError("Production CLI runtime facts are invalid");
+  }
+  return Object.freeze({
+    protectedRoots: distinctAbsolutePaths(protectedRoots),
+    ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
+  });
+}
+
+function codexLoginProtectedRoots(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw new TypeError("Codex login locations are invalid");
+  }
+  const fields = ["sourceFile", "mirrorRoot", "mirrorDirectory", "probeRoot"];
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    Reflect.ownKeys(descriptors).length !== fields.length ||
+    fields.some(
+      (field) =>
+        !descriptors[field]?.enumerable ||
+        !("value" in descriptors[field]) ||
+        typeof descriptors[field].value !== "string" ||
+        !path.isAbsolute(descriptors[field].value),
+    )
+  ) {
+    throw new TypeError("Codex login locations are invalid");
+  }
+  return distinctAbsolutePaths([
+    path.dirname(descriptors.sourceFile.value),
+    descriptors.mirrorRoot.value,
+    descriptors.mirrorDirectory.value,
+    descriptors.probeRoot.value,
+  ]);
 }
 
 function configuredRepositoryRoots(config) {
@@ -482,6 +576,9 @@ export async function createApplication({
     new AgentMemoryQueryService(options),
   memoryBrainRouterFactory = createConfiguredBrainRouter,
   memoryAnswerDependencies = {},
+  codexLoginCredentialBrokerFactory =
+    createProductionCodexLoginCredentialBroker,
+  codexLoginLocationsFactory = productionCodexLoginLocations,
   localSessionImporterFactory = (options) => new LocalSessionImporter(options),
   gitActivityImporterFactory = (options) => new GitActivityImporter(options),
   codeJobMemoryProjectorFactory = (options) =>
@@ -586,6 +683,12 @@ export async function createApplication({
   if (typeof ownerWorkRequestRuntimeFactory !== "function") {
     throw new TypeError("ownerWorkRequestRuntimeFactory must be a function");
   }
+  if (typeof codexLoginCredentialBrokerFactory !== "function") {
+    throw new TypeError("codexLoginCredentialBrokerFactory must be a function");
+  }
+  if (typeof codexLoginLocationsFactory !== "function") {
+    throw new TypeError("codexLoginLocationsFactory must be a function");
+  }
   const scopedRuntimeGuardFactory = createProjectScopedGuardFactory({
     projectRoot,
   });
@@ -682,16 +785,8 @@ export async function createApplication({
   let changePackageApplicationResultBarrier = null;
   let changePackageApplicationRequester = null;
   let grantFactory = null;
-  let cliProtectedRoots = supervisedCliProtectedRoots({
-    storeDataDirectory,
-    operationsDataDirectory: dataDirectory,
-    backupDirectory,
-    codeExecutorRuntime,
-    config,
-  });
-  let cliCompositionCapability = issueProductionCliCompositionGrant(
-    cliProtectedRoots,
-  );
+  let cliCompositionCapability = null;
+  let brainProviderStatus = null;
   const brainDependencies = (dependencies, trustedProductionFactory) => ({
     ...dependencies,
     ...(trustedProductionFactory
@@ -741,16 +836,36 @@ export async function createApplication({
         store,
       }),
     );
-    cliProtectedRoots = supervisedCliProtectedRoots({
+    const cliProtectedRoots = supervisedCliProtectedRoots({
       storeDataDirectory,
       operationsDataDirectory: dataDirectory,
       backupDirectory,
       codeExecutorRuntime,
       config,
     });
-    cliCompositionCapability = issueProductionCliCompositionGrant(
-      cliProtectedRoots,
+    const brokerCompositionGrant = issueProductionCliCompositionGrant({
+      protectedRoots: cliProtectedRoots,
+    });
+    const codexLoginCredentialBroker = trackRuntime(frozenPort(
+      await codexLoginCredentialBrokerFactory(brokerCompositionGrant),
+      ["acquire", "checkAvailability", "readStatus", "close"],
+      "codexLoginCredentialBroker",
+    ));
+    brainProviderStatus = frozenPort(
+      codexLoginCredentialBroker,
+      ["readStatus"],
+      "brainProviderStatus",
     );
+    const credentialRoots = codexLoginProtectedRoots(
+      codexLoginLocationsFactory(),
+    );
+    cliCompositionCapability = issueProductionCliCompositionGrant({
+      protectedRoots: distinctAbsolutePaths([
+        ...cliProtectedRoots,
+        ...credentialRoots,
+      ]),
+      codexLoginCredentialBroker,
+    });
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
       codeExecutorRuntime,
@@ -2162,6 +2277,7 @@ export async function createApplication({
       memoryAnswer,
       memoryImports,
       memoryProjector,
+      brainProviderStatus,
       operations,
       close,
     };

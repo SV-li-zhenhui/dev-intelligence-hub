@@ -1322,6 +1322,158 @@ test("system operations API preserves the browser projection and validates backu
   assert.equal(independentLive.status, 200);
 });
 
+test("brain provider status API exposes only the sanitized readiness projection", async (t) => {
+  const privateMarker = "private-codex-login-marker";
+  const fixture = operationalApplication();
+  const originalConfig = structuredClone(fixture.application.config);
+  let receivedSignal = null;
+  fixture.application.brainProviderStatus = {
+    async readStatus({ signal }) {
+      receivedSignal = signal;
+      return {
+        schemaVersion: 1,
+        state: "available",
+        cliAvailable: true,
+        fileLoginAvailable: true,
+      };
+    },
+  };
+  const server = createDashboardServer(fixture.application, {
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+
+  const response = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+  });
+  assert.ok(receivedSignal instanceof AbortSignal);
+  assert.deepEqual(fixture.application.config, originalConfig);
+  assert.equal(response.body.includes(privateMarker), false);
+
+  const query = await request(server, {
+    path: "/api/brain-providers/status?source=private",
+  });
+  assert.equal(query.status, 400);
+
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1,
+    state: "file_login_unavailable",
+    cliAvailable: true,
+    fileLoginAvailable: false,
+  });
+  const unavailable = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(unavailable.status, 200);
+  assert.equal(JSON.parse(unavailable.body).state, "file_login_unavailable");
+
+  for (const [state, cliAvailable] of [
+    ["unsafe_source", true],
+    ["broker_blocked", true],
+    ["cli_unavailable", false],
+  ]) {
+    fixture.application.brainProviderStatus.readStatus = async () => ({
+      schemaVersion: 1,
+      state,
+      cliAvailable,
+      fileLoginAvailable: false,
+    });
+    const projected = await request(server, {
+      path: "/api/brain-providers/status",
+    });
+    assert.equal(projected.status, 200, state);
+    assert.equal(JSON.parse(projected.body).state, state);
+  }
+
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: false,
+    fileLoginAvailable: true,
+  });
+  const incoherent = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(incoherent.status, 500);
+
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+    privateMarker,
+  });
+  const invalid = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(invalid.status, 500);
+  assert.equal(invalid.body.includes(privateMarker), false);
+
+  fixture.application.brainProviderStatus = null;
+  const missing = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(missing.status, 503);
+});
+
+test("brain provider status request cancellation is isolated per client", async (t) => {
+  const fixture = operationalApplication();
+  const firstStarted = deferred();
+  const firstAborted = deferred();
+  let reads = 0;
+  fixture.application.brainProviderStatus = {
+    async readStatus({ signal }) {
+      reads += 1;
+      if (reads > 1) {
+        return {
+          schemaVersion: 1,
+          state: "available",
+          cliAvailable: true,
+          fileLoginAvailable: true,
+        };
+      }
+      firstStarted.resolve();
+      return new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          firstAborted.resolve();
+          reject(Object.assign(new Error("cancelled"), { code: "ABORT_ERR" }));
+        }, { once: true });
+      });
+    },
+  };
+  const server = createDashboardServer(fixture.application, {
+    reportError() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+
+  const outgoing = http.request({
+    host: "127.0.0.1",
+    port: server.address().port,
+    path: "/api/brain-providers/status",
+    headers: { host: "127.0.0.1:4173" },
+  });
+  outgoing.on("error", () => {});
+  outgoing.end();
+  await firstStarted.promise;
+
+  const independent = await request(server, {
+    path: "/api/brain-providers/status",
+  });
+  assert.equal(independent.status, 200);
+  outgoing.destroy();
+  await firstAborted.promise;
+  assert.equal(reads, 2);
+});
+
 test("backup drains an admitted HTTP mutation while liveness and status remain independent", async (t) => {
   const refreshStarted = deferred();
   const releaseRefresh = deferred();

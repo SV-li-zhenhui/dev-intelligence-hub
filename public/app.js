@@ -11,6 +11,7 @@ import {
   configurationDocumentFromForm,
   createConfigurationFormState,
 } from "./configuration-form-support.js";
+import { renderBrainProviderStatus } from "./brain-provider-status-view.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { createWorkflowView } from "./workflow-view.js";
@@ -152,6 +153,12 @@ let configurationPreview = null;
 let configurationOperationPending = false;
 let configurationNotice = "";
 let configurationAutoSelected = false;
+let brainProviderStatusState = null;
+let brainProviderStatusError = "";
+let brainProviderStatusLoading = false;
+let brainProviderStatusRequestSequence = 0;
+let lastAppliedBrainProviderStatusRequest = 0;
+let brainProviderStatusAbortController = null;
 let systemStatusState = null;
 let systemStatusError = "";
 let systemStatusLoading = false;
@@ -1216,8 +1223,15 @@ function configurationVersionsMarkup(activeVersion, actionsEnabled) {
 }
 
 function configurationView() {
+  const brainProviderStatus = renderBrainProviderStatus({
+    state: brainProviderStatusState,
+    loading: brainProviderStatusLoading,
+    error: brainProviderStatusError,
+    pendingRestart: configurationRequiresRestart(),
+  });
   if (!hasConfigurationState()) {
     return `<section class="configuration-panel">
+      ${brainProviderStatus}
       <div class="empty">${escapeHtml(configurationLoadError || "正在读取本地配置状态…")}</div>
       ${configurationLoadError ? '<button class="secondary-button" data-configuration-reload>重新读取</button>' : ""}
     </section>`;
@@ -1280,6 +1294,7 @@ function configurationView() {
       </div>`;
 
   return `<div class="configuration-panel">
+    ${brainProviderStatus}
     ${notice ? `<div class="${noticeClass}" ${operationNotice ? "data-configuration-operation-notice" : ""} role="${runtime.tone === "error" ? "alert" : "status"}"><strong>${escapeHtml(notice)}</strong>${runtime.detail ? `<span>${escapeHtml(runtime.detail)}</span>` : ""}</div>` : ""}
     ${configurationLoadError ? `<div class="configuration-inline-error" role="alert">${escapeHtml(configurationLoadError)}</div>` : ""}
     ${configurationOperationError ? `<div class="configuration-inline-error" data-configuration-operation-error role="alert">${escapeHtml(configurationOperationError)}</div>` : ""}
@@ -1442,6 +1457,53 @@ function bindSystemStatusView() {
   );
 }
 
+async function loadBrainProviderStatus() {
+  const sequence = ++brainProviderStatusRequestSequence;
+  brainProviderStatusAbortController?.abort();
+  const controller = new AbortController();
+  brainProviderStatusAbortController = controller;
+  brainProviderStatusLoading = true;
+  brainProviderStatusError = "";
+  if (currentView === "configuration") {
+    renderConfigurationPreservingEditorFocus();
+  }
+  try {
+    const response = await fetch("/api/brain-providers/status", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`读取 Codex CLI 能力失败（${response.status}）`);
+    }
+    const result = await response.json();
+    if (
+      controller.signal.aborted ||
+      sequence !== brainProviderStatusRequestSequence ||
+      sequence < lastAppliedBrainProviderStatusRequest
+    ) {
+      return false;
+    }
+    lastAppliedBrainProviderStatusRequest = sequence;
+    brainProviderStatusState = result;
+    brainProviderStatusError = "";
+    return true;
+  } catch (error) {
+    if (error?.name === "AbortError") return false;
+    if (sequence === brainProviderStatusRequestSequence) {
+      brainProviderStatusError = error.message || "读取 Codex CLI 能力失败";
+    }
+    return false;
+  } finally {
+    if (brainProviderStatusAbortController === controller) {
+      brainProviderStatusAbortController = null;
+      brainProviderStatusLoading = false;
+      if (currentView === "configuration") {
+        renderConfigurationPreservingEditorFocus();
+      }
+    }
+  }
+}
+
 async function loadSystemStatus() {
   const sequence = ++systemStatusRequestSequence;
   systemStatusAbortController?.abort();
@@ -1510,6 +1572,9 @@ async function createSystemBackup() {
 }
 
 function bindConfigurationView() {
+  content
+    .querySelector("[data-brain-provider-status-reload]")
+    ?.addEventListener("click", () => void loadBrainProviderStatus());
   const form = content.querySelector("[data-configuration-structured-form]");
   form?.addEventListener("submit", handleConfigurationSave);
   if (form && configurationFormState) {
@@ -4191,6 +4256,9 @@ async function load({ showConfirmation = true } = {}) {
   if (!hasConfigurationState() || currentView === "configuration") {
     void loadConfiguration();
   }
+  if (currentView === "configuration") {
+    void loadBrainProviderStatus();
+  }
   if (currentView === "system") {
     void loadSystemStatus();
   }
@@ -4225,6 +4293,7 @@ async function refresh() {
     try {
       await Promise.all([
         loadConfiguration(),
+        loadBrainProviderStatus(),
         refreshConfirmationQueue({
           showConfirmation: false,
           renderView: false,
@@ -4284,6 +4353,7 @@ function activateView(view) {
   render();
   if (currentView === "configuration") {
     void loadConfiguration();
+    void loadBrainProviderStatus();
   }
   if (currentView === "system") {
     void loadSystemStatus();

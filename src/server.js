@@ -109,6 +109,13 @@ const configurationRuntimeModes = new Set([
   "restart_required",
   "unknown",
 ]);
+const brainProviderStatusCapabilities = new Map([
+  ["available", Object.freeze({ cliAvailable: true, fileLoginAvailable: true })],
+  ["file_login_unavailable", Object.freeze({ cliAvailable: true, fileLoginAvailable: false })],
+  ["unsafe_source", Object.freeze({ cliAvailable: true, fileLoginAvailable: false })],
+  ["broker_blocked", Object.freeze({ cliAvailable: true, fileLoginAvailable: false })],
+  ["cli_unavailable", Object.freeze({ cliAvailable: false, fileLoginAvailable: false })],
+]);
 const safeConfigurationResourceId =
   /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/;
 const confirmationHistoryStatuses = new Set(CONFIRMATION_HISTORY_STATUSES);
@@ -1203,6 +1210,47 @@ function requireApplicationPort(application, property, methods, message) {
     throw httpError(503, message);
   }
   return port;
+}
+
+function brainProviderStatusProjection(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw httpError(500, "Codex CLI 能力状态无效");
+  }
+  const fields = [
+    "schemaVersion",
+    "state",
+    "cliAvailable",
+    "fileLoginAvailable",
+  ];
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    Reflect.ownKeys(descriptors).length !== fields.length ||
+    fields.some(
+      (field) =>
+        !descriptors[field]?.enumerable ||
+        !("value" in descriptors[field]),
+    )
+  ) {
+    throw httpError(500, "Codex CLI 能力状态无效");
+  }
+  const status = Object.fromEntries(
+    fields.map((field) => [field, descriptors[field].value]),
+  );
+  const capabilities = brainProviderStatusCapabilities.get(status.state);
+  if (
+    status.schemaVersion !== 1 ||
+    !capabilities ||
+    status.cliAvailable !== capabilities.cliAvailable ||
+    status.fileLoginAvailable !== capabilities.fileLoginAvailable
+  ) {
+    throw httpError(500, "Codex CLI 能力状态无效");
+  }
+  return Object.freeze(status);
 }
 
 function resolveOperationalAdmission(application) {
@@ -2399,6 +2447,27 @@ export function createDashboardServer(
       }
       if (processController?.isPending()) {
         throw httpError(503, "进程尚未被管理器认领");
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/brain-providers/status"
+      ) {
+        requireNoQuery(url, "Codex CLI 能力查询参数无效");
+        const providerStatus = requireApplicationPort(
+          application,
+          "brainProviderStatus",
+          ["readStatus"],
+          "Codex CLI 能力状态端口未启用",
+        );
+        await withClientAbortSignal(request, response, async (signal) => {
+          const result = brainProviderStatusProjection(
+            await providerStatus.readStatus({ signal }),
+          );
+          if (!signal.aborted && !response.destroyed) {
+            sendJson(response, 200, result);
+          }
+        });
+        return;
       }
       if (request.method === "GET" && url.pathname === "/api/system/status") {
         requireNoQuery(url, "系统状态查询参数无效");

@@ -438,7 +438,8 @@ function defaultProcessAlive(processId) {
   }
 }
 
-function productionBrokerDependencies(protectedRoots) {
+function productionBrokerDependencies(runtimeFacts) {
+  const { protectedRoots } = runtimeFacts;
   const locations = productionCodexLoginLocations();
   return Object.freeze({
     options: Object.freeze({

@@ -4361,6 +4361,158 @@ test("default application composition supplies lexical authority for configured 
   await application.close();
 });
 
+test("production composition shares one Codex login broker across every configured CLI route", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI composition is Windows x64 only");
+    return;
+  }
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  const loginBrain = {
+    provider: "offline-cli",
+    model: "fixed-login-model",
+    remoteData: { requirements: true, code: true, memory: true },
+  };
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-login";
+  rawConfig.employees.roles.developer.enabled = true;
+  rawConfig.employees.roles.developer.initialPaused = false;
+  rawConfig.employees.roles.developer.brain = structuredClone(loginBrain);
+  rawConfig.employees.roles.developer.taskBrain = structuredClone(loginBrain);
+  rawConfig.memory.answering = {
+    enabled: true,
+    maximumRecords: 7,
+    maximumContextBytes: 110_000,
+    maximumConcurrent: 2,
+    brain: structuredClone(loginBrain),
+    localBrain: {
+      provider: "ollama",
+      model: "local-model",
+      remoteData: { requirements: false, code: false, memory: false },
+    },
+  };
+  const config = normalizeConfigurationDocument(rawConfig);
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  const providerCloses = [];
+  observeClose(
+    t,
+    SupervisedCliBrainProvider.prototype,
+    "provider",
+    providerCloses,
+  );
+  let brokerFactoryCalls = 0;
+  let brokerRuntimeFacts = null;
+  let memoryRouter = null;
+  let availabilityCalls = 0;
+  let acquireCalls = 0;
+  const closeOrder = [];
+  let providersClosedBeforeBroker = null;
+  const unavailable = Object.assign(
+    new Error("stable broker denial"),
+    { code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE", statusCode: 503 },
+  );
+  const broker = Object.freeze({
+    async acquire() {
+      acquireCalls += 1;
+      throw unavailable;
+    },
+    async checkAvailability() {
+      availabilityCalls += 1;
+    },
+    async readStatus() {
+      return Object.freeze({
+        schemaVersion: 1,
+        state: "available",
+        cliAvailable: true,
+        fileLoginAvailable: true,
+      });
+    },
+    async close() {
+      providersClosedBeforeBroker = providerCloses.length;
+      closeOrder.push("broker");
+    },
+  });
+  function inspectBrokerRuntimeFacts(runtimeFacts) {
+    brokerRuntimeFacts = runtimeFacts;
+    return runtimeFacts;
+  }
+  function brokerFactory(grant) {
+    brokerFactoryCalls += 1;
+    grant.consume(inspectBrokerRuntimeFacts);
+    return broker;
+  }
+  const locations = Object.freeze({
+    sourceFile: path.join(homedir(), ".codex", "auth.json"),
+    mirrorRoot: path.join(homedir(), ".mydashboard-cli-credentials-v1"),
+    mirrorDirectory: path.join(
+      homedir(),
+      ".mydashboard-cli-credentials-v1",
+      "codex-login",
+    ),
+    probeRoot: path.join(homedir(), ".mydashboard-codex-login-probe-v1"),
+  });
+  const baseOptions = defaultCodeJobApplicationOptions({
+    config,
+    calls,
+    closeCalls,
+    lifecycle,
+    versioned: false,
+  });
+  const {
+    configuredWorkforceFactory: _injectedWorkforce,
+    ...productionOptions
+  } = baseOptions;
+  const application = await createApplication({
+    ...productionOptions,
+    codexLoginCredentialBrokerFactory: brokerFactory,
+    codexLoginLocationsFactory: () => locations,
+    memoryContextRetrieverFactory: () => ({ async retrieve() {} }),
+    memoryAnswerServiceFactory(options) {
+      memoryRouter = options.brainRouter;
+      return { async answer() {} };
+    },
+  });
+
+  assert.equal(brokerFactoryCalls, 1);
+  assert.deepEqual(Object.keys(brokerRuntimeFacts), ["protectedRoots"]);
+  assert.equal(Object.isFrozen(brokerRuntimeFacts), true);
+  assert.equal(Object.isFrozen(brokerRuntimeFacts.protectedRoots), true);
+  assert.ok(brokerRuntimeFacts.protectedRoots.includes(path.resolve(".")));
+  assert.deepEqual(Object.keys(application.brainProviderStatus), ["readStatus"]);
+  assert.deepEqual(await application.brainProviderStatus.readStatus(), {
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+  });
+  for (const privateName of [
+    "codexLoginCredentialBroker",
+    "codexLoginCredentialStore",
+    "credentialLocations",
+  ]) {
+    assert.equal(privateName in application, false);
+  }
+
+  await memoryRouter.checkAvailability(loginBrain);
+  await application.employeeRegistry
+    .require("developer")
+    .checkAvailability({});
+  await assert.rejects(
+    calls.codeJobRuntime.brainDirectory.decide(
+      defaultCodeDecisionInput(),
+      { beforeGenerate: async () => {} },
+    ),
+    { code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" },
+  );
+  assert.equal(availabilityCalls, 2);
+  assert.equal(acquireCalls, 1);
+
+  await application.close();
+  assert.ok(providerCloses.length >= 3, providerCloses.length);
+  assert.equal(providersClosedBeforeBroker, providerCloses.length);
+  assert.deepEqual(closeOrder, ["broker"]);
+});
+
 test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "supervised-cli-application-close-"),

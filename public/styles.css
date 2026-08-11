@@ -1990,6 +1990,103 @@ h1 {
   max-width: 940px;
 }
 
+.brain-provider-status-card {
+  min-width: 0;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+
+.brain-provider-status-card.status-available {
+  border-color: #6c9c83;
+}
+
+.brain-provider-status-card.status-attention {
+  border-color: #c69a55;
+}
+
+.brain-provider-status-card.status-blocked {
+  border-color: #c87868;
+}
+
+.brain-provider-status-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.brain-provider-status-heading h2 {
+  margin: 0;
+  font-family: Georgia, "Noto Serif SC", serif;
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.brain-provider-status-body {
+  margin-top: 14px;
+}
+
+.brain-provider-status-body p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.brain-provider-status-body strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.brain-provider-status-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 16px 0 12px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.brain-provider-status-facts div {
+  min-width: 0;
+  padding: 10px 12px 10px 0;
+}
+
+.brain-provider-status-facts div + div {
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+.brain-provider-status-facts dt,
+.brain-provider-status-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.brain-provider-status-facts dt {
+  color: var(--faint);
+}
+
+.brain-provider-status-body .brain-provider-status-notice,
+.brain-provider-status-body .brain-provider-status-error {
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  border-radius: 6px;
+}
+
+.brain-provider-status-body .brain-provider-status-notice {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.brain-provider-status-body .brain-provider-status-error {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
 .system-status-panel {
   display: grid;
   gap: 22px;
@@ -2978,6 +3075,16 @@ dialog::backdrop {
 }
 
 @media (max-width: 820px) {
+  .brain-provider-status-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .brain-provider-status-facts div + div {
+    padding-left: 0;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
   .workflow-owner-fields {
     grid-template-columns: 1fr;
   }
