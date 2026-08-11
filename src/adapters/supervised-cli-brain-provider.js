@@ -75,6 +75,7 @@ const INSTRUCTION =
 const OPTION_KEYS = Object.freeze([
   "id",
   "cliKind",
+  "credentialMode",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -325,9 +326,17 @@ function providerOptions(rawOptions) {
   if (!CLI_KINDS.has(options.cliKind)) {
     throw new TypeError("cliKind is invalid");
   }
+  const credentialMode = options.credentialMode ?? "api-key";
+  if (!["api-key", "codex-login"].includes(credentialMode)) {
+    throw new TypeError("credentialMode is invalid");
+  }
+  if (options.cliKind === "claude-cli" && credentialMode !== "api-key") {
+    throw new TypeError("Claude CLI credentialMode is invalid");
+  }
   return Object.freeze({
     id: options.id,
     cliKind: options.cliKind,
+    credentialMode,
     timeoutMs: boundedInteger(
       options.timeoutMs ?? 300_000,
       "timeoutMs",
@@ -426,7 +435,13 @@ function defaultProcessAlive(processId) {
   }
 }
 
-function productionDependencies(additionalProtectedRoots = []) {
+function productionDependencies(runtimeFacts = []) {
+  const additionalProtectedRoots = Array.isArray(runtimeFacts)
+    ? runtimeFacts
+    : runtimeFacts.protectedRoots;
+  const codexLoginCredentialBroker = Array.isArray(runtimeFacts)
+    ? null
+    : runtimeFacts.codexLoginCredentialBroker;
   return Object.freeze({
     processRunner: new SupervisedProcessRunner(),
     commandLocator: new KnownCliLocator(),
@@ -442,6 +457,7 @@ function productionDependencies(additionalProtectedRoots = []) {
     isProcessAlive: defaultProcessAlive,
     staleInvocationScavenger: scavengeStaleInvocations,
     codexResultReader: readCodexResult,
+    codexLoginCredentialBroker,
   });
 }
 
@@ -470,6 +486,7 @@ function providerDependencies(constructionToken, rawDependencies) {
       "protectedRoots",
       "cleanupFileSystem",
       "rootDirectoryManager",
+      "codexLoginCredentialBroker",
     ],
     ["processRunner", "commandLocator", "environment", "temporaryRoot"],
     "Supervised CLI provider test dependencies are invalid",
@@ -491,6 +508,24 @@ function providerDependencies(constructionToken, rawDependencies) {
     staleInvocationScavenger:
       dependencies.staleInvocationScavenger ?? scavengeStaleInvocations,
     codexResultReader: dependencies.codexResultReader ?? readCodexResult,
+    codexLoginCredentialBroker:
+      dependencies.codexLoginCredentialBroker ?? null,
+  });
+}
+
+function credentialBroker(value) {
+  if (value === null) return null;
+  if (
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    typeof value.acquire !== "function" ||
+    typeof value.checkAvailability !== "function"
+  ) {
+    throw new TypeError("Codex login credential broker is invalid");
+  }
+  return Object.freeze({
+    acquire: value.acquire.bind(value),
+    checkAvailability: value.checkAvailability.bind(value),
   });
 }
 
@@ -1341,7 +1376,7 @@ async function createInvocation({
   }
 }
 
-function childEnvironment(invocation, configuredCredential) {
+function childEnvironment(invocation, configuredCredential, codexHome = null) {
   const { profiles } = invocation;
   return {
     HOME: profiles.home,
@@ -1359,8 +1394,18 @@ function childEnvironment(invocation, configuredCredential) {
     TERM: "dumb",
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
-    [configuredCredential.name]: configuredCredential.value,
+    ...(codexHome === null
+      ? { [configuredCredential.name]: configuredCredential.value }
+      : { CODEX_HOME: codexHome }),
   };
+}
+
+function credentialInvocationIdentity(invocation) {
+  return Object.freeze({
+    path: invocation.path,
+    device: invocation.device,
+    inode: invocation.inode,
+  });
 }
 
 function requestPayload(request, maximumBytes) {
@@ -1737,6 +1782,8 @@ async function verifiedResidue(
 }
 
 export class SupervisedCliBrainProvider {
+  #credentialMode;
+  #credentialBroker;
   #timeoutMs;
   #maxResponseBytes;
   #maxRequestBytes;
@@ -1778,6 +1825,16 @@ export class SupervisedCliBrainProvider {
     this.kind = options.cliKind;
     this.remote = true;
     this.singleAttempt = true;
+    this.#credentialMode = options.credentialMode;
+    this.#credentialBroker = credentialBroker(
+      dependencies.codexLoginCredentialBroker,
+    );
+    if (
+      this.#credentialMode === "codex-login" &&
+      this.#credentialBroker === null
+    ) {
+      throw new TypeError("codex-login requires a credential broker");
+    }
     this.#timeoutMs = options.timeoutMs;
     this.#maxResponseBytes = options.maxResponseBytes;
     this.#maxRequestBytes = options.maxRequestBytes;
@@ -1937,6 +1994,9 @@ export class SupervisedCliBrainProvider {
     wireInput,
     deadline,
     configuredCredential,
+    credentialLease,
+    onCredentialStageStarted,
+    onCredentialSettled,
     expectedRoot,
   }) {
     const root = await deadline.run(({ signal }) => this.#root(signal));
@@ -1961,6 +2021,10 @@ export class SupervisedCliBrainProvider {
     let invocation = null;
     let result;
     let failure = null;
+    let credentialStaged = false;
+    let processReaped = credentialLease === null;
+    let credentialCaptured = credentialLease === null;
+    let cleanupCompleted = false;
     try {
       invocation = await runRootOperation(
         this.#rootState,
@@ -1977,7 +2041,29 @@ export class SupervisedCliBrainProvider {
         { blocking: true, requireSafe: true },
       );
       this.#assertRunnable();
-      const environment = childEnvironment(invocation, configuredCredential);
+      let codexHome = null;
+      if (credentialLease !== null) {
+        onCredentialStageStarted();
+        const staged = await deadline.run(({ signal }) =>
+          credentialLease.stage({
+            invocation: credentialInvocationIdentity(invocation),
+            signal,
+          }));
+        if (
+          staged === null ||
+          typeof staged !== "object" ||
+          staged.codexHome !== path.join(invocation.path, "codex-home")
+        ) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+        codexHome = staged.codexHome;
+        credentialStaged = true;
+      }
+      const environment = childEnvironment(
+        invocation,
+        configuredCredential,
+        codexHome,
+      );
       if (this.kind === "codex-cli") {
         const schemaFile = path.join(invocation.path, "output-schema.json");
         const resultFile = path.join(invocation.path, "last-message.json");
@@ -1996,20 +2082,33 @@ export class SupervisedCliBrainProvider {
             () => this.#assertRunnable(),
           ));
         this.#assertRunnable();
-        await this.#runProcess(invocation, deadline, {
-          executable: descriptor,
-          args: codexArguments({
-            request,
-            invocation,
-            schemaFile,
-            resultFile,
-          }),
-          cwd: invocation.path,
-          env: environment,
-          input: wireInput,
-          maxStdoutBytes: this.#maxResponseBytes,
-          maxStderrBytes: this.#maxResponseBytes,
-        });
+        let processFailure = null;
+        try {
+          await this.#runProcess(invocation, deadline, {
+            executable: descriptor,
+            args: codexArguments({
+              request,
+              invocation,
+              schemaFile,
+              resultFile,
+            }),
+            cwd: invocation.path,
+            env: environment,
+            input: wireInput,
+            maxStdoutBytes: this.#maxResponseBytes,
+            maxStderrBytes: this.#maxResponseBytes,
+          });
+          processReaped = true;
+        } catch (error) {
+          processFailure = error;
+          processReaped = error?.code !== "STRUCTURED_PROVIDER_REAP_FAILED";
+        }
+        if (credentialLease !== null && processReaped) {
+          await deadline.run(({ signal }) =>
+            credentialLease.capture({ signal }));
+          credentialCaptured = true;
+        }
+        if (processFailure !== null) throw processFailure;
         deadline.throwIfExpired();
         result = await deadline.run(
           ({ signal }) => this.#codexResultReader(
@@ -2048,9 +2147,19 @@ export class SupervisedCliBrainProvider {
     } else {
       try {
         await this.#cleanup(invocation, root, deadline);
+        cleanupCompleted = true;
       } catch (cleanupError) {
         failure = cleanupError;
       }
+    }
+    if (
+      credentialLease !== null &&
+      credentialStaged &&
+      processReaped &&
+      credentialCaptured &&
+      cleanupCompleted
+    ) {
+      onCredentialSettled();
     }
     if (failure) throw failure;
     return result;
@@ -2093,8 +2202,25 @@ export class SupervisedCliBrainProvider {
       startedAt,
     });
     this.#activeGenerations += 1;
+    let credentialLease = null;
+    let credentialLifecycleSafe = true;
     try {
-      const configuredCredential = credential(this.#environment, this.kind);
+      if (this.#credentialMode === "codex-login") {
+        credentialLease = await deadline.run(({ signal }) =>
+          this.#credentialBroker.acquire({ signal }));
+        if (
+          credentialLease === null ||
+          typeof credentialLease !== "object" ||
+          typeof credentialLease.stage !== "function" ||
+          typeof credentialLease.capture !== "function" ||
+          typeof credentialLease.release !== "function"
+        ) {
+          throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+        }
+      }
+      const configuredCredential = this.#credentialMode === "api-key"
+        ? credential(this.#environment, this.kind)
+        : null;
       const root = await deadline.run(({ signal }) => this.#root(signal));
       this.#assertOpen();
       await this.#recover(root, deadline);
@@ -2106,10 +2232,78 @@ export class SupervisedCliBrainProvider {
         wireInput: admitted.wireInput,
         deadline,
         configuredCredential,
+        credentialLease,
+        onCredentialStageStarted() {
+          credentialLifecycleSafe = false;
+        },
+        onCredentialSettled() {
+          credentialLifecycleSafe = true;
+        },
         expectedRoot: root,
       });
       deadline.throwIfExpired();
       return result;
+    } catch (error) {
+      if (FAILURE_PRECEDES_DEADLINE.has(error?.code)) {
+        throw sanitizeRuntimeFailure(error);
+      }
+      try {
+        deadline.throwIfExpired();
+      } catch (deadlineError) {
+        throw sanitizeRuntimeFailure(deadlineError);
+      }
+      throw sanitizeRuntimeFailure(error);
+    } finally {
+      this.#activeGenerations -= 1;
+      deadline.dispose();
+      if (credentialLease !== null) {
+        try {
+          credentialLease.release({ safe: credentialLifecycleSafe });
+        } catch (error) {
+          throw sanitizeRuntimeFailure(error);
+        }
+      }
+    }
+  }
+
+  async checkAvailability(rawRequest = {}) {
+    this.#assertOpen();
+    if (!this.#productionPlatformSupported) {
+      throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+    }
+    let signal;
+    try {
+      const request = exactDataObject(
+        rawRequest,
+        ["signal"],
+        [],
+        "Supervised CLI availability request is invalid",
+      );
+      signal = normalizeAbortSignal(request.signal ?? null);
+      if (signal?.aborted) {
+        throw providerError("STRUCTURED_PROVIDER_CANCELLED");
+      }
+    } catch (error) {
+      throw sanitizeInputFailure(error);
+    }
+    const startedAt = this.#monotonicClock();
+    const deadline = createRequestDeadline({
+      signal,
+      timeoutMs: this.#timeoutMs,
+      monotonicClock: this.#monotonicClock,
+      startedAt,
+    });
+    this.#activeGenerations += 1;
+    try {
+      if (this.#credentialMode === "codex-login") {
+        await deadline.run(({ signal: operationSignal }) =>
+          this.#credentialBroker.checkAvailability({ signal: operationSignal }));
+      } else {
+        credential(this.#environment, this.kind);
+        await deadline.run(({ signal: operationSignal }) =>
+          this.#commandLocator.resolve(this.kind, { signal: operationSignal }));
+      }
+      deadline.throwIfExpired();
     } catch (error) {
       if (FAILURE_PRECEDES_DEADLINE.has(error?.code)) {
         throw sanitizeRuntimeFailure(error);

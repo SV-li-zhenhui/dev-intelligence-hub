@@ -120,6 +120,7 @@ function normalizeProvider(value) {
     value,
     "singleAttempt",
   );
+  const availability = value.checkAvailability;
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -127,11 +128,17 @@ function normalizeProvider(value) {
   ) {
     throw new TypeError("brain provider is invalid");
   }
+  if (availability !== undefined && typeof availability !== "function") {
+    throw new TypeError("brain provider is invalid");
+  }
   return Object.freeze({
     id,
     remote: value.remote,
     singleAttempt: attemptDescriptor?.value === true,
     generate: value.generate.bind(value),
+    ...(availability
+      ? { checkAvailability: availability.bind(value) }
+      : {}),
   });
 }
 
@@ -205,6 +212,23 @@ export class BrainRouter {
       model: brain.model,
       messages,
       schema,
+      ...(requestSignal ? { signal: requestSignal } : {}),
+    });
+  }
+
+  async checkAvailability(brainValue, { signal = null } = {}) {
+    const brain = normalizeBrainConfig(brainValue);
+    const provider = this.#provider(brain.provider);
+    const requestSignal = normalizeAbortSignal(signal);
+    if (requestSignal?.aborted) {
+      throw routerError(
+        "BRAIN_REQUEST_CANCELLED",
+        "Brain request was cancelled",
+        499,
+      );
+    }
+    if (typeof provider.checkAvailability !== "function") return;
+    await provider.checkAvailability({
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
   }

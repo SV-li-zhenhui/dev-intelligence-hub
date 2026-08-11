@@ -4,8 +4,10 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   readdir,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -94,12 +96,18 @@ async function createCliHarness(t, name) {
     NODE_OPTIONS: "--require=host-hook.js",
     USERPROFILE: "HOST_PROFILE_MUST_NOT_ESCAPE",
   });
-  const supervisedCliProviderFactory = (options) =>
+  const supervisedCliProviderFactory = (options, runtimeFacts = {}) =>
     createTestSupervisedCliBrainProvider(options, {
       processRunner: recordingRunner,
       commandLocator,
       environment,
       temporaryRoot,
+      ...(runtimeFacts.codexLoginCredentialBroker
+        ? {
+            codexLoginCredentialBroker:
+              runtimeFacts.codexLoginCredentialBroker,
+          }
+        : {}),
     });
 
   return {
@@ -107,6 +115,41 @@ async function createCliHarness(t, name) {
     temporaryRoot,
     supervisedCliProviderFactory,
   };
+}
+
+function persistentLoginBroker() {
+  const refreshed = Buffer.from("fictional-refreshed-login-v1");
+  let credential = Buffer.from("fictional-initial-login-v1");
+  let captures = 0;
+  let safeReleases = 0;
+  return Object.freeze({
+    async acquire() {
+      let codexHome = null;
+      return Object.freeze({
+        async stage({ invocation }) {
+          codexHome = path.join(invocation.path, "codex-home");
+          await mkdir(codexHome);
+          await writeFile(path.join(codexHome, "auth.json"), credential);
+          return Object.freeze({ codexHome });
+        },
+        async capture() {
+          credential = await readFile(path.join(codexHome, "auth.json"));
+          captures += 1;
+        },
+        release({ safe }) {
+          if (safe) safeReleases += 1;
+        },
+      });
+    },
+    async checkAvailability() {},
+    view() {
+      return Object.freeze({
+        captures,
+        safeReleases,
+        refreshed: credential.equals(refreshed),
+      });
+    },
+  });
 }
 
 function providerConfig(kind) {
@@ -194,6 +237,61 @@ test("malformed CLI output starts exactly one child and never starts a correctio
     );
     assert.equal(harness.invocations.length, before + 1);
   }
+  assert.deepEqual(await readdir(harness.temporaryRoot), []);
+});
+
+test("Codex login refresh survives a second invocation and reconstructed provider", async (t) => {
+  const harness = await createCliHarness(t, "supervised-cli-login-e2e");
+  const broker = persistentLoginBroker();
+  const options = {
+    id: "codex-login-fixture",
+    cliKind: "codex-cli",
+    credentialMode: "codex-login",
+    timeoutMs: 30_000,
+    maxResponseBytes: 128 * 1024,
+    maxRequestBytes: 256 * 1024,
+  };
+  const request = {
+    model: "gpt-5.6-codex",
+    messages: [
+      { role: "system", content: "Return the fixture JSON." },
+      {
+        role: "user",
+        content: "FIXTURE_REQUIRE_CODEX_LOGIN FIXTURE_REFRESH_CODEX_LOGIN",
+      },
+    ],
+    schema: ISOLATION_SCHEMA,
+  };
+
+  const firstProvider = harness.supervisedCliProviderFactory(options, {
+    codexLoginCredentialBroker: broker,
+  });
+  const first = JSON.parse(await firstProvider.generate(request));
+
+  assert.equal(first.fixture.authVisible, true);
+  assert.equal(first.fixture.codexHomeInsideCwd, true);
+  assert.equal(broker.view().refreshed, true);
+  assert.deepEqual(
+    harness.invocations.at(-1).environmentKeys.includes("OPENAI_API_KEY"),
+    false,
+  );
+
+  const reconstructedProvider = harness.supervisedCliProviderFactory(options, {
+    codexLoginCredentialBroker: broker,
+  });
+  request.messages[1] = {
+    role: "user",
+    content: "FIXTURE_REQUIRE_CODEX_LOGIN",
+  };
+  const second = JSON.parse(await reconstructedProvider.generate(request));
+
+  assert.equal(second.fixture.authVisible, true);
+  assert.equal(second.fixture.codexHomeInsideCwd, true);
+  assert.deepEqual(broker.view(), {
+    captures: 2,
+    safeReleases: 2,
+    refreshed: true,
+  });
   assert.deepEqual(await readdir(harness.temporaryRoot), []);
 });
 

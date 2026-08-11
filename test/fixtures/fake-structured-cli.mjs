@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { lstat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const [kind, ...cliArguments] = process.argv.slice(2);
@@ -12,6 +12,9 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
 
   const request = JSON.parse(input);
   const cwd = process.cwd();
+  const messageText = request.messages
+    .map(({ content }) => content)
+    .join("\n");
   const profileNames = [
     "HOME",
     "USERPROFILE",
@@ -32,9 +35,34 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
       !relative.startsWith(`..${path.sep}`) &&
       !path.isAbsolute(relative);
   };
+  const codexHomeInsideCwd = inside(process.env.CODEX_HOME);
+  let authVisible = false;
+  if (messageText.includes("FIXTURE_REQUIRE_CODEX_LOGIN")) {
+    try {
+      const details = await lstat(
+        path.join(process.env.CODEX_HOME, "auth.json"),
+      );
+      authVisible = details.isFile() && !details.isSymbolicLink();
+    } catch {
+      authVisible = false;
+    }
+    if (!authVisible || !codexHomeInsideCwd) process.exitCode = 4;
+  }
+  if (
+    authVisible &&
+    messageText.includes("FIXTURE_REFRESH_CODEX_LOGIN")
+  ) {
+    await writeFile(
+      path.join(process.env.CODEX_HOME, "auth.json"),
+      Buffer.from("fictional-refreshed-login-v1"),
+      { flag: "w" },
+    );
+  }
   const observation = {
     kind,
     cwd,
+    authVisible,
+    codexHomeInsideCwd,
     profileRootsInsideCwd: profileNames.every((name) => inside(process.env[name])),
     forbiddenEnvironmentPresent: [
       "GH_TOKEN",
@@ -55,9 +83,6 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
     "utf8",
   );
 
-  const messageText = request.messages
-    .map(({ content }) => content)
-    .join("\n");
   let result;
   if (messageText.includes("FIXTURE_MALFORMED_RESULT")) {
     result = "not-json";

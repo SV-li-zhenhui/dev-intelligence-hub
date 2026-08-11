@@ -20,6 +20,7 @@ const PROVIDER_KEYS = new Set([
   "maxResponseBytes",
   "maxRequestBytes",
   "contextTokens",
+  "credentialMode",
   "remote",
 ]);
 const PROVIDER_LIMIT_KEYS = Object.freeze([
@@ -32,6 +33,7 @@ const CLI_PROVIDER_KEYS = new Set([
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
+  "credentialMode",
   "remote",
 ]);
 const ROLE_KEYS = new Set([
@@ -248,6 +250,8 @@ function configuredProvidersCanAcquireCleanup(value) {
 
 function testSupervisedCliRuntimeFacts(dependencies) {
   const protectedRoots = dependencies.supervisedCliProtectedRoots ?? [];
+  const codexLoginCredentialBroker =
+    dependencies.codexLoginCredentialBroker ?? null;
   if (
     !Array.isArray(protectedRoots) ||
     protectedRoots.some(
@@ -256,7 +260,20 @@ function testSupervisedCliRuntimeFacts(dependencies) {
   ) {
     throw new TypeError("supervised CLI protected roots are invalid");
   }
-  return Object.freeze({ protectedRoots: Object.freeze([...protectedRoots]) });
+  if (
+    codexLoginCredentialBroker !== null &&
+    (typeof codexLoginCredentialBroker !== "object" ||
+      typeof codexLoginCredentialBroker.acquire !== "function" ||
+      typeof codexLoginCredentialBroker.checkAvailability !== "function")
+  ) {
+    throw new TypeError("Codex login credential broker is invalid");
+  }
+  return Object.freeze({
+    protectedRoots: Object.freeze([...protectedRoots]),
+    ...(codexLoginCredentialBroker === null
+      ? {}
+      : { codexLoginCredentialBroker }),
+  });
 }
 
 function productionSupervisedCliCapability(dependencies) {
@@ -297,6 +314,7 @@ function providerWithBoundary(provider, remote, lifecycle) {
     provider,
     "singleAttempt",
   );
+  const availability = provider.checkAvailability;
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -304,11 +322,17 @@ function providerWithBoundary(provider, remote, lifecycle) {
   ) {
     throw new TypeError("brain provider singleAttempt is invalid");
   }
+  if (availability !== undefined && typeof availability !== "function") {
+    throw new TypeError("brain provider availability is invalid");
+  }
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     generate: provider.generate.bind(provider),
+    ...(availability
+      ? { checkAvailability: availability.bind(provider) }
+      : {}),
     ...(runtime ? { close: runtime.close } : {}),
   });
   return boundary;
@@ -365,6 +389,7 @@ function providerOptions(
       supervisedCliProviderFactory({
         ...common,
         cliKind: config.kind,
+        ...selectOptions(config, ["credentialMode"]),
       }, cliRuntimeFacts(dependencies)),
       remote,
       lifecycle,
@@ -430,6 +455,7 @@ function configuredBrainRouter(
     const router = new BrainRouter({ providers });
     return Object.freeze({
       generate: router.generate.bind(router),
+      checkAvailability: router.checkAvailability.bind(router),
       describe: router.describe.bind(router),
       close: lifecycle.close,
     });

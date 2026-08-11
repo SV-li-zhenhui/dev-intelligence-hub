@@ -286,9 +286,17 @@ function worker({
   workerId = `employee-${roleId}`,
   paused = false,
   enabled = true,
+  checkAvailability,
   decide = async () => completeDecision(),
 } = {}) {
-  return { roleId, workerId, paused, enabled, decide };
+  return {
+    roleId,
+    workerId,
+    paused,
+    enabled,
+    ...(checkAvailability ? { checkAvailability } : {}),
+    decide,
+  };
 }
 
 function createLoop({ ledger, directory, time, ...options }) {
@@ -372,6 +380,105 @@ test("a paused PR role leaves every PR queued without asking or deciding", async
     "queued",
     "queued",
   ]);
+});
+
+test("provider credential degradation leaves the selected task unclaimed without fallback", async () => {
+  const time = controlledClock();
+  const source = workItem(4, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const availabilityItems = [];
+  let fallbackCalls = 0;
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      async checkAvailability({ item, signal }) {
+        availabilityItems.push(item);
+        assert.equal(signal instanceof AbortSignal, true);
+        throw Object.assign(new Error("private credential detail"), {
+          code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+        });
+      },
+      async decide() {
+        fallbackCalls += 1;
+        return completeDecision();
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(result.claimed, 0);
+  assert.equal(result.claimAttempts, 0);
+  assert.deepEqual(result.outcomes, [{
+    itemId: source.itemId,
+    status: "degraded",
+    code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+  }]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(fallbackCalls, 0);
+  assert.equal(availabilityItems.length, 1);
+  assert.equal(availabilityItems[0].event.eventType, "pull_request.created");
+  assert.equal(Object.hasOwn(availabilityItems[0], "ownerId"), false);
+});
+
+test("availability remains item-specific while target resolution is cached", async () => {
+  const time = controlledClock();
+  const first = workItem(5, { type: "role", id: "developer" });
+  const second = workItem(6, { type: "role", id: "developer" });
+  first.event.eventType = "issue.updated";
+  const ledger = new FakeLedger({ source: [first, second], time });
+  const checkedEventTypes = [];
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      async checkAvailability({ item }) {
+        checkedEventTypes.push(item.event.eventType);
+        throw Object.assign(new Error("provider unavailable"), {
+          code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+        });
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ roleId: "developer", workLimit: 2 });
+
+  assert.equal(directory.calls.length, 1);
+  assert.deepEqual(checkedEventTypes, ["issue.updated", "pull_request.created"]);
+  assert.deepEqual(
+    result.outcomes.map(({ status, code }) => ({ status, code })),
+    [
+      { status: "degraded", code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+      { status: "degraded", code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+    ],
+  );
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("unexpected availability errors remain resolution failures before claim", async () => {
+  const time = controlledClock();
+  const source = workItem(7, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      async checkAvailability() {
+        throw new TypeError("programming error");
+      },
+    }),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ roleId: "developer" });
+
+  assert.deepEqual(result.outcomes, [{
+    itemId: source.itemId,
+    status: "resolution_failed",
+  }]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.items[0].status, "queued");
 });
 
 test("ten assignments for one missing role create only one durable question", async () => {

@@ -109,8 +109,12 @@ function brain(overrides = {}) {
   };
 }
 
-function fakeDecisionEngine(id, calls = [], { remote = false } = {}) {
-  return {
+function fakeDecisionEngine(
+  id,
+  calls = [],
+  { remote = false, availabilityCalls = null, availabilityError = null } = {},
+) {
+  const engine = {
     async decide(input) {
       calls.push({ id, input: structuredClone(input) });
       return completeDecision();
@@ -123,6 +127,13 @@ function fakeDecisionEngine(id, calls = [], { remote = false } = {}) {
       };
     },
   };
+  if (availabilityCalls !== null) {
+    engine.checkAvailability = async (input) => {
+      availabilityCalls.push({ id, input });
+      if (availabilityError) throw availabilityError;
+    };
+  }
+  return engine;
 }
 
 function assignedTask(eventType, suffix = "1") {
@@ -199,6 +210,38 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
     code: { files: ["src/app.js"] },
   });
   assert.equal(engine.view().brain.remoteData.memory, false);
+});
+
+test("RoleDecisionEngine checks its configured provider without generating a decision", async () => {
+  const availabilityCalls = [];
+  let generateCalls = 0;
+  const router = {
+    async generate() {
+      generateCalls += 1;
+      return JSON.stringify(completeDecision());
+    },
+    async checkAvailability(config, options) {
+      availabilityCalls.push({ config, options });
+    },
+    describe(config) {
+      return { ...config, remote: false };
+    },
+  };
+  const configuredBrain = brain({ model: "availability-model" });
+  const engine = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: configuredBrain,
+    brainRouter: router,
+  });
+  const controller = new AbortController();
+
+  await engine.checkAvailability({ signal: controller.signal });
+
+  assert.equal(generateCalls, 0);
+  assert.equal(availabilityCalls.length, 1);
+  assert.deepEqual(availabilityCalls[0].config, configuredBrain);
+  assert.strictEqual(availabilityCalls[0].options.signal, controller.signal);
 });
 
 test("RoleDecisionEngine uses supplied trusted context without invoking its legacy factory", async () => {
@@ -715,6 +758,78 @@ test("assigned PR work uses the task brain while assigned issue work stays routi
   );
 });
 
+test("availability preflight uses the same routine and task brain selection as decide", async () => {
+  const routineDecisions = [];
+  const taskDecisions = [];
+  const routineAvailability = [];
+  const taskAvailability = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("complete"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine(
+      "requirements-analyst",
+      routineDecisions,
+      { availabilityCalls: routineAvailability },
+    ),
+    taskDecisionEngine: fakeDecisionEngine(
+      "requirements-analyst",
+      taskDecisions,
+      { availabilityCalls: taskAvailability },
+    ),
+    store: new MemoryStore(),
+  });
+  const controller = new AbortController();
+
+  await employee.checkAvailability({
+    item: assignedTask("issue.updated", "routine-availability"),
+    signal: controller.signal,
+  });
+  await employee.asRoleWorker().checkAvailability({
+    item: assignedTask("pull_request.updated", "task-availability"),
+    signal: controller.signal,
+  });
+
+  assert.equal(routineDecisions.length, 0);
+  assert.equal(taskDecisions.length, 0);
+  assert.equal(routineAvailability.length, 1);
+  assert.equal(taskAvailability.length, 1);
+  assert.strictEqual(routineAvailability[0].input.signal, controller.signal);
+  assert.strictEqual(taskAvailability[0].input.signal, controller.signal);
+});
+
+test("availability preflight propagates the selected task-brain failure", async () => {
+  const expected = Object.assign(new Error("login unavailable"), {
+    code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+  });
+  const routineAvailability = [];
+  const taskAvailability = [];
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("complete"),
+    brain: brain({ model: "routine-model" }),
+    taskBrain: brain({ model: "task-model" }),
+    decisionEngine: fakeDecisionEngine("requirements-analyst", [], {
+      availabilityCalls: routineAvailability,
+    }),
+    taskDecisionEngine: fakeDecisionEngine("requirements-analyst", [], {
+      availabilityCalls: taskAvailability,
+      availabilityError: expected,
+    }),
+    store: new MemoryStore(),
+  });
+
+  await assert.rejects(
+    employee.checkAvailability({
+      item: assignedTask("pull_request.updated", "failed-availability"),
+    }),
+    (error) => error === expected,
+  );
+  assert.equal(routineAvailability.length, 0);
+  assert.equal(taskAvailability.length, 1);
+});
+
 test("every assigned task for a code-capable role uses the task brain", async () => {
   const routineCalls = [];
   const taskCalls = [];
@@ -752,6 +867,13 @@ test("task-risk work fails closed when no task brain is configured", async () =>
       error instanceof Error &&
       error.code === "ROLE_TASK_BRAIN_NOT_CONFIGURED" &&
       error.statusCode === 503,
+  );
+  assert.equal(codeRoutineCalls.length, 0);
+  await assert.rejects(
+    codeEmployee.checkAvailability({
+      item: assignedTask("issue.updated", "missing-code-brain-preflight"),
+    }),
+    (error) => error?.code === "ROLE_TASK_BRAIN_NOT_CONFIGURED",
   );
   assert.equal(codeRoutineCalls.length, 0);
 

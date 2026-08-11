@@ -98,11 +98,18 @@ function normalizeWorker(worker) {
   if (typeof worker.view !== "function" || typeof worker.decide !== "function") {
     throw directoryError("worker is invalid");
   }
+  const availability = worker.checkAvailability;
+  if (availability !== undefined && typeof availability !== "function") {
+    throw directoryError("worker is invalid");
+  }
   return Object.freeze({
     roleId,
     workerId,
     view: worker.view.bind(worker),
     decide: worker.decide.bind(worker),
+    ...(availability
+      ? { checkAvailability: availability.bind(worker) }
+      : {}),
   });
 }
 
@@ -180,6 +187,9 @@ export class RoleWorkerDirectory {
         enabled: state.enabled,
         paused: state.paused,
         decide: worker.decide,
+        ...(worker.checkAvailability
+          ? { checkAvailability: worker.checkAvailability }
+          : {}),
       });
     }
 

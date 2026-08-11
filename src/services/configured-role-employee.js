@@ -197,9 +197,16 @@ function requireDecisionEngine(value) {
   ) {
     throw new TypeError("decisionEngine is invalid");
   }
+  const availability = value.checkAvailability;
+  if (availability !== undefined && typeof availability !== "function") {
+    throw new TypeError("decisionEngine is invalid");
+  }
   return Object.freeze({
     decide: value.decide.bind(value),
     view: value.view.bind(value),
+    checkAvailability: availability
+      ? availability.bind(value)
+      : async () => {},
   });
 }
 
@@ -442,6 +449,7 @@ export class ConfiguredRoleEmployee {
       roleId: this.roleId,
       workerId: this.workerId,
       view: this.workerView.bind(this),
+      checkAvailability: this.checkAvailability.bind(this),
       decide: this.decide.bind(this),
     });
     Object.freeze(this);
@@ -485,17 +493,7 @@ export class ConfiguredRoleEmployee {
     return { enabled: role.enabled, paused: role.paused };
   }
 
-  async decide(input) {
-    const signal = decisionSignal(input);
-    throwIfDecisionAborted(signal);
-    const before = await this.#controller.roleView();
-    throwIfDecisionAborted(signal);
-    if (!before.enabled) {
-      throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
-    }
-    if (before.paused) {
-      throw employeeError("ROLE_PAUSED", "Configured role is paused", 409);
-    }
+  #decisionEngineFor(input) {
     const risk = assignedTaskRisk(input, this.#canProposeCodeAction);
     if (risk === "invalid") {
       throw employeeError(
@@ -511,19 +509,26 @@ export class ConfiguredRoleEmployee {
         503,
       );
     }
-    const decisionEngine = risk === "task"
+    return risk === "task"
       ? this.#taskDecisionEngine
       : this.#routineDecisionEngine;
-    const decision = await decisionEngine.decide(input);
+  }
+
+  async #activeRole(signal) {
     throwIfDecisionAborted(signal);
-    const after = await this.#controller.roleView();
+    const role = await this.#controller.roleView();
     throwIfDecisionAborted(signal);
-    if (!after.enabled) {
+    if (!role.enabled) {
       throw employeeError("ROLE_DISABLED", "Configured role is disabled", 409);
     }
-    if (after.paused) {
+    if (role.paused) {
       throw employeeError("ROLE_PAUSED", "Configured role is paused", 409);
     }
+    return role;
+  }
+
+  async #assertRoleUnchanged(before, signal) {
+    const after = await this.#activeRole(signal);
     if (after.revision !== before.revision) {
       throw employeeError(
         "ROLE_STATE_CHANGED",
@@ -531,6 +536,26 @@ export class ConfiguredRoleEmployee {
         409,
       );
     }
+  }
+
+  async checkAvailability(input = {}) {
+    const signal = decisionSignal(input);
+    const before = await this.#activeRole(signal);
+    const decisionEngine = this.#decisionEngineFor(input);
+    await decisionEngine.checkAvailability({
+      ...(signal === null ? {} : { signal }),
+    });
+    throwIfDecisionAborted(signal);
+    await this.#assertRoleUnchanged(before, signal);
+  }
+
+  async decide(input) {
+    const signal = decisionSignal(input);
+    const before = await this.#activeRole(signal);
+    const decisionEngine = this.#decisionEngineFor(input);
+    const decision = await decisionEngine.decide(input);
+    throwIfDecisionAborted(signal);
+    await this.#assertRoleUnchanged(before, signal);
     return decision;
   }
 

@@ -323,6 +323,112 @@ test("configured supervised CLIs stay remote and declare one process attempt", a
   }
 });
 
+test("configured routing forwards credential mode and provider availability", async () => {
+  const availabilityCalls = [];
+  let receivedOptions = null;
+  const router = createOwnedTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        cli: {
+          kind: "codex-cli",
+          credentialMode: "codex-login",
+          remote: true,
+        },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        receivedOptions = options;
+        return {
+          id: options.id,
+          remote: true,
+          singleAttempt: true,
+          async checkAvailability(request) { availabilityCalls.push(request); },
+          async generate() { return '{"ok":true}'; },
+        };
+      },
+    },
+  );
+  const brain = {
+    provider: "cli",
+    model: "gpt-5.6-codex",
+    remoteData: { requirements: true, code: true, memory: false },
+  };
+  const controller = new AbortController();
+
+  await router.checkAvailability(brain, { signal: controller.signal });
+
+  assert.equal(receivedOptions.credentialMode, "codex-login");
+  assert.deepEqual(availabilityCalls, [{ signal: controller.signal }]);
+});
+
+test("configured routing preserves prototype-defined provider availability", async () => {
+  let availabilityCalls = 0;
+  class CliProvider {
+    constructor(id) {
+      this.id = id;
+      this.remote = true;
+      this.singleAttempt = true;
+    }
+
+    async checkAvailability() { availabilityCalls += 1; }
+
+    async generate() { return '{"ok":true}'; }
+  }
+  const router = createOwnedTestConfiguredBrainRouter(
+    { brainProviders: { cli: { kind: "codex-cli" } } },
+    {
+      supervisedCliProviderFactory(options) {
+        return new CliProvider(options.id);
+      },
+    },
+  );
+
+  await router.checkAvailability({
+    provider: "cli",
+    model: "gpt-5.6-codex",
+    remoteData: { requirements: true, code: true, memory: false },
+  });
+
+  assert.equal(availabilityCalls, 1);
+});
+
+test("all configured Codex providers receive the same credential broker fact", () => {
+  const broker = Object.freeze({
+    async acquire() {},
+    async checkAvailability() {},
+  });
+  const received = [];
+  createOwnedTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        first: { kind: "codex-cli", credentialMode: "codex-login" },
+        second: { kind: "codex-cli", credentialMode: "codex-login" },
+      },
+      dependencies: {
+        supervisedCliProtectedRoots: [path.join(process.cwd(), "data")],
+        codexLoginCredentialBroker: broker,
+      },
+    },
+    {
+      supervisedCliProviderFactory(options, runtimeFacts) {
+        received.push({ options, runtimeFacts });
+        return {
+          id: options.id,
+          remote: true,
+          singleAttempt: true,
+          async checkAvailability() {},
+          async generate() { return '{"ok":true}'; },
+        };
+      },
+    },
+  );
+
+  assert.equal(received.length, 2);
+  assert.equal(received[0].runtimeFacts.codexLoginCredentialBroker, broker);
+  assert.equal(received[1].runtimeFacts.codexLoginCredentialBroker, broker);
+});
+
 test("production configured CLI routing fails closed without lexical composition authority", () => {
   for (const kind of ["codex-cli", "claude-cli"]) {
     assert.throws(

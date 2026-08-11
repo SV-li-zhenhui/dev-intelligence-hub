@@ -307,6 +307,47 @@ function providerOptions(cliKind) {
   };
 }
 
+function recordingCodexLoginBroker(events, options = {}) {
+  return Object.freeze({
+    async acquire({ signal }) {
+      assert.equal(signal instanceof AbortSignal, true);
+      events.push("acquire");
+      return Object.freeze({
+        async stage({ invocation, signal: stageSignal }) {
+          assert.equal(stageSignal instanceof AbortSignal, true);
+          assert.equal(Object.isFrozen(invocation), true);
+          assert.deepEqual(Reflect.ownKeys(invocation).sort(), [
+            "device",
+            "inode",
+            "path",
+          ]);
+          events.push("stage");
+          const codexHome = path.join(invocation.path, "codex-home");
+          await mkdir(codexHome);
+          await writeFile(
+            path.join(codexHome, "auth.json"),
+            "fictional-login-credential",
+          );
+          return Object.freeze({ codexHome });
+        },
+        async capture({ signal: captureSignal }) {
+          assert.equal(captureSignal instanceof AbortSignal, true);
+          events.push("capture");
+          if (options.captureError) throw options.captureError;
+        },
+        release({ safe }) {
+          events.push(`release:${safe}`);
+        },
+      });
+    },
+    async checkAvailability({ signal }) {
+      assert.equal(signal instanceof AbortSignal, true);
+      events.push("checkAvailability");
+      if (options.availabilityError) throw options.availabilityError;
+    },
+  });
+}
+
 test("Codex runs once with fixed no-authority flags and an isolated environment", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-codex-provider-");
   const temporaryRoot = path.join(parent, "runtime");
@@ -445,6 +486,281 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
   assert.deepEqual(locator.calls, ["codex-cli"]);
   assert.equal(runner.calls.length, 1);
   await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
+});
+
+test("Codex login mode stages one isolated profile and omits every API credential", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-codex-login-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const descriptor = testDescriptor("codex-cli");
+  const events = [];
+  const locator = {
+    async resolve() {
+      events.push("locator");
+      return descriptor;
+    },
+  };
+  const runner = recordingRunner(async (invocation) => {
+    events.push("run");
+    assert.deepEqual(Object.keys(invocation.env).sort(), [
+      "APPDATA",
+      "CI",
+      "CODEX_HOME",
+      "HOME",
+      "LANG",
+      "LC_ALL",
+      "LOCALAPPDATA",
+      "NO_COLOR",
+      "TEMP",
+      "TERM",
+      "TMP",
+      "TMPDIR",
+      "USERPROFILE",
+      "XDG_CACHE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+    ].sort());
+    assert.equal(invocation.env.CODEX_HOME, path.join(invocation.cwd, "codex-home"));
+    for (const name of [
+      "OPENAI_API_KEY",
+      "CODEX_API_KEY",
+      "CODEX_ACCESS_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+    ]) {
+      assert.equal(Object.hasOwn(invocation.env, name), false, name);
+    }
+    assert.equal(
+      await readFile(path.join(invocation.env.CODEX_HOME, "auth.json"), "utf8"),
+      "fictional-login-credential",
+    );
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, '{"ok":true}', "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    {
+      ...providerOptions("codex-cli"),
+      credentialMode: "codex-login",
+    },
+    {
+      processRunner: runner,
+      commandLocator: locator,
+      environment: {
+        OPENAI_API_KEY: "MUST_NOT_ESCAPE",
+        CODEX_API_KEY: "MUST_NOT_ESCAPE",
+        CODEX_ACCESS_TOKEN: "MUST_NOT_ESCAPE",
+      },
+      temporaryRoot,
+      codexLoginCredentialBroker: recordingCodexLoginBroker(events),
+    },
+  );
+
+  assert.equal(await provider.generate(brainRequest()), '{"ok":true}');
+  assert.deepEqual(events, [
+    "acquire",
+    "locator",
+    "stage",
+    "run",
+    "capture",
+    "release:true",
+  ]);
+});
+
+test("credential mode combinations fail at construction without touching a broker", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-mode-");
+  const dependencies = {
+    processRunner: recordingRunner(async () => successfulProcess()),
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot: path.join(parent, "runtime"),
+  };
+  assert.throws(
+    () => createTestSupervisedCliBrainProvider({
+      ...providerOptions("codex-cli"),
+      credentialMode: "codex-login",
+    }, dependencies),
+    /credential broker|codex-login/u,
+  );
+  assert.throws(
+    () => createTestSupervisedCliBrainProvider({
+      ...providerOptions("claude-cli"),
+      credentialMode: "codex-login",
+    }, {
+      ...dependencies,
+      codexLoginCredentialBroker: recordingCodexLoginBroker([]),
+    }),
+    /Claude CLI credentialMode/u,
+  );
+  assert.throws(
+    () => createTestSupervisedCliBrainProvider({
+      ...providerOptions("codex-cli"),
+      credentialMode: "unknown-mode",
+    }, dependencies),
+    /credentialMode/u,
+  );
+});
+
+test("availability checks credentials or the login broker without invoking a model", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-availability-");
+  const apiLocator = recordingLocator(testDescriptor("codex-cli"));
+  const apiRunner = recordingRunner(async () => {
+    throw new Error("model process must not run");
+  });
+  const apiProvider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: apiRunner,
+      commandLocator: apiLocator,
+      environment: { OPENAI_API_KEY: "fictional-api-credential" },
+      temporaryRoot: path.join(parent, "api-runtime"),
+    },
+  );
+  const apiController = new AbortController();
+  await apiProvider.checkAvailability({ signal: apiController.signal });
+  assert.deepEqual(apiLocator.calls, ["codex-cli"]);
+  assert.equal(apiRunner.calls.length, 0);
+
+  const loginEvents = [];
+  const loginLocator = recordingLocator(testDescriptor("codex-cli"));
+  const loginRunner = recordingRunner(async () => {
+    throw new Error("model process must not run");
+  });
+  const loginProvider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: loginRunner,
+    commandLocator: loginLocator,
+    environment: {},
+    temporaryRoot: path.join(parent, "login-runtime"),
+    codexLoginCredentialBroker: recordingCodexLoginBroker(loginEvents),
+  });
+  const loginController = new AbortController();
+  await loginProvider.checkAvailability({ signal: loginController.signal });
+  assert.deepEqual(loginEvents, ["checkAvailability"]);
+  assert.equal(loginLocator.calls.length, 0);
+  assert.equal(loginRunner.calls.length, 0);
+});
+
+test("availability fails before locator when the selected credential is unavailable", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-availability-denied-");
+  const locator = recordingLocator(testDescriptor("codex-cli"));
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: recordingRunner(async () => successfulProcess()),
+      commandLocator: locator,
+      environment: {},
+      temporaryRoot: path.join(parent, "runtime"),
+    },
+  );
+  await assert.rejects(provider.checkAvailability(), {
+    code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+  });
+  assert.equal(locator.calls.length, 0);
+});
+
+test("login mode captures after a reaped process failure and before malformed result parsing", async (t) => {
+  for (const scenario of ["process-failed", "malformed-result"]) {
+    await t.test(scenario, async (child) => {
+      const parent = await temporaryDirectory(child, `supervised-login-${scenario}-`);
+      const events = [];
+      const runner = recordingRunner(async (invocation) => {
+        events.push("run");
+        if (scenario === "process-failed") {
+          throw Object.assign(new Error("fictional process detail"), {
+            code: "STRUCTURED_PROVIDER_PROCESS_FAILED",
+          });
+        }
+        const resultFile = argumentValue(invocation.args, "--output-last-message");
+        await writeFile(resultFile, "not-json", "utf8");
+        return successfulProcess();
+      });
+      const provider = createTestSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        credentialMode: "codex-login",
+      }, {
+        processRunner: runner,
+        commandLocator: {
+          async resolve() {
+            events.push("locator");
+            return testDescriptor("codex-cli");
+          },
+        },
+        environment: {},
+        temporaryRoot: path.join(parent, "runtime"),
+        codexLoginCredentialBroker: recordingCodexLoginBroker(events),
+      });
+
+      await assert.rejects(
+        provider.generate(brainRequest()),
+        {
+          code: scenario === "process-failed"
+            ? "STRUCTURED_PROVIDER_PROCESS_FAILED"
+            : "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+        },
+      );
+      assert.deepEqual(events, [
+        "acquire",
+        "locator",
+        "stage",
+        "run",
+        "capture",
+        "release:true",
+      ]);
+    });
+  }
+});
+
+test("login mode never captures an unproved process and fences capture uncertainty", async (t) => {
+  for (const scenario of ["reap-failed", "capture-failed"]) {
+    await t.test(scenario, async (child) => {
+      const parent = await temporaryDirectory(child, `supervised-login-${scenario}-`);
+      const events = [];
+      const captureError = scenario === "capture-failed"
+        ? Object.assign(new Error("fictional capture detail"), {
+            code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+          })
+        : null;
+      const runner = recordingRunner(async (invocation) => {
+        events.push("run");
+        if (scenario === "reap-failed") {
+          throw Object.assign(new Error("fictional reap detail"), {
+            code: "STRUCTURED_PROVIDER_REAP_FAILED",
+          });
+        }
+        const resultFile = argumentValue(invocation.args, "--output-last-message");
+        await writeFile(resultFile, '{"ok":true}', "utf8");
+        return successfulProcess();
+      });
+      const provider = createTestSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        credentialMode: "codex-login",
+      }, {
+        processRunner: runner,
+        commandLocator: {
+          async resolve() {
+            events.push("locator");
+            return testDescriptor("codex-cli");
+          },
+        },
+        environment: {},
+        temporaryRoot: path.join(parent, "runtime"),
+        codexLoginCredentialBroker: recordingCodexLoginBroker(events, {
+          captureError,
+        }),
+      });
+
+      await assert.rejects(provider.generate(brainRequest()), {
+        code: scenario === "reap-failed"
+          ? "STRUCTURED_PROVIDER_REAP_FAILED"
+          : "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+      });
+      assert.deepEqual(events, scenario === "reap-failed"
+        ? ["acquire", "locator", "stage", "run", "release:false"]
+        : ["acquire", "locator", "stage", "run", "capture", "release:false"]);
+    });
+  }
 });
 
 test("Claude runs once with tools disabled and accepts only its exact success envelope", async (t) => {
@@ -1257,6 +1573,42 @@ test("remote data denial reaches neither supervised CLI locator nor runner", asy
     assert.equal(locator.calls.length, 0);
     assert.equal(runner.calls.length, 0);
   }
+
+  const brokerEvents = [];
+  const loginLocator = recordingLocator(testDescriptor("codex-cli"));
+  const loginRunner = recordingRunner(async () => successfulProcess());
+  const loginProvider = createTestSupervisedCliBrainProvider(
+    {
+      ...providerOptions("codex-cli"),
+      credentialMode: "codex-login",
+    },
+    {
+      processRunner: loginRunner,
+      commandLocator: loginLocator,
+      environment: { OPENAI_API_KEY: "must-not-be-read" },
+      temporaryRoot: path.join(parent, "codex-login"),
+      codexLoginCredentialBroker:
+        recordingCodexLoginBroker(brokerEvents),
+    },
+  );
+  const loginRouter = new BrainRouter({ providers: [loginProvider] });
+
+  await assert.rejects(
+    loginRouter.generate({
+      brain: {
+        provider: "codex-cli",
+        model: "bounded-model",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+      messages: brainRequest().messages,
+      schema: SCHEMA,
+      dataClasses: ["code"],
+    }),
+    (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
+  );
+  assert.deepEqual(brokerEvents, []);
+  assert.equal(loginLocator.calls.length, 0);
+  assert.equal(loginRunner.calls.length, 0);
 });
 
 test("an unavailable known CLI stays redacted and never reaches the runner", async (t) => {

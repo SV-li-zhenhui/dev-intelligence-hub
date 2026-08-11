@@ -82,6 +82,34 @@ test("explicit workers expose only dynamic state and a bound decision port", asy
   assert.equal(Object.isFrozen(resolved), true);
 });
 
+test("explicit workers preserve an optional bound availability port", async () => {
+  const availabilityCalls = [];
+  const worker = {
+    roleId: "developer",
+    workerId: "developer-worker-1",
+    async view() {
+      return { enabled: true, paused: false };
+    },
+    async decide() {
+      return { ok: true };
+    },
+    async checkAvailability(input) {
+      assert.strictEqual(this, worker);
+      availabilityCalls.push(input);
+    },
+  };
+  const directory = new RoleWorkerDirectory({
+    workers: [worker],
+    legacyOwnedRoleIds: [],
+  });
+  const resolved = await directory.resolve({ type: "role", id: "developer" });
+  const input = { item: { itemId: "work-1" } };
+
+  await resolved.checkAvailability(input);
+
+  assert.deepEqual(availabilityCalls, [input]);
+});
+
 test("unknown, person, and node targets remain available for orchestrator fallback", async () => {
   const directory = new RoleWorkerDirectory({ legacyOwnedRoleIds: [] });
 

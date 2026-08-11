@@ -644,6 +644,15 @@ export class ProactiveWorkLoop {
       this.inFlightItemIds.add(item.itemId);
       try {
         workAttempts += 1;
+        const availabilityOutcome = await this.#checkAvailability(
+          item,
+          resolution,
+          options.signal,
+        );
+        if (availabilityOutcome !== null) {
+          outcomes.push({ itemId: item.itemId, ...availabilityOutcome });
+          continue;
+        }
         if (
           this.roleContextAssembler !== null &&
           configuredRoot
@@ -737,6 +746,11 @@ export class ProactiveWorkLoop {
       throw new TypeError("roleDirectory returned an invalid worker");
     }
     const workerId = boundedString(candidate.workerId, "workerId");
+    const checkAvailability = optionalPortMethod(
+      candidate,
+      "checkAvailability",
+      "roleDirectory returned an invalid worker",
+    );
     if (!candidate.enabled || candidate.paused) {
       return {
         status: "paused",
@@ -751,6 +765,7 @@ export class ProactiveWorkLoop {
       roleId: candidate.roleId,
       workerId,
       decide: candidate.decide.bind(candidate),
+      ...(checkAvailability === null ? {} : { checkAvailability }),
     };
   }
 
@@ -762,6 +777,35 @@ export class ProactiveWorkLoop {
       workerId: ORCHESTRATOR_WORKER_ID,
       decide: async () => orchestratorDecision(target),
     };
+  }
+
+  async #checkAvailability(item, worker, signal) {
+    if (
+      worker.orchestrator ||
+      typeof worker.checkAvailability !== "function"
+    ) {
+      return null;
+    }
+    try {
+      await withinAbortable(
+        (availabilitySignal) => worker.checkAvailability({
+          item: workerItemDto(item),
+          signal: availabilitySignal,
+        }),
+        this.resolveTimeoutMs,
+        "ROLE_RESOLUTION_TIMEOUT",
+        signal,
+      );
+      throwIfLoopAborted(signal);
+      return null;
+    } catch (error) {
+      throwIfLoopAborted(signal);
+      const code = stableFailureCode(error);
+      if (brainFailureOwnerAttention(code) !== null) {
+        return { status: "degraded", code };
+      }
+      return { status: "resolution_failed" };
+    }
   }
 
   async #claim(item, worker, options) {

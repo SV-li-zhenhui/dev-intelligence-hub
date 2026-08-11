@@ -241,9 +241,16 @@ function requireRouter(value) {
   ) {
     throw new TypeError("brainRouter is invalid");
   }
+  const availability = value.checkAvailability;
+  if (availability !== undefined && typeof availability !== "function") {
+    throw new TypeError("brainRouter is invalid");
+  }
   return Object.freeze({
     generate: value.generate.bind(value),
     describe: value.describe.bind(value),
+    checkAvailability: availability
+      ? availability.bind(value)
+      : async () => {},
   });
 }
 
@@ -385,6 +392,15 @@ export class RoleDecisionEngine {
     }
     throwIfAborted(signal);
     return decision;
+  }
+
+  async checkAvailability({ signal: signalValue = null } = {}) {
+    const signal = normalizeAbortSignal(signalValue);
+    throwIfAborted(signal);
+    await this.#router.checkAvailability(this.#brain, {
+      ...(signal === null ? {} : { signal }),
+    });
+    throwIfAborted(signal);
   }
 
   view() {
