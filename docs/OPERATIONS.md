@@ -121,7 +121,12 @@ runtime identity before importing the application and verifies it again before
 opening the service. A Git checkout must be clean and binds its real commit and
 tree. A clean npm/offline payload without `.git` receives a deterministic
 identity from its declared package files. Any source change during module load
-fails startup closed.
+fails startup closed. Git-backed startup also binds a process-private HEAD
+reflog digest, so an ordinary commit, checkout, or reset from A to B and back to
+A still fails. This check supplies consistency evidence; it does not defend
+against an actively malicious process using the same operating-system account,
+which is inside the documented trust boundary. Do not edit or switch the
+checkout while starting the service.
 
 The manager stores private process identity and bounded diagnostics outside the
 repository. On Windows the root is:

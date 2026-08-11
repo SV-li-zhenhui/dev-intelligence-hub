@@ -42,6 +42,17 @@ data-class authorization before remote model calls, fixed semantic executor
 operations, immutable evidence, one-at-a-time confirmations, exact Git target
 binding, and recovery-before-retry for uncertain external results.
 
+Managed startup uses source identity as a consistency and provenance check. It
+captures the declared runtime files, Git commit/tree, and a private digest of
+the HEAD reflog before application import, then verifies them after the module
+graph loads and again before the listener is claimed. A normal commit,
+checkout, or reset sequence is rejected even when it returns from A to A. This
+does not make mutable source a sandbox against an actively malicious process
+running as the same operating-system user: that process is already inside the
+documented local trust boundary and could also replace the bootstrap, Git
+metadata, process, or data. Keep the checkout on trusted user-controlled
+storage and do not edit it during startup.
+
 ## Deployment guidance
 
 - Keep the listener on `127.0.0.1`; do not reverse-proxy or port-forward it.

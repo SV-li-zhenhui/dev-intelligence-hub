@@ -173,7 +173,14 @@ export async function computeRuntimeSourceIdentity(root) {
   });
 }
 
-export async function computeVersionedRuntimeSourceIdentity(root) {
+function runtimeSourceCheckpoint(runtimeSource, historyDigest) {
+  return Object.freeze({
+    historyDigest,
+    runtimeSource,
+  });
+}
+
+export async function captureVersionedRuntimeSourceCheckpoint(root) {
   const runtime = await computeRuntimeSourceIdentity(root);
   const hadLocalRepositoryMetadata = await hasLocalRepositoryMetadata(root);
   let source;
@@ -186,16 +193,27 @@ export async function computeVersionedRuntimeSourceIdentity(root) {
     ) {
       return null;
     }
-    return packagedRuntimeSourceIdentity(runtime);
+    return runtimeSourceCheckpoint(
+      packagedRuntimeSourceIdentity(runtime),
+      packagedObjectIdentity("history", runtime),
+    );
   }
   if (!source.clean) return null;
-  return Object.freeze({
-    schemaVersion: 1,
-    headOid: source.headOid,
-    treeOid: source.treeOid,
-    clean: true,
-    runtimeDigest: runtime.digest,
-    runtimeFileCount: runtime.fileCount,
-    runtimeByteCount: runtime.byteCount,
-  });
+  return runtimeSourceCheckpoint(
+    Object.freeze({
+      schemaVersion: 1,
+      headOid: source.headOid,
+      treeOid: source.treeOid,
+      clean: true,
+      runtimeDigest: runtime.digest,
+      runtimeFileCount: runtime.fileCount,
+      runtimeByteCount: runtime.byteCount,
+    }),
+    source.headLogDigest,
+  );
+}
+
+export async function computeVersionedRuntimeSourceIdentity(root) {
+  const checkpoint = await captureVersionedRuntimeSourceCheckpoint(root);
+  return checkpoint?.runtimeSource ?? null;
 }

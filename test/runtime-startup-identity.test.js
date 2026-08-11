@@ -16,11 +16,12 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 async function git(root, ...arguments_) {
-  await execFileAsync("git", arguments_, {
+  const { stdout } = await execFileAsync("git", arguments_, {
     cwd: root,
     encoding: "utf8",
     windowsHide: true,
   });
+  return stdout.trim();
 }
 
 async function fixture(t) {
@@ -35,6 +36,7 @@ async function fixture(t) {
     files: ["src/"],
   }, null, 2)}\n`);
   await git(root, "init", "--quiet");
+  await git(root, "config", "core.autocrlf", "false");
   await git(root, "config", "user.email", "startup@example.invalid");
   await git(root, "config", "user.name", "Startup Fixture");
   await git(root, "add", ".");
@@ -79,6 +81,32 @@ test("startup identity rejects source changed while application modules load", a
   await assert.rejects(
     verifyRuntimeStartupIdentity(root, captured),
     /runtime source changed while application modules loaded/u,
+  );
+});
+
+test("startup identity rejects an A-to-B-to-A HEAD transition while modules load", async (t) => {
+  const root = await fixture(t);
+  const {
+    captureRuntimeStartupIdentity,
+    verifyRuntimeStartupIdentity,
+  } = await loadStartupIdentity();
+  const originalHead = await git(root, "rev-parse", "--verify", "HEAD^{commit}");
+  const captured = await captureRuntimeStartupIdentity(root);
+  await writeFile(path.join(root, "src/app.js"), "export const version = 2;\n");
+  await git(root, "add", "src/app.js");
+  await git(root, "commit", "--quiet", "-m", "temporary application source");
+  await git(root, "reset", "--hard", "--quiet", originalHead);
+  assert.equal(
+    await git(root, "status", "--porcelain=v1", "--untracked-files=all"),
+    "",
+  );
+  const restored = await captureRuntimeStartupIdentity(root);
+
+  assert.deepEqual(restored, captured);
+
+  await assert.rejects(
+    verifyRuntimeStartupIdentity(root, captured),
+    /repository history changed while application modules loaded/u,
   );
 });
 

@@ -135,6 +135,14 @@ writers, records a global checkpoint, then copies and hashes the declared data
 set. Restore validates into a separate directory, migrates and reconciles it,
 and activates it only after those checks pass.
 
+The startup bootstrap captures a private source checkpoint before importing
+the application. The public runtime identity contains the commit, tree, and
+declared-package digest; the process-private checkpoint also binds the Git HEAD
+reflog. Rechecking both after module loading detects edits and ordinary
+commit/checkout/reset A-to-B-to-A races without exposing local history through
+the status API. It is a provenance boundary, not protection from another
+process already running as the same trusted local user.
+
 Liveness answers only whether the local process can serve. Readiness also
 accounts for store health, reconciliation blockers, recovery state, and
 capacity. See [OPERATIONS.md](OPERATIONS.md) for procedures.

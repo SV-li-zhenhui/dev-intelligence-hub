@@ -1,4 +1,6 @@
-import { computeVersionedRuntimeSourceIdentity } from "./runtime-source-identity.js";
+import {
+  captureVersionedRuntimeSourceCheckpoint,
+} from "./runtime-source-identity.js";
 
 const OBJECT_IDENTITY = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const SHA_256 = /^[a-f0-9]{64}$/u;
@@ -11,6 +13,7 @@ const FIELDS = Object.freeze([
   "schemaVersion",
   "treeOid",
 ]);
+const startupHistoryByIdentity = new WeakMap();
 
 function runtimeIdentity(value) {
   if (
@@ -34,18 +37,32 @@ function runtimeIdentity(value) {
 }
 
 export async function captureRuntimeStartupIdentity(root) {
-  const identity = await computeVersionedRuntimeSourceIdentity(root);
-  if (identity === null) {
+  const checkpoint = await captureVersionedRuntimeSourceCheckpoint(root);
+  if (checkpoint === null) {
     throw new Error("runtime startup requires a clean versioned source");
   }
-  return runtimeIdentity(identity);
+  if (!SHA_256.test(checkpoint.historyDigest)) {
+    throw new Error("runtime startup source history is invalid");
+  }
+  const identity = runtimeIdentity(checkpoint.runtimeSource);
+  startupHistoryByIdentity.set(identity, checkpoint.historyDigest);
+  return identity;
 }
 
 export async function verifyRuntimeStartupIdentity(root, capturedIdentity) {
+  const capturedHistory = startupHistoryByIdentity.get(capturedIdentity);
+  if (capturedHistory === undefined) {
+    throw new Error("runtime startup identity was not captured by this process");
+  }
   const captured = runtimeIdentity(capturedIdentity);
   const current = await captureRuntimeStartupIdentity(root);
   if (FIELDS.some((field) => current[field] !== captured[field])) {
     throw new Error("runtime source changed while application modules loaded");
   }
-  return captured;
+  if (startupHistoryByIdentity.get(current) !== capturedHistory) {
+    throw new Error(
+      "repository history changed while application modules loaded",
+    );
+  }
+  return capturedIdentity;
 }
