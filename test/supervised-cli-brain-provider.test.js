@@ -278,6 +278,32 @@ function argumentValue(args, flag) {
   return args[index + 1];
 }
 
+function isSameOrDescendantPath(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+test("repository path checks distinguish sibling validation roots", () => {
+  const repository = path.join(
+    path.parse(process.cwd()).root,
+    "workspace",
+    "MyDashboard",
+  );
+  assert.equal(isSameOrDescendantPath(repository, repository), true);
+  assert.equal(
+    isSameOrDescendantPath(repository, path.join(repository, "runtime")),
+    true,
+  );
+  assert.equal(
+    isSameOrDescendantPath(repository, `${repository}-validation-temp`),
+    false,
+  );
+});
+
 function claudeEnvelope(result = '{"ok":true,"order":2}', overrides = {}) {
   return {
     type: "result",
@@ -410,7 +436,14 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
       assert.equal(invocation.args.includes(forbidden), false, forbidden);
     }
     assert.equal(invocation.args.join(" ").includes(PRIVATE_PROMPT), false);
-    assert.equal(invocation.args.join(" ").includes(process.cwd()), false);
+    for (const argument of invocation.args) {
+      if (!path.isAbsolute(argument)) continue;
+      assert.equal(
+        isSameOrDescendantPath(process.cwd(), argument),
+        false,
+        `repository path escaped through argument: ${argument}`,
+      );
+    }
 
     const payload = JSON.parse(Buffer.from(invocation.input).toString("utf8"));
     assert.equal(payload.schemaVersion, 1);
