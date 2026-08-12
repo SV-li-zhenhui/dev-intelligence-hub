@@ -269,29 +269,50 @@ function assertSnapshotRedacted(snapshot, markers) {
   assert.equal(markers.every((marker) => !reflected.includes(marker)), true, reflected);
 }
 
-test("production locations use an existing absolute CODEX_HOME and fixed private siblings", async (t) => {
+test("production locations keep login state under the project-scoped private runtime", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-codex-store-locations-"));
   const home = path.join(root, "home");
   const codexRoot = path.join(root, "codex-home");
+  const localAppData = path.join(root, "local-app-data");
   await mkdir(home);
   await mkdir(codexRoot);
+  await mkdir(localAppData);
   const previousCodexHome = process.env.CODEX_HOME;
+  const previousLocalAppData = process.env.LOCALAPPDATA;
   const previousUserProfile = process.env.USERPROFILE;
   t.after(async () => {
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
+    if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousLocalAppData;
     if (previousUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = previousUserProfile;
     await rm(root, { recursive: true, force: true });
   });
   process.env.CODEX_HOME = codexRoot;
+  process.env.LOCALAPPDATA = localAppData;
   process.env.USERPROFILE = home;
+
+  const projectRoot = await realpath(path.resolve(import.meta.dirname, ".."));
+  const projectIdentity = process.platform === "win32"
+    ? projectRoot.toUpperCase()
+    : projectRoot;
+  const projectDigest = createHash("sha256")
+    .update(projectIdentity, "utf8")
+    .digest("hex");
+  const privateRuntime = path.join(
+    localAppData,
+    "MyDashboard",
+    "runtime",
+    projectDigest,
+  );
+  const mirrorRoot = path.join(privateRuntime, "cli-credentials-v1");
 
   assert.deepEqual(productionCodexLoginLocations(), {
     sourceFile: path.join(codexRoot, "auth.json"),
-    mirrorRoot: path.join(home, ".mydashboard-cli-credentials-v1"),
-    mirrorDirectory: path.join(home, ".mydashboard-cli-credentials-v1", "codex-login"),
-    probeRoot: path.join(home, ".mydashboard-codex-login-probe-v1"),
+    mirrorRoot,
+    mirrorDirectory: path.join(mirrorRoot, "codex-login"),
+    probeRoot: path.join(privateRuntime, "codex-login-probe-v1"),
   });
 
   process.env.CODEX_HOME = "relative-codex-home";

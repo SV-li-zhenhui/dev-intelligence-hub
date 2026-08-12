@@ -7,6 +7,7 @@ import { types as utilTypes } from "node:util";
 
 import { canonicalJsonStringify } from "./canonical-json-digest.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "./private-directory-manager.js";
+import { projectIdentityDigest } from "./project-identity.js";
 import {
   createProductionCodexCredentialFilePort,
 } from "./windows-codex-credential-file.js";
@@ -899,12 +900,29 @@ export function productionCodexLoginLocations() {
     }
     codexRoot = path.resolve(configured);
   }
-  const mirrorRoot = path.join(home, ".mydashboard-cli-credentials-v1");
+  const projectRoot = path.resolve(import.meta.dirname, "../..");
+  const projectDigest = projectIdentityDigest({ projectRoot });
+  let runtimeBase;
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (
+      typeof localAppData !== "string" ||
+      !path.isAbsolute(localAppData) ||
+      localAppData.includes("\0")
+    ) {
+      throw blocked();
+    }
+    runtimeBase = path.join(localAppData, "MyDashboard", "runtime");
+  } else {
+    runtimeBase = path.join(home, ".local", "state", "mydashboard", "runtime");
+  }
+  const privateRuntime = path.join(runtimeBase, projectDigest);
+  const mirrorRoot = path.join(privateRuntime, "cli-credentials-v1");
   return {
     sourceFile: path.join(codexRoot, AUTH_NAME),
     mirrorRoot,
     mirrorDirectory: path.join(mirrorRoot, "codex-login"),
-    probeRoot: path.join(home, ".mydashboard-codex-login-probe-v1"),
+    probeRoot: path.join(privateRuntime, "codex-login-probe-v1"),
   };
 }
 
