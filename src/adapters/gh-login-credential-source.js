@@ -182,6 +182,50 @@ function createCleanupSignal(request, clock) {
   });
 }
 
+function closeLateCleanupSession(session) {
+  void Promise.resolve()
+    .then(() => {
+      if (session === null || typeof session !== "object") return;
+      const close = session.close;
+      if (typeof close === "function") {
+        return Reflect.apply(close, session, []);
+      }
+    })
+    .catch(() => {});
+}
+
+async function awaitCleanupPreparation(operation, signal) {
+  let abandoned = false;
+  const preparation = Promise.resolve()
+    .then(operation)
+    .then(
+      (session) => {
+        if (!abandoned) return session;
+        closeLateCleanupSession(session);
+        return null;
+      },
+      (error) => {
+        if (!abandoned) throw error;
+        return null;
+      },
+    );
+  let handleAbort;
+  const aborted = new Promise((_, reject) => {
+    handleAbort = () => {
+      if (abandoned) return;
+      abandoned = true;
+      reject(cleanupFailedError());
+    };
+    signal.addEventListener("abort", handleAbort, { once: true });
+    if (signal.aborted) handleAbort();
+  });
+  try {
+    return await Promise.race([preparation, aborted]);
+  } finally {
+    signal.removeEventListener("abort", handleAbort);
+  }
+}
+
 async function prepareCleanupSession(
   identity,
   request,
@@ -190,13 +234,16 @@ async function prepareCleanupSession(
 ) {
   const signalOwner = createCleanupSignal(request, clock);
   try {
-    const session = await prepareCleanupTrees([identity], {
-      maximumEntries: 16,
-      maximumEntriesPerRoot: 16,
-      maximumDepth: 1,
-      maximumBytes: 64 * 1024,
-      signal: signalOwner.signal,
-    });
+    const session = await awaitCleanupPreparation(
+      () => prepareCleanupTrees([identity], {
+        maximumEntries: 16,
+        maximumEntriesPerRoot: 16,
+        maximumDepth: 1,
+        maximumBytes: 64 * 1024,
+        signal: signalOwner.signal,
+      }),
+      signalOwner.signal,
+    );
     if (
       session === null ||
       typeof session !== "object" ||

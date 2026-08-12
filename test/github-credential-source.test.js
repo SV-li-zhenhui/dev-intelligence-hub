@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { getEventListeners } from "node:events";
 import {
   lstat,
   mkdir,
@@ -150,11 +151,30 @@ function compileOfflineGitHubCli(output) {
   assert.equal(result.status, 0, result.stderr);
 }
 
-async function waitForAbort(signal) {
-  if (signal.aborted) return;
-  await new Promise((resolve) => {
-    signal.addEventListener("abort", resolve, { once: true });
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
   });
+  return Object.freeze({ promise, resolve, reject });
+}
+
+function trackSettlement(promise) {
+  let outcome = null;
+  void promise.then(
+    (value) => { outcome = Object.freeze({ status: "fulfilled", value }); },
+    (error) => { outcome = Object.freeze({ status: "rejected", error }); },
+  );
+  return Object.freeze({ read: () => outcome });
+}
+
+async function settlementWithinTurns(tracker, maximumTurns = 20) {
+  for (let turn = 0; turn < maximumTurns && tracker.read() === null; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return tracker.read();
 }
 
 async function fixture(t, overrides = {}) {
@@ -642,51 +662,123 @@ test("gh-login gives unproven cleanup precedence after prepare cancellation", as
   assert.equal(current.calls.run.length, 0);
 });
 
-test("gh-login caller cancellation bounds blocked cleanup preparation", async (t) => {
+test("gh-login caller cancellation bounds uncooperative cleanup preparation", async (t) => {
   const controller = new AbortController();
+  const preparationStarted = deferred();
+  const preparation = deferred();
+  let cleanupSignal = null;
   const current = await fixture(t, {
-    clock: () => Date.now(),
     async prepareCleanupTrees(_roots, { signal }) {
-      await waitForAbort(signal);
-      throw failure("PRIVATE_CLEANUP_PREPARATION_ABORTED", TOKEN);
+      cleanupSignal = signal;
+      preparationStarted.resolve();
+      return preparation.promise;
     },
   });
-  const startedAt = Date.now();
-  const cancellation = setTimeout(
-    () => controller.abort(new Error(`${TOKEN}-caller-reason`)),
-    25,
-  );
-  try {
-    await assert.rejects(
-      acquire(current.source, {
-        signal: controller.signal,
-        deadline: Date.now() + 10_000,
-      }),
-      { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" },
-    );
-  } finally {
-    clearTimeout(cancellation);
-  }
-  assert.ok(Date.now() - startedAt < 1_000);
+  const acquisition = acquire(current.source, {
+    signal: controller.signal,
+    deadline: Date.now() + 10_000,
+  });
+  const settlement = trackSettlement(acquisition);
+  await preparationStarted.promise;
+
+  controller.abort(new Error(`${TOKEN}-caller-reason`));
+  const outcome = await settlementWithinTurns(settlement);
+  assert.equal(outcome?.status, "rejected");
+  assert.equal(outcome?.error?.code, "GITHUB_CREDENTIAL_CLEANUP_FAILED");
+  assert.equal(JSON.stringify(outcome.error).includes(TOKEN), false);
   assert.equal(current.calls.run.length, 0);
+  assert.equal(cleanupSignal.aborted, true);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(getEventListeners(cleanupSignal, "abort").length, 0);
+
+  preparation.reject(failure("PRIVATE_CLEANUP_PREPARATION_LATE_FAILURE", TOKEN));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settlement.read(), outcome);
 });
 
-test("gh-login shared deadline bounds blocked cleanup preparation", async (t) => {
-  const current = await fixture(t, {
-    clock: () => Date.now(),
-    async prepareCleanupTrees(_roots, { signal }) {
-      await waitForAbort(signal);
-      throw failure("PRIVATE_CLEANUP_PREPARATION_ABORTED", TOKEN);
-    },
-  });
-  const startedAt = Date.now();
+test("gh-login shared deadline bounds uncooperative cleanup preparation", async (t) => {
+  const now = 1_000_000;
+  const preparationStarted = deferred();
+  let cleanupSignal = null;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const current = await fixture(t, {
+      clock: () => now,
+      async prepareCleanupTrees(_roots, { signal }) {
+        cleanupSignal = signal;
+        preparationStarted.resolve();
+        return new Promise(() => {});
+      },
+    });
+    const settlement = trackSettlement(acquire(current.source, {
+      deadline: now + 50,
+    }));
+    await preparationStarted.promise;
 
-  await assert.rejects(
-    acquire(current.source, { deadline: Date.now() + 50 }),
-    { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" },
-  );
-  assert.ok(Date.now() - startedAt < 1_000);
-  assert.equal(current.calls.run.length, 0);
+    t.mock.timers.tick(49);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settlement.read(), null);
+
+    t.mock.timers.tick(1);
+    const outcome = await settlementWithinTurns(settlement);
+    assert.equal(outcome?.status, "rejected");
+    assert.equal(outcome?.error?.code, "GITHUB_CREDENTIAL_CLEANUP_FAILED");
+    assert.equal(current.calls.run.length, 0);
+    assert.equal(cleanupSignal.aborted, true);
+    assert.equal(getEventListeners(cleanupSignal, "abort").length, 0);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("gh-login fixed cleanup cap bounds preparation and closes a late session", async (t) => {
+  const now = 1_000_000;
+  const preparationStarted = deferred();
+  const preparation = deferred();
+  let commitCalls = 0;
+  let closeCalls = 0;
+  let cleanupSignal = null;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const current = await fixture(t, {
+      clock: () => now,
+      async prepareCleanupTrees(_roots, { signal }) {
+        cleanupSignal = signal;
+        preparationStarted.resolve();
+        return preparation.promise;
+      },
+    });
+    const settlement = trackSettlement(acquire(current.source, {
+      deadline: now + 60_000,
+    }));
+    await preparationStarted.promise;
+
+    t.mock.timers.tick(4_999);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settlement.read(), null);
+
+    t.mock.timers.tick(1);
+    const outcome = await settlementWithinTurns(settlement);
+    assert.equal(outcome?.status, "rejected");
+    assert.equal(outcome?.error?.code, "GITHUB_CREDENTIAL_CLEANUP_FAILED");
+    assert.equal(current.calls.run.length, 0);
+    assert.equal(cleanupSignal.aborted, true);
+    assert.equal(getEventListeners(cleanupSignal, "abort").length, 0);
+
+    preparation.resolve(Object.freeze({
+      async commit() { commitCalls += 1; },
+      async close() {
+        closeCalls += 1;
+        throw failure("PRIVATE_CLEANUP_LATE_CLOSE_FAILED", TOKEN);
+      },
+    }));
+    await settlementWithinTurns({ read: () => closeCalls === 1 ? true : null });
+    assert.equal(commitCalls, 0);
+    assert.equal(closeCalls, 1);
+    assert.equal(settlement.read(), outcome);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
 test("gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure", {
