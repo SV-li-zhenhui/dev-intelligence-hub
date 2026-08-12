@@ -499,6 +499,13 @@ const SLOTS = deepFreeze([
     operations: ["add", "remove", "replace"],
   },
   {
+    pattern: ["githubActions", "tokenEnv"],
+    label: "GitHub Token 环境变量",
+    template: "github-token-env",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
     pattern: ["employees", "roles", "*", "taskBrain"],
     label: "任务大脑",
     template: "task-brain",
@@ -606,6 +613,7 @@ const TEMPLATES = deepFreeze({
   },
   "provider-credential-mode": "api-key",
   "github-credential-mode": "gh-login",
+  "github-token-env": "MYDASHBOARD_GITHUB_TOKEN",
   intent: "ask_user",
   "github-pr-action": "review",
   "retry-minute": 5,

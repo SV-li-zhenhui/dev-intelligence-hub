@@ -26,6 +26,18 @@ function createAdapter(runner, overrides = {}) {
   });
 }
 
+test("constructor accepts the shared GitHub timeout boundary", () => {
+  for (const timeoutMs of [1_000, 600_000]) {
+    assert.doesNotThrow(() => createAdapter(new FakeRunner(), { timeoutMs }));
+  }
+  for (const timeoutMs of [999, 600_001]) {
+    assert.throws(
+      () => createAdapter(new FakeRunner(), { timeoutMs }),
+      /outside the supported range/u,
+    );
+  }
+});
+
 function acceptingInputAuthorityVerifier() {
   return {
     calls: [],

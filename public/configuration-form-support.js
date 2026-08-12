@@ -2211,6 +2211,30 @@ function normalizeFormState(state) {
   });
 }
 
+function githubCredentialModeTokenOperation(structureDocument, edit) {
+  if (
+    edit.path.length !== 2 ||
+    edit.path[0] !== "githubActions" ||
+    edit.path[1] !== "credentialMode" ||
+    !["gh-login", "token-env"].includes(edit.rawValue)
+  ) {
+    return null;
+  }
+  const path = ["githubActions", "tokenEnv"];
+  const hasTokenEnv = descriptorAtPath(structureDocument, path) !== null;
+  if (edit.rawValue === "gh-login" && hasTokenEnv) {
+    return { operation: "remove", path };
+  }
+  if (edit.rawValue === "token-env" && !hasTokenEnv) {
+    return {
+      operation: "add",
+      path,
+      value: "MYDASHBOARD_GITHUB_TOKEN",
+    };
+  }
+  return null;
+}
+
 export function setConfigurationFormField(state, input) {
   const snapshot = normalizeFormState(state);
   const editInput = shallowDataRecord(
@@ -2272,11 +2296,33 @@ export function setConfigurationFormField(state, input) {
   } else {
     edits[existingIndex] = edit;
   }
+  const tokenOperationInput = githubCredentialModeTokenOperation(
+    structureDocument,
+    edit,
+  );
+  const entityOperations = snapshot.entityOperations.slice();
+  if (tokenOperationInput) {
+    if (entityOperations.length >= CONFIGURATION_FORM_LIMITS.maxEntityOperations) {
+      throw formError(
+        "FORM_LIMIT_EXCEEDED",
+        "configuration entity operation count exceeds limit",
+        "entityOperations",
+      );
+    }
+    const operation = normalizeStructureOperation(
+      tokenOperationInput,
+      new Set(),
+      entityOperations.length,
+      structureDocument,
+    );
+    applyStructureOperation(structureDocument, operation);
+    entityOperations.push(operation);
+  }
   return buildFormState({
     baseDocument: snapshot.baseDocument,
     binding: snapshot.binding,
     edits,
-    entityOperations: snapshot.entityOperations,
+    entityOperations,
   });
 }
 

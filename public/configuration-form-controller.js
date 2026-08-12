@@ -459,13 +459,19 @@ export function bindConfigurationFormController({
 
   function applyField(control) {
     try {
+      const edit = configurationFieldEdit(control);
       const nextState = setConfigurationFormField(
         getState(),
-        configurationFieldEdit(control),
+        edit,
       );
       clearFieldError(control);
       onInvalidate();
-      onStateChange(nextState, { render: false, operation: "field" });
+      onStateChange(nextState, {
+        render:
+          edit.path[0] === "githubActions" &&
+          edit.path[1] === "credentialMode",
+        operation: "field",
+      });
     } catch (error) {
       onError(error.message, { focus: control });
     }

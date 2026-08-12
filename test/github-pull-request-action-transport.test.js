@@ -155,6 +155,18 @@ function actionTransport(runner, options = {}) {
   });
 }
 
+test("constructor accepts the shared GitHub timeout boundary", () => {
+  for (const timeoutMs of [1_000, 600_000]) {
+    assert.doesNotThrow(() => actionTransport(new FakeRunner(), { timeoutMs }));
+  }
+  for (const timeoutMs of [999, 600_001]) {
+    assert.throws(
+      () => actionTransport(new FakeRunner(), { timeoutMs }),
+      /outside the supported range/u,
+    );
+  }
+});
+
 function actorRecord(input) {
   return { login: input.actorAccountId };
 }

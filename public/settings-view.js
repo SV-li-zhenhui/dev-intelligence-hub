@@ -361,7 +361,10 @@ function optionalSlots(path, value, context) {
         descriptor.pattern.length !== path.length + 1 ||
         typeof field !== "string" ||
         ["*", "#", "**"].includes(field) ||
-        Object.hasOwn(value, field)
+        Object.hasOwn(value, field) ||
+        (pathText(path) === "githubActions" &&
+          field === "tokenEnv" &&
+          value.credentialMode === "gh-login")
       ) {
         return false;
       }

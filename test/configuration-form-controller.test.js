@@ -1,9 +1,81 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  bindConfigurationFormController,
   configurationFieldEdit,
   configurationTemplateValue,
 } from "../public/configuration-form-controller.js";
+import {
+  configurationDocumentFromForm,
+  createConfigurationFormState,
+} from "../public/configuration-form-support.js";
+import { renderConfigurationSettingsSkeleton } from "../public/settings-view.js";
+
+const currentConfigurationText = await readFile(
+  new URL("../config.example.json", import.meta.url),
+  "utf8",
+);
+
+function credentialConfiguration(mode) {
+  const configuration = JSON.parse(currentConfigurationText);
+  configuration.githubActions = {
+    enabled: true,
+    credentialMode: mode,
+    actorAccountId: "runtime-user",
+    ghCommand: process.execPath,
+    ...(mode === "token-env" ? { tokenEnv: "MYDASHBOARD_GITHUB_TOKEN" } : {}),
+  };
+  return configuration;
+}
+
+function selectControl(value) {
+  return {
+    tagName: "SELECT",
+    type: "select-one",
+    value,
+    checked: false,
+    dataset: {
+      configurationField: JSON.stringify(["githubActions", "credentialMode"]),
+      configurationEditKind: "text",
+    },
+    ownerDocument: { getElementById: () => null },
+    getAttribute: () => null,
+    removeAttribute() {},
+    setAttribute() {},
+  };
+}
+
+function credentialModeController(configuration) {
+  let state = createConfigurationFormState(configuration);
+  const listeners = new Map();
+  const changes = [];
+  const root = {
+    addEventListener(type, handler) { listeners.set(type, handler); },
+    removeEventListener(type) { listeners.delete(type); },
+    contains: () => true,
+  };
+  bindConfigurationFormController({
+    root,
+    getState: () => state,
+    onStateChange(nextState, options) {
+      state = nextState;
+      changes.push({
+        options,
+        markup: options.render ? renderConfigurationSettingsSkeleton({ state }) : null,
+      });
+    },
+    onInvalidate() {},
+    onError(message) { throw new Error(message); },
+  });
+  return {
+    change(mode) {
+      listeners.get("change")({ target: selectControl(mode) });
+      return changes.at(-1);
+    },
+    document() { return configurationDocumentFromForm(state); },
+  };
+}
 
 test("field controls produce immutable typed edits without coercing invalid text", () => {
   const path = ["workflowRouting", "rules", "0", "priority"];
@@ -94,5 +166,38 @@ test("template collection fails closed on invalid values and paths outside its r
         },
       ]),
     /root|范围/i,
+  );
+});
+
+test("credential mode select changes rerender dependent Token fields without migrating legacy mode", () => {
+  const tokenEnv = credentialModeController(credentialConfiguration("token-env"));
+  const ghLoginChange = tokenEnv.change("gh-login");
+  assert.equal(ghLoginChange.options.render, true);
+  assert.doesNotMatch(ghLoginChange.markup, /GitHub Token 环境变量/);
+  assert.equal(
+    Object.hasOwn(tokenEnv.document().configuration.githubActions, "tokenEnv"),
+    false,
+  );
+
+  const ghLogin = credentialModeController(credentialConfiguration("gh-login"));
+  const tokenEnvChange = ghLogin.change("token-env");
+  assert.equal(tokenEnvChange.options.render, true);
+  assert.match(tokenEnvChange.markup, /GitHub Token 环境变量/);
+  assert.match(
+    tokenEnvChange.markup,
+    /data-configuration-field="\[&quot;githubActions&quot;,&quot;tokenEnv&quot;\]"/,
+  );
+  assert.equal(ghLogin.document().ok, true);
+  assert.equal(
+    Object.hasOwn(ghLogin.document().configuration.githubActions, "tokenEnv"),
+    true,
+  );
+
+  const legacy = JSON.parse(currentConfigurationText);
+  delete legacy.githubActions.credentialMode;
+  const unrelated = credentialModeController(legacy);
+  assert.equal(
+    Object.hasOwn(unrelated.document().configuration.githubActions, "credentialMode"),
+    false,
   );
 });

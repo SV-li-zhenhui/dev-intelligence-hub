@@ -638,7 +638,7 @@ class GitHubPullRequestActionTransport {
     if (
       !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1_000 ||
-      timeoutMs > 120_000
+      timeoutMs > 600_000
     ) {
       throw new TypeError("timeoutMs is outside the supported range");
     }

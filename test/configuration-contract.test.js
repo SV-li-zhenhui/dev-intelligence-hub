@@ -8,11 +8,18 @@ import {
   configurationDocumentImpact,
   normalizeConfigurationDocument,
 } from "../src/domain/configuration-contract.js";
+import {
+  configurationDocumentFromForm,
+  createConfigurationFormState,
+  setConfigurationFormField,
+} from "../public/configuration-form-support.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const committedDocument = JSON.parse(
   await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
+const LEGACY_GITHUB_CREDENTIAL_DIGEST =
+  "a2095ebe59886ba1590ef4fc3eba7bd9efee23fef95a5e659cbeb74ed52a5089";
 
 function document() {
   return structuredClone(committedDocument);
@@ -567,9 +574,25 @@ test("GitHub credential modes preserve legacy shape and enforce mode-specific re
   const legacy = document();
   const legacyNormalized = normalizeConfigurationDocument(legacy);
   assert.equal(Object.hasOwn(legacyNormalized.githubActions, "credentialMode"), false);
+  assert.equal(configurationDocumentDigest(legacy), LEGACY_GITHUB_CREDENTIAL_DIGEST);
+
+  const unrelatedEdit = configurationDocumentFromForm(
+    setConfigurationFormField(createConfigurationFormState(legacy), {
+      path: ["refreshMinutes"],
+      kind: "integer",
+      rawValue: "11",
+    }),
+  );
+  const expectedUnrelatedEdit = structuredClone(legacy);
+  expectedUnrelatedEdit.refreshMinutes = 11;
+  assert.equal(unrelatedEdit.ok, true);
   assert.equal(
-    configurationDocumentDigest(legacy),
-    configurationDocumentDigest(structuredClone(legacy)),
+    Object.hasOwn(unrelatedEdit.configuration.githubActions, "credentialMode"),
+    false,
+  );
+  assert.equal(
+    configurationDocumentDigest(unrelatedEdit.configuration),
+    configurationDocumentDigest(expectedUnrelatedEdit),
   );
 
   const ghLogin = structuredClone(legacy);
