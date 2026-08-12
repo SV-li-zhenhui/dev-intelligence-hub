@@ -563,6 +563,68 @@ test("GitHub PR external actions require an explicit unique allow-list", () => {
   );
 });
 
+test("GitHub credential modes preserve legacy shape and enforce mode-specific references", () => {
+  const legacy = document();
+  const legacyNormalized = normalizeConfigurationDocument(legacy);
+  assert.equal(Object.hasOwn(legacyNormalized.githubActions, "credentialMode"), false);
+  assert.equal(
+    configurationDocumentDigest(legacy),
+    configurationDocumentDigest(structuredClone(legacy)),
+  );
+
+  const ghLogin = structuredClone(legacy);
+  ghLogin.githubActions = {
+    enabled: true,
+    credentialMode: "gh-login",
+    actorAccountId: "runtime-user",
+    ghCommand: process.execPath,
+    timeoutMs: 600_000,
+  };
+  assert.deepEqual(normalizeConfigurationDocument(ghLogin).githubActions, {
+    enabled: true,
+    credentialMode: "gh-login",
+    actorAccountId: "runtime-user",
+    ghCommand: process.execPath,
+    timeoutMs: 600_000,
+  });
+
+  for (const mutate of [
+    (value) => { value.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN"; },
+    (value) => { value.githubActions.credentialMode = "token-env"; },
+    (value) => { value.githubActions.ghCommand = "relative/gh"; },
+    (value) => { value.githubActions.timeoutMs = 999; },
+    (value) => { value.githubActions.timeoutMs = 600_001; },
+  ]) {
+    const invalid = structuredClone(ghLogin);
+    mutate(invalid);
+    assertInvalid(invalid);
+  }
+
+  const tokenEnv = structuredClone(ghLogin);
+  tokenEnv.githubActions.credentialMode = "token-env";
+  tokenEnv.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
+  assert.equal(
+    normalizeConfigurationDocument(tokenEnv).githubActions.credentialMode,
+    "token-env",
+  );
+});
+
+test("GitHub credential mode changes are security-sensitive and restart-required", () => {
+  const before = document();
+  before.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
+  const after = structuredClone(before);
+  after.githubActions.credentialMode = "gh-login";
+  delete after.githubActions.tokenEnv;
+
+  const impact = configurationDocumentImpact(before, after);
+  assert.deepEqual(impact.security_tightening, ["githubActions.credentialMode"]);
+  assert.deepEqual(impact.authority_expansion, ["githubActions.credentialMode"]);
+  assert.deepEqual(impact.restart_required, [
+    "githubActions.credentialMode",
+    "githubActions.tokenEnv",
+  ]);
+});
+
 test("GitHub PR action capability changes are authority changes requiring restart", () => {
   const legacy = document();
   delete legacy.githubActions.enabledActions;

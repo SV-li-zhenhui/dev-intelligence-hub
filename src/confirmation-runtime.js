@@ -43,6 +43,7 @@ const RECOVERY_STATUS_READER_METHODS = ["readRecoveryStatus"];
 const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
 const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabled",
+  "credentialMode",
   "actorAccountId",
   "tokenEnv",
   "ghCommand",
@@ -130,7 +131,8 @@ function normalizeEnabledActions(value) {
   return Object.freeze(result);
 }
 
-function githubCredentialProvider(dependencies, name) {
+function githubCredentialProvider(dependencies, credentialMode, name) {
+  if (credentialMode === "gh-login") return () => null;
   return () => {
     let environment;
     try {
@@ -167,7 +169,7 @@ function normalizeEnabledConfig(config) {
     )
   ) {
     throw invalidConfig(
-      "GitHub 动作配置包含不受支持的字段；凭据只能通过 tokenEnv 提供",
+      "GitHub 动作配置包含不受支持的字段",
     );
   }
 
@@ -183,13 +185,20 @@ function normalizeEnabledConfig(config) {
     throw invalidConfig("GitHub 写入账号无效");
   }
 
+  const credentialMode = dataProperty(githubActions, "credentialMode") ?? "token-env";
+  if (!new Set(["gh-login", "token-env"]).has(credentialMode)) {
+    throw invalidConfig("GitHub 凭据模式无效");
+  }
   const tokenEnv = dataProperty(githubActions, "tokenEnv");
-  if (
+  if (credentialMode === "token-env" && (
     typeof tokenEnv !== "string" ||
     !TOKEN_ENV_NAME.test(tokenEnv) ||
     tokenEnv === "__PROTO__"
-  ) {
+  )) {
     throw invalidConfig("GitHub 凭据环境变量名无效");
+  }
+  if (credentialMode === "gh-login" && tokenEnv !== undefined) {
+    throw invalidConfig("GitHub CLI 登录模式不接受环境变量 Token");
   }
   const ghCommand = dataProperty(githubActions, "ghCommand");
   if (
@@ -203,7 +212,7 @@ function normalizeEnabledConfig(config) {
   const timeoutMs = dataProperty(githubActions, "timeoutMs");
   if (
     timeoutMs !== undefined &&
-    (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000)
+    (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 600_000)
   ) {
     throw invalidConfig("GitHub 动作超时时间无效");
   }
@@ -213,7 +222,8 @@ function normalizeEnabledConfig(config) {
   return Object.freeze({
     actorAccountId,
     ghCommand,
-    tokenEnv,
+    credentialMode,
+    ...(credentialMode === "token-env" ? { tokenEnv } : {}),
     enabledActions,
     reviewEnabled:
       enabledActionsSource === undefined || enabledActions.includes("review"),
@@ -428,6 +438,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       ghCommand: enabledConfig.ghCommand,
       credentialProvider: githubCredentialProvider(
         dependencies,
+        enabledConfig.credentialMode,
         enabledConfig.tokenEnv,
       ),
       networkEnv: enabledConfig.networkEnv,

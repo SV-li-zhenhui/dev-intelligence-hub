@@ -141,6 +141,7 @@ const GITHUB_EXTERNAL_ACTIONS = new Set([
   "push",
   "merge",
 ]);
+const GITHUB_CREDENTIAL_MODES = new Set(["gh-login", "token-env"]);
 const NETWORK_ENV_FIELDS = new Set([
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -375,7 +376,7 @@ function endpoint(value, path) {
 function absoluteLocalPath(value, path) {
   const localPath = text(value, path, 4_096);
   if (
-    !nodePath.isAbsolute(localPath) ||
+    (!nodePath.isAbsolute(localPath) && !nodePath.win32.isAbsolute(localPath)) ||
     localPath.startsWith("\\\\") ||
     localPath.startsWith("//")
   ) {
@@ -1031,6 +1032,7 @@ function normalizeGithubActions(value) {
   const path = "githubActions";
   const allowed = [
     "enabled",
+    "credentialMode",
     "actorAccountId",
     "tokenEnv",
     "ghCommand",
@@ -1040,16 +1042,29 @@ function normalizeGithubActions(value) {
   ];
   const config = fields(value, path, allowed, ["enabled"]);
   const enabled = boolean(config.enabled, `${path}.enabled`);
+  const credentialMode = Object.hasOwn(config, "credentialMode")
+    ? text(config.credentialMode, `${path}.credentialMode`, 32)
+    : "token-env";
+  if (!GITHUB_CREDENTIAL_MODES.has(credentialMode)) {
+    throw invalid(`${path}.credentialMode`, "GitHub 凭据模式无效");
+  }
   if (
     enabled &&
-    ["actorAccountId", "tokenEnv", "ghCommand"].some(
+    ["actorAccountId", "ghCommand"].some(
       (name) => !Object.hasOwn(config, name),
     )
   ) {
-    throw invalid(path, "启用后缺少账号、凭据引用或固定命令");
+    throw invalid(path, "启用后缺少账号或固定命令");
+  }
+  if (enabled && credentialMode === "token-env" && !Object.hasOwn(config, "tokenEnv")) {
+    throw invalid(`${path}.tokenEnv`, "环境变量 Token 模式需要凭据引用");
+  }
+  if (credentialMode === "gh-login" && Object.hasOwn(config, "tokenEnv")) {
+    throw invalid(`${path}.tokenEnv`, "GitHub CLI 登录模式不接受环境变量 Token");
   }
   const normalized = {
     enabled,
+    ...(Object.hasOwn(config, "credentialMode") ? { credentialMode } : {}),
     ...optional(config, "actorAccountId", (entry) =>
       text(entry, `${path}.actorAccountId`, 40, {
         empty: !enabled,
@@ -1059,9 +1074,10 @@ function normalizeGithubActions(value) {
     ...optional(config, "tokenEnv", (entry) =>
       envReference(entry, `${path}.tokenEnv`),
     ),
-    ...optional(config, "ghCommand", (entry) =>
-      text(entry, `${path}.ghCommand`, 4_096),
-    ),
+    ...optional(config, "ghCommand", (entry) => {
+      const command = text(entry, `${path}.ghCommand`, 4_096);
+      return enabled ? absoluteLocalPath(command, `${path}.ghCommand`) : command;
+    }),
     ...optional(config, "enabledActions", (entry) =>
       uniqueArray(
         entry,
@@ -1093,7 +1109,7 @@ function normalizeGithubActions(value) {
   Object.assign(
     normalized,
     optional(config, "timeoutMs", (entry) =>
-      integer(entry, `${path}.timeoutMs`, 1, 600_000),
+      integer(entry, `${path}.timeoutMs`, 1_000, 600_000),
     ),
   );
   return normalized;
@@ -1613,6 +1629,12 @@ function authorityDirection(change) {
     );
     return { tightening: direction.removed, expansion: direction.added };
   }
+  if (path === "githubActions.credentialMode") {
+    return {
+      tightening: before !== after,
+      expansion: before !== after,
+    };
+  }
   const providerIdentity =
     path.startsWith("brainProviders.") &&
     (
@@ -1719,6 +1741,7 @@ function requiresInfrastructureRestart(path) {
     path.startsWith("codeExecutor.") ||
     path.startsWith("changePackages.") ||
     path === "githubActions.enabled" ||
+    path.startsWith("githubActions.credentialMode") ||
     path.startsWith("githubActions.actorAccountId") ||
     path.startsWith("githubActions.tokenEnv") ||
     path.startsWith("githubActions.ghCommand") ||

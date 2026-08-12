@@ -109,7 +109,7 @@ function representativeConfiguration() {
       enabled: true,
       actorAccountId: "local-owner",
       tokenEnv: "MYDASHBOARD_GITHUB_TOKEN",
-      ghCommand: "gh.exe",
+      ghCommand: "C:/Program Files/GitHub CLI/gh.exe",
       networkEnv: {
         HTTPS_PROXY: "http://127.0.0.1:7890",
         NO_PROXY: "127.0.0.1,localhost",
@@ -1271,6 +1271,34 @@ test("credential controls accept environment references but never secret values"
       /environment variable name/i,
     );
   }
+});
+
+test("GitHub credential mode removes tokenEnv for CLI login and restores it for token mode", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  configuration.githubActions.enabled = true;
+  configuration.githubActions.actorAccountId = "runtime-user";
+  configuration.githubActions.ghCommand = process.execPath;
+  configuration.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
+
+  let state = createConfigurationFormState(configuration);
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["githubActions", "credentialMode"],
+    value: "gh-login",
+  });
+  const cliLogin = configurationDocumentFromForm(state);
+  assert.equal(cliLogin.ok, true);
+  assert.equal(cliLogin.configuration.githubActions.credentialMode, "gh-login");
+  assert.equal(Object.hasOwn(cliLogin.configuration.githubActions, "tokenEnv"), false);
+
+  state = setConfigurationFormField(state, {
+    path: ["githubActions", "credentialMode"],
+    kind: "text",
+    rawValue: "token-env",
+  });
+  const tokenEnv = configurationDocumentFromForm(state);
+  assert.equal(tokenEnv.ok, true);
+  assert.equal(tokenEnv.configuration.githubActions.tokenEnv, "MYDASHBOARD_GITHUB_TOKEN");
 });
 
 test("reference graph blocks deleting providers, roles, workspaces, and profiles in use", () => {

@@ -759,7 +759,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.githubActions,
     "configuration.githubActions",
-    ["enabled", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions"],
+    ["enabled", "credentialMode", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions"],
     ["enabled"],
   );
   if (Object.hasOwn(value.githubActions, "enabledActions")) {
@@ -1522,13 +1522,24 @@ function configurationRelationshipIssues(configuration) {
   if (configuration.changePackages.enabled && !configuration.changePackages.gitCommand) {
     issues.push(issue(["changePackages", "gitCommand"], "INCOMPLETE_CONFIGURATION", "启用后需要固定 Git 命令。"));
   }
+  const credentialMode = configuration.githubActions.credentialMode ?? "token-env";
+  if (!["gh-login", "token-env"].includes(credentialMode)) {
+    issues.push(issue(["githubActions", "credentialMode"], "INVALID_CREDENTIAL_MODE", "请选择受支持的 GitHub 凭据来源。"));
+  }
   if (
     configuration.githubActions.enabled &&
-    ["actorAccountId", "tokenEnv", "ghCommand"].some(
+    ["actorAccountId", "ghCommand"].some(
       (name) => !Object.hasOwn(configuration.githubActions, name),
     )
   ) {
-    issues.push(issue(["githubActions"], "INCOMPLETE_CONFIGURATION", "启用后需要账号、环境变量引用和固定命令。"));
+    issues.push(issue(["githubActions"], "INCOMPLETE_CONFIGURATION", "启用后需要账号和固定 GitHub CLI 命令。"));
+  }
+  if (
+    configuration.githubActions.enabled &&
+    credentialMode === "token-env" &&
+    !Object.hasOwn(configuration.githubActions, "tokenEnv")
+  ) {
+    issues.push(issue(["githubActions", "tokenEnv"], "INCOMPLETE_CONFIGURATION", "环境变量 Token 模式需要 Token 环境变量名。"));
   }
   if (
     configuration.memory.answering?.enabled &&
@@ -2535,6 +2546,9 @@ function materializeConfigurationFormState(state) {
     if (!descriptorAtPath(document, edit.path)) continue;
     const value = editValue(edit, issues);
     if (value !== undefined) setValueAtPath(document, edit.path, value);
+  }
+  if (document.githubActions.credentialMode === "gh-login") {
+    delete document.githubActions.tokenEnv;
   }
   let supportedStructure = true;
   try {

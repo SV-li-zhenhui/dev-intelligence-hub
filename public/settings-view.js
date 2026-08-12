@@ -419,6 +419,11 @@ function renderNode(value, path, context) {
   const collection = configurationCollectionDescriptor(path, value);
   if (collection) return renderCollection(path, value, collection, context);
   const children = Object.entries(value)
+    .filter(([key]) =>
+      !(pathText(path) === "githubActions" &&
+        key === "tokenEnv" &&
+        value.credentialMode === "gh-login"),
+    )
     .map(([key, entry]) => renderNode(entry, [...path, key], context))
     .join("");
   const label = path.length > 0 ? configurationNodeLabel(path) : "配置";

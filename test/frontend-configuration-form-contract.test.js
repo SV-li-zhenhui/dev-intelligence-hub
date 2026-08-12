@@ -332,6 +332,24 @@ test("credential controls render only environment variable names and explain the
   ]);
 });
 
+test("GitHub credential mode conditionally removes the Token environment field", () => {
+  const configuration = configurationWithCredentialReferences();
+  configuration.githubActions.enabled = true;
+  configuration.githubActions.actorAccountId = "runtime-user";
+  configuration.githubActions.ghCommand = process.execPath;
+  let state = createConfigurationFormState(configuration);
+  state = applyConfigurationStructureOperation(state, {
+    operation: "add",
+    path: ["githubActions", "credentialMode"],
+    value: "gh-login",
+  });
+
+  const markup = renderConfigurationSettingsSkeleton({ state });
+  assert.match(markup, /GitHub CLI 当前登录（推荐）/);
+  assert.match(markup, /环境变量 Token（兼容）/);
+  assert.doesNotMatch(markup, /GitHub Token 环境变量/);
+});
+
 test("all interpolated configuration values are HTML escaped", () => {
   const configuration = configurationWithCredentialReferences();
   configuration.employees.roles.developer.mission = '<img src=x onerror="alert(1)">';

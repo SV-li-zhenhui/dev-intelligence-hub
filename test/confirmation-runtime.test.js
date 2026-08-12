@@ -1026,3 +1026,13 @@ test("invalid enabled settings fail before constructing any component", async ()
   assert.equal(executorOptions.credentialProvider(), null);
   await runtime.close();
 });
+
+test("runtime validation accepts gh-login without a token environment reference", async (t) => {
+  let runtime = null;
+  t.after(() => runtime?.close());
+  runtime = await createConfirmationRuntime(
+    enabledConfig({ credentialMode: "gh-login", tokenEnv: undefined, timeoutMs: 600_000 }),
+    runtimeDependencies(),
+  );
+  assert.ok(runtime);
+});

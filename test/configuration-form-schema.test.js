@@ -250,6 +250,29 @@ test("GitHub PR external actions use an optional structured allow-list", () => {
   );
 });
 
+test("GitHub credential mode exposes the approved selector and shared timeout range", () => {
+  const descriptor = configurationFieldDescriptor(
+    ["githubActions", "credentialMode"],
+    "gh-login",
+  );
+  assert.equal(descriptor.control, "select");
+  assert.deepEqual(descriptor.options, ["gh-login", "token-env"]);
+  assert.deepEqual(descriptor.optionLabels, {
+    "gh-login": "GitHub CLI 当前登录（推荐）",
+    "token-env": "环境变量 Token（兼容）",
+  });
+  assert.deepEqual(
+    configurationStructureTemplate(["githubActions", "credentialMode"]),
+    { kind: "slot", value: "gh-login" },
+  );
+  const timeout = configurationFieldDescriptor(
+    ["githubActions", "timeoutMs"],
+    60_000,
+  );
+  assert.equal(timeout.minimum, 1_000);
+  assert.equal(timeout.maximum, 600_000);
+});
+
 test("Git Head snapshot fields expose safe scalar templates for old configurations", () => {
   assert.deepEqual(
     configurationStructureTemplate(["codeExecutor", "gitCommand"]),
