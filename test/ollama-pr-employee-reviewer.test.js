@@ -183,6 +183,7 @@ test("creates a schema-constrained review draft from untrusted PR context", asyn
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://127.0.0.1:11434/api/chat");
   assert.equal(calls[0].request.model, "qwen3.5:9b");
+  assert.equal(calls[0].request.keep_alive, "30m");
   assert.equal(calls[0].request.format.additionalProperties, false);
   assert.equal(calls[0].request.format.properties.requiresApproval.type, "boolean");
   assert.match(calls[0].request.messages[0].content, /untrusted|不可信/i);

@@ -7,6 +7,7 @@ const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_CONTEXT_TOKENS = 8_192;
+const MODEL_KEEP_ALIVE = "30m";
 const MAX_OUTPUT_TOKENS = 1_024;
 const CHAT_TEMPLATE_ALLOWANCE_TOKENS = 512;
 const MAX_PROMPT_BYTES = 64 * 1_024;
@@ -624,6 +625,7 @@ export class OllamaPrEmployeeReviewer {
             model: this.model,
             stream: false,
             think: false,
+            keep_alive: MODEL_KEEP_ALIVE,
             format: OLLAMA_GENERATION_SCHEMA,
             options: {
               temperature: 0,
