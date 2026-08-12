@@ -845,6 +845,30 @@ test("real supervised runner distinguishes a clean nonzero status from stream fa
   await streamFailure.broker.close();
 });
 
+test("default readStatus budget includes bounded secure probe preparation", {
+  timeout: 35_000,
+}, async (t) => {
+  const current = await fixture(t, {
+    store: {
+      async beginTask() { return Object.freeze(Object.create(null)); },
+      async stageTask() {},
+      async captureTask() {},
+      async stageProbe({ signal }) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, 31_000);
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(brokerFailure("ABORT_ERR"));
+          }, { once: true });
+        });
+      },
+    },
+  });
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+  await current.broker.close();
+});
+
 test("internal broker deadline is a timeout while caller abort remains cancellation", async (t) => {
   const statusStarted = deferred();
   const statusFixture = await fixture(t, {

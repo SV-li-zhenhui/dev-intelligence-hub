@@ -164,18 +164,18 @@ test("readiness command accepts no authority-bearing origin or extra option", as
   }
 });
 
-test("readiness command aborts a response that never starts within 15 seconds", {
-  timeout: 25_000,
+test("readiness command leaves time for the bounded broker probe and cleanup", {
+  timeout: 55_000,
 }, async (t) => {
   const origin = await listen(t, () => {});
   const startedAt = Date.now();
-  const result = await runReadiness(["--origin", origin], { timeoutMs: 20_000 });
+  const result = await runReadiness(["--origin", origin], { timeoutMs: 52_000 });
   const elapsed = Date.now() - startedAt;
 
   assert.equal(result.status, 1);
   assert.equal(result.signal, null);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, failureMarker);
-  assert.equal(elapsed >= 14_000, true, `aborted too early after ${elapsed} ms`);
-  assert.equal(elapsed < 19_000, true, `aborted too late after ${elapsed} ms`);
+  assert.equal(elapsed >= 44_000, true, `aborted too early after ${elapsed} ms`);
+  assert.equal(elapsed < 50_000, true, `aborted too late after ${elapsed} ms`);
 });
