@@ -427,7 +427,7 @@ function systemPrompt(mode, isRetry) {
       ? "Produce a review_draft. Choose approve, comment, or request_changes; requiresApproval must be true."
       : "Produce an owner_plan. reviewVerdict must be none, reviewBody must be empty, and requiresApproval must be false.";
   const retry = isRetry
-    ? "The previous result violated the contract. Recheck every field and return only the corrected JSON object."
+    ? "The previous result violated the contract. Recheck every field. Steps must contain 1-8 items; if there are more, combine related steps without dropping safety, validation, or rollback requirements. Return only the corrected JSON object."
     : "";
   return [
     "You are the reasoning brain for a proactive PR employee.",

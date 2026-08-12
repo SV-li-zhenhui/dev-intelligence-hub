@@ -219,6 +219,59 @@ test("uses an Ollama generation schema without weakening review-body validation"
   }
 });
 
+test("retry tells Ollama to consolidate excess steps within the trusted limit", async () => {
+  const calls = [];
+  const tooManySteps = Array.from(
+    { length: 9 },
+    (_, index) => `验证步骤 ${index + 1}`,
+  );
+  const correctedSteps = [
+    ...tooManySteps.slice(0, 7),
+    `${tooManySteps[7]}；${tooManySteps[8]}`,
+  ];
+  const reviewer = new OllamaPrEmployeeReviewer({
+    fetch: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return response(
+        reviewDraft({
+          steps: calls.length === 1 ? tooManySteps : correctedSteps,
+        }),
+      );
+    },
+  });
+
+  const result = await reviewer.analyze(context());
+
+  assert.deepEqual(result.steps, correctedSteps);
+  assert.equal(calls.length, 2);
+  const retryPrompt = calls[1].messages[0].content;
+  assert.match(retryPrompt, /steps must contain 1-8 items/i);
+  assert.match(retryPrompt, /combine related steps/i);
+});
+
+test("still rejects excess steps when Ollama ignores the correction retry", async () => {
+  let calls = 0;
+  const reviewer = new OllamaPrEmployeeReviewer({
+    fetch: async () => {
+      calls += 1;
+      return response(
+        reviewDraft({
+          steps: Array.from(
+            { length: 9 },
+            (_, index) => `验证步骤 ${index + 1}`,
+          ),
+        }),
+      );
+    },
+  });
+
+  await assert.rejects(
+    reviewer.analyze(context()),
+    /invalid Ollama employee result.*steps must contain at most 8 items/i,
+  );
+  assert.equal(calls, 2);
+});
+
 test("reserves output and template capacity while reusing fitted facts on retry", async () => {
   const contextTokens = 5_500;
   const calls = [];
@@ -254,7 +307,7 @@ test("reserves output and template capacity while reusing fitted facts on retry"
 });
 
 test("seals the exact retry boundary when input evidence starts complete", async () => {
-  const contextTokens = 3_445;
+  const contextTokens = 3_576;
   const calls = [];
   const reviewer = new OllamaPrEmployeeReviewer({
     contextTokens,
