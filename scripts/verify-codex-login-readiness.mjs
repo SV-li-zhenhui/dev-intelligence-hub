@@ -1,7 +1,7 @@
 import { parseJsonWithUniqueKeys } from "../src/lib/strict-json.js";
 
 const maximumBodyBytes = 16 * 1024;
-const requestTimeoutMs = 45_000;
+const requestTimeoutMs = 60_000;
 const failureMarker = "CODEX_LOGIN_READINESS_FAILED\n";
 const capabilities = new Map([
   ["available", Object.freeze({ cliAvailable: true, fileLoginAvailable: true })],

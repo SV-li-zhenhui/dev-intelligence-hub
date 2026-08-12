@@ -19,7 +19,7 @@ import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const STATUS_TEXT = "Logged in using ChatGPT";
-const STATUS_TIMEOUT_MS = 10_000;
+const STATUS_TIMEOUT_MS = 20_000;
 const STATUS_OUTPUT_LIMIT = 4_096;
 const CLEANUP_TIMEOUT_MS = 10_000;
 const STATUS_PREPARATION_TIMEOUT_MS = 10_000;

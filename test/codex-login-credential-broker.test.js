@@ -450,7 +450,7 @@ test("readStatus runs only a bounded no-model login probe and removes its tree",
   assert.equal(run.executable, current.descriptor);
   assert.deepEqual(run.args, ["login", "status"]);
   assert.equal(run.input.length, 0);
-  assert.equal(run.timeoutMs <= 10_000, true);
+  assert.equal(run.timeoutMs <= 20_000, true);
   assert.equal(run.maxStdoutBytes <= 4_096, true);
   assert.equal(run.maxStderrBytes <= 4_096, true);
   assert.equal(path.isAbsolute(run.cwd), true);
@@ -861,6 +861,29 @@ test("default readStatus budget includes bounded secure probe preparation", {
             reject(brokerFailure("ABORT_ERR"));
           }, { once: true });
         });
+      },
+    },
+  });
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+  await current.broker.close();
+});
+
+test("default readStatus budget includes supervised CLI startup under host load", async (t) => {
+  const current = await fixture(t, {
+    processRunner: {
+      async run({ timeoutMs }) {
+        if (timeoutMs < 15_000) {
+          throw brokerFailure("STRUCTURED_PROVIDER_TIMEOUT");
+        }
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: "Logged in using ChatGPT\n",
+          stderr: "",
+          stdoutBytes: 26,
+          stderrBytes: 0,
+        };
       },
     },
   });
