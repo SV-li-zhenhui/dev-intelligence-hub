@@ -186,6 +186,45 @@ test("concurrent cycles share one in-flight claim and handler execution", async 
   assert.equal(runner.advanceCalls.length, 1);
 });
 
+test("shutdown stops a batch after the current proposal is durably advanced", async () => {
+  let releaseHandler;
+  let markStarted;
+  const handlerStarted = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const handlerReleased = new Promise((resolve) => {
+    releaseHandler = resolve;
+  });
+  const runner = new FakeRunner([claim(1), claim(2)]);
+  const service = new WorkProposalRunnerService({
+    runner,
+    handler: {
+      async handle() {
+        markStarted();
+        await handlerReleased;
+        return {
+          status: "waiting_confirmation",
+          downstreamRef: "confirmation-work-intent-proposal-1",
+          nextAttemptAt: "2026-08-02T03:00:05.000Z",
+        };
+      },
+    },
+  });
+  const controller = new AbortController();
+  const reason = Object.assign(new Error("shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+
+  const cycle = service.runCycle({ limit: 2, signal: controller.signal });
+  await handlerStarted;
+  controller.abort(reason);
+  releaseHandler();
+
+  await assert.rejects(cycle, (error) => error === reason);
+  assert.equal(runner.claimCalls.length, 1);
+  assert.equal(runner.advanceCalls.length, 1);
+});
+
 test("claim and advance acknowledgement loss are retried with the exact request", async () => {
   const claimFailure = new Error("claim acknowledgement unavailable");
   const runner = new FakeRunner([claimFailure, claim(1), null]);
@@ -245,7 +284,14 @@ test("runner construction and cycle limits fail closed", () => {
   assert.throws(() => new WorkProposalRunnerService({ runner: {}, handler }), /runner/);
   assert.throws(() => new WorkProposalRunnerService({ runner, handler: {} }), /handler/);
   const service = new WorkProposalRunnerService({ runner, handler });
-  for (const options of [null, [], { limit: 0 }, { limit: 101 }, { extra: true }]) {
-    assert.throws(() => service.runCycle(options), /runCycle options|limit/);
+  for (const options of [
+    null,
+    [],
+    { limit: 0 },
+    { limit: 101 },
+    { signal: {} },
+    { extra: true },
+  ]) {
+    assert.throws(() => service.runCycle(options), /runCycle options|limit|signal/);
   }
 });

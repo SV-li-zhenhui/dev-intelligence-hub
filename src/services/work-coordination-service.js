@@ -374,7 +374,10 @@ export class WorkCoordinationService {
               limit: this.#defaults.codeJobMemoryLimit,
             })],
           ["proposal_execution", () =>
-            this.#runProposals({ limit: this.#defaults.proposalLimit })],
+            this.#runProposals({
+              limit: this.#defaults.proposalLimit,
+              ...(options.signal === null ? {} : { signal: options.signal }),
+            })],
           ["proposal_results", () =>
             this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
           ["attention_results", () =>

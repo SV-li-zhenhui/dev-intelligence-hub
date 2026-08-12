@@ -11,6 +11,7 @@ import {
   normalizeWorkProposalTimestamp,
   safeWorkProposalInteger,
 } from "../domain/work-proposal-contract.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
 const MAX_BATCH = 100;
 const MAX_DURATION_MS = 24 * 60 * 60 * 1_000;
@@ -39,7 +40,7 @@ function positiveInteger(value, name, maximum) {
   return value;
 }
 
-function cycleLimit(value, fallback) {
+function cycleOptions(value, fallback) {
   if (
     value === null ||
     typeof value !== "object" ||
@@ -49,16 +50,26 @@ function cycleLimit(value, fallback) {
     throw new TypeError("runCycle options are invalid");
   }
   const keys = Reflect.ownKeys(value);
-  if (keys.some((key) => key !== "limit")) {
+  if (keys.some((key) => !["limit", "signal"].includes(key))) {
     throw new TypeError("runCycle options are invalid");
   }
-  const descriptor = Object.getOwnPropertyDescriptor(value, "limit");
-  if (descriptor && (!descriptor.enumerable || !("value" in descriptor))) {
-    throw new TypeError("runCycle options are invalid");
+  const descriptors = Object.fromEntries(
+    ["limit", "signal"].map((name) => [
+      name,
+      Object.getOwnPropertyDescriptor(value, name),
+    ]),
+  );
+  for (const descriptor of Object.values(descriptors)) {
+    if (descriptor && (!descriptor.enumerable || !("value" in descriptor))) {
+      throw new TypeError("runCycle options are invalid");
+    }
   }
-  return descriptor
-    ? positiveInteger(descriptor.value, "limit", MAX_BATCH)
-    : fallback;
+  return {
+    limit: descriptors.limit
+      ? positiveInteger(descriptors.limit.value, "limit", MAX_BATCH)
+      : fallback,
+    signal: normalizeAbortSignal(descriptors.signal?.value ?? null),
+  };
 }
 
 function normalizeClock(clock) {
@@ -269,8 +280,9 @@ export class WorkProposalRunnerService {
 
   runCycle(options = {}) {
     if (this.#inFlight) return this.#inFlight;
-    const limit = cycleLimit(options, this.#defaultBatchLimit);
-    const execution = Promise.resolve().then(() => this.#run(limit));
+    const cycle = cycleOptions(options, this.#defaultBatchLimit);
+    cycle.signal?.throwIfAborted();
+    const execution = Promise.resolve().then(() => this.#run(cycle));
     const tracked = execution.finally(() => {
       if (this.#inFlight === tracked) this.#inFlight = null;
     });
@@ -278,12 +290,15 @@ export class WorkProposalRunnerService {
     return tracked;
   }
 
-  async #run(limit) {
+  async #run({ limit, signal }) {
     const outcomes = [];
     for (let index = 0; index < limit; index += 1) {
-      const claim = await this.#claimRecoverably();
+      signal?.throwIfAborted();
+      const claim = await this.#claimRecoverably(signal);
+      signal?.throwIfAborted();
       if (claim === null) break;
       outcomes.push(await this.#handleClaim(normalizeClaim(claim)));
+      signal?.throwIfAborted();
     }
     return {
       claimed: outcomes.length,
@@ -300,12 +315,13 @@ export class WorkProposalRunnerService {
     };
   }
 
-  async #claimRecoverably() {
+  async #claimRecoverably(signal) {
     const request = { leaseDurationMs: this.#leaseDurationMs };
     try {
       return await this.#claim(request);
     } catch (error) {
       if (RUNTIME_ADMISSION_FAILURES.has(stableFailureCode(error))) throw error;
+      signal?.throwIfAborted();
       return this.#claim(request);
     }
   }

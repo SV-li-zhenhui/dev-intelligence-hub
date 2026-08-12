@@ -192,6 +192,37 @@ test("shutdown abort cancels active role work and prevents later dispatch", asyn
   assert.equal(dispatches, 0);
 });
 
+test("shutdown signal reaches housekeeping proposal execution", async () => {
+  const started = deferred();
+  const release = deferred();
+  let observedSignal = null;
+  const { service } = fixture({
+    proposalRunner: {
+      async runCycle({ signal }) {
+        observedSignal = signal;
+        started.resolve();
+        await release.promise;
+      },
+    },
+  });
+  const controller = new AbortController();
+  const reason = Object.assign(new Error("shutdown"), {
+    code: "LIFECYCLE_SHUTDOWN_ABORTED",
+  });
+  const cycle = service.runCycle({
+    trigger: "scheduled",
+    includeWork: false,
+    signal: controller.signal,
+  });
+
+  await started.promise;
+  controller.abort(reason);
+  release.resolve();
+
+  await assert.rejects(cycle, (error) => error === reason);
+  assert.strictEqual(observedSignal, controller.signal);
+});
+
 test("housekeeping activates settled pending PR source revisions through ledger CAS", async () => {
   const calls = [];
   const root = {

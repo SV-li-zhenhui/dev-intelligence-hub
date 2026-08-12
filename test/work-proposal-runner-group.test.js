@@ -31,6 +31,27 @@ test("the group runs every proposal scope with the same bounded cycle options", 
   ]);
 });
 
+test("the group forwards one shutdown signal to every proposal scope", async () => {
+  const observedSignals = [];
+  const controller = new AbortController();
+  const group = new WorkProposalRunnerGroup({
+    runners: ["github", "code"].map(() => ({
+      async runCycle(options) {
+        observedSignals.push(options.signal);
+        return {};
+      },
+    })),
+  });
+
+  await group.runCycle({ limit: 7, signal: controller.signal });
+
+  assert.equal(observedSignals.length, 2);
+  assert.equal(
+    observedSignals.every((signal) => signal === controller.signal),
+    true,
+  );
+});
+
 test("a failing runner never starves another proposal scope", async () => {
   const calls = [];
   const failure = new Error("github unavailable");
@@ -64,5 +85,6 @@ test("invalid groups and unbounded options fail before running", async () => {
     runners: [{ async runCycle() {} }],
   });
   await assert.rejects(group.runCycle({ limit: 0 }), /limit/);
+  await assert.rejects(group.runCycle({ signal: {} }), /signal/);
   await assert.rejects(group.runCycle({ limit: 1, extra: true }), /options/);
 });
