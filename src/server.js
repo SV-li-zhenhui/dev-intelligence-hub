@@ -1255,7 +1255,10 @@ function brainProviderStatusProjection(value) {
 
 function resolveOperationalAdmission(application) {
   if (application?.operations === undefined) {
-    return Object.freeze({ run: (operation) => operation() });
+    return Object.freeze({
+      run: (operation) => operation(),
+      assertOpen: () => undefined,
+    });
   }
   const admission = application.operations?.admission;
   if (!admission || typeof admission.run !== "function") {
@@ -1263,7 +1266,10 @@ function resolveOperationalAdmission(application) {
       "application.operations.admission.run must be a function",
     );
   }
-  return Object.freeze({ run: admission.run.bind(admission) });
+  return Object.freeze({
+    run: admission.run.bind(admission),
+    assertOpen: () => admission.run(() => undefined),
+  });
 }
 
 function requireOperationsBrowser(application, methods) {
@@ -3845,13 +3851,45 @@ export function startApplicationBackgroundWork(
     tracked = createCycle().finally(() => {
       if (cycles.get(key) === tracked) cycles.delete(key);
     });
+    tracked.catch(() => {});
     cycles.set(key, tracked);
     return tracked;
   }
 
-  function enqueueCoalescedAgencyCycle(key, options) {
-    return coalesceCycle(coalescedAgencyCycles, key, () =>
-      enqueueAgencyCycle(options),
+  function runCoalescedTracked(
+    cycles,
+    key,
+    operation,
+    { rethrow = false } = {},
+  ) {
+    const existing = cycles.get(key);
+    if (existing) {
+      let admissionCheck;
+      try {
+        admissionCheck = Promise.resolve(operationalAdmission.assertOpen());
+      } catch (error) {
+        admissionCheck = Promise.reject(error);
+      }
+      const admitted = admissionCheck
+        .catch((error) => {
+          reportBackgroundError(error);
+          throw error;
+        })
+        .then(() => existing);
+      return rethrow ? admitted : admitted.catch(() => undefined);
+    }
+    const tracked = coalesceCycle(cycles, key, () =>
+      runTracked(operation, { rethrow: true }),
+    );
+    return rethrow ? tracked : tracked.catch(() => undefined);
+  }
+
+  function runCoalescedAgencyCycle(key, options, runOptions = {}) {
+    return runCoalescedTracked(
+      coalescedAgencyCycles,
+      key,
+      (signal) => enqueueAgencyCycle({ ...options, signal }),
+      runOptions,
     );
   }
 
@@ -3902,30 +3940,33 @@ export function startApplicationBackgroundWork(
     return result;
   }
 
-  function enqueueRefresh({ notify = false } = {}, signal = workController.signal) {
+  function runCoalescedRefresh({ notify = false } = {}, runOptions = {}) {
     const key = notify ? "notify" : "silent";
-    return coalesceCycle(coalescedRefreshCycles, key, () =>
-      enqueueFactCycle(
-        () => runDrainParticipant(
-          DRAIN_PARTICIPANTS.refresh,
-          () => application.refreshService.refresh(
-            backgroundRefreshOptions(notify, signal),
+    return runCoalescedTracked(
+      coalescedRefreshCycles,
+      key,
+      (signal) =>
+        enqueueFactCycle(
+          () => runDrainParticipant(
+            DRAIN_PARTICIPANTS.refresh,
+            () => application.refreshService.refresh(
+              backgroundRefreshOptions(notify, signal),
+            ),
           ),
+          signal,
         ),
-        signal,
-      ),
+      runOptions,
     );
   }
 
-  const initialRefresh = runTracked(
-    (signal) => enqueueRefresh({ notify: false }, signal),
+  const initialRefresh = runCoalescedRefresh(
+    { notify: false },
     { rethrow: true },
   );
 
   timers.push(
     setIntervalFn(
-      () =>
-        runTracked((signal) => enqueueRefresh({ notify: false }, signal)),
+      () => runCoalescedRefresh({ notify: false }),
       application.config.refreshMinutes * 60_000,
     ),
   );
@@ -3939,15 +3980,11 @@ export function startApplicationBackgroundWork(
   ) {
     timers.push(
       setIntervalFn(
-        () =>
-          runTracked((signal) =>
-            enqueueCoalescedAgencyCycle("coordination", {
-              trigger: "scheduled",
-              includeLegacyEmployees: false,
-              discardWhenFactsPending: true,
-              signal,
-            }),
-          ),
+        () => runCoalescedAgencyCycle("coordination", {
+          trigger: "scheduled",
+          includeLegacyEmployees: false,
+          discardWhenFactsPending: true,
+        }),
         agencyTickSeconds * 1_000,
       ),
     );
@@ -3955,15 +3992,11 @@ export function startApplicationBackgroundWork(
   for (const schedule of employeeRegistry.schedules()) {
     timers.push(
       setIntervalFn(
-        () =>
-          runTracked((signal) =>
-            enqueueCoalescedAgencyCycle(`employee:${schedule.id}`, {
-              trigger: "scheduled",
-              employeeIds: [schedule.id],
-              discardWhenFactsPending: true,
-              signal,
-            }),
-          ),
+        () => runCoalescedAgencyCycle(`employee:${schedule.id}`, {
+          trigger: "scheduled",
+          employeeIds: [schedule.id],
+          discardWhenFactsPending: true,
+        }),
         schedule.intervalMinutes * 60_000,
       ),
     );
@@ -3989,26 +4022,22 @@ export function startApplicationBackgroundWork(
     initialRefresh,
     timers,
     stop,
-    refresh: (options) =>
-      runTracked((signal) => enqueueRefresh(options, signal), { rethrow: true }),
+    refresh: (options) => runCoalescedRefresh(options, { rethrow: true }),
     mutateFacts: (operation) =>
       runTracked((signal) => enqueueFactCycle(operation, signal), { rethrow: true }),
     signalAgency: ({ trigger = "signal" } = {}) =>
-      runTracked((signal) =>
-        enqueueCoalescedAgencyCycle("signal", {
+      runCoalescedAgencyCycle(
+        "signal",
+        {
           trigger,
           includeLegacyEmployees: false,
-          signal,
-        }),
-      { rethrow: true }),
+        },
+        { rethrow: true },
+      ),
     runEmployee: (id, { trigger = "manual" } = {}) =>
-      runTracked(
-        (signal) =>
-          enqueueCoalescedAgencyCycle(`manual-employee:${id}`, {
-            trigger,
-            employeeIds: [id],
-            signal,
-          }),
+      runCoalescedAgencyCycle(
+        `manual-employee:${id}`,
+        { trigger, employeeIds: [id] },
         { rethrow: true },
       ),
     runConfirmationOperation: (operation) =>

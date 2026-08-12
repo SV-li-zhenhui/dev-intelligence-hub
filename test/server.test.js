@@ -3267,6 +3267,99 @@ test("overlapping scheduled role and refresh ticks are coalesced", async () => {
   }
 });
 
+test("coalesced scheduled role ticks occupy one operational admission", async () => {
+  const roleStarted = deferred();
+  const releaseRole = deferred();
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  const timers = [];
+  const gate = new OperationalQuiescenceGate();
+  let roleRunCount = 0;
+  let refreshCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    operations: {
+      admission: { run: gate.run.bind(gate) },
+    },
+    employeeRegistry: {
+      schedules() {
+        return [{ id: "requirements-analyst", intervalMinutes: 11 }];
+      },
+      async runSelected(ids) {
+        if (ids[0] !== "requirements-analyst") return;
+        roleRunCount += 1;
+        roleStarted.resolve();
+        await releaseRole.promise;
+      },
+    },
+    refreshService: {
+      async refresh() {
+        refreshCount += 1;
+        if (refreshCount === 1) return;
+        refreshStarted.resolve();
+        await releaseRefresh.promise;
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+  const pending = [];
+
+  try {
+    await backgroundWork.initialRefresh;
+    pending.push(timers[1].callback());
+    await roleStarted.promise;
+    for (let index = 0; index < 20; index += 1) {
+      pending.push(timers[1].callback());
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(roleRunCount, 1);
+    assert.deepEqual(gate.readStatus(), {
+      mode: "open",
+      activeOperations: 1,
+    });
+
+    releaseRole.resolve();
+    await Promise.all(pending);
+    assert.deepEqual(gate.readStatus(), {
+      mode: "open",
+      activeOperations: 0,
+    });
+
+    pending.push(timers[0].callback());
+    await refreshStarted.promise;
+    for (let index = 0; index < 20; index += 1) {
+      pending.push(timers[0].callback());
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(refreshCount, 2);
+    assert.deepEqual(gate.readStatus(), {
+      mode: "open",
+      activeOperations: 1,
+    });
+
+    releaseRefresh.resolve();
+    await Promise.all(pending);
+    assert.deepEqual(gate.readStatus(), {
+      mode: "open",
+      activeOperations: 0,
+    });
+  } finally {
+    releaseRole.resolve();
+    releaseRefresh.resolve();
+    await Promise.allSettled(pending);
+    await backgroundWork.stop();
+  }
+});
+
 test("a pending refresh skips obsolete queued role ticks", async () => {
   const firstRoleStarted = deferred();
   const releaseFirstRole = deferred();
