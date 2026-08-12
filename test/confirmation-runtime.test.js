@@ -78,7 +78,11 @@ function runtimeDependencies(overrides = {}) {
     UNRELATED_SECRET: "must-not-become-network-config",
   };
   return {
-    env: environment,
+    credentialSource: Object.freeze({
+      async acquire() {
+        throw new Error("test credential source must remain lazy");
+      },
+    }),
     dataDirectory: path.join(path.dirname(process.execPath), "confirmation-test-data"),
     createStore: () => ({ read() {}, write() {} }),
     createOperationQueue: () => ({ enqueue(operation) { return operation(); } }),
@@ -177,14 +181,18 @@ test("disabled GitHub actions construct no confirmation runtime components", asy
 
 test("enabled runtime composes private ports, acquires, then recovers", async () => {
   const events = [];
-  const environment = {
-    [TOKEN_ENV]: TOKEN,
-    HTTPS_PROXY: "http://ambient-proxy.example",
-    UNRELATED_SECRET: "do-not-forward",
-  };
+  const credentialSource = Object.freeze({
+    async acquire() {
+      throw new Error("runtime composition must not acquire");
+    },
+  });
   const store = { read() {}, write() {} };
   const operationQueue = { enqueue(operation) { return operation(); } };
-  const executor = { execute() {}, reconcile() {} };
+  const executor = {
+    execute() {},
+    reconcile() {},
+    close() { events.push("executorClose"); },
+  };
   const router = { execute() {}, reconcile() {} };
   const guard = {
     acquire() { events.push("acquire"); },
@@ -199,7 +207,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   const runtime = await createConfirmationRuntime(
     enabledConfig(),
     runtimeDependencies({
-      env: environment,
+      credentialSource,
       createStore(dataDirectory) {
         events.push("store");
         assert.equal(path.isAbsolute(dataDirectory), true);
@@ -243,14 +251,12 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "recover",
   ]);
   assert.deepEqual(Object.keys(executorOptions).sort(), [
-    "credentialProvider",
+    "credentialSource",
     "ghCommand",
     "networkEnv",
   ]);
-  assert.deepEqual(executorOptions.credentialProvider(), {
-    token: TOKEN,
-    environment,
-  });
+  assert.strictEqual(executorOptions.credentialSource, credentialSource);
+  assert.equal(Object.isFrozen(executorOptions.credentialSource), true);
   assert.deepEqual(executorOptions.networkEnv, {
     HTTPS_PROXY: "http://127.0.0.1:8080",
   });
@@ -258,6 +264,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal("tokenEnv" in executorOptions, false);
   assert.equal("token" in executorOptions, false);
   assert.equal("env" in executorOptions, false);
+  assert.equal("credentialProvider" in executorOptions, false);
   assert.deepEqual(queueOptions, {
     store,
     executor: router,
@@ -388,7 +395,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   const secondClose = runtime.close();
   assert.equal(firstClose, secondClose);
   await firstClose;
-  assert.deepEqual(events.slice(-1), ["close"]);
+  assert.deepEqual(events.slice(-2), ["executorClose", "close"]);
 });
 
 test("enabled runtime forwards the ledger authority verifier to the GitHub executor", async () => {
@@ -1012,10 +1019,15 @@ test("invalid enabled settings fail before constructing any component", async ()
   }
 
   let executorOptions;
+  const credentialSource = Object.freeze({
+    async acquire() {
+      throw new Error("credential source remains lazy");
+    },
+  });
   const runtime = await createConfirmationRuntime(
     enabledConfig(),
     runtimeDependencies({
-      env: {},
+      credentialSource,
       createExecutor(options) {
         executorOptions = options;
         return { execute() {}, reconcile() {} };
@@ -1023,7 +1035,8 @@ test("invalid enabled settings fail before constructing any component", async ()
     }),
   );
   assert.ok(runtime);
-  assert.equal(executorOptions.credentialProvider(), null);
+  assert.strictEqual(executorOptions.credentialSource, credentialSource);
+  assert.equal("credentialProvider" in executorOptions, false);
   await runtime.close();
 });
 

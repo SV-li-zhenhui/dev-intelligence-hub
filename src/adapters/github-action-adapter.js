@@ -1,10 +1,14 @@
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import {
+  GitHubCredentialSourceError,
+} from "../lib/github-credential-source.js";
 import {
   ManagedProcess,
   ManagedProcessError,
@@ -50,7 +54,7 @@ class GitHubActionError extends Error {
   }
 }
 
-function actionError(code, trust = "unknown") {
+function actionError(code, trust = null) {
   return new GitHubActionError(code, trust);
 }
 
@@ -300,6 +304,14 @@ function markerForEnvelope(envelope) {
 
 function stableError(error) {
   if (error instanceof GitHubActionError) return error;
+  if (error instanceof GitHubCredentialSourceError) {
+    const trust = error.code === "GITHUB_ACTOR_MISMATCH"
+      ? "trusted"
+      : error.code === "GITHUB_CREDENTIAL_CLEANUP_FAILED"
+        ? "unknown"
+        : "absent";
+    return actionError(error.code, trust);
+  }
   if (error instanceof ManagedProcessError) {
     const code = {
       PROCESS_TIMEOUT: "GITHUB_TIMEOUT",
@@ -316,10 +328,30 @@ function errorResult(error, { fallbackTrust = "unknown" } = {}) {
   return {
     status: "error",
     error: {
-      trust: stable.trust === "unknown" ? fallbackTrust : stable.trust,
+      trust: stable.trust ?? fallbackTrust,
       code: stable.code,
     },
   };
+}
+
+function exactCredentialLease(value) {
+  const keys = value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value)
+    ? []
+    : Reflect.ownKeys(value);
+  if (
+    keys.length !== 2 ||
+    !keys.includes("use") ||
+    !keys.includes("release") ||
+    !Object.isFrozen(value) ||
+    keys.some((key) =>
+      typeof key !== "string" ||
+      typeof Object.getOwnPropertyDescriptor(value, key)?.value !== "function")
+  ) {
+    throw actionError("GITHUB_CREDENTIAL_OUTPUT_INVALID", "absent");
+  }
+  return value;
 }
 
 function githubReceipt(record, envelope) {
@@ -370,9 +402,14 @@ function githubReceipt(record, envelope) {
 class GitHubActionAdapter {
   #runner;
   #command;
-  #childEnvironment;
+  #credentialSource;
+  #environment;
+  #networkEnvironment;
+  #clock;
   #timeoutMs;
   #verifyInputAuthority;
+  #activeOperations;
+  #closed;
 
   constructor({
     runner = new ManagedProcessRunner({
@@ -382,10 +419,10 @@ class GitHubActionAdapter {
           maxOutputBytes: 4 * 1024 * 1024,
         }),
     }),
-    env = process.env,
+    environment = process.env,
     networkEnv = {},
-    token = env?.GH_TOKEN || env?.GITHUB_TOKEN,
-    credentialProvider,
+    credentialSource,
+    clock = () => Date.now(),
     ghCommand,
     timeoutMs = 60_000,
     inputAuthorityVerifier,
@@ -404,11 +441,22 @@ class GitHubActionAdapter {
     ) {
       throw new TypeError("ghCommand must be an absolute executable path");
     }
+    const credentialSourceKeys = credentialSource === null ||
+      typeof credentialSource !== "object" ||
+      utilTypes.isProxy(credentialSource)
+      ? []
+      : Reflect.ownKeys(credentialSource);
     if (
-      credentialProvider !== undefined &&
-      typeof credentialProvider !== "function"
+      credentialSourceKeys.length !== 1 ||
+      credentialSourceKeys[0] !== "acquire" ||
+      !Object.isFrozen(credentialSource) ||
+      typeof Object.getOwnPropertyDescriptor(credentialSource, "acquire")?.value !==
+        "function"
     ) {
-      throw new TypeError("credentialProvider must be a function");
+      throw new TypeError("credentialSource must be an exact frozen acquire port");
+    }
+    if (typeof clock !== "function") {
+      throw new TypeError("clock must be a function");
     }
     if (!isPlainObject(networkEnv)) {
       throw new TypeError("networkEnv must be a plain object");
@@ -433,40 +481,13 @@ class GitHubActionAdapter {
       normalizedNetworkEnv[key] = descriptor.value;
     }
     const network = Object.freeze(normalizedNetworkEnv);
-    if (credentialProvider === undefined) {
-      if (typeof token !== "string" || !GITHUB_TOKEN.test(token)) {
-        throw new TypeError("A fixed GitHub token is required");
-      }
-      const fixedEnvironment = this.#buildChildEnvironment(token, env, network);
-      this.#childEnvironment = () => fixedEnvironment;
-    } else {
-      this.#childEnvironment = () => {
-        let credentials;
-        try {
-          credentials = credentialProvider();
-        } catch (cause) {
-          throw actionError("GITHUB_CREDENTIAL_MISSING", "absent", { cause });
-        }
-        if (
-          !isPlainObject(credentials) ||
-          Reflect.ownKeys(credentials).length !== 2 ||
-          !Object.hasOwn(credentials, "token") ||
-          !Object.hasOwn(credentials, "environment") ||
-          typeof credentials.token !== "string" ||
-          !GITHUB_TOKEN.test(credentials.token) ||
-          credentials.environment === null ||
-          typeof credentials.environment !== "object"
-        ) {
-          throw actionError("GITHUB_CREDENTIAL_MISSING", "absent");
-        }
-        return this.#buildChildEnvironment(
-          credentials.token,
-          credentials.environment,
-          network,
-        );
-      };
-    }
+    this.#credentialSource = credentialSource;
+    this.#environment = environment;
+    this.#networkEnvironment = network;
+    this.#clock = clock;
     this.#timeoutMs = timeoutMs;
+    this.#activeOperations = new Set();
+    this.#closed = false;
     if (
       inputAuthorityVerifier !== undefined &&
       (!inputAuthorityVerifier ||
@@ -486,34 +507,51 @@ class GitHubActionAdapter {
     } catch (error) {
       return errorResult(error);
     }
+    const operation = this.#beginOperation();
     try {
-      const childEnvironment = this.#childEnvironment();
-      await this.#assertActor(envelope.actor.accountId, childEnvironment);
-      const matched = await this.#findMarker(envelope, childEnvironment);
-      if (matched) return { status: "already", receipt: matched };
-      if (
-        envelope.kind === "github.work-proposal-review" &&
-        !envelope.action.inputBinding
-      ) {
-        return { status: "stale" };
-      }
-      if (!(await this.#inputAuthorityCurrent(envelope))) {
-        return { status: "stale" };
-      }
-      const currentTarget = await this.#currentTarget(
+      return await this.#withCredential(
         envelope,
-        childEnvironment,
+        async (childEnvironment, operation) => {
+          await this.#assertActor(
+            envelope.actor.accountId,
+            childEnvironment,
+            operation,
+          );
+          const matched = await this.#findMarker(
+            envelope,
+            childEnvironment,
+            operation,
+          );
+          if (matched) return { status: "already", receipt: matched };
+          if (
+            envelope.kind === "github.work-proposal-review" &&
+            !envelope.action.inputBinding
+          ) {
+            return { status: "stale" };
+          }
+          if (!(await this.#inputAuthorityCurrent(envelope))) {
+            return { status: "stale" };
+          }
+          const currentTarget = await this.#currentTarget(
+            envelope,
+            childEnvironment,
+            operation,
+          );
+          if (!currentTarget.matches) {
+            return {
+              status: "stale",
+              expectedVersion: envelope.target.version,
+              actualVersion: currentTarget.actualVersion,
+            };
+          }
+          return { status: "absent", code: "GITHUB_MARKER_ABSENT" };
+        },
+        operation,
       );
-      if (!currentTarget.matches) {
-        return {
-          status: "stale",
-          expectedVersion: envelope.target.version,
-          actualVersion: currentTarget.actualVersion,
-        };
-      }
-      return { status: "absent", code: "GITHUB_MARKER_ABSENT" };
     } catch (error) {
       return errorResult(error);
+    } finally {
+      this.#finishOperation(operation);
     }
   }
 
@@ -525,53 +563,138 @@ class GitHubActionAdapter {
     } catch (error) {
       return errorResult(error);
     }
+    const operation = this.#beginOperation();
     try {
       if (!(await this.#inputAuthorityCurrent(envelope))) {
         return { status: "stale" };
       }
-      const childEnvironment = this.#childEnvironment();
-      await this.#assertActor(envelope.actor.accountId, childEnvironment);
-      const matched = await this.#findMarker(envelope, childEnvironment);
-      if (matched) return { status: "already", receipt: matched };
-      const observedTarget = await this.#currentTarget(
-        envelope,
+      return await this.#withCredential(envelope, async (
         childEnvironment,
-      );
-      if (!observedTarget.matches) {
-        return {
-          status: "stale",
-          expectedVersion: envelope.target.version,
-          actualVersion: observedTarget.actualVersion,
-        };
-      }
-      await this.#assertActor(envelope.actor.accountId, childEnvironment);
-      const finalTarget = await this.#currentTarget(envelope, childEnvironment);
-      if (!finalTarget.matches) {
-        return {
-          status: "stale",
-          expectedVersion: envelope.target.version,
-          actualVersion: finalTarget.actualVersion,
-        };
-      }
-      if (!(await this.#inputAuthorityCurrent(envelope))) {
-        return { status: "stale" };
-      }
-      postStarted = true;
-      return {
-        status: "applied",
-        receipt: await this.#post(envelope, childEnvironment),
-      };
+        credentialOperation,
+      ) => this.#executeWithEnvironment(
+          envelope,
+          childEnvironment,
+          credentialOperation,
+          () => { postStarted = true; },
+        ), operation);
     } catch (error) {
       return errorResult(error, {
         fallbackTrust: postStarted ? "unknown" : "absent",
       });
+    } finally {
+      this.#finishOperation(operation);
     }
   }
 
-  async #assertActor(expectedLogin, childEnvironment) {
+  async #executeWithEnvironment(
+    envelope,
+    childEnvironment,
+    operation,
+    markPostStarted,
+  ) {
+    await this.#assertActor(
+        envelope.actor.accountId,
+        childEnvironment,
+        operation,
+    );
+    const matched = await this.#findMarker(
+        envelope,
+        childEnvironment,
+        operation,
+    );
+    if (matched) return { status: "already", receipt: matched };
+    const observedTarget = await this.#currentTarget(
+        envelope,
+        childEnvironment,
+        operation,
+    );
+    if (!observedTarget.matches) {
+      return {
+        status: "stale",
+        expectedVersion: envelope.target.version,
+        actualVersion: observedTarget.actualVersion,
+      };
+    }
+    await this.#assertActor(
+        envelope.actor.accountId,
+        childEnvironment,
+        operation,
+    );
+    const finalTarget = await this.#currentTarget(
+        envelope,
+        childEnvironment,
+        operation,
+    );
+    if (!finalTarget.matches) {
+      return {
+        status: "stale",
+        expectedVersion: envelope.target.version,
+        actualVersion: finalTarget.actualVersion,
+      };
+    }
+    if (!(await this.#inputAuthorityCurrent(envelope))) {
+      return { status: "stale" };
+    }
+    markPostStarted();
+    return {
+      status: "applied",
+      receipt: await this.#post(envelope, childEnvironment, operation),
+    };
+  }
+
+  #beginOperation() {
+    const controller = new AbortController();
+    this.#activeOperations.add(controller);
+    if (this.#closed) controller.abort();
+    const deadline = this.#clock() + this.#timeoutMs;
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(0, deadline - this.#clock()),
+    );
+    timer.unref?.();
+    return Object.freeze({ controller, signal: controller.signal, deadline, timer });
+  }
+
+  #finishOperation(operation) {
+    clearTimeout(operation.timer);
+    this.#activeOperations.delete(operation.controller);
+  }
+
+  async #withCredential(envelope, callback, operation) {
+    let lease = null;
+    try {
+      lease = exactCredentialLease(
+        await this.#credentialSource.acquire(Object.freeze({
+        actorAccountId: envelope.actor.accountId,
+        signal: operation.signal,
+        deadline: operation.deadline,
+        })),
+      );
+      return await lease.use((token) => callback(
+        this.#buildChildEnvironment(
+          token,
+          this.#environment,
+          this.#networkEnvironment,
+        ),
+        Object.freeze({
+          signal: operation.signal,
+          deadline: operation.deadline,
+        }),
+      ));
+    } finally {
+      await lease?.release();
+    }
+  }
+
+  close() {
+    this.#closed = true;
+    for (const controller of this.#activeOperations) controller.abort();
+  }
+
+  async #assertActor(expectedLogin, childEnvironment, operation = null) {
     const value = await this.#runJson(
       ["api", "--method", "GET", "user"],
-      { childEnvironment },
+      { childEnvironment, operation },
     );
     if (!isPlainObject(value) || typeof value.login !== "string") {
       throw actionError("GITHUB_PROTOCOL");
@@ -597,7 +720,7 @@ class GitHubActionAdapter {
     }
   }
 
-  async #currentTarget(envelope, childEnvironment) {
+  async #currentTarget(envelope, childEnvironment, operation = null) {
     const targetAware = Boolean(envelope.action.inputBinding);
     const value = await this.#runJson(
       [
@@ -609,7 +732,7 @@ class GitHubActionAdapter {
           ? "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
           : "headRefOid",
       ],
-      { childEnvironment },
+      { childEnvironment, operation },
     );
     if (
       !isPlainObject(value) ||
@@ -655,7 +778,7 @@ class GitHubActionAdapter {
     };
   }
 
-  async #findMarker(envelope, childEnvironment) {
+  async #findMarker(envelope, childEnvironment, operation = null) {
     const route = `repos/${envelope.target.repo}/pulls/${envelope.target.number}/reviews?per_page=100`;
     const marker = markerForEnvelope(envelope);
     const records = await this.#runJsonLines(
@@ -668,7 +791,7 @@ class GitHubActionAdapter {
         "--jq",
         `.[] | select((.body // "") | contains("${marker}")) | {id, html_url, submitted_at, user: {login: .user.login}, body, state, commit_id}`,
       ],
-      { childEnvironment },
+      { childEnvironment, operation },
     );
     const candidates = records.filter(
       (record) => typeof record?.body === "string" && record.body.includes(marker),
@@ -695,7 +818,7 @@ class GitHubActionAdapter {
     );
   }
 
-  async #post(envelope, childEnvironment) {
+  async #post(envelope, childEnvironment, operation = null) {
     const marker = markerForEnvelope(envelope);
     const body = `${envelope.action.body}\n\n${marker}`;
     const args = [
@@ -713,6 +836,7 @@ class GitHubActionAdapter {
         commit_id: envelope.target.version,
       }),
       childEnvironment,
+      operation,
     });
     if (!this.#matchesRecord(envelope, record, marker)) {
       throw actionError("GITHUB_PROTOCOL");
@@ -720,8 +844,8 @@ class GitHubActionAdapter {
     return githubReceipt(record, envelope);
   }
 
-  async #runJson(args, { input, childEnvironment } = {}) {
-    const result = await this.#run(args, { input, childEnvironment });
+  async #runJson(args, { input, childEnvironment, operation } = {}) {
+    const result = await this.#run(args, { input, childEnvironment, operation });
     try {
       return JSON.parse(result.stdout);
     } catch {
@@ -729,8 +853,8 @@ class GitHubActionAdapter {
     }
   }
 
-  async #runJsonLines(args, { childEnvironment } = {}) {
-    const result = await this.#run(args, { childEnvironment });
+  async #runJsonLines(args, { childEnvironment, operation } = {}) {
+    const result = await this.#run(args, { childEnvironment, operation });
     if (!result.stdout.trim()) return [];
     try {
       return result.stdout.split("\n").map((line) => JSON.parse(line));
@@ -739,19 +863,31 @@ class GitHubActionAdapter {
     }
   }
 
-  async #run(args, { input, childEnvironment } = {}) {
+  async #run(args, { input, childEnvironment, operation } = {}) {
     const fixedArgs =
       args[0] === "api"
         ? ["api", "--hostname", "github.com", ...args.slice(1)]
         : args;
     let result;
     try {
+      const timeoutMs = operation === undefined || operation === null
+        ? this.#timeoutMs
+        : operation.deadline - this.#clock();
+      if (operation?.signal.aborted) {
+        throw new ManagedProcessError("PROCESS_ABORTED", "Process was aborted");
+      }
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+        throw new ManagedProcessError("PROCESS_TIMEOUT", "Process timed out");
+      }
       result = await this.#runner.run({
         command: this.#command,
         args: fixedArgs,
         env: { ...childEnvironment },
         ...(input === undefined ? {} : { input }),
-        timeoutMs: this.#timeoutMs,
+        timeoutMs,
+        ...(operation === undefined || operation === null
+          ? {}
+          : { signal: operation.signal }),
       });
     } catch (error) {
       throw stableError(error);
@@ -763,6 +899,9 @@ class GitHubActionAdapter {
   }
 
   #buildChildEnvironment(token, environment, networkEnv) {
+    if (typeof token !== "string" || !GITHUB_TOKEN.test(token)) {
+      throw actionError("GITHUB_CREDENTIAL_OUTPUT_INVALID", "absent");
+    }
     const childEnv = {
       GH_TOKEN: token,
       GH_PROMPT_DISABLED: "1",
@@ -789,5 +928,6 @@ export function createGitHubActionExecutor(options) {
   return Object.freeze({
     execute: (input) => adapter.execute(input),
     reconcile: (input) => adapter.reconcile(input),
+    close: () => adapter.close(),
   });
 }

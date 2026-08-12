@@ -4,6 +4,9 @@ import {
   createGitHubActionExecutor,
   markerForGitHubAction,
 } from "../src/adapters/github-action-adapter.js";
+import {
+  githubCredentialSourceError,
+} from "../src/lib/github-credential-source.js";
 import { ManagedProcessError } from "../src/lib/managed-process.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
@@ -21,7 +24,7 @@ function createAdapter(runner, overrides = {}) {
   return createGitHubActionExecutor({
     runner,
     ghCommand: GH_COMMAND,
-    token: GH_TOKEN,
+    credentialSource: recordingCredentialSource(GH_TOKEN).source,
     ...overrides,
   });
 }
@@ -36,6 +39,38 @@ test("constructor accepts the shared GitHub timeout boundary", () => {
       /outside the supported range/u,
     );
   }
+});
+
+test("constructor accepts only an exact frozen credential acquire port", () => {
+  const source = recordingCredentialSource().source;
+  assert.doesNotThrow(() => createGitHubActionExecutor({
+    runner: new FakeRunner(),
+    ghCommand: GH_COMMAND,
+    credentialSource: source,
+  }));
+  assert.throws(() => createGitHubActionExecutor({
+    runner: new FakeRunner(),
+    ghCommand: GH_COMMAND,
+    token: GH_TOKEN,
+  }), /credentialSource/u);
+  assert.throws(() => createGitHubActionExecutor({
+    runner: new FakeRunner(),
+    ghCommand: GH_COMMAND,
+    credentialProvider: () => GH_TOKEN,
+  }), /credentialSource/u);
+  assert.throws(() => createGitHubActionExecutor({
+    runner: new FakeRunner(),
+    ghCommand: GH_COMMAND,
+    credentialSource: { acquire: source.acquire },
+  }), /credentialSource/u);
+  assert.throws(() => createGitHubActionExecutor({
+    runner: new FakeRunner(),
+    ghCommand: GH_COMMAND,
+    credentialSource: Object.freeze({
+      acquire: source.acquire,
+      release: () => {},
+    }),
+  }), /credentialSource/u);
 });
 
 function acceptingInputAuthorityVerifier() {
@@ -153,6 +188,29 @@ class FakeRunner {
       truncated: false,
     };
   }
+}
+
+function recordingCredentialSource(token = "fictional_review_token") {
+  const calls = {
+    acquire: [],
+    use: 0,
+    release: 0,
+  };
+  const source = Object.freeze({
+    async acquire(request) {
+      calls.acquire.push(request);
+      return Object.freeze({
+        async use(callback) {
+          calls.use += 1;
+          return callback(token);
+        },
+        release() {
+          calls.release += 1;
+        },
+      });
+    },
+  });
+  return { calls, source, token };
 }
 
 function actor(login = "local-owner") {
@@ -377,11 +435,14 @@ test("every GitHub call uses one fixed token, absolute executable, and minimal e
     SystemRoot: "C:\\Windows",
     HTTPS_PROXY: "http://127.0.0.1:8080",
   };
+  const credential = recordingCredentialSource(
+    "fixed_token_for_confirmed_account",
+  );
   const runner = new FakeRunner([actor(), pages([]), head()]);
   const adapter = createAdapter(runner, {
-    env: sourceEnv,
+    credentialSource: credential.source,
+    environment: sourceEnv,
     networkEnv: { HTTPS_PROXY: sourceEnv.HTTPS_PROXY },
-    token: "fixed_token_for_confirmed_account",
   });
   sourceEnv.GH_TOKEN = "changed_after_construction";
 
@@ -404,16 +465,18 @@ test("every GitHub call uses one fixed token, absolute executable, and minimal e
   }
 });
 
-test("lazy credentials are read only when an action runs and absence makes no GitHub call", async () => {
+test("credentials are acquired only when an action runs and absence makes no GitHub call", async () => {
   let reads = 0;
   const runner = new FakeRunner();
   const adapter = createGitHubActionExecutor({
     runner,
     ghCommand: GH_COMMAND,
-    credentialProvider() {
-      reads += 1;
-      return null;
-    },
+    credentialSource: Object.freeze({
+      async acquire() {
+        reads += 1;
+        throw githubCredentialSourceError("GITHUB_CREDENTIAL_MISSING");
+      },
+    }),
   });
 
   assert.equal(reads, 0);
@@ -425,8 +488,8 @@ test("lazy credentials are read only when an action runs and absence makes no Gi
   assert.equal(runner.calls.length, 0);
 });
 
-test("one Review execution seals one lazy credential across every GitHub call", async () => {
-  let reads = 0;
+test("one Review execution seals one leased credential across every GitHub call", async () => {
+  const credential = recordingCredentialSource("operation_token_1");
   const runner = new FakeRunner([
     actor(),
     pages([]),
@@ -443,21 +506,240 @@ test("one Review execution seals one lazy credential across every GitHub call", 
   const adapter = createGitHubActionExecutor({
     runner,
     ghCommand: GH_COMMAND,
-    credentialProvider() {
-      reads += 1;
-      return {
-        token: `operation_token_${reads}`,
-        environment: { SystemRoot: "C:\\Windows" },
-      };
-    },
+    credentialSource: credential.source,
+    environment: { SystemRoot: "C:\\Windows" },
   });
 
   assert.equal((await adapter.execute(reviewEnvelope())).status, "applied");
-  assert.equal(reads, 1);
+  assert.equal(credential.calls.acquire.length, 1);
   assert.equal(runner.calls.length, 6);
   for (const call of runner.calls) {
     assert.equal(call.env.GH_TOKEN, "operation_token_1");
   }
+});
+
+test("one Review execution acquires, uses, and releases one actor-bound lease", async () => {
+  const credential = recordingCredentialSource();
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    head(),
+    actor(),
+    head(),
+    (input) => {
+      const marker = markerFromPost(input);
+      return reviewRecord(marker, {
+        body: `${reviewEnvelope().action.body}\n\n${marker}`,
+      });
+    },
+  ]);
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+    environment: { SystemRoot: "C:\\Windows" },
+    clock: () => 1_000_000,
+    timeoutMs: 60_000,
+  });
+
+  const result = await adapter.execute(reviewEnvelope());
+
+  assert.equal(result.status, "applied");
+  assert.deepEqual(credential.calls.acquire, [{
+    actorAccountId: "local-owner",
+    signal: credential.calls.acquire[0].signal,
+    deadline: 1_060_000,
+  }]);
+  assert.equal(credential.calls.acquire[0].signal instanceof AbortSignal, true);
+  assert.equal(credential.calls.use, 1);
+  assert.equal(credential.calls.release, 1);
+  assert.equal(runner.calls.length, 6);
+  for (const call of runner.calls) {
+    assert.equal(call.env.GH_TOKEN, credential.token);
+  }
+  assert.equal(JSON.stringify(result).includes(credential.token), false);
+});
+
+test("one Review reconcile acquires, uses, and releases one actor-bound lease", async () => {
+  const credential = recordingCredentialSource();
+  const runner = new FakeRunner([actor(), pages([]), head()]);
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+    clock: () => 2_000_000,
+    timeoutMs: 60_000,
+  });
+
+  const result = await adapter.reconcile(reviewEnvelope());
+
+  assert.deepEqual(result, { status: "absent", code: "GITHUB_MARKER_ABSENT" });
+  assert.equal(credential.calls.acquire.length, 1);
+  assert.equal(credential.calls.acquire[0].actorAccountId, "local-owner");
+  assert.equal(credential.calls.acquire[0].deadline, 2_060_000);
+  assert.equal(credential.calls.acquire[0].signal instanceof AbortSignal, true);
+  assert.equal(credential.calls.use, 1);
+  assert.equal(credential.calls.release, 1);
+});
+
+test("closing the Review executor cancels the active lease and prevents later calls", async () => {
+  const credential = recordingCredentialSource();
+  let adapter;
+  const runner = new FakeRunner([
+    async () => {
+      await adapter.close();
+      return actor();
+    },
+  ]);
+  adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+  });
+
+  const result = await adapter.execute(reviewEnvelope());
+
+  assert.deepEqual(result, {
+    status: "error",
+    error: { trust: "absent", code: "GITHUB_UNAVAILABLE" },
+  });
+  assert.equal(runner.calls.length, 1);
+  assert.equal(credential.calls.use, 1);
+  assert.equal(credential.calls.release, 1);
+  assert.equal(credential.calls.acquire[0].signal.aborted, true);
+});
+
+test("Review authority checks and subprocesses share one decreasing total deadline", async () => {
+  let now = 3_000_000;
+  const credential = recordingCredentialSource();
+  const verifier = acceptingInputAuthorityVerifier();
+  verifier.verify = async function verify(value) {
+    this.calls.push(structuredClone(value));
+    now += 5_000;
+    return structuredClone(value);
+  };
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    {
+      number: 42,
+      url: "https://github.com/acme/command-center/pull/42",
+      baseRefName: "main",
+      baseRefOid: BASE_HEAD,
+      headRefName: "fix/conflict",
+      headRefOid: HEAD,
+      headRepository: { nameWithOwner: "contributor/command-center" },
+    },
+    actor(),
+    {
+      number: 42,
+      url: "https://github.com/acme/command-center/pull/42",
+      baseRefName: "main",
+      baseRefOid: BASE_HEAD,
+      headRefName: "fix/conflict",
+      headRefOid: HEAD,
+      headRepository: { nameWithOwner: "contributor/command-center" },
+    },
+    (input) => reviewRecord(markerFromPost(input)),
+  ]);
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+    clock: () => now,
+    timeoutMs: 60_000,
+    inputAuthorityVerifier: verifier,
+  });
+
+  assert.equal((await adapter.execute(workProposalEnvelope())).status, "applied");
+  assert.equal(credential.calls.acquire[0].deadline, 3_060_000);
+  assert.deepEqual(
+    runner.calls.map((call) => call.timeoutMs),
+    [55_000, 55_000, 55_000, 55_000, 55_000, 50_000],
+  );
+});
+
+test("Review leases release after already, stale, mismatch, timeout, and callback failure", async (t) => {
+  const marker = markerForGitHubAction(reviewEnvelope());
+  const cases = [
+    { name: "already", responses: [actor(), pages([reviewRecord(marker)])] },
+    { name: "actor mismatch", responses: [actor("other-owner")] },
+    { name: "target mismatch", responses: [actor(), pages([]), head(OTHER_HEAD)] },
+    {
+      name: "transport timeout",
+      responses: [new ManagedProcessError("PROCESS_TIMEOUT", "timed out")],
+    },
+    { name: "callback failure", responses: [new Error("callback failed")] },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const credential = recordingCredentialSource();
+      const adapter = createGitHubActionExecutor({
+        runner: new FakeRunner(entry.responses),
+        ghCommand: GH_COMMAND,
+        credentialSource: credential.source,
+      });
+
+      await adapter.reconcile(reviewEnvelope());
+
+      assert.equal(credential.calls.acquire.length, 1);
+      assert.equal(credential.calls.use, 1);
+      assert.equal(credential.calls.release, 1);
+    });
+  }
+});
+
+test("credential cleanup uncertainty blocks every Review consumer call", async () => {
+  const canary = "fictional_cleanup_canary_742";
+  const runner = new FakeRunner();
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: Object.freeze({
+      async acquire() {
+        throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
+      },
+    }),
+  });
+
+  const result = await adapter.execute(reviewEnvelope());
+
+  assert.deepEqual(result, {
+    status: "error",
+    error: { trust: "unknown", code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" },
+  });
+  assert.equal(runner.calls.length, 0);
+  assert.equal(JSON.stringify(result).includes(canary), false);
+});
+
+test("Review rejects a non-exact credential lease before use or GitHub calls", async () => {
+  let uses = 0;
+  let releases = 0;
+  const runner = new FakeRunner();
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: Object.freeze({
+      async acquire() {
+        return Object.freeze({
+          async use() { uses += 1; },
+          release() { releases += 1; },
+          token: "fictional_smuggled_token",
+        });
+      },
+    }),
+  });
+
+  const result = await adapter.execute(reviewEnvelope());
+
+  assert.deepEqual(result, {
+    status: "error",
+    error: { trust: "absent", code: "GITHUB_CREDENTIAL_OUTPUT_INVALID" },
+  });
+  assert.equal(uses, 0);
+  assert.equal(releases, 0);
+  assert.equal(runner.calls.length, 0);
+  assert.equal(JSON.stringify(result).includes("fictional_smuggled_token"), false);
 });
 
 test("reconciliation finds one exact COMMENT review marker across paginated results", async () => {
@@ -728,6 +1010,7 @@ test("a transport failure becomes unknown only after the GitHub POST starts", as
 });
 
 test("approval is required before a write and repeated approval does not write twice", async () => {
+  const credential = recordingCredentialSource(GH_TOKEN);
   const runner = new FakeRunner([
     actor(),
     pages([]),
@@ -741,7 +1024,9 @@ test("approval is required before a write and repeated approval does not write t
       });
     },
   ]);
-  const adapter = createAdapter(runner);
+  const adapter = createAdapter(runner, {
+    credentialSource: credential.source,
+  });
   let persisted = null;
   const store = {
     async read(_name, fallback) {
@@ -792,6 +1077,12 @@ test("approval is required before a write and repeated approval does not write t
     },
   });
   assert.equal(runner.calls.length, 0);
+  assert.equal(credential.calls.acquire.length, 0);
+
+  await queue.next();
+  await queue.list({ limit: 10 });
+  await queue.get(envelope.id);
+  assert.equal(credential.calls.acquire.length, 0);
 
   const next = await queue.next();
   const request = {
@@ -803,8 +1094,69 @@ test("approval is required before a write and repeated approval does not write t
   };
   const completed = await queue.approve(next.item.id, request);
   assert.equal(completed.status, "completed");
+  assert.equal(credential.calls.acquire.length, 1);
   assert.equal(runner.calls.filter((call) => call.args.includes("POST")).length, 1);
 
   await queue.approve(next.item.id, request);
+  assert.equal(credential.calls.acquire.length, 1);
   assert.equal(runner.calls.filter((call) => call.args.includes("POST")).length, 1);
+});
+
+test("pending and rejected confirmations never acquire a Review credential", async () => {
+  let acquisitions = 0;
+  let persisted = null;
+  const queue = new ConfirmationQueue({
+    store: {
+      async read(_name, fallback) {
+        return persisted === null ? structuredClone(fallback) : structuredClone(persisted);
+      },
+      async write(_name, value) { persisted = structuredClone(value); },
+    },
+    executor: {
+      async execute(envelope) {
+        acquisitions += 1;
+        return { status: "stale", envelope };
+      },
+      async reconcile(envelope) {
+        acquisitions += 1;
+        return { status: "stale", envelope };
+      },
+    },
+    operationQueue: new OperationQueue(),
+    exclusiveLease: { run: (operation) => operation() },
+  });
+  await queue.recover();
+  const envelope = reviewEnvelope({ id: "confirmation-review-reject-42" });
+  await queue.enqueue({
+    id: envelope.id,
+    kind: envelope.kind,
+    requestedBy: envelope.requestedBy,
+    actor: envelope.actor,
+    target: envelope.target,
+    action: envelope.action,
+    display: {
+      title: "Reject Review",
+      summary: "No credential may be acquired.",
+      actionLabel: "Reject",
+      evidence: [],
+      payload: {
+        actor: envelope.actor,
+        target: envelope.target,
+        action: envelope.action,
+      },
+    },
+  });
+  const pending = await queue.next();
+
+  await queue.list({ limit: 10 });
+  await queue.get(envelope.id);
+  await queue.reject(envelope.id, {
+    requestId: "request-reject-0001",
+    expectedQueueRevision: pending.queueRevision,
+    expectedItemRevision: pending.item.itemRevision,
+    displayedPayloadDigest: pending.item.displayedPayloadDigest,
+    approvalBindingDigest: pending.item.approvalBindingDigest,
+  });
+
+  assert.equal(acquisitions, 0);
 });

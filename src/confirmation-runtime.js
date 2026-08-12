@@ -1,4 +1,5 @@
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import { createGitHubActionExecutor } from "./adapters/github-action-adapter.js";
 import {
   PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS,
@@ -13,7 +14,6 @@ import { ConfirmationQueue } from "./services/confirmation-queue.js";
 
 const GUARD_NAME = "mydashboard-confirmation-queue-v1";
 const TOKEN_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
-const TOKEN_VALUE = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const NETWORK_ENV_KEYS = new Set([
@@ -129,32 +129,6 @@ function normalizeEnabledActions(value) {
     result.push(action);
   }
   return Object.freeze(result);
-}
-
-function githubCredentialProvider(dependencies, credentialMode, name) {
-  if (credentialMode === "gh-login") return () => null;
-  return () => {
-    let environment;
-    try {
-      const configuredEnvironment = dataProperty(dependencies, "env");
-      environment = configuredEnvironment === undefined
-        ? process.env
-        : configuredEnvironment;
-    } catch {
-      return null;
-    }
-    if (!environment || typeof environment !== "object") return null;
-    const descriptor = Object.getOwnPropertyDescriptor(environment, name);
-    if (
-      !descriptor ||
-      !("value" in descriptor) ||
-      typeof descriptor.value !== "string" ||
-      !TOKEN_VALUE.test(descriptor.value)
-    ) {
-      return null;
-    }
-    return { token: descriptor.value, environment };
-  };
 }
 
 function normalizeEnabledConfig(config) {
@@ -370,6 +344,26 @@ function runtimeInputAuthorityVerifier(dependencies) {
   );
 }
 
+function runtimeCredentialSource(enabledConfig, dependencies) {
+  if (!enabledConfig?.reviewEnabled) return null;
+  const source = dataProperty(dependencies, "credentialSource");
+  const keys = source === null ||
+    typeof source !== "object" ||
+    utilTypes.isProxy(source)
+    ? []
+    : Reflect.ownKeys(source);
+  if (
+    keys.length !== 1 ||
+    keys[0] !== "acquire" ||
+    !Object.isFrozen(source) ||
+    typeof Object.getOwnPropertyDescriptor(source, "acquire")?.value !==
+      "function"
+  ) {
+    throw new TypeError("credentialSource must be an exact frozen acquire port");
+  }
+  return source;
+}
+
 function fenceExecutor(kind, executor, admissionGate) {
   if (admissionGate === null || kind === CONFIGURATION_ACTIVATION_KIND) {
     return executor;
@@ -408,10 +402,18 @@ function reconcileOnlyExecutor(executor) {
   });
 }
 
-function closeOnce(guard) {
+function closeOnce(guard, githubExecutor) {
   let result;
   return () => {
-    if (!result) result = Promise.resolve().then(() => guard.close());
+    if (!result) {
+      result = Promise.resolve().then(async () => {
+        try {
+          await githubExecutor?.close?.();
+        } finally {
+          await guard.close();
+        }
+      });
+    }
     return result;
   };
 }
@@ -432,15 +434,12 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   const factories = validateDependencies(dependencies);
   const actionAdmissionGate = runtimeAdmissionGate(dependencies);
   const inputAuthorityVerifier = runtimeInputAuthorityVerifier(dependencies);
+  const credentialSource = runtimeCredentialSource(enabledConfig, dependencies);
   let githubExecutorOptions = null;
   if (enabledConfig?.reviewEnabled) {
     githubExecutorOptions = {
       ghCommand: enabledConfig.ghCommand,
-      credentialProvider: githubCredentialProvider(
-        dependencies,
-        enabledConfig.credentialMode,
-        enabledConfig.tokenEnv,
-      ),
+      credentialSource,
       networkEnv: enabledConfig.networkEnv,
       ...(inputAuthorityVerifier === null
         ? {}
@@ -501,7 +500,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     ["acquire", "run", "close"],
     "guard",
   );
-  const close = closeOnce(guard);
+  const close = closeOnce(guard, githubExecutor);
 
   try {
     const queueOptions = {
