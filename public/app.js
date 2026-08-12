@@ -96,6 +96,7 @@ let requestSequence = 0;
 let lastAppliedRequest = 0;
 let confirmationRequestSequence = 0;
 let lastAppliedConfirmationRequest = 0;
+let deferredConfirmationRestore = null;
 let confirmationQueueState = {
   available: false,
   source: null,
@@ -596,9 +597,11 @@ function confirmationPendingMarkup() {
 }
 
 function deferredConfirmationMarkup() {
-  if (deferredConfirmations.size === 0) return "";
+  const restore = deferredConfirmationRestore;
+  const count = restore ? restore.deferred.length : deferredConfirmations.size;
+  if (count === 0) return "";
   return `<div class="confirmation-deferred-controls">
-    <button class="secondary-button" id="confirmation-deferred-restore" type="button">重新查看稍后项（${deferredConfirmations.size}）</button>
+    <button class="secondary-button" id="confirmation-deferred-restore" type="button" ${restore ? 'disabled aria-busy="true"' : ""}>${restore ? `正在重新查看稍后项（${count}）…` : `重新查看稍后项（${count}）`}</button>
     <small>仅恢复本页会话中选择“稍后”的事项，不会批准或执行任何动作。</small>
   </div>`;
 }
@@ -4328,8 +4331,8 @@ function refreshLoadedConfirmationHistory(
 async function refreshConfirmationQueue({
   showConfirmation = true,
   renderView = true,
+  sequence = ++confirmationRequestSequence,
 } = {}) {
-  const sequence = ++confirmationRequestSequence;
   const nextState = await fetchConfirmationQueue();
   const applied = applyConfirmationQueue(nextState, sequence);
   if (applied && dashboard && renderView) render();
@@ -4339,19 +4342,39 @@ async function refreshConfirmationQueue({
 }
 
 async function restoreDeferredConfirmations() {
+  if (deferredConfirmationRestore !== null) return;
   const deferred = [...deferredConfirmations];
   if (deferred.length === 0) return;
+  const restore = {
+    sequence: ++confirmationRequestSequence,
+    deferred,
+  };
+  deferredConfirmationRestore = restore;
   deferredConfirmations.clear();
+  if (dashboard && currentView === "employees") render();
   try {
-    await refreshConfirmationQueue({ showConfirmation: false });
+    await refreshConfirmationQueue({
+      showConfirmation: false,
+      sequence: restore.sequence,
+    });
+    const superseded = lastAppliedConfirmationRequest > restore.sequence;
+    if (deferredConfirmationRestore === restore) {
+      deferredConfirmationRestore = null;
+      if (dashboard && currentView === "employees") render();
+    }
+    if (!superseded) queueMicrotask(showNextConfirmation);
   } catch (error) {
-    for (const key of deferred) rememberDeferredConfirmation(key);
-    if (dashboard && currentView === "employees") render();
-    statusBanner.hidden = false;
-    statusBanner.textContent = `${error.message}。稍后项仍保留，可再次尝试。`;
-    return;
+    const superseded = lastAppliedConfirmationRequest > restore.sequence;
+    if (!superseded) {
+      for (const key of restore.deferred) rememberDeferredConfirmation(key);
+      statusBanner.hidden = false;
+      statusBanner.textContent = `${error.message}。稍后项仍保留，可再次尝试。`;
+    }
+    if (deferredConfirmationRestore === restore) {
+      deferredConfirmationRestore = null;
+      if (dashboard && currentView === "employees") render();
+    }
   }
-  queueMicrotask(showNextConfirmation);
 }
 
 async function refreshAfterDeferral() {

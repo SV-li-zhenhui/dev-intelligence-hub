@@ -27,6 +27,7 @@ const CONFIRMATION_MEMORY_PAGE_LIMIT = 100;
 const PULL_REQUEST_MEMORY_KINDS = new Set([
   "github.pull-request-comment",
   "github.pull-request-review",
+  "github.work-proposal-review",
   "github.pull-request-update-branch",
   "github.pull-request-push",
   "github.pull-request-merge",

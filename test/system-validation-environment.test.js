@@ -95,3 +95,19 @@ test("validation children receive only allowlisted system values and empty profi
   await assert.rejects(access(directory), { code: "ENOENT" });
   await context.cleanup();
 });
+
+test("validation rejects ambiguous case-insensitive environment names", async (t) => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "validation-env-ambiguous-"));
+  t.after(() => rm(parent, { force: true, recursive: true }));
+
+  await assert.rejects(
+    prepareIsolatedValidationEnvironment({
+      temporaryRoot: parent,
+      sourceEnvironment: {
+        PATH: "C:\\trusted-tools",
+        Path: "C:\\host-controlled-tools",
+      },
+    }),
+    /ambiguous validation environment variable: PATH/u,
+  );
+});

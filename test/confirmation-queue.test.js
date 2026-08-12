@@ -815,6 +815,17 @@ test("confirmation memory pages are sanitized, high-water bound, and restart sta
     next.item.id,
     approvalRequest(next, "memory-page-approval"),
   );
+  const reviewBody = "Current Review must reach durable memory";
+  await queue.enqueue(pullRequestExternalActionQueuePlan({
+    type: "review",
+    verdict: "approve",
+    body: reviewBody,
+  }));
+  const reviewNext = await queue.next();
+  await queue.approve(
+    reviewNext.item.id,
+    approvalRequest(reviewNext, "memory-page-review-approval"),
+  );
 
   const first = await queue.readMemoryPage({
     cursor: 0,
@@ -825,13 +836,32 @@ test("confirmation memory pages are sanitized, high-water bound, and restart sta
     highWatermark: first.highWatermark,
   });
 
-  assert.equal(first.items.length, 1);
-  assert.equal(first.items[0].status, "completed");
-  assert.equal(first.items[0].action.type, "pull_request_comment");
-  assert.equal(first.items[0].action.inputBinding.schemaVersion, 2);
-  assert.match(first.items[0].action.bodyDigest, /^[a-f0-9]{64}$/u);
-  assert.equal(first.items[0].action.bodyBytes, Buffer.byteLength(secretBody));
-  assert.deepEqual(first.items[0].receipt, { id: "review-42" });
+  assert.equal(first.items.length, 2);
+  const byType = Object.fromEntries(
+    first.items.map((item) => [item.action.type, item]),
+  );
+  assert.equal(byType.pull_request_comment.status, "completed");
+  assert.equal(
+    byType.pull_request_comment.action.inputBinding.schemaVersion,
+    2,
+  );
+  assert.match(
+    byType.pull_request_comment.action.bodyDigest,
+    /^[a-f0-9]{64}$/u,
+  );
+  assert.equal(
+    byType.pull_request_comment.action.bodyBytes,
+    Buffer.byteLength(secretBody),
+  );
+  assert.deepEqual(byType.pull_request_comment.receipt, { id: "review-42" });
+  assert.equal(byType.pull_request_review.kind, "github.work-proposal-review");
+  assert.equal(byType.pull_request_review.status, "completed");
+  assert.equal(byType.pull_request_review.action.reviewEvent, "APPROVE");
+  assert.equal(
+    byType.pull_request_review.action.bodyBytes,
+    Buffer.byteLength(reviewBody),
+  );
+  assert.deepEqual(byType.pull_request_review.receipt, { id: "review-42" });
   const serialized = JSON.stringify(first);
   assert.equal(serialized.includes(secretBody), false);
   assert.equal(serialized.includes("C:\\private"), false);

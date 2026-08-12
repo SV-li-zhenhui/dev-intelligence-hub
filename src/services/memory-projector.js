@@ -47,6 +47,7 @@ const CONFIRMATION_STATUSES = new Set([
 const ACTION_BY_CONFIRMATION_KIND = Object.freeze({
   "github.pull-request-comment": "pull_request_comment",
   "github.pull-request-review": "pull_request_review",
+  "github.work-proposal-review": "pull_request_review",
   "github.pull-request-update-branch": "pull_request_update_branch",
   "github.pull-request-push": "pull_request_push",
   "github.pull-request-merge": "pull_request_merge",

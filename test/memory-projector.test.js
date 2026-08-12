@@ -247,6 +247,7 @@ function pullRequestWorkItem(binding, {
 function completedConfirmationMemoryItem(
   binding,
   {
+    type = "comment",
     body = "Safe review summary",
     revision = 2,
     updatedAt = "2026-08-08T07:01:00.000Z",
@@ -254,7 +255,9 @@ function completedConfirmationMemoryItem(
   } = {},
 ) {
   const plan = pullRequestExternalActionPlan(
-    { type: "comment", body },
+    type === "review"
+      ? { type, verdict: "approve", body }
+      : { type, body },
     { binding },
   );
   return {
@@ -277,6 +280,7 @@ function completedConfirmationMemoryItem(
       inputBinding: structuredClone(plan.action.inputBinding),
       bodyDigest: digestValue(body),
       bodyBytes: Buffer.byteLength(body, "utf8"),
+      ...(type === "review" ? { reviewEvent: plan.action.reviewEvent } : {}),
     },
     displayedPayloadDigest: plan.displayedPayloadDigest,
     approvalBindingDigest: plan.approvalBindingDigest,
@@ -589,6 +593,7 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
     receiptId: "opaque-old-receipt",
   });
   const newConfirmation = completedConfirmationMemoryItem(newBinding, {
+    type: "review",
     body: "new head review body",
     revision: 3,
     updatedAt: "2026-08-08T08:01:00.000Z",

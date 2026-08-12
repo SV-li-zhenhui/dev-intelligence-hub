@@ -14,6 +14,7 @@ let confirmationFixtureName = "active";
 let historyMutation = 0;
 let queueRevision = 1;
 let historyRequestCount = 0;
+let deferredRestoreRace = null;
 
 function json(response, status, value) {
   response.writeHead(status, {
@@ -203,6 +204,27 @@ function confirmationItem() {
   };
 }
 
+function attentionFixture() {
+  if (confirmationEnabled) {
+    return {
+      available: true,
+      source: "external_confirmation",
+      pendingCount: 1,
+      externalEnabled: true,
+      externalQueueRevision: queueRevision,
+      item: confirmationItem(),
+    };
+  }
+  return {
+    available: false,
+    source: null,
+    pendingCount: 0,
+    externalEnabled: true,
+    externalQueueRevision: queueRevision,
+    item: null,
+  };
+}
+
 function safeStaticPath(pathname) {
   const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
   const resolved = path.resolve(publicDirectory, relative);
@@ -250,26 +272,28 @@ function createFixtureServer() {
         json(response, 200, { ok: true });
         return;
       }
+      if (url.pathname === "/fixture/deferred-restore-race") {
+        deferredRestoreRace = { requests: 0, releaseOlder: null };
+        json(response, 200, { ok: true });
+        return;
+      }
       if (url.pathname === "/api/attention/next") {
-        if (confirmationEnabled) {
-          json(response, 200, {
-            available: true,
-            source: "external_confirmation",
-            pendingCount: 1,
-            externalEnabled: true,
-            externalQueueRevision: queueRevision,
-            item: confirmationItem(),
-          });
+        if (deferredRestoreRace !== null) {
+          deferredRestoreRace.requests += 1;
+          if (deferredRestoreRace.requests === 1) {
+            await new Promise((resolve) => {
+              deferredRestoreRace.releaseOlder = resolve;
+            });
+            json(response, 503, { error: "older restore failed" });
+            return;
+          }
+          const race = deferredRestoreRace;
+          deferredRestoreRace = null;
+          json(response, 200, attentionFixture());
+          setTimeout(() => race.releaseOlder(), 300);
           return;
         }
-        json(response, 200, {
-          available: false,
-          source: null,
-          pendingCount: 0,
-          externalEnabled: true,
-          externalQueueRevision: queueRevision,
-          item: null,
-        });
+        json(response, 200, attentionFixture());
         return;
       }
       if (
@@ -446,6 +470,33 @@ try {
       assert.match(
         await page.locator("#confirmation-dialog").textContent(),
         /Fixture PR 评论.*Fixture PR comment/s,
+      );
+      await page.getByRole("button", { name: "稍后再看" }).click();
+      await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+
+      await page.evaluate(() =>
+        fetch("/fixture/deferred-restore-race", { method: "POST" })
+      );
+      await page.locator("#confirmation-deferred-restore").click();
+      const newerQueueResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return url.pathname === "/api/attention/next" && response.status() === 200;
+      });
+      await page.locator("#refresh-button").dispatchEvent("click");
+      await newerQueueResponse;
+      assert.equal(
+        await page.locator("#confirmation-deferred-restore").isDisabled(),
+        true,
+      );
+      await page.locator("#confirmation-dialog[open]").waitFor();
+      await page.waitForTimeout(350);
+      assert.equal(
+        await page.locator("#confirmation-deferred-restore").count(),
+        0,
+      );
+      assert.doesNotMatch(
+        await page.locator("#status-banner").textContent(),
+        /稍后项仍保留/u,
       );
       await page.getByRole("button", { name: "稍后再看" }).click();
       await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
