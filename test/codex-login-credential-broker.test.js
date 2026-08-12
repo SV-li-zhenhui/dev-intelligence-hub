@@ -466,6 +466,38 @@ test("readStatus runs only a bounded no-model login probe and removes its tree",
   await current.broker.close();
 });
 
+test("simultaneous readStatus callers share one isolated login probe", async (t) => {
+  const probeStarted = deferred();
+  const releaseProbe = deferred();
+  let probes = 0;
+  const current = await fixture(t, {
+    store: {
+      async beginTask() { return Object.freeze(Object.create(null)); },
+      async stageTask() {},
+      async captureTask() {},
+      async stageProbe() {
+        probes += 1;
+        probeStarted.resolve();
+        await releaseProbe.promise;
+      },
+    },
+  });
+
+  const first = current.broker.readStatus({
+    signal: new AbortController().signal,
+  });
+  await probeStarted.promise;
+  const second = current.broker.readStatus({
+    signal: new AbortController().signal,
+  });
+  releaseProbe.resolve();
+
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results.map(({ state }) => state), ["available", "available"]);
+  assert.equal(probes, 1);
+  await current.broker.close();
+});
+
 test("readStatus accepts the exact Codex login status on stderr only", async (t) => {
   const current = await fixture(t, {
     processRunner: {

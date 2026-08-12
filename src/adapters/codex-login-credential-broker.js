@@ -611,6 +611,7 @@ function createBroker(rawOptions, rawDependencies) {
   const options = brokerOptions(rawOptions);
   const dependencies = brokerDependencies(rawDependencies);
   const queue = createAdmissionQueue();
+  let statusFlight = null;
 
   async function prepareProbeRoot(signal) {
     assertIsolatedProbeRoot(options.probeRoot, options.protectedRoots);
@@ -1114,7 +1115,7 @@ function createBroker(rawOptions, rawDependencies) {
     }
   }
 
-  async function readStatus(rawRequest = {}) {
+  async function executeStatusProbe(callerSignal) {
     let operation = null;
     let signal = null;
     let token = null;
@@ -1124,8 +1125,6 @@ function createBroker(rawOptions, rawDependencies) {
     let lifecycleSafe = true;
     let cleanupAllowed = true;
     try {
-      const request = exactRecord(rawRequest, [], ["signal"]);
-      const callerSignal = normalizeSignal(request.signal, { optional: true });
       operation = createOperationSignal(
         callerSignal,
         dependencies.operationTimeoutMs,
@@ -1178,6 +1177,94 @@ function createBroker(rawOptions, rawDependencies) {
     }
     if (failure !== null) throw failure;
     return statusProjection(state);
+  }
+
+  function beginStatusFlight() {
+    const controller = new AbortController();
+    const flight = {
+      controller,
+      subscribers: 0,
+      promise: null,
+    };
+    flight.promise = executeStatusProbe(controller.signal);
+    statusFlight = flight;
+    void flight.promise.then(
+      () => settleStatusFlight(flight),
+      () => settleStatusFlight(flight),
+    );
+    return flight;
+  }
+
+  function settleStatusFlight(flight) {
+    if (statusFlight === flight) statusFlight = null;
+  }
+
+  function subscribeToStatusFlight(flight, callerSignal) {
+    flight.subscribers += 1;
+    return new Promise((resolve, reject) => {
+      let cancelled = false;
+      let detached = false;
+      let settled = false;
+
+      const detach = () => {
+        if (detached) return;
+        detached = true;
+        flight.subscribers -= 1;
+        callerSignal?.removeEventListener("abort", cancel);
+      };
+      const finish = (operation, value) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        operation(value);
+      };
+      const cancel = () => {
+        if (settled || cancelled) return;
+        cancelled = true;
+        detach();
+        if (flight.subscribers > 0) {
+          finish(reject, brokerError("STRUCTURED_PROVIDER_CANCELLED"));
+          return;
+        }
+        if (statusFlight === flight) statusFlight = null;
+        flight.controller.abort();
+      };
+
+      callerSignal?.addEventListener("abort", cancel, { once: true });
+      flight.promise.then(
+        (value) => {
+          if (cancelled) {
+            finish(reject, brokerError("STRUCTURED_PROVIDER_CANCELLED"));
+          } else {
+            finish(resolve, value);
+          }
+        },
+        (error) => {
+          if (
+            cancelled &&
+            failureCode(error) !== "STRUCTURED_PROVIDER_CLEANUP_FAILED"
+          ) {
+            finish(reject, brokerError("STRUCTURED_PROVIDER_CANCELLED"));
+          } else {
+            finish(reject, error);
+          }
+        },
+      );
+      if (callerSignal?.aborted) cancel();
+    });
+  }
+
+  async function readStatus(rawRequest = {}) {
+    let callerSignal = null;
+    try {
+      const request = exactRecord(rawRequest, [], ["signal"]);
+      callerSignal = normalizeSignal(request.signal, { optional: true });
+      throwIfCancelled(callerSignal);
+    } catch (error) {
+      return statusProjection(statusStateFor(error, callerSignal));
+    }
+    const flight = statusFlight ?? beginStatusFlight();
+    return subscribeToStatusFlight(flight, callerSignal);
   }
 
   async function checkAvailability(rawRequest = {}) {
