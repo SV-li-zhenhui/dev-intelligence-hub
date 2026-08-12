@@ -1915,7 +1915,7 @@ export class MemoryProjector {
     const initial = normalizeMemoryAuthoritySnapshot(
       await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
     );
-    const confirmationSnapshot = this.#verifyInputAuthority === null
+    const confirmationPreflight = this.#verifyInputAuthority === null
       ? null
       : await readConfirmationMemorySnapshot(this.#readConfirmationPage);
     const graph = initial.graph;
@@ -1983,6 +1983,9 @@ export class MemoryProjector {
       graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
     });
     added += Number(workResult?.added) || 0;
+    const confirmationSnapshot = confirmationPreflight === null
+      ? null
+      : await readConfirmationMemorySnapshot(this.#readConfirmationPage);
     const authorityBound = await this.#projectAuthorityBoundRecords(
       finalSnapshot,
       confirmationSnapshot,

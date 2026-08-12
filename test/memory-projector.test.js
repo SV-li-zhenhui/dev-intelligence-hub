@@ -752,6 +752,77 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   assert.equal(values.get("unified-memory-records").records.length, beforeRestartCount);
 });
 
+test("memory projector captures confirmation authority after earlier projection work", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const item = pullRequestWorkItem(binding);
+  const confirmation = completedConfirmationMemoryItem(binding);
+  const graphSource = graphProjectionSource();
+  const { journal, store } = await localMemoryFixture();
+  let confirmationRevision = 1;
+  let releaseWorkProjection;
+  let reportWorkProjectionStarted;
+  const workProjectionStarted = new Promise((resolve) => {
+    reportWorkProjectionStarted = resolve;
+  });
+  const workProjectionRelease = new Promise((resolve) => {
+    releaseWorkProjection = resolve;
+  });
+  const lifecycle = {
+    appendAuthorityProjection: (value) =>
+      journal.appendAuthorityProjection(value),
+    appendProjectionRecords: (value) =>
+      journal.appendProjectionRecords(value),
+    async appendWorkItems(value) {
+      reportWorkProjectionStarted();
+      await workProjectionRelease;
+      return journal.appendWorkItems(value);
+    },
+    appendGraphEvents: (value) => journal.appendGraphEvents(value),
+    adoptGraphCheckpoint: (value) => journal.adoptGraphCheckpoint(value),
+  };
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: lifecycle,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
+    graphProjectionSource: graphSource,
+    confirmationProjectionSource: {
+      async readMemoryPage({ cursor, limit, highWatermark }) {
+        if (
+          highWatermark !== null &&
+          highWatermark !== confirmationRevision
+        ) {
+          throw new Error("confirmation source changed");
+        }
+        const items = [confirmation].slice(cursor, cursor + limit);
+        return structuredClone({
+          highWatermark: confirmationRevision,
+          cursor,
+          items,
+          nextCursor: null,
+        });
+      },
+    },
+    inputAuthorityVerifier: {
+      async verify(value) {
+        return structuredClone(value);
+      },
+    },
+    store,
+  });
+
+  const cycle = projector.runCycle();
+  await workProjectionStarted;
+  confirmationRevision = 2;
+  releaseWorkProjection();
+  const result = await cycle;
+
+  assert.equal(result.authorityBound.highWatermark, 2);
+  assert.equal(
+    journal.getAuthorityProjectionState().confirmationHighWatermark,
+    2,
+  );
+});
+
 test("authority verification runs once per distinct binding for a large projection cycle", async () => {
   const bindingFor = (number, marker) => pullRequestExternalActionBinding({
     repository: `acme/repo-${number}`,
