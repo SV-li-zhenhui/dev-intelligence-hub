@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { opendir } from "node:fs/promises";
+import { lstat, opendir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { types as utilTypes } from "node:util";
 
@@ -88,6 +88,128 @@ function validDirectoryIdentity(value) {
     path.isAbsolute(value.path) &&
     typeof value.device === "string" &&
     typeof value.inode === "string";
+}
+
+function cleanupFailedError() {
+  return githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
+}
+
+function sameDirectoryIdentity(identity, details) {
+  return details.isDirectory() &&
+    !details.isSymbolicLink() &&
+    details.dev.toString() === identity.device &&
+    details.ino.toString() === identity.inode;
+}
+
+async function trustedDirectoryIdentity(directory, platform) {
+  const before = await lstat(directory, { bigint: true });
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw cleanupFailedError();
+  }
+  const resolved = await realpath(directory);
+  if (canonicalPath(resolved, platform) !== canonicalPath(directory, platform)) {
+    throw cleanupFailedError();
+  }
+  const after = await lstat(resolved, { bigint: true });
+  const identity = Object.freeze({
+    path: resolved,
+    device: before.dev.toString(),
+    inode: before.ino.toString(),
+  });
+  if (!sameDirectoryIdentity(identity, after)) throw cleanupFailedError();
+  return identity;
+}
+
+async function verifyDirectoryIdentity(identity, platform) {
+  const current = await trustedDirectoryIdentity(identity.path, platform);
+  if (
+    current.device !== identity.device ||
+    current.inode !== identity.inode
+  ) {
+    throw cleanupFailedError();
+  }
+  return identity;
+}
+
+async function recoverDirectoryIdentity(
+  directory,
+  runtimeRootIdentity,
+  platform,
+) {
+  try {
+    await verifyDirectoryIdentity(runtimeRootIdentity, platform);
+    if (
+      canonicalPath(path.dirname(directory), platform) !==
+        canonicalPath(runtimeRootIdentity.path, platform)
+    ) {
+      throw cleanupFailedError();
+    }
+    const identity = await trustedDirectoryIdentity(directory, platform);
+    await verifyDirectoryIdentity(runtimeRootIdentity, platform);
+    return identity;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw cleanupFailedError();
+    try {
+      await verifyDirectoryIdentity(runtimeRootIdentity, platform);
+      return null;
+    } catch {
+      throw cleanupFailedError();
+    }
+  }
+}
+
+function createCleanupSignal(request, clock) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const remaining = request.deadline - clock();
+  request.signal?.addEventListener("abort", abort, { once: true });
+  let timer = null;
+  if (request.signal?.aborted || remaining <= 0) {
+    abort();
+  } else {
+    timer = setTimeout(
+      abort,
+      Math.min(remaining, CLEANUP_TIMEOUT_MS),
+    );
+    timer.unref?.();
+  }
+  return Object.freeze({
+    signal: controller.signal,
+    close() {
+      if (timer !== null) clearTimeout(timer);
+      request.signal?.removeEventListener("abort", abort);
+    },
+  });
+}
+
+async function prepareCleanupSession(
+  identity,
+  request,
+  clock,
+  prepareCleanupTrees,
+) {
+  const signalOwner = createCleanupSignal(request, clock);
+  try {
+    const session = await prepareCleanupTrees([identity], {
+      maximumEntries: 16,
+      maximumEntriesPerRoot: 16,
+      maximumDepth: 1,
+      maximumBytes: 64 * 1024,
+      signal: signalOwner.signal,
+    });
+    if (
+      session === null ||
+      typeof session !== "object" ||
+      typeof session.commit !== "function" ||
+      typeof session.close !== "function"
+    ) {
+      throw cleanupFailedError();
+    }
+    return Object.freeze({ session, signalOwner });
+  } catch {
+    signalOwner.close();
+    throw cleanupFailedError();
+  }
 }
 
 function validDescriptor(value, command) {
@@ -316,14 +438,24 @@ export class GhLoginCredentialSource {
     }
 
     let identity = null;
-    let cleanupSession = null;
+    let cleanup = null;
     let result;
     let failure = null;
+    let runtimeRootIdentity;
+    try {
+      runtimeRootIdentity = await trustedDirectoryIdentity(
+        this.#runtimeTemporaryRoot,
+        this.#platform,
+      );
+    } catch {
+      throw cleanupFailedError();
+    }
     try {
       identity = await this.#privateDirectoryManager.prepare({
         directory,
         signal: request.signal,
         validateLocation: async () => {
+          await verifyDirectoryIdentity(runtimeRootIdentity, this.#platform);
           if (
             path.dirname(directory) !== this.#runtimeTemporaryRoot ||
             isProtectedRoot(canonicalDirectory, this.#protectedRoots)
@@ -335,21 +467,12 @@ export class GhLoginCredentialSource {
       if (!validDirectoryIdentity(identity) || identity.path !== directory) {
         throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
       }
-      cleanupSession = await this.#prepareCleanupTrees([identity], {
-        maximumEntries: 16,
-        maximumEntriesPerRoot: 16,
-        maximumDepth: 1,
-        maximumBytes: 64 * 1024,
-        signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS),
-      });
-      if (
-        cleanupSession === null ||
-        typeof cleanupSession !== "object" ||
-        typeof cleanupSession.commit !== "function" ||
-        typeof cleanupSession.close !== "function"
-      ) {
-        throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
-      }
+      cleanup = await prepareCleanupSession(
+        identity,
+        request,
+        this.#clock,
+        this.#prepareCleanupTrees,
+      );
       await assertEmptyDirectory(directory);
       if (request.signal?.aborted) {
         throw githubCredentialSourceError("GITHUB_CREDENTIAL_CANCELLED");
@@ -379,21 +502,40 @@ export class GhLoginCredentialSource {
       failure = error instanceof Error && error.name === "GitHubCredentialSourceError"
         ? error
         : mapFailure(error, request, this.#clock);
+      if (identity === null) {
+        try {
+          identity = await recoverDirectoryIdentity(
+            directory,
+            runtimeRootIdentity,
+            this.#platform,
+          );
+          if (identity !== null) {
+            cleanup = await prepareCleanupSession(
+              identity,
+              request,
+              this.#clock,
+              this.#prepareCleanupTrees,
+            );
+          }
+        } catch {
+          throw cleanupFailedError();
+        }
+      }
     }
 
     if (identity !== null) {
       try {
-        if (cleanupSession === null) {
-          throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
-        }
-        await cleanupSession.commit();
+        if (cleanup === null) throw cleanupFailedError();
+        await cleanup.session.commit();
       } catch {
         try {
-          await cleanupSession?.close?.();
+          await cleanup?.session.close();
         } catch {
           // Cleanup uncertainty is reported by the stable error below.
         }
-        throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
+        throw cleanupFailedError();
+      } finally {
+        cleanup?.signalOwner.close();
       }
     }
     if (failure !== null) throw failure;

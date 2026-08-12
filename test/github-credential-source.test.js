@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   lstat,
   mkdir,
@@ -18,11 +19,29 @@ import {
   TokenEnvCredentialSource,
 } from "../src/adapters/token-env-credential-source.js";
 import {
+  pinGitHubCliDescriptor,
+} from "../src/lib/known-cli-locator.js";
+import {
   createCredentialLease,
 } from "../src/lib/github-credential-source.js";
+import {
+  prepareCleanupTreesByIdentity,
+  PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
+} from "../src/lib/private-directory-manager.js";
+import {
+  SupervisedProcessRunner,
+} from "../src/lib/supervised-process-runner.js";
 
 const TOKEN = "ghp_fictionalCredentialValue123456789";
 const ACTOR = "owner-login";
+const OFFLINE_GH_SOURCE = path.join(
+  import.meta.dirname,
+  "fixtures",
+  "offline-gh-token.cs",
+);
+const WINDOWS_PRODUCTION_SKIP = process.platform === "win32" && process.arch === "x64"
+  ? false
+  : "production credential supervision is Windows x64 only";
 
 function failure(code, privateDetail = "private failure detail") {
   return Object.assign(new Error(privateDetail), { code });
@@ -51,6 +70,91 @@ async function assertEmptyDirectory(directory) {
   } finally {
     await handle.close();
   }
+}
+
+function setWindowsDirectoryAcl(directory) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const executable = path.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $target = [Text.Encoding]::UTF8.GetString(
+      [Convert]::FromBase64String($env:MYDASHBOARD_TEST_ACL_PATH)
+    )
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sddl = ('O:{0}G:{0}D:P' -f $sid) +
+      ('(A;OICI;FA;;;{0})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' -f $sid)
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $sections = [Security.AccessControl.AccessControlSections]::Access -bor
+      [Security.AccessControl.AccessControlSections]::Owner -bor
+      [Security.AccessControl.AccessControlSections]::Group
+    $security.SetSecurityDescriptorSddlForm($sddl, $sections)
+    [System.IO.Directory]::SetAccessControl($target, $security)
+  `;
+  const result = spawnSync(
+    executable,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      timeout: 30_000,
+      windowsHide: true,
+      env: {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        MYDASHBOARD_TEST_ACL_PATH: Buffer.from(directory, "utf8").toString("base64"),
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+}
+
+function compileOfflineGitHubCli(output) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const executable = path.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const result = spawnSync(
+    executable,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Add-Type -Path $env:MYDASHBOARD_FIXTURE_SOURCE " +
+        "-OutputAssembly $env:MYDASHBOARD_FIXTURE_OUTPUT " +
+        "-OutputType ConsoleApplication",
+    ],
+    {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      timeout: 30_000,
+      windowsHide: true,
+      env: {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        MYDASHBOARD_FIXTURE_SOURCE: OFFLINE_GH_SOURCE,
+        MYDASHBOARD_FIXTURE_OUTPUT: output,
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+}
+
+async function waitForAbort(signal) {
+  if (signal.aborted) return;
+  await new Promise((resolve) => {
+    signal.addEventListener("abort", resolve, { once: true });
+  });
 }
 
 async function fixture(t, overrides = {}) {
@@ -488,6 +592,165 @@ test("gh-login uses the caller's remaining total deadline", async (t) => {
   );
   assert.equal(current.calls.run[0].timeoutMs, 5_000);
   assert.equal(current.calls.cleanup.length, 1);
+});
+
+test("gh-login recovers and cleans a directory when prepare fails after creation", async (t) => {
+  let createdDirectory = null;
+  const current = await fixture(t, {
+    privateDirectoryManager: {
+      async prepare({ directory, validateLocation }) {
+        await validateLocation();
+        await mkdir(directory);
+        createdDirectory = directory;
+        await validateLocation();
+        throw failure("STRUCTURED_PROVIDER_UNAVAILABLE");
+      },
+    },
+  });
+
+  await assert.rejects(
+    acquire(current.source),
+    { code: "GITHUB_CLI_UNAVAILABLE" },
+  );
+  assert.equal(current.calls.run.length, 0);
+  assert.equal(current.calls.cleanup.length, 1);
+  await assert.rejects(lstat(createdDirectory), { code: "ENOENT" });
+});
+
+test("gh-login gives unproven cleanup precedence after prepare cancellation", async (t) => {
+  const controller = new AbortController();
+  const current = await fixture(t, {
+    privateDirectoryManager: {
+      async prepare({ directory, validateLocation }) {
+        await validateLocation();
+        await mkdir(directory);
+        controller.abort(new Error(`${TOKEN}-caller-reason`));
+        throw failure("ABORT_ERR", TOKEN);
+      },
+    },
+    async prepareCleanupTrees() {
+      throw failure("PRIVATE_CLEANUP_FAILURE", TOKEN);
+    },
+  });
+
+  await assert.rejects(
+    acquire(current.source, { signal: controller.signal }),
+    (error) => error?.code === "GITHUB_CREDENTIAL_CLEANUP_FAILED" &&
+      !error.message.includes(TOKEN) &&
+      !JSON.stringify(error).includes(TOKEN),
+  );
+  assert.equal(current.calls.run.length, 0);
+});
+
+test("gh-login caller cancellation bounds blocked cleanup preparation", async (t) => {
+  const controller = new AbortController();
+  const current = await fixture(t, {
+    clock: () => Date.now(),
+    async prepareCleanupTrees(_roots, { signal }) {
+      await waitForAbort(signal);
+      throw failure("PRIVATE_CLEANUP_PREPARATION_ABORTED", TOKEN);
+    },
+  });
+  const startedAt = Date.now();
+  const cancellation = setTimeout(
+    () => controller.abort(new Error(`${TOKEN}-caller-reason`)),
+    25,
+  );
+  try {
+    await assert.rejects(
+      acquire(current.source, {
+        signal: controller.signal,
+        deadline: Date.now() + 10_000,
+      }),
+      { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" },
+    );
+  } finally {
+    clearTimeout(cancellation);
+  }
+  assert.ok(Date.now() - startedAt < 1_000);
+  assert.equal(current.calls.run.length, 0);
+});
+
+test("gh-login shared deadline bounds blocked cleanup preparation", async (t) => {
+  const current = await fixture(t, {
+    clock: () => Date.now(),
+    async prepareCleanupTrees(_roots, { signal }) {
+      await waitForAbort(signal);
+      throw failure("PRIVATE_CLEANUP_PREPARATION_ABORTED", TOKEN);
+    },
+  });
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    acquire(current.source, { deadline: Date.now() + 50 }),
+    { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" },
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
+  assert.equal(current.calls.run.length, 0);
+});
+
+test("gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure", {
+  skip: WINDOWS_PRODUCTION_SKIP,
+}, async (t) => {
+  const parent = await temporaryDirectory(t, "github-credential-production-");
+  const runtimeTemporaryRoot = path.join(parent, "private-runtime-temp");
+  const ghCommand = path.join(parent, "gh.exe");
+  await mkdir(runtimeTemporaryRoot);
+  setWindowsDirectoryAcl(runtimeTemporaryRoot);
+  compileOfflineGitHubCli(ghCommand);
+
+  const supervisedRunner = new SupervisedProcessRunner();
+  let failAfterCreate = false;
+  let uuidSequence = 0;
+  const source = await createTestGhLoginCredentialSource({
+    actorAccountId: ACTOR,
+    ghCommand,
+    runtimeTemporaryRoot,
+    protectedRoots: [path.resolve(".")],
+  }, {
+    platform: process.platform,
+    environment: Object.fromEntries(
+      ["SystemRoot", "WINDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA"]
+        .flatMap((name) => typeof process.env[name] === "string"
+          ? [[name, process.env[name]]]
+          : []),
+    ),
+    clock: () => Date.now(),
+    randomUUID: () => {
+      uuidSequence += 1;
+      return `00000000-0000-4000-8000-${String(uuidSequence).padStart(12, "0")}`;
+    },
+    executablePinner: pinGitHubCliDescriptor,
+    processRunner: Object.freeze({
+      run: supervisedRunner.run.bind(supervisedRunner),
+    }),
+    privateDirectoryManager: Object.freeze({
+      async prepare(options) {
+        const identity = await PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare(options);
+        if (failAfterCreate) throw failure("STRUCTURED_PROVIDER_UNAVAILABLE");
+        return identity;
+      },
+    }),
+    prepareCleanupTrees: prepareCleanupTreesByIdentity,
+  });
+
+  const controller = new AbortController();
+  const lease = await acquire(source, {
+    signal: controller.signal,
+    deadline: Date.now() + 30_000,
+  });
+  assert.equal(await lease.use((token) => token), TOKEN);
+  await assertEmptyDirectory(runtimeTemporaryRoot);
+
+  failAfterCreate = true;
+  await assert.rejects(
+    acquire(source, {
+      signal: controller.signal,
+      deadline: Date.now() + 30_000,
+    }),
+    { code: "GITHUB_CLI_UNAVAILABLE" },
+  );
+  await assertEmptyDirectory(runtimeTemporaryRoot);
 });
 
 test("gh-login cancellation and cleanup uncertainty fail closed", async (t) => {
