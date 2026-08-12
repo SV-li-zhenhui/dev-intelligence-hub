@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  chmod,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -18,6 +20,7 @@ import {
   createTestKnownCliLocator,
   KnownCliLocator,
   materializeVerifiedCliDescriptor,
+  pinGitHubCliDescriptor,
 } from "../src/lib/known-cli-locator.js";
 
 async function temporaryDirectory(t, prefix) {
@@ -34,6 +37,11 @@ async function writeJson(file, value) {
 async function regularFile(file) {
   await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, "fixture", "utf8");
+}
+
+async function nativeExecutable(file) {
+  await regularFile(file);
+  await chmod(file, 0o755);
 }
 
 async function npmCliLayout(root, kind) {
@@ -385,6 +393,65 @@ test("verified descriptors rehash same-size replacements with restored metadata"
   await writeFile(layout.executable, "changed", "utf8");
   await utimes(layout.executable, fixedTime, fixedTime);
 
+  await assert.rejects(
+    materializeVerifiedCliDescriptor(descriptor),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+});
+
+test("pinned GitHub CLI descriptors accept only the fixed native executable identity", async (t) => {
+  const directory = await temporaryDirectory(t, "known-gh-cli-");
+  const filename = process.platform === "win32" ? "gh.exe" : "gh";
+  const executable = path.join(directory, filename);
+  await nativeExecutable(executable);
+
+  const descriptor = await pinGitHubCliDescriptor(executable);
+  assert.deepEqual(descriptor, { command: executable, prefixArgs: [] });
+  assert.match(
+    (await materializeVerifiedCliDescriptor(descriptor)).sha256,
+    /^[a-f0-9]{64}$/,
+  );
+
+  await assert.rejects(
+    pinGitHubCliDescriptor(path.join(directory, "gh-wrapper.exe")),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+  await assert.rejects(
+    pinGitHubCliDescriptor(filename),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+});
+
+test("pinned GitHub CLI descriptors reject links, aliases, and replacement", async (t) => {
+  const directory = await temporaryDirectory(t, "known-gh-cli-identity-");
+  const filename = process.platform === "win32" ? "gh.exe" : "gh";
+  const executable = path.join(directory, filename);
+  await nativeExecutable(executable);
+  const descriptor = await pinGitHubCliDescriptor(executable);
+
+  const alias = path.join(directory, `alias-${filename}`);
+  await link(executable, alias);
+  await assert.rejects(
+    materializeVerifiedCliDescriptor(descriptor),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+  await rm(alias);
+
+  const targetDirectory = path.join(directory, "target");
+  const linkedDirectory = path.join(directory, "linked");
+  await mkdir(targetDirectory);
+  await nativeExecutable(path.join(targetDirectory, filename));
+  await symlink(
+    targetDirectory,
+    linkedDirectory,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await assert.rejects(
+    pinGitHubCliDescriptor(path.join(linkedDirectory, filename)),
+    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  );
+
+  await writeFile(executable, "replaced", "utf8");
   await assert.rejects(
     materializeVerifiedCliDescriptor(descriptor),
     { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },

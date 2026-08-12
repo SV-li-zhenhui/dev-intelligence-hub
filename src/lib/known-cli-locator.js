@@ -173,12 +173,21 @@ async function readBoundedRegularFile(
 async function trustedFileIdentity(
   file,
   platform,
-  { executable = false, digest = true, signal = null } = {},
+  {
+    executable = false,
+    digest = true,
+    signal = null,
+    singleLink = false,
+  } = {},
 ) {
   try {
     throwIfAborted(signal);
     const before = await lstat(file, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink()) return null;
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      (singleLink && before.nlink !== 1n)
+    ) return null;
     if (before.size > MAX_EXECUTABLE_BYTES) return null;
     if (executable && platform !== "win32" && (before.mode & 0o111n) === 0n) {
       return null;
@@ -202,6 +211,7 @@ async function trustedFileIdentity(
     if (
       !after.isFile() ||
       after.isSymbolicLink() ||
+      (singleLink && after.nlink !== 1n) ||
       before.dev !== after.dev ||
       before.ino !== after.ino ||
       before.size !== after.size ||
@@ -293,7 +303,7 @@ function supportsTarget(value, target) {
   );
 }
 
-function frozenDescriptor(identity, platform) {
+function frozenDescriptor(identity, platform, { singleLink = false } = {}) {
   const descriptor = Object.freeze({
     command: identity.command,
     prefixArgs: Object.freeze([]),
@@ -303,6 +313,7 @@ function frozenDescriptor(identity, platform) {
     platform,
     command: identity.command,
     prefixArgs: Object.freeze([]),
+    singleLink,
   }));
   return descriptor;
 }
@@ -318,7 +329,12 @@ export async function materializeVerifiedCliDescriptor(
   const current = await trustedFileIdentity(
     verified.command,
     verified.platform,
-    { executable: true, digest: true, signal },
+    {
+      executable: true,
+      digest: true,
+      signal,
+      singleLink: verified.singleLink,
+    },
   );
   if (!sameFileIdentity(verified.identity, current, { includeDigest: true })) {
     throw unavailableError();
@@ -328,6 +344,31 @@ export async function materializeVerifiedCliDescriptor(
     prefixArgs: Object.freeze([...verified.prefixArgs]),
     sha256: verified.identity.sha256,
   });
+}
+
+export async function pinGitHubCliDescriptor(
+  command,
+  { signal = null } = {},
+) {
+  const platform = process.platform;
+  const expectedName = platform === "win32" ? "gh.exe" : "gh";
+  if (
+    typeof command !== "string" ||
+    !path.isAbsolute(command) ||
+    command.includes("\0") ||
+    path.basename(command).toLowerCase() !== expectedName
+  ) {
+    throw unavailableError();
+  }
+  const normalizedCommand = path.resolve(command);
+  const identity = await trustedFileIdentity(normalizedCommand, platform, {
+    executable: true,
+    digest: true,
+    signal,
+    singleLink: true,
+  });
+  if (!identity) throw unavailableError();
+  return frozenDescriptor(identity, platform, { singleLink: true });
 }
 
 export class KnownCliLocator {
