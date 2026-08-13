@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   chmod,
@@ -20,6 +20,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { createApplicationWriterLease } from "../src/lib/application-writer-lease.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const powershell = process.platform === "win32"
@@ -55,6 +57,9 @@ const READINESS_PRIVATE_MARKERS = Object.freeze({
 });
 const READINESS_SAFE_MESSAGE =
   "MyDashboard is running but readiness could not be confirmed safely.";
+const PRESERVED_RECOVERY_SNAPSHOT_ID =
+  "shutdown-failure-20260813-191305-ebe114efc20d42ac99e6fc0cc0c99b8f";
+const RECOVERY_SNAPSHOT_CREATED_AT = "2026-08-13T19:13:05.000Z";
 
 async function copyWritableFixtureFile(source, destination) {
   await copyFile(source, destination);
@@ -337,8 +342,131 @@ async function assertPortUnavailable(port) {
   }));
 }
 
+function recoveryManifestPath(fixture) {
+  return path.join(fixture.snapshotDirectory, "manifest.json");
+}
+
+async function rewriteRecoveryManifest(fixture, transform) {
+  const manifestPath = recoveryManifestPath(fixture);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const transformed = transform(structuredClone(manifest));
+  await writeFile(manifestPath, `${JSON.stringify(transformed)}\n`, "utf8");
+}
+
+async function rewriteFixtureManager(root, find, replace) {
+  const managerPath = path.join(root, "scripts", "Manage-MyDashboard.ps1");
+  const source = await readFile(managerPath, "utf8");
+  const changed = source.replace(find, replace);
+  assert.notEqual(changed, source, "fixture manager mutation must match production source");
+  await writeFile(managerPath, changed, "utf8");
+}
+
+function controlPayload(state) {
+  return [
+    "control-v1",
+    String(state.processId),
+    state.instanceId,
+    state.startIdentity,
+    state.processStartTimeUtcTicks,
+    String(state.port),
+    state.projectDigest,
+  ].join("\n");
+}
+
+function receiptPayload(receipt) {
+  return [
+    "receipt-v1",
+    receipt.phase,
+    receipt.status,
+    String(receipt.processId),
+    receipt.instanceId,
+    receipt.startIdentity,
+    receipt.atUnixMilliseconds,
+    receipt.errorCode || "",
+  ].join("\n");
+}
+
+function signFixtureDocument(token, payload) {
+  return createHmac("sha256", Buffer.from(token, "base64"))
+    .update(payload, "utf8")
+    .digest("base64");
+}
+
+async function writeSignedControl(fixture, mutate) {
+  const state = mutate(structuredClone(fixture.state));
+  state.controlHmac = signFixtureDocument(state.controlToken, controlPayload(state));
+  await writeFile(fixture.controlPath, `${JSON.stringify(state)}\n`, "utf8");
+  return state;
+}
+
+async function writeSignedReceipt(fixture, phase, mutate) {
+  const target = phase === "requested" ? fixture.requestedPath : fixture.terminalPath;
+  const receipt = mutate(JSON.parse(await readFile(target, "utf8")));
+  receipt.hmac = signFixtureDocument(fixture.state.controlToken, receiptPayload(receipt));
+  await writeFile(target, `${JSON.stringify(receipt)}\n`, "utf8");
+  return receipt;
+}
+
+function fixtureProcessStartTicks(processId) {
+  const inspected = spawnSync(
+    powershell,
+    [
+      "-NoProfile",
+      "-Command",
+      `(Get-Process -Id ${processId} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
+    ],
+    { encoding: "utf8", timeout: 10_000, windowsHide: true },
+  );
+  assert.equal(inspected.status, 0, `${inspected.stderr}\n${inspected.stdout}`);
+  assert.match(inspected.stdout.trim(), /^[1-9][0-9]{16,18}$/u);
+  return inspected.stdout.trim();
+}
+
+function invokeRecovery(fixture, snapshotId = fixture.snapshotId) {
+  return invokeManager(
+    fixture.root,
+    "RecoverFailedShutdown",
+    10,
+    powershell,
+    ["-RecoverySnapshotId", snapshotId],
+  );
+}
+
+async function assertRecoveryRejectedBeforeKill(fixture, result) {
+  assert.notEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+  assert.equal(await fileExists(fixture.controlPath), true);
+}
+
+async function replaceFixtureFileWithSymlinkOrSkip(
+  t,
+  linkPath,
+  targetPath,
+) {
+  const original = await readFile(linkPath);
+  await writeFile(targetPath, original);
+  await unlink(linkPath);
+  try {
+    await symlink(targetPath, linkPath, "file");
+    return true;
+  } catch (error) {
+    await unlink(linkPath).catch((cleanupError) => {
+      if (cleanupError?.code !== "ENOENT") throw cleanupError;
+    });
+    await writeFile(linkPath, original);
+    if (
+      process.platform === "win32"
+      && ["EACCES", "EPERM"].includes(error?.code)
+    ) {
+      t.skip(`Windows denied fixture file-symlink creation (${error.code})`);
+      return false;
+    }
+    throw error;
+  }
+}
+
 async function createRecoverySnapshot(root, runtime) {
-  const snapshotId = `snapshot-${randomBytes(16).toString("hex")}`;
+  const snapshotId = PRESERVED_RECOVERY_SNAPSHOT_ID;
   const activeData = path.join(root, "data");
   const snapshotRoot = path.join(runtime.runtimeDirectory, "recovery-snapshots");
   const snapshotDirectory = path.join(snapshotRoot, snapshotId);
@@ -356,6 +484,7 @@ async function createRecoverySnapshot(root, runtime) {
     path.join(snapshotDirectory, "manifest.json"),
     `${JSON.stringify({
       schemaVersion: 1,
+      createdAt: RECOVERY_SNAPSHOT_CREATED_AT,
       reason: "managed_shutdown_lifecycle_failure",
       sourceDirectory: activeData,
       consistent: true,
@@ -373,6 +502,7 @@ async function createFixture(
   {
     shutdownExitCode = 0,
     holdWriterLeaseAfterFailedShutdown = false,
+    spawnDescendantAfterFailedShutdown = false,
     claimMode = "normal",
     listenDelayMilliseconds = 0,
     readinessMode = "ready",
@@ -405,7 +535,8 @@ async function createFixture(
   await writeFile(path.join(root, "config.json"), `${JSON.stringify({ port })}\n`);
   await writeFile(
     path.join(root, "src", "server.js"),
-    `import { createHmac, timingSafeEqual } from "node:crypto";
+    `import { spawn } from "node:child_process";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
@@ -590,6 +721,17 @@ const server = http.createServer((request, response) => {
           ${shutdownExitCode} === 0 ? "success" : "failure",
           ${shutdownExitCode} === 0 ? null : "LIFECYCLE_FAILURE",
         );
+        if (${JSON.stringify(spawnDescendantAfterFailedShutdown)} && ${shutdownExitCode} !== 0) {
+          const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          writeFileSync(
+            path.join(environment.MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY, "fixture-descendant-started.marker"),
+            JSON.stringify({ processId: descendant.pid }),
+            { encoding: "utf8", flag: "w", mode: 0o600 },
+          );
+        }
       }
       process.exitCode = ${shutdownExitCode};
       server.close();
@@ -676,10 +818,126 @@ setTimeout(() => {
     } catch {
       // No fixture-owned listener remains.
     }
+    for (const markerName of [
+      "fixture-child-started.marker",
+      "fixture-descendant-started.marker",
+    ]) {
+      try {
+        const marker = JSON.parse(await readFile(
+          path.join(runtime.runtimeDirectory, markerName),
+          "utf8",
+        ));
+        if (Number.isInteger(marker.processId) && marker.processId > 0) {
+          process.kill(marker.processId);
+          await waitForProcessExit(marker.processId, 5_000);
+        }
+      } catch {
+        // The exact fixture-owned process already exited or was never created.
+      }
+    }
     await removeFixtureTree(runtime.runtimeDirectory);
     await removeFixtureTree(root);
   });
   return { root, port };
+}
+
+async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
+  const { root, port } = await createFixture(t, {
+    shutdownExitCode: 1,
+    holdWriterLeaseAfterFailedShutdown: true,
+    ...fixtureOptions,
+  });
+  const runtime = readRuntimeInfo(root);
+  const controlPath = path.join(runtime.runtimeDirectory, "mydashboard-server-process.json");
+  const started = invokeManager(root, "Start");
+  assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+  const controlText = await readFile(controlPath, "utf8");
+  const state = JSON.parse(controlText);
+  const stopped = invokeManager(root, "Stop");
+  assert.notEqual(stopped.status, 0);
+  assert.match(`${stopped.stderr}\n${stopped.stdout}`, /shutdown failure/u);
+  await assertPortUnavailable(port);
+  assert.doesNotThrow(() => process.kill(state.processId, 0));
+  if (fixtureOptions.spawnDescendantAfterFailedShutdown) {
+    await waitForPath(path.join(
+      runtime.runtimeDirectory,
+      "fixture-descendant-started.marker",
+    ));
+  }
+  const requestedPath = path.join(
+    runtime.runtimeDirectory,
+    `mydashboard-shutdown-${state.instanceId}-requested.json`,
+  );
+  const terminalPath = path.join(
+    runtime.runtimeDirectory,
+    `mydashboard-shutdown-${state.instanceId}-terminal.json`,
+  );
+  const requestedText = await readFile(requestedPath, "utf8");
+  const terminalText = await readFile(terminalPath, "utf8");
+  const snapshot = await createRecoverySnapshot(root, runtime);
+  return {
+    root,
+    port,
+    runtime,
+    controlPath,
+    controlText,
+    state,
+    requestedPath,
+    requestedText,
+    terminalPath,
+    terminalText,
+    ...snapshot,
+  };
+}
+
+async function restoreFixtureManager(root) {
+  await copyWritableFixtureFile(
+    path.join(projectRoot, "scripts", "Manage-MyDashboard.ps1"),
+    path.join(root, "scripts", "Manage-MyDashboard.ps1"),
+  );
+}
+
+async function onlyRecoveryIncident(fixture) {
+  const directory = path.join(fixture.runtime.runtimeDirectory, "incidents");
+  const names = await readdir(directory);
+  assert.equal(names.length, 1, `expected one recovery incident, found ${names.join(", ")}`);
+  return {
+    id: names[0],
+    directory: path.join(directory, names[0]),
+    recordPath: path.join(directory, names[0], "incident.json"),
+  };
+}
+
+async function interruptRecoveryAfterExactExit(fixture) {
+  await rewriteFixtureManager(
+    fixture.root,
+    /(\s*Wait-ForExactProcessExit -State [$]evidence[.]State\r?\n)/u,
+    '$1    throw "fixture interruption after exact process exit"\n',
+  );
+  const interrupted = invokeRecovery(fixture);
+  assert.notEqual(interrupted.status, 0, `${interrupted.stderr}\n${interrupted.stdout}`);
+  assert.match(`${interrupted.stderr}\n${interrupted.stdout}`, /fixture interruption/u);
+  await waitForProcessExit(fixture.state.processId);
+  assert.equal(await fileExists(fixture.controlPath), true);
+  return onlyRecoveryIncident(fixture);
+}
+
+async function assertOrdinaryLifecycleBlocked(fixture) {
+  for (const action of ["Start", "Restart"]) {
+    const result = invokeManager(fixture.root, action);
+    assert.notEqual(result.status, 0, `${action} unexpectedly succeeded:\n${result.stderr}\n${result.stdout}`);
+    assert.equal(await fileExists(fixture.controlPath), true);
+  }
+}
+
+async function assertRecoveryCompleted(fixture, result) {
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  assert.match(result.stdout, /remains stopped/u);
+  await waitForProcessExit(fixture.state.processId);
+  assert.equal(await fileExists(fixture.controlPath), false);
+  assert.equal(await fileExists(fixture.requestedPath), false);
+  assert.equal(await fileExists(fixture.terminalPath), false);
+  await assertPortUnavailable(fixture.port);
 }
 
 async function createRealServerFixture(t) {
@@ -809,6 +1067,24 @@ test(
     );
     await assertPortUnavailable(port);
     await assert.rejects(readFile(controlPath, "utf8"), { code: "ENOENT" });
+  },
+);
+
+test(
+  "RecoverySnapshotId is rejected for other actions even when explicitly empty",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const { root } = await createFixture(t);
+    const rejected = invokeManager(
+      root,
+      "Status",
+      5,
+      powershell,
+      ["-RecoverySnapshotId", ""],
+    );
+
+    assert.notEqual(rejected.status, 0);
+    assert.match(`${rejected.stderr}\n${rejected.stdout}`, /valid only/u);
   },
 );
 
@@ -1612,6 +1888,812 @@ test(
   },
 );
 
+for (const { label, mutate } of [
+  {
+    label: "string schemaVersion",
+    mutate(manifest) { manifest.schemaVersion = "1"; return manifest; },
+  },
+  {
+    label: "missing createdAt",
+    mutate(manifest) { delete manifest.createdAt; return manifest; },
+  },
+  {
+    label: "non-string createdAt",
+    mutate(manifest) { manifest.createdAt = 1; return manifest; },
+  },
+  {
+    label: "empty createdAt",
+    mutate(manifest) { manifest.createdAt = ""; return manifest; },
+  },
+  {
+    label: "oversized createdAt",
+    mutate(manifest) { manifest.createdAt = "x".repeat(65); return manifest; },
+  },
+  {
+    label: "non-string reason",
+    mutate(manifest) { manifest.reason = [manifest.reason]; return manifest; },
+  },
+  {
+    label: "non-string sourceDirectory",
+    mutate(manifest) { manifest.sourceDirectory = [manifest.sourceDirectory]; return manifest; },
+  },
+  {
+    label: "numeric consistent flag",
+    mutate(manifest) { manifest.consistent = 1; return manifest; },
+  },
+  {
+    label: "string fileCount",
+    mutate(manifest) { manifest.fileCount = "1"; return manifest; },
+  },
+  {
+    label: "fractional fileCount",
+    mutate(manifest) { manifest.fileCount = 1.5; return manifest; },
+  },
+  {
+    label: "out-of-bounds fileCount",
+    mutate(manifest) { manifest.fileCount = 4097; return manifest; },
+  },
+  {
+    label: "string totalBytes",
+    mutate(manifest) { manifest.totalBytes = String(manifest.totalBytes); return manifest; },
+  },
+  {
+    label: "fractional totalBytes",
+    mutate(manifest) { manifest.totalBytes += 0.5; return manifest; },
+  },
+  {
+    label: "out-of-bounds totalBytes",
+    mutate(manifest) { manifest.totalBytes = 536_870_913; return manifest; },
+  },
+  {
+    label: "object files collection",
+    mutate(manifest) { manifest.files = manifest.files[0]; return manifest; },
+  },
+  {
+    label: "numeric file name",
+    mutate(manifest) { manifest.files[0].name = 1; return manifest; },
+  },
+  {
+    label: "string file byte count",
+    mutate(manifest) { manifest.files[0].bytes = String(manifest.files[0].bytes); return manifest; },
+  },
+  {
+    label: "non-string file hash",
+    mutate(manifest) { manifest.files[0].sha256 = [manifest.files[0].sha256]; return manifest; },
+  },
+  {
+    label: "numeric sourceStable flag",
+    mutate(manifest) { manifest.files[0].sourceStable = 1; return manifest; },
+  },
+  {
+    label: "out-of-bounds file byte count",
+    mutate(manifest) { manifest.files[0].bytes = 536_870_913; return manifest; },
+  },
+]) {
+  test(
+    `RecoverFailedShutdown rejects manifest ${label} before termination`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      await rewriteRecoveryManifest(fixture, mutate);
+
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}
+
+for (const { label, snapshotId } of [
+  { label: "malformed snapshot identifier", snapshotId: "shutdown-failure-invalid" },
+  {
+    label: "absent valid snapshot identifier",
+    snapshotId: "shutdown-failure-20260813-191305-00000000000000000000000000000000",
+  },
+  {
+    label: "traversal snapshot identifier",
+    snapshotId: `../${PRESERVED_RECOVERY_SNAPSHOT_ID}`,
+  },
+  {
+    label: "nested snapshot identifier",
+    snapshotId: `${PRESERVED_RECOVERY_SNAPSHOT_ID}\\child`,
+  },
+]) {
+  test(
+    `RecoverFailedShutdown fail-before-kill: ${label}`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      await assertRecoveryRejectedBeforeKill(
+        fixture,
+        invokeRecovery(fixture, snapshotId),
+      );
+    },
+  );
+}
+
+test(
+  "RecoverFailedShutdown fail-before-kill: missing snapshot parameter",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const rejected = invokeManager(fixture.root, "RecoverFailedShutdown", 10);
+    await assertRecoveryRejectedBeforeKill(fixture, rejected);
+  },
+);
+
+for (const { label, mutate } of [
+  {
+    label: "malformed manifest JSON",
+    async mutate(fixture) {
+      await writeFile(recoveryManifestPath(fixture), "{\"schemaVersion\":1", "utf8");
+    },
+  },
+  {
+    label: "extra manifest key",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => ({
+        ...manifest,
+        unexpected: true,
+      }));
+    },
+  },
+  {
+    label: "tampered manifest hash",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => {
+        manifest.files[0].sha256 = "0".repeat(64);
+        return manifest;
+      });
+    },
+  },
+  {
+    label: "mismatched manifest source directory",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => {
+        manifest.sourceDirectory = path.join(fixture.root, "other-data");
+        return manifest;
+      });
+    },
+  },
+  {
+    label: "mismatched manifest reason",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => {
+        manifest.reason = "other_reason";
+        return manifest;
+      });
+    },
+  },
+  {
+    label: "mismatched manifest count",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => {
+        manifest.fileCount += 1;
+        return manifest;
+      });
+    },
+  },
+  {
+    label: "mismatched manifest total",
+    mutate(fixture) {
+      return rewriteRecoveryManifest(fixture, (manifest) => {
+        manifest.totalBytes += 1;
+        return manifest;
+      });
+    },
+  },
+]) {
+  test(
+    `RecoverFailedShutdown fail-before-kill: ${label}`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      await mutate(fixture);
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}
+
+for (const { label, mutate } of [
+  {
+    label: "missing snapshot file",
+    async mutate(fixture) {
+      await unlink(path.join(fixture.snapshotDirectory, "data", "fixture-data.json"));
+    },
+  },
+  {
+    label: "extra snapshot file",
+    async mutate(fixture) {
+      await writeFile(path.join(fixture.snapshotDirectory, "data", "extra.json"), "{}\n");
+    },
+  },
+  {
+    label: "reparse snapshot data directory",
+    async mutate(fixture) {
+      const dataPath = path.join(fixture.snapshotDirectory, "data");
+      const target = path.join(fixture.root, "snapshot-data-target");
+      await mkdir(target);
+      await writeFile(path.join(target, "fixture-data.json"), '{"fixture":"failed-shutdown"}\n');
+      await rm(dataPath, { recursive: true });
+      await symlink(target, dataPath, "junction");
+    },
+  },
+  {
+    label: "reparse snapshot file",
+    mutate(fixture, t) {
+      return replaceFixtureFileWithSymlinkOrSkip(
+        t,
+        path.join(fixture.snapshotDirectory, "data", "fixture-data.json"),
+        path.join(fixture.root, "snapshot-file-target.json"),
+      );
+    },
+  },
+  {
+    label: "hash-mismatched snapshot file",
+    async mutate(fixture) {
+      const target = path.join(fixture.snapshotDirectory, "data", "fixture-data.json");
+      const source = await readFile(target, "utf8");
+      await writeFile(target, source.replace("shutdown", "shutdowN"));
+    },
+  },
+  {
+    label: "byte-mismatched snapshot file",
+    async mutate(fixture) {
+      const target = path.join(fixture.snapshotDirectory, "data", "fixture-data.json");
+      await writeFile(target, `${await readFile(target, "utf8")}x`);
+    },
+  },
+  {
+    label: "missing active file",
+    async mutate(fixture) {
+      await unlink(path.join(fixture.root, "data", "fixture-data.json"));
+    },
+  },
+  {
+    label: "extra active file",
+    async mutate(fixture) {
+      await writeFile(path.join(fixture.root, "data", "extra.json"), "{}\n");
+    },
+  },
+  {
+    label: "reparse active data directory",
+    async mutate(fixture) {
+      const dataPath = path.join(fixture.root, "data");
+      const target = path.join(fixture.root, "active-data-target");
+      await mkdir(target);
+      await writeFile(path.join(target, "fixture-data.json"), '{"fixture":"failed-shutdown"}\n');
+      await rm(dataPath, { recursive: true });
+      await symlink(target, dataPath, "junction");
+    },
+  },
+  {
+    label: "reparse active file",
+    mutate(fixture, t) {
+      return replaceFixtureFileWithSymlinkOrSkip(
+        t,
+        path.join(fixture.root, "data", "fixture-data.json"),
+        path.join(fixture.root, "active-file-target.json"),
+      );
+    },
+  },
+  {
+    label: "hash-mismatched active file",
+    async mutate(fixture) {
+      const target = path.join(fixture.root, "data", "fixture-data.json");
+      const source = await readFile(target, "utf8");
+      await writeFile(target, source.replace("shutdown", "shutdowN"));
+    },
+  },
+  {
+    label: "byte-mismatched active file",
+    async mutate(fixture) {
+      const target = path.join(fixture.root, "data", "fixture-data.json");
+      await writeFile(target, `${await readFile(target, "utf8")}x`);
+    },
+  },
+]) {
+  test(
+    `RecoverFailedShutdown fail-before-kill: ${label}`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      if (await mutate(fixture, t) === false) return;
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}
+
+for (const { label, mutate } of [
+  {
+    label: "tampered control",
+    async mutate(fixture) {
+      const state = JSON.parse(fixture.controlText);
+      state.processId += 1;
+      await writeFile(fixture.controlPath, `${JSON.stringify(state)}\n`, "utf8");
+    },
+  },
+  {
+    label: "tampered requested receipt",
+    async mutate(fixture) {
+      const receipt = JSON.parse(fixture.requestedText);
+      receipt.hmac = "A".repeat(44);
+      await writeFile(fixture.requestedPath, `${JSON.stringify(receipt)}\n`, "utf8");
+    },
+  },
+  {
+    label: "tampered terminal receipt",
+    async mutate(fixture) {
+      const receipt = JSON.parse(fixture.terminalText);
+      receipt.hmac = "A".repeat(44);
+      await writeFile(fixture.terminalPath, `${JSON.stringify(receipt)}\n`, "utf8");
+    },
+  },
+  {
+    label: "missing requested receipt",
+    async mutate(fixture) { await unlink(fixture.requestedPath); },
+  },
+  {
+    label: "missing terminal receipt",
+    async mutate(fixture) { await unlink(fixture.terminalPath); },
+  },
+  {
+    label: "success terminal receipt",
+    mutate(fixture) {
+      return writeSignedReceipt(fixture, "terminal", (receipt) => ({
+        ...receipt,
+        status: "success",
+        errorCode: null,
+      }));
+    },
+  },
+  {
+    label: "unknown terminal receipt",
+    mutate(fixture) {
+      return writeSignedReceipt(fixture, "terminal", (receipt) => ({
+        ...receipt,
+        status: "unknown",
+        errorCode: null,
+      }));
+    },
+  },
+]) {
+  test(
+    `RecoverFailedShutdown fail-before-kill: ${label}`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      await mutate(fixture);
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}
+
+test(
+  "RecoverFailedShutdown fail-before-kill: arbitrary dead control without an incident",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const absentPid = 2_147_483_646;
+    await writeSignedControl(fixture, (state) => ({
+      ...state,
+      processId: absentPid,
+    }));
+    await writeSignedReceipt(fixture, "requested", (receipt) => ({
+      ...receipt,
+      processId: absentPid,
+    }));
+    await writeSignedReceipt(fixture, "terminal", (receipt) => ({
+      ...receipt,
+      processId: absentPid,
+    }));
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: executable identity mismatch",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const sentinel = spawn(
+      powershell,
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    t.after(() => {
+      if (sentinel.exitCode === null) sentinel.kill();
+    });
+    const sentinelTicks = fixtureProcessStartTicks(sentinel.pid);
+    await writeSignedControl(fixture, (state) => ({
+      ...state,
+      processId: sentinel.pid,
+      processStartTimeUtcTicks: sentinelTicks,
+    }));
+    for (const phase of ["requested", "terminal"]) {
+      await writeSignedReceipt(fixture, phase, (receipt) => ({
+        ...receipt,
+        processId: sentinel.pid,
+      }));
+    }
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    assert.doesNotThrow(() => process.kill(sentinel.pid, 0));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: process start-time identity mismatch",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await writeSignedControl(fixture, (state) => ({
+      ...state,
+      processStartTimeUtcTicks: String(BigInt(state.processStartTimeUtcTicks) + 1n),
+    }));
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: live loopback listener",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await startForeignListener(t, { mode: "raw", port: fixture.port });
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: live managed descendant",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      spawnDescendantAfterFailedShutdown: true,
+    });
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: ambiguous listener probe",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      "return $probe.ExitCode -ne 61",
+      "return $true",
+    );
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: descendant inspection failure",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(function Test-NoManagedDescendants \{\r?\n\s*param\([^\n]+\)\r?\n)/u,
+      '$1    throw "fixture descendant inspection failure"\n',
+    );
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown fail-before-kill: evidence changes after lengthy snapshot validation",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*[$]evidence = Assert-SameRecoveryEvidence -Evidence [$]evidence\r?\n)(\s*[$]process = Get-ManagedProcess -State [$]evidence[.]State)/u,
+      '    [System.IO.File]::AppendAllText((Get-ReceiptPath -State $evidence.State -Phase "terminal"), " ")\n$1$2',
+    );
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: incident path is short and binds every original identity",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      '$1    throw "fixture interruption after incident publication"\n',
+    );
+    const interrupted = invokeRecovery(fixture);
+    assert.notEqual(interrupted.status, 0);
+    assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+    const incident = await onlyRecoveryIncident(fixture);
+    assert.match(incident.id, /^incident-[a-f0-9]{32}$/u);
+    assert.ok(incident.directory.length < 240, incident.directory);
+    assert.equal(incident.id.includes(fixture.state.instanceId), false);
+    assert.equal(incident.id.includes(fixture.snapshotId), false);
+
+    const record = JSON.parse(await readFile(incident.recordPath, "utf8"));
+    assert.deepEqual(Object.keys(record).sort(), [
+      "authorityHmac",
+      "incidentId",
+      "instanceId",
+      "processId",
+      "processStartTimeUtcTicks",
+      "projectDigest",
+      "schemaVersion",
+      "snapshotId",
+      "sourceHashes",
+      "startIdentity",
+      "state",
+    ]);
+    assert.equal(record.incidentId, incident.id);
+    assert.equal(record.projectDigest, fixture.state.projectDigest);
+    assert.equal(record.processId, fixture.state.processId);
+    assert.equal(record.instanceId, fixture.state.instanceId);
+    assert.equal(
+      record.processStartTimeUtcTicks,
+      fixture.state.processStartTimeUtcTicks,
+    );
+    assert.equal(record.startIdentity, fixture.state.startIdentity);
+    assert.equal(record.snapshotId, PRESERVED_RECOVERY_SNAPSHOT_ID);
+    assert.match(record.authorityHmac, /^[A-Za-z0-9+/]{43}=$/u);
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: matching pre-termination incident resumes idempotently",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      '$1    throw "fixture interruption after incident publication"\n',
+    );
+    const interrupted = invokeRecovery(fixture);
+    assert.notEqual(interrupted.status, 0);
+    assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+    await onlyRecoveryIncident(fixture);
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: conflicting incident is rejected before termination",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      '$1    throw "fixture interruption after incident publication"\n',
+    );
+    assert.notEqual(invokeRecovery(fixture).status, 0);
+    const incident = await onlyRecoveryIncident(fixture);
+    const record = JSON.parse(await readFile(incident.recordPath, "utf8"));
+    record.snapshotId = "shutdown-failure-20260813-191305-00000000000000000000000000000000";
+    await writeFile(incident.recordPath, `${JSON.stringify(record)}\n`, "utf8");
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: matching authenticated incident resumes after exact process exit",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await interruptRecoveryAfterExactExit(fixture);
+    assert.equal(await fileExists(fixture.requestedPath), true);
+    assert.equal(await fileExists(fixture.terminalPath), true);
+    await assertOrdinaryLifecycleBlocked(fixture);
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+for (const archiveName of [
+  "control-state.json",
+  "requested-receipt.json",
+  "terminal-receipt.json",
+  "recovery-manifest.json",
+]) {
+  test(
+    `RecoverFailedShutdown state-machine: tampered ${archiveName} is rejected on dead-process resume`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      const incident = await interruptRecoveryAfterExactExit(fixture);
+      await writeFile(
+        path.join(incident.directory, archiveName),
+        `${await readFile(path.join(incident.directory, archiveName), "utf8")} `,
+        "utf8",
+      );
+
+      await restoreFixtureManager(fixture.root);
+      const rejected = invokeRecovery(fixture);
+      assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+      assert.equal(await fileExists(fixture.controlPath), true);
+    },
+  );
+}
+
+test(
+  "RecoverFailedShutdown state-machine: tampered incident authentication is rejected on resume",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const incident = await interruptRecoveryAfterExactExit(fixture);
+    const record = JSON.parse(await readFile(incident.recordPath, "utf8"));
+    record.state = "recovered";
+    await writeFile(incident.recordPath, `${JSON.stringify(record)}\n`, "utf8");
+
+    await restoreFixtureManager(fixture.root);
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.equal(await fileExists(fixture.controlPath), true);
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: held writer lease retains authority and retry succeeds",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await interruptRecoveryAfterExactExit(fixture);
+    await restoreFixtureManager(fixture.root);
+    const holder = createApplicationWriterLease({
+      projectRoot: fixture.root,
+      projectDigest: fixture.state.projectDigest,
+    });
+    await holder.acquire();
+    let holderClosed = false;
+    t.after(async () => {
+      if (!holderClosed) await holder.close();
+    });
+
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.match(`${rejected.stderr}\n${rejected.stdout}`, /writer lease is not free/u);
+    await waitForProcessExit(fixture.state.processId);
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), true);
+    assert.equal(await fileExists(fixture.terminalPath), true);
+    await onlyRecoveryIncident(fixture);
+    await assertOrdinaryLifecycleBlocked(fixture);
+
+    await holder.close();
+    holderClosed = true;
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: dead-process retry re-proves the listener postcondition",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await interruptRecoveryAfterExactExit(fixture);
+    await restoreFixtureManager(fixture.root);
+    const listener = await startForeignListener(t, { mode: "raw", port: fixture.port });
+
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.match(`${rejected.stderr}\n${rejected.stdout}`, /port remained occupied/u);
+    assert.equal(await fileExists(fixture.controlPath), true);
+
+    await stopOwnedFixtureProcess(listener.child);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: receipt cleanup resumes after one receipt was removed",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(function Remove-ExactShutdownReceipts \{[\s\S]*?foreach \([$]phase in @\("requested", "terminal"\)\) \{\r?\n)/u,
+      '$1        if ($phase -eq "terminal") { throw "fixture interruption after requested receipt cleanup" }\n',
+    );
+
+    const interrupted = invokeRecovery(fixture);
+    assert.notEqual(interrupted.status, 0, `${interrupted.stderr}\n${interrupted.stdout}`);
+    await waitForProcessExit(fixture.state.processId);
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), false);
+    assert.equal(await fileExists(fixture.terminalPath), true);
+    const incident = await onlyRecoveryIncident(fixture);
+    assert.equal(
+      JSON.parse(await readFile(incident.recordPath, "utf8")).state,
+      "postconditions_verified",
+    );
+    await assertOrdinaryLifecycleBlocked(fixture);
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: receipt cleanup resumes from an authenticated tombstone",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(function Remove-ExactShutdownReceipts \{[\s\S]*?\[System[.]IO[.]File\]::Move\([$]path, [$]tombstone\)\r?\n)/u,
+      '$1        if ($phase -eq "requested") { throw "fixture interruption with receipt tombstone" }\n',
+    );
+
+    const interrupted = invokeRecovery(fixture);
+    assert.notEqual(interrupted.status, 0, `${interrupted.stderr}\n${interrupted.stdout}`);
+    await waitForProcessExit(fixture.state.processId);
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), false);
+    const incident = await onlyRecoveryIncident(fixture);
+    assert.equal(
+      await fileExists(path.join(incident.directory, "requested-receipt-removal.tmp")),
+      true,
+    );
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+    assert.equal(
+      await fileExists(path.join(incident.directory, "requested-receipt-removal.tmp")),
+      false,
+    );
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: durable finalization precedes final control removal",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /^([ \t]*)Remove-ControlState -ExpectedState [$]evidence[.]State\r?$/mu,
+      '$1throw "fixture interruption before final control removal"\r\n$1Remove-ControlState -ExpectedState $evidence.State',
+    );
+
+    const interrupted = invokeRecovery(fixture);
+    assert.notEqual(interrupted.status, 0, `${interrupted.stderr}\n${interrupted.stdout}`);
+    assert.match(
+      `${interrupted.stderr}\n${interrupted.stdout}`,
+      /fixture interruption before final control removal/u,
+    );
+    await waitForProcessExit(fixture.state.processId);
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), false);
+    assert.equal(await fileExists(fixture.terminalPath), false);
+    const incident = await onlyRecoveryIncident(fixture);
+    assert.equal(
+      JSON.parse(await readFile(incident.recordPath, "utf8")).state,
+      "recovered",
+    );
+    await assertOrdinaryLifecycleBlocked(fixture);
+
+    await restoreFixtureManager(fixture.root);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
 test(
   "RecoverFailedShutdown archives a stable failed-shutdown snapshot and leaves the service stopped",
   { skip: WINDOWS_MANAGER_SKIP },
@@ -1643,13 +2725,14 @@ test(
     const requestedText = await readFile(requestedPath, "utf8");
     const terminalText = await readFile(terminalPath, "utf8");
     const { snapshotId, snapshotDirectory } = await createRecoverySnapshot(root, runtime);
+    assert.equal(snapshotId, PRESERVED_RECOVERY_SNAPSHOT_ID);
 
     const restarted = invokeManager(root, "Restart");
     assert.notEqual(restarted.status, 0);
     assert.doesNotThrow(() => process.kill(state.processId, 0));
     for (const rejectedSnapshotId of [
-      `snapshot-${"0".repeat(32)}`,
-      "../snapshot-00000000000000000000000000000000",
+      "shutdown-failure-20260813-191305-00000000000000000000000000000000",
+      "../shutdown-failure-20260813-191305-ebe114efc20d42ac99e6fc0cc0c99b8f",
     ]) {
       const rejected = invokeManager(
         root,
@@ -1664,6 +2747,7 @@ test(
     }
     const manifestPath = path.join(snapshotDirectory, "manifest.json");
     const manifest = await readFile(manifestPath, "utf8");
+    assert.equal(JSON.parse(manifest).createdAt, RECOVERY_SNAPSHOT_CREATED_AT);
     await writeFile(
       manifestPath,
       `${JSON.stringify({ ...JSON.parse(manifest), unexpected: true })}\n`,
@@ -1732,18 +2816,17 @@ test(
     ), "utf8"), { code: "ENOENT" });
     const incidentNames = await readdir(path.join(runtime.runtimeDirectory, "incidents"));
     assert.equal(incidentNames.length, 1);
-    const incidents = await readFile(path.join(
-      runtime.runtimeDirectory,
-      "incidents",
-      `${state.projectDigest}-${state.instanceId}-${snapshotId}`,
-      "incident.json",
-    ), "utf8");
-    assert.match(incidents, /"state":"recovered"/u);
+    assert.match(incidentNames[0], /^incident-[a-f0-9]{32}$/u);
     const incidentDirectory = path.join(
       runtime.runtimeDirectory,
       "incidents",
-      `${state.projectDigest}-${state.instanceId}-${snapshotId}`,
+      incidentNames[0],
     );
+    const incidents = await readFile(path.join(
+      incidentDirectory,
+      "incident.json",
+    ), "utf8");
+    assert.match(incidents, /"state":"recovered"/u);
     assert.equal(await readFile(path.join(incidentDirectory, "control-state.json"), "utf8"), controlText);
     assert.equal(await readFile(path.join(incidentDirectory, "requested-receipt.json"), "utf8"), requestedText);
     assert.equal(await readFile(path.join(incidentDirectory, "terminal-receipt.json"), "utf8"), terminalText);

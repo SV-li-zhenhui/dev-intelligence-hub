@@ -959,18 +959,15 @@ function Get-ReceiptPath {
         -Child (Join-Path $runtimeDirectory "mydashboard-shutdown-$($State.instanceId)-$Phase.json")
 }
 
-function Read-ShutdownReceipt {
+function Read-ShutdownReceiptFromPath {
     param(
         [Parameter(Mandatory = $true)]$State,
-        [ValidateSet("requested", "terminal")][string]$Phase
+        [ValidateSet("requested", "terminal")][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$Path
     )
-    $path = Get-ReceiptPath -State $State -Phase $Phase
-    if (-not (Test-Path -LiteralPath $path)) {
-        return $null
-    }
-    Assert-RegularManagedFile -Path $path -Description "Shutdown receipt"
+    Assert-RegularManagedFile -Path $Path -Description "Shutdown receipt"
     $receipt = ConvertFrom-ExactJson -Json (
-        Get-Content -LiteralPath $path -Raw
+        Get-Content -LiteralPath $Path -Raw
     )
     $properties = @($receipt.PSObject.Properties.Name | Sort-Object)
     if (
@@ -1016,6 +1013,21 @@ function Read-ShutdownReceipt {
         throw "Shutdown receipt authentication failed."
     }
     return $receipt
+}
+
+function Read-ShutdownReceipt {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [ValidateSet("requested", "terminal")][string]$Phase
+    )
+    $path = Get-ReceiptPath -State $State -Phase $Phase
+    if (-not (Test-Path -LiteralPath $path)) {
+        return $null
+    }
+    return Read-ShutdownReceiptFromPath `
+        -State $State `
+        -Phase $Phase `
+        -Path $path
 }
 
 function Invoke-ManagedShutdownRequest {
@@ -1093,11 +1105,79 @@ function Get-BoundedSha256 {
     ) | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
+function Get-StringSha256 {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Value)
+        return ($algorithm.ComputeHash($bytes) | ForEach-Object {
+            $_.ToString("x2")
+        }) -join ""
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
 function Assert-RecoverySnapshotId {
     param([Parameter(Mandatory = $true)][string]$SnapshotId)
-    if ($SnapshotId -notmatch '^snapshot-[a-f0-9]{32}$') {
+    if ($SnapshotId -notmatch '^shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}$') {
         throw "RecoverySnapshotId is malformed."
     }
+}
+
+function Test-RecoveryJsonInteger {
+    param([AllowNull()]$Value)
+    return $Value -is [int] -or $Value -is [long]
+}
+
+function Test-RecoveryCreatedAt {
+    param([AllowNull()]$Value)
+    if (
+        $Value -isnot [string] -or
+        $Value.Length -lt 20 -or
+        $Value.Length -gt 35 -or
+        $Value -notmatch `
+            '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,7})?Z$'
+    ) {
+        return $false
+    }
+    $parsed = [DateTimeOffset]::MinValue
+    return [DateTimeOffset]::TryParse(
+        $Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$parsed
+    ) -and $parsed.Offset -eq [TimeSpan]::Zero
+}
+
+function ConvertTo-RecoveryJsonValue {
+    param([AllowNull()]$Value)
+    if ($Value -is [System.Collections.IDictionary]) {
+        $properties = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $properties[[string]$key] = ConvertTo-RecoveryJsonValue -Value $Value[$key]
+        }
+        return [pscustomobject]$properties
+    }
+    if ($Value -is [System.Array]) {
+        $items = @($Value | ForEach-Object {
+            ConvertTo-RecoveryJsonValue -Value $_
+        })
+        return ,$items
+    }
+    return $Value
+}
+
+function ConvertFrom-RecoveryManifestJson {
+    param([Parameter(Mandatory = $true)][string]$Json)
+    if ($convertFromJsonPreservesDates) {
+        return ConvertFrom-ExactJson -Json $Json
+    }
+    Add-Type -AssemblyName System.Web.Extensions
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = 1048576
+    $serializer.RecursionLimit = 8
+    return ConvertTo-RecoveryJsonValue -Value $serializer.DeserializeObject($Json)
 }
 
 function Get-RecoverySnapshotFiles {
@@ -1106,23 +1186,41 @@ function Get-RecoverySnapshotFiles {
         [Parameter(Mandatory = $true)]$Manifest
     )
     Assert-NotReparseDirectory -Path $Directory
+    if ($Manifest.files -isnot [System.Array]) {
+        throw "Recovery snapshot files must be one JSON array."
+    }
     $entries = @($Manifest.files)
     if ($entries.Count -lt 1 -or $entries.Count -gt 4096) {
         throw "Recovery snapshot file count is outside the safe bound."
+    }
+    if (
+        -not (Test-RecoveryJsonInteger -Value $Manifest.fileCount) -or
+        [long]$Manifest.fileCount -lt 1 -or
+        [long]$Manifest.fileCount -gt 4096 -or
+        [long]$Manifest.fileCount -ne $entries.Count -or
+        -not (Test-RecoveryJsonInteger -Value $Manifest.totalBytes) -or
+        [long]$Manifest.totalBytes -lt 0 -or
+        [long]$Manifest.totalBytes -gt 536870912
+    ) {
+        throw "Recovery snapshot manifest totals are invalid."
     }
     $expected = @{}
     [long]$total = 0
     foreach ($entry in $entries) {
         $properties = @($entry.PSObject.Properties.Name | Sort-Object)
         if (
+            $entry -isnot [pscustomobject] -or
             (Compare-Object `
                 -ReferenceObject @("bytes", "name", "sha256", "sourceStable") `
                 -DifferenceObject $properties) -or
-            [string]$entry.name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
-            ($entry.bytes -isnot [int] -and $entry.bytes -isnot [long]) -or
+            $entry.name -isnot [string] -or
+            $entry.name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+            -not (Test-RecoveryJsonInteger -Value $entry.bytes) -or
             [long]$entry.bytes -lt 0 -or
             [long]$entry.bytes -gt 536870912 -or
-            [string]$entry.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            $entry.sha256 -isnot [string] -or
+            $entry.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            $entry.sourceStable -isnot [bool] -or
             $entry.sourceStable -ne $true -or
             $expected.ContainsKey([string]$entry.name)
         ) {
@@ -1134,12 +1232,7 @@ function Get-RecoverySnapshotFiles {
         }
         $expected[[string]$entry.name] = $entry
     }
-    if (
-        ($Manifest.fileCount -isnot [int] -and $Manifest.fileCount -isnot [long]) -or
-        [long]$Manifest.fileCount -ne $entries.Count -or
-        ($Manifest.totalBytes -isnot [int] -and $Manifest.totalBytes -isnot [long]) -or
-        [long]$Manifest.totalBytes -ne $total
-    ) {
+    if ([long]$Manifest.totalBytes -ne $total) {
         throw "Recovery snapshot manifest totals are invalid."
     }
     $actual = @(Get-ChildItem -LiteralPath $Directory -Force)
@@ -1206,21 +1299,31 @@ function Get-ValidatedRecoverySnapshot {
         throw "Recovery snapshot data directory is unavailable."
     }
     Assert-NotReparseDirectory -Path $dataPath
-    $manifest = ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $manifestPath -Raw)
+    $manifest = ConvertFrom-RecoveryManifestJson -Json (
+        Get-Content -LiteralPath $manifestPath -Raw
+    )
+    if ($manifest -isnot [pscustomobject]) {
+        throw "Recovery snapshot manifest must be one JSON object."
+    }
     $properties = @($manifest.PSObject.Properties.Name | Sort-Object)
     if (
         (Compare-Object `
             -ReferenceObject @(
-                "consistent", "fileCount", "files", "reason", "schemaVersion",
-                "sourceDirectory", "totalBytes"
+                "consistent", "createdAt", "fileCount", "files", "reason",
+                "schemaVersion", "sourceDirectory", "totalBytes"
             ) `
             -DifferenceObject $properties) -or
-        $manifest.schemaVersion -ne 1 -or
-        [string]$manifest.reason -ne "managed_shutdown_lifecycle_failure" -or
+        -not (Test-RecoveryJsonInteger -Value $manifest.schemaVersion) -or
+        [long]$manifest.schemaVersion -ne 1 -or
+        -not (Test-RecoveryCreatedAt -Value $manifest.createdAt) -or
+        $manifest.reason -isnot [string] -or
+        $manifest.reason -ne "managed_shutdown_lifecycle_failure" -or
+        $manifest.sourceDirectory -isnot [string] -or
         -not $pathComparer.Equals(
-            [System.IO.Path]::GetFullPath([string]$manifest.sourceDirectory),
+            [System.IO.Path]::GetFullPath($manifest.sourceDirectory),
             $dataDirectory
         ) -or
+        $manifest.consistent -isnot [bool] -or
         $manifest.consistent -ne $true
     ) {
         throw "Recovery snapshot manifest has an invalid shape or source."
@@ -1354,6 +1457,280 @@ function Publish-ExactRecoveryEvidenceCopy {
     }
 }
 
+function Get-RecoveryIncidentId {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $identity = @(
+        "recovery-incident-v1",
+        $projectDigest,
+        [string]$State.processId,
+        [string]$State.instanceId,
+        [string]$State.processStartTimeUtcTicks,
+        [string]$State.startIdentity,
+        [string]$Snapshot.Id
+    ) -join "`n"
+    return "incident-$((Get-StringSha256 -Value $identity).Substring(0, 32))"
+}
+
+function Get-RecoveryIncidentLocation {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $incidentId = Get-RecoveryIncidentId -State $State -Snapshot $Snapshot
+    $incidentDirectory = Assert-DirectChildPath `
+        -Parent $incidentsDirectory `
+        -Child (Join-Path $incidentsDirectory $incidentId)
+    return [pscustomobject]@{
+        Id = $incidentId
+        Directory = $incidentDirectory
+        RecordPath = Assert-DirectChildPath `
+            -Parent $incidentDirectory `
+            -Child (Join-Path $incidentDirectory "incident.json")
+    }
+}
+
+function Get-RecoveryIncidentAuthorityPayload {
+    param([Parameter(Mandatory = $true)]$Record)
+    return @(
+        "recovery-incident-authority-v1",
+        [string]$Record.incidentId,
+        [string]$Record.state,
+        [string]$Record.projectDigest,
+        [string]$Record.processId,
+        [string]$Record.instanceId,
+        [string]$Record.processStartTimeUtcTicks,
+        [string]$Record.startIdentity,
+        [string]$Record.snapshotId,
+        [string]$Record.sourceHashes.control,
+        [string]$Record.sourceHashes.requestedReceipt,
+        [string]$Record.sourceHashes.terminalReceipt,
+        [string]$Record.sourceHashes.manifest
+    ) -join "`n"
+}
+
+function New-RecoveryIncidentRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Location,
+        [Parameter(Mandatory = $true)]$Evidence,
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [ValidateSet("pre_termination", "postconditions_verified", "recovered")]
+        [string]$State = "pre_termination"
+    )
+    $record = [ordered]@{
+        schemaVersion = 1
+        incidentId = [string]$Location.Id
+        state = $State
+        projectDigest = $projectDigest
+        processId = [int]$Evidence.State.processId
+        instanceId = [string]$Evidence.State.instanceId
+        processStartTimeUtcTicks = [string]$Evidence.State.processStartTimeUtcTicks
+        startIdentity = [string]$Evidence.State.startIdentity
+        snapshotId = [string]$Snapshot.Id
+        sourceHashes = [ordered]@{
+            control = [string]$Evidence.ControlSha256
+            requestedReceipt = [string]$Evidence.RequestedSha256
+            terminalReceipt = [string]$Evidence.TerminalSha256
+            manifest = [string]$Snapshot.ManifestSha256
+        }
+        authorityHmac = ""
+    }
+    $record.authorityHmac = Get-HmacBase64 `
+        -Token ([string]$Evidence.State.controlToken) `
+        -Payload (Get-RecoveryIncidentAuthorityPayload -Record ([pscustomobject]$record))
+    return [pscustomobject]$record
+}
+
+function Assert-RecoveryIncidentRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)]$Location,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $properties = @($Record.PSObject.Properties.Name | Sort-Object)
+    $sourceHashProperties = @($Record.sourceHashes.PSObject.Properties.Name | Sort-Object)
+    $sourceHashValues = @(
+        $Record.sourceHashes.control,
+        $Record.sourceHashes.requestedReceipt,
+        $Record.sourceHashes.terminalReceipt,
+        $Record.sourceHashes.manifest
+    )
+    $invalidSourceHashCount = @($sourceHashValues | Where-Object {
+        $_ -isnot [string] -or $_ -notmatch '^[a-f0-9]{64}$'
+    }).Count
+    if (
+        $Record -isnot [pscustomobject] -or
+        (Compare-Object `
+            -ReferenceObject @(
+                "authorityHmac", "incidentId", "instanceId", "processId",
+                "processStartTimeUtcTicks", "projectDigest", "schemaVersion",
+                "snapshotId", "sourceHashes", "startIdentity", "state"
+            ) `
+            -DifferenceObject $properties) -or
+        $Record.schemaVersion -ne 1 -or
+        $Record.incidentId -isnot [string] -or
+        $Record.incidentId -notmatch '^incident-[a-f0-9]{32}$' -or
+        $Record.incidentId -ne $Location.Id -or
+        $Record.state -isnot [string] -or
+        $Record.state -notin @("pre_termination", "postconditions_verified", "recovered") -or
+        $Record.projectDigest -isnot [string] -or
+        $Record.projectDigest -ne $projectDigest -or
+        -not (Test-RecoveryJsonInteger -Value $Record.processId) -or
+        [int]$Record.processId -ne [int]$State.processId -or
+        $Record.instanceId -isnot [string] -or
+        $Record.instanceId -ne [string]$State.instanceId -or
+        $Record.processStartTimeUtcTicks -isnot [string] -or
+        $Record.processStartTimeUtcTicks -ne [string]$State.processStartTimeUtcTicks -or
+        $Record.startIdentity -isnot [string] -or
+        $Record.startIdentity -ne [string]$State.startIdentity -or
+        $Record.snapshotId -isnot [string] -or
+        $Record.snapshotId -ne [string]$Snapshot.Id -or
+        $Record.sourceHashes -isnot [pscustomobject] -or
+        (Compare-Object `
+            -ReferenceObject @("control", "manifest", "requestedReceipt", "terminalReceipt") `
+            -DifferenceObject $sourceHashProperties) -or
+        $invalidSourceHashCount -ne 0 -or
+        $Record.authorityHmac -isnot [string] -or
+        $Record.authorityHmac -notmatch '^[A-Za-z0-9+/]{43}=$'
+    ) {
+        throw "Recovery incident record has an invalid identity or shape."
+    }
+    $expectedHmac = Get-HmacBase64 `
+        -Token ([string]$State.controlToken) `
+        -Payload (Get-RecoveryIncidentAuthorityPayload -Record $Record)
+    if (-not (Test-FixedTimeString `
+        -Left $expectedHmac `
+        -Right ([string]$Record.authorityHmac))) {
+        throw "Recovery incident authentication failed."
+    }
+}
+
+function Write-NewRecoveryIncidentRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Location,
+        [Parameter(Mandatory = $true)]$Record
+    )
+    $json = $Record | ConvertTo-Json -Depth 4 -Compress
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    $stream = New-Object System.IO.FileStream(
+        $Location.RecordPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    if ((Get-Content -LiteralPath $Location.RecordPath -Raw) -ne $json) {
+        throw "Recovery incident durable publication did not match."
+    }
+}
+
+function Get-ArchivedRecoveryEvidence {
+    param(
+        [Parameter(Mandatory = $true)]$Location,
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $controlPath = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "control-state.json")
+    $requestedPath = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "requested-receipt.json")
+    $terminalPath = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "terminal-receipt.json")
+    $manifestPath = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "recovery-manifest.json")
+    $archivedState = Read-ControlStateFromPath -Path $controlPath
+    if (-not (Test-SameControlIdentity -Left $archivedState -Right $State)) {
+        throw "Archived recovery control identity does not match active authority."
+    }
+    $requested = Read-ShutdownReceiptFromPath `
+        -State $archivedState `
+        -Phase "requested" `
+        -Path $requestedPath
+    $terminal = Read-ShutdownReceiptFromPath `
+        -State $archivedState `
+        -Phase "terminal" `
+        -Path $terminalPath
+    if ($terminal.status -ne "failure") {
+        throw "Archived recovery evidence does not contain a terminal failure."
+    }
+    $controlHash = Get-BoundedSha256 -Path $controlPath -Description "Archived process control state"
+    $requestedHash = Get-BoundedSha256 -Path $requestedPath -Description "Archived shutdown request receipt"
+    $terminalHash = Get-BoundedSha256 -Path $terminalPath -Description "Archived shutdown terminal receipt"
+    $manifestHash = Get-BoundedSha256 `
+        -Path $manifestPath `
+        -Description "Archived recovery snapshot manifest" `
+        -MaximumBytes 1048576
+    if (
+        $controlHash -ne $Record.sourceHashes.control -or
+        $requestedHash -ne $Record.sourceHashes.requestedReceipt -or
+        $terminalHash -ne $Record.sourceHashes.terminalReceipt -or
+        $manifestHash -ne $Record.sourceHashes.manifest -or
+        $manifestHash -ne $Snapshot.ManifestSha256 -or
+        (Get-BoundedSha256 -Path $controlFile -Description "Process control state") -ne $controlHash
+    ) {
+        throw "Archived recovery evidence authentication failed."
+    }
+    return [pscustomobject]@{
+        State = $archivedState
+        Requested = $requested
+        Terminal = $terminal
+        ControlSha256 = $controlHash
+        RequestedSha256 = $requestedHash
+        TerminalSha256 = $terminalHash
+    }
+}
+
+function Read-AuthenticatedRecoveryIncident {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $location = Get-RecoveryIncidentLocation -State $State -Snapshot $Snapshot
+    if (-not (Test-Path -LiteralPath $location.Directory -PathType Container)) {
+        throw "No authenticated recovery incident is available for reconciliation."
+    }
+    Assert-NotReparseDirectory -Path $location.Directory
+    Assert-RegularManagedFile `
+        -Path $location.RecordPath `
+        -Description "Recovery incident record" `
+        -MaximumBytes 65536
+    $record = ConvertFrom-ExactJson -Json (
+        Get-Content -LiteralPath $location.RecordPath -Raw
+    )
+    Assert-RecoveryIncidentRecord `
+        -Record $record `
+        -Location $location `
+        -State $State `
+        -Snapshot $Snapshot
+    $evidence = Get-ArchivedRecoveryEvidence `
+        -Location $location `
+        -Record $record `
+        -State $State `
+        -Snapshot $Snapshot
+    return [pscustomobject]@{
+        Id = $location.Id
+        Directory = $location.Directory
+        RecordPath = $location.RecordPath
+        Record = $record
+        Evidence = $evidence
+    }
+}
+
 function Publish-RecoveryIncident {
     param(
         [Parameter(Mandatory = $true)]$Evidence,
@@ -1363,114 +1740,118 @@ function Publish-RecoveryIncident {
         New-Item -ItemType Directory -Path $incidentsDirectory -Force | Out-Null
     }
     Assert-NotReparseDirectory -Path $incidentsDirectory
-    $incidentId = "$projectDigest-$($Evidence.State.instanceId)-$($Snapshot.Id)"
-    $incidentDirectory = Assert-DirectChildPath `
-        -Parent $incidentsDirectory `
-        -Child (Join-Path $incidentsDirectory $incidentId)
-    if (-not (Test-Path -LiteralPath $incidentDirectory)) {
-        New-Item -ItemType Directory -Path $incidentDirectory -ErrorAction Stop | Out-Null
+    $location = Get-RecoveryIncidentLocation -State $Evidence.State -Snapshot $Snapshot
+    if (-not (Test-Path -LiteralPath $location.Directory)) {
+        New-Item -ItemType Directory -Path $location.Directory -ErrorAction Stop | Out-Null
     }
-    Assert-NotReparseDirectory -Path $incidentDirectory
-    $recordPath = Assert-DirectChildPath `
-        -Parent $incidentDirectory `
-        -Child (Join-Path $incidentDirectory "incident.json")
-    $record = [ordered]@{
-        schemaVersion = 1
-        state = "pre_termination"
-        projectDigest = $projectDigest
-        processId = [int]$Evidence.State.processId
-        instanceId = [string]$Evidence.State.instanceId
-        processStartTimeUtcTicks = [string]$Evidence.State.processStartTimeUtcTicks
-        startIdentity = [string]$Evidence.State.startIdentity
-        snapshotId = [string]$Snapshot.Id
-        sourceHashes = [ordered]@{
-            control = $Evidence.ControlSha256
-            requestedReceipt = $Evidence.RequestedSha256
-            terminalReceipt = $Evidence.TerminalSha256
-            manifest = $Snapshot.ManifestSha256
-        }
-    }
-    $json = ([pscustomobject]$record) | ConvertTo-Json -Depth 4 -Compress
-    if (Test-Path -LiteralPath $recordPath) {
-        Assert-RegularManagedFile -Path $recordPath -Description "Recovery incident record"
-        if ((Get-Content -LiteralPath $recordPath -Raw).TrimEnd("`r", "`n") -ne $json) {
+    Assert-NotReparseDirectory -Path $location.Directory
+    if (Test-Path -LiteralPath $location.RecordPath) {
+        $existing = Read-AuthenticatedRecoveryIncident `
+            -State $Evidence.State `
+            -Snapshot $Snapshot
+        if (
+            $existing.Evidence.ControlSha256 -ne $Evidence.ControlSha256 -or
+            $existing.Evidence.RequestedSha256 -ne $Evidence.RequestedSha256 -or
+            $existing.Evidence.TerminalSha256 -ne $Evidence.TerminalSha256 -or
+            $existing.Record.state -ne "pre_termination"
+        ) {
             throw "Recovery incident record conflicts with this recovery authority."
         }
-    } else {
-        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
-        $stream = New-Object System.IO.FileStream(
-            $recordPath,
-            [System.IO.FileMode]::CreateNew,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None,
-            4096,
-            [System.IO.FileOptions]::WriteThrough
-        )
-        try {
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        } finally {
-            $stream.Dispose()
-        }
-        if ((Get-Content -LiteralPath $recordPath -Raw) -ne $json) {
-            throw "Recovery incident durable publication did not match."
-        }
+        return $existing
     }
     Publish-ExactRecoveryEvidenceCopy `
         -Source $controlFile `
         -Destination (Assert-DirectChildPath `
-            -Parent $incidentDirectory `
-            -Child (Join-Path $incidentDirectory "control-state.json")) `
+            -Parent $location.Directory `
+            -Child (Join-Path $location.Directory "control-state.json")) `
         -ExpectedSha256 $Evidence.ControlSha256 `
         -Description "Process control state"
     Publish-ExactRecoveryEvidenceCopy `
         -Source (Get-ReceiptPath -State $Evidence.State -Phase "requested") `
         -Destination (Assert-DirectChildPath `
-            -Parent $incidentDirectory `
-            -Child (Join-Path $incidentDirectory "requested-receipt.json")) `
+            -Parent $location.Directory `
+            -Child (Join-Path $location.Directory "requested-receipt.json")) `
         -ExpectedSha256 $Evidence.RequestedSha256 `
         -Description "Shutdown request receipt"
     Publish-ExactRecoveryEvidenceCopy `
         -Source (Get-ReceiptPath -State $Evidence.State -Phase "terminal") `
         -Destination (Assert-DirectChildPath `
-            -Parent $incidentDirectory `
-            -Child (Join-Path $incidentDirectory "terminal-receipt.json")) `
+            -Parent $location.Directory `
+            -Child (Join-Path $location.Directory "terminal-receipt.json")) `
         -ExpectedSha256 $Evidence.TerminalSha256 `
         -Description "Shutdown terminal receipt"
     Publish-ExactRecoveryEvidenceCopy `
         -Source $Snapshot.ManifestPath `
         -Destination (Assert-DirectChildPath `
-            -Parent $incidentDirectory `
-            -Child (Join-Path $incidentDirectory "recovery-manifest.json")) `
+            -Parent $location.Directory `
+            -Child (Join-Path $location.Directory "recovery-manifest.json")) `
         -ExpectedSha256 $Snapshot.ManifestSha256 `
         -Description "Recovery snapshot manifest"
-    return [pscustomobject]@{ Id = $incidentId; Directory = $incidentDirectory; RecordPath = $recordPath }
+    $record = New-RecoveryIncidentRecord `
+        -Location $location `
+        -Evidence $Evidence `
+        -Snapshot $Snapshot
+    Write-NewRecoveryIncidentRecord -Location $location -Record $record
+    return Read-AuthenticatedRecoveryIncident -State $Evidence.State -Snapshot $Snapshot
 }
 
-function Complete-RecoveryIncident {
-    param([Parameter(Mandatory = $true)]$Incident)
-    $record = ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $Incident.RecordPath -Raw)
-    if ($record.state -ne "pre_termination") {
-        throw "Recovery incident state is not eligible for completion."
+function Set-RecoveryIncidentState {
+    param(
+        [Parameter(Mandatory = $true)]$Incident,
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedStates,
+        [ValidateSet("postconditions_verified", "recovered")]
+        [string]$NewState
+    )
+    $current = Read-AuthenticatedRecoveryIncident `
+        -State $Incident.Evidence.State `
+        -Snapshot $Snapshot
+    if ($current.Record.state -eq $NewState) {
+        return $current
     }
-    $record.state = "recovered"
+    if ($current.Record.state -notin $ExpectedStates) {
+        throw "Recovery incident state is not eligible for transition."
+    }
+    $record = New-RecoveryIncidentRecord `
+        -Location $current `
+        -Evidence $current.Evidence `
+        -Snapshot $Snapshot `
+        -State $NewState
     $json = $record | ConvertTo-Json -Depth 4 -Compress
     $temporary = Assert-DirectChildPath `
-        -Parent $Incident.Directory `
-        -Child (Join-Path $Incident.Directory "incident-$PID.tmp")
+        -Parent $current.Directory `
+        -Child (Join-Path $current.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).tmp")
     $backup = Assert-DirectChildPath `
-        -Parent $Incident.Directory `
-        -Child (Join-Path $Incident.Directory "incident-$PID.bak")
-    [System.IO.File]::WriteAllText($temporary, $json, (New-Object System.Text.UTF8Encoding($false)))
+        -Parent $current.Directory `
+        -Child (Join-Path $current.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).bak")
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    $stream = New-Object System.IO.FileStream(
+        $temporary,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
     try {
-        [System.IO.File]::Replace($temporary, $Incident.RecordPath, $backup, $true)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    try {
+        [System.IO.File]::Replace($temporary, $current.RecordPath, $backup, $true)
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     } finally {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
     }
-    if ((ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $Incident.RecordPath -Raw)).state -ne "recovered") {
-        throw "Recovery incident finalization did not persist."
+    $updated = Read-AuthenticatedRecoveryIncident `
+        -State $current.Evidence.State `
+        -Snapshot $Snapshot
+    if ($updated.Record.state -ne $NewState) {
+        throw "Recovery incident state transition did not persist."
     }
+    return $updated
 }
 
 function Wait-ForExactProcessExit {
@@ -1535,7 +1916,10 @@ function Assert-ApplicationWriterLeaseFree {
 }
 
 function Remove-ExactShutdownReceipts {
-    param([Parameter(Mandatory = $true)]$Evidence)
+    param(
+        [Parameter(Mandatory = $true)]$Evidence,
+        [Parameter(Mandatory = $true)]$Incident
+    )
     foreach ($phase in @("requested", "terminal")) {
         $path = Get-ReceiptPath -State $Evidence.State -Phase $phase
         $expectedHash = if ($phase -eq "requested") {
@@ -1543,25 +1927,40 @@ function Remove-ExactShutdownReceipts {
         } else {
             $Evidence.TerminalSha256
         }
-        [void](Read-ShutdownReceipt -State $Evidence.State -Phase $phase)
+        $tombstone = Assert-DirectChildPath `
+            -Parent $Incident.Directory `
+            -Child (Join-Path $Incident.Directory "$phase-receipt-removal.tmp")
+        $pathExists = Test-Path -LiteralPath $path
+        $tombstoneExists = Test-Path -LiteralPath $tombstone
+        if ($pathExists -and $tombstoneExists) {
+            throw "Shutdown receipt removal has conflicting active and tombstone files."
+        }
+        if ($tombstoneExists) {
+            [void](Read-ShutdownReceiptFromPath `
+                -State $Evidence.State `
+                -Phase $phase `
+                -Path $tombstone)
+            if ((Get-BoundedSha256 -Path $tombstone -Description "Shutdown receipt tombstone") -ne $expectedHash) {
+                throw "Shutdown receipt tombstone changed during identity-bound removal."
+            }
+            Remove-Item -LiteralPath $tombstone -Force
+            continue
+        }
+        if (-not $pathExists) {
+            continue
+        }
+        [void](Read-ShutdownReceiptFromPath `
+            -State $Evidence.State `
+            -Phase $phase `
+            -Path $path)
         if ((Get-BoundedSha256 -Path $path -Description "Shutdown receipt") -ne $expectedHash) {
             throw "Shutdown receipt changed before identity-bound removal."
         }
-        $tombstone = Assert-DirectChildPath `
-            -Parent $runtimeDirectory `
-            -Child (Join-Path $runtimeDirectory "receipt-remove-$phase-$PID.tmp")
         [System.IO.File]::Move($path, $tombstone)
-        try {
-            if ((Get-BoundedSha256 -Path $tombstone -Description "Shutdown receipt") -ne $expectedHash) {
-                throw "Shutdown receipt changed during identity-bound removal."
-            }
-            Remove-Item -LiteralPath $tombstone -Force
-        } catch {
-            if (-not (Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $tombstone)) {
-                [System.IO.File]::Move($tombstone, $path)
-            }
-            throw
+        if ((Get-BoundedSha256 -Path $tombstone -Description "Shutdown receipt tombstone") -ne $expectedHash) {
+            throw "Shutdown receipt changed during identity-bound removal."
         }
+        Remove-Item -LiteralPath $tombstone -Force
     }
 }
 
@@ -1571,40 +1970,63 @@ function Recover-FailedShutdown {
     if ($null -eq $state) {
         throw "No authenticated failed-shutdown control state is available for recovery."
     }
-    $process = Get-ManagedProcess -State $state
-    if ($null -eq $process) {
-        throw "Failed-shutdown recovery requires the exact managed process to remain alive."
-    }
     if ([int]$state.port -ne (Get-ConfiguredPort)) {
         throw "Authenticated control state does not match the configured port."
     }
-    $evidence = Get-AuthenticatedRecoveryEvidence -State $state
-    if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
-        throw "The controlled port is occupied or its probe was ambiguous."
-    }
-    if (-not (Test-NoManagedDescendants -ProcessId ([int]$state.processId))) {
-        throw "Managed process has live descendants; refusing recovery termination."
-    }
     $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
-    $incident = Publish-RecoveryIncident -Evidence $evidence -Snapshot $snapshot
-    $evidence = Assert-SameRecoveryEvidence -Evidence $evidence
-    $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
-    $process = Get-ManagedProcess -State $evidence.State
-    if ($null -eq $process -or (Test-LoopbackTcpListener -Port ([int]$evidence.State.port))) {
-        throw "Recovery pre-termination identity or listener verification changed."
+    $process = Get-ManagedProcess -State $state
+    if ($null -ne $process) {
+        $evidence = Get-AuthenticatedRecoveryEvidence -State $state
+        if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
+            throw "The controlled port is occupied or its probe was ambiguous."
+        }
+        if (-not (Test-NoManagedDescendants -ProcessId ([int]$state.processId))) {
+            throw "Managed process has live descendants; refusing recovery termination."
+        }
+        $incident = Publish-RecoveryIncident -Evidence $evidence -Snapshot $snapshot
+        $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
+        if (Test-LoopbackTcpListener -Port ([int]$evidence.State.port)) {
+            throw "Recovery pre-termination listener verification changed."
+        }
+        if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
+            throw "Managed process descendants changed during recovery preflight."
+        }
+        $evidence = Assert-SameRecoveryEvidence -Evidence $evidence
+        $process = Get-ManagedProcess -State $evidence.State
+        if ($null -eq $process) {
+            throw "Recovery pre-termination process identity changed."
+        }
+        Stop-Process -Id ([int]$evidence.State.processId) -ErrorAction Stop
+        Wait-ForExactProcessExit -State $evidence.State
+    } else {
+        $incident = Read-AuthenticatedRecoveryIncident -State $state -Snapshot $snapshot
+        $evidence = $incident.Evidence
     }
-    if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
-        throw "Managed process descendants changed during recovery preflight."
-    }
-    Stop-Process -Id ([int]$evidence.State.processId) -ErrorAction Stop
-    Wait-ForExactProcessExit -State $evidence.State
     if (Test-LoopbackTcpListener -Port ([int]$evidence.State.port)) {
         throw "Controlled port remained occupied after recovery termination."
     }
     Assert-ApplicationWriterLeaseFree
+    if ($incident.Record.state -eq "pre_termination") {
+        $incident = Set-RecoveryIncidentState `
+            -Incident $incident `
+            -Snapshot $snapshot `
+            -ExpectedStates @("pre_termination") `
+            -NewState "postconditions_verified"
+    }
+    $evidence = $incident.Evidence
+    Remove-ExactShutdownReceipts -Evidence $evidence -Incident $incident
+    if ($incident.Record.state -eq "postconditions_verified") {
+        $incident = Set-RecoveryIncidentState `
+            -Incident $incident `
+            -Snapshot $snapshot `
+            -ExpectedStates @("postconditions_verified") `
+            -NewState "recovered"
+    }
+    $incident = Read-AuthenticatedRecoveryIncident `
+        -State $incident.Evidence.State `
+        -Snapshot $snapshot
+    $evidence = $incident.Evidence
     Remove-ControlState -ExpectedState $evidence.State
-    Remove-ExactShutdownReceipts -Evidence $evidence
-    Complete-RecoveryIncident -Incident $incident
     Write-Output "Failed-shutdown incident $($incident.Id) was archived; MyDashboard remains stopped."
 }
 
@@ -1985,7 +2407,7 @@ function Show-ManagedStatus {
 if ($Action -ne "Restore" -and -not [string]::IsNullOrWhiteSpace($BackupId)) {
     throw "BackupId is valid only for the Restore action."
 }
-if ($Action -ne "RecoverFailedShutdown" -and -not [string]::IsNullOrWhiteSpace($RecoverySnapshotId)) {
+if ($Action -ne "RecoverFailedShutdown" -and $PSBoundParameters.ContainsKey("RecoverySnapshotId")) {
     throw "RecoverySnapshotId is valid only for the RecoverFailedShutdown action."
 }
 if ($Action -eq "RecoverFailedShutdown" -and [string]::IsNullOrWhiteSpace($RecoverySnapshotId)) {

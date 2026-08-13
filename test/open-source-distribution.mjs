@@ -694,6 +694,8 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "npm-shrinkwrap.json",
     "package.json",
     "README.md",
+    "scripts/Manage-MyDashboard.ps1",
+    "scripts/probe-application-writer-lease.mjs",
     "scripts/verify-codex-login-readiness.mjs",
     "src/lib/config.js",
     "src/lib/windows-codex-credential-helper.ps1",
@@ -731,6 +733,80 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
       /^(?:data|logs|backups|restore-control|validation-artifacts|node_modules|\.review-runs|playwright-report|test-results|test|test-support|docs\/(?:plans|reviews))(?:\/|$)/u,
     );
   }
+});
+
+test("packed manager resolves the packaged writer lease probe in a clean runtime", async (context) => {
+  const fixtureRoot = await mkdtemp(
+    path.join(tmpdir(), "mydashboard-packed-manager-"),
+  );
+  context.after(async () => {
+    assert.equal(path.dirname(fixtureRoot), path.resolve(tmpdir()));
+    await rm(fixtureRoot, { recursive: true, force: true });
+  });
+  const packRoot = path.join(fixtureRoot, "pack");
+  const installRoot = path.join(fixtureRoot, "install");
+  const environmentRoot = path.join(fixtureRoot, "environment");
+  await Promise.all([
+    mkdir(packRoot, { recursive: true }),
+    mkdir(installRoot, { recursive: true }),
+    mkdir(environmentRoot, { recursive: true, mode: 0o700 }),
+  ]);
+
+  const packed = runNpm(
+    ["pack", "--json", "--ignore-scripts", "--pack-destination", packRoot],
+    root,
+    60_000,
+  );
+  assert.equal(packed.status, 0, `npm pack failed:\n${diagnostic(packed)}`);
+  const [{ filename }] = JSON.parse(packed.stdout);
+  const tarball = path.join(packRoot, filename);
+  await writeFile(
+    path.join(installRoot, "package.json"),
+    '{"name":"packed-manager-fixture","private":true}\n',
+  );
+  const installed = runNpm(
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball],
+    installRoot,
+    60_000,
+  );
+  assert.equal(
+    installed.status,
+    0,
+    `packed manager install failed:\n${diagnostic(installed)}`,
+  );
+
+  const packageRoot = path.join(installRoot, "node_modules", "my-dashboard");
+  assert.equal(
+    existsSync(path.join(packageRoot, "scripts", "Manage-MyDashboard.ps1")),
+    true,
+  );
+  assert.equal(
+    existsSync(path.join(packageRoot, "scripts", "probe-application-writer-lease.mjs")),
+    true,
+  );
+
+  const powershell = managerPowerShell();
+  if (powershell === null) {
+    context.skip("requires PowerShell manager availability");
+    return;
+  }
+  protectWindowsFixtureDirectory(environmentRoot, powershell);
+  const { environment, directories } = cleanManagerEnvironment(environmentRoot);
+  for (const directory of directories) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+  }
+  const status = runManager({
+    executable: powershell,
+    rootDirectory: packageRoot,
+    environment,
+    action: "Status",
+  });
+  assert.equal(
+    status.status,
+    3,
+    `packed manager could not resolve its helper:\n${diagnostic(status)}`,
+  );
+  assert.match(status.stdout, /stopped/iu);
 });
 
 test("brokered Codex login examples and public guidance agree with the runtime", () => {

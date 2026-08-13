@@ -131,18 +131,22 @@ recovery snapshot is available, an operator may explicitly recover it:
 
 ```powershell
 .\scripts\Manage-MyDashboard.ps1 -Action RecoverFailedShutdown `
-  -RecoverySnapshotId snapshot-<32-lowercase-hex>
+  -RecoverySnapshotId shutdown-failure-YYYYMMDD-HHmmss-<32-lowercase-hex>
 ```
 
 The command accepts no browser option and leaves the service stopped. It checks
 the snapshot manifest and active `data/` files byte-for-byte, writes private
 incident evidence under the private runtime, terminates only the authenticated
 PID, verifies the project writer lease can be acquired and released, then
-removes only the matching control state and receipts. Any uncertainty before
-termination leaves the process and evidence intact; any failure after
-termination retains the control state, receipts, and incident evidence. Inspect
-the incident record before taking a separate explicit `Start` action. Never
-delete private lifecycle evidence to bypass these checks.
+durably finalizes the incident, reconciles only the matching receipts, and
+removes the exact control state as the final safety-affecting step. Any
+uncertainty before termination leaves the process and evidence intact. A
+failure after termination retains the control barrier and authenticated
+incident evidence; a retry can resume receipt/tombstone cleanup and final
+control removal only from that matching incident. Arbitrary dead control state
+is not recoverable. Inspect the incident record before taking a separate
+explicit `Start` action. Never delete private lifecycle evidence to bypass
+these checks.
 
 Both `npm start` and managed startup use a bootstrap that captures the packaged
 runtime identity before importing the application and verifies it again before
