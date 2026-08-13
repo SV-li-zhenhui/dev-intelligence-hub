@@ -236,6 +236,14 @@ export function mergeConfig(base, local = {}) {
           },
         }
       : {}),
+    ...(base.githubRead !== undefined || local.githubRead !== undefined
+      ? {
+          githubRead: {
+            ...(base.githubRead || {}),
+            ...(local.githubRead || {}),
+          },
+        }
+      : {}),
     prResponsibility: {
       ...base.prResponsibility,
       ...local.prResponsibility,

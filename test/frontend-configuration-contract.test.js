@@ -39,6 +39,16 @@ test("configuration center is a first-class view with an accessible structured f
   assert.match(styles, /\.configuration-actions button:focus-visible/);
 });
 
+test("configuration save is registered after the structured controller submit guard", () => {
+  const source = functionSource("bindConfigurationView");
+  const controller = source.indexOf("bindConfigurationFormController({");
+  const save = source.indexOf(
+    'form?.addEventListener("submit", handleConfigurationSave)',
+  );
+  assert.ok(controller >= 0);
+  assert.ok(save > controller);
+});
+
 test("configuration and confirmation loading do not depend on a dashboard snapshot", () => {
   const load = functionSource("load");
   const applyDashboard = functionSource("applyDashboard");

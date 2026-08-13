@@ -12,6 +12,7 @@ import {
   configurationStructureTemplate,
 } from "./configuration-form-schema.js";
 import { escapeHtml } from "./view-format.js";
+import { pullRequestUpdatedWindowFormPresentation } from "./pull-request-updated-window-form.js";
 
 function pathText(path) {
   return path.map((segment) => `${segment}`).join(".");
@@ -375,6 +376,9 @@ function optionalSlots(path, value, context) {
     })
     .map((descriptor) => {
       const childPath = [...path, descriptor.pattern.at(-1)];
+      if (pathText(childPath) === "githubRead.pullRequestUpdatedWindow") {
+        return renderPullRequestUpdatedWindow(undefined);
+      }
       return renderSlotTemplate(
         childPath,
         configurationSlotDescriptor(childPath, resolvedProviderContext(path, context)),
@@ -383,6 +387,59 @@ function optionalSlots(path, value, context) {
       );
     })
     .join("");
+}
+
+function browserTimeZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+function selectedOption(value, current, label) {
+  return `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function renderPullRequestUpdatedWindow(value) {
+  const presentation = pullRequestUpdatedWindowFormPresentation(value);
+  const existing = value !== undefined;
+  const mode = presentation.mode;
+  const days = mode === "rolling" ? presentation.days : 7;
+  const fromDate = mode === "fixed" ? presentation.fromDate : "";
+  const throughDate = mode === "fixed" ? presentation.throughDate : "";
+  const timeZone = mode === "fixed" ? presentation.timeZone : browserTimeZone();
+  const status = mode === "unlimited"
+    ? "不限时间（兼容模式）"
+    : mode === "rolling"
+      ? `最近 ${days} 天（每次刷新按 24 小时冻结下界）`
+      : `固定日期 ${fromDate}–${throughDate}（首尾日期都包含）`;
+  const preview = mode === "fixed"
+    ? `<output class="configuration-help" data-configuration-pr-window-preview>${escapeHtml(presentation.preview)}</output>`
+    : "";
+  return `<section class="configuration-structured-node configuration-pr-window" data-configuration-pr-window data-configuration-pr-window-existing="${existing}">
+    <h3>自动发现 PR 更新时间</h3>
+    <p id="configuration-pr-window-help" class="configuration-help"><strong>${escapeHtml(status)}</strong>。旧配置保持不限时间；只有点击应用、保存草稿并经统一确认后才改变。最近 7 天是推荐值，不会因打开页面自动写入。</p>
+    <div class="configuration-structured-grid">
+      <label class="configuration-structured-field"><span>时间范围模式</span><select data-configuration-pr-window-mode aria-describedby="configuration-pr-window-help">
+        ${selectedOption("unlimited", mode, "不限时间（兼容模式）")}
+        ${selectedOption("rolling", mode, "最近 N 天")}
+        ${selectedOption("fixed", mode, "固定日期范围")}
+      </select></label>
+      <div data-configuration-pr-window-fields="rolling"${mode === "rolling" ? "" : " hidden"}>
+        <label class="configuration-structured-field"><span>最近天数</span><input type="number" value="${escapeHtml(days)}" min="1" max="3650" step="1" data-configuration-pr-window-days></label>
+        <p class="configuration-help">最近 7 天（推荐）；按连续 24 小时滚动，不按自然日截断。</p>
+      </div>
+      <div data-configuration-pr-window-fields="fixed"${mode === "fixed" ? "" : " hidden"}>
+        <label class="configuration-structured-field"><span>开始日期（含）</span><input type="text" inputmode="numeric" pattern="[0-9]{8}" maxlength="8" value="${escapeHtml(fromDate)}" placeholder="YYYYMMDD" data-configuration-pr-window-from></label>
+        <label class="configuration-structured-field"><span>结束日期（含）</span><input type="text" inputmode="numeric" pattern="[0-9]{8}" maxlength="8" value="${escapeHtml(throughDate)}" placeholder="YYYYMMDD" data-configuration-pr-window-through></label>
+        <label class="configuration-structured-field"><span>IANA 时区</span><input type="text" value="${escapeHtml(timeZone)}" data-configuration-pr-window-time-zone></label>
+        <p class="configuration-help">首尾日期都包含；系统保存当地午夜对应的 UTC 半开边界，并在这里预览。</p>
+        ${preview}
+      </div>
+    </div>
+    <button type="button" data-configuration-pr-window-apply>应用时间范围到本地表单</button>
+  </section>`;
 }
 
 function slotActions(path, value, context) {
@@ -416,6 +473,9 @@ function renderSlotTemplate(path, slot, operation, context) {
 }
 
 function renderNode(value, path, context) {
+  if (pathText(path) === "githubRead.pullRequestUpdatedWindow") {
+    return renderPullRequestUpdatedWindow(value);
+  }
   if (value === null || typeof value !== "object") {
     return `${slotActions(path, value, context)}${renderField(path, value, context)}`;
   }

@@ -1616,7 +1616,6 @@ function bindConfigurationView() {
     .querySelector("[data-brain-provider-status-reload]")
     ?.addEventListener("click", () => void loadBrainProviderStatus());
   const form = content.querySelector("[data-configuration-structured-form]");
-  form?.addEventListener("submit", handleConfigurationSave);
   if (form && configurationFormState) {
     bindConfigurationFormController({
       root: form,
@@ -1652,6 +1651,7 @@ function bindConfigurationView() {
     }
     updateConfigurationFormStatus();
   }
+  form?.addEventListener("submit", handleConfigurationSave);
   content
     .querySelector("[data-configuration-preview]")
     ?.addEventListener("click", handleConfigurationPreview);

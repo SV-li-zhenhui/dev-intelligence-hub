@@ -250,6 +250,24 @@ test("GitHub PR external actions use an optional structured allow-list", () => {
   );
 });
 
+test("PR discovery window exposes explicit rolling and fixed structured choices", () => {
+  const path = ["githubRead", "pullRequestUpdatedWindow"];
+  const slot = configurationSlotDescriptor(path);
+  assert.equal(slot.optional, true);
+  assert.deepEqual(slot.operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path), {
+    kind: "slot",
+    value: { mode: "rolling", days: 7 },
+  });
+  assert.deepEqual(
+    configurationFieldDescriptor([...path, "mode"], "rolling").options,
+    ["rolling", "fixed"],
+  );
+  const days = configurationFieldDescriptor([...path, "days"], 7);
+  assert.equal(days.minimum, 1);
+  assert.equal(days.maximum, 3_650);
+});
+
 test("GitHub credential mode exposes the approved selector and shared timeout range", () => {
   const descriptor = configurationFieldDescriptor(
     ["githubActions", "credentialMode"],

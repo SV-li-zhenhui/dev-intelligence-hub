@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   bindConfigurationFormController,
   configurationFieldEdit,
+  configurationPullRequestWindowOperation,
   configurationTemplateValue,
 } from "../public/configuration-form-controller.js";
 import {
@@ -199,5 +200,127 @@ test("credential mode select changes rerender dependent Token fields without mig
   assert.equal(
     Object.hasOwn(unrelated.document().configuration.githubActions, "credentialMode"),
     false,
+  );
+});
+
+test("PR window controller converts local fixed dates before creating a slot operation", () => {
+  const values = new Map([
+    ["[data-configuration-pr-window-mode]", "fixed"],
+    ["[data-configuration-pr-window-days]", "7"],
+    ["[data-configuration-pr-window-from]", "20260801"],
+    ["[data-configuration-pr-window-through]", "20260812"],
+    ["[data-configuration-pr-window-time-zone]", "Asia/Shanghai"],
+  ]);
+  const operation = configurationPullRequestWindowOperation({
+    dataset: { configurationPrWindowExisting: "false" },
+    querySelector(selector) {
+      return values.has(selector) ? { value: values.get(selector) } : null;
+    },
+  });
+  assert.deepEqual(operation, {
+    operation: "add",
+    path: ["githubRead", "pullRequestUpdatedWindow"],
+    value: {
+      mode: "fixed",
+      fromInclusive: "2026-07-31T16:00:00.000Z",
+      untilExclusive: "2026-08-12T16:00:00.000Z",
+      timeZone: "Asia/Shanghai",
+    },
+  });
+});
+
+test("bound PR window Apply action updates form state and requests a rerender", () => {
+  let state = createConfigurationFormState(JSON.parse(currentConfigurationText));
+  const listeners = new Map();
+  const values = new Map([
+    ["[data-configuration-pr-window-mode]", "rolling"],
+    ["[data-configuration-pr-window-days]", "7"],
+    ["[data-configuration-pr-window-from]", ""],
+    ["[data-configuration-pr-window-through]", ""],
+    ["[data-configuration-pr-window-time-zone]", "Asia/Shanghai"],
+  ]);
+  const container = {
+    dataset: { configurationPrWindowExisting: "false" },
+    querySelector(selector) {
+      return values.has(selector) ? { value: values.get(selector) } : null;
+    },
+  };
+  const button = {
+    closest(selector) {
+      if (selector === "[data-configuration-pr-window-apply]") return button;
+      if (selector === "[data-configuration-pr-window]") return container;
+      return null;
+    },
+  };
+  let changeOptions = null;
+  let invalidations = 0;
+  const root = {
+    addEventListener(type, handler) { listeners.set(type, handler); },
+    removeEventListener(type) { listeners.delete(type); },
+    contains: () => true,
+  };
+  bindConfigurationFormController({
+    root,
+    getState: () => state,
+    onStateChange(nextState, options) {
+      state = nextState;
+      changeOptions = options;
+    },
+    onInvalidate() { invalidations += 1; },
+    onError(message) { throw new Error(message); },
+  });
+
+  listeners.get("click")({ target: button });
+
+  assert.deepEqual(
+    configurationDocumentFromForm(state).configuration.githubRead.pullRequestUpdatedWindow,
+    { mode: "rolling", days: 7 },
+  );
+  assert.equal(changeOptions.render, true);
+  assert.equal(invalidations, 1);
+});
+
+test("form submit captures dirty PR window controls before the save listener runs", () => {
+  let state = createConfigurationFormState(JSON.parse(currentConfigurationText));
+  const listeners = new Map();
+  const values = new Map([
+    ["[data-configuration-pr-window-mode]", "rolling"],
+    ["[data-configuration-pr-window-days]", "30"],
+    ["[data-configuration-pr-window-from]", ""],
+    ["[data-configuration-pr-window-through]", ""],
+    ["[data-configuration-pr-window-time-zone]", "Asia/Shanghai"],
+  ]);
+  const container = {
+    dataset: {
+      configurationPrWindowExisting: "false",
+      configurationPrWindowDirty: "true",
+    },
+    querySelector(selector) {
+      return values.has(selector) ? { value: values.get(selector) } : null;
+    },
+  };
+  const root = {
+    addEventListener(type, handler) { listeners.set(type, handler); },
+    removeEventListener(type) { listeners.delete(type); },
+    contains: () => true,
+    querySelector: () => container,
+  };
+  bindConfigurationFormController({
+    root,
+    getState: () => state,
+    onStateChange(nextState) { state = nextState; },
+    onInvalidate() {},
+    onError(message) { throw new Error(message); },
+  });
+  let prevented = false;
+  listeners.get("submit")({
+    preventDefault() { prevented = true; },
+    stopImmediatePropagation() {},
+  });
+
+  assert.equal(prevented, false);
+  assert.deepEqual(
+    configurationDocumentFromForm(state).configuration.githubRead.pullRequestUpdatedWindow,
+    { mode: "rolling", days: 30 },
   );
 });

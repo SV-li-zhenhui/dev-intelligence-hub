@@ -8,6 +8,7 @@ import {
   configurationCollectionDescriptor,
   configurationStructureTemplate,
 } from "./configuration-form-schema.js";
+import { pullRequestUpdatedWindowOperationFromForm } from "./pull-request-updated-window-form.js";
 
 const EDIT_KINDS = new Set(["text", "integer", "number", "boolean", "scalar"]);
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -299,6 +300,48 @@ function structureOperation(state, button) {
   return input;
 }
 
+function requiredWindowControl(container, selector, label) {
+  const control = container?.querySelector?.(selector);
+  if (!control || typeof control.value !== "string") {
+    throw configurationControllerError(`${label} control is unavailable`);
+  }
+  return control;
+}
+
+export function configurationPullRequestWindowOperation(container) {
+  if (!container || typeof container !== "object") {
+    throw configurationControllerError("PR discovery window form is unavailable");
+  }
+  return pullRequestUpdatedWindowOperationFromForm({
+    existing: container.dataset?.configurationPrWindowExisting === "true",
+    mode: requiredWindowControl(
+      container,
+      "[data-configuration-pr-window-mode]",
+      "PR discovery window mode",
+    ).value,
+    days: requiredWindowControl(
+      container,
+      "[data-configuration-pr-window-days]",
+      "PR discovery rolling days",
+    ).value,
+    fromDate: requiredWindowControl(
+      container,
+      "[data-configuration-pr-window-from]",
+      "PR discovery start date",
+    ).value,
+    throughDate: requiredWindowControl(
+      container,
+      "[data-configuration-pr-window-through]",
+      "PR discovery end date",
+    ).value,
+    timeZone: requiredWindowControl(
+      container,
+      "[data-configuration-pr-window-time-zone]",
+      "PR discovery time zone",
+    ).value,
+  });
+}
+
 function entityIdentity(state, operation) {
   const key = JSON.stringify(operation.path);
   const mapKinds = new Map([
@@ -415,6 +458,18 @@ function eventControl(event, attribute) {
   return target?.dataset?.[attribute] !== undefined ? target : null;
 }
 
+function pullRequestWindowContainer(control) {
+  return control?.closest?.("[data-configuration-pr-window]") ?? null;
+}
+
+function markPullRequestWindowDirty(control, onInvalidate) {
+  const container = pullRequestWindowContainer(control);
+  if (!container) return false;
+  container.dataset.configurationPrWindowDirty = "true";
+  onInvalidate();
+  return true;
+}
+
 function clearFieldError(control) {
   control.removeAttribute("aria-invalid");
   control.removeAttribute("data-configuration-first-invalid");
@@ -483,6 +538,7 @@ export function bindConfigurationFormController({
       applyField(field);
       return;
     }
+    if (markPullRequestWindowDirty(event.target, onInvalidate)) return;
     if (eventControl(event, "configurationTemplateField")) onInvalidate();
   }
 
@@ -502,10 +558,57 @@ export function bindConfigurationFormController({
       applyField(field);
       return;
     }
+    const windowMode = eventControl(event, "configurationPrWindowMode");
+    if (windowMode) {
+      const container = windowMode.closest?.("[data-configuration-pr-window]");
+      if (container) container.dataset.configurationPrWindowDirty = "true";
+      container
+        ?.querySelectorAll?.("[data-configuration-pr-window-fields]")
+        .forEach((fields) => {
+          fields.hidden = fields.dataset.configurationPrWindowFields !== windowMode.value;
+        });
+      onInvalidate();
+      return;
+    }
     if (eventControl(event, "configurationTemplateField")) onInvalidate();
   }
 
+  function handleSubmit(event) {
+    const container = root.querySelector?.("[data-configuration-pr-window]");
+    if (container?.dataset?.configurationPrWindowDirty !== "true") return;
+    try {
+      const operation = configurationPullRequestWindowOperation(container);
+      if (operation === null) return;
+      const state = getState();
+      const nextState = applyConfigurationStructureOperation(state, operation);
+      onStateChange(nextState, { render: false, operation: "pr-window-submit" });
+    } catch (error) {
+      event.preventDefault();
+      event.stopImmediatePropagation?.();
+      onError(error.message, {
+        focus: container.querySelector?.("[data-configuration-pr-window-mode]"),
+      });
+    }
+  }
+
   function handleClick(event) {
+    const windowButton = event.target?.closest?.(
+      "[data-configuration-pr-window-apply]",
+    );
+    if (windowButton && root.contains(windowButton)) {
+      try {
+        const state = getState();
+        const container = windowButton.closest("[data-configuration-pr-window]");
+        const operation = configurationPullRequestWindowOperation(container);
+        if (operation === null) return;
+        const nextState = applyConfigurationStructureOperation(state, operation);
+        onInvalidate();
+        onStateChange(nextState, structureChangeOptions(state, operation));
+      } catch (error) {
+        onError(error.message, { focus: windowButton });
+      }
+      return;
+    }
     const button = event.target?.closest?.("[data-configuration-operation]");
     if (!button || !root.contains(button)) return;
     try {
@@ -538,11 +641,13 @@ export function bindConfigurationFormController({
   root.addEventListener("input", handleInput);
   root.addEventListener("change", handleChange);
   root.addEventListener("click", handleClick);
+  root.addEventListener("submit", handleSubmit);
   return Object.freeze({
     destroy() {
       root.removeEventListener("input", handleInput);
       root.removeEventListener("change", handleChange);
       root.removeEventListener("click", handleClick);
+      root.removeEventListener("submit", handleSubmit);
     },
   });
 }

@@ -4,6 +4,7 @@ import {
   configurationSlotDescriptor,
   deepFreeze,
 } from "./configuration-form-schema.js";
+import { validatePullRequestUpdatedWindowFormValue } from "./pull-request-updated-window-form.js";
 
 export { CONFIGURATION_FORM_GROUPS } from "./configuration-form-schema.js";
 
@@ -742,7 +743,25 @@ function assertSupportedConfigurationShape(value) {
   ];
   assertFields(value, "configuration", topLevelFields, topLevelFields);
   requireArray(value.trackedRepositories, "configuration.trackedRepositories");
-  assertFields(value.githubRead, "configuration.githubRead", ["enabled"], ["enabled"]);
+  assertFields(
+    value.githubRead,
+    "configuration.githubRead",
+    ["enabled", "pullRequestUpdatedWindow"],
+    ["enabled"],
+  );
+  if (Object.hasOwn(value.githubRead, "pullRequestUpdatedWindow")) {
+    try {
+      validatePullRequestUpdatedWindowFormValue(
+        value.githubRead.pullRequestUpdatedWindow,
+      );
+    } catch (error) {
+      throw formError(
+        "UNSUPPORTED_CONFIGURATION_SCHEMA",
+        error.message,
+        "configuration.githubRead.pullRequestUpdatedWindow",
+      );
+    }
+  }
   assertFields(
     value.prResponsibility,
     "configuration.prResponsibility",

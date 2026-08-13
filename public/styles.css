@@ -2416,6 +2416,35 @@ h1 {
   grid-column: 1 / -1;
 }
 
+.configuration-pr-window {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.configuration-pr-window [data-configuration-pr-window-fields] {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: 11px;
+}
+
+.configuration-pr-window [data-configuration-pr-window-fields][hidden] {
+  display: none;
+}
+
+.configuration-pr-window output {
+  grid-column: 1 / -1;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+  background: var(--paper);
+  border-radius: 6px;
+}
+
+.configuration-pr-window > button {
+  margin-top: 11px;
+}
+
 .configuration-structured-node > h3,
 .configuration-structured-collection > header {
   margin: 10px 0 8px;

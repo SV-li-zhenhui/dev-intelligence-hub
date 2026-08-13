@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   normalizeWorkspacePath,
@@ -9,6 +10,10 @@ import {
   canonicalJsonDigest,
   canonicalJsonStringify,
 } from "../lib/canonical-json-digest.js";
+import {
+  normalizePullRequestUpdatedWindow,
+  pullRequestUpdatedWindowSetDirection,
+} from "./pull-request-updated-window.js";
 
 const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_DEPTH = 32;
@@ -193,6 +198,7 @@ function cloneSafeData(value, path, ancestors, depth) {
     return value;
   }
   if (typeof value !== "object") throw invalid(path);
+  if (utilTypes.isProxy(value)) throw invalid(path, "不得使用代理对象");
   if (ancestors.has(value)) throw invalid(path, "包含循环引用");
   ancestors.add(value);
   try {
@@ -1376,9 +1382,27 @@ function normalizeDingTalk(value) {
 
 function normalizeGithubRead(value) {
   const path = "githubRead";
-  const config = fields(value, path, ["enabled"], ["enabled"]);
+  const config = fields(
+    value,
+    path,
+    ["enabled", "pullRequestUpdatedWindow"],
+    ["enabled"],
+  );
   return {
     enabled: boolean(config.enabled, `${path}.enabled`),
+    ...(Object.hasOwn(config, "pullRequestUpdatedWindow")
+      ? {
+          pullRequestUpdatedWindow: (() => {
+            try {
+              return normalizePullRequestUpdatedWindow(
+                config.pullRequestUpdatedWindow,
+              );
+            } catch (cause) {
+              throw invalid(`${path}.pullRequestUpdatedWindow`, "无效", cause);
+            }
+          })(),
+        }
+      : {}),
   };
 }
 
@@ -1736,7 +1760,9 @@ function requiresInfrastructureRestart(path) {
   return (
     path === "port" ||
     path === "githubLogin" ||
-    (path === "githubRead" || path === "githubRead.enabled") ||
+    (path === "githubRead" ||
+      path === "githubRead.enabled" ||
+      path === "githubRead.pullRequestUpdatedWindow") ||
     path.startsWith("brainProviders.") ||
     path.startsWith("codeExecutor.") ||
     path.startsWith("changePackages.") ||
@@ -1761,7 +1787,26 @@ export function configurationDocumentImpact(beforeValue, afterValue) {
     benign_claim_change: new Set(),
     restart_required: new Set(),
   };
+  const windowPath = "githubRead.pullRequestUpdatedWindow";
+  const beforeWindow = before.githubRead?.pullRequestUpdatedWindow;
+  const afterWindow = after.githubRead?.pullRequestUpdatedWindow;
+  const windowChanged = !equalValue(beforeWindow, afterWindow);
+  if (windowChanged) {
+    const direction = pullRequestUpdatedWindowSetDirection(
+      beforeWindow,
+      afterWindow,
+    );
+    if (direction.tightening) categories.security_tightening.add(windowPath);
+    if (direction.expansion) categories.authority_expansion.add(windowPath);
+    categories.restart_required.add(windowPath);
+  }
   for (const change of collectChanges(before, after)) {
+    if (
+      windowChanged &&
+      (change.path === windowPath || change.path.startsWith(`${windowPath}.`))
+    ) {
+      continue;
+    }
     const direction = authorityDirection(change);
     const infrastructureRestart = requiresInfrastructureRestart(change.path);
     if (direction.tightening) categories.security_tightening.add(change.path);

@@ -87,6 +87,12 @@ const LABELS = deepFreeze({
   browserPollSeconds: "浏览器轮询（秒）",
   githubLogin: "GitHub 登录名",
   githubRead: "GitHub 读取",
+  pullRequestUpdatedWindow: "自动发现 PR 更新时间",
+  mode: "时间范围模式",
+  days: "最近天数",
+  fromInclusive: "UTC 开始边界（含）",
+  untilExclusive: "UTC 结束边界（不含）",
+  timeZone: "IANA 时区",
   trackedRepositories: "跟踪仓库",
   prResponsibility: "PR 责任范围",
   historicalAfterDays: "历史 PR 天数",
@@ -229,6 +235,11 @@ const INTEGER_FIELDS = deepFreeze([
   { pattern: ["port"], minimum: 1, maximum: 65_535 },
   { pattern: ["refreshMinutes"], minimum: 1, maximum: 1_440 },
   { pattern: ["browserPollSeconds"], minimum: 1, maximum: 86_400 },
+  {
+    pattern: ["githubRead", "pullRequestUpdatedWindow", "days"],
+    minimum: 1,
+    maximum: 3_650,
+  },
   { pattern: ["prResponsibility", "historicalAfterDays"], minimum: 0, maximum: 10_000 },
   { pattern: ["workflowRouting", "schemaVersion"], minimum: 1, maximum: 1, options: [1] },
   { pattern: ["workflowRouting", "maxHops"], minimum: 1, maximum: 32 },
@@ -310,6 +321,16 @@ const INTEGER_FIELDS = deepFreeze([
 ]);
 
 const FIELD_RULES = deepFreeze([
+  {
+    pattern: ["githubRead", "pullRequestUpdatedWindow", "mode"],
+    control: "select",
+    kind: "text",
+    options: ["rolling", "fixed"],
+    optionLabels: {
+      rolling: "最近 N 天（按 24 小时滚动）",
+      fixed: "固定日期范围（首尾日期都包含）",
+    },
+  },
   { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
   { pattern: ["codeExecutor", "workspaces", "#", "gitHeadSnapshot"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "initialPaused"], control: "checkbox", kind: "boolean" },
@@ -484,6 +505,13 @@ const COLLECTIONS = deepFreeze([
 
 const SLOTS = deepFreeze([
   {
+    pattern: ["githubRead", "pullRequestUpdatedWindow"],
+    label: "自动发现 PR 更新时间",
+    template: "pr-updated-window-rolling",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
     pattern: ["brainProviders", "*", "credentialMode"],
     label: "认证方式",
     template: "provider-credential-mode",
@@ -545,6 +573,7 @@ const SLOTS = deepFreeze([
 ]);
 
 const TEMPLATES = deepFreeze({
+  "pr-updated-window-rolling": { mode: "rolling", days: 7 },
   repository: "owner/repository",
   provider: {
     kind: "openai-compatible",

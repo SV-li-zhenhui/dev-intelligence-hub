@@ -131,6 +131,190 @@ test("the legacy GitHub-read default is classified by effective authority", () =
   assert.deepEqual(restored.authority_expansion, ["githubRead"]);
 });
 
+test("GitHub-read window omission remains omitted while rolling windows are exact", () => {
+  const legacy = document();
+  const normalizedLegacy = normalizeConfigurationDocument(legacy);
+  assert.equal(
+    Object.hasOwn(normalizedLegacy.githubRead, "pullRequestUpdatedWindow"),
+    false,
+  );
+  assert.equal(configurationDocumentDigest(normalizedLegacy), configurationDocumentDigest(legacy));
+
+  for (const days of [1, 7, 3_650]) {
+    const configured = document();
+    configured.githubRead.pullRequestUpdatedWindow = { mode: "rolling", days };
+    assert.deepEqual(
+      normalizeConfigurationDocument(configured).githubRead.pullRequestUpdatedWindow,
+      { mode: "rolling", days },
+    );
+  }
+
+  for (const invalidWindow of [
+    { mode: "rolling", days: 0 },
+    { mode: "rolling", days: 3_651 },
+    { mode: "rolling", days: 1.5 },
+    { mode: "rolling", days: 7, unexpected: true },
+    { mode: "unknown", days: 7 },
+  ]) {
+    const invalid = document();
+    invalid.githubRead.pullRequestUpdatedWindow = invalidWindow;
+    assertInvalid(invalid);
+  }
+
+  const accessor = document();
+  let getterCalls = 0;
+  accessor.githubRead.pullRequestUpdatedWindow = { mode: "rolling", days: 7 };
+  Object.defineProperty(accessor.githubRead.pullRequestUpdatedWindow, "days", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 7;
+    },
+  });
+  assertInvalid(accessor);
+  assert.equal(getterCalls, 0);
+
+  const abnormalPrototype = document();
+  abnormalPrototype.githubRead.pullRequestUpdatedWindow = Object.assign(
+    Object.create(null),
+    { mode: "rolling", days: 7 },
+  );
+  assertInvalid(abnormalPrototype);
+
+  const proxied = document();
+  let proxyTrapCalls = 0;
+  proxied.githubRead.pullRequestUpdatedWindow = new Proxy(
+    { mode: "rolling", days: 7 },
+    {
+      getOwnPropertyDescriptor() {
+        proxyTrapCalls += 1;
+        throw new Error("configuration must not inspect a proxy");
+      },
+    },
+  );
+  assertInvalid(proxied);
+  assert.equal(proxyTrapCalls, 0);
+});
+
+test("fixed GitHub-read windows require canonical UTC local midnights across DST", () => {
+  const configured = document();
+  configured.githubRead.pullRequestUpdatedWindow = {
+    mode: "fixed",
+    fromInclusive: "2026-03-08T05:00:00.000Z",
+    untilExclusive: "2026-03-10T04:00:00.000Z",
+    timeZone: "America/New_York",
+  };
+  assert.deepEqual(
+    normalizeConfigurationDocument(configured).githubRead.pullRequestUpdatedWindow,
+    configured.githubRead.pullRequestUpdatedWindow,
+  );
+
+  const nonHourOffset = document();
+  nonHourOffset.githubRead.pullRequestUpdatedWindow = {
+    mode: "fixed",
+    fromInclusive: "2026-08-01T18:15:00.000Z",
+    untilExclusive: "2026-08-03T18:15:00.000Z",
+    timeZone: "Asia/Kathmandu",
+  };
+  assert.deepEqual(
+    normalizeConfigurationDocument(nonHourOffset).githubRead.pullRequestUpdatedWindow,
+    nonHourOffset.githubRead.pullRequestUpdatedWindow,
+  );
+
+  for (const invalidWindow of [
+    {
+      mode: "fixed",
+      fromInclusive: "2026-03-08T05:00:00Z",
+      untilExclusive: "2026-03-10T04:00:00.000Z",
+      timeZone: "America/New_York",
+    },
+    {
+      mode: "fixed",
+      fromInclusive: "2026-03-08T05:00:00.000Z",
+      untilExclusive: "2026-03-08T05:00:00.000Z",
+      timeZone: "America/New_York",
+    },
+    {
+      mode: "fixed",
+      fromInclusive: "2026-03-08T06:00:00.000Z",
+      untilExclusive: "2026-03-10T04:00:00.000Z",
+      timeZone: "America/New_York",
+    },
+    {
+      mode: "fixed",
+      fromInclusive: "2026-03-08T05:00:00.000Z",
+      untilExclusive: "2026-03-10T04:00:00.000Z",
+      timeZone: "Not/A_Zone",
+    },
+    {
+      mode: "fixed",
+      fromInclusive: "2026-03-08T05:00:00.000Z",
+      untilExclusive: "2026-03-10T04:00:00.000Z",
+      timeZone: "America/New_York",
+      unexpected: true,
+    },
+    {
+      mode: "fixed",
+      fromInclusive: "2000-10-29T04:00:00.000Z",
+      untilExclusive: "2000-10-30T05:00:00.000Z",
+      timeZone: "America/Havana",
+    },
+  ]) {
+    const invalid = document();
+    invalid.githubRead.pullRequestUpdatedWindow = invalidWindow;
+    assertInvalid(invalid);
+  }
+});
+
+test("GitHub-read window impact follows discovery-set containment", () => {
+  const path = "githubRead.pullRequestUpdatedWindow";
+  const withWindow = (window) => {
+    const value = document();
+    if (window !== undefined) value.githubRead.pullRequestUpdatedWindow = window;
+    return value;
+  };
+  const rolling7 = { mode: "rolling", days: 7 };
+  const rolling30 = { mode: "rolling", days: 30 };
+  const fixedWide = {
+    mode: "fixed",
+    fromInclusive: "2026-03-08T05:00:00.000Z",
+    untilExclusive: "2026-03-12T04:00:00.000Z",
+    timeZone: "America/New_York",
+  };
+  const fixedNarrow = {
+    ...fixedWide,
+    fromInclusive: "2026-03-09T04:00:00.000Z",
+    untilExclusive: "2026-03-11T04:00:00.000Z",
+  };
+  const fixedShifted = {
+    ...fixedWide,
+    fromInclusive: "2026-03-10T04:00:00.000Z",
+    untilExclusive: "2026-03-14T04:00:00.000Z",
+  };
+
+  const expectDirection = (before, after, tightening, expansion) => {
+    const impact = configurationDocumentImpact(withWindow(before), withWindow(after));
+    assert.deepEqual(impact.security_tightening, tightening ? [path] : []);
+    assert.deepEqual(impact.authority_expansion, expansion ? [path] : []);
+    assert.deepEqual(impact.restart_required, [path]);
+  };
+
+  expectDirection(undefined, rolling7, true, false);
+  expectDirection(rolling7, undefined, false, true);
+  expectDirection(rolling30, rolling7, true, false);
+  expectDirection(rolling7, rolling30, false, true);
+  expectDirection(fixedWide, fixedNarrow, true, false);
+  expectDirection(fixedNarrow, fixedWide, false, true);
+  expectDirection(fixedWide, fixedShifted, true, true);
+  expectDirection(rolling7, fixedWide, true, true);
+
+  const sameBoundariesNewZone = {
+    ...fixedWide,
+    timeZone: "America/Toronto",
+  };
+  expectDirection(fixedWide, sameBoundariesNewZone, false, false);
+});
+
 test("unknown and dangerous fields are rejected even below a disabled feature", () => {
   const unknown = document();
   unknown.codeExecutor.unrestrictedShell = true;

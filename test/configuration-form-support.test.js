@@ -397,6 +397,68 @@ test("a pre-boundary configuration is editable with its effective GitHub-read de
   assert.deepEqual(result.configuration.githubRead, { enabled: true });
 });
 
+test("PR discovery windows round-trip explicitly without drifting legacy unlimited configs", () => {
+  const path = ["githubRead", "pullRequestUpdatedWindow"];
+  const legacy = createConfigurationFormState(representativeConfiguration());
+  assert.equal(
+    Object.hasOwn(
+      configurationDocumentFromForm(legacy).configuration.githubRead,
+      "pullRequestUpdatedWindow",
+    ),
+    false,
+  );
+  const unrelated = setConfigurationFormField(legacy, {
+    path: ["browserPollSeconds"],
+    kind: "integer",
+    rawValue: "61",
+  });
+  assert.equal(
+    Object.hasOwn(
+      configurationDocumentFromForm(unrelated).configuration.githubRead,
+      "pullRequestUpdatedWindow",
+    ),
+    false,
+  );
+
+  const rolling = applyConfigurationStructureOperation(legacy, {
+    operation: "add",
+    path,
+    value: { mode: "rolling", days: 7 },
+  });
+  assert.deepEqual(
+    configurationDocumentFromForm(rolling).configuration.githubRead.pullRequestUpdatedWindow,
+    { mode: "rolling", days: 7 },
+  );
+
+  const fixedValue = {
+    mode: "fixed",
+    fromInclusive: "2026-03-08T05:00:00.000Z",
+    untilExclusive: "2026-03-10T04:00:00.000Z",
+    timeZone: "America/New_York",
+  };
+  const fixed = applyConfigurationStructureOperation(rolling, {
+    operation: "replace",
+    path,
+    value: fixedValue,
+  });
+  assert.deepEqual(
+    configurationDocumentFromForm(fixed).configuration.githubRead.pullRequestUpdatedWindow,
+    fixedValue,
+  );
+
+  const removed = applyConfigurationStructureOperation(fixed, {
+    operation: "remove",
+    path,
+  });
+  assert.equal(
+    Object.hasOwn(
+      configurationDocumentFromForm(removed).configuration.githubRead,
+      "pullRequestUpdatedWindow",
+    ),
+    false,
+  );
+});
+
 test("Git Head snapshot scalar fields round-trip and remain directly editable", () => {
   const configuration = configurationWithGitHeadSnapshot();
   let state = createConfigurationFormState(configuration);

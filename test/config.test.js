@@ -57,6 +57,30 @@ test("local provider settings merge without erasing base defaults", () => {
   });
 });
 
+test("GitHub-read overrides deep merge without inventing or deleting a PR window", () => {
+  const rolling = { mode: "rolling", days: 7 };
+  const base = {
+    githubRead: { enabled: true, pullRequestUpdatedWindow: rolling },
+  };
+
+  assert.deepEqual(mergeConfig(base, { githubRead: { enabled: false } }).githubRead, {
+    enabled: false,
+    pullRequestUpdatedWindow: rolling,
+  });
+  assert.deepEqual(
+    mergeConfig(base, {
+      githubRead: {
+        pullRequestUpdatedWindow: { mode: "rolling", days: 30 },
+      },
+    }).githubRead,
+    {
+      enabled: true,
+      pullRequestUpdatedWindow: { mode: "rolling", days: 30 },
+    },
+  );
+  assert.equal(Object.hasOwn(mergeConfig({}, {}), "githubRead"), false);
+});
+
 test("configured brains and role permissions merge independently by id", () => {
   const result = mergeConfig(
     {

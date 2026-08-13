@@ -177,6 +177,41 @@ test("settings skeleton is structured and never falls back to a JSON editor", ()
   }
 });
 
+test("PR discovery window UI preserves unlimited mode and restores fixed local dates", () => {
+  const legacy = configurationWithCredentialReferences();
+  let markup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(legacy),
+  });
+  assert.match(markup, /自动发现 PR 更新时间/);
+  assert.match(markup, /不限时间（兼容模式）/);
+  assert.match(markup, /value="7"[^>]+data-configuration-pr-window-days/);
+  assert.match(markup, /最近 7 天（推荐）/);
+  assert.match(markup, /data-configuration-pr-window-apply/);
+  assert.equal(
+    Object.hasOwn(legacy.githubRead, "pullRequestUpdatedWindow"),
+    false,
+  );
+
+  const fixed = configurationWithCredentialReferences();
+  fixed.githubRead.pullRequestUpdatedWindow = {
+    mode: "fixed",
+    fromInclusive: "2026-03-08T05:00:00.000Z",
+    untilExclusive: "2026-03-10T04:00:00.000Z",
+    timeZone: "America/New_York",
+  };
+  markup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(fixed),
+  });
+  assert.match(markup, /value="20260308"[^>]+data-configuration-pr-window-from/);
+  assert.match(markup, /value="20260309"[^>]+data-configuration-pr-window-through/);
+  assert.match(markup, /value="America\/New_York"[^>]+data-configuration-pr-window-time-zone/);
+  assert.match(
+    markup,
+    /2026-03-08T05:00:00\.000Z ≤ updatedAt &lt; 2026-03-10T04:00:00\.000Z/,
+  );
+  assert.match(markup, /首尾日期都包含/);
+});
+
 test("old code workspaces expose structured Git Head setup and native controls", () => {
   let state = createConfigurationFormState(configurationWithLegacyCodeWorkspace());
   let markup = renderConfigurationSettingsSkeleton({ state });
