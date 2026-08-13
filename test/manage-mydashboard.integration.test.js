@@ -2050,6 +2050,28 @@ test(
   },
 );
 
+test(
+  "RecoverFailedShutdown permits declared regenerable caches in active data",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const activeData = path.join(fixture.root, "data");
+    await mkdir(path.join(activeData, "playwright-browsers", ".links"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(activeData, "playwright-browsers", ".links", "browser.json"),
+      "{}\n",
+    );
+    await mkdir(
+      path.join(activeData, "validation-profile-probe", "runtime", "profile"),
+      { recursive: true },
+    );
+
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
 for (const { label, snapshotId } of [
   { label: "malformed snapshot identifier", snapshotId: "shutdown-failure-invalid" },
   {
@@ -2175,6 +2197,16 @@ for (const { label, mutate } of [
     },
   },
   {
+    label: "declared cache directory inside snapshot",
+    async mutate(fixture) {
+      await mkdir(path.join(
+        fixture.snapshotDirectory,
+        "data",
+        "playwright-browsers",
+      ));
+    },
+  },
+  {
     label: "reparse snapshot data directory",
     async mutate(fixture) {
       const dataPath = path.join(fixture.snapshotDirectory, "data");
@@ -2220,6 +2252,24 @@ for (const { label, mutate } of [
     label: "extra active file",
     async mutate(fixture) {
       await writeFile(path.join(fixture.root, "data", "extra.json"), "{}\n");
+    },
+  },
+  {
+    label: "undeclared active directory",
+    async mutate(fixture) {
+      await mkdir(path.join(fixture.root, "data", "unexpected-cache"));
+    },
+  },
+  {
+    label: "reparse declared active cache directory",
+    async mutate(fixture) {
+      const target = path.join(fixture.root, "cache-junction-target");
+      await mkdir(target);
+      await symlink(
+        target,
+        path.join(fixture.root, "data", "playwright-browsers"),
+        "junction",
+      );
     },
   },
   {

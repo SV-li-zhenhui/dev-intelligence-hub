@@ -81,6 +81,10 @@ $offlineRestoreScript = [System.IO.Path]::GetFullPath(
 $dataDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $projectDirectory "data")
 )
+$recoveryExcludedDataDirectories = @(
+    "playwright-browsers",
+    "validation-profile-probe"
+)
 $restoreControlDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $projectDirectory "restore-control")
 )
@@ -1201,7 +1205,8 @@ function ConvertFrom-RecoveryManifestJson {
 function Get-RecoverySnapshotFiles {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
-        [Parameter(Mandatory = $true)]$Manifest
+        [Parameter(Mandatory = $true)]$Manifest,
+        [string[]]$AllowedExcludedDirectories = @()
     )
     Assert-NotReparseDirectory -Path $Directory
     if ($Manifest.files -isnot [System.Array]) {
@@ -1253,16 +1258,27 @@ function Get-RecoverySnapshotFiles {
     if ([long]$Manifest.totalBytes -ne $total) {
         throw "Recovery snapshot manifest totals are invalid."
     }
-    $actual = @(Get-ChildItem -LiteralPath $Directory -Force)
-    if ($actual.Count -ne $expected.Count) {
+    $actualFiles = @()
+    foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Force)) {
+        $isReparse = (
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        )
+        if ($item.PSIsContainer) {
+            if ($isReparse -or $AllowedExcludedDirectories -notcontains $item.Name) {
+                throw "Recovery snapshot contains an unsafe directory entry."
+            }
+            continue
+        }
+        if ($isReparse) {
+            throw "Recovery snapshot contains an unsafe file entry."
+        }
+        $actualFiles += $item
+    }
+    if ($actualFiles.Count -ne $expected.Count) {
         throw "Recovery snapshot file set does not match its manifest."
     }
-    foreach ($item in $actual) {
-        if (
-            $item.PSIsContainer -or
-            (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
-            -not $expected.ContainsKey($item.Name)
-        ) {
+    foreach ($item in $actualFiles) {
+        if (-not $expected.ContainsKey($item.Name)) {
             throw "Recovery snapshot contains an unsafe file entry."
         }
         $entry = $expected[$item.Name]
@@ -1347,7 +1363,10 @@ function Get-ValidatedRecoverySnapshot {
         throw "Recovery snapshot manifest has an invalid shape or source."
     }
     $files = Get-RecoverySnapshotFiles -Directory $dataPath -Manifest $manifest
-    $activeFiles = Get-RecoverySnapshotFiles -Directory $dataDirectory -Manifest $manifest
+    $activeFiles = Get-RecoverySnapshotFiles `
+        -Directory $dataDirectory `
+        -Manifest $manifest `
+        -AllowedExcludedDirectories $recoveryExcludedDataDirectories
     foreach ($name in $files.Keys) {
         if (
             [long]$files[$name].bytes -ne [long]$activeFiles[$name].bytes -or
