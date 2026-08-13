@@ -5,7 +5,10 @@ import {
   normalizeConfigurationBinding,
   sameConfigurationBinding,
 } from "./configuration-view-support.js";
-import { createConfirmationDialogOwnership } from "./confirmation-dialog-support.js";
+import {
+  createConfirmationDialogOwnership,
+  createSessionDeferredConfirmationStore,
+} from "./confirmation-dialog-support.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
   configurationDocumentFromForm,
@@ -181,7 +184,11 @@ let systemStatusRequestSequence = 0;
 let lastAppliedSystemStatusRequest = 0;
 let systemStatusAbortController = null;
 const MAX_DEFERRED_CONFIRMATIONS = 32;
-const deferredConfirmations = new Set();
+const deferredConfirmationStore = createSessionDeferredConfirmationStore({
+  getStorage: () => window.sessionStorage,
+  storageKey: "mydashboard.deferred-confirmations.v1",
+});
+const deferredConfirmations = new Set(deferredConfirmationStore.load());
 
 function rememberDeferredConfirmation(key) {
   if (!key) return;
@@ -190,6 +197,7 @@ function rememberDeferredConfirmation(key) {
   while (deferredConfirmations.size > MAX_DEFERRED_CONFIRMATIONS) {
     deferredConfirmations.delete(deferredConfirmations.values().next().value);
   }
+  deferredConfirmationStore.save(deferredConfirmations);
 }
 
 function attentionNextUrl() {
@@ -4351,6 +4359,7 @@ async function restoreDeferredConfirmations() {
   };
   deferredConfirmationRestore = restore;
   deferredConfirmations.clear();
+  deferredConfirmationStore.clear();
   if (dashboard && currentView === "employees") render();
   try {
     await refreshConfirmationQueue({

@@ -7,8 +7,10 @@ import { validationBrowserLaunchOptions } from
   "../../scripts/playwright-validation-options.mjs";
 
 const publicDirectory = path.resolve("public");
+const deferredConfirmationStorageKey = "mydashboard.deferred-confirmations.v1";
 const historyDelayMs = 120;
 let appendFailuresRemaining = 1;
+let attentionFailuresRemaining = 0;
 let confirmationEnabled = false;
 let confirmationFixtureName = "active";
 let historyMutation = 0;
@@ -277,7 +279,17 @@ function createFixtureServer() {
         json(response, 200, { ok: true });
         return;
       }
+      if (url.pathname === "/fixture/fail-next-attention") {
+        attentionFailuresRemaining = 1;
+        json(response, 200, { ok: true });
+        return;
+      }
       if (url.pathname === "/api/attention/next") {
+        if (attentionFailuresRemaining > 0) {
+          attentionFailuresRemaining -= 1;
+          json(response, 503, { error: "fixture attention failure" });
+          return;
+        }
         if (deferredRestoreRace !== null) {
           deferredRestoreRace.requests += 1;
           if (deferredRestoreRace.requests === 1) {
@@ -383,9 +395,9 @@ try {
     await page.locator('#confirmation-history-role option[value="former-reviewer"]').count(),
     1,
   );
-  const form = await page.locator("#confirmation-history-filter").elementHandle();
-  const liveRegion = await page.locator("#confirmation-history-results").elementHandle();
-  const loadMore = await page.locator("#confirmation-history-load-more").elementHandle();
+  let form = await page.locator("#confirmation-history-filter").elementHandle();
+  let liveRegion = await page.locator("#confirmation-history-results").elementHandle();
+  let loadMore = await page.locator("#confirmation-history-load-more").elementHandle();
 
   assert.match(
     await page.locator(".confirmation-history-item").first().textContent(),
@@ -465,8 +477,52 @@ try {
       const restore = page.locator("#confirmation-deferred-restore");
       await restore.waitFor();
       assert.match(await restore.textContent(), /重新查看稍后项（1）/);
-      await restore.click();
+      const deferredKey = `external\u0000confirmation-comment\u0000${"b".repeat(64)}`;
+      assert.equal(
+        await page.evaluate(
+          (storageKey) => sessionStorage.getItem(storageKey),
+          deferredConfirmationStorageKey,
+        ),
+        JSON.stringify([deferredKey]),
+      );
+
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator('[data-view="employees"]').click();
+      await page.locator(".confirmation-history-item").first().waitFor();
+      form = await page.locator("#confirmation-history-filter").elementHandle();
+      liveRegion = await page.locator("#confirmation-history-results").elementHandle();
+      loadMore = await page.locator("#confirmation-history-load-more").elementHandle();
+      await page.locator("#confirmation-deferred-restore").waitFor();
+      assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
+      assert.match(
+        await page.locator("#confirmation-deferred-restore").textContent(),
+        /重新查看稍后项（1）/,
+      );
+
+      await page.evaluate(() =>
+        fetch("/fixture/fail-next-attention", { method: "POST" })
+      );
+      await page.locator("#confirmation-deferred-restore").click();
+      await page.getByText(/稍后项仍保留，可再次尝试/u).waitFor();
+      assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
+      assert.equal(
+        await page.evaluate(
+          (storageKey) => sessionStorage.getItem(storageKey),
+          deferredConfirmationStorageKey,
+        ),
+        JSON.stringify([deferredKey]),
+      );
+
+      await page.locator("#confirmation-deferred-restore").click();
       await page.locator("#confirmation-dialog[open]").waitFor();
+      assert.equal(
+        await page.evaluate(
+          (storageKey) => sessionStorage.getItem(storageKey),
+          deferredConfirmationStorageKey,
+        ),
+        null,
+      );
+      assert.equal(historyMutation, 0);
       assert.match(
         await page.locator("#confirmation-dialog").textContent(),
         /Fixture PR 评论.*Fixture PR comment/s,

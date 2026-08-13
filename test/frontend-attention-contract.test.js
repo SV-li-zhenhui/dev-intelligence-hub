@@ -4,6 +4,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import * as confirmationDialogSupport from "../public/confirmation-dialog-support.js";
+
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 async function sources() {
@@ -13,6 +15,143 @@ async function sources() {
   ]);
   return { html, app };
 }
+
+test("stored confirmation deferrals deduplicate without reordering valid keys", () => {
+  const parse = confirmationDialogSupport.parseDeferredConfirmationKeys;
+  assert.equal(typeof parse, "function");
+  const external = `external\u0000confirmation-1\u0000${"a".repeat(64)}`;
+  const responsibility = `responsibility\u0000pull-request-1\u0000${"b".repeat(40)}`;
+  const internal = `internal\u0000attention-${"c".repeat(64)}\u0000${"d".repeat(64)}`;
+  const review = `review\u0000review-job-1\u0000${"e".repeat(40)}`;
+
+  assert.deepEqual(
+    parse(JSON.stringify([
+      external,
+      responsibility,
+      external,
+      internal,
+      review,
+    ])),
+    [external, responsibility, internal, review],
+  );
+});
+
+test("stored confirmation deferrals reject malformed or oversized containers", () => {
+  const parse = confirmationDialogSupport.parseDeferredConfirmationKeys;
+  const head = "a".repeat(40);
+
+  assert.deepEqual(parse("{"), []);
+  assert.deepEqual(parse(JSON.stringify({ key: "value" })), []);
+  assert.deepEqual(parse(JSON.stringify([null])), []);
+  assert.deepEqual(
+    parse(JSON.stringify(
+      Array.from(
+        { length: 33 },
+        (_, index) => `review\u0000review-${index}\u0000${head}`,
+      ),
+    )),
+    [],
+  );
+});
+
+test("stored confirmation deferrals reject invalid key kinds, shapes, ids, and bindings", () => {
+  const parse = confirmationDialogSupport.parseDeferredConfirmationKeys;
+  const sha1 = "a".repeat(40);
+  const sha256 = "b".repeat(64);
+  const invalidKeys = [
+    "external",
+    `unknown\u0000item-1\u0000${sha256}`,
+    `toString\u0000item-1\u0000${sha256}`,
+    "external\u0000item-1",
+    `external\u0000item-1\u0000${sha256}\u0000payload`,
+    `external\u0000\u0000${sha256}`,
+    `review\u0000${"x".repeat(129)}\u0000${sha1}`,
+    `external\u0000confirmation-1\u0000${"c".repeat(63)}`,
+    `internal\u0000attention-${"d".repeat(64)}\u0000${sha1}`,
+    `responsibility\u0000pull-request-1\u0000${sha256}`,
+    `review\u0000review-1\u0000${"g".repeat(40)}`,
+  ];
+
+  for (const key of invalidKeys) {
+    assert.deepEqual(parse(JSON.stringify([key])), [], key);
+  }
+});
+
+test("the session deferral store writes key-only state and clears it explicitly", () => {
+  const createStore =
+    confirmationDialogSupport.createSessionDeferredConfirmationStore;
+  assert.equal(typeof createStore, "function");
+  const values = new Map();
+  const storage = {
+    getItem(key) {
+      return values.get(key) ?? null;
+    },
+    setItem(key, value) {
+      values.set(key, value);
+    },
+    removeItem(key) {
+      values.delete(key);
+    },
+  };
+  const store = createStore({
+    getStorage: () => storage,
+    storageKey: "test.deferred-confirmations",
+  });
+  const valid = `external\u0000confirmation-1\u0000${"a".repeat(64)}`;
+  const invalid = `external\u0000confirmation-1\u0000${"b".repeat(40)}`;
+
+  assert.equal(
+    store.save([
+      invalid,
+      valid,
+      { key: valid, payload: { body: "must not persist" }, approved: true },
+      valid,
+    ]),
+    true,
+  );
+  assert.equal(
+    values.get("test.deferred-confirmations"),
+    JSON.stringify([valid]),
+  );
+  assert.deepEqual(store.load(), [valid]);
+  assert.equal(store.clear(), true);
+  assert.equal(values.has("test.deferred-confirmations"), false);
+});
+
+test("the session deferral store safely falls back when storage is unavailable", () => {
+  const createStore =
+    confirmationDialogSupport.createSessionDeferredConfirmationStore;
+  const valid = `external\u0000confirmation-1\u0000${"a".repeat(64)}`;
+  const unavailable = createStore({
+    getStorage() {
+      throw new Error("storage access denied");
+    },
+    storageKey: "test.deferred-confirmations",
+  });
+
+  assert.deepEqual(unavailable.load(), []);
+  assert.equal(unavailable.save([valid]), false);
+  assert.equal(unavailable.clear(), false);
+
+  const throwingMethods = createStore({
+    getStorage: () => ({
+      getItem() {
+        throw new Error("read denied");
+      },
+      setItem() {
+        throw new Error("write denied");
+      },
+      removeItem() {
+        throw new Error("remove denied");
+      },
+    }),
+    storageKey: "test.deferred-confirmations",
+  });
+
+  assert.deepEqual(throwingMethods.load(), []);
+  assert.equal(throwingMethods.save([valid]), false);
+  assert.equal(throwingMethods.clear(), false);
+});
 
 test("all attention sources share one dialog and one unified next endpoint", async () => {
   const { html, app } = await sources();
@@ -41,6 +180,32 @@ test("session deferrals are bounded and sent as exact source bindings", async ()
   assert.match(app, /while \(deferredConfirmations\.size > MAX_DEFERRED_CONFIRMATIONS\)/);
   assert.match(app, /params\.append\("deferred", `\$\{source\}:\$\{id\}:\$\{digest\}`\)/);
   assert.match(app, /async function refreshAfterDeferral/);
+});
+
+test("session deferrals hydrate, persist, clear before restore, and recover on failure", async () => {
+  const { app } = await sources();
+
+  assert.match(app, /createSessionDeferredConfirmationStore/);
+  assert.match(
+    app,
+    /const deferredConfirmations = new Set\(deferredConfirmationStore\.load\(\)\)/,
+  );
+
+  const rememberStart = app.indexOf("function rememberDeferredConfirmation");
+  const rememberEnd = app.indexOf("\nfunction attentionNextUrl", rememberStart);
+  const remember = app.slice(rememberStart, rememberEnd);
+  assert.ok(rememberStart >= 0 && rememberEnd > rememberStart);
+  assert.match(remember, /deferredConfirmationStore\.save\(deferredConfirmations\)/);
+
+  const restoreStart = app.indexOf("async function restoreDeferredConfirmations");
+  const restoreEnd = app.indexOf("\nasync function refreshAfterDeferral", restoreStart);
+  const restore = app.slice(restoreStart, restoreEnd);
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
+  assert.ok(
+    restore.indexOf("deferredConfirmationStore.clear()") <
+      restore.indexOf("await refreshConfirmationQueue"),
+  );
+  assert.match(restore, /catch \(error\)[\s\S]*rememberDeferredConfirmation/);
 });
 
 test("deferred confirmations have a visible retry control with failure-safe recovery", async () => {
