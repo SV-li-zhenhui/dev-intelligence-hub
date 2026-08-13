@@ -3737,14 +3737,20 @@ export function startApplicationBackgroundWork(
     });
   }
 
-  function runTracked(operation, { rethrow = false } = {}) {
+  function runTracked(
+    operation,
+    { rethrow = false, admitOnDequeue = false } = {},
+  ) {
     if (stopped) return Promise.resolve();
     let task;
+    const runOperation = async () => {
+      if (stopped) return undefined;
+      return operation(workController.signal);
+    };
     task = Promise.resolve()
-      .then(() => operationalAdmission.run(async () => {
-        if (stopped) return undefined;
-        return operation(workController.signal);
-      }))
+      .then(() => admitOnDequeue
+        ? runOperation()
+        : operationalAdmission.run(runOperation))
       .catch((error) => {
         if (!(stopped && workController.signal.aborted && error === workController.signal.reason)) {
           reportBackgroundError(error);
@@ -3890,8 +3896,14 @@ export function startApplicationBackgroundWork(
     return { skipped: null };
   }
 
-  function enqueueAgencyCycle(options, priority) {
-    const operation = () => performAgencyCycle(options);
+  function enqueueAgencyCycle(
+    options,
+    priority,
+    { admitOnDequeue = false } = {},
+  ) {
+    const operation = () => admitOnDequeue
+      ? operationalAdmission.run(() => performAgencyCycle(options))
+      : performAgencyCycle(options);
     return enqueueBackgroundOperation(priority, operation);
   }
 
@@ -3911,7 +3923,7 @@ export function startApplicationBackgroundWork(
     cycles,
     key,
     operation,
-    { rethrow = false } = {},
+    { rethrow = false, admitOnDequeue = false } = {},
   ) {
     const existing = cycles.get(key);
     if (existing) {
@@ -3930,7 +3942,7 @@ export function startApplicationBackgroundWork(
       return rethrow ? admitted : admitted.catch(() => undefined);
     }
     const tracked = coalesceCycle(cycles, key, () =>
-      runTracked(operation, { rethrow: true }),
+      runTracked(operation, { rethrow: true, admitOnDequeue }),
     );
     return rethrow ? tracked : tracked.catch(() => undefined);
   }
@@ -3944,11 +3956,15 @@ export function startApplicationBackgroundWork(
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
-      (signal) => enqueueAgencyCycle({
-        ...options,
-        factCycleSequenceAtRequest: factCycleSequence,
-        signal,
-      }, priority),
+      (signal) => enqueueAgencyCycle(
+        {
+          ...options,
+          factCycleSequenceAtRequest: factCycleSequence,
+          signal,
+        },
+        priority,
+        runOptions,
+      ),
       runOptions,
     );
   }
@@ -4046,7 +4062,7 @@ export function startApplicationBackgroundWork(
           trigger: "scheduled",
           includeLegacyEmployees: false,
           discardWhenFactsPending: true,
-        }, backgroundPriority.scheduled),
+        }, backgroundPriority.scheduled, { admitOnDequeue: true }),
         agencyTickSeconds * 1_000,
       ),
     );
@@ -4058,7 +4074,7 @@ export function startApplicationBackgroundWork(
           trigger: "scheduled",
           employeeIds: [schedule.id],
           discardWhenFactsPending: true,
-        }, backgroundPriority.scheduled),
+        }, backgroundPriority.scheduled, { admitOnDequeue: true }),
         schedule.intervalMinutes * 60_000,
       ),
     );

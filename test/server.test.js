@@ -3360,6 +3360,129 @@ test("coalesced scheduled role ticks occupy one operational admission", async ()
   }
 });
 
+test("queued periodic roles do not occupy or survive quiescence", {
+  timeout: 2_000,
+}, async () => {
+  const firstRoleStarted = deferred();
+  const releaseFirstRole = deferred();
+  const timers = [];
+  const calls = [];
+  const reportedErrors = [];
+  const gate = new OperationalQuiescenceGate({ drainTimeoutMs: 500 });
+  const application = {
+    config: { refreshMinutes: 7 },
+    operations: {
+      admission: { run: gate.run.bind(gate) },
+    },
+    workCoordination: {
+      async runCycle({ trigger }) {
+        calls.push({ operation: "coordination", trigger });
+      },
+    },
+    employeeRegistry: {
+      schedules() {
+        return [
+          { id: "requirements-analyst", intervalMinutes: 11 },
+          { id: "developer", intervalMinutes: 13 },
+        ];
+      },
+      async runSelected(ids, { trigger }) {
+        calls.push({ operation: "employee", id: ids[0], trigger });
+        if (ids[0] === "requirements-analyst") {
+          firstRoleStarted.resolve();
+          await releaseFirstRole.promise;
+        }
+      },
+    },
+    memoryProjector: {
+      async runCycle() {
+        calls.push({ operation: "memory" });
+      },
+    },
+    refreshService: {
+      async refresh() {},
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+  const pendingTicks = [];
+  let entering = null;
+  let maintenanceToken = null;
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+
+    pendingTicks.push(timers[1].callback());
+    await firstRoleStarted.promise;
+    pendingTicks.push(timers[2].callback());
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(gate.readStatus(), {
+      mode: "open",
+      activeOperations: 1,
+    });
+
+    entering = gate.enter();
+    assert.deepEqual(gate.readStatus(), {
+      mode: "closing",
+      activeOperations: 1,
+    });
+    releaseFirstRole.resolve();
+    maintenanceToken = await entering;
+    assert.deepEqual(gate.readStatus(), {
+      mode: "closed",
+      activeOperations: 0,
+    });
+    await Promise.all(pendingTicks);
+    assert.deepEqual(calls, [
+      { operation: "coordination", trigger: "scheduled" },
+      {
+        operation: "employee",
+        id: "requirements-analyst",
+        trigger: "scheduled",
+      },
+      { operation: "memory" },
+    ]);
+    assert.deepEqual(
+      reportedErrors.map((error) => error.code),
+      ["SYSTEM_QUIESCING"],
+    );
+
+    gate.leave(maintenanceToken);
+    maintenanceToken = null;
+    await timers[2].callback();
+    assert.deepEqual(calls.slice(-3), [
+      { operation: "coordination", trigger: "scheduled" },
+      { operation: "employee", id: "developer", trigger: "scheduled" },
+      { operation: "memory" },
+    ]);
+  } finally {
+    releaseFirstRole.resolve();
+    if (entering && gate.readStatus().mode === "closing") {
+      try {
+        maintenanceToken = await entering;
+      } catch {
+        maintenanceToken = null;
+      }
+    }
+    if (maintenanceToken && gate.readStatus().mode === "closed") {
+      gate.leave(maintenanceToken);
+    }
+    await Promise.allSettled(pendingTicks);
+    await backgroundWork.stop();
+  }
+});
+
 test("a pending refresh skips obsolete queued role ticks", async () => {
   const firstRoleStarted = deferred();
   const releaseFirstRole = deferred();
