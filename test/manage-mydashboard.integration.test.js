@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   chmod,
@@ -8,6 +8,7 @@ import {
   cp,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -336,10 +337,42 @@ async function assertPortUnavailable(port) {
   }));
 }
 
+async function createRecoverySnapshot(root, runtime) {
+  const snapshotId = `snapshot-${randomBytes(16).toString("hex")}`;
+  const activeData = path.join(root, "data");
+  const snapshotRoot = path.join(runtime.runtimeDirectory, "recovery-snapshots");
+  const snapshotDirectory = path.join(snapshotRoot, snapshotId);
+  const snapshotData = path.join(snapshotDirectory, "data");
+  const fileName = "fixture-data.json";
+  const contents = '{"fixture":"failed-shutdown"}\n';
+
+  await mkdir(activeData, { recursive: true });
+  await writeFile(path.join(activeData, fileName), contents, "utf8");
+  await mkdir(snapshotData, { recursive: true });
+  await writeFile(path.join(snapshotData, fileName), contents, "utf8");
+  const bytes = Buffer.byteLength(contents, "utf8");
+  const sha256 = createHash("sha256").update(contents, "utf8").digest("hex");
+  await writeFile(
+    path.join(snapshotDirectory, "manifest.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      reason: "managed_shutdown_lifecycle_failure",
+      sourceDirectory: activeData,
+      consistent: true,
+      fileCount: 1,
+      totalBytes: bytes,
+      files: [{ name: fileName, bytes, sha256, sourceStable: true }],
+    })}\n`,
+    "utf8",
+  );
+  return { snapshotId, snapshotDirectory };
+}
+
 async function createFixture(
   t,
   {
     shutdownExitCode = 0,
+    holdWriterLeaseAfterFailedShutdown = false,
     claimMode = "normal",
     listenDelayMilliseconds = 0,
     readinessMode = "ready",
@@ -348,6 +381,9 @@ async function createFixture(
   const root = await mkdtemp(path.join(tmpdir(), "mydashboard-manager-"));
   await mkdir(path.join(root, "scripts"), { recursive: true });
   await mkdir(path.join(root, "src"), { recursive: true });
+  await cp(path.join(projectRoot, "src", "lib"), path.join(root, "src", "lib"), {
+    recursive: true,
+  });
   const port = await availablePort();
   await copyWritableFixtureFile(
     path.join(projectRoot, "scripts", "Manage-MyDashboard.ps1"),
@@ -356,6 +392,10 @@ async function createFixture(
   await copyWritableFixtureFile(
     path.join(projectRoot, "scripts", "launch-mydashboard-process.mjs"),
     path.join(root, "scripts", "launch-mydashboard-process.mjs"),
+  );
+  await copyWritableFixtureFile(
+    path.join(projectRoot, "scripts", "probe-application-writer-lease.mjs"),
+    path.join(root, "scripts", "probe-application-writer-lease.mjs"),
   );
   await writeFile(
     path.join(root, "scripts", "run-managed-dashboard.mjs"),
@@ -370,6 +410,8 @@ import { writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 const config = JSON.parse(await readFile(new URL("../config.json", import.meta.url)));
 const origin = \`http://127.0.0.1:\${config.port}\`;
 const names = [
@@ -384,7 +426,13 @@ const names = [
 const environment = Object.fromEntries(names.map((name) => [name, process.env[name]]));
 for (const name of names) delete process.env[name];
 const managed = Boolean(environment.MYDASHBOARD_MANAGED_TOKEN);
+const holdsWriterLeaseAfterFailure = ${JSON.stringify(holdWriterLeaseAfterFailedShutdown)};
 const tokenBytes = managed ? Buffer.from(environment.MYDASHBOARD_MANAGED_TOKEN, "base64") : null;
+const writerLease = holdsWriterLeaseAfterFailure ? createApplicationWriterLease({
+  projectRoot: path.dirname(path.dirname(fileURLToPath(import.meta.url))),
+  projectDigest: environment.MYDASHBOARD_MANAGED_PROJECT_DIGEST,
+}) : null;
+if (writerLease) await writerLease.acquire();
 let lifecycleState = managed ? "pending_claim" : "running";
 let livenessStartIdentity = environment.MYDASHBOARD_MANAGED_START_IDENTITY;
 let watchdog = null;
@@ -1561,6 +1609,152 @@ test(
     assert.match(`${restarted.stderr}\n${restarted.stdout}`, /shutdown failure/u);
     assert.equal(await readFile(controlPath, "utf8").then(Boolean), true);
     await assertPortUnavailable(port);
+  },
+);
+
+test(
+  "RecoverFailedShutdown archives a stable failed-shutdown snapshot and leaves the service stopped",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const { root, port } = await createFixture(t, {
+      shutdownExitCode: 1,
+      holdWriterLeaseAfterFailedShutdown: true,
+    });
+    const runtime = readRuntimeInfo(root);
+    const controlPath = path.join(runtime.runtimeDirectory, "mydashboard-server-process.json");
+    const started = invokeManager(root, "Start");
+    assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+    const controlText = await readFile(controlPath, "utf8");
+    const state = JSON.parse(controlText);
+
+    const stopped = invokeManager(root, "Stop");
+    assert.notEqual(stopped.status, 0);
+    assert.match(`${stopped.stderr}\n${stopped.stdout}`, /shutdown failure/u);
+    await assertPortUnavailable(port);
+    assert.doesNotThrow(() => process.kill(state.processId, 0));
+    const requestedPath = path.join(
+      runtime.runtimeDirectory,
+      `mydashboard-shutdown-${state.instanceId}-requested.json`,
+    );
+    const terminalPath = path.join(
+      runtime.runtimeDirectory,
+      `mydashboard-shutdown-${state.instanceId}-terminal.json`,
+    );
+    const requestedText = await readFile(requestedPath, "utf8");
+    const terminalText = await readFile(terminalPath, "utf8");
+    const { snapshotId, snapshotDirectory } = await createRecoverySnapshot(root, runtime);
+
+    const restarted = invokeManager(root, "Restart");
+    assert.notEqual(restarted.status, 0);
+    assert.doesNotThrow(() => process.kill(state.processId, 0));
+    for (const rejectedSnapshotId of [
+      `snapshot-${"0".repeat(32)}`,
+      "../snapshot-00000000000000000000000000000000",
+    ]) {
+      const rejected = invokeManager(
+        root,
+        "RecoverFailedShutdown",
+        10,
+        powershell,
+        ["-RecoverySnapshotId", rejectedSnapshotId],
+      );
+      assert.notEqual(rejected.status, 0);
+      assert.doesNotThrow(() => process.kill(state.processId, 0));
+      assert.equal(await fileExists(controlPath), true);
+    }
+    const manifestPath = path.join(snapshotDirectory, "manifest.json");
+    const manifest = await readFile(manifestPath, "utf8");
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ ...JSON.parse(manifest), unexpected: true })}\n`,
+      "utf8",
+    );
+    const malformedManifest = invokeManager(
+      root,
+      "RecoverFailedShutdown",
+      10,
+      powershell,
+      ["-RecoverySnapshotId", snapshotId],
+    );
+    assert.notEqual(malformedManifest.status, 0);
+    assert.doesNotThrow(() => process.kill(state.processId, 0));
+    await writeFile(manifestPath, manifest, "utf8");
+    const activeDataPath = path.join(root, "data", "fixture-data.json");
+    const activeData = await readFile(activeDataPath, "utf8");
+    await writeFile(activeDataPath, "tampered\n", "utf8");
+    const mismatchedData = invokeManager(
+      root,
+      "RecoverFailedShutdown",
+      10,
+      powershell,
+      ["-RecoverySnapshotId", snapshotId],
+    );
+    assert.notEqual(mismatchedData.status, 0);
+    assert.doesNotThrow(() => process.kill(state.processId, 0));
+    await writeFile(activeDataPath, activeData, "utf8");
+    const terminal = await readFile(terminalPath, "utf8");
+    await writeFile(
+      terminalPath,
+      `${JSON.stringify({ ...JSON.parse(terminal), hmac: "A".repeat(44) })}\n`,
+      "utf8",
+    );
+    const tamperedReceipt = invokeManager(
+      root,
+      "RecoverFailedShutdown",
+      10,
+      powershell,
+      ["-RecoverySnapshotId", snapshotId],
+    );
+    assert.notEqual(tamperedReceipt.status, 0);
+    assert.doesNotThrow(() => process.kill(state.processId, 0));
+    await writeFile(terminalPath, terminal, "utf8");
+    const recovered = invokeManager(
+      root,
+      "RecoverFailedShutdown",
+      10,
+      powershell,
+      ["-RecoverySnapshotId", snapshotId],
+    );
+
+    assert.equal(recovered.status, 0, `${recovered.stderr}\n${recovered.stdout}`);
+    assert.match(recovered.stdout, /incident/u);
+    assert.match(recovered.stdout, /remains stopped/u);
+    await waitForProcessExit(state.processId);
+    await assertPortUnavailable(port);
+    await assert.rejects(readFile(controlPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(readFile(path.join(
+      runtime.runtimeDirectory,
+      `mydashboard-shutdown-${state.instanceId}-requested.json`,
+    ), "utf8"), { code: "ENOENT" });
+    await assert.rejects(readFile(path.join(
+      runtime.runtimeDirectory,
+      `mydashboard-shutdown-${state.instanceId}-terminal.json`,
+    ), "utf8"), { code: "ENOENT" });
+    const incidentNames = await readdir(path.join(runtime.runtimeDirectory, "incidents"));
+    assert.equal(incidentNames.length, 1);
+    const incidents = await readFile(path.join(
+      runtime.runtimeDirectory,
+      "incidents",
+      `${state.projectDigest}-${state.instanceId}-${snapshotId}`,
+      "incident.json",
+    ), "utf8");
+    assert.match(incidents, /"state":"recovered"/u);
+    const incidentDirectory = path.join(
+      runtime.runtimeDirectory,
+      "incidents",
+      `${state.projectDigest}-${state.instanceId}-${snapshotId}`,
+    );
+    assert.equal(await readFile(path.join(incidentDirectory, "control-state.json"), "utf8"), controlText);
+    assert.equal(await readFile(path.join(incidentDirectory, "requested-receipt.json"), "utf8"), requestedText);
+    assert.equal(await readFile(path.join(incidentDirectory, "terminal-receipt.json"), "utf8"), terminalText);
+    assert.equal(await readFile(path.join(incidentDirectory, "recovery-manifest.json"), "utf8"), manifest);
+
+    const laterStart = invokeManager(root, "Start");
+    assert.equal(laterStart.status, 0, `${laterStart.stderr}\n${laterStart.stdout}`);
+    const nextState = JSON.parse(await readFile(controlPath, "utf8"));
+    assert.notEqual(nextState.processId, state.processId);
+    process.kill(nextState.processId);
+    await waitForProcessExit(nextState.processId);
   },
 );
 

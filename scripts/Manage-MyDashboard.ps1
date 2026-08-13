@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Start", "Stop", "Restart", "Status", "Restore")]
+    [ValidateSet("Start", "Stop", "Restart", "Status", "Restore", "RecoverFailedShutdown")]
     [string]$Action = "Status",
     [string]$BackupId,
+    [string]$RecoverySnapshotId,
     [switch]$OpenBrowser,
     [ValidateRange(5, 120)]
     [int]$TimeoutSeconds = 120
@@ -98,6 +99,15 @@ $configurationStateFile = [System.IO.Path]::GetFullPath(
 $runtimeLogDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $runtimeDirectory "logs")
 )
+$recoverySnapshotsDirectory = [System.IO.Path]::GetFullPath(
+    (Join-Path $runtimeDirectory "recovery-snapshots")
+)
+$incidentsDirectory = [System.IO.Path]::GetFullPath(
+    (Join-Path $runtimeDirectory "incidents")
+)
+$writerLeaseProbeScript = [System.IO.Path]::GetFullPath(
+    (Join-Path $projectDirectory "scripts/probe-application-writer-lease.mjs")
+)
 
 if (
     -not $pathComparer.Equals(
@@ -106,7 +116,8 @@ if (
     ) -or
     -not (Test-Path -LiteralPath $launcherScript -PathType Leaf) -or
     -not (Test-Path -LiteralPath $managedEntryScript -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $serverScript -PathType Leaf)
+    -not (Test-Path -LiteralPath $serverScript -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $writerLeaseProbeScript -PathType Leaf)
 ) {
     throw "The resolved project runtime identity is inconsistent."
 }
@@ -162,7 +173,7 @@ function Assert-RegularManagedFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Description,
-        [ValidateRange(1, 65536)][long]$MaximumBytes = 16384
+        [ValidateRange(1, 536870912)][long]$MaximumBytes = 16384
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Description is not a regular file."
@@ -1067,6 +1078,536 @@ function Complete-SuccessfulShutdown {
     return $true
 }
 
+function Get-BoundedSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [ValidateRange(1, 536870912)][long]$MaximumBytes = 65536
+    )
+    Assert-RegularManagedFile `
+        -Path $Path `
+        -Description $Description `
+        -MaximumBytes $MaximumBytes
+    return ([System.Security.Cryptography.SHA256]::Create().ComputeHash(
+        [System.IO.File]::ReadAllBytes($Path)
+    ) | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+function Assert-RecoverySnapshotId {
+    param([Parameter(Mandatory = $true)][string]$SnapshotId)
+    if ($SnapshotId -notmatch '^snapshot-[a-f0-9]{32}$') {
+        throw "RecoverySnapshotId is malformed."
+    }
+}
+
+function Get-RecoverySnapshotFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    Assert-NotReparseDirectory -Path $Directory
+    $entries = @($Manifest.files)
+    if ($entries.Count -lt 1 -or $entries.Count -gt 4096) {
+        throw "Recovery snapshot file count is outside the safe bound."
+    }
+    $expected = @{}
+    [long]$total = 0
+    foreach ($entry in $entries) {
+        $properties = @($entry.PSObject.Properties.Name | Sort-Object)
+        if (
+            (Compare-Object `
+                -ReferenceObject @("bytes", "name", "sha256", "sourceStable") `
+                -DifferenceObject $properties) -or
+            [string]$entry.name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+            ($entry.bytes -isnot [int] -and $entry.bytes -isnot [long]) -or
+            [long]$entry.bytes -lt 0 -or
+            [long]$entry.bytes -gt 536870912 -or
+            [string]$entry.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            $entry.sourceStable -ne $true -or
+            $expected.ContainsKey([string]$entry.name)
+        ) {
+            throw "Recovery snapshot manifest file entry is invalid."
+        }
+        $total += [long]$entry.bytes
+        if ($total -gt 536870912) {
+            throw "Recovery snapshot total size is outside the safe bound."
+        }
+        $expected[[string]$entry.name] = $entry
+    }
+    if (
+        ($Manifest.fileCount -isnot [int] -and $Manifest.fileCount -isnot [long]) -or
+        [long]$Manifest.fileCount -ne $entries.Count -or
+        ($Manifest.totalBytes -isnot [int] -and $Manifest.totalBytes -isnot [long]) -or
+        [long]$Manifest.totalBytes -ne $total
+    ) {
+        throw "Recovery snapshot manifest totals are invalid."
+    }
+    $actual = @(Get-ChildItem -LiteralPath $Directory -Force)
+    if ($actual.Count -ne $expected.Count) {
+        throw "Recovery snapshot file set does not match its manifest."
+    }
+    foreach ($item in $actual) {
+        if (
+            $item.PSIsContainer -or
+            (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not $expected.ContainsKey($item.Name)
+        ) {
+            throw "Recovery snapshot contains an unsafe file entry."
+        }
+        $entry = $expected[$item.Name]
+        if (
+            [long]$item.Length -ne [long]$entry.bytes -or
+            (Get-BoundedSha256 `
+                -Path $item.FullName `
+                -Description "Recovery snapshot data file" `
+                -MaximumBytes 536870912) -ne [string]$entry.sha256
+        ) {
+            throw "Recovery snapshot data file does not match its manifest."
+        }
+    }
+    return $expected
+}
+
+function Get-ValidatedRecoverySnapshot {
+    param([Parameter(Mandatory = $true)][string]$SnapshotId)
+    Assert-RecoverySnapshotId -SnapshotId $SnapshotId
+    if (-not (Test-Path -LiteralPath $recoverySnapshotsDirectory -PathType Container)) {
+        throw "Recovery snapshots directory is unavailable."
+    }
+    Assert-NotReparseDirectory -Path $recoverySnapshotsDirectory
+    $snapshotDirectory = Assert-DirectChildPath `
+        -Parent $recoverySnapshotsDirectory `
+        -Child (Join-Path $recoverySnapshotsDirectory $SnapshotId)
+    if (-not (Test-Path -LiteralPath $snapshotDirectory -PathType Container)) {
+        throw "Recovery snapshot does not exist."
+    }
+    Assert-NotReparseDirectory -Path $snapshotDirectory
+    $snapshotEntries = @(Get-ChildItem -LiteralPath $snapshotDirectory -Force)
+    if (
+        $snapshotEntries.Count -ne 2 -or
+        @($snapshotEntries.Name | Sort-Object) -join "," -ne "data,manifest.json" -or
+        @($snapshotEntries | Where-Object {
+            ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        }).Count -ne 0
+    ) {
+        throw "Recovery snapshot contains unexpected nesting or entries."
+    }
+    $manifestPath = Assert-DirectChildPath `
+        -Parent $snapshotDirectory `
+        -Child (Join-Path $snapshotDirectory "manifest.json")
+    $dataPath = Assert-DirectChildPath `
+        -Parent $snapshotDirectory `
+        -Child (Join-Path $snapshotDirectory "data")
+    Assert-RegularManagedFile `
+        -Path $manifestPath `
+        -Description "Recovery snapshot manifest" `
+        -MaximumBytes 1048576
+    if (-not (Test-Path -LiteralPath $dataPath -PathType Container)) {
+        throw "Recovery snapshot data directory is unavailable."
+    }
+    Assert-NotReparseDirectory -Path $dataPath
+    $manifest = ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $manifestPath -Raw)
+    $properties = @($manifest.PSObject.Properties.Name | Sort-Object)
+    if (
+        (Compare-Object `
+            -ReferenceObject @(
+                "consistent", "fileCount", "files", "reason", "schemaVersion",
+                "sourceDirectory", "totalBytes"
+            ) `
+            -DifferenceObject $properties) -or
+        $manifest.schemaVersion -ne 1 -or
+        [string]$manifest.reason -ne "managed_shutdown_lifecycle_failure" -or
+        -not $pathComparer.Equals(
+            [System.IO.Path]::GetFullPath([string]$manifest.sourceDirectory),
+            $dataDirectory
+        ) -or
+        $manifest.consistent -ne $true
+    ) {
+        throw "Recovery snapshot manifest has an invalid shape or source."
+    }
+    $files = Get-RecoverySnapshotFiles -Directory $dataPath -Manifest $manifest
+    $activeFiles = Get-RecoverySnapshotFiles -Directory $dataDirectory -Manifest $manifest
+    foreach ($name in $files.Keys) {
+        if (
+            [long]$files[$name].bytes -ne [long]$activeFiles[$name].bytes -or
+            [string]$files[$name].sha256 -ne [string]$activeFiles[$name].sha256
+        ) {
+            throw "Recovery snapshot and active data are not byte-identical."
+        }
+    }
+    return [pscustomobject]@{
+        Id = $SnapshotId
+        Directory = $snapshotDirectory
+        ManifestPath = $manifestPath
+        ManifestSha256 = Get-BoundedSha256 `
+            -Path $manifestPath `
+            -Description "Recovery snapshot manifest" `
+            -MaximumBytes 1048576
+    }
+}
+
+function Get-AuthenticatedRecoveryEvidence {
+    param([Parameter(Mandatory = $true)]$State)
+    $requested = Read-ShutdownReceipt -State $State -Phase "requested"
+    $terminal = Read-ShutdownReceipt -State $State -Phase "terminal"
+    if ($null -eq $requested -or $null -eq $terminal -or $terminal.status -ne "failure") {
+        throw "Recovery requires authenticated requested and failure terminal receipts."
+    }
+    $requestedPath = Get-ReceiptPath -State $State -Phase "requested"
+    $terminalPath = Get-ReceiptPath -State $State -Phase "terminal"
+    return [pscustomobject]@{
+        State = $State
+        Requested = $requested
+        Terminal = $terminal
+        ControlSha256 = Get-BoundedSha256 -Path $controlFile -Description "Process control state"
+        RequestedSha256 = Get-BoundedSha256 -Path $requestedPath -Description "Shutdown request receipt"
+        TerminalSha256 = Get-BoundedSha256 -Path $terminalPath -Description "Shutdown terminal receipt"
+    }
+}
+
+function Assert-SameRecoveryEvidence {
+    param([Parameter(Mandatory = $true)]$Evidence)
+    $currentState = Read-ControlState
+    if ($null -eq $currentState -or -not (Test-SameControlIdentity `
+        -Left $currentState `
+        -Right $Evidence.State)) {
+        throw "Authenticated control state changed during recovery preflight."
+    }
+    $current = Get-AuthenticatedRecoveryEvidence -State $currentState
+    if (
+        $current.ControlSha256 -ne $Evidence.ControlSha256 -or
+        $current.RequestedSha256 -ne $Evidence.RequestedSha256 -or
+        $current.TerminalSha256 -ne $Evidence.TerminalSha256
+    ) {
+        throw "Authenticated recovery evidence changed during preflight."
+    }
+    return $current
+}
+
+function Test-NoManagedDescendants {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    try {
+        $children = @(Get-CimInstance `
+            -ClassName Win32_Process `
+            -Filter "ParentProcessId = $ProcessId" `
+            -ErrorAction Stop)
+        foreach ($candidate in $children) {
+            if (
+                $null -eq $candidate.ProcessId -or
+                $null -eq $candidate.ParentProcessId -or
+                [int]$candidate.ProcessId -lt 1 -or
+                [int]$candidate.ParentProcessId -ne $ProcessId
+            ) {
+                throw "Process descendant inspection returned an invalid identity."
+            }
+            return $false
+        }
+        return $true
+    } catch {
+        throw "Unable to inspect managed process descendants safely."
+    }
+}
+
+function Publish-ExactRecoveryEvidenceCopy {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [ValidateRange(1, 536870912)][long]$MaximumBytes = 1048576
+    )
+    if ((Get-BoundedSha256 `
+        -Path $Source `
+        -Description $Description `
+        -MaximumBytes $MaximumBytes) -ne $ExpectedSha256) {
+        throw "$Description changed before incident archival."
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        if ((Get-BoundedSha256 `
+            -Path $Destination `
+            -Description "Archived $Description" `
+            -MaximumBytes $MaximumBytes) -ne $ExpectedSha256) {
+            throw "Archived $Description conflicts with this recovery authority."
+        }
+        return
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Source)
+    $stream = New-Object System.IO.FileStream(
+        $Destination,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    if ((Get-BoundedSha256 `
+        -Path $Destination `
+        -Description "Archived $Description" `
+        -MaximumBytes $MaximumBytes) -ne $ExpectedSha256) {
+        throw "Archived $Description did not preserve its exact bytes."
+    }
+}
+
+function Publish-RecoveryIncident {
+    param(
+        [Parameter(Mandatory = $true)]$Evidence,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    if (-not (Test-Path -LiteralPath $incidentsDirectory)) {
+        New-Item -ItemType Directory -Path $incidentsDirectory -Force | Out-Null
+    }
+    Assert-NotReparseDirectory -Path $incidentsDirectory
+    $incidentId = "$projectDigest-$($Evidence.State.instanceId)-$($Snapshot.Id)"
+    $incidentDirectory = Assert-DirectChildPath `
+        -Parent $incidentsDirectory `
+        -Child (Join-Path $incidentsDirectory $incidentId)
+    if (-not (Test-Path -LiteralPath $incidentDirectory)) {
+        New-Item -ItemType Directory -Path $incidentDirectory -ErrorAction Stop | Out-Null
+    }
+    Assert-NotReparseDirectory -Path $incidentDirectory
+    $recordPath = Assert-DirectChildPath `
+        -Parent $incidentDirectory `
+        -Child (Join-Path $incidentDirectory "incident.json")
+    $record = [ordered]@{
+        schemaVersion = 1
+        state = "pre_termination"
+        projectDigest = $projectDigest
+        processId = [int]$Evidence.State.processId
+        instanceId = [string]$Evidence.State.instanceId
+        processStartTimeUtcTicks = [string]$Evidence.State.processStartTimeUtcTicks
+        startIdentity = [string]$Evidence.State.startIdentity
+        snapshotId = [string]$Snapshot.Id
+        sourceHashes = [ordered]@{
+            control = $Evidence.ControlSha256
+            requestedReceipt = $Evidence.RequestedSha256
+            terminalReceipt = $Evidence.TerminalSha256
+            manifest = $Snapshot.ManifestSha256
+        }
+    }
+    $json = ([pscustomobject]$record) | ConvertTo-Json -Depth 4 -Compress
+    if (Test-Path -LiteralPath $recordPath) {
+        Assert-RegularManagedFile -Path $recordPath -Description "Recovery incident record"
+        if ((Get-Content -LiteralPath $recordPath -Raw).TrimEnd("`r", "`n") -ne $json) {
+            throw "Recovery incident record conflicts with this recovery authority."
+        }
+    } else {
+        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+        $stream = New-Object System.IO.FileStream(
+            $recordPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::WriteThrough
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+        if ((Get-Content -LiteralPath $recordPath -Raw) -ne $json) {
+            throw "Recovery incident durable publication did not match."
+        }
+    }
+    Publish-ExactRecoveryEvidenceCopy `
+        -Source $controlFile `
+        -Destination (Assert-DirectChildPath `
+            -Parent $incidentDirectory `
+            -Child (Join-Path $incidentDirectory "control-state.json")) `
+        -ExpectedSha256 $Evidence.ControlSha256 `
+        -Description "Process control state"
+    Publish-ExactRecoveryEvidenceCopy `
+        -Source (Get-ReceiptPath -State $Evidence.State -Phase "requested") `
+        -Destination (Assert-DirectChildPath `
+            -Parent $incidentDirectory `
+            -Child (Join-Path $incidentDirectory "requested-receipt.json")) `
+        -ExpectedSha256 $Evidence.RequestedSha256 `
+        -Description "Shutdown request receipt"
+    Publish-ExactRecoveryEvidenceCopy `
+        -Source (Get-ReceiptPath -State $Evidence.State -Phase "terminal") `
+        -Destination (Assert-DirectChildPath `
+            -Parent $incidentDirectory `
+            -Child (Join-Path $incidentDirectory "terminal-receipt.json")) `
+        -ExpectedSha256 $Evidence.TerminalSha256 `
+        -Description "Shutdown terminal receipt"
+    Publish-ExactRecoveryEvidenceCopy `
+        -Source $Snapshot.ManifestPath `
+        -Destination (Assert-DirectChildPath `
+            -Parent $incidentDirectory `
+            -Child (Join-Path $incidentDirectory "recovery-manifest.json")) `
+        -ExpectedSha256 $Snapshot.ManifestSha256 `
+        -Description "Recovery snapshot manifest"
+    return [pscustomobject]@{ Id = $incidentId; Directory = $incidentDirectory; RecordPath = $recordPath }
+}
+
+function Complete-RecoveryIncident {
+    param([Parameter(Mandatory = $true)]$Incident)
+    $record = ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $Incident.RecordPath -Raw)
+    if ($record.state -ne "pre_termination") {
+        throw "Recovery incident state is not eligible for completion."
+    }
+    $record.state = "recovered"
+    $json = $record | ConvertTo-Json -Depth 4 -Compress
+    $temporary = Assert-DirectChildPath `
+        -Parent $Incident.Directory `
+        -Child (Join-Path $Incident.Directory "incident-$PID.tmp")
+    $backup = Assert-DirectChildPath `
+        -Parent $Incident.Directory `
+        -Child (Join-Path $Incident.Directory "incident-$PID.bak")
+    [System.IO.File]::WriteAllText($temporary, $json, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        [System.IO.File]::Replace($temporary, $Incident.RecordPath, $backup, $true)
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+    if ((ConvertFrom-ExactJson -Json (Get-Content -LiteralPath $Incident.RecordPath -Raw)).state -ne "recovered") {
+        throw "Recovery incident finalization did not persist."
+    }
+}
+
+function Wait-ForExactProcessExit {
+    param([Parameter(Mandatory = $true)]$State)
+    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Min($TimeoutSeconds, 30))
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $process = Get-Process -Id ([int]$State.processId) -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            return
+        }
+        [void](Get-ManagedProcess -State $State)
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Managed process did not exit after exact PID termination."
+}
+
+function Assert-ApplicationWriterLeaseFree {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $nodePath
+    $startInfo.Arguments = ('"' + $writerLeaseProbeScript + '"')
+    $startInfo.WorkingDirectory = $projectDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.EnvironmentVariables.Clear()
+    $startInfo.EnvironmentVariables["MYDASHBOARD_WRITER_LEASE_PROJECT_DIGEST"] = $projectDigest
+    foreach ($name in @("SystemRoot", "WINDIR")) {
+        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $startInfo.EnvironmentVariables[$name] = $value
+        }
+    }
+    $probe = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        if ($null -eq $probe -or -not $probe.WaitForExit(5000)) {
+            if ($null -ne $probe -and -not $probe.HasExited) {
+                $probe.Kill()
+                [void]$probe.WaitForExit(500)
+            }
+            throw "Application writer lease probe did not finish safely."
+        }
+        $output = $probe.StandardOutput.ReadToEnd()
+        [void]$probe.StandardError.ReadToEnd()
+        if ($output.Length -gt 1024 -or $probe.ExitCode -ne 0) {
+            throw "Application writer lease is not free."
+        }
+        $result = ConvertFrom-ExactJson -Json $output
+        $properties = @($result.PSObject.Properties.Name | Sort-Object)
+        if (
+            (Compare-Object -ReferenceObject @("ok", "schemaVersion") -DifferenceObject $properties) -or
+            $result.schemaVersion -ne 1 -or
+            $result.ok -ne $true
+        ) {
+            throw "Application writer lease probe returned invalid data."
+        }
+    } finally {
+        if ($null -ne $probe) {
+            $probe.Dispose()
+        }
+    }
+}
+
+function Remove-ExactShutdownReceipts {
+    param([Parameter(Mandatory = $true)]$Evidence)
+    foreach ($phase in @("requested", "terminal")) {
+        $path = Get-ReceiptPath -State $Evidence.State -Phase $phase
+        $expectedHash = if ($phase -eq "requested") {
+            $Evidence.RequestedSha256
+        } else {
+            $Evidence.TerminalSha256
+        }
+        [void](Read-ShutdownReceipt -State $Evidence.State -Phase $phase)
+        if ((Get-BoundedSha256 -Path $path -Description "Shutdown receipt") -ne $expectedHash) {
+            throw "Shutdown receipt changed before identity-bound removal."
+        }
+        $tombstone = Assert-DirectChildPath `
+            -Parent $runtimeDirectory `
+            -Child (Join-Path $runtimeDirectory "receipt-remove-$phase-$PID.tmp")
+        [System.IO.File]::Move($path, $tombstone)
+        try {
+            if ((Get-BoundedSha256 -Path $tombstone -Description "Shutdown receipt") -ne $expectedHash) {
+                throw "Shutdown receipt changed during identity-bound removal."
+            }
+            Remove-Item -LiteralPath $tombstone -Force
+        } catch {
+            if (-not (Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $tombstone)) {
+                [System.IO.File]::Move($tombstone, $path)
+            }
+            throw
+        }
+    }
+}
+
+function Recover-FailedShutdown {
+    param([Parameter(Mandatory = $true)][string]$SnapshotId)
+    $state = Read-ControlState
+    if ($null -eq $state) {
+        throw "No authenticated failed-shutdown control state is available for recovery."
+    }
+    $process = Get-ManagedProcess -State $state
+    if ($null -eq $process) {
+        throw "Failed-shutdown recovery requires the exact managed process to remain alive."
+    }
+    if ([int]$state.port -ne (Get-ConfiguredPort)) {
+        throw "Authenticated control state does not match the configured port."
+    }
+    $evidence = Get-AuthenticatedRecoveryEvidence -State $state
+    if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
+        throw "The controlled port is occupied or its probe was ambiguous."
+    }
+    if (-not (Test-NoManagedDescendants -ProcessId ([int]$state.processId))) {
+        throw "Managed process has live descendants; refusing recovery termination."
+    }
+    $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
+    $incident = Publish-RecoveryIncident -Evidence $evidence -Snapshot $snapshot
+    $evidence = Assert-SameRecoveryEvidence -Evidence $evidence
+    $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
+    $process = Get-ManagedProcess -State $evidence.State
+    if ($null -eq $process -or (Test-LoopbackTcpListener -Port ([int]$evidence.State.port))) {
+        throw "Recovery pre-termination identity or listener verification changed."
+    }
+    if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
+        throw "Managed process descendants changed during recovery preflight."
+    }
+    Stop-Process -Id ([int]$evidence.State.processId) -ErrorAction Stop
+    Wait-ForExactProcessExit -State $evidence.State
+    if (Test-LoopbackTcpListener -Port ([int]$evidence.State.port)) {
+        throw "Controlled port remained occupied after recovery termination."
+    }
+    Assert-ApplicationWriterLeaseFree
+    Remove-ControlState -ExpectedState $evidence.State
+    Remove-ExactShutdownReceipts -Evidence $evidence
+    Complete-RecoveryIncident -Incident $incident
+    Write-Output "Failed-shutdown incident $($incident.Id) was archived; MyDashboard remains stopped."
+}
+
 function Assert-OfflineRestoreAllowed {
     $state = Read-ControlState
     if ($null -ne $state) {
@@ -1444,8 +1985,17 @@ function Show-ManagedStatus {
 if ($Action -ne "Restore" -and -not [string]::IsNullOrWhiteSpace($BackupId)) {
     throw "BackupId is valid only for the Restore action."
 }
+if ($Action -ne "RecoverFailedShutdown" -and -not [string]::IsNullOrWhiteSpace($RecoverySnapshotId)) {
+    throw "RecoverySnapshotId is valid only for the RecoverFailedShutdown action."
+}
+if ($Action -eq "RecoverFailedShutdown" -and [string]::IsNullOrWhiteSpace($RecoverySnapshotId)) {
+    throw "RecoverFailedShutdown requires one RecoverySnapshotId."
+}
 if ($Action -eq "Restore" -and $OpenBrowser) {
     throw "Restore leaves the service stopped and cannot open a browser."
+}
+if ($Action -eq "RecoverFailedShutdown" -and $OpenBrowser) {
+    throw "RecoverFailedShutdown leaves the service stopped and cannot open a browser."
 }
 
 $managerMutex = New-Object System.Threading.Mutex($false, $mutexName)
@@ -1496,6 +2046,9 @@ try {
                 -Mode Activate `
                 -RequestedBackupId $BackupId
             Write-Output "MyDashboard restored $($restored.result.backupId); the service remains stopped."
+        }
+        "RecoverFailedShutdown" {
+            Recover-FailedShutdown -SnapshotId $RecoverySnapshotId
         }
     }
 } finally {

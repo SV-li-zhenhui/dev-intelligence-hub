@@ -42,10 +42,14 @@ test("process management is PID and health bound and never kills an arbitrary li
     path.join(root, "scripts", "run-managed-dashboard.mjs"),
     "utf8",
   );
+  const writerLeaseProbe = await readFile(
+    path.join(root, "scripts", "probe-application-writer-lease.mjs"),
+    "utf8",
+  );
 
   assert.match(
     manager,
-    /ValidateSet\("Start", "Stop", "Restart", "Status", "Restore"\)/,
+    /ValidateSet\("Start", "Stop", "Restart", "Status", "Restore", "RecoverFailedShutdown"\)/,
   );
   assert.match(manager, /processStartTime/);
   assert.match(manager, /Liveness\.service -ne "mydashboard"/);
@@ -62,6 +66,13 @@ test("process management is PID and health bound and never kills an arbitrary li
   assert.match(manager, /WaitOne/);
   assert.match(manager, /it was not force-killed and control state was retained/);
   assert.doesNotMatch(manager, /taskkill|Stop-Process\s+-Name|Get-NetTCPConnection.*Stop-Process/);
+  assert.match(manager, /function Recover-FailedShutdown/);
+  assert.match(manager, /Stop-Process\s+-Id/);
+  assert.match(manager, /probe-application-writer-lease\.mjs/);
+  assert.doesNotMatch(
+    manager.match(/"Restart"\s*\{[\s\S]*?\n\s*\}/u)?.[0] || "",
+    /Recover-FailedShutdown/,
+  );
   assert.match(manager, /launch-mydashboard-process\.mjs/);
   assert.match(manager, /manage-offline-restore\.mjs/);
   assert.match(manager, /Assert-OfflineRestoreAllowed/);
@@ -82,6 +93,9 @@ test("process management is PID and health bound and never kills an arbitrary li
   assert.doesNotMatch(manager, /C:\\Program Files\\nodejs/);
   assert.match(starter, /Manage-MyDashboard\.ps1/);
   assert.doesNotMatch(starter, /Start-Process|C:\\Program Files\\nodejs/);
+  assert.match(writerLeaseProbe, /createApplicationWriterLease/);
+  assert.match(writerLeaseProbe, /MYDASHBOARD_WRITER_LEASE_PROJECT_DIGEST/);
+  assert.doesNotMatch(writerLeaseProbe, /process\.env\.(?:PATH|NODE_OPTIONS)/);
 });
 
 test("managed shutdown allows bounded durable projection drain before manager timeout", async () => {

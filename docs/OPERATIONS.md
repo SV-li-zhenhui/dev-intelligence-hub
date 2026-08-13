@@ -122,6 +122,28 @@ returns a non-zero exit code for stopped, retained-uncertain, identity-mismatch,
 or otherwise unhealthy managed state. Treat retained control state as evidence
 to investigate; do not delete it merely to make `Start` succeed.
 
+### Failed-shutdown recovery
+
+`Restart` never overrides a retained shutdown failure. When the authenticated
+managed process is still alive, has emitted an authenticated `failure` terminal
+receipt, is no longer listening, has no descendants, and an exact stable
+recovery snapshot is available, an operator may explicitly recover it:
+
+```powershell
+.\scripts\Manage-MyDashboard.ps1 -Action RecoverFailedShutdown `
+  -RecoverySnapshotId snapshot-<32-lowercase-hex>
+```
+
+The command accepts no browser option and leaves the service stopped. It checks
+the snapshot manifest and active `data/` files byte-for-byte, writes private
+incident evidence under the private runtime, terminates only the authenticated
+PID, verifies the project writer lease can be acquired and released, then
+removes only the matching control state and receipts. Any uncertainty before
+termination leaves the process and evidence intact; any failure after
+termination retains the control state, receipts, and incident evidence. Inspect
+the incident record before taking a separate explicit `Start` action. Never
+delete private lifecycle evidence to bypass these checks.
+
 Both `npm start` and managed startup use a bootstrap that captures the packaged
 runtime identity before importing the application and verifies it again before
 opening the service. A Git checkout must be clean and binds its real commit and
