@@ -455,6 +455,78 @@ test("explicit PR action allow-list routes only supported injected executors", a
   await runtime.close();
 });
 
+test("runtime closes one shared generic executor once before closing the guard", async () => {
+  const events = [];
+  const externalExecutor = {
+    async execute() {},
+    async reconcile() {},
+    async close() { events.push("genericClose"); },
+  };
+  const runtime = await createConfirmationRuntime(
+    enabledConfig({
+      enabledActions: ["comment", "update_branch", "merge"],
+    }),
+    runtimeDependencies({
+      pullRequestExternalActionExecutor: externalExecutor,
+      createExecutorRouter: () => externalExecutor,
+      createGuard: () => ({
+        acquire() {},
+        run(operation) { return operation(); },
+        close() { events.push("guardClose"); },
+      }),
+    }),
+  );
+
+  await Promise.all([runtime.close(), runtime.close()]);
+  assert.deepEqual(events, ["genericClose", "guardClose"]);
+});
+
+test("runtime attempts Review, one shared generic close, and guard while preserving the first close failure", async (t) => {
+  for (const failingExecutor of ["review", "generic"]) {
+    await t.test(`${failingExecutor} close fails`, async () => {
+      const events = [];
+      const failure = new Error(`${failingExecutor} close failed`);
+      const reviewExecutor = {
+        async execute() {},
+        async reconcile() {},
+        async close() {
+          events.push("reviewClose");
+          if (failingExecutor === "review") throw failure;
+        },
+      };
+      let genericCloseCalls = 0;
+      const externalExecutor = {
+        async execute() {},
+        async reconcile() {},
+        async close() {
+          genericCloseCalls += 1;
+          events.push("genericClose");
+          if (failingExecutor === "generic") throw failure;
+        },
+      };
+      const runtime = await createConfirmationRuntime(
+        enabledConfig({
+          enabledActions: ["review", "comment", "update_branch", "merge"],
+        }),
+        runtimeDependencies({
+          createExecutor: () => reviewExecutor,
+          pullRequestExternalActionExecutor: externalExecutor,
+          createExecutorRouter: () => externalExecutor,
+          createGuard: () => ({
+            acquire() {},
+            run(operation) { return operation(); },
+            close() { events.push("guardClose"); },
+          }),
+        }),
+      );
+
+      await assert.rejects(runtime.close(), (error) => error === failure);
+      assert.deepEqual(events, ["reviewClose", "genericClose", "guardClose"]);
+      assert.equal(genericCloseCalls, 1);
+    });
+  }
+});
+
 test("an explicit empty PR action allow-list starts inert without credentials", async () => {
   let githubExecutors = 0;
   let routed;

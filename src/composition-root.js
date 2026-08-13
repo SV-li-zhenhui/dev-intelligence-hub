@@ -1,12 +1,16 @@
 import path from "node:path";
+import { homedir } from "node:os";
+import { types as utilTypes } from "node:util";
 import {
   createProductionCodexLoginCredentialBroker,
 } from "./adapters/codex-login-credential-broker.js";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
+import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
+import { TokenEnvCredentialSource } from "./adapters/token-env-credential-source.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
 import { createChangePackageRuntime } from "./change-package-runtime.js";
 import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
@@ -19,8 +23,12 @@ import {
 import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
+import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "./lib/private-directory-manager.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
-import { createProjectScopedGuardFactory } from "./lib/project-identity.js";
+import {
+  createProjectScopedGuardFactory,
+  projectIdentityDigest,
+} from "./lib/project-identity.js";
 import { StateStore } from "./lib/state-store.js";
 import { createMemoryRuntime } from "./memory-runtime.js";
 import { createOperationsRuntime } from "./operations-runtime.js";
@@ -154,15 +162,27 @@ function frozenPort(source, methods, name) {
   );
 }
 
-function environmentCredentialProvider(environment, name) {
-  return () => {
-    if (!environment || typeof environment !== "object") return null;
-    const descriptor = Object.getOwnPropertyDescriptor(environment, name);
-    return descriptor?.enumerable && "value" in descriptor &&
-        typeof descriptor.value === "string"
-      ? descriptor.value
-      : null;
-  };
+function ownedExecutorPort(source, name) {
+  if (
+    !source ||
+    ["execute", "reconcile", "close"].some(
+      (method) => typeof source[method] !== "function",
+    )
+  ) {
+    throw new TypeError(`${name} is invalid`);
+  }
+  const execute = source.execute.bind(source);
+  const reconcile = source.reconcile.bind(source);
+  const closeOwner = source.close.bind(source);
+  let closeAttempt = null;
+  return Object.freeze({
+    execute: (...args) => execute(...args),
+    reconcile: (...args) => reconcile(...args),
+    close() {
+      closeAttempt ??= Promise.resolve().then(closeOwner);
+      return closeAttempt;
+    },
+  });
 }
 
 function distinctAbsolutePaths(values) {
@@ -179,6 +199,200 @@ function distinctAbsolutePaths(values) {
     result.push(resolved);
   }
   return Object.freeze(result);
+}
+
+function canonicalPath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function pathsOverlap(left, right) {
+  const canonicalLeft = canonicalPath(left);
+  const canonicalRight = canonicalPath(right);
+  const leftToRight = path.relative(canonicalLeft, canonicalRight);
+  const rightToLeft = path.relative(canonicalRight, canonicalLeft);
+  const contains = (relative) =>
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  return contains(leftToRight) || contains(rightToLeft);
+}
+
+function assertGitHubRuntimeTemporaryRoot(runtimeTemporaryRoot, protectedRoots) {
+  if (
+    typeof runtimeTemporaryRoot !== "string" ||
+    !path.isAbsolute(runtimeTemporaryRoot) ||
+    protectedRoots.some((protectedRoot) =>
+      pathsOverlap(runtimeTemporaryRoot, protectedRoot))
+  ) {
+    throw new Error(
+      "GitHub runtime temporary root overlaps a protected root",
+    );
+  }
+}
+
+function githubCredentialSourceDependencies(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    throw new TypeError("GitHub credential source dependencies are invalid");
+  }
+  const allowed = new Set([
+    "homeDirectory",
+    "projectIdentity",
+    "createTokenEnvCredentialSource",
+    "createGhLoginCredentialSource",
+    "privateDirectoryManager",
+  ]);
+  const result = {};
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !allowed.has(key) ||
+      !descriptor?.enumerable ||
+      !Object.hasOwn(descriptor, "value")
+    ) {
+      throw new TypeError("GitHub credential source dependencies are invalid");
+    }
+    result[key] = descriptor.value;
+  }
+  if (
+    result.homeDirectory !== undefined &&
+    (
+      typeof result.homeDirectory !== "string" ||
+      !path.isAbsolute(result.homeDirectory) ||
+      result.homeDirectory.includes("\0")
+    )
+  ) {
+    throw new TypeError("GitHub credential source dependencies are invalid");
+  }
+  for (const name of [
+    "projectIdentity",
+    "createTokenEnvCredentialSource",
+    "createGhLoginCredentialSource",
+  ]) {
+    if (result[name] !== undefined && typeof result[name] !== "function") {
+      throw new TypeError("GitHub credential source dependencies are invalid");
+    }
+  }
+  if (
+    result.privateDirectoryManager !== undefined &&
+    (
+      result.privateDirectoryManager === null ||
+      typeof result.privateDirectoryManager !== "object" ||
+      utilTypes.isProxy(result.privateDirectoryManager) ||
+      typeof result.privateDirectoryManager.prepare !== "function"
+    )
+  ) {
+    throw new TypeError("GitHub credential source dependencies are invalid");
+  }
+  return Object.freeze(result);
+}
+
+function exactPreparedDirectoryIdentity(value, expectedPath) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    !Object.isFrozen(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
+    return false;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== 3 ||
+    !["path", "device", "inode"].every((key) => keys.includes(key))
+  ) {
+    return false;
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    keys.some((key) =>
+      typeof key !== "string" ||
+      !descriptors[key]?.enumerable ||
+      !Object.hasOwn(descriptors[key], "value"))
+  ) {
+    return false;
+  }
+  return descriptors.path.value === expectedPath &&
+    typeof descriptors.device.value === "string" &&
+    /^[0-9]+$/u.test(descriptors.device.value) &&
+    typeof descriptors.inode.value === "string" &&
+    /^[0-9]+$/u.test(descriptors.inode.value);
+}
+
+export async function createConfiguredGitHubCredentialSource(
+  { githubActions, projectRoot: configuredProjectRoot, protectedRoots },
+  rawDependencies = {},
+) {
+  const dependencies = githubCredentialSourceDependencies(rawDependencies);
+  const createTokenEnvSource = dependencies.createTokenEnvCredentialSource ??
+    ((options) => new TokenEnvCredentialSource(options));
+  const createGhLoginSource = dependencies.createGhLoginCredentialSource ??
+    createGhLoginCredentialSource;
+  const privateDirectoryManager = dependencies.privateDirectoryManager ??
+    PRODUCTION_PRIVATE_DIRECTORY_MANAGER;
+  const projectIdentity = dependencies.projectIdentity ?? projectIdentityDigest;
+  const homeDirectory = dependencies.homeDirectory ?? homedir();
+  const credentialMode = githubActions.credentialMode ?? "token-env";
+  if (credentialMode === "token-env") {
+    return createTokenEnvSource({
+      actorAccountId: githubActions.actorAccountId,
+      tokenEnv: githubActions.tokenEnv,
+    });
+  }
+
+  const digest = projectIdentity({ projectRoot: configuredProjectRoot });
+  if (!/^[a-f0-9]{64}$/u.test(digest)) {
+    throw new TypeError("GitHub credential project identity is invalid");
+  }
+  const runtimeTemporaryRoot = path.join(
+    homeDirectory,
+    `.mydashboard-github-runtime-${digest}`,
+  );
+  assertGitHubRuntimeTemporaryRoot(runtimeTemporaryRoot, protectedRoots);
+  const preparedIdentity = await privateDirectoryManager.prepare({
+    directory: runtimeTemporaryRoot,
+    signal: null,
+    validateLocation() {
+      assertGitHubRuntimeTemporaryRoot(runtimeTemporaryRoot, protectedRoots);
+    },
+  });
+  if (!exactPreparedDirectoryIdentity(preparedIdentity, runtimeTemporaryRoot)) {
+    throw new Error(
+      "GitHub runtime temporary root prepared identity is invalid",
+    );
+  }
+  return await createGhLoginSource({
+    actorAccountId: githubActions.actorAccountId,
+    ghCommand: githubActions.ghCommand,
+    runtimeTemporaryRoot,
+    protectedRoots,
+  });
+}
+
+function immutableGitHubActionsConfig(config) {
+  const enabledActions = Array.isArray(config.enabledActions)
+    ? Object.freeze([...config.enabledActions])
+    : null;
+  const networkEnv = Object.freeze({ ...(config.networkEnv || {}) });
+  const credentialMode = config.credentialMode ?? "token-env";
+  return Object.freeze({
+    enabled: config.enabled === true,
+    credentialMode,
+    actorAccountId: config.actorAccountId,
+    ...(credentialMode === "token-env" ? { tokenEnv: config.tokenEnv } : {}),
+    ghCommand: config.ghCommand,
+    networkEnv,
+    ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+    ...(enabledActions === null ? {} : { enabledActions }),
+  });
 }
 
 function productionCliRuntimeFacts(value) {
@@ -604,6 +818,7 @@ export async function createApplication({
     createPullRequestExternalActionExecutor,
   pullRequestExternalActionTransportFactory =
     createGitHubPullRequestActionTransport,
+  githubCredentialSourceFactory = createConfiguredGitHubCredentialSource,
   pullRequestExternalActionProposalRunnerFactory =
     createPullRequestExternalActionProposalRunnerService,
   pullRequestExternalActionDependencies = {},
@@ -658,6 +873,9 @@ export async function createApplication({
     throw new TypeError(
       "pullRequestExternalActionTransportFactory must be a function",
     );
+  }
+  if (typeof githubCredentialSourceFactory !== "function") {
+    throw new TypeError("githubCredentialSourceFactory must be a function");
   }
   if (typeof pullRequestExternalActionProposalRunnerFactory !== "function") {
     throw new TypeError(
@@ -770,6 +988,8 @@ export async function createApplication({
   let agentMemoryQueries = null;
   let codeJobRuntime = null;
   let confirmationRuntime = null;
+  let pullRequestExternalActionExecutor = null;
+  let pullRequestExternalActionExecutorOwned = false;
   let codeJobReader = null;
   let inputAuthorityVerifier = null;
   let codeJobDeliveryEvidenceReader = null;
@@ -859,11 +1079,12 @@ export async function createApplication({
     const credentialRoots = codexLoginProtectedRoots(
       codexLoginLocationsFactory(),
     );
+    const cliAndCredentialProtectedRoots = distinctAbsolutePaths([
+      ...cliProtectedRoots,
+      ...credentialRoots,
+    ]);
     cliCompositionCapability = issueProductionCliCompositionGrant({
-      protectedRoots: distinctAbsolutePaths([
-        ...cliProtectedRoots,
-        ...credentialRoots,
-      ]),
+      protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
     });
     const controlledConflictPorts = conflictPreparationPorts(
@@ -958,6 +1179,30 @@ export async function createApplication({
       externalActions &&
       configuredGithubActions.enabled === true &&
       explicitPullRequestActions.length > 0;
+    const githubReviewExecutionEnabled =
+      externalActions &&
+      configuredGithubActions.enabled === true &&
+      (
+        configuredGithubActions.enabledActions === undefined ||
+        explicitPullRequestActions.includes("review")
+      );
+    const githubCredentialExecutionEnabled =
+      githubReviewExecutionEnabled || pullRequestExternalActionExecutionEnabled;
+    let githubCredentialSource = null;
+    if (githubCredentialExecutionEnabled) {
+      const activeGithubActions = immutableGitHubActionsConfig(
+        configuredGithubActions,
+      );
+      githubCredentialSource = frozenPort(
+        await githubCredentialSourceFactory({
+          githubActions: activeGithubActions,
+          projectRoot,
+          protectedRoots: cliAndCredentialProtectedRoots,
+        }),
+        ["acquire"],
+        "githubCredentialSource",
+      );
+    }
     const localCodeExecutionEnabled =
       coordinationEnabled && externalActions && Boolean(codeExecutorRuntime);
     const configurationChangeRoleIds = Array.isArray(
@@ -1449,7 +1694,6 @@ export async function createApplication({
         "changePackageRuntime.applicationExecutor",
       );
     }
-    let pullRequestExternalActionExecutor = null;
     if (pullRequestExternalActionExecutionEnabled) {
       if (inputAuthorityVerifier === null) {
         throw new Error("GitHub PR 外部动作需要可核验的 PR 输入授权");
@@ -1476,60 +1720,58 @@ export async function createApplication({
       ) {
         throw new Error("GitHub push 动作需要可核验的受控 commit 证据");
       }
-      if (pullRequestExternalActionDependencies.executor === undefined) {
-        const environment =
-          pullRequestExternalActionDependencies.env ?? process.env;
-        const credentialProvider =
-          pullRequestExternalActionDependencies.credentialProvider ??
-          environmentCredentialProvider(
-            environment,
-            configuredGithubActions.tokenEnv,
-          );
-        let transport = pullRequestExternalActionDependencies.transport;
-        if (transport === undefined) {
-          if (
-            explicitPullRequestActions.includes("push") &&
-            controlledCommitPublisher === null
-          ) {
-            throw new Error("GitHub push 动作需要受控 commit 发布端口");
-          }
-          transport = pullRequestExternalActionTransportFactory({
-            ghCommand: configuredGithubActions.ghCommand,
-            env: environment,
-            networkEnv: configuredGithubActions.networkEnv,
-            ...(configuredGithubActions.timeoutMs === undefined
-              ? {}
-              : { timeoutMs: configuredGithubActions.timeoutMs }),
-            ...(controlledCommitPublisher === null
-              ? {}
-              : { controlledCommitPublisher }),
-            ...(pullRequestExternalActionDependencies.processRunner === undefined
-              ? {}
-              : {
-                  runner:
-                    pullRequestExternalActionDependencies.processRunner,
-                }),
-          });
+      const environment = pullRequestExternalActionDependencies.env ?? process.env;
+      let transport = pullRequestExternalActionDependencies.transport;
+      if (transport === undefined) {
+        if (
+          explicitPullRequestActions.includes("push") &&
+          controlledCommitPublisher === null
+        ) {
+          throw new Error("GitHub push 动作需要受控 commit 发布端口");
         }
-        pullRequestExternalActionExecutor =
-          pullRequestExternalActionExecutorFactory({
-            enabledActions: explicitPullRequestActions,
-            credentialProvider,
-            transport,
-            inputAuthorityVerifier,
-            ...(controlledCommitVerifier === null
-              ? {}
-              : { controlledCommitVerifier }),
-          });
-      } else {
-        pullRequestExternalActionExecutor =
-          pullRequestExternalActionDependencies.executor;
+        transport = pullRequestExternalActionTransportFactory({
+          ghCommand: configuredGithubActions.ghCommand,
+          env: environment,
+          networkEnv: configuredGithubActions.networkEnv,
+          ...(configuredGithubActions.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: configuredGithubActions.timeoutMs }),
+          ...(controlledCommitPublisher === null
+            ? {}
+            : { controlledCommitPublisher }),
+          ...(pullRequestExternalActionDependencies.processRunner === undefined
+            ? {}
+            : {
+                runner: pullRequestExternalActionDependencies.processRunner,
+              }),
+        });
       }
-      pullRequestExternalActionExecutor = frozenPort(
-        pullRequestExternalActionExecutor,
-        ["execute", "reconcile"],
-        "pullRequestExternalActionExecutor",
-      );
+      const constructedPullRequestExternalActionExecutor =
+        pullRequestExternalActionExecutorFactory({
+          enabledActions: explicitPullRequestActions,
+          credentialSource: githubCredentialSource,
+          ...(configuredGithubActions.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: configuredGithubActions.timeoutMs }),
+          transport,
+          inputAuthorityVerifier,
+          ...(controlledCommitVerifier === null
+            ? {}
+            : { controlledCommitVerifier }),
+        });
+      try {
+        pullRequestExternalActionExecutor = ownedExecutorPort(
+          constructedPullRequestExternalActionExecutor,
+          "pullRequestExternalActionExecutor",
+        );
+      } catch (error) {
+        try {
+          await constructedPullRequestExternalActionExecutor?.close?.();
+        } catch {
+          // Preserve the composition error after attempting acquired cleanup.
+        }
+        throw error;
+      }
     }
     if (
       externalActions &&
@@ -1554,8 +1796,12 @@ export async function createApplication({
           ...(pullRequestExternalActionExecutor === null
             ? {}
             : { pullRequestExternalActionExecutor }),
+          ...(githubCredentialSource === null
+            ? {}
+            : { credentialSource: githubCredentialSource }),
         }),
       );
+      pullRequestExternalActionExecutorOwned = confirmationRuntime !== null;
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {
       throw new Error("本地代码工作提案需要可用的确认运行时");
@@ -2282,6 +2528,16 @@ export async function createApplication({
       close,
     };
   } catch (error) {
+    if (
+      pullRequestExternalActionExecutor !== null &&
+      !pullRequestExternalActionExecutorOwned
+    ) {
+      try {
+        await pullRequestExternalActionExecutor.close();
+      } catch {
+        // Preserve the startup failure after attempting executor cleanup.
+      }
+    }
     let constructionCleanup = readConfiguredConstructionCleanup(
       configuredConstructionCleanupOwner,
     );

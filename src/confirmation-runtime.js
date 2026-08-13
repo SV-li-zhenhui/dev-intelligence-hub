@@ -402,16 +402,29 @@ function reconcileOnlyExecutor(executor) {
   });
 }
 
-function closeOnce(guard, githubExecutor) {
+function closeOnce(guard, githubExecutor, pullRequestExternalExecutors) {
   let result;
   return () => {
     if (!result) {
       result = Promise.resolve().then(async () => {
-        try {
-          await githubExecutor?.close?.();
-        } finally {
-          await guard.close();
+        let firstFailure = null;
+        const owners = new Set([
+          githubExecutor,
+          ...Object.values(pullRequestExternalExecutors),
+        ]);
+        for (const owner of owners) {
+          try {
+            await owner?.close?.();
+          } catch (error) {
+            firstFailure ??= error;
+          }
         }
+        try {
+          await guard.close();
+        } catch (error) {
+          firstFailure ??= error;
+        }
+        if (firstFailure) throw firstFailure;
       });
     }
     return result;
@@ -500,7 +513,11 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     ["acquire", "run", "close"],
     "guard",
   );
-  const close = closeOnce(guard, githubExecutor);
+  const close = closeOnce(
+    guard,
+    githubExecutor,
+    pullRequestExternalExecutors,
+  );
 
   try {
     const queueOptions = {

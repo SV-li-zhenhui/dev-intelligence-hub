@@ -24,6 +24,7 @@ import {
   createBrain,
   createApplication,
   createApplicationRuntimeLifecycle,
+  createConfiguredGitHubCredentialSource,
   createEmployeeRegistry,
   createPrEmployeeReviewer,
 } from "../src/composition-root.js";
@@ -37,6 +38,7 @@ import {
   configurationDocumentDigest,
   normalizeConfigurationDocument,
 } from "../src/domain/configuration-contract.js";
+import { projectIdentityDigest } from "../src/lib/project-identity.js";
 import {
   createConfiguredConstructionCleanupOwner,
   createConfiguredWorkforce,
@@ -129,6 +131,8 @@ function externalActionConfig(codeExecutor = { enabled: false }) {
     githubActions: {
       enabled: true,
       actorAccountId: "review-account",
+      tokenEnv: "TEST_GITHUB_TOKEN",
+      ghCommand: process.execPath,
     },
   };
 }
@@ -143,7 +147,12 @@ function workCoordinationConfig({ externalActions = true } = {}) {
       rules: [],
     },
     githubActions: externalActions
-      ? { enabled: true, actorAccountId: "review-account" }
+      ? {
+          enabled: true,
+          actorAccountId: "review-account",
+          tokenEnv: "TEST_GITHUB_TOKEN",
+          ghCommand: process.execPath,
+        }
       : { enabled: false },
     workCoordination: {
       enabled: true,
@@ -182,7 +191,12 @@ function localCodeCoordinationConfig({ githubActions = true } = {}) {
     codeExecutor: { enabled: true },
     memory: { enabled: true },
     githubActions: githubActions
-      ? { enabled: true, actorAccountId: "review-account" }
+      ? {
+          enabled: true,
+          actorAccountId: "review-account",
+          tokenEnv: "TEST_GITHUB_TOKEN",
+          ghCommand: process.execPath,
+        }
       : { enabled: false },
     brainProviders: {
       ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" },
@@ -3241,6 +3255,456 @@ test("external confirmation runtime requires both action authorization gates", a
   await withoutProcessAuthorization.close();
 });
 
+test("Review and generic GitHub actions share one credential acquire port while disabled actions construct none", async () => {
+  const enabledCalls = {};
+  const enabledCloseCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    timeoutMs: 12_000,
+    enabledActions: ["review", "comment"],
+  };
+  const source = Object.freeze({
+    async acquire() {
+      throw new Error("credential acquisition must remain behind confirmation");
+    },
+  });
+  let sourceConstructions = 0;
+  const runners = {
+    "github-review-runner": { async claim() {}, async advance() {} },
+    "github-pr-action-runner": { async claim() {}, async advance() {} },
+  };
+  const confirmationProducer = confirmationProducerPort();
+
+  const enabledApplication = await createApplication({
+    config,
+    store: memoryStore(),
+    ...localCoordinationStubs({
+      calls: enabledCalls,
+      closeCalls: enabledCloseCalls,
+      runners,
+    }),
+    githubCredentialSourceFactory: async () => {
+      sourceConstructions += 1;
+      return source;
+    },
+    pullRequestExternalActionTransportFactory: () => ({
+      async observe() {},
+      async perform() {},
+    }),
+    pullRequestExternalActionExecutorFactory(options) {
+      enabledCalls.externalExecutor = options;
+      return {
+        async execute() {},
+        async reconcile() {},
+        async close() {},
+      };
+    },
+    confirmationRuntimeFactory: async (_activeConfig, dependencies) => {
+      enabledCalls.confirmation = dependencies;
+      return {
+        queue: confirmationQueuePort(),
+        producerQueue: confirmationProducer,
+        async close() {},
+      };
+    },
+    githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+    pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+
+  assert.equal(sourceConstructions, 1);
+  assert.strictEqual(
+    enabledCalls.externalExecutor.credentialSource,
+    enabledCalls.confirmation.credentialSource,
+  );
+  assert.notStrictEqual(enabledCalls.externalExecutor.credentialSource, source);
+  assert.deepEqual(
+    Reflect.ownKeys(enabledCalls.externalExecutor.credentialSource),
+    ["acquire"],
+  );
+  assert.equal(Object.isFrozen(enabledCalls.externalExecutor.credentialSource), true);
+  await enabledApplication.close();
+
+  const disabledConfig = workCoordinationConfig({ externalActions: false });
+  const disabledCalls = {};
+  const disabledCloseCalls = [];
+  const disabledApplication = await createApplication({
+    config: disabledConfig,
+    store: memoryStore(),
+    ...localCoordinationStubs({
+      calls: disabledCalls,
+      closeCalls: disabledCloseCalls,
+      runners: {},
+    }),
+    githubCredentialSourceFactory: async () => {
+      sourceConstructions += 1;
+      throw new Error("disabled GitHub actions must not construct credentials");
+    },
+  });
+
+  assert.equal(sourceConstructions, 1);
+  await disabledApplication.close();
+});
+
+test("configured GitHub credential factory keeps token-env directory-free and prepares one project-private gh-login root", async (t) => {
+  const projectDirectory = path.join(path.parse(process.cwd()).root, "projects", "dashboard");
+  const homeDirectory = path.join(path.parse(process.cwd()).root, "users", "owner");
+  const protectedRoots = Object.freeze([
+    projectDirectory,
+    path.join(homeDirectory, ".codex"),
+    path.join(homeDirectory, ".mydashboard-cli-credentials-v1"),
+  ]);
+  const tokenSources = [];
+  const ghSources = [];
+  const prepared = [];
+  const dependencies = {
+    homeDirectory,
+    projectIdentity: ({ projectRoot }) => projectIdentityDigest({
+      projectRoot,
+      projectDigest: "a".repeat(64),
+    }),
+    createTokenEnvCredentialSource(options) {
+      tokenSources.push(options);
+      return Object.freeze({ async acquire() {} });
+    },
+    async createGhLoginCredentialSource(options) {
+      ghSources.push(options);
+      return Object.freeze({ async acquire() {} });
+    },
+    privateDirectoryManager: {
+      async prepare(options) {
+        prepared.push(options);
+        await options.validateLocation();
+        return Object.freeze({
+          path: options.directory,
+          device: "1",
+          inode: "2",
+        });
+      },
+    },
+  };
+  const baseConfig = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+  };
+
+  for (const credentialMode of [undefined, "token-env"]) {
+    const githubActions = Object.freeze({
+      ...baseConfig,
+      ...(credentialMode === undefined ? {} : { credentialMode }),
+    });
+    await createConfiguredGitHubCredentialSource(
+      { githubActions, projectRoot: projectDirectory, protectedRoots },
+      dependencies,
+    );
+  }
+  assert.equal(tokenSources.length, 2);
+  assert.equal(prepared.length, 0);
+  assert.equal(ghSources.length, 0);
+  assert.deepEqual(tokenSources, [
+    { actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN" },
+    { actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN" },
+  ]);
+
+  const ghSource = await createConfiguredGitHubCredentialSource(
+    {
+      githubActions: Object.freeze({
+        enabled: true,
+        credentialMode: "gh-login",
+        actorAccountId: "review-account",
+        ghCommand: process.execPath,
+      }),
+      projectRoot: projectDirectory,
+      protectedRoots,
+    },
+    dependencies,
+  );
+  assert.equal(typeof ghSource.acquire, "function");
+  assert.equal(prepared.length, 1);
+  assert.equal(ghSources.length, 1);
+  const expectedRoot = path.join(
+    homeDirectory,
+    `.mydashboard-github-runtime-${"a".repeat(64)}`,
+  );
+  assert.equal(prepared[0].directory, expectedRoot);
+  assert.equal(path.dirname(prepared[0].directory), homeDirectory);
+  assert.equal(ghSources[0].runtimeTemporaryRoot, expectedRoot);
+  assert.deepEqual(ghSources[0].protectedRoots, protectedRoots);
+
+  await t.test("location validation rejects either overlap direction", async () => {
+    for (const protectedRoot of [homeDirectory, path.join(expectedRoot, "nested")]) {
+      await assert.rejects(
+        createConfiguredGitHubCredentialSource(
+          {
+            githubActions: Object.freeze({
+              enabled: true,
+              credentialMode: "gh-login",
+              actorAccountId: "review-account",
+              ghCommand: process.execPath,
+            }),
+            projectRoot: projectDirectory,
+            protectedRoots: Object.freeze([protectedRoot]),
+          },
+          dependencies,
+        ),
+        /runtime temporary root/i,
+      );
+    }
+  });
+
+  await t.test("prepared identity must name the exact configured root", async () => {
+    let sourceCreations = 0;
+    await assert.rejects(
+      createConfiguredGitHubCredentialSource(
+        {
+          githubActions: Object.freeze({
+            enabled: true,
+            credentialMode: "gh-login",
+            actorAccountId: "review-account",
+            ghCommand: process.execPath,
+          }),
+          projectRoot: projectDirectory,
+          protectedRoots,
+        },
+        {
+          ...dependencies,
+          privateDirectoryManager: {
+            async prepare(options) {
+              await options.validateLocation();
+              return Object.freeze({
+                path: path.join(options.directory, "redirected"),
+                device: "1",
+                inode: "2",
+              });
+            },
+          },
+          async createGhLoginCredentialSource() {
+            sourceCreations += 1;
+            return Object.freeze({ async acquire() {} });
+          },
+        },
+      ),
+      /prepared identity/i,
+    );
+    assert.equal(sourceCreations, 0);
+  });
+
+  await t.test("prepared identity is an exact passive directory identity", async () => {
+    const invalidIdentities = [
+      Object.freeze({ path: expectedRoot }),
+      Object.freeze({ path: expectedRoot, device: "1", inode: "2", extra: true }),
+      Object.freeze({ path: expectedRoot, device: 1, inode: "2" }),
+      new Proxy(Object.freeze({
+        path: expectedRoot,
+        device: "1",
+        inode: "2",
+      }), {}),
+      Object.freeze(Object.defineProperty({ device: "1", inode: "2" }, "path", {
+        enumerable: true,
+        get() { return expectedRoot; },
+      })),
+    ];
+    for (const identity of invalidIdentities) {
+      await assert.rejects(
+        createConfiguredGitHubCredentialSource(
+          {
+            githubActions: Object.freeze({
+              enabled: true,
+              credentialMode: "gh-login",
+              actorAccountId: "review-account",
+              ghCommand: process.execPath,
+            }),
+            projectRoot: projectDirectory,
+            protectedRoots,
+          },
+          {
+            ...dependencies,
+            privateDirectoryManager: {
+              async prepare(options) {
+                await options.validateLocation();
+                return identity;
+              },
+            },
+          },
+        ),
+        /prepared identity/i,
+      );
+    }
+  });
+
+  await t.test("test dependencies are an exact plain data record", async () => {
+    const githubActions = Object.freeze({
+      ...baseConfig,
+      credentialMode: "token-env",
+    });
+    const cases = [
+      { ...dependencies, unexpectedAuthority: true },
+      new Proxy({ ...dependencies }, {}),
+      Object.defineProperty({ ...dependencies }, "homeDirectory", {
+        enumerable: true,
+        get() { return homeDirectory; },
+      }),
+    ];
+    for (const candidate of cases) {
+      await assert.rejects(
+        createConfiguredGitHubCredentialSource(
+          { githubActions, projectRoot: projectDirectory, protectedRoots },
+          candidate,
+        ),
+        /dependencies are invalid/i,
+      );
+    }
+  });
+});
+
+test("generic action dependencies cannot replace the actor-bound executor or expose its credential source", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    enabledActions: ["comment"],
+  };
+  const source = Object.freeze({ async acquire() {} });
+  const transport = Object.freeze({ async observe() {}, async perform() {} });
+  const dependencyBag = { transport };
+  for (const name of ["executor", "credentialProvider", "credentialSource"]) {
+    Object.defineProperty(dependencyBag, name, {
+      enumerable: true,
+      get() {
+        throw new Error(`${name} compatibility seam must not be read`);
+      },
+    });
+  }
+  const application = await createApplication({
+    config,
+    store: memoryStore(),
+    ...localCoordinationStubs({
+      calls,
+      closeCalls,
+      runners: {
+        "github-pr-action-runner": { async claim() {}, async advance() {} },
+      },
+    }),
+    githubCredentialSourceFactory: async () => source,
+    pullRequestExternalActionDependencies: dependencyBag,
+    pullRequestExternalActionExecutorFactory(options) {
+      calls.externalExecutor = options;
+      return {
+        async execute() {},
+        async reconcile() {},
+        async close() {},
+      };
+    },
+    confirmationRuntimeFactory: async (_config, dependencies) => ({
+      queue: confirmationQueuePort(),
+      producerQueue: confirmationProducerPort(),
+      async close() {
+        await dependencies.pullRequestExternalActionExecutor.close();
+      },
+    }),
+    pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+
+  assert.equal("credentialProvider" in calls.externalExecutor, false);
+  assert.notStrictEqual(calls.externalExecutor.credentialSource, source);
+  assert.deepEqual(Reflect.ownKeys(calls.externalExecutor.credentialSource), ["acquire"]);
+  assert.equal(typeof calls.externalExecutor.credentialSource.acquire, "function");
+  assert.equal("credentialSource" in application, false);
+  assert.equal("githubCredentialSource" in application, false);
+  await application.close();
+});
+
+test("generic GitHub action composition requires an owned close capability", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    enabledActions: ["comment"],
+  };
+
+  const outcome = await createApplication({
+      config,
+      store: memoryStore(),
+      ...localCoordinationStubs({
+        calls,
+        closeCalls,
+        runners: {
+          "github-pr-action-runner": { async claim() {}, async advance() {} },
+        },
+      }),
+      githubCredentialSourceFactory: async () => Object.freeze({ async acquire() {} }),
+      pullRequestExternalActionDependencies: {
+        transport: Object.freeze({ async observe() {}, async perform() {} }),
+      },
+      pullRequestExternalActionExecutorFactory: () => ({
+        async execute() {},
+        async reconcile() {},
+      }),
+    }).then(
+      (application) => ({ application }),
+      (error) => ({ error }),
+    );
+  if (outcome.application) await outcome.application.close();
+  assert.match(outcome.error?.message ?? "", /pullRequestExternalActionExecutor is invalid/);
+});
+
+test("generic executor is closed when confirmation runtime ownership handoff fails", async () => {
+  const calls = {};
+  const closeCalls = [];
+  const startupFailure = new Error("confirmation startup failed");
+  const config = workCoordinationConfig();
+  config.githubActions = {
+    enabled: true,
+    actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
+    enabledActions: ["comment"],
+  };
+  let executorCloses = 0;
+
+  await assert.rejects(
+    createApplication({
+      config,
+      store: memoryStore(),
+      ...localCoordinationStubs({
+        calls,
+        closeCalls,
+        runners: {
+          "github-pr-action-runner": { async claim() {}, async advance() {} },
+        },
+      }),
+      githubCredentialSourceFactory: async () =>
+        Object.freeze({ async acquire() {} }),
+      pullRequestExternalActionDependencies: {
+        transport: Object.freeze({ async observe() {}, async perform() {} }),
+      },
+      pullRequestExternalActionExecutorFactory: () => ({
+        async execute() {},
+        async reconcile() {},
+        async close() { executorCloses += 1; },
+      }),
+      confirmationRuntimeFactory: async () => { throw startupFailure; },
+    }),
+    (error) => error === startupFailure,
+  );
+  assert.equal(executorCloses, 1);
+});
+
 test("an explicit comment-only PR action composes one fixed executor and one scoped runner", async () => {
   const calls = {};
   const closeCalls = [];
@@ -3260,6 +3724,7 @@ test("an explicit comment-only PR action composes one fixed executor and one sco
   const executor = {
     async execute() { executorCalls += 1; },
     async reconcile() { executorCalls += 1; },
+    async close() {},
   };
   const proposalRunnerPort = { async runCycle() {} };
   const groupedRunner = { async runCycle() {} };
@@ -3316,7 +3781,12 @@ test("an explicit comment-only PR action composes one fixed executor and one sco
     allowedRoleIds: ["pr-reviewer"],
   }]);
   assert.deepEqual(calls.externalExecutor.enabledActions, ["comment"]);
-  assert.equal(calls.externalExecutor.credentialProvider(), "test-only-token");
+  assert.deepEqual(Reflect.ownKeys(calls.externalExecutor.credentialSource), [
+    "acquire",
+  ]);
+  assert.equal(Object.isFrozen(calls.externalExecutor.credentialSource), true);
+  assert.equal("credentialProvider" in calls.externalExecutor, false);
+  assert.equal(calls.externalExecutor.timeoutMs, 12_000);
   assert.strictEqual(calls.externalExecutor.transport, transport);
   assert.deepEqual(calls.transport, {
     ghCommand: process.execPath,
@@ -3404,6 +3874,8 @@ test("an explicit Review keeps legacy intake while unified execution owns work-p
   config.githubActions = {
     enabled: true,
     actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
     enabledActions: ["review"],
   };
   const legacyAuthority = { async claim() {}, async advance() {} };
@@ -3414,6 +3886,7 @@ test("an explicit Review keeps legacy intake while unified execution owns work-p
   const executor = {
     async execute() { executorCalls += 1; },
     async reconcile() { executorCalls += 1; },
+    async close() {},
   };
   const application = await createApplication({
     config,
@@ -3427,7 +3900,6 @@ test("an explicit Review keeps legacy intake while unified execution owns work-p
       },
     }),
     pullRequestExternalActionDependencies: {
-      credentialProvider: () => ({ token: "test-only" }),
       transport: { async review() {} },
     },
     pullRequestExternalActionExecutorFactory() { return executor; },
@@ -3481,6 +3953,8 @@ test("a configured PR push fails closed without sealed controlled-commit verific
   config.githubActions = {
     enabled: true,
     actorAccountId: "review-account",
+    tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath,
     enabledActions: ["push"],
   };
 
@@ -3496,7 +3970,6 @@ test("a configured PR push fails closed without sealed controlled-commit verific
         },
       }),
       pullRequestExternalActionDependencies: {
-        credentialProvider: () => ({ token: "test-only" }),
         transport: { async push() {} },
       },
     }),
@@ -3669,6 +4142,8 @@ test("employee recovery failure closes an acquired confirmation runtime", async 
         githubActions: {
           enabled: true,
           actorAccountId: "review-account",
+          tokenEnv: "TEST_GITHUB_TOKEN",
+          ghCommand: process.execPath,
         },
       },
       store,
@@ -3700,6 +4175,8 @@ test("application does not open until a persisted invalidation intent is recover
       githubActions: {
         enabled: true,
         actorAccountId: "review-account",
+        tokenEnv: "TEST_GITHUB_TOKEN",
+        ghCommand: process.execPath,
       },
     },
     store,
@@ -3761,6 +4238,8 @@ test("failed persisted invalidation recovery aborts startup and closes the runti
         githubActions: {
           enabled: true,
           actorAccountId: "review-account",
+          tokenEnv: "TEST_GITHUB_TOKEN",
+          ghCommand: process.execPath,
         },
       },
       store,

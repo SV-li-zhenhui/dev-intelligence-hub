@@ -218,6 +218,57 @@ function executor(overrides = {}) {
   };
 }
 
+function credentialGatedExecutor({ source, reconcileResult = { status: "unknown" } }) {
+  async function withCredential(envelope, result) {
+    const lease = await source.acquire({
+      actorAccountId: envelope.actor.accountId,
+      signal: null,
+      deadline: Date.now() + 10_000,
+    });
+    try {
+      return await lease.use(async () => structuredClone(result));
+    } finally {
+      lease.release();
+    }
+  }
+  return {
+    execute(envelope) {
+      return withCredential(envelope, {
+        status: "applied",
+        receipt: { id: "credential-gated-execution" },
+      });
+    },
+    reconcile(envelope) {
+      return withCredential(envelope, reconcileResult);
+    },
+  };
+}
+
+function recordingCredentialSource(token = "fictional-queue-credential-canary") {
+  const events = [];
+  return {
+    events,
+    source: Object.freeze({
+      async acquire(request) {
+        events.push({ type: "acquire", request: structuredClone(request) });
+        let available = true;
+        return Object.freeze({
+          async use(callback) {
+            assert.equal(available, true);
+            available = false;
+            events.push({ type: "use" });
+            return callback(token);
+          },
+          release() {
+            available = false;
+            events.push({ type: "release" });
+          },
+        });
+      },
+    }),
+  };
+}
+
 async function readyQueue({
   store = new MemoryStore(),
   actionExecutor = executor(),
@@ -1662,6 +1713,113 @@ test("rejection is durable and cannot execute", async () => {
   assert.equal(result.status, "rejected");
   assert.equal(actionExecutor.executeCalls.length, 0);
   assert.equal((await queue.next()).item, null);
+});
+
+test("pending startup, proposal, reads, status, history, and rejection never acquire GitHub credentials", async () => {
+  const credential = recordingCredentialSource();
+  const store = new MemoryStore();
+  const first = await readyQueue({
+    store,
+    actionExecutor: credentialGatedExecutor({ source: credential.source }),
+  });
+  const queued = await first.enqueue(actionPlan());
+
+  await first.next();
+  await first.nextForAction("github.pull-request-review", "pull_request_review");
+  await first.get(queued.id);
+  await first.list();
+  await first.readRecoveryStatus();
+  await first.readMemoryStatus();
+  await first.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null });
+  assert.equal(credential.events.length, 0);
+
+  const recovered = await readyQueue({
+    store,
+    actionExecutor: credentialGatedExecutor({ source: credential.source }),
+  });
+  assert.equal(credential.events.length, 0);
+  const next = await recovered.next();
+  await recovered.reject(next.item.id, {
+    ...approvalRequest(next, "request-zero-acquire-reject"),
+    reason: "owner rejected the fictional proposal",
+  });
+
+  assert.equal(credential.events.length, 0);
+  assert.equal(JSON.stringify(store.value).includes("fictional-queue-credential-canary"), false);
+  assert.equal(JSON.stringify(await recovered.list()).includes("fictional-queue-credential-canary"), false);
+});
+
+test("only durable executing or unknown Review and generic recovery acquires one credential lease", async (t) => {
+  const scenarios = [
+    { name: "Review executing", plan: actionPlan(), durable: "executing" },
+    {
+      name: "generic executing",
+      plan: pullRequestExternalActionQueuePlan({
+        type: "comment",
+        body: "fictional recovery comment",
+      }),
+      durable: "executing",
+    },
+    { name: "Review unknown", plan: actionPlan(), durable: "unknown" },
+    {
+      name: "generic unknown",
+      plan: pullRequestExternalActionQueuePlan({
+        type: "comment",
+        body: "fictional recovery comment",
+      }),
+      durable: "unknown",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const requestId = `request-recovery-${scenario.name
+        .toLowerCase()
+        .replaceAll(" ", "-")}`;
+      const store = new MemoryStore();
+      const first = await readyQueue({ store, actionExecutor: executor({
+        async execute(envelope) {
+          this.executeCalls.push(structuredClone(envelope));
+          if (scenario.durable === "unknown") {
+            throw new ConfirmationExecutionError("GITHUB_RESPONSE_LOST", "unknown");
+          }
+          return { status: "applied", receipt: { id: "first-write" } };
+        },
+      }) });
+      await first.enqueue(scenario.plan);
+      const next = await first.next();
+      if (scenario.durable === "executing") {
+        store.failWriteAt = store.writeCount + 2;
+        await assert.rejects(
+          first.approve(next.item.id, approvalRequest(next, requestId)),
+          /disk unavailable/,
+        );
+        store.failWriteAt = null;
+        assert.equal(store.value.items[0].status, "executing");
+      } else {
+        const failed = await first.approve(
+          next.item.id,
+          approvalRequest(next, requestId),
+        );
+        assert.equal(failed.failure.outcome, "unknown");
+      }
+
+      const credential = recordingCredentialSource();
+      const recovered = await readyQueue({
+        store,
+        actionExecutor: credentialGatedExecutor({
+          source: credential.source,
+          reconcileResult: { status: "unknown", code: "GITHUB_RESPONSE_LOST" },
+        }),
+      });
+      assert.deepEqual(
+        credential.events.map(({ type }) => type),
+        ["acquire", "use", "release"],
+      );
+      assert.equal(JSON.stringify(store.value).includes("fictional-queue-credential-canary"), false);
+      assert.equal(JSON.stringify(await recovered.readRecoveryStatus()).includes("fictional-queue-credential-canary"), false);
+    });
+  }
 });
 
 test("a proven absent failure is retryable but an unknown outcome is not", async () => {
