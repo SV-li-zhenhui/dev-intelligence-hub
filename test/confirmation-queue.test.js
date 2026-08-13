@@ -1927,7 +1927,7 @@ test("startup recovery never turns an unknown action into a retryable absence", 
   assert.equal(item.status, "failed");
   assert.equal(item.retryable, false);
   assert.deepEqual(item.failure, {
-    code: "EXTERNAL_OUTCOME_UNKNOWN",
+    code: "GITHUB_MARKER_ABSENT",
     outcome: "unknown",
     retryable: false,
     at: "2026-08-02T01:00:00.000Z",
@@ -1962,7 +1962,7 @@ test("startup recovery refreshes a stable diagnostic without relaxing unknown", 
       this.reconcileCalls.push(structuredClone(envelope));
       throw new ConfirmationExecutionError(
         "GITHUB_LOGIN_UNAVAILABLE",
-        "unknown",
+        "absent",
       );
     },
   });

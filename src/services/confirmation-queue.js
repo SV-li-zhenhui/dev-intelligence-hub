@@ -1068,9 +1068,11 @@ export class ConfirmationQueue {
     const item = this.#requireItem(id);
     let outcome = await this.#invokeReconcile(item);
     if (outcome.status === "absent") {
+      // A later absence cannot prove the originally admitted write never ran.
+      // Keep the outcome fenced while retaining the current safe diagnostic.
       outcome = {
         status: "unknown",
-        code: "EXTERNAL_OUTCOME_UNKNOWN",
+        code: outcome.code,
       };
     }
     if (
