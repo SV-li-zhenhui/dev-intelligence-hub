@@ -113,5 +113,9 @@ test("dashboard wires system status as a separately loaded view", async () => {
   );
   assert.match(app, /currentView === "system"/u);
   assert.match(styles, /\.system-status-grid/u);
+  assert.match(
+    styles,
+    /\.system-status-backups li strong\s*\{[^}]*display:\s*block;[^}]*overflow-wrap:\s*anywhere;/u,
+  );
   assert.match(styles, /@media \(max-width: 820px\)[\s\S]*\.system-status-grid/u);
 });

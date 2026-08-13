@@ -2242,6 +2242,15 @@ h1 {
   padding-left: 20px;
 }
 
+.system-status-backups li {
+  min-width: 0;
+}
+
+.system-status-backups li strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .system-status-backups li span {
   display: block;
   color: var(--muted);

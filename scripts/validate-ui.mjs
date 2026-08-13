@@ -1136,6 +1136,13 @@ async function validateExternalReviewConfirmation() {
 
   confirmationPhase = "approve";
   await page.reload({ waitUntil: "networkidle" });
+  const deferredPersistedAcrossReload =
+    (await page.locator("#confirmation-dialog[open]").count()) === 0;
+  await page.locator('[data-view="employees"]').click();
+  const deferredRestore = page.locator("#confirmation-deferred-restore");
+  await deferredRestore.waitFor();
+  const deferredRestoreVisible = await deferredRestore.isVisible();
+  await deferredRestore.click();
   await page.locator("#confirmation-dialog[open]").waitFor();
   await page
     .getByRole("button", { name: "确认并发布到 GitHub", exact: true })
@@ -1156,6 +1163,8 @@ async function validateExternalReviewConfirmation() {
     reviewBodyVisible,
     publishedVisible,
     laterRequestCount,
+    deferredPersistedAcrossReload,
+    deferredRestoreVisible,
     request: requests.find((request) => request.phase === "approve"),
     ...diagnostics,
   });
@@ -1401,6 +1410,8 @@ assert.equal(reviewResult.headVisible, true);
 assert.equal(reviewResult.reviewBodyVisible, true);
 assert.equal(reviewResult.publishedVisible, true);
 assert.equal(reviewResult.laterRequestCount, 0);
+assert.equal(reviewResult.deferredPersistedAcrossReload, true);
+assert.equal(reviewResult.deferredRestoreVisible, true);
 assert.equal(
   reviewResult.request.pathname,
   "/api/confirmations/confirmation-pr-work-fixture/approve",
