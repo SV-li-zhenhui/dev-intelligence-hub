@@ -1130,6 +1130,17 @@ function Test-RecoveryJsonInteger {
     return $Value -is [int] -or $Value -is [long]
 }
 
+function Test-RecoveryTotalBytesValue {
+    param([AllowNull()]$Value)
+    if (Test-RecoveryJsonInteger -Value $Value) {
+        return $true
+    }
+    return (
+        $Value -is [decimal] -and
+        $Value -eq [decimal]::Truncate([decimal]$Value)
+    )
+}
+
 function Test-RecoveryCreatedAt {
     param([AllowNull()]$Value)
     if (
@@ -1198,7 +1209,7 @@ function Get-RecoverySnapshotFiles {
         [long]$Manifest.fileCount -lt 1 -or
         [long]$Manifest.fileCount -gt 4096 -or
         [long]$Manifest.fileCount -ne $entries.Count -or
-        -not (Test-RecoveryJsonInteger -Value $Manifest.totalBytes) -or
+        -not (Test-RecoveryTotalBytesValue -Value $Manifest.totalBytes) -or
         [long]$Manifest.totalBytes -lt 0 -or
         [long]$Manifest.totalBytes -gt 536870912
     ) {
