@@ -28,6 +28,19 @@ function statusState() {
       probeFailures: [{ probeId: "secondary", code: "PROBE_TIMEOUT" }],
     },
     maintenance: { mode: "open", activeOperations: 2 },
+    pullRequestDiscovery: {
+      available: true,
+      enabled: true,
+      refreshedAt: "2026-08-13T01:02:03.004Z",
+      complete: true,
+      stale: false,
+      effectiveUpdatedWindow: {
+        mode: "rolling",
+        days: 7,
+        refreshStartedAt: "2026-08-13T01:02:03.004Z",
+        fromInclusive: "2026-08-06T01:02:03.004Z",
+      },
+    },
     backups: {
       available: true,
       items: [{
@@ -61,6 +74,10 @@ test("system status presents every API blocker without inventing controls", () =
     "backup-safe",
     "重新检查",
     "创建备份",
+    "PR 自动发现",
+    "完整",
+    "近 7 天",
+    "2026-08-06T01:02:03.004Z",
   ]) {
     assert.equal(markup.includes(value), true, value);
   }

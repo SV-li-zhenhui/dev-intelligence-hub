@@ -115,6 +115,15 @@ function probeFailureIssue(item) {
   });
 }
 
+function pullRequestWindowLabel(window) {
+  if (window?.mode === "rolling") return `近 ${window.days} 天`;
+  if (window?.mode === "fixed") {
+    return `${window.fromInclusive} 至 ${window.untilExclusive}（${window.timeZone}）`;
+  }
+  if (window?.mode === "unlimited") return "不限更新时间";
+  return "未知";
+}
+
 export function renderSystemStatus({
   state = null,
   loading = false,
@@ -134,6 +143,7 @@ export function renderSystemStatus({
   const readiness = state.readiness || {};
   const maintenance = state.maintenance || {};
   const backups = state.backups || {};
+  const pullRequestDiscovery = state.pullRequestDiscovery || {};
   const recoveryBlockers = Array.isArray(readiness.recoveryBlockers)
     ? readiness.recoveryBlockers
     : [];
@@ -169,6 +179,15 @@ export function renderSystemStatus({
       <p class="system-status-checked">检查时间：${escapeHtml(readiness.checkedAt || "未知")}</p>
     </section>
     <div class="system-status-grid">
+      <section class="system-status-card">
+        <h3>PR 自动发现</h3>
+        <dl class="system-status-metrics">
+          <div><dt>最近刷新</dt><dd>${escapeHtml(pullRequestDiscovery.refreshedAt || "尚无快照")}</dd></div>
+          <div><dt>搜索结果</dt><dd>${pullRequestDiscovery.available !== true ? "不可用" : pullRequestDiscovery.enabled !== true ? "已禁用" : pullRequestDiscovery.complete === true && pullRequestDiscovery.stale !== true ? "完整" : "不完整或陈旧"}</dd></div>
+          <div><dt>更新时间范围</dt><dd>${escapeHtml(pullRequestWindowLabel(pullRequestDiscovery.effectiveUpdatedWindow))}</dd></div>
+          <div><dt>范围起点</dt><dd>${escapeHtml(pullRequestDiscovery.effectiveUpdatedWindow?.fromInclusive || "无")}</dd></div>
+        </dl>
+      </section>
       <section class="system-status-card">
         <h3>恢复阻断</h3>
         ${list(

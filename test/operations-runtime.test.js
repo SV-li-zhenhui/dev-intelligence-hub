@@ -73,6 +73,75 @@ test("operations runtime joins checkpoint, backup, restore, and readiness", asyn
   );
 });
 
+test("browser status exposes only the bounded PR discovery projection", async (t) => {
+  const paths = await fixture(t);
+  const effectiveUpdatedWindow = Object.freeze({
+    mode: "rolling",
+    days: 7,
+    refreshStartedAt: "2026-08-13T01:02:03.004Z",
+    fromInclusive: "2026-08-06T01:02:03.004Z",
+  });
+  const runtime = createOperationsRuntime({
+    dataDirectory: paths.dataDirectory,
+    backupDirectory: paths.backupDirectory,
+    snapshotReader: {
+      async read(name) {
+        assert.equal(name, "snapshot");
+        return {
+          refreshedAt: "2026-08-13T01:02:03.004Z",
+          sourceStatus: {
+            githubPullRequests: {
+              ok: true,
+              enabled: true,
+              stale: false,
+              complete: true,
+              effectiveUpdatedWindow,
+              secret: "must-not-leak",
+            },
+          },
+          items: [{ token: "must-not-leak" }],
+        };
+      },
+    },
+  });
+
+  const status = await runtime.browser.readStatus();
+  assert.deepEqual(status.pullRequestDiscovery, {
+    available: true,
+    enabled: true,
+    refreshedAt: "2026-08-13T01:02:03.004Z",
+    complete: true,
+    stale: false,
+    effectiveUpdatedWindow,
+  });
+  assert.equal(JSON.stringify(status).includes("must-not-leak"), false);
+  assert.equal(Object.isFrozen(status.pullRequestDiscovery), true);
+});
+
+test("system status stays available when the optional snapshot projection is unreadable", async (t) => {
+  const paths = await fixture(t);
+  const runtime = createOperationsRuntime({
+    dataDirectory: paths.dataDirectory,
+    backupDirectory: paths.backupDirectory,
+    snapshotReader: {
+      async read() {
+        throw new Error("corrupt snapshot");
+      },
+    },
+  });
+
+  const status = await runtime.browser.readStatus();
+  assert.deepEqual(status.pullRequestDiscovery, {
+    available: false,
+    enabled: false,
+    refreshedAt: "",
+    complete: false,
+    stale: true,
+    effectiveUpdatedWindow: null,
+  });
+  assert.equal(status.liveness.live, true);
+});
+
 test("operations runtime does not expose a trusted-registry replacement seam", async (t) => {
   const paths = await fixture(t);
 

@@ -2469,6 +2469,7 @@ export async function createApplication({
       {
         dataDirectory,
         backupDirectory,
+        snapshotReader: store,
         ...(configuredOperations.probeTimeoutMs === undefined
           ? {}
           : { probeTimeoutMs: configuredOperations.probeTimeoutMs }),

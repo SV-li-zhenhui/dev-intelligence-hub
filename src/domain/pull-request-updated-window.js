@@ -7,6 +7,23 @@ const FIXED_WINDOW_FIELDS = Object.freeze([
   "untilExclusive",
   "timeZone",
 ]);
+const EFFECTIVE_UNLIMITED_FIELDS = Object.freeze([
+  "mode",
+  "refreshStartedAt",
+]);
+const EFFECTIVE_ROLLING_FIELDS = Object.freeze([
+  "mode",
+  "days",
+  "refreshStartedAt",
+  "fromInclusive",
+]);
+const EFFECTIVE_FIXED_FIELDS = Object.freeze([
+  "mode",
+  "fromInclusive",
+  "untilExclusive",
+  "timeZone",
+  "refreshStartedAt",
+]);
 const CANONICAL_UTC_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const HOUR_MS = 60 * 60 * 1_000;
 const TWO_DAYS_MS = 2 * 24 * HOUR_MS;
@@ -257,4 +274,90 @@ export function pullRequestUpdatedWindowSetDirection(before, after) {
     });
   }
   return Object.freeze(fixedWindowDirection(before, after));
+}
+
+function canonicalRefreshStartedAt(value) {
+  if (typeof value !== "string") {
+    throw invalid("refreshStartedAt must be a canonical UTC instant");
+  }
+  const timestamp = Date.parse(value);
+  if (
+    !Number.isFinite(timestamp) ||
+    new Date(timestamp).toISOString() !== value ||
+    !CANONICAL_UTC_INSTANT.test(value)
+  ) {
+    throw invalid("refreshStartedAt must be a canonical UTC instant");
+  }
+  return timestamp;
+}
+
+export function resolveEffectivePullRequestUpdatedWindow(
+  configuredWindow,
+  refreshStartedAt,
+) {
+  const refreshTimestamp = canonicalRefreshStartedAt(refreshStartedAt);
+  if (configuredWindow === undefined) {
+    return Object.freeze({ mode: "unlimited", refreshStartedAt });
+  }
+  const configured = normalizePullRequestUpdatedWindow(configuredWindow);
+  if (configured.mode === "rolling") {
+    const fromInclusive = new Date(
+      refreshTimestamp - configured.days * 24 * HOUR_MS,
+    ).toISOString();
+    if (!CANONICAL_UTC_INSTANT.test(fromInclusive)) {
+      throw invalid("rolling window exceeds canonical UTC range");
+    }
+    return Object.freeze({
+      mode: "rolling",
+      days: configured.days,
+      refreshStartedAt,
+      fromInclusive,
+    });
+  }
+  return Object.freeze({
+    mode: "fixed",
+    fromInclusive: configured.fromInclusive,
+    untilExclusive: configured.untilExclusive,
+    timeZone: configured.timeZone,
+    refreshStartedAt,
+  });
+}
+
+export function normalizeEffectivePullRequestUpdatedWindow(value) {
+  if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) {
+    throw invalid("effective window must be a plain object");
+  }
+  const mode = Object.getOwnPropertyDescriptor(value, "mode")?.value;
+  if (mode === "unlimited") {
+    const window = exactDataRecord(value, EFFECTIVE_UNLIMITED_FIELDS);
+    canonicalRefreshStartedAt(window.refreshStartedAt);
+    return Object.freeze({
+      mode: "unlimited",
+      refreshStartedAt: window.refreshStartedAt,
+    });
+  }
+  if (mode === "rolling") {
+    const window = exactDataRecord(value, EFFECTIVE_ROLLING_FIELDS);
+    const expected = resolveEffectivePullRequestUpdatedWindow(
+      { mode: "rolling", days: window.days },
+      window.refreshStartedAt,
+    );
+    if (window.fromInclusive !== expected.fromInclusive) {
+      throw invalid("effective rolling window does not match its refresh instant");
+    }
+    return expected;
+  }
+  if (mode === "fixed") {
+    const window = exactDataRecord(value, EFFECTIVE_FIXED_FIELDS);
+    return resolveEffectivePullRequestUpdatedWindow(
+      {
+        mode: "fixed",
+        fromInclusive: window.fromInclusive,
+        untilExclusive: window.untilExclusive,
+        timeZone: window.timeZone,
+      },
+      window.refreshStartedAt,
+    );
+  }
+  throw invalid("unsupported effective window mode");
 }

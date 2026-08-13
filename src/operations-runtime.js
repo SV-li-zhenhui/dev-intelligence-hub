@@ -12,6 +12,9 @@ import { ReadinessService } from "./services/readiness-service.js";
 import {
   createTrustedRestoreMigration,
 } from "./services/trusted-restore-migration.js";
+import {
+  normalizeEffectivePullRequestUpdatedWindow,
+} from "./domain/pull-request-updated-window.js";
 
 const OPTION_KEYS = new Set([
   "dataDirectory",
@@ -19,6 +22,7 @@ const OPTION_KEYS = new Set([
   "externalActionStatus",
   "migration",
   "probeTimeoutMs",
+  "snapshotReader",
 ]);
 
 const DEPENDENCY_KEYS = new Set([
@@ -119,6 +123,68 @@ function backupProjection(manifest) {
   });
 }
 
+const UNAVAILABLE_PULL_REQUEST_DISCOVERY = Object.freeze({
+  available: false,
+  enabled: false,
+  refreshedAt: "",
+  complete: false,
+  stale: true,
+  effectiveUpdatedWindow: null,
+});
+
+function ownDataValue(record, field) {
+  if (
+    record === null ||
+    typeof record !== "object" ||
+    Array.isArray(record) ||
+    utilTypes.isProxy(record) ||
+    Object.getPrototypeOf(record) !== Object.prototype
+  ) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, field);
+  return descriptor?.enumerable && "value" in descriptor
+    ? descriptor.value
+    : undefined;
+}
+
+function pullRequestDiscoveryProjection(snapshot) {
+  const refreshedAt = ownDataValue(snapshot, "refreshedAt");
+  const sourceStatus = ownDataValue(snapshot, "sourceStatus");
+  const pullRequests = ownDataValue(sourceStatus, "githubPullRequests");
+  const enabled = ownDataValue(pullRequests, "enabled");
+  const complete = ownDataValue(pullRequests, "complete");
+  const stale = ownDataValue(pullRequests, "stale");
+  const effective = ownDataValue(pullRequests, "effectiveUpdatedWindow");
+  const refreshedTimestamp = typeof refreshedAt === "string"
+    ? Date.parse(refreshedAt)
+    : Number.NaN;
+  if (
+    !Number.isFinite(refreshedTimestamp) ||
+    new Date(refreshedTimestamp).toISOString() !== refreshedAt ||
+    typeof enabled !== "boolean" ||
+    typeof complete !== "boolean" ||
+    typeof stale !== "boolean" ||
+    (enabled && complete === stale) ||
+    (!enabled && (complete || stale))
+  ) {
+    return UNAVAILABLE_PULL_REQUEST_DISCOVERY;
+  }
+  try {
+    return Object.freeze({
+      available: true,
+      enabled,
+      refreshedAt,
+      complete,
+      stale,
+      effectiveUpdatedWindow:
+        normalizeEffectivePullRequestUpdatedWindow(effective),
+    });
+  } catch {
+    return UNAVAILABLE_PULL_REQUEST_DISCOVERY;
+  }
+}
+
 export function createOperationsRuntime(options = {}, dependencies = {}) {
   const entries = plainEntries(options, OPTION_KEYS, "operations options");
   const dependencyEntries = plainEntries(
@@ -171,6 +237,9 @@ export function createOperationsRuntime(options = {}, dependencies = {}) {
     trustedRegistry: trustedRestoreMigration,
     candidateExtension: candidateMigrationExtension,
   });
+  const snapshotReader = entries.has("snapshotReader")
+    ? port(entries.get("snapshotReader"), ["read"], "snapshotReader")
+    : null;
 
   const gate = port(
     quiescenceGateFactory(),
@@ -218,15 +287,22 @@ export function createOperationsRuntime(options = {}, dependencies = {}) {
     "readiness service",
   );
   const readStatus = async () => {
-    const [readinessState, backupCatalog] = await Promise.all([
+    const snapshotRead = snapshotReader === null
+      ? Promise.resolve(null)
+      : Promise.resolve()
+          .then(() => snapshotReader.read("snapshot", null))
+          .catch(() => null);
+    const [readinessState, backupCatalog, snapshot] = await Promise.all([
       readiness.readiness(),
       backup.listBackups(),
+      snapshotRead,
     ]);
     return Object.freeze({
       schemaVersion: 1,
       liveness: readiness.liveness(),
       readiness: readinessState,
       maintenance: gate.readStatus(),
+      pullRequestDiscovery: pullRequestDiscoveryProjection(snapshot),
       backups: Object.freeze({
         available: true,
         items: backupCatalog.items,

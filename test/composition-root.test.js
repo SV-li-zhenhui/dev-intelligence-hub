@@ -120,6 +120,7 @@ test("application exposes one operations runtime bound to explicit local directo
     dataDirectory,
     backupDirectory,
     probeTimeoutMs: 1234,
+    snapshotReader: application.store,
   });
   assert.strictEqual(calls.dependencies, dependencies);
   await application.close();

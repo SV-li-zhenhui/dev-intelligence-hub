@@ -3,6 +3,8 @@ import test from "node:test";
 import { RefreshService } from "../src/services/refresh-service.js";
 import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
 
+const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
+
 class MemoryStore {
   constructor(entries = {}) {
     this.values = new Map(Object.entries(entries));
@@ -67,10 +69,14 @@ test("an explicitly disabled GitHub read boundary makes no adapter call", async 
   const snapshot = await store.read("snapshot");
   assert.deepEqual(snapshot.errors, []);
   assert.deepEqual(snapshot.sources, { github: 0, dingtalk: 0 });
-  assert.deepEqual(snapshot.sourceStatus.githubPullRequests, {
-    ok: true,
-    stale: false,
-  });
+  assert.equal(snapshot.sourceStatus.githubPullRequests.ok, true);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.stale, false);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.enabled, false);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.complete, false);
+  assert.equal(
+    snapshot.sourceStatus.githubPullRequests.effectiveUpdatedWindow.mode,
+    "unlimited",
+  );
 });
 
 test("refresh classifies complete PR facts and asks the brain only about uncertain items", async () => {
@@ -135,10 +141,10 @@ test("refresh classifies complete PR facts and asks the brain only about uncerta
   assert.deepEqual(brainCalls, ["github:pr:acme/repo#2"]);
   assert.equal(firstSnapshot.brain.assessed, 1);
   assert.equal(snapshot.brain.assessed, 0);
-  assert.deepEqual(snapshot.sourceStatus.githubPullRequests, {
-    ok: true,
-    stale: false,
-  });
+  assert.equal(snapshot.sourceStatus.githubPullRequests.ok, true);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.stale, false);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.enabled, true);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.complete, true);
 });
 
 test("an uncertain PR is reassessed when material facts change on the same head", async () => {
@@ -263,10 +269,95 @@ test("a failed source retains its last known data instead of reporting completio
   );
   assert.deepEqual(snapshot.versions, [previousVersion]);
   assert.equal(snapshot.errors.length, 4);
-  assert.deepEqual(snapshot.sourceStatus.githubPullRequests, {
-    ok: false,
-    stale: true,
+  assert.equal(snapshot.sourceStatus.githubPullRequests.ok, false);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.stale, true);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.enabled, true);
+  assert.equal(snapshot.sourceStatus.githubPullRequests.complete, false);
+});
+
+test("refresh freezes one effective PR window and publishes its completeness", async () => {
+  const store = new MemoryStore();
+  let receivedOptions;
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests(options) {
+        receivedOptions = options;
+        return [];
+      },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: null,
+    dingtalk: {},
+    store,
+    notifier: {},
+    config: {
+      githubRead: {
+        enabled: true,
+        pullRequestUpdatedWindow: { mode: "rolling", days: 7 },
+      },
+      trackedRepositories: [],
+      dingtalk: { enabled: false },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date(REFRESH_STARTED_AT),
   });
+
+  await service.refresh();
+
+  const effectiveUpdatedWindow = receivedOptions.effectiveUpdatedWindow;
+  assert.equal(Object.isFrozen(effectiveUpdatedWindow), true);
+  assert.deepEqual(effectiveUpdatedWindow, {
+    mode: "rolling",
+    days: 7,
+    refreshStartedAt: REFRESH_STARTED_AT,
+    fromInclusive: "2026-08-06T01:02:03.004Z",
+  });
+  const snapshot = await store.read("snapshot");
+  assert.strictEqual(
+    snapshot.sourceStatus.githubPullRequests.effectiveUpdatedWindow,
+    effectiveUpdatedWindow,
+  );
+  assert.equal(snapshot.sourceStatus.githubPullRequests.complete, true);
+});
+
+test("failed finite PR discovery remains incomplete without changing its effective window", async () => {
+  const store = new MemoryStore();
+  let receivedWindow;
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests({ effectiveUpdatedWindow }) {
+        receivedWindow = effectiveUpdatedWindow;
+        throw new Error("segmented search failed closed");
+      },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: null,
+    dingtalk: {},
+    store,
+    notifier: {},
+    config: {
+      githubRead: {
+        enabled: true,
+        pullRequestUpdatedWindow: { mode: "rolling", days: 7 },
+      },
+      trackedRepositories: [],
+      dingtalk: { enabled: false },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date(REFRESH_STARTED_AT),
+  });
+
+  await service.refresh();
+
+  const status = (await store.read("snapshot")).sourceStatus.githubPullRequests;
+  assert.equal(status.ok, false);
+  assert.equal(status.stale, true);
+  assert.equal(status.complete, false);
+  assert.strictEqual(status.effectiveUpdatedWindow, receivedWindow);
 });
 
 test("a slow refresh cannot renew the freshness age of earlier PR facts", async () => {

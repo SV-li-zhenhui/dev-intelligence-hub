@@ -8,6 +8,7 @@ import {
 import {
   createPullRequestReadIdentity,
 } from "../domain/pull-request-read-facts.js";
+import { normalizeEffectivePullRequestUpdatedWindow } from "../domain/pull-request-updated-window.js";
 import {
   GITHUB_PULL_REQUEST_FACTS_QUERY,
   githubGraphPullRequestTarget,
@@ -16,6 +17,11 @@ import {
 } from "./github-pull-request-facts.js";
 
 const GITHUB_HOST = "github.com";
+const SEARCH_LIMIT = 1_000;
+const SECOND_MS = 1_000;
+const MAX_SEARCH_TIMESTAMP = Date.parse("9999-12-31T23:59:59.000Z");
+const SEARCH_TIMESTAMP =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
 const PR_SEARCH_FIELDS =
   "number,title,url,repository,updatedAt,createdAt,author,state";
 const PR_DETAIL_FIELDS =
@@ -268,6 +274,146 @@ export function classifyPullRequestRelation(source, author, currentUser) {
 
 function pullRequestKey(record) {
   return `${repositoryName(record)}#${record.number}`;
+}
+
+function canonicalSearchTimestamp(value, field) {
+  if (typeof value !== "string" || !SEARCH_TIMESTAMP.test(value)) {
+    throw new TypeError(`GitHub PR ${field} is invalid`);
+  }
+  const milliseconds = Date.parse(value);
+  const expectedCanonical = value.includes(".")
+    ? value.replace(/\.(\d{1,3})Z$/u, (_match, fraction) =>
+        `.${fraction.padEnd(3, "0")}Z`)
+    : value.replace(/Z$/u, ".000Z");
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString() !== expectedCanonical
+  ) {
+    throw new TypeError(`GitHub PR ${field} is invalid`);
+  }
+  return { milliseconds, canonical: new Date(milliseconds).toISOString() };
+}
+
+function safeSearchRecord(record) {
+  if (
+    record === null ||
+    typeof record !== "object" ||
+    utilTypes.isProxy(record) ||
+    Array.isArray(record) ||
+    Object.getPrototypeOf(record) !== Object.prototype
+  ) {
+    throw new TypeError("GitHub PR search record is invalid");
+  }
+  const repository = repositoryName(record);
+  const identity = pullRequestIdentity(record.url);
+  const author = record.author?.login;
+  const updated = canonicalSearchTimestamp(record.updatedAt, "updatedAt");
+  const created = canonicalSearchTimestamp(record.createdAt, "createdAt");
+  if (
+    !Number.isSafeInteger(record.number) ||
+    record.number < 1 ||
+    typeof record.title !== "string" ||
+    record.title.length > 64 * 1_024 ||
+    identity === null ||
+    identity.number !== record.number ||
+    identity.repository !== repository ||
+    typeof author !== "string" ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(author) ||
+    typeof record.state !== "string"
+  ) {
+    throw new TypeError("GitHub PR search identity is invalid");
+  }
+  return {
+    ...record,
+    createdAt: created.canonical,
+    updatedAt: updated.canonical,
+    searchUpdatedAtMilliseconds: updated.milliseconds,
+    searchIdentity: Object.freeze({
+      repository,
+      number: record.number,
+      url: record.url,
+      createdAt: created.canonical,
+      author,
+    }),
+  };
+}
+
+function sameSearchIdentity(left, right) {
+  return (
+    left.repository === right.repository &&
+    left.number === right.number &&
+    left.url === right.url &&
+    left.createdAt === right.createdAt &&
+    left.author === right.author
+  );
+}
+
+function mergeSearchRecords(groups) {
+  const records = new Map();
+  for (const group of groups) {
+    for (const record of group) {
+      const key = pullRequestKey(record);
+      const existing = records.get(key);
+      if (
+        existing &&
+        (!sameSearchIdentity(existing.searchIdentity, record.searchIdentity) ||
+          existing.updatedAt !== record.updatedAt)
+      ) {
+        throw new Error(`GitHub PR search identity conflict for ${key}`);
+      }
+      if (!existing) records.set(key, record);
+    }
+  }
+  return [...records.values()];
+}
+
+function githubSearchInstant(milliseconds) {
+  return new Date(Math.floor(milliseconds / SECOND_MS) * SECOND_MS)
+    .toISOString()
+    .replace(".000Z", "+00:00");
+}
+
+function searchRangeArgument(startMilliseconds, endMilliseconds) {
+  return `${githubSearchInstant(startMilliseconds)}..${githubSearchInstant(endMilliseconds)}`;
+}
+
+function effectiveSearchBounds(window) {
+  return {
+    startMilliseconds:
+      Math.floor(Date.parse(window.fromInclusive) / SECOND_MS) * SECOND_MS,
+    endMilliseconds:
+      window.mode === "fixed"
+        ? Math.floor(Date.parse(window.untilExclusive) / SECOND_MS) * SECOND_MS
+        : MAX_SEARCH_TIMESTAMP,
+  };
+}
+
+function withinEffectiveWindow(record, window) {
+  const timestamp = record.searchUpdatedAtMilliseconds;
+  if (timestamp < Date.parse(window.fromInclusive)) return false;
+  return window.mode !== "fixed" || timestamp < Date.parse(window.untilExclusive);
+}
+
+function discoveryOptions(options) {
+  if (
+    options === null ||
+    typeof options !== "object" ||
+    utilTypes.isProxy(options) ||
+    Array.isArray(options) ||
+    Object.getPrototypeOf(options) !== Object.prototype
+  ) {
+    throw new TypeError("GitHub discovery options are invalid");
+  }
+  const commandOptions = { ...options };
+  const suppliedWindow = commandOptions.effectiveUpdatedWindow;
+  delete commandOptions.effectiveUpdatedWindow;
+  return {
+    commandOptions,
+    effectiveUpdatedWindow:
+      suppliedWindow === undefined
+        ? null
+        : normalizeEffectivePullRequestUpdatedWindow(suppliedWindow),
+  };
 }
 
 export function combinePullRequestRecords(assigned, authored, currentUser) {
@@ -530,21 +676,97 @@ export class GitHubAdapter {
     return githubAccountLogin(data);
   }
 
-  async #searchPullRequestRecords(relation, options) {
+  #pullRequestSearchArguments(relation, range = null) {
     const filter = {
       assigned: "--assignee=@me",
       authored: "--author=@me",
     }[relation];
-    return this.run("gh", [
+    return [
       "search",
       "prs",
       filter,
       "--state=open",
       "--limit",
-      "1000",
+      `${SEARCH_LIMIT}`,
       "--json",
       PR_SEARCH_FIELDS,
-    ], options);
+      ...(range === null
+        ? []
+        : ["--updated", range, "--sort", "updated", "--order", "asc"]),
+    ];
+  }
+
+  async #searchPullRequestSegment(
+    relation,
+    startMilliseconds,
+    endMilliseconds,
+    options,
+  ) {
+    const range = searchRangeArgument(startMilliseconds, endMilliseconds);
+    const rawRecords = await this.run(
+      "gh",
+      this.#pullRequestSearchArguments(relation, range),
+      options,
+    );
+    options.signal?.throwIfAborted();
+    if (!Array.isArray(rawRecords) || rawRecords.length > SEARCH_LIMIT) {
+      throw new TypeError("GitHub PR search result count is invalid");
+    }
+    const records = rawRecords.map(safeSearchRecord);
+    if (
+      records.some(
+        (record) =>
+          record.searchUpdatedAtMilliseconds < startMilliseconds ||
+          record.searchUpdatedAtMilliseconds > endMilliseconds + 999,
+      )
+    ) {
+      throw new Error("GitHub PR search returned a record outside its segment");
+    }
+    if (records.length < SEARCH_LIMIT) return records;
+    if (endMilliseconds - startMilliseconds <= SECOND_MS) {
+      throw new Error("GitHub PR search is saturated within one second");
+    }
+    const startSecond = Math.floor(startMilliseconds / SECOND_MS);
+    const endSecond = Math.floor(endMilliseconds / SECOND_MS);
+    const midpoint =
+      Math.floor((startSecond + endSecond) / 2) * SECOND_MS;
+    if (midpoint <= startMilliseconds || midpoint >= endMilliseconds) {
+      throw new Error("GitHub PR search range cannot be split safely");
+    }
+    const left = await this.#searchPullRequestSegment(
+      relation,
+      startMilliseconds,
+      midpoint,
+      options,
+    );
+    const right = await this.#searchPullRequestSegment(
+      relation,
+      midpoint,
+      endMilliseconds,
+      options,
+    );
+    return mergeSearchRecords([left, right]);
+  }
+
+  async #searchPullRequestRecords(relation, effectiveWindow, options) {
+    if (effectiveWindow === null || effectiveWindow.mode === "unlimited") {
+      return this.run(
+        "gh",
+        this.#pullRequestSearchArguments(relation),
+        options,
+      );
+    }
+    const { startMilliseconds, endMilliseconds } =
+      effectiveSearchBounds(effectiveWindow);
+    const records = await this.#searchPullRequestSegment(
+      relation,
+      startMilliseconds,
+      endMilliseconds,
+      options,
+    );
+    return records.filter((record) =>
+      withinEffectiveWindow(record, effectiveWindow),
+    );
   }
 
   async #enrichPullRequest(record, currentUser, options) {
@@ -607,20 +829,32 @@ export class GitHubAdapter {
   }
 
   async searchRelevantPullRequests(options = {}) {
-    const currentUser = await this.currentUser(options);
+    const { commandOptions, effectiveUpdatedWindow } = discoveryOptions(options);
+    const currentUser = await this.currentUser(commandOptions);
     const [assigned, authored] = await Promise.all([
-      this.#searchPullRequestRecords("assigned", options),
-      this.#searchPullRequestRecords("authored", options),
+      this.#searchPullRequestRecords(
+        "assigned",
+        effectiveUpdatedWindow,
+        commandOptions,
+      ),
+      this.#searchPullRequestRecords(
+        "authored",
+        effectiveUpdatedWindow,
+        commandOptions,
+      ),
     ]);
+    if (effectiveUpdatedWindow && effectiveUpdatedWindow.mode !== "unlimited") {
+      mergeSearchRecords([assigned, authored]);
+    }
     const records = combinePullRequestRecords(
       assigned,
       authored,
       currentUser,
     );
     const items = await mapWithConcurrency(records, 4, (record) =>
-      this.#enrichPullRequest(record, currentUser, options),
+      this.#enrichPullRequest(record, currentUser, commandOptions),
     );
-    const finalUser = await this.currentUser(options);
+    const finalUser = await this.currentUser(commandOptions);
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }
@@ -628,7 +862,12 @@ export class GitHubAdapter {
   }
 
   async searchPullRequests(relation, currentUser, options = {}) {
-    const records = await this.#searchPullRequestRecords(relation, options);
+    const { commandOptions, effectiveUpdatedWindow } = discoveryOptions(options);
+    const records = await this.#searchPullRequestRecords(
+      relation,
+      effectiveUpdatedWindow,
+      commandOptions,
+    );
     const items = await mapWithConcurrency(records, 4, (record) =>
       this.#enrichPullRequest(
         {
@@ -645,10 +884,10 @@ export class GitHubAdapter {
             relation === "assigned" ? "assignee" : "author",
         },
         currentUser,
-        options,
+        commandOptions,
       ),
     );
-    const finalUser = await this.currentUser(options);
+    const finalUser = await this.currentUser(commandOptions);
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }

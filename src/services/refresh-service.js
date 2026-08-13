@@ -5,6 +5,9 @@ import {
 } from "../domain/pr-responsibility.js";
 import { prioritize } from "../domain/prioritizer.js";
 import { diffSnapshots } from "../domain/snapshot-diff.js";
+import {
+  resolveEffectivePullRequestUpdatedWindow,
+} from "../domain/pull-request-updated-window.js";
 
 const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.ACTION_NOW,
@@ -270,6 +273,10 @@ export class RefreshService {
     signal?.throwIfAborted();
     const startedAt = clockMilliseconds(this.clock);
     const observationLowerBound = new Date(startedAt).toISOString();
+    const effectiveUpdatedWindow = resolveEffectivePullRequestUpdatedWindow(
+      this.config.githubRead?.pullRequestUpdatedWindow,
+      observationLowerBound,
+    );
     const [previous, notificationBaseline, responsibilityOverrides] =
       await Promise.all([
         this.store.read("snapshot"),
@@ -284,7 +291,10 @@ export class RefreshService {
     const githubCalls = this.config.githubRead?.enabled === false
       ? [[], [], []].map((value) => ({ status: "fulfilled", value }))
       : await Promise.allSettled([
-          this.github.searchRelevantPullRequests({ signal }),
+          this.github.searchRelevantPullRequests({
+            signal,
+            effectiveUpdatedWindow,
+          }),
           this.github.searchIssues({ signal }),
           this.github.versions(this.config.trackedRepositories, { signal }),
         ]);
@@ -383,6 +393,11 @@ export class RefreshService {
         githubPullRequests: {
           ok: githubCalls[0].status === "fulfilled",
           stale: githubCalls[0].status !== "fulfilled",
+          enabled: this.config.githubRead?.enabled !== false,
+          complete:
+            this.config.githubRead?.enabled !== false &&
+            githubCalls[0].status === "fulfilled",
+          effectiveUpdatedWindow,
         },
         githubIssues: {
           ok: githubCalls[1].status === "fulfilled",
