@@ -288,6 +288,14 @@ payload, verifies the published backup, and then reopens admission. New writes
 receive HTTP 503 while the maintenance gate is closing or closed. A failed
 backup also reopens the gate in `finally`.
 
+The replaceable `data/playwright-browsers/` and
+`data/validation-profile-probe/` validation caches are explicitly outside the
+durable checkpoint and can be recreated with `npm run setup:validation-browser`.
+Every other StateStore JSON value, including legacy array-valued stores, is
+hashed into the checkpoint; values without a revision envelope use revision
+`0` plus their content digest. Undeclared hidden paths and aliases still fail
+the scan closed instead of being silently omitted.
+
 The equivalent same-origin browser contract is:
 
 ```http

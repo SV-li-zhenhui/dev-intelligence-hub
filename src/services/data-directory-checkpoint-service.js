@@ -21,6 +21,10 @@ const SAFE_STORE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/u;
 const SAFE_SEGMENT =
   /^(?!\.)(?!.*[. ]$)(?!.*[<>:"|?*])[^\u0000-\u001f\u007f\\/]+$/u;
 const EXCLUDED_ROOT_FILES = new Set(["mydashboard-server-process.json"]);
+const EXCLUDED_ROOT_DIRECTORIES = new Set([
+  "playwright-browsers",
+  "validation-profile-probe",
+]);
 const OPTION_KEYS = new Set(["sourceDirectory", "gate"]);
 
 export class DataDirectoryCheckpointError extends Error {
@@ -202,7 +206,7 @@ function storeRevision(content) {
   } catch (cause) {
     throw failure("CHECKPOINT_STORE_INVALID", "状态 store 不是有效 UTF-8 JSON", cause);
   }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (value === null || typeof value !== "object") {
     throw failure("CHECKPOINT_STORE_INVALID", "状态 store 根结构无效");
   }
   const candidates = [value.revision, value.queueRevision];
@@ -250,6 +254,28 @@ async function inventory(directory) {
     entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
     for (const entry of entries) {
       if (current.relative === "" && EXCLUDED_ROOT_FILES.has(entry.name)) {
+        continue;
+      }
+      if (
+        current.relative === "" &&
+        EXCLUDED_ROOT_DIRECTORIES.has(entry.name)
+      ) {
+        const excludedPath = path.resolve(root, entry.name);
+        const excludedInfo = await lstat(excludedPath);
+        const excludedCanonical = await realpath(excludedPath);
+        if (
+          entry.isSymbolicLink() ||
+          excludedInfo.isSymbolicLink() ||
+          !entry.isDirectory() ||
+          !excludedInfo.isDirectory() ||
+          !isWithin(root, excludedCanonical) ||
+          comparable(excludedCanonical) !== comparable(excludedPath)
+        ) {
+          throw failure(
+            "CHECKPOINT_PATH_INVALID",
+            "可重建验证缓存路径身份无效",
+          );
+        }
         continue;
       }
       const relative = validateRelative(relativePath(current.relative, entry.name));

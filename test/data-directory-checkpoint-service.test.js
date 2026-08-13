@@ -49,6 +49,63 @@ test("a drained checkpoint binds store revisions and every durable file", async 
   assert.equal(gate.readStatus().mode, "open");
 });
 
+test("array-valued StateStore files remain revision-zero checkpoint stores", async (t) => {
+  const { data } = await fixture(t);
+  await writeFile(
+    path.join(data, "pr-employee-memory.json"),
+    `${JSON.stringify([{ id: "memory-1" }])}\n`,
+  );
+  const gate = new OperationalQuiescenceGate();
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate });
+
+  const checkpoint = await service.enter();
+  const memoryFile = checkpoint.files.find(({ path: filePath }) =>
+    filePath === "pr-employee-memory.json");
+  assert.ok(memoryFile);
+  assert.deepEqual(
+    checkpoint.stores.find(({ name }) => name === "pr-employee-memory"),
+    {
+      name: "pr-employee-memory",
+      revision: 0,
+      digest: memoryFile.sha256,
+    },
+  );
+  await service.leave(checkpoint.token);
+});
+
+test("checkpoint excludes declared regenerable validation caches", async (t) => {
+  const { data } = await fixture(t);
+  await mkdir(path.join(data, "playwright-browsers", ".links"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(data, "playwright-browsers", ".links", "browser-cache.json"),
+    "{}\n",
+  );
+  await mkdir(path.join(data, "validation-profile-probe", "runtime"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(data, "validation-profile-probe", "runtime", "probe.json"),
+    "{}\n",
+  );
+  const gate = new OperationalQuiescenceGate();
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate });
+
+  const checkpoint = await service.enter();
+  assert.equal(
+    checkpoint.files.some(({ path: filePath }) =>
+      filePath.startsWith("playwright-browsers/") ||
+      filePath.startsWith("validation-profile-probe/")),
+    false,
+  );
+  assert.deepEqual(
+    checkpoint.files.map(({ path: filePath }) => filePath),
+    ["code-executor/artifacts/evidence.bin", "work-ledger.json"],
+  );
+  await service.leave(checkpoint.token);
+});
+
 test("scan failure automatically reopens admission and publishes no checkpoint", async (t) => {
   const { data } = await fixture(t);
   await writeFile(path.join(data, ".transient.tmp"), "unsafe");
