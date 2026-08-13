@@ -3193,8 +3193,8 @@ test("scheduled and manual employees wait for refresh without an external queue"
 
     assert.deepEqual(employeeRuns, [
       { ids: ["pr-reviewer"], trigger: "refresh_completed" },
-      { ids: ["requirements-analyst"], trigger: "scheduled" },
       { ids: ["developer"], trigger: "manual" },
+      { ids: ["requirements-analyst"], trigger: "scheduled" },
     ]);
   } finally {
     releaseRefresh.resolve();
@@ -3431,6 +3431,66 @@ test("a pending refresh skips obsolete queued role ticks", async () => {
     });
   } finally {
     releaseFirstRole.resolve();
+    await backgroundWork.stop();
+  }
+});
+
+test("a manual employee run overtakes a queued scheduled role", async () => {
+  const activeRoleStarted = deferred();
+  const releaseActiveRole = deferred();
+  const timers = [];
+  const calls = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [
+          { id: "requirements-analyst", intervalMinutes: 11 },
+          { id: "developer", intervalMinutes: 13 },
+        ];
+      },
+      async runSelected(ids, options) {
+        calls.push({ operation: "run", ids, ...options });
+        if (ids[0] === "requirements-analyst") {
+          activeRoleStarted.resolve();
+          await releaseActiveRole.promise;
+        }
+      },
+    },
+    refreshService: {
+      async refresh() {},
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+    const activeRole = timers[1].callback();
+    await activeRoleStarted.promise;
+    const queuedScheduledRole = timers[2].callback();
+    const manualEmployee = backgroundWork.runEmployee("pr-reviewer");
+    releaseActiveRole.resolve();
+    await Promise.all([activeRole, queuedScheduledRole, manualEmployee]);
+
+    assert.deepEqual(calls, [
+      {
+        operation: "run",
+        ids: ["requirements-analyst"],
+        trigger: "scheduled",
+      },
+      { operation: "run", ids: ["pr-reviewer"], trigger: "manual" },
+      { operation: "run", ids: ["developer"], trigger: "scheduled" },
+    ]);
+  } finally {
+    releaseActiveRole.resolve();
     await backgroundWork.stop();
   }
 });

@@ -3692,9 +3692,17 @@ export function startApplicationBackgroundWork(
   const workController = new AbortController();
   let stopped = false;
   let stopPromise = null;
-  let backgroundTail = Promise.resolve();
+  const backgroundPriority = Object.freeze({
+    factOrExplicit: "fact_or_explicit",
+    scheduled: "scheduled",
+  });
+  const backgroundQueues = new Map(
+    Object.values(backgroundPriority).map((priority) => [priority, []]),
+  );
+  let backgroundOperationActive = false;
   let factsReady = false;
   let pendingFactCycles = 0;
+  let factCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
   const coalescedRefreshCycles = new Map();
 
@@ -3704,6 +3712,29 @@ export function startApplicationBackgroundWork(
     } catch {
       // A diagnostics failure must not alter lifecycle safety.
     }
+  }
+
+  function runNextBackgroundOperation() {
+    if (backgroundOperationActive) return;
+    const priority = Object.values(backgroundPriority)
+      .find((candidate) => backgroundQueues.get(candidate).length > 0);
+    const next = priority ? backgroundQueues.get(priority).shift() : null;
+    if (!next) return;
+    backgroundOperationActive = true;
+    Promise.resolve()
+      .then(next.operation)
+      .then(next.resolve, next.reject)
+      .finally(() => {
+        backgroundOperationActive = false;
+        runNextBackgroundOperation();
+      });
+  }
+
+  function enqueueBackgroundOperation(priority, operation) {
+    return new Promise((resolve, reject) => {
+      backgroundQueues.get(priority).push({ operation, resolve, reject });
+      runNextBackgroundOperation();
+    });
   }
 
   function runTracked(operation, { rethrow = false } = {}) {
@@ -3774,12 +3805,19 @@ export function startApplicationBackgroundWork(
     includeLegacyEmployees = false,
     employeeIds = [],
     discardWhenFactsPending = false,
+    factCycleSequenceAtRequest = factCycleSequence,
     signal = workController.signal,
   }) {
     signal.throwIfAborted();
     if (stopped) return { skipped: "stopped" };
     if (!factsReady) return { skipped: "facts_not_ready" };
-    if (discardWhenFactsPending && pendingFactCycles > 0) {
+    if (
+      discardWhenFactsPending &&
+      (
+        pendingFactCycles > 0 ||
+        factCycleSequenceAtRequest < factCycleSequence
+      )
+    ) {
       return { skipped: "newer_facts_pending" };
     }
     const failures = [];
@@ -3852,11 +3890,9 @@ export function startApplicationBackgroundWork(
     return { skipped: null };
   }
 
-  function enqueueAgencyCycle(options) {
+  function enqueueAgencyCycle(options, priority) {
     const operation = () => performAgencyCycle(options);
-    const result = backgroundTail.then(operation, operation);
-    backgroundTail = result.catch(() => {});
-    return result;
+    return enqueueBackgroundOperation(priority, operation);
   }
 
   function coalesceCycle(cycles, key, createCycle) {
@@ -3899,16 +3935,27 @@ export function startApplicationBackgroundWork(
     return rethrow ? tracked : tracked.catch(() => undefined);
   }
 
-  function runCoalescedAgencyCycle(key, options, runOptions = {}) {
+  function runCoalescedAgencyCycle(
+    key,
+    options,
+    priority,
+    runOptions = {},
+  ) {
+    const factCycleSequenceAtRequest = factCycleSequence;
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
-      (signal) => enqueueAgencyCycle({ ...options, signal }),
+      (signal) => enqueueAgencyCycle({
+        ...options,
+        factCycleSequenceAtRequest,
+        signal,
+      }, priority),
       runOptions,
     );
   }
 
   function enqueueFactCycle(factOperation, signal = workController.signal) {
+    factCycleSequence += 1;
     pendingFactCycles += 1;
     const operation = async () => {
       try {
@@ -3950,9 +3997,10 @@ export function startApplicationBackgroundWork(
         if (stopped) factsReady = false;
       }
     };
-    const result = backgroundTail.then(operation, operation);
-    backgroundTail = result.catch(() => {});
-    return result;
+    return enqueueBackgroundOperation(
+      backgroundPriority.factOrExplicit,
+      operation,
+    );
   }
 
   function runCoalescedRefresh({ notify = false } = {}, runOptions = {}) {
@@ -3999,7 +4047,7 @@ export function startApplicationBackgroundWork(
           trigger: "scheduled",
           includeLegacyEmployees: false,
           discardWhenFactsPending: true,
-        }),
+        }, backgroundPriority.scheduled),
         agencyTickSeconds * 1_000,
       ),
     );
@@ -4011,7 +4059,7 @@ export function startApplicationBackgroundWork(
           trigger: "scheduled",
           employeeIds: [schedule.id],
           discardWhenFactsPending: true,
-        }),
+        }, backgroundPriority.scheduled),
         schedule.intervalMinutes * 60_000,
       ),
     );
@@ -4047,12 +4095,14 @@ export function startApplicationBackgroundWork(
           trigger,
           includeLegacyEmployees: false,
         },
+        backgroundPriority.factOrExplicit,
         { rethrow: true },
       ),
     runEmployee: (id, { trigger = "manual" } = {}) =>
       runCoalescedAgencyCycle(
         `manual-employee:${id}`,
         { trigger, employeeIds: [id] },
+        backgroundPriority.factOrExplicit,
         { rethrow: true },
       ),
     runConfirmationOperation: (operation) =>
