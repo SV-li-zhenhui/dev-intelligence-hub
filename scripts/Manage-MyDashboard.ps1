@@ -5,7 +5,7 @@ param(
     [string]$BackupId,
     [switch]$OpenBrowser,
     [ValidateRange(5, 120)]
-    [int]$TimeoutSeconds = 45
+    [int]$TimeoutSeconds = 120
 )
 
 $ErrorActionPreference = "Stop"

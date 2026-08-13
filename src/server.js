@@ -172,7 +172,7 @@ function runtimeSourceIdentity(value) {
   }
   return Object.freeze(structuredClone(value));
 }
-const defaultShutdownDrainTimeoutMs = 30_000;
+const defaultShutdownDrainTimeoutMs = 90_000;
 
 function decodeManagedToken(token) {
   if (typeof token !== "string" || !/^[A-Za-z0-9+/]{43}=$/u.test(token)) {

@@ -83,3 +83,25 @@ test("process management is PID and health bound and never kills an arbitrary li
   assert.match(starter, /Manage-MyDashboard\.ps1/);
   assert.doesNotMatch(starter, /Start-Process|C:\\Program Files\\nodejs/);
 });
+
+test("managed shutdown allows bounded durable projection drain before manager timeout", async () => {
+  const manager = await readFile(
+    path.join(root, "scripts", "Manage-MyDashboard.ps1"),
+    "utf8",
+  );
+  const server = await readFile(path.join(root, "src", "server.js"), "utf8");
+  const drainMatch = server.match(
+    /const defaultShutdownDrainTimeoutMs\s*=\s*([0-9_]+);/,
+  );
+  const managerMatch = manager.match(
+    /\[int\]\$TimeoutSeconds\s*=\s*([0-9_]+)/,
+  );
+  assert.notEqual(drainMatch, null);
+  assert.notEqual(managerMatch, null);
+  const drainMilliseconds = Number(drainMatch[1].replaceAll("_", ""));
+  const managerMilliseconds = Number(
+    managerMatch[1].replaceAll("_", ""),
+  ) * 1_000;
+  assert.equal(drainMilliseconds >= 90_000, true);
+  assert.equal(managerMilliseconds - drainMilliseconds >= 30_000, true);
+});
