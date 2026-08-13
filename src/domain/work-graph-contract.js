@@ -692,7 +692,7 @@ function assertTaskStatusTransition(
   const allowedReactivation =
     previousStatus !== "superseded" &&
     reactivationIds.has(previousTask.taskId) &&
-    nextStatus === "pending" &&
+    ["in_progress", "pending"].includes(nextStatus) &&
     nextRevision === previousRevision + 1 &&
     sameValue(previousContent, nextContent);
   const allowedSupersession =

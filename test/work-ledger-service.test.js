@@ -734,6 +734,80 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
   );
 });
 
+test("a completed automatic PR root can leave scope without blocking later intake", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const oldBinding = prExecutionBinding(root);
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  root = await fixture.service.complete({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    result: { outcome: "completed-before-scope-exit" },
+  });
+  assert.equal(root.status, "completed");
+
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, leftEvent),
+    assignment(3),
+  );
+  fixture.source.highWatermark = 3;
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  const inactive = items.find(({ itemId }) => itemId === root.itemId);
+
+  assert.equal(intake.received, 2);
+  assert.equal((await fixture.service.getSummary()).intakeCursor, 3);
+  assert.notEqual(items.find(({ assignmentId }) => assignmentId === "workflow-assignment-3"), undefined);
+  assert.equal(inactive.source.scope.active, false);
+  assert.equal(inactive.source.authorityEpoch, root.source.authorityEpoch + 1);
+  assert.equal(inactive.source.inputRevision, root.source.inputRevision + 1);
+  assert.equal(inactive.status, "blocked");
+  assert.equal(inactive.statusReason, "pr_source_left_scope");
+  assert.equal(inactive.ownerId, null);
+  assert.equal(inactive.leaseId, null);
+  assert.equal(inactive.activeIntentId, null);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  const created = prAssignment(5, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(4, created.event),
+    created,
+  );
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake({ limit: 10 });
+
+  const reentered = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === root.itemId,
+  );
+  assert.equal(reentered.source.scope.active, true);
+  assert.equal(reentered.source.authorityEpoch, inactive.source.authorityEpoch + 1);
+  assert.equal(reentered.status, "queued");
+  assert.equal(reentered.statusReason, "pr_source_reentered_scope");
+});
+
 test("an explicit owner PR source survives automatic left-scope and never reuses its old binding", async () => {
   const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
   const fixture = await createFixture({ records: [initial] });

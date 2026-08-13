@@ -455,6 +455,31 @@ function isReplacedPullRequestRootCutover(previous, next) {
     nextSequence > previousSequence;
 }
 
+function isCompletedPullRequestRootScopeExit(previous, next) {
+  return (
+    previous.kind === "source_root" &&
+    previous.source?.kind === "pull_request" &&
+    previous.source.scope.kind === "automatic" &&
+    previous.source.scope.active === true &&
+    previous.status === "completed" &&
+    next?.kind === "source_root" &&
+    next.source?.kind === "pull_request" &&
+    next.source.scope.kind === "automatic" &&
+    next.source.scope.active === false &&
+    next.revision === previous.revision + 1 &&
+    next.status === "blocked" &&
+    next.statusReason === "pr_source_left_scope" &&
+    next.ownerId === null &&
+    next.leaseId === null &&
+    next.leaseUntil === null &&
+    next.activeIntentId === null &&
+    next.availableAt === null &&
+    next.source.authorityEpoch > previous.source.authorityEpoch &&
+    next.source.inputRevision > previous.source.inputRevision &&
+    next.source.activeRevision > previous.source.activeRevision
+  );
+}
+
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const previous = projectWorkLedgerGraphSnapshot(previousState);
   const next = projectWorkLedgerGraphSnapshot(nextState);
@@ -479,8 +504,11 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
         item.status === "completed" &&
         nextItem?.kind === "source_root" &&
         nextItem.source?.kind === "pull_request" &&
-        nextItem.status === "queued" &&
-        nextItem.source.activeRevision > item.source.activeRevision
+        (
+          (nextItem.status === "queued" &&
+            nextItem.source.activeRevision > item.source.activeRevision) ||
+          isCompletedPullRequestRootScopeExit(item, nextItem)
+        )
       );
     })
     .map(({ itemId }) => itemId);

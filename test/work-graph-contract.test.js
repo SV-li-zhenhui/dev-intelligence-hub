@@ -759,6 +759,12 @@ test("supports non-terminal requeue while keeping terminal tasks immutable", () 
       terminalReactivationTaskIds: ["one"],
     })
   );
+  assert.doesNotThrow(() =>
+    transition(
+      completed,
+      { ...completed, revision: 3, status: "in_progress" },
+    )({ terminalReactivationTaskIds: ["one"] })
+  );
 
   const superseded = task("one", {
     revision: 2,
