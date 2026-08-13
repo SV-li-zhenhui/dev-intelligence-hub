@@ -529,7 +529,7 @@ class GitHubActionAdapter {
           ) {
             return { status: "stale" };
           }
-          if (!(await this.#inputAuthorityCurrent(envelope))) {
+          if (!(await this.#inputAuthorityCurrent(envelope, operation))) {
             return { status: "stale" };
           }
           const currentTarget = await this.#currentTarget(
@@ -565,7 +565,7 @@ class GitHubActionAdapter {
     }
     const operation = this.#beginOperation();
     try {
-      if (!(await this.#inputAuthorityCurrent(envelope))) {
+      if (!(await this.#inputAuthorityCurrent(envelope, operation))) {
         return { status: "stale" };
       }
       return await this.#withCredential(envelope, async (
@@ -632,7 +632,7 @@ class GitHubActionAdapter {
         actualVersion: finalTarget.actualVersion,
       };
     }
-    if (!(await this.#inputAuthorityCurrent(envelope))) {
+    if (!(await this.#inputAuthorityCurrent(envelope, operation))) {
       return { status: "stale" };
     }
     markPostStarted();
@@ -704,20 +704,58 @@ class GitHubActionAdapter {
     }
   }
 
-  async #inputAuthorityCurrent(envelope) {
+  async #inputAuthorityCurrent(envelope, operation) {
     const binding = envelope.action.inputBinding;
     if (!binding) {
       return envelope.kind !== "github.work-proposal-review";
     }
     if (this.#verifyInputAuthority === null) return false;
     try {
-      const verified = await this.#verifyInputAuthority(
-        structuredClone(binding),
+      const verified = await this.#awaitOperation(
+        operation,
+        () => this.#verifyInputAuthority(structuredClone(binding)),
       );
       return samePullRequestExecutionBinding(verified, binding);
-    } catch {
+    } catch (error) {
+      if (error instanceof GitHubActionError) throw error;
       return false;
     }
+  }
+
+  async #awaitOperation(operation, callback) {
+    this.#assertOperationCurrent(operation);
+    let abort;
+    const aborted = new Promise((_, reject) => {
+      abort = () => reject(this.#operationError(operation));
+      operation.signal.addEventListener("abort", abort, { once: true });
+    });
+    if (operation.signal.aborted) abort();
+    const work = Promise.resolve().then(() => {
+      this.#assertOperationCurrent(operation);
+      return callback();
+    });
+    try {
+      const value = await Promise.race([work, aborted]);
+      this.#assertOperationCurrent(operation);
+      return value;
+    } finally {
+      operation.signal.removeEventListener("abort", abort);
+    }
+  }
+
+  #assertOperationCurrent(operation) {
+    if (this.#clock() >= operation.deadline) {
+      throw actionError("GITHUB_TIMEOUT");
+    }
+    if (operation.signal.aborted) {
+      throw actionError("GITHUB_UNAVAILABLE");
+    }
+  }
+
+  #operationError(operation) {
+    return this.#clock() >= operation.deadline
+      ? actionError("GITHUB_TIMEOUT")
+      : actionError("GITHUB_UNAVAILABLE");
   }
 
   async #currentTarget(envelope, childEnvironment, operation = null) {

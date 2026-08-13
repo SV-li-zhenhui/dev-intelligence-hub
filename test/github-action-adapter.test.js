@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   createGitHubActionExecutor,
   markerForGitHubAction,
@@ -19,6 +20,45 @@ const GH_COMMAND =
     ? "C:\\Program Files\\GitHub CLI\\gh.exe"
     : "/usr/bin/gh";
 const GH_TOKEN = "github_test_token";
+
+async function settleWithin(promise, milliseconds = 100) {
+  const timeout = Symbol("timeout");
+  const controller = new AbortController();
+  try {
+    const result = await Promise.race([
+      promise,
+      delay(milliseconds, timeout, { signal: controller.signal }),
+    ]);
+    assert.notEqual(result, timeout, "operation did not settle after cancellation");
+    return result;
+  } finally {
+    controller.abort();
+  }
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
+async function assertLateRejectionHandled(pending) {
+  const unhandled = [];
+  const listener = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    pending.reject(new Error("late verifier rejection"));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
+}
 
 function createAdapter(runner, overrides = {}) {
   return createGitHubActionExecutor({
@@ -609,6 +649,103 @@ test("closing the Review executor cancels the active lease and prevents later ca
   assert.equal(credential.calls.acquire[0].signal.aborted, true);
 });
 
+test("closing Review bounds a hanging authority verifier before credentials", async () => {
+  const started = deferred();
+  const pending = deferred();
+  const credential = recordingCredentialSource();
+  const runner = new FakeRunner();
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+    inputAuthorityVerifier: {
+      async verify() {
+        started.resolve();
+        return pending.promise;
+      },
+    },
+  });
+
+  const execution = adapter.execute(workProposalEnvelope());
+  await started.promise;
+  adapter.close();
+
+  assert.deepEqual(await settleWithin(execution), {
+    status: "error",
+    error: { trust: "absent", code: "GITHUB_UNAVAILABLE" },
+  });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.equal(runner.calls.length, 0);
+  await assertLateRejectionHandled(pending);
+});
+
+test("Review deadline bounds a hanging authority recheck and releases its lease", async (t) => {
+  let now = 4_000_000;
+  let operationTimer;
+  t.mock.method(globalThis, "setTimeout", (callback, milliseconds) => {
+    operationTimer = { callback, milliseconds, unref() {} };
+    return operationTimer;
+  });
+  t.mock.method(globalThis, "clearTimeout", () => {});
+  const started = deferred();
+  const pending = deferred();
+  let checks = 0;
+  const binding = workProposalEnvelope().action.inputBinding;
+  const credential = recordingCredentialSource();
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    {
+      number: 42,
+      url: "https://github.com/acme/command-center/pull/42",
+      baseRefName: "main",
+      baseRefOid: BASE_HEAD,
+      headRefName: "fix/conflict",
+      headRefOid: HEAD,
+      headRepository: { nameWithOwner: "contributor/command-center" },
+    },
+    actor(),
+    {
+      number: 42,
+      url: "https://github.com/acme/command-center/pull/42",
+      baseRefName: "main",
+      baseRefOid: BASE_HEAD,
+      headRefName: "fix/conflict",
+      headRefOid: HEAD,
+      headRepository: { nameWithOwner: "contributor/command-center" },
+    },
+  ]);
+  const adapter = createGitHubActionExecutor({
+    runner,
+    ghCommand: GH_COMMAND,
+    credentialSource: credential.source,
+    inputAuthorityVerifier: {
+      async verify() {
+        checks += 1;
+        if (checks === 1) return structuredClone(binding);
+        started.resolve();
+        return pending.promise;
+      },
+    },
+    clock: () => now,
+    timeoutMs: 1_000,
+  });
+
+  const execution = adapter.execute(workProposalEnvelope());
+  await started.promise;
+  now = 4_001_000;
+  operationTimer.callback();
+
+  assert.deepEqual(await settleWithin(execution), {
+    status: "error",
+    error: { trust: "absent", code: "GITHUB_TIMEOUT" },
+  });
+  assert.equal(runner.calls.length, 5);
+  assert.equal(runner.calls.some((call) => call.args.includes("POST")), false);
+  assert.equal(credential.calls.release, 1);
+  await assertLateRejectionHandled(pending);
+});
+
 test("Review authority checks and subprocesses share one decreasing total deadline", async () => {
   let now = 3_000_000;
   const credential = recordingCredentialSource();
@@ -868,7 +1005,7 @@ test("COMMENT review execution keeps arbitrary body text off process argv", asyn
       });
     },
   ]);
-  const adapter = createAdapter(runner);
+  const adapter = createAdapter(runner, { clock: () => 6_000_000 });
   const envelope = commentEnvelope();
   const result = await adapter.execute(envelope);
   const post = runner.calls.at(-1);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { pullRequestExternalActionMarker } from "../src/domain/pull-request-external-action.js";
 import {
@@ -19,6 +20,45 @@ import {
 
 const RECEIPT_AT = "2026-08-08T06:08:09.012Z";
 const ACTION_TYPES = ["comment", "review", "update_branch", "push", "merge"];
+
+async function settleWithin(promise, milliseconds = 100) {
+  const timeout = Symbol("timeout");
+  const controller = new AbortController();
+  try {
+    const result = await Promise.race([
+      promise,
+      delay(milliseconds, timeout, { signal: controller.signal }),
+    ]);
+    assert.notEqual(result, timeout, "operation did not settle after cancellation");
+    return result;
+  } finally {
+    controller.abort();
+  }
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
+async function assertLateRejectionHandled(pending) {
+  const unhandled = [];
+  const listener = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    pending.reject(new Error("late verifier rejection"));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
+}
 
 function proposalAction(type, binding) {
   return {
@@ -309,6 +349,113 @@ test("closing the generic executor releases its lease and prevents later stages"
   assert.deepEqual(calls, ["observe"]);
   assert.equal(credential.calls.release, 1);
   assert.equal(credential.calls.acquire[0].signal.aborted, true);
+});
+
+test("closing generic execution bounds a hanging authority verifier", async () => {
+  const envelope = envelopeFor("comment");
+  const started = deferred();
+  const pending = deferred();
+  const credential = recordingCredentialSource();
+  const transport = mutableTransport(envelope);
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: {
+      async verify() {
+        started.resolve();
+        return pending.promise;
+      },
+    },
+  });
+
+  const execution = executor.execute(envelope);
+  await started.promise;
+  executor.close();
+
+  assert.deepEqual(await settleWithin(execution), {
+    status: "error",
+    error: { code: "GITHUB_UNAVAILABLE", trust: "absent" },
+  });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+  await assertLateRejectionHandled(pending);
+});
+
+test("generic deadline bounds a hanging authority recheck and releases its lease", async (t) => {
+  const envelope = envelopeFor("comment");
+  let now = 5_000_000;
+  let operationTimer;
+  t.mock.method(globalThis, "setTimeout", (callback, milliseconds) => {
+    operationTimer = { callback, milliseconds, unref() {} };
+    return operationTimer;
+  });
+  t.mock.method(globalThis, "clearTimeout", () => {});
+  const started = deferred();
+  const pending = deferred();
+  let checks = 0;
+  const credential = recordingCredentialSource();
+  const transport = mutableTransport(envelope);
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: {
+      async verify() {
+        checks += 1;
+        if (checks === 1) return structuredClone(envelope.action.inputBinding);
+        started.resolve();
+        return pending.promise;
+      },
+    },
+    clock: () => now,
+    timeoutMs: 1_000,
+  });
+
+  const execution = executor.execute(envelope);
+  await started.promise;
+  now = 5_001_000;
+  operationTimer.callback();
+
+  assert.deepEqual(await settleWithin(execution), {
+    status: "error",
+    error: { code: "GITHUB_TIMEOUT", trust: "absent" },
+  });
+  assert.deepEqual(transport.calls.map(({ method }) => method), ["observe"]);
+  assert.equal(credential.calls.release, 1);
+  await assertLateRejectionHandled(pending);
+});
+
+test("closing generic execution bounds a hanging controlled-commit verifier", async () => {
+  const envelope = envelopeFor("push");
+  const started = deferred();
+  const pending = deferred();
+  const credential = recordingCredentialSource();
+  const transport = mutableTransport(envelope);
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["push"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
+    controlledCommitVerifier: {
+      async verify() {
+        started.resolve();
+        return pending.promise;
+      },
+    },
+  });
+
+  const execution = executor.execute(envelope);
+  await started.promise;
+  executor.close();
+
+  assert.deepEqual(await settleWithin(execution), {
+    status: "error",
+    error: { code: "GITHUB_UNAVAILABLE", trust: "absent" },
+  });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+  await assertLateRejectionHandled(pending);
 });
 
 test("all five actions execute once and reconcile from action-specific proof", async () => {

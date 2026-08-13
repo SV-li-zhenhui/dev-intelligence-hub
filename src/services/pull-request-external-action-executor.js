@@ -570,13 +570,19 @@ class PullRequestExternalActionExecutor {
     const operation = this.#beginOperation();
     try {
       try {
-        if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
+        if (!(await this.#controlledCommitCurrent(
+          envelope,
+          "absent",
+          operation,
+        ))) {
           return { status: "stale" };
         }
       } catch (error) {
         return errorResult(error);
       }
-      if (!(await this.#authorityCurrent(envelope))) return { status: "stale" };
+      if (!(await this.#authorityCurrent(envelope, operation))) {
+        return { status: "stale" };
+      }
       try {
         return await this.#withCredential(
           envelope,
@@ -591,7 +597,7 @@ class PullRequestExternalActionExecutor {
             );
             const firstResult = observationResult(envelope, first, marker);
             if (firstResult.status !== "absent") return firstResult;
-            if (!(await this.#authorityCurrent(envelope))) {
+            if (!(await this.#authorityCurrent(envelope, operation))) {
               return { status: "stale" };
             }
             const final = await this.#observe(
@@ -602,10 +608,14 @@ class PullRequestExternalActionExecutor {
             );
             const finalResult = observationResult(envelope, final, marker);
             if (finalResult.status !== "absent") return finalResult;
-            if (!(await this.#authorityCurrent(envelope))) {
+            if (!(await this.#authorityCurrent(envelope, operation))) {
               return { status: "stale" };
             }
-            if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
+            if (!(await this.#controlledCommitCurrent(
+              envelope,
+              "absent",
+              operation,
+            ))) {
               return { status: "stale" };
             }
             try {
@@ -639,6 +649,8 @@ class PullRequestExternalActionExecutor {
       } catch (error) {
         return errorResult(error);
       }
+    } catch (error) {
+      return errorResult(error);
     } finally {
       this.#finishOperation(operation);
     }
@@ -665,7 +677,7 @@ class PullRequestExternalActionExecutor {
             marker,
           );
           if (result.status !== "absent") return result;
-          return (await this.#authorityCurrent(envelope))
+          return (await this.#authorityCurrent(envelope, operation))
             ? result
             : { status: "stale" };
         },
@@ -735,21 +747,25 @@ class PullRequestExternalActionExecutor {
     for (const controller of this.#activeOperations) controller.abort();
   }
 
-  async #authorityCurrent(envelope) {
+  async #authorityCurrent(envelope, operation) {
     try {
-      const verified = await this.#inputAuthorityVerifier.verify(
-        structuredClone(envelope.action.inputBinding),
+      const verified = await this.#awaitOperation(
+        operation,
+        () => this.#inputAuthorityVerifier.verify(
+          structuredClone(envelope.action.inputBinding),
+        ),
       );
       return samePullRequestExecutionBinding(
         verified,
         envelope.action.inputBinding,
       );
-    } catch {
+    } catch (error) {
+      if (this.#isOperationError(error, operation)) throw error;
       return false;
     }
   }
 
-  async #controlledCommitCurrent(envelope, failureTrust) {
+  async #controlledCommitCurrent(envelope, failureTrust, operation) {
     if (envelope.action.type !== "pull_request_push") return true;
     if (this.#controlledCommitVerifier === null) {
       throw new PullRequestExternalActionTransportError(
@@ -759,10 +775,15 @@ class PullRequestExternalActionExecutor {
     }
     let evidence;
     try {
-      evidence = await this.#controlledCommitVerifier.verify({
-        evidenceId: envelope.action.controlledCommitEvidence.evidenceId,
-      });
+      evidence = await this.#awaitOperation(
+        operation,
+        () => this.#controlledCommitVerifier.verify({
+          evidenceId: envelope.action.controlledCommitEvidence.evidenceId,
+        }),
+        failureTrust,
+      );
     } catch (cause) {
+      if (this.#isOperationError(cause, operation)) throw cause;
       throw new PullRequestExternalActionTransportError(
         "CONTROLLED_COMMIT_VERIFIER_UNAVAILABLE",
         failureTrust,
@@ -789,19 +810,55 @@ class PullRequestExternalActionExecutor {
     return normalizeObservation(observation, envelope);
   }
 
-  #assertOperationCurrent(operation) {
-    if (operation.signal.aborted) {
-      throw new PullRequestExternalActionTransportError(
-        "GITHUB_UNAVAILABLE",
-        "absent",
-      );
+  async #awaitOperation(operation, callback, failureTrust = "absent") {
+    this.#assertOperationCurrent(operation, failureTrust);
+    let abort;
+    const aborted = new Promise((_, reject) => {
+      abort = () => reject(this.#operationError(operation, failureTrust));
+      operation.signal.addEventListener("abort", abort, { once: true });
+    });
+    if (operation.signal.aborted) abort();
+    const work = Promise.resolve().then(() => {
+      this.#assertOperationCurrent(operation, failureTrust);
+      return callback();
+    });
+    try {
+      const value = await Promise.race([work, aborted]);
+      this.#assertOperationCurrent(operation, failureTrust);
+      return value;
+    } finally {
+      operation.signal.removeEventListener("abort", abort);
     }
+  }
+
+  #assertOperationCurrent(operation, failureTrust = "absent") {
     if (this.#clock() >= operation.deadline) {
       throw new PullRequestExternalActionTransportError(
         "GITHUB_TIMEOUT",
-        "absent",
+        failureTrust,
       );
     }
+    if (operation.signal.aborted) {
+      throw new PullRequestExternalActionTransportError(
+        "GITHUB_UNAVAILABLE",
+        failureTrust,
+      );
+    }
+  }
+
+  #operationError(operation, failureTrust) {
+    return new PullRequestExternalActionTransportError(
+      this.#clock() >= operation.deadline
+        ? "GITHUB_TIMEOUT"
+        : "GITHUB_UNAVAILABLE",
+      failureTrust,
+    );
+  }
+
+  #isOperationError(error, operation) {
+    return error instanceof PullRequestExternalActionTransportError &&
+      ["GITHUB_TIMEOUT", "GITHUB_UNAVAILABLE"].includes(error.code) &&
+      (operation.signal.aborted || this.#clock() >= operation.deadline);
   }
 
   #transportInput(envelope, marker, credential) {
