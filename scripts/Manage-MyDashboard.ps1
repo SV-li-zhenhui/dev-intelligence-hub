@@ -1135,9 +1135,16 @@ function Test-RecoveryTotalBytesValue {
     if (Test-RecoveryJsonInteger -Value $Value) {
         return $true
     }
+    if ($Value -is [decimal]) {
+        return $Value -eq [decimal]::Truncate([decimal]$Value)
+    }
+    if ($Value -isnot [double]) {
+        return $false
+    }
     return (
-        $Value -is [decimal] -and
-        $Value -eq [decimal]::Truncate([decimal]$Value)
+        -not [double]::IsNaN([double]$Value) -and
+        -not [double]::IsInfinity([double]$Value) -and
+        $Value -eq [Math]::Truncate([double]$Value)
     )
 }
 

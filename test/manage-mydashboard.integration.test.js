@@ -2002,6 +2002,54 @@ test(
   },
 );
 
+test(
+  "PowerShell 7 RecoverFailedShutdown accepts a preserved integral-decimal totalBytes",
+  { skip: POWERSHELL_7_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const manifestPath = recoveryManifestPath(fixture);
+    const manifestText = await readFile(manifestPath, "utf8");
+    const manifest = JSON.parse(manifestText);
+    const integerTotal = `\"totalBytes\":${manifest.totalBytes}`;
+    assert.equal(manifestText.includes(integerTotal), true);
+    await writeFile(
+      manifestPath,
+      manifestText.replace(integerTotal, `${integerTotal}.0`),
+      "utf8",
+    );
+
+    const recovered = invokeManager(
+      fixture.root,
+      "RecoverFailedShutdown",
+      10,
+      powershell7,
+      ["-RecoverySnapshotId", fixture.snapshotId],
+    );
+    await assertRecoveryCompleted(fixture, recovered);
+  },
+);
+
+test(
+  "PowerShell 7 RecoverFailedShutdown rejects a fractional totalBytes",
+  { skip: POWERSHELL_7_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteRecoveryManifest(fixture, (manifest) => ({
+      ...manifest,
+      totalBytes: manifest.totalBytes + 0.5,
+    }));
+    const rejected = invokeManager(
+      fixture.root,
+      "RecoverFailedShutdown",
+      10,
+      powershell7,
+      ["-RecoverySnapshotId", fixture.snapshotId],
+    );
+
+    await assertRecoveryRejectedBeforeKill(fixture, rejected);
+  },
+);
+
 for (const { label, snapshotId } of [
   { label: "malformed snapshot identifier", snapshotId: "shutdown-failure-invalid" },
   {
