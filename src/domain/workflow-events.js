@@ -18,6 +18,7 @@ const EVENT_TYPES = new Set(
   ),
 );
 EVENT_TYPES.add("owner_request.created");
+EVENT_TYPES.add("pull_request.owner_requested");
 const BASE_KEYS = Object.freeze([
   "schemaVersion",
   "eventType",
@@ -507,6 +508,24 @@ function assertOwnerRequestSemantics(content) {
   }
 }
 
+function assertOwnerPullRequestSemantics(content) {
+  if (content.eventType !== "pull_request.owner_requested") return;
+  const target = content.payload.gitTarget;
+  if (
+    content.source.provider !== "local-owner" ||
+    !/^owner-request:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+      .test(content.source.scopeId) ||
+    content.payload.gitTargetAvailable !== true ||
+    target === null ||
+    typeof target !== "object" ||
+    target.provider !== "github" ||
+    target.baseRepository !== content.subject.repository ||
+    target.headRefOid !== content.payload.headRefOid
+  ) {
+    throw invalid("owner requested pull request semantics");
+  }
+}
+
 function normalizeContent(value) {
   assertExactKeys(value, BASE_KEYS, "event");
   if (value.schemaVersion !== SCHEMA_VERSION) {
@@ -526,6 +545,7 @@ function normalizeContent(value) {
     payload: normalizePayload(value.payload),
   };
   assertOwnerRequestSemantics(content);
+  assertOwnerPullRequestSemantics(content);
   const hasGitTarget = Object.hasOwn(content.payload, "gitTarget");
   const hasGitTargetAvailability = Object.hasOwn(
     content.payload,

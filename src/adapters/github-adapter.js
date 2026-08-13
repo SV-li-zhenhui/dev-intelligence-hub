@@ -1068,6 +1068,84 @@ export class GitHubAdapter {
     };
   }
 
+  async resolvePullRequestTarget(value, { signal = null } = {}) {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      Reflect.ownKeys(value).length !== 2 ||
+      typeof value.repository !== "string" ||
+      !Number.isSafeInteger(value.number) ||
+      value.number < 1
+    ) {
+      throw new TypeError("pull request target is invalid");
+    }
+    const url = `https://${GITHUB_HOST}/${value.repository}/pull/${value.number}`;
+    const identity = pullRequestIdentity(url);
+    if (
+      identity === null ||
+      identity.repository !== value.repository ||
+      identity.number !== value.number
+    ) {
+      throw new TypeError("pull request target is invalid");
+    }
+    const commandOptions = signal === null ? {} : { signal };
+    const [initialAccount, initial] = await Promise.all([
+      this.currentUser(commandOptions),
+      this.run(
+        "gh",
+        ["pr", "view", url, "--json", PR_REVIEW_CONTEXT_FIELDS],
+        commandOptions,
+      ),
+    ]);
+    const initialIdentity = pullRequestIdentity(initial.url);
+    const facts = pullRequestGitFacts(initial, {
+      repository: value.repository,
+      account: initialAccount,
+    });
+    if (
+      initialIdentity === null ||
+      initialIdentity.repository !== value.repository ||
+      initialIdentity.number !== value.number ||
+      initial.number !== value.number ||
+      !completePullRequestGitFacts(facts)
+    ) {
+      throw staleReviewContext();
+    }
+    const gitTarget = gitTargetFromFacts(facts);
+    const [finalAccount, final] = await Promise.all([
+      this.currentUser(commandOptions),
+      this.run(
+        "gh",
+        ["pr", "view", url, "--json", PR_TARGET_FIELDS],
+        commandOptions,
+      ),
+    ]);
+    const finalIdentity = pullRequestIdentity(final.url);
+    const finalFacts = pullRequestGitFacts(final, {
+      repository: value.repository,
+      account: finalAccount,
+    });
+    if (
+      finalIdentity === null ||
+      finalIdentity.repository !== value.repository ||
+      finalIdentity.number !== value.number ||
+      final.number !== value.number ||
+      !completePullRequestGitFacts(finalFacts) ||
+      !samePullRequestGitTarget(gitTarget, gitTargetFromFacts(finalFacts))
+    ) {
+      throw staleReviewContext();
+    }
+    return Object.freeze({
+      repository: value.repository,
+      number: value.number,
+      title: typeof initial.title === "string" && initial.title.trim()
+        ? initial.title.trim()
+        : `PR #${value.number}`,
+      gitTarget,
+    });
+  }
+
   async loadPullRequestFacts(request, { signal = null } = {}) {
     const commandOptions = signal === null ? {} : { signal };
     const identity = createPullRequestReadIdentity(request);

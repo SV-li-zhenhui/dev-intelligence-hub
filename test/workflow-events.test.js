@@ -54,6 +54,7 @@ test("supports every PR and Issue workflow event plus trusted owner intake", () 
   assert.deepEqual(WORKFLOW_EVENT_TYPES, [
     ...expectedTypes,
     "owner_request.created",
+    "pull_request.owner_requested",
   ]);
   for (const eventType of expectedTypes) {
     const normalized = normalizeWorkflowEvent(event({ eventType }));

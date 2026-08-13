@@ -1332,11 +1332,18 @@ test(
         prEngineerExclusiveGuardFactory: guardFactory,
         pullRequestFactsLoaderFactory: () =>
           pullRequestFactsLoader(clock, factCalls),
-        pullRequestExternalActionDependencies: {
-          credentialProvider() {
+        githubCredentialSourceFactory: async () => Object.freeze({
+          async acquire() {
             credentialCalls.push("requested");
-            return "fake-github-token";
+            return Object.freeze({
+              async use(callback) {
+                return callback("fake-github-token");
+              },
+              async release() {},
+            });
           },
+        }),
+        pullRequestExternalActionDependencies: {
           transport,
         },
         workProposalRuntimeFactory: async (options) => {

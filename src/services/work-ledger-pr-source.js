@@ -205,13 +205,13 @@ function plainArray(value, name) {
 function normalizePullRequestScope(value) {
   exact(value, SCOPE_KEYS, "PR scope");
   if (
-    value.kind !== "automatic" ||
+    !["automatic", "owner_requested"].includes(value.kind) ||
     typeof value.active !== "boolean"
   ) {
     throw invalid("PR scope 状态无效");
   }
-  return {
-    kind: "automatic",
+  const normalized = {
+    kind: value.kind,
     active: value.active,
     revision: positiveInteger(value.revision, "scope.revision"),
     lastLifecycleEventId: value.lastLifecycleEventId === null
@@ -222,6 +222,15 @@ function normalizePullRequestScope(value) {
           192,
         ),
   };
+  if (
+    normalized.kind === "owner_requested" &&
+    (!normalized.active ||
+      normalized.revision !== 1 ||
+      normalized.lastLifecycleEventId !== null)
+  ) {
+    throw invalid("owner requested PR scope 状态无效");
+  }
+  return normalized;
 }
 
 function canonical(value, name) {
@@ -284,7 +293,11 @@ function identityFor(assignment, event, trustedLifecycle = false) {
     (!trustedLifecycle &&
       (target.type !== "role" || target.id !== "pr-engineer")) ||
     !event.eventType.startsWith("pull_request.") ||
-    event.source.provider !== "github"
+    !(
+      event.source.provider === "github" ||
+      (event.source.provider === "local-owner" &&
+        event.eventType === "pull_request.owner_requested")
+    )
   ) {
     return null;
   }
@@ -419,7 +432,9 @@ export function createPullRequestWorkSource(envelope) {
       headRevision: 1,
       authorityEpoch: 1,
       scope: {
-        kind: "automatic",
+        kind: input.event.eventType === "pull_request.owner_requested"
+          ? "owner_requested"
+          : "automatic",
         active: true,
         revision: 1,
         lastLifecycleEventId: null,
@@ -1198,6 +1213,10 @@ function evaluatePullRequestSubjectAuthority(state, root) {
   );
   let predecessor = null;
   let canonical = null;
+  const validAuthorities = new Map();
+  const selectLatestValidAuthority = () => [...validAuthorities.values()]
+    .sort((left, right) => right.sourceSequence - left.sourceSequence)[0] ??
+    null;
   let trustedOccurredAtWatermark = Number.NEGATIVE_INFINITY;
   let trustedEvent = null;
   let trustedObservation = null;
@@ -1206,16 +1225,34 @@ function evaluatePullRequestSubjectAuthority(state, root) {
     const gitTargetState = observation.pointer === null
       ? null
       : gitTargetStateForEvent(observation.pointer.event);
+    const sourceInactive = observation.source.scope.active === false;
     const authorityNegative =
-      observation.source.scope.active === false ||
       observation.item.sourceQuarantine !== null ||
       isAuthorityFenceDisposition(observation.revision.disposition) ||
       (observation.pointer !== null &&
         (gitTargetState === "unavailable" ||
           (markerRequired && gitTargetState === "legacy")));
+    if (sourceInactive) {
+      validAuthorities.delete(observation.item.itemId);
+      canonical = selectLatestValidAuthority();
+      authorityFenced = canonical === null;
+      continue;
+    }
     if (authorityNegative) {
-      canonical = null;
-      authorityFenced = true;
+      const independentOwnerAuthority = [...validAuthorities.values()].some(
+        (candidate) =>
+          candidate.item.itemId !== observation.item.itemId &&
+          candidate.source.scope.kind === "owner_requested",
+      );
+      if (independentOwnerAuthority) {
+        validAuthorities.delete(observation.item.itemId);
+        canonical = selectLatestValidAuthority();
+        authorityFenced = false;
+      } else {
+        validAuthorities.clear();
+        canonical = null;
+        authorityFenced = true;
+      }
       continue;
     }
     const exactFenceRecovery =
@@ -1227,18 +1264,32 @@ function evaluatePullRequestSubjectAuthority(state, root) {
         observation.pointer.event,
       );
     if (
+      observation.source.scope.kind !== "owner_requested" &&
       observation.occurredAtMs < trustedOccurredAtWatermark &&
       !exactFenceRecovery
     ) {
       continue;
     }
-    const causal = predecessor === null ||
+    const ownerRequestedAnchor =
+      observation.source.scope.kind === "owner_requested" &&
+      observation.pointer?.event.eventType ===
+        "pull_request.owner_requested";
+    const causal = ownerRequestedAnchor || predecessor === null ||
       observation.revision.headRefOid === predecessor.revision.headRefOid ||
       observation.revision.previousHeadRefOid ===
         predecessor.revision.headRefOid;
     if (!causal) {
+      validAuthorities.clear();
       canonical = null;
       authorityFenced = true;
+      continue;
+    }
+    if (observation.revision.disposition !== "accepted") {
+      if (observation.revision.disposition === "ignored_unproven_head") {
+        validAuthorities.clear();
+        canonical = null;
+        authorityFenced = true;
+      }
       continue;
     }
     predecessor = observation;
@@ -1251,16 +1302,27 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       targetAuthorityCurrent &&
       observation.pointer !== null
     ) {
-      trustedOccurredAtWatermark = observation.occurredAtMs;
+      trustedOccurredAtWatermark = Math.max(
+        trustedOccurredAtWatermark,
+        observation.occurredAtMs,
+      );
       trustedEvent = observation.pointer.event;
       trustedObservation = observation;
     }
     const executable =
-      observation.revision.disposition === "accepted" &&
       observation.pointer !== null &&
       targetAuthorityCurrent;
-    canonical = executable ? observation : null;
-    if (executable) authorityFenced = false;
+    if (executable) {
+      if (
+        canonical !== null &&
+        canonical.item.itemId !== observation.item.itemId
+      ) {
+        validAuthorities.clear();
+      }
+      validAuthorities.set(observation.item.itemId, observation);
+      canonical = selectLatestValidAuthority();
+      authorityFenced = false;
+    }
   }
   return {
     canonical,

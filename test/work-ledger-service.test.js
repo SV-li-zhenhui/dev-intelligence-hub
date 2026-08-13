@@ -223,6 +223,7 @@ function prAssignment(
     repository = "acme/repo",
     pullRequestNumber = 42,
     sourceScopeId = "github-dashboard",
+    sourceProvider = "github",
     gitFacts = {},
   } = {},
 ) {
@@ -230,7 +231,7 @@ function prAssignment(
     schemaVersion: 1,
     eventType,
     occurredAt,
-    source: { provider: "github", scopeId: sourceScopeId },
+    source: { provider: sourceProvider, scopeId: sourceScopeId },
     subject: {
       id: `github:pr:${repository}#${pullRequestNumber}`,
       repository,
@@ -256,6 +257,17 @@ function prAssignment(
     },
     event,
   };
+}
+
+function ownerRequestedPrAssignment(sequence, overrides = {}) {
+  return prAssignment(sequence, {
+    eventType: "pull_request.owner_requested",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceProvider: "local-owner",
+    sourceScopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000",
+    gitFacts: prGitFacts(PR_HEAD_A),
+    ...overrides,
+  });
 }
 
 function prScopeLifecycleAssignment(sequence, event) {
@@ -720,6 +732,219 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
     await fixture.service.verifyPullRequestExecutionBinding(currentBinding),
     currentBinding,
   );
+});
+
+test("an explicit owner PR source survives automatic left-scope and never reuses its old binding", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const automatic = (await fixture.service.listItems()).items[0];
+  const automaticBinding = prExecutionBinding(automatic);
+
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, leftEvent),
+    ownerRequestedPrAssignment(3),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const owner = roots.find(({ source }) => source.scope.kind === "owner_requested");
+  const inactiveAutomatic = roots.find(
+    ({ source }) => source.scope.kind === "automatic",
+  );
+  assert.notEqual(owner, undefined);
+  assert.equal(owner.source.scope.active, true);
+  assert.equal(owner.status, "queued");
+  assert.equal(inactiveAutomatic.source.scope.active, false);
+  assert.equal(inactiveAutomatic.status, "blocked");
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(automaticBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const ownerBinding = prExecutionBinding(owner);
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
+    ownerBinding,
+  );
+});
+
+test("automatic left-scope after an owner request revokes only the automatic source", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const ownerBeforeExit = roots.find(
+    ({ source }) => source.scope.kind === "owner_requested",
+  );
+  const ownerBinding = prExecutionBinding(ownerBeforeExit);
+
+  const leftEvent = prAssignment(3, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(3, leftEvent));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const owner = roots.find(({ source }) => source.scope.kind === "owner_requested");
+  const automatic = roots.find(({ source }) => source.scope.kind === "automatic");
+  assert.equal(owner.status, "queued");
+  assert.equal(owner.source.scope.active, true);
+  assert.equal(automatic.status, "blocked");
+  assert.equal(automatic.source.scope.active, false);
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
+    ownerBinding,
+  );
+});
+
+test("cross-source assignment order outranks an older owner event timestamp", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      occurredAt: "2026-08-02T01:20:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  const automatic = (await fixture.service.listItems()).items[0];
+  const automaticBinding = prExecutionBinding(automatic);
+  fixture.source.records.push(ownerRequestedPrAssignment(2, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+  }));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  const owner = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ source }) => source?.scope?.kind === "owner_requested",
+  );
+  const ownerBinding = prExecutionBinding(owner);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(automaticBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
+    ownerBinding,
+  );
+});
+
+test("an owner-requested dual read anchors a new Head before automatic discovery catches up", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      headRefOid: PR_HEAD_A,
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  await fixture.service.intake();
+  const automatic = (await fixture.service.listItems()).items[0];
+  const automaticBinding = prExecutionBinding(automatic);
+  fixture.source.records.push(ownerRequestedPrAssignment(2, {
+    headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  const owner = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ source }) => source?.scope?.kind === "owner_requested",
+  );
+  const ownerBinding = prExecutionBinding(owner);
+  assert.equal(owner.source.current.headRefOid, PR_HEAD_B);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(automaticBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
+    ownerBinding,
+  );
+});
+
+test("an unavailable automatic source cannot revoke a valid owner source", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const owner = (await fixture.service.listItems({ limit: 10 })).items.find(
+    ({ source }) => source?.scope?.kind === "owner_requested",
+  );
+  const ownerBinding = prExecutionBinding(owner);
+
+  fixture.source.records.push(prAssignment(3, {
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    gitFacts: { gitTargetAvailable: false },
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
+    ownerBinding,
+  );
+});
+
+test("a retired owner source never revives its old binding when the successor is fenced", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const owner = roots.find(({ source }) => source.scope.kind === "owner_requested");
+  const ownerBinding = prExecutionBinding(owner);
+
+  fixture.source.records.push(prAssignment(3, {
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  roots = (await fixture.service.listItems({ limit: 10 })).items
+    .filter(({ kind }) => kind === "source_root");
+  const automatic = roots.find(({ source }) => source.scope.kind === "automatic");
+  const automaticBinding = prExecutionBinding(automatic);
+  assert.equal(
+    roots.find(({ source }) => source.scope.kind === "owner_requested")
+      .statusReason,
+    "pr_source_cross_root_cutover_retired",
+  );
+
+  fixture.source.records.push(prAssignment(4, {
+    occurredAt: "2026-08-02T01:20:00.000Z",
+    gitFacts: { gitTargetAvailable: false },
+  }));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+
+  for (const binding of [ownerBinding, automaticBinding]) {
+    await assert.rejects(
+      fixture.service.verifyPullRequestExecutionBinding(binding),
+      (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    );
+  }
 });
 
 test("a forged PR scope lifecycle assignment cannot revoke automatic authority", async () => {

@@ -895,6 +895,77 @@ test("owner work can load structured PR context without downloading the patch", 
   ]);
 });
 
+test("an owner-selected PR target is resolved twice against one GitHub account", async () => {
+  const headRefOid = "a".repeat(40);
+  const baseRefOid = "b".repeat(40);
+  let viewCalls = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "Runtime-User" };
+      viewCalls += 1;
+      return {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        title: "Fix CI",
+        body: "Repair the failing check",
+        baseRefName: "main",
+        baseRefOid,
+        headRefName: "fix/ci",
+        headRefOid,
+        headRepository: { name: "repo" },
+        headRepositoryOwner: { login: "contributor" },
+        files: [],
+      };
+    },
+  });
+
+  const result = await adapter.resolvePullRequestTarget({
+    repository: "acme/repo",
+    number: 42,
+  });
+
+  assert.equal(viewCalls, 2);
+  assert.equal(result.title, "Fix CI");
+  assert.deepEqual(result.gitTarget, {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid,
+    headRepository: "contributor/repo",
+    headRefName: "fix/ci",
+    headRefOid,
+  });
+});
+
+test("an owner-selected PR target fails closed when its Head changes during resolution", async () => {
+  let viewCalls = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      viewCalls += 1;
+      return {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        title: "Fix CI",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRefName: "fix/ci",
+        headRefOid: (viewCalls === 1 ? "a" : "c").repeat(40),
+        headRepository: { name: "repo" },
+        headRepositoryOwner: { login: "contributor" },
+        files: [],
+      };
+    },
+  });
+
+  await assert.rejects(
+    adapter.resolvePullRequestTarget({ repository: "acme/repo", number: 42 }),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
+});
+
 test("version records retain source creation timestamps for newest-first display", async () => {
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {

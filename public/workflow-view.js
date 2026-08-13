@@ -22,6 +22,8 @@ function emptyOwnerDraft() {
     title: "",
     description: "",
     acceptanceCriteria: "",
+    pullRequestRepository: "",
+    pullRequestNumber: "",
   };
 }
 
@@ -234,6 +236,18 @@ function ownerRequestPanel(state) {
           </select>
         </label>
       </div>
+      <fieldset class="workflow-owner-pr-target">
+        <legend>指定 PR（工作类型选择“PR 推进”时必填）</legend>
+        <div class="workflow-owner-fields">
+          <label>仓库
+            <input name="pullRequestRepository" maxlength="140" value="${escapeWorkflowHtml(draft.pullRequestRepository)}" placeholder="owner/repository"${loading ? " disabled" : ""} />
+          </label>
+          <label>PR 编号
+            <input name="pullRequestNumber" type="number" min="1" step="1" value="${escapeWorkflowHtml(draft.pullRequestNumber)}" placeholder="123"${loading ? " disabled" : ""} />
+          </label>
+        </div>
+        <small>系统会用当前 GitHub 登录读取并冻结这一 PR 的当前 Head；不会因此直接评论、Review、push 或 merge。</small>
+      </fieldset>
       <label>标题
         <input name="title" maxlength="256" required value="${escapeWorkflowHtml(draft.title)}" placeholder="一句话说明要完成什么"${loading ? " disabled" : ""} />
       </label>
@@ -398,6 +412,8 @@ export function createWorkflowView({
       title: String(input.title || ""),
       description: String(input.description || ""),
       acceptanceCriteria: String(input.acceptanceCriteria || ""),
+      pullRequestRepository: String(input.pullRequestRepository || "").trim(),
+      pullRequestNumber: String(input.pullRequestNumber || "").trim(),
     };
     change({
       ownerDraft: draft,
@@ -406,7 +422,7 @@ export function createWorkflowView({
       ownerRequestError: "",
     });
     const request = {
-      schemaVersion: 1,
+      schemaVersion: draft.workType === "pull_request" ? 2 : 1,
       requestId: state.ownerRequestId,
       workType: draft.workType,
       priority: draft.priority,
@@ -417,6 +433,12 @@ export function createWorkflowView({
         .map((line) => line.trim())
         .filter(Boolean),
     };
+    if (draft.workType === "pull_request") {
+      request.pullRequest = {
+        repository: draft.pullRequestRepository,
+        number: Number(draft.pullRequestNumber),
+      };
+    }
     try {
       const response = await fetchImpl("/api/work/requests", {
         method: "POST",
@@ -455,6 +477,8 @@ export function createWorkflowView({
           title: form.get("title"),
           description: form.get("description"),
           acceptanceCriteria: form.get("acceptanceCriteria"),
+          pullRequestRepository: form.get("pullRequestRepository"),
+          pullRequestNumber: form.get("pullRequestNumber"),
         });
       },
     );

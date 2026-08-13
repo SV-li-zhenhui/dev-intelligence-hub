@@ -1,6 +1,6 @@
 import {
-  createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
+  ownerWorkRequestEventMatches,
   ownerWorkRequestDigest,
 } from "../domain/owner-work-request.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
@@ -247,11 +247,10 @@ export function normalizeOwnerWorkRequestRecord(value) {
   const createdAt = timestamp(value.createdAt, "所有者工作请求创建时间");
   const updatedAt = timestamp(value.updatedAt, "所有者工作请求更新时间");
   const requestDigest = ownerWorkRequestDigest(request);
-  const expectedEvent = createOwnerWorkRequestEvent(request, createdAt);
   if (
     value.requestId !== request.requestId ||
     value.requestDigest !== requestDigest ||
-    !sameValue(event, expectedEvent) ||
+    !ownerWorkRequestEventMatches(request, event, createdAt) ||
     !PHASES.includes(value.phase) ||
     Date.parse(updatedAt) < Date.parse(createdAt)
   ) {

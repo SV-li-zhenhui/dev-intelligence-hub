@@ -33,6 +33,7 @@ import {
   SupervisedProcessRunner,
 } from "../src/lib/supervised-process-runner.js";
 
+// PRIVACY_FAKE_CREDENTIAL_SHA256:02255638daaeab21a0201e46ab454b5616c4d4e21e06ae5608194ade5b7646e4
 const TOKEN = "ghp_fictionalCredentialValue123456789";
 const ACTOR = "owner-login";
 const OFFLINE_GH_SOURCE = path.join(

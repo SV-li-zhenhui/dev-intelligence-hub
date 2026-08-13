@@ -3,6 +3,7 @@ using System.Text;
 
 public static class OfflineGitHubToken
 {
+    // PRIVACY_FAKE_CREDENTIAL_SHA256:02255638daaeab21a0201e46ab454b5616c4d4e21e06ae5608194ade5b7646e4
     private const string Token = "ghp_fictionalCredentialValue123456789";
 
     public static int Main(string[] arguments)

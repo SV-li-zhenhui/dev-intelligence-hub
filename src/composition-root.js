@@ -2097,6 +2097,11 @@ export async function createApplication({
                 };
               },
             }),
+            pullRequestResolver: frozenPort(
+              github,
+              ["resolvePullRequestTarget"],
+              "owner pull request resolver",
+            ),
             ...(ordinaryActionAdmissionGate === null
               ? {}
               : { actionAdmissionGate: ordinaryActionAdmissionGate }),

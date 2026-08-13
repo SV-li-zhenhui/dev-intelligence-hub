@@ -366,3 +366,41 @@ test("owner work form submits only structured business fields and preserves retr
   assert.match(markup, /岗位 · orchestrator/);
   assert.equal(markup.includes("事件 JSON（使用当前配置模拟）"), true);
 });
+
+test("PR owner work submits a structured repository and number without browser authority fields", async () => {
+  let submitted;
+  const view = createWorkflowView({
+    fetchImpl: async (url, options) => {
+      if (url === "/api/workflow/routing") return jsonResponse(routingDefinition());
+      if (url === "/api/workflow/assignments?limit=30") return jsonResponse({ items: [] });
+      if (url === "/api/workflow/audit?limit=30") return jsonResponse({ items: [] });
+      submitted = JSON.parse(options.body);
+      return jsonResponse({
+        deduplicated: false,
+        requestId: submitted.requestId,
+        phase: "intaken",
+        assignment: { target: { type: "role", id: "pr-engineer" } },
+        workItemId: `work-item-${"a".repeat(64)}`,
+      }, 201);
+    },
+    requestIdFactory: () => "123e4567-e89b-42d3-a456-426614174000",
+  });
+  await view.load();
+  await view.submitOwnerRequest({
+    workType: "pull_request",
+    priority: "high",
+    title: "Review selected PR",
+    description: "Use an independent owner-requested source.",
+    acceptanceCriteria: "Bind the current Head",
+    pullRequestRepository: "acme/repo",
+    pullRequestNumber: "42",
+  });
+
+  assert.deepEqual(submitted.pullRequest, {
+    repository: "acme/repo",
+    number: 42,
+  });
+  assert.equal(submitted.schemaVersion, 2);
+  assert.equal("roleId" in submitted, false);
+  assert.match(view.render(), /pr-engineer/);
+});

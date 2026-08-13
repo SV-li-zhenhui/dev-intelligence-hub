@@ -1,5 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
+  createOwnerPullRequestEvent,
   createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
   ownerWorkRequestDigest,
@@ -172,6 +173,7 @@ export class OwnerWorkRequestService {
     workflowRouting,
     ledger,
     roleReadiness,
+    pullRequestResolver,
     exclusiveLease,
     actionAdmissionGate,
     operationQueue,
@@ -185,6 +187,13 @@ export class OwnerWorkRequestService {
     );
     this.ledger = requirePort(ledger, ["intake", "listItems"], "ledger");
     this.roleReadiness = requirePort(roleReadiness, ["read"], "roleReadiness");
+    this.pullRequestResolver = pullRequestResolver === undefined
+      ? null
+      : requirePort(
+          pullRequestResolver,
+          ["resolvePullRequestTarget"],
+          "pullRequestResolver",
+        );
     this.exclusiveLease = requirePort(exclusiveLease, ["run"], "exclusiveLease");
     const gate = actionAdmissionGate ?? DIRECT_ADMISSION;
     this.runNewWorkAdmission = requirePort(
@@ -300,6 +309,12 @@ export class OwnerWorkRequestService {
       );
     }
     if (!record) {
+      if (request.schemaVersion === 1 && request.workType === "pull_request") {
+        throw ownerRequestError(
+          "OWNER_WORK_REQUEST_INVALID",
+          "PR 推进必须提供结构化仓库与 PR 编号",
+        );
+      }
       if (this.state.records.length >= OWNER_WORK_REQUEST_MAX_RECORDS) {
         throw ownerRequestError(
           "OWNER_WORK_REQUEST_CAPACITY_EXCEEDED",
@@ -308,13 +323,40 @@ export class OwnerWorkRequestService {
         );
       }
       const createdAt = this.#now();
-      const event = createOwnerWorkRequestEvent(request, createdAt);
+      const event = request.schemaVersion === 2
+        ? await this.#createPullRequestEvent(request, createdAt)
+        : createOwnerWorkRequestEvent(request, createdAt);
       await this.#preflight(event);
       record = createStagedOwnerWorkRequestRecord(request, event, createdAt);
       await this.#persistRecord(record);
     }
     record = await this.#advance(record);
     return publicRecord(record, deduplicated);
+  }
+
+  async #createPullRequestEvent(request, createdAt) {
+    if (this.pullRequestResolver === null) {
+      throw ownerRequestError(
+        "OWNER_PULL_REQUEST_RESOLVER_NOT_READY",
+        "PR 推进的 GitHub 解析器尚未就绪",
+        503,
+      );
+    }
+    let resolved;
+    try {
+      resolved = await this.pullRequestResolver.resolvePullRequestTarget(
+        request.pullRequest,
+      );
+      return createOwnerPullRequestEvent(request, resolved, createdAt);
+    } catch (cause) {
+      if (cause?.code === "OWNER_WORK_REQUEST_INVALID") throw cause;
+      throw ownerRequestError(
+        "OWNER_PULL_REQUEST_RESOLUTION_FAILED",
+        "无法读取并冻结指定 PR 的当前 Git 目标",
+        cause?.statusCode === 409 ? 409 : 503,
+        { cause },
+      );
+    }
   }
 
   async #advance(recordValue) {
@@ -411,7 +453,11 @@ export class OwnerWorkRequestService {
         );
       }
       const item = result.items.find(
-        (candidate) => candidate?.assignmentId === assignmentId,
+        (candidate) =>
+          candidate?.assignmentId === assignmentId ||
+          candidate?.source?.bindings?.some(
+            (binding) => binding.assignmentId === assignmentId,
+          ),
       );
       if (item) return item;
       if (result.nextCursor === null) return null;

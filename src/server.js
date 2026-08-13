@@ -2877,9 +2877,24 @@ export function createDashboardServer(
       if (request.method === "POST" && url.pathname === "/api/work/requests") {
         requireNoQuery(url, "所有者工作请求参数无效");
         assertTrustedMutation(request, expectedOrigin, { json: true });
+        const ownerRequestBody = await readJsonBody(
+          request,
+          ownerWorkRequestMaximumBytes,
+        );
         const input = requireExactJsonFields(
-          await readJsonBody(request, ownerWorkRequestMaximumBytes),
-          [
+          ownerRequestBody,
+          ownerRequestBody?.schemaVersion === 2
+            ? [
+                "schemaVersion",
+                "requestId",
+                "workType",
+                "priority",
+                "title",
+                "description",
+                "acceptanceCriteria",
+                "pullRequest",
+              ]
+            : [
             "schemaVersion",
             "requestId",
             "workType",
@@ -2887,7 +2902,7 @@ export function createDashboardServer(
             "title",
             "description",
             "acceptanceCriteria",
-          ],
+              ],
           "所有者工作请求字段无效",
         );
         const result = await requireOwnerWorkRequests(application).submit(input);

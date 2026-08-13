@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createOwnerPullRequestEvent,
   createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
   withOwnerWorkRequestDefaultRoute,
@@ -30,6 +31,20 @@ function request(overrides = {}) {
     title: "Build a safe owner intake",
     description: "Route one durable shared task through the command center.",
     acceptanceCriteria: ["One shared root", "No browser-selected authority"],
+    ...overrides,
+  };
+}
+
+function pullRequest(overrides = {}) {
+  return {
+    schemaVersion: 2,
+    requestId: REQUEST_ID,
+    workType: "pull_request",
+    priority: "high",
+    title: "Review an explicitly selected PR",
+    description: "Continue this PR even when it is outside automatic discovery.",
+    acceptanceCriteria: ["Use a newly bound authority source"],
+    pullRequest: { repository: "acme/repo", number: 42 },
     ...overrides,
   };
 }
@@ -202,6 +217,70 @@ test("owner request DTO exposes business fields only and creates a bound workflo
   }
 });
 
+test("an explicit PR request requires a structured target and creates a distinct owner authority event", () => {
+  const normalized = normalizeOwnerWorkRequest(pullRequest());
+  assert.deepEqual(normalized.pullRequest, {
+    repository: "acme/repo",
+    number: 42,
+  });
+  assert.throws(
+    () => normalizeOwnerWorkRequest(pullRequest({ pullRequest: undefined })),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
+  assert.equal(
+    normalizeOwnerWorkRequest(request({ workType: "pull_request" }))
+      .schemaVersion,
+    1,
+  );
+
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "d".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/owner-request",
+    headRefOid: "a".repeat(40),
+  };
+  const event = createOwnerPullRequestEvent(
+    normalized,
+    {
+      repository: "acme/repo",
+      number: 42,
+      title: "PR 42",
+      gitTarget,
+    },
+    "2026-08-08T01:00:00.000Z",
+  );
+  assert.equal(event.eventType, "pull_request.owner_requested");
+  assert.deepEqual(event.source, {
+    provider: "local-owner",
+    scopeId: `owner-request:${REQUEST_ID}`,
+  });
+  assert.deepEqual(event.subject, {
+    id: "github:pr:acme/repo#42",
+    repository: "acme/repo",
+    number: 42,
+  });
+  assert.equal(event.payload.headRefOid, gitTarget.headRefOid);
+  assert.deepEqual(event.payload.gitTarget, gitTarget);
+
+  const routed = withOwnerWorkRequestDefaultRoute({
+    schemaVersion: 1,
+    enabled: true,
+    maxHops: 8,
+    rules: [],
+  });
+  assert.deepEqual(
+    routeWorkflowEvent({ event, config: routed }).assignments.map(
+      ({ target }) => target,
+    ),
+    [{ type: "role", id: "pr-engineer" }],
+  );
+});
+
 test("default route creates exactly one durable orchestrator root and replay is idempotent", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "owner-work-request-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -253,6 +332,63 @@ test("default route creates exactly one durable orchestrator root and replay is 
   );
   assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 1);
   assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
+});
+
+test("an explicit PR request resolves one immutable target before staging a PR engineer root", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-pr-request-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  let resolveCalls = 0;
+  const owner = await createOwnerWorkRequestRuntime({
+    store,
+    workflowRouting: routing,
+    ledger,
+    roleReadiness: roleReadiness(),
+    pullRequestResolver: {
+      async resolvePullRequestTarget(target) {
+        resolveCalls += 1;
+        return {
+          ...target,
+          title: "PR 42",
+          gitTarget: {
+            schemaVersion: 1,
+            provider: "github",
+            sourceAccountId: "runtime-user",
+            baseRepository: target.repository,
+            baseRefName: "main",
+            baseRefOid: "d".repeat(40),
+            headRepository: "contributor/repo",
+            headRefName: "fix/owner-request",
+            headRefOid: "a".repeat(40),
+          },
+        };
+      },
+    },
+    clock,
+    createGuard: guardFactory,
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+
+  await assert.rejects(
+    owner.submit(request({ workType: "pull_request" })),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
+  assert.equal(resolveCalls, 0);
+  const first = await owner.submit(pullRequest());
+  const replay = await owner.submit(pullRequest());
+  assert.equal(resolveCalls, 1);
+  assert.equal(first.phase, "intaken");
+  assert.deepEqual(first.assignment.target, {
+    type: "role",
+    id: "pr-engineer",
+  });
+  assert.equal(replay.deduplicated, true);
+  assert.equal(replay.workItemId, first.workItemId);
+  const item = (await ledger.listItems({ limit: 10 })).items[0];
+  assert.equal(item.source.scope.kind, "owner_requested");
+  assert.equal(item.source.current.event.payload.headRefOid, "a".repeat(40));
 });
 
 test("restart resumes a staged request after a lost routing response without duplication", async (t) => {

@@ -1688,6 +1688,26 @@ h1 {
   font-size: 11px;
 }
 
+.workflow-owner-pr-target {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.workflow-owner-pr-target legend {
+  padding: 0 5px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.workflow-owner-pr-target small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .workflow-owner-form input,
 .workflow-owner-form select,
 .workflow-owner-form textarea {

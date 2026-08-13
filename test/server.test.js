@@ -4077,6 +4077,24 @@ test("owner work request HTTP API is same-origin, structured, and read-back capa
       assert.equal(replay.status, 200);
       assert.equal(JSON.parse(created.body).assignment.target.id, "orchestrator");
 
+      const explicitPr = {
+        schemaVersion: 2,
+        requestId: id,
+        workType: "pull_request",
+        priority: "high",
+        title: "Review selected PR",
+        description: "Use an independently resolved PR authority source.",
+        acceptanceCriteria: ["Bind the current Head"],
+        pullRequest: { repository: "acme/repo", number: 42 },
+      };
+      const prResponse = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: JSON.stringify(explicitPr),
+      });
+      assert.equal(prResponse.status, 200);
+
       const listed = await request(server, {
         path: `/api/work/requests?limit=7&cursor=${id}`,
       });
@@ -4088,6 +4106,7 @@ test("owner work request HTTP API is same-origin, structured, and read-back capa
       assert.deepEqual(calls, [
         { operation: "submit", input },
         { operation: "submit", input },
+        { operation: "submit", input: explicitPr },
         { operation: "list", options: { limit: "7", cursor: id } },
         { operation: "get", requestId: id },
       ]);

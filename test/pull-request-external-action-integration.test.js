@@ -151,7 +151,16 @@ function fakeTransport({
 function executorFor(binding, evidence, transport, overrides = {}) {
   return createPullRequestExternalActionExecutor({
     enabledActions: ACTIONS,
-    credentialProvider: () => "fake-runtime-secret",
+    credentialSource: Object.freeze({
+      async acquire() {
+        return Object.freeze({
+          async use(callback) {
+            return callback("fake-runtime-secret");
+          },
+          async release() {},
+        });
+      },
+    }),
     transport,
     inputAuthorityVerifier: {
       async verify() { return structuredClone(binding); },
