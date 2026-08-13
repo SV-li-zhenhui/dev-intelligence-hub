@@ -1,6 +1,9 @@
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import { projectWorkflowSnapshot } from "../domain/workflow-snapshot-events.js";
+import {
+  isTrustedPullRequestScopeLifecycleAssignment,
+} from "../domain/pull-request-scope-lifecycle.js";
 import { validateWorkflowRouteResultAgainstTrustedEvaluation } from "./workflow-route-result.js";
 import {
   assertWorkflowAssignmentFeedConsistency,
@@ -311,18 +314,21 @@ function assertCrossRecordConsistency(state) {
     const rule = config?.definition.rules.find(
       (candidate) => candidate.id === assignment.ruleId,
     );
+    const trustedLifecycle =
+      isTrustedPullRequestScopeLifecycleAssignment(assignment, event);
     if (
       !event ||
       !config ||
       assignment.eventType !== event.eventType ||
       workflowDigest(assignment.subject) !== workflowDigest(event.subject) ||
-      !rule ||
-      assignment.priority !== rule.priority ||
-      !rule.targets.some(
-        (target) =>
-          target.type === assignment.target.type &&
-          target.id === assignment.target.id,
-      )
+      (!trustedLifecycle &&
+        (!rule ||
+          assignment.priority !== rule.priority ||
+          !rule.targets.some(
+            (target) =>
+              target.type === assignment.target.type &&
+              target.id === assignment.target.id,
+          )))
     ) {
       throw workflowServiceError(
         "WORKFLOW_STATE_CORRUPTED",
@@ -366,11 +372,15 @@ function assertCrossRecordConsistency(state) {
       );
     }
     try {
+      const ordinaryAssignments = related.filter(
+        (assignment) =>
+          !isTrustedPullRequestScopeLifecycleAssignment(assignment, event),
+      );
       validateWorkflowRouteResultAgainstTrustedEvaluation(
         {
           outcome: entry.outcome,
           matches: entry.matchedRuleIds,
-          assignments: related.map(({ ruleId, target, priority }) => ({
+          assignments: ordinaryAssignments.map(({ ruleId, target, priority }) => ({
             ruleId,
             target,
             priority,

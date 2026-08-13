@@ -688,10 +688,17 @@ test("an employee PR action remains inert until the owner confirmation API bound
   };
   const executor = createPullRequestExternalActionExecutor({
     enabledActions: ["comment"],
-    credentialProvider() {
-      credentialCalls += 1;
-      return "fake-token-never-leaves-the-test";
-    },
+    credentialSource: Object.freeze({
+      async acquire() {
+        credentialCalls += 1;
+        return Object.freeze({
+          async use(callback) {
+            return callback("fake-token-never-leaves-the-test");
+          },
+          release() {},
+        });
+      },
+    }),
     transport,
     inputAuthorityVerifier: {
       async verify() {

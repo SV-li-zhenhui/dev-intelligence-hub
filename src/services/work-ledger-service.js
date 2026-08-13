@@ -1,5 +1,8 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
+  isTrustedPullRequestScopeLifecycleAssignment,
+} from "../domain/pull-request-scope-lifecycle.js";
+import {
   planWorkItemClaim,
   planWorkItemCompletion,
   planWorkItemHandoff,
@@ -50,6 +53,7 @@ import {
 } from "./work-ledger-records.js";
 import {
   activatePendingPullRequestWorkSource,
+  applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
@@ -129,6 +133,17 @@ function samePullRequestSubject(left, right) {
       left.source.identity.pullRequestNumber ===
         right.source.identity.pullRequestNumber,
   );
+}
+
+function pullRequestRootForLifecycle(itemsById, event) {
+  return [...itemsById.values()].find((item) =>
+    item?.source?.kind === "pull_request" &&
+    item.source.identity.provider === event.source?.provider &&
+    item.source.identity.scopeId === event.source?.scopeId &&
+    item.source.identity.subjectId === event.subject?.id &&
+    item.source.identity.repository === event.subject?.repository &&
+    item.source.identity.pullRequestNumber === event.subject?.number
+  ) ?? null;
 }
 
 function operationalPullRequestPredecessor(itemsById, root, authority) {
@@ -792,6 +807,113 @@ export class WorkLedgerService {
         deduplicated += 1;
         continue;
       }
+      const trustedScopeLifecycle =
+        isTrustedPullRequestScopeLifecycleAssignment(
+          envelope.assignment,
+          envelope.event,
+        );
+      const ordinaryRouteForLifecycle = batch.items.some(
+        (candidate) =>
+          candidate.event.eventId === envelope.event.eventId &&
+          candidate.assignment.target?.type === "role" &&
+          candidate.assignment.target?.id === "pr-engineer",
+      );
+      if (trustedScopeLifecycle) {
+        let root = pullRequestRootForLifecycle(itemsById, envelope.event);
+        if (root !== null) {
+          const applied = applyPullRequestScopeLifecycle(root.source, envelope);
+          const active = applied.source.scope.active;
+          const cutover = inspectPullRequestSourceCutover(
+            root,
+            [...itemsById.values()],
+            outboxById,
+            { forceHeadChanged: true },
+          );
+          if (cutover.blockers.length === 0) {
+            root = applyReadyPullRequestSourceCutover({
+              root,
+              activation: cutover,
+              itemsById,
+              outboxById,
+              nextInputRevision: applied.source.activeRevision,
+              nextHeadRevision: applied.source.headRevision,
+              now,
+              timelineEvents,
+            });
+          }
+          const firstRevisionInBatch =
+            initialItemIds.has(root.itemId) &&
+            !revisedItemIds.has(root.itemId);
+          const settlementPending = cutover.blockers.length > 0;
+          root = {
+            ...root,
+            source: applied.source,
+            inputDigest: applied.source.current.inputDigest,
+            ...(firstRevisionInBatch
+              ? { revision: root.revision + 1 }
+              : {}),
+            ...(settlementPending
+              ? {
+                  statusReason: active
+                    ? "pr_source_reentered_scope_pending_settlement"
+                    : "pr_source_left_scope_pending_settlement",
+                }
+              : {
+                  status: active && ordinaryRouteForLifecycle
+                    ? "queued"
+                    : "blocked",
+                  ownerId: null,
+                  leaseId: null,
+                  leaseUntil: null,
+                  activeIntentId: null,
+                  decisionContext: null,
+                  availableAt: null,
+                  statusReason: active
+                    ? ordinaryRouteForLifecycle
+                      ? "pr_source_reentered_scope"
+                      : "pr_source_reentered_scope_without_route"
+                    : "pr_source_left_scope",
+                }),
+            updatedAt: now,
+          };
+          if (firstRevisionInBatch) revisedItemIds.add(root.itemId);
+          rootByWorkKey.set(root.source.workKey, root);
+          itemsById.set(root.itemId, root);
+          touchedItemIds.add(root.itemId);
+          timelineEvents.push({
+            itemId: root.itemId,
+            type: "pr_source_revised",
+            at: now,
+            actorId: "work-ledger-system",
+            details: {
+              workKey: root.source.workKey,
+              sourceSequence: envelope.sequence,
+              inputRevision: root.source.inputRevision,
+              activeRevision: root.source.activeRevision,
+              pendingRevision: root.source.pendingRevision,
+              headRevision: root.source.headRevision,
+              headRefOid: root.source.current.headRefOid,
+              disposition: applied.disposition,
+              scopeActive: active,
+              authorityEpoch: root.source.authorityEpoch,
+            },
+          });
+        }
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        continue;
+      }
+      if (envelope.event.eventType === "pull_request.left_scope") {
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        continue;
+      }
       const rootCandidate = createPullRequestSourceRootWorkItem(envelope, now);
       if (rootCandidate === null) {
         knownAssignments.set(assignmentItem.assignmentId, {
@@ -1205,6 +1327,11 @@ export class WorkLedgerService {
         }
         disposition = appended.disposition;
         headAdvanced = appended.headAdvanced === true;
+        const restoresLifecycleRoute =
+          appended.disposition === "bound_existing_event" &&
+          envelope.event.eventType === "pull_request.created" &&
+          root.source.scope.active === true &&
+          root.statusReason === "pr_source_reentered_scope_without_route";
         const firstRevisionInBatch =
           initialItemIds.has(root.itemId) && !revisedItemIds.has(root.itemId);
         root = {
@@ -1214,14 +1341,17 @@ export class WorkLedgerService {
           ...(firstRevisionInBatch
             ? { revision: root.revision + 1 }
             : {}),
-          ...(appended.activeAdvanced && canRequeueAdvancedPullRequestRoot(root)
+          ...((appended.activeAdvanced && canRequeueAdvancedPullRequestRoot(root)) ||
+            restoresLifecycleRoute
             ? {
                 status: "queued",
                 ownerId: null,
                 leaseId: null,
                 leaseUntil: null,
                 availableAt: null,
-                statusReason: "pr_source_revised",
+                statusReason: restoresLifecycleRoute
+                  ? "pr_source_reentered_scope"
+                  : "pr_source_revised",
               }
             : {}),
           updatedAt: now,

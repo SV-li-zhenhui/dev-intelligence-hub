@@ -94,6 +94,7 @@ test("rejects extra fields, duplicate ids, invalid fallback conditions, and unsa
     config([rule({ targets: [{ type: "queue", id: "review" }] })]),
     config([rule({ targets: [{ type: "node", id: "../unsafe" }] })]),
     config([rule({ priority: 1.5 })]),
+    config([rule({ id: "system-pull-request-scope-lifecycle" })]),
   ];
 
   for (const definition of invalidDefinitions) {

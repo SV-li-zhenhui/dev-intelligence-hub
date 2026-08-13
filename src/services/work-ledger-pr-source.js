@@ -10,6 +10,9 @@ import {
 } from "../domain/git-tool-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import {
+  isTrustedPullRequestScopeLifecycleAssignment,
+} from "../domain/pull-request-scope-lifecycle.js";
+import {
   SHA256_PATTERN,
   boundedLedgerString,
   canonicalLedgerValue,
@@ -28,11 +31,22 @@ const SOURCE_KEYS = [
   "inputRevision",
   "activeRevision",
   "headRevision",
+  "authorityEpoch",
+  "scope",
   "pendingRevision",
   "current",
   "pending",
   "revisions",
   "bindings",
+];
+const LEGACY_SOURCE_KEYS = SOURCE_KEYS.filter(
+  (key) => !["authorityEpoch", "scope"].includes(key),
+);
+const SCOPE_KEYS = [
+  "kind",
+  "active",
+  "revision",
+  "lastLifecycleEventId",
 ];
 const IDENTITY_KEYS = [
   "provider",
@@ -188,6 +202,28 @@ function plainArray(value, name) {
   return result;
 }
 
+function normalizePullRequestScope(value) {
+  exact(value, SCOPE_KEYS, "PR scope");
+  if (
+    value.kind !== "automatic" ||
+    typeof value.active !== "boolean"
+  ) {
+    throw invalid("PR scope 状态无效");
+  }
+  return {
+    kind: "automatic",
+    active: value.active,
+    revision: positiveInteger(value.revision, "scope.revision"),
+    lastLifecycleEventId: value.lastLifecycleEventId === null
+      ? null
+      : text(
+          value.lastLifecycleEventId,
+          "scope.lastLifecycleEventId",
+          192,
+        ),
+  };
+}
+
 function canonical(value, name) {
   try {
     return canonicalLedgerValue(value, {
@@ -237,7 +273,7 @@ function sourceInputDigest(workKey, event) {
   return ledgerDigest({ workKey, event }, { maximumEntries: 30_000 });
 }
 
-function identityFor(assignment, event) {
+function identityFor(assignment, event, trustedLifecycle = false) {
   let target;
   try {
     target = normalizeLedgerTarget(assignment.target);
@@ -245,8 +281,8 @@ function identityFor(assignment, event) {
     return null;
   }
   if (
-    target.type !== "role" ||
-    target.id !== "pr-engineer" ||
+    (!trustedLifecycle &&
+      (target.type !== "role" || target.id !== "pr-engineer")) ||
     !event.eventType.startsWith("pull_request.") ||
     event.source.provider !== "github"
   ) {
@@ -261,7 +297,7 @@ function identityFor(assignment, event) {
       event.subject.number,
       "pullRequestNumber",
     ),
-    targetRoleId: target.id,
+    targetRoleId: "pr-engineer",
   };
 }
 
@@ -273,16 +309,23 @@ function normalizedEnvelope(value) {
   const sequence = positiveInteger(value.sequence, "sourceSequence");
   const assignment = canonical(value.assignment, "assignment");
   const rawEvent = canonical(value.event, "event");
-  if (
-    assignment.target?.type !== "role" ||
-    assignment.target?.id !== "pr-engineer" ||
-    typeof rawEvent.eventType !== "string" ||
-    !rawEvent.eventType.startsWith("pull_request.")
-  ) {
+  const ordinaryTarget = assignment.target?.type === "role" &&
+    assignment.target?.id === "pr-engineer";
+  const lifecycleTarget = assignment.target?.type === "node" &&
+    assignment.target?.id === "system-pull-request-scope-lifecycle" &&
+    assignment.ruleId === "system-pull-request-scope-lifecycle";
+  if (typeof rawEvent.eventType !== "string" ||
+      !rawEvent.eventType.startsWith("pull_request.") ||
+      (!ordinaryTarget && !lifecycleTarget)) {
     return null;
   }
   const event = storedEvent(rawEvent);
-  const identity = identityFor(assignment, event);
+  const trustedLifecycle =
+    isTrustedPullRequestScopeLifecycleAssignment(assignment, event);
+  if (!trustedLifecycle && !ordinaryTarget) {
+    return null;
+  }
+  const identity = identityFor(assignment, event, trustedLifecycle);
   if (identity === null) return null;
   const assignmentId = text(
     assignment.assignmentId,
@@ -307,6 +350,7 @@ function normalizedEnvelope(value) {
       ? null
       : previousHead(event.payload.previousHeadRefOid),
     inputDigest: sourceInputDigest(workKey, event),
+    trustedLifecycle,
   };
 }
 
@@ -362,7 +406,7 @@ export function pullRequestWorkDescriptor(envelope) {
 
 export function createPullRequestWorkSource(envelope) {
   const input = normalizedEnvelope(envelope);
-  if (input === null) return null;
+  if (input === null || input.trustedLifecycle) return null;
   return {
     descriptor: input,
     source: {
@@ -373,6 +417,13 @@ export function createPullRequestWorkSource(envelope) {
       inputRevision: 1,
       activeRevision: 1,
       headRevision: 1,
+      authorityEpoch: 1,
+      scope: {
+        kind: "automatic",
+        active: true,
+        revision: 1,
+        lastLifecycleEventId: null,
+      },
       pendingRevision: null,
       current: currentFrom(input),
       pending: null,
@@ -545,6 +596,7 @@ export function appendPullRequestWorkSource(
       inputRevision: revision,
       activeRevision: accepted && activate ? revision : source.activeRevision,
       headRevision: accepted ? headRevision : source.headRevision,
+      authorityEpoch: accepted ? headRevision : source.authorityEpoch,
       pendingRevision: accepted
         ? activate ? null : revision
         : source.pendingRevision,
@@ -569,6 +621,42 @@ export function appendPullRequestWorkSource(
     disposition,
     headAdvanced: accepted && executionAuthorityChanged,
     activeAdvanced: accepted && activate,
+  };
+}
+
+export function applyPullRequestScopeLifecycle(value, envelope) {
+  const source = normalizePullRequestWorkSource(value);
+  const input = normalizedEnvelope(envelope);
+  if (input === null || !input.trustedLifecycle) {
+    throw invalid("PR 范围生命周期分派无效");
+  }
+  if (input.workKey !== source.workKey) {
+    throw invalid("PR 范围生命周期工作键不一致");
+  }
+  const active = input.event.eventType === "pull_request.created";
+  const authorityChanged = source.scope.active !== active;
+  const appended = appendPullRequestWorkSource(source, envelope, {
+    activate: true,
+    authorityEpochChanged: authorityChanged,
+  });
+  if (!appended.changed) return appended;
+  return {
+    ...appended,
+    source: {
+      ...appended.source,
+      authorityEpoch: appended.source.headRevision,
+      scope: {
+        ...appended.source.scope,
+        active,
+        revision: authorityChanged
+          ? appended.source.scope.revision + 1
+          : appended.source.scope.revision,
+        lastLifecycleEventId: authorityChanged
+          ? input.event.eventId
+          : appended.source.scope.lastLifecycleEventId,
+      },
+    },
+    authorityChanged,
   };
 }
 
@@ -792,7 +880,8 @@ function normalizeEventPointer(
 }
 
 export function normalizePullRequestWorkSource(value) {
-  exact(value, SOURCE_KEYS, "PR source");
+  const legacySource = hasExactLedgerKeys(value, LEGACY_SOURCE_KEYS);
+  if (!legacySource) exact(value, SOURCE_KEYS, "PR source");
   if (value.schemaVersion !== 1 || value.kind !== "pull_request") {
     throw invalid("PR source 版本或类型无效");
   }
@@ -802,6 +891,20 @@ export function normalizePullRequestWorkSource(value) {
   const inputRevision = positiveInteger(value.inputRevision, "inputRevision");
   const activeRevision = positiveInteger(value.activeRevision, "activeRevision");
   let headRevision = positiveInteger(value.headRevision, "headRevision");
+  const authorityEpoch = legacySource
+    ? headRevision
+    : positiveInteger(value.authorityEpoch, "authorityEpoch");
+  const scope = legacySource
+    ? {
+        kind: "automatic",
+        active: true,
+        revision: 1,
+        lastLifecycleEventId: null,
+      }
+    : normalizePullRequestScope(value.scope);
+  if (authorityEpoch !== headRevision) {
+    throw invalid("PR authority epoch 指针无效");
+  }
   const pendingRevision = optionalPositiveInteger(
     value.pendingRevision,
     "pendingRevision",
@@ -868,6 +971,8 @@ export function normalizePullRequestWorkSource(value) {
     inputRevision,
     activeRevision,
     headRevision,
+    authorityEpoch: headRevision,
+    scope,
     pendingRevision,
     current: null,
     pending: null,
@@ -901,6 +1006,23 @@ export function normalizePullRequestWorkSource(value) {
     )
   ) {
     throw invalid("PR current input 没有分派来源");
+  }
+  if (
+    scope.lastLifecycleEventId === source.current.eventId &&
+    (!["pull_request.created", "pull_request.left_scope"].includes(
+      source.current.event.eventType,
+    ) ||
+      scope.active !==
+        (source.current.event.eventType === "pull_request.created"))
+  ) {
+    throw invalid("PR scope 生命周期绑定无效");
+  }
+  if (
+    scope.active === false &&
+    (scope.lastLifecycleEventId !== source.current.eventId ||
+      source.current.event.eventType !== "pull_request.left_scope")
+  ) {
+    throw invalid("PR scope 非活动状态缺少生命周期绑定");
   }
   if (
     source.pending !== null &&
@@ -1085,6 +1207,7 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       ? null
       : gitTargetStateForEvent(observation.pointer.event);
     const authorityNegative =
+      observation.source.scope.active === false ||
       observation.item.sourceQuarantine !== null ||
       isAuthorityFenceDisposition(observation.revision.disposition) ||
       (observation.pointer !== null &&
@@ -1329,6 +1452,36 @@ export function hasPendingPullRequestSource(item) {
     item.source.pendingRevision !== null;
 }
 
+function validPullRequestScopeTransition(previousSource, nextSource) {
+  const previousScope = previousSource.scope;
+  const nextScope = nextSource.scope;
+  if (nextScope.revision < previousScope.revision) return false;
+  if (nextScope.revision === previousScope.revision) {
+    return isDeepStrictEqual(previousScope, nextScope);
+  }
+  const advances = nextScope.revision - previousScope.revision;
+  const appendedRevisions = nextSource.revisions.slice(
+    previousSource.revisions.length,
+  );
+  const authorityChanges = appendedRevisions.filter(
+    ({ disposition, authorityEpochChanged }) =>
+      disposition === "accepted" && authorityEpochChanged,
+  ).length;
+  return (
+    advances <= appendedRevisions.length &&
+    advances <= authorityChanges &&
+    nextSource.authorityEpoch - previousSource.authorityEpoch >= advances &&
+    nextScope.active ===
+      (advances % 2 === 0 ? previousScope.active : !previousScope.active) &&
+    nextScope.lastLifecycleEventId !==
+      previousScope.lastLifecycleEventId &&
+    nextSource.current.eventId === nextScope.lastLifecycleEventId &&
+    ["pull_request.created", "pull_request.left_scope"].includes(
+      nextSource.current.event.eventType,
+    )
+  );
+}
+
 export function validatePullRequestSourceTransition(previousItems, nextItems) {
   const nextById = new Map(nextItems.map((item) => [item.itemId, item]));
   for (const previous of previousItems) {
@@ -1344,6 +1497,8 @@ export function validatePullRequestSourceTransition(previousItems, nextItems) {
       nextSource.inputRevision < previousSource.inputRevision ||
       nextSource.activeRevision < previousSource.activeRevision ||
       nextSource.headRevision < previousSource.headRevision ||
+      nextSource.authorityEpoch < previousSource.authorityEpoch ||
+      !validPullRequestScopeTransition(previousSource, nextSource) ||
       (previousSource.pendingRevision !== null &&
         nextSource.pendingRevision !== null &&
         nextSource.pendingRevision < previousSource.pendingRevision) ||

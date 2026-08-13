@@ -5,6 +5,13 @@ import {
   workflowEventsFromSnapshots,
 } from "../domain/workflow-snapshot-events.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import {
+  isPullRequestScopeLifecycleEventType,
+  PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY,
+  PULL_REQUEST_SCOPE_LIFECYCLE_REASON,
+  PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID,
+  PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
+} from "../domain/pull-request-scope-lifecycle.js";
 import { routeWorkflowWithIsolation } from "./workflow-route-result.js";
 import {
   appendWorkflowAssignmentFeed,
@@ -291,6 +298,7 @@ export class WorkflowRoutingService {
           event,
           config,
           normalizeWorkflowTimestamp(this.clock()),
+          { includeTrustedScopeLifecycle: true },
         );
         assignments.push(...routed.assignments);
         audit.push(...routed.audit);
@@ -388,13 +396,38 @@ export class WorkflowRoutingService {
     });
   }
 
-  async #routeEvent(event, config, createdAt) {
+  async #routeEvent(
+    event,
+    config,
+    createdAt,
+    { includeTrustedScopeLifecycle = false } = {},
+  ) {
     const routed = await routeWorkflowWithIsolation({
       router: this.router,
       event,
       definition: config.definition,
     });
-    const assignments = routed.result.assignments.map((assignment) =>
+    const assignments = [];
+    if (
+      includeTrustedScopeLifecycle &&
+      isPullRequestScopeLifecycleEventType(routed.event.eventType)
+    ) {
+      assignments.push(
+        identifiedWorkflowRecord("assignmentId", "workflow-assignment", {
+          eventId: routed.event.eventId,
+          eventType: routed.event.eventType,
+          subject: cloneWorkflowValue(routed.event.subject),
+          configVersion: config.version,
+          configDigest: config.digest,
+          ruleId: PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID,
+          target: PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
+          priority: PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY,
+          reason: PULL_REQUEST_SCOPE_LIFECYCLE_REASON,
+          createdAt,
+        }),
+      );
+    }
+    assignments.push(...routed.result.assignments.map((assignment) =>
       identifiedWorkflowRecord("assignmentId", "workflow-assignment", {
         eventId: routed.event.eventId,
         eventType: routed.event.eventType,
@@ -407,7 +440,7 @@ export class WorkflowRoutingService {
         reason: assignment.reason,
         createdAt,
       }),
-    );
+    ));
     const audit = [
       identifiedWorkflowRecord("auditId", "workflow-audit", {
         eventId: routed.event.eventId,

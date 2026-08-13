@@ -162,6 +162,12 @@ function pendingHeadChanged(source) {
 
 function definitivelySettledBlocked(item, outboxById) {
   if (item.status !== "blocked" || item.activeIntentId !== null) return false;
+  if ([
+    "pr_source_left_scope",
+    "pr_source_reentered_scope_without_route",
+  ].includes(item.statusReason)) {
+    return true;
+  }
   if (item.statusReason === "pr_source_cross_root_cutover_retired") {
     return true;
   }

@@ -936,6 +936,7 @@ export class WorkIntentDispatcher {
   #admitAction;
   #createAttention;
   #createProposal;
+  #verifyInputAuthority;
   #prepareConflictExecutionSource;
   #verifyControlledCommitEvidence;
   #clock;
@@ -956,6 +957,10 @@ export class WorkIntentDispatcher {
     leaseDurationMs = DEFAULT_LEASE_MS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   } = {}) {
+    this.#verifyInputAuthority =
+      typeof ledger?.verifyPullRequestExecutionBinding === "function"
+        ? ledger.verifyPullRequestExecutionBinding.bind(ledger)
+        : null;
     this.#ledger = validateDependency(
       ledger,
       ["listOutbox", "listItems", "claimIntent", "bindIntent", "ackIntent"],
@@ -1498,6 +1503,26 @@ export class WorkIntentDispatcher {
         nextStatus: "blocked",
         code: "proposal-binding-invalid",
       });
+    }
+    const inputBinding = proposal.normalized.binding.inputBinding ?? null;
+    if (inputBinding !== null) {
+      let verified = null;
+      try {
+        verified = this.#verifyInputAuthority === null
+          ? null
+          : await this.#verifyInputAuthority(structuredClone(inputBinding));
+      } catch {
+        verified = null;
+      }
+      if (
+        verified === null ||
+        !samePullRequestExecutionBinding(verified, inputBinding)
+      ) {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "blocked",
+          code: "proposal-input-authority-stale",
+        });
+      }
     }
     let receipt;
     try {

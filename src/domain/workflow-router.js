@@ -1,3 +1,7 @@
+import {
+  PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID,
+} from "./pull-request-scope-lifecycle.js";
+
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const SAFE_PATH_SEGMENT = /^[A-Za-z][A-Za-z0-9_]*$/;
 const INVALID_TEXT_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -453,6 +457,9 @@ export function normalizeWorkflowRoutingConfig(value) {
   plainArray(value.rules, MAX_RULES, error);
   const globBudget = { patterns: 0, patternBytes: 0 };
   const rules = value.rules.map((rule) => normalizeRule(rule, globBudget));
+  if (rules.some(({ id }) => id === PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID)) {
+    throw invalidConfig("系统 PR 生命周期规则 ID 为保留标识");
+  }
   if (new Set(rules.map(({ id }) => id)).size !== rules.length) throw error;
 
   const normalized = {

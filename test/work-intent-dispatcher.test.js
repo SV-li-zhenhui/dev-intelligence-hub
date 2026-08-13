@@ -358,6 +358,11 @@ class FakeLedger {
     this.failAckBeforeOnce = false;
     this.failAckAfterOnce = false;
     this.failBindAfterOnce = false;
+    this.verifyInputAuthority = async (binding) => clone(binding);
+  }
+
+  async verifyPullRequestExecutionBinding(binding) {
+    return this.verifyInputAuthority(binding);
   }
 
   async listOutbox(options) {
@@ -745,6 +750,26 @@ test("internal outcomes and durable proposals map to explicit ledger states", as
       assert.equal(Object.hasOwn(ledger.ackCalls[0], "accountId"), false);
     });
   }
+});
+
+test("revoked PR authority after sealing prevents downstream proposal creation", async () => {
+  const pair = workPair(9, reviewIntent());
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+  ledger.verifyInputAuthority = async () => {
+    throw Object.assign(new Error("scope authority revoked"), {
+      code: "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+    });
+  };
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(ledger.bindCalls.length, 1);
+  assert.equal(proposals.calls.length, 0);
+  assert.equal(result.blocked, 1);
+  assert.equal(
+    ledger.ackCalls[0].details.code,
+    "proposal-input-authority-stale",
+  );
 });
 
 test("trusted PR role decisions produce five durable external action proposals", async (t) => {

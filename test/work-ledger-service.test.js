@@ -20,6 +20,12 @@ import {
   createPullRequestExecutionBinding,
 } from "../src/domain/pull-request-execution-binding.js";
 import {
+  PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY,
+  PULL_REQUEST_SCOPE_LIFECYCLE_REASON,
+  PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID,
+  PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
+} from "../src/domain/pull-request-scope-lifecycle.js";
+import {
   createLegacyWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../src/domain/work-graph-memory-event.js";
@@ -249,6 +255,26 @@ function prAssignment(
       createdAt: occurredAt,
     },
     event,
+  };
+}
+
+function prScopeLifecycleAssignment(sequence, event) {
+  return {
+    sequence,
+    assignment: {
+      assignmentId: `workflow-assignment-pr-scope-${sequence}`,
+      eventId: event.eventId,
+      eventType: event.eventType,
+      subject: clone(event.subject),
+      configVersion: 1,
+      configDigest: "1".repeat(64),
+      ruleId: PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID,
+      target: PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
+      priority: PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY,
+      reason: PULL_REQUEST_SCOPE_LIFECYCLE_REASON,
+      createdAt: event.occurredAt,
+    },
+    event: clone(event),
   };
 }
 
@@ -626,6 +652,302 @@ test("a new PR Head advances the epoch without creating another task", async () 
   assert.equal(items[0].source.inputRevision, 2);
   assert.equal(items[0].source.headRevision, 2);
   assert.equal(items[0].source.current.headRefOid, PR_HEAD_B);
+});
+
+test("leaving and re-entering automatic PR scope fences every older authority epoch", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items[0];
+  const oldBinding = prExecutionBinding(before);
+
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const inactive = (await fixture.service.listItems()).items[0];
+  assert.deepEqual(inactive.source.scope, {
+    kind: "automatic",
+    active: false,
+    revision: 2,
+    lastLifecycleEventId: leftEvent.eventId,
+  });
+  assert.equal(inactive.source.authorityEpoch, 2);
+  assert.equal(inactive.source.headRevision, 2);
+  assert.equal(inactive.status, "blocked");
+  assert.equal(inactive.statusReason, "pr_source_left_scope");
+  assert.equal(inactive.ownerId, null);
+  assert.equal(inactive.leaseId, null);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+
+  const createdOrdinary = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(3, createdOrdinary.event),
+    createdOrdinary,
+  );
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+
+  const active = (await fixture.service.listItems()).items[0];
+  assert.deepEqual(active.source.scope, {
+    kind: "automatic",
+    active: true,
+    revision: 3,
+    lastLifecycleEventId: createdOrdinary.event.eventId,
+  });
+  assert.equal(active.source.authorityEpoch, 3);
+  assert.equal(active.source.headRevision, 3);
+  assert.equal(active.status, "queued");
+  assert.equal(active.statusReason, "pr_source_reentered_scope");
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const currentBinding = prExecutionBinding(active);
+  assert.deepEqual(
+    await fixture.service.verifyPullRequestExecutionBinding(currentBinding),
+    currentBinding,
+  );
+});
+
+test("a forged PR scope lifecycle assignment cannot revoke automatic authority", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const forgedEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  const forged = prScopeLifecycleAssignment(2, forgedEvent);
+  forged.assignment.priority -= 1;
+  const fixture = await createFixture({ records: [initial, forged] });
+
+  await fixture.service.intake();
+  const items = (await fixture.service.listItems()).items;
+  const root = items.find(({ kind }) => kind === "source_root");
+
+  assert.equal(root.source.scope.active, true);
+  assert.equal(root.source.authorityEpoch, 1);
+  assert.equal(items.length, 1);
+  assert.equal((await fixture.service.getSummary()).intakeCursor, 2);
+});
+
+test("inactive PR scope and its authority epoch survive restart", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  const source = new FakeAssignmentSource([
+    initial,
+    prScopeLifecycleAssignment(2, leftEvent),
+  ]);
+  const store = new MemoryStore();
+  const first = await createFixture({ source, store });
+  await first.service.intake();
+
+  const recovered = await createFixture({ source, store });
+  const root = (await recovered.service.listItems()).items[0];
+
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.source.authorityEpoch, 2);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_left_scope");
+});
+
+test("a re-entry route split across intake pages still restores queued work", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const created = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(3, created.event),
+    created,
+  );
+  fixture.source.highWatermark = 4;
+
+  await fixture.service.intake({ limit: 1 });
+  let root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_reentered_scope_without_route");
+  await fixture.service.intake({ limit: 1 });
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.statusReason, "pr_source_reentered_scope");
+  assert.equal(root.source.authorityEpoch, 3);
+});
+
+test("a backlog may leave and re-enter PR scope in one atomic intake", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  const created = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, leftEvent),
+    prScopeLifecycleAssignment(3, created.event),
+    created,
+  );
+  fixture.source.highWatermark = 4;
+
+  await fixture.service.intake({ limit: 10 });
+  const root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.scope.active, true);
+  assert.equal(root.source.scope.revision, 3);
+  assert.equal(root.source.authorityEpoch, 3);
+  assert.equal(root.status, "queued");
+});
+
+test("leaving PR scope atomically fails an unsealed pending action", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  await fixture.service.stageIntent({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  const outbox = (await fixture.service.listOutbox()).items[0];
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.activeIntentId, null);
+  assert.equal(outbox.status, "failed");
+  assert.equal(
+    outbox.outcome.details.reason,
+    "pr_source_superseded_before_dispatch",
+  );
+});
+
+test("a sealed action can settle after scope exit but cannot restore PR authority", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const oldBinding = prExecutionBinding(root);
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    roleId: "pr-engineer",
+    intent: reviewIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const sealed = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: claimed.dispatcherId,
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, {
+      requestedBy: {
+        roleId: "pr-engineer",
+        workItemId: staged.item.itemId,
+      },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 },
+    }),
+  });
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.status, "dispatch_pending");
+  assert.equal(root.statusReason, "pr_source_left_scope_pending_settlement");
+  assert.equal(root.activeIntentId, sealed.intentId);
+
+  await fixture.service.ackIntent({
+    intentId: sealed.intentId,
+    expectedRevision: sealed.revision,
+    itemExpectedRevision: root.revision,
+    dispatchLeaseId: sealed.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "sealed-before-left-scope" },
+  });
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.status, "completed");
+  assert.equal(root.activeIntentId, null);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(
+      oldBinding,
+    ),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
 });
 
 test("PR execution verification rereads shared durable state before every decision", async () => {

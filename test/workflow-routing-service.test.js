@@ -391,6 +391,80 @@ test("configuration replacements are versioned, content-addressed, and whole rat
   assert.equal(store.writes.length, 2);
 });
 
+test("trusted PR scope lifecycle assignments survive disabled ordinary routing", async () => {
+  const { service, store } = await createFixture();
+  await configure(service, {
+    schemaVersion: 1,
+    enabled: false,
+    maxHops: 8,
+    rules: [],
+  });
+
+  const observed = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({ items: [pullRequest(42)] }),
+  });
+  const leftScope = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-02T01:01:00.000Z",
+      items: [],
+    }),
+  });
+
+  assert.deepEqual(
+    observed.events.map(({ eventType }) => eventType),
+    ["pull_request.observed"],
+  );
+  assert.equal(observed.assignments.length, 0);
+  for (const [result, eventType] of [
+    [leftScope, "pull_request.left_scope"],
+  ]) {
+    assert.deepEqual(result.events.map(({ eventType: type }) => type), [eventType]);
+    assert.equal(result.assignments.length, 1);
+    assert.equal(
+      result.assignments[0].ruleId,
+      "system-pull-request-scope-lifecycle",
+    );
+    assert.deepEqual(result.assignments[0].target, {
+      type: "node",
+      id: "system-pull-request-scope-lifecycle",
+    });
+    assert.deepEqual(result.audit[0].assignmentIds, [
+      result.assignments[0].assignmentId,
+    ]);
+  }
+
+  const recreated = await createFixture({ store });
+  const batch = await recreated.service.readAssignmentBatch({
+    afterSequence: 0,
+    limit: 10,
+  });
+  assert.deepEqual(
+    batch.items.map(({ event }) => event.eventType),
+    ["pull_request.left_scope"],
+  );
+});
+
+test("ordinary configuration cannot impersonate the trusted PR lifecycle route", async () => {
+  const { service, store } = await createFixture();
+  const forged = workflowConfig();
+  forged.rules[0] = {
+    ...forged.rules[0],
+    id: "system-pull-request-scope-lifecycle",
+    priority: 10_000,
+    targets: [{
+      type: "node",
+      id: "system-pull-request-scope-lifecycle",
+    }],
+  };
+
+  await assert.rejects(
+    configure(service, forged),
+    (error) => error.code === "INVALID_ROUTING_CONFIG",
+  );
+  assert.equal(store.writes.length, 0);
+  assert.equal((await service.getConfig()).current, null);
+});
+
 test("recover restores configuration history and content-addressed routing records", async () => {
   const { service, store } = await createFixture();
   const config = await configure(service);
@@ -886,8 +960,14 @@ test("a failed snapshot write preserves the old checkpoint for exact retry", asy
       "pull_request.created",
     ],
   );
-  assert.equal(retried.assignments.length, 3);
-  assert.equal((await recovered.listAssignments()).items.length, 4);
+  assert.equal(retried.assignments.length, 4);
+  assert.equal(
+    retried.assignments.filter(
+      ({ ruleId }) => ruleId === "system-pull-request-scope-lifecycle",
+    ).length,
+    1,
+  );
+  assert.equal((await recovered.listAssignments()).items.length, 5);
 });
 
 test("an unhealthy refresh retains the last healthy routing baseline", async () => {
