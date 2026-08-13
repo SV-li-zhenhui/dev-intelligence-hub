@@ -2365,11 +2365,26 @@ test(
     const fixture = await prepareFailedShutdownRecovery(t);
     await rewriteFixtureManager(
       fixture.root,
-      "return $probe.ExitCode -ne 61",
-      "return $true",
+      'const net = require("node:net");',
+      'process.exit(2);\nconst net = require("node:net");',
     );
 
-    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    const managerSource = await readFile(
+      path.join(fixture.root, "scripts", "Manage-MyDashboard.ps1"),
+      "utf8",
+    );
+    assert.match(
+      managerSource,
+      /return [$]probe[.]ExitCode -ne 61/u,
+      "listener ambiguity fixture must preserve the production exit-code mapping",
+    );
+
+    const rejected = invokeRecovery(fixture);
+    assert.match(
+      `${rejected.stderr}\n${rejected.stdout}`,
+      /occupied or its probe was ambiguous/u,
+    );
+    await assertRecoveryRejectedBeforeKill(fixture, rejected);
   },
 );
 
@@ -2543,6 +2558,45 @@ test(
     await writeFile(incident.recordPath, `${JSON.stringify(record)}\n`, "utf8");
 
     await restoreFixtureManager(fixture.root);
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.equal(await fileExists(fixture.controlPath), true);
+  },
+);
+
+test(
+  "RecoverFailedShutdown state-machine: string incident schemaVersion is rejected with its original HMAC",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const incident = await interruptRecoveryAfterExactExit(fixture);
+    const record = JSON.parse(await readFile(incident.recordPath, "utf8"));
+    const expectedAuthorityPayload = [
+      "recovery-incident-authority-v1",
+      String(record.schemaVersion),
+      record.incidentId,
+      record.state,
+      record.projectDigest,
+      String(record.processId),
+      record.instanceId,
+      record.processStartTimeUtcTicks,
+      record.startIdentity,
+      record.snapshotId,
+      record.sourceHashes.control,
+      record.sourceHashes.requestedReceipt,
+      record.sourceHashes.terminalReceipt,
+      record.sourceHashes.manifest,
+    ].join("\n");
+    assert.equal(
+      record.authorityHmac,
+      signFixtureDocument(fixture.state.controlToken, expectedAuthorityPayload),
+      "incident HMAC must cover schemaVersion before every authority field",
+    );
+
+    record.schemaVersion = "1";
+    await writeFile(incident.recordPath, `${JSON.stringify(record)}\n`, "utf8");
+    await restoreFixtureManager(fixture.root);
+
     const rejected = invokeRecovery(fixture);
     assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
     assert.equal(await fileExists(fixture.controlPath), true);

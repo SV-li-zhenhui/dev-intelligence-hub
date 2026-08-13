@@ -1496,6 +1496,7 @@ function Get-RecoveryIncidentAuthorityPayload {
     param([Parameter(Mandatory = $true)]$Record)
     return @(
         "recovery-incident-authority-v1",
+        [string]$Record.schemaVersion,
         [string]$Record.incidentId,
         [string]$Record.state,
         [string]$Record.projectDigest,
@@ -1570,7 +1571,8 @@ function Assert-RecoveryIncidentRecord {
                 "snapshotId", "sourceHashes", "startIdentity", "state"
             ) `
             -DifferenceObject $properties) -or
-        $Record.schemaVersion -ne 1 -or
+        -not (Test-RecoveryJsonInteger -Value $Record.schemaVersion) -or
+        [long]$Record.schemaVersion -ne 1 -or
         $Record.incidentId -isnot [string] -or
         $Record.incidentId -notmatch '^incident-[a-f0-9]{32}$' -or
         $Record.incidentId -ne $Location.Id -or
