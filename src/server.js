@@ -3941,13 +3941,12 @@ export function startApplicationBackgroundWork(
     priority,
     runOptions = {},
   ) {
-    const factCycleSequenceAtRequest = factCycleSequence;
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
       (signal) => enqueueAgencyCycle({
         ...options,
-        factCycleSequenceAtRequest,
+        factCycleSequenceAtRequest: factCycleSequence,
         signal,
       }, priority),
       runOptions,

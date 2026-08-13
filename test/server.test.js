@@ -3435,6 +3435,75 @@ test("a pending refresh skips obsolete queued role ticks", async () => {
   }
 });
 
+test("a scheduled role requested after refresh in the same turn uses refreshed facts", async () => {
+  const activeRoleStarted = deferred();
+  const releaseActiveRole = deferred();
+  const timers = [];
+  const calls = [];
+  let refreshCount = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules() {
+        return [
+          { id: "requirements-analyst", intervalMinutes: 11 },
+          { id: "developer", intervalMinutes: 13 },
+        ];
+      },
+      async runSelected(ids, options) {
+        calls.push({ operation: "run", ids, ...options });
+        if (ids[0] === "requirements-analyst") {
+          activeRoleStarted.resolve();
+          await releaseActiveRole.promise;
+        }
+      },
+    },
+    refreshService: {
+      async refresh(options) {
+        refreshCount += 1;
+        calls.push({ operation: "refresh", count: refreshCount, ...options });
+      },
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+    calls.length = 0;
+    const activeRole = timers[1].callback();
+    await activeRoleStarted.promise;
+    const refresh = backgroundWork.refresh();
+    const scheduledAfterRefresh = timers[2].callback();
+    releaseActiveRole.resolve();
+    await Promise.all([activeRole, refresh, scheduledAfterRefresh]);
+
+    assert.deepEqual(calls, [
+      {
+        operation: "run",
+        ids: ["requirements-analyst"],
+        trigger: "scheduled",
+      },
+      { operation: "refresh", count: 2, notify: false },
+      {
+        operation: "run",
+        ids: ["pr-reviewer"],
+        trigger: "refresh_completed",
+      },
+      { operation: "run", ids: ["developer"], trigger: "scheduled" },
+    ]);
+  } finally {
+    releaseActiveRole.resolve();
+    await backgroundWork.stop();
+  }
+});
+
 test("a manual employee run overtakes a queued scheduled role", async () => {
   const activeRoleStarted = deferred();
   const releaseActiveRole = deferred();
