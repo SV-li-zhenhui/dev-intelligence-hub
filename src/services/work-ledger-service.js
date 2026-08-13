@@ -60,7 +60,9 @@ import {
   validatePullRequestSourceTransition,
 } from "./work-ledger-pr-source.js";
 import {
+  appendPullRequestCutoverTimelineEvent,
   applyReadyPullRequestSourceCutover,
+  createPullRequestCutoverTimelineIndex,
   CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON,
   crossRootPullRequestCutoverCandidate,
   crossRootPullRequestCutoverActivation,
@@ -788,6 +790,20 @@ export class WorkLedgerService {
     const touchedItemIds = new Set();
     const revisedItemIds = new Set();
     const timelineEvents = [];
+    const cutoverTimelineIndex = createPullRequestCutoverTimelineIndex(
+      this.state.timeline,
+    );
+    let indexedTimelineEventCount = 0;
+    const currentCutoverTimelineIndex = () => {
+      while (indexedTimelineEventCount < timelineEvents.length) {
+        appendPullRequestCutoverTimelineEvent(
+          cutoverTimelineIndex,
+          timelineEvents[indexedTimelineEventCount],
+        );
+        indexedTimelineEventCount += 1;
+      }
+      return cutoverTimelineIndex;
+    };
     let received = 0;
     let deduplicated = 0;
     for (const envelope of batch.items) {
@@ -827,7 +843,10 @@ export class WorkLedgerService {
             root,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true, timeline: this.state.timeline },
+            {
+              forceHeadChanged: true,
+              timelineIndex: currentCutoverTimelineIndex(),
+            },
           );
           if (cutover.blockers.length === 0) {
             root = applyReadyPullRequestSourceCutover({
@@ -978,7 +997,10 @@ export class WorkLedgerService {
             predecessor,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true, timeline: this.state.timeline },
+            {
+              forceHeadChanged: true,
+              timelineIndex: currentCutoverTimelineIndex(),
+            },
           );
           if (activation.blockers.length > 0) {
             rootCandidate.status = "blocked";
@@ -1104,7 +1126,10 @@ export class WorkLedgerService {
             currentPredecessor,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true, timeline: this.state.timeline },
+            {
+              forceHeadChanged: true,
+              timelineIndex: currentCutoverTimelineIndex(),
+            },
           );
           if (activation.blockers.length > 0) {
             root = {
@@ -1214,7 +1239,10 @@ export class WorkLedgerService {
               currentPredecessor,
               [...itemsById.values()],
               outboxById,
-              { forceHeadChanged: true, timeline: this.state.timeline },
+              {
+                forceHeadChanged: true,
+                timelineIndex: currentCutoverTimelineIndex(),
+              },
             );
             if (activation.blockers.length > 0) {
               root = {
@@ -1298,7 +1326,7 @@ export class WorkLedgerService {
               pendingRoot,
               [...itemsById.values()],
               outboxById,
-              { timeline: this.state.timeline },
+              { timelineIndex: currentCutoverTimelineIndex() },
             );
             if (activation.blockers.length === 0) {
               const pendingRevision = appended.source.pendingRevision;

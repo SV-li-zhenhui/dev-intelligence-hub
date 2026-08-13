@@ -50,6 +50,41 @@ export const CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON =
 export const CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_REASON =
   "pr_source_cross_root_cutover_blocker";
 
+const pullRequestCutoverTimelineIndexes = new WeakMap();
+
+function recordCutoverTimelineEvent(index, entry) {
+  const latestByItemId = pullRequestCutoverTimelineIndexes.get(index);
+  if (
+    latestByItemId === undefined ||
+    typeof entry?.itemId !== "string" ||
+    entry.type === "pr_source_revised"
+  ) {
+    return;
+  }
+  latestByItemId.set(entry.itemId, entry);
+}
+
+export function createPullRequestCutoverTimelineIndex(timeline = []) {
+  if (!Array.isArray(timeline)) {
+    throw new TypeError("pull request cutover timeline must be an array");
+  }
+  const index = Object.freeze({});
+  pullRequestCutoverTimelineIndexes.set(index, new Map());
+  for (const entry of timeline) recordCutoverTimelineEvent(index, entry);
+  return index;
+}
+
+export function appendPullRequestCutoverTimelineEvent(index, entry) {
+  if (!pullRequestCutoverTimelineIndexes.has(index)) {
+    throw new TypeError("pull request cutover timeline index is invalid");
+  }
+  recordCutoverTimelineEvent(index, entry);
+}
+
+function latestCutoverTimelineEvent(index, itemId) {
+  return pullRequestCutoverTimelineIndexes.get(index)?.get(itemId) ?? null;
+}
+
 function marker(reason, itemId) {
   return `${reason}:${itemId}`;
 }
@@ -160,37 +195,34 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function durablyRejectedProposal(item) {
-  return item.statusReason === "proposal_rejected" &&
-    item.decisionContext?.source === "proposal" &&
-    item.decisionContext?.outcome === "rejected";
-}
-
-function persistedRejectedProposalBlocker(item, timeline) {
+function hasLatestRejectedProposalProof(item, timelineIndex) {
   if (
-    crossRootPullRequestCutoverPendingId(item) === null ||
     item.decisionContext?.source !== "proposal" ||
     item.decisionContext?.outcome !== "rejected" ||
-    typeof item.decisionContext.contentDigest !== "string" ||
-    !Array.isArray(timeline)
+    typeof item.decisionContext.contentDigest !== "string"
   ) {
     return false;
   }
-  for (let index = timeline.length - 1; index >= 0; index -= 1) {
-    const entry = timeline[index];
-    if (entry?.itemId !== item.itemId) continue;
-    if (entry.type === "pr_source_revised") continue;
-    return entry.type === "proposal_result_applied" &&
-      entry.details?.outcome === "rejected" &&
-      entry.details?.decision?.contentDigest ===
-        item.decisionContext.contentDigest &&
-      Number.isSafeInteger(entry.details?.workItemRevision) &&
-      entry.details.workItemRevision <= item.revision;
-  }
-  return false;
+  const entry = latestCutoverTimelineEvent(timelineIndex, item.itemId);
+  return entry?.type === "proposal_result_applied" &&
+    entry.details?.outcome === "rejected" &&
+    entry.details?.decision?.contentDigest ===
+      item.decisionContext.contentDigest &&
+    Number.isSafeInteger(entry.details?.workItemRevision) &&
+    entry.details.workItemRevision <= item.revision;
 }
 
-function definitivelySettledBlocked(item, outboxById, timeline) {
+function durablyRejectedProposal(item, timelineIndex) {
+  return item.statusReason === "proposal_rejected" &&
+    hasLatestRejectedProposalProof(item, timelineIndex);
+}
+
+function persistedRejectedProposalBlocker(item, timelineIndex) {
+  return crossRootPullRequestCutoverPendingId(item) !== null &&
+    hasLatestRejectedProposalProof(item, timelineIndex);
+}
+
+function definitivelySettledBlocked(item, outboxById, timelineIndex) {
   if (item.status !== "blocked" || item.activeIntentId !== null) return false;
   if ([
     "pr_source_left_scope",
@@ -219,8 +251,8 @@ function definitivelySettledBlocked(item, outboxById, timeline) {
     return true;
   }
   if (
-    durablyRejectedProposal(item) ||
-    persistedRejectedProposalBlocker(item, timeline)
+    durablyRejectedProposal(item, timelineIndex) ||
+    persistedRejectedProposalBlocker(item, timelineIndex)
   ) {
     return true;
   }
@@ -265,7 +297,7 @@ export function inspectPullRequestSourceCutover(
   root,
   items,
   outboxById,
-  { forceHeadChanged = false, timeline = [] } = {},
+  { forceHeadChanged = false, timelineIndex = null } = {},
 ) {
   const headChanged = forceHeadChanged || pendingHeadChanged(root.source);
   const participants = [
@@ -275,12 +307,12 @@ export function inspectPullRequestSourceCutover(
   const blockers = participants.filter((item) => {
     if (item.itemId === root.itemId) {
       return !ROOT_READY_STATUSES.has(item.status) &&
-        !definitivelySettledBlocked(item, outboxById, timeline) &&
+        !definitivelySettledBlocked(item, outboxById, timelineIndex) &&
         unstartedIntent(item, outboxById) === null;
     }
     return !CHILD_TERMINAL_STATUSES.has(item.status) &&
       !CHILD_SUPERSEDABLE_STATUSES.has(item.status) &&
-      !definitivelySettledBlocked(item, outboxById, timeline) &&
+      !definitivelySettledBlocked(item, outboxById, timelineIndex) &&
       unstartedIntent(item, outboxById) === null;
   });
   return { blockers, headChanged, participants };
@@ -639,7 +671,10 @@ function planCrossRootPullRequestSourceReconciliation({
     predecessor,
     state.items,
     outboxById,
-    { forceHeadChanged: true, timeline: state.timeline },
+    {
+      forceHeadChanged: true,
+      timelineIndex: createPullRequestCutoverTimelineIndex(state.timeline),
+    },
   );
   if (
     activation.blockers.some(
@@ -810,7 +845,9 @@ export function planPullRequestSourceReconciliation({ state, input, clock }) {
     root,
     state.items,
     outboxById,
-    { timeline: state.timeline },
+    {
+      timelineIndex: createPullRequestCutoverTimelineIndex(state.timeline),
+    },
   );
   const blockers = publicBlockers(activation);
   if (blockers.length > 0) {

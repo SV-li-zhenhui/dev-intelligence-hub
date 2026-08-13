@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createPullRequestCutoverTimelineIndex,
   inspectPullRequestSourceCutover,
 } from "../src/services/work-ledger-pr-cutover-commands.js";
 
@@ -18,11 +19,15 @@ function root(overrides = {}) {
 }
 
 function blockersFor(item, outbox = [], options = {}) {
+  const { timeline = [], ...inspectionOptions } = options;
   return inspectPullRequestSourceCutover(
     item,
     [item],
     new Map(outbox.map((entry) => [entry.intentId, entry])),
-    options,
+    {
+      ...inspectionOptions,
+      timelineIndex: createPullRequestCutoverTimelineIndex(timeline),
+    },
   ).blockers;
 }
 
@@ -35,10 +40,26 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
     statusReason: "proposal_failed",
     decisionContext: { source: "proposal", outcome: "failed" },
   });
+  const proposalDecisionDigest = "c".repeat(64);
   const proposalRejected = root({
+    revision: 1,
     statusReason: "proposal_rejected",
-    decisionContext: { source: "proposal", outcome: "rejected" },
+    decisionContext: {
+      source: "proposal",
+      outcome: "rejected",
+      contentDigest: proposalDecisionDigest,
+    },
   });
+  const proposalRejectedResult = {
+    sequence: 1,
+    itemId: proposalRejected.itemId,
+    type: "proposal_result_applied",
+    details: {
+      outcome: "rejected",
+      workItemRevision: 1,
+      decision: { contentDigest: proposalDecisionDigest },
+    },
+  };
   const intentFailed = root({ statusReason: "intent_failed" });
   const failedOutbox = {
     intentId: "intent-failed",
@@ -52,7 +73,30 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
 
   assert.deepEqual(blockersFor(rejected), []);
   assert.deepEqual(blockersFor(proposalFailed), []);
-  assert.deepEqual(blockersFor(proposalRejected), []);
+  assert.deepEqual(
+    blockersFor(proposalRejected, [], {
+      timeline: [proposalRejectedResult],
+    }),
+    [],
+  );
+  assert.deepEqual(
+    blockersFor(proposalRejected).map(({ itemId }) => itemId),
+    ["root-a"],
+  );
+  assert.deepEqual(
+    blockersFor(proposalRejected, [], {
+      timeline: [
+        proposalRejectedResult,
+        {
+          sequence: 2,
+          itemId: proposalRejected.itemId,
+          type: "transitioned",
+          details: {},
+        },
+      ],
+    }).map(({ itemId }) => itemId),
+    ["root-a"],
+  );
   assert.deepEqual(blockersFor(intentFailed, [failedOutbox]), []);
   assert.deepEqual(
     blockersFor(root({

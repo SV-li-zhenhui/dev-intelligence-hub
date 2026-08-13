@@ -36,6 +36,7 @@ import { MemoryContextRetriever } from "../src/services/memory-context-retriever
 import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import {
+  createWorkDecisionContext,
   emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
   WORK_LEDGER_STATE_SCHEMA_VERSION,
@@ -52,6 +53,7 @@ import {
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "../src/services/work-ledger-pr-source.js";
 import {
+  crossRootPullRequestCutoverBlockerReason,
   crossRootPullRequestCutoverCandidate,
 } from "../src/services/work-ledger-pr-cutover-commands.js";
 import {
@@ -1907,11 +1909,7 @@ for (const predecessorStatus of ["queued", "working"]) {
   });
 }
 
-test("an owner-requested PR root retires a durably rejected proposal predecessor", async () => {
-  const fixture = await createFixture({
-    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
-  });
-  const sealed = await stageSealedPrReview(fixture);
+async function rejectBoundPullRequestProposal(fixture, sealed) {
   const {
     intentId: proposalId,
     ...proposalContent
@@ -1920,8 +1918,9 @@ test("an owner-requested PR root retires a durably rejected proposal predecessor
     proposalId,
     ...proposalContent,
   });
+  const sealedItemId = sealed.rootItemId ?? sealed.childItemId;
   let predecessor = (await fixture.service.listItems()).items.find(
-    ({ itemId }) => itemId === sealed.rootItemId,
+    ({ itemId }) => itemId === sealedItemId,
   );
   await fixture.service.ackIntent({
     intentId: sealed.outbox.intentId,
@@ -1957,6 +1956,21 @@ test("an owner-requested PR root retires a durably rejected proposal predecessor
   );
   assert.equal(predecessor.status, "blocked");
   assert.equal(predecessor.statusReason, "proposal_rejected");
+  return predecessor;
+}
+
+async function rejectSealedPullRequestProposal(fixture) {
+  return rejectBoundPullRequestProposal(
+    fixture,
+    await stageSealedPrReview(fixture),
+  );
+}
+
+test("an owner-requested PR root retires a durably rejected proposal predecessor", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
 
   fixture.source.records.push(ownerRequestedPrAssignment(2));
   fixture.source.highWatermark = 2;
@@ -1969,6 +1983,244 @@ test("an owner-requested PR root retires a durably rejected proposal predecessor
   assert.equal(retired.statusReason, "pr_source_cross_root_cutover_retired");
   assert.equal(active.status, "queued");
   assert.equal(active.statusReason, null);
+});
+
+test("an owner-requested PR root supersedes a child with a durably rejected proposal", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrChildReview(fixture);
+  const rejectedChild = await rejectBoundPullRequestProposal(fixture, sealed);
+  const predecessor = (await fixture.service.listItems({ limit: 10 })).items
+    .find(({ kind }) => kind === "source_root");
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  const retired = items.find(({ itemId }) => itemId === predecessor.itemId);
+  const child = items.find(({ itemId }) => itemId === rejectedChild.itemId);
+  const active = items.find(
+    ({ kind, itemId }) => kind === "source_root" && itemId !== retired.itemId,
+  );
+  assert.equal(
+    retired.statusReason,
+    "pr_source_cross_root_cutover_retired",
+  );
+  assert.equal(child.status, "superseded");
+  assert.equal(child.statusReason, "pr_head_superseded");
+  assert.equal(active.status, "queued");
+});
+
+test("an intervening source audit in the same intake batch keeps rejected proposal cutover blocked", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
+  fixture.source.records.push(
+    prAssignment(2, {
+      eventType: "pull_request.status",
+      occurredAt: "2026-08-02T00:59:00.000Z",
+      headRefOid: PR_HEAD_A,
+      changedFields: ["ciStatus"],
+      ciStatus: "FAILURE",
+    }),
+    ownerRequestedPrAssignment(3),
+  );
+  fixture.source.highWatermark = 3;
+
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.match(blocked.source.revisions.at(-1).disposition, /^ignored_/);
+  assert.equal(
+    blocked.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(pending.status, "blocked");
+  assert.equal(
+    pending.statusReason,
+    `pr_source_cross_root_cutover_pending:${blocked.itemId}`,
+  );
+});
+
+test("a persisted rejected-proposal blocker recovers through restart and real reconciliation", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const predecessorId = sealed.rootItemId;
+  const pendingId = roots.find(({ itemId }) => itemId !== predecessorId).itemId;
+  await rejectBoundPullRequestProposal(fixture, sealed);
+
+  const legacy = fixture.store.stored();
+  const legacyPredecessor = legacy.items.find(
+    ({ itemId }) => itemId === predecessorId,
+  );
+  legacyPredecessor.statusReason = crossRootPullRequestCutoverBlockerReason(
+    pendingId,
+  );
+  fixture.store.replaceStored(legacy);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  let pending = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === pendingId,
+  );
+
+  const result = await recovered.reconcilePullRequestSource({
+    itemId: pending.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: pending.revision,
+    expectedPendingRevision:
+      pending.source.pendingRevision ?? pending.source.activeRevision,
+  });
+
+  assert.equal(result.applied, true);
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const predecessor = roots.find(({ itemId }) => itemId === predecessorId);
+  pending = roots.find(({ itemId }) => itemId === pendingId);
+  assert.equal(
+    predecessor.statusReason,
+    "pr_source_cross_root_cutover_retired",
+  );
+  assert.equal(pending.status, "queued");
+  assert.equal(pending.statusReason, "pr_source_cutover_activated");
+});
+
+test("a rejected proposal stays blocked after its retained proof rotates out", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    limits: { timelineLimit: 6 },
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
+  fixture.source.records.push(
+    ...Array.from({ length: 7 }, (_, index) => assignment(index + 2)),
+  );
+  fixture.source.highWatermark = 8;
+  await fixture.service.intake();
+  assert.equal(
+    (await fixture.service.listTimeline({ limit: 20 })).items.some(
+      ({ itemId, type }) =>
+        itemId === predecessor.itemId && type === "proposal_result_applied",
+    ),
+    false,
+  );
+
+  fixture.source.records.push(ownerRequestedPrAssignment(9));
+  fixture.source.highWatermark = 9;
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 20 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(
+    blocked.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(pending.status, "blocked");
+  assert.equal(
+    pending.statusReason,
+    `pr_source_cross_root_cutover_pending:${blocked.itemId}`,
+  );
+});
+
+test("a later durable transition keeps stale rejected-proposal context blocked across restart", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  let predecessor = await rejectSealedPullRequestProposal(fixture);
+  predecessor = await fixture.service.transition({
+    itemId: predecessor.itemId,
+    expectedRevision: predecessor.revision,
+    leaseId: null,
+    actorId: "work-ledger-system",
+    toStatus: "queued",
+    reason: "owner_reopened_after_rejection",
+  });
+  predecessor = await fixture.service.transition({
+    itemId: predecessor.itemId,
+    expectedRevision: predecessor.revision,
+    leaseId: null,
+    actorId: "work-ledger-system",
+    toStatus: "blocked",
+    reason: "proposal_rejected",
+  });
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+
+  await recovered.intake();
+
+  const roots = (await recovered.listItems({ limit: 10 })).items;
+  const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(
+    blocked.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(pending.status, "blocked");
+});
+
+test("a self-consistent forged rejected-proposal context without matching evidence stays blocked", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
+  const forged = fixture.store.stored();
+  const forgedItem = forged.items.find(
+    ({ itemId }) => itemId === predecessor.itemId,
+  );
+  forgedItem.decisionContext = createWorkDecisionContext({
+    source: "proposal",
+    referenceId: `work-intent-${"f".repeat(64)}`,
+    outcome: "rejected",
+    value: { summary: "self-consistent but unattested replacement" },
+    observedAt: fixture.time.clock(),
+  });
+  fixture.store.replaceStored(forged);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+
+  await recovered.intake();
+
+  const roots = (await recovered.listItems({ limit: 10 })).items;
+  const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(
+    blocked.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(pending.status, "blocked");
 });
 
 for (const cutover of ["same-root-head", "cross-provenance-root"]) {
