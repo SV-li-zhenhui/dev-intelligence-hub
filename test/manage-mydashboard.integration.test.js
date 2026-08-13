@@ -2072,6 +2072,45 @@ test(
   },
 );
 
+test(
+  "RecoverFailedShutdown rejects wrong-case active cache directory before termination",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await mkdir(path.join(fixture.root, "data", "Playwright-Browsers"));
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "RecoverFailedShutdown rejects a declared cache name represented as a file before termination",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const cacheName = "playwright-browsers";
+    const contents = "not a regenerable cache directory\n";
+    const bytes = Buffer.byteLength(contents, "utf8");
+    const sha256 = createHash("sha256").update(contents, "utf8").digest("hex");
+    const activePath = path.join(fixture.root, "data", cacheName);
+    const snapshotPath = path.join(fixture.snapshotDirectory, "data", cacheName);
+
+    await writeFile(activePath, contents, "utf8");
+    await writeFile(snapshotPath, contents, "utf8");
+    await rewriteRecoveryManifest(fixture, (manifest) => ({
+      ...manifest,
+      fileCount: manifest.fileCount + 1,
+      totalBytes: manifest.totalBytes + bytes,
+      files: [
+        ...manifest.files,
+        { name: cacheName, bytes, sha256, sourceStable: true },
+      ],
+    }));
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
 for (const { label, snapshotId } of [
   { label: "malformed snapshot identifier", snapshotId: "shutdown-failure-invalid" },
   {

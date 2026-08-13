@@ -81,10 +81,6 @@ $offlineRestoreScript = [System.IO.Path]::GetFullPath(
 $dataDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $projectDirectory "data")
 )
-$recoveryExcludedDataDirectories = @(
-    "playwright-browsers",
-    "validation-profile-probe"
-)
 $restoreControlDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $projectDirectory "restore-control")
 )
@@ -1202,11 +1198,27 @@ function ConvertFrom-RecoveryManifestJson {
     return ConvertTo-RecoveryJsonValue -Value $serializer.DeserializeObject($Json)
 }
 
+function Test-RecoveryExcludedActiveDataDirectoryName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return (
+        [string]::Equals(
+            $Name,
+            "playwright-browsers",
+            [System.StringComparison]::Ordinal
+        ) -or
+        [string]::Equals(
+            $Name,
+            "validation-profile-probe",
+            [System.StringComparison]::Ordinal
+        )
+    )
+}
+
 function Get-RecoverySnapshotFiles {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
         [Parameter(Mandatory = $true)]$Manifest,
-        [string[]]$AllowedExcludedDirectories = @()
+        [switch]$AllowProductionExcludedCacheDirectories
     )
     Assert-NotReparseDirectory -Path $Directory
     if ($Manifest.files -isnot [System.Array]) {
@@ -1264,12 +1276,19 @@ function Get-RecoverySnapshotFiles {
             ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
         )
         if ($item.PSIsContainer) {
-            if ($isReparse -or $AllowedExcludedDirectories -notcontains $item.Name) {
+            if (
+                $isReparse -or
+                -not $AllowProductionExcludedCacheDirectories -or
+                -not (Test-RecoveryExcludedActiveDataDirectoryName -Name $item.Name)
+            ) {
                 throw "Recovery snapshot contains an unsafe directory entry."
             }
             continue
         }
-        if ($isReparse) {
+        if (
+            $isReparse -or
+            (Test-RecoveryExcludedActiveDataDirectoryName -Name $item.Name)
+        ) {
             throw "Recovery snapshot contains an unsafe file entry."
         }
         $actualFiles += $item
@@ -1366,7 +1385,7 @@ function Get-ValidatedRecoverySnapshot {
     $activeFiles = Get-RecoverySnapshotFiles `
         -Directory $dataDirectory `
         -Manifest $manifest `
-        -AllowedExcludedDirectories $recoveryExcludedDataDirectories
+        -AllowProductionExcludedCacheDirectories
     foreach ($name in $files.Keys) {
         if (
             [long]$files[$name].bytes -ne [long]$activeFiles[$name].bytes -or
