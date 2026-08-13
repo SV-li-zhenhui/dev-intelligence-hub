@@ -120,7 +120,10 @@ class FakeRunner {
   }
 
   async run(options) {
-    this.calls.push(structuredClone(options));
+    this.calls.push({
+      ...structuredClone(options),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
     if (this.responses.length === 0) {
       throw new Error("unexpected gh call");
     }
@@ -169,6 +172,21 @@ test("constructor accepts the shared GitHub timeout boundary", () => {
 
 function actorRecord(input) {
   return { login: input.actorAccountId };
+}
+
+function operation(deadline, signal = new AbortController().signal) {
+  return Object.freeze({ signal, deadline });
+}
+
+function credentialSource(token = CREDENTIAL) {
+  return Object.freeze({
+    async acquire() {
+      return Object.freeze({
+        use: (callback) => callback(token),
+        release() {},
+      });
+    },
+  });
 }
 
 function assertTransportError(code, trust) {
@@ -233,6 +251,31 @@ test("observes all five action kinds through fixed github.com commands", async (
   }
 });
 
+test("one transport operation gives each subprocess only its remaining budget", async () => {
+  let now = 1_000_000;
+  const input = transportInput("comment");
+  const runner = new FakeRunner([
+    () => { now += 5_000; return actorRecord(input); },
+    () => { now += 7_000; return pullRequestRecord(input); },
+    () => { now += 3_000; return []; },
+  ]);
+  const transport = actionTransport(runner, { clock: () => now });
+
+  await transport.observe(input, operation(1_060_000));
+
+  assert.deepEqual(
+    runner.calls.map((call) => call.timeoutMs),
+    [60_000, 55_000, 48_000],
+  );
+  assert.deepEqual(
+    runner.calls.map((call) => ({
+      hasSignal: Object.hasOwn(call, "signal"),
+      isSignal: call.signal instanceof AbortSignal,
+    })),
+    Array.from({ length: 3 }, () => ({ hasSignal: true, isSignal: true })),
+  );
+});
+
 test("satisfies the executor transport contract through a complete comment cycle", async () => {
   const directInput = transportInput("comment");
   const envelope = pullRequestExternalActionEnvelope(
@@ -265,7 +308,7 @@ test("satisfies the executor transport contract through a complete comment cycle
   const transport = actionTransport(runner);
   const executor = createPullRequestExternalActionExecutor({
     enabledActions: ["comment"],
-    credentialProvider: () => CREDENTIAL,
+    credentialSource: credentialSource(),
     transport,
     inputAuthorityVerifier: {
       async verify() {
@@ -919,7 +962,7 @@ test("a merge with a lost proof comment stays unknown after restart", async () =
   const recoveryTransport = actionTransport(recoveryRunner);
   const executor = createPullRequestExternalActionExecutor({
     enabledActions: ["merge"],
-    credentialProvider: () => CREDENTIAL,
+    credentialSource: credentialSource(),
     transport: recoveryTransport,
     inputAuthorityVerifier: {
       async verify() {

@@ -395,6 +395,39 @@ function normalizeTransportInput(value) {
   return Object.freeze(input);
 }
 
+function normalizeOperation(value, clock, timeoutMs) {
+  if (value === undefined) {
+    return Object.freeze({ signal: null, deadline: clock() + timeoutMs });
+  }
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    !Object.isFrozen(value)
+  ) {
+    throw new TypeError("operation is invalid");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== 2 ||
+    !keys.includes("signal") ||
+    !keys.includes("deadline") ||
+    keys.some((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return typeof key !== "string" ||
+        !descriptor?.enumerable ||
+        !Object.hasOwn(descriptor, "value");
+    }) ||
+    !(value.signal instanceof AbortSignal) ||
+    !Number.isSafeInteger(value.deadline) ||
+    value.deadline < 1
+  ) {
+    throw new TypeError("operation is invalid");
+  }
+  return value;
+}
+
 function normalizeNetworkEnvironment(value) {
   if (value === undefined) return Object.freeze({});
   assertPassiveData(value);
@@ -605,6 +638,7 @@ class GitHubPullRequestActionTransport {
   #updatePollAttempts;
   #updatePollIntervalMs;
   #delay;
+  #clock;
 
   constructor({
     runner = new ManagedProcessRunner({
@@ -623,6 +657,7 @@ class GitHubPullRequestActionTransport {
     updatePollIntervalMs = 250,
     delay = (milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    clock = () => Date.now(),
   } = {}) {
     if (!runner || typeof runner.run !== "function") {
       throw new TypeError("runner must provide run");
@@ -653,6 +688,7 @@ class GitHubPullRequestActionTransport {
     ) {
       throw new TypeError("update-branch polling configuration is invalid");
     }
+    if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.#runner = Object.freeze({ run: runner.run.bind(runner) });
     this.#ghCommand = ghCommand;
     this.#baseEnvironment = normalizeBaseEnvironment(env);
@@ -662,19 +698,32 @@ class GitHubPullRequestActionTransport {
     this.#updatePollAttempts = updatePollAttempts;
     this.#updatePollIntervalMs = updatePollIntervalMs;
     this.#delay = delay;
+    this.#clock = clock;
     Object.freeze(this);
   }
 
-  async observe(value) {
+  async observe(value, rawOperation) {
     const input = normalizeTransportInput(value);
+    const operation = normalizeOperation(rawOperation, this.#clock, this.#timeoutMs);
     const environment = this.#childEnvironment(input.credential);
-    const actorAccountId = await this.#assertActor(input, environment, "absent");
-    const facts = await this.#readPullRequest(input, environment, "absent");
+    const actorAccountId = await this.#assertActor(
+      input,
+      environment,
+      "absent",
+      operation,
+    );
+    const facts = await this.#readPullRequest(
+      input,
+      environment,
+      "absent",
+      operation,
+    );
     const actionEvidence = await this.#actionEvidence(
       input,
       facts,
       environment,
       "absent",
+      operation,
     );
     return Object.freeze({
       schemaVersion: 1,
@@ -685,11 +734,17 @@ class GitHubPullRequestActionTransport {
     });
   }
 
-  async perform(value) {
+  async perform(value, rawOperation) {
     const input = normalizeTransportInput(value);
+    const operation = normalizeOperation(rawOperation, this.#clock, this.#timeoutMs);
     const environment = this.#childEnvironment(input.credential);
-    await this.#assertActor(input, environment, "absent");
-    const facts = await this.#readPullRequest(input, environment, "absent");
+    await this.#assertActor(input, environment, "absent", operation);
+    const facts = await this.#readPullRequest(
+      input,
+      environment,
+      "absent",
+      operation,
+    );
     if (
       facts.state !== "open" ||
       !samePullRequestGitTarget(
@@ -700,15 +755,15 @@ class GitHubPullRequestActionTransport {
       throw transportError("GITHUB_TARGET_STALE", "absent");
     }
     if (input.actionType === "comment") {
-      await this.#postReview(input, environment);
+      await this.#postReview(input, environment, operation);
     } else if (input.actionType === "review") {
-      await this.#postReview(input, environment);
+      await this.#postReview(input, environment, operation);
     } else if (input.actionType === "update_branch") {
-      await this.#updateBranch(input, environment);
+      await this.#updateBranch(input, environment, operation);
     } else if (input.actionType === "push") {
-      await this.#publishControlledCommit(input);
+      await this.#publishControlledCommit(input, operation);
     } else {
-      await this.#merge(input, environment);
+      await this.#merge(input, environment, operation);
     }
     return Object.freeze({ accepted: true });
   }
@@ -726,10 +781,10 @@ class GitHubPullRequestActionTransport {
     });
   }
 
-  async #assertActor(input, environment, trust) {
+  async #assertActor(input, environment, trust, operation) {
     const record = await this.#runJson(
       ["api", "--method", "GET", "user"],
-      { environment, trust },
+      { environment, trust, operation },
     );
     const login = githubLogin(record?.login);
     if (login.toLowerCase() !== input.actorAccountId.toLowerCase()) {
@@ -738,7 +793,7 @@ class GitHubPullRequestActionTransport {
     return login;
   }
 
-  async #readPullRequest(input, environment, trust) {
+  async #readPullRequest(input, environment, trust, operation) {
     const record = await this.#runJson(
       [
         "api",
@@ -746,7 +801,7 @@ class GitHubPullRequestActionTransport {
         "GET",
         `repos/${input.repository}/pulls/${input.pullRequestNumber}`,
       ],
-      { environment, trust },
+      { environment, trust, operation },
     );
     try {
       const number = record?.number;
@@ -832,23 +887,39 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #actionEvidence(input, facts, environment, trust) {
+  async #actionEvidence(input, facts, environment, trust, operation) {
     if (input.actionType === "comment") {
       return Object.freeze({
         kind: "marker_records",
-        records: await this.#reviewMarkerRecords(input, environment, trust),
+        records: await this.#reviewMarkerRecords(
+          input,
+          environment,
+          trust,
+          operation,
+        ),
       });
     }
     if (input.actionType === "review") {
       return Object.freeze({
         kind: "marker_records",
-        records: await this.#reviewMarkerRecords(input, environment, trust),
+        records: await this.#reviewMarkerRecords(
+          input,
+          environment,
+          trust,
+          operation,
+        ),
       });
     }
     if (input.actionType === "update_branch") {
       return Object.freeze({
         kind: "head_commit",
-        commit: await this.#updatedHeadCommit(input, facts, environment, trust),
+        commit: await this.#updatedHeadCommit(
+          input,
+          facts,
+          environment,
+          trust,
+          operation,
+        ),
       });
     }
     if (input.actionType === "push") {
@@ -856,11 +927,17 @@ class GitHubPullRequestActionTransport {
     }
     return Object.freeze({
       kind: "merge_state",
-      merge: await this.#mergeEvidence(input, facts, environment, trust),
+      merge: await this.#mergeEvidence(
+        input,
+        facts,
+        environment,
+        trust,
+        operation,
+      ),
     });
   }
 
-  async #pages(endpoint, environment, trust) {
+  async #pages(endpoint, environment, trust, operation) {
     const records = [];
     for (let page = 1; page <= MAX_API_PAGES; page += 1) {
       const separator = endpoint.includes("?") ? "&" : "?";
@@ -871,7 +948,7 @@ class GitHubPullRequestActionTransport {
           "GET",
           `${endpoint}${separator}per_page=${API_PAGE_SIZE}&page=${page}`,
         ],
-        { environment, trust },
+        { environment, trust, operation },
       );
       if (!Array.isArray(value) || value.length > API_PAGE_SIZE) {
         throw transportError("GITHUB_PROTOCOL_ERROR", trust);
@@ -882,11 +959,12 @@ class GitHubPullRequestActionTransport {
     throw transportError("GITHUB_PAGINATION_LIMIT", trust);
   }
 
-  async #reviewMarkerRecords(input, environment, trust) {
+  async #reviewMarkerRecords(input, environment, trust, operation) {
     const records = await this.#pages(
       `repos/${input.repository}/pulls/${input.pullRequestNumber}/reviews`,
       environment,
       trust,
+      operation,
     );
     const candidates = records.filter(
       (record) =>
@@ -927,7 +1005,7 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #updatedHeadCommit(input, facts, environment, trust) {
+  async #updatedHeadCommit(input, facts, environment, trust, operation) {
     if (facts.gitTarget.headRefOid === input.action.expectedHeadOid) return null;
     const record = await this.#runJson(
       [
@@ -936,7 +1014,7 @@ class GitHubPullRequestActionTransport {
         "GET",
         `repos/${facts.gitTarget.headRepository}/git/commits/${facts.gitTarget.headRefOid}`,
       ],
-      { environment, trust },
+      { environment, trust, operation },
     );
     try {
       if (record?.sha !== facts.gitTarget.headRefOid || !Array.isArray(record?.parents)) {
@@ -968,12 +1046,13 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #mergeEvidence(input, facts, environment, trust) {
+  async #mergeEvidence(input, facts, environment, trust, operation) {
     if (facts.state !== "merged") return null;
     const records = await this.#pages(
       `repos/${input.repository}/issues/${input.pullRequestNumber}/comments`,
       environment,
       trust,
+      operation,
     );
     const candidates = records.filter(
       (record) =>
@@ -1014,7 +1093,7 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #postReview(input, environment) {
+  async #postReview(input, environment, operation) {
     const body = `${input.action.body}\n\n${input.marker}`;
     const reviewEvent = expectedReviewEvent(input);
     const record = await this.#runJson(
@@ -1034,6 +1113,7 @@ class GitHubPullRequestActionTransport {
           commit_id: input.action.inputBinding.gitTarget.headRefOid,
         }),
         trust: "unknown",
+        operation,
       },
     );
     try {
@@ -1052,7 +1132,7 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #updateBranch(input, environment) {
+  async #updateBranch(input, environment, operation) {
     const response = await this.#runJson(
       [
         "api",
@@ -1066,6 +1146,7 @@ class GitHubPullRequestActionTransport {
         environment,
         input: JSON.stringify({ expected_head_sha: input.action.expectedHeadOid }),
         trust: "unknown",
+        operation,
       },
     );
     if (
@@ -1080,13 +1161,19 @@ class GitHubPullRequestActionTransport {
       throw transportError("GITHUB_PROTOCOL_ERROR", "unknown");
     }
     for (let attempt = 1; attempt <= this.#updatePollAttempts; attempt += 1) {
-      const facts = await this.#readPullRequest(input, environment, "unknown");
+      const facts = await this.#readPullRequest(
+        input,
+        environment,
+        "unknown",
+        operation,
+      );
       if (facts.gitTarget.headRefOid !== input.action.expectedHeadOid) {
         const commit = await this.#updatedHeadCommit(
           input,
           facts,
           environment,
           "unknown",
+          operation,
         );
         if (
           facts.state === "open" &&
@@ -1099,17 +1186,19 @@ class GitHubPullRequestActionTransport {
         throw transportError("GITHUB_UPDATE_BRANCH_OUTCOME_UNKNOWN", "unknown");
       }
       if (attempt < this.#updatePollAttempts) {
+        this.#assertOperationCurrent(operation, "unknown");
         try {
           await this.#delay(this.#updatePollIntervalMs);
         } catch {
           throw transportError("GITHUB_UPDATE_BRANCH_OUTCOME_UNKNOWN", "unknown");
         }
+        this.#assertOperationCurrent(operation, "unknown");
       }
     }
     throw transportError("GITHUB_UPDATE_BRANCH_OUTCOME_UNKNOWN", "unknown");
   }
 
-  async #publishControlledCommit(input) {
+  async #publishControlledCommit(input, operation) {
     if (this.#controlledCommitPublisher === null) {
       throw transportError("CONTROLLED_COMMIT_PUBLISHER_UNAVAILABLE", "absent");
     }
@@ -1122,7 +1211,7 @@ class GitHubPullRequestActionTransport {
         pullRequestNumber: input.pullRequestNumber,
         marker: input.marker,
         action: structuredClone(input.action),
-      });
+      }, operation);
     } catch {
       throw transportError("CONTROLLED_GIT_PUBLISH_OUTCOME_UNKNOWN", "unknown");
     }
@@ -1145,7 +1234,7 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #merge(input, environment) {
+  async #merge(input, environment, operation) {
     const response = await this.#runJson(
       [
         "api",
@@ -1162,6 +1251,7 @@ class GitHubPullRequestActionTransport {
           merge_method: input.action.method,
         }),
         trust: "unknown",
+        operation,
       },
     );
     if (response?.merged !== true) {
@@ -1189,7 +1279,12 @@ class GitHubPullRequestActionTransport {
         "--input",
         "-",
       ],
-      { environment, input: JSON.stringify({ body }), trust: "unknown" },
+      {
+        environment,
+        input: JSON.stringify({ body }),
+        trust: "unknown",
+        operation,
+      },
     );
     try {
       if (
@@ -1205,9 +1300,20 @@ class GitHubPullRequestActionTransport {
     }
   }
 
-  async #runJson(args, { environment, input, trust }) {
+  #assertOperationCurrent(operation, trust) {
+    if (operation.signal?.aborted) {
+      throw transportError("GITHUB_UNAVAILABLE", trust);
+    }
+    if (this.#clock() >= operation.deadline) {
+      throw transportError("GITHUB_TIMEOUT", trust);
+    }
+  }
+
+  async #runJson(args, { environment, input, trust, operation }) {
     let result;
     try {
+      this.#assertOperationCurrent(operation, trust);
+      const timeoutMs = operation.deadline - this.#clock();
       result = await this.#runner.run({
         command: this.#ghCommand,
         args: [
@@ -1222,7 +1328,8 @@ class GitHubPullRequestActionTransport {
         ],
         env: { ...environment },
         ...(input === undefined ? {} : { input }),
-        timeoutMs: this.#timeoutMs,
+        timeoutMs,
+        ...(operation.signal === null ? {} : { signal: operation.signal }),
       });
     } catch (error) {
       throw transportError(processFailureCode(error), trust);
@@ -1251,7 +1358,7 @@ class GitHubPullRequestActionTransport {
 export function createGitHubPullRequestActionTransport(options) {
   const transport = new GitHubPullRequestActionTransport(options);
   return Object.freeze({
-    observe: (input) => transport.observe(input),
-    perform: (input) => transport.perform(input),
+    observe: (input, operation) => transport.observe(input, operation),
+    perform: (input, operation) => transport.perform(input, operation),
   });
 }

@@ -11,6 +11,9 @@ import {
   samePullRequestExternalControlledEvidence,
 } from "../domain/pull-request-external-action.js";
 import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
+import {
+  GitHubCredentialSourceError,
+} from "../lib/github-credential-source.js";
 
 const ACTION_NAMES = Object.freeze({
   pull_request_comment: "comment",
@@ -307,13 +310,62 @@ function port(value, methods, name, { optional = false } = {}) {
 
 function errorResult(error, forcedTrust = null) {
   const known = error instanceof PullRequestExternalActionTransportError;
+  const credential = error instanceof GitHubCredentialSourceError;
+  const credentialTrust = error?.code === "GITHUB_CREDENTIAL_CLEANUP_FAILED"
+    ? "unknown"
+    : "absent";
   return {
     status: "error",
     error: {
-      code: known ? error.code : "GITHUB_UNAVAILABLE",
-      trust: forcedTrust ?? (known ? error.trust : "unknown"),
+      code: known || credential ? error.code : "GITHUB_UNAVAILABLE",
+      trust: forcedTrust ?? (known
+        ? error.trust
+        : credential
+          ? credentialTrust
+          : "unknown"),
     },
   };
+}
+
+function exactCredentialPort(value) {
+  const keys = value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value)
+    ? []
+    : Reflect.ownKeys(value);
+  if (
+    keys.length !== 1 ||
+    keys[0] !== "acquire" ||
+    !Object.isFrozen(value) ||
+    typeof Object.getOwnPropertyDescriptor(value, "acquire")?.value !==
+      "function"
+  ) {
+    throw new TypeError("credentialSource is invalid");
+  }
+  return value;
+}
+
+function exactCredentialLease(value) {
+  const keys = value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value)
+    ? []
+    : Reflect.ownKeys(value);
+  if (
+    keys.length !== 2 ||
+    !keys.includes("use") ||
+    !keys.includes("release") ||
+    !Object.isFrozen(value) ||
+    keys.some((key) =>
+      typeof key !== "string" ||
+      typeof Object.getOwnPropertyDescriptor(value, key)?.value !== "function")
+  ) {
+    throw new PullRequestExternalActionTransportError(
+      "GITHUB_CREDENTIAL_OUTPUT_INVALID",
+      "absent",
+    );
+  }
+  return value;
 }
 
 function sameTargetIdentity(left, right) {
@@ -453,23 +505,40 @@ function observationResult(envelope, observation, marker) {
 
 class PullRequestExternalActionExecutor {
   #enabledActions;
-  #credentialProvider;
+  #credentialSource;
   #transport;
   #inputAuthorityVerifier;
   #controlledCommitVerifier;
+  #clock;
+  #timeoutMs;
+  #activeOperations;
+  #closed;
 
   constructor({
     enabledActions = [],
-    credentialProvider = () => null,
+    credentialSource,
     transport,
     inputAuthorityVerifier,
     controlledCommitVerifier,
+    clock = () => Date.now(),
+    timeoutMs = 60_000,
   } = {}) {
     this.#enabledActions = normalizeEnabledActions(enabledActions);
-    if (typeof credentialProvider !== "function") {
-      throw new TypeError("credentialProvider is invalid");
+    if (typeof clock !== "function") throw new TypeError("clock is invalid");
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 1_000 ||
+      timeoutMs > 600_000
+    ) {
+      throw new TypeError("timeoutMs is outside the supported range");
     }
-    this.#credentialProvider = credentialProvider;
+    this.#credentialSource = this.#enabledActions.size === 0
+      ? null
+      : exactCredentialPort(credentialSource);
+    this.#clock = clock;
+    this.#timeoutMs = timeoutMs;
+    this.#activeOperations = new Set();
+    this.#closed = false;
     if (this.#enabledActions.size === 0) {
       this.#transport = null;
       this.#inputAuthorityVerifier = null;
@@ -488,7 +557,6 @@ class PullRequestExternalActionExecutor {
         { optional: true },
       );
     }
-    Object.freeze(this);
   }
 
   async execute(input) {
@@ -499,56 +567,80 @@ class PullRequestExternalActionExecutor {
       return errorResult(error);
     }
     if (!this.#isEnabled(envelope)) return { status: "stale" };
+    const operation = this.#beginOperation();
     try {
-      if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
-        return { status: "stale" };
-      }
-    } catch (error) {
-      return errorResult(error);
-    }
-    if (!(await this.#authorityCurrent(envelope))) return { status: "stale" };
-    let credential;
-    try {
-      credential = this.#credential();
-      const marker = pullRequestExternalActionMarker(envelope);
-      const first = await this.#observe(envelope, marker, credential);
-      const firstResult = observationResult(envelope, first, marker);
-      if (firstResult.status !== "absent") return firstResult;
-      if (!(await this.#authorityCurrent(envelope))) return { status: "stale" };
-      const final = await this.#observe(envelope, marker, credential);
-      const finalResult = observationResult(envelope, final, marker);
-      if (finalResult.status !== "absent") return finalResult;
-      if (!(await this.#authorityCurrent(envelope))) return { status: "stale" };
-      if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
-        return { status: "stale" };
-      }
       try {
-        await this.#transport.perform(
-          this.#transportInput(envelope, marker, credential),
-        );
+        if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
+          return { status: "stale" };
+        }
       } catch (error) {
-        return errorResult(error, "unknown");
+        return errorResult(error);
       }
-      let completed;
+      if (!(await this.#authorityCurrent(envelope))) return { status: "stale" };
       try {
-        completed = observationResult(
+        return await this.#withCredential(
           envelope,
-          await this.#observe(envelope, marker, credential),
-          marker,
+          operation,
+          async (credential) => {
+            const marker = pullRequestExternalActionMarker(envelope);
+            const first = await this.#observe(
+              envelope,
+              marker,
+              credential,
+              operation,
+            );
+            const firstResult = observationResult(envelope, first, marker);
+            if (firstResult.status !== "absent") return firstResult;
+            if (!(await this.#authorityCurrent(envelope))) {
+              return { status: "stale" };
+            }
+            const final = await this.#observe(
+              envelope,
+              marker,
+              credential,
+              operation,
+            );
+            const finalResult = observationResult(envelope, final, marker);
+            if (finalResult.status !== "absent") return finalResult;
+            if (!(await this.#authorityCurrent(envelope))) {
+              return { status: "stale" };
+            }
+            if (!(await this.#controlledCommitCurrent(envelope, "absent"))) {
+              return { status: "stale" };
+            }
+            try {
+              await this.#transport.perform(
+                this.#transportInput(envelope, marker, credential),
+                this.#transportOperation(operation),
+              );
+            } catch (error) {
+              return errorResult(error, "unknown");
+            }
+            let completed;
+            try {
+              completed = observationResult(
+                envelope,
+                await this.#observe(envelope, marker, credential, operation),
+                marker,
+              );
+            } catch (error) {
+              return errorResult(error, "unknown");
+            }
+            return completed.status === "already"
+              ? { ...completed, status: "applied" }
+              : errorResult(
+                new PullRequestExternalActionTransportError(
+                  "GITHUB_OUTCOME_UNKNOWN",
+                  "unknown",
+                ),
+              );
+          },
         );
       } catch (error) {
-        return errorResult(error, "unknown");
+        return errorResult(error);
       }
-      return completed.status === "already"
-        ? { ...completed, status: "applied" }
-        : errorResult(
-            new PullRequestExternalActionTransportError(
-              "GITHUB_OUTCOME_UNKNOWN",
-              "unknown",
-            ),
-          );
-    } catch (error) {
-      return errorResult(error);
+    } finally {
+      this.#finishOperation(operation);
     }
   }
 
@@ -560,20 +652,28 @@ class PullRequestExternalActionExecutor {
       return errorResult(error);
     }
     if (!this.#isEnabled(envelope)) return { status: "stale" };
+    const operation = this.#beginOperation();
     try {
-      const credential = this.#credential();
-      const marker = pullRequestExternalActionMarker(envelope);
-      const result = observationResult(
+      return await this.#withCredential(
         envelope,
-        await this.#observe(envelope, marker, credential),
-        marker,
+        operation,
+        async (credential) => {
+          const marker = pullRequestExternalActionMarker(envelope);
+          const result = observationResult(
+            envelope,
+            await this.#observe(envelope, marker, credential, operation),
+            marker,
+          );
+          if (result.status !== "absent") return result;
+          return (await this.#authorityCurrent(envelope))
+            ? result
+            : { status: "stale" };
+        },
       );
-      if (result.status !== "absent") return result;
-      return (await this.#authorityCurrent(envelope))
-        ? result
-        : { status: "stale" };
     } catch (error) {
       return errorResult(error, "unknown");
+    } finally {
+      this.#finishOperation(operation);
     }
   }
 
@@ -581,24 +681,58 @@ class PullRequestExternalActionExecutor {
     return this.#enabledActions.has(ACTION_NAMES[envelope.action.type]);
   }
 
-  #credential() {
-    let value;
+  #beginOperation() {
+    const controller = new AbortController();
+    this.#activeOperations.add(controller);
+    if (this.#closed) controller.abort();
+    const deadline = this.#clock() + this.#timeoutMs;
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(0, deadline - this.#clock()),
+    );
+    timer.unref?.();
+    return Object.freeze({ controller, signal: controller.signal, deadline, timer });
+  }
+
+  #finishOperation(operation) {
+    clearTimeout(operation.timer);
+    this.#activeOperations.delete(operation.controller);
+  }
+
+  async #withCredential(envelope, operation, callback) {
+    let lease = null;
     try {
-      value = this.#credentialProvider();
-    } catch (cause) {
-      throw new PullRequestExternalActionTransportError(
-        "GITHUB_CREDENTIAL_MISSING",
-        "absent",
-        { cause },
+      lease = exactCredentialLease(
+        await this.#credentialSource.acquire(Object.freeze({
+          actorAccountId: envelope.actor.accountId,
+          signal: operation.signal,
+          deadline: operation.deadline,
+        })),
       );
+      return await lease.use((credential) => {
+        if (typeof credential !== "string" || !CREDENTIAL.test(credential)) {
+          throw new PullRequestExternalActionTransportError(
+            "GITHUB_CREDENTIAL_OUTPUT_INVALID",
+            "absent",
+          );
+        }
+        return callback(credential);
+      });
+    } finally {
+      await lease?.release();
     }
-    if (typeof value !== "string" || !CREDENTIAL.test(value)) {
-      throw new PullRequestExternalActionTransportError(
-        "GITHUB_CREDENTIAL_MISSING",
-        "absent",
-      );
-    }
-    return value;
+  }
+
+  #transportOperation(operation) {
+    return Object.freeze({
+      signal: operation.signal,
+      deadline: operation.deadline,
+    });
+  }
+
+  close() {
+    this.#closed = true;
+    for (const controller of this.#activeOperations) controller.abort();
   }
 
   async #authorityCurrent(envelope) {
@@ -645,13 +779,29 @@ class PullRequestExternalActionExecutor {
     }
   }
 
-  async #observe(envelope, marker, credential) {
-    return normalizeObservation(
-      await this.#transport.observe(
-        this.#transportInput(envelope, marker, credential),
-      ),
-      envelope,
+  async #observe(envelope, marker, credential, operation) {
+    this.#assertOperationCurrent(operation);
+    const observation = await this.#transport.observe(
+      this.#transportInput(envelope, marker, credential),
+      this.#transportOperation(operation),
     );
+    this.#assertOperationCurrent(operation);
+    return normalizeObservation(observation, envelope);
+  }
+
+  #assertOperationCurrent(operation) {
+    if (operation.signal.aborted) {
+      throw new PullRequestExternalActionTransportError(
+        "GITHUB_UNAVAILABLE",
+        "absent",
+      );
+    }
+    if (this.#clock() >= operation.deadline) {
+      throw new PullRequestExternalActionTransportError(
+        "GITHUB_TIMEOUT",
+        "absent",
+      );
+    }
   }
 
   #transportInput(envelope, marker, credential) {
@@ -673,5 +823,6 @@ export function createPullRequestExternalActionExecutor(options) {
   return Object.freeze({
     execute: (input) => executor.execute(input),
     reconcile: (input) => executor.reconcile(input),
+    close: () => executor.close(),
   });
 }

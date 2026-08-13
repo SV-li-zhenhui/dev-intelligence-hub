@@ -7,6 +7,9 @@ import {
   createPullRequestExternalActionExecutor,
 } from "../src/services/pull-request-external-action-executor.js";
 import {
+  githubCredentialSourceError,
+} from "../src/lib/github-credential-source.js";
+import {
   externalActionControlledCommit,
   externalActionOid,
   pullRequestExternalActionBinding,
@@ -158,10 +161,30 @@ function acceptingCommit(evidence) {
   };
 }
 
+function recordingCredentialSource(token = "fictional_generic_token") {
+  const calls = { acquire: [], use: 0, release: 0 };
+  return {
+    calls,
+    token,
+    source: Object.freeze({
+      async acquire(request) {
+        calls.acquire.push(request);
+        return Object.freeze({
+          async use(callback) {
+            calls.use += 1;
+            return callback(token);
+          },
+          release() { calls.release += 1; },
+        });
+      },
+    }),
+  };
+}
+
 function executorFor(envelope, transport, overrides = {}) {
   return createPullRequestExternalActionExecutor({
     enabledActions: ACTION_TYPES,
-    credentialProvider: () => "runtime-secret",
+    credentialSource: recordingCredentialSource("runtime-secret").source,
     transport,
     inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
     ...(envelope.action.controlledCommitEvidence
@@ -183,7 +206,6 @@ test("external actions are disabled by default and missing credentials never rea
     perform() { throw new Error("must not perform"); },
   };
   const disabled = createPullRequestExternalActionExecutor({
-    credentialProvider() { credentials += 1; return "secret"; },
     transport,
   });
 
@@ -193,7 +215,12 @@ test("external actions are disabled by default and missing credentials never rea
 
   const enabled = createPullRequestExternalActionExecutor({
     enabledActions: ["comment"],
-    credentialProvider() { credentials += 1; return null; },
+    credentialSource: Object.freeze({
+      async acquire() {
+        credentials += 1;
+        throw githubCredentialSourceError("GITHUB_CREDENTIAL_MISSING");
+      },
+    }),
     transport,
     inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
   });
@@ -202,6 +229,86 @@ test("external actions are disabled by default and missing credentials never rea
     error: { code: "GITHUB_CREDENTIAL_MISSING", trust: "absent" },
   });
   assert.equal(credentials, 1);
+
+  assert.throws(() => createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialProvider: () => "legacy-secret",
+    transport,
+    inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
+  }), /credentialSource/u);
+});
+
+test("one generic execution acquires, uses, and releases one actor-bound lease", async () => {
+  const envelope = envelopeFor("comment");
+  const transport = mutableTransport(envelope);
+  const credential = recordingCredentialSource();
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
+    clock: () => 1_000_000,
+    timeoutMs: 60_000,
+  });
+
+  const result = await executor.execute(envelope);
+
+  assert.equal(result.status, "applied");
+  assert.equal(credential.calls.acquire.length, 1);
+  assert.equal(credential.calls.acquire[0].actorAccountId, envelope.actor.accountId);
+  assert.equal(credential.calls.acquire[0].deadline, 1_060_000);
+  assert.equal(credential.calls.acquire[0].signal instanceof AbortSignal, true);
+  assert.equal(credential.calls.use, 1);
+  assert.equal(credential.calls.release, 1);
+  assert.equal(JSON.stringify(result).includes(credential.token), false);
+});
+
+test("one generic reconcile acquires, uses, and releases one actor-bound lease", async () => {
+  const envelope = envelopeFor("comment");
+  const transport = mutableTransport(envelope);
+  const credential = recordingCredentialSource();
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
+  });
+
+  assert.equal((await executor.reconcile(envelope)).status, "absent");
+  assert.equal(credential.calls.acquire.length, 1);
+  assert.equal(credential.calls.use, 1);
+  assert.equal(credential.calls.release, 1);
+});
+
+test("closing the generic executor releases its lease and prevents later stages", async () => {
+  const envelope = envelopeFor("comment");
+  const credential = recordingCredentialSource();
+  let executor;
+  const calls = [];
+  const transport = {
+    async observe() {
+      calls.push("observe");
+      executor.close();
+      return observationFor(envelope);
+    },
+    async perform() { calls.push("perform"); },
+  };
+  executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: credential.source,
+    transport,
+    inputAuthorityVerifier: acceptingAuthority(envelope.action.inputBinding),
+  });
+
+  const result = await executor.execute(envelope);
+
+  assert.deepEqual(result, {
+    status: "error",
+    error: { code: "GITHUB_UNAVAILABLE", trust: "absent" },
+  });
+  assert.deepEqual(calls, ["observe"]);
+  assert.equal(credential.calls.release, 1);
+  assert.equal(credential.calls.acquire[0].signal.aborted, true);
 });
 
 test("all five actions execute once and reconcile from action-specific proof", async () => {
@@ -358,12 +465,9 @@ test("stale target or authority never performs an external action", async () => 
 test("stale input authority is fenced before credentials or transport", async () => {
   const envelope = envelopeFor("comment");
   const transport = mutableTransport(envelope);
-  let credentials = 0;
+  const credential = recordingCredentialSource("runtime-secret");
   const executor = executorFor(envelope, transport, {
-    credentialProvider() {
-      credentials += 1;
-      return "runtime-secret";
-    },
+    credentialSource: credential.source,
     inputAuthorityVerifier: {
       async verify() {
         throw new Error("the PR Head changed before owner confirmation");
@@ -372,8 +476,56 @@ test("stale input authority is fenced before credentials or transport", async ()
   });
 
   assert.deepEqual(await executor.execute(envelope), { status: "stale" });
-  assert.equal(credentials, 0);
+  assert.equal(credential.calls.acquire.length, 0);
   assert.deepEqual(transport.calls, []);
+});
+
+test("pre-credential stale and verification errors clear operation timers", async (t) => {
+  const timers = [];
+  const cleared = [];
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const timer = { callback, delay, unref() {} };
+    timers.push(timer);
+    return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer) => cleared.push(timer));
+
+  const staleEnvelope = envelopeFor("comment");
+  const staleCredential = recordingCredentialSource();
+  const staleTransport = mutableTransport(staleEnvelope);
+  const staleExecutor = createPullRequestExternalActionExecutor({
+    enabledActions: ["comment"],
+    credentialSource: staleCredential.source,
+    transport: staleTransport,
+    inputAuthorityVerifier: {
+      async verify() { throw new Error("authority changed"); },
+    },
+  });
+
+  const pushEnvelope = envelopeFor("push");
+  const pushCredential = recordingCredentialSource();
+  const pushExecutor = createPullRequestExternalActionExecutor({
+    enabledActions: ["push"],
+    credentialSource: pushCredential.source,
+    transport: mutableTransport(pushEnvelope),
+    inputAuthorityVerifier: acceptingAuthority(pushEnvelope.action.inputBinding),
+    controlledCommitVerifier: {
+      async verify() { throw new Error("sealed evidence unavailable"); },
+    },
+  });
+
+  assert.deepEqual(await staleExecutor.execute(staleEnvelope), { status: "stale" });
+  assert.deepEqual(await pushExecutor.execute(pushEnvelope), {
+    status: "error",
+    error: {
+      code: "CONTROLLED_COMMIT_VERIFIER_UNAVAILABLE",
+      trust: "absent",
+    },
+  });
+  assert.equal(staleCredential.calls.acquire.length, 0);
+  assert.equal(pushCredential.calls.acquire.length, 0);
+  assert.equal(timers.length, 2);
+  assert.deepEqual(cleared, timers);
 });
 
 test("lost response recovery proves completion after authority is revoked", async () => {
@@ -409,12 +561,9 @@ test("lost response recovery proves completion after authority is revoked", asyn
 test("absent recovery proof checks revoked authority after one observation", async () => {
   const envelope = envelopeFor("comment");
   const transport = mutableTransport(envelope);
-  let credentials = 0;
+  const credential = recordingCredentialSource("runtime-secret");
   const executor = executorFor(envelope, transport, {
-    credentialProvider() {
-      credentials += 1;
-      return "runtime-secret";
-    },
+    credentialSource: credential.source,
     inputAuthorityVerifier: {
       async verify() {
         throw new Error("the PR Head changed before recovery");
@@ -423,7 +572,7 @@ test("absent recovery proof checks revoked authority after one observation", asy
   });
 
   assert.deepEqual(await executor.reconcile(envelope), { status: "stale" });
-  assert.equal(credentials, 1);
+  assert.equal(credential.calls.acquire.length, 1);
   assert.deepEqual(
     transport.calls.map(({ method }) => method),
     ["observe"],
@@ -434,7 +583,11 @@ test("recovery without credentials remains unknown and never performs", async ()
   const envelope = envelopeFor("comment");
   const transport = mutableTransport(envelope);
   const executor = executorFor(envelope, transport, {
-    credentialProvider() { return null; },
+    credentialSource: Object.freeze({
+      async acquire() {
+        throw githubCredentialSourceError("GITHUB_CREDENTIAL_MISSING");
+      },
+    }),
   });
 
   assert.deepEqual(await executor.reconcile(envelope), {
@@ -475,10 +628,10 @@ test("authority revoked during the final observation is fenced before perform", 
 
 test("push verifies sealed controlled evidence before any credential or transport call", async () => {
   const envelope = envelopeFor("push");
-  let credentials = 0;
+  const credential = recordingCredentialSource("secret");
   const transport = mutableTransport(envelope);
   const executor = executorFor(envelope, transport, {
-    credentialProvider() { credentials += 1; return "secret"; },
+    credentialSource: credential.source,
     controlledCommitVerifier: {
       async verify() {
         const changed = structuredClone(envelope.action.controlledCommitEvidence);
@@ -489,7 +642,7 @@ test("push verifies sealed controlled evidence before any credential or transpor
   });
 
   assert.deepEqual(await executor.execute(envelope), { status: "stale" });
-  assert.equal(credentials, 0);
+  assert.equal(credential.calls.acquire.length, 0);
   assert.equal(transport.calls.length, 0);
 });
 
@@ -541,18 +694,18 @@ test("push revalidates controlled evidence after the final observation before pe
 
 test("push recovery uses sealed proof when the current evidence verifier is unavailable", async () => {
   const envelope = envelopeFor("push");
-  let credentials = 0;
+  const credential = recordingCredentialSource("secret");
   const transport = mutableTransport(envelope);
   transport.setObservation(completedObservation(envelope, "unused"));
   const executor = executorFor(envelope, transport, {
-    credentialProvider() { credentials += 1; return "secret"; },
+    credentialSource: credential.source,
     controlledCommitVerifier: {
       async verify() { throw new Error("sealed store temporarily unavailable"); },
     },
   });
 
   assert.equal((await executor.reconcile(envelope)).status, "already");
-  assert.equal(credentials, 1);
+  assert.equal(credential.calls.acquire.length, 1);
   assert.deepEqual(
     transport.calls.map(({ method }) => method),
     ["observe"],
