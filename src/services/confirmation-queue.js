@@ -363,6 +363,7 @@ function projectHistoryItem(item) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     retryable: Boolean(item.failure?.retryable),
+    ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
   };
 }
 
@@ -1075,7 +1076,8 @@ export class ConfirmationQueue {
     if (
       item.status === "failed" &&
       item.failure?.outcome === "unknown" &&
-      outcome.status === "unknown"
+      outcome.status === "unknown" &&
+      item.failure.code === outcome.code
     ) {
       return;
     }

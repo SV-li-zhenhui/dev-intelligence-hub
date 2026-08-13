@@ -610,7 +610,7 @@ test("history listing is read-only, newest-first, cursor paged, filtered, and sa
   assert.equal(first.roleIdFacets.includes("unsupported-history-role"), false);
 });
 
-test("history projects completed and retryable failed actions", async () => {
+test("history projects completed and failed actions with stable diagnostics", async () => {
   const actionExecutor = executor({
     async execute(envelope) {
       this.executeCalls.push(structuredClone(envelope));
@@ -643,17 +643,24 @@ test("history projects completed and retryable failed actions", async () => {
   const history = await queue.list({ limit: 10 });
 
   assert.deepEqual(
-    history.items.map(({ id, status, retryable }) => ({ id, status, retryable })),
+    history.items.map(({ id, status, retryable, diagnosticCode }) => ({
+      id,
+      status,
+      retryable,
+      diagnosticCode,
+    })),
     [
       {
         id: "confirmation-history-failed",
         status: "failed",
         retryable: true,
+        diagnosticCode: "GITHUB_REJECTED",
       },
       {
         id: "confirmation-history-success",
         status: "completed",
         retryable: false,
+        diagnosticCode: undefined,
       },
     ],
   );
@@ -1928,6 +1935,63 @@ test("startup recovery never turns an unknown action into a retryable absence", 
   assert.equal((await recovered.next()).item, null);
   assert.equal(recoveryExecutor.reconcileCalls.length, 1);
   assert.equal(recoveryExecutor.executeCalls.length, 0);
+});
+
+test("startup recovery refreshes a stable diagnostic without relaxing unknown", async () => {
+  const store = new MemoryStore();
+  const firstExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      throw new ConfirmationExecutionError(
+        "GITHUB_RESPONSE_LOST",
+        "unknown",
+      );
+    },
+  });
+  const first = await readyQueue({ store, actionExecutor: firstExecutor });
+  await first.enqueue(actionPlan());
+  let next = await first.next();
+  const failed = await first.approve(next.item.id, approvalRequest(next));
+
+  assert.equal(failed.failure.code, "GITHUB_RESPONSE_LOST");
+  assert.equal(failed.failure.outcome, "unknown");
+  assert.equal(failed.retryable, false);
+
+  const recoveryExecutor = executor({
+    async reconcile(envelope) {
+      this.reconcileCalls.push(structuredClone(envelope));
+      throw new ConfirmationExecutionError(
+        "GITHUB_LOGIN_UNAVAILABLE",
+        "unknown",
+      );
+    },
+  });
+  const recovered = await readyQueue({
+    store,
+    actionExecutor: recoveryExecutor,
+  });
+  const current = await recovered.get(failed.id);
+
+  assert.deepEqual(current.failure, {
+    code: "GITHUB_LOGIN_UNAVAILABLE",
+    outcome: "unknown",
+    retryable: false,
+    at: "2026-08-02T01:00:00.000Z",
+  });
+  assert.equal(current.status, "failed");
+  assert.equal(current.retryable, false);
+  assert.equal(recoveryExecutor.reconcileCalls.length, 1);
+  assert.equal(recoveryExecutor.executeCalls.length, 0);
+  assert.equal(
+    (await recovered.list({ status: "failed", limit: 10 })).items[0]
+      .diagnosticCode,
+    "GITHUB_LOGIN_UNAVAILABLE",
+  );
+
+  const writesAfterDiagnosticRefresh = store.writeCount;
+  await readyQueue({ store, actionExecutor: recoveryExecutor });
+  assert.equal(store.writeCount, writesAfterDiagnosticRefresh);
+  assert.equal(recoveryExecutor.reconcileCalls.length, 2);
 });
 
 test("unknown external recovery blocks configuration activation across restarts", async () => {

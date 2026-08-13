@@ -624,6 +624,7 @@ function confirmationHistoryItemMarkup(item) {
     </div>
     <p>${escapeHtml(item.summary || "")}</p>
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
+    ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
   </article>`;
 }
 
@@ -2661,6 +2662,10 @@ function normalizedConfirmationHistoryItems(value) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       retryable: item.retryable === true,
+      ...(typeof item.diagnosticCode === "string" &&
+          /^[A-Z][A-Z0-9_]{2,63}$/.test(item.diagnosticCode)
+        ? { diagnosticCode: item.diagnosticCode }
+        : {}),
     }];
   });
 }

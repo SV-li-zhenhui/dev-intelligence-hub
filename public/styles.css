@@ -651,6 +651,14 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.confirmation-history-diagnostic {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 .confirmation-pending-item,
 .confirmation-history-item {
   padding: 13px 0;

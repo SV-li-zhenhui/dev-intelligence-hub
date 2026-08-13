@@ -75,6 +75,9 @@ function historyItem(status, suffix) {
     createdAt: "2026-08-06T01:00:00.000Z",
     updatedAt: "2026-08-06T01:01:00.000Z",
     retryable: status === "failed",
+    ...(status === "failed"
+      ? { diagnosticCode: "GITHUB_LOGIN_UNAVAILABLE" }
+      : {}),
   };
 }
 
@@ -433,6 +436,10 @@ try {
   assert.match(
     await page.locator(".confirmation-history-item").first().textContent(),
     /可再次逐项确认/,
+  );
+  assert.match(
+    await page.locator(".confirmation-history-item").first().textContent(),
+    /诊断：GITHUB_LOGIN_UNAVAILABLE/,
   );
 
   await submitHistoryFilter(page, { role: "unavailable-reader" });
