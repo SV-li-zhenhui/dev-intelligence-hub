@@ -17,11 +17,12 @@ function root(overrides = {}) {
   };
 }
 
-function blockersFor(item, outbox = []) {
+function blockersFor(item, outbox = [], options = {}) {
   return inspectPullRequestSourceCutover(
     item,
     [item],
     new Map(outbox.map((entry) => [entry.intentId, entry])),
+    options,
   ).blockers;
 }
 
@@ -33,6 +34,10 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
   const proposalFailed = root({
     statusReason: "proposal_failed",
     decisionContext: { source: "proposal", outcome: "failed" },
+  });
+  const proposalRejected = root({
+    statusReason: "proposal_rejected",
+    decisionContext: { source: "proposal", outcome: "rejected" },
   });
   const intentFailed = root({ statusReason: "intent_failed" });
   const failedOutbox = {
@@ -47,6 +52,7 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
 
   assert.deepEqual(blockersFor(rejected), []);
   assert.deepEqual(blockersFor(proposalFailed), []);
+  assert.deepEqual(blockersFor(proposalRejected), []);
   assert.deepEqual(blockersFor(intentFailed, [failedOutbox]), []);
   assert.deepEqual(
     blockersFor(root({
@@ -63,6 +69,66 @@ test("cutover releases only blocked outcomes with durable final evidence", () =>
   assert.deepEqual(
     blockersFor(root({ statusReason: "manual_block" }))
       .map(({ itemId }) => itemId),
+    ["root-a"],
+  );
+});
+
+test("cutover recovers a persisted blocker only from its latest durable rejected proposal", () => {
+  const decisionDigest = "d".repeat(64);
+  const persisted = root({
+    revision: 7,
+    statusReason: "pr_source_cross_root_cutover_blocker:root-b",
+    decisionContext: {
+      source: "proposal",
+      outcome: "rejected",
+      contentDigest: decisionDigest,
+    },
+  });
+  const rejected = {
+    sequence: 10,
+    itemId: persisted.itemId,
+    type: "proposal_result_applied",
+    details: {
+      outcome: "rejected",
+      workItemRevision: 6,
+      decision: { contentDigest: decisionDigest },
+    },
+  };
+  const sourceRevision = {
+    sequence: 11,
+    itemId: persisted.itemId,
+    type: "pr_source_revised",
+    details: {},
+  };
+
+  assert.deepEqual(
+    blockersFor(persisted, [], { timeline: [rejected, sourceRevision] }),
+    [],
+  );
+  assert.deepEqual(
+    blockersFor(persisted, [], {
+      timeline: [
+        rejected,
+        {
+          sequence: 11,
+          itemId: persisted.itemId,
+          type: "transitioned",
+          details: {},
+        },
+      ],
+    }).map(({ itemId }) => itemId),
+    ["root-a"],
+  );
+  assert.deepEqual(
+    blockersFor(persisted, [], {
+      timeline: [{
+        ...rejected,
+        details: {
+          ...rejected.details,
+          decision: { contentDigest: "e".repeat(64) },
+        },
+      }],
+    }).map(({ itemId }) => itemId),
     ["root-a"],
   );
 });

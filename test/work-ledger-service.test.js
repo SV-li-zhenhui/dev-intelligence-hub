@@ -1907,6 +1907,70 @@ for (const predecessorStatus of ["queued", "working"]) {
   });
 }
 
+test("an owner-requested PR root retires a durably rejected proposal predecessor", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  const {
+    intentId: proposalId,
+    ...proposalContent
+  } = sealed.outbox.dispatchBinding.boundIntent;
+  const proposal = normalizeBoundWorkProposal({
+    proposalId,
+    ...proposalContent,
+  });
+  let predecessor = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === sealed.rootItemId,
+  );
+  await fixture.service.ackIntent({
+    intentId: sealed.outbox.intentId,
+    expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: predecessor.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "waiting_external",
+    details: {
+      downstreamRef: proposal.proposalId,
+      proposalDigest: proposal.contentDigest,
+    },
+  });
+  await fixture.service.applyProposalBatch({
+    items: [createWorkProposalResult({
+      proposal,
+      sequence: 1,
+      transition: {
+        status: "rejected",
+        summary: "所有者拒绝旧提案",
+        evidence: [],
+      },
+      downstreamRef: "confirmation-rejected-cross-root",
+      at: fixture.time.clock(),
+    })],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  predecessor = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId === predecessor.itemId,
+  );
+  assert.equal(predecessor.status, "blocked");
+  assert.equal(predecessor.statusReason, "proposal_rejected");
+
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const retired = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const active = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(retired.status, "blocked");
+  assert.equal(retired.statusReason, "pr_source_cross_root_cutover_retired");
+  assert.equal(active.status, "queued");
+  assert.equal(active.statusReason, null);
+});
+
 for (const cutover of ["same-root-head", "cross-provenance-root"]) {
   test(`${cutover} invalidates old PR memory through the durable system pipeline`, async () => {
     const fixture = await createFixture({

@@ -160,7 +160,37 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function definitivelySettledBlocked(item, outboxById) {
+function durablyRejectedProposal(item) {
+  return item.statusReason === "proposal_rejected" &&
+    item.decisionContext?.source === "proposal" &&
+    item.decisionContext?.outcome === "rejected";
+}
+
+function persistedRejectedProposalBlocker(item, timeline) {
+  if (
+    crossRootPullRequestCutoverPendingId(item) === null ||
+    item.decisionContext?.source !== "proposal" ||
+    item.decisionContext?.outcome !== "rejected" ||
+    typeof item.decisionContext.contentDigest !== "string" ||
+    !Array.isArray(timeline)
+  ) {
+    return false;
+  }
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+    if (entry?.itemId !== item.itemId) continue;
+    if (entry.type === "pr_source_revised") continue;
+    return entry.type === "proposal_result_applied" &&
+      entry.details?.outcome === "rejected" &&
+      entry.details?.decision?.contentDigest ===
+        item.decisionContext.contentDigest &&
+      Number.isSafeInteger(entry.details?.workItemRevision) &&
+      entry.details.workItemRevision <= item.revision;
+  }
+  return false;
+}
+
+function definitivelySettledBlocked(item, outboxById, timeline) {
   if (item.status !== "blocked" || item.activeIntentId !== null) return false;
   if ([
     "pr_source_left_scope",
@@ -185,6 +215,12 @@ function definitivelySettledBlocked(item, outboxById) {
     item.statusReason === "proposal_failed" &&
     item.decisionContext?.source === "proposal" &&
     item.decisionContext?.outcome === "failed"
+  ) {
+    return true;
+  }
+  if (
+    durablyRejectedProposal(item) ||
+    persistedRejectedProposalBlocker(item, timeline)
   ) {
     return true;
   }
@@ -229,7 +265,7 @@ export function inspectPullRequestSourceCutover(
   root,
   items,
   outboxById,
-  { forceHeadChanged = false } = {},
+  { forceHeadChanged = false, timeline = [] } = {},
 ) {
   const headChanged = forceHeadChanged || pendingHeadChanged(root.source);
   const participants = [
@@ -239,12 +275,12 @@ export function inspectPullRequestSourceCutover(
   const blockers = participants.filter((item) => {
     if (item.itemId === root.itemId) {
       return !ROOT_READY_STATUSES.has(item.status) &&
-        !definitivelySettledBlocked(item, outboxById) &&
+        !definitivelySettledBlocked(item, outboxById, timeline) &&
         unstartedIntent(item, outboxById) === null;
     }
     return !CHILD_TERMINAL_STATUSES.has(item.status) &&
       !CHILD_SUPERSEDABLE_STATUSES.has(item.status) &&
-      !definitivelySettledBlocked(item, outboxById) &&
+      !definitivelySettledBlocked(item, outboxById, timeline) &&
       unstartedIntent(item, outboxById) === null;
   });
   return { blockers, headChanged, participants };
@@ -603,7 +639,7 @@ function planCrossRootPullRequestSourceReconciliation({
     predecessor,
     state.items,
     outboxById,
-    { forceHeadChanged: true },
+    { forceHeadChanged: true, timeline: state.timeline },
   );
   if (
     activation.blockers.some(
@@ -774,6 +810,7 @@ export function planPullRequestSourceReconciliation({ state, input, clock }) {
     root,
     state.items,
     outboxById,
+    { timeline: state.timeline },
   );
   const blockers = publicBlockers(activation);
   if (blockers.length > 0) {

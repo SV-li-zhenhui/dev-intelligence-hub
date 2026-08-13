@@ -827,7 +827,7 @@ export class WorkLedgerService {
             root,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true },
+            { forceHeadChanged: true, timeline: this.state.timeline },
           );
           if (cutover.blockers.length === 0) {
             root = applyReadyPullRequestSourceCutover({
@@ -978,7 +978,7 @@ export class WorkLedgerService {
             predecessor,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true },
+            { forceHeadChanged: true, timeline: this.state.timeline },
           );
           if (activation.blockers.length > 0) {
             rootCandidate.status = "blocked";
@@ -1104,7 +1104,7 @@ export class WorkLedgerService {
             currentPredecessor,
             [...itemsById.values()],
             outboxById,
-            { forceHeadChanged: true },
+            { forceHeadChanged: true, timeline: this.state.timeline },
           );
           if (activation.blockers.length > 0) {
             root = {
@@ -1214,7 +1214,7 @@ export class WorkLedgerService {
               currentPredecessor,
               [...itemsById.values()],
               outboxById,
-              { forceHeadChanged: true },
+              { forceHeadChanged: true, timeline: this.state.timeline },
             );
             if (activation.blockers.length > 0) {
               root = {
@@ -1298,6 +1298,7 @@ export class WorkLedgerService {
               pendingRoot,
               [...itemsById.values()],
               outboxById,
+              { timeline: this.state.timeline },
             );
             if (activation.blockers.length === 0) {
               const pendingRevision = appended.source.pendingRevision;
