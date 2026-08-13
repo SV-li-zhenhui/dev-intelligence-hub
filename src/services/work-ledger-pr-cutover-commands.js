@@ -53,23 +53,55 @@ export const CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_REASON =
 const pullRequestCutoverTimelineIndexes = new WeakMap();
 
 function recordCutoverTimelineEvent(index, entry) {
-  const latestByItemId = pullRequestCutoverTimelineIndexes.get(index);
-  if (
-    latestByItemId === undefined ||
-    typeof entry?.itemId !== "string" ||
-    entry.type === "pr_source_revised"
-  ) {
-    return;
+  const state = pullRequestCutoverTimelineIndexes.get(index);
+  if (state === undefined) return;
+  const itemId =
+    typeof entry?.itemId === "string" && entry.type !== "pr_source_revised"
+      ? entry.itemId
+      : null;
+  const record = { entry, itemId };
+  if (itemId !== null) state.latestByItemId.set(itemId, record);
+  if (state.timelineLimit === null) return;
+  state.window.push(record);
+  while (state.window.length - state.windowStart > state.timelineLimit) {
+    const expired = state.window[state.windowStart];
+    state.windowStart += 1;
+    if (
+      expired.itemId !== null &&
+      state.latestByItemId.get(expired.itemId) === expired
+    ) {
+      state.latestByItemId.delete(expired.itemId);
+    }
   }
-  latestByItemId.set(entry.itemId, entry);
+  if (
+    state.windowStart >= 1024 &&
+    state.windowStart * 2 >= state.window.length
+  ) {
+    state.window.splice(0, state.windowStart);
+    state.windowStart = 0;
+  }
 }
 
-export function createPullRequestCutoverTimelineIndex(timeline = []) {
+export function createPullRequestCutoverTimelineIndex(
+  timeline = [],
+  timelineLimit = null,
+) {
   if (!Array.isArray(timeline)) {
     throw new TypeError("pull request cutover timeline must be an array");
   }
+  if (
+    timelineLimit !== null &&
+    (!Number.isSafeInteger(timelineLimit) || timelineLimit < 1)
+  ) {
+    throw new TypeError("pull request cutover timeline limit must be positive");
+  }
   const index = Object.freeze({});
-  pullRequestCutoverTimelineIndexes.set(index, new Map());
+  pullRequestCutoverTimelineIndexes.set(index, {
+    latestByItemId: new Map(),
+    timelineLimit,
+    window: timelineLimit === null ? null : [],
+    windowStart: 0,
+  });
   for (const entry of timeline) recordCutoverTimelineEvent(index, entry);
   return index;
 }
@@ -82,7 +114,32 @@ export function appendPullRequestCutoverTimelineEvent(index, entry) {
 }
 
 function latestCutoverTimelineEvent(index, itemId) {
-  return pullRequestCutoverTimelineIndexes.get(index)?.get(itemId) ?? null;
+  return pullRequestCutoverTimelineIndexes.get(index)?.latestByItemId
+    .get(itemId)?.entry ?? null;
+}
+
+export function arePullRequestCutoverProofsRetained({
+  timeline,
+  timelineLimit,
+  appendedEventCount,
+  proofs,
+}) {
+  if (!Array.isArray(timeline) || !Array.isArray(proofs)) {
+    throw new TypeError("pull request cutover proof inputs must be arrays");
+  }
+  if (!Number.isSafeInteger(timelineLimit) || timelineLimit < 1) {
+    throw new TypeError("pull request cutover timeline limit must be positive");
+  }
+  if (!Number.isSafeInteger(appendedEventCount) || appendedEventCount < 0) {
+    throw new TypeError(
+      "pull request cutover appended event count must be non-negative",
+    );
+  }
+  const retainedStart = Math.max(
+    0,
+    timeline.length + appendedEventCount - timelineLimit,
+  );
+  return proofs.every((proof) => timeline.indexOf(proof) >= retainedStart);
 }
 
 function marker(reason, itemId) {
@@ -195,13 +252,13 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function hasLatestRejectedProposalProof(item, timelineIndex) {
+function latestRejectedProposalProof(item, timelineIndex) {
   if (
     item.decisionContext?.source !== "proposal" ||
     item.decisionContext?.outcome !== "rejected" ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
-    return false;
+    return null;
   }
   const entry = latestCutoverTimelineEvent(timelineIndex, item.itemId);
   return entry?.type === "proposal_result_applied" &&
@@ -209,54 +266,48 @@ function hasLatestRejectedProposalProof(item, timelineIndex) {
     entry.details?.decision?.contentDigest ===
       item.decisionContext.contentDigest &&
     Number.isSafeInteger(entry.details?.workItemRevision) &&
-    entry.details.workItemRevision <= item.revision;
+    entry.details.workItemRevision <= item.revision
+    ? entry
+    : null;
 }
 
-function durablyRejectedProposal(item, timelineIndex) {
-  return item.statusReason === "proposal_rejected" &&
-    hasLatestRejectedProposalProof(item, timelineIndex);
-}
-
-function persistedRejectedProposalBlocker(item, timelineIndex) {
-  return crossRootPullRequestCutoverPendingId(item) !== null &&
-    hasLatestRejectedProposalProof(item, timelineIndex);
-}
-
-function definitivelySettledBlocked(item, outboxById, timelineIndex) {
-  if (item.status !== "blocked" || item.activeIntentId !== null) return false;
+function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
+  if (item.status !== "blocked" || item.activeIntentId !== null) return null;
   if ([
     "pr_source_left_scope",
     "pr_source_reentered_scope_without_route",
   ].includes(item.statusReason)) {
-    return true;
+    return { proposalProof: null };
   }
   if (item.statusReason === "pr_source_cross_root_cutover_retired") {
-    return true;
+    return { proposalProof: null };
   }
   if (item.statusReason === "decision_attempts_exhausted") {
-    return true;
+    return { proposalProof: null };
   }
   if (
     item.statusReason === "attention_rejected" &&
     item.decisionContext?.source === "attention" &&
     item.decisionContext?.outcome === "rejected"
   ) {
-    return true;
+    return { proposalProof: null };
   }
   if (
     item.statusReason === "proposal_failed" &&
     item.decisionContext?.source === "proposal" &&
     item.decisionContext?.outcome === "failed"
   ) {
-    return true;
+    return { proposalProof: null };
   }
+  const proposalProof = latestRejectedProposalProof(item, timelineIndex);
   if (
-    durablyRejectedProposal(item, timelineIndex) ||
-    persistedRejectedProposalBlocker(item, timelineIndex)
+    proposalProof !== null &&
+    (item.statusReason === "proposal_rejected" ||
+      crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
-    return true;
+    return { proposalProof };
   }
-  if (item.statusReason !== "intent_failed") return false;
+  if (item.statusReason !== "intent_failed") return null;
   return [...outboxById.values()].some(
     (outbox) =>
       outbox.itemId === item.itemId &&
@@ -264,7 +315,9 @@ function definitivelySettledBlocked(item, outboxById, timelineIndex) {
       outbox.status === "failed" &&
       outbox.outcome?.status === "failed" &&
       outbox.updatedAt === item.updatedAt,
-  );
+  )
+    ? { proposalProof: null }
+    : null;
 }
 
 function sourceEpochChildren(items, root) {
@@ -304,18 +357,30 @@ export function inspectPullRequestSourceCutover(
     root,
     ...(headChanged ? sourceEpochChildren(items, root) : []),
   ];
+  const proposalSettlements = [];
   const blockers = participants.filter((item) => {
-    if (item.itemId === root.itemId) {
-      return !ROOT_READY_STATUSES.has(item.status) &&
-        !definitivelySettledBlocked(item, outboxById, timelineIndex) &&
-        unstartedIntent(item, outboxById) === null;
+    const statusReady = item.itemId === root.itemId
+      ? ROOT_READY_STATUSES.has(item.status)
+      : CHILD_TERMINAL_STATUSES.has(item.status) ||
+        CHILD_SUPERSEDABLE_STATUSES.has(item.status);
+    if (statusReady) return false;
+    const settlement = definitiveBlockedSettlement(
+      item,
+      outboxById,
+      timelineIndex,
+    );
+    if (settlement !== null) {
+      if (settlement.proposalProof !== null) {
+        proposalSettlements.push({
+          participant: item,
+          proof: settlement.proposalProof,
+        });
+      }
+      return false;
     }
-    return !CHILD_TERMINAL_STATUSES.has(item.status) &&
-      !CHILD_SUPERSEDABLE_STATUSES.has(item.status) &&
-      !definitivelySettledBlocked(item, outboxById, timelineIndex) &&
-      unstartedIntent(item, outboxById) === null;
+    return unstartedIntent(item, outboxById) === null;
   });
-  return { blockers, headChanged, participants };
+  return { blockers, headChanged, participants, proposalSettlements };
 }
 
 export function crossRootPullRequestCutoverActivation(root, activation) {
@@ -619,6 +684,7 @@ function planCrossRootPullRequestSourceReconciliation({
   root,
   predecessorItemId,
   clock,
+  timelineLimit,
 }) {
   if (root.status !== "blocked") {
     throw conflict("跨来源 PR cutover 状态无效");
@@ -673,7 +739,10 @@ function planCrossRootPullRequestSourceReconciliation({
     outboxById,
     {
       forceHeadChanged: true,
-      timelineIndex: createPullRequestCutoverTimelineIndex(state.timeline),
+      timelineIndex: createPullRequestCutoverTimelineIndex(
+        state.timeline,
+        timelineLimit,
+      ),
     },
   );
   if (
@@ -789,6 +858,22 @@ function planCrossRootPullRequestSourceReconciliation({
       predecessorItemId,
     },
   });
+  if (!arePullRequestCutoverProofsRetained({
+    timeline: state.timeline,
+    timelineLimit,
+    appendedEventCount: timelineEvents.length,
+    proofs: activation.proposalSettlements.map(({ proof }) => proof),
+  })) {
+    return {
+      write: false,
+      result: resultFor(
+        state.revision,
+        root,
+        false,
+        publicBlockers({ ...activation, blockers: [predecessor] }),
+      ),
+    };
+  }
   return {
     patch: {
       items: [...itemsById.values()],
@@ -799,7 +884,12 @@ function planCrossRootPullRequestSourceReconciliation({
   };
 }
 
-export function planPullRequestSourceReconciliation({ state, input, clock }) {
+export function planPullRequestSourceReconciliation({
+  state,
+  input,
+  clock,
+  timelineLimit,
+}) {
   const command = normalizeCommand(input);
   const root = requireWorkLedgerItem(state, command.itemId);
   if (root.kind !== "source_root" || root.source?.kind !== "pull_request") {
@@ -813,6 +903,7 @@ export function planPullRequestSourceReconciliation({ state, input, clock }) {
       root,
       predecessorItemId,
       clock,
+      timelineLimit,
     });
   }
   if (
@@ -846,7 +937,10 @@ export function planPullRequestSourceReconciliation({ state, input, clock }) {
     state.items,
     outboxById,
     {
-      timelineIndex: createPullRequestCutoverTimelineIndex(state.timeline),
+      timelineIndex: createPullRequestCutoverTimelineIndex(
+        state.timeline,
+        timelineLimit,
+      ),
     },
   );
   const blockers = publicBlockers(activation);
@@ -903,6 +997,22 @@ export function planPullRequestSourceReconciliation({ state, input, clock }) {
       headRefOid: next.source.current.headRefOid,
     },
   });
+  if (!arePullRequestCutoverProofsRetained({
+    timeline: state.timeline,
+    timelineLimit,
+    appendedEventCount: timelineEvents.length,
+    proofs: activation.proposalSettlements.map(({ proof }) => proof),
+  })) {
+    return {
+      write: false,
+      result: resultFor(
+        state.revision,
+        root,
+        false,
+        publicBlockers({ ...activation, blockers: [root] }),
+      ),
+    };
+  }
   return {
     patch: {
       items: [...itemsById.values()],

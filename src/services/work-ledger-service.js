@@ -61,6 +61,7 @@ import {
 } from "./work-ledger-pr-source.js";
 import {
   appendPullRequestCutoverTimelineEvent,
+  arePullRequestCutoverProofsRetained,
   applyReadyPullRequestSourceCutover,
   createPullRequestCutoverTimelineIndex,
   CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON,
@@ -663,6 +664,7 @@ export class WorkLedgerService {
         state: this.state,
         input,
         clock: () => this.#now(),
+        timelineLimit: this.limits.timelineLimit,
         ...(requiresLeaseId
           ? { newLeaseId: () => this.#newLeaseId() }
           : {}),
@@ -741,7 +743,7 @@ export class WorkLedgerService {
     });
   }
 
-  async #recordBatch(batch, now) {
+  async #recordBatch(batch, now, deniedCutoverProofs = new Set()) {
     if (batch.items.length === 0) {
       return cloneLedgerValue({
         received: 0,
@@ -792,6 +794,7 @@ export class WorkLedgerService {
     const timelineEvents = [];
     const cutoverTimelineIndex = createPullRequestCutoverTimelineIndex(
       this.state.timeline,
+      this.limits.timelineLimit,
     );
     let indexedTimelineEventCount = 0;
     const currentCutoverTimelineIndex = () => {
@@ -803,6 +806,28 @@ export class WorkLedgerService {
         indexedTimelineEventCount += 1;
       }
       return cutoverTimelineIndex;
+    };
+    const cutoverProofChecks = [];
+    const applyCutoverProofPolicy = (activation, checkId) => {
+      if (activation.proposalSettlements.length === 0) return activation;
+      if (deniedCutoverProofs.has(checkId)) {
+        const blockersByItemId = new Map(
+          activation.blockers.map((blocker) => [blocker.itemId, blocker]),
+        );
+        for (const { participant } of activation.proposalSettlements) {
+          blockersByItemId.set(participant.itemId, participant);
+        }
+        return {
+          ...activation,
+          blockers: [...blockersByItemId.values()],
+          proposalSettlements: [],
+        };
+      }
+      cutoverProofChecks.push({
+        checkId,
+        proofs: activation.proposalSettlements.map(({ proof }) => proof),
+      });
+      return activation;
     };
     let received = 0;
     let deduplicated = 0;
@@ -839,7 +864,7 @@ export class WorkLedgerService {
         if (root !== null) {
           const applied = applyPullRequestScopeLifecycle(root.source, envelope);
           const active = applied.source.scope.active;
-          const cutover = inspectPullRequestSourceCutover(
+          let cutover = inspectPullRequestSourceCutover(
             root,
             [...itemsById.values()],
             outboxById,
@@ -847,6 +872,10 @@ export class WorkLedgerService {
               forceHeadChanged: true,
               timelineIndex: currentCutoverTimelineIndex(),
             },
+          );
+          cutover = applyCutoverProofPolicy(
+            cutover,
+            `lifecycle:${envelope.assignment.assignmentId}:${root.itemId}`,
           );
           if (cutover.blockers.length === 0) {
             root = applyReadyPullRequestSourceCutover({
@@ -993,7 +1022,7 @@ export class WorkLedgerService {
           samePullRequestSubject(predecessor, rootCandidate) &&
           (candidateIsAuthoritative || candidateFencesAuthority)
         ) {
-          const activation = inspectPullRequestSourceCutover(
+          let activation = inspectPullRequestSourceCutover(
             predecessor,
             [...itemsById.values()],
             outboxById,
@@ -1001,6 +1030,10 @@ export class WorkLedgerService {
               forceHeadChanged: true,
               timelineIndex: currentCutoverTimelineIndex(),
             },
+          );
+          activation = applyCutoverProofPolicy(
+            activation,
+            `new-root:${envelope.assignment.assignmentId}:${predecessor.itemId}:${rootCandidate.itemId}`,
           );
           if (activation.blockers.length > 0) {
             rootCandidate.status = "blocked";
@@ -1122,7 +1155,7 @@ export class WorkLedgerService {
           const currentPredecessor = itemsById.get(
             crossRootPredecessor.itemId,
           );
-          const activation = inspectPullRequestSourceCutover(
+          let activation = inspectPullRequestSourceCutover(
             currentPredecessor,
             [...itemsById.values()],
             outboxById,
@@ -1130,6 +1163,10 @@ export class WorkLedgerService {
               forceHeadChanged: true,
               timelineIndex: currentCutoverTimelineIndex(),
             },
+          );
+          activation = applyCutoverProofPolicy(
+            activation,
+            `authority-fence:${envelope.assignment.assignmentId}:${currentPredecessor.itemId}:${root.itemId}`,
           );
           if (activation.blockers.length > 0) {
             root = {
@@ -1235,7 +1272,7 @@ export class WorkLedgerService {
             const currentPredecessor = itemsById.get(
               crossRootPredecessor.itemId,
             );
-            const activation = inspectPullRequestSourceCutover(
+            let activation = inspectPullRequestSourceCutover(
               currentPredecessor,
               [...itemsById.values()],
               outboxById,
@@ -1243,6 +1280,10 @@ export class WorkLedgerService {
                 forceHeadChanged: true,
                 timelineIndex: currentCutoverTimelineIndex(),
               },
+            );
+            activation = applyCutoverProofPolicy(
+              activation,
+              `existing-root:${envelope.assignment.assignmentId}:${currentPredecessor.itemId}:${root.itemId}`,
             );
             if (activation.blockers.length > 0) {
               root = {
@@ -1322,11 +1363,15 @@ export class WorkLedgerService {
               };
             }
           } else {
-            const activation = inspectPullRequestSourceCutover(
+            let activation = inspectPullRequestSourceCutover(
               pendingRoot,
               [...itemsById.values()],
               outboxById,
               { timelineIndex: currentCutoverTimelineIndex() },
+            );
+            activation = applyCutoverProofPolicy(
+              activation,
+              `same-root:${envelope.assignment.assignmentId}:${pendingRoot.itemId}`,
             );
             if (activation.blockers.length === 0) {
               const pendingRevision = appended.source.pendingRevision;
@@ -1441,6 +1486,28 @@ export class WorkLedgerService {
         deduplicated,
       },
     });
+    const invalidCutoverProofs = cutoverProofChecks.filter(
+      ({ proofs }) => !arePullRequestCutoverProofsRetained({
+        timeline: this.state.timeline,
+        timelineLimit: this.limits.timelineLimit,
+        appendedEventCount: timelineEvents.length,
+        proofs,
+      }),
+    );
+    if (invalidCutoverProofs.length > 0) {
+      const nextDeniedCutoverProofs = new Set(deniedCutoverProofs);
+      for (const { checkId } of invalidCutoverProofs) {
+        nextDeniedCutoverProofs.add(checkId);
+      }
+      if (nextDeniedCutoverProofs.size === deniedCutoverProofs.size) {
+        throw workLedgerError(
+          "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+          "PR cutover 证明无法在提交窗口内保持有效",
+          409,
+        );
+      }
+      return this.#recordBatch(batch, now, nextDeniedCutoverProofs);
+    }
     const nextState = this.#candidateWithTimeline(
       {
         ...this.state,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  appendPullRequestCutoverTimelineEvent,
   createPullRequestCutoverTimelineIndex,
   inspectPullRequestSourceCutover,
 } from "../src/services/work-ledger-pr-cutover-commands.js";
@@ -175,6 +176,109 @@ test("cutover recovers a persisted blocker only from its latest durable rejected
     }).map(({ itemId }) => itemId),
     ["root-a"],
   );
+});
+
+test("cutover proof expires when unrelated same-batch events rotate it out", () => {
+  const decisionDigest = "f".repeat(64);
+  const rejected = root({
+    revision: 1,
+    statusReason: "proposal_rejected",
+    decisionContext: {
+      source: "proposal",
+      outcome: "rejected",
+      contentDigest: decisionDigest,
+    },
+  });
+  const timelineIndex = createPullRequestCutoverTimelineIndex([{
+    sequence: 1,
+    itemId: rejected.itemId,
+    type: "proposal_result_applied",
+    details: {
+      outcome: "rejected",
+      workItemRevision: 1,
+      decision: { contentDigest: decisionDigest },
+    },
+  }], 2);
+  appendPullRequestCutoverTimelineEvent(timelineIndex, {
+    sequence: 2,
+    itemId: null,
+    type: "intake_completed",
+    details: {},
+  });
+  appendPullRequestCutoverTimelineEvent(timelineIndex, {
+    sequence: 3,
+    itemId: "unrelated-item",
+    type: "assignment_intaken",
+    details: {},
+  });
+
+  const blockers = inspectPullRequestSourceCutover(
+    rejected,
+    [rejected],
+    new Map(),
+    { timelineIndex },
+  ).blockers;
+
+  assert.deepEqual(blockers.map(({ itemId }) => itemId), ["root-a"]);
+});
+
+test("cutover keeps a newer same-item proof when the older record expires after compaction", () => {
+  const decisionDigest = "9".repeat(64);
+  const rejected = root({
+    revision: 2,
+    statusReason: "proposal_rejected",
+    decisionContext: {
+      source: "proposal",
+      outcome: "rejected",
+      contentDigest: decisionDigest,
+    },
+  });
+  const timelineIndex = createPullRequestCutoverTimelineIndex([], 1024);
+  for (let sequence = 1; sequence <= 1024; sequence += 1) {
+    appendPullRequestCutoverTimelineEvent(timelineIndex, {
+      sequence,
+      itemId: `old-${sequence}`,
+      type: "assignment_intaken",
+      details: {},
+    });
+  }
+  appendPullRequestCutoverTimelineEvent(timelineIndex, {
+    sequence: 1025,
+    itemId: rejected.itemId,
+    type: "proposal_result_applied",
+    details: {
+      outcome: "rejected",
+      workItemRevision: 1,
+      decision: { contentDigest: "8".repeat(64) },
+    },
+  });
+  appendPullRequestCutoverTimelineEvent(timelineIndex, {
+    sequence: 1026,
+    itemId: rejected.itemId,
+    type: "proposal_result_applied",
+    details: {
+      outcome: "rejected",
+      workItemRevision: 2,
+      decision: { contentDigest: decisionDigest },
+    },
+  });
+  for (let sequence = 1027; sequence <= 2049; sequence += 1) {
+    appendPullRequestCutoverTimelineEvent(timelineIndex, {
+      sequence,
+      itemId: `new-${sequence}`,
+      type: "assignment_intaken",
+      details: {},
+    });
+  }
+
+  const blockers = inspectPullRequestSourceCutover(
+    rejected,
+    [rejected],
+    new Map(),
+    { timelineIndex },
+  ).blockers;
+
+  assert.deepEqual(blockers, []);
 });
 
 test("cutover treats side-effect-free decision exhaustion as settled", () => {

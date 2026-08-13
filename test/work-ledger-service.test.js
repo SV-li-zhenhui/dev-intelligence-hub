@@ -2139,6 +2139,313 @@ test("a rejected proposal stays blocked after its retained proof rotates out", a
   );
 });
 
+test("same-intake retention rotation cannot release a rejected proposal cutover", async () => {
+  const timelineLimit = 6;
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    limits: { timelineLimit },
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
+  const before = fixture.store.stored();
+  const proofIndex = before.timeline.findIndex(
+    ({ itemId, type }) =>
+      itemId === predecessor.itemId && type === "proposal_result_applied",
+  );
+  assert.notEqual(proofIndex, -1);
+  const eventsAfterProof = before.timeline.length - proofIndex - 1;
+  const fillerCount = timelineLimit - eventsAfterProof;
+  assert.ok(fillerCount > 0);
+  fixture.source.records.push(
+    ...Array.from(
+      { length: fillerCount },
+      (_, index) => assignment(index + 2),
+    ),
+    ownerRequestedPrAssignment(fillerCount + 2),
+  );
+  fixture.source.highWatermark = fillerCount + 2;
+
+  await fixture.service.intake();
+
+  const retainedTimeline = (await fixture.service.listTimeline({ limit: 20 }))
+    .items;
+  assert.equal(
+    retainedTimeline.some(
+      ({ itemId, type }) =>
+        itemId === predecessor.itemId && type === "proposal_result_applied",
+    ),
+    false,
+  );
+  const roots = (await fixture.service.listItems({ limit: 20 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(
+    blocked.statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(pending.status, "blocked");
+  assert.equal(
+    pending.statusReason,
+    `pr_source_cross_root_cutover_pending:${blocked.itemId}`,
+  );
+});
+
+for (const targetPosition of ["first", "middle", "boundary"]) {
+  test(`same-intake ${targetPosition} cutover cannot rely on proof evicted before commit`, async () => {
+    const timelineLimit = 6;
+    const fixture = await createFixture({
+      records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+      limits: { timelineLimit },
+    });
+    const predecessor = await rejectSealedPullRequestProposal(fixture);
+    const before = fixture.store.stored();
+    const proofIndex = before.timeline.findIndex(
+      ({ itemId, type }) =>
+        itemId === predecessor.itemId && type === "proposal_result_applied",
+    );
+    assert.notEqual(proofIndex, -1);
+    const eventsAfterProof = before.timeline.length - proofIndex - 1;
+    const eventsNeededToEvict = timelineLimit - eventsAfterProof;
+    assert.ok(eventsNeededToEvict > 1);
+    const beforeCount = targetPosition === "first"
+      ? 0
+      : targetPosition === "middle"
+        ? Math.floor(eventsNeededToEvict / 2)
+        : eventsNeededToEvict - 1;
+    const afterCount = targetPosition === "boundary"
+      ? 0
+      : eventsNeededToEvict - beforeCount;
+    let nextSequence = 2;
+    const beforeAssignments = Array.from(
+      { length: beforeCount },
+      () => assignment(nextSequence++),
+    );
+    const ownerAssignment = ownerRequestedPrAssignment(nextSequence++);
+    const afterAssignments = Array.from(
+      { length: afterCount },
+      () => assignment(nextSequence++),
+    );
+    fixture.source.records.push(
+      ...beforeAssignments,
+      ownerAssignment,
+      ...afterAssignments,
+    );
+    fixture.source.highWatermark = nextSequence - 1;
+
+    await fixture.service.intake();
+
+    const retainedTimeline = (
+      await fixture.service.listTimeline({ limit: 20 })
+    ).items;
+    assert.equal(
+      retainedTimeline.some(
+        ({ itemId, type }) =>
+          itemId === predecessor.itemId && type === "proposal_result_applied",
+      ),
+      false,
+    );
+    const roots = (await fixture.service.listItems({ limit: 20 })).items
+      .filter(({ kind }) => kind === "source_root");
+    const blocked = roots.find(({ itemId }) => itemId === predecessor.itemId);
+    const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+    assert.equal(
+      blocked.statusReason,
+      `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+    );
+    assert.equal(pending.status, "blocked");
+    assert.equal(
+      pending.statusReason,
+      `pr_source_cross_root_cutover_pending:${blocked.itemId}`,
+    );
+  });
+}
+
+test("direct reconciliation cannot rely on proof evicted by its activation event", async () => {
+  const timelineLimit = 12;
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    limits: { timelineLimit },
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const predecessor = await rejectBoundPullRequestProposal(fixture, sealed);
+  let stored = fixture.store.stored();
+  const pending = stored.items.find(
+    ({ kind, itemId }) =>
+      kind === "source_root" && itemId !== predecessor.itemId,
+  );
+  const proofIndex = stored.timeline.findIndex(
+    ({ itemId, type }) =>
+      itemId === predecessor.itemId && type === "proposal_result_applied",
+  );
+  assert.notEqual(proofIndex, -1);
+  const eventsAfterProof = stored.timeline.length - proofIndex - 1;
+  const fillerCount = timelineLimit - eventsAfterProof - 2;
+  assert.ok(fillerCount > 0);
+  fixture.source.records.push(
+    ...Array.from(
+      { length: fillerCount },
+      (_, index) => assignment(index + 3),
+    ),
+  );
+  fixture.source.highWatermark = fillerCount + 2;
+  await fixture.service.intake();
+  stored = fixture.store.stored();
+  const storedPredecessor = stored.items.find(
+    ({ itemId }) => itemId === predecessor.itemId,
+  );
+  storedPredecessor.statusReason = crossRootPullRequestCutoverBlockerReason(
+    pending.itemId,
+  );
+  fixture.store.replaceStored(stored);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+    limits: { timelineLimit },
+  });
+  await recovered.recover();
+  const currentPending = (await recovered.listItems({ limit: 20 })).items
+    .find(({ itemId }) => itemId === pending.itemId);
+
+  const result = await recovered.reconcilePullRequestSource({
+    itemId: currentPending.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: currentPending.revision,
+    expectedPendingRevision:
+      currentPending.source.pendingRevision ??
+      currentPending.source.activeRevision,
+  });
+
+  assert.equal(result.applied, false);
+  const roots = (await recovered.listItems({ limit: 20 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  assert.equal(
+    roots.find(({ itemId }) => itemId === predecessor.itemId).statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(
+    roots.find(({ itemId }) => itemId === pending.itemId).statusReason,
+    `pr_source_cross_root_cutover_pending:${predecessor.itemId}`,
+  );
+});
+
+test("a new authority fence registers a predecessor whose proof expires before commit", async () => {
+  const timelineLimit = 24;
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    limits: { timelineLimit },
+  });
+  const predecessor = await rejectSealedPullRequestProposal(fixture);
+  const before = fixture.store.stored();
+  const proofIndex = before.timeline.findIndex(
+    ({ itemId, type }) =>
+      itemId === predecessor.itemId && type === "proposal_result_applied",
+  );
+  assert.notEqual(proofIndex, -1);
+  const eventsAfterProof = before.timeline.length - proofIndex - 1;
+  const fillerCount = timelineLimit - eventsAfterProof - 2;
+  assert.ok(fillerCount > 0);
+  fixture.source.records.push(
+    prAssignment(2, {
+      sourceScopeId: "github-secondary",
+      gitFacts: { gitTargetAvailable: false },
+    }),
+    ...Array.from(
+      { length: fillerCount },
+      (_, index) => assignment(index + 3),
+    ),
+  );
+  fixture.source.highWatermark = fillerCount + 2;
+
+  await fixture.service.intake();
+
+  const roots = (await fixture.service.listItems({ limit: 50 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  const pending = roots.find(({ itemId }) => itemId !== predecessor.itemId);
+  assert.equal(
+    roots.find(({ itemId }) => itemId === predecessor.itemId).statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(
+    pending.statusReason,
+    `pr_source_cross_root_cutover_pending:${predecessor.itemId}`,
+  );
+});
+
+test("an existing authority fence registers a predecessor whose proof expires before commit", async () => {
+  const timelineLimit = 24;
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+    limits: { timelineLimit },
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(2, {
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let roots = (await fixture.service.listItems({ limit: 20 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  const existing = roots.find(
+    ({ source }) => source.identity.scopeId === "github-dashboard",
+  );
+  const predecessorRoot = roots.find(
+    ({ source }) => source.identity.scopeId === "github-secondary",
+  );
+  const predecessor = await rejectBoundPullRequestProposal(
+    fixture,
+    await stageSealedPrReview(fixture, predecessorRoot.itemId),
+  );
+  const before = fixture.store.stored();
+  const proofIndex = before.timeline.findIndex(
+    ({ itemId, type }) =>
+      itemId === predecessor.itemId && type === "proposal_result_applied",
+  );
+  assert.notEqual(proofIndex, -1);
+  const eventsAfterProof = before.timeline.length - proofIndex - 1;
+  const fillerCount = timelineLimit - eventsAfterProof - 2;
+  assert.ok(fillerCount > 0);
+  fixture.source.records.push(
+    prAssignment(3, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: { gitTargetAvailable: false },
+    }),
+    ...Array.from(
+      { length: fillerCount },
+      (_, index) => assignment(index + 4),
+    ),
+  );
+  fixture.source.highWatermark = fillerCount + 3;
+
+  await fixture.service.intake();
+
+  roots = (await fixture.service.listItems({ limit: 50 })).items.filter(
+    ({ kind }) => kind === "source_root",
+  );
+  const pending = roots.find(({ itemId }) => itemId === existing.itemId);
+  assert.equal(
+    roots.find(({ itemId }) => itemId === predecessor.itemId).statusReason,
+    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+  );
+  assert.equal(
+    pending.statusReason,
+    `pr_source_cross_root_cutover_pending:${predecessor.itemId}`,
+  );
+});
+
 test("a later durable transition keeps stale rejected-proposal context blocked across restart", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
