@@ -11,6 +11,9 @@ import {
 import {
   normalizeChangePackageApplicationEnvelope,
 } from "../domain/change-package-application-confirmation.js";
+import {
+  isGitHubCredentialRecoveryActivationPlan,
+} from "../domain/configuration-activation-confirmation.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   normalizeExternalDeferredOptions,
@@ -172,6 +175,16 @@ function isProjectableHistoryItem(item) {
 function requiresRecovery(item) {
   return item.status === "executing" ||
     (item.status === "failed" && item.failure?.outcome === "unknown");
+}
+
+function permitsGitHubCredentialRecoveryActivation(item, items) {
+  const unresolved = items.filter(
+    (candidate) => candidate.id !== item.id && requiresRecovery(candidate),
+  );
+  return unresolved.length > 0 &&
+    unresolved.every((candidate) =>
+      PULL_REQUEST_MEMORY_KINDS.has(candidate.kind)) &&
+    isGitHubCredentialRecoveryActivationPlan(item);
 }
 
 function historyRoleIdFacets(items) {
@@ -1033,7 +1046,8 @@ export class ConfirmationQueue {
       item.kind === CONFIGURATION_ACTIVATION_KIND &&
       this.state.items.some(
         (candidate) => candidate.id !== item.id && requiresRecovery(candidate),
-      )
+      ) &&
+      !permitsGitHubCredentialRecoveryActivation(item, this.state.items)
     ) {
       throw queueError(
         "CONFIRMATION_RECOVERY_REQUIRED",

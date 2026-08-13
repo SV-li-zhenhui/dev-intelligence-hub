@@ -966,6 +966,7 @@ async function createRealServerFixture(t) {
   for (const name of [
     "Manage-MyDashboard.ps1",
     "launch-mydashboard-process.mjs",
+    "probe-application-writer-lease.mjs",
     "run-managed-dashboard.mjs",
   ]) {
     await copyWritableFixtureFile(

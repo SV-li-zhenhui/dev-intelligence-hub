@@ -1,3 +1,5 @@
+import { types as utilTypes } from "node:util";
+
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 
@@ -15,6 +17,15 @@ const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MAX_IMPACT_PATHS = 256;
 const MAX_DISPLAY_IMPACT_PATHS = 12;
+const CREDENTIAL_RECOVERY_IMPACT_PATHS = Object.freeze({
+  securityTightening: Object.freeze(["githubActions.credentialMode"]),
+  authorityExpansion: Object.freeze(["githubActions.credentialMode"]),
+  benignClaimChange: Object.freeze([]),
+  restartRequired: Object.freeze([
+    "githubActions.credentialMode",
+    "githubActions.tokenEnv",
+  ]),
+});
 
 const PREPARED_KEYS = Object.freeze({
   "configuration.initialize": [
@@ -216,6 +227,158 @@ function impactCategory(paths) {
     count: paths.length,
     paths: paths.slice(0, MAX_DISPLAY_IMPACT_PATHS),
   };
+}
+
+function plainDataObject(value) {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !utilTypes.isProxy(value) &&
+    Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function exactPlainDataObject(value, expectedKeys) {
+  if (
+    !plainDataObject(value)
+  ) {
+    return false;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expectedKeys.length ||
+    expectedKeys.some((key) => !keys.includes(key))
+  ) {
+    return false;
+  }
+  return keys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return typeof key === "string" &&
+      descriptor?.enumerable === true &&
+      Object.hasOwn(descriptor, "value");
+  });
+}
+
+function ownDataValue(value, name) {
+  if (!plainDataObject(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value")
+    ? descriptor.value
+    : undefined;
+}
+
+function exactStringList(value, expected) {
+  if (
+    !Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1 ||
+    value.length !== expected.length
+  ) {
+    return false;
+  }
+  return expected.every((entry, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    return descriptor?.enumerable === true &&
+      Object.hasOwn(descriptor, "value") &&
+      descriptor.value === entry;
+  });
+}
+
+function exactImpactCategory(value, expectedPaths) {
+  return exactPlainDataObject(value, ["count", "paths"]) &&
+    value.count === expectedPaths.length &&
+    exactStringList(value.paths, expectedPaths);
+}
+
+export function isGitHubCredentialRecoveryActivationPlan(value) {
+  try {
+    const kind = ownDataValue(value, "kind");
+    const requestedBy = ownDataValue(value, "requestedBy");
+    const actor = ownDataValue(value, "actor");
+    const target = ownDataValue(value, "target");
+    const action = ownDataValue(value, "action");
+    const display = ownDataValue(value, "display");
+    if (
+      kind !== KIND ||
+      !exactPlainDataObject(requestedBy, ["roleId", "workItemId"]) ||
+      requestedBy.roleId !== OWNER_ROLE ||
+      !exactPlainDataObject(actor, ["provider", "accountId"]) ||
+      actor.provider !== PROVIDER ||
+      actor.accountId !== OWNER_ACCOUNT ||
+      !exactPlainDataObject(target, ["provider", "resourceId", "version"]) ||
+      target.provider !== PROVIDER ||
+      target.resourceId !== RESOURCE_ID ||
+      !exactPlainDataObject(display, [
+        "title",
+        "summary",
+        "actionLabel",
+        "evidence",
+        "payload",
+      ])
+    ) {
+      return false;
+    }
+    if (
+      !exactPlainDataObject(action, ["type", ...ACTION_KEYS.activate_draft]) ||
+      action.type !== "activate_draft" ||
+      target.version !== action.validationDigest
+    ) {
+      return false;
+    }
+    const payload = display.payload;
+    if (
+      !exactPlainDataObject(payload, ["actor", "target", "action", "impact"]) ||
+      digestValue(payload.actor) !== digestValue(actor) ||
+      digestValue(payload.target) !== digestValue(target) ||
+      digestValue(payload.action) !== digestValue(action)
+    ) {
+      return false;
+    }
+    const impact = payload.impact;
+    if (
+      !exactPlainDataObject(impact, [
+        "changed",
+        "beforeDigest",
+        "afterDigest",
+        "securityTightening",
+        "authorityExpansion",
+        "benignClaimChange",
+        "restartRequired",
+      ]) ||
+      impact.changed !== true ||
+      impact.beforeDigest !== action.activeDigest ||
+      impact.afterDigest !== action.documentDigest ||
+      !exactImpactCategory(
+        impact.securityTightening,
+        CREDENTIAL_RECOVERY_IMPACT_PATHS.securityTightening,
+      ) ||
+      !exactImpactCategory(
+        impact.authorityExpansion,
+        CREDENTIAL_RECOVERY_IMPACT_PATHS.authorityExpansion,
+      ) ||
+      !exactImpactCategory(
+        impact.benignClaimChange,
+        CREDENTIAL_RECOVERY_IMPACT_PATHS.benignClaimChange,
+      ) ||
+      !exactImpactCategory(
+        impact.restartRequired,
+        CREDENTIAL_RECOVERY_IMPACT_PATHS.restartRequired,
+      )
+    ) {
+      return false;
+    }
+    return action.impactDigest === digestValue({
+      changed: impact.changed,
+      beforeDigest: impact.beforeDigest,
+      afterDigest: impact.afterDigest,
+      security_tightening: impact.securityTightening.paths,
+      authority_expansion: impact.authorityExpansion.paths,
+      benign_claim_change: impact.benignClaimChange.paths,
+      restart_required: impact.restartRequired.paths,
+    });
+  } catch {
+    return false;
+  }
 }
 
 function normalizeDraftBinding(value, { initialization }) {

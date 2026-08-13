@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createConfigurationActivationConfirmationPlan,
+  isGitHubCredentialRecoveryActivationPlan,
   normalizeConfigurationActivationEnvelope,
 } from "../src/domain/configuration-activation-confirmation.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { configurationImpactDigest } from "../src/services/configuration-state.js";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -177,5 +179,60 @@ test("prepared bindings and private envelopes reject accessors and tampering", (
   assert.throws(
     () => normalizeConfigurationActivationEnvelope(forged),
     /configuration activation/i,
+  );
+});
+
+test("credential recovery activation requires one complete digest-bound impact", () => {
+  const input = prepared("configuration.activate");
+  input.impact = {
+    changed: true,
+    beforeDigest: input.activeDigest,
+    afterDigest: input.documentDigest,
+    security_tightening: ["githubActions.credentialMode"],
+    authority_expansion: ["githubActions.credentialMode"],
+    benign_claim_change: [],
+    restart_required: [
+      "githubActions.credentialMode",
+      "githubActions.tokenEnv",
+    ],
+  };
+  input.impactDigest = configurationImpactDigest(input.impact);
+  const plan = createConfigurationActivationConfirmationPlan(input);
+
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(plan), true);
+
+  const wrongDigest = structuredClone(plan);
+  wrongDigest.action.impactDigest = C;
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(wrongDigest), false);
+
+  const incomplete = structuredClone(plan);
+  incomplete.display.payload.impact.restartRequired.count = 3;
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(incomplete), false);
+
+  const expanded = structuredClone(plan);
+  expanded.display.payload.impact.restartRequired.paths.push(
+    "githubActions.actorAccountId",
+  );
+  expanded.display.payload.impact.restartRequired.count = 3;
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(expanded), false);
+
+  const rollback = structuredClone(plan);
+  rollback.action.type = "activate_rollback";
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(rollback), false);
+
+  const hostile = structuredClone(plan);
+  let reads = 0;
+  Object.defineProperty(hostile, "action", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return plan.action;
+    },
+  });
+  assert.equal(isGitHubCredentialRecoveryActivationPlan(hostile), false);
+  assert.equal(reads, 0);
+  assert.equal(
+    isGitHubCredentialRecoveryActivationPlan(new Proxy(plan, {})),
+    false,
   );
 });

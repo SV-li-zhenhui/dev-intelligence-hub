@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import {
+  createConfigurationActivationConfirmationPlan,
+} from "../src/domain/configuration-activation-confirmation.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
@@ -9,6 +12,7 @@ import {
   ConfirmationExecutionError,
   ConfirmationQueue,
 } from "../src/services/confirmation-queue.js";
+import { configurationImpactDigest } from "../src/services/configuration-state.js";
 import {
   pullRequestExternalActionQueuePlan,
 } from "./support/pull-request-external-action-fixture.js";
@@ -140,6 +144,36 @@ function configurationPlan(type, suffix) {
       evidence: [],
       payload: { actor, target, action },
     },
+  });
+}
+
+function githubCredentialRecoveryConfigurationPlan() {
+  const activeDigest = "1".repeat(64);
+  const documentDigest = "2".repeat(64);
+  const impact = {
+    changed: true,
+    beforeDigest: activeDigest,
+    afterDigest: documentDigest,
+    security_tightening: ["githubActions.credentialMode"],
+    authority_expansion: ["githubActions.credentialMode"],
+    benign_claim_change: [],
+    restart_required: [
+      "githubActions.credentialMode",
+      "githubActions.tokenEnv",
+    ],
+  };
+  return createConfigurationActivationConfirmationPlan({
+    kind: "configuration.activate",
+    expectedStateRevision: 27,
+    expectedActiveVersion: 8,
+    activeDigest,
+    draftId: "credential-recovery-draft",
+    draftRevision: 1,
+    draftRevisionId: `configuration-draft-revision-${"3".repeat(64)}`,
+    documentDigest,
+    validationDigest: "4".repeat(64),
+    impactDigest: configurationImpactDigest(impact),
+    impact,
   });
 }
 
@@ -2081,6 +2115,108 @@ test("unknown external recovery blocks configuration activation across restarts"
     recoveredExecutor.executeCalls[0].kind,
     "local.configuration-activate",
   );
+});
+
+test("owner-confirmed credential-source activation can unblock only GitHub recovery", async () => {
+  const actionExecutor = executor({
+    async execute(envelope) {
+      this.executeCalls.push(structuredClone(envelope));
+      if (envelope.kind.startsWith("github.")) {
+        throw new ConfirmationExecutionError(
+          "GITHUB_LOGIN_UNAVAILABLE",
+          "unknown",
+        );
+      }
+      return { status: "applied", receipt: { id: "configuration-v9" } };
+    },
+  });
+  const queue = await readyQueue({ actionExecutor });
+  await queue.enqueue(actionPlan());
+  let next = await queue.next();
+  const unknown = await queue.approve(
+    next.item.id,
+    approvalRequest(next, "request-unknown-review"),
+  );
+  const configuration = await queue.enqueue(
+    githubCredentialRecoveryConfigurationPlan(),
+  );
+  next = await queue.nextForAction(
+    "local.configuration-activate",
+    "activate_draft",
+  );
+
+  const activated = await queue.approve(
+    next.item.id,
+    approvalRequest(next, "request-credential-recovery"),
+  );
+
+  assert.equal(unknown.failure.outcome, "unknown");
+  assert.equal(unknown.retryable, false);
+  assert.equal(activated.id, configuration.id);
+  assert.equal(activated.status, "completed");
+  assert.equal((await queue.get(unknown.id)).failure.outcome, "unknown");
+  assert.deepEqual(
+    actionExecutor.executeCalls.map(({ kind }) => kind),
+    ["github.pull-request-review", "local.configuration-activate"],
+  );
+});
+
+test("credential recovery activation rejects broader changes and local uncertainty", async () => {
+  for (const scenario of ["broader_configuration", "local_unknown"]) {
+    const actionExecutor = executor({
+      async execute(envelope) {
+        this.executeCalls.push(structuredClone(envelope));
+        if (envelope.kind !== "local.configuration-activate") {
+          throw new ConfirmationExecutionError(
+            "TEST_EXTERNAL_OUTCOME_UNKNOWN",
+            "unknown",
+          );
+        }
+        return { status: "applied", receipt: { id: "must-not-activate" } };
+      },
+    });
+    const queue = await readyQueue({ actionExecutor });
+    const uncertainPlan = scenario === "local_unknown"
+      ? actionPlan({
+          id: "confirmation-local-unknown",
+          kind: "local.change-package-apply",
+        })
+      : actionPlan();
+    await queue.enqueue(uncertainPlan);
+    let next = await queue.next();
+    await queue.approve(
+      next.item.id,
+      approvalRequest(next, `request-${scenario}-unknown`),
+    );
+
+    let configurationPlan = githubCredentialRecoveryConfigurationPlan();
+    if (scenario === "broader_configuration") {
+      configurationPlan = structuredClone(configurationPlan);
+      const impact = configurationPlan.display.payload.impact;
+      impact.restartRequired.paths.push("githubActions.actorAccountId");
+      impact.restartRequired.count = impact.restartRequired.paths.length;
+    }
+    const configuration = await queue.enqueue(configurationPlan);
+    next = await queue.nextForAction(
+      "local.configuration-activate",
+      "activate_draft",
+    );
+
+    await assert.rejects(
+      queue.approve(
+        next.item.id,
+        approvalRequest(next, `request-${scenario}-activation`),
+      ),
+      (error) => error.code === "CONFIRMATION_RECOVERY_REQUIRED",
+    );
+    assert.equal((await queue.get(configuration.id)).status, "pending");
+    assert.equal(
+      actionExecutor.executeCalls.some(
+        ({ kind }) => kind === "local.configuration-activate",
+      ),
+      false,
+    );
+  }
 });
 
 test("corrupted durable state fails closed without making the queue ready", async () => {
