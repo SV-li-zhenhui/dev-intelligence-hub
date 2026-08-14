@@ -22,4 +22,3 @@ Node rejects before ACL inspection.
   credential-source tests, composition-root tests, syntax checks, and diff
   validation.
 - Do not invoke real CLI models, GitHub, credentials, network writes, or push.
-

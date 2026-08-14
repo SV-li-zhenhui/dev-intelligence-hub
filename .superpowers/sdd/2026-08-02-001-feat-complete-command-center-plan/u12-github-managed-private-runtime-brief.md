@@ -38,4 +38,3 @@ directory root.
   GitHub credential-source suites; run syntax and diff checks.
 - No real CLI/model invocation, credential read, GitHub action, network write,
   or push.
-

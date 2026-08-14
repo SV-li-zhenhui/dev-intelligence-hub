@@ -41,4 +41,3 @@ or GitHub operation.
 
 No real CLI/model invocation, credential read, GitHub action, network write,
 service mutation beyond the failed startup attempt, or push occurred.
-
