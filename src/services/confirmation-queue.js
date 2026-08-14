@@ -984,14 +984,18 @@ export class ConfirmationQueue {
       );
     }
     const timestamp = this.#now();
+    const preserveUnknownOutcome =
+      item.status === "failed" &&
+      item.execution?.outcome === "unknown" &&
+      item.failure?.outcome === "unknown";
     await this.#replaceItem(item.id, {
       ...item,
       status: "rejected",
       itemRevision: item.itemRevision + 1,
       updatedAt: timestamp,
-      execution: null,
+      execution: preserveUnknownOutcome ? item.execution : null,
       receipt: null,
-      failure: null,
+      failure: preserveUnknownOutcome ? item.failure : null,
       rejection: {
         requestId: request.requestId,
         reason: request.reason || "",
@@ -1295,7 +1299,7 @@ export class ConfirmationQueue {
       displayedPayloadDigest: item.displayedPayloadDigest,
       approvalBindingDigest: item.approvalBindingDigest,
       retryable: Boolean(item.failure?.retryable),
-      ...(item.failure?.outcome === "unknown"
+      ...(item.status === "failed" && item.failure?.outcome === "unknown"
         ? { resolutionRequired: true }
         : {}),
       ...(item.receipt ? { receipt: item.receipt } : {}),

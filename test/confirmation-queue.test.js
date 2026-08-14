@@ -1944,7 +1944,10 @@ test("startup recovery reconciles an applied action after the final local write 
 test("startup recovery never turns an unknown action into a retryable absence", async () => {
   const store = new MemoryStore();
   const queue = await readyQueue({ store, actionExecutor: executor() });
-  await queue.enqueue(actionPlan());
+  await queue.enqueue(pullRequestExternalActionQueuePlan(
+    { type: "review", verdict: "approve", body: "Review result" },
+    { proposalId: "proposal-sealed-unknown" },
+  ));
   const next = await queue.next();
   store.failWriteAt = store.writeCount + 2;
 
@@ -1974,6 +1977,10 @@ test("startup recovery never turns an unknown action into a retryable absence", 
   assert.equal(resolution.item.id, next.item.id);
   assert.equal(resolution.item.resolutionRequired, true);
   assert.equal(resolution.item.retryable, false);
+  const executionBeforeSealing = structuredClone(
+    store.value.items.find(({ id }) => id === resolution.item.id).execution,
+  );
+  const failureBeforeSealing = structuredClone(resolution.item.failure);
 
   const sealed = await recovered.reject(
     resolution.item.id,
@@ -1983,9 +1990,56 @@ test("startup recovery never turns an unknown action into a retryable absence", 
     },
   );
   assert.equal(sealed.status, "rejected");
+  assert.deepEqual(sealed.failure, failureBeforeSealing);
+  assert.deepEqual(
+    store.value.items.find(({ id }) => id === resolution.item.id).execution,
+    executionBeforeSealing,
+  );
+  assert.equal(
+    sealed.rejection.reason,
+    "owner acknowledged the uncertain result without replay",
+  );
+  assert.deepEqual(
+    (await recovered.list({ limit: 10 })).items.map(
+      ({ status, diagnosticCode }) => ({ status, diagnosticCode }),
+    ),
+    [{ status: "rejected", diagnosticCode: "GITHUB_MARKER_ABSENT" }],
+  );
+  const sealedMemoryItem = (
+    await recovered.readMemoryPage({
+      cursor: 0,
+      limit: 10,
+      highWatermark: null,
+    })
+  ).items[0];
+  assert.deepEqual(
+    {
+      status: sealedMemoryItem.status,
+      executionOutcome: sealedMemoryItem.execution.outcome,
+      failure: sealedMemoryItem.failure,
+      rejectedAt: sealedMemoryItem.rejectedAt,
+    },
+    {
+      status: "rejected",
+      executionOutcome: "unknown",
+      failure: failureBeforeSealing,
+      rejectedAt: sealed.rejection.at,
+    },
+  );
   assert.equal((await recovered.next()).item, null);
   assert.equal(recoveryExecutor.reconcileCalls.length, 1);
   assert.equal(recoveryExecutor.executeCalls.length, 0);
+
+  const postSealExecutor = executor();
+  const restarted = await readyQueue({
+    store: new MemoryStore(structuredClone(store.value)),
+    actionExecutor: postSealExecutor,
+  });
+  const afterRestart = await restarted.get(resolution.item.id);
+  assert.equal(afterRestart.status, "rejected");
+  assert.deepEqual(afterRestart.failure, failureBeforeSealing);
+  assert.equal(postSealExecutor.reconcileCalls.length, 0);
+  assert.equal(postSealExecutor.executeCalls.length, 0);
 });
 
 test("startup recovery refreshes a stable diagnostic without relaxing unknown", async () => {

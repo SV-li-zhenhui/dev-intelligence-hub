@@ -576,7 +576,17 @@ function normalizePersistedItem(value) {
       item.failure === null &&
       item.rejection === null &&
       (item.invalidation !== null || item.execution !== null),
-    rejected: item.execution === null && item.receipt === null && item.failure === null && item.rejection !== null && item.invalidation === null,
+    rejected:
+      item.receipt === null &&
+      item.rejection !== null &&
+      item.invalidation === null &&
+      (
+        (item.execution === null && item.failure === null) ||
+        (
+          item.execution?.outcome === "unknown" &&
+          item.failure?.outcome === "unknown"
+        )
+      ),
   }[item.status];
   if (!validShape) throw invalidRequest();
   const validOutcome = {
