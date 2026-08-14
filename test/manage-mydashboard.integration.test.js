@@ -361,6 +361,42 @@ async function rewriteFixtureManager(root, find, replace) {
   await writeFile(managerPath, changed, "utf8");
 }
 
+async function installRecoveryTerminationTrap(root, markerPath) {
+  const escapedMarkerPath = markerPath.replaceAll("'", "''");
+  await rewriteFixtureManager(
+    root,
+    /^([ \t]*)Stop-Process -Id \(\[int\]\$evidence[.]State[.]processId\) -ErrorAction Stop\r?$/mu,
+    `$1[System.IO.File]::WriteAllText('${escapedMarkerPath}', 'called')\r\n`
+      + "$1Stop-Process -Id ([int]$evidence.State.processId) -ErrorAction Stop",
+  );
+}
+
+function writerLeaseProbeInjection(markerPath) {
+  const escapedMarkerPath = markerPath.replaceAll("'", "''");
+  return [
+    "    $fixtureLeaseProbeHadHold = Test-Path Env:MYDASHBOARD_WRITER_LEASE_HOLD",
+    "    $fixtureLeaseProbePriorHold = $env:MYDASHBOARD_WRITER_LEASE_HOLD",
+    "    Remove-Item Env:MYDASHBOARD_WRITER_LEASE_HOLD -ErrorAction SilentlyContinue",
+    "    $env:MYDASHBOARD_WRITER_LEASE_PROJECT_DIGEST = $projectDigest",
+    "    $fixtureLeaseProbeOutput = & $nodePath $writerLeaseProbeScript | Out-String",
+    "    $fixtureLeaseProbeExitCode = $LASTEXITCODE",
+    "    Remove-Item Env:MYDASHBOARD_WRITER_LEASE_PROJECT_DIGEST -ErrorAction SilentlyContinue",
+    "    if ($fixtureLeaseProbeHadHold) { $env:MYDASHBOARD_WRITER_LEASE_HOLD = $fixtureLeaseProbePriorHold }",
+    `    [System.IO.File]::WriteAllText('${escapedMarkerPath}', ([string]$fixtureLeaseProbeExitCode + [Environment]::NewLine + $fixtureLeaseProbeOutput))`,
+    "",
+  ].join("\r\n");
+}
+
+async function assertWriterLeaseProbeWasExcluded(markerPath) {
+  const [exitCode, ...output] = (await readFile(markerPath, "utf8")).split(/\r?\n/u);
+  assert.equal(exitCode, "1");
+  assert.deepEqual(JSON.parse(output.join("\n")), {
+    schemaVersion: 1,
+    ok: false,
+    error: { code: "PROCESS_GUARD_HELD" },
+  });
+}
+
 function controlPayload(state) {
   return [
     "control-v1",
@@ -922,6 +958,69 @@ async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
     terminalPath,
     terminalText,
     ...snapshot,
+  };
+}
+
+async function createUnexpectedExitRecoveryFixture(
+  t,
+  { prepare = true, dataLabel = "unexpected-process-exit" } = {},
+) {
+  const { root, port } = await createFixture(t);
+  const runtime = readRuntimeInfo(root);
+  const controlPath = path.join(
+    runtime.runtimeDirectory,
+    "mydashboard-server-process.json",
+  );
+  const started = invokeManager(root, "Start");
+  assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+  const state = JSON.parse(await readFile(controlPath, "utf8"));
+  await waitForHealth(port, state.processId);
+
+  process.kill(state.processId);
+  await waitForProcessExit(state.processId);
+  await assertPortUnavailable(port);
+  const requestedPath = path.join(
+    runtime.runtimeDirectory,
+    `mydashboard-shutdown-${state.instanceId}-requested.json`,
+  );
+  const terminalPath = path.join(
+    runtime.runtimeDirectory,
+    `mydashboard-shutdown-${state.instanceId}-terminal.json`,
+  );
+  assert.equal(await fileExists(requestedPath), false);
+  assert.equal(await fileExists(terminalPath), false);
+  await mkdir(path.join(root, "data"), { recursive: true });
+  await writeFile(
+    path.join(root, "data", "fixture-data.json"),
+    `${JSON.stringify({ fixture: dataLabel })}\n`,
+    "utf8",
+  );
+
+  const fixture = {
+    root,
+    port,
+    runtime,
+    controlPath,
+    state,
+    requestedPath,
+    terminalPath,
+  };
+  if (!prepare) return fixture;
+
+  const prepared = invokeManager(root, "PrepareFailedShutdownRecovery", 10);
+  assert.equal(prepared.status, 0, `${prepared.stderr}\n${prepared.stdout}`);
+  const snapshotId = prepared.stdout.match(
+    /shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u,
+  )?.[0];
+  assert.equal(typeof snapshotId, "string");
+  return {
+    ...fixture,
+    snapshotId,
+    snapshotDirectory: path.join(
+      runtime.runtimeDirectory,
+      "recovery-snapshots",
+      snapshotId,
+    ),
   };
 }
 
@@ -1651,6 +1750,262 @@ test(
       `${refusedRestart.stderr}\n${refusedRestart.stdout}`,
       /dead without a durable success receipt/u,
     );
+  },
+);
+
+test(
+  "an authenticated managed process that dies before receipts can be recovered without termination",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const manifest = JSON.parse(await readFile(
+      path.join(fixture.snapshotDirectory, "manifest.json"),
+      "utf8",
+    ));
+    assert.equal(manifest.reason, "managed_process_exit_without_receipt");
+    await assertOrdinaryLifecycleBlocked(fixture);
+
+    const recovered = invokeRecovery(fixture);
+    assert.equal(recovered.status, 0, `${recovered.stderr}\n${recovered.stdout}`);
+    assert.equal(await fileExists(fixture.controlPath), false);
+    await assertPortUnavailable(fixture.port);
+
+    const restarted = invokeManager(fixture.root, "Start");
+    assert.equal(restarted.status, 0, `${restarted.stderr}\n${restarted.stdout}`);
+    const replacement = JSON.parse(await readFile(fixture.controlPath, "utf8"));
+    await waitForHealth(fixture.port, replacement.processId);
+    const stopped = invokeManager(fixture.root, "Stop");
+    assert.equal(stopped.status, 0, `${stopped.stderr}\n${stopped.stdout}`);
+  },
+);
+
+for (const phase of ["requested", "terminal"]) {
+  test(
+    `unexpected-exit recovery permanently rejects authority after a late ${phase} receipt appears`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await createUnexpectedExitRecoveryFixture(t);
+      const lateReceiptPath = phase === "requested"
+        ? fixture.requestedPath
+        : fixture.terminalPath;
+      await writeFile(lateReceiptPath, '{"fixture":"late-receipt"}\n', "utf8");
+
+      const first = invokeRecovery(fixture);
+      assert.notEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
+      assert.match(
+        `${first.stderr}\n${first.stdout}`,
+        /permanently invalidated by a late shutdown receipt/u,
+      );
+      assert.equal(await fileExists(fixture.controlPath), true);
+      const incident = await onlyRecoveryIncident(fixture);
+      assert.equal(
+        JSON.parse(await readFile(incident.recordPath, "utf8")).state,
+        "invalidated",
+      );
+      await assertOrdinaryLifecycleBlocked(fixture);
+
+      await unlink(lateReceiptPath);
+      const second = invokeRecovery(fixture);
+      assert.notEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
+      assert.match(
+        `${second.stderr}\n${second.stdout}`,
+        /permanently invalidated by a late shutdown receipt/u,
+      );
+      assert.equal(await fileExists(fixture.controlPath), true);
+      assert.equal(
+        JSON.parse(await readFile(incident.recordPath, "utf8")).state,
+        "invalidated",
+      );
+    },
+  );
+}
+
+test(
+  "unexpected-exit recovery preparation refuses a held application writer lease",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t, {
+      prepare: false,
+      dataLabel: "held-writer-lease",
+    });
+
+    const lease = createApplicationWriterLease({
+      projectRoot: fixture.root,
+      projectDigest: fixture.state.projectDigest,
+    });
+    await lease.acquire();
+    let leaseClosed = false;
+    t.after(async () => {
+      if (!leaseClosed) await lease.close();
+    });
+
+    const rejected = invokeManager(
+      fixture.root,
+      "PrepareFailedShutdownRecovery",
+      10,
+    );
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.match(
+      `${rejected.stderr}\n${rejected.stdout}`,
+      /Application writer lease is not free/u,
+    );
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), false);
+    assert.equal(await fileExists(fixture.terminalPath), false);
+    const snapshotsDirectory = path.join(
+      fixture.runtime.runtimeDirectory,
+      "recovery-snapshots",
+    );
+    try {
+      assert.deepEqual(await readdir(snapshotsDirectory), []);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await assert.rejects(
+      readdir(path.join(fixture.runtime.runtimeDirectory, "incidents")),
+      { code: "ENOENT" },
+    );
+
+    await lease.close();
+    leaseClosed = true;
+    const prepared = invokeManager(
+      fixture.root,
+      "PrepareFailedShutdownRecovery",
+      10,
+    );
+    assert.equal(prepared.status, 0, `${prepared.stderr}\n${prepared.stdout}`);
+    assert.equal((await readdir(snapshotsDirectory)).length, 1);
+    assert.equal(
+      (await readdir(path.join(fixture.runtime.runtimeDirectory, "incidents"))).length,
+      1,
+    );
+  },
+);
+
+test(
+  "unexpected-exit recovery never controls a PID reused by another process",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const sentinel = spawn(
+      powershell,
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    t.after(() => {
+      if (sentinel.exitCode === null) sentinel.kill();
+    });
+    const terminationMarker = path.join(fixture.root, "unexpected-stop.marker");
+    await rewriteFixtureManager(
+      fixture.root,
+      /([$]process = Get-Process -Id )\(\[int\][$]State[.]processId\)( -ErrorAction SilentlyContinue)/u,
+      `$1${sentinel.pid}$2`,
+    );
+    await installRecoveryTerminationTrap(fixture.root, terminationMarker);
+
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.match(
+      `${rejected.stderr}\n${rejected.stdout}`,
+      /Recorded PID belongs to a different process/u,
+    );
+    assert.doesNotThrow(() => process.kill(sentinel.pid, 0));
+    assert.equal(await fileExists(terminationMarker), false);
+    assert.equal(await fileExists(fixture.controlPath), true);
+  },
+);
+
+test(
+  "unexpected-exit recovery authority is zero-termination even if lookup reports a live process",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const sentinel = spawn(
+      powershell,
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    t.after(() => {
+      if (sentinel.exitCode === null) sentinel.kill();
+    });
+    const terminationMarker = path.join(fixture.root, "unexpected-stop.marker");
+    await rewriteFixtureManager(
+      fixture.root,
+      /(function Get-ManagedProcess \{\r?\n\s*param\([^\n]+\)\r?\n)/u,
+      `$1    return Get-Process -Id ${sentinel.pid} -ErrorAction Stop\r\n`,
+    );
+    await installRecoveryTerminationTrap(fixture.root, terminationMarker);
+
+    const rejected = invokeRecovery(fixture);
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    assert.match(
+      `${rejected.stderr}\n${rejected.stdout}`,
+      /Unexpected-exit recovery authority cannot terminate a live process/u,
+    );
+    assert.doesNotThrow(() => process.kill(sentinel.pid, 0));
+    assert.equal(await fileExists(terminationMarker), false);
+    assert.equal(await fileExists(fixture.controlPath), true);
+  },
+);
+
+for (const phase of ["requested", "terminal"]) {
+  test(
+    `unexpected-exit recovery blocks ${phase} receipt publication through final control removal`,
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await createUnexpectedExitRecoveryFixture(t);
+      const publicationMarker = path.join(
+        fixture.root,
+        `late-${phase}-receipt-publication.marker`,
+      );
+      const escapedMarker = publicationMarker.replaceAll("'", "''");
+      await rewriteFixtureManager(
+        fixture.root,
+        /^([ \t]*)Remove-ControlState -ExpectedState [$]evidence[.]State\r?$/mu,
+        [
+          "$1try {",
+          `$1    [System.IO.File]::WriteAllText((Get-ReceiptPath -State $evidence.State -Phase \"${phase}\"), '{\"fixture\":\"final-window\"}')`,
+          `$1    [System.IO.File]::WriteAllText('${escapedMarker}', 'published')`,
+          "$1} catch [System.IO.IOException] {",
+          `$1    [System.IO.File]::WriteAllText('${escapedMarker}', 'blocked')`,
+          "$1}",
+          "$1Remove-ControlState -ExpectedState $evidence.State",
+        ].join("\r\n"),
+      );
+
+      const recovered = invokeRecovery(fixture);
+      assert.equal(recovered.status, 0, `${recovered.stderr}\n${recovered.stdout}`);
+      assert.equal(await readFile(publicationMarker, "utf8"), "blocked");
+      assert.equal(await fileExists(fixture.requestedPath), false);
+      assert.equal(await fileExists(fixture.terminalPath), false);
+      assert.equal(await fileExists(fixture.controlPath), false);
+    },
+  );
+}
+
+test(
+  "RecoverFailedShutdown holds the writer lease through final validation and control removal",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const validationMarker = path.join(fixture.root, "validation-writer-lease.marker");
+    const finalizationMarker = path.join(fixture.root, "finalization-writer-lease.marker");
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*[$]writerLease = Open-ApplicationWriterLease\r?\n)(\s*[$]snapshot = Get-ValidatedRecoverySnapshot -SnapshotId [$]SnapshotId)/u,
+      `$1${writerLeaseProbeInjection(validationMarker)}$2`,
+    );
+    await rewriteFixtureManager(
+      fixture.root,
+      /(^[ \t]*Remove-ControlState -ExpectedState [$]evidence[.]State\r?$)/mu,
+      `${writerLeaseProbeInjection(finalizationMarker)}$1`,
+    );
+
+    const recovered = invokeRecovery(fixture);
+    assert.equal(recovered.status, 0, `${recovered.stderr}\n${recovered.stdout}`);
+    await assertWriterLeaseProbeWasExcluded(validationMarker);
+    await assertWriterLeaseProbeWasExcluded(finalizationMarker);
+    assert.equal(await fileExists(fixture.controlPath), false);
   },
 );
 

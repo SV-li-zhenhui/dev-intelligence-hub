@@ -124,10 +124,13 @@ to investigate; do not delete it merely to make `Start` succeed.
 
 ### Failed-shutdown recovery
 
-`Restart` never overrides a retained shutdown failure. When the authenticated
-managed process is still alive, has emitted an authenticated `failure` terminal
-receipt, is no longer listening, and has no descendants, first prepare private
-recovery evidence without terminating the process:
+`Restart` never overrides retained lifecycle uncertainty. Recovery preparation
+accepts two bounded cases: an authenticated managed process that is still alive
+and has emitted authenticated requested/`failure` receipts, or an authenticated
+control generation whose exact process identity is already absent. The latter
+may carry the same complete failure-receipt pair, or no receipts at all after an
+unexpected exit; a partial pair is never accepted. The controlled port must be
+unused and the recorded generation must have no visible descendants:
 
 ```powershell
 .\scripts\Manage-MyDashboard.ps1 -Action PrepareFailedShutdownRecovery
@@ -144,7 +147,14 @@ authenticated `pre_termination` incident in the private runtime. It does not
 restore data, terminate a process, remove lifecycle evidence, restart the
 service, or open a browser. Record the exact snapshot identifier emitted by the
 command. A preparation failure removes its unpublished temporary snapshot and
-leaves the managed process and lifecycle barrier intact.
+leaves the managed process and lifecycle barrier intact. When the exact process
+is already absent, preparation acquires the production application writer lease
+before capture and holds it through snapshot and incident publication. A
+no-receipt incident uses the dedicated
+`managed_process_exit_without_receipt` snapshot reason and HMAC-bound absence
+digests for both receipt paths. A receipt that appears later durably transitions
+the HMAC-authenticated incident to `invalidated`; deleting that receipt cannot
+revive the old recovery authority.
 
 After inspecting that evidence and granting a separate, snapshot-specific
 authorization, an operator may explicitly recover the failed lifecycle state:
@@ -157,14 +167,21 @@ authorization, an operator may explicitly recover the failed lifecycle state:
 The recovery command accepts no browser option and leaves the service stopped.
 It checks the snapshot manifest and active `data/` files byte-for-byte,
 terminates only the PID whose executable path and process start time still
-match the authenticated control generation, verifies the project writer lease
-can be acquired and released, and then checks the snapshot against active data
-again after exact process exit. Only then does it durably finalize the
-incident, reconcile the matching receipts, and remove the exact control state
-as the final safety-affecting step. Any uncertainty before termination leaves
+match a live authenticated control generation, verifies the project writer
+lease can be acquired, holds it through final data validation and exact control
+removal, and checks the snapshot against active data again after exact process
+exit. An unexpected-exit snapshot is a
+zero-termination authority: if the exact generation appears live, recovery
+refuses instead of calling process termination. Before its final control removal,
+the manager atomically reserves both absent receipt paths with exclusive,
+delete-on-close barriers, so neither a requested nor terminal receipt can race
+the finalization window. Only then does it durably finalize the incident,
+reconcile the matching receipts, and remove the exact control state as the final
+safety-affecting step. Any uncertainty before termination leaves
 the process and evidence intact. A failure after termination retains the
 control barrier and authenticated incident evidence; a retry can resume only
-from that matching incident. Arbitrary dead control state is not recoverable.
+from that matching incident. An arbitrary, malformed, partially receipted, or
+PID-reused dead control state is not recoverable.
 Inspect the incident record before taking a separate explicit `Start` action.
 Never delete private lifecycle evidence to bypass these checks.
 

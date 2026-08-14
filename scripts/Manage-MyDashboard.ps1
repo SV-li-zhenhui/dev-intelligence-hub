@@ -116,6 +116,14 @@ $incidentsDirectory = [System.IO.Path]::GetFullPath(
 $writerLeaseProbeScript = [System.IO.Path]::GetFullPath(
     (Join-Path $projectDirectory "scripts/probe-application-writer-lease.mjs")
 )
+$shutdownFailureRecoveryReason = "managed_shutdown_lifecycle_failure"
+$unexpectedExitRecoveryReason = "managed_process_exit_without_receipt"
+$shutdownFailureEvidenceKind = "shutdown_failure"
+$unexpectedExitEvidenceKind = "unexpected_exit"
+$unexpectedExitAuthorityInvalidatedMessage = (
+    "Unexpected-exit recovery authority was permanently invalidated " +
+    "by a late shutdown receipt."
+)
 
 if (
     -not $pathComparer.Equals(
@@ -1390,7 +1398,10 @@ function Get-ValidatedRecoverySnapshot {
         [long]$manifest.schemaVersion -ne 1 -or
         -not (Test-RecoveryCreatedAt -Value $manifest.createdAt) -or
         $manifest.reason -isnot [string] -or
-        $manifest.reason -ne "managed_shutdown_lifecycle_failure" -or
+        $manifest.reason -notin @(
+            $shutdownFailureRecoveryReason,
+            $unexpectedExitRecoveryReason
+        ) -or
         $manifest.sourceDirectory -isnot [string] -or
         -not $pathComparer.Equals(
             [System.IO.Path]::GetFullPath($manifest.sourceDirectory),
@@ -1418,6 +1429,7 @@ function Get-ValidatedRecoverySnapshot {
         Id = $SnapshotId
         Directory = $snapshotDirectory
         ManifestPath = $manifestPath
+        Reason = [string]$manifest.reason
         ManifestSha256 = Get-BoundedSha256 `
             -Path $manifestPath `
             -Description "Recovery snapshot manifest" `
@@ -1435,6 +1447,7 @@ function Get-AuthenticatedRecoveryEvidence {
     $requestedPath = Get-ReceiptPath -State $State -Phase "requested"
     $terminalPath = Get-ReceiptPath -State $State -Phase "terminal"
     return [pscustomobject]@{
+        Kind = $shutdownFailureEvidenceKind
         State = $State
         Requested = $requested
         Terminal = $terminal
@@ -1442,6 +1455,77 @@ function Get-AuthenticatedRecoveryEvidence {
         RequestedSha256 = Get-BoundedSha256 -Path $requestedPath -Description "Shutdown request receipt"
         TerminalSha256 = Get-BoundedSha256 -Path $terminalPath -Description "Shutdown terminal receipt"
     }
+}
+
+function Get-AbsentRecoveryReceiptSha256 {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [ValidateSet("requested", "terminal")][string]$Phase
+    )
+    return (Get-StringSha256 -Value (@(
+        "recovery-absent-receipt-v1",
+        $projectDigest,
+        [string]$State.processId,
+        [string]$State.instanceId,
+        [string]$State.processStartTimeUtcTicks,
+        [string]$State.startIdentity,
+        $Phase
+    ) -join "`n"))
+}
+
+function Assert-RecoveryPathAbsent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    $parent = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        return
+    }
+    Assert-NotReparseDirectory -Path $parent
+    foreach ($entry in @(Get-ChildItem -LiteralPath $parent -Force)) {
+        if ($pathComparer.Equals(
+            [System.IO.Path]::GetFullPath($entry.FullName),
+            [System.IO.Path]::GetFullPath($Path)
+        )) {
+            throw "$Description must remain absent."
+        }
+    }
+}
+
+function Get-UnexpectedExitRecoveryEvidence {
+    param([Parameter(Mandatory = $true)]$State)
+    foreach ($phase in @("requested", "terminal")) {
+        Assert-RecoveryPathAbsent `
+            -Path (Get-ReceiptPath -State $State -Phase $phase) `
+            -Description "Unexpected-exit shutdown $phase receipt"
+    }
+    return [pscustomobject]@{
+        Kind = $unexpectedExitEvidenceKind
+        State = $State
+        Requested = $null
+        Terminal = $null
+        ControlSha256 = Get-BoundedSha256 -Path $controlFile -Description "Process control state"
+        RequestedSha256 = Get-AbsentRecoveryReceiptSha256 `
+            -State $State `
+            -Phase "requested"
+        TerminalSha256 = Get-AbsentRecoveryReceiptSha256 `
+            -State $State `
+            -Phase "terminal"
+    }
+}
+
+function Get-DeadProcessRecoveryEvidence {
+    param([Parameter(Mandatory = $true)]$State)
+    $requested = Read-ShutdownReceipt -State $State -Phase "requested"
+    $terminal = Read-ShutdownReceipt -State $State -Phase "terminal"
+    if ($null -eq $requested -and $null -eq $terminal) {
+        return Get-UnexpectedExitRecoveryEvidence -State $State
+    }
+    if ($null -eq $requested -or $null -eq $terminal) {
+        throw "Dead-process recovery has incomplete shutdown receipt evidence."
+    }
+    return Get-AuthenticatedRecoveryEvidence -State $State
 }
 
 function Assert-SameRecoveryEvidence {
@@ -1452,8 +1536,15 @@ function Assert-SameRecoveryEvidence {
         -Right $Evidence.State)) {
         throw "Authenticated control state changed during recovery preflight."
     }
-    $current = Get-AuthenticatedRecoveryEvidence -State $currentState
+    $current = if ($Evidence.Kind -eq $shutdownFailureEvidenceKind) {
+        Get-AuthenticatedRecoveryEvidence -State $currentState
+    } elseif ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+        Get-UnexpectedExitRecoveryEvidence -State $currentState
+    } else {
+        throw "Recovery evidence kind is invalid."
+    }
     if (
+        $current.Kind -ne $Evidence.Kind -or
         $current.ControlSha256 -ne $Evidence.ControlSha256 -or
         $current.RequestedSha256 -ne $Evidence.RequestedSha256 -or
         $current.TerminalSha256 -ne $Evidence.TerminalSha256
@@ -1557,7 +1648,13 @@ function Write-RecoverySnapshotManifest {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][System.Array]$Files,
-        [Parameter(Mandatory = $true)][string]$CreatedAt
+        [Parameter(Mandatory = $true)][string]$CreatedAt,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet(
+            "managed_shutdown_lifecycle_failure",
+            "managed_process_exit_without_receipt"
+        )]
+        [string]$Reason
     )
     [long]$totalBytes = 0
     foreach ($entry in $Files) {
@@ -1566,7 +1663,7 @@ function Write-RecoverySnapshotManifest {
     $manifest = [ordered]@{
         schemaVersion = 1
         createdAt = $CreatedAt
-        reason = "managed_shutdown_lifecycle_failure"
+        reason = $Reason
         sourceDirectory = $dataDirectory
         consistent = $true
         fileCount = $Files.Count
@@ -1598,10 +1695,17 @@ function Prepare-FailedShutdownRecovery {
         throw "Authenticated control state does not match the configured port."
     }
     $process = Get-ManagedProcess -State $state
-    if ($null -eq $process) {
-        throw "Failed-shutdown recovery preparation requires the exact managed process."
+    $processWasPresent = $null -ne $process
+    $evidence = if ($processWasPresent) {
+        Get-AuthenticatedRecoveryEvidence -State $state
+    } else {
+        Get-DeadProcessRecoveryEvidence -State $state
     }
-    $evidence = Get-AuthenticatedRecoveryEvidence -State $state
+    $snapshotReason = if ($evidence.Kind -eq $shutdownFailureEvidenceKind) {
+        $shutdownFailureRecoveryReason
+    } else {
+        $unexpectedExitRecoveryReason
+    }
     if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
         throw "The controlled port is occupied or its probe was ambiguous."
     }
@@ -1632,7 +1736,11 @@ function Prepare-FailedShutdownRecovery {
     }
     $snapshotMoved = $false
     $incidentAttempted = $false
+    $writerLease = $null
     try {
+        if (-not $processWasPresent) {
+            $writerLease = Open-ApplicationWriterLease
+        }
         New-Item -ItemType Directory -Path $temporaryDirectory -ErrorAction Stop | Out-Null
         Assert-NotReparseDirectory -Path $temporaryDirectory
         $temporaryData = Assert-DirectChildPath `
@@ -1658,7 +1766,8 @@ function Prepare-FailedShutdownRecovery {
             -CreatedAt $created.ToUniversalTime().ToString(
                 "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
                 [Globalization.CultureInfo]::InvariantCulture
-            )
+            ) `
+            -Reason $snapshotReason
         $manifest = ConvertFrom-RecoveryManifestJson -Json (
             Get-Content -LiteralPath $manifestPath -Raw
         )
@@ -1684,7 +1793,11 @@ function Prepare-FailedShutdownRecovery {
         if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
             throw "Managed process descendants changed during recovery preparation."
         }
-        if ($null -eq (Get-ManagedProcess -State $evidence.State)) {
+        $currentProcess = Get-ManagedProcess -State $evidence.State
+        if (
+            ($processWasPresent -and $null -eq $currentProcess) -or
+            (-not $processWasPresent -and $null -ne $currentProcess)
+        ) {
             throw "Recovery preparation process identity changed."
         }
         [System.IO.Directory]::Move($temporaryDirectory, $snapshotDirectory)
@@ -1698,17 +1811,23 @@ function Prepare-FailedShutdownRecovery {
             "and authenticated incident $($incident.Id); MyDashboard remains stopped."
         )
     } finally {
-        if (-not $snapshotMoved -and (Test-Path -LiteralPath $temporaryDirectory)) {
-            Assert-NotReparseDirectory -Path $temporaryDirectory
-            Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
-        }
-        if (
-            $snapshotMoved -and
-            -not $incidentAttempted -and
-            (Test-Path -LiteralPath $snapshotDirectory)
-        ) {
-            Assert-NotReparseDirectory -Path $snapshotDirectory
-            Remove-Item -LiteralPath $snapshotDirectory -Recurse -Force
+        try {
+            if (-not $snapshotMoved -and (Test-Path -LiteralPath $temporaryDirectory)) {
+                Assert-NotReparseDirectory -Path $temporaryDirectory
+                Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
+            }
+            if (
+                $snapshotMoved -and
+                -not $incidentAttempted -and
+                (Test-Path -LiteralPath $snapshotDirectory)
+            ) {
+                Assert-NotReparseDirectory -Path $snapshotDirectory
+                Remove-Item -LiteralPath $snapshotDirectory -Recurse -Force
+            }
+        } finally {
+            if ($null -ne $writerLease) {
+                Close-ApplicationWriterLease -Holder $writerLease
+            }
         }
     }
 }
@@ -1843,7 +1962,7 @@ function New-RecoveryIncidentRecord {
         [Parameter(Mandatory = $true)]$Location,
         [Parameter(Mandatory = $true)]$Evidence,
         [Parameter(Mandatory = $true)]$Snapshot,
-        [ValidateSet("pre_termination", "postconditions_verified", "recovered")]
+        [ValidateSet("pre_termination", "postconditions_verified", "recovered", "invalidated")]
         [string]$State = "pre_termination"
     )
     $record = [ordered]@{
@@ -1903,7 +2022,12 @@ function Assert-RecoveryIncidentRecord {
         $Record.incidentId -notmatch '^incident-[a-f0-9]{32}$' -or
         $Record.incidentId -ne $Location.Id -or
         $Record.state -isnot [string] -or
-        $Record.state -notin @("pre_termination", "postconditions_verified", "recovered") -or
+        $Record.state -notin @(
+            "pre_termination",
+            "postconditions_verified",
+            "recovered",
+            "invalidated"
+        ) -or
         $Record.projectDigest -isnot [string] -or
         $Record.projectDigest -ne $projectDigest -or
         -not (Test-RecoveryJsonInteger -Value $Record.processId) -or
@@ -1962,6 +2086,158 @@ function Write-NewRecoveryIncidentRecord {
     }
 }
 
+function Write-ReplacementRecoveryIncidentRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Location,
+        [Parameter(Mandatory = $true)]$Record
+    )
+    $json = $Record | ConvertTo-Json -Depth 4 -Compress
+    $temporary = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).tmp")
+    $backup = Assert-DirectChildPath `
+        -Parent $Location.Directory `
+        -Child (Join-Path $Location.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).bak")
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    $stream = New-Object System.IO.FileStream(
+        $temporary,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    try {
+        [System.IO.File]::Replace($temporary, $Location.RecordPath, $backup, $true)
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Read-RecoveryIncidentAuthority {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $location = Get-RecoveryIncidentLocation -State $State -Snapshot $Snapshot
+    if (-not (Test-Path -LiteralPath $location.Directory -PathType Container)) {
+        throw "No authenticated recovery incident is available for reconciliation."
+    }
+    Assert-NotReparseDirectory -Path $location.Directory
+    Assert-RegularManagedFile `
+        -Path $location.RecordPath `
+        -Description "Recovery incident record" `
+        -MaximumBytes 65536
+    $record = ConvertFrom-ExactJson -Json (
+        Get-Content -LiteralPath $location.RecordPath -Raw
+    )
+    Assert-RecoveryIncidentRecord `
+        -Record $record `
+        -Location $location `
+        -State $State `
+        -Snapshot $Snapshot
+    return [pscustomobject]@{
+        Id = $location.Id
+        Directory = $location.Directory
+        RecordPath = $location.RecordPath
+        Record = $record
+    }
+}
+
+function Invalidate-UnexpectedExitRecoveryAuthority {
+    param(
+        [Parameter(Mandatory = $true)]$Authority,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    if ($Snapshot.Reason -ne $unexpectedExitRecoveryReason) {
+        throw "Only unexpected-exit recovery authority can be invalidated by receipt presence."
+    }
+    if ($Authority.Record.state -ne "invalidated") {
+        $evidence = [pscustomobject]@{
+            State = $State
+            ControlSha256 = [string]$Authority.Record.sourceHashes.control
+            RequestedSha256 = [string]$Authority.Record.sourceHashes.requestedReceipt
+            TerminalSha256 = [string]$Authority.Record.sourceHashes.terminalReceipt
+        }
+        $record = New-RecoveryIncidentRecord `
+            -Location $Authority `
+            -Evidence $evidence `
+            -Snapshot $Snapshot `
+            -State "invalidated"
+        Write-ReplacementRecoveryIncidentRecord -Location $Authority -Record $record
+        $persisted = Read-RecoveryIncidentAuthority -State $State -Snapshot $Snapshot
+        if ($persisted.Record.state -ne "invalidated") {
+            throw "Unexpected-exit recovery invalidation did not persist."
+        }
+    }
+    throw $unexpectedExitAuthorityInvalidatedMessage
+}
+
+function Assert-OrInvalidateUnexpectedExitRecoveryAuthority {
+    param(
+        [Parameter(Mandatory = $true)]$Authority,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    if ($Authority.Record.state -eq "invalidated") {
+        throw $unexpectedExitAuthorityInvalidatedMessage
+    }
+    $paths = @(
+        [pscustomobject]@{
+            Path = Get-ReceiptPath -State $State -Phase "requested"
+            Description = "Active unexpected-exit shutdown requested receipt"
+        },
+        [pscustomobject]@{
+            Path = Get-ReceiptPath -State $State -Phase "terminal"
+            Description = "Active unexpected-exit shutdown terminal receipt"
+        },
+        [pscustomobject]@{
+            Path = Assert-DirectChildPath `
+                -Parent $Authority.Directory `
+                -Child (Join-Path $Authority.Directory "requested-receipt.json")
+            Description = "Archived unexpected-exit shutdown requested receipt"
+        },
+        [pscustomobject]@{
+            Path = Assert-DirectChildPath `
+                -Parent $Authority.Directory `
+                -Child (Join-Path $Authority.Directory "terminal-receipt.json")
+            Description = "Archived unexpected-exit shutdown terminal receipt"
+        },
+        [pscustomobject]@{
+            Path = Assert-DirectChildPath `
+                -Parent $Authority.Directory `
+                -Child (Join-Path $Authority.Directory "requested-receipt-removal.tmp")
+            Description = "Unexpected-exit shutdown requested receipt tombstone"
+        },
+        [pscustomobject]@{
+            Path = Assert-DirectChildPath `
+                -Parent $Authority.Directory `
+                -Child (Join-Path $Authority.Directory "terminal-receipt-removal.tmp")
+            Description = "Unexpected-exit shutdown terminal receipt tombstone"
+        }
+    )
+    foreach ($candidate in $paths) {
+        try {
+            Assert-RecoveryPathAbsent `
+                -Path ([string]$candidate.Path) `
+                -Description ([string]$candidate.Description)
+        } catch {
+            Invalidate-UnexpectedExitRecoveryAuthority `
+                -Authority $Authority `
+                -State $State `
+                -Snapshot $Snapshot
+        }
+    }
+}
+
 function Get-ArchivedRecoveryEvidence {
     param(
         [Parameter(Mandatory = $true)]$Location,
@@ -1985,20 +2261,48 @@ function Get-ArchivedRecoveryEvidence {
     if (-not (Test-SameControlIdentity -Left $archivedState -Right $State)) {
         throw "Archived recovery control identity does not match active authority."
     }
-    $requested = Read-ShutdownReceiptFromPath `
-        -State $archivedState `
-        -Phase "requested" `
-        -Path $requestedPath
-    $terminal = Read-ShutdownReceiptFromPath `
-        -State $archivedState `
-        -Phase "terminal" `
-        -Path $terminalPath
-    if ($terminal.status -ne "failure") {
-        throw "Archived recovery evidence does not contain a terminal failure."
-    }
     $controlHash = Get-BoundedSha256 -Path $controlPath -Description "Archived process control state"
-    $requestedHash = Get-BoundedSha256 -Path $requestedPath -Description "Archived shutdown request receipt"
-    $terminalHash = Get-BoundedSha256 -Path $terminalPath -Description "Archived shutdown terminal receipt"
+    if ($Snapshot.Reason -eq $shutdownFailureRecoveryReason) {
+        $kind = $shutdownFailureEvidenceKind
+        $requested = Read-ShutdownReceiptFromPath `
+            -State $archivedState `
+            -Phase "requested" `
+            -Path $requestedPath
+        $terminal = Read-ShutdownReceiptFromPath `
+            -State $archivedState `
+            -Phase "terminal" `
+            -Path $terminalPath
+        if ($terminal.status -ne "failure") {
+            throw "Archived recovery evidence does not contain a terminal failure."
+        }
+        $requestedHash = Get-BoundedSha256 `
+            -Path $requestedPath `
+            -Description "Archived shutdown request receipt"
+        $terminalHash = Get-BoundedSha256 `
+            -Path $terminalPath `
+            -Description "Archived shutdown terminal receipt"
+    } elseif ($Snapshot.Reason -eq $unexpectedExitRecoveryReason) {
+        $kind = $unexpectedExitEvidenceKind
+        $requested = $null
+        $terminal = $null
+        Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
+            -Authority ([pscustomobject]@{
+                Id = $Location.Id
+                Directory = $Location.Directory
+                RecordPath = $Location.RecordPath
+                Record = $Record
+            }) `
+            -State $archivedState `
+            -Snapshot $Snapshot
+        $requestedHash = Get-AbsentRecoveryReceiptSha256 `
+            -State $archivedState `
+            -Phase "requested"
+        $terminalHash = Get-AbsentRecoveryReceiptSha256 `
+            -State $archivedState `
+            -Phase "terminal"
+    } else {
+        throw "Recovery snapshot reason is unsupported."
+    }
     $manifestHash = Get-BoundedSha256 `
         -Path $manifestPath `
         -Description "Archived recovery snapshot manifest" `
@@ -2014,6 +2318,7 @@ function Get-ArchivedRecoveryEvidence {
         throw "Archived recovery evidence authentication failed."
     }
     return [pscustomobject]@{
+        Kind = $kind
         State = $archivedState
         Requested = $requested
         Terminal = $terminal
@@ -2028,33 +2333,20 @@ function Read-AuthenticatedRecoveryIncident {
         [Parameter(Mandatory = $true)]$State,
         [Parameter(Mandatory = $true)]$Snapshot
     )
-    $location = Get-RecoveryIncidentLocation -State $State -Snapshot $Snapshot
-    if (-not (Test-Path -LiteralPath $location.Directory -PathType Container)) {
-        throw "No authenticated recovery incident is available for reconciliation."
+    $authority = Read-RecoveryIncidentAuthority -State $State -Snapshot $Snapshot
+    if ($authority.Record.state -eq "invalidated") {
+        throw $unexpectedExitAuthorityInvalidatedMessage
     }
-    Assert-NotReparseDirectory -Path $location.Directory
-    Assert-RegularManagedFile `
-        -Path $location.RecordPath `
-        -Description "Recovery incident record" `
-        -MaximumBytes 65536
-    $record = ConvertFrom-ExactJson -Json (
-        Get-Content -LiteralPath $location.RecordPath -Raw
-    )
-    Assert-RecoveryIncidentRecord `
-        -Record $record `
-        -Location $location `
-        -State $State `
-        -Snapshot $Snapshot
     $evidence = Get-ArchivedRecoveryEvidence `
-        -Location $location `
-        -Record $record `
+        -Location $authority `
+        -Record $authority.Record `
         -State $State `
         -Snapshot $Snapshot
     return [pscustomobject]@{
-        Id = $location.Id
-        Directory = $location.Directory
-        RecordPath = $location.RecordPath
-        Record = $record
+        Id = $authority.Id
+        Directory = $authority.Directory
+        RecordPath = $authority.RecordPath
+        Record = $authority.Record
         Evidence = $evidence
     }
 }
@@ -2064,6 +2356,22 @@ function Publish-RecoveryIncident {
         [Parameter(Mandatory = $true)]$Evidence,
         [Parameter(Mandatory = $true)]$Snapshot
     )
+    if (
+        (
+            $Evidence.Kind -eq $shutdownFailureEvidenceKind -and
+            $Snapshot.Reason -ne $shutdownFailureRecoveryReason
+        ) -or
+        (
+            $Evidence.Kind -eq $unexpectedExitEvidenceKind -and
+            $Snapshot.Reason -ne $unexpectedExitRecoveryReason
+        ) -or
+        $Evidence.Kind -notin @(
+            $shutdownFailureEvidenceKind,
+            $unexpectedExitEvidenceKind
+        )
+    ) {
+        throw "Recovery snapshot reason does not match its evidence kind."
+    }
     if (-not (Test-Path -LiteralPath $incidentsDirectory)) {
         New-Item -ItemType Directory -Path $incidentsDirectory -Force | Out-Null
     }
@@ -2094,20 +2402,36 @@ function Publish-RecoveryIncident {
             -Child (Join-Path $location.Directory "control-state.json")) `
         -ExpectedSha256 $Evidence.ControlSha256 `
         -Description "Process control state"
-    Publish-ExactRecoveryEvidenceCopy `
-        -Source (Get-ReceiptPath -State $Evidence.State -Phase "requested") `
-        -Destination (Assert-DirectChildPath `
-            -Parent $location.Directory `
-            -Child (Join-Path $location.Directory "requested-receipt.json")) `
-        -ExpectedSha256 $Evidence.RequestedSha256 `
-        -Description "Shutdown request receipt"
-    Publish-ExactRecoveryEvidenceCopy `
-        -Source (Get-ReceiptPath -State $Evidence.State -Phase "terminal") `
-        -Destination (Assert-DirectChildPath `
-            -Parent $location.Directory `
-            -Child (Join-Path $location.Directory "terminal-receipt.json")) `
-        -ExpectedSha256 $Evidence.TerminalSha256 `
-        -Description "Shutdown terminal receipt"
+    $archivedRequestedPath = Assert-DirectChildPath `
+        -Parent $location.Directory `
+        -Child (Join-Path $location.Directory "requested-receipt.json")
+    $archivedTerminalPath = Assert-DirectChildPath `
+        -Parent $location.Directory `
+        -Child (Join-Path $location.Directory "terminal-receipt.json")
+    if ($Evidence.Kind -eq $shutdownFailureEvidenceKind) {
+        Publish-ExactRecoveryEvidenceCopy `
+            -Source (Get-ReceiptPath -State $Evidence.State -Phase "requested") `
+            -Destination $archivedRequestedPath `
+            -ExpectedSha256 $Evidence.RequestedSha256 `
+            -Description "Shutdown request receipt"
+        Publish-ExactRecoveryEvidenceCopy `
+            -Source (Get-ReceiptPath -State $Evidence.State -Phase "terminal") `
+            -Destination $archivedTerminalPath `
+            -ExpectedSha256 $Evidence.TerminalSha256 `
+            -Description "Shutdown terminal receipt"
+    } else {
+        foreach ($phase in @("requested", "terminal")) {
+            Assert-RecoveryPathAbsent `
+                -Path (Get-ReceiptPath -State $Evidence.State -Phase $phase) `
+                -Description "Unexpected-exit shutdown $phase receipt"
+        }
+        Assert-RecoveryPathAbsent `
+            -Path $archivedRequestedPath `
+            -Description "Archived unexpected-exit shutdown requested receipt"
+        Assert-RecoveryPathAbsent `
+            -Path $archivedTerminalPath `
+            -Description "Archived unexpected-exit shutdown terminal receipt"
+    }
     Publish-ExactRecoveryEvidenceCopy `
         -Source $Snapshot.ManifestPath `
         -Destination (Assert-DirectChildPath `
@@ -2145,34 +2469,7 @@ function Set-RecoveryIncidentState {
         -Evidence $current.Evidence `
         -Snapshot $Snapshot `
         -State $NewState
-    $json = $record | ConvertTo-Json -Depth 4 -Compress
-    $temporary = Assert-DirectChildPath `
-        -Parent $current.Directory `
-        -Child (Join-Path $current.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).tmp")
-    $backup = Assert-DirectChildPath `
-        -Parent $current.Directory `
-        -Child (Join-Path $current.Directory "incident-$PID-$([guid]::NewGuid().ToString('N')).bak")
-    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
-    $stream = New-Object System.IO.FileStream(
-        $temporary,
-        [System.IO.FileMode]::CreateNew,
-        [System.IO.FileAccess]::Write,
-        [System.IO.FileShare]::None,
-        4096,
-        [System.IO.FileOptions]::WriteThrough
-    )
-    try {
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush($true)
-    } finally {
-        $stream.Dispose()
-    }
-    try {
-        [System.IO.File]::Replace($temporary, $current.RecordPath, $backup, $true)
-        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-    } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-    }
+    Write-ReplacementRecoveryIncidentRecord -Location $current -Record $record
     $updated = Read-AuthenticatedRecoveryIncident `
         -State $current.Evidence.State `
         -Snapshot $Snapshot
@@ -2196,58 +2493,125 @@ function Wait-ForExactProcessExit {
     throw "Managed process did not exit after exact PID termination."
 }
 
-function Assert-ApplicationWriterLeaseFree {
+function New-ApplicationWriterLeaseHolderStartInfo {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $nodePath
     $startInfo.Arguments = ('"' + $writerLeaseProbeScript + '"')
     $startInfo.WorkingDirectory = $projectDirectory
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.EnvironmentVariables.Clear()
     $startInfo.EnvironmentVariables["MYDASHBOARD_WRITER_LEASE_PROJECT_DIGEST"] = $projectDigest
+    $startInfo.EnvironmentVariables["MYDASHBOARD_WRITER_LEASE_HOLD"] = "1"
     foreach ($name in @("SystemRoot", "WINDIR")) {
         $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
         if (-not [string]::IsNullOrWhiteSpace($value)) {
             $startInfo.EnvironmentVariables[$name] = $value
         }
     }
-    $probe = [System.Diagnostics.Process]::Start($startInfo)
+    return $startInfo
+}
+
+function Open-ApplicationWriterLease {
+    $holder = [System.Diagnostics.Process]::Start(
+        (New-ApplicationWriterLeaseHolderStartInfo)
+    )
     try {
-        if ($null -eq $probe -or -not $probe.WaitForExit(5000)) {
-            if ($null -ne $probe -and -not $probe.HasExited) {
-                $probe.Kill()
-                [void]$probe.WaitForExit(500)
-            }
-            throw "Application writer lease probe did not finish safely."
+        if ($null -eq $holder) {
+            throw "Application writer lease holder did not start safely."
         }
-        $output = $probe.StandardOutput.ReadToEnd()
-        [void]$probe.StandardError.ReadToEnd()
-        if ($output.Length -gt 1024 -or $probe.ExitCode -ne 0) {
-            throw "Application writer lease is not free."
+        $readTask = $holder.StandardOutput.ReadLineAsync()
+        if (-not $readTask.Wait(5000)) {
+            throw "Application writer lease holder did not acquire safely."
+        }
+        $output = [string]$readTask.Result
+        if ([string]::IsNullOrWhiteSpace($output) -or $output.Length -gt 1024) {
+            throw "Application writer lease holder returned invalid data."
         }
         $result = ConvertFrom-ExactJson -Json $output
+        if ($result.ok -ne $true) {
+            throw "Application writer lease is not free."
+        }
         $properties = @($result.PSObject.Properties.Name | Sort-Object)
         if (
-            (Compare-Object -ReferenceObject @("ok", "schemaVersion") -DifferenceObject $properties) -or
+            (Compare-Object `
+                -ReferenceObject @("holding", "ok", "schemaVersion") `
+                -DifferenceObject $properties) -or
             $result.schemaVersion -ne 1 -or
-            $result.ok -ne $true
+            $result.holding -ne $true -or
+            $holder.HasExited
         ) {
-            throw "Application writer lease probe returned invalid data."
+            throw "Application writer lease holder returned invalid data."
+        }
+        return $holder
+    } catch {
+        $failure = $_
+        if ($null -ne $holder) {
+            try {
+                if (-not $holder.HasExited) {
+                    $holder.StandardInput.Close()
+                    if (-not $holder.WaitForExit(500)) {
+                        $holder.Kill()
+                        [void]$holder.WaitForExit(1000)
+                    }
+                }
+            } catch {
+                if (-not $holder.HasExited) {
+                    $holder.Kill()
+                    [void]$holder.WaitForExit(1000)
+                }
+            } finally {
+                $holder.Dispose()
+            }
+        }
+        throw $failure
+    }
+}
+
+function Close-ApplicationWriterLease {
+    param([Parameter(Mandatory = $true)]$Holder)
+    try {
+        if (-not $Holder.HasExited) {
+            $Holder.StandardInput.Close()
+            if (-not $Holder.WaitForExit(5000)) {
+                $Holder.Kill()
+                if (-not $Holder.WaitForExit(1000)) {
+                    throw "Application writer lease holder did not release safely."
+                }
+                throw "Application writer lease holder required forced release."
+            }
+        }
+        $remainingOutput = $Holder.StandardOutput.ReadToEnd()
+        $errorOutput = $Holder.StandardError.ReadToEnd()
+        if (
+            $remainingOutput.Length -gt 1024 -or
+            $errorOutput.Length -gt 1024 -or
+            -not [string]::IsNullOrEmpty($remainingOutput) -or
+            -not [string]::IsNullOrEmpty($errorOutput) -or
+            $Holder.ExitCode -ne 0
+        ) {
+            throw "Application writer lease holder did not close cleanly."
         }
     } finally {
-        if ($null -ne $probe) {
-            $probe.Dispose()
-        }
+        $Holder.Dispose()
     }
 }
 
 function Remove-ExactShutdownReceipts {
     param(
         [Parameter(Mandatory = $true)]$Evidence,
-        [Parameter(Mandatory = $true)]$Incident
+        [Parameter(Mandatory = $true)]$Incident,
+        [Parameter(Mandatory = $true)]$Snapshot
     )
+    if ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+        Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
+            -Authority $Incident `
+            -State $Evidence.State `
+            -Snapshot $Snapshot
+    }
     foreach ($phase in @("requested", "terminal")) {
         $path = Get-ReceiptPath -State $Evidence.State -Phase $phase
         $expectedHash = if ($phase -eq "requested") {
@@ -2258,6 +2622,22 @@ function Remove-ExactShutdownReceipts {
         $tombstone = Assert-DirectChildPath `
             -Parent $Incident.Directory `
             -Child (Join-Path $Incident.Directory "$phase-receipt-removal.tmp")
+        if ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+            Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
+                -Authority $Incident `
+                -State $Evidence.State `
+                -Snapshot $Snapshot
+            $expectedAbsentHash = Get-AbsentRecoveryReceiptSha256 `
+                -State $Evidence.State `
+                -Phase $phase
+            if ($expectedHash -ne $expectedAbsentHash) {
+                throw "Unexpected-exit receipt absence authority changed."
+            }
+            continue
+        }
+        if ($Evidence.Kind -ne $shutdownFailureEvidenceKind) {
+            throw "Recovery evidence kind is invalid during receipt cleanup."
+        }
         $pathExists = Test-Path -LiteralPath $path
         $tombstoneExists = Test-Path -LiteralPath $tombstone
         if ($pathExists -and $tombstoneExists) {
@@ -2292,6 +2672,80 @@ function Remove-ExactShutdownReceipts {
     }
 }
 
+function Open-UnexpectedExitReceiptBarriers {
+    param(
+        [Parameter(Mandatory = $true)]$Incident,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+    $state = $Incident.Evidence.State
+    Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
+        -Authority $Incident `
+        -State $state `
+        -Snapshot $Snapshot
+    $streams = @()
+    try {
+        foreach ($phase in @("requested", "terminal")) {
+            $path = Get-ReceiptPath -State $state -Phase $phase
+            $parent = [System.IO.Path]::GetDirectoryName($path)
+            Assert-NotReparseDirectory -Path $parent
+            $options = (
+                [System.IO.FileOptions]::WriteThrough -bor
+                [System.IO.FileOptions]::DeleteOnClose
+            )
+            $stream = New-Object System.IO.FileStream(
+                $path,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None,
+                4096,
+                $options
+            )
+            $stream.Flush($true)
+            $streams += $stream
+        }
+        return $streams
+    } catch {
+        foreach ($stream in $streams) {
+            $stream.Dispose()
+        }
+        Invalidate-UnexpectedExitRecoveryAuthority `
+            -Authority $Incident `
+            -State $state `
+            -Snapshot $Snapshot
+    }
+}
+
+function Close-UnexpectedExitReceiptBarriers {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Streams,
+        [Parameter(Mandatory = $true)]$State
+    )
+    $failure = $null
+    for ($index = $Streams.Count - 1; $index -ge 0; $index -= 1) {
+        try {
+            $Streams[$index].Dispose()
+        } catch {
+            if ($null -eq $failure) {
+                $failure = $_
+            }
+        }
+    }
+    foreach ($phase in @("requested", "terminal")) {
+        try {
+            Assert-RecoveryPathAbsent `
+                -Path (Get-ReceiptPath -State $State -Phase $phase) `
+                -Description "Unexpected-exit shutdown $phase receipt barrier"
+        } catch {
+            if ($null -eq $failure) {
+                $failure = $_
+            }
+        }
+    }
+    if ($null -ne $failure) {
+        throw $failure
+    }
+}
+
 function Recover-FailedShutdown {
     param([Parameter(Mandatory = $true)][string]$SnapshotId)
     $state = Read-ControlState
@@ -2304,6 +2758,9 @@ function Recover-FailedShutdown {
     $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
     $process = Get-ManagedProcess -State $state
     if ($null -ne $process) {
+        if ($snapshot.Reason -ne $shutdownFailureRecoveryReason) {
+            throw "Unexpected-exit recovery authority cannot terminate a live process."
+        }
         $evidence = Get-AuthenticatedRecoveryEvidence -State $state
         if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
             throw "The controlled port is occupied or its probe was ambiguous."
@@ -2330,32 +2787,64 @@ function Recover-FailedShutdown {
         $incident = Read-AuthenticatedRecoveryIncident -State $state -Snapshot $snapshot
         $evidence = $incident.Evidence
     }
+    if ($null -ne (Get-ManagedProcess -State $evidence.State)) {
+        throw "Managed process remained present after recovery process resolution."
+    }
     if (Test-LoopbackTcpListener -Port ([int]$evidence.State.port)) {
         throw "Controlled port remained occupied after recovery termination."
     }
-    Assert-ApplicationWriterLeaseFree
-    $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
-    if ($incident.Record.state -eq "pre_termination") {
-        $incident = Set-RecoveryIncidentState `
-            -Incident $incident `
-            -Snapshot $snapshot `
-            -ExpectedStates @("pre_termination") `
-            -NewState "postconditions_verified"
+    if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
+        throw "Managed process descendants remained after recovery process resolution."
     }
-    $evidence = $incident.Evidence
-    Remove-ExactShutdownReceipts -Evidence $evidence -Incident $incident
-    if ($incident.Record.state -eq "postconditions_verified") {
-        $incident = Set-RecoveryIncidentState `
+    $writerLease = $null
+    $receiptBarriers = @()
+    try {
+        $writerLease = Open-ApplicationWriterLease
+        $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
+        if ($incident.Record.state -eq "pre_termination") {
+            $incident = Set-RecoveryIncidentState `
+                -Incident $incident `
+                -Snapshot $snapshot `
+                -ExpectedStates @("pre_termination") `
+                -NewState "postconditions_verified"
+        }
+        $evidence = $incident.Evidence
+        Remove-ExactShutdownReceipts `
+            -Evidence $evidence `
             -Incident $incident `
-            -Snapshot $snapshot `
-            -ExpectedStates @("postconditions_verified") `
-            -NewState "recovered"
+            -Snapshot $snapshot
+        if ($incident.Record.state -eq "postconditions_verified") {
+            $incident = Set-RecoveryIncidentState `
+                -Incident $incident `
+                -Snapshot $snapshot `
+                -ExpectedStates @("postconditions_verified") `
+                -NewState "recovered"
+        }
+        $incident = Read-AuthenticatedRecoveryIncident `
+            -State $incident.Evidence.State `
+            -Snapshot $snapshot
+        $evidence = $incident.Evidence
+        if ($evidence.Kind -eq $unexpectedExitEvidenceKind) {
+            $receiptBarriers = @(
+                Open-UnexpectedExitReceiptBarriers `
+                    -Incident $incident `
+                    -Snapshot $snapshot
+            )
+        }
+        Remove-ControlState -ExpectedState $evidence.State
+    } finally {
+        try {
+            if ($receiptBarriers.Count -gt 0) {
+                Close-UnexpectedExitReceiptBarriers `
+                    -Streams $receiptBarriers `
+                    -State $evidence.State
+            }
+        } finally {
+            if ($null -ne $writerLease) {
+                Close-ApplicationWriterLease -Holder $writerLease
+            }
+        }
     }
-    $incident = Read-AuthenticatedRecoveryIncident `
-        -State $incident.Evidence.State `
-        -Snapshot $snapshot
-    $evidence = $incident.Evidence
-    Remove-ControlState -ExpectedState $evidence.State
     Write-Output "Failed-shutdown incident $($incident.Id) was archived; MyDashboard remains stopped."
 }
 
