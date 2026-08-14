@@ -723,6 +723,7 @@ test("committed privileged capabilities are disabled and secret-free", async () 
   assert.deepEqual(config.changePackages, { enabled: false });
   assert.deepEqual(config.githubActions, {
     enabled: false,
+    credentialMode: "gh-login",
     enabledActions: [],
   });
   assert.deepEqual(config.githubRead, { enabled: false });

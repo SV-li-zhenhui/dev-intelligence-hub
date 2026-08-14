@@ -24,6 +24,7 @@ function configurationWithCredentialReferences() {
     apiKeyEnv: "MYDASHBOARD_OPENAI_API_KEY",
     remote: true,
   };
+  delete configuration.githubActions.credentialMode;
   configuration.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
   return configuration;
 }
