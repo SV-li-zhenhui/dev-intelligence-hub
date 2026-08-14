@@ -56,3 +56,10 @@ No home ACL mutation, real CLI/model call, credential read, GitHub action,
 network write, or push occurred. Managed startup remains the next acceptance
 gate.
 
+## Review fix round 1
+
+The independent review approved the task with no Critical or Important
+finding and identified one Minor: validation for the removed `homeDirectory`
+dependency was unreachable after the dependency allowlist change. Commit
+`b40afda` removes only that dead branch. The full composition-root suite passed
+84/84, and syntax/diff checks passed.
