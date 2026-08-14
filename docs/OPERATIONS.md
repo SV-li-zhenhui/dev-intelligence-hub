@@ -126,27 +126,47 @@ to investigate; do not delete it merely to make `Start` succeed.
 
 `Restart` never overrides a retained shutdown failure. When the authenticated
 managed process is still alive, has emitted an authenticated `failure` terminal
-receipt, is no longer listening, has no descendants, and an exact stable
-recovery snapshot is available, an operator may explicitly recover it:
+receipt, is no longer listening, and has no descendants, first prepare private
+recovery evidence without terminating the process:
+
+```powershell
+.\scripts\Manage-MyDashboard.ps1 -Action PrepareFailedShutdownRecovery
+```
+
+Preparation rejects changed receipts, a reused PID/process identity, an IPv4
+or IPv6 loopback listener, visible managed child processes, links, unexpected
+data nesting, and files that change while they are copied or verified. Managed
+external executors use Windows Job Objects so their descendants are reaped with
+the supervised invocation; recovery does not treat an arbitrary uncontained
+same-user process as belonging to MyDashboard. Preparation creates a
+byte-exact observational snapshot and an
+authenticated `pre_termination` incident in the private runtime. It does not
+restore data, terminate a process, remove lifecycle evidence, restart the
+service, or open a browser. Record the exact snapshot identifier emitted by the
+command. A preparation failure removes its unpublished temporary snapshot and
+leaves the managed process and lifecycle barrier intact.
+
+After inspecting that evidence and granting a separate, snapshot-specific
+authorization, an operator may explicitly recover the failed lifecycle state:
 
 ```powershell
 .\scripts\Manage-MyDashboard.ps1 -Action RecoverFailedShutdown `
   -RecoverySnapshotId shutdown-failure-YYYYMMDD-HHmmss-<32-lowercase-hex>
 ```
 
-The command accepts no browser option and leaves the service stopped. It checks
-the snapshot manifest and active `data/` files byte-for-byte, writes private
-incident evidence under the private runtime, terminates only the authenticated
-PID, verifies the project writer lease can be acquired and released, then
-durably finalizes the incident, reconciles only the matching receipts, and
-removes the exact control state as the final safety-affecting step. Any
-uncertainty before termination leaves the process and evidence intact. A
-failure after termination retains the control barrier and authenticated
-incident evidence; a retry can resume receipt/tombstone cleanup and final
-control removal only from that matching incident. Arbitrary dead control state
-is not recoverable. Inspect the incident record before taking a separate
-explicit `Start` action. Never delete private lifecycle evidence to bypass
-these checks.
+The recovery command accepts no browser option and leaves the service stopped.
+It checks the snapshot manifest and active `data/` files byte-for-byte,
+terminates only the PID whose executable path and process start time still
+match the authenticated control generation, verifies the project writer lease
+can be acquired and released, and then checks the snapshot against active data
+again after exact process exit. Only then does it durably finalize the
+incident, reconcile the matching receipts, and remove the exact control state
+as the final safety-affecting step. Any uncertainty before termination leaves
+the process and evidence intact. A failure after termination retains the
+control barrier and authenticated incident evidence; a retry can resume only
+from that matching incident. Arbitrary dead control state is not recoverable.
+Inspect the incident record before taking a separate explicit `Start` action.
+Never delete private lifecycle evidence to bypass these checks.
 
 Both `npm start` and managed startup use a bootstrap that captures the packaged
 runtime identity before importing the application and verifies it again before

@@ -438,6 +438,27 @@ async function assertRecoveryRejectedBeforeKill(fixture, result) {
   assert.equal(await fileExists(fixture.controlPath), true);
 }
 
+async function assertPreparationRejectedPreservingAuthority(fixture, result) {
+  assert.notEqual(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+  assert.equal(await fileExists(fixture.controlPath), true);
+  assert.equal(await fileExists(fixture.requestedPath), true);
+  assert.equal(await fileExists(fixture.terminalPath), true);
+  const snapshotsDirectory = path.join(
+    fixture.runtime.runtimeDirectory,
+    "recovery-snapshots",
+  );
+  try {
+    assert.deepEqual(await readdir(snapshotsDirectory), []);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await assert.rejects(
+    readdir(path.join(fixture.runtime.runtimeDirectory, "incidents")),
+    { code: "ENOENT" },
+  );
+}
+
 async function replaceFixtureFileWithSymlinkOrSkip(
   t,
   linkPath,
@@ -842,10 +863,14 @@ setTimeout(() => {
 }
 
 async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
+  const {
+    createRecoverySnapshot: shouldCreateRecoverySnapshot = true,
+    ...serverFixtureOptions
+  } = fixtureOptions;
   const { root, port } = await createFixture(t, {
     shutdownExitCode: 1,
     holdWriterLeaseAfterFailedShutdown: true,
-    ...fixtureOptions,
+    ...serverFixtureOptions,
   });
   const runtime = readRuntimeInfo(root);
   const controlPath = path.join(runtime.runtimeDirectory, "mydashboard-server-process.json");
@@ -858,7 +883,7 @@ async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
   assert.match(`${stopped.stderr}\n${stopped.stdout}`, /shutdown failure/u);
   await assertPortUnavailable(port);
   assert.doesNotThrow(() => process.kill(state.processId, 0));
-  if (fixtureOptions.spawnDescendantAfterFailedShutdown) {
+  if (serverFixtureOptions.spawnDescendantAfterFailedShutdown) {
     await waitForPath(path.join(
       runtime.runtimeDirectory,
       "fixture-descendant-started.marker",
@@ -874,7 +899,17 @@ async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
   );
   const requestedText = await readFile(requestedPath, "utf8");
   const terminalText = await readFile(terminalPath, "utf8");
-  const snapshot = await createRecoverySnapshot(root, runtime);
+  if (!shouldCreateRecoverySnapshot) {
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(
+      path.join(root, "data", "fixture-data.json"),
+      '{"fixture":"failed-shutdown"}\n',
+      "utf8",
+    );
+  }
+  const snapshot = shouldCreateRecoverySnapshot
+    ? await createRecoverySnapshot(root, runtime)
+    : {};
   return {
     root,
     port,
@@ -1889,6 +1924,198 @@ test(
   },
 );
 
+test(
+  "PrepareFailedShutdownRecovery publishes an exact snapshot without terminating the failed process",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    const prepared = invokeManager(
+      fixture.root,
+      "PrepareFailedShutdownRecovery",
+      10,
+    );
+
+    assert.equal(prepared.status, 0, `${prepared.stderr}\n${prepared.stdout}`);
+    const snapshotId = prepared.stdout.match(
+      /shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u,
+    )?.[0];
+    assert.equal(typeof snapshotId, "string");
+    assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), true);
+    assert.equal(await fileExists(fixture.terminalPath), true);
+
+    fixture.snapshotId = snapshotId;
+    fixture.snapshotDirectory = path.join(
+      fixture.runtime.runtimeDirectory,
+      "recovery-snapshots",
+      snapshotId,
+    );
+    const manifest = JSON.parse(await readFile(
+      path.join(fixture.snapshotDirectory, "manifest.json"),
+      "utf8",
+    ));
+    assert.equal(manifest.reason, "managed_shutdown_lifecycle_failure");
+    assert.equal(manifest.consistent, true);
+    assert.deepEqual(manifest.files.map(({ name }) => name), [
+      "fixture-data.json",
+    ]);
+    assert.equal(
+      await readFile(path.join(
+        fixture.snapshotDirectory,
+        "data",
+        "fixture-data.json",
+      ), "utf8"),
+      await readFile(path.join(fixture.root, "data", "fixture-data.json"), "utf8"),
+    );
+    const incidents = await readdir(path.join(
+      fixture.runtime.runtimeDirectory,
+      "incidents",
+    ));
+    assert.equal(incidents.length, 1);
+    assert.match(incidents[0], /^incident-[a-f0-9]{32}$/u);
+
+    process.kill(fixture.state.processId);
+    await waitForProcessExit(fixture.state.processId);
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
+  "PowerShell 7 PrepareFailedShutdownRecovery publishes private evidence",
+  { skip: POWERSHELL_7_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    const prepared = invokeManager(
+      fixture.root,
+      "PrepareFailedShutdownRecovery",
+      10,
+      powershell7,
+    );
+
+    assert.equal(prepared.status, 0, `${prepared.stderr}\n${prepared.stdout}`);
+    assert.match(
+      prepared.stdout,
+      /shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u,
+    );
+    assert.doesNotThrow(() => process.kill(fixture.state.processId, 0));
+    await onlyRecoveryIncident(fixture);
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects active data changed at publication time",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*\[System[.]IO[.]Directory\]::Move\(\$temporaryDirectory, \$snapshotDirectory\)\r?\n)/u,
+      '    [System.IO.File]::AppendAllText((Join-Path $dataDirectory "fixture-data.json"), "changed")\n$1',
+    );
+
+    const rejected = invokeManager(
+      fixture.root,
+      "PrepareFailedShutdownRecovery",
+      10,
+    );
+
+    await assertPreparationRejectedPreservingAuthority(fixture, rejected);
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects an occupied controlled port",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    await startForeignListener(t, { mode: "raw", port: fixture.port });
+
+    await assertPreparationRejectedPreservingAuthority(
+      fixture,
+      invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10),
+    );
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects an IPv6-only controlled port",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    await startForeignListener(t, { mode: "raw-ipv6", port: fixture.port });
+
+    await assertPreparationRejectedPreservingAuthority(
+      fixture,
+      invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10),
+    );
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects a live managed descendant",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+      spawnDescendantAfterFailedShutdown: true,
+    });
+
+    await assertPreparationRejectedPreservingAuthority(
+      fixture,
+      invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10),
+    );
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects changed authenticated evidence",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    const terminal = JSON.parse(fixture.terminalText);
+    terminal.hmac = "A".repeat(44);
+    await writeFile(
+      fixture.terminalPath,
+      `${JSON.stringify(terminal)}\n`,
+      "utf8",
+    );
+
+    await assertPreparationRejectedPreservingAuthority(
+      fixture,
+      invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10),
+    );
+  },
+);
+
+test(
+  "PrepareFailedShutdownRecovery rejects unexpected active data directories",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t, {
+      createRecoverySnapshot: false,
+    });
+    await mkdir(path.join(fixture.root, "data", "unexpected"));
+
+    await assertPreparationRejectedPreservingAuthority(
+      fixture,
+      invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10),
+    );
+  },
+);
+
 for (const { label, mutate } of [
   {
     label: "string schemaVersion",
@@ -2505,6 +2732,17 @@ test(
 );
 
 test(
+  "RecoverFailedShutdown fail-before-kill: IPv6-only loopback listener",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await startForeignListener(t, { mode: "raw-ipv6", port: fixture.port });
+
+    await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+  },
+);
+
+test(
   "RecoverFailedShutdown fail-before-kill: live managed descendant",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
@@ -2577,13 +2815,37 @@ test(
 );
 
 test(
+  "RecoverFailedShutdown retains authority when active data changes after exact process exit",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    await rewriteFixtureManager(
+      fixture.root,
+      /(\s*Wait-ForExactProcessExit -State \$evidence[.]State\r?\n)/u,
+      '$1    [System.IO.File]::AppendAllText((Join-Path $dataDirectory "fixture-data.json"), "changed-after-exit")\n',
+    );
+
+    const rejected = invokeRecovery(fixture);
+
+    assert.notEqual(rejected.status, 0, `${rejected.stderr}\n${rejected.stdout}`);
+    await waitForProcessExit(fixture.state.processId);
+    assert.equal(await fileExists(fixture.controlPath), true);
+    assert.equal(await fileExists(fixture.requestedPath), true);
+    assert.equal(await fileExists(fixture.terminalPath), true);
+    const incident = await onlyRecoveryIncident(fixture);
+    const record = JSON.parse(await readFile(incident.recordPath, "utf8"));
+    assert.equal(record.state, "pre_termination");
+  },
+);
+
+test(
   "RecoverFailedShutdown state-machine: incident path is short and binds every original identity",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const fixture = await prepareFailedShutdownRecovery(t);
     await rewriteFixtureManager(
       fixture.root,
-      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      /(function Recover-FailedShutdown \{[\s\S]*?\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
       '$1    throw "fixture interruption after incident publication"\n',
     );
     const interrupted = invokeRecovery(fixture);
@@ -2630,7 +2892,7 @@ test(
     const fixture = await prepareFailedShutdownRecovery(t);
     await rewriteFixtureManager(
       fixture.root,
-      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      /(function Recover-FailedShutdown \{[\s\S]*?\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
       '$1    throw "fixture interruption after incident publication"\n',
     );
     const interrupted = invokeRecovery(fixture);
@@ -2650,7 +2912,7 @@ test(
     const fixture = await prepareFailedShutdownRecovery(t);
     await rewriteFixtureManager(
       fixture.root,
-      /(\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
+      /(function Recover-FailedShutdown \{[\s\S]*?\s*[$]incident = Publish-RecoveryIncident -Evidence [$]evidence -Snapshot [$]snapshot\r?\n)/u,
       '$1    throw "fixture interruption after incident publication"\n',
     );
     assert.notEqual(invokeRecovery(fixture).status, 0);

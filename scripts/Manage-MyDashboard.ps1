@@ -1,6 +1,14 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Start", "Stop", "Restart", "Status", "Restore", "RecoverFailedShutdown")]
+    [ValidateSet(
+        "Start",
+        "Stop",
+        "Restart",
+        "Status",
+        "Restore",
+        "PrepareFailedShutdownRecovery",
+        "RecoverFailedShutdown"
+    )]
     [string]$Action = "Status",
     [string]$BackupId,
     [string]$RecoverySnapshotId,
@@ -649,27 +657,39 @@ function Test-LoopbackTcpListener {
     $probeSource = @'
 const net = require("node:net");
 const port = Number(process.argv[2]);
-let settled = false;
-let timer;
-let verifier;
-const client = net.createConnection({ host: "127.0.0.1", port });
-function finish(code) {
-  if (settled) return;
-  settled = true;
-  clearTimeout(timer);
-  client.destroy();
-  process.exit(code);
-}
-client.once("connect", () => finish(2));
-client.once("error", (error) => {
-  if (error?.code !== "ECONNREFUSED") return finish(2);
-  verifier = net.createServer();
-  verifier.once("error", () => finish(2));
-  verifier.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
-    verifier.close((closeError) => finish(closeError ? 2 : 61));
+function proveAddressUnused(host) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let verifier;
+    const client = net.createConnection({ host, port });
+    const timer = setTimeout(() => finish(false), 500);
+    function finish(unused) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      if (verifier) verifier.close(() => resolve(unused));
+      else resolve(unused);
+    }
+    client.once("connect", () => finish(false));
+    client.once("error", (error) => {
+      if (error?.code !== "ECONNREFUSED") return finish(false);
+      verifier = net.createServer();
+      verifier.once("error", () => finish(false));
+      verifier.listen({
+        host,
+        port,
+        exclusive: true,
+        ...(host === "::1" ? { ipv6Only: true } : {}),
+      }, () => finish(true));
+    });
   });
-});
-timer = setTimeout(() => finish(2), 500);
+}
+(async () => {
+  const ipv4Unused = await proveAddressUnused("127.0.0.1");
+  const ipv6Unused = ipv4Unused && await proveAddressUnused("::1");
+  process.exit(ipv4Unused && ipv6Unused ? 61 : 2);
+})().catch(() => process.exit(2));
 '@
     $probe = $null
     try {
@@ -1443,6 +1463,256 @@ function Assert-SameRecoveryEvidence {
     return $current
 }
 
+function Get-StableRecoverySourceFiles {
+    Assert-NotReparseDirectory -Path $dataDirectory
+    $files = @()
+    [long]$totalBytes = 0
+    foreach ($item in @(Get-ChildItem -LiteralPath $dataDirectory -Force | Sort-Object Name)) {
+        $isReparse = (
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        )
+        if ($item.PSIsContainer) {
+            if (
+                $isReparse -or
+                -not (Test-RecoveryExcludedActiveDataDirectoryName -Name $item.Name)
+            ) {
+                throw "Active data contains an unsafe directory entry."
+            }
+            continue
+        }
+        if (
+            $isReparse -or
+            (Test-RecoveryExcludedActiveDataDirectoryName -Name $item.Name) -or
+            $item.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+            [long]$item.Length -gt 536870912
+        ) {
+            throw "Active data contains an unsafe file entry."
+        }
+        $totalBytes += [long]$item.Length
+        if ($files.Count -ge 4096 -or $totalBytes -gt 536870912) {
+            throw "Active data is outside the recovery snapshot safe bound."
+        }
+        $files += $item
+    }
+    if ($files.Count -lt 1) {
+        throw "Active data has no recoverable state files."
+    }
+    return $files
+}
+
+function Copy-StableRecoveryFile {
+    param(
+        [Parameter(Mandatory = $true)]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    Assert-RegularManagedFile `
+        -Path $Source.FullName `
+        -Description "Active recovery data file" `
+        -MaximumBytes 536870912
+    $expectedBytes = [long]$Source.Length
+    $beforeHash = Get-BoundedSha256 `
+        -Path $Source.FullName `
+        -Description "Active recovery data file" `
+        -MaximumBytes 536870912
+    $content = [System.IO.File]::ReadAllBytes($Source.FullName)
+    if ([long]$content.LongLength -ne $expectedBytes) {
+        throw "Active recovery data changed during snapshot capture."
+    }
+    $stream = New-Object System.IO.FileStream(
+        $Destination,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $stream.Write($content, 0, $content.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    $afterHash = Get-BoundedSha256 `
+        -Path $Source.FullName `
+        -Description "Active recovery data file" `
+        -MaximumBytes 536870912
+    $copiedHash = Get-BoundedSha256 `
+        -Path $Destination `
+        -Description "Prepared recovery data file" `
+        -MaximumBytes 536870912
+    if (
+        $beforeHash -ne $afterHash -or
+        $beforeHash -ne $copiedHash -or
+        [long](Get-Item -LiteralPath $Source.FullName -Force).Length -ne $expectedBytes
+    ) {
+        throw "Active recovery data changed during snapshot capture."
+    }
+    return [pscustomobject]@{
+        name = [string]$Source.Name
+        bytes = $expectedBytes
+        sha256 = $beforeHash
+        sourceStable = $true
+    }
+}
+
+function Write-RecoverySnapshotManifest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Array]$Files,
+        [Parameter(Mandatory = $true)][string]$CreatedAt
+    )
+    [long]$totalBytes = 0
+    foreach ($entry in $Files) {
+        $totalBytes += [long]$entry.bytes
+    }
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        createdAt = $CreatedAt
+        reason = "managed_shutdown_lifecycle_failure"
+        sourceDirectory = $dataDirectory
+        consistent = $true
+        fileCount = $Files.Count
+        totalBytes = $totalBytes
+        files = @($Files)
+    }
+    $json = ([pscustomobject]$manifest) | ConvertTo-Json -Depth 4 -Compress
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes("$json`n")
+    $stream = New-Object System.IO.FileStream(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Prepare-FailedShutdownRecovery {
+    $state = Read-ControlState
+    if ($null -eq $state) {
+        throw "No authenticated failed-shutdown control state is available for preparation."
+    }
+    if ([int]$state.port -ne (Get-ConfiguredPort)) {
+        throw "Authenticated control state does not match the configured port."
+    }
+    $process = Get-ManagedProcess -State $state
+    if ($null -eq $process) {
+        throw "Failed-shutdown recovery preparation requires the exact managed process."
+    }
+    $evidence = Get-AuthenticatedRecoveryEvidence -State $state
+    if (Test-LoopbackTcpListener -Port ([int]$state.port)) {
+        throw "The controlled port is occupied or its probe was ambiguous."
+    }
+    if (-not (Test-NoManagedDescendants -ProcessId ([int]$state.processId))) {
+        throw "Managed process has live descendants; refusing recovery preparation."
+    }
+    if (-not (Test-Path -LiteralPath $recoverySnapshotsDirectory)) {
+        New-Item `
+            -ItemType Directory `
+            -Path $recoverySnapshotsDirectory `
+            -ErrorAction Stop | Out-Null
+    }
+    Assert-NotReparseDirectory -Path $recoverySnapshotsDirectory
+    $created = [DateTimeOffset]::UtcNow
+    $snapshotId = "shutdown-failure-$($created.ToString('yyyyMMdd-HHmmss'))-$([guid]::NewGuid().ToString('N'))"
+    Assert-RecoverySnapshotId -SnapshotId $snapshotId
+    $snapshotDirectory = Assert-DirectChildPath `
+        -Parent $recoverySnapshotsDirectory `
+        -Child (Join-Path $recoverySnapshotsDirectory $snapshotId)
+    $temporaryDirectory = Assert-DirectChildPath `
+        -Parent $recoverySnapshotsDirectory `
+        -Child (Join-Path $recoverySnapshotsDirectory ".prepare-$PID-$([guid]::NewGuid().ToString('N'))")
+    if (
+        (Test-Path -LiteralPath $snapshotDirectory) -or
+        (Test-Path -LiteralPath $temporaryDirectory)
+    ) {
+        throw "Recovery snapshot destination already exists."
+    }
+    $snapshotMoved = $false
+    $incidentAttempted = $false
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory -ErrorAction Stop | Out-Null
+        Assert-NotReparseDirectory -Path $temporaryDirectory
+        $temporaryData = Assert-DirectChildPath `
+            -Parent $temporaryDirectory `
+            -Child (Join-Path $temporaryDirectory "data")
+        New-Item -ItemType Directory -Path $temporaryData -ErrorAction Stop | Out-Null
+        Assert-NotReparseDirectory -Path $temporaryData
+        $entries = @()
+        foreach ($source in @(Get-StableRecoverySourceFiles)) {
+            $destination = Assert-DirectChildPath `
+                -Parent $temporaryData `
+                -Child (Join-Path $temporaryData $source.Name)
+            $entries += Copy-StableRecoveryFile `
+                -Source $source `
+                -Destination $destination
+        }
+        $manifestPath = Assert-DirectChildPath `
+            -Parent $temporaryDirectory `
+            -Child (Join-Path $temporaryDirectory "manifest.json")
+        Write-RecoverySnapshotManifest `
+            -Path $manifestPath `
+            -Files $entries `
+            -CreatedAt $created.ToUniversalTime().ToString(
+                "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        $manifest = ConvertFrom-RecoveryManifestJson -Json (
+            Get-Content -LiteralPath $manifestPath -Raw
+        )
+        $copiedFiles = Get-RecoverySnapshotFiles `
+            -Directory $temporaryData `
+            -Manifest $manifest
+        $activeFiles = Get-RecoverySnapshotFiles `
+            -Directory $dataDirectory `
+            -Manifest $manifest `
+            -AllowProductionExcludedCacheDirectories
+        foreach ($name in $copiedFiles.Keys) {
+            if (
+                [long]$copiedFiles[$name].bytes -ne [long]$activeFiles[$name].bytes -or
+                [string]$copiedFiles[$name].sha256 -ne [string]$activeFiles[$name].sha256
+            ) {
+                throw "Prepared recovery snapshot and active data are not byte-identical."
+            }
+        }
+        $evidence = Assert-SameRecoveryEvidence -Evidence $evidence
+        if (Test-LoopbackTcpListener -Port ([int]$evidence.State.port)) {
+            throw "Recovery preparation listener verification changed."
+        }
+        if (-not (Test-NoManagedDescendants -ProcessId ([int]$evidence.State.processId))) {
+            throw "Managed process descendants changed during recovery preparation."
+        }
+        if ($null -eq (Get-ManagedProcess -State $evidence.State)) {
+            throw "Recovery preparation process identity changed."
+        }
+        [System.IO.Directory]::Move($temporaryDirectory, $snapshotDirectory)
+        $snapshotMoved = $true
+        $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $snapshotId
+        $evidence = Assert-SameRecoveryEvidence -Evidence $evidence
+        $incidentAttempted = $true
+        $incident = Publish-RecoveryIncident -Evidence $evidence -Snapshot $snapshot
+        Write-Output (
+            "Prepared failed-shutdown recovery snapshot $($snapshot.Id) " +
+            "and authenticated incident $($incident.Id); MyDashboard remains stopped."
+        )
+    } finally {
+        if (-not $snapshotMoved -and (Test-Path -LiteralPath $temporaryDirectory)) {
+            Assert-NotReparseDirectory -Path $temporaryDirectory
+            Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
+        }
+        if (
+            $snapshotMoved -and
+            -not $incidentAttempted -and
+            (Test-Path -LiteralPath $snapshotDirectory)
+        ) {
+            Assert-NotReparseDirectory -Path $snapshotDirectory
+            Remove-Item -LiteralPath $snapshotDirectory -Recurse -Force
+        }
+    }
+}
+
 function Test-NoManagedDescendants {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
     try {
@@ -2064,6 +2334,7 @@ function Recover-FailedShutdown {
         throw "Controlled port remained occupied after recovery termination."
     }
     Assert-ApplicationWriterLeaseFree
+    $snapshot = Get-ValidatedRecoverySnapshot -SnapshotId $SnapshotId
     if ($incident.Record.state -eq "pre_termination") {
         $incident = Set-RecoveryIncidentState `
             -Incident $incident `
@@ -2477,6 +2748,9 @@ if ($Action -eq "Restore" -and $OpenBrowser) {
 if ($Action -eq "RecoverFailedShutdown" -and $OpenBrowser) {
     throw "RecoverFailedShutdown leaves the service stopped and cannot open a browser."
 }
+if ($Action -eq "PrepareFailedShutdownRecovery" -and $OpenBrowser) {
+    throw "PrepareFailedShutdownRecovery leaves the service stopped and cannot open a browser."
+}
 
 $managerMutex = New-Object System.Threading.Mutex($false, $mutexName)
 $managerMutexHeld = $false
@@ -2526,6 +2800,9 @@ try {
                 -Mode Activate `
                 -RequestedBackupId $BackupId
             Write-Output "MyDashboard restored $($restored.result.backupId); the service remains stopped."
+        }
+        "PrepareFailedShutdownRecovery" {
+            Prepare-FailedShutdownRecovery
         }
         "RecoverFailedShutdown" {
             Recover-FailedShutdown -SnapshotId $RecoverySnapshotId

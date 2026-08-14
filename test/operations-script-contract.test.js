@@ -49,7 +49,7 @@ test("process management is PID and health bound and never kills an arbitrary li
 
   assert.match(
     manager,
-    /ValidateSet\("Start", "Stop", "Restart", "Status", "Restore", "RecoverFailedShutdown"\)/,
+    /ValidateSet\(\s*"Start",\s*"Stop",\s*"Restart",\s*"Status",\s*"Restore",\s*"PrepareFailedShutdownRecovery",\s*"RecoverFailedShutdown"\s*\)/u,
   );
   assert.match(manager, /processStartTime/);
   assert.match(manager, /Liveness\.service -ne "mydashboard"/);
