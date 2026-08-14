@@ -1,5 +1,4 @@
 import path from "node:path";
-import { homedir } from "node:os";
 import { types as utilTypes } from "node:util";
 import {
   createProductionCodexLoginCredentialBroker,
@@ -242,7 +241,6 @@ function githubCredentialSourceDependencies(value) {
     throw new TypeError("GitHub credential source dependencies are invalid");
   }
   const allowed = new Set([
-    "homeDirectory",
     "projectIdentity",
     "createTokenEnvCredentialSource",
     "createGhLoginCredentialSource",
@@ -329,7 +327,12 @@ function exactPreparedDirectoryIdentity(value, expectedPath) {
 }
 
 export async function createConfiguredGitHubCredentialSource(
-  { githubActions, projectRoot: configuredProjectRoot, protectedRoots },
+  {
+    githubActions,
+    projectRoot: configuredProjectRoot,
+    privateRuntimeDirectory,
+    protectedRoots,
+  },
   rawDependencies = {},
 ) {
   const dependencies = githubCredentialSourceDependencies(rawDependencies);
@@ -340,7 +343,6 @@ export async function createConfiguredGitHubCredentialSource(
   const privateDirectoryManager = dependencies.privateDirectoryManager ??
     PRODUCTION_PRIVATE_DIRECTORY_MANAGER;
   const projectIdentity = dependencies.projectIdentity ?? projectIdentityDigest;
-  const homeDirectory = dependencies.homeDirectory ?? homedir();
   const credentialMode = githubActions.credentialMode ?? "token-env";
   if (credentialMode === "token-env") {
     return createTokenEnvSource({
@@ -353,9 +355,24 @@ export async function createConfiguredGitHubCredentialSource(
   if (!/^[a-f0-9]{64}$/u.test(digest)) {
     throw new TypeError("GitHub credential project identity is invalid");
   }
+  const resolvedPrivateRuntimeDirectory = typeof privateRuntimeDirectory === "string"
+    ? path.resolve(privateRuntimeDirectory)
+    : "";
+  const privateRuntimeProjectDigest = path.basename(
+    resolvedPrivateRuntimeDirectory,
+  );
+  if (
+    typeof privateRuntimeDirectory !== "string" ||
+    !path.isAbsolute(privateRuntimeDirectory) ||
+    (process.platform === "win32"
+      ? privateRuntimeProjectDigest.toLowerCase()
+      : privateRuntimeProjectDigest) !== digest
+  ) {
+    throw new TypeError("GitHub project-private runtime directory is invalid");
+  }
   const runtimeTemporaryRoot = path.join(
-    homeDirectory,
-    `.mydashboard-github-runtime-${digest}`,
+    resolvedPrivateRuntimeDirectory,
+    "github-credentials-v1",
   );
   assertGitHubRuntimeTemporaryRoot(runtimeTemporaryRoot, protectedRoots);
   const preparedIdentity = await privateDirectoryManager.prepare({
@@ -845,6 +862,7 @@ export async function createApplication({
   attentionCoordinatorFactory = (options) => new AttentionCoordinator(options),
   workCoordinationDependencies = {},
   externalActions = true,
+  privateRuntimeDirectory = null,
   runtimeLifecycle: suppliedRuntimeLifecycle,
 } = {}) {
   if (typeof versionedConfiguration !== "boolean") {
@@ -1198,6 +1216,7 @@ export async function createApplication({
         await githubCredentialSourceFactory({
           githubActions: activeGithubActions,
           projectRoot,
+          privateRuntimeDirectory,
           protectedRoots: cliAndCredentialProtectedRoots,
         }),
         ["acquire"],

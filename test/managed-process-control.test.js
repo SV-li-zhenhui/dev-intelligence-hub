@@ -16,6 +16,7 @@ import {
   createDashboardServer,
   createManagedFileDiagnostics,
   readManagedProcessEnvironment,
+  startDashboardServer,
 } from "../src/server.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 
@@ -93,6 +94,14 @@ async function listen(server) {
   });
 }
 
+async function availablePort() {
+  const server = http.createServer();
+  await listen(server);
+  const port = server.address().port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
 function receiptPayload(receipt) {
   return [
     "receipt-v1",
@@ -140,6 +149,42 @@ test("managed environment is all-or-nothing and is erased after capture", () => 
     /environment is incomplete/u,
   );
   assert.deepEqual(Object.keys(incomplete), []);
+});
+
+test("managed startup passes its authenticated private runtime directory to composition", async (t) => {
+  const runtimeDirectory = await mkdtemp(path.join(tmpdir(), "managed-composition-"));
+  t.after(() => rm(runtimeDirectory, { recursive: true, force: true }));
+  const identity = managedIdentity(runtimeDirectory);
+  const composedApplication = application();
+  composedApplication.config.port = await availablePort();
+  let compositionOptions = null;
+  const server = await startDashboardServer({
+    managedProcess: identity,
+    createApplicationFn: async (options) => {
+      compositionOptions = options;
+      return composedApplication;
+    },
+    startBackgroundWorkFn: () => ({
+      initialRefresh: Promise.resolve(),
+      async stop() {},
+    }),
+    log() {},
+  });
+
+  try {
+    assert.equal(compositionOptions.privateRuntimeDirectory, runtimeDirectory);
+    const claimed = await request(server, {
+      method: "POST",
+      path: "/api/system/claim",
+      headers: controlHeaders(identity, {
+        host: `127.0.0.1:${composedApplication.config.port}`,
+        origin: `http://127.0.0.1:${composedApplication.config.port}`,
+      }),
+    });
+    assert.equal(claimed.status, 200);
+  } finally {
+    await server.shutdown();
+  }
 });
 
 test("pending claim gates work and shutdown is bound to token and start identity", async (t) => {

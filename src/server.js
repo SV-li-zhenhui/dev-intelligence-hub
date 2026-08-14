@@ -4230,7 +4230,10 @@ export async function startDashboardServer(
   const runtimeLifecycle = createApplicationRuntimeLifecycle();
   try {
     if (writerLease !== null) await writerLease.acquire();
-    application = await createApplicationFn({ runtimeLifecycle });
+    application = await createApplicationFn({
+      runtimeLifecycle,
+      privateRuntimeDirectory: managedProcess?.runtimeDirectory ?? null,
+    });
     if (managedProcess) {
       backgroundWork = createDeferredBackgroundWork(
         application,

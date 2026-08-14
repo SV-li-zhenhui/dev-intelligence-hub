@@ -3274,6 +3274,12 @@ test("Review and generic GitHub actions share one credential acquire port while 
     },
   });
   let sourceConstructions = 0;
+  let sourceFactoryOptions = null;
+  const privateRuntimeDirectory = path.join(
+    path.parse(process.cwd()).root,
+    "mydashboard-runtime",
+    "c".repeat(64),
+  );
   const runners = {
     "github-review-runner": { async claim() {}, async advance() {} },
     "github-pr-action-runner": { async claim() {}, async advance() {} },
@@ -3283,13 +3289,15 @@ test("Review and generic GitHub actions share one credential acquire port while 
   const enabledApplication = await createApplication({
     config,
     store: memoryStore(),
+    privateRuntimeDirectory,
     ...localCoordinationStubs({
       calls: enabledCalls,
       closeCalls: enabledCloseCalls,
       runners,
     }),
-    githubCredentialSourceFactory: async () => {
+    githubCredentialSourceFactory: async (options) => {
       sourceConstructions += 1;
+      sourceFactoryOptions = options;
       return source;
     },
     pullRequestExternalActionTransportFactory: () => ({
@@ -3318,6 +3326,10 @@ test("Review and generic GitHub actions share one credential acquire port while 
   });
 
   assert.equal(sourceConstructions, 1);
+  assert.equal(
+    sourceFactoryOptions.privateRuntimeDirectory,
+    privateRuntimeDirectory,
+  );
   assert.strictEqual(
     enabledCalls.externalExecutor.credentialSource,
     enabledCalls.confirmation.credentialSource,
@@ -3351,18 +3363,21 @@ test("Review and generic GitHub actions share one credential acquire port while 
   await disabledApplication.close();
 });
 
-test("configured GitHub credential factory permits a home-drive runtime root outside project protected roots", async (t) => {
+test("configured GitHub credential factory uses the project-private managed runtime across volumes", async (t) => {
   if (process.platform !== "win32") {
     t.skip("cross-volume path.relative behavior is Windows-specific");
     return;
   }
 
   const projectRoot = "D:\\projects\\dashboard";
-  const homeDirectory = "C:\\Users\\owner";
   const digest = "b".repeat(64);
+  const privateRuntimeDirectory = path.join(
+    "C:\\Users\\owner\\AppData\\Local\\MyDashboard\\runtime",
+    digest,
+  );
   const expectedRuntimeTemporaryRoot = path.join(
-    homeDirectory,
-    `.mydashboard-github-runtime-${digest}`,
+    privateRuntimeDirectory,
+    "github-credentials-v1",
   );
   const preparedRoots = [];
   const ghSourceOptions = [];
@@ -3376,10 +3391,10 @@ test("configured GitHub credential factory permits a home-drive runtime root out
         ghCommand: "gh",
       }),
       projectRoot,
+      privateRuntimeDirectory,
       protectedRoots: Object.freeze([projectRoot]),
     },
     {
-      homeDirectory,
       projectIdentity: ({ projectRoot: receivedProjectRoot }) => {
         assert.equal(receivedProjectRoot, projectRoot);
         return digest;
@@ -3413,6 +3428,12 @@ test("configured GitHub credential factory permits a home-drive runtime root out
 test("configured GitHub credential factory keeps token-env directory-free and prepares one project-private gh-login root", async (t) => {
   const projectDirectory = path.join(path.parse(process.cwd()).root, "projects", "dashboard");
   const homeDirectory = path.join(path.parse(process.cwd()).root, "users", "owner");
+  const projectDigest = "a".repeat(64);
+  const privateRuntimeDirectory = path.join(
+    path.parse(process.cwd()).root,
+    "mydashboard-runtime",
+    projectDigest,
+  );
   const protectedRoots = Object.freeze([
     projectDirectory,
     path.join(homeDirectory, ".codex"),
@@ -3422,10 +3443,9 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
   const ghSources = [];
   const prepared = [];
   const dependencies = {
-    homeDirectory,
     projectIdentity: ({ projectRoot }) => projectIdentityDigest({
       projectRoot,
-      projectDigest: "a".repeat(64),
+      projectDigest,
     }),
     createTokenEnvCredentialSource(options) {
       tokenSources.push(options);
@@ -3481,6 +3501,7 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
         ghCommand: process.execPath,
       }),
       projectRoot: projectDirectory,
+      privateRuntimeDirectory,
       protectedRoots,
     },
     dependencies,
@@ -3489,16 +3510,16 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
   assert.equal(prepared.length, 1);
   assert.equal(ghSources.length, 1);
   const expectedRoot = path.join(
-    homeDirectory,
-    `.mydashboard-github-runtime-${"a".repeat(64)}`,
+    privateRuntimeDirectory,
+    "github-credentials-v1",
   );
   assert.equal(prepared[0].directory, expectedRoot);
-  assert.equal(path.dirname(prepared[0].directory), homeDirectory);
+  assert.equal(path.dirname(prepared[0].directory), privateRuntimeDirectory);
   assert.equal(ghSources[0].runtimeTemporaryRoot, expectedRoot);
   assert.deepEqual(ghSources[0].protectedRoots, protectedRoots);
 
   await t.test("location validation rejects either overlap direction", async () => {
-    for (const protectedRoot of [homeDirectory, path.join(expectedRoot, "nested")]) {
+    for (const protectedRoot of [privateRuntimeDirectory, path.join(expectedRoot, "nested")]) {
       await assert.rejects(
         createConfiguredGitHubCredentialSource(
           {
@@ -3509,6 +3530,7 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
               ghCommand: process.execPath,
             }),
             projectRoot: projectDirectory,
+            privateRuntimeDirectory,
             protectedRoots: Object.freeze([protectedRoot]),
           },
           dependencies,
@@ -3530,6 +3552,7 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
             ghCommand: process.execPath,
           }),
           projectRoot: projectDirectory,
+          privateRuntimeDirectory,
           protectedRoots,
         },
         {
@@ -3581,6 +3604,7 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
               ghCommand: process.execPath,
             }),
             projectRoot: projectDirectory,
+            privateRuntimeDirectory,
             protectedRoots,
           },
           {
@@ -3598,6 +3622,29 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
     }
   });
 
+  await t.test("managed runtime identity must bind the current project digest", async () => {
+    await assert.rejects(
+      createConfiguredGitHubCredentialSource(
+        {
+          githubActions: Object.freeze({
+            enabled: true,
+            credentialMode: "gh-login",
+            actorAccountId: "review-account",
+            ghCommand: process.execPath,
+          }),
+          projectRoot: projectDirectory,
+          privateRuntimeDirectory: path.join(
+            path.dirname(privateRuntimeDirectory),
+            "d".repeat(64),
+          ),
+          protectedRoots,
+        },
+        dependencies,
+      ),
+      /project-private runtime directory/i,
+    );
+  });
+
   await t.test("test dependencies are an exact plain data record", async () => {
     const githubActions = Object.freeze({
       ...baseConfig,
@@ -3606,9 +3653,9 @@ test("configured GitHub credential factory keeps token-env directory-free and pr
     const cases = [
       { ...dependencies, unexpectedAuthority: true },
       new Proxy({ ...dependencies }, {}),
-      Object.defineProperty({ ...dependencies }, "homeDirectory", {
+      Object.defineProperty({ ...dependencies }, "projectIdentity", {
         enumerable: true,
-        get() { return homeDirectory; },
+        get() { return dependencies.projectIdentity; },
       }),
     ];
     for (const candidate of cases) {
