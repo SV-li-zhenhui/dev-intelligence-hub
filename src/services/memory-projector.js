@@ -17,6 +17,7 @@ import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
 const WRITE_BATCH = 100;
 const SAFE_ROLE = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -381,6 +382,38 @@ function exactProjectionObject(value, keys, message) {
     throw new TypeError(message);
   }
   return data;
+}
+
+function normalizeCycleOptions(value) {
+  if (value === undefined) return { signal: null };
+  const message = "memory projection cycle options are invalid";
+  const options = plainData(value);
+  if (
+    options === null ||
+    Object.keys(options).some((key) => key !== "signal")
+  ) {
+    throw new TypeError(message);
+  }
+  try {
+    return { signal: normalizeAbortSignal(options.signal ?? null) };
+  } catch {
+    throw new TypeError(message);
+  }
+}
+
+function throwIfProjectionAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason !== undefined) throw signal.reason;
+  const error = new Error("Memory projection cycle was cancelled");
+  error.code = "MEMORY_PROJECTION_CANCELLED";
+  throw error;
+}
+
+async function runProjectionPort(signal, operation) {
+  throwIfProjectionAborted(signal);
+  const result = await operation();
+  throwIfProjectionAborted(signal);
+  return result;
 }
 
 function nonNegativeInteger(value, message) {
@@ -763,18 +796,20 @@ function normalizeConfirmationMemoryPage(value, expected) {
   return { highWatermark, cursor, items, nextCursor };
 }
 
-async function readConfirmationMemorySnapshot(readPage) {
+async function readConfirmationMemorySnapshot(readPage, signal = null) {
   if (readPage === null) return { highWatermark: 0, items: [] };
   const items = [];
   let cursor = 0;
   let highWatermark = null;
   for (let pageNumber = 0; pageNumber < 10; pageNumber += 1) {
     const page = normalizeConfirmationMemoryPage(
-      await readPage({
-        cursor,
-        limit: CONFIRMATION_PAGE_LIMIT,
-        highWatermark,
-      }),
+      await runProjectionPort(signal, () =>
+        readPage({
+          cursor,
+          limit: CONFIRMATION_PAGE_LIMIT,
+          highWatermark,
+        })
+      ),
       { cursor, highWatermark },
     );
     highWatermark = page.highWatermark;
@@ -1935,9 +1970,12 @@ export class MemoryProjector {
     this.#store = store;
   }
 
-  runCycle() {
+  runCycle(value) {
+    const { signal } = normalizeCycleOptions(value);
+    // One projection cycle is one admitted write sequence. Joiners observe the
+    // same completion, while only the caller that admitted it owns cancellation.
     if (this.#inFlight) return this.#inFlight;
-    const execution = Promise.resolve().then(() => this.#run());
+    const execution = Promise.resolve().then(() => this.#run(signal));
     const tracked = execution.finally(() => {
       if (this.#inFlight === tracked) this.#inFlight = null;
     });
@@ -1945,24 +1983,28 @@ export class MemoryProjector {
     return tracked;
   }
 
-  async #run() {
+  async #run(signal) {
     const initial = normalizeMemoryAuthoritySnapshot(
-      await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
+      await runProjectionPort(signal, () =>
+        this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })
+      ),
     );
     const confirmationPreflight = this.#verifyInputAuthority === null
       ? null
-      : await readConfirmationMemorySnapshot(this.#readConfirmationPage);
+      : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
     const graph = initial.graph;
     const localAuthority = normalizeLocalMemoryAuthorityState(
-      await this.#getAuthorityState(),
+      await runProjectionPort(signal, () => this.#getAuthorityState()),
     );
     if (localAuthority.cursor === 0 && graph.cursor > 0) {
-      await this.#adoptGraphCheckpoint({
-        cursor: graph.cursor,
-        checkpointDigest: graph.checkpointDigest,
-        ledgerRevision: initial.ledgerRevision,
-        authorityStateDigest: graph.authorityStateDigest,
-      });
+      await runProjectionPort(signal, () =>
+        this.#adoptGraphCheckpoint({
+          cursor: graph.cursor,
+          checkpointDigest: graph.checkpointDigest,
+          ledgerRevision: initial.ledgerRevision,
+          authorityStateDigest: graph.authorityStateDigest,
+        })
+      );
     }
     let graphAdded = 0;
     let graphCursor = graph.cursor;
@@ -1971,18 +2013,22 @@ export class MemoryProjector {
       const records = graph.items.map(memoryRecordForWorkGraphMemoryEvent);
       const expectedRecords = records.map((record) => normalizeMemoryRecord(record));
       graphAdded = normalizeGraphAppendResult(
-        await this.#appendGraphEvents({
-          events: graph.items,
-          ledgerRevision: initial.ledgerRevision,
-          highWatermark: graph.highWatermark,
-          authorityStateDigest: graph.authorityStateDigest,
-        }),
+        await runProjectionPort(signal, () =>
+          this.#appendGraphEvents({
+            events: graph.items,
+            ledgerRevision: initial.ledgerRevision,
+            highWatermark: graph.highWatermark,
+            authorityStateDigest: graph.authorityStateDigest,
+          })
+        ),
         expectedRecords,
       ).added;
       const acknowledgement = normalizeGraphAckResult(
-        await this.#graphAckBatch({
-          receipts: graph.items.map(workGraphMemoryRecordReceipt),
-        }),
+        await runProjectionPort(signal, () =>
+          this.#graphAckBatch({
+            receipts: graph.items.map(workGraphMemoryRecordReceipt),
+          })
+        ),
         graph.items.at(-1),
         graphHighWatermark,
       );
@@ -1990,10 +2036,14 @@ export class MemoryProjector {
       graphHighWatermark = acknowledgement.highWatermark;
     }
     const finalSnapshot = normalizeMemoryAuthoritySnapshot(
-      await this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT }),
+      await runProjectionPort(signal, () =>
+        this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })
+      ),
     );
     const { items, timeline } = finalSnapshot;
-    const legacy = await this.#store.read("pr-employee-memory", []);
+    const legacy = await runProjectionPort(signal, () =>
+      this.#store.read("pr-employee-memory", [])
+    );
     const state = { items };
     const workRecords = items.map((item) => workItemRecord(item, state))
       .filter(Boolean);
@@ -2004,26 +2054,32 @@ export class MemoryProjector {
     ].filter(Boolean);
     let added = 0;
     for (let index = 0; index < historyRecords.length; index += WRITE_BATCH) {
-      const result = await this.#appendProjectionRecords({
-        records: historyRecords.slice(index, index + WRITE_BATCH),
-      });
+      const result = await runProjectionPort(signal, () =>
+        this.#appendProjectionRecords({
+          records: historyRecords.slice(index, index + WRITE_BATCH),
+        })
+      );
       added += Number(result?.added) || 0;
     }
-    const workResult = await this.#appendWorkItems({
-      records: workRecords,
-      ledgerRevision: finalSnapshot.ledgerRevision,
-      authorityStateDigest: finalSnapshot.graph.authorityStateDigest,
-      graphCursor: finalSnapshot.graph.cursor,
-      graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
-    });
+    const workResult = await runProjectionPort(signal, () =>
+      this.#appendWorkItems({
+        records: workRecords,
+        ledgerRevision: finalSnapshot.ledgerRevision,
+        authorityStateDigest: finalSnapshot.graph.authorityStateDigest,
+        graphCursor: finalSnapshot.graph.cursor,
+        graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
+      })
+    );
     added += Number(workResult?.added) || 0;
     const confirmationSnapshot = confirmationPreflight === null
       ? null
-      : await readConfirmationMemorySnapshot(this.#readConfirmationPage);
+      : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
     const authorityBound = await this.#projectAuthorityBoundRecords(
       finalSnapshot,
       confirmationSnapshot,
+      signal,
     );
+    throwIfProjectionAborted(signal);
     added += authorityBound?.added ?? 0;
     return {
       observed:
@@ -2047,7 +2103,7 @@ export class MemoryProjector {
     };
   }
 
-  async #projectAuthorityBoundRecords(snapshot, confirmationSnapshot) {
+  async #projectAuthorityBoundRecords(snapshot, confirmationSnapshot, signal) {
     if (this.#verifyInputAuthority === null) {
       if (
         this.#appendAuthorityProjection === null ||
@@ -2057,11 +2113,15 @@ export class MemoryProjector {
         return null;
       }
       const stored = normalizeLegacyAuthorityProjectionState(
-        await this.#getAuthorityProjectionState(),
+        await runProjectionPort(signal, () =>
+          this.#getAuthorityProjectionState()
+        ),
       );
       const authorityMemoryExists =
         stored.entries.length > 0 ||
-        await this.#requiresAuthorityProjectionCheckpoint();
+        await runProjectionPort(signal, () =>
+          this.#requiresAuthorityProjectionCheckpoint()
+        );
       if (authorityMemoryExists) return null;
       if (
         stored.workLedgerRevision !== snapshot.ledgerRevision ||
@@ -2076,10 +2136,12 @@ export class MemoryProjector {
           entries: [],
         };
         normalizeLegacyAuthorityProjectionState(nextState);
-        await this.#appendAuthorityProjection({
-          records: [],
-          projectionState: nextState,
-        });
+        await runProjectionPort(signal, () =>
+          this.#appendAuthorityProjection({
+            records: [],
+            projectionState: nextState,
+          })
+        );
       }
       return {
         observed: 0,
@@ -2092,7 +2154,9 @@ export class MemoryProjector {
       };
     }
     const journalState = normalizeLegacyAuthorityProjectionState(
-      await this.#getAuthorityProjectionState(),
+      await runProjectionPort(signal, () =>
+        this.#getAuthorityProjectionState()
+      ),
     );
     const legacyState =
       journalState.revision === 0 &&
@@ -2101,9 +2165,11 @@ export class MemoryProjector {
         journalState.confirmationHighWatermark === 0 &&
         journalState.entries.length === 0
         ? normalizeLegacyAuthorityProjectionState(
-            await this.#store.read(
-              LEGACY_AUTHORITY_PROJECTION_STATE_KEY,
-              null,
+            await runProjectionPort(signal, () =>
+              this.#store.read(
+                LEGACY_AUTHORITY_PROJECTION_STATE_KEY,
+                null,
+              )
             ),
           )
         : null;
@@ -2118,25 +2184,30 @@ export class MemoryProjector {
           confirmationHighWatermark:
             journalState.confirmationHighWatermark,
         };
+    const verifyInputAuthority = (...args) =>
+      runProjectionPort(signal, () => this.#verifyInputAuthority(...args));
     const plan = await planAuthorityBoundProjectionCandidate({
       stored,
       snapshot,
       confirmationSnapshot,
-      verifyInputAuthority: this.#verifyInputAuthority,
+      verifyInputAuthority,
       requiresJournalAdoption: legacyState !== null &&
         (legacyState.revision > 0 || legacyState.entries.length > 0),
       strictBindings: false,
     });
+    throwIfProjectionAborted(signal);
     let added = 0;
     if (plan.projectionState !== null) {
       const expected = plan.records.map((record) =>
         normalizeMemoryRecord(record)
       );
       added = normalizeGraphAppendResult(
-        await this.#appendAuthorityProjection({
-          records: plan.records,
-          projectionState: plan.projectionState,
-        }),
+        await runProjectionPort(signal, () =>
+          this.#appendAuthorityProjection({
+            records: plan.records,
+            projectionState: plan.projectionState,
+          })
+        ),
         expected,
       ).added;
     }

@@ -1809,13 +1809,73 @@ test("memory projector coalesces concurrent runs", async () => {
     store: { async read() { return []; } },
   });
 
-  const first = projector.runCycle();
-  const second = projector.runCycle();
+  const admitted = new AbortController();
+  const joining = new AbortController();
+  const first = projector.runCycle({ signal: admitted.signal });
+  const second = projector.runCycle({ signal: joining.signal });
   assert.strictEqual(first, second);
+  joining.abort(new Error("a joiner cannot cancel the admitted cycle"));
   await new Promise((resolve) => setImmediate(resolve));
   release();
   await first;
   assert.equal(calls, 2);
+});
+
+test("memory projector stops after the admitted write when shutdown is requested", async () => {
+  let releaseWrite;
+  let markWriteStarted;
+  let authorityReads = 0;
+  let settled = false;
+  const writeStarted = new Promise((resolve) => {
+    markWriteStarted = resolve;
+  });
+  const writeReleased = new Promise((resolve) => {
+    releaseWrite = resolve;
+  });
+  const graphSource = graphProjectionSource();
+  const memoryProducer = { async appendBatch() { return { added: 0 }; } };
+  const lifecycle = {
+    ...memoryLifecycleProducer(memoryProducer),
+    async appendWorkItems() {
+      markWriteStarted();
+      await writeReleased;
+      return { added: 0 };
+    },
+  };
+  const authorityReader = {
+    ...emptyMemoryAuthorityReader(),
+    async getAuthorityProjectionState() {
+      authorityReads += 1;
+      return emptyMemoryAuthorityReader().getAuthorityProjectionState();
+    },
+    async requiresAuthorityProjectionCheckpoint() {
+      throw new Error("must not continue after shutdown");
+    },
+  };
+  const projector = new MemoryProjector({
+    memoryProducer,
+    memoryLifecycleProducer: lifecycle,
+    memoryAuthorityReader: authorityReader,
+    memoryAuthoritySource: memoryAuthoritySource([], [], graphSource),
+    graphProjectionSource: graphSource,
+    store: { async read() { return []; } },
+  });
+  const controller = new AbortController();
+  const shutdown = new Error("shutdown requested");
+
+  const cycle = projector.runCycle({ signal: controller.signal });
+  cycle.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await writeStarted;
+  controller.abort(shutdown);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "the admitted write must not be abandoned");
+
+  releaseWrite();
+  await assert.rejects(cycle, (error) => error === shutdown);
+  assert.equal(authorityReads, 0, "no later projection port may be entered");
 });
 
 test("memory projector rejects malformed atomic authority snapshots before writes", async () => {

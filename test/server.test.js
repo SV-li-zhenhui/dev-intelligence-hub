@@ -1731,6 +1731,57 @@ test("a shutdown drain failure sets a nonzero process outcome", async () => {
   }
 });
 
+test("a background drain timeout identifies the active participant without payloads", async () => {
+  const memoryStarted = deferred();
+  const releaseMemory = deferred();
+  const privateMarker = "must-not-appear-in-drain-diagnostics";
+  const application = startupApplication();
+  application.memoryProjector = {
+    async runCycle() {
+      memoryStarted.resolve();
+      await releaseMemory.promise;
+      return privateMarker;
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 1_000,
+  });
+  await memoryStarted.promise;
+  const server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 25,
+    reportError() {},
+    setProcessExitCode() {},
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  try {
+    await assert.rejects(
+      server.shutdown(),
+      (error) => {
+        assert.equal(error?.code, "LIFECYCLE_DRAIN_TIMEOUT");
+        assert.match(error.message, /memoryProjector[.]runCycle/u);
+        assert.doesNotMatch(error.message, new RegExp(privateMarker, "u"));
+        assert.deepEqual(error.drainStatus, {
+          schemaVersion: 1,
+          activeParticipants: [{
+            id: "memoryProjector.runCycle",
+            count: 1,
+          }],
+          activeTaskCount: 1,
+          backgroundOperationActive: true,
+          confirmationOperationCount: 0,
+          queuedOperationCount: 0,
+        });
+        return true;
+      },
+    );
+  } finally {
+    releaseMemory.resolve();
+    await backgroundWork.stop();
+  }
+});
+
 test("configuration safe mode starts no background reads or employees but permits confirmation operations", async () => {
   let refreshCalls = 0;
   let operationCalls = 0;
@@ -6643,6 +6694,71 @@ test("shutdown aborts cooperative background work before bounded draining", asyn
   assert.equal(observedSignal instanceof AbortSignal, true);
   assert.equal(observedSignal.aborted, true);
   await Promise.allSettled([backgroundWork.initialRefresh]);
+});
+
+test("shutdown drains the admitted memory projection port then stops its cycle", async () => {
+  const projectionStarted = deferred();
+  const releaseProjectionPort = deferred();
+  let observedSignal = null;
+  let laterSteps = 0;
+  let stopSettled = false;
+  const application = startupApplication();
+  application.memoryProjector = {
+    async runCycle({ signal }) {
+      observedSignal = signal;
+      projectionStarted.resolve();
+      await releaseProjectionPort.promise;
+      signal.throwIfAborted();
+      laterSteps += 1;
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 500,
+  });
+  await projectionStarted.promise;
+
+  const stopping = backgroundWork.stop().finally(() => {
+    stopSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(observedSignal instanceof AbortSignal, true);
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(stopSettled, false, "the admitted projection port must drain");
+
+  releaseProjectionPort.resolve();
+  await stopping;
+  assert.equal(laterSteps, 0);
+  await Promise.allSettled([backgroundWork.initialRefresh]);
+});
+
+test("shutdown preserves a real memory projection failure after abort", async () => {
+  const projectionStarted = deferred();
+  const releaseProjectionPort = deferred();
+  const projectionFailure = new Error("memory projection append failed");
+  const reportedErrors = [];
+  const application = startupApplication();
+  application.memoryProjector = {
+    async runCycle() {
+      projectionStarted.resolve();
+      await releaseProjectionPort.promise;
+      throw projectionFailure;
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 500,
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+  const initialFailure = backgroundWork.initialRefresh.catch((error) => error);
+  await projectionStarted.promise;
+
+  const stopping = backgroundWork.stop();
+  releaseProjectionPort.resolve();
+
+  await assert.rejects(stopping, (error) => error === projectionFailure);
+  assert.equal(await initialFailure, projectionFailure);
+  assert.deepEqual(reportedErrors, [projectionFailure]);
 });
 
 test("shutdown reaps an active external refresh command before completing", async (t) => {

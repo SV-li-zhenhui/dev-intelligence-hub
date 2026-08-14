@@ -72,13 +72,35 @@ const registeredDrainParticipants = new Set(
 );
 
 function createDrainParticipantRunner(observeDrainParticipant) {
-  return function runDrainParticipant(participant, operation) {
+  const active = new Map();
+
+  function release(participant) {
+    const count = active.get(participant.id) ?? 0;
+    if (count <= 1) active.delete(participant.id);
+    else active.set(participant.id, count - 1);
+  }
+
+  function runDrainParticipant(participant, operation) {
     if (!registeredDrainParticipants.has(participant)) {
       throw new TypeError("background participant is not registered for drain");
     }
     observeDrainParticipant(participant);
-    return operation();
-  };
+    active.set(participant.id, (active.get(participant.id) ?? 0) + 1);
+    let result;
+    try {
+      result = operation();
+    } catch (error) {
+      release(participant);
+      throw error;
+    }
+    return Promise.resolve(result).finally(() => release(participant));
+  }
+
+  runDrainParticipant.readActive = () =>
+    [...active.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, count]) => Object.freeze({ id, count }));
+  return runDrainParticipant;
 }
 const browserSecurityHeaders = {
   "content-security-policy": [
@@ -2133,6 +2155,9 @@ function createConfirmationAccessGate(enabled) {
     isReady() {
       return ready;
     },
+    activeCount() {
+      return activeOperations;
+    },
     async closeAndDrain() {
       if (!enabled) return;
       ready = false;
@@ -2230,16 +2255,101 @@ function shutdownTimeoutMilliseconds(value) {
   return value;
 }
 
-function lifecycleDrainTimeout(phase) {
-  return Object.assign(new Error(`Lifecycle drain timed out during ${phase}`), {
-    code: "LIFECYCLE_DRAIN_TIMEOUT",
+function normalizeLifecycleDrainStatus(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.schemaVersion !== 1 ||
+    !Array.isArray(value.activeParticipants) ||
+    value.activeParticipants.length > registeredDrainParticipants.size ||
+    !Number.isSafeInteger(value.activeTaskCount) ||
+    value.activeTaskCount < 0 ||
+    !Number.isSafeInteger(value.confirmationOperationCount) ||
+    value.confirmationOperationCount < 0 ||
+    !Number.isSafeInteger(value.queuedOperationCount) ||
+    value.queuedOperationCount < 0 ||
+    typeof value.backgroundOperationActive !== "boolean"
+  ) {
+    return null;
+  }
+  const registeredIds = new Set(
+    [...registeredDrainParticipants].map(({ id }) => id),
+  );
+  const seen = new Set();
+  const activeParticipants = [];
+  for (const participant of value.activeParticipants) {
+    if (
+      participant === null ||
+      typeof participant !== "object" ||
+      Array.isArray(participant) ||
+      !registeredIds.has(participant.id) ||
+      seen.has(participant.id) ||
+      !Number.isSafeInteger(participant.count) ||
+      participant.count < 1
+    ) {
+      return null;
+    }
+    seen.add(participant.id);
+    activeParticipants.push(Object.freeze({
+      id: participant.id,
+      count: participant.count,
+    }));
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    activeParticipants: Object.freeze(activeParticipants),
+    activeTaskCount: value.activeTaskCount,
+    backgroundOperationActive: value.backgroundOperationActive,
+    confirmationOperationCount: value.confirmationOperationCount,
+    queuedOperationCount: value.queuedOperationCount,
   });
 }
 
-async function settleBeforeDeadline(promises, deadline, phase, controller) {
+function lifecycleDrainTimeout(phase, suppliedDrainStatus = null) {
+  const drainStatus = normalizeLifecycleDrainStatus(suppliedDrainStatus);
+  const participantIds = drainStatus?.activeParticipants.map(({ id }) => id) ?? [];
+  const diagnostic = drainStatus === null
+    ? ""
+    : `; pending participants: ${participantIds.join(", ") || "none"}` +
+      `; active tasks: ${drainStatus.activeTaskCount}` +
+      `; confirmation operations: ${drainStatus.confirmationOperationCount}` +
+      `; queued operations: ${drainStatus.queuedOperationCount}`;
+  const error = Object.assign(new Error(
+    `Lifecycle drain timed out during ${phase}${diagnostic}`,
+  ), {
+    code: "LIFECYCLE_DRAIN_TIMEOUT",
+  });
+  if (drainStatus !== null) {
+    Object.defineProperty(error, "drainStatus", {
+      configurable: false,
+      enumerable: false,
+      value: drainStatus,
+      writable: false,
+    });
+  }
+  return error;
+}
+
+function readDrainStatus(readStatus) {
+  if (typeof readStatus !== "function") return null;
+  try {
+    return readStatus();
+  } catch {
+    return null;
+  }
+}
+
+async function settleBeforeDeadline(
+  promises,
+  deadline,
+  phase,
+  controller,
+  readStatus = null,
+) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
-    const error = lifecycleDrainTimeout(phase);
+    const error = lifecycleDrainTimeout(phase, readDrainStatus(readStatus));
     controller.abort(error);
     throw error;
   }
@@ -2249,7 +2359,10 @@ async function settleBeforeDeadline(promises, deadline, phase, controller) {
       Promise.allSettled(promises),
       new Promise((_, reject) => {
         timer = setTimeout(() => {
-          const error = lifecycleDrainTimeout(phase);
+          const error = lifecycleDrainTimeout(
+            phase,
+            readDrainStatus(readStatus),
+          );
           controller.abort(error);
           reject(error);
         }, remaining);
@@ -2283,6 +2396,7 @@ function attachServerLifecycle(
       deadline,
       "background services",
       controller,
+      () => backgroundWork?.drainStatus?.(),
     );
     const serviceFailure = lifecycleFailure(serviceResults);
     if (serviceFailure) throw serviceFailure;
@@ -3617,6 +3731,25 @@ async function drainBackgroundWork(operation, drainTimeoutMs) {
   if (failure) throw failure;
 }
 
+function backgroundDrainStatus({
+  runDrainParticipant,
+  activeTaskCount,
+  backgroundOperationActive,
+  confirmationOperationCount,
+  queuedOperationCount,
+}) {
+  return Object.freeze({
+    schemaVersion: 1,
+    activeParticipants: Object.freeze(
+      runDrainParticipant.readActive(),
+    ),
+    activeTaskCount,
+    backgroundOperationActive,
+    confirmationOperationCount,
+    queuedOperationCount,
+  });
+}
+
 function configurationSafeModeBackgroundWork(
   application,
   operationalAdmission,
@@ -3657,6 +3790,13 @@ function configurationSafeModeBackgroundWork(
     },
     confirmationReady: () =>
       confirmationEnabled && confirmationAccess.isReady(),
+    drainStatus: () => backgroundDrainStatus({
+      runDrainParticipant,
+      activeTaskCount: 0,
+      backgroundOperationActive: false,
+      confirmationOperationCount: confirmationAccess.activeCount(),
+      queuedOperationCount: 0,
+    }),
   });
 }
 
@@ -3806,6 +3946,20 @@ export function startApplicationBackgroundWork(
     signal.throwIfAborted();
   }
 
+  function throwAgencyCycleFailures(failures, signal) {
+    const reportableFailures = signal.aborted
+      ? failures.filter((error) => error !== signal.reason)
+      : failures;
+    if (reportableFailures.length === 1) throw reportableFailures[0];
+    if (reportableFailures.length > 1) {
+      throw new AggregateError(
+        reportableFailures,
+        "员工主动循环、旧岗位巡查或记忆投影失败",
+      );
+    }
+    signal.throwIfAborted();
+  }
+
   async function performAgencyCycle({
     trigger,
     includeLegacyEmployees = false,
@@ -3842,7 +3996,7 @@ export function startApplicationBackgroundWork(
         failures.push(error);
       }
     }
-    signal.throwIfAborted();
+    if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     const selectedEmployeeIds = [
       ...(includeLegacyEmployees ? ["pr-reviewer"] : []),
       ...employeeIds,
@@ -3874,25 +4028,18 @@ export function startApplicationBackgroundWork(
         failures.push(error);
       }
     }
-    signal.throwIfAborted();
+    if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     if (typeof application.memoryProjector?.runCycle === "function" && !stopped) {
       try {
         await runDrainParticipant(
           DRAIN_PARTICIPANTS.memoryProjection,
-          () => application.memoryProjector.runCycle(),
+          () => application.memoryProjector.runCycle({ signal }),
         );
       } catch (error) {
         failures.push(error);
       }
     }
-    signal.throwIfAborted();
-    if (failures.length === 1) throw failures[0];
-    if (failures.length > 1) {
-      throw new AggregateError(
-        failures,
-        "员工主动循环、旧岗位巡查或记忆投影失败",
-      );
-    }
+    throwAgencyCycleFailures(failures, signal);
     return { skipped: null };
   }
 
@@ -4002,7 +4149,7 @@ export function startApplicationBackgroundWork(
               signal,
             });
           } catch (error) {
-            if (signal.aborted) throw signal.reason ?? error;
+            if (signal.aborted) throw error;
             reportBackgroundError(error);
           }
         }
@@ -4087,13 +4234,36 @@ export function startApplicationBackgroundWork(
     factsReady = false;
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
+    const tasksToDrain = [...activeTasks];
     stopPromise = drainBackgroundWork(async () => {
       await confirmationAccess.closeAndDrain();
-      while (activeTasks.size > 0) {
-        await Promise.allSettled([...activeTasks]);
+      const results = await Promise.allSettled(tasksToDrain);
+      const failures = results
+        .filter((result) =>
+          result.status === "rejected" &&
+          result.reason !== workController.signal.reason
+        )
+        .map((result) => result.reason);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(
+          failures,
+          "后台任务排空时发生多个错误",
+        );
       }
     }, drainTimeoutMs);
     return stopPromise;
+  }
+
+  function readBackgroundDrainStatus() {
+    return backgroundDrainStatus({
+      runDrainParticipant,
+      activeTaskCount: activeTasks.size,
+      backgroundOperationActive,
+      confirmationOperationCount: confirmationAccess.activeCount(),
+      queuedOperationCount: [...backgroundQueues.values()]
+        .reduce((total, queue) => total + queue.length, 0),
+    });
   }
 
   return {
@@ -4128,6 +4298,7 @@ export function startApplicationBackgroundWork(
         ),
       )),
     confirmationReady: () => confirmationAccess.isReady(),
+    drainStatus: readBackgroundDrainStatus,
   };
 }
 
@@ -4204,6 +4375,7 @@ function createDeferredBackgroundWork(
     runConfirmationOperation: (...arguments_) =>
       requireDelegate().runConfirmationOperation(...arguments_),
     confirmationReady: () => delegate?.confirmationReady?.() === true,
+    drainStatus: () => delegate?.drainStatus?.() ?? null,
   });
 }
 
