@@ -27,6 +27,13 @@ const MAX_STDERR_BYTES = 8_192;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
+const LOGIN_ENVIRONMENT_NAMES = Object.freeze([
+  "SystemRoot",
+  "WINDIR",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+]);
 
 function plainRecord(value) {
   return value !== null &&
@@ -281,13 +288,7 @@ function environmentValue(environment, name) {
 
 function loginEnvironment(environment, directory) {
   const result = {};
-  for (const name of [
-    "SystemRoot",
-    "WINDIR",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-  ]) {
+  for (const name of LOGIN_ENVIRONMENT_NAMES) {
     const value = environmentValue(environment, name);
     if (value !== null) result[name] = value;
   }
@@ -619,12 +620,21 @@ async function createSource(options, dependencies, platform) {
 }
 
 export function createGhLoginCredentialSource(options) {
+  const supervisedProcessRunner = new SupervisedProcessRunner();
+  const environment = Object.fromEntries(
+    LOGIN_ENVIRONMENT_NAMES.flatMap((name) => {
+      const value = environmentValue(process.env, name);
+      return value === null ? [] : [[name, value]];
+    }),
+  );
   return createSource(options, {
-    environment: process.env,
+    environment,
     clock: () => Date.now(),
     randomUUID,
     executablePinner: pinGitHubCliDescriptor,
-    processRunner: new SupervisedProcessRunner(),
+    processRunner: Object.freeze({
+      run: supervisedProcessRunner.run.bind(supervisedProcessRunner),
+    }),
     privateDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
     prepareCleanupTrees: prepareCleanupTreesByIdentity,
   }, process.platform);

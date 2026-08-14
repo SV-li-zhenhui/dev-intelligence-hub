@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  createGhLoginCredentialSource,
   createTestGhLoginCredentialSource,
 } from "../src/adapters/gh-login-credential-source.js";
 import {
@@ -780,6 +781,26 @@ test("gh-login fixed cleanup cap bounds preparation and closes a late session", 
   } finally {
     t.mock.timers.reset();
   }
+});
+
+test("gh-login production factory constructs from sealed production ports", {
+  skip: WINDOWS_PRODUCTION_SKIP,
+}, async (t) => {
+  const parent = await temporaryDirectory(t, "github-credential-factory-");
+  const runtimeTemporaryRoot = path.join(parent, "private-runtime-temp");
+  const ghCommand = path.join(parent, "gh.exe");
+  await mkdir(runtimeTemporaryRoot);
+  setWindowsDirectoryAcl(runtimeTemporaryRoot);
+  compileOfflineGitHubCli(ghCommand);
+
+  const source = await createGhLoginCredentialSource({
+    actorAccountId: ACTOR,
+    ghCommand,
+    runtimeTemporaryRoot,
+    protectedRoots: [path.resolve(".")],
+  });
+
+  assert.equal(typeof source.acquire, "function");
 });
 
 test("gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure", {
