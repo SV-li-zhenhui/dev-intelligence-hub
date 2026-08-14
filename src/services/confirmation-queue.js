@@ -1322,7 +1322,9 @@ export class ConfirmationQueue {
         : {}),
       ...(item.receipt ? { receipt: item.receipt } : {}),
       ...(item.failure ? { failure: item.failure } : {}),
-      ...(item.rejection ? { rejection: item.rejection } : {}),
+      ...(item.rejection && ownerDecision === null
+        ? { rejection: item.rejection }
+        : {}),
       ...(ownerDecision === null ? {} : { ownerDecision }),
       ...(item.invalidation ? { invalidation: item.invalidation } : {}),
     });

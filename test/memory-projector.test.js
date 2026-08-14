@@ -725,6 +725,33 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   assert.equal(initialByKind.confirmation.content.includes(secretBody), false);
   assert.equal(initialByKind["external-result"].content.includes(secretBody), false);
 
+  const malformedSealedUnknown = sealedUnknownConfirmationMemoryItem(
+    oldBinding,
+    {
+      body: "malformed sealed unknown",
+      revision: 2,
+      updatedAt: "2026-08-08T07:02:00.000Z",
+    },
+  );
+  malformedSealedUnknown.rejectedAt = null;
+  malformedSealedUnknown.ownerDecision = null;
+  confirmations = [malformedSealedUnknown];
+  confirmationRevision = 2;
+  const recordsBeforeMalformedProjection =
+    values.get("unified-memory-records").records.length;
+  await assert.rejects(
+    createProjector().runCycle(),
+    /confirmation memory projection item is invalid/u,
+  );
+  assert.equal(
+    values.get("unified-memory-records").records.length,
+    recordsBeforeMalformedProjection,
+  );
+  assert.equal(
+    journal.getAuthorityProjectionState().confirmationHighWatermark,
+    1,
+  );
+
   currentHead = newBinding.headRefOid;
   items = [newItem];
   timeline = [

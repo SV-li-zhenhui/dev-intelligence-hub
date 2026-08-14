@@ -1993,9 +1993,14 @@ test("startup recovery never turns an unknown action into a retryable absence", 
     },
   );
   assert.equal(sealed.status, "rejected");
+  const durableSealed = store.value.items.find(
+    ({ id }) => id === resolution.item.id,
+  );
+  const durableRejection = structuredClone(durableSealed.rejection);
+  assert.equal(Object.hasOwn(sealed, "rejection"), false);
   assert.deepEqual(sealed.ownerDecision, {
     type: "seal_unknown_and_forbid_replay",
-    at: sealed.rejection.at,
+    at: durableRejection.at,
   });
   assert.deepEqual(sealed.failure, failureBeforeSealing);
   assert.deepEqual(
@@ -2003,7 +2008,7 @@ test("startup recovery never turns an unknown action into a retryable absence", 
     executionBeforeSealing,
   );
   assert.equal(
-    sealed.rejection.reason,
+    durableRejection.reason,
     "owner acknowledged the uncertain result without replay",
   );
   assert.deepEqual(
@@ -2019,7 +2024,7 @@ test("startup recovery never turns an unknown action into a retryable absence", 
       diagnosticCode: "GITHUB_MARKER_ABSENT",
       ownerDecision: {
         type: "seal_unknown_and_forbid_replay",
-        at: sealed.rejection.at,
+        at: durableRejection.at,
       },
     }],
   );
@@ -2042,10 +2047,10 @@ test("startup recovery never turns an unknown action into a retryable absence", 
       status: "rejected",
       executionOutcome: "unknown",
       failure: failureBeforeSealing,
-      rejectedAt: sealed.rejection.at,
+      rejectedAt: durableRejection.at,
       ownerDecision: {
         type: "seal_unknown_and_forbid_replay",
-        at: sealed.rejection.at,
+        at: durableRejection.at,
       },
     },
   );

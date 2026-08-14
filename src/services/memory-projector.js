@@ -670,11 +670,14 @@ function normalizeConfirmationMemoryItem(value) {
   ) {
     throw new TypeError(message);
   }
+  const rejected = item.status === "rejected";
+  if (rejected !== (item.rejectedAt !== null)) {
+    throw new TypeError(message);
+  }
   const sealedUnknown =
-    item.status === "rejected" &&
+    rejected &&
     execution?.outcome === "unknown" &&
-    failure?.outcome === "unknown" &&
-    item.rejectedAt !== null;
+    failure?.outcome === "unknown";
   if (
     (ownerDecision !== null) !== sealedUnknown ||
     (ownerDecision !== null && ownerDecision.at !== item.rejectedAt)
