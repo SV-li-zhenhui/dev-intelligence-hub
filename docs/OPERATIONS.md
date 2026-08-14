@@ -297,6 +297,48 @@ Vendor calls may incur usage charges even though MyDashboard itself runs
 locally. Review vendor billing, retention, region, and training settings before
 resuming a role.
 
+## GitHub CLI login credentials
+
+GitHub writes remain disabled until both the action type and its exact queued
+item are enabled and confirmed. The recommended `credentialMode: "gh-login"`
+uses the current GitHub CLI login of the same operating-system user that runs
+MyDashboard. Install an admitted `gh.exe` at a fixed absolute path, then log in
+as that user without involving MyDashboard:
+
+```powershell
+gh auth login --hostname github.com
+```
+
+In **配置**, choose **GitHub CLI 当前登录（推荐）**, set the exact
+`actorAccountId` and fixed `ghCommand`, enable only the required actions, then
+validate, inspect, and confirm the version one item at a time. Restart only
+after the activated version reports that a restart is required. Do not set
+`GH_CONFIG_DIR` for the managed service and do not copy a host `hosts.yml` into
+the project or application data.
+
+At a confirmed execution or reconciliation boundary, MyDashboard supervises
+the equivalent of `gh auth token --hostname github.com --user
+<actorAccountId>` in a private temporary working directory. It verifies the
+requested account before exposing the bounded result to either GitHub
+transport. The token lives only in a short in-memory lease; it is not persisted
+or shown, and cleanup releases all retained references before another action
+can acquire the source. Every Review, comment, update branch, push, or merge
+still requires its own confirmation; selecting `gh-login` grants no action by
+itself.
+
+For compatibility, `credentialMode: "token-env"` reads only the environment
+variable named by `tokenEnv`. Use a dedicated minimum-permission token and
+restart the managed service after changing its environment. There is no silent
+migration or fallback between `gh-login` and `token-env`.
+
+Missing login, unavailable or replaced CLI, account mismatch, timeout,
+oversized or malformed output, and temporary-directory cleanup failure all
+fail before a GitHub write. Correct the same-user CLI login or activated
+configuration, then let the durable queue retry only when its state permits.
+If an already-started external result is `unknown`, do not click repeatedly or
+run `gh` manually; reconciliation must resolve that receipt before duplicates
+are unblocked.
+
 ## Runtime status
 
 Open the **系统** view to inspect:

@@ -142,7 +142,9 @@ async function availablePort() {
 function cleanManagerEnvironment(environmentRoot, sourceEnvironment = process.env) {
   const environment = {};
   const replacedNames = new Set([
+    "appdata",
     "codex_home",
+    "gh_config_dir",
     "home",
     "localappdata",
     "path",
@@ -164,10 +166,12 @@ function cleanManagerEnvironment(environmentRoot, sourceEnvironment = process.en
     environment[name] = value;
   }
   const home = path.join(environmentRoot, "clean-home");
+  const appData = path.join(environmentRoot, "clean-app-data");
   const localAppData = path.join(environmentRoot, "clean-local-app-data");
   const temporary = path.join(environmentRoot, "clean-temp");
   const runtime = path.join(environmentRoot, "clean-runtime");
   Object.assign(environment, {
+    APPDATA: appData,
     HOME: home,
     LOCALAPPDATA: localAppData,
     TEMP: temporary,
@@ -177,7 +181,10 @@ function cleanManagerEnvironment(environmentRoot, sourceEnvironment = process.en
     [process.platform === "win32" ? "Path" : "PATH"]:
       path.dirname(process.execPath),
   });
-  return { environment, directories: [home, localAppData, temporary, runtime] };
+  return {
+    environment,
+    directories: [home, appData, localAppData, temporary, runtime],
+  };
 }
 
 function runManager({ executable, rootDirectory, environment, action }) {
@@ -679,6 +686,29 @@ test("clean manager environment excludes every spelling of the host Codex login 
   assert.equal(environment.SAFE_PORTABLE_VALUE, "preserved");
 });
 
+test("clean manager environment excludes host GitHub CLI profile roots", () => {
+  const environmentRoot = "C:\\clean-room";
+  const { environment, directories } = cleanManagerEnvironment(environmentRoot, {
+    APPDATA: "C:\\Users\\private-owner\\AppData\\Roaming",
+    GH_CONFIG_DIR: "C:\\Users\\private-owner\\.config\\gh",
+    SAFE_PORTABLE_VALUE: "preserved",
+  });
+
+  assert.equal(
+    environment.APPDATA,
+    path.join(environmentRoot, "clean-app-data"),
+  );
+  assert.equal(
+    Object.keys(environment).some((name) => name.toLowerCase() === "gh_config_dir"),
+    false,
+  );
+  assert.equal(
+    directories.includes(path.join(environmentRoot, "clean-app-data")),
+    true,
+  );
+  assert.equal(environment.SAFE_PORTABLE_VALUE, "preserved");
+});
+
 test("npm distribution contains the safe bootstrap and excludes local runtime state", () => {
   const files = loadDistributionManifest();
   const included = new Set(files);
@@ -707,8 +737,8 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
   for (const filePath of files) {
     assert.doesNotMatch(
       filePath,
-      /(?:^|\/)(?:auth\.json|\.codex|\.mydashboard-cli-credentials-v1)(?:\/|$)/u,
-      `packaged Codex credential material ${filePath}`,
+      /(?:^|\/)(?:auth\.json|hosts\.yml|\.codex|\.config\/gh|\.mydashboard-cli-credentials-v1|github-credentials-v1)(?:\/|$)/u,
+      `packaged credential material ${filePath}`,
     );
   }
 
@@ -875,6 +905,45 @@ test("brokered Codex login examples and public guidance agree with the runtime",
     documents["docs/PRIVACY.md"],
     /MyDashboard uses only the\s+fixed `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`/u,
   );
+});
+
+test("brokered GitHub CLI login examples and public guidance agree with the runtime", () => {
+  const example = JSON.parse(
+    readFileSync(path.join(root, "config.example.json"), "utf8"),
+  );
+  assert.equal(example.githubActions.credentialMode, "gh-login");
+  assert.equal(Object.hasOwn(example.githubActions, "tokenEnv"), false);
+
+  const documents = Object.fromEntries(
+    [
+      "README.md",
+      "SECURITY.md",
+      "docs/ARCHITECTURE.md",
+      "docs/OPERATIONS.md",
+      "docs/PRIVACY.md",
+    ].map((filePath) => [
+      filePath,
+      readFileSync(path.join(root, filePath), "utf8"),
+    ]),
+  );
+  const guidance = Object.values(documents).join("\n");
+  for (const [filePath, contents] of Object.entries(documents)) {
+    assert.match(contents, /gh-login/u, `${filePath} omits GitHub CLI login`);
+  }
+  for (const expected of [
+    /credentialMode.*gh-login/isu,
+    /GitHub CLI 当前登录|current GitHub CLI login/iu,
+    /actorAccountId/u,
+    /token-env/u,
+    /confirm|确认/iu,
+    /memory|内存/iu,
+    /persist|持久/iu,
+    /physical memory|物理内存/iu,
+    /account mismatch|账号不一致|错误账号/iu,
+    /cleanup|清理/iu,
+  ]) {
+    assert.match(guidance, expected);
+  }
 });
 
 test("Apache-2.0 distribution identity rejects missing, corrupt, inconsistent, or unpackaged license artifacts", () => {

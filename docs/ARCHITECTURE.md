@@ -114,6 +114,25 @@ reconciliation stages. If the process cannot prove whether a call completed,
 the result becomes `unknown`; duplicate execution remains blocked until a
 trusted observation resolves it.
 
+GitHub mutations select one credential source only after authority and the
+current confirmation have both been revalidated. The compatibility source,
+`credentialMode: "token-env"`, resolves the configured environment-variable
+name. The recommended `credentialMode: "gh-login"` source supervises a fixed
+absolute GitHub CLI binary in a private temporary working directory and asks
+the same operating-system user's current login for the exact
+`actorAccountId`. Browser data cannot supply a command, profile path,
+`GH_CONFIG_DIR`, token, hostname, or account override. Account mismatch,
+timeout, malformed output, or cleanup failure occurs before the transport can
+write.
+
+The legacy GitHub action adapter and the PR external-action transport share
+this credential-source boundary and the same confirmation executor. A bounded
+credential lease exists only for confirmed execution or reconciliation, is
+passed directly to the selected transport, and releases its references during
+cleanup. No credential enters intent state, receipts, logs, browser responses,
+model context, backup, or recovery data. Credential selection never changes
+the immutable account, repository, ref, Head OID, action, or payload binding.
+
 ## Memory
 
 Raw local records are authoritative. Search and cited answering select bounded

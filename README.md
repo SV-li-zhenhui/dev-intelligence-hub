@@ -155,21 +155,23 @@ GitHub 写入默认关闭。可以按动作分别启用 PR comment、Review、up
 
 所有外部动作都经过同一个逐条弹框。弹框展示写入账号、目标、Head、动作、完整正文和依据；浏览器只提交队列修订号与内容摘要，不能覆盖服务端保存的动作。点击“稍后”不会产生写入，点击确认后才会执行这一项。外部结果不确定时会阻塞重复动作，重启后先只读对账；无法安全证明的结果保持 `unknown`，不会猜测成功或重复提交。
 
-账号和凭据只配置在本机。首次导入前可由 `config.local.json` 保存账号、`gh.exe` 路径和凭据环境变量名；已有活动版本时应在“配置”页面创建并确认新版本。两种方式都只保存环境变量名，不保存 Token 本身：
+账号和凭据只配置在本机。推荐使用 `credentialMode: "gh-login"` 代理运行 MyDashboard 的同一 Windows 用户的 GitHub CLI 当前登录；系统不读取或复制 `hosts.yml`，页面也不能指定 `GH_CONFIG_DIR`。先在该用户会话中执行 `gh auth login --hostname github.com`，再在“配置”页面创建版本、核对影响并逐项确认激活。首次导入前也可在 `config.local.json` 使用同一结构：
 
 ```json
 {
   "githubActions": {
     "enabled": true,
+    "credentialMode": "gh-login",
     "enabledActions": ["comment", "review"],
     "actorAccountId": "用于发布 Review 的 GitHub 登录名",
-    "tokenEnv": "MYDASHBOARD_GITHUB_TOKEN",
     "ghCommand": "<GitHub CLI 的绝对可执行文件路径>"
   }
 }
 ```
 
-在启动服务的用户环境中设置 `MYDASHBOARD_GITHUB_TOKEN`，然后重启服务。系统启动时会用该固定 Token 核对实际 GitHub 账号；账号不一致会拒绝写入。若确实需要代理或自定义 CA，必须在 `githubActions.networkEnv` 中逐项显式配置，因为携带 Token 的网络链路会随之改变。
+`gh-login` 只会在已经确认的动作执行或结果对账边界，由固定的 `gh.exe` 运行 `gh auth token --hostname github.com --user <actorAccountId>`；短期 Token 仅进入受限内存租约和对应 GitHub 传输，不写配置、台账、日志、页面、模型上下文、备份或验收产物，结束后清理引用。登录缺失、账号不一致、命令超时、输出异常或清理失败都会在任何写入前关闭失败。
+
+兼容模式 `credentialMode: "token-env"` 仍可显式配置 `tokenEnv: "MYDASHBOARD_GITHUB_TOKEN"`，系统不会在两种模式之间静默切换。此时在启动服务的用户环境中设置专用最小权限 Token，再重启服务；配置仍只保存环境变量名。若确实需要代理或自定义 CA，必须在 `githubActions.networkEnv` 中逐项显式配置，因为携带 Token 的网络链路会随之改变。无论哪种凭据模式，每个动作仍须在统一确认中心逐项确认。
 
 确认队列先持久化意图，再允许外部调用；进程崩溃后会先对账再恢复。同一 Head 下若职责、下一动作或岗位策略已经变化，原岗位会先持久化失效旧确认，旧 Review 不能继续执行；结果未知时，同一 PR 的后续动作会保持阻塞，避免重复发布。启动、定时刷新、手动刷新和本地 PR 事实变更都会先关闭确认入口，只有 GitHub PR 数据健康且岗位复核完成后才重新开放。Windows 上使用 named pipe 保证同一时刻只有一个外部动作写入进程；服务关闭会先停止定时工作并等待运行时释放，崩溃时句柄由操作系统回收。
 

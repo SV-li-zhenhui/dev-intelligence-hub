@@ -56,9 +56,11 @@ storage and do not edit it during startup.
 ## Deployment guidance
 
 - Keep the listener on `127.0.0.1`; do not reverse-proxy or port-forward it.
-- Store secrets only in environment variables and restrict access to the
-  process account.
-- Use a dedicated GitHub token with the minimum repository permissions.
+- Store API keys and explicit `token-env` secrets only in environment variables
+  and restrict access to the process account. Brokered login modes have their
+  separate bounded credential-source rules below.
+- Prefer GitHub `credentialMode: "gh-login"`; if `token-env` is required, use a
+  dedicated GitHub token with the minimum repository permissions.
 - Review every enabled provider, role permission, workspace, writable path,
   GitHub action, and routing rule before resuming employees.
 - Keep backups and the active data directory on trusted local storage with
@@ -71,6 +73,13 @@ storage and do not edit it during startup.
 - Do not make a linked, shared-writable, wrong-owner, oversized, or otherwise
   unsafe Codex login source pass by disabling checks. MyDashboard reports
   `unsafe_source` and never changes the host file or ACL automatically.
+- For GitHub `gh-login`, run MyDashboard as the same user that owns the intended
+  GitHub CLI current login, bind the exact `actorAccountId`, and use only the
+  fixed admitted `gh.exe`. Do not configure `GH_CONFIG_DIR`, copy `hosts.yml`,
+  or put a GitHub token in configuration, logs, tests, backups, or packages.
+- Treat every GitHub mutation as separately privileged. Login availability
+  never substitutes for the per-action confirmation, immutable target/Head
+  binding, receipt, or unknown-result reconciliation gate.
 
 `credentialMode: "codex-login"` changes only how a Codex model request
 authenticates. The broker selects a fixed same-user file source, stages only its
@@ -80,6 +89,14 @@ mirror from backup, restore, npm packaging, and open-source distribution. It
 does not expose the full host profile, support OS keyring export, or grant Git,
 GitHub, repository, code-execution, plugin, MCP, shell, or browser authority.
 Claude login brokering is not implemented; Claude remains API-key only.
+
+GitHub `credentialMode: "gh-login"` invokes the fixed CLI only after an exact
+confirmation or during reconciliation, verifies account identity, and gives
+the selected transport a bounded in-memory credential lease. Account mismatch,
+timeout, invalid output, or cleanup failure produces zero writes. The token is
+never persisted, but reference cleanup cannot promise physical memory
+zeroization by the JavaScript runtime or operating system. Explicit
+`token-env` remains available without silent fallback between modes.
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) and
 [docs/OPERATIONS.md](docs/OPERATIONS.md) for the complete data and operational

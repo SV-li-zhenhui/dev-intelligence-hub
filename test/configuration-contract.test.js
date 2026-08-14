@@ -25,6 +25,12 @@ function document() {
   return structuredClone(committedDocument);
 }
 
+function legacyGithubCredentialDocument() {
+  const value = document();
+  delete value.githubActions.credentialMode;
+  return value;
+}
+
 function trustedGitCommand() {
   return process.platform === "win32"
     ? "C:\\Program Files\\Git\\mingw64\\bin\\git.exe"
@@ -755,7 +761,7 @@ test("GitHub PR external actions require an explicit unique allow-list", () => {
 });
 
 test("GitHub credential modes preserve legacy shape and enforce mode-specific references", () => {
-  const legacy = document();
+  const legacy = legacyGithubCredentialDocument();
   const legacyNormalized = normalizeConfigurationDocument(legacy);
   assert.equal(Object.hasOwn(legacyNormalized.githubActions, "credentialMode"), false);
   assert.equal(configurationDocumentDigest(legacy), LEGACY_GITHUB_CREDENTIAL_DIGEST);
@@ -817,7 +823,7 @@ test("GitHub credential modes preserve legacy shape and enforce mode-specific re
 });
 
 test("GitHub credential mode changes are security-sensitive and restart-required", () => {
-  const before = document();
+  const before = legacyGithubCredentialDocument();
   before.githubActions.tokenEnv = "MYDASHBOARD_GITHUB_TOKEN";
   const after = structuredClone(before);
   after.githubActions.credentialMode = "gh-login";

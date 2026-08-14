@@ -76,6 +76,24 @@ comment, review, branch update, push, or merge is a separate owner-confirmed
 action. Unknown results block retries until reconciliation so the application
 does not deliberately duplicate an external write.
 
+For GitHub writes, recommended `credentialMode: "gh-login"` asks a fixed
+GitHub CLI executable for the current login of the same operating-system user
+only after a specific action has been confirmed or needs reconciliation. The
+page cannot choose a profile path, set `GH_CONFIG_DIR`, or receive the token;
+MyDashboard does not read, copy, persist, back up, or package the host
+`hosts.yml`. The exact `actorAccountId` is verified before write authority is
+released, so an account mismatch produces no GitHub mutation.
+
+The returned token is held only in a bounded in-memory lease and is excluded
+from configuration, durable state, logs, UI/API responses, model context,
+backup, recovery, and acceptance artifacts. Cleanup drops retained references
+before the next lease. JavaScript, its runtime, and the operating system do not
+provide a reliable promise of physical memory zeroization, so MyDashboard does
+not claim that discarded bytes are immediately erased from physical memory.
+The explicit compatibility mode `credentialMode: "token-env"` has the same
+non-persistence boundary but reads the named service environment variable;
+neither mode silently falls back to the other.
+
 ## Retention and deletion
 
 Retention is controlled by local store limits and configuration. Backups are
