@@ -784,6 +784,11 @@ test("packed manager resolves the packaged writer lease probe in a clean runtime
     existsSync(path.join(packageRoot, "scripts", "probe-application-writer-lease.mjs")),
     true,
   );
+  await writeFile(
+    path.join(packageRoot, "config.json"),
+    `${JSON.stringify({ port: await availablePort() })}\n`,
+    { mode: 0o600 },
+  );
 
   const powershell = managerPowerShell();
   if (powershell === null) {
