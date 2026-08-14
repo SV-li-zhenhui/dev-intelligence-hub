@@ -76,7 +76,7 @@ function runPowerShell(script, environment, signal) {
       ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
       {
         windowsHide: true,
-        signal,
+        ...(signal === null || signal === undefined ? {} : { signal }),
         encoding: "utf8",
         maxBuffer: 64 * 1024,
         env: {

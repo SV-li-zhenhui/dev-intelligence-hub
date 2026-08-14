@@ -1453,6 +1453,28 @@ test("Windows production root creation allows only supported non-mutating broad 
   assert.equal((await lstat(root)).isDirectory(), true);
 });
 
+test("Windows production directory preparation accepts an omitted optional signal", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("production supervised CLI roots are Windows x64 only");
+    return;
+  }
+  const managerModule = await privateDirectoryManagerModule();
+  const parent = await temporaryDirectory(t, "supervised-cli-optional-signal-");
+  const root = path.join(parent, "runtime");
+  setWindowsDirectoryAcl(
+    parent,
+    "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+  );
+
+  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+    directory: root,
+    validateLocation: async () => {},
+  });
+
+  assert.equal(path.resolve(identity.path), path.resolve(root));
+  assert.equal((await lstat(root)).isDirectory(), true);
+});
+
 async function assertProductionRootAclRejected(t, name, extraAce) {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
