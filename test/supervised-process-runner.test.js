@@ -22,13 +22,18 @@ async function temporaryDirectory(t, prefix) {
   return directory;
 }
 
-async function waitForMarker(marker) {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+async function waitForMarker(marker, { timeoutMs = 5_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
     try {
       return await readFile(marker, "utf8");
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(10, remainingMs)),
+      );
     }
   }
   throw new Error("supervised child did not publish its marker");
