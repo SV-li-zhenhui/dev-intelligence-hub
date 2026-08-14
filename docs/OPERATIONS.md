@@ -232,7 +232,10 @@ node scripts/verify-codex-login-readiness.mjs --origin http://127.0.0.1:4173
 
 The command performs one bounded GET to the sanitized status endpoint. It does
 not invoke a model, inspect a repository or PR, accept credentials/headers, or
-print response details. Success prints exactly one of these states:
+print response details. A cold Windows CLI startup can take tens of seconds; the
+command keeps a 90-second client deadline while the broker retains its shorter
+bounded process and cleanup deadlines. Success prints exactly one of these
+states:
 
 - `available`: the supported CLI and safe file login are usable;
 - `file_login_unavailable`: no supported file login is available (logged out or

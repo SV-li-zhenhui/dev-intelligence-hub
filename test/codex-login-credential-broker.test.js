@@ -450,7 +450,7 @@ test("readStatus runs only a bounded no-model login probe and removes its tree",
   assert.equal(run.executable, current.descriptor);
   assert.deepEqual(run.args, ["login", "status"]);
   assert.equal(run.input.length, 0);
-  assert.equal(run.timeoutMs <= 20_000, true);
+  assert.equal(run.timeoutMs, 45_000);
   assert.equal(run.maxStdoutBytes <= 4_096, true);
   assert.equal(run.maxStderrBytes <= 4_096, true);
   assert.equal(path.isAbsolute(run.cwd), true);

@@ -19,10 +19,12 @@ import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const STATUS_TEXT = "Logged in using ChatGPT";
-const STATUS_TIMEOUT_MS = 20_000;
+const STATUS_TIMEOUT_MS = 45_000;
 const STATUS_OUTPUT_LIMIT = 4_096;
 const CLEANUP_TIMEOUT_MS = 10_000;
 const STATUS_PREPARATION_TIMEOUT_MS = 10_000;
+const MAX_STATUS_TIMEOUT_MS = 60_000;
+const MAX_STATUS_OPERATION_TIMEOUT_MS = 120_000;
 const CLEANUP_MAXIMUM_ENTRIES = 128;
 const CLEANUP_MAXIMUM_DEPTH = 16;
 const CLEANUP_MAXIMUM_BYTES = 16 * 1024 * 1024;
@@ -97,9 +99,9 @@ function failureCode(error) {
   }
 }
 
-function boundedTimeout(value, fallback, name) {
+function boundedTimeout(value, fallback, name, maximum) {
   const timeout = value ?? fallback;
-  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000) {
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > maximum) {
     throw new TypeError(`${name} is invalid`);
   }
   return timeout;
@@ -395,11 +397,13 @@ function brokerDependencies(rawDependencies) {
     dependencies.statusTimeoutMs,
     STATUS_TIMEOUT_MS,
     "statusTimeoutMs",
+    MAX_STATUS_TIMEOUT_MS,
   );
   const operationTimeoutMs = boundedTimeout(
     dependencies.operationTimeoutMs,
     STATUS_OPERATION_TIMEOUT_MS,
     "operationTimeoutMs",
+    MAX_STATUS_OPERATION_TIMEOUT_MS,
   );
   const requiredOperations = [
     [dependencies.store, ["beginTask", "stageTask", "captureTask", "stageProbe"]],

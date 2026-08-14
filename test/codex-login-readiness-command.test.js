@@ -4,9 +4,16 @@ import { once } from "node:events";
 import http from "node:http";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 const root = path.resolve(import.meta.dirname, "..");
 const command = path.join(root, "scripts", "verify-codex-login-readiness.mjs");
+const timeoutScaleHook = pathToFileURL(path.join(
+  root,
+  "test",
+  "fixtures",
+  "codex-login-readiness-timeout-scale.mjs",
+)).href;
 const failureMarker = "CODEX_LOGIN_READINESS_FAILED\n";
 const privateCanary = "PRIVATE_READINESS_CANARY_MUST_NOT_ESCAPE";
 const capabilities = Object.freeze({
@@ -31,8 +38,11 @@ async function listen(t, handler) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
-async function runReadiness(arguments_, { timeoutMs = 20_000 } = {}) {
-  const child = spawn(process.execPath, [command, ...arguments_], {
+async function runReadiness(
+  arguments_,
+  { timeoutMs = 20_000, nodeArguments = [] } = {},
+) {
+  const child = spawn(process.execPath, [...nodeArguments, command, ...arguments_], {
     cwd: root,
     env: { ...process.env, MYDASHBOARD_PRIVATE_CANARY: privateCanary },
     stdio: ["ignore", "pipe", "pipe"],
@@ -164,18 +174,43 @@ test("readiness command accepts no authority-bearing origin or extra option", as
   }
 });
 
+test("readiness command accepts a broker response after its 75-second budget", async (t) => {
+  const origin = await listen(t, (_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+      });
+      response.end(JSON.stringify({
+        schemaVersion: 1,
+        state: "available",
+        cliAvailable: true,
+        fileLoginAvailable: true,
+      }));
+    }, 760);
+  });
+  const result = await runReadiness(["--origin", origin], {
+    timeoutMs: 5_000,
+    nodeArguments: ["--import", timeoutScaleHook],
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.signal, null);
+  assert.equal(result.stdout, "CODEX_LOGIN_READINESS_OK state=available\n");
+  assert.equal(result.stderr, "");
+});
+
 test("readiness command leaves time for the bounded broker probe and cleanup", {
-  timeout: 70_000,
+  timeout: 100_000,
 }, async (t) => {
   const origin = await listen(t, () => {});
   const startedAt = Date.now();
-  const result = await runReadiness(["--origin", origin], { timeoutMs: 67_000 });
+  const result = await runReadiness(["--origin", origin], { timeoutMs: 97_000 });
   const elapsed = Date.now() - startedAt;
 
   assert.equal(result.status, 1);
   assert.equal(result.signal, null);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, failureMarker);
-  assert.equal(elapsed >= 59_000, true, `aborted too early after ${elapsed} ms`);
-  assert.equal(elapsed < 65_000, true, `aborted too late after ${elapsed} ms`);
+  assert.equal(elapsed >= 89_000, true, `aborted too early after ${elapsed} ms`);
+  assert.equal(elapsed < 95_000, true, `aborted too late after ${elapsed} ms`);
 });
