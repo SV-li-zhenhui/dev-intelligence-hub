@@ -80,9 +80,11 @@ For GitHub writes, recommended `credentialMode: "gh-login"` asks a fixed
 GitHub CLI executable for the current login of the same operating-system user
 only after a specific action has been confirmed or needs reconciliation. The
 page cannot choose a profile path, set `GH_CONFIG_DIR`, or receive the token;
-MyDashboard does not read, copy, persist, back up, or package the host
-`hosts.yml`. The exact `actorAccountId` is verified before write authority is
-released, so an account mismatch produces no GitHub mutation.
+MyDashboard does not directly parse, copy, persist, back up, or package the
+host `hosts.yml`. The fixed GitHub CLI reads the current login from the same
+user's default profile. The selected transport verifies the exact
+`actorAccountId` with GitHub before write authority is released, so an account
+mismatch produces no GitHub mutation.
 
 The returned token is held only in a bounded in-memory lease and is excluded
 from configuration, durable state, logs, UI/API responses, model context,

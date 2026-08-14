@@ -946,6 +946,34 @@ test("brokered GitHub CLI login examples and public guidance agree with the runt
   }
 });
 
+test("GitHub login guidance locates profile and actor verification at the real boundaries", () => {
+  const readDocument = (filePath) =>
+    readFileSync(path.join(root, filePath), "utf8");
+  const readme = readDocument("README.md");
+  const operations = readDocument("docs/OPERATIONS.md");
+  const privacy = readDocument("docs/PRIVACY.md");
+
+  assert.match(
+    operations,
+    /transport[\s\S]{0,240}(?:GET\s+`?\/user`?|account)[\s\S]{0,240}(?:before|prior to)[\s\S]{0,80}(?:write|mutation)/iu,
+  );
+  assert.doesNotMatch(
+    operations,
+    /verifies the requested account before exposing[\s\S]{0,120}GitHub transport/iu,
+  );
+  for (const contents of [readme, privacy]) {
+    assert.match(contents, /不直接解析|does not directly parse/iu);
+    assert.match(
+      contents,
+      /(?:固定|fixed)[\s\S]{0,80}(?:`gh\.exe`|GitHub CLI)[\s\S]{0,160}(?:默认|default)[\s\S]{0,80}profile/iu,
+    );
+    assert.doesNotMatch(
+      contents,
+      /(?:系统不读取|MyDashboard does not read)[^\n.]{0,120}`hosts\.yml`/iu,
+    );
+  }
+});
+
 test("Apache-2.0 distribution identity rejects missing, corrupt, inconsistent, or unpackaged license artifacts", () => {
   const licensePath = path.join(root, "LICENSE");
   assert.equal(existsSync(licensePath), true, "missing root LICENSE");

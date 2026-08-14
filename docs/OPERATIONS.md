@@ -318,9 +318,10 @@ the project or application data.
 
 At a confirmed execution or reconciliation boundary, MyDashboard supervises
 the equivalent of `gh auth token --hostname github.com --user
-<actorAccountId>` in a private temporary working directory. It verifies the
-requested account before exposing the bounded result to either GitHub
-transport. The token lives only in a short in-memory lease; it is not persisted
+<actorAccountId>` in a private temporary working directory and validates the
+bounded token output. The selected GitHub transport then uses that lease to run
+`GET /user` and verifies the exact `actorAccountId` before any write or other
+mutation. The token lives only in a short in-memory lease; it is not persisted
 or shown, and cleanup releases all retained references before another action
 can acquire the source. Every Review, comment, update branch, push, or merge
 still requires its own confirmation; selecting `gh-login` grants no action by

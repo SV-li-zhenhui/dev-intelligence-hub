@@ -155,7 +155,7 @@ GitHub 写入默认关闭。可以按动作分别启用 PR comment、Review、up
 
 所有外部动作都经过同一个逐条弹框。弹框展示写入账号、目标、Head、动作、完整正文和依据；浏览器只提交队列修订号与内容摘要，不能覆盖服务端保存的动作。点击“稍后”不会产生写入，点击确认后才会执行这一项。外部结果不确定时会阻塞重复动作，重启后先只读对账；无法安全证明的结果保持 `unknown`，不会猜测成功或重复提交。
 
-账号和凭据只配置在本机。推荐使用 `credentialMode: "gh-login"` 代理运行 MyDashboard 的同一 Windows 用户的 GitHub CLI 当前登录；系统不读取或复制 `hosts.yml`，页面也不能指定 `GH_CONFIG_DIR`。先在该用户会话中执行 `gh auth login --hostname github.com`，再在“配置”页面创建版本、核对影响并逐项确认激活。首次导入前也可在 `config.local.json` 使用同一结构：
+账号和凭据只配置在本机。推荐使用 `credentialMode: "gh-login"` 代理运行 MyDashboard 的同一 Windows 用户的 GitHub CLI 当前登录；系统不直接解析、复制或持久化 `hosts.yml`，固定的 `gh.exe` 会代表 MyDashboard 从同一用户的默认 GitHub CLI profile 读取当前登录，页面不能指定 `GH_CONFIG_DIR`。先在该用户会话中执行 `gh auth login --hostname github.com`，再在“配置”页面创建版本、核对影响并逐项确认激活。首次导入前也可在 `config.local.json` 使用同一结构：
 
 ```json
 {
