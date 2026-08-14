@@ -353,7 +353,11 @@ function parseToken(result) {
   } catch {
     throw githubCredentialSourceError("GITHUB_CREDENTIAL_OUTPUT_INVALID");
   }
-  const token = text.endsWith("\r\n") ? text.slice(0, -2) : text;
+  const token = text.endsWith("\r\n")
+    ? text.slice(0, -2)
+    : text.endsWith("\n")
+      ? text.slice(0, -1)
+      : text;
   if (!validGitHubToken(token)) {
     throw githubCredentialSourceError("GITHUB_CREDENTIAL_OUTPUT_INVALID");
   }

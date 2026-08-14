@@ -459,10 +459,13 @@ test("gh-login rejects actor injection and protected temporary roots before spaw
 });
 
 test("gh-login accepts only one strict UTF-8 token line", async (t) => {
-  const valid = [Buffer.from(TOKEN), Buffer.from(`${TOKEN}\r\n`)];
+  const valid = [
+    Buffer.from(TOKEN),
+    Buffer.from(`${TOKEN}\n`),
+    Buffer.from(`${TOKEN}\r\n`),
+  ];
   const invalid = [
     Buffer.alloc(0),
-    Buffer.from(`${TOKEN}\n`),
     Buffer.from(` ${TOKEN}`),
     Buffer.from(`${TOKEN} `),
     Buffer.from(`${TOKEN}\r\nextra`),
