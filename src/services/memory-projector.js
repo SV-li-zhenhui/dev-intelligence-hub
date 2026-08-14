@@ -568,6 +568,7 @@ function normalizeConfirmationMemoryItem(value) {
       "receipt",
       "failure",
       "rejectedAt",
+      "ownerDecision",
       "invalidation",
     ],
     message,
@@ -653,6 +654,33 @@ function normalizeConfirmationMemoryItem(value) {
   if (!(item.rejectedAt === null || validTimestamp(item.rejectedAt))) {
     throw new TypeError(message);
   }
+  const ownerDecision = item.ownerDecision === null
+    ? null
+    : exactProjectionObject(
+        item.ownerDecision,
+        ["type", "at"],
+        message,
+      );
+  if (
+    ownerDecision !== null &&
+    (
+      ownerDecision.type !== "seal_unknown_and_forbid_replay" ||
+      !validTimestamp(ownerDecision.at)
+    )
+  ) {
+    throw new TypeError(message);
+  }
+  const sealedUnknown =
+    item.status === "rejected" &&
+    execution?.outcome === "unknown" &&
+    failure?.outcome === "unknown" &&
+    item.rejectedAt !== null;
+  if (
+    (ownerDecision !== null) !== sealedUnknown ||
+    (ownerDecision !== null && ownerDecision.at !== item.rejectedAt)
+  ) {
+    throw new TypeError(message);
+  }
   const invalidation = item.invalidation === null
     ? null
     : exactProjectionObject(item.invalidation, ["reason", "at"], message);
@@ -683,6 +711,7 @@ function normalizeConfirmationMemoryItem(value) {
     receipt: receipt === null ? null : { ...receipt },
     failure: failure === null ? null : { ...failure },
     rejectedAt: item.rejectedAt,
+    ownerDecision: ownerDecision === null ? null : { ...ownerDecision },
     invalidation: invalidation === null ? null : { ...invalidation },
   };
   const expectedStatusDigest = digestValue({
@@ -1081,6 +1110,7 @@ function confirmationMemoryRecord(item, current, previousRecordId) {
     approvalBindingDigest: item.approvalBindingDigest,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
+    ownerDecision: item.ownerDecision,
     authority: authorityContent(binding, current),
   };
   return boundedRecord({
@@ -1133,6 +1163,7 @@ function externalResultMemoryRecord(
     receipt: item.receipt,
     failure: item.failure,
     rejectedAt: item.rejectedAt,
+    ownerDecision: item.ownerDecision,
     invalidation: item.invalidation,
     updatedAt: item.updatedAt,
     authority: authorityContent(binding, current),

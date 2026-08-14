@@ -79,6 +79,15 @@ function historyItem(status, suffix) {
     ...(status === "failed"
       ? { diagnosticCode: "GITHUB_LOGIN_UNAVAILABLE" }
       : {}),
+    ...(status === "rejected"
+      ? {
+          diagnosticCode: "GITHUB_MARKER_ABSENT",
+          ownerDecision: {
+            type: "seal_unknown_and_forbid_replay",
+            at: "2026-08-06T01:01:00.000Z",
+          },
+        }
+      : {}),
   };
 }
 
@@ -446,6 +455,10 @@ try {
   assert.equal(await page.evaluate(() => document.activeElement?.id), "confirmation-history-apply");
   await page.locator("#refresh-button").dispatchEvent("click");
   await page.getByText("History rejected", { exact: true }).waitFor();
+  assert.match(
+    await page.locator(".confirmation-history-item").first().textContent(),
+    /已承认结果未知并封存（禁止重放）/u,
+  );
   assert.equal(await stableIdentity(page, form, "#confirmation-history-filter"), true);
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.evaluate(() => document.activeElement?.id), "confirmation-history-apply");

@@ -627,6 +627,7 @@ function confirmationHistoryItemMarkup(item) {
     <p>${escapeHtml(item.summary || "")}</p>
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
     ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
+    ${item.ownerDecision?.type === "seal_unknown_and_forbid_replay" ? '<small class="confirmation-history-resolution">已承认结果未知并封存（禁止重放）</small>' : ""}
   </article>`;
 }
 
@@ -2650,6 +2651,15 @@ function normalizedConfirmationHistoryItems(value) {
     ) {
       return [];
     }
+    const ownerDecision = item.ownerDecision;
+    const validOwnerDecision =
+      item.status === "rejected" &&
+      ownerDecision &&
+      typeof ownerDecision === "object" &&
+      !Array.isArray(ownerDecision) &&
+      Object.keys(ownerDecision).length === 2 &&
+      ownerDecision.type === "seal_unknown_and_forbid_replay" &&
+      typeof ownerDecision.at === "string";
     return [{
       id: item.id.slice(0, 128),
       kind: item.kind,
@@ -2667,6 +2677,14 @@ function normalizedConfirmationHistoryItems(value) {
       ...(typeof item.diagnosticCode === "string" &&
           /^[A-Z][A-Z0-9_]{2,63}$/.test(item.diagnosticCode)
         ? { diagnosticCode: item.diagnosticCode }
+        : {}),
+      ...(validOwnerDecision
+        ? {
+            ownerDecision: {
+              type: ownerDecision.type,
+              at: ownerDecision.at,
+            },
+          }
         : {}),
     }];
   });

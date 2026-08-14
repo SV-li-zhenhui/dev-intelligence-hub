@@ -286,7 +286,10 @@ test("lost H1-bound comment response is recovered at H2 without replay", async (
   assert.equal(unknown.status, "failed");
   assert.equal(unknown.failure.outcome, "unknown");
   assert.equal(unknown.retryable, false);
-  assert.equal((await firstQueue.next()).item, null);
+  const resolution = await firstQueue.next();
+  assert.equal(resolution.item.id, unknown.id);
+  assert.equal(resolution.item.resolutionRequired, true);
+  assert.equal(resolution.item.retryable, false);
   const checksBeforeRecovery = authorityChecks;
 
   const recoveredQueue = await readyQueue(store, executor);

@@ -363,6 +363,7 @@ function normalizeHistoryQuery(value) {
 }
 
 function projectHistoryItem(item) {
+  const ownerDecision = projectOwnerDecision(item);
   return {
     id: item.id,
     kind: item.kind,
@@ -377,6 +378,21 @@ function projectHistoryItem(item) {
     updatedAt: item.updatedAt,
     retryable: Boolean(item.failure?.retryable),
     ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
+    ...(ownerDecision === null ? {} : { ownerDecision }),
+  };
+}
+
+function projectOwnerDecision(item) {
+  if (
+    item.status !== "rejected" ||
+    item.execution?.outcome !== "unknown" ||
+    item.failure?.outcome !== "unknown"
+  ) {
+    return null;
+  }
+  return {
+    type: "seal_unknown_and_forbid_replay",
+    at: item.rejection.at,
   };
 }
 
@@ -487,6 +503,7 @@ function projectConfirmationMemoryItem(item) {
     receipt: item.receipt === null ? null : { id: item.receipt.id },
     failure: item.failure === null ? null : clone(item.failure),
     rejectedAt: item.rejection?.at ?? null,
+    ownerDecision: projectOwnerDecision(item),
     invalidation: item.invalidation === null
       ? null
       : { reason: item.invalidation.reason, at: item.invalidation.at },
@@ -1286,6 +1303,7 @@ export class ConfirmationQueue {
   }
 
   #projectItem(item) {
+    const ownerDecision = projectOwnerDecision(item);
     return clone({
       id: item.id,
       kind: item.kind,
@@ -1305,6 +1323,7 @@ export class ConfirmationQueue {
       ...(item.receipt ? { receipt: item.receipt } : {}),
       ...(item.failure ? { failure: item.failure } : {}),
       ...(item.rejection ? { rejection: item.rejection } : {}),
+      ...(ownerDecision === null ? {} : { ownerDecision }),
       ...(item.invalidation ? { invalidation: item.invalidation } : {}),
     });
   }

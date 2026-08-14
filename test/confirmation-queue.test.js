@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import {
+  normalizeConfirmationPlan,
+  normalizeConfirmationState,
+} from "../src/domain/confirmation-contract.js";
 import {
   createConfigurationActivationConfirmationPlan,
 } from "../src/domain/configuration-activation-confirmation.js";
@@ -1990,6 +1993,10 @@ test("startup recovery never turns an unknown action into a retryable absence", 
     },
   );
   assert.equal(sealed.status, "rejected");
+  assert.deepEqual(sealed.ownerDecision, {
+    type: "seal_unknown_and_forbid_replay",
+    at: sealed.rejection.at,
+  });
   assert.deepEqual(sealed.failure, failureBeforeSealing);
   assert.deepEqual(
     store.value.items.find(({ id }) => id === resolution.item.id).execution,
@@ -2001,9 +2008,20 @@ test("startup recovery never turns an unknown action into a retryable absence", 
   );
   assert.deepEqual(
     (await recovered.list({ limit: 10 })).items.map(
-      ({ status, diagnosticCode }) => ({ status, diagnosticCode }),
+      ({ status, diagnosticCode, ownerDecision }) => ({
+        status,
+        diagnosticCode,
+        ownerDecision,
+      }),
     ),
-    [{ status: "rejected", diagnosticCode: "GITHUB_MARKER_ABSENT" }],
+    [{
+      status: "rejected",
+      diagnosticCode: "GITHUB_MARKER_ABSENT",
+      ownerDecision: {
+        type: "seal_unknown_and_forbid_replay",
+        at: sealed.rejection.at,
+      },
+    }],
   );
   const sealedMemoryItem = (
     await recovered.readMemoryPage({
@@ -2018,12 +2036,17 @@ test("startup recovery never turns an unknown action into a retryable absence", 
       executionOutcome: sealedMemoryItem.execution.outcome,
       failure: sealedMemoryItem.failure,
       rejectedAt: sealedMemoryItem.rejectedAt,
+      ownerDecision: sealedMemoryItem.ownerDecision,
     },
     {
       status: "rejected",
       executionOutcome: "unknown",
       failure: failureBeforeSealing,
       rejectedAt: sealed.rejection.at,
+      ownerDecision: {
+        type: "seal_unknown_and_forbid_replay",
+        at: sealed.rejection.at,
+      },
     },
   );
   assert.equal((await recovered.next()).item, null);
@@ -2040,6 +2063,33 @@ test("startup recovery never turns an unknown action into a retryable absence", 
   assert.deepEqual(afterRestart.failure, failureBeforeSealing);
   assert.equal(postSealExecutor.reconcileCalls.length, 0);
   assert.equal(postSealExecutor.executeCalls.length, 0);
+
+  const invalidSealedUnknownStates = [
+    (durableItem) => {
+      durableItem.failure = null;
+    },
+    (durableItem) => {
+      durableItem.execution = null;
+    },
+    (durableItem) => {
+      durableItem.execution.outcome = "absent";
+    },
+    (durableItem) => {
+      durableItem.failure = {
+        ...durableItem.failure,
+        outcome: "absent",
+        retryable: true,
+      };
+    },
+  ];
+  for (const corrupt of invalidSealedUnknownStates) {
+    const corrupted = structuredClone(store.value);
+    corrupt(corrupted.items.find(({ id }) => id === resolution.item.id));
+    assert.throws(
+      () => normalizeConfirmationState(corrupted),
+      (error) => error.code === "CONFIRMATION_STATE_CORRUPTED",
+    );
+  }
 });
 
 test("startup recovery refreshes a stable diagnostic without relaxing unknown", async () => {

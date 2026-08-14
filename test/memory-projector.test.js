@@ -294,8 +294,35 @@ function completedConfirmationMemoryItem(
     receipt: { id: receiptId },
     failure: null,
     rejectedAt: null,
+    ownerDecision: null,
     invalidation: null,
   };
+}
+
+function sealedUnknownConfirmationMemoryItem(binding, options = {}) {
+  const item = completedConfirmationMemoryItem(binding, options);
+  item.status = "rejected";
+  item.statusDigest = digestValue({
+    confirmationId: item.confirmationId,
+    itemRevision: item.itemRevision,
+    status: item.status,
+    approvalBindingDigest: item.approvalBindingDigest,
+    updatedAt: item.updatedAt,
+  });
+  item.execution.outcome = "unknown";
+  item.receipt = null;
+  item.failure = {
+    code: "GITHUB_MARKER_ABSENT",
+    outcome: "unknown",
+    retryable: false,
+    at: item.updatedAt,
+  };
+  item.rejectedAt = item.updatedAt;
+  item.ownerDecision = {
+    type: "seal_unknown_and_forbid_replay",
+    at: item.updatedAt,
+  };
+  return item;
 }
 
 function proposalDecisionTimeline(item, suffix = "old") {
@@ -592,7 +619,7 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
     body: secretBody,
     receiptId: "opaque-old-receipt",
   });
-  const newConfirmation = completedConfirmationMemoryItem(newBinding, {
+  const newConfirmation = sealedUnknownConfirmationMemoryItem(newBinding, {
     type: "review",
     body: "new head review body",
     revision: 3,
@@ -745,6 +772,16 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   }).items.every(({ labels }) =>
     labels.authority === "raw" && labels.lifecycle === "current"
   ));
+  const currentConfirmationContent = JSON.parse(currentRecords[3].content);
+  const currentExternalResultContent = JSON.parse(currentRecords[4].content);
+  assert.deepEqual(
+    currentConfirmationContent.ownerDecision,
+    newConfirmation.ownerDecision,
+  );
+  assert.deepEqual(
+    currentExternalResultContent.ownerDecision,
+    newConfirmation.ownerDecision,
+  );
 
   const beforeRestartCount = values.get("unified-memory-records").records.length;
   const restarted = await createProjector().runCycle();
