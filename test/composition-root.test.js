@@ -3351,6 +3351,65 @@ test("Review and generic GitHub actions share one credential acquire port while 
   await disabledApplication.close();
 });
 
+test("configured GitHub credential factory permits a home-drive runtime root outside project protected roots", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("cross-volume path.relative behavior is Windows-specific");
+    return;
+  }
+
+  const projectRoot = "D:\\projects\\dashboard";
+  const homeDirectory = "C:\\Users\\owner";
+  const digest = "b".repeat(64);
+  const expectedRuntimeTemporaryRoot = path.join(
+    homeDirectory,
+    `.mydashboard-github-runtime-${digest}`,
+  );
+  const preparedRoots = [];
+  const ghSourceOptions = [];
+
+  const source = await createConfiguredGitHubCredentialSource(
+    {
+      githubActions: Object.freeze({
+        enabled: true,
+        credentialMode: "gh-login",
+        actorAccountId: "review-account",
+        ghCommand: "gh",
+      }),
+      projectRoot,
+      protectedRoots: Object.freeze([projectRoot]),
+    },
+    {
+      homeDirectory,
+      projectIdentity: ({ projectRoot: receivedProjectRoot }) => {
+        assert.equal(receivedProjectRoot, projectRoot);
+        return digest;
+      },
+      privateDirectoryManager: {
+        async prepare(options) {
+          preparedRoots.push(options.directory);
+          await options.validateLocation();
+          return Object.freeze({
+            path: options.directory,
+            device: "1",
+            inode: "2",
+          });
+        },
+      },
+      async createGhLoginCredentialSource(options) {
+        ghSourceOptions.push(options);
+        return Object.freeze({ async acquire() {} });
+      },
+    },
+  );
+
+  assert.equal(typeof source.acquire, "function");
+  assert.deepEqual(preparedRoots, [expectedRuntimeTemporaryRoot]);
+  assert.equal(
+    ghSourceOptions[0].runtimeTemporaryRoot,
+    expectedRuntimeTemporaryRoot,
+  );
+});
+
 test("configured GitHub credential factory keeps token-env directory-free and prepares one project-private gh-login root", async (t) => {
   const projectDirectory = path.join(path.parse(process.cwd()).root, "projects", "dashboard");
   const homeDirectory = path.join(path.parse(process.cwd()).root, "users", "owner");

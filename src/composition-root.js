@@ -213,7 +213,8 @@ function pathsOverlap(left, right) {
   const rightToLeft = path.relative(canonicalRight, canonicalLeft);
   const contains = (relative) =>
     relative === "" ||
-    (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+    (!path.isAbsolute(relative) &&
+      !relative.startsWith(`..${path.sep}`) && relative !== "..");
   return contains(leftToRight) || contains(rightToLeft);
 }
 
