@@ -12,7 +12,7 @@ Command:
 node --test --test-reporter=tap --test-name-pattern "permits a home-drive runtime root outside project protected roots" test/composition-root.test.js
 ```
 
-Result: failed as expected before the production correction: 0 pass, 1 fail, 0 skipped. The regression exercised `createConfiguredGitHubCredentialSource` with `D:\projects\dashboard` as both project and protected root and `C:\Users\owner` as the injected home directory. It failed with `GitHub runtime temporary root overlaps a protected root` from `assertGitHubRuntimeTemporaryRoot`.
+Result: failed as expected before the production correction: 0 pass, 1 fail, 0 skipped. The regression exercised `createConfiguredGitHubCredentialSource` with `D:\projects\dashboard` as both project and protected root and `C:\Users\<user>` as the injected home directory. It failed with `GitHub runtime temporary root overlaps a protected root` from `assertGitHubRuntimeTemporaryRoot`.
 
 ## Implementation
 

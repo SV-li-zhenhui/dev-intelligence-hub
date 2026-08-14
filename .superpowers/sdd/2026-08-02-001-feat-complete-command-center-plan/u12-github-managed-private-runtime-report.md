@@ -8,7 +8,7 @@ DONE
 
 The failed managed startup logged `Private directory trust is unavailable` at
 the parent inspection used by `createConfiguredGitHubCredentialSource`.
-Read-only ACL inspection established that `C:\Users\SVision` has an additional
+Read-only ACL inspection established that `C:\Users\<user>` has an additional
 SID with inheritable write rights, while the manager-authenticated project
 runtime directory is protected and grants full control only to the current
 user, SYSTEM, and Administrators. No ACL was changed.
