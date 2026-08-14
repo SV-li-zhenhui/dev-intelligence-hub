@@ -1264,7 +1264,16 @@ export class ConfirmationQueue {
           isVisible(item),
       )
       .sort(byCreation);
-    const actionable = [...pending, ...retryable];
+    const unresolved = this.state.items
+      .filter(
+        (item) =>
+          item.status === "failed" &&
+          item.failure?.outcome === "unknown" &&
+          !this.#isProducerVetoed(item) &&
+          isVisible(item),
+      )
+      .sort(byCreation);
+    const actionable = [...pending, ...retryable, ...unresolved];
     return {
       queueRevision: this.state.revision,
       pendingCount: actionable.length,
@@ -1286,6 +1295,9 @@ export class ConfirmationQueue {
       displayedPayloadDigest: item.displayedPayloadDigest,
       approvalBindingDigest: item.approvalBindingDigest,
       retryable: Boolean(item.failure?.retryable),
+      ...(item.failure?.outcome === "unknown"
+        ? { resolutionRequired: true }
+        : {}),
       ...(item.receipt ? { receipt: item.receipt } : {}),
       ...(item.failure ? { failure: item.failure } : {}),
       ...(item.rejection ? { rejection: item.rejection } : {}),

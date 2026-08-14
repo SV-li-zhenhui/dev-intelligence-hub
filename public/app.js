@@ -591,9 +591,11 @@ function confirmationPendingMarkup() {
   const title = item.display?.title || item.title || "待确认事项";
   const summary = item.display?.summary || item.summary || "等待你逐项判断";
   const roleId = item.requestedBy?.roleId || item.producer?.roleId || "未标注岗位";
-  const source = confirmationQueueState.source === "internal_request"
-    ? "员工咨询"
-    : "动作授权";
+  const source = item.resolutionRequired === true
+    ? "结果未知待封存"
+    : confirmationQueueState.source === "internal_request"
+      ? "员工咨询"
+      : "动作授权";
   return `<article class="confirmation-pending-item">
     <div class="confirmation-history-row-heading">
       <strong>${escapeHtml(title)}</strong>
@@ -3535,7 +3537,55 @@ function showUnsupportedExternalConfirmation(entry, remaining) {
     .addEventListener("click", handleExternalConfirmation);
 }
 
+function showUnknownResultResolution(entry, remaining) {
+  const item = structuredClone(entry.item);
+  const payload = item.display?.payload || {};
+  const target = payload.target || item.target || {};
+  const action = payload.action || {};
+  const githubAction =
+    pullRequestConfirmationActionType(item.kind) === action.type;
+  const historicalBody = githubAction &&
+      ["pull_request_comment", "pull_request_review"].includes(action.type)
+    ? `<div class="review-preview">
+        <strong>当时拟发布的完整正文（不会再次发布）</strong>
+        <pre>${escapeHtml(action.body || "没有正文")}</pre>
+      </div>`
+    : "";
+  activeInternalAttention = null;
+  activeExternalConfirmation = item;
+  confirmationContent.innerHTML = `
+    <article class="confirmation external-confirmation">
+      <p class="eyebrow">UNCERTAIN EXTERNAL RESULT / ${remaining} LEFT</p>
+      <h2>${escapeHtml(item.display?.title || "外部动作结果未知")}</h2>
+      <p class="confirmation-reason">系统已完成只读核对，但现有证据仍不能证明该动作当时一定执行或一定未执行。为防止重复写入，系统不会自动重试。</p>
+      <dl class="detail-grid confirmation-grid">
+        <dt>请求岗位</dt><dd>${escapeHtml(item.requestedBy?.roleId || "未指定")}</dd>
+        <dt>目标</dt><dd>${escapeHtml(target.resourceId || "未知")}</dd>
+        <dt>绑定版本</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
+        <dt>诊断</dt><dd><code>${escapeHtml(item.failure?.code || "EXTERNAL_OUTCOME_UNKNOWN")}</code></dd>
+        ${githubAction ? pullRequestActionDetailRows(action) : `<dt>动作类型</dt><dd>${escapeHtml(action.type || "未知")}</dd>`}
+      </dl>
+      ${historicalBody}
+      <p class="confirmation-reason"><strong>原始提案摘要</strong></p>
+      <p>${escapeHtml(item.display?.summary || "未提供")}</p>
+      <p class="confirmation-reason"><strong>依据</strong></p>
+      ${listMarkup(item.display?.evidence)}
+      <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
+        <button data-external-operation="reject">承认结果未知并封存</button>
+        <button class="secondary wide" data-external-operation="later">稍后再看</button>
+      </div>
+      <p class="confirmation-note">封存只记录本机所有者决定并解除恢复阻断；不会调用 GitHub，也不会重新执行、评论、Review、更新、推送或合并。</p>
+    </article>`;
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    .addEventListener("click", handleExternalConfirmation);
+}
+
 function showExternalActionConfirmation(entry, remaining) {
+  if (entry.item?.resolutionRequired === true) {
+    showUnknownResultResolution(entry, remaining);
+    return;
+  }
   const configurationActionType = entry.item?.display?.payload?.action?.type;
   const configurationAction = Object.hasOwn(
     configurationActivationActions,
@@ -3857,7 +3907,13 @@ async function handleExternalConfirmation(event) {
         expectedItemRevision: item.itemRevision,
         displayedPayloadDigest: item.displayedPayloadDigest,
         approvalBindingDigest: item.approvalBindingDigest,
-        ...(operation === "reject" ? { reason: "用户在确认弹框中驳回" } : {}),
+        ...(operation === "reject"
+          ? {
+              reason: item.resolutionRequired === true
+                ? "用户确认结果仍未知并封存，禁止重试"
+                : "用户在确认弹框中驳回",
+            }
+          : {}),
       }),
       },
     );

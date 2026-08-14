@@ -249,7 +249,7 @@ test("a package application closes detail before refreshing and showing the unif
 test("unknown confirmation kinds have no approve or reject control", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("function showUnsupportedExternalConfirmation");
-  const end = app.indexOf("\nfunction showExternalActionConfirmation", start);
+  const end = app.indexOf("\nfunction showUnknownResultResolution", start);
   const renderer = app.slice(start, end);
 
   assert.ok(start >= 0 && end > start);
@@ -257,6 +257,21 @@ test("unknown confirmation kinds have no approve or reject control", async () =>
   assert.equal(renderer.includes('data-external-operation="approve"'), false);
   assert.equal(renderer.includes('data-external-operation="retry"'), false);
   assert.equal(renderer.includes('data-external-operation="reject"'), false);
+});
+
+test("unknown external results expose sealing but never approval or replay", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function showUnknownResultResolution");
+  const end = app.indexOf("\nfunction showExternalActionConfirmation", start);
+  const renderer = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(renderer, /不会自动重试/);
+  assert.match(renderer, /承认结果未知并封存/);
+  assert.match(renderer, /data-external-operation="reject"/);
+  assert.match(renderer, /data-external-operation="later"/);
+  assert.equal(renderer.includes('data-external-operation="approve"'), false);
+  assert.equal(renderer.includes('data-external-operation="retry"'), false);
 });
 
 test("browser mutations send binding metadata and never submit an action payload", async () => {

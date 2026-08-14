@@ -1863,7 +1863,7 @@ test("only durable executing or unknown Review and generic recovery acquires one
   }
 });
 
-test("a proven absent failure is retryable but an unknown outcome is not", async () => {
+test("a proven absent failure is retryable but an unknown outcome requires sealing", async () => {
   const absentExecutor = executor({
     async execute(envelope) {
       this.executeCalls.push(structuredClone(envelope));
@@ -1906,7 +1906,10 @@ test("a proven absent failure is retryable but an unknown outcome is not", async
   next = await unknownQueue.next();
   result = await unknownQueue.approve(next.item.id, approvalRequest(next));
   assert.equal(result.failure.retryable, false);
-  assert.equal((await unknownQueue.next()).item, null);
+  const resolution = await unknownQueue.next();
+  assert.equal(resolution.item.id, result.id);
+  assert.equal(resolution.item.resolutionRequired, true);
+  assert.equal(resolution.item.retryable, false);
   await assert.rejects(
     unknownQueue.retry(result.id, approvalRequest({ queueRevision: result.queueRevision, item: result }, "request-retry-0002")),
     (error) => error.code === "CONFIRMATION_NOT_RETRYABLE",
@@ -1966,6 +1969,20 @@ test("startup recovery never turns an unknown action into a retryable absence", 
     retryable: false,
     at: "2026-08-02T01:00:00.000Z",
   });
+  const resolution = await recovered.next();
+  assert.equal(resolution.pendingCount, 1);
+  assert.equal(resolution.item.id, next.item.id);
+  assert.equal(resolution.item.resolutionRequired, true);
+  assert.equal(resolution.item.retryable, false);
+
+  const sealed = await recovered.reject(
+    resolution.item.id,
+    {
+      ...approvalRequest(resolution, "request-seal-unknown-result"),
+      reason: "owner acknowledged the uncertain result without replay",
+    },
+  );
+  assert.equal(sealed.status, "rejected");
   assert.equal((await recovered.next()).item, null);
   assert.equal(recoveryExecutor.reconcileCalls.length, 1);
   assert.equal(recoveryExecutor.executeCalls.length, 0);

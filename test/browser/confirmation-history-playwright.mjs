@@ -17,6 +17,7 @@ let historyMutation = 0;
 let queueRevision = 1;
 let historyRequestCount = 0;
 let deferredRestoreRace = null;
+const confirmationSubmissions = [];
 
 function json(response, status, value) {
   response.writeHead(status, {
@@ -183,6 +184,17 @@ const confirmationFixtures = Object.freeze({
       expectedHeadOid: "1".repeat(40),
     }),
   }),
+  unknown: Object.freeze({
+    kind: "github.work-proposal-review",
+    title: "Fixture 结果未知 Review",
+    actionLabel: "不得显示发布按钮",
+    resolutionRequired: true,
+    action: Object.freeze({
+      type: "pull_request_review",
+      reviewEvent: "COMMENT",
+      body: "Fixture uncertain review",
+    }),
+  }),
 });
 
 function confirmationItem() {
@@ -195,6 +207,17 @@ function confirmationItem() {
     displayedPayloadDigest: "a".repeat(64),
     approvalBindingDigest: "b".repeat(64),
     retryable: false,
+    ...(fixture.resolutionRequired
+      ? {
+          resolutionRequired: true,
+          failure: {
+            code: "GITHUB_MARKER_ABSENT",
+            outcome: "unknown",
+            retryable: false,
+            at: "2026-08-06T01:02:00.000Z",
+          },
+        }
+      : {}),
     requestedBy: { roleId: "pr-reviewer", workItemId: "work-active" },
     display: {
       title: fixture.title,
@@ -317,10 +340,20 @@ function createFixtureServer() {
           url.pathname,
         )
       ) {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        confirmationSubmissions.push({
+          path: url.pathname,
+          body: JSON.parse(body),
+        });
         confirmationEnabled = false;
         historyMutation += 1;
         queueRevision += 1;
-        json(response, 200, { item: { status: "completed" } });
+        json(response, 200, {
+          item: {
+            status: url.pathname.endsWith("/reject") ? "rejected" : "completed",
+          },
+        });
         return;
       }
       if (url.pathname === "/api/employees") {
@@ -585,6 +618,30 @@ try {
   assert.equal(await stableIdentity(page, form, "#confirmation-history-filter"), true);
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
+
+  await page.evaluate(() =>
+    fetch("/fixture/enable-confirmation?fixture=unknown", { method: "POST" })
+  );
+  await page.locator("#refresh-button").click();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  assert.match(
+    await page.locator("#confirmation-dialog").textContent(),
+    /结果未知.*不会自动重试/s,
+  );
+  assert.equal(
+    await page.getByRole("button", { name: /发布|批准|重试/ }).count(),
+    0,
+  );
+  await page.getByRole("button", { name: "承认结果未知并封存" }).click();
+  await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  assert.equal(
+    confirmationSubmissions.at(-1).path,
+    "/api/confirmations/confirmation-unknown/reject",
+  );
+  assert.equal(
+    confirmationSubmissions.at(-1).body.reason,
+    "用户确认结果仍未知并封存，禁止重试",
+  );
   assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
 } finally {
   await browser.close();
