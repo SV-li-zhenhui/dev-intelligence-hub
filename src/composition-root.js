@@ -259,16 +259,6 @@ function githubCredentialSourceDependencies(value) {
     }
     result[key] = descriptor.value;
   }
-  if (
-    result.homeDirectory !== undefined &&
-    (
-      typeof result.homeDirectory !== "string" ||
-      !path.isAbsolute(result.homeDirectory) ||
-      result.homeDirectory.includes("\0")
-    )
-  ) {
-    throw new TypeError("GitHub credential source dependencies are invalid");
-  }
   for (const name of [
     "projectIdentity",
     "createTokenEnvCredentialSource",
