@@ -30,6 +30,11 @@ const DELIVERY_FAILURE_REASONS = Object.freeze({
   retry: "delivery_failed",
   exhausted: "delivery_attempts_exhausted",
 });
+const OWNER_REQUEST_PRIORITIES = Object.freeze({
+  normal: 1,
+  high: 2,
+  urgent: 3,
+});
 
 function requirePort(value, methods, name) {
   if (
@@ -216,6 +221,33 @@ function isAvailable(item, now) {
     typeof item.leaseUntil === "string" &&
     Date.parse(item.leaseUntil) <= Date.parse(now)
   );
+}
+
+function ownerRequestPriority(item) {
+  let event;
+  try {
+    event = currentWorkItemEvent(item);
+  } catch {
+    return 0;
+  }
+  if (
+    event?.source?.provider !== "local-owner" ||
+    !["owner_request.created", "pull_request.owner_requested"].includes(
+      event.eventType,
+    )
+  ) {
+    return 0;
+  }
+  return OWNER_REQUEST_PRIORITIES[event.payload?.priority] ?? 0;
+}
+
+function prioritizeWorkItems(items) {
+  return items
+    .map((item, index) => ({ item, index, priority: ownerRequestPriority(item) }))
+    .sort((left, right) =>
+      right.priority - left.priority || left.index - right.index
+    )
+    .map(({ item }) => item);
 }
 
 function graphBlockedItemIds(items) {
@@ -538,7 +570,7 @@ export class ProactiveWorkLoop {
     let claimAttempts = 0;
     let workAttempts = 0;
 
-    for (const item of items) {
+    for (const item of prioritizeWorkItems(items)) {
       throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;

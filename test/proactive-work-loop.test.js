@@ -766,6 +766,42 @@ test("workLimit processes the oldest available items first", async () => {
   assert.equal(ledger.items[2].status, "dispatch_pending");
 });
 
+test("explicit local owner requests take priority without reordering peers", async () => {
+  const time = controlledClock();
+  const oldest = workItem(1);
+  const high = workItem(2);
+  const urgent = workItem(3);
+  const laterHigh = workItem(4);
+  for (const [item, priority] of [
+    [high, "high"],
+    [urgent, "urgent"],
+    [laterHigh, "high"],
+  ]) {
+    item.event.eventType = "pull_request.owner_requested";
+    item.event.source = {
+      provider: "local-owner",
+      scopeId: `owner-request:${item.itemId}`,
+    };
+    item.event.payload.priority = priority;
+  }
+  const ledger = new FakeLedger({
+    source: [oldest, high, urgent, laterHigh],
+    time,
+  });
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  await loop.runCycle({ workLimit: 3 });
+
+  assert.deepEqual(
+    ledger.calls.claim.map(({ itemId }) => itemId),
+    [urgent.itemId, high.itemId, laterHigh.itemId],
+  );
+  assert.equal(ledger.items[0].status, "queued");
+});
+
 test("graph-blocked parents do not consume the claim budget before ready children", async () => {
   const time = controlledClock();
   const parent = workItem(1);
