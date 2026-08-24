@@ -5015,7 +5015,7 @@ test("production composition shares one Codex login broker across every configur
   let brokerFactoryCalls = 0;
   let brokerRuntimeFacts = null;
   let memoryRouter = null;
-  let availabilityCalls = 0;
+  let statusCalls = 0;
   let acquireCalls = 0;
   const closeOrder = [];
   let providersClosedBeforeBroker = null;
@@ -5029,9 +5029,10 @@ test("production composition shares one Codex login broker across every configur
       throw unavailable;
     },
     async checkAvailability() {
-      availabilityCalls += 1;
+      throw new Error("provider availability must use the read-only status probe");
     },
     async readStatus() {
+      statusCalls += 1;
       return Object.freeze({
         schemaVersion: 1,
         state: "available",
@@ -5116,7 +5117,7 @@ test("production composition shares one Codex login broker across every configur
     ),
     { code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" },
   );
-  assert.equal(availabilityCalls, 2);
+  assert.equal(statusCalls, 3);
   assert.equal(acquireCalls, 1);
 
   await application.close();

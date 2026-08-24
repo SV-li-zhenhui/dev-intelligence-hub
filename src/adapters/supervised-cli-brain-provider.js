@@ -532,14 +532,48 @@ function credentialBroker(value) {
     typeof value !== "object" ||
     utilTypes.isProxy(value) ||
     typeof value.acquire !== "function" ||
-    typeof value.checkAvailability !== "function"
+    typeof value.readStatus !== "function"
   ) {
     throw new TypeError("Codex login credential broker is invalid");
   }
   return Object.freeze({
     acquire: value.acquire.bind(value),
-    checkAvailability: value.checkAvailability.bind(value),
+    readStatus: value.readStatus.bind(value),
   });
+}
+
+function assertCodexLoginAvailable(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    value.schemaVersion !== 1 ||
+    typeof value.state !== "string" ||
+    typeof value.cliAvailable !== "boolean" ||
+    typeof value.fileLoginAvailable !== "boolean" ||
+    Reflect.ownKeys(value).length !== 4
+  ) {
+    throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+  }
+  if (
+    value.state === "available" &&
+    value.cliAvailable === true &&
+    value.fileLoginAvailable === true
+  ) {
+    return;
+  }
+  if (value.state === "broker_blocked") {
+    throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  }
+  if (
+    (value.state === "file_login_unavailable" ||
+      value.state === "unsafe_source") &&
+    value.cliAvailable === true &&
+    value.fileLoginAvailable === false
+  ) {
+    throw providerError("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE");
+  }
+  throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
 }
 
 function validateDependencies(dependencies) {
@@ -2317,8 +2351,9 @@ export class SupervisedCliBrainProvider {
     this.#activeGenerations += 1;
     try {
       if (this.#credentialMode === "codex-login") {
-        await deadline.run(({ signal: operationSignal }) =>
-          this.#credentialBroker.checkAvailability({ signal: operationSignal }));
+        const status = await deadline.run(({ signal: operationSignal }) =>
+          this.#credentialBroker.readStatus({ signal: operationSignal }));
+        assertCodexLoginAvailable(status);
       } else {
         credential(this.#environment, this.kind);
         await deadline.run(({ signal: operationSignal }) =>

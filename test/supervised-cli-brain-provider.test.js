@@ -368,10 +368,16 @@ function recordingCodexLoginBroker(events, options = {}) {
         },
       });
     },
-    async checkAvailability({ signal }) {
+    async readStatus({ signal }) {
       assert.equal(signal instanceof AbortSignal, true);
-      events.push("checkAvailability");
+      events.push("readStatus");
       if (options.availabilityError) throw options.availabilityError;
+      return options.availabilityStatus ?? Object.freeze({
+        schemaVersion: 1,
+        state: "available",
+        cliAvailable: true,
+        fileLoginAvailable: true,
+      });
     },
   });
 }
@@ -635,7 +641,7 @@ test("credential mode combinations fail at construction without touching a broke
   );
 });
 
-test("availability checks credentials or the login broker without invoking a model", async (t) => {
+test("availability checks credentials or the login broker status without invoking a model", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-availability-");
   const apiLocator = recordingLocator(testDescriptor("codex-cli"));
   const apiRunner = recordingRunner(async () => {
@@ -672,9 +678,50 @@ test("availability checks credentials or the login broker without invoking a mod
   });
   const loginController = new AbortController();
   await loginProvider.checkAvailability({ signal: loginController.signal });
-  assert.deepEqual(loginEvents, ["checkAvailability"]);
+  assert.deepEqual(loginEvents, ["readStatus"]);
   assert.equal(loginLocator.calls.length, 0);
   assert.equal(loginRunner.calls.length, 0);
+});
+
+test("login availability maps broker status without publishing credential state", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-status-");
+  const cases = [
+    [
+      "file_login_unavailable",
+      true,
+      false,
+      "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+    ],
+    ["unsafe_source", true, false, "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE"],
+    ["cli_unavailable", false, false, "STRUCTURED_PROVIDER_UNAVAILABLE"],
+    ["broker_blocked", true, false, "STRUCTURED_PROVIDER_CLEANUP_FAILED"],
+  ];
+  for (const [state, cliAvailable, fileLoginAvailable, expectedCode] of cases) {
+    await t.test(state, async (child) => {
+      const events = [];
+      const provider = createTestSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        credentialMode: "codex-login",
+      }, {
+        processRunner: recordingRunner(async () => successfulProcess()),
+        commandLocator: recordingLocator(testDescriptor("codex-cli")),
+        environment: {},
+        temporaryRoot: path.join(parent, child.name),
+        codexLoginCredentialBroker: recordingCodexLoginBroker(events, {
+          availabilityStatus: Object.freeze({
+            schemaVersion: 1,
+            state,
+            cliAvailable,
+            fileLoginAvailable,
+          }),
+        }),
+      });
+
+      await assert.rejects(provider.checkAvailability(), { code: expectedCode });
+      assert.deepEqual(events, ["readStatus"]);
+      await provider.close();
+    });
+  }
 });
 
 test("availability fails before locator when the selected credential is unavailable", async (t) => {
