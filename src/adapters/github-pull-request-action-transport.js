@@ -754,6 +754,13 @@ class GitHubPullRequestActionTransport {
     ) {
       throw transportError("GITHUB_TARGET_STALE", "absent");
     }
+    if (
+      input.actionType === "review" &&
+      input.action.reviewEvent !== "COMMENT" &&
+      facts.authorAccountId.toLowerCase() === input.actorAccountId.toLowerCase()
+    ) {
+      throw transportError("GITHUB_SELF_REVIEW_UNSUPPORTED", "absent");
+    }
     if (input.actionType === "comment") {
       await this.#postReview(input, environment, operation);
     } else if (input.actionType === "review") {
@@ -811,6 +818,7 @@ class GitHubPullRequestActionTransport {
         input.pullRequestNumber,
       );
       const state = record?.state;
+      const authorAccountId = githubLogin(record?.user?.login);
       if (
         number !== input.pullRequestNumber ||
         typeof url !== "string" ||
@@ -877,6 +885,7 @@ class GitHubPullRequestActionTransport {
       }
       return Object.freeze({
         state: normalizedState,
+        authorAccountId,
         gitTarget,
         mergedAt,
         mergeCommitOid,

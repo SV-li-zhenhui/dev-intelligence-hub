@@ -68,6 +68,7 @@ function pullRequestRecord(input, overrides = {}) {
   const merged = overrides.state === "merged";
   return {
     number: input.pullRequestNumber,
+    user: { login: overrides.authorAccountId ?? "contributor" },
     html_url: `https://github.com/${input.repository}/pull/${input.pullRequestNumber}`,
     state: merged ? "closed" : (overrides.state ?? "open"),
     merged_at: merged ? (overrides.mergedAt ?? CREATED_AT) : null,
@@ -499,6 +500,55 @@ test("posts comments and all explicit reviews as exact Head-bound reviews with b
     );
     assertSafeGhCalls(runner.calls);
   }
+});
+
+test("rejects self approval and change requests before mutation while allowing COMMENT", async () => {
+  const binding = pullRequestExternalActionBinding();
+  for (const verdict of ["approve", "request_changes"]) {
+    const input = transportInput("review", binding, {
+      type: "review",
+      verdict,
+      body: "Self review must not be submitted.",
+    });
+    const runner = new FakeRunner([
+      actorRecord(input),
+      pullRequestRecord(input, { authorAccountId: input.actorAccountId }),
+    ]);
+
+    await assert.rejects(
+      actionTransport(runner).perform(input),
+      assertTransportError("GITHUB_SELF_REVIEW_UNSUPPORTED", "absent"),
+    );
+    assert.equal(runner.calls.length, 2);
+    assert.equal(
+      runner.calls.some((call) => call.args.includes("POST")),
+      false,
+    );
+  }
+
+  const commentInput = transportInput("review", binding, {
+    type: "review",
+    verdict: "comment",
+    body: "A non-blocking self review comment is allowed.",
+  });
+  const body = `${commentInput.action.body}\n\n${commentInput.marker}`;
+  const runner = new FakeRunner([
+    actorRecord(commentInput),
+    pullRequestRecord(commentInput, {
+      authorAccountId: commentInput.actorAccountId,
+    }),
+    markerRecord(commentInput, {
+      kind: "review",
+      id: 503,
+      body,
+      state: REVIEW_STATE.COMMENT,
+      commitId: commentInput.action.inputBinding.gitTarget.headRefOid,
+    }),
+  ]);
+
+  assert.deepEqual(await actionTransport(runner).perform(commentInput), {
+    accepted: true,
+  });
 });
 
 test("binds a comment to confirmed H1 when Head changes after the final preflight", async () => {

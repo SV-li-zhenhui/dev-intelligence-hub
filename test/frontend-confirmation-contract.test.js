@@ -299,6 +299,21 @@ test("browser mutations send binding metadata and never submit an action payload
   assert.equal(handler.includes("body: action"), false);
 });
 
+test("GitHub confirmation results are reported before another dialog can replace them", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function externalConfirmationOutcomeMessage");
+  const end = app.indexOf("\nasync function handleReviewDraftDecision", start);
+  const handler = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(handler, /GitHub 已确认发布成功/);
+  assert.match(handler, /已确认没有产生外部写入/);
+  assert.match(handler, /新提案将改为 COMMENT Review/);
+  assert.match(handler, /未能确认发布结果，已禁止自动重试/);
+  assert.match(handler, /if \(outcomeMessage\)/);
+  assert.match(handler, /else \{\s*queueMicrotask\(showNextConfirmation\)/s);
+});
+
 test("later closes the popup without entering the mutation branch", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("async function handleExternalConfirmation");

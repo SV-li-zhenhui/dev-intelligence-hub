@@ -204,6 +204,16 @@ const confirmationFixtures = Object.freeze({
       body: "Fixture uncertain review",
     }),
   }),
+  failed: Object.freeze({
+    kind: "github.work-proposal-review",
+    title: "Fixture failed Review",
+    actionLabel: "Publish failing fixture",
+    action: Object.freeze({
+      type: "pull_request_review",
+      reviewEvent: "COMMENT",
+      body: "Fixture failed review",
+    }),
+  }),
 });
 
 function confirmationItem() {
@@ -359,9 +369,20 @@ function createFixtureServer() {
         historyMutation += 1;
         queueRevision += 1;
         json(response, 200, {
-          item: {
-            status: url.pathname.endsWith("/reject") ? "rejected" : "completed",
-          },
+          item: confirmationFixtureName === "failed"
+            ? {
+                status: "failed",
+                failure: {
+                  code: "GITHUB_SELF_REVIEW_UNSUPPORTED",
+                  outcome: "absent",
+                  retryable: true,
+                },
+              }
+            : {
+                status: url.pathname.endsWith("/reject")
+                  ? "rejected"
+                  : "completed",
+              },
         });
         return;
       }
@@ -633,6 +654,11 @@ try {
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
 
   await page.getByRole("button", { name: "Approve fixture" }).click();
+  assert.equal(
+    confirmationSubmissions.at(-1).path,
+    "/api/confirmations/confirmation-active/approve",
+  );
+  await page.getByText("GitHub 已确认发布成功。", { exact: true }).waitFor();
   await page
     .locator(".confirmation-history-item strong")
     .filter({ hasText: "History mutation 1" })
@@ -641,6 +667,18 @@ try {
   assert.equal(await stableIdentity(page, form, "#confirmation-history-filter"), true);
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
+
+  await page.evaluate(() =>
+    fetch("/fixture/enable-confirmation?fixture=failed", { method: "POST" })
+  );
+  await page.locator("#refresh-button").click();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  await page.getByRole("button", { name: "Publish failing fixture" }).click();
+  await page.getByText(
+    "GitHub 不允许 PR 作者批准或请求修改自己的 PR，本次确认未产生外部写入；新提案将改为 COMMENT Review。",
+    { exact: true },
+  ).waitFor();
+  assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
 
   await page.evaluate(() =>
     fetch("/fixture/enable-confirmation?fixture=unknown", { method: "POST" })

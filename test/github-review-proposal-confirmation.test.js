@@ -134,6 +134,31 @@ test("a trusted GitHub proposal becomes the exact user-visible action", () => {
   assert.equal("approvalBindingDigest" in plan, false);
 });
 
+test("self-authored blocking verdicts become explicit COMMENT reviews", () => {
+  for (const verdict of ["approve", "request_changes"]) {
+    const plan = createGitHubReviewProposalConfirmationPlan(
+      proposal({ payload: { verdict } }),
+      {
+        actorAccountId: "review-account",
+        selfAuthored: true,
+      },
+    );
+
+    assert.equal(plan.action.reviewEvent, "COMMENT");
+    assert.equal(plan.display.payload.action.reviewEvent, "COMMENT");
+    assert.equal(plan.display.actionLabel, "确认并以 COMMENT 发布到 GitHub");
+    assert.match(plan.display.evidence.at(-1), /PR 作者.*COMMENT/u);
+  }
+
+  const alreadyComment = createGitHubReviewProposalConfirmationPlan(
+    proposal({ payload: { verdict: "comment" } }),
+    { actorAccountId: "review-account", selfAuthored: true },
+  );
+  assert.equal(alreadyComment.action.reviewEvent, "COMMENT");
+  assert.equal(alreadyComment.display.actionLabel, "确认并发布到 GitHub");
+  assert.equal(alreadyComment.display.evidence.length, 1);
+});
+
 test("review confirmation accepts exact proposal authority and rejects foreign targets", () => {
   const dispatchIntentId = `work-dispatch-intent-${"d".repeat(64)}`;
   const authorized = proposal({

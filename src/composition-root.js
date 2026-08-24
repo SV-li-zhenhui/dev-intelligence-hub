@@ -1923,6 +1923,10 @@ export async function createApplication({
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
           inputAuthorityVerifier,
+          pullRequestContextReader: Object.freeze({
+            readCurrent: (binding) =>
+              workLedgerRuntime.readPullRequestExecutionContext(binding),
+          }),
           actorAccountId: config.githubActions.actorAccountId,
           leaseDurationMs: coordinationConfig.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,

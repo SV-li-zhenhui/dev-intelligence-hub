@@ -114,8 +114,11 @@ function confirmationId(proposal) {
 
 export function createGitHubReviewProposalConfirmationPlan(
   value,
-  { actorAccountId, legacyRecovery = false } = {},
+  { actorAccountId, legacyRecovery = false, selfAuthored = false } = {},
 ) {
+  if (typeof selfAuthored !== "boolean") {
+    throw invalid("selfAuthored 无效");
+  }
   const proposal = normalizedStoredProposal(value);
   if (proposal.kind !== "github_review_proposal") {
     throw invalid("工作提案类型无效");
@@ -201,11 +204,20 @@ export function createGitHubReviewProposalConfirmationPlan(
   ) {
     throw invalid("binding.inputBinding 与 Review 目标不匹配");
   }
-  const reviewEvent = REVIEW_EVENTS[payload.verdict];
-  if (!reviewEvent) throw invalid("payload.verdict 无效");
+  const proposedReviewEvent = REVIEW_EVENTS[payload.verdict];
+  if (!proposedReviewEvent) throw invalid("payload.verdict 无效");
+  const downgradedSelfReview =
+    selfAuthored && proposedReviewEvent !== "COMMENT";
+  const reviewEvent = downgradedSelfReview ? "COMMENT" : proposedReviewEvent;
   const body = text(payload.body, "payload.body", 16 * 1_024);
   const summary = text(payload.summary, "payload.summary", 2_048);
   const reasons = evidence(payload.evidence);
+  const displayEvidence = downgradedSelfReview
+    ? [
+        ...reasons.slice(0, 19),
+        "GitHub 不允许 PR 作者批准或请求修改自己的 PR；本次将以 COMMENT Review 发布。",
+      ]
+    : reasons;
   const accountId = text(
     actorAccountId,
     "actorAccountId",
@@ -244,8 +256,10 @@ export function createGitHubReviewProposalConfirmationPlan(
     display: {
       title: `${repository} #${number} · 岗位 Review 提案`,
       summary,
-      actionLabel: "确认并发布到 GitHub",
-      evidence: reasons,
+      actionLabel: downgradedSelfReview
+        ? "确认并以 COMMENT 发布到 GitHub"
+        : "确认并发布到 GitHub",
+      evidence: displayEvidence,
       payload: inputBinding.schemaVersion === 2
         ? { actor, target, action }
         : { actor, target, action, inputBinding },

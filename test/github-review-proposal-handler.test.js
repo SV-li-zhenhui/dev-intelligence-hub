@@ -140,10 +140,24 @@ function acceptingVerifier() {
   };
 }
 
+function acceptingContextReader(author = "contributor") {
+  return {
+    calls: [],
+    async readCurrent(value) {
+      this.calls.push(structuredClone(value));
+      return {
+        inputBinding: structuredClone(value),
+        author,
+      };
+    },
+  };
+}
+
 function handler(producer, overrides = {}) {
   return new GitHubReviewProposalHandler({
     confirmationProducer: producer,
     inputAuthorityVerifier: acceptingVerifier(),
+    pullRequestContextReader: acceptingContextReader(),
     actorAccountId: "review-account",
     clock: () => new Date("2026-08-02T03:00:00.000Z"),
     pollIntervalMs: 5_000,
@@ -170,6 +184,32 @@ test("a pending proposal is idempotently enqueued and waits on its exact confirm
     downstreamRef: producer.enqueueCalls[0].id,
     nextAttemptAt: "2026-08-02T03:00:05.000Z",
   });
+});
+
+test("a self-authored blocking proposal is queued as a COMMENT review", async () => {
+  const producer = new FakeConfirmationProducer();
+  await handler(producer, {
+    pullRequestContextReader: acceptingContextReader("REVIEW-ACCOUNT"),
+  }).handle(handlerInput());
+
+  assert.equal(producer.enqueueCalls[0].action.reviewEvent, "COMMENT");
+  assert.equal(
+    producer.enqueueCalls[0].display.actionLabel,
+    "确认并以 COMMENT 发布到 GitHub",
+  );
+});
+
+test("missing author context preserves the proposed verdict", async () => {
+  const producer = new FakeConfirmationProducer();
+  await handler(producer, {
+    pullRequestContextReader: acceptingContextReader(null),
+  }).handle(handlerInput());
+
+  assert.equal(producer.enqueueCalls[0].action.reviewEvent, "REQUEST_CHANGES");
+  assert.equal(
+    producer.enqueueCalls[0].display.actionLabel,
+    "确认并发布到 GitHub",
+  );
 });
 
 test("a bound proposal polls get without enqueuing another action", async () => {

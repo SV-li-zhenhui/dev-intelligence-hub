@@ -118,6 +118,7 @@ const PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS = new Set([
   "ignored_legacy_downgrade",
   "ignored_unproven_head",
 ]);
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
 function canRequeueAdvancedPullRequestRoot(root) {
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
@@ -425,6 +426,30 @@ export class WorkLedgerService {
         return cloneLedgerValue(
           verifyPullRequestExecutionAuthority(this.state, input),
         );
+      }),
+    );
+  }
+
+  async readPullRequestExecutionContext(input = {}) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        const inputBinding = verifyPullRequestExecutionAuthority(
+          this.state,
+          input,
+        );
+        const root = this.state.items.find(
+          (candidate) => candidate.itemId === inputBinding.rootItemId,
+        );
+        const author = root?.source?.current?.event?.payload?.author;
+        return cloneLedgerValue({
+          inputBinding,
+          author:
+            typeof author === "string" && GITHUB_LOGIN.test(author)
+              ? author
+              : null,
+        });
       }),
     );
   }

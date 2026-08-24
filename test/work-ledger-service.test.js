@@ -221,6 +221,7 @@ function prAssignment(
     previousHeadRefOid,
     changedFields = ["ciStatus"],
     ciStatus = "PENDING",
+    author,
     title = "PR 42",
     repository = "acme/repo",
     pullRequestNumber = 42,
@@ -243,6 +244,7 @@ function prAssignment(
       title,
       headRefOid,
       ciStatus,
+      ...(author === undefined ? {} : { author }),
       changedFields,
       ...gitFacts,
       ...(previousHeadRefOid === undefined ? {} : { previousHeadRefOid }),
@@ -539,6 +541,25 @@ test("intake atomically advances its cursor and preserves unresolved targets", a
   assert.equal(store.writes[0].name, STATE_KEY);
   assert.equal(store.writes[0].value.intakeCursor, 3);
   assert.equal(store.writes[0].value.items.length, 3);
+});
+
+test("PR execution context returns the current author with the verified binding", async () => {
+  const fixture = await createFixture({
+    records: [
+      prAssignment(1, {
+        author: "review-account",
+        gitFacts: prGitFacts(PR_HEAD_A),
+      }),
+    ],
+  });
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+  const inputBinding = prExecutionBinding(item);
+
+  assert.deepEqual(
+    await fixture.service.readPullRequestExecutionContext(inputBinding),
+    { inputBinding, author: "review-account" },
+  );
 });
 
 test("PR engineer intake keeps one durable task across events on the same Head", async () => {

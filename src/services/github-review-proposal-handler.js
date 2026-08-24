@@ -52,6 +52,7 @@ const FACTORY_KEYS = new Set([
   "runner",
   "confirmationProducer",
   "inputAuthorityVerifier",
+  "pullRequestContextReader",
   "actorAccountId",
   "clock",
   "pollIntervalMs",
@@ -278,6 +279,7 @@ export class GitHubReviewProposalHandler {
   #get;
   #invalidate;
   #verifyInputAuthority;
+  #readPullRequestContext;
   #actorAccountId;
   #clock;
   #pollIntervalMs;
@@ -285,6 +287,7 @@ export class GitHubReviewProposalHandler {
   constructor({
     confirmationProducer,
     inputAuthorityVerifier,
+    pullRequestContextReader,
     actorAccountId,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
@@ -302,6 +305,13 @@ export class GitHubReviewProposalHandler {
       ["verify"],
       "inputAuthorityVerifier",
     ).verify;
+    this.#readPullRequestContext = pullRequestContextReader === undefined
+      ? null
+      : requirePort(
+          pullRequestContextReader,
+          ["readCurrent"],
+          "pullRequestContextReader",
+        ).readCurrent;
     this.#actorAccountId = normalizeActor(actorAccountId);
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.#clock = clock;
@@ -314,13 +324,24 @@ export class GitHubReviewProposalHandler {
 
   async handle(value) {
     const input = normalizeHandlerInput(value);
-    const plan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
+    const initialPlan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
       actorAccountId: this.#actorAccountId,
       legacyRecovery: true,
     });
-    const expected = normalizeConfirmationPlan(plan);
     const inputBinding =
-      plan.action.inputBinding ?? plan.display.payload.inputBinding;
+      initialPlan.action.inputBinding ?? initialPlan.display.payload.inputBinding;
+    const authority = await this.#currentAuthority(inputBinding);
+    const selfAuthored =
+      authority?.author !== null &&
+      authority?.author.toLowerCase() === this.#actorAccountId.toLowerCase();
+    const plan = selfAuthored
+      ? createGitHubReviewProposalConfirmationPlan(input.proposal, {
+          actorAccountId: this.#actorAccountId,
+          legacyRecovery: true,
+          selfAuthored: true,
+        })
+      : initialPlan;
+    const expected = normalizeConfirmationPlan(plan);
     const legacyInputBinding =
       inputBinding !== null &&
       inputBinding !== undefined &&
@@ -341,7 +362,7 @@ export class GitHubReviewProposalHandler {
         }
       }
     }
-    if (!(await this.#hasCurrentAuthority(inputBinding))) {
+    if (authority === null) {
       if (item === null) {
         return {
           status: "stale",
@@ -364,17 +385,41 @@ export class GitHubReviewProposalHandler {
     return transitionFor(item, this.#clock, this.#pollIntervalMs);
   }
 
-  async #hasCurrentAuthority(inputBinding) {
-    if (inputBinding?.schemaVersion !== 2) return false;
+  async #currentAuthority(inputBinding) {
+    if (inputBinding?.schemaVersion !== 2) return null;
     let verified;
     try {
       verified = await this.#verifyInputAuthority(
         cloneWorkProposalValue(inputBinding),
       );
     } catch {
-      return false;
+      return null;
     }
-    return sameValue(verified, inputBinding);
+    if (!sameValue(verified, inputBinding)) return null;
+    if (this.#readPullRequestContext === null) return { author: null };
+    let context;
+    try {
+      context = await this.#readPullRequestContext(
+        cloneWorkProposalValue(inputBinding),
+      );
+    } catch {
+      return null;
+    }
+    if (
+      context === null ||
+      typeof context !== "object" ||
+      Array.isArray(context) ||
+      Object.getPrototypeOf(context) !== Object.prototype ||
+      Reflect.ownKeys(context).length !== 2 ||
+      !Object.hasOwn(context, "inputBinding") ||
+      !Object.hasOwn(context, "author") ||
+      !sameValue(context.inputBinding, inputBinding) ||
+      (context.author !== null &&
+        (typeof context.author !== "string" || !GITHUB_LOGIN.test(context.author)))
+    ) {
+      return null;
+    }
+    return { author: context.author };
   }
 
   async #invalidateChangedAuthorization(item, expected, proposal) {
@@ -441,6 +486,7 @@ export function createGitHubReviewProposalRunnerService(value = {}) {
   const handler = new GitHubReviewProposalHandler({
     confirmationProducer: options.confirmationProducer,
     inputAuthorityVerifier: options.inputAuthorityVerifier,
+    pullRequestContextReader: options.pullRequestContextReader,
     actorAccountId: options.actorAccountId,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,

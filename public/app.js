@@ -3905,6 +3905,38 @@ async function handleConfirmation(event) {
   }
 }
 
+function externalConfirmationOutcomeMessage(item, result, operation) {
+  if (
+    !["approve", "retry"].includes(operation) ||
+    typeof item?.kind !== "string" ||
+    !item.kind.startsWith("github.")
+  ) {
+    return null;
+  }
+  const completed = result?.item;
+  if (completed?.status === "completed") {
+    return "GitHub 已确认发布成功。";
+  }
+  if (completed?.status === "failed") {
+    if (completed.failure?.code === "GITHUB_SELF_REVIEW_UNSUPPORTED") {
+      return (
+        "GitHub 不允许 PR 作者批准或请求修改自己的 PR，" +
+        "本次确认未产生外部写入；新提案将改为 COMMENT Review。"
+      );
+    }
+    return completed.failure?.outcome === "unknown"
+      ? "GitHub 未能确认发布结果，已禁止自动重试；请在确认历史中查看诊断。"
+      : "GitHub 发布失败，已确认没有产生外部写入；可在确认历史中安全重试。";
+  }
+  if (completed?.status === "stale") {
+    return "GitHub 目标已经变化，本次未发布；请查看最新提案。";
+  }
+  if (["pending", "executing"].includes(completed?.status)) {
+    return "GitHub 发布请求已接受，正在执行；请稍后在确认历史中查看结果。";
+  }
+  return null;
+}
+
 async function handleExternalConfirmation(event) {
   const button = event.target.closest("[data-external-operation]");
   if (!button) return;
@@ -3982,7 +4014,17 @@ async function handleExternalConfirmation(event) {
     if (!closeExternalConfirmation(submissionOwner)) return;
     await load({ showConfirmation: false });
     if (configurationCompleted) await loadConfiguration();
-    queueMicrotask(showNextConfirmation);
+    const outcomeMessage = externalConfirmationOutcomeMessage(
+      item,
+      confirmationResult,
+      operation,
+    );
+    if (outcomeMessage) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = outcomeMessage;
+    } else {
+      queueMicrotask(showNextConfirmation);
+    }
   } catch (error) {
     if (!restoreExternalConfirmation(submissionOwner)) return;
     statusBanner.hidden = false;
