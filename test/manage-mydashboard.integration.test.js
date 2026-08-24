@@ -1916,6 +1916,24 @@ test(
 );
 
 test(
+  "unexpected-exit recovery treats the current manager PID as a dead managed process",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const terminationMarker = path.join(fixture.root, "unexpected-stop.marker");
+    await rewriteFixtureManager(
+      fixture.root,
+      /([$]process = Get-Process -Id )\(\[int\][$]State[.]processId\)( -ErrorAction SilentlyContinue)/u,
+      "$1$PID$2",
+    );
+    await installRecoveryTerminationTrap(fixture.root, terminationMarker);
+
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+    assert.equal(await fileExists(terminationMarker), false);
+  },
+);
+
+test(
   "unexpected-exit recovery authority is zero-termination even if lookup reports a live process",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {

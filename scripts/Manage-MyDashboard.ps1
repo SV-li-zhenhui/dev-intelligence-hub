@@ -646,6 +646,9 @@ function Get-ManagedProcess {
     if ($null -eq $process) {
         return $null
     }
+    if ([int]$process.Id -eq [int]$PID) {
+        return $null
+    }
     if (
         [string]::IsNullOrWhiteSpace($process.Path) -or
         -not $pathComparer.Equals(
