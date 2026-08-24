@@ -126,6 +126,7 @@ test("confirmation center layout stays bounded on tablet and mobile widths", asy
 
 test("external confirmation renders the exact authorization context", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const styles = await readFile(path.join(root, "public", "styles.css"), "utf8");
 
   for (const visibleLabel of [
     "执行账号",
@@ -141,6 +142,14 @@ test("external confirmation renders the exact authorization context", async () =
   assert.match(
     app,
     /external\\u0000\$\{confirmationQueueState\.item\.id\}\\u0000\$\{confirmationQueueState\.item\.approvalBindingDigest\}/,
+  );
+  assert.match(app, /githubTargetUrl/);
+  assert.match(app, /target="_blank"/);
+  assert.match(app, /rel="noreferrer"/);
+  assert.match(app, /在 GitHub 中打开/);
+  assert.match(
+    styles,
+    /\.confirmation-target-link:focus-visible \{[\s\S]*outline: 2px solid var\(--green\);[\s\S]*outline-offset: 2px;/,
   );
 });
 

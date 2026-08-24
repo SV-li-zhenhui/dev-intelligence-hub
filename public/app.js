@@ -15,6 +15,7 @@ import {
   createConfigurationFormState,
 } from "./configuration-form-support.js";
 import { renderBrainProviderStatus } from "./brain-provider-status-view.js";
+import { githubTargetUrl } from "./github-target-link.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { createWorkflowView } from "./workflow-view.js";
@@ -3338,6 +3339,16 @@ function pullRequestActionBodyMarkup(action) {
   </div>`;
 }
 
+function pullRequestTargetMarkup(target) {
+  const resourceId = target.resourceId || "未知";
+  const url = githubTargetUrl({
+    resourceId,
+    resourceType: "pull_request",
+  });
+  if (url === null) return escapeHtml(resourceId);
+  return `<a class="confirmation-target-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(resourceId)} · 在 GitHub 中打开 ↗</a>`;
+}
+
 function showGitHubActionConfirmation(entry, remaining) {
   const item = structuredClone(entry.item);
   const payload = item.display?.payload || {};
@@ -3362,7 +3373,7 @@ function showGitHubActionConfirmation(entry, remaining) {
       <p class="confirmation-reason">${escapeHtml(item.display?.summary || "确认后将执行外部写入")}</p>
       <dl class="detail-grid confirmation-grid">
         <dt>执行账号</dt><dd>${escapeHtml(actor.accountId || "未指定")}</dd>
-        <dt>目标</dt><dd>${escapeHtml(target.resourceId || "未知")}</dd>
+        <dt>目标</dt><dd>${pullRequestTargetMarkup(target)}</dd>
         <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
         ${pullRequestActionDetailRows(action)}
       </dl>

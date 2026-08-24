@@ -234,7 +234,7 @@ function confirmationItem() {
       actionLabel: fixture.actionLabel,
       payload: {
         actor: { accountId: "fixture" },
-        target: { resourceId: "fixture/pr", version: "abcdef" },
+        target: { resourceId: "fixture/pr#42", version: "abcdef" },
         action: structuredClone(fixture.action),
       },
     },
@@ -523,6 +523,16 @@ try {
     await page.locator("#refresh-button").click();
     await page.locator("#confirmation-dialog[open]").waitFor();
     assert.match(await page.locator("#confirmation-dialog").textContent(), fixture[1]);
+    const targetLink = page.getByRole("link", {
+      name: "fixture/pr#42 · 在 GitHub 中打开 ↗",
+      exact: true,
+    });
+    assert.equal(
+      await targetLink.getAttribute("href"),
+      "https://github.com/fixture/pr/pull/42",
+    );
+    assert.equal(await targetLink.getAttribute("target"), "_blank");
+    assert.equal(await targetLink.getAttribute("rel"), "noreferrer");
     await page.getByRole("button", { name: fixture[2] }).waitFor();
     await page.getByRole("button", { name: "稍后再看" }).click();
     await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });

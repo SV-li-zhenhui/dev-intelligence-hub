@@ -3135,6 +3135,23 @@ dialog::backdrop {
   overflow-wrap: anywhere;
 }
 
+.confirmation-target-link {
+  color: var(--green);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.confirmation-target-link:hover,
+.confirmation-target-link:focus-visible {
+  text-decoration: underline;
+}
+
+.confirmation-target-link:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
 .confirmation-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
