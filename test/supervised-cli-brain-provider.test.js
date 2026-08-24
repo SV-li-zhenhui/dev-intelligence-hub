@@ -414,7 +414,7 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
   const runner = recordingRunner(async (invocation) => {
     invocationDirectory = invocation.cwd;
     assert.equal(invocation.executable, descriptor);
-    assert.deepEqual(invocation.args.slice(0, 23), [
+    assert.deepEqual(invocation.args.slice(0, 33), [
       "exec",
       "--ephemeral",
       "--ignore-user-config",
@@ -437,9 +437,19 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
       "multi_agent",
       "--disable",
       "hooks",
+      "--disable",
+      "plugins",
+      "--disable",
+      "remote_plugin",
+      "--disable",
+      "plugin_sharing",
+      "--disable",
+      "skill_search",
+      "--disable",
+      "goals",
       "--color",
     ]);
-    assert.equal(invocation.args[23], "never");
+    assert.equal(invocation.args[33], "never");
     assert.equal(argumentValue(invocation.args, "--model"), "bounded-model");
     assert.equal(argumentValue(invocation.args, "-C"), invocation.cwd);
     assert.equal(invocation.args.at(-1), "-");
