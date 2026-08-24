@@ -480,7 +480,12 @@ export class WorkCoordinationService {
     if (failures.length) {
       const error = failures.length === 1
         ? failures[0]
-        : new AggregateError(failures, "员工主动循环有多个阶段失败");
+        : new AggregateError(
+            failures,
+            `员工主动循环有多个阶段失败: ${
+              failures.map(({ stage }) => stage).join(", ")
+            }`,
+          );
       Object.defineProperty(error, "result", {
         configurable: false,
         enumerable: false,
