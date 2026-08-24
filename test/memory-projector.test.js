@@ -517,9 +517,24 @@ test("current work memory carries a bounded PR and CI observation", async () => 
   };
   const graphSource = graphProjectionSource();
   const journal = await localMemoryJournal();
+  let workItemAppendCalls = 0;
+  let projectionAppendCalls = 0;
   const projector = new MemoryProjector({
     memoryProducer: journal,
-    memoryLifecycleProducer: journal,
+    memoryLifecycleProducer: {
+      async appendWorkItems(value) {
+        workItemAppendCalls += 1;
+        return journal.appendWorkItems(value);
+      },
+      async appendProjectionRecords(value) {
+        projectionAppendCalls += 1;
+        return journal.appendProjectionRecords(value);
+      },
+      appendGraphEvents: (value) => journal.appendGraphEvents(value),
+      appendAuthorityProjection: (value) =>
+        journal.appendAuthorityProjection(value),
+      adoptGraphCheckpoint: (value) => journal.adoptGraphCheckpoint(value),
+    },
     memoryAuthorityReader: journal,
     memoryAuthoritySource: memoryAuthoritySource([item], [], graphSource),
     graphProjectionSource: graphSource,
@@ -527,6 +542,17 @@ test("current work memory carries a bounded PR and CI observation", async () => 
   });
 
   await projector.runCycle();
+  const callsAfterFirst = {
+    workItemAppendCalls,
+    projectionAppendCalls,
+  };
+  const repeated = await projector.runCycle();
+
+  assert.equal(repeated.added, 0);
+  assert.deepEqual(
+    { workItemAppendCalls, projectionAppendCalls },
+    callsAfterFirst,
+  );
 
   const match = journal.search({ eventType: "work.completed" }).items[0];
   const content = JSON.parse(
@@ -698,6 +724,10 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   assert.equal(first.authorityBound.added, 5);
   assert.equal(individualVerificationCalls, 0);
   assert.equal(verificationCalls.get(oldBinding.headRefOid), 1);
+  const verificationCallsAfterFirst = new Map(verificationCalls);
+  const repeated = await createProjector().runCycle();
+  assert.equal(repeated.added, 0);
+  assert.deepEqual(verificationCalls, verificationCallsAfterFirst);
   assert.equal(
     journal.getAuthorityProjectionState().confirmationHighWatermark,
     1,

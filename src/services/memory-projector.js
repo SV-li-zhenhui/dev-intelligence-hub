@@ -1637,6 +1637,52 @@ function normalizeLocalMemoryAuthorityState(value) {
   };
 }
 
+function memorySnapshotIsProjected(snapshot, localAuthority) {
+  const graph = snapshot.graph;
+  return (
+    graph.items.length === 0 &&
+    graph.cursor === graph.highWatermark &&
+    localAuthority.cursor === graph.cursor &&
+    localAuthority.checkpointDigest === graph.checkpointDigest &&
+    localAuthority.workLedgerRevision === snapshot.ledgerRevision &&
+    localAuthority.authorityStateDigest === graph.authorityStateDigest
+  );
+}
+
+function authorityProjectionObservationCounts(snapshot, confirmationSnapshot) {
+  let externalResults = 0;
+  for (const item of confirmationSnapshot.items) {
+    if (hasExternalResult(item)) externalResults += 1;
+  }
+  const itemById = new Map(snapshot.items.map((item) => [item.itemId, item]));
+  let decisions = 0;
+  let consultations = 0;
+  for (const entry of snapshot.timeline) {
+    const kind = timelineProjectionKind(entry);
+    const item = itemById.get(entry.itemId);
+    if (
+      kind === null ||
+      item === undefined ||
+      timelineBinding(entry, item) === undefined
+    ) {
+      continue;
+    }
+    if (kind === "work-decision") decisions += 1;
+    else consultations += 1;
+  }
+  return {
+    observed:
+      confirmationSnapshot.items.length +
+      externalResults +
+      decisions +
+      consultations,
+    confirmations: confirmationSnapshot.items.length,
+    externalResults,
+    decisions,
+    consultations,
+  };
+}
+
 function normalizeGraphAppendResult(value, expectedRecords) {
   const message = "task graph memory append receipt is invalid";
   const result = plainData(value);
@@ -2063,6 +2109,10 @@ export class MemoryProjector {
     const localAuthority = normalizeLocalMemoryAuthorityState(
       await runProjectionPort(signal, () => this.#getAuthorityState()),
     );
+    const workSnapshotAlreadyProjected = memorySnapshotIsProjected(
+      initial,
+      localAuthority,
+    );
     if (localAuthority.cursor === 0 && graph.cursor > 0) {
       await runProjectionPort(signal, () =>
         this.#adoptGraphCheckpoint({
@@ -2102,21 +2152,26 @@ export class MemoryProjector {
       graphCursor = acknowledgement.cursor;
       graphHighWatermark = acknowledgement.highWatermark;
     }
-    const finalSnapshot = normalizeMemoryAuthoritySnapshot(
-      await runProjectionPort(signal, () =>
-        this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })
-      ),
-    );
+    const finalSnapshot = workSnapshotAlreadyProjected
+      ? initial
+      : normalizeMemoryAuthoritySnapshot(
+          await runProjectionPort(signal, () =>
+            this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })
+          ),
+        );
     const { items, timeline } = finalSnapshot;
     const legacy = await runProjectionPort(signal, () =>
       this.#store.read("pr-employee-memory", [])
     );
     const state = { items };
-    const workRecords = items.map((item) => workItemRecord(item, state))
-      .filter(Boolean);
+    const workRecords = workSnapshotAlreadyProjected
+      ? []
+      : items.map((item) => workItemRecord(item, state)).filter(Boolean);
     const itemById = new Map(items.map((item) => [item.itemId, item]));
     const historyRecords = [
-      ...timeline.map((entry) => timelineRecord(entry, itemById)),
+      ...(workSnapshotAlreadyProjected
+        ? []
+        : timeline.map((entry) => timelineRecord(entry, itemById))),
       ...(Array.isArray(legacy) ? legacy.map(legacyRecord) : []),
     ].filter(Boolean);
     let added = 0;
@@ -2128,15 +2183,17 @@ export class MemoryProjector {
       );
       added += Number(result?.added) || 0;
     }
-    const workResult = await runProjectionPort(signal, () =>
-      this.#appendWorkItems({
-        records: workRecords,
-        ledgerRevision: finalSnapshot.ledgerRevision,
-        authorityStateDigest: finalSnapshot.graph.authorityStateDigest,
-        graphCursor: finalSnapshot.graph.cursor,
-        graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
-      })
-    );
+    const workResult = workSnapshotAlreadyProjected
+      ? { added: 0 }
+      : await runProjectionPort(signal, () =>
+          this.#appendWorkItems({
+            records: workRecords,
+            ledgerRevision: finalSnapshot.ledgerRevision,
+            authorityStateDigest: finalSnapshot.graph.authorityStateDigest,
+            graphCursor: finalSnapshot.graph.cursor,
+            graphCheckpointDigest: finalSnapshot.graph.checkpointDigest,
+          })
+        );
     added += Number(workResult?.added) || 0;
     const confirmationSnapshot = confirmationPreflight === null
       ? null
@@ -2251,6 +2308,24 @@ export class MemoryProjector {
           confirmationHighWatermark:
             journalState.confirmationHighWatermark,
         };
+    const requiresJournalAdoption = legacyState !== null &&
+      (legacyState.revision > 0 || legacyState.entries.length > 0);
+    if (
+      !requiresJournalAdoption &&
+      stored.workLedgerRevision === snapshot.ledgerRevision &&
+      stored.authorityStateDigest === snapshot.graph.authorityStateDigest &&
+      stored.confirmationHighWatermark === confirmationSnapshot.highWatermark
+    ) {
+      return {
+        ...authorityProjectionObservationCounts(
+          snapshot,
+          confirmationSnapshot,
+        ),
+        added: 0,
+        lifecycleInvalidations: 0,
+        highWatermark: confirmationSnapshot.highWatermark,
+      };
+    }
     let verifyInputAuthority;
     if (this.#verifyInputAuthorityBatch === null) {
       verifyInputAuthority = (...args) =>
@@ -2280,8 +2355,7 @@ export class MemoryProjector {
       snapshot,
       confirmationSnapshot,
       verifyInputAuthority,
-      requiresJournalAdoption: legacyState !== null &&
-        (legacyState.revision > 0 || legacyState.entries.length > 0),
+      requiresJournalAdoption,
       strictBindings: false,
     });
     throwIfProjectionAborted(signal);
