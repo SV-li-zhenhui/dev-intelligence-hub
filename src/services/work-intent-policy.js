@@ -29,6 +29,9 @@ const ACTIVE_PR_EVENTS = new Set([
   "pull_request.updated",
   "pull_request.classified",
   "pull_request.status",
+]);
+const REVIEWABLE_PR_EVENTS = new Set([
+  ...ACTIVE_PR_EVENTS,
   "pull_request.owner_requested",
 ]);
 const CODE_OPERATIONS = Object.freeze(["inspect", "modify", "verify"]);
@@ -452,7 +455,7 @@ export function createWorkIntentPolicy({
     }
     if (intent.type === "propose_github_review") {
       if (!trustedGithubRoles.has(context.roleId)) denied();
-      if (!ACTIVE_PR_EVENTS.has(context.event.eventType)) {
+      if (!REVIEWABLE_PR_EVENTS.has(context.event.eventType)) {
         denied("只有活动 PR 事件可以提出 Review");
       }
       const headRefOid = context.event.payload?.headRefOid;

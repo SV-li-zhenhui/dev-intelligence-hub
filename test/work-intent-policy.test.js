@@ -339,6 +339,20 @@ test("allows an owner-requested active PR to produce a GitHub review proposal", 
   assert.equal(bound.binding.repository, "acme/repo");
   assert.equal(bound.binding.pullRequestNumber, 42);
   assert.equal(bound.binding.headRefOid, headRefOid);
+
+  assert.throws(
+    () => policy().bind({
+      context: trustedContext,
+      intent: {
+        ...common("propose_github_pull_request_action"),
+        action: { type: "merge", method: "squash" },
+        evidence: ["owner requested a review, not a merge"],
+      },
+    }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
 });
 
 test("binds five PR external actions only for a trusted role and v2 target", () => {
