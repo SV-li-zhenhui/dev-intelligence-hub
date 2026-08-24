@@ -2169,6 +2169,7 @@ export async function createApplication({
           "PR engineer fact guard",
         ),
       );
+      const pullRequestFactsLoader = pullRequestFactsLoaderFactory({ github });
       const prEngineerService = prEngineerServiceFactory({
         store: frozenPort(
           store,
@@ -2176,10 +2177,11 @@ export async function createApplication({
           "PR engineer fact state store",
         ),
         pullRequestFactsLoader: frozenPort(
-          pullRequestFactsLoaderFactory({ github }),
+          pullRequestFactsLoader,
           ["loadPullRequestFacts"],
           "GitHub pull request facts loader",
         ),
+        reviewContextLoader: pullRequestFactsLoader,
         exclusiveLease: frozenPort(
           prEngineerGuard,
           ["run"],

@@ -7,6 +7,10 @@ import {
   projectPullRequestReadFactsContext,
   pullRequestReadFactsMatch,
 } from "../domain/pull-request-read-facts.js";
+import {
+  normalizePullRequestGitTarget,
+  samePullRequestGitTarget,
+} from "../domain/git-tool-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
@@ -16,6 +20,8 @@ const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAXIMUM_AGE_MS = 2 * 60 * 1_000;
 const DEFAULT_MAXIMUM_RECORDS = 32;
 const MAXIMUM_PERSISTED_RECORDS = 64;
+const MAXIMUM_TASK_CONTEXT_BYTES = 96 * 1024;
+const MAXIMUM_REVIEW_FILES = 100;
 
 export class PrEngineerServiceError extends Error {
   constructor(code, message, statusCode = 503, options) {
@@ -213,6 +219,167 @@ function bindPort(value, method, name) {
   throw new TypeError(`${name} is invalid`);
 }
 
+function optionalBindPort(value, method, name) {
+  if (value === undefined || value === null) return null;
+  try {
+    if (
+      (typeof value !== "object" && typeof value !== "function") ||
+      utilTypes.isProxy(value)
+    ) {
+      throw new TypeError(`${name} is invalid`);
+    }
+    let current = value;
+    while (current !== null) {
+      if (Object.getOwnPropertyDescriptor(current, method)) {
+        return bindPort(value, method, name);
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  } catch (error) {
+    if (error instanceof TypeError && error.message === `${name} is invalid`) throw error;
+    throw new TypeError(`${name} is invalid`, { cause: error });
+  }
+}
+
+function reviewInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw serviceError("PR_REVIEW_CONTEXT_INVALID", `${name} is invalid`, 502);
+  }
+  return value;
+}
+
+function reviewPath(value, name) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    /[\u0000\r\n]/u.test(value) ||
+    Buffer.byteLength(value, "utf8") > 2_048
+  ) {
+    throw serviceError("PR_REVIEW_CONTEXT_INVALID", `${name} is invalid`, 502);
+  }
+  return value;
+}
+
+function reviewFiles(value) {
+  if (
+    !Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    value.length > MAXIMUM_REVIEW_FILES
+  ) {
+    throw serviceError("PR_REVIEW_CONTEXT_INVALID", "review files are invalid", 502);
+  }
+  return value.map((entry, index) => {
+    const fields = exactRecord(
+      entry,
+      ["path", "additions", "deletions"],
+      `review files[${index}]`,
+    );
+    return {
+      path: reviewPath(fields.get("path"), `review files[${index}].path`),
+      additions: reviewInteger(
+        fields.get("additions"),
+        `review files[${index}].additions`,
+      ),
+      deletions: reviewInteger(
+        fields.get("deletions"),
+        `review files[${index}].deletions`,
+      ),
+    };
+  });
+}
+
+function truncateUtf8(value, maximumBytes) {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maximumBytes) return value;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const minimumEnd = Math.max(0, maximumBytes - 3);
+  for (let end = Math.max(0, maximumBytes); end >= minimumEnd; end -= 1) {
+    try {
+      return decoder.decode(bytes.subarray(0, end));
+    } catch {
+      // A UTF-8 code point can cross the byte boundary by at most three bytes.
+    }
+  }
+  return "";
+}
+
+function reviewContextRequest(input, identity) {
+  const binding = identity.executionBinding;
+  return {
+    repo: binding.repository,
+    number: binding.pullRequestNumber,
+    url: `https://github.com/${binding.repository}/pull/${binding.pullRequestNumber}`,
+    headRefOid: binding.gitTarget.headRefOid,
+    githubAccount: binding.gitTarget.sourceAccountId,
+    gitTargetAvailable: true,
+    gitTarget: structuredClone(binding.gitTarget),
+    title: typeof input.event?.payload?.title === "string"
+      ? input.event.payload.title
+      : `PR #${binding.pullRequestNumber}`,
+  };
+}
+
+function projectReviewMaterial(value, identity, factsContext) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw serviceError("PR_REVIEW_CONTEXT_INVALID", "review context is invalid", 502);
+  }
+  let target;
+  try {
+    target = normalizePullRequestGitTarget(value.gitTarget);
+  } catch (cause) {
+    throw serviceError(
+      "PR_REVIEW_CONTEXT_INVALID",
+      "review context Git target is invalid",
+      502,
+      { cause },
+    );
+  }
+  if (!samePullRequestGitTarget(target, identity.executionBinding.gitTarget)) {
+    throw serviceError(
+      "PR_REVIEW_CONTEXT_STALE",
+      "review context Head is stale",
+      409,
+    );
+  }
+  if (typeof value.patch !== "string" || /\u0000/u.test(value.patch)) {
+    throw serviceError("PR_REVIEW_CONTEXT_INVALID", "review patch is invalid", 502);
+  }
+  const files = reviewFiles(value.files);
+  const changedFiles = reviewInteger(value.changedFiles, "changedFiles");
+  const material = {
+    schemaVersion: 1,
+    gitTarget: target,
+    additions: reviewInteger(value.additions, "additions"),
+    deletions: reviewInteger(value.deletions, "deletions"),
+    changedFiles,
+    files,
+    filesTruncated: files.length < changedFiles,
+    patch: "",
+    patchTruncated: value.patchTruncated === true,
+  };
+  const emptyCandidate = { ...factsContext, reviewMaterial: material };
+  const remaining = MAXIMUM_TASK_CONTEXT_BYTES -
+    Buffer.byteLength(JSON.stringify(emptyCandidate), "utf8");
+  if (remaining < 0) {
+    throw serviceError(
+      "PR_REVIEW_CONTEXT_INVALID",
+      "review metadata exceeds the task context budget",
+      502,
+    );
+  }
+  material.patch = truncateUtf8(value.patch, remaining);
+  material.patchTruncated ||= material.patch !== value.patch;
+  return material;
+}
+
 function timestamp(value, name) {
   const normalized = value instanceof Date ? value.toISOString() : value;
   if (
@@ -298,6 +465,7 @@ export class PrEngineerService {
   #readState;
   #writeState;
   #loadFacts;
+  #loadReviewContext;
   #clock;
   #maximumAgeMs;
   #maximumRecords;
@@ -308,6 +476,7 @@ export class PrEngineerService {
   constructor({
     store,
     pullRequestFactsLoader,
+    reviewContextLoader = pullRequestFactsLoader,
     exclusiveLease,
     clock = () => new Date(),
     maximumAgeMs = DEFAULT_MAXIMUM_AGE_MS,
@@ -320,6 +489,11 @@ export class PrEngineerService {
       pullRequestFactsLoader,
       "loadPullRequestFacts",
       "pullRequestFactsLoader",
+    );
+    this.#loadReviewContext = optionalBindPort(
+      reviewContextLoader,
+      "loadReviewContext",
+      "reviewContextLoader",
     );
     this.#exclusiveLease = Object.freeze({
       run: bindPort(exclusiveLease, "run", "exclusiveLease"),
@@ -392,7 +566,34 @@ export class PrEngineerService {
   }
 
   async context(input, options) {
-    return projectPullRequestReadFactsContext(await this.observe(input, options));
+    const factsContext = projectPullRequestReadFactsContext(
+      await this.observe(input, options),
+    );
+    if (this.#loadReviewContext === null) return factsContext;
+    const signal = operationSignal(options);
+    signal?.throwIfAborted();
+    const identity = createPullRequestReadIdentity(input);
+    let loaded;
+    try {
+      loaded = await this.#loadReviewContext(
+        reviewContextRequest(input, identity),
+        {
+          includePatch: true,
+          ...(signal === null ? {} : { signal }),
+        },
+      );
+    } catch (cause) {
+      signal?.throwIfAborted();
+      throw serviceError(
+        "PR_REVIEW_CONTEXT_REFRESH_FAILED",
+        "Unable to refresh bounded PR review context",
+        503,
+        { cause },
+      );
+    }
+    signal?.throwIfAborted();
+    const reviewMaterial = projectReviewMaterial(loaded, identity, factsContext);
+    return { ...factsContext, reviewMaterial };
   }
 
   async #refresh(input, identity, signal) {

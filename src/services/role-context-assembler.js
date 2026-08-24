@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 
+import {
+  normalizePullRequestGitTarget,
+  samePullRequestGitTarget,
+} from "../domain/git-tool-contract.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
@@ -15,7 +19,7 @@ import {
 export { RoleContextAssemblerError };
 
 const MAX_CONTEXT_BYTES = 128 * 1024;
-const MAX_PULL_REQUEST_CONTEXT_BYTES = 64 * 1024;
+const MAX_PULL_REQUEST_CONTEXT_BYTES = 96 * 1024;
 const MAX_CANONICAL_DEPTH = 16;
 const MAX_CANONICAL_ENTRIES = 500;
 const MAX_ROOT_DELIVERABLE_SLOTS = 4;
@@ -974,6 +978,7 @@ async function readFacts(factSource, event, signal) {
 
 function normalizePullRequestContext(value) {
   const normalized = canonicalValue(value);
+  const hasReviewMaterial = Object.hasOwn(normalized, "reviewMaterial");
   const fields = exactData(
     normalized,
     [
@@ -987,6 +992,7 @@ function normalizePullRequestContext(value) {
       "reviewThreads",
       "checks",
       "contextTruncated",
+      ...(hasReviewMaterial ? ["reviewMaterial"] : []),
     ],
     "pullRequest context",
   );
@@ -995,6 +1001,59 @@ function normalizePullRequestContext(value) {
     typeof fields.get("contextTruncated") !== "boolean"
   ) {
     throw invalid("pullRequest context is invalid");
+  }
+  if (hasReviewMaterial) {
+    const material = exactData(
+      fields.get("reviewMaterial"),
+      [
+        "schemaVersion",
+        "gitTarget",
+        "additions",
+        "deletions",
+        "changedFiles",
+        "files",
+        "filesTruncated",
+        "patch",
+        "patchTruncated",
+      ],
+      "pullRequest review material",
+    );
+    const files = material.get("files");
+    if (
+      material.get("schemaVersion") !== 1 ||
+      typeof material.get("patch") !== "string" ||
+      /\u0000/u.test(material.get("patch")) ||
+      typeof material.get("patchTruncated") !== "boolean" ||
+      typeof material.get("filesTruncated") !== "boolean" ||
+      !Array.isArray(files) ||
+      files.length > 100 ||
+      !["additions", "deletions", "changedFiles"].every((name) =>
+        Number.isSafeInteger(material.get(name)) && material.get(name) >= 0)
+    ) {
+      throw invalid("pullRequest review material is invalid");
+    }
+    try {
+      normalizePullRequestGitTarget(material.get("gitTarget"));
+    } catch (cause) {
+      throw invalid("pullRequest review material is invalid", { cause });
+    }
+    for (const [index, file] of files.entries()) {
+      const entry = exactData(
+        file,
+        ["path", "additions", "deletions"],
+        `pullRequest review material file ${index}`,
+      );
+      if (
+        typeof entry.get("path") !== "string" ||
+        entry.get("path").length === 0 ||
+        INVALID_CONTROL.test(entry.get("path")) ||
+        Buffer.byteLength(entry.get("path"), "utf8") > 2_048 ||
+        !["additions", "deletions"].every((name) =>
+          Number.isSafeInteger(entry.get(name)) && entry.get(name) >= 0)
+      ) {
+        throw invalid("pullRequest review material file is invalid");
+      }
+    }
   }
   digest(fields.get("identityDigest"), "pullRequest.identityDigest");
   digest(fields.get("contentDigest"), "pullRequest.contentDigest");
@@ -1032,7 +1091,21 @@ async function readPullRequestContext(reader, item, signal) {
       signal === undefined ? undefined : { signal },
     );
     signal?.throwIfAborted();
-    return normalizePullRequestContext(value);
+    const normalized = normalizePullRequestContext(value);
+    if (
+      normalized.reviewMaterial &&
+      !samePullRequestGitTarget(
+        normalizePullRequestGitTarget(normalized.reviewMaterial.gitTarget),
+        item.sourceBinding.gitTarget,
+      )
+    ) {
+      throw contextError(
+        "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+        "PR review material does not match the exact source binding",
+        503,
+      );
+    }
+    return normalized;
   } catch (cause) {
     signal?.throwIfAborted();
     if (

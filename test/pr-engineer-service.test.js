@@ -161,15 +161,21 @@ class ExclusiveLease {
 function service({
   store,
   load,
+  loadReview,
   maximumRecords = 32,
   maximumAgeMs,
   clock = () => NOW,
   exclusiveLease = new ExclusiveLease(),
   operationQueue,
 } = {}) {
+  const loader = {
+    loadPullRequestFacts: load,
+    ...(loadReview === undefined ? {} : { loadReviewContext: loadReview }),
+  };
   return new PrEngineerService({
     store,
-    pullRequestFactsLoader: { loadPullRequestFacts: load },
+    pullRequestFactsLoader: loader,
+    reviewContextLoader: loader,
     exclusiveLease,
     clock,
     maximumRecords,
@@ -219,6 +225,49 @@ test("fresh observations are idempotent and survive a service restart", async ()
   });
   assert.deepEqual(await restarted.recover(), { revision: 1, records: 1 });
   assert.deepEqual(await restarted.observe(fixture.input), facts);
+});
+
+test("task context includes exact-Head review material within its byte budget", async () => {
+  const store = new MemoryStore();
+  const fixture = executionFixture();
+  const facts = factsFixture(fixture);
+  let reviewRequest = null;
+  const engineer = service({
+    store,
+    load: async () => facts,
+    loadReview: async (request, options) => {
+      reviewRequest = { request: structuredClone(request), options };
+      return {
+        ...request,
+        additions: 12,
+        deletions: 3,
+        changedFiles: 2,
+        files: [
+          { path: "src/codec.cpp", additions: 10, deletions: 3 },
+          { path: "test/codec.test.cpp", additions: 2, deletions: 0 },
+        ],
+        patch: "x".repeat(120 * 1024),
+        patchTruncated: false,
+      };
+    },
+  });
+
+  const context = await engineer.context(fixture.input);
+
+  assert.equal(reviewRequest.options.includePatch, true);
+  assert.equal(reviewRequest.request.number, 42);
+  assert.equal(reviewRequest.request.headRefOid, HEAD_OID);
+  assert.deepEqual(
+    reviewRequest.request.gitTarget,
+    fixture.executionBinding.gitTarget,
+  );
+  assert.equal(context.reviewMaterial.changedFiles, 2);
+  assert.equal(context.reviewMaterial.patchTruncated, true);
+  assert.equal(context.reviewMaterial.patch.length < 120 * 1024, true);
+  assert.equal(
+    Buffer.byteLength(JSON.stringify(context), "utf8") <= 96 * 1024,
+    true,
+  );
 });
 
 test("PR fact loading forwards shutdown and performs no state write after abort", async () => {
