@@ -22,6 +22,7 @@ function identityFixture({
   scopeId = "github-account:runtime-user",
   headRefOid = HEAD_OID,
   inputRevision = 4,
+  ownerRequested = false,
 } = {}) {
   const gitTarget = {
     schemaVersion: 1,
@@ -36,9 +37,16 @@ function identityFixture({
   };
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
-    eventType: "pull_request.observed",
+    eventType: ownerRequested
+      ? "pull_request.owner_requested"
+      : "pull_request.observed",
     occurredAt: "2026-08-08T01:00:00.000Z",
-    source: { provider: "github", scopeId },
+    source: ownerRequested
+      ? {
+          provider: "local-owner",
+          scopeId: "owner-request:12345678-1234-4123-8123-123456789abc",
+        }
+      : { provider: "github", scopeId },
     subject: {
       id: "github:pr:acme/repo#42",
       repository: "acme/repo",
@@ -207,6 +215,22 @@ test("the identity binds the exact Head and outer event/source provenance", () =
       event: otherSource.event,
     }),
     false,
+  );
+});
+
+test("an owner-requested PR reads facts from its bound GitHub account", () => {
+  const requested = identityFixture({ ownerRequested: true });
+
+  assert.deepEqual(requested.identity.source, {
+    provider: "github",
+    scopeId: "github-account:runtime-user",
+  });
+  assert.equal(
+    pullRequestReadFactsMatchExecution(factsFixture(requested.identity), {
+      executionBinding: requested.executionBinding,
+      event: requested.event,
+    }),
+    true,
   );
 });
 

@@ -465,15 +465,27 @@ export function createPullRequestReadIdentity(value) {
   }
   if (
     binding.schemaVersion !== 2 ||
-    event.source.provider !== "github" ||
     !pullRequestExecutionBindingMatchesEvent(binding, event)
   ) {
     throw invalid("read identity is not bound to the supplied PR event");
   }
+  const source = event.source.provider === "github"
+    ? event.source
+    : event.source.provider === "local-owner" &&
+        event.eventType === "pull_request.owner_requested" &&
+        binding.gitTarget.provider === "github"
+      ? {
+          provider: "github",
+          scopeId: `github-account:${binding.gitTarget.sourceAccountId}`,
+        }
+      : null;
+  if (source === null) {
+    throw invalid("read identity is not bound to a GitHub fact source");
+  }
   const content = {
     schemaVersion: 1,
     executionBinding: structuredClone(binding),
-    source: structuredClone(event.source),
+    source: structuredClone(source),
   };
   return normalizePullRequestReadIdentity({
     ...content,
