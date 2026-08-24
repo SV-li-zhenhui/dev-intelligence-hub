@@ -567,6 +567,9 @@ test("decision failures use bounded retry and block at maxAttempts", async () =>
   assert.equal(ledger.items[0].attempt, 2);
   assert.equal(decisions, 2);
   assert.equal(ledger.calls.scheduleRetry[0].expectedRevision, 2);
+  assert.deepEqual(ledger.calls.scheduleRetry[0].details, {
+    code: "ROLE_DECISION_FAILED",
+  });
   assert.equal(ledger.calls.transition[0].expectedRevision, 4);
 });
 

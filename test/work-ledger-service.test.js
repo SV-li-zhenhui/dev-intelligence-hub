@@ -8132,10 +8132,15 @@ test("retry, handoff, and completion are explicit durable timeline events", asyn
     actorId: "employee-pr-reviewer",
     availableAt: "2026-08-02T02:01:00.000Z",
     reason: "ci-still-running",
+    details: { code: "ROLE_CONTEXT_TIMEOUT" },
   });
 
   assert.equal(item.status, "retry_wait");
   assert.equal(item.availableAt, "2026-08-02T02:01:00.000Z");
+  const retryEvent = (await fixture.service.listTimeline()).items.find(
+    ({ type }) => type === "retry_scheduled",
+  );
+  assert.equal(retryEvent.details.code, "ROLE_CONTEXT_TIMEOUT");
   await assert.rejects(
     fixture.service.claim({
       itemId: item.itemId,

@@ -1339,6 +1339,7 @@ export class ProactiveWorkLoop {
       );
       await this.ledger.scheduleRetry({
         ...input,
+        details: { code },
         availableAt: new Date(
           Date.parse(normalizeLoopClock(this.clock)) + delay,
         ).toISOString(),

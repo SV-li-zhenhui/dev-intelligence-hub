@@ -236,6 +236,7 @@ export function planWorkItemRetry({ state, input, clock }) {
   const itemId = boundedLedgerString(input.itemId, "itemId", 192);
   const actorId = normalizeWorkActor(input.actorId);
   const reason = normalizeWorkReason(input.reason);
+  const details = normalizeWorkDetails(input.details);
   const item = requireWorkLedgerItem(state, itemId);
   assertWorkItemNotInLegacyPullRequestCutover(item);
   assertNoActiveIntent(item);
@@ -264,6 +265,7 @@ export function planWorkItemRetry({ state, input, clock }) {
           fromStatus: item.status,
           availableAt,
           reason,
+          ...details,
         },
       },
     ],
