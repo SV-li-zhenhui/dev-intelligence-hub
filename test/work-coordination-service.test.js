@@ -414,6 +414,7 @@ test("role cycles forward the role scope to the proactive work loop", async () =
 test("a failed work stage cannot strand an already durable dispatch", async () => {
   const calls = [];
   const failure = new Error("brain unavailable");
+  failure.code = "STRUCTURED_PROVIDER_UNAVAILABLE";
   const service = new WorkCoordinationService({
     ledger: { async intake() {} },
     proposalRunner: { async runCycle() { calls.push("proposal_execution"); } },
@@ -427,6 +428,12 @@ test("a failed work stage cannot strand an already durable dispatch", async () =
   await assert.rejects(service.runCycle(), (error) => {
     assert.equal(error.code, "WORK_COORDINATION_STAGE_FAILED");
     assert.equal(error.stage, "work");
+    assert.deepEqual(error.causeCodes, ["STRUCTURED_PROVIDER_UNAVAILABLE"]);
+    assert.deepEqual(error.result.stages.work, {
+      ok: false,
+      code: "WORK_COORDINATION_STAGE_FAILED",
+      causeCodes: ["STRUCTURED_PROVIDER_UNAVAILABLE"],
+    });
     assert.deepEqual(error.result.stages.dispatch, { ok: true, result: {} });
     return true;
   });

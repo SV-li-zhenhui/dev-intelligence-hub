@@ -4,6 +4,7 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 
 const SAFE_TRIGGER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
+const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const NO_ROLE_SCOPE = "*";
 const SOURCE_RECONCILIATION_MAX_PAGES = Math.ceil(
   MAX_WORK_LEDGER_ITEMS / MAX_WORK_LEDGER_QUERY_PAGE,
@@ -267,10 +268,41 @@ function optionalPullRequestSourceReconciler(ledger) {
   };
 }
 
+function stableErrorCodes(error) {
+  const codes = [];
+  const pending = [error];
+  const seen = new Set();
+  while (pending.length > 0 && seen.size < 16 && codes.length < 8) {
+    const current = pending.shift();
+    if (
+      current === null ||
+      (typeof current !== "object" && typeof current !== "function") ||
+      seen.has(current)
+    ) {
+      continue;
+    }
+    seen.add(current);
+    const code = Object.getOwnPropertyDescriptor(current, "code")?.value;
+    if (
+      typeof code === "string" &&
+      SAFE_ERROR_CODE.test(code) &&
+      !codes.includes(code)
+    ) {
+      codes.push(code);
+    }
+    const cause = Object.getOwnPropertyDescriptor(current, "cause")?.value;
+    if (cause !== undefined) pending.push(cause);
+    const errors = Object.getOwnPropertyDescriptor(current, "errors")?.value;
+    if (Array.isArray(errors)) pending.push(...errors.slice(0, 8));
+  }
+  return Object.freeze(codes);
+}
+
 function stageFailure(stage, error) {
   const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
   wrapped.stage = stage;
+  wrapped.causeCodes = stableErrorCodes(error);
   return wrapped;
 }
 
@@ -474,7 +506,11 @@ export class WorkCoordinationService {
         if (options.signal?.aborted) throwIfAborted(options.signal);
         const failure = stageFailure(name, error);
         failures.push(failure);
-        result.stages[name] = { ok: false, code: failure.code };
+        result.stages[name] = {
+          ok: false,
+          code: failure.code,
+          causeCodes: failure.causeCodes,
+        };
       }
     }
     if (failures.length) {
@@ -483,7 +519,9 @@ export class WorkCoordinationService {
         : new AggregateError(
             failures,
             `员工主动循环有多个阶段失败: ${
-              failures.map(({ stage }) => stage).join(", ")
+              failures.map(({ stage, causeCodes }) =>
+                `${stage}${causeCodes.length ? ` [${causeCodes.join(" > ")}]` : ""}`
+              ).join(", ")
             }`,
           );
       Object.defineProperty(error, "result", {
