@@ -125,7 +125,11 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
     if (resultFlag < 0 || !inside(resultFile)) {
       process.exitCode = 3;
     } else {
-      await writeFile(resultFile, result, "utf8");
+      await writeFile(
+        resultFile,
+        JSON.stringify({ result }),
+        "utf8",
+      );
     }
   } else {
     process.stdout.write(JSON.stringify({

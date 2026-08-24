@@ -141,7 +141,14 @@ function persistentLoginBroker() {
         },
       });
     },
-    async checkAvailability() {},
+    async readStatus() {
+      return Object.freeze({
+        schemaVersion: 1,
+        state: "available",
+        cliAvailable: true,
+        fileLoginAvailable: true,
+      });
+    },
     view() {
       return Object.freeze({
         captures,
