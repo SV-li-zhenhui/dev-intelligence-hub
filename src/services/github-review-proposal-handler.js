@@ -342,11 +342,20 @@ export class GitHubReviewProposalHandler {
         })
       : initialPlan;
     const expected = normalizeConfirmationPlan(plan);
+    const initialExpected = normalizeConfirmationPlan(initialPlan);
+    const migratesLegacySelfReview =
+      input.downstreamRef !== null &&
+      plan.id !== initialPlan.id &&
+      input.downstreamRef === initialPlan.id;
     const legacyInputBinding =
       inputBinding !== null &&
       inputBinding !== undefined &&
       inputBinding.schemaVersion !== 2;
-    if (input.downstreamRef !== null && input.downstreamRef !== expected.id) {
+    if (
+      input.downstreamRef !== null &&
+      input.downstreamRef !== expected.id &&
+      !migratesLegacySelfReview
+    ) {
       throw invalidConfirmation("GitHub Review 确认绑定已变化");
     }
     let item = null;
@@ -354,7 +363,7 @@ export class GitHubReviewProposalHandler {
       try {
         item = normalizeConfirmationItem(
           await this.#get(input.downstreamRef),
-          expected,
+          migratesLegacySelfReview ? initialExpected : expected,
         );
       } catch (error) {
         if (!legacyInputBinding || error?.code !== "CONFIRMATION_NOT_FOUND") {
@@ -375,6 +384,15 @@ export class GitHubReviewProposalHandler {
       }
       return this.#invalidateChangedAuthorization(
         item,
+        migratesLegacySelfReview ? initialExpected : expected,
+        input.proposal,
+      );
+    }
+    if (migratesLegacySelfReview) {
+      return this.#migrateLegacySelfReview(
+        item,
+        initialExpected,
+        plan,
         expected,
         input.proposal,
       );
@@ -455,6 +473,48 @@ export class GitHubReviewProposalHandler {
       current,
       ["authorization_changed", `old_confirmation_status:${current.status}`],
     );
+  }
+
+  async #migrateLegacySelfReview(
+    item,
+    legacyExpected,
+    plan,
+    expected,
+    proposal,
+  ) {
+    let current = item;
+    if (
+      item.status === "pending" ||
+      (item.status === "failed" && item.failure?.retryable) ||
+      item.status === "stale"
+    ) {
+      if (item.status !== "stale") {
+        try {
+          current = normalizeConfirmationItem(
+            await this.#invalidate(item.id, {
+              requestedBy: proposal.requestedBy,
+              approvalBindingDigest: item.approvalBindingDigest,
+              reason: "authorization_changed",
+            }),
+            legacyExpected,
+          );
+        } catch (error) {
+          if (error?.code !== "CONFIRMATION_NOT_INVALIDATABLE") throw error;
+          current = normalizeConfirmationItem(
+            await this.#get(item.id),
+            legacyExpected,
+          );
+        }
+      }
+      if (current.status === "stale") {
+        const replacement = normalizeConfirmationItem(
+          await this.#enqueue(plan),
+          expected,
+        );
+        return transitionFor(replacement, this.#clock, this.#pollIntervalMs);
+      }
+    }
+    return transitionFor(current, this.#clock, this.#pollIntervalMs);
   }
 }
 

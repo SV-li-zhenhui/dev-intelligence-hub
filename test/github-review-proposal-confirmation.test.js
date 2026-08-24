@@ -145,6 +145,13 @@ test("self-authored blocking verdicts become explicit COMMENT reviews", () => {
     );
 
     assert.equal(plan.action.reviewEvent, "COMMENT");
+    assert.notEqual(
+      plan.id,
+      createGitHubReviewProposalConfirmationPlan(
+        proposal({ payload: { verdict } }),
+        { actorAccountId: "review-account" },
+      ).id,
+    );
     assert.equal(plan.display.payload.action.reviewEvent, "COMMENT");
     assert.equal(plan.display.actionLabel, "确认并以 COMMENT 发布到 GitHub");
     assert.match(plan.display.evidence.at(-1), /PR 作者.*COMMENT/u);

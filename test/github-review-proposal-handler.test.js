@@ -107,6 +107,14 @@ class FakeConfirmationProducer {
   }
 
   async enqueue(plan) {
+    if (
+      this.plan !== null &&
+      this.plan.id !== plan.id &&
+      this.status === "stale"
+    ) {
+      this.status = "pending";
+      this.overrides = {};
+    }
     this.plan = structuredClone(plan);
     this.enqueueCalls.push(structuredClone(plan));
     return confirmationItem(plan, this.status, this.overrides);
@@ -210,6 +218,30 @@ test("missing author context preserves the proposed verdict", async () => {
     producer.enqueueCalls[0].display.actionLabel,
     "确认并发布到 GitHub",
   );
+});
+
+test("a pending legacy self-review is invalidated and replaced by COMMENT", async () => {
+  const producer = new FakeConfirmationProducer();
+  await handler(producer).handle(handlerInput());
+  const legacyId = producer.plan.id;
+  producer.enqueueCalls.length = 0;
+
+  const transition = await handler(producer, {
+    pullRequestContextReader: acceptingContextReader("review-account"),
+  }).handle(handlerInput({
+    status: "waiting_confirmation",
+    downstreamRef: legacyId,
+  }));
+
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.notEqual(producer.enqueueCalls[0].id, legacyId);
+  assert.equal(producer.enqueueCalls[0].action.reviewEvent, "COMMENT");
+  assert.deepEqual(transition, {
+    status: "waiting_confirmation",
+    downstreamRef: producer.enqueueCalls[0].id,
+    nextAttemptAt: "2026-08-02T03:00:05.000Z",
+  });
 });
 
 test("a bound proposal polls get without enqueuing another action", async () => {

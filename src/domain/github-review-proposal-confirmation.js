@@ -103,11 +103,15 @@ function queuePlan(value) {
   return plan;
 }
 
-function confirmationId(proposal) {
+function confirmationId(proposal, downgradedSelfReview) {
   const digest = createHash("sha256")
     .update(proposal.proposalId, "utf8")
     .update("\0", "utf8")
     .update(proposal.contentDigest, "utf8")
+    .update(
+      downgradedSelfReview ? "\0self-authored-comment-v1" : "",
+      "utf8",
+    )
     .digest("hex");
   return `confirmation-github-review-${digest}`;
 }
@@ -247,7 +251,7 @@ export function createGitHubReviewProposalConfirmationPlan(
     : { type: "pull_request_review", reviewEvent, body };
 
   return queuePlan({
-    id: confirmationId(proposal),
+    id: confirmationId(proposal, downgradedSelfReview),
     kind: "github.work-proposal-review",
     requestedBy: proposal.requestedBy,
     actor,
