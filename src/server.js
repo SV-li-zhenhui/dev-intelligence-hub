@@ -980,6 +980,24 @@ function requireMemorySearch(application) {
   return search;
 }
 
+async function readMemoryHealth(application) {
+  if (!application.memorySearch) return null;
+  try {
+    return await requireMemorySearch(application).getHealth();
+  } catch (error) {
+    if (
+      error?.code === "MEMORY_AUTHORITY_NOT_CURRENT" &&
+      error?.statusCode === 503
+    ) {
+      return Object.freeze({
+        ready: false,
+        authorityCurrent: false,
+      });
+    }
+    throw error;
+  }
+}
+
 function requireMemoryAnswer(application) {
   const service = application.memoryAnswer;
   if (!service || typeof service.answer !== "function") {
@@ -2626,9 +2644,7 @@ export function createDashboardServer(
         const employees = await employeeRegistry.listRoles();
         const employee =
           employees.find((role) => role.id === "pr-reviewer") || null;
-        const memory = application.memorySearch
-          ? await requireMemorySearch(application).getHealth()
-          : null;
+        const memory = await readMemoryHealth(application);
         sendJson(response, 200, {
           ok: true,
           service: "mydashboard",

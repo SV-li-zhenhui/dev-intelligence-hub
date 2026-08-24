@@ -7853,6 +7853,64 @@ test("unified memory keeps the legacy search shape and reports local health", as
   );
 });
 
+test("health reports memory authority catch-up without exposing stale query data", async () => {
+  const authorityError = Object.assign(
+    new Error("memory authority has not caught up"),
+    {
+      code: "MEMORY_AUTHORITY_NOT_CURRENT",
+      statusCode: 503,
+    },
+  );
+  const memorySearch = {
+    async search() {
+      throw authorityError;
+    },
+    async getHealth() {
+      throw authorityError;
+    },
+  };
+
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const health = await request(server, { path: "/api/health" });
+      const query = await request(server, {
+        path: "/api/memory/query?q=checkout",
+      });
+
+      assert.equal(health.status, 200);
+      assert.deepEqual(JSON.parse(health.body).memory, {
+        ready: false,
+        authorityCurrent: false,
+      });
+      assert.equal(query.status, 503);
+      assert.deepEqual(reportedErrors, []);
+    },
+    { memorySearch },
+  );
+});
+
+test("health does not mask unexpected memory failures", async () => {
+  const memorySearch = {
+    async search() {
+      return { items: [] };
+    },
+    async getHealth() {
+      throw new Error("memory health failed unexpectedly");
+    },
+  };
+
+  await withServer(
+    async ({ server, reportedErrors }) => {
+      const health = await request(server, { path: "/api/health" });
+
+      assert.equal(health.status, 500);
+      assert.equal(reportedErrors.length, 1);
+      assert.match(reportedErrors[0].message, /failed unexpectedly/);
+    },
+    { memorySearch },
+  );
+});
+
 test("unified memory query forwards only bounded filters and pagination", async () => {
   const calls = [];
   const cursor = Buffer.from(
