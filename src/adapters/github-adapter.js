@@ -30,6 +30,8 @@ const PR_REVIEW_CONTEXT_FIELDS =
   "number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,additions,deletions,changedFiles,files";
 const PR_TARGET_FIELDS =
   "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner";
+const PR_OWNER_CONTEXT_FIELDS = `${PR_REVIEW_CONTEXT_FIELDS},state`;
+const PR_OPEN_TARGET_FIELDS = `${PR_TARGET_FIELDS},state`;
 const ISSUE_FIELDS =
   "number,title,url,repository,updatedAt,createdAt,author,state,labels,assignees";
 const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
@@ -1094,7 +1096,7 @@ export class GitHubAdapter {
       this.currentUser(commandOptions),
       this.run(
         "gh",
-        ["pr", "view", url, "--json", PR_REVIEW_CONTEXT_FIELDS],
+        ["pr", "view", url, "--json", PR_OWNER_CONTEXT_FIELDS],
         commandOptions,
       ),
     ]);
@@ -1108,6 +1110,7 @@ export class GitHubAdapter {
       initialIdentity.repository !== value.repository ||
       initialIdentity.number !== value.number ||
       initial.number !== value.number ||
+      initial.state !== "OPEN" ||
       !completePullRequestGitFacts(facts)
     ) {
       throw staleReviewContext();
@@ -1117,7 +1120,7 @@ export class GitHubAdapter {
       this.currentUser(commandOptions),
       this.run(
         "gh",
-        ["pr", "view", url, "--json", PR_TARGET_FIELDS],
+        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
         commandOptions,
       ),
     ]);
@@ -1131,6 +1134,7 @@ export class GitHubAdapter {
       finalIdentity.repository !== value.repository ||
       finalIdentity.number !== value.number ||
       final.number !== value.number ||
+      final.state !== "OPEN" ||
       !completePullRequestGitFacts(finalFacts) ||
       !samePullRequestGitTarget(gitTarget, gitTargetFromFacts(finalFacts))
     ) {
@@ -1142,6 +1146,7 @@ export class GitHubAdapter {
       title: typeof initial.title === "string" && initial.title.trim()
         ? initial.title.trim()
         : `PR #${value.number}`,
+      state: "open",
       gitTarget,
     });
   }

@@ -515,6 +515,8 @@ function assertOwnerPullRequestSemantics(content) {
     content.source.provider !== "local-owner" ||
     !/^owner-request:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
       .test(content.source.scopeId) ||
+    (Object.hasOwn(content.payload, "state") &&
+      content.payload.state !== "open") ||
     content.payload.gitTargetAvailable !== true ||
     target === null ||
     typeof target !== "object" ||

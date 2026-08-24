@@ -238,7 +238,7 @@ export function createOwnerPullRequestEvent(
   if (request.schemaVersion !== 2) throw invalid("PR 推进请求无效");
   exactKeys(
     resolvedValue,
-    ["repository", "number", "title", "gitTarget"],
+    ["repository", "number", "title", "state", "gitTarget"],
     "PR 解析结果",
   );
   const resolved = resolvedValue;
@@ -247,6 +247,7 @@ export function createOwnerPullRequestEvent(
     resolved.number !== request.pullRequest.number ||
     typeof resolved.title !== "string" ||
     resolved.title.trim() === "" ||
+    resolved.state !== "open" ||
     resolved.gitTarget === null ||
     typeof resolved.gitTarget !== "object"
   ) {
@@ -272,6 +273,7 @@ export function createOwnerPullRequestEvent(
       priority: request.priority,
       acceptanceCriteria: [...request.acceptanceCriteria],
       headRefOid: resolved.gitTarget.headRefOid,
+      state: resolved.state,
       gitTargetAvailable: true,
       gitTarget: structuredClone(resolved.gitTarget),
     },

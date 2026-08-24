@@ -354,6 +354,7 @@ test("work proposal reviews verify the full sealed Git target at execution time"
   const currentTarget = {
     number: 42,
     url: "https://github.com/acme/command-center/pull/42",
+    state: "OPEN",
     baseRefName: "main",
     baseRefOid: BASE_HEAD,
     headRefName: "fix/conflict",
@@ -371,7 +372,7 @@ test("work proposal reviews verify the full sealed Git target at execution time"
   assert.equal(matchingVerifier.calls.length, 1);
   assert.equal(
     matching.calls[2].args.at(-1),
-    "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
+    "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
   );
 
   const changedBase = new FakeRunner([
@@ -391,6 +392,7 @@ test("work proposal execution rechecks ledger authority and the full target befo
   const currentTarget = {
     number: 42,
     url: "https://github.com/acme/command-center/pull/42",
+    state: "OPEN",
     baseRefName: "main",
     baseRefOid: BASE_HEAD,
     headRefName: "fix/conflict",
@@ -432,6 +434,34 @@ test("work proposal execution rechecks ledger authority and the full target befo
     actualVersion: HEAD,
   });
   assert.equal(changedBase.calls.some((call) => call.args.includes("POST")), false);
+});
+
+test("work proposal review execution becomes stale if the PR closes before POST", async () => {
+  const openTarget = {
+    number: 42,
+    url: "https://github.com/acme/command-center/pull/42",
+    state: "OPEN",
+    baseRefName: "main",
+    baseRefOid: BASE_HEAD,
+    headRefName: "fix/conflict",
+    headRefOid: HEAD,
+    headRepository: { nameWithOwner: "contributor/command-center" },
+  };
+  const runner = new FakeRunner([
+    actor(),
+    pages([]),
+    openTarget,
+    actor(),
+    { ...openTarget, state: "CLOSED" },
+  ]);
+
+  assert.deepEqual(
+    await createAdapter(runner, {
+      inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
+    }).execute(workProposalEnvelope()),
+    { status: "stale", expectedVersion: HEAD, actualVersion: HEAD },
+  );
+  assert.equal(runner.calls.some((call) => call.args.includes("POST")), false);
 });
 
 test("revoked work proposal authority prevents every GitHub call", async () => {
@@ -698,6 +728,7 @@ test("Review deadline bounds a hanging authority recheck and releases its lease"
     {
       number: 42,
       url: "https://github.com/acme/command-center/pull/42",
+      state: "OPEN",
       baseRefName: "main",
       baseRefOid: BASE_HEAD,
       headRefName: "fix/conflict",
@@ -708,6 +739,7 @@ test("Review deadline bounds a hanging authority recheck and releases its lease"
     {
       number: 42,
       url: "https://github.com/acme/command-center/pull/42",
+      state: "OPEN",
       baseRefName: "main",
       baseRefOid: BASE_HEAD,
       headRefName: "fix/conflict",
@@ -761,6 +793,7 @@ test("Review authority checks and subprocesses share one decreasing total deadli
     {
       number: 42,
       url: "https://github.com/acme/command-center/pull/42",
+      state: "OPEN",
       baseRefName: "main",
       baseRefOid: BASE_HEAD,
       headRefName: "fix/conflict",
@@ -771,6 +804,7 @@ test("Review authority checks and subprocesses share one decreasing total deadli
     {
       number: 42,
       url: "https://github.com/acme/command-center/pull/42",
+      state: "OPEN",
       baseRefName: "main",
       baseRefOid: BASE_HEAD,
       headRefName: "fix/conflict",

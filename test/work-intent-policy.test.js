@@ -317,6 +317,7 @@ test("allows an owner-requested active PR to produce a GitHub review proposal", 
   const rootItemId = `work-item-${"b".repeat(64)}`;
   const trustedContext = context({
     event: trustedEvent,
+    roleId: "pr-engineer",
     workItemId: rootItemId,
     inputBinding: {
       ...inputBinding(trustedEvent, rootItemId),
@@ -324,7 +325,7 @@ test("allows an owner-requested active PR to produce a GitHub review proposal", 
       gitTarget: structuredClone(trustedEvent.payload.gitTarget),
     },
   });
-  const bound = policy().bind({
+  const bound = policy({ githubReviewRoles: ["pr-engineer"] }).bind({
     context: trustedContext,
     intent: {
       ...common("propose_github_review"),
@@ -341,12 +342,65 @@ test("allows an owner-requested active PR to produce a GitHub review proposal", 
   assert.equal(bound.binding.headRefOid, headRefOid);
 
   assert.throws(
-    () => policy().bind({
+    () => policy({ githubReviewRoles: ["pr-engineer"] }).bind({
       context: trustedContext,
       intent: {
         ...common("propose_github_pull_request_action"),
         action: { type: "merge", method: "squash" },
         evidence: ["owner requested a review, not a merge"],
+      },
+    }),
+    (error) =>
+      error instanceof WorkIntentPolicyError &&
+      error.code === "WORK_INTENT_POLICY_DENIED",
+  );
+});
+
+test("denies a legacy owner-requested PR without a trusted OPEN snapshot", () => {
+  const headRefOid = "a".repeat(40);
+  const legacyEvent = event({
+    eventType: "pull_request.owner_requested",
+    source: {
+      provider: "local-owner",
+      scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000",
+    },
+    payload: {
+      title: "Legacy request",
+      headRefOid,
+      gitTargetAvailable: true,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/legacy",
+        headRefOid,
+      },
+    },
+  });
+  const rootItemId = `work-item-${"b".repeat(64)}`;
+  const legacyContext = context({
+    event: legacyEvent,
+    roleId: "pr-engineer",
+    workItemId: rootItemId,
+    inputBinding: {
+      ...inputBinding(legacyEvent, rootItemId),
+      schemaVersion: 2,
+      gitTarget: structuredClone(legacyEvent.payload.gitTarget),
+    },
+  });
+
+  assert.throws(
+    () => policy({ githubReviewRoles: ["pr-engineer"] }).bind({
+      context: legacyContext,
+      intent: {
+        ...common("propose_github_review"),
+        verdict: "comment",
+        body: "This must not publish.",
+        evidence: ["No trusted OPEN snapshot"],
       },
     }),
     (error) =>

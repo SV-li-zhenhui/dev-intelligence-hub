@@ -767,7 +767,7 @@ class GitHubActionAdapter {
         `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
         "--json",
         targetAware
-          ? "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+          ? "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
           : "headRefOid",
       ],
       { childEnvironment, operation },
@@ -792,6 +792,7 @@ class GitHubActionAdapter {
       value.number !== envelope.target.number ||
       typeof value.url !== "string" ||
       value.url.toLowerCase() !== expectedUrl.toLowerCase() ||
+      value.state !== "OPEN" ||
       typeof value.baseRefName !== "string" ||
       typeof value.baseRefOid !== "string" ||
       typeof value.headRefName !== "string" ||

@@ -458,6 +458,12 @@ export function createWorkIntentPolicy({
       if (!REVIEWABLE_PR_EVENTS.has(context.event.eventType)) {
         denied("只有活动 PR 事件可以提出 Review");
       }
+      if (
+        context.event.eventType === "pull_request.owner_requested" &&
+        context.event.payload?.state !== "open"
+      ) {
+        denied("所有者指定的 PR 必须处于 OPEN 状态");
+      }
       const headRefOid = context.event.payload?.headRefOid;
       if (typeof headRefOid !== "string" || !headRefOid) {
         denied("PR 事件缺少可信 Head");

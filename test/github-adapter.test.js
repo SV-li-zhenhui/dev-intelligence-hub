@@ -769,6 +769,7 @@ test("target-aware no-patch context verifies the target and account twice", asyn
       return {
         number: 42,
         url: "https://github.com/acme/repo/pull/42",
+        state: "OPEN",
         title: "Fix CI",
         baseRefName: "main",
         baseRefOid,
@@ -906,6 +907,7 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
       return {
         number: 42,
         url: "https://github.com/acme/repo/pull/42",
+        state: "OPEN",
         title: "Fix CI",
         body: "Repair the failing check",
         baseRefName: "main",
@@ -926,6 +928,7 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
 
   assert.equal(viewCalls, 2);
   assert.equal(result.title, "Fix CI");
+  assert.equal(result.state, "open");
   assert.deepEqual(result.gitTarget, {
     schemaVersion: 1,
     provider: "github",
@@ -948,6 +951,7 @@ test("an owner-selected PR target fails closed when its Head changes during reso
       return {
         number: 42,
         url: "https://github.com/acme/repo/pull/42",
+        state: "OPEN",
         title: "Fix CI",
         baseRefName: "main",
         baseRefOid: "b".repeat(40),
@@ -964,6 +968,63 @@ test("an owner-selected PR target fails closed when its Head changes during reso
     adapter.resolvePullRequestTarget({ repository: "acme/repo", number: 42 }),
     (error) => error.code === "PR_CONTEXT_STALE",
   );
+});
+
+for (const state of ["CLOSED", "MERGED"]) {
+  test(`an owner-selected ${state.toLowerCase()} PR fails closed`, async () => {
+    const adapter = new GitHubAdapter({
+      run: async (_command, args) => {
+        if (args[0] === "api") return { login: "runtime-user" };
+        return {
+          number: 42,
+          url: "https://github.com/acme/repo/pull/42",
+          state,
+          title: "Inactive PR",
+          baseRefName: "main",
+          baseRefOid: "b".repeat(40),
+          headRefName: "fix/inactive",
+          headRefOid: "a".repeat(40),
+          headRepository: { name: "repo" },
+          headRepositoryOwner: { login: "contributor" },
+          files: [],
+        };
+      },
+    });
+
+    await assert.rejects(
+      adapter.resolvePullRequestTarget({ repository: "acme/repo", number: 42 }),
+      (error) => error.code === "PR_CONTEXT_STALE",
+    );
+  });
+}
+
+test("an owner-selected PR fails closed when it closes during resolution", async () => {
+  let viewCalls = 0;
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "api") return { login: "runtime-user" };
+      viewCalls += 1;
+      return {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        state: viewCalls === 1 ? "OPEN" : "CLOSED",
+        title: "Closing PR",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRefName: "fix/closing",
+        headRefOid: "a".repeat(40),
+        headRepository: { name: "repo" },
+        headRepositoryOwner: { login: "contributor" },
+        files: [],
+      };
+    },
+  });
+
+  await assert.rejects(
+    adapter.resolvePullRequestTarget({ repository: "acme/repo", number: 42 }),
+    (error) => error.code === "PR_CONTEXT_STALE",
+  );
+  assert.equal(viewCalls, 2);
 });
 
 test("version records retain source creation timestamps for newest-first display", async () => {

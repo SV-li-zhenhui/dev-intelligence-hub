@@ -250,6 +250,7 @@ test("an explicit PR request requires a structured target and creates a distinct
       repository: "acme/repo",
       number: 42,
       title: "PR 42",
+      state: "open",
       gitTarget,
     },
     "2026-08-08T01:00:00.000Z",
@@ -265,7 +266,23 @@ test("an explicit PR request requires a structured target and creates a distinct
     number: 42,
   });
   assert.equal(event.payload.headRefOid, gitTarget.headRefOid);
+  assert.equal(event.payload.state, "open");
   assert.deepEqual(event.payload.gitTarget, gitTarget);
+
+  assert.throws(
+    () => createOwnerPullRequestEvent(
+      normalized,
+      {
+        repository: "acme/repo",
+        number: 42,
+        title: "PR 42",
+        state: "closed",
+        gitTarget,
+      },
+      "2026-08-08T01:00:00.000Z",
+    ),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
 
   const routed = withOwnerWorkRequestDefaultRoute({
     schemaVersion: 1,
@@ -352,6 +369,7 @@ test("an explicit PR request resolves one immutable target before staging a PR e
         return {
           ...target,
           title: "PR 42",
+          state: "open",
           gitTarget: {
             schemaVersion: 1,
             provider: "github",
@@ -389,6 +407,7 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   const item = (await ledger.listItems({ limit: 10 })).items[0];
   assert.equal(item.source.scope.kind, "owner_requested");
   assert.equal(item.source.current.event.payload.headRefOid, "a".repeat(40));
+  assert.equal(item.source.current.event.payload.state, "open");
 });
 
 test("restart resumes a staged request after a lost routing response without duplication", async (t) => {
