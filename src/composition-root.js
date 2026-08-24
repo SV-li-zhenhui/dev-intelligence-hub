@@ -417,6 +417,7 @@ function productionCliRuntimeFacts(value) {
   const allowed = new Set([
     "protectedRoots",
     "codexLoginCredentialBroker",
+    "supervisedCliTemporaryRoot",
   ]);
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
@@ -454,9 +455,23 @@ function productionCliRuntimeFacts(value) {
   ) {
     throw new TypeError("Production CLI runtime facts are invalid");
   }
+  const supervisedCliTemporaryRoot =
+    descriptors.supervisedCliTemporaryRoot?.value;
+  if (
+    supervisedCliTemporaryRoot !== undefined &&
+    (
+      typeof supervisedCliTemporaryRoot !== "string" ||
+      !path.isAbsolute(supervisedCliTemporaryRoot)
+    )
+  ) {
+    throw new TypeError("Production CLI runtime facts are invalid");
+  }
   return Object.freeze({
     protectedRoots: distinctAbsolutePaths(protectedRoots),
     ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
+    ...(supervisedCliTemporaryRoot === undefined
+      ? {}
+      : { supervisedCliTemporaryRoot: path.resolve(supervisedCliTemporaryRoot) }),
   });
 }
 
@@ -1085,9 +1100,8 @@ export async function createApplication({
       ["readStatus"],
       "brainProviderStatus",
     );
-    const credentialRoots = codexLoginProtectedRoots(
-      codexLoginLocationsFactory(),
-    );
+    const codexLoginLocations = codexLoginLocationsFactory();
+    const credentialRoots = codexLoginProtectedRoots(codexLoginLocations);
     const cliAndCredentialProtectedRoots = distinctAbsolutePaths([
       ...cliProtectedRoots,
       ...credentialRoots,
@@ -1095,6 +1109,17 @@ export async function createApplication({
     cliCompositionCapability = issueProductionCliCompositionGrant({
       protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
+      ...(typeof privateRuntimeDirectory === "string" &&
+          path.isAbsolute(privateRuntimeDirectory) &&
+          path.resolve(privateRuntimeDirectory) ===
+            path.dirname(codexLoginLocations.probeRoot)
+        ? {
+            supervisedCliTemporaryRoot: path.join(
+              path.resolve(privateRuntimeDirectory),
+              "supervised-cli-v1",
+            ),
+          }
+        : {}),
     });
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,

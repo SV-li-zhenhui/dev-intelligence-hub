@@ -455,11 +455,15 @@ function productionDependencies(runtimeFacts = []) {
   const codexLoginCredentialBroker = Array.isArray(runtimeFacts)
     ? null
     : runtimeFacts.codexLoginCredentialBroker;
+  const supervisedCliTemporaryRoot = Array.isArray(runtimeFacts)
+    ? null
+    : runtimeFacts.supervisedCliTemporaryRoot;
   return Object.freeze({
     processRunner: new SupervisedProcessRunner(),
     commandLocator: new KnownCliLocator(),
     environment: process.env,
-    temporaryRoot: path.join(homedir(), ".mydashboard-supervised-cli-v1"),
+    temporaryRoot: supervisedCliTemporaryRoot ??
+      path.join(homedir(), ".mydashboard-supervised-cli-v1"),
     protectedRoots: protectedRootPaths([projectRoot, ...additionalProtectedRoots]),
     cleanupFileSystem: PRODUCTION_CLEANUP_FILE_SYSTEM,
     rootDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
