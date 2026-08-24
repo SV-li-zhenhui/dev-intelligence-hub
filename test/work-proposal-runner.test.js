@@ -104,7 +104,14 @@ test("a bounded cycle claims, delegates without lease authority, and advances a 
     ],
   });
   assert.equal(runner.claimCalls.length, 2);
-  assert.deepEqual(runner.claimCalls[0], { leaseDurationMs: 60_000 });
+  assert.deepEqual(runner.claimCalls[0], {
+    leaseDurationMs: 60_000,
+    excludeProposalIds: [],
+  });
+  assert.deepEqual(runner.claimCalls[1], {
+    leaseDurationMs: 60_000,
+    excludeProposalIds: ["work-intent-proposal-1"],
+  });
   assert.deepEqual(Object.keys(inputs[0]).sort(), [
     "attempt",
     "downstreamRef",

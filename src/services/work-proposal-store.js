@@ -612,6 +612,7 @@ export class WorkProposalStore {
     return this.#mutate((state) => {
       const now = this.#now(state);
       const nowMs = Date.parse(now);
+      const excludedProposalIds = new Set(request.excludeProposalIds);
       const activeClaim = [...state.proposals]
         .sort(
           (left, right) =>
@@ -647,6 +648,7 @@ export class WorkProposalStore {
         .find(
           (candidate) =>
             this.#runnerCanAccess(candidate, scope) &&
+            !excludedProposalIds.has(candidate.proposal.proposalId) &&
             !isTerminalWorkProposalStatus(candidate.status) &&
             (candidate.nextAttemptAt === null ||
               Date.parse(candidate.nextAttemptAt) <= nowMs) &&

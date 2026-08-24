@@ -139,6 +139,24 @@ test("create persists before returning and is idempotent by ID and digest", asyn
   assert.equal(store.writeCount, 1);
 });
 
+test("a runner can exclude proposals already handled in the same cycle", async () => {
+  const { proposals } = await readyStore();
+  await proposals.create(proposal());
+  await proposals.create(proposal({
+    proposalId: "work-intent-proposal-2",
+    requestedBy: { roleId: "developer", workItemId: "work-2" },
+    source: { assignmentId: "assignment-2", eventId: "event-2" },
+  }));
+
+  const claimed = await claimAs(proposals, {
+    runnerId: "code-runner",
+    leaseDurationMs: 30_000,
+    excludeProposalIds: ["work-intent-proposal-1"],
+  });
+
+  assert.equal(claimed.proposal.proposalId, "work-intent-proposal-2");
+});
+
 test("runner claims with a lease, binds one downstream, and emits unknown once", async () => {
   const { proposals, time } = await readyStore();
   await proposals.create(proposal());

@@ -292,12 +292,15 @@ export class WorkProposalRunnerService {
 
   async #run({ limit, signal }) {
     const outcomes = [];
+    const handledProposalIds = new Set();
     for (let index = 0; index < limit; index += 1) {
       signal?.throwIfAborted();
-      const claim = await this.#claimRecoverably(signal);
+      const claim = await this.#claimRecoverably(signal, handledProposalIds);
       signal?.throwIfAborted();
       if (claim === null) break;
-      outcomes.push(await this.#handleClaim(normalizeClaim(claim)));
+      const normalizedClaim = normalizeClaim(claim);
+      handledProposalIds.add(normalizedClaim.proposal.proposalId);
+      outcomes.push(await this.#handleClaim(normalizedClaim));
       signal?.throwIfAborted();
     }
     return {
@@ -315,8 +318,11 @@ export class WorkProposalRunnerService {
     };
   }
 
-  async #claimRecoverably(signal) {
-    const request = { leaseDurationMs: this.#leaseDurationMs };
+  async #claimRecoverably(signal, handledProposalIds) {
+    const request = {
+      leaseDurationMs: this.#leaseDurationMs,
+      excludeProposalIds: [...handledProposalIds],
+    };
     try {
       return await this.#claim(request);
     } catch (error) {

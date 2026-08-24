@@ -397,17 +397,41 @@ export function normalizeBoundWorkProposal(value) {
 
 export function normalizeWorkProposalClaimRequest(value) {
   const error = invalidRunnerRequest();
-  assertWorkProposalExactKeys(value, ["runnerId", "leaseDurationMs"], error);
+  const fields = new Map(workProposalDataEntries(value, error));
+  if (
+    fields.size < 2 ||
+    fields.size > 3 ||
+    !fields.has("runnerId") ||
+    !fields.has("leaseDurationMs") ||
+    [...fields.keys()].some((key) =>
+      !["runnerId", "leaseDurationMs", "excludeProposalIds"].includes(key)
+    )
+  ) {
+    throw error;
+  }
+  const excludeProposalIds = fields.has("excludeProposalIds")
+    ? workProposalArrayValues(fields.get("excludeProposalIds"), 100, error)
+      .map((proposalId) =>
+        normalizeWorkProposalReference(proposalId, "excludeProposalIds", {
+          maximumBytes: 192,
+          error,
+        })
+      )
+    : [];
+  if (new Set(excludeProposalIds).size !== excludeProposalIds.length) {
+    throw error;
+  }
   return {
-    runnerId: normalizeWorkProposalReference(value.runnerId, "runnerId", {
+    runnerId: normalizeWorkProposalReference(fields.get("runnerId"), "runnerId", {
       maximumBytes: 128,
       error,
     }),
     leaseDurationMs: safeWorkProposalInteger(
-      value.leaseDurationMs,
+      fields.get("leaseDurationMs"),
       "leaseDurationMs",
       { minimum: 1_000, maximum: 300_000, error },
     ),
+    excludeProposalIds,
   };
 }
 

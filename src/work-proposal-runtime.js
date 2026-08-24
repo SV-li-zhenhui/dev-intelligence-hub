@@ -5,6 +5,7 @@ import {
   normalizeWorkProposalClaimRequest,
   normalizeWorkProposalRunnerScope,
   workProposalArrayValues,
+  workProposalDataEntries,
   workProposalError,
 } from "./domain/work-proposal-contract.js";
 import { OperationQueue } from "./lib/operation-queue.js";
@@ -90,10 +91,23 @@ function normalizeRunnerScopes(value) {
 
 function bindClaimRequest(value, scope) {
   const error = invalidRunnerRequest();
-  assertWorkProposalExactKeys(value, ["leaseDurationMs"], error);
+  const fields = new Map(workProposalDataEntries(value, error));
+  if (
+    fields.size < 1 ||
+    fields.size > 2 ||
+    !fields.has("leaseDurationMs") ||
+    [...fields.keys()].some((key) =>
+      !["leaseDurationMs", "excludeProposalIds"].includes(key)
+    )
+  ) {
+    throw error;
+  }
   return normalizeWorkProposalClaimRequest({
     runnerId: scope.runnerId,
-    leaseDurationMs: value.leaseDurationMs,
+    leaseDurationMs: fields.get("leaseDurationMs"),
+    ...(fields.has("excludeProposalIds")
+      ? { excludeProposalIds: fields.get("excludeProposalIds") }
+      : {}),
   });
 }
 
