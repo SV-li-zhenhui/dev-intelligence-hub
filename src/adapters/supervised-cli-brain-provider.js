@@ -74,6 +74,19 @@ const TEST_CLEANUP_FILE_SYSTEM = Object.freeze({
 const INSTRUCTION =
   "Return exactly one JSON object that matches the supplied schema. " +
   "Do not call tools or perform actions. The object has no action authority.";
+const CODEX_INSTRUCTION =
+  "Return exactly one output envelope with a result string. " +
+  "The result string must contain exactly one JSON object that matches the " +
+  "supplied business schema. Do not call tools or perform actions. " +
+  "The object has no action authority.";
+const CODEX_OUTPUT_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: Object.freeze(["result"]),
+  properties: Object.freeze({
+    result: Object.freeze({ type: "string" }),
+  }),
+});
 const OPTION_KEYS = Object.freeze([
   "id",
   "cliKind",
@@ -1467,10 +1480,10 @@ function credentialInvocationIdentity(invocation) {
   });
 }
 
-function requestPayload(request, maximumBytes) {
+function requestPayload(request, maximumBytes, cliKind) {
   const text = canonicalJsonStringify({
     schemaVersion: 1,
-    instruction: INSTRUCTION,
+    instruction: cliKind === "codex-cli" ? CODEX_INSTRUCTION : INSTRUCTION,
     messages: request.messages,
     schema: request.schema,
   });
@@ -1612,6 +1625,26 @@ function structuredResult(text) {
   return canonicalJsonStringify(cloneResultJson(parsed));
 }
 
+function codexResult(text) {
+  let envelope;
+  try {
+    envelope = parseJsonWithUniqueKeys(text);
+  } catch {
+    throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
+  }
+  if (
+    envelope === null ||
+    typeof envelope !== "object" ||
+    Array.isArray(envelope) ||
+    Object.getPrototypeOf(envelope) !== Object.prototype ||
+    Reflect.ownKeys(envelope).length !== 1 ||
+    typeof envelope.result !== "string"
+  ) {
+    throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
+  }
+  return structuredResult(envelope.result);
+}
+
 function plainMetadataObject(value) {
   if (
     value === null ||
@@ -1740,7 +1773,7 @@ async function readCodexResult(
           : "STRUCTURED_PROVIDER_RESPONSE_INVALID",
       );
     }
-    return structuredResult(fatalUtf8(bytes));
+    return codexResult(fatalUtf8(bytes));
   } catch (error) {
     if (error instanceof SupervisedCliBrainProviderError) throw error;
     throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
@@ -2128,7 +2161,7 @@ export class SupervisedCliBrainProvider {
         const resultFile = path.join(invocation.path, "last-message.json");
         await deadline.run(({ signal }) => writeNewFile(
             schemaFile,
-            Buffer.from(canonicalJsonStringify(request.schema), "utf8"),
+            Buffer.from(canonicalJsonStringify(CODEX_OUTPUT_SCHEMA), "utf8"),
             signal,
             () => this.#assertRunnable(),
           ));
@@ -2249,7 +2282,7 @@ export class SupervisedCliBrainProvider {
       admitted = Object.freeze({
         request,
         signal,
-        wireInput: requestPayload(request, this.#maxRequestBytes),
+        wireInput: requestPayload(request, this.#maxRequestBytes, this.kind),
       });
     } catch (error) {
       throw sanitizeInputFailure(error);

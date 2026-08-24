@@ -264,6 +264,17 @@ function successfulProcess(stdoutBytes = Buffer.alloc(0)) {
   };
 }
 
+function codexOutput(value) {
+  return JSON.stringify({ result: JSON.stringify(value) });
+}
+
+const CODEX_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["result"],
+  properties: { result: { type: "string" } },
+};
+
 async function directoryIdentity(directory) {
   const details = await lstat(directory, { bigint: true });
   return Object.freeze({
@@ -455,7 +466,7 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
 
     const payload = JSON.parse(Buffer.from(invocation.input).toString("utf8"));
     assert.equal(payload.schemaVersion, 1);
-    assert.match(payload.instruction, /one JSON object|一个 JSON 对象/i);
+    assert.match(payload.instruction, /output envelope/i);
     assert.deepEqual(payload.messages, brainRequest().messages);
     assert.deepEqual(payload.schema, SCHEMA);
 
@@ -507,12 +518,15 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
 
     const schemaFile = argumentValue(invocation.args, "--output-schema");
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    assert.deepEqual(JSON.parse(await readFile(schemaFile, "utf8")), SCHEMA);
+    assert.deepEqual(
+      JSON.parse(await readFile(schemaFile, "utf8")),
+      CODEX_OUTPUT_SCHEMA,
+    );
     if (process.platform !== "win32") {
       assert.equal((await lstat(schemaFile)).mode & 0o777, 0o600);
       assert.equal((await lstat(invocation.cwd)).mode & 0o777, 0o700);
     }
-    await writeFile(resultFile, '{"order":2,"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ order: 2, ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -575,7 +589,7 @@ test("Codex login mode stages one isolated profile and omits every API credentia
       "fictional-login-credential",
     );
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -743,7 +757,12 @@ test("availability fails before locator when the selected credential is unavaila
 });
 
 test("login mode captures after a reaped process failure and before malformed result parsing", async (t) => {
-  for (const scenario of ["process-failed", "malformed-result"]) {
+  for (const scenario of [
+    "process-failed",
+    "malformed-result",
+    "missing-envelope",
+    "malformed-envelope-result",
+  ]) {
     await t.test(scenario, async (child) => {
       const parent = await temporaryDirectory(child, `supervised-login-${scenario}-`);
       const events = [];
@@ -755,7 +774,12 @@ test("login mode captures after a reaped process failure and before malformed re
           });
         }
         const resultFile = argumentValue(invocation.args, "--output-last-message");
-        await writeFile(resultFile, "not-json", "utf8");
+        const result = scenario === "missing-envelope"
+          ? '{"ok":true}'
+          : scenario === "malformed-envelope-result"
+            ? '{"result":"not-json"}'
+            : "not-json";
+        await writeFile(resultFile, result, "utf8");
         return successfulProcess();
       });
       const provider = createTestSupervisedCliBrainProvider({
@@ -812,7 +836,7 @@ test("login mode never captures an unproved process and fences capture uncertain
           });
         }
         const resultFile = argumentValue(invocation.args, "--output-last-message");
-        await writeFile(resultFile, '{"ok":true}', "utf8");
+        await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
         return successfulProcess();
       });
       const provider = createTestSupervisedCliBrainProvider({
@@ -945,7 +969,7 @@ test("credentials, cancellation, and request limits fail before locator or spawn
   const locator = recordingLocator(descriptor);
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const environment = {};
@@ -1030,7 +1054,7 @@ test("cancellation bounds unresolved CLI discovery and a later attempt recovers"
   };
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -1097,7 +1121,7 @@ test("cancellation bounds stale scanning and does not poison later use", async (
   const released = new Promise((resolve) => { releaseScavenge = resolve; });
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -1234,7 +1258,7 @@ test("cleanup inventory closes its directory handle after cancellation", async (
   t.after(async () => cleanupHandle?.close().catch(() => {}));
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -1346,7 +1370,7 @@ test("CLI discovery and initialization consume the runner's one total deadline",
   const runner = recordingRunner(async (invocation) => {
     assert.equal(invocation.timeoutMs, 500);
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -1729,7 +1753,7 @@ test("a replaced validated root fails before a second discovery or spawn", async
   const locator = recordingLocator(testDescriptor("codex-cli"));
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2054,7 +2078,7 @@ test("invocation initialization failure cleans its verified directory and the pr
   let clockCalls = 0;
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2085,7 +2109,7 @@ test("temporary root and stale scan failures are retryable on the same provider"
   let scanCalls = 0;
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2240,7 +2264,7 @@ test("cleanup retains an invocation whose entry count exceeds the fixed bound", 
       );
     }
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2272,7 +2296,7 @@ test("cleanup retains an invocation whose directory depth exceeds the fixed boun
       await mkdir(directory);
     }
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2302,7 +2326,7 @@ test("cleanup retains an invocation whose aggregate regular-file bytes exceed th
     await writeFile(oversized, "");
     await truncate(oversized, 16 * 1024 * 1024 + 1);
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2331,7 +2355,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   const firstRunner = recordingRunner(async (invocation) => {
     invocationDirectory = invocation.cwd;
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const first = createTestSupervisedCliBrainProvider(
@@ -2387,7 +2411,7 @@ test("cancellation with no cleanup budget retains the invocation and reports cle
   const runner = recordingRunner(async (invocation) => {
     invocationDirectory = invocation.cwd;
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     controller.abort(new Error("private cancellation"));
     return successfulProcess();
   });
@@ -2421,7 +2445,7 @@ async function assertCleanupLinkRejected(t, attack) {
     if (attack === "hardlink") await link(victim, entry);
     else await symlink(victim, entry, "file");
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2487,7 +2511,7 @@ test("cleanup rejects a queued-directory swap before reading outside the quarant
     await mkdir(nestedDirectory);
     await writeFile(path.join(nestedDirectory, "inside.txt"), "inside", "utf8");
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2548,7 +2572,7 @@ test("cleanup rejects a parent swap after a file check without deleting the repl
     await mkdir(nestedDirectory);
     await writeFile(attackFile, "inside", "utf8");
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -2662,7 +2686,7 @@ test("provider cancellation after native READY retains the root lease until hand
   let checkedFile = null;
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(
@@ -3042,7 +3066,7 @@ test("a sibling blocked after final recovery reaches neither locator nor runner"
       invocation.args,
       "--output-last-message",
     );
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const nextProvider = createTestSupervisedCliBrainProvider(
@@ -3286,7 +3310,7 @@ test("the first use scavenges only stale verified residues and concurrent calls 
   const runner = recordingRunner(async (invocation) => {
     directories.push(invocation.cwd);
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     if (directories.length === 2) release();
     await released;
     return successfulProcess();
@@ -3333,7 +3357,7 @@ test("a staggered provider reaches its isolated runner while the first process r
       processRunner: recordingRunner(async (invocation) => {
         invocationDirectories.push(invocation.cwd);
         const resultFile = argumentValue(invocation.args, "--output-last-message");
-        await writeFile(resultFile, '{"ok":true}', "utf8");
+        await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
         onStart();
         await released;
         return successfulProcess();
@@ -3612,7 +3636,7 @@ test("stale scavenging fails closed before mutation when the root exceeds 128 en
   let processChecks = 0;
   const runner = recordingRunner(async (invocation) => {
     const resultFile = argumentValue(invocation.args, "--output-last-message");
-    await writeFile(resultFile, '{"ok":true}', "utf8");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
   });
   const provider = createTestSupervisedCliBrainProvider(

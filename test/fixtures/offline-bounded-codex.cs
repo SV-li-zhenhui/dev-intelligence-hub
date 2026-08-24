@@ -6,7 +6,7 @@ using System.Threading;
 public static class OfflineBoundedCodex
 {
     private const string Result =
-        "{\"schemaVersion\":1,\"confidence\":96,\"summary\":\"Inspect one bounded source file.\",\"reason\":\"The fixed offline fixture exercises lifecycle ownership.\",\"action\":{\"type\":\"read_text\",\"path\":\"src/app.js\"}}";
+        "{\"result\":\"{\\\"schemaVersion\\\":1,\\\"confidence\\\":96,\\\"summary\\\":\\\"Inspect one bounded source file.\\\",\\\"reason\\\":\\\"The fixed offline fixture exercises lifecycle ownership.\\\",\\\"action\\\":{\\\"type\\\":\\\"read_text\\\",\\\"path\\\":\\\"src/app.js\\\"}}\"}";
 
     public static int Main(string[] arguments)
     {
