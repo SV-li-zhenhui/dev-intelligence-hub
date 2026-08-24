@@ -512,7 +512,14 @@ export class GitHubReviewProposalHandler {
           await this.#enqueue(plan),
           expected,
         );
-        return transitionFor(replacement, this.#clock, this.#pollIntervalMs);
+        const transition = transitionFor(
+          replacement,
+          this.#clock,
+          this.#pollIntervalMs,
+        );
+        return Object.hasOwn(transition, "downstreamRef")
+          ? { ...transition, downstreamRef: item.id }
+          : transition;
       }
     }
     return transitionFor(current, this.#clock, this.#pollIntervalMs);

@@ -1,6 +1,9 @@
 import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js";
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
+  normalizePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
+import {
   isWorkItemInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
@@ -32,6 +35,45 @@ const PROPOSAL_INTENT_TYPES = new Map([
   ["code_action_proposal", "propose_code_action"],
   ["configuration_change_proposal", "propose_configuration_change"],
 ]);
+
+const PULL_REQUEST_BINDING_FIELDS = Object.freeze([
+  "kind",
+  "rootItemId",
+  "workKey",
+  "inputRevision",
+  "headRevision",
+  "headRefOid",
+  "eventId",
+  "eventDigest",
+  "inputDigest",
+]);
+
+function samePullRequestSourceBinding(left, right) {
+  return left !== null && right !== null &&
+    PULL_REQUEST_BINDING_FIELDS.every((field) => left?.[field] === right?.[field]);
+}
+
+function proposalTimelineInputBinding(state, item, outbox) {
+  const sourceBinding = outbox.sourceBinding;
+  if (sourceBinding === null) return null;
+  const dispatched = outbox.dispatchBinding?.boundIntent?.binding?.inputBinding;
+  if (dispatched !== undefined) {
+    const normalized = normalizePullRequestExecutionBinding(dispatched);
+    if (samePullRequestSourceBinding(normalized, sourceBinding)) return normalized;
+  }
+  const current = currentWorkItemExecutionBinding(item);
+  if (samePullRequestSourceBinding(current, sourceBinding)) return current;
+  const root = state.items.find(
+    (candidate) => candidate.itemId === sourceBinding.rootItemId,
+  );
+  return normalizePullRequestExecutionBinding({
+    schemaVersion: 1,
+    kind: "pull_request",
+    repository: root.source.identity.repository,
+    pullRequestNumber: root.source.identity.pullRequestNumber,
+    ...sourceBinding,
+  });
+}
 
 function invalid(message = "工作提案结果批次无效") {
   return workLedgerError("WORK_LEDGER_PROPOSAL_BATCH_INVALID", message, 502);
@@ -151,13 +193,37 @@ function requireBoundProposal(state, result) {
     item.status === "waiting_external" &&
     item.activeIntentId === outbox?.intentId;
   const expectedIntentType = PROPOSAL_INTENT_TYPES.get(result.kind);
+  const sealedSourceSettlement = (() => {
+    if (
+      !new Set([
+        "pr_source_left_scope_pending_settlement",
+        "pr_source_reentered_scope_pending_settlement",
+      ]).has(item.statusReason) ||
+      item.source?.kind !== "pull_request" ||
+      outbox?.sourceBinding?.kind !== "pull_request" ||
+      outbox.sourceBinding.rootItemId !== item.itemId ||
+      outbox.sourceBinding.workKey !== item.source.workKey
+    ) {
+      return false;
+    }
+    const binding = outbox.sourceBinding;
+    return item.source.revisions.some(
+      (revision) =>
+        revision.revision === binding.inputRevision &&
+        revision.headRevision === binding.headRevision &&
+        revision.headRefOid === binding.headRefOid &&
+        revision.eventId === binding.eventId &&
+        revision.eventDigest === binding.eventDigest &&
+        revision.inputDigest === binding.inputDigest,
+    );
+  })();
   if (
     !outbox ||
     matchingDownstreams.length !== 1 ||
     matchingDownstreams[0].intentId !== outbox.intentId ||
     !expectedIntentType ||
     outbox.itemId !== item.itemId ||
-    outbox.inputDigest !== item.inputDigest ||
+    (outbox.inputDigest !== item.inputDigest && !sealedSourceSettlement) ||
     outbox.status !== "delivered" ||
     outbox.intent.type !== expectedIntentType ||
     outbox.requestedBy.roleId !== result.requestedBy.roleId ||
@@ -235,6 +301,11 @@ export function planProposalBatchApplication({ state, input, clock }) {
       evidenceTarget,
       discardUnsealedLegacyResult,
     } = requireBoundProposal(workingState, result);
+    const timelineInputBinding = proposalTimelineInputBinding(
+      workingState,
+      item,
+      outbox,
+    );
     if (Date.parse(result.at) > Date.parse(now)) {
       throw invalid("工作提案结果时间晚于台账时钟");
     }
@@ -323,9 +394,9 @@ export function planProposalBatchApplication({ state, input, clock }) {
       at: now,
       actorId: "work-proposal-result-reconciler",
       details: {
-        inputBinding: currentWorkItemExecutionBinding(item),
+        inputBinding: timelineInputBinding,
         workItemRevision: itemResult.revision,
-        inputDigest: item.inputDigest,
+        inputDigest: outbox.inputDigest,
         intentId: outbox.intentId,
         resultAttestationDigest: resultAttestation.attestationDigest,
         decision: decisionContext,

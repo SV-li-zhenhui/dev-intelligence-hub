@@ -248,7 +248,7 @@ test("a pending legacy self-review is invalidated and replaced by COMMENT", asyn
   assert.equal(producer.enqueueCalls[0].action.reviewEvent, "COMMENT");
   assert.deepEqual(transition, {
     status: "waiting_confirmation",
-    downstreamRef: producer.enqueueCalls[0].id,
+    downstreamRef: legacyId,
     nextAttemptAt: "2026-08-02T03:00:05.000Z",
   });
 });

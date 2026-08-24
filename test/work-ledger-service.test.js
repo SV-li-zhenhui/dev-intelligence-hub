@@ -10398,6 +10398,43 @@ test("a bound GitHub proposal id distinct from its staged intent completes work"
   assert.equal(fixture.store.writes.length, writesBeforeReplay);
 });
 
+test("a sealed proposal result settles after its PR leaves scope", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const result = await prepareProposalResult(fixture, {
+    roleId: "pr-engineer",
+  });
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  const pending = (await fixture.service.listItems()).items[0];
+  assert.equal(pending.status, "waiting_external");
+  assert.equal(
+    pending.statusReason,
+    "pr_source_left_scope_pending_settlement",
+  );
+
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const settled = (await fixture.service.listItems()).items[0];
+
+  assert.equal(applied.applied, 1);
+  assert.equal(settled.status, "completed");
+  assert.equal(settled.activeIntentId, null);
+  assert.equal(settled.statusReason, "proposal_succeeded");
+});
+
 test("recovery rejects a rehashed proposal conclusion not sealed by its result attestation", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   const result = await prepareProposalResult(fixture);
