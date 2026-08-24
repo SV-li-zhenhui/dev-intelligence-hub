@@ -425,6 +425,12 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     verifyPullRequestExecutionBinding(binding) {
       return structuredClone(binding);
     },
+    verifyPullRequestExecutionBindings(request) {
+      return structuredClone({
+        ledgerRevision: request.ledgerRevision,
+        current: request.bindings.map(() => true),
+      });
+    },
     async close() {
       closeCalls.push("ledger");
     },
@@ -2251,6 +2257,15 @@ test("enabled unified memory exposes search only and projects the existing work 
       async getSummary() {},
       async listItems() { return { items: [], nextCursor: null }; },
       async listTimeline() { return { items: [], nextCursor: null }; },
+      verifyPullRequestExecutionBinding(binding) {
+        return structuredClone(binding);
+      },
+      verifyPullRequestExecutionBindings(request) {
+        return structuredClone({
+          ledgerRevision: request.ledgerRevision,
+          current: request.bindings.map(() => true),
+        });
+      },
       ...ownerRetryLedgerMethods(),
       async close() {},
     }),
@@ -2324,6 +2339,17 @@ test("enabled unified memory exposes search only and projects the existing work 
   assert.deepEqual(Object.keys(calls.projector.memoryAuthoritySource), [
     "readSnapshot",
   ]);
+  assert.equal(
+    Object.isFrozen(calls.projector.inputAuthorityBatchVerifier),
+    true,
+  );
+  assert.deepEqual(
+    await calls.projector.inputAuthorityBatchVerifier.verify({
+      ledgerRevision: 7,
+      bindings: [],
+    }),
+    { ledgerRevision: 7, current: [] },
+  );
   assert.equal(Object.isFrozen(calls.projector.graphProjectionSource), true);
   assert.deepEqual(
     Object.keys(calls.projector.graphProjectionSource).sort(),

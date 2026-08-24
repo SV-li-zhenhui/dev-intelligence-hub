@@ -1482,6 +1482,52 @@ test("PR execution verification rereads shared durable state before every decisi
   );
 });
 
+test("PR execution bindings are batch-verified against one exact ledger revision", async () => {
+  const store = new MemoryStore();
+  const lease = new ExclusiveLease();
+  const source = new FakeAssignmentSource([prAssignment(1)]);
+  const first = await createFixture({ store, lease, source });
+  await first.service.intake();
+  const headAItem = (await first.service.listItems()).items[0];
+  const headABinding = prExecutionBinding(headAItem);
+  const headASnapshot = await first.service.readMemoryAuthoritySnapshot();
+
+  source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  source.highWatermark = 2;
+  const second = await createFixture({ store, lease, source });
+  await second.service.intake();
+  const headBItem = (await second.service.listItems()).items[0];
+  const headBBinding = prExecutionBinding(headBItem);
+
+  await assert.rejects(
+    first.service.verifyPullRequestExecutionBindings({
+      ledgerRevision: headASnapshot.ledgerRevision,
+      bindings: [headABinding],
+    }),
+    (error) =>
+      error?.code === "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE" &&
+      error?.statusCode === 409,
+  );
+  const currentSnapshot = await first.service.readMemoryAuthoritySnapshot();
+  assert.deepEqual(
+    await first.service.verifyPullRequestExecutionBindings({
+      ledgerRevision: currentSnapshot.ledgerRevision,
+      bindings: [headABinding, headBBinding],
+    }),
+    {
+      ledgerRevision: currentSnapshot.ledgerRevision,
+      current: [false, true],
+    },
+  );
+});
+
 test("a new PR Head clears an answered old-Head decision while same-Head facts preserve it", async () => {
   const fixture = await createFixture({ records: [prAssignment(1)] });
   const attentionResult = await prepareAttentionResult(

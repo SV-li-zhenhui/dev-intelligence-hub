@@ -105,6 +105,8 @@ const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
   },
 });
 
+const MAX_PR_EXECUTION_BINDING_VERIFICATION_BATCH = 100_000;
+
 const PR_SOURCE_REQUEUE_STATUSES = new Set([
   "blocked",
   "working",
@@ -426,6 +428,49 @@ export class WorkLedgerService {
         return cloneLedgerValue(
           verifyPullRequestExecutionAuthority(this.state, input),
         );
+      }),
+    );
+  }
+
+  async verifyPullRequestExecutionBindings(input = {}) {
+    this.#assertReady();
+    if (
+      !hasExactLedgerKeys(input, ["ledgerRevision", "bindings"]) ||
+      !Number.isSafeInteger(input.ledgerRevision) ||
+      input.ledgerRevision < 0 ||
+      !Array.isArray(input.bindings) ||
+      input.bindings.length > MAX_PR_EXECUTION_BINDING_VERIFICATION_BATCH
+    ) {
+      throw workLedgerError(
+        "WORK_LEDGER_PR_EXECUTION_BINDING_BATCH_INVALID",
+        "PR 执行输入批量校验请求无效",
+      );
+    }
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        if (this.state.revision !== input.ledgerRevision) {
+          throw workLedgerError(
+            "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE",
+            "记忆投影绑定的工作台账快照已变化",
+            409,
+          );
+        }
+        const current = input.bindings.map((binding) => {
+          try {
+            verifyPullRequestExecutionAuthority(this.state, binding);
+            return true;
+          } catch (error) {
+            if (error?.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE") {
+              return false;
+            }
+            throw error;
+          }
+        });
+        return cloneLedgerValue({
+          ledgerRevision: this.state.revision,
+          current,
+        });
       }),
     );
   }

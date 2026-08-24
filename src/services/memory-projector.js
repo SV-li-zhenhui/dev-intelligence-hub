@@ -28,6 +28,7 @@ const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const GRAPH_BATCH_LIMIT = 100;
 const CONFIRMATION_PAGE_LIMIT = 100;
 const CONFIRMATION_MAXIMUM_ITEMS = 1_000;
+const AUTHORITY_VERIFICATION_MAXIMUM_BINDINGS = 100_000;
 export const LEGACY_AUTHORITY_PROJECTION_STATE_KEY =
   "authority-bound-memory-projection";
 const AUTHORITY_PROJECTION_STATE_SCHEMA_VERSION = 4;
@@ -1118,6 +1119,63 @@ function memoizedBindingAuthority(verify, { strict = false } = {}) {
   };
 }
 
+function authorityProjectionBindings(stored, snapshot, confirmationSnapshot) {
+  const bindings = new Map();
+  const add = (binding) => {
+    const normalized = normalizePullRequestExecutionBinding(binding);
+    bindings.set(authorityBindingDigest(normalized), normalized);
+  };
+  for (const item of confirmationSnapshot.items) {
+    if (item.status !== "stale") add(item.action.inputBinding);
+  }
+  const itemById = new Map(snapshot.items.map((item) => [item.itemId, item]));
+  for (const entry of snapshot.timeline) {
+    if (timelineProjectionKind(entry) === null) continue;
+    const item = itemById.get(entry.itemId);
+    if (item === undefined || item.status === "superseded") continue;
+    const binding = timelineBinding(entry, item);
+    if (binding !== null && binding !== undefined) add(binding);
+  }
+  for (const entry of stored.entries) {
+    if (entry.current === true && entry.binding !== null) add(entry.binding);
+  }
+  if (bindings.size > AUTHORITY_VERIFICATION_MAXIMUM_BINDINGS) {
+    throw new TypeError("authority-bound memory projection exceeds capacity");
+  }
+  return [...bindings.values()];
+}
+
+function normalizeAuthorityVerificationBatch(value, expectedRevision, bindings) {
+  const message = "input authority batch verification result is invalid";
+  const result = exactProjectionObject(
+    value,
+    ["ledgerRevision", "current"],
+    message,
+  );
+  if (
+    result.ledgerRevision !== expectedRevision ||
+    !Array.isArray(result.current) ||
+    result.current.length !== bindings.length ||
+    result.current.some((current) => typeof current !== "boolean")
+  ) {
+    throw new TypeError(message);
+  }
+  return new Map(bindings.map((binding, index) => [
+    authorityBindingDigest(binding),
+    result.current[index],
+  ]));
+}
+
+function verifiedBindingReader(currentByDigest) {
+  return async (binding) => {
+    const normalized = normalizePullRequestExecutionBinding(binding);
+    if (currentByDigest.get(authorityBindingDigest(normalized)) !== true) {
+      throw new Error("input authority is stale");
+    }
+    return structuredClone(normalized);
+  };
+}
+
 function authorityContent(binding, current) {
   return {
     applies: true,
@@ -1862,6 +1920,7 @@ export class MemoryProjector {
   #readSnapshot;
   #store;
   #verifyInputAuthority;
+  #verifyInputAuthorityBatch;
   #inFlight = null;
 
   constructor({
@@ -1871,6 +1930,7 @@ export class MemoryProjector {
     graphProjectionSource,
     confirmationProjectionSource,
     inputAuthorityVerifier,
+    inputAuthorityBatchVerifier,
     store,
   } = {}) {
     const lifecycle = requirePort(
@@ -1915,6 +1975,13 @@ export class MemoryProjector {
           inputAuthorityVerifier,
           ["verify"],
           "inputAuthorityVerifier",
+        ).verify;
+    this.#verifyInputAuthorityBatch = inputAuthorityBatchVerifier === undefined
+      ? null
+      : requirePort(
+          inputAuthorityBatchVerifier,
+          ["verify"],
+          "inputAuthorityBatchVerifier",
         ).verify;
     this.#readConfirmationPage = confirmationProjectionSource === undefined
       ? null
@@ -2184,8 +2251,30 @@ export class MemoryProjector {
           confirmationHighWatermark:
             journalState.confirmationHighWatermark,
         };
-    const verifyInputAuthority = (...args) =>
-      runProjectionPort(signal, () => this.#verifyInputAuthority(...args));
+    let verifyInputAuthority;
+    if (this.#verifyInputAuthorityBatch === null) {
+      verifyInputAuthority = (...args) =>
+        runProjectionPort(signal, () => this.#verifyInputAuthority(...args));
+    } else {
+      const bindings = authorityProjectionBindings(
+        stored,
+        snapshot,
+        confirmationSnapshot,
+      );
+      const currentByDigest = bindings.length === 0
+        ? new Map()
+        : normalizeAuthorityVerificationBatch(
+            await runProjectionPort(signal, () =>
+              this.#verifyInputAuthorityBatch({
+                ledgerRevision: snapshot.ledgerRevision,
+                bindings: structuredClone(bindings),
+              })
+            ),
+            snapshot.ledgerRevision,
+            bindings,
+          );
+      verifyInputAuthority = verifiedBindingReader(currentByDigest);
+    }
     const plan = await planAuthorityBoundProjectionCandidate({
       stored,
       snapshot,

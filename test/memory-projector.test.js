@@ -649,12 +649,24 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   };
   let currentHead = oldBinding.headRefOid;
   const verificationCalls = new Map();
+  let individualVerificationCalls = 0;
   const inputAuthorityVerifier = {
     async verify(binding) {
-      const count = verificationCalls.get(binding.headRefOid) ?? 0;
-      verificationCalls.set(binding.headRefOid, count + 1);
-      if (binding.headRefOid !== currentHead) throw new Error("stale head");
-      return structuredClone(binding);
+      individualVerificationCalls += 1;
+      throw new Error(
+        `unexpected individual verification for ${binding.headRefOid}`,
+      );
+    },
+  };
+  const inputAuthorityBatchVerifier = {
+    async verify({ ledgerRevision, bindings }) {
+      assert.equal(ledgerRevision, items[0].revision);
+      const current = bindings.map((binding) => {
+        const count = verificationCalls.get(binding.headRefOid) ?? 0;
+        verificationCalls.set(binding.headRefOid, count + 1);
+        return binding.headRefOid === currentHead;
+      });
+      return { ledgerRevision, current };
     },
   };
   const memoryAuthoritySource = {
@@ -674,6 +686,7 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
     graphProjectionSource: graphSource,
     confirmationProjectionSource,
     inputAuthorityVerifier,
+    inputAuthorityBatchVerifier,
     store,
   });
   const recordsFor = (kind) =>
@@ -683,6 +696,7 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
 
   const first = await createProjector().runCycle();
   assert.equal(first.authorityBound.added, 5);
+  assert.equal(individualVerificationCalls, 0);
   assert.equal(verificationCalls.get(oldBinding.headRefOid), 1);
   assert.equal(
     journal.getAuthorityProjectionState().confirmationHighWatermark,
@@ -762,6 +776,7 @@ test("authority-bound PR memory is independent, sanitized, memoized, and invalid
   confirmationRevision = 2;
   const callsBeforeHeadChange = new Map(verificationCalls);
   const second = await createProjector().runCycle();
+  assert.equal(individualVerificationCalls, 0);
   assert.equal(second.authorityBound.lifecycleInvalidations, 3);
   assert.equal(
     journal.getAuthorityProjectionState().confirmationHighWatermark,

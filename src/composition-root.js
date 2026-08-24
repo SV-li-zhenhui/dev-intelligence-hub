@@ -2416,7 +2416,15 @@ export async function createApplication({
                 }),
             ...(inputAuthorityVerifier === null
               ? {}
-              : { inputAuthorityVerifier }),
+              : {
+                  inputAuthorityVerifier,
+                  inputAuthorityBatchVerifier: Object.freeze({
+                    verify: (request) =>
+                      workLedgerRuntime.verifyPullRequestExecutionBindings(
+                        request,
+                      ),
+                  }),
+                }),
             store,
           }),
           ["runCycle"],
