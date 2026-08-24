@@ -1780,6 +1780,21 @@ test("a sealed old-Head intent blocks cutover until its result is reconciled", a
     pendingTimeline.details.currentHeadRefOid,
   );
   const writesBeforeBlockedReconciliation = fixture.store.writes.length;
+  assert.deepEqual(
+    await fixture.service.reconcilePullRequestSourceBatch({
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      items: [{
+        itemId: root.itemId,
+        expectedRevision: root.revision,
+        expectedPendingRevision: 2,
+      }],
+    }),
+    {
+      outcomes: [{ itemId: root.itemId, status: "blocked" }],
+      stoppedAfterWrite: false,
+    },
+  );
+  assert.equal(fixture.store.writes.length, writesBeforeBlockedReconciliation);
   const blocked = await fixture.service.reconcilePullRequestSource({
     itemId: root.itemId,
     expectedGraphRevision: (await fixture.service.getSummary()).revision,
@@ -1812,13 +1827,20 @@ test("a sealed old-Head intent blocks cutover until its result is reconciled", a
     expectedRevision: root.revision,
     expectedPendingRevision: 2,
   };
-  const activated = await fixture.service.reconcilePullRequestSource(
-    activationCommand,
+  assert.deepEqual(
+    await fixture.service.reconcilePullRequestSourceBatch({
+      expectedGraphRevision: activationCommand.expectedGraphRevision,
+      items: [{
+        itemId: activationCommand.itemId,
+        expectedRevision: activationCommand.expectedRevision,
+        expectedPendingRevision: activationCommand.expectedPendingRevision,
+      }],
+    }),
+    {
+      outcomes: [{ itemId: root.itemId, status: "applied" }],
+      stoppedAfterWrite: true,
+    },
   );
-  assert.equal(activated.applied, true);
-  assert.equal(activated.activeRevision, 2);
-  assert.equal(activated.pendingRevision, null);
-  assert.deepEqual(activated.blockers, []);
   const writesAfterActivation = fixture.store.writes.length;
   const timelineAfterActivation = (await fixture.service.listTimeline({
     limit: 100,

@@ -638,6 +638,75 @@ export class WorkLedgerService {
     return this.#executeCommand(planPullRequestSourceReconciliation, input);
   }
 
+  async reconcilePullRequestSourceBatch(input = {}) {
+    this.#assertReady();
+    if (
+      !hasExactLedgerKeys(input, ["expectedGraphRevision", "items"]) ||
+      !Number.isSafeInteger(input.expectedGraphRevision) ||
+      input.expectedGraphRevision < 0 ||
+      !Array.isArray(input.items) ||
+      input.items.length < 1 ||
+      input.items.length > MAX_WORK_LEDGER_QUERY_PAGE ||
+      input.items.some((item) =>
+        !hasExactLedgerKeys(item, [
+          "itemId",
+          "expectedRevision",
+          "expectedPendingRevision",
+        ])
+      )
+    ) {
+      throw workLedgerError(
+        "WORK_LEDGER_PR_SOURCE_RECONCILIATION_BATCH_INVALID",
+        "PR 来源批量对账请求无效",
+      );
+    }
+    return this.#writeTransaction(async () => {
+      if (this.state.revision !== input.expectedGraphRevision) {
+        throw workLedgerError(
+          "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT",
+          "PR 来源批量对账的台账版本已变化",
+          409,
+        );
+      }
+      const outcomes = [];
+      for (const item of input.items) {
+        let mutation;
+        try {
+          mutation = planPullRequestSourceReconciliation({
+            state: this.state,
+            input: {
+              ...item,
+              expectedGraphRevision: input.expectedGraphRevision,
+            },
+            clock: () => this.#now(),
+            timelineLimit: this.limits.timelineLimit,
+          });
+        } catch (error) {
+          if (
+            error?.code !== "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT"
+          ) {
+            throw error;
+          }
+          outcomes.push({ itemId: item.itemId, status: "conflicted" });
+          continue;
+        }
+        if (mutation.write === false) {
+          outcomes.push({
+            itemId: item.itemId,
+            status: mutation.result.blockers.length > 0
+              ? "blocked"
+              : "unchanged",
+          });
+          continue;
+        }
+        await this.#commitMutation(mutation);
+        outcomes.push({ itemId: item.itemId, status: "applied" });
+        return cloneLedgerValue({ outcomes, stoppedAfterWrite: true });
+      }
+      return cloneLedgerValue({ outcomes, stoppedAfterWrite: false });
+    });
+  }
+
   async claim(input = {}) {
     return this.#admitNewWork(() =>
       this.#executeCommand(planWorkItemClaim, input, true),

@@ -158,23 +158,38 @@ async function readPendingPullRequestSources(listPendingSources, signal) {
 }
 
 function optionalPullRequestSourceReconciler(ledger) {
-  const methods = [
+  const commonMethods = [
     "listPendingPullRequestSources",
     "getSummary",
-    "reconcilePullRequestSource",
   ];
-  const available = methods.filter(
+  const available = commonMethods.filter(
     (method) => typeof ledger?.[method] === "function",
   );
-  if (available.length === 0) return skipPullRequestSourceReconciliation;
-  if (available.length !== methods.length) {
+  const reconcileBatch =
+    typeof ledger?.reconcilePullRequestSourceBatch === "function"
+      ? ledger.reconcilePullRequestSourceBatch.bind(ledger)
+      : null;
+  const reconcileOne =
+    typeof ledger?.reconcilePullRequestSource === "function"
+      ? ledger.reconcilePullRequestSource.bind(ledger)
+      : null;
+  if (
+    available.length === 0 &&
+    reconcileBatch === null &&
+    reconcileOne === null
+  ) {
+    return skipPullRequestSourceReconciliation;
+  }
+  if (
+    available.length !== commonMethods.length ||
+    (reconcileBatch === null && reconcileOne === null)
+  ) {
     throw new TypeError(
       "ledger PR source reconciliation port is only partially configured",
     );
   }
   const listPendingSources = ledger.listPendingPullRequestSources.bind(ledger);
   const getSummary = ledger.getSummary.bind(ledger);
-  const reconcile = ledger.reconcilePullRequestSource.bind(ledger);
   return async ({ limit, signal = null }) => {
     const pendingRoots = await readPendingPullRequestSources(
       listPendingSources,
@@ -187,6 +202,41 @@ function optionalPullRequestSourceReconciler(ledger) {
       blocked: 0,
       conflicted: 0,
     };
+    if (reconcileBatch !== null && pendingRoots.length > 0) {
+      const summary = await getSummary();
+      throwIfAborted(signal);
+      const batch = await reconcileBatch({
+        expectedGraphRevision: summary.revision,
+        items: pendingRoots.slice(0, limit).map((root) => ({
+          itemId: root.itemId,
+          expectedRevision: root.revision,
+          expectedPendingRevision:
+            root.source.pendingRevision ?? root.source.activeRevision,
+        })),
+      });
+      throwIfAborted(signal);
+      if (!batch || !Array.isArray(batch.outcomes)) {
+        throw new TypeError(
+          "ledger reconcilePullRequestSourceBatch returned an invalid result",
+        );
+      }
+      result.scanned = batch.outcomes.length;
+      for (const outcome of batch.outcomes) {
+        if (outcome?.status === "applied") result.applied += 1;
+        else if (outcome?.status === "blocked") result.blocked += 1;
+        else if (
+          outcome?.status === "conflicted" ||
+          outcome?.status === "unchanged"
+        ) {
+          result.conflicted += 1;
+        } else {
+          throw new TypeError(
+            "ledger reconcilePullRequestSourceBatch returned an invalid result",
+          );
+        }
+      }
+      return result;
+    }
     for (const root of pendingRoots) {
       throwIfAborted(signal);
       if (result.applied >= limit) break;
@@ -194,7 +244,7 @@ function optionalPullRequestSourceReconciler(ledger) {
       try {
         const summary = await getSummary();
         throwIfAborted(signal);
-        const outcome = await reconcile({
+        const outcome = await reconcileOne({
           itemId: root.itemId,
           expectedGraphRevision: summary.revision,
           expectedRevision: root.revision,

@@ -22,6 +22,7 @@ const RUNTIME_METHODS = Object.freeze([
   "readPullRequestExecutionContext",
   "intake",
   "reconcilePullRequestSource",
+  "reconcilePullRequestSourceBatch",
   "claim",
   "transition",
   "scheduleRetry",

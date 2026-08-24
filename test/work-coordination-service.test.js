@@ -274,6 +274,68 @@ test("housekeeping activates settled pending PR source revisions through ledger 
   });
 });
 
+test("housekeeping reconciles a bounded PR source batch against one ledger revision", async () => {
+  const calls = [];
+  const roots = [1, 2].map((number) => ({
+    itemId: `work-item-pr-root-${number}`,
+    revision: number + 5,
+    source: {
+      kind: "pull_request",
+      activeRevision: 1,
+      pendingRevision: number + 1,
+    },
+  }));
+  const { service } = fixture({
+    intakeLimit: 2,
+    ledger: {
+      async intake() {},
+      async listPendingPullRequestSources(input) {
+        calls.push(["list", input]);
+        return { items: roots, nextCursor: null };
+      },
+      async getSummary() {
+        calls.push(["summary"]);
+        return { revision: 23 };
+      },
+      async reconcilePullRequestSource() {
+        throw new Error("individual reconciliation must not run");
+      },
+      async reconcilePullRequestSourceBatch(input) {
+        calls.push(["batch", input]);
+        return {
+          outcomes: [
+            { itemId: roots[0].itemId, status: "blocked" },
+            { itemId: roots[1].itemId, status: "applied" },
+          ],
+          stoppedAfterWrite: true,
+        };
+      },
+    },
+  });
+
+  const result = await service.runCycle({ includeWork: false });
+
+  assert.deepEqual(calls, [
+    ["list", { limit: 100 }],
+    ["summary"],
+    ["batch", {
+      expectedGraphRevision: 23,
+      items: roots.map((root) => ({
+        itemId: root.itemId,
+        expectedRevision: root.revision,
+        expectedPendingRevision: root.source.pendingRevision,
+      })),
+    }],
+  ]);
+  assert.deepEqual(result.stages.pull_request_source_reconciliation.result, {
+    scanned: 2,
+    pending: 2,
+    applied: 1,
+    blocked: 1,
+    conflicted: 0,
+  });
+});
+
 test("blocked pending PR sources on the first page cannot starve later pages", async () => {
   const roots = Array.from({ length: 101 }, (_, index) => ({
     itemId: `work-item-pr-root-${String(index + 1).padStart(3, "0")}`,
