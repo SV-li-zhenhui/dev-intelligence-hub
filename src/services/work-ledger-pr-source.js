@@ -88,6 +88,10 @@ const REVISION_KEYS = [
   ...AUTHORITY_REVISION_KEYS,
   "authorityEpochCutover",
 ];
+const SCOPE_REVOCATION_REVISION_KEYS = [
+  ...REVISION_KEYS,
+  "scopeRevocationApplied",
+];
 const BINDING_KEYS = [
   "sourceSequence",
   "assignmentId",
@@ -572,6 +576,7 @@ export function appendPullRequestWorkSource(
   const observed = latestObservedInput(source);
   const acceptedCausalHead = causalHead ?? observed.headRefOid;
   const recoveringAuthorityFence =
+    !input.trustedLifecycle &&
     (hasUnresolvedAuthorityFence(source) || authorityFenceRecovery) &&
     sameEventExecutionAuthority(source.current.event, input.event);
   const stale = Date.parse(input.event.occurredAt) <
@@ -655,23 +660,39 @@ export function applyPullRequestScopeLifecycle(value, envelope) {
     authorityEpochChanged: authorityChanged,
   });
   if (!appended.changed) return appended;
+  const appendedRevision = appended.source.revisions.at(-1);
+  const rejectedRevocation =
+    authorityChanged &&
+    !active &&
+    appended.source.inputRevision > source.inputRevision &&
+    appended.disposition !== "accepted";
+  const appliedAuthorityChange =
+    authorityChanged &&
+    (appended.disposition === "accepted" || rejectedRevocation);
+  const revisions = rejectedRevocation
+    ? [
+        ...appended.source.revisions.slice(0, -1),
+        { ...appendedRevision, scopeRevocationApplied: true },
+      ]
+    : appended.source.revisions;
   return {
     ...appended,
     source: {
       ...appended.source,
+      revisions,
       authorityEpoch: appended.source.headRevision,
       scope: {
         ...appended.source.scope,
-        active,
-        revision: authorityChanged
+        active: appliedAuthorityChange ? active : appended.source.scope.active,
+        revision: appliedAuthorityChange
           ? appended.source.scope.revision + 1
           : appended.source.scope.revision,
-        lastLifecycleEventId: authorityChanged
+        lastLifecycleEventId: appliedAuthorityChange
           ? input.event.eventId
           : appended.source.scope.lastLifecycleEventId,
       },
     },
-    authorityChanged,
+    authorityChanged: appliedAuthorityChange,
   };
 }
 
@@ -691,7 +712,12 @@ function normalizeIdentity(value) {
 }
 
 function normalizeRevision(value, expectedRevision) {
-  const hasAuthorityCutover = hasExactLedgerKeys(value, REVISION_KEYS);
+  const hasScopeRevocation = hasExactLedgerKeys(
+    value,
+    SCOPE_REVOCATION_REVISION_KEYS,
+  );
+  const hasAuthorityCutover = hasScopeRevocation ||
+    hasExactLedgerKeys(value, REVISION_KEYS);
   const hasAuthorityEpoch = hasAuthorityCutover ||
     hasExactLedgerKeys(value, AUTHORITY_REVISION_KEYS);
   const hasCausalHead = hasAuthorityEpoch ||
@@ -714,6 +740,9 @@ function normalizeRevision(value, expectedRevision) {
   if ((disposition === "accepted") !== (headRevision !== null)) {
     throw invalid("PR input revision Head epoch 无效");
   }
+  if (hasScopeRevocation && value.scopeRevocationApplied !== true) {
+    throw invalid("PR scope 撤销历史无效");
+  }
   return {
     revision,
     eventId: text(value.eventId, "inputRevision.eventId", 192),
@@ -732,6 +761,7 @@ function normalizeRevision(value, expectedRevision) {
     authorityEpochCutover: hasAuthorityCutover
       ? value.authorityEpochCutover
       : undefined,
+    ...(hasScopeRevocation ? { scopeRevocationApplied: true } : {}),
     disposition,
   };
 }
@@ -927,7 +957,8 @@ export function normalizePullRequestWorkSource(value) {
   const rawRevisions = plainArray(value.revisions, "revisions");
   const hasIncompleteAuthorityHistory = rawRevisions.some(
     (revision) => !hasExactLedgerKeys(revision, AUTHORITY_REVISION_KEYS) &&
-      !hasExactLedgerKeys(revision, REVISION_KEYS),
+      !hasExactLedgerKeys(revision, REVISION_KEYS) &&
+      !hasExactLedgerKeys(revision, SCOPE_REVOCATION_REVISION_KEYS),
   );
   const revisions = rawRevisions.map(
     (revision, index) => normalizeRevision(revision, index + 1),
@@ -1022,21 +1053,29 @@ export function normalizePullRequestWorkSource(value) {
   ) {
     throw invalid("PR current input 没有分派来源");
   }
-  if (
+  const lastLifecycleRevision = revisionsByEvent.get(
+    scope.lastLifecycleEventId,
+  );
+  const currentLifecycleMatches =
     scope.lastLifecycleEventId === source.current.eventId &&
-    (!["pull_request.created", "pull_request.left_scope"].includes(
+    ["pull_request.created", "pull_request.left_scope"].includes(
       source.current.event.eventType,
-    ) ||
-      scope.active !==
-        (source.current.event.eventType === "pull_request.created"))
+    ) &&
+    scope.active ===
+      (source.current.event.eventType === "pull_request.created");
+  const rejectedRevocationMatches =
+    scope.active === false &&
+    lastLifecycleRevision?.scopeRevocationApplied === true &&
+    lastLifecycleRevision.disposition !== "accepted";
+  if (
+    scope.lastLifecycleEventId !== null &&
+    !currentLifecycleMatches &&
+    !rejectedRevocationMatches
   ) {
     throw invalid("PR scope 生命周期绑定无效");
   }
-  if (
-    scope.active === false &&
-    (scope.lastLifecycleEventId !== source.current.eventId ||
-      source.current.event.eventType !== "pull_request.left_scope")
-  ) {
+  if (scope.active === false && !currentLifecycleMatches &&
+      !rejectedRevocationMatches) {
     throw invalid("PR scope 非活动状态缺少生命周期绑定");
   }
   if (
@@ -1529,18 +1568,28 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
     ({ disposition, authorityEpochChanged }) =>
       disposition === "accepted" && authorityEpochChanged,
   ).length;
+  const rejectedRevocations = appendedRevisions.filter(
+    ({ disposition, scopeRevocationApplied }) =>
+      disposition !== "accepted" && scopeRevocationApplied === true,
+  ).length;
+  const lastLifecycleRevision = nextSource.revisions.find(
+    ({ eventId }) => eventId === nextScope.lastLifecycleEventId,
+  );
   return (
     advances <= appendedRevisions.length &&
-    advances <= authorityChanges &&
-    nextSource.authorityEpoch - previousSource.authorityEpoch >= advances &&
+    advances <= authorityChanges + rejectedRevocations &&
+    nextSource.authorityEpoch - previousSource.authorityEpoch >=
+      advances - rejectedRevocations &&
     nextScope.active ===
       (advances % 2 === 0 ? previousScope.active : !previousScope.active) &&
     nextScope.lastLifecycleEventId !==
       previousScope.lastLifecycleEventId &&
-    nextSource.current.eventId === nextScope.lastLifecycleEventId &&
-    ["pull_request.created", "pull_request.left_scope"].includes(
-      nextSource.current.event.eventType,
-    )
+    (nextSource.current.eventId === nextScope.lastLifecycleEventId ||
+      lastLifecycleRevision?.scopeRevocationApplied === true) &&
+    (lastLifecycleRevision?.scopeRevocationApplied === true ||
+      ["pull_request.created", "pull_request.left_scope"].includes(
+        nextSource.current.event.eventType,
+      ))
   );
 }
 

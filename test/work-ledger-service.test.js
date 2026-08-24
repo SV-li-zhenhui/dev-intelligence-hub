@@ -736,6 +736,178 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
   );
 });
 
+test("a changed Head cannot restore automatic PR scope without causal proof", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const changedHead = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(3, changedHead.event),
+    changedHead,
+  );
+  fixture.source.highWatermark = 4;
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const root = (await fixture.service.listItems()).items[0];
+
+  assert.equal(intake.cursor, 4);
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.source.scope.revision, 2);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.revisions.at(-1).headRefOid, PR_HEAD_B);
+  assert.equal(
+    root.source.revisions.at(-1).disposition,
+    "ignored_unproven_head",
+  );
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_left_scope");
+});
+
+test("a rejected changed-Head left-scope still revokes automatic authority", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items[0];
+  const oldBinding = prExecutionBinding(before);
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+
+  await fixture.service.intake();
+  const inactive = (await fixture.service.listItems()).items[0];
+
+  assert.equal(inactive.source.scope.active, false);
+  assert.equal(inactive.source.scope.revision, 2);
+  assert.equal(inactive.source.scope.lastLifecycleEventId, leftEvent.eventId);
+  assert.equal(inactive.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(
+    inactive.source.revisions.at(-1).disposition,
+    "ignored_unproven_head",
+  );
+  assert.equal(inactive.status, "blocked");
+  assert.equal(inactive.statusReason, "pr_source_left_scope");
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+  const restarted = await createFixture({ store: fixture.store });
+  const recoveredInactive = (await restarted.service.listItems()).items[0];
+  assert.equal(recoveredInactive.source.scope.active, false);
+  assert.equal(
+    recoveredInactive.source.scope.lastLifecycleEventId,
+    leftEvent.eventId,
+  );
+  assert.equal(recoveredInactive.source.current.headRefOid, PR_HEAD_A);
+
+  const reentered = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(3, reentered.event),
+    reentered,
+  );
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  const active = (await fixture.service.listItems()).items[0];
+
+  assert.equal(active.source.scope.active, true);
+  assert.equal(active.source.scope.revision, 3);
+  assert.equal(active.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(active.source.authorityEpoch, before.source.authorityEpoch + 1);
+  await assert.rejects(
+    fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+    (error) => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  );
+});
+
+test("a stale lifecycle replay cannot recover an unresolved authority fence", async () => {
+  const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, leftEvent),
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:20:00.000Z",
+      gitFacts: { gitTargetAvailable: false },
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  const staleCreated = prAssignment(4, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(4, staleCreated));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.source.scope.revision, 2);
+  assert.equal(root.source.current.eventId, leftEvent.eventId);
+  assert.equal(root.source.revisions.at(-1).disposition, "ignored_stale");
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_left_scope");
+});
+
+test("rebinding an accepted lifecycle event cannot restore revoked PR scope", async () => {
+  const initial = prAssignment(1, {
+    eventType: "pull_request.created",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  const fixture = await createFixture({ records: [initial] });
+  await fixture.service.intake();
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  fixture.source.records.push(prScopeLifecycleAssignment(3, initial.event));
+  fixture.source.highWatermark = 3;
+
+  const intake = await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+
+  assert.equal(intake.cursor, 3);
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.source.scope.revision, 2);
+  assert.equal(root.source.current.eventId, leftEvent.eventId);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "pr_source_left_scope");
+});
+
 test("a completed automatic PR root can leave scope without blocking later intake", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
