@@ -175,10 +175,19 @@ function handler(producer, overrides = {}) {
 
 test("a pending proposal is idempotently enqueued and waits on its exact confirmation", async () => {
   const producer = new FakeConfirmationProducer();
-  const transition = await handler(producer).handle(handlerInput());
+  const verifier = acceptingVerifier();
+  const contextReader = acceptingContextReader();
+  const transition = await handler(producer, {
+    inputAuthorityVerifier: verifier,
+    pullRequestContextReader: contextReader,
+  }).handle(handlerInput());
 
   assert.equal(producer.enqueueCalls.length, 1);
   assert.equal(producer.getCalls.length, 0);
+  assert.equal(verifier.calls.length, 0);
+  assert.deepEqual(contextReader.calls, [
+    handlerInput().proposal.binding.inputBinding,
+  ]);
   assert.match(
     producer.enqueueCalls[0].id,
     /^confirmation-github-review-[a-f0-9]{64}$/,
@@ -348,7 +357,7 @@ test("mismatched confirmation bindings fail closed", async () => {
 test("revoked target authority prevents enqueue and invalidates an existing confirmation", async () => {
   const producer = new FakeConfirmationProducer();
   const revoked = {
-    async verify() {
+    async readCurrent() {
       throw Object.assign(new Error("stale"), {
         code: "WORK_LEDGER_PR_BINDING_STALE",
       });
@@ -356,7 +365,7 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
   };
 
   const beforeEnqueue = await handler(producer, {
-    inputAuthorityVerifier: revoked,
+    pullRequestContextReader: revoked,
   }).handle(handlerInput());
   assert.equal(beforeEnqueue.status, "stale");
   assert.equal(producer.enqueueCalls.length, 0);
@@ -364,7 +373,7 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
   await handler(producer).handle(handlerInput());
   const downstreamRef = producer.plan.id;
   const afterEnqueue = await handler(producer, {
-    inputAuthorityVerifier: revoked,
+    pullRequestContextReader: revoked,
   }).handle(
     handlerInput({ status: "waiting_confirmation", downstreamRef }),
   );
@@ -374,6 +383,21 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
     producer.invalidateCalls[0][1].reason,
     "authorization_changed",
   );
+});
+
+test("the legacy verifier remains the authority fallback without a context reader", async () => {
+  const producer = new FakeConfirmationProducer();
+  const verifier = acceptingVerifier();
+
+  await handler(producer, {
+    inputAuthorityVerifier: verifier,
+    pullRequestContextReader: undefined,
+  }).handle(handlerInput());
+
+  assert.deepEqual(verifier.calls, [
+    handlerInput().proposal.binding.inputBinding,
+  ]);
+  assert.equal(producer.enqueueCalls.length, 1);
 });
 
 test("persisted v1 review proposals terminate stale instead of retrying forever", async () => {

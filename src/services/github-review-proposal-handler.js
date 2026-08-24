@@ -405,16 +405,17 @@ export class GitHubReviewProposalHandler {
 
   async #currentAuthority(inputBinding) {
     if (inputBinding?.schemaVersion !== 2) return null;
-    let verified;
-    try {
-      verified = await this.#verifyInputAuthority(
-        cloneWorkProposalValue(inputBinding),
-      );
-    } catch {
-      return null;
+    if (this.#readPullRequestContext === null) {
+      let verified;
+      try {
+        verified = await this.#verifyInputAuthority(
+          cloneWorkProposalValue(inputBinding),
+        );
+      } catch {
+        return null;
+      }
+      return sameValue(verified, inputBinding) ? { author: null } : null;
     }
-    if (!sameValue(verified, inputBinding)) return null;
-    if (this.#readPullRequestContext === null) return { author: null };
     let context;
     try {
       context = await this.#readPullRequestContext(
