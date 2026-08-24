@@ -422,7 +422,7 @@ function productionCliRuntimeFacts(value) {
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
     keys.length < 1 ||
-    keys.length > 2 ||
+    keys.length > 3 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||

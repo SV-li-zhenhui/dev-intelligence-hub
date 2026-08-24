@@ -4957,6 +4957,14 @@ test("default application composition supplies lexical authority for configured 
   const config = workCoordinationConfig({ externalActions: false });
   config.brainProviders = { cli: { kind: "codex-cli" } };
   config.employees = { ...config.employees, roles: {} };
+  const privateRuntimeDirectory = path.join(
+    tmpdir(),
+    "mydashboard-managed-cli-runtime-fixture",
+  );
+  const credentialRoot = path.join(
+    tmpdir(),
+    "mydashboard-managed-cli-credential-fixture",
+  );
   const calls = {};
   const closeCalls = [];
   const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
@@ -4966,6 +4974,17 @@ test("default application composition supplies lexical authority for configured 
     store: memoryStore(),
     versionedConfiguration: false,
     externalActions: false,
+    privateRuntimeDirectory,
+    codexLoginLocationsFactory: () => ({
+      sourceFile: path.join(credentialRoot, "auth.json"),
+      mirrorRoot: path.join(privateRuntimeDirectory, "cli-credentials-v1"),
+      mirrorDirectory: path.join(
+        privateRuntimeDirectory,
+        "cli-credentials-v1",
+        "codex-login",
+      ),
+      probeRoot: path.join(privateRuntimeDirectory, "codex-login-probe-v1"),
+    }),
     ...runtimeStubs,
     operationsRuntimeFactory: () => Object.freeze({}),
   });
