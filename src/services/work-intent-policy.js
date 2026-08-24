@@ -29,6 +29,7 @@ const ACTIVE_PR_EVENTS = new Set([
   "pull_request.updated",
   "pull_request.classified",
   "pull_request.status",
+  "pull_request.owner_requested",
 ]);
 const CODE_OPERATIONS = Object.freeze(["inspect", "modify", "verify"]);
 

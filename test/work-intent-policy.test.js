@@ -287,6 +287,60 @@ test("derives a GitHub review target only from the trusted event", () => {
   assert.equal(repeated.intentId, bound.intentId);
 });
 
+test("allows an owner-requested active PR to produce a GitHub review proposal", () => {
+  const headRefOid = "a".repeat(40);
+  const trustedEvent = event({
+    eventType: "pull_request.owner_requested",
+    source: {
+      provider: "local-owner",
+      scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000",
+    },
+    payload: {
+      title: "Fix race",
+      headRefOid,
+      state: "open",
+      changedFields: ["headRefOid"],
+      gitTargetAvailable: true,
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "b".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/race",
+        headRefOid,
+      },
+    },
+  });
+  const rootItemId = `work-item-${"b".repeat(64)}`;
+  const trustedContext = context({
+    event: trustedEvent,
+    workItemId: rootItemId,
+    inputBinding: {
+      ...inputBinding(trustedEvent, rootItemId),
+      schemaVersion: 2,
+      gitTarget: structuredClone(trustedEvent.payload.gitTarget),
+    },
+  });
+  const bound = policy().bind({
+    context: trustedContext,
+    intent: {
+      ...common("propose_github_review"),
+      verdict: "request_changes",
+      body: "请先修复阻断问题。",
+      evidence: ["完整补丁显示输入校验发生在分配之后。"],
+    },
+  });
+
+  assert.equal(bound.kind, "github_review_proposal");
+  assert.equal(bound.binding.eventId, trustedContext.event.eventId);
+  assert.equal(bound.binding.repository, "acme/repo");
+  assert.equal(bound.binding.pullRequestNumber, 42);
+  assert.equal(bound.binding.headRefOid, headRefOid);
+});
+
 test("binds five PR external actions only for a trusted role and v2 target", () => {
   const trusted = gitContext({ roleId: "pr-reviewer" });
   const controlledCommitEvidence = externalActionControlledCommit(
