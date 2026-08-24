@@ -1921,7 +1921,14 @@ test("production drain participants reject every public trigger before execution
   });
   await backgroundWork.initialRefresh;
   await backgroundWork.runConfirmationOperation(async () => {});
-  assert.deepEqual(executed, participantIds);
+  const employeeParticipant = DRAIN_PARTICIPANTS.employeeExecution.id;
+  const employeeParticipantIndex = participantIds.indexOf(employeeParticipant);
+  const expectedParticipantRun = [
+    ...participantIds.slice(0, employeeParticipantIndex),
+    DRAIN_PARTICIPANTS.memoryProjection.id,
+    ...participantIds.slice(employeeParticipantIndex),
+  ];
+  assert.deepEqual(executed, expectedParticipantRun);
 
   async function assertRejectedBeforeParticipant(trigger) {
     const baseline = [...executed];
@@ -1967,7 +1974,7 @@ test("production drain participants reject every public trigger before execution
   executed.length = 0;
   await backgroundWork.refresh();
   await backgroundWork.runConfirmationOperation(async () => {});
-  assert.deepEqual(executed, participantIds);
+  assert.deepEqual(executed, expectedParticipantRun);
   assert.deepEqual(
     reportedErrors.map((error) => error.code),
     Array(6).fill("SYSTEM_QUIESCING"),
@@ -2823,8 +2830,10 @@ test("background work runs every registered employee after the initial refresh a
   assert.deepEqual(calls, callsAfterStop);
 });
 
-test("background work projects durable activity into unified memory after employees run", async () => {
+test("background work projects coordination before employees and their activity after", async () => {
   const calls = [];
+  const employeeStarted = deferred();
+  const releaseEmployee = deferred();
   const application = {
     config: { refreshMinutes: 7 },
     employeeRegistry: {
@@ -2833,6 +2842,8 @@ test("background work projects durable activity into unified memory after employ
       },
       async runAll(options) {
         calls.push({ operation: "run_all", ...options });
+        employeeStarted.resolve();
+        await releaseEmployee.promise;
       },
     },
     refreshService: {
@@ -2862,6 +2873,19 @@ test("background work projects durable activity into unified memory after employ
   });
 
   try {
+    await employeeStarted.promise;
+    assert.deepEqual(calls, [
+      { operation: "refresh", notify: false },
+      { operation: "intake" },
+      {
+        operation: "work_cycle",
+        trigger: "refresh_completed",
+        includeWork: false,
+      },
+      { operation: "memory_projection" },
+      { operation: "run_all", trigger: "refresh_completed" },
+    ]);
+    releaseEmployee.resolve();
     await backgroundWork.initialRefresh;
     assert.deepEqual(calls, [
       { operation: "refresh", notify: false },
@@ -2871,10 +2895,12 @@ test("background work projects durable activity into unified memory after employ
         trigger: "refresh_completed",
         includeWork: false,
       },
+      { operation: "memory_projection" },
       { operation: "run_all", trigger: "refresh_completed" },
       { operation: "memory_projection" },
     ]);
   } finally {
+    releaseEmployee.resolve();
     await backgroundWork.stop();
   }
 });
@@ -3497,6 +3523,7 @@ test("queued periodic roles do not occupy or survive quiescence", {
     await Promise.all(pendingTicks);
     assert.deepEqual(calls, [
       { operation: "coordination", trigger: "scheduled" },
+      { operation: "memory" },
       {
         operation: "employee",
         id: "requirements-analyst",
@@ -3512,8 +3539,9 @@ test("queued periodic roles do not occupy or survive quiescence", {
     gate.leave(maintenanceToken);
     maintenanceToken = null;
     await timers[2].callback();
-    assert.deepEqual(calls.slice(-3), [
+    assert.deepEqual(calls.slice(-4), [
       { operation: "coordination", trigger: "scheduled" },
+      { operation: "memory" },
       { operation: "employee", id: "developer", trigger: "scheduled" },
       { operation: "memory" },
     ]);

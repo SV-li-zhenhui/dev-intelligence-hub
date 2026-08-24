@@ -3960,6 +3960,20 @@ export function startApplicationBackgroundWork(
     signal.throwIfAborted();
   }
 
+  async function projectMemory(failures, signal) {
+    if (typeof application.memoryProjector?.runCycle !== "function" || stopped) {
+      return;
+    }
+    try {
+      await runDrainParticipant(
+        DRAIN_PARTICIPANTS.memoryProjection,
+        () => application.memoryProjector.runCycle({ signal }),
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+
   async function performAgencyCycle({
     trigger,
     includeLegacyEmployees = false,
@@ -4001,6 +4015,10 @@ export function startApplicationBackgroundWork(
       ...(includeLegacyEmployees ? ["pr-reviewer"] : []),
       ...employeeIds,
     ].filter((id, index, ids) => ids.indexOf(id) === index);
+    if (selectedEmployeeIds.length > 0) {
+      await projectMemory(failures, signal);
+    }
+    if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     if (selectedEmployeeIds.length > 0 && !stopped) {
       try {
         const runOptions = backgroundOperationOptions({ trigger }, signal);
@@ -4029,16 +4047,7 @@ export function startApplicationBackgroundWork(
       }
     }
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
-    if (typeof application.memoryProjector?.runCycle === "function" && !stopped) {
-      try {
-        await runDrainParticipant(
-          DRAIN_PARTICIPANTS.memoryProjection,
-          () => application.memoryProjector.runCycle({ signal }),
-        );
-      } catch (error) {
-        failures.push(error);
-      }
-    }
+    await projectMemory(failures, signal);
     throwAgencyCycleFailures(failures, signal);
     return { skipped: null };
   }
