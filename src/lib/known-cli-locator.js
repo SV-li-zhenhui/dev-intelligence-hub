@@ -25,7 +25,7 @@ const CLI_IDENTITIES = new Set(["codex-cli", "claude-cli"]);
 const SUPPORTED_VERSION_RANGES = Object.freeze({
   "codex-cli": Object.freeze({
     minimum: Object.freeze([0, 147, 0]),
-    maximumExclusive: Object.freeze([0, 148, 0]),
+    maximumExclusive: Object.freeze([0, 150, 0]),
   }),
   "claude-cli": Object.freeze({
     minimum: Object.freeze([2, 1, 222]),
