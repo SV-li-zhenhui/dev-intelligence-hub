@@ -769,6 +769,103 @@ test("a PR source root binds context and facts to its active Head revision", asy
   }]);
 });
 
+test("PR review material is checked against the atomic target reconstructed from the source event", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  const headRefOid = "b".repeat(40);
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "octo/repo",
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/review",
+    headRefOid,
+  };
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "pull_request.updated",
+    occurredAt: "2026-08-03T05:00:00.000Z",
+    source: { provider: "github", scopeId: "github-dashboard" },
+    subject: {
+      id: "github:pr:octo/repo#12",
+      repository: "octo/repo",
+      number: 12,
+    },
+    payload: {
+      title: "Review atomic PR context",
+      headRefOid,
+      changedFields: ["headRefOid"],
+      gitTargetAvailable: true,
+      gitTarget,
+    },
+  });
+  const source = createPullRequestWorkSource(
+    pullRequestAssignment(1, event),
+  ).source;
+  fixture.item = {
+    ...fixture.item,
+    currentTarget: { type: "role", id: "pr-engineer" },
+    decisionContext: null,
+    inputDigest: source.current.inputDigest,
+    event,
+    source,
+  };
+  fixture.snapshot.graph.tasks.find(
+    ({ taskId }) => taskId === fixture.item.itemId,
+  ).responsibility = { type: "role", id: "pr-engineer" };
+  const pullRequestContext = {
+    schemaVersion: 1,
+    identityDigest: "1".repeat(64),
+    contentDigest: "2".repeat(64),
+    observedAt: "2026-08-03T05:01:00.000Z",
+    summary: { reviewDecision: "REVIEW_REQUIRED" },
+    comments: [],
+    reviews: [],
+    reviewThreads: [],
+    checks: [],
+    contextTruncated: false,
+    reviewMaterial: {
+      schemaVersion: 1,
+      gitTarget,
+      additions: 4,
+      deletions: 1,
+      changedFiles: 1,
+      files: [{ path: "src/review.js", additions: 4, deletions: 1 }],
+      filesTruncated: false,
+      patch: "diff --git a/src/review.js b/src/review.js\n",
+      patchTruncated: false,
+    },
+  };
+
+  const packet = await assemble(fixture, {
+    roleId: "pr-engineer",
+    pullRequestContextReader: {
+      async read() {
+        return structuredClone(pullRequestContext);
+      },
+    },
+  });
+
+  assert.deepEqual(
+    packet.context.code.pullRequest.reviewMaterial.gitTarget,
+    gitTarget,
+  );
+
+  const stale = structuredClone(pullRequestContext);
+  stale.reviewMaterial.gitTarget.headRefOid = "c".repeat(40);
+  await assert.rejects(
+    assemble(fixture, {
+      roleId: "pr-engineer",
+      pullRequestContextReader: { async read() { return stale; } },
+    }),
+    (error) =>
+      error instanceof RoleContextAssemblerError &&
+      error.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+  );
+});
+
 test("a configured PR context reader fails closed without an exact source", async () => {
   const fixture = graphFixture({ pullRequest: true });
   let contextCalls = 0;

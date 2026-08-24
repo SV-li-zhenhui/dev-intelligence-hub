@@ -4,6 +4,9 @@ import {
   normalizePullRequestGitTarget,
   samePullRequestGitTarget,
 } from "../domain/git-tool-contract.js";
+import {
+  createPullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
@@ -1092,18 +1095,34 @@ async function readPullRequestContext(reader, item, signal) {
     );
     signal?.throwIfAborted();
     const normalized = normalizePullRequestContext(value);
-    if (
-      normalized.reviewMaterial &&
-      !samePullRequestGitTarget(
-        normalizePullRequestGitTarget(normalized.reviewMaterial.gitTarget),
-        item.sourceBinding.gitTarget,
-      )
-    ) {
-      throw contextError(
-        "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
-        "PR review material does not match the exact source binding",
-        503,
-      );
+    if (normalized.reviewMaterial) {
+      let executionBinding;
+      try {
+        executionBinding = createPullRequestExecutionBinding({
+          sourceBinding: item.sourceBinding,
+          event: item.event,
+        });
+      } catch (cause) {
+        throw contextError(
+          "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+          "PR review material requires an atomic execution binding",
+          503,
+          { cause },
+        );
+      }
+      if (
+        executionBinding.schemaVersion !== 2 ||
+        !samePullRequestGitTarget(
+          normalizePullRequestGitTarget(normalized.reviewMaterial.gitTarget),
+          executionBinding.gitTarget,
+        )
+      ) {
+        throw contextError(
+          "ROLE_CONTEXT_PR_FACT_UNAVAILABLE",
+          "PR review material does not match the exact source binding",
+          503,
+        );
+      }
     }
     return normalized;
   } catch (cause) {
