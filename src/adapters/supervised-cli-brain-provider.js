@@ -1542,6 +1542,9 @@ function codexArguments({ request, invocation, schemaFile, resultFile }) {
     resultFile,
     "--model",
     request.model,
+    ...(request.reasoningEffort
+      ? ["-c", `model_reasoning_effort="${request.reasoningEffort}"`]
+      : []),
     "-C",
     invocation.path,
     "-",
@@ -2283,6 +2286,9 @@ export class SupervisedCliBrainProvider {
       const request = normalizeStructuredBrainRequest(
         {
           model: input.model,
+          ...(input.reasoningEffort
+            ? { reasoningEffort: input.reasoningEffort }
+            : {}),
           messages: input.messages,
           schema: input.schema,
         },

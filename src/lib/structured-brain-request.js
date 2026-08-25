@@ -12,6 +12,14 @@ const MAX_CONTAINER_KEYS = 4_096;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MESSAGE_ROLES = new Set(["system", "user", "assistant"]);
+const REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
 
 export class StructuredBrainRequestError extends Error {
   constructor(code, message, statusCode = 500) {
@@ -78,9 +86,9 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     required.some((key) => !keys.includes(key)) ||
     keys.some((key) =>
       typeof key !== "string" ||
-      ![...required, "signal"].includes(key)
+      ![...required, "reasoningEffort", "signal"].includes(key)
     ) ||
-    keys.length > required.length + 1
+    keys.length > required.length + 2
   ) {
     throw new TypeError("structured request is invalid");
   }
@@ -94,6 +102,7 @@ export function readStructuredBrainGenerateInput(rawRequest) {
   }
   return Object.freeze({
     model: result.model,
+    reasoningEffort: result.reasoningEffort ?? null,
     messages: result.messages,
     schema: result.schema,
     signal: result.signal ?? null,
@@ -295,13 +304,34 @@ function deepFreeze(value) {
 
 export function normalizeStructuredBrainRequest(rawRequest, options) {
   const maxRequestBytes = maximumRequestBytes(options);
+  const hasReasoningEffort =
+    rawRequest !== null &&
+    typeof rawRequest === "object" &&
+    !Array.isArray(rawRequest) &&
+    !utilTypes.isProxy(rawRequest) &&
+    Object.getPrototypeOf(rawRequest) === Object.prototype &&
+    Object.hasOwn(rawRequest, "reasoningEffort");
   const request = exactDataObject(
     rawRequest,
-    ["model", "messages", "schema"],
+    [
+      "model",
+      ...(hasReasoningEffort ? ["reasoningEffort"] : []),
+      "messages",
+      "schema",
+    ],
     "structured request is invalid",
   );
+  if (
+    hasReasoningEffort &&
+    !REASONING_EFFORTS.has(request.reasoningEffort)
+  ) {
+    throw new TypeError("reasoningEffort is invalid");
+  }
   const normalized = {
     model: safeText(request.model, "model", MAX_MODEL_BYTES),
+    ...(hasReasoningEffort
+      ? { reasoningEffort: request.reasoningEffort }
+      : {}),
     messages: normalizeMessages(request.messages),
     schema: normalizeSchema(request.schema),
   };

@@ -131,6 +131,14 @@ const INTENT_TYPES = new Set([
   "submit_delivery",
 ]);
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
+const REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
 const CAPABILITIES = new Set([
   "coordination",
   "requirements",
@@ -499,12 +507,19 @@ function normalizeAssignedBrain(value, path) {
   const config = fields(
     value,
     path,
-    ["provider", "model", "remoteData"],
+    ["provider", "model", "reasoningEffort", "remoteData"],
     ["provider", "model", "remoteData"],
   );
   return {
     provider: safeId(config.provider, `${path}.provider`),
     model: text(config.model, `${path}.model`, 256),
+    ...optional(config, "reasoningEffort", (entry) => {
+      const effort = text(entry, `${path}.reasoningEffort`, 16);
+      if (!REASONING_EFFORTS.has(effort)) {
+        throw invalid(`${path}.reasoningEffort`);
+      }
+      return effort;
+    }),
     remoteData: normalizeRemoteData(config.remoteData, `${path}.remoteData`),
   };
 }
@@ -1431,6 +1446,29 @@ function assertProviderReferences(document) {
   }
   for (const [path, provider] of references) {
     if (!providers.has(provider)) throw invalid(path, "引用了未知 Provider");
+  }
+  const assignedBrains = [
+    ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
+      [`employees.roles.${id}.brain`, role.brain],
+      ...(role.taskBrain
+        ? [[`employees.roles.${id}.taskBrain`, role.taskBrain]]
+        : []),
+    ]),
+    ...["brain", "localBrain"].flatMap((name) => {
+      const brain = document.memory.answering?.[name];
+      return brain ? [[`memory.answering.${name}`, brain]] : [];
+    }),
+  ];
+  for (const [path, brain] of assignedBrains) {
+    if (
+      Object.hasOwn(brain, "reasoningEffort") &&
+      document.brainProviders[brain.provider].kind !== "codex-cli"
+    ) {
+      throw invalid(
+        `${path}.reasoningEffort`,
+        "仅 Codex CLI 岗位大脑支持推理档位",
+      );
+    }
   }
 }
 

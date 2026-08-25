@@ -288,7 +288,7 @@ function assertLegacyBrain(value, path, { partial = false } = {}) {
 }
 
 function assertAssignedBrain(value, path) {
-  assertFields(value, path, ["provider", "model", "remoteData"], [
+  assertFields(value, path, ["provider", "model", "reasoningEffort", "remoteData"], [
     "provider",
     "model",
     "remoteData",

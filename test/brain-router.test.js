@@ -38,6 +38,32 @@ test("BrainRouter preserves and invokes an optional provider availability check"
   assert.deepEqual(calls, [controller.signal]);
 });
 
+test("BrainRouter forwards an assigned reasoning effort to the provider", async () => {
+  const calls = [];
+  const router = new BrainRouter({
+    providers: [provider({
+      async generate(request) {
+        calls.push(request);
+        return '{"ok":true}';
+      },
+    })],
+  });
+  const brain = {
+    ...BRAIN,
+    reasoningEffort: "high",
+  };
+
+  await router.generate({
+    brain,
+    messages: [{ role: "user", content: "Return JSON." }],
+    schema: { type: "object" },
+    dataClasses: ["requirements"],
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].reasoningEffort, "high");
+});
+
 test("BrainRouter preserves prototype-defined availability", async () => {
   let calls = 0;
   class Provider {

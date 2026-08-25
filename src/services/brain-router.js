@@ -3,6 +3,14 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
+const REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
 
 export class BrainRouterError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -80,14 +88,29 @@ function normalizeRemoteData(value) {
 }
 
 export function normalizeBrainConfig(value) {
-  const config = exactData(
-    value,
-    ["provider", "model", "remoteData"],
-    "brain",
-  );
+  const entries = dataEntries(value, "brain");
+  const actual = new Set(entries.map(([key]) => key));
+  const required = ["provider", "model", "remoteData"];
+  const allowed = new Set([...required, "reasoningEffort"]);
+  if (
+    required.some((key) => !actual.has(key)) ||
+    [...actual].some((key) => !allowed.has(key))
+  ) {
+    throw new TypeError("brain is invalid");
+  }
+  const config = Object.fromEntries(entries);
+  if (
+    Object.hasOwn(config, "reasoningEffort") &&
+    !REASONING_EFFORTS.has(config.reasoningEffort)
+  ) {
+    throw new TypeError("brain.reasoningEffort is invalid");
+  }
   return Object.freeze({
     provider: safeId(config.provider, "brain.provider"),
     model: safeModel(config.model),
+    ...(Object.hasOwn(config, "reasoningEffort")
+      ? { reasoningEffort: config.reasoningEffort }
+      : {}),
     remoteData: normalizeRemoteData(config.remoteData),
   });
 }
@@ -146,6 +169,9 @@ function frozenDescription(provider, brain) {
   return Object.freeze({
     provider: provider.id,
     model: brain.model,
+    ...(brain.reasoningEffort
+      ? { reasoningEffort: brain.reasoningEffort }
+      : {}),
     remote: provider.remote,
     remoteData: Object.freeze({ ...brain.remoteData }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
@@ -210,6 +236,9 @@ export class BrainRouter {
     }
     return provider.generate({
       model: brain.model,
+      ...(brain.reasoningEffort
+        ? { reasoningEffort: brain.reasoningEffort }
+        : {}),
       messages,
       schema,
       ...(requestSignal ? { signal: requestSignal } : {}),

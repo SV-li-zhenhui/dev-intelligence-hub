@@ -451,6 +451,10 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
     ]);
     assert.equal(invocation.args[33], "never");
     assert.equal(argumentValue(invocation.args, "--model"), "bounded-model");
+    assert.equal(
+      argumentValue(invocation.args, "-c"),
+      'model_reasoning_effort="high"',
+    );
     assert.equal(argumentValue(invocation.args, "-C"), invocation.cwd);
     assert.equal(invocation.args.at(-1), "-");
     for (const forbidden of [
@@ -544,7 +548,10 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
     { processRunner: runner, commandLocator: locator, environment, temporaryRoot },
   );
 
-  assert.equal(await provider.generate(brainRequest()), '{"ok":true,"order":2}');
+  assert.equal(
+    await provider.generate(brainRequest({ reasoningEffort: "high" })),
+    '{"ok":true,"order":2}',
+  );
   assert.equal(provider.kind, "codex-cli");
   assert.equal(provider.remote, true);
   assert.equal(provider.singleAttempt, true);

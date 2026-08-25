@@ -343,8 +343,9 @@ test("role task brains are optional exact assigned brains without legacy backfil
 
   const configured = document();
   configured.employees.roles.developer.taskBrain = {
-    provider: "ollama",
-    model: "qwen3.5:task",
+    provider: "codex-local-cli",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "high",
     remoteData: { requirements: true, code: true, memory: false },
   };
   const normalized = normalizeConfigurationDocument(configured);
@@ -361,6 +362,11 @@ test("role task brains are optional exact assigned brains without legacy backfil
   const incomplete = structuredClone(configured);
   delete incomplete.employees.roles.developer.taskBrain.remoteData;
   assertInvalid(incomplete);
+
+  const invalidReasoningEffort = structuredClone(configured);
+  invalidReasoningEffort.employees.roles.developer.taskBrain.reasoningEffort =
+    "maximum";
+  assertInvalid(invalidReasoningEffort);
 
   const unknownProvider = structuredClone(configured);
   unknownProvider.employees.roles.developer.taskBrain.provider = "missing";
