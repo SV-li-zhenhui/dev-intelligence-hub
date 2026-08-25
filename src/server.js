@@ -2472,6 +2472,7 @@ export function createDashboardServer(
     setProcessExitCode = (code) => {
       process.exitCode = code;
     },
+    terminateManagedProcess = null,
   } = {},
 ) {
   if (typeof reportError !== "function") {
@@ -2479,6 +2480,12 @@ export function createDashboardServer(
   }
   if (typeof setProcessExitCode !== "function") {
     throw new TypeError("setProcessExitCode must be a function");
+  }
+  if (
+    terminateManagedProcess !== null &&
+    typeof terminateManagedProcess !== "function"
+  ) {
+    throw new TypeError("terminateManagedProcess must be a function or null");
   }
   if (onManagedClaim !== null && typeof onManagedClaim !== "function") {
     throw new TypeError("onManagedClaim must be a function or null");
@@ -2544,6 +2551,7 @@ export function createDashboardServer(
               () => {
                 try {
                   processController?.completeShutdown(null);
+                  terminateManagedProcess?.(0);
                 } catch (error) {
                   try {
                     setProcessExitCode(1);
@@ -4415,6 +4423,7 @@ export async function startDashboardServer(
     shutdownDrainTimeoutMs = defaultShutdownDrainTimeoutMs,
     runtimeSourceIdentity: runtimeSourceIdentityInput = null,
     verifyRuntimeSourceFn = null,
+    terminateManagedProcess = null,
   } = {},
 ) {
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
@@ -4453,6 +4462,7 @@ export async function startDashboardServer(
       allowUnmanagedShutdown: false,
       runtimeSourceIdentity: runtimeSourceIdentityInput,
       shutdownDrainTimeoutMs,
+      terminateManagedProcess,
     });
     if (verifyRuntimeSourceFn !== null) await verifyRuntimeSourceFn();
     await listenForLocalConnections(server, application.config.port);
@@ -4545,6 +4555,9 @@ async function runDashboardProcess(
       reportError: diagnostics.reportError,
       runtimeSourceIdentity: verifiedRuntimeSourceIdentity,
       verifyRuntimeSourceFn,
+      terminateManagedProcess: managedProcess
+        ? (code) => setImmediate(() => process.exit(code))
+        : null,
     });
   } catch (error) {
     diagnostics.reportError(error);

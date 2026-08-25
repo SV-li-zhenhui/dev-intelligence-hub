@@ -193,12 +193,14 @@ test("pending claim gates work and shutdown is bound to token and start identity
   const identity = managedIdentity(runtimeDirectory);
   let activations = 0;
   let stops = 0;
+  const terminations = [];
   const reportedErrors = [];
   const server = createDashboardServer(application(), {
     managedProcess: identity,
     backgroundWork: { async stop() { stops += 1; } },
     onManagedClaim() { activations += 1; },
     reportError(error) { reportedErrors.push(error); },
+    terminateManagedProcess(code) { terminations.push(code); },
   });
   await listen(server);
 
@@ -259,6 +261,7 @@ test("pending claim gates work and shutdown is bound to token and start identity
   assert.equal(terminal.status, "success");
   assertAuthenticatedReceipt(terminal, identity);
   assert.equal(stops, 1);
+  assert.deepEqual(terminations, [0]);
   assert.deepEqual(reportedErrors, []);
 });
 
