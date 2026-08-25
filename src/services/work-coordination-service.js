@@ -298,7 +298,7 @@ function stableErrorCodes(error) {
   return Object.freeze(codes);
 }
 
-function stableLedgerErrorDetails(error) {
+function stableInternalErrorDetails(error) {
   const details = [];
   const pending = [error];
   const seen = new Set();
@@ -316,7 +316,7 @@ function stableLedgerErrorDetails(error) {
     const message = Object.getOwnPropertyDescriptor(current, "message")?.value;
     if (
       typeof code === "string" &&
-      code.startsWith("WORK_LEDGER_") &&
+      (code.startsWith("WORK_LEDGER_") || code.startsWith("ORCHESTRATOR_")) &&
       typeof message === "string" &&
       message.length > 0 &&
       Buffer.byteLength(message, "utf8") <= 240 &&
@@ -334,7 +334,7 @@ function stableLedgerErrorDetails(error) {
 
 function stageFailure(stage, error) {
   const causeCodes = stableErrorCodes(error);
-  const causeDetails = stableLedgerErrorDetails(error);
+  const causeDetails = stableInternalErrorDetails(error);
   const causeSummary = causeCodes.length
     ? ` [${causeCodes.join(" > ")}]`
     : "";

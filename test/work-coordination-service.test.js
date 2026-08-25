@@ -474,6 +474,29 @@ test("work ledger failures retain their bounded local diagnostic detail", async 
   });
 });
 
+test("orchestrator failures retain their bounded local diagnostic detail", async () => {
+  const failure = new Error("Delivery lacks authoritative evidence");
+  failure.code = "ORCHESTRATOR_EVIDENCE_REJECTED";
+  const { service } = fixture({
+    workLoop: {
+      async runCycle() {
+        throw failure;
+      },
+    },
+  });
+
+  await assert.rejects(service.runCycle(), (error) => {
+    assert.match(
+      error.message,
+      /ORCHESTRATOR_EVIDENCE_REJECTED: Delivery lacks authoritative evidence/u,
+    );
+    assert.deepEqual(error.causeDetails, [
+      "ORCHESTRATOR_EVIDENCE_REJECTED: Delivery lacks authoritative evidence",
+    ]);
+    return true;
+  });
+});
+
 test("all independent stage failures are reported after every stage is attempted", async () => {
   const calls = [];
   const failing = (name, method) => ({
