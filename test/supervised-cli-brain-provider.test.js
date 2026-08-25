@@ -714,6 +714,40 @@ test("availability checks credentials or the login broker status without invokin
   assert.equal(loginRunner.calls.length, 0);
 });
 
+test("availability does not queue a login probe behind an admitted generation", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-busy-availability-");
+  const events = [];
+  const generationStarted = deferred();
+  const releaseGeneration = deferred();
+  const runner = recordingRunner(async (invocation) => {
+    generationStarted.resolve();
+    await releaseGeneration.promise;
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot: path.join(parent, "runtime"),
+    codexLoginCredentialBroker: recordingCodexLoginBroker(events),
+  });
+
+  const generation = provider.generate(brainRequest());
+  await generationStarted.promise;
+
+  await within(250, provider.checkAvailability());
+  assert.equal(events.includes("readStatus"), false);
+
+  releaseGeneration.resolve();
+  assert.equal(await generation, '{"ok":true}');
+  await provider.close();
+});
+
 test("login availability maps broker status without publishing credential state", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-login-status-");
   const cases = [

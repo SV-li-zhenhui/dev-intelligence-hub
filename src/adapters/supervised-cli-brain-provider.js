@@ -2394,6 +2394,14 @@ export class SupervisedCliBrainProvider {
     } catch (error) {
       throw sanitizeInputFailure(error);
     }
+    // A generation or another availability probe already admitted by this
+    // provider is stronger evidence than a second login-status probe. The
+    // Codex login broker serializes credential access, so probing here would
+    // wait behind the active model call and can misclassify ordinary provider
+    // contention as unavailability at the caller's shorter resolution bound.
+    // The queued generation still performs the authoritative credential and
+    // process checks before any result is accepted.
+    if (this.#activeGenerations > 0) return;
     const startedAt = this.#monotonicClock();
     const deadline = createRequestDeadline({
       signal,
