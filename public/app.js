@@ -18,6 +18,7 @@ import { renderBrainProviderStatus } from "./brain-provider-status-view.js";
 import { githubTargetUrl } from "./github-target-link.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
+import { announcementDetailMarkup } from "./announcement-markup.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 import {
@@ -3051,7 +3052,9 @@ function showDetail(item) {
   dialogContent.innerHTML = `
     <article class="detail">
       <p class="eyebrow">${kindLabel(item)} / EVIDENCE</p>
-      <h2>${escapeHtml(item.title)}</h2>
+      ${item.kind === "announcement"
+        ? announcementDetailMarkup(item.title)
+        : `<h2>${escapeHtml(item.title)}</h2>`}
       ${brainAssessment(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
       ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">在来源中打开 →</a>` : ""}

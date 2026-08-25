@@ -2862,6 +2862,50 @@ dialog::backdrop {
   line-height: 1.35;
 }
 
+.detail .announcement-title {
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+
+.announcement-copy {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 22px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border-left: 3px solid var(--green);
+  border-radius: 6px;
+}
+
+.announcement-copy h3,
+.announcement-copy p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.announcement-copy h3 {
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.announcement-copy h3:first-child {
+  margin-top: 0;
+}
+
+.announcement-fact,
+.announcement-paragraph {
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.announcement-fact strong {
+  display: inline-block;
+  min-width: 72px;
+  color: var(--muted);
+  font-weight: 650;
+}
+
 .detail-grid {
   display: grid;
   grid-template-columns: 130px 1fr;
