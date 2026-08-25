@@ -451,6 +451,29 @@ test("a failed work stage cannot strand an already durable dispatch", async () =
   ]);
 });
 
+test("work ledger failures retain their bounded local diagnostic detail", async () => {
+  const failure = new Error("当前任务状态不能安全编排");
+  failure.code = "WORK_LEDGER_GRAPH_TASK_CONFLICT";
+  const { service } = fixture({
+    workLoop: {
+      async runCycle() {
+        throw failure;
+      },
+    },
+  });
+
+  await assert.rejects(service.runCycle(), (error) => {
+    assert.match(
+      error.message,
+      /WORK_LEDGER_GRAPH_TASK_CONFLICT: 当前任务状态不能安全编排/u,
+    );
+    assert.deepEqual(error.causeDetails, [
+      "WORK_LEDGER_GRAPH_TASK_CONFLICT: 当前任务状态不能安全编排",
+    ]);
+    return true;
+  });
+});
+
 test("all independent stage failures are reported after every stage is attempted", async () => {
   const calls = [];
   const failing = (name, method) => ({

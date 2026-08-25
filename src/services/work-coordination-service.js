@@ -298,18 +298,57 @@ function stableErrorCodes(error) {
   return Object.freeze(codes);
 }
 
+function stableLedgerErrorDetails(error) {
+  const details = [];
+  const pending = [error];
+  const seen = new Set();
+  while (pending.length > 0 && seen.size < 16 && details.length < 4) {
+    const current = pending.shift();
+    if (
+      current === null ||
+      (typeof current !== "object" && typeof current !== "function") ||
+      seen.has(current)
+    ) {
+      continue;
+    }
+    seen.add(current);
+    const code = Object.getOwnPropertyDescriptor(current, "code")?.value;
+    const message = Object.getOwnPropertyDescriptor(current, "message")?.value;
+    if (
+      typeof code === "string" &&
+      code.startsWith("WORK_LEDGER_") &&
+      typeof message === "string" &&
+      message.length > 0 &&
+      Buffer.byteLength(message, "utf8") <= 240 &&
+      !/\p{Cc}/u.test(message)
+    ) {
+      details.push(`${code}: ${message}`);
+    }
+    const cause = Object.getOwnPropertyDescriptor(current, "cause")?.value;
+    if (cause !== undefined) pending.push(cause);
+    const errors = Object.getOwnPropertyDescriptor(current, "errors")?.value;
+    if (Array.isArray(errors)) pending.push(...errors.slice(0, 8));
+  }
+  return Object.freeze(details);
+}
+
 function stageFailure(stage, error) {
   const causeCodes = stableErrorCodes(error);
+  const causeDetails = stableLedgerErrorDetails(error);
   const causeSummary = causeCodes.length
     ? ` [${causeCodes.join(" > ")}]`
     : "";
+  const detailSummary = causeDetails.length
+    ? ` (${causeDetails.join("; ")})`
+    : "";
   const wrapped = new Error(
-    `员工主动循环阶段失败: ${stage}${causeSummary}`,
+    `员工主动循环阶段失败: ${stage}${causeSummary}${detailSummary}`,
     { cause: error },
   );
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
   wrapped.stage = stage;
   wrapped.causeCodes = causeCodes;
+  wrapped.causeDetails = causeDetails;
   return wrapped;
 }
 
