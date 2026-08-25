@@ -79,7 +79,13 @@ export function buildDashboard(snapshot, previousSnapshot = null) {
           item.kind === "pull_request" && item.relation === "authored",
       ),
       dingtalk: group(prioritized, (item) =>
-        ["mention", "todo", "conversation"].includes(item.kind),
+        [
+          "announcement",
+          "message",
+          "mention",
+          "todo",
+          "conversation",
+        ].includes(item.kind),
       ),
       versions: newestVersionsFirst(snapshot.versions || []),
       recentlyCompleted,

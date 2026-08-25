@@ -65,6 +65,12 @@ export function scoreItem(item, now = new Date().toISOString()) {
   } else if (item.kind === "mention") {
     score = 82;
     reasons.push("钉钉 @我");
+  } else if (item.kind === "announcement") {
+    score = 88;
+    reasons.push("今日公告/重要通知");
+  } else if (item.kind === "message") {
+    score = 78;
+    reasons.push("今日重要消息");
   } else if (item.kind === "pull_request" && item.relation === "authored") {
     score = 55;
     reasons.push("需要你修改或推进");

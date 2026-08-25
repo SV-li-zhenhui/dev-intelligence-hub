@@ -122,3 +122,23 @@ test("notification delivery forwards the refresh shutdown signal", async () => {
   await notifier.send(diff, prioritizedItems, { signal: controller.signal });
   assert.strictEqual(receivedSignal, controller.signal);
 });
+
+test("collected DingTalk messages never notify back into DingTalk", async () => {
+  const calls = [];
+  const notifier = service(new ActionAdmissionGate(), calls);
+  const item = {
+    id: "dingtalk:message:1",
+    kind: "announcement",
+    title: "群公告",
+    score: 88,
+    reasons: ["今日公告/重要通知"],
+  };
+
+  const result = await notifier.send(
+    { baseline: false, added: [item], changed: [] },
+    [item],
+  );
+
+  assert.deepEqual(result, { sent: false, reason: "no-important-change" });
+  assert.deepEqual(calls, []);
+});

@@ -62,6 +62,7 @@ export class NotificationService {
     const candidates = changedItems(diff)
       .map((item) => prioritizedById.get(item.id))
       .filter(Boolean)
+      .filter((item) => !["announcement", "message"].includes(item.kind))
       .filter((item) => item.score >= this.config.notifyMinimumScore)
       .slice(0, this.config.maxNotificationsPerRun);
 

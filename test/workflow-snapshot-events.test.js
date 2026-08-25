@@ -159,6 +159,23 @@ test("an initial healthy snapshot emits stable observed events with safe facts",
   assert.ok(events.every(Object.isFrozen));
 });
 
+test("historical pull requests leave employee workflow scope but remain dashboard facts", () => {
+  const active = snapshot([pullRequest(1)]);
+  const historical = snapshot([
+    pullRequest(1, {
+      actionState: "historical",
+      nextActor: "none",
+      nextAction: "cleanup",
+      inactiveDays: 30,
+    }),
+  ]);
+
+  assert.deepEqual(projectWorkflowSnapshot(historical).items, []);
+  assert.deepEqual(eventTypes(workflowEventsFromSnapshots(active, historical)), [
+    "github:pr:acme/repo#1:pull_request.left_scope",
+  ]);
+});
+
 test("additions and material changes emit granular events without flooding unchanged items", () => {
   const previous = snapshot([
     pullRequest(1),

@@ -231,7 +231,8 @@ export function projectWorkflowSnapshot(snapshot) {
     .filter(
       (item) =>
         plainObject(item) &&
-        SOURCE_DEFINITIONS.some(({ kind }) => kind === item.kind),
+        SOURCE_DEFINITIONS.some(({ kind }) => kind === item.kind) &&
+        !(item.kind === "pull_request" && item.actionState === "historical"),
     )
     .map(projectItem)
     .sort(compareItems);

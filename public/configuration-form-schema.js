@@ -95,7 +95,7 @@ const LABELS = deepFreeze({
   timeZone: "IANA 时区",
   trackedRepositories: "跟踪仓库",
   prResponsibility: "PR 责任范围",
-  historicalAfterDays: "历史 PR 天数",
+  historicalAfterDays: "停止扫描旧 PR 的天数",
   codeExecutor: "代码执行器",
   enabled: "启用",
   docker: "Docker",

@@ -324,7 +324,7 @@ export class RefreshService {
         ...item,
         ...assessPullRequestResponsibility(item, {
           historicalAfterDays:
-            this.config.prResponsibility?.historicalAfterDays ?? 60,
+            this.config.prResponsibility?.historicalAfterDays ?? 30,
         }),
       };
       const previousItem = previousPullRequests.get(item.id);
@@ -370,7 +370,13 @@ export class RefreshService {
     const dingtalkCollection = this.config.dingtalk.enabled
       ? this.dingtalk.collect(since, { signal }).catch((error) => ({
           items: previousItems.filter((item) =>
-            ["mention", "todo", "conversation"].includes(item.kind),
+            [
+              "announcement",
+              "message",
+              "mention",
+              "todo",
+              "conversation",
+            ].includes(item.kind),
           ),
           errors: [`钉钉: ${error.message}`],
         }))

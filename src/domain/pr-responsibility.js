@@ -225,7 +225,7 @@ export function assessPullRequestResponsibility(
   item,
   {
     now = new Date().toISOString(),
-    historicalAfterDays = 60,
+    historicalAfterDays = 30,
   } = {},
 ) {
   if (item.state && item.state !== "open") {

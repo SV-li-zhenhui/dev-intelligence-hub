@@ -18,6 +18,75 @@ function textValue(message) {
     : value.content || JSON.stringify(value);
 }
 
+const IMPORTANT_MESSAGE =
+  /(?:@|公告|通知|提醒|预警|风险|阻塞|故障|截止|待办|确认|评审|审核|测试|发布|版本|研发|需求|客户|FDA|\bPR\b|\bIssue\b|日报|早报|周报|总结|关注)/iu;
+const ANNOUNCEMENT_MESSAGE =
+  /(?:公告|通知|提醒|预警|风险|截止|日报|早报|周报|总结|关注)/u;
+
+function localDateTime(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
+    date.getSeconds(),
+  )}`;
+}
+
+function messageTimestamp(value, fallback) {
+  const normalized = typeof value === "string"
+    ? value.replace(
+        /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})$/u,
+        "$1T$2",
+      )
+    : value;
+  const parsed = new Date(normalized || fallback);
+  return Number.isFinite(parsed.getTime())
+    ? parsed.toISOString()
+    : fallback.toISOString();
+}
+
+function firstWebLink(content) {
+  return content.match(/https:\/\/[^\s)\]]+/u)?.[0] || "";
+}
+
+function dailyMessageItems(data, fallback) {
+  const conversations = data.result?.conversationMessagesList || [];
+  const items = [];
+  const seen = new Set();
+  for (const conversation of conversations) {
+    for (const [index, message] of (conversation.messages || []).entries()) {
+      const content = textValue(message).replace(/\s+/gu, " ").trim();
+      if (
+        !content ||
+        (conversation.singleChat !== false && !IMPORTANT_MESSAGE.test(content))
+      ) {
+        continue;
+      }
+      const messageId =
+        message.openMessageId ||
+        message.msgId ||
+        `${conversation.openConversationId || "unknown"}:${message.createTime || index}`;
+      if (seen.has(messageId)) continue;
+      seen.add(messageId);
+      const announcement =
+        ANNOUNCEMENT_MESSAGE.test(content) ||
+        /(?:notice|公告)/iu.test(message.sender || "");
+      items.push({
+        id: `dingtalk:message:${messageId}`,
+        kind: announcement ? "announcement" : "message",
+        relation: "daily",
+        title: content.slice(0, 240),
+        author: message.sender || "",
+        context: conversation.title || "钉钉消息",
+        updatedAt: messageTimestamp(message.createTime, fallback),
+        url: firstWebLink(content),
+        state: "open",
+      });
+    }
+  }
+  return items;
+}
+
 export class DingTalkAdapter {
   constructor({ run = runJson, runText = runCommand } = {}) {
     this.run = run;
@@ -26,9 +95,11 @@ export class DingTalkAdapter {
 
   async collect(since, { signal = null } = {}) {
     const now = new Date();
-    const start = since ? new Date(since) : new Date(now.getTime() - 3_600_000);
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
     const commandOptions = signal === null ? {} : { signal };
-    const [unread, mentions, todos] = await Promise.allSettled([
+    const [dailyMessages, unread, mentions, todos] = await Promise.allSettled([
+      this.dailyMessages(start, now, commandOptions),
       this.unreadConversations(commandOptions),
       this.mentions(start, now, commandOptions),
       this.todos(commandOptions),
@@ -41,12 +112,32 @@ export class DingTalkAdapter {
     };
     return {
       items: [
+        ...value(dailyMessages, "daily messages"),
         ...value(unread, "unread"),
         ...value(mentions, "mentions"),
         ...value(todos, "todos"),
       ],
       errors,
     };
+  }
+
+  async dailyMessages(start, end, options = {}) {
+    const data = await this.run("dws", [
+      "chat",
+      "message",
+      "list-all",
+      "--start",
+      localDateTime(start),
+      "--end",
+      localDateTime(end),
+      "--limit",
+      "30",
+      "--cursor",
+      "0",
+      "--format",
+      "json",
+    ], options);
+    return dailyMessageItems(data, end);
   }
 
   async unreadConversations(options = {}) {

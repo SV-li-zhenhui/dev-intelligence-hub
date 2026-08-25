@@ -294,6 +294,8 @@ function kindLabel(item) {
     mention: "@ME",
     todo: "TODO",
     conversation: "CHAT",
+    announcement: "NOTICE",
+    message: "TODAY",
   }[item.kind] || item.kind.toUpperCase();
 }
 
@@ -1437,7 +1439,7 @@ function render() {
       section("开放 Issues", dashboard.groups.myIssues, "没有分配给你的开放 Issue。"),
     versions: versionsView,
     signals: () =>
-      section("钉钉行动信号", dashboard.groups.dingtalk, "当前没有 @我、待办或未读会话。"),
+      section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、公告、@我或待办。"),
     employees: employeesView,
     memory: memoryView,
     workflow: () => workflowView.render(),

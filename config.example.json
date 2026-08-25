@@ -8,7 +8,7 @@
   },
   "trackedRepositories": [],
   "prResponsibility": {
-    "historicalAfterDays": 60
+    "historicalAfterDays": 30
   },
   "codeExecutor": {
     "enabled": false
