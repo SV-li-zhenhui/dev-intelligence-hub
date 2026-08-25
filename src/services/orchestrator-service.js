@@ -19,6 +19,10 @@ const RESERVED_EVIDENCE_KINDS = new Set([
   "work-inputs",
   "requirement-spec",
 ]);
+const INTERNALLY_TRUSTED_DELIVERABLE_KINDS = new Set([
+  "requirement-spec",
+  "text-report",
+]);
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const MAX_SAFE_DEPTH = 24;
@@ -777,7 +781,9 @@ function assertAcceptanceEvidence(task, submitted, externalEvidence) {
     submitted.deliverableId,
     submitted.contractRevision,
   );
-  if (binding.expected.kind === "requirement-spec") return binding;
+  if (INTERNALLY_TRUSTED_DELIVERABLE_KINDS.has(binding.expected.kind)) {
+    return binding;
+  }
   if (!externalEvidence.some(({ kind }) => kind === binding.expected.kind)) {
     throw evidenceRejected(
       `Delivery ${submitted.deliverableId} lacks authoritative ${binding.expected.kind} evidence`,

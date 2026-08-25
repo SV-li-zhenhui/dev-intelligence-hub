@@ -33,6 +33,7 @@ const RESERVED_CALLER_EVIDENCE_KINDS = [
 ];
 const TRUSTED_DELIVERABLE_KINDS = new Set([
   "requirement-spec",
+  "text-report",
   "change-package",
   "test-report",
   "review-report",

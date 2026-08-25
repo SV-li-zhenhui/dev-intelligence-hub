@@ -234,6 +234,28 @@ test("rejects malformed revisions, duplicate dependencies, and invalid initial c
   }
 });
 
+test("accepts text-report contracts for prose-only specialist work", () => {
+  const input = decomposeIntent();
+  input.acceptanceContract.expectedDeliverables[0] = {
+    deliverableId: "analysis-report",
+    kind: "text-report",
+    description: "只读文字分析报告",
+    required: true,
+  };
+
+  const normalized = normalizeOrchestrationIntent(input);
+
+  assert.equal(
+    normalized.acceptanceContract.expectedDeliverables[0].kind,
+    "text-report",
+  );
+  assert.ok(
+    ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf[0]
+      .properties.acceptanceContract.properties.expectedDeliverables.items
+      .properties.kind.enum.includes("text-report"),
+  );
+});
+
 test("rejects accessors, sparse arrays, symbols, extra fields, and UTF-8 overflow", () => {
   const accessor = decomposeIntent();
   Object.defineProperty(accessor.work, "title", {

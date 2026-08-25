@@ -943,6 +943,7 @@ test("projects bounded authoritative evidence for the exact current role and con
   const deliverables = [
     expected("verification", "test-report"),
     expected("requirements", "requirement-spec"),
+    expected("analysis", "text-report"),
     expected("implementation", "change-package"),
     expected("secondary-change", "change-package", false),
   ];

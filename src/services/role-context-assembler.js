@@ -46,6 +46,7 @@ const FACT_NAMES = Object.freeze([
 ]);
 const DATA_CLASS_BY_DELIVERABLE_KIND = new Map([
   ["requirement-spec", "requirements"],
+  ["text-report", "requirements"],
   ["change-package", "code"],
   ["test-report", "code"],
   ["review-report", "code"],

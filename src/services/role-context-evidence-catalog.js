@@ -130,7 +130,7 @@ function catalogKinds(contract) {
   return [...new Set(
     contract.expectedDeliverables
       .map(({ kind }) => kind)
-      .filter((kind) => kind !== "requirement-spec"),
+      .filter((kind) => !["requirement-spec", "text-report"].includes(kind)),
   )].sort(compareText);
 }
 

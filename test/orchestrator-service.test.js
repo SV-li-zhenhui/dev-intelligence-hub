@@ -332,6 +332,7 @@ function serviceFrom(
 function rootFixture({
   submitted = false,
   externalEvidence = [deliverableEvidence()],
+  childContract = contract(),
 } = {}) {
   const root = task({ taskId: "root", revision: 3 });
   const child = task({
@@ -339,11 +340,11 @@ function rootFixture({
     revision: submitted ? 2 : 1,
     parentTaskId: root.taskId,
     role: "developer",
-    acceptanceContract: contract(),
+    acceptanceContract: childContract,
     deliveries: submitted
       ? [
           {
-            deliverableId: "implementation",
+            deliverableId: childContract.expectedDeliverables[0].deliverableId,
             revision: 1,
             contractRevision: 1,
             status: "submitted",
@@ -1152,6 +1153,28 @@ test("mutation-first admission releases cutover before graph storage settles", a
 });
 
 test("requires matching authoritative evidence before accepting non-requirement deliveries", async (t) => {
+  await t.test("trusted text reports do not require external evidence", async () => {
+    const fixture = rootFixture({
+      submitted: true,
+      externalEvidence: [],
+      childContract: contract({
+        deliverableId: "analysis-report",
+        kind: "text-report",
+      }),
+    });
+    const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+
+    const result = await executeDeliveryDecision(
+      fakes,
+      fixture,
+      "accept_delivery",
+    );
+
+    assert.equal(result.action, "accept_delivery");
+    assert.equal(fakes.calls.verify.length, 0);
+    assert.equal(fakes.calls.planner.length, 1);
+  });
+
   await t.test("legacy evidence-free submission cannot be accepted", async () => {
     const fixture = rootFixture({
       submitted: true,
