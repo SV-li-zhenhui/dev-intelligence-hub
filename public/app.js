@@ -16,6 +16,7 @@ import {
 } from "./configuration-form-support.js";
 import { renderBrainProviderStatus } from "./brain-provider-status-view.js";
 import { githubTargetUrl } from "./github-target-link.js";
+import { githubItemDetailMarkup } from "./github-item-detail.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { announcementDetailMarkup } from "./announcement-markup.js";
@@ -2186,14 +2187,39 @@ async function handleConfigurationRollbackRequest(event) {
 }
 
 function detailRows(item) {
+  const stateLabels = {
+    open: "Open",
+    closed: "Closed",
+    merged: "Merged",
+  };
+  const relationLabels = {
+    assigned: "分配给我",
+    authored: "我创建的",
+    review_requested: "等待我 Review",
+  };
+  const updatedAt = item.updatedAt
+    ? new Date(item.updatedAt).toLocaleString("zh-CN")
+    : null;
+  const createdAt = item.createdAt
+    ? new Date(item.createdAt).toLocaleString("zh-CN")
+    : null;
+  const changeSize = item.kind === "pull_request" &&
+      Number.isFinite(item.changedFiles)
+    ? `${item.changedFiles} 个文件 · +${item.additions || 0} / -${item.deletions || 0}`
+    : null;
   const fields = [
     ["来源", item.repo || item.context || "钉钉"],
     ["编号", item.number ? `#${item.number}` : null],
+    ["状态", stateLabels[item.state] || item.state],
+    ["与我的关系", relationLabels[item.relation] || item.relation],
     ["优先级", `${item.score} · ${(item.reasons || []).join("、")}`],
     ["责任状态", actionStateLabel(item.actionState)],
     ["下一位行动人", nextActorLabel(item.nextActor)],
     ["下一步", item.nextAction],
     ["作者", item.author],
+    ["负责人", item.assignees?.length ? item.assignees.map((name) => `@${name}`).join("、") : null],
+    ["改动规模", changeSize],
+    ["讨论", Number.isSafeInteger(item.commentsCount) ? `${item.commentsCount} 条评论` : null],
     ["我的审核结论", item.myReviewState],
     ["我的审核提交", item.myReviewCommitOid],
     ["当前提交", item.headRefOid],
@@ -2202,7 +2228,8 @@ function detailRows(item) {
     ["合并状态", item.mergeStateStatus],
     ["里程碑", item.milestone],
     ["标签", item.labels?.join("、")],
-    ["更新时间", item.updatedAt ? new Date(item.updatedAt).toLocaleString("zh-CN") : null],
+    ["创建时间", createdAt],
+    ["最近更新", updatedAt],
   ].filter(([, value]) => value);
   return fields.map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join("");
 }
@@ -3057,8 +3084,9 @@ function showDetail(item) {
         ? announcementDetailMarkup(item.title)
         : `<h2>${escapeHtml(item.title)}</h2>`}
       ${brainAssessment(item)}
+      ${githubItemDetailMarkup(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
-      ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">在来源中打开 →</a>` : ""}
+      ${item.url ? `<a class="detail-source-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${["issue", "pull_request"].includes(item.kind) ? "在 GitHub 查看完整内容" : "在来源中打开"} →</a>` : ""}
     </article>`;
   dialog.showModal();
 }

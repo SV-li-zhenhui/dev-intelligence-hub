@@ -229,6 +229,70 @@ test("refresh-facing GitHub reads forward one shutdown signal to every command",
   assert.ok(calls.every((call) => call.options.signal === controller.signal));
 });
 
+test("assigned issues include bounded context, milestone, and latest discussion", async () => {
+  const calls = [];
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      calls.push(args);
+      if (args[0] === "search") {
+        return [{
+          id: "I_issue_12855",
+          number: 12855,
+          title: "数据库初始化失败",
+          body: "search fallback",
+          url: "https://github.com/SVisions/OCT-Product/issues/12855",
+          repository: { nameWithOwner: "SVisions/OCT-Product" },
+          updatedAt: "2026-08-08T09:12:17Z",
+          createdAt: "2026-08-08T03:08:53Z",
+          author: { login: "SV-author" },
+          state: "open",
+          labels: [{ name: "S4 Highly desired" }],
+          assignees: [{ login: "SV-li-zhenhui" }],
+          commentsCount: 1,
+        }];
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        return {
+          data: {
+            nodes: [{
+              id: "I_issue_12855",
+              number: 12855,
+              body: "# Problem Statement\n启动后首次进入患者页失败",
+              milestone: { title: "Review Request" },
+              comments: {
+                totalCount: 1,
+                nodes: [{
+                  author: { login: "SV-author" },
+                  body: "已经增加日志，可以先移出 440",
+                  createdAt: "2026-08-08T09:12:06Z",
+                  updatedAt: "2026-08-08T09:12:06Z",
+                  url: "https://github.com/example/comment",
+                }],
+              },
+            }],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${args.join(" ")}`);
+    },
+  });
+
+  const [issue] = await adapter.searchIssues();
+
+  assert.equal(issue.description, "# Problem Statement\n启动后首次进入患者页失败");
+  assert.equal(issue.milestone, "Review Request");
+  assert.equal(issue.commentsCount, 1);
+  assert.deepEqual(issue.latestComment, {
+    author: "SV-author",
+    body: "已经增加日志，可以先移出 440",
+    createdAt: "2026-08-08T09:12:06Z",
+    updatedAt: "2026-08-08T09:12:06Z",
+    url: "https://github.com/example/comment",
+  });
+  const graphql = calls.find((args) => args[0] === "api");
+  assert.ok(graphql.includes("ids[]=I_issue_12855"));
+});
+
 test("a GitHub refresh cannot continue command work after shutdown abort", async () => {
   const controller = new AbortController();
   const shutdown = new Error("lifecycle shutdown");

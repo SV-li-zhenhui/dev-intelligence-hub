@@ -2912,6 +2912,76 @@ dialog::backdrop {
   border-top: 1px solid var(--line);
 }
 
+.github-detail-section {
+  margin: 18px 0;
+  padding: 16px 18px;
+  background: var(--surface);
+  border-left: 3px solid var(--green);
+  border-radius: 6px;
+}
+
+.github-detail-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.github-detail-heading h3,
+.github-detail-copy h4,
+.github-detail-copy p,
+.github-detail-copy ul {
+  margin: 0;
+}
+
+.github-detail-heading h3 {
+  font-size: 14px;
+}
+
+.github-detail-heading span,
+.github-media-note {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.github-detail-copy {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.github-detail-copy h4 {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.github-detail-copy ul {
+  padding-left: 20px;
+}
+
+.github-detail-copy code {
+  padding: 1px 4px;
+  background: var(--paper);
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.detail-source-link {
+  display: inline-block;
+  margin-top: 18px;
+  font-weight: 650;
+}
+
+@media (max-width: 620px) {
+  .github-detail-heading {
+    display: grid;
+    gap: 4px;
+  }
+}
+
 .detail-grid dt,
 .detail-grid dd {
   margin: 0;

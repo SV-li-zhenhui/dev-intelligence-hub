@@ -27,7 +27,7 @@ const SEARCH_TIMESTAMP =
 const PR_SEARCH_FIELDS =
   "number,title,url,repository,updatedAt,createdAt,author,state";
 const PR_DETAIL_FIELDS =
-  "number,url,reviewDecision,statusCheckRollup,mergeStateStatus,isDraft,labels,assignees,milestone,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,reviews";
+  "number,url,body,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,mergeStateStatus,isDraft,labels,assignees,milestone,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,reviews";
 const PR_REVIEW_CONTEXT_FIELDS =
   "number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,additions,deletions,changedFiles,files";
 const PR_TARGET_FIELDS =
@@ -35,7 +35,11 @@ const PR_TARGET_FIELDS =
 const PR_OWNER_CONTEXT_FIELDS = `${PR_REVIEW_CONTEXT_FIELDS},state`;
 const PR_OPEN_TARGET_FIELDS = `${PR_TARGET_FIELDS},state`;
 const ISSUE_FIELDS =
-  "number,title,url,repository,updatedAt,createdAt,author,state,labels,assignees";
+  "id,number,title,body,url,repository,updatedAt,createdAt,author,state,labels,assignees,commentsCount";
+const ISSUE_DETAIL_QUERY =
+  "query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number body milestone{title} comments(last:1){totalCount nodes{author{login} body createdAt updatedAt url}}}}}";
+const GITHUB_DESCRIPTION_MAXIMUM_BYTES = 12 * 1024;
+const ISSUE_COMMENT_MAXIMUM_BYTES = 4 * 1024;
 const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
   "githubAccount",
   "baseRepository",
@@ -70,6 +74,57 @@ function recentActiveMilestones(value) {
 
 function repositoryName(item) {
   return item.repository?.nameWithOwner || item.repository?.name || "";
+}
+
+function boundedGitHubText(value, maximumBytes) {
+  if (typeof value !== "string" || maximumBytes < 1) return "";
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const nextBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + nextBytes > maximumBytes) break;
+    result += character;
+    bytes += nextBytes;
+  }
+  return result;
+}
+
+function issueNodeId(value) {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    value.length > 256 ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new TypeError("GitHub issue node id is invalid");
+  }
+  return value;
+}
+
+function issueLatestComment(connection) {
+  const count = Number.isSafeInteger(connection?.totalCount) &&
+      connection.totalCount >= 0
+    ? connection.totalCount
+    : 0;
+  const comment = Array.isArray(connection?.nodes)
+    ? connection.nodes.at(-1)
+    : null;
+  return {
+    commentsCount: count,
+    latestComment: comment && typeof comment === "object"
+      ? {
+          author: boundedGitHubText(comment.author?.login, 256),
+          body: boundedGitHubText(comment.body, ISSUE_COMMENT_MAXIMUM_BYTES),
+          createdAt: typeof comment.createdAt === "string"
+            ? comment.createdAt
+            : "",
+          updatedAt: typeof comment.updatedAt === "string"
+            ? comment.updatedAt
+            : "",
+          url: typeof comment.url === "string" ? comment.url : "",
+        }
+      : null,
+  };
 }
 
 function headRepositoryName(detail) {
@@ -841,6 +896,15 @@ export class GitHubAdapter {
       ciStatus: summarizeCheckStatus(detail.statusCheckRollup),
       mergeStateStatus: detail.mergeStateStatus || "",
       isDraft: Boolean(detail.isDraft),
+      description: boundedGitHubText(
+        detail.body,
+        GITHUB_DESCRIPTION_MAXIMUM_BYTES,
+      ),
+      additions: Number.isSafeInteger(detail.additions) ? detail.additions : 0,
+      deletions: Number.isSafeInteger(detail.deletions) ? detail.deletions : 0,
+      changedFiles: Number.isSafeInteger(detail.changedFiles)
+        ? detail.changedFiles
+        : 0,
       labels: (detail.labels || []).map((label) => label.name),
       assignees: (detail.assignees || []).map((user) => user.login),
       milestone: detail.milestone?.title || "",
@@ -931,8 +995,45 @@ export class GitHubAdapter {
       "--json",
       ISSUE_FIELDS,
     ], options);
+    options.signal?.throwIfAborted();
+    if (!Array.isArray(records) || records.length > 50) {
+      throw new TypeError("GitHub issue search result count is invalid");
+    }
+    const ids = records.map((record) => issueNodeId(record?.id));
+    const detailsResponse = ids.length === 0
+      ? { data: { nodes: [] } }
+      : await this.run("gh", [
+          "api",
+          "graphql",
+          "-f",
+          `query=${ISSUE_DETAIL_QUERY}`,
+          ...ids.flatMap((id) => ["-F", `ids[]=${id}`]),
+        ], options);
+    options.signal?.throwIfAborted();
+    const detailNodes = detailsResponse?.data?.nodes;
+    if (!Array.isArray(detailNodes) || detailNodes.length !== ids.length) {
+      throw new TypeError("GitHub issue detail result is invalid");
+    }
+    const detailsById = new Map();
+    for (const detail of detailNodes) {
+      const id = issueNodeId(detail?.id);
+      if (
+        detailsById.has(id) ||
+        !ids.includes(id) ||
+        !Number.isSafeInteger(detail?.number) ||
+        detail.number < 1
+      ) {
+        throw new TypeError("GitHub issue detail identity is invalid");
+      }
+      detailsById.set(id, detail);
+    }
     return records.map((record) => {
       const repo = repositoryName(record);
+      const detail = detailsById.get(record.id);
+      if (!detail || detail.number !== record.number) {
+        throw new Error("GitHub issue identity changed during refresh");
+      }
+      const discussion = issueLatestComment(detail.comments);
       return {
         id: `github:issue:${repo}#${record.number}`,
         kind: "issue",
@@ -945,8 +1046,15 @@ export class GitHubAdapter {
         state: record.state?.toLowerCase() || "open",
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
+        description: boundedGitHubText(
+          detail.body || record.body,
+          GITHUB_DESCRIPTION_MAXIMUM_BYTES,
+        ),
         labels: (record.labels || []).map((label) => label.name),
         assignees: (record.assignees || []).map((user) => user.login),
+        milestone: detail.milestone?.title || "",
+        commentsCount: discussion.commentsCount,
+        latestComment: discussion.latestComment,
       };
     });
   }
