@@ -427,6 +427,10 @@ test("a failed work stage cannot strand an already durable dispatch", async () =
 
   await assert.rejects(service.runCycle(), (error) => {
     assert.equal(error.code, "WORK_COORDINATION_STAGE_FAILED");
+    assert.equal(
+      error.message,
+      "员工主动循环阶段失败: work [STRUCTURED_PROVIDER_UNAVAILABLE]",
+    );
     assert.equal(error.stage, "work");
     assert.deepEqual(error.causeCodes, ["STRUCTURED_PROVIDER_UNAVAILABLE"]);
     assert.deepEqual(error.result.stages.work, {

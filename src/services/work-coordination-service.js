@@ -299,10 +299,17 @@ function stableErrorCodes(error) {
 }
 
 function stageFailure(stage, error) {
-  const wrapped = new Error(`员工主动循环阶段失败: ${stage}`, { cause: error });
+  const causeCodes = stableErrorCodes(error);
+  const causeSummary = causeCodes.length
+    ? ` [${causeCodes.join(" > ")}]`
+    : "";
+  const wrapped = new Error(
+    `员工主动循环阶段失败: ${stage}${causeSummary}`,
+    { cause: error },
+  );
   wrapped.code = "WORK_COORDINATION_STAGE_FAILED";
   wrapped.stage = stage;
-  wrapped.causeCodes = stableErrorCodes(error);
+  wrapped.causeCodes = causeCodes;
   return wrapped;
 }
 
