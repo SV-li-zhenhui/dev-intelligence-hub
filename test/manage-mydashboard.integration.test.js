@@ -60,6 +60,10 @@ const READINESS_SAFE_MESSAGE =
 const PRESERVED_RECOVERY_SNAPSHOT_ID =
   "shutdown-failure-20260813-191305-ebe114efc20d42ac99e6fc0cc0c99b8f";
 const RECOVERY_SNAPSHOT_CREATED_AT = "2026-08-13T19:13:05.000Z";
+const WINDOWS_FIXTURE_PORT_START = 30_000;
+const WINDOWS_FIXTURE_PORT_COUNT = 2_000;
+let nextWindowsFixturePort = WINDOWS_FIXTURE_PORT_START +
+  (randomBytes(2).readUInt16BE(0) % WINDOWS_FIXTURE_PORT_COUNT);
 
 async function copyWritableFixtureFile(source, destination) {
   await copyFile(source, destination);
@@ -67,16 +71,33 @@ async function copyWritableFixtureFile(source, destination) {
 }
 
 async function availablePort() {
-  const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = server.address().port;
-  await new Promise((resolve, reject) =>
-    server.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
+  for (let attempt = 0; attempt < WINDOWS_FIXTURE_PORT_COUNT; attempt += 1) {
+    const requestedPort = process.platform === "win32"
+      ? nextWindowsFixturePort
+      : 0;
+    if (process.platform === "win32") {
+      nextWindowsFixturePort = WINDOWS_FIXTURE_PORT_START +
+        ((nextWindowsFixturePort - WINDOWS_FIXTURE_PORT_START + 1) %
+          WINDOWS_FIXTURE_PORT_COUNT);
+    }
+    const server = net.createServer();
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(requestedPort, "127.0.0.1", resolve);
+      });
+      const port = server.address().port;
+      await new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      return port;
+    } catch (error) {
+      if (server.listening) server.close();
+      if (process.platform === "win32" && error.code === "EADDRINUSE") continue;
+      throw error;
+    }
+  }
+  throw new Error("No dedicated Windows fixture port is available");
 }
 
 function invokeManager(
@@ -621,6 +642,7 @@ const writerLease = holdsWriterLeaseAfterFailure ? createApplicationWriterLease(
   projectDigest: environment.MYDASHBOARD_MANAGED_PROJECT_DIGEST,
 }) : null;
 if (writerLease) await writerLease.acquire();
+if (holdsWriterLeaseAfterFailure) setInterval(() => {}, 1_000);
 let lifecycleState = managed ? "pending_claim" : "running";
 let livenessStartIdentity = environment.MYDASHBOARD_MANAGED_START_IDENTITY;
 let watchdog = null;
@@ -963,7 +985,11 @@ async function prepareFailedShutdownRecovery(t, fixtureOptions = {}) {
 
 async function createUnexpectedExitRecoveryFixture(
   t,
-  { prepare = true, dataLabel = "unexpected-process-exit" } = {},
+  {
+    prepare = true,
+    dataLabel = "unexpected-process-exit",
+    stabilizeDeadProcessLookup = true,
+  } = {},
 ) {
   const { root, port } = await createFixture(t);
   const runtime = readRuntimeInfo(root);
@@ -979,6 +1005,13 @@ async function createUnexpectedExitRecoveryFixture(
   process.kill(state.processId);
   await waitForProcessExit(state.processId);
   await assertPortUnavailable(port);
+  if (stabilizeDeadProcessLookup) {
+    await rewriteFixtureManager(
+      root,
+      /(function Get-ManagedProcess \{\r?\n\s*param\([^\n]+\)\r?\n)/u,
+      `$1    if ([int]$State.processId -eq ${state.processId}) { return $null }\r\n`,
+    );
+  }
   const requestedPath = path.join(
     runtime.runtimeDirectory,
     `mydashboard-shutdown-${state.instanceId}-requested.json`,
@@ -1793,7 +1826,7 @@ for (const phase of ["requested", "terminal"]) {
       const first = invokeRecovery(fixture);
       assert.notEqual(first.status, 0, `${first.stderr}\n${first.stdout}`);
       assert.match(
-        `${first.stderr}\n${first.stdout}`,
+        `${first.stderr}\n${first.stdout}`.replace(/\s+/gu, " "),
         /permanently invalidated by a late shutdown receipt/u,
       );
       assert.equal(await fileExists(fixture.controlPath), true);
@@ -1808,7 +1841,7 @@ for (const phase of ["requested", "terminal"]) {
       const second = invokeRecovery(fixture);
       assert.notEqual(second.status, 0, `${second.stderr}\n${second.stdout}`);
       assert.match(
-        `${second.stderr}\n${second.stdout}`,
+        `${second.stderr}\n${second.stdout}`.replace(/\s+/gu, " "),
         /permanently invalidated by a late shutdown receipt/u,
       );
       assert.equal(await fileExists(fixture.controlPath), true);
@@ -1886,7 +1919,9 @@ test(
   "unexpected-exit recovery never controls a PID reused by another process",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
-    const fixture = await createUnexpectedExitRecoveryFixture(t);
+    const fixture = await createUnexpectedExitRecoveryFixture(t, {
+      stabilizeDeadProcessLookup: false,
+    });
     const sentinel = spawn(
       powershell,
       ["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],

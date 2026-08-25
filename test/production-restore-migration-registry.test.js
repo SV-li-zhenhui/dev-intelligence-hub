@@ -368,7 +368,7 @@ test("coverage validation rejects accessors and proxies without invoking them", 
   assert.equal(proxyTrapCalls, 0);
 });
 
-test("validation-only owner adapters clone and validate their empty v1 states", () => {
+test("validation-only adapters clone v1 states and migrate role lifecycle state", () => {
   const prFactContent = { schemaVersion: 1, revision: 0, records: [] };
   const fixtures = [
     [
@@ -418,14 +418,23 @@ test("validation-only owner adapters clone and validate their empty v1 states", 
         lastRun: null,
         lastErrorCode: "",
       },
+      {
+        schemaVersion: 2,
+        revision: 0,
+        paused: false,
+        runCount: 0,
+        lastRun: null,
+        lastErrorCode: "",
+      },
+      3,
     ],
   ];
 
-  for (const [normalize, fixture] of fixtures) {
+  for (const [normalize, fixture, expected = fixture, invalidVersion = 2] of fixtures) {
     const result = normalize(fixture);
-    assert.deepEqual(result, fixture);
+    assert.deepEqual(result, expected);
     assert.notEqual(result, fixture);
-    assert.throws(() => normalize({ ...fixture, schemaVersion: 2 }));
+    assert.throws(() => normalize({ ...fixture, schemaVersion: invalidVersion }));
   }
 });
 
