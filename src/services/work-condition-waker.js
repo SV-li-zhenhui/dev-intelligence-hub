@@ -117,6 +117,8 @@ function workerItemDto(item) {
 
 export class WorkConditionWaker {
   #ledger;
+  #readGraph = null;
+  #resumeGraphTask = null;
   #readFact;
   #clock;
   #admitWake;
@@ -124,6 +126,8 @@ export class WorkConditionWaker {
 
   constructor({
     ledger,
+    graphReader,
+    graphPlanner,
     factSource,
     actionAdmissionGate,
     clock = () => new Date(),
@@ -133,6 +137,21 @@ export class WorkConditionWaker {
       ["listItems", "listOutbox", "wakeCondition"],
       "ledger",
     );
+    if ((graphReader === undefined) !== (graphPlanner === undefined)) {
+      throw new TypeError("graph wake ports must be configured together");
+    }
+    if (graphReader !== undefined) {
+      this.#readGraph = bindPort(
+        graphReader,
+        ["getSnapshot"],
+        "graphReader",
+      ).getSnapshot;
+      this.#resumeGraphTask = bindPort(
+        graphPlanner,
+        ["resumeTask"],
+        "graphPlanner",
+      ).resumeTask;
+    }
     this.#readFact = factSource === undefined
       ? null
       : bindPort(factSource, ["read"], "factSource").read;
@@ -160,6 +179,7 @@ export class WorkConditionWaker {
 
   async #run(limit) {
     const now = normalizedClock(this.#clock);
+    await this.#wakePausedOrchestratorParent();
     const waiting = await this.#readAll(this.#ledger.listItems, {
       status: "waiting_condition",
     });
@@ -214,6 +234,50 @@ export class WorkConditionWaker {
       uncertain: outcomes.filter(({ status }) => status === "wake_uncertain").length,
       outcomes,
     };
+  }
+
+  async #wakePausedOrchestratorParent() {
+    if (this.#readGraph === null || this.#resumeGraphTask === null) return;
+    const snapshot = await this.#readGraph();
+    const graph = snapshot?.graph;
+    if (!graph || !Array.isArray(graph.tasks) || !Number.isSafeInteger(graph.revision)) {
+      throw new TypeError("graphReader returned an invalid snapshot");
+    }
+    const submittedParents = new Set(
+      graph.tasks
+        .filter((task) =>
+          task?.parentTaskId !== null &&
+          task?.deliveries?.at(-1)?.status === "submitted"
+        )
+        .map(({ parentTaskId }) => parentTaskId),
+    );
+    const parent = graph.tasks.find((task) =>
+      submittedParents.has(task?.taskId) &&
+      task?.status === "paused" &&
+      task?.responsibility?.type === "role" &&
+      task.responsibility.id === "orchestrator"
+    );
+    if (!parent) return;
+    const command = {
+      taskId: parent.taskId,
+      reason: "直属子任务已提交交付，恢复主脑验收",
+      expectedGraphRevision: graph.revision,
+      expectedTaskRevision: parent.revision,
+    };
+    let admitted;
+    try {
+      admitted = await this.#admitWake(() => carryOperation(() =>
+        this.#resumeGraphTask(command)
+      ));
+    } catch (error) {
+      throw error;
+    }
+    try {
+      if (admitted.status === "failed") throw admitted.error;
+      await admitted.operation;
+    } catch {
+      // The next cycle rereads the graph and safely reconciles an uncertain wake.
+    }
   }
 
   async #observe(item, condition, now) {

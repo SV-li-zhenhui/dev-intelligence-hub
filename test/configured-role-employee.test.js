@@ -211,6 +211,10 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   );
   assert.match(
     calls[0].messages[0].content,
+    /Never pause the current root merely to wait for normal child work/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
     /multiple compatible expected deliverables.*deliverableId|deliverableId.*multiple compatible expected deliverables/i,
   );
   assert.deepEqual(JSON.parse(calls[0].messages[1].content), {

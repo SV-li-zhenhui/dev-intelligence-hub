@@ -1372,6 +1372,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       async createChild() {
         throw new Error("graph planner must remain private");
       },
+      async resumeTask() {
+        throw new Error("graph planner must remain private");
+      },
     },
     graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
     async getSummary() {

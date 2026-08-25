@@ -211,6 +211,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "createChild",
     "reviseAcceptanceContract",
     "decideDelivery",
+    "resumeTask",
   ]);
   assert.deepEqual(Object.keys(runtime.scopedGraphPlannerFactory), ["forRoot"]);
   assert.deepEqual(Object.keys(runtime.graphDelivererFactory), ["forClaim"]);
@@ -287,6 +288,10 @@ test("runtime owns one named process guard and exposes least-authority graph por
   );
   await assert.rejects(
     runtime.graphPlanner.decideDelivery({}),
+    (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
+  );
+  await assert.rejects(
+    runtime.graphPlanner.resumeTask({}),
     (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
   );
 });

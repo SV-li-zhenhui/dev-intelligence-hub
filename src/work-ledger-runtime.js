@@ -179,6 +179,7 @@ export async function createWorkLedgerRuntime({
           admit(() => graphPlanner.reviseAcceptanceContract(command)),
         decideDelivery: (command) =>
           admit(() => graphPlanner.decideDelivery(command)),
+        resumeTask: (command) => admit(() => graphPlanner.resumeTask(command)),
       }),
       scopedGraphPlannerFactory: Object.freeze({
         forRoot: (request) => {

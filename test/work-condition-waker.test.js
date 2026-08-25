@@ -95,6 +95,53 @@ class FakeLedger {
   }
 }
 
+test("submitted child delivery wakes a paused orchestrator root", async () => {
+  const ledger = new FakeLedger([]);
+  const parent = {
+    taskId: "work-item-root",
+    revision: 4,
+    parentTaskId: null,
+    status: "paused",
+    responsibility: { type: "role", id: "orchestrator" },
+    deliveries: [],
+  };
+  const child = {
+    taskId: "work-item-child",
+    revision: 3,
+    parentTaskId: parent.taskId,
+    status: "waiting_external",
+    responsibility: { type: "role", id: "developer" },
+    deliveries: [{ status: "submitted" }],
+  };
+  const resumeCalls = [];
+  const waker = new WorkConditionWaker({
+    ledger,
+    graphReader: {
+      async getSnapshot() {
+        return { graph: { revision: 9, tasks: [parent, child] } };
+      },
+    },
+    graphPlanner: {
+      async resumeTask(command) {
+        resumeCalls.push(clone(command));
+        parent.status = "queued";
+        parent.revision += 1;
+      },
+    },
+    clock: () => "2026-08-02T02:00:00.000Z",
+  });
+
+  await waker.runCycle();
+  await waker.runCycle();
+
+  assert.deepEqual(resumeCalls, [{
+    taskId: parent.taskId,
+    reason: "直属子任务已提交交付，恢复主脑验收",
+    expectedGraphRevision: 9,
+    expectedTaskRevision: 4,
+  }]);
+});
+
 test("time conditions wake only at the exact durable notBefore boundary", async () => {
   let now = Date.parse("2026-08-02T01:59:59.999Z");
   const pair = waitingPair({
@@ -307,5 +354,15 @@ test("rejects an explicit invalid action admission gate", () => {
       actionAdmissionGate: null,
     }),
     /actionAdmissionGate is invalid/,
+  );
+});
+
+test("requires graph wake ports as a complete pair", () => {
+  assert.throws(
+    () => new WorkConditionWaker({
+      ledger: new FakeLedger([]),
+      graphReader: { getSnapshot: async () => ({}) },
+    }),
+    /graph wake ports must be configured together/,
   );
 });

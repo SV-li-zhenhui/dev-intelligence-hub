@@ -2296,6 +2296,8 @@ export async function createApplication({
       });
       const conditionWaker = workConditionWakerFactory({
         ledger: workLedgerRuntime,
+        graphReader: workLedgerRuntime.graphReader,
+        graphPlanner: workLedgerRuntime.graphPlanner,
         factSource,
         ...clockOptions,
         ...(ordinaryActionAdmissionGate === null
