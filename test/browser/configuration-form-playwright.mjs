@@ -415,7 +415,17 @@ try {
   await page.locator('[data-view="configuration"]').click();
   await page.locator("[data-configuration-structured-form]").waitFor();
 
-  assert.equal(await page.locator(".configuration-editor textarea").count(), 0);
+  assert.equal(
+    await page.locator(
+      ".configuration-editor textarea:not([data-configuration-field]):not([data-configuration-template-field])",
+    ).count(),
+    0,
+  );
+  assert.ok(
+    await page.locator(
+      ".configuration-editor textarea[data-configuration-template-field]",
+    ).count() >= 1,
+  );
 
   let gitCommandTemplate = await openDetailsBySummary(
     page,
@@ -1188,7 +1198,12 @@ try {
   assert.ok(overflow.document <= 0, `mobile document overflowed by ${overflow.document}px`);
   assert.ok(overflow.form <= 0, `mobile form overflowed by ${overflow.form}px`);
   assert.ok(overflow.inputFontSize >= 16, `mobile input font is ${overflow.inputFontSize}px`);
-  assert.equal(await mobile.locator(".configuration-editor textarea").count(), 0);
+  assert.equal(
+    await mobile.locator(
+      ".configuration-editor textarea:not([data-configuration-field]):not([data-configuration-template-field])",
+    ).count(),
+    0,
+  );
   assert.equal(mobileErrors.length, 0, mobileErrors.join("\n"));
   await mobile.close();
 
