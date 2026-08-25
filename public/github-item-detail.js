@@ -77,8 +77,8 @@ function latestCommentMarkup(comment) {
   return `
     <section class="github-detail-section github-latest-comment">
       <div class="github-detail-heading">
-        <h3>最近讨论</h3>
-        <span>${escapeHtml(author)}${timestamp ? ` · ${escapeHtml(new Date(timestamp).toLocaleString("zh-CN"))}` : ""}</span>
+        <h3>最新评论</h3>
+        <span>评论者 ${escapeHtml(author)}${timestamp ? ` · ${escapeHtml(new Date(timestamp).toLocaleString("zh-CN"))}` : ""}</span>
       </div>
       <div class="github-detail-copy">${markdownBlocks(comment.body, 900)}</div>
     </section>`;

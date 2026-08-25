@@ -18,7 +18,8 @@ test("GitHub issue detail presents description, images, and latest discussion", 
   assert.match(markup, /<h4>Problem Statement<\/h4>/u);
   assert.match(markup, /<li>启动失败<\/li>/u);
   assert.match(markup, /正文包含图片/u);
-  assert.match(markup, /最近讨论/u);
+  assert.match(markup, /最新评论/u);
+  assert.match(markup, /评论者 @SV-author/u);
   assert.match(markup, /<strong>v4\.0\.440<\/strong>/u);
   assert.doesNotMatch(markup, /<img|onerror=/u);
 });
