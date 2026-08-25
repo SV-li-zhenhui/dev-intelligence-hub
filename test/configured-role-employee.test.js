@@ -203,6 +203,10 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   );
   assert.match(
     calls[0].messages[0].content,
+    /prose-only specialist work.*text-report.*first return any submitted delivery/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
     /multiple compatible expected deliverables.*deliverableId|deliverableId.*multiple compatible expected deliverables/i,
   );
   assert.deepEqual(JSON.parse(calls[0].messages[1].content), {
