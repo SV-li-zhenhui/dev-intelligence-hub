@@ -627,6 +627,21 @@ test("checkAvailability uses a task snapshot, captures refresh, and makes no mod
   await current.broker.close();
 });
 
+test("checkAvailability treats an admitted credential operation as busy, not unavailable", async (t) => {
+  const current = await fixture(t);
+  const signal = new AbortController().signal;
+  const lease = await current.broker.acquire({ signal });
+
+  await current.broker.checkAvailability({ signal });
+
+  assert.equal(current.calls.beginTask.length, 1);
+  assert.equal(current.calls.stageTask.length, 0);
+  assert.equal(current.calls.stageProbe.length, 0);
+  assert.equal(current.calls.process.length, 0);
+  lease.release({ safe: true });
+  await current.broker.close();
+});
+
 test("checkAvailability fences future work when credential publication is unsafe", async (t) => {
   let beginCalls = 0;
   const current = await fixture(t, {

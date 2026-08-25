@@ -553,9 +553,19 @@ function credentialBroker(value) {
   ) {
     throw new TypeError("Codex login credential broker is invalid");
   }
+  const checkAvailability = value.checkAvailability;
+  if (
+    checkAvailability !== undefined &&
+    typeof checkAvailability !== "function"
+  ) {
+    throw new TypeError("Codex login credential broker is invalid");
+  }
   return Object.freeze({
     acquire: value.acquire.bind(value),
     readStatus: value.readStatus.bind(value),
+    ...(checkAvailability === undefined
+      ? {}
+      : { checkAvailability: checkAvailability.bind(value) }),
   });
 }
 
@@ -2412,9 +2422,16 @@ export class SupervisedCliBrainProvider {
     this.#activeGenerations += 1;
     try {
       if (this.#credentialMode === "codex-login") {
-        const status = await deadline.run(({ signal: operationSignal }) =>
-          this.#credentialBroker.readStatus({ signal: operationSignal }));
-        assertCodexLoginAvailable(status);
+        if (this.#credentialBroker.checkAvailability) {
+          await deadline.run(({ signal: operationSignal }) =>
+            this.#credentialBroker.checkAvailability({
+              signal: operationSignal,
+            }));
+        } else {
+          const status = await deadline.run(({ signal: operationSignal }) =>
+            this.#credentialBroker.readStatus({ signal: operationSignal }));
+          assertCodexLoginAvailable(status);
+        }
       } else {
         credential(this.#environment, this.kind);
         await deadline.run(({ signal: operationSignal }) =>

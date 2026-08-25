@@ -579,7 +579,17 @@ function createAdmissionQueue() {
     });
   }
 
-  return Object.freeze({ enter, leave, closeAdmission, waitUntilIdle });
+  function isBusy() {
+    return active !== null;
+  }
+
+  return Object.freeze({
+    enter,
+    leave,
+    closeAdmission,
+    waitUntilIdle,
+    isBusy,
+  });
 }
 
 function profileEnvironment(invocation, codexHome) {
@@ -1283,6 +1293,13 @@ function createBroker(rawOptions, rawDependencies) {
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
       const callerSignal = normalizeSignal(request.signal, { optional: true });
+      throwIfCancelled(callerSignal);
+      // Credential access is serialized. An admitted task already owns the
+      // same broker gate, so waiting behind it to run a redundant login probe
+      // turns normal contention into a false availability timeout. The model
+      // generation that follows still acquires a fresh credential snapshot
+      // and performs every authoritative CLI check.
+      if (queue.isBusy()) return;
       operation = createOperationSignal(
         callerSignal,
         dependencies.operationTimeoutMs,
