@@ -75,7 +75,7 @@ test("dashboard separates PRs by next actor and exposes brain health", () => {
   assert.equal(dashboard.meta.brain.model, "qwen3.5:9b");
 });
 
-test("tracked versions put the most recently created or published record first", () => {
+test("tracked versions put the most recently published or active record first", () => {
   const dashboard = buildDashboard({
     refreshedAt: "2026-07-31T09:00:00.000Z",
     durationMs: 10,
@@ -100,12 +100,13 @@ test("tracked versions put the most recently created or published record first",
         type: "milestone",
         title: "Middle milestone",
         createdAt: "2026-06-15T00:00:00.000Z",
+        updatedAt: "2026-07-31T00:00:00.000Z",
       },
     ],
   });
 
   assert.deepEqual(
     dashboard.groups.versions.map((version) => version.id),
-    ["new-release", "middle-milestone", "old-milestone"],
+    ["middle-milestone", "new-release", "old-milestone"],
   );
 });

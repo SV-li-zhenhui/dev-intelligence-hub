@@ -18,6 +18,8 @@ import {
 
 const GITHUB_HOST = "github.com";
 const SEARCH_LIMIT = 1_000;
+const MILESTONE_PAGE_SIZE = 100;
+const MILESTONES_PER_REPOSITORY = 10;
 const SECOND_MS = 1_000;
 const MAX_SEARCH_TIMESTAMP = Date.parse("9999-12-31T23:59:59.000Z");
 const SEARCH_TIMESTAMP =
@@ -43,6 +45,28 @@ const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
   "headRefName",
   "headRefOid",
 ]);
+
+function recentActiveMilestones(value) {
+  if (!Array.isArray(value)) {
+    throw new TypeError("GitHub milestone response must be an array");
+  }
+  const milestones = value.every(Array.isArray) ? value.flat() : value;
+  return [...milestones]
+    .sort((left, right) => {
+      const activityDifference =
+        Number((right?.open_issues || 0) > 0) -
+        Number((left?.open_issues || 0) > 0);
+      if (activityDifference !== 0) return activityDifference;
+      const updatedDifference =
+        Date.parse(right?.updated_at || 0) -
+        Date.parse(left?.updated_at || 0);
+      if (Number.isFinite(updatedDifference) && updatedDifference !== 0) {
+        return updatedDifference;
+      }
+      return Number(right?.number || 0) - Number(left?.number || 0);
+    })
+    .slice(0, MILESTONES_PER_REPOSITORY);
+}
 
 function repositoryName(item) {
   return item.repository?.nameWithOwner || item.repository?.name || "";
@@ -1239,7 +1263,9 @@ export class GitHubAdapter {
       const [milestonesResult, releaseResult] = await Promise.allSettled([
         this.run("gh", [
           "api",
-          `repos/${repo}/milestones?state=open&sort=due_on&direction=asc&per_page=10`,
+          `repos/${repo}/milestones?state=open&per_page=${MILESTONE_PAGE_SIZE}`,
+          "--paginate",
+          "--slurp",
         ], options),
         this.run(
           "gh",
@@ -1248,7 +1274,7 @@ export class GitHubAdapter {
         ),
       ]);
       if (milestonesResult.status === "fulfilled") {
-        for (const milestone of milestonesResult.value) {
+        for (const milestone of recentActiveMilestones(milestonesResult.value)) {
           versions.push({
             id: `github:milestone:${repo}#${milestone.number}`,
             repo,

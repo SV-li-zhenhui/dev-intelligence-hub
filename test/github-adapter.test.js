@@ -1027,21 +1027,37 @@ test("an owner-selected PR fails closed when it closes during resolution", async
   assert.equal(viewCalls, 2);
 });
 
-test("version records retain source creation timestamps for newest-first display", async () => {
+test("versions paginate milestones and retain the most recently active work", async () => {
+  const calls = [];
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      calls.push(args);
       if (args[1].includes("milestones")) {
         return [
-          {
-            number: 3,
-            title: "M3",
-            created_at: "2026-07-20T00:00:00Z",
-            updated_at: "2026-07-21T00:00:00Z",
-            due_on: "2026-08-01T00:00:00Z",
-            open_issues: 2,
-            closed_issues: 5,
-            html_url: "https://example.invalid/m3",
-          },
+          [
+            {
+              number: 3,
+              title: "Inactive but recently updated",
+              created_at: "2026-07-20T00:00:00Z",
+              updated_at: "2026-08-24T00:00:00Z",
+              due_on: "2026-09-01T00:00:00Z",
+              open_issues: 0,
+              closed_issues: 5,
+              html_url: "https://example.invalid/m3",
+            },
+          ],
+          [
+            {
+              number: 42,
+              title: "Current milestone",
+              created_at: "2026-08-20T00:00:00Z",
+              updated_at: "2026-08-23T00:00:00Z",
+              due_on: null,
+              open_issues: 2,
+              closed_issues: 1,
+              html_url: "https://example.invalid/m42",
+            },
+          ],
         ];
       }
       return [
@@ -1059,9 +1075,17 @@ test("version records retain source creation timestamps for newest-first display
 
   const versions = await adapter.versions(["acme/repo"]);
 
+  const milestoneCall = calls.find((args) => args[1].includes("milestones"));
+  assert.ok(milestoneCall[1].includes("per_page=100"));
+  assert.ok(milestoneCall.includes("--paginate"));
+  assert.ok(milestoneCall.includes("--slurp"));
+  assert.equal(
+    versions.find((version) => version.type === "milestone").title,
+    "Current milestone",
+  );
   assert.equal(
     versions.find((version) => version.type === "milestone").createdAt,
-    "2026-07-20T00:00:00Z",
+    "2026-08-20T00:00:00Z",
   );
   assert.equal(
     versions.find((version) => version.type === "release").createdAt,

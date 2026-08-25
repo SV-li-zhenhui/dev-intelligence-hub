@@ -8,8 +8,8 @@ function newestVersionsFirst(versions) {
   const timestamp = (version) => {
     const value =
       version.publishedAt ||
-      version.createdAt ||
       version.updatedAt ||
+      version.createdAt ||
       version.dueAt;
     const parsed = Date.parse(value || 0);
     return Number.isFinite(parsed) ? parsed : 0;
