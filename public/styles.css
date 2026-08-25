@@ -136,6 +136,87 @@ button {
   background: rgb(255 255 255 / 8%);
 }
 
+.automation-test-library {
+  display: grid;
+  gap: 22px;
+}
+
+.automation-test-library-intro,
+.automation-test-library-summary,
+.automation-test-card header,
+.automation-test-card dl div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.automation-test-library-intro {
+  padding: 24px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.automation-test-library-intro h2,
+.automation-test-card h2 {
+  margin: 0;
+}
+
+.automation-test-library-intro p:last-child {
+  max-width: 780px;
+  margin-bottom: 0;
+  color: var(--muted);
+}
+
+.automation-test-library-summary {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.automation-test-library-summary span {
+  color: var(--muted);
+}
+
+.automation-test-card {
+  padding: 24px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.automation-test-card > p {
+  color: var(--muted);
+}
+
+.automation-test-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 28px;
+  margin: 18px 0;
+}
+
+.automation-test-card dl div {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.automation-test-card dt {
+  color: var(--muted);
+}
+
+.automation-test-card dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.automation-test-card pre {
+  max-height: 320px;
+  overflow: auto;
+  padding: 16px;
+  background: var(--surface);
+  white-space: pre-wrap;
+}
+
 .nav-item.active {
   box-shadow: inset 2px 0 #8fc2ad;
 }
@@ -3601,6 +3682,21 @@ dialog::backdrop {
 
   .configuration-structured-grid,
   .configuration-structure-template-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .automation-test-library-intro,
+  .automation-test-card header {
+    align-items: flex-start;
+    display: grid;
+  }
+
+  .automation-test-library-intro button {
+    width: 100%;
+  }
+
+  .automation-test-library-summary,
+  .automation-test-card dl {
     grid-template-columns: minmax(0, 1fr);
   }
 

@@ -127,6 +127,9 @@ function inputControl(path, descriptor, value, attributes) {
   if (descriptor.control === "checkbox") {
     return `<input type="checkbox" data-configuration-field="${pathAttribute(path)}" data-configuration-value-kind="boolean" data-configuration-edit-kind="boolean" id="configuration-field-${pathDomId(path)}" name="${pathAttribute(path)}"${value ? " checked" : ""}${attributes}>`;
   }
+  if (descriptor.control === "textarea") {
+    return `<textarea data-configuration-field="${pathAttribute(path)}" data-configuration-value-kind="text" data-configuration-edit-kind="text" id="configuration-field-${pathDomId(path)}" name="${pathAttribute(path)}" spellcheck="false"${attributes}>${escapeHtml(value)}</textarea>`;
+  }
   const type = descriptor.control === "number" ? "number" : "text";
   const range = [
     descriptor.minimum === undefined ? "" : ` min="${descriptor.minimum}"`,
@@ -184,6 +187,9 @@ function renderField(path, value, context, { template = false } = {}) {
         })
         .join("");
       return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><select data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(descriptor.kind)}">${options}</select></label>`;
+    }
+    if (descriptor.control === "textarea") {
+      return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><textarea data-configuration-template-field="${templatePath}" data-configuration-edit-kind="text" spellcheck="false">${escapeHtml(value ?? "")}</textarea></label>`;
     }
     const editKind = descriptor.control === "env-reference" ? "text" : descriptor.kind;
     const readOnly = descriptor.readOnly ? ' readonly aria-readonly="true"' : "";

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -207,6 +207,82 @@ test("Docker profiles run pinned Node tests with a read-only, offline boundary",
   assert.equal(invocation.args.includes("--allow-fs-read=/tmp"), true);
   assert.equal(invocation.args.includes("--allow-fs-read=/artifacts"), true);
   assert.equal(invocation.args.includes("--allow-worker"), false);
+});
+
+test("approved Node script assets are materialized by digest and run read-only", async (t) => {
+  const source = [
+    'import assert from "node:assert/strict";',
+    'assert.equal(2 + 2, 4);',
+    'console.log("asset passed");',
+  ].join("\n");
+  const setup = await fixture(
+    t,
+    [
+      result({ stdout: "29.2.1" }),
+      result({ stdout: `sha256:${"b".repeat(64)}` }),
+      result({ stdout: "asset passed" }),
+    ],
+    {
+      profile: {
+        kind: "node-script",
+        image,
+        timeoutMs: 30_000,
+        asset: {
+          schemaVersion: 1,
+          title: "Reusable smoke assertion",
+          description: "Reusable across code jobs in this workspace.",
+          version: 3,
+          source,
+        },
+      },
+    },
+  );
+
+  const output = await setup.sandbox.run(
+    request({ workspacePath: setup.workspacePath }),
+  );
+
+  assert.equal(output.exitCode, 0);
+  const invocation = setup.processRunner.calls[2];
+  const assetMount = invocation.args.find(
+    (argument) => argument.includes("target=/test-library") && argument.includes("readonly"),
+  );
+  assert.ok(assetMount);
+  assert.equal(invocation.args.includes("--allow-fs-read=/test-library"), true);
+  assert.equal(invocation.args.at(-1), "/test-library/test.mjs");
+  assert.equal(invocation.args.includes(source), false);
+
+  const sourcePath = assetMount
+    .slice(assetMount.indexOf("source=") + "source=".length)
+    .split(",target=")[0];
+  assert.equal(await readFile(sourcePath, "utf8"), source);
+});
+
+test("script asset metadata and source are sealed into the profile fingerprint", async (t) => {
+  const base = {
+    kind: "node-script",
+    image,
+    timeoutMs: 30_000,
+    asset: {
+      schemaVersion: 1,
+      title: "Reusable test",
+      description: "Runs for every bound code job.",
+      version: 1,
+      source: 'console.log("one");',
+    },
+  };
+  const first = await fixture(t, [], { profile: base });
+  const changed = await fixture(t, [], {
+    profile: {
+      ...base,
+      asset: { ...base.asset, version: 2, source: 'console.log("two");' },
+    },
+  });
+
+  assert.notEqual(
+    first.sandbox.getProfileFingerprint("node-tests"),
+    changed.sandbox.getProfileFingerprint("node-tests"),
+  );
 });
 
 test("profile fingerprints use the sandbox's immutable validated configuration", async (t) => {

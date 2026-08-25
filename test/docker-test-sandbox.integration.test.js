@@ -51,6 +51,25 @@ test("container boundary", async () => {
       allowedWorkspaceRoot: root,
       profiles: {
         "node-tests": { kind: "node-test", image, timeoutMs: 30_000 },
+        "library-boundary": {
+          kind: "node-script",
+          image,
+          timeoutMs: 30_000,
+          asset: {
+            schemaVersion: 1,
+            title: "Live reusable test",
+            description: "Proves a centrally managed script runs inside the real boundary.",
+            version: 1,
+            source: `import assert from "node:assert/strict";
+import { readFile, writeFile } from "node:fs/promises";
+
+assert.equal(process.env.MYDASHBOARD_TEST_SECRET, undefined);
+assert.match(await readFile("/workspace/test/boundary.test.js", "utf8"), /container boundary/);
+await assert.rejects(writeFile("/workspace/library-escape.txt", "blocked"));
+await writeFile("/artifacts/library-result.txt", "reusable-test-passed");
+console.log("reusable-test-passed");`,
+          },
+        },
       },
       sourceEnvironment: {
         ...process.env,
@@ -67,5 +86,20 @@ test("container boundary", async () => {
 
     assert.equal(result.exitCode, 0, `${result.stderr}\n${result.stdout}`);
     assert.match(result.stdout, /pass 1/);
+
+    const libraryResult = await sandbox.run({
+      profileId: "library-boundary",
+      workspacePath,
+      executionId: "live-library",
+      actionId: "live-script",
+    });
+
+    assert.equal(
+      libraryResult.exitCode,
+      0,
+      `${libraryResult.stderr}\n${libraryResult.stdout}`,
+    );
+    assert.match(libraryResult.stdout, /reusable-test-passed/);
+    assert.match(libraryResult.profileFingerprint, /^[a-f0-9]{64}$/);
   },
 );

@@ -19,7 +19,7 @@ const committedDocument = JSON.parse(
   await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 const LEGACY_GITHUB_CREDENTIAL_DIGEST =
-  "a2095ebe59886ba1590ef4fc3eba7bd9efee23fef95a5e659cbeb74ed52a5089";
+  "0b0eac25934c311360dc0ce88900d15caf8d6d67a7d7bfc4116f26fce396d927";
 
 function document() {
   return structuredClone(committedDocument);
@@ -642,6 +642,80 @@ test("Git Head snapshot fields retain strict data-only boundaries", () => {
 
     assertInvalid(accessor);
     assert.equal(getterCalls, 0);
+  }
+});
+
+test("versioned code executor profiles accept reusable Node script assets", () => {
+  const value = document();
+  value.codeExecutor = {
+    enabled: true,
+    docker: {
+      executable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+    },
+    workspaces: [{ id: "dashboard", sourceRoot: "." }],
+    profiles: {
+      "reusable-smoke": {
+        kind: "node-script",
+        image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+        timeoutMs: 30_000,
+        asset: {
+          schemaVersion: 1,
+          title: "Reusable smoke test",
+          description: "Checks a stable cross-PR invariant.",
+          version: 4,
+          source: 'console.log("ok");',
+        },
+      },
+    },
+    requiredProfilesByWorkspace: { dashboard: ["reusable-smoke"] },
+  };
+
+  const normalized = normalizeConfigurationDocument(value);
+  assert.deepEqual(
+    normalized.codeExecutor.profiles["reusable-smoke"].asset,
+    value.codeExecutor.profiles["reusable-smoke"].asset,
+  );
+});
+
+test("reusable test assets reject unversioned, empty, oversized, or extra content", () => {
+  const valid = () => {
+    const value = document();
+    value.codeExecutor = {
+      enabled: true,
+      docker: {
+        executable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+        host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+      },
+      workspaces: [{ id: "dashboard", sourceRoot: "." }],
+      profiles: {
+        "reusable-smoke": {
+          kind: "node-script",
+          image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+          timeoutMs: 30_000,
+          asset: {
+            schemaVersion: 1,
+            title: "Reusable smoke test",
+            description: "Checks a stable cross-PR invariant.",
+            version: 1,
+            source: 'console.log("ok");',
+          },
+        },
+      },
+      requiredProfilesByWorkspace: { dashboard: ["reusable-smoke"] },
+    };
+    return value;
+  };
+
+  for (const mutate of [
+    (asset) => { delete asset.version; },
+    (asset) => { asset.source = ""; },
+    (asset) => { asset.source = "x".repeat(65_537); },
+    (asset) => { asset.command = "powershell.exe"; },
+  ]) {
+    const value = valid();
+    mutate(value.codeExecutor.profiles["reusable-smoke"].asset);
+    assertInvalid(value);
   }
 });
 

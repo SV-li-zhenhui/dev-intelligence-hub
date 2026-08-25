@@ -520,16 +520,26 @@ function assertCodeExecutor(value, path) {
   }
   if (value.profiles) {
     assertNamedMap(value.profiles, `${path}.profiles`, (profile, profilePath) => {
-      assertFields(profile, profilePath, ["kind", "image", "timeoutMs"], [
-        "kind",
-        "image",
-        "timeoutMs",
-      ]);
-      if (profile.kind !== "node-test") {
+      const isScript = profile.kind === "node-script";
+      assertFields(
+        profile,
+        profilePath,
+        ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
+        ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
+      );
+      if (!["node-test", "node-script"].includes(profile.kind)) {
         throw formError(
           "UNSUPPORTED_CONFIGURATION_SCHEMA",
           `unsupported execution profile kind ${profile.kind}`,
           `${profilePath}.kind`,
+        );
+      }
+      if (isScript) {
+        assertFields(
+          profile.asset,
+          `${profilePath}.asset`,
+          ["schemaVersion", "title", "description", "version", "source"],
+          ["schemaVersion", "title", "description", "version", "source"],
         );
       }
     });

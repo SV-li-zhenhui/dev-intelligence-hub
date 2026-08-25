@@ -1627,6 +1627,35 @@ test("structured operations cover routing, roles, policies and profile bindings"
   );
 });
 
+test("structured configuration preserves reusable Node script assets", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  configuration.codeExecutor.profiles["reusable-smoke"] = {
+    kind: "node-script",
+    image: `node@sha256:${"c".repeat(64)}`,
+    timeoutMs: 60_000,
+    asset: {
+      schemaVersion: 1,
+      title: "Reusable smoke test",
+      description: "A stable assertion shared by future pull requests.",
+      version: 2,
+      source: 'console.log("ok");',
+    },
+  };
+  configuration.codeExecutor.requiredProfilesByWorkspace.dashboard.push(
+    "reusable-smoke",
+  );
+
+  const result = configurationDocumentFromForm(
+    createConfigurationFormState(configuration),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.configuration.codeExecutor.profiles["reusable-smoke"],
+    configuration.codeExecutor.profiles["reusable-smoke"],
+  );
+});
+
 test("configuration-change proposal authority is configured structurally and must match role intent permission", () => {
   const initial = createConfigurationFormState(representativeConfiguration());
   assert.equal(

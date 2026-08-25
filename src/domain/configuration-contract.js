@@ -946,19 +946,61 @@ function normalizeCodeExecutor(value) {
       (profile, profilePath, id) => {
         safeId(id, profilePath);
         profileIds.add(id);
+        const isScript = profile?.kind === "node-script";
         const item = fields(
           profile,
           profilePath,
-          ["kind", "image", "timeoutMs"],
-          ["kind", "image", "timeoutMs"],
+          ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
+          ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
         );
-        if (item.kind !== "node-test") throw invalid(`${profilePath}.kind`);
+        if (!["node-test", "node-script"].includes(item.kind)) {
+          throw invalid(`${profilePath}.kind`);
+        }
+        let asset;
+        if (isScript) {
+          const assetPath = `${profilePath}.asset`;
+          const input = fields(
+            item.asset,
+            assetPath,
+            [
+              "schemaVersion",
+              "title",
+              "description",
+              "version",
+              "source",
+            ],
+            [
+              "schemaVersion",
+              "title",
+              "description",
+              "version",
+              "source",
+            ],
+          );
+          asset = {
+            schemaVersion: integer(
+              input.schemaVersion,
+              `${assetPath}.schemaVersion`,
+              1,
+              1,
+            ),
+            title: text(input.title, `${assetPath}.title`, 256),
+            description: text(
+              input.description,
+              `${assetPath}.description`,
+              2_048,
+            ),
+            version: integer(input.version, `${assetPath}.version`, 1, 1_000_000),
+            source: text(input.source, `${assetPath}.source`, 64 * 1_024),
+          };
+        }
         return {
           kind: item.kind,
           image: text(item.image, `${profilePath}.image`, 1_024, {
             pattern: PINNED_IMAGE,
           }),
           timeoutMs: integer(item.timeoutMs, `${profilePath}.timeoutMs`, 1_000, 600_000),
+          ...(asset === undefined ? {} : { asset }),
         };
       },
       { maximum: 100 },

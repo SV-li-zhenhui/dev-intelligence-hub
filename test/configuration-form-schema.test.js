@@ -324,6 +324,35 @@ test("Git Head snapshot fields expose safe scalar templates for old configuratio
   );
 });
 
+test("test library profiles expose a dedicated script template and source editor", () => {
+  const template = configurationStructureTemplate(
+    ["codeExecutor", "profiles"],
+    "node-script",
+  );
+  assert.equal(template.value.kind, "node-script");
+  assert.equal(template.value.asset.schemaVersion, 1);
+  assert.equal(template.value.asset.version, 1);
+  assert.match(template.value.asset.source, /console\.log/u);
+
+  const kind = configurationFieldDescriptor(
+    ["codeExecutor", "profiles", "reusable-smoke", "kind"],
+    "node-script",
+  );
+  assert.deepEqual(kind.options, ["node-test", "node-script"]);
+  const source = configurationFieldDescriptor(
+    [
+      "codeExecutor",
+      "profiles",
+      "reusable-smoke",
+      "asset",
+      "source",
+    ],
+    "console.log('ok');",
+  );
+  assert.equal(source.control, "textarea");
+  assert.equal(source.maximumBytes, 65_536);
+});
+
 test("router-backed brain references declare a dynamic provider option source", () => {
   for (const path of [
     ["employees", "roles", "developer", "brain", "provider"],

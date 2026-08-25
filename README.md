@@ -251,16 +251,32 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
         "kind": "node-test",
         "image": "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32",
         "timeoutMs": 30000
+      },
+      "repository-contract": {
+        "kind": "node-script",
+        "image": "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32",
+        "timeoutMs": 30000,
+        "asset": {
+          "schemaVersion": 1,
+          "title": "仓库契约冒烟测试",
+          "description": "跨 PR 复用，验证仓库必须保留的目录和清单。",
+          "version": 1,
+          "source": "import { access } from 'node:fs/promises';\nawait access('/workspace/src');\nconsole.log('repository contract passed');"
+        }
       }
     },
     "requiredProfilesByWorkspace": {
-      "my-dashboard": ["node-tests"]
+      "my-dashboard": ["node-tests", "repository-contract"]
     }
   }
 }
 ```
 
 临时工作副本和不可变审计产物保存在被 Git 忽略的 `data/code-executor/`。源仓库保持只读；员工只能提交固定语义动作，不能传入任意 shell 命令。
+
+“自动化测试库”页面展示活动配置中的可复用脚本、资产版本、固定镜像、绑定工作区和自动复用仓库。脚本由配置草稿管理，激活时经过影响确认；正文、版本和运行边界一起进入配置摘要。把脚本 Profile 加入 `requiredProfilesByWorkspace` 后，相关仓库的开发和测试 Code Job 在完成前必须通过该脚本，结果、标准输出、标准错误、镜像 ID、Profile 摘要和工作区 revision 会进入受控执行证据。更新脚本时必须递增 `asset.version`，再激活配置；已经发出的任务仍绑定原来的配置摘要，不会静默改用新脚本。
+
+测试库脚本目前使用固定的 `node-script` 运行器：宿主机只物化已经激活的脚本文本，Docker 以无网络、只读仓库、只读脚本、无 Linux capability 和固定资源限制运行。模型不能提供命令、镜像或脚本文本。需要 Vitest、Playwright、编译器等工具时，应先制作包含依赖的专用镜像并固定到 digest；不要在脚本中联网安装依赖。Windows/Qt/FastBuild 不能在 Linux Docker 运行，因此这类 Profile 必须等待受控 Windows 沙箱能力，不能退回到不受控的宿主机 PowerShell。
 
 PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对象生成执行副本，不读取当前 checkout 的脏文件，也不会运行 hook、filter 或网络拉取。Windows 必须把 `gitCommand` 直接指向 Git for Windows 的实际实现（通常位于 `mingw64\bin\git.exe`），不能使用 `cmd\git.exe` 或安装目录下的分发包装器；程序路径、内容摘要和大小都会随工作区权限一起封存。该能力只接受本地普通仓库的真实 `.git` 目录，不接受 UNC、linked worktree、alternate/partial object store 或对象链接。
 

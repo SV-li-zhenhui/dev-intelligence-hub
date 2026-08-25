@@ -231,6 +231,7 @@ const viewTitles = {
   memory: "搜索做过的事情",
   workflow: "工作流指挥",
   work: "主动工作台账",
+  "automation-tests": "自动化测试库",
   configuration: "配置中心",
   system: "系统状态与恢复",
 };
@@ -1003,6 +1004,77 @@ function versionsView() {
   </section>`;
 }
 
+function activeConfigurationDocument() {
+  return plainRecord(storedActiveConfiguration()?.configuration) ||
+    plainRecord(configurationState?.runtimeEffective?.configuration) ||
+    null;
+}
+
+function automationTestsView() {
+  if (!hasConfigurationState()) {
+    return `<section class="automation-test-library"><div class="empty">${escapeHtml(configurationLoadError || "正在读取自动化测试库…")}</div></section>`;
+  }
+  const configuration = activeConfigurationDocument();
+  const executor = plainRecord(configuration?.codeExecutor) || {};
+  const profiles = plainRecord(executor.profiles) || {};
+  const bindings = plainRecord(executor.requiredProfilesByWorkspace) || {};
+  const repositoryBindings = plainRecord(
+    configuration?.workCoordination?.policy?.workspaceByRepository,
+  ) || {};
+  const assets = Object.entries(profiles)
+    .filter(([, profile]) => profile?.kind === "node-script" && plainRecord(profile.asset))
+    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
+  const activeVersion = configurationActiveVersion();
+  const rows = assets.map(([profileId, profile]) => {
+    const asset = profile.asset;
+    const workspaceIds = Object.entries(bindings)
+      .filter(([, profileIds]) => Array.isArray(profileIds) && profileIds.includes(profileId))
+      .map(([workspaceId]) => workspaceId)
+      .sort();
+    const repositories = Object.entries(repositoryBindings)
+      .filter(([, workspaceId]) => workspaceIds.includes(workspaceId))
+      .map(([repository]) => repository)
+      .sort();
+    const automatic = workspaceIds.length > 0;
+    return `<article class="automation-test-card">
+      <header>
+        <div>
+          <p class="eyebrow">TEST ASSET / ${escapeHtml(profileId)}</p>
+          <h2>${escapeHtml(asset.title)}</h2>
+        </div>
+        <span class="status-pill ${automatic ? "status-active" : "status-waiting_user"}">${automatic ? "自动执行" : "尚未绑定"}</span>
+      </header>
+      <p>${escapeHtml(asset.description)}</p>
+      <dl>
+        <div><dt>资产版本</dt><dd>v${escapeHtml(asset.version)}</dd></div>
+        <div><dt>运行镜像</dt><dd><code>${escapeHtml(profile.image)}</code></dd></div>
+        <div><dt>超时</dt><dd>${escapeHtml(profile.timeoutMs)} ms</dd></div>
+        <div><dt>工作区</dt><dd>${workspaceIds.length ? workspaceIds.map(escapeHtml).join("、") : "未绑定"}</dd></div>
+        <div><dt>自动复用仓库</dt><dd>${repositories.length ? repositories.map(escapeHtml).join("、") : "绑定工作区后生效"}</dd></div>
+      </dl>
+      <details>
+        <summary>查看受版本保护的脚本</summary>
+        <pre><code>${escapeHtml(asset.source)}</code></pre>
+      </details>
+    </article>`;
+  }).join("");
+  return `<section class="automation-test-library">
+    <div class="automation-test-library-intro">
+      <div>
+        <p class="eyebrow">LOCAL / VERSIONED / REUSABLE</p>
+        <h2>受控自动化测试资产</h2>
+        <p>脚本正文和版本随配置摘要封印。绑定工作区后，开发或测试岗位处理该仓库的每个代码任务时都会自动执行；脚本不能从模型返回值临时替换。</p>
+      </div>
+      <button type="button" class="secondary-button" data-open-test-library-configuration>在配置中心管理</button>
+    </div>
+    <div class="automation-test-library-summary">
+      <strong>${assets.length} 个脚本资产</strong>
+      <span>${activeVersion === null ? "尚无 Active 配置" : `活动配置 v${activeVersion}`} · ${Object.keys(bindings).length} 个工作区绑定</span>
+    </div>
+    ${rows || '<div class="empty">当前还没有可复用脚本。请在配置中心新增“可复用自动化测试脚本”，再把它绑定到工作区。</div>'}
+  </section>`;
+}
+
 function plainRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value
@@ -1417,7 +1489,7 @@ function bindConfirmationHistoryView() {
 function render() {
   pageTitle.textContent = viewTitles[currentView];
   document.title = `${viewTitles[currentView]} · MyDashboard`;
-  if (!["configuration", "system"].includes(currentView) && !dashboard) {
+  if (!["automation-tests", "configuration", "system"].includes(currentView) && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
   }
@@ -1447,6 +1519,7 @@ function render() {
     memory: memoryView,
     workflow: () => workflowView.render(),
     work: () => workView.render(),
+    "automation-tests": automationTestsView,
     configuration: configurationView,
     system: () => renderSystemStatus({
       state: systemStatusState,
@@ -1497,6 +1570,10 @@ function render() {
   content.querySelector("#memory-rerun-local")?.addEventListener(
     "click",
     handleMemoryLocalRerun,
+  );
+  content.querySelector("[data-open-test-library-configuration]")?.addEventListener(
+    "click",
+    () => activateView("configuration"),
   );
   bindConfigurationView();
   bindSystemStatusView();
@@ -4370,7 +4447,7 @@ function applyConfigurationState(
     if (!runtimeUnchanged) updateConfigurationChrome();
     if (
       renderView &&
-      currentView === "configuration" &&
+      ["automation-tests", "configuration"].includes(currentView) &&
       (!runtimeUnchanged || hadLoadError)
     ) {
       renderConfigurationPreservingEditorFocus();
@@ -4407,7 +4484,10 @@ function applyConfigurationState(
   ) {
     configurationAutoSelected = true;
     activateView("configuration", { focusHeading: false });
-  } else if (renderView && currentView === "configuration") {
+  } else if (
+    renderView &&
+    ["automation-tests", "configuration"].includes(currentView)
+  ) {
     render();
   }
   return true;
@@ -4454,7 +4534,11 @@ async function loadConfiguration({ renderView = true } = {}) {
     const nextError = error.message;
     const errorChanged = configurationLoadError !== nextError;
     configurationLoadError = nextError;
-    if (renderView && errorChanged && currentView === "configuration") {
+    if (
+      renderView &&
+      errorChanged &&
+      ["automation-tests", "configuration"].includes(currentView)
+    ) {
       renderConfigurationPreservingEditorFocus();
     }
     return false;
@@ -4566,7 +4650,10 @@ async function load({ showConfirmation = true } = {}) {
   const sequence = ++requestSequence;
   const confirmationSequence = ++confirmationRequestSequence;
   void loadEmployeeRoles();
-  if (!hasConfigurationState() || currentView === "configuration") {
+  if (
+    !hasConfigurationState() ||
+    ["automation-tests", "configuration"].includes(currentView)
+  ) {
     void loadConfiguration();
   }
   if (currentView === "configuration") {
@@ -4583,12 +4670,12 @@ async function load({ showConfirmation = true } = {}) {
     applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
     if (showConfirmation) queueMicrotask(showNextConfirmation);
     if (!nextDashboard) {
-      if (currentView !== "configuration") render();
+      if (!["automation-tests", "configuration"].includes(currentView)) render();
       refreshLoadedConfirmationHistory();
       return;
     }
     applyDashboard(nextDashboard, sequence, {
-      renderView: currentView !== "configuration",
+      renderView: !["automation-tests", "configuration"].includes(currentView),
     });
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
@@ -4607,6 +4694,25 @@ async function refresh() {
       await Promise.all([
         loadConfiguration(),
         loadBrainProviderStatus(),
+        refreshConfirmationQueue({
+          showConfirmation: false,
+          renderView: false,
+        }),
+      ]);
+      queueMicrotask(showNextConfirmation);
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = error.message;
+    } finally {
+      refreshButton.disabled = false;
+      refreshButton.classList.remove("loading");
+    }
+    return;
+  }
+  if (currentView === "automation-tests") {
+    try {
+      await Promise.all([
+        loadConfiguration(),
         refreshConfirmationQueue({
           showConfirmation: false,
           renderView: false,
@@ -4678,6 +4784,9 @@ function activateView(view, { focusHeading = true } = {}) {
   if (currentView === "configuration") {
     void loadConfiguration();
     void loadBrainProviderStatus();
+  }
+  if (currentView === "automation-tests") {
+    void loadConfiguration();
   }
   if (currentView === "system") {
     void loadSystemStatus();
@@ -4758,6 +4867,9 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key.toLowerCase() === "s") {
     activateView("system");
+  }
+  if (event.key.toLowerCase() === "t") {
+    activateView("automation-tests");
   }
 });
 

@@ -1,4 +1,4 @@
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { digestValue } from "../domain/code-executor-contract.js";
@@ -27,6 +27,17 @@ const NODE_TEST_ARGS = Object.freeze([
   "--allow-fs-write=/artifacts",
   "--allow-fs-write=/tmp",
   "--test",
+]);
+const NODE_SCRIPT_ARGS = Object.freeze([
+  "--permission",
+  "--allow-child-process",
+  "--allow-fs-read=/workspace",
+  "--allow-fs-read=/artifacts",
+  "--allow-fs-read=/test-library",
+  "--allow-fs-read=/tmp",
+  "--allow-fs-write=/artifacts",
+  "--allow-fs-write=/tmp",
+  "/test-library/test.mjs",
 ]);
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 const REDACTED_HOST_VALUE = "[host-redacted]";
@@ -65,9 +76,15 @@ function normalizeProfiles(profiles) {
   for (const [id, profile] of Object.entries(profiles)) {
     assertSafeId(id, "profileId");
     const keys = Object.keys(profile || {}).sort();
+    const isScript = profile?.kind === "node-script";
     if (
-      !keys.every((key) => ["image", "kind", "timeoutMs"].includes(key)) ||
-      profile.kind !== "node-test" ||
+      keys.join("\0") !== [
+        ...(isScript ? ["asset"] : []),
+        "image",
+        "kind",
+        "timeoutMs",
+      ].sort().join("\0") ||
+      !["node-test", "node-script"].includes(profile.kind) ||
       !IMAGE_WITH_DIGEST.test(profile.image) ||
       !Number.isSafeInteger(profile.timeoutMs) ||
       profile.timeoutMs < 1_000 ||
@@ -75,10 +92,48 @@ function normalizeProfiles(profiles) {
     ) {
       throw sandboxError("INVALID_SANDBOX_CONFIG", "Sandbox profile is invalid");
     }
+    let asset;
+    if (isScript) {
+      const value = profile.asset;
+      const assetKeys = Object.keys(value || {}).sort();
+      if (
+        !isPlainRecord(value) ||
+        assetKeys.join("\0") !== [
+          "description",
+          "schemaVersion",
+          "source",
+          "title",
+          "version",
+        ].join("\0") ||
+        value.schemaVersion !== 1 ||
+        typeof value.title !== "string" ||
+        !value.title.trim() ||
+        Buffer.byteLength(value.title, "utf8") > 256 ||
+        typeof value.description !== "string" ||
+        !value.description.trim() ||
+        Buffer.byteLength(value.description, "utf8") > 2_048 ||
+        !Number.isSafeInteger(value.version) ||
+        value.version < 1 ||
+        value.version > 1_000_000 ||
+        typeof value.source !== "string" ||
+        !value.source.trim() ||
+        Buffer.byteLength(value.source, "utf8") > 64 * 1_024
+      ) {
+        throw sandboxError("INVALID_SANDBOX_CONFIG", "Sandbox script asset is invalid");
+      }
+      asset = Object.freeze({
+        schemaVersion: value.schemaVersion,
+        title: value.title,
+        description: value.description,
+        version: value.version,
+        source: value.source,
+      });
+    }
     const definition = Object.freeze({
       kind: profile.kind,
       image: profile.image,
       timeoutMs: profile.timeoutMs,
+      ...(asset === undefined ? {} : { asset }),
     });
     normalized.set(
       id,
@@ -181,6 +236,64 @@ async function resolveDirectory(value) {
     throw sandboxError("INVALID_SANDBOX_REQUEST", "Sandbox directory is invalid");
   }
   return resolved;
+}
+
+async function ensurePlainDirectory(directory) {
+  try {
+    await mkdir(directory);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  const stats = await lstat(directory);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw sandboxError(
+      "INVALID_SANDBOX_REQUEST",
+      "Sandbox test library directory is invalid",
+    );
+  }
+  return realpath(directory);
+}
+
+async function materializeScriptAsset(allowedRoot, profile) {
+  const libraryRoot = await ensurePlainDirectory(
+    path.join(allowedRoot, ".test-library"),
+  );
+  if (!isStrictDescendant(allowedRoot, libraryRoot)) {
+    throw sandboxError(
+      "INVALID_SANDBOX_REQUEST",
+      "Sandbox test library directory is invalid",
+    );
+  }
+  const assetDirectory = await ensurePlainDirectory(
+    path.join(libraryRoot, profile.fingerprint),
+  );
+  if (!isStrictDescendant(libraryRoot, assetDirectory)) {
+    throw sandboxError(
+      "INVALID_SANDBOX_REQUEST",
+      "Sandbox test asset directory is invalid",
+    );
+  }
+  const sourcePath = path.join(assetDirectory, "test.mjs");
+  try {
+    await writeFile(sourcePath, profile.definition.asset.source, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const stats = await lstat(sourcePath);
+    if (
+      !stats.isFile() ||
+      stats.isSymbolicLink() ||
+      await readFile(sourcePath, "utf8") !== profile.definition.asset.source
+    ) {
+      throw sandboxError(
+        "INVALID_SANDBOX_REQUEST",
+        "Sandbox test asset cache does not match its digest",
+      );
+    }
+  }
+  return realpath(sourcePath);
 }
 
 function isStrictDescendant(root, candidate) {
@@ -314,6 +427,9 @@ export class DockerTestSandbox {
     this.assertRunRequest(request);
     const profile = this.#profile(request.profileId);
     const workspace = await this.#resolveWorkspace(request.workspacePath);
+    const assetPath = profile.definition.kind === "node-script"
+      ? await materializeScriptAsset(workspace.allowedWorkspaceRoot, profile)
+      : null;
     const sanitizeBoundaryOutput = createOutputSanitizer([
       request.workspacePath,
       workspace.workspacePath,
@@ -321,6 +437,7 @@ export class DockerTestSandbox {
       workspace.allowedWorkspaceRoot,
       this.dockerExecutable,
       this.dockerHost,
+      ...(assetPath === null ? [] : [assetPath, path.dirname(assetPath)]),
     ]);
     const name = containerName(request.executionId, request.actionId);
     const imageId = await this.probe(
@@ -335,6 +452,7 @@ export class DockerTestSandbox {
           name,
           profile: profile.definition,
           workspacePath: workspace.workspacePath,
+          assetPath,
         }),
         profile.definition.timeoutMs,
         request.signal,
@@ -489,7 +607,7 @@ export class DockerTestSandbox {
     return imageId;
   }
 
-  runArguments({ name, profile, workspacePath }) {
+  runArguments({ name, profile, workspacePath, assetPath = null }) {
     return [
       "run",
       "--rm",
@@ -520,6 +638,12 @@ export class DockerTestSandbox {
       "/artifacts:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=65532,gid=65532",
       "--mount",
       `type=bind,source=${workspacePath},target=/workspace,readonly,bind-recursive=disabled`,
+      ...(profile.kind === "node-script"
+        ? [
+            "--mount",
+            `type=bind,source=${assetPath},target=/test-library/test.mjs,readonly,bind-recursive=disabled`,
+          ]
+        : []),
       "--workdir",
       "/workspace",
       "--env",
@@ -531,7 +655,7 @@ export class DockerTestSandbox {
       "--entrypoint",
       "node",
       profile.image,
-      ...NODE_TEST_ARGS,
+      ...(profile.kind === "node-script" ? NODE_SCRIPT_ARGS : NODE_TEST_ARGS),
     ];
   }
 
