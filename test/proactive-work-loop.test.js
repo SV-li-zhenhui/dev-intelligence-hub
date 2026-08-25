@@ -2518,6 +2518,81 @@ test("a superseded child is terminal and does not block root completion", async 
   assert.equal(ledger.calls.stageIntent.length, 1);
 });
 
+test("a cancelled child is settled and lets the root judge replacement work", async () => {
+  const time = controlledClock();
+  const root = workItem(144, { type: "role", id: "orchestrator" });
+  const cancelled = workItem(145, { type: "role", id: "developer" });
+  const replacement = workItem(146, { type: "role", id: "developer" });
+  cancelled.graph = { parentItemId: root.itemId, dependsOnItemIds: [] };
+  replacement.graph = { parentItemId: root.itemId, dependsOnItemIds: [] };
+  cancelled.status = "cancelled";
+  replacement.status = "completed";
+  const ledger = new FakeLedger({ source: [root, cancelled, replacement], time });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async () => completeDecision(),
+    }),
+    developer: worker({ roleId: "developer" }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.staged, 1);
+  assert.equal(cycle.claimed, 1);
+  assert.equal(ledger.calls.stageIntent.length, 1);
+});
+
+test("a cancelled dependency remains unsatisfied", async () => {
+  const time = controlledClock();
+  const dependency = workItem(147, { type: "role", id: "developer" });
+  const dependent = workItem(148, { type: "role", id: "developer" });
+  dependency.status = "cancelled";
+  dependent.graph = {
+    parentItemId: null,
+    dependsOnItemIds: [dependency.itemId],
+  };
+  const ledger = new FakeLedger({ source: [dependency, dependent], time });
+  let decisions = 0;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({
+        roleId: "developer",
+        decide: async () => {
+          decisions += 1;
+          return completeDecision();
+        },
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "developer" });
+
+  assert.equal(cycle.claimed, 0);
+  assert.equal(decisions, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+});
+
 test("a ready root decides before claiming and staging a generic intent", async () => {
   const time = controlledClock();
   const root = workItem(44, { type: "role", id: "orchestrator" });

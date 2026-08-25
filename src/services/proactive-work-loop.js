@@ -17,6 +17,10 @@ const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const ORCHESTRATOR_WORKER_ID = "employee-orchestrator";
 const SATISFIED_GRAPH_STATUSES = new Set(["completed", "superseded"]);
+const SETTLED_GRAPH_CHILD_STATUSES = new Set([
+  ...SATISFIED_GRAPH_STATUSES,
+  "cancelled",
+]);
 const RUNTIME_ADMISSION_ERROR_CODES = new Set([
   "RUNTIME_RESTART_REQUIRED",
   "RUNTIME_CONFIGURATION_NOT_READY",
@@ -265,7 +269,7 @@ function prioritizeWorkItems(items) {
           child.graph?.deliveries?.at(-1)?.status === "submitted"
         ).length,
         satisfiedChildren: children.filter((child) =>
-          SATISFIED_GRAPH_STATUSES.has(child.status)
+          SETTLED_GRAPH_CHILD_STATUSES.has(child.status)
         ).length,
       };
     })
@@ -299,7 +303,7 @@ function graphBlockedItemIds(items) {
           );
         const blockedByChild = (childrenByParent.get(item.itemId) ?? []).some(
           (childId) =>
-            !SATISFIED_GRAPH_STATUSES.has(statusById.get(childId)),
+            !SETTLED_GRAPH_CHILD_STATUSES.has(statusById.get(childId)),
         );
         return blockedByDependency || blockedByChild;
       })
