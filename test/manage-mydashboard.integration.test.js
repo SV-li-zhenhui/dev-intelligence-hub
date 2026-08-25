@@ -2674,6 +2674,26 @@ test(
 );
 
 test(
+  "RecoverFailedShutdown preserves the separately validated change package store",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const fixture = await prepareFailedShutdownRecovery(t);
+    const packagePath = path.join(
+      fixture.root,
+      "data",
+      "change-packages",
+      "packages",
+      `change-package-${"a".repeat(64)}.json`,
+    );
+    await mkdir(path.dirname(packagePath), { recursive: true });
+    await writeFile(packagePath, "{}\n", "utf8");
+
+    await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+    assert.equal(await readFile(packagePath, "utf8"), "{}\n");
+  },
+);
+
+test(
   "RecoverFailedShutdown rejects wrong-case active cache directory before termination",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {

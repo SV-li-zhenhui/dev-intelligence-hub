@@ -1241,6 +1241,11 @@ function Test-RecoveryExcludedActiveDataDirectoryName {
             $Name,
             "validation-profile-probe",
             [System.StringComparison]::Ordinal
+        ) -or
+        [string]::Equals(
+            $Name,
+            "change-packages",
+            [System.StringComparison]::Ordinal
         )
     )
 }
