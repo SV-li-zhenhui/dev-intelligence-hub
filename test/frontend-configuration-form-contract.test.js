@@ -151,11 +151,14 @@ test("settings skeleton exposes every structured configuration group", () => {
   assert.equal(CONFIGURATION_FORM_GROUPS.every(Object.isFrozen), true);
 });
 
-test("settings skeleton is structured and never falls back to a JSON editor", () => {
+test("settings skeleton is structured and never falls back to a whole-document JSON editor", () => {
   const state = createConfigurationFormState(configurationWithCredentialReferences());
   const markup = renderConfigurationSettingsSkeleton({ state });
 
-  assert.doesNotMatch(markup, /<textarea/i);
+  assert.doesNotMatch(
+    markup,
+    /<textarea[^>]+(?:id|name)=["']configuration-document["']/i,
+  );
   assert.doesNotMatch(markup, /type=["']password/i);
   assert.doesNotMatch(settingsSource, /JSON\.stringify|JSON\.parse/);
   assert.doesNotMatch(supportSource, /eval\s*\(|new Function\s*\(/);
@@ -230,7 +233,10 @@ test("old code workspaces expose structured Git Head setup and native controls",
       `missing structured add control for ${expected.join(".")}`,
     );
   }
-  assert.doesNotMatch(markup, /<textarea/i);
+  assert.doesNotMatch(
+    markup,
+    /<textarea[^>]+(?:id|name)=["']configuration-document["']/i,
+  );
 
   state = applyConfigurationStructureOperation(state, {
     operation: "add",
@@ -265,7 +271,10 @@ test("old code workspaces expose structured Git Head setup and native controls",
   ]);
   assert.match(snapshot, /type="checkbox"/);
   assert.match(snapshot, / checked(?:\s|>)/);
-  assert.doesNotMatch(markup, /<textarea/i);
+  assert.doesNotMatch(
+    markup,
+    /<textarea[^>]+(?:id|name)=["']configuration-document["']/i,
+  );
 });
 
 test("settings skeleton overlays valid edits and preserves invalid raw input", () => {

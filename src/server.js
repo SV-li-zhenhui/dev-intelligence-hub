@@ -1650,6 +1650,7 @@ async function readConfigurationHttpState(application) {
     runtimeEffective: {
       activeVersion: runtimeActiveVersion,
       configurationDigest: runtimeConfigurationDigest,
+      configuration: application.config,
     },
     pendingRestart,
     drafts: headDrafts.map((draft) => projectConfigurationDraft(draft)),

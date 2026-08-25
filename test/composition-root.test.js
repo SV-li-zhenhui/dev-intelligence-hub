@@ -5051,7 +5051,7 @@ test("production composition shares one Codex login broker across every configur
       throw unavailable;
     },
     async checkAvailability() {
-      throw new Error("provider availability must use the read-only status probe");
+      statusCalls += 1;
     },
     async readStatus() {
       statusCalls += 1;

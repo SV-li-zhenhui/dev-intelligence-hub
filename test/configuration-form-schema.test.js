@@ -332,7 +332,8 @@ test("test library profiles expose a dedicated script template and source editor
   assert.equal(template.value.kind, "node-script");
   assert.equal(template.value.asset.schemaVersion, 1);
   assert.equal(template.value.asset.version, 1);
-  assert.match(template.value.asset.source, /console\.log/u);
+  assert.match(template.value.asset.source, /throw new Error/u);
+  assert.match(template.value.asset.source, /before activation/u);
 
   const kind = configurationFieldDescriptor(
     ["codeExecutor", "profiles", "reusable-smoke", "kind"],

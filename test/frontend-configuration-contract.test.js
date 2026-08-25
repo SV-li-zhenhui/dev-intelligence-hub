@@ -51,6 +51,9 @@ test("configuration save is registered after the structured controller submit gu
 
 test("configuration and confirmation loading do not depend on a dashboard snapshot", () => {
   const load = functionSource("load");
+  const loadConfigurationBackedView = functionSource(
+    "loadConfigurationBackedView",
+  );
   const applyDashboard = functionSource("applyDashboard");
   const applyConfiguration = functionSource("applyConfigurationState");
   const showNext = functionSource("showNextConfirmation");
@@ -59,18 +62,18 @@ test("configuration and confirmation loading do not depend on a dashboard snapsh
   assert.match(app, /configurationFetch\("\/api\/configuration"/);
   assert.match(
     load,
-    /if \(!hasConfigurationState\(\) \|\| currentView === "configuration"\)/,
+    /if \(isConfigurationBackedView\(\)\)/,
   );
+  assert.match(load, /await loadConfigurationBackedView\(\{ showConfirmation \}\)/);
+  assert.match(loadConfigurationBackedView, /loadConfiguration\(\)/);
+  assert.match(loadConfigurationBackedView, /loadBrainProviderStatus\(\)/);
+  assert.match(loadConfigurationBackedView, /refreshConfirmationQueue\(\{/);
   assert.match(applyConfiguration, /sameConfigurationRevision/);
   assert.match(applyDashboard, /\{ renderView = true \}/);
   assert.match(applyDashboard, /if \(renderView\) render\(\)/);
   assert.match(
     load,
-    /renderView: currentView !== "configuration"/,
-  );
-  assert.match(
-    load,
-    /if \(currentView !== "configuration"\) render\(\)/,
+    /if \(isConfigurationBackedView\(\)\) \{[\s\S]*?return;[\s\S]*?fetchDashboard\(\)/,
   );
   assert.match(app, /isCurrentConfigurationRequest/);
   assert.match(app, /configurationFetch/);

@@ -121,6 +121,34 @@ function changedConfiguration() {
   return changed;
 }
 
+function configurationWithReusableTest({ version = 1, source = "assert.ok(true);" } = {}) {
+  const value = configuration();
+  value.codeExecutor = {
+    enabled: true,
+    docker: {
+      executable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+    },
+    workspaces: [{ id: "dashboard", sourceRoot: "." }],
+    profiles: {
+      "reusable-smoke": {
+        kind: "node-script",
+        image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+        timeoutMs: 30_000,
+        asset: {
+          schemaVersion: 1,
+          title: "Reusable smoke test",
+          description: "Checks a stable cross-PR invariant.",
+          version,
+          source,
+        },
+      },
+    },
+    requiredProfilesByWorkspace: { dashboard: ["reusable-smoke"] },
+  };
+  return value;
+}
+
 function assertCode(code, statusCode) {
   return (error) => error?.code === code && error?.statusCode === statusCode;
 }
@@ -894,6 +922,58 @@ test("activation is revision-bound, audited, projected, and idempotent", async (
   assert.equal(repeated.applied, false);
   assert.deepEqual(repeated.active, activated.active);
   assert.equal(store.writes.length, 3);
+});
+
+test("script asset changes require a higher asset version on draft activation", async () => {
+  const { configurations } = await readyStore();
+  await configurations.importBootstrap({
+    configuration: configurationWithReusableTest(),
+    importedBy: "bootstrap-file",
+  });
+  const unchangedVersion = configurationWithReusableTest({
+    source: "assert.equal(2 + 2, 4);",
+  });
+  const draft = await configurations.createDraft({
+    configuration: unchangedVersion,
+    expectedStateRevision: 1,
+    proposedBy: "owner",
+  });
+
+  await assert.rejects(
+    configurations.prepareDraftActivation({
+      draftId: draft.draftId,
+      draftRevision: draft.revision,
+      expectedStateRevision: 2,
+      expectedActiveVersion: 1,
+    }),
+    assertCode("CONFIGURATION_TEST_ASSET_VERSION_REQUIRED", 409),
+  );
+
+  const bumped = configurationWithReusableTest({
+    version: 2,
+    source: "assert.equal(2 + 2, 4);",
+  });
+  const revised = await configurations.reviseDraft({
+    draftId: draft.draftId,
+    configuration: bumped,
+    expectedStateRevision: 2,
+    expectedDraftRevision: 1,
+    proposedBy: "owner",
+  });
+  const plan = await configurations.prepareDraftActivation({
+    draftId: revised.draftId,
+    draftRevision: revised.revision,
+    expectedStateRevision: 3,
+    expectedActiveVersion: 1,
+  });
+  const activated = await configurations.activateDraft({
+    ...plan,
+    activatedBy: "owner",
+  });
+  assert.equal(
+    activated.active.configuration.codeExecutor.profiles["reusable-smoke"].asset.version,
+    2,
+  );
 });
 
 test("a draft from an older Active baseline cannot be disguised as a new activation", async () => {

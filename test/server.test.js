@@ -2094,6 +2094,10 @@ test("safe-mode configuration API creates, revises, previews, and reloads only i
     assert.equal(initialState.storedActive, null);
     assert.equal(initialState.runtimeEffective.activeVersion, null);
     assert.match(initialState.runtimeEffective.configurationDigest, /^[a-f0-9]{64}$/);
+    assert.deepEqual(
+      initialState.runtimeEffective.configuration,
+      safeEditableConfiguration,
+    );
     assert.equal(initialState.pendingRestart, false);
     assert.deepEqual(initialState.drafts, []);
     assert.deepEqual(initialState.versions, []);

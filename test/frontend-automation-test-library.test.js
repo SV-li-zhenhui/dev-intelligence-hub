@@ -20,6 +20,13 @@ test("test library cards disclose reuse bindings, versions, and immutable source
   assert.match(app, /requiredProfilesByWorkspace/u);
   assert.match(app, /workspaceByRepository/u);
   assert.match(app, /查看受版本保护的脚本/u);
+  assert.match(app, /data-automation-test-source/u);
+  assert.match(app, /activeAutomationTestSource/u);
+  assert.match(app, /code\.textContent = activeAutomationTestSource/u);
+  assert.match(app, /runtimeEffective\?\.configuration/u);
+  assert.match(app, /已保存，等待重启/u);
+  assert.match(app, /本页卡片仅表示当前运行时实际执行的配置/u);
+  assert.doesNotMatch(app, /<pre><code>\$\{escapeHtml\(asset\.source\)\}/u);
   assert.match(styles, /\.automation-test-library/u);
   assert.match(styles, /\.automation-test-card/u);
 });

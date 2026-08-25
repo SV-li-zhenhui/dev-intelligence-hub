@@ -700,7 +700,7 @@ const TEMPLATES = deepFreeze({
       title: "可复用自动化测试",
       description: "说明这个脚本验证的稳定行为，以及适合复用的场景。",
       version: 1,
-      source: 'console.log("replace with an assertion");',
+      source: 'throw new Error("Replace this placeholder with assertions before activation");',
     },
   },
   "profile-binding": ["profile-id"],

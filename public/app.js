@@ -235,6 +235,14 @@ const viewTitles = {
   configuration: "配置中心",
   system: "系统状态与恢复",
 };
+const CONFIGURATION_BACKED_VIEWS = Object.freeze([
+  "automation-tests",
+  "configuration",
+]);
+
+function isConfigurationBackedView(view = currentView) {
+  return CONFIGURATION_BACKED_VIEWS.includes(view);
+}
 
 const workflowView = createWorkflowView({
   onChange() {
@@ -1005,9 +1013,17 @@ function versionsView() {
 }
 
 function activeConfigurationDocument() {
-  return plainRecord(storedActiveConfiguration()?.configuration) ||
-    plainRecord(configurationState?.runtimeEffective?.configuration) ||
-    null;
+  return plainRecord(configurationState?.runtimeEffective?.configuration);
+}
+
+function activeAutomationTestSource(profileId) {
+  const profile = plainRecord(
+    activeConfigurationDocument()?.codeExecutor?.profiles?.[profileId],
+  );
+  const asset = plainRecord(profile?.asset);
+  return profile?.kind === "node-script" && typeof asset?.source === "string"
+    ? asset.source
+    : "";
 }
 
 function automationTestsView() {
@@ -1021,10 +1037,22 @@ function automationTestsView() {
   const repositoryBindings = plainRecord(
     configuration?.workCoordination?.policy?.workspaceByRepository,
   ) || {};
+  const runtimeVersion = configurationState?.runtimeEffective?.activeVersion;
+  const storedVersion = storedActiveConfiguration()?.version;
+  const pendingRestart = Number.isSafeInteger(storedVersion) &&
+    storedVersion !== runtimeVersion;
+  const pendingConfiguration = pendingRestart
+    ? plainRecord(storedActiveConfiguration()?.configuration)
+    : null;
+  const pendingAssets = Object.values(
+    plainRecord(pendingConfiguration?.codeExecutor?.profiles) || {},
+  ).filter(
+    (profile) => profile?.kind === "node-script" && plainRecord(profile.asset),
+  ).length;
   const assets = Object.entries(profiles)
     .filter(([, profile]) => profile?.kind === "node-script" && plainRecord(profile.asset))
     .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
-  const activeVersion = configurationActiveVersion();
+  const activeVersion = Number.isSafeInteger(runtimeVersion) ? runtimeVersion : null;
   const rows = assets.map(([profileId, profile]) => {
     const asset = profile.asset;
     const workspaceIds = Object.entries(bindings)
@@ -1035,7 +1063,7 @@ function automationTestsView() {
       .filter(([, workspaceId]) => workspaceIds.includes(workspaceId))
       .map(([repository]) => repository)
       .sort();
-    const automatic = workspaceIds.length > 0;
+    const automatic = activeVersion !== null && workspaceIds.length > 0;
     return `<article class="automation-test-card">
       <header>
         <div>
@@ -1052,9 +1080,9 @@ function automationTestsView() {
         <div><dt>工作区</dt><dd>${workspaceIds.length ? workspaceIds.map(escapeHtml).join("、") : "未绑定"}</dd></div>
         <div><dt>自动复用仓库</dt><dd>${repositories.length ? repositories.map(escapeHtml).join("、") : "绑定工作区后生效"}</dd></div>
       </dl>
-      <details>
+      <details data-automation-test-source="${escapeHtml(profileId)}">
         <summary>查看受版本保护的脚本</summary>
-        <pre><code>${escapeHtml(asset.source)}</code></pre>
+        <pre><code></code></pre>
       </details>
     </article>`;
   }).join("");
@@ -1069,8 +1097,9 @@ function automationTestsView() {
     </div>
     <div class="automation-test-library-summary">
       <strong>${assets.length} 个脚本资产</strong>
-      <span>${activeVersion === null ? "尚无 Active 配置" : `活动配置 v${activeVersion}`} · ${Object.keys(bindings).length} 个工作区绑定</span>
+      <span>${activeVersion === null ? "当前运行时未载入 Active 配置" : `运行时配置 v${activeVersion}`} · ${Object.keys(bindings).length} 个工作区绑定</span>
     </div>
+    ${pendingRestart ? `<div class="notice warning">配置 v${escapeHtml(storedVersion)} 已保存，等待重启；其中有 ${pendingAssets} 个脚本资产。本页卡片仅表示当前运行时实际执行的配置。</div>` : ""}
     ${rows || '<div class="empty">当前还没有可复用脚本。请在配置中心新增“可复用自动化测试脚本”，再把它绑定到工作区。</div>'}
   </section>`;
 }
@@ -1489,7 +1518,7 @@ function bindConfirmationHistoryView() {
 function render() {
   pageTitle.textContent = viewTitles[currentView];
   document.title = `${viewTitles[currentView]} · MyDashboard`;
-  if (!["automation-tests", "configuration", "system"].includes(currentView) && !dashboard) {
+  if (!isConfigurationBackedView() && currentView !== "system" && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
   }
@@ -1575,10 +1604,25 @@ function render() {
     "click",
     () => activateView("configuration"),
   );
+  bindAutomationTestLibraryView();
   bindConfigurationView();
   bindSystemStatusView();
   workflowView.bind(content);
   workView.bind(content);
+}
+
+function bindAutomationTestLibraryView() {
+  content.querySelectorAll("[data-automation-test-source]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (!details.open) return;
+      const code = details.querySelector("code");
+      if (code) {
+        code.textContent = activeAutomationTestSource(
+          details.dataset.automationTestSource,
+        );
+      }
+    }, { once: true });
+  });
 }
 
 function bindSystemStatusView() {
@@ -4447,7 +4491,7 @@ function applyConfigurationState(
     if (!runtimeUnchanged) updateConfigurationChrome();
     if (
       renderView &&
-      ["automation-tests", "configuration"].includes(currentView) &&
+      isConfigurationBackedView() &&
       (!runtimeUnchanged || hadLoadError)
     ) {
       renderConfigurationPreservingEditorFocus();
@@ -4486,7 +4530,7 @@ function applyConfigurationState(
     activateView("configuration", { focusHeading: false });
   } else if (
     renderView &&
-    ["automation-tests", "configuration"].includes(currentView)
+    isConfigurationBackedView()
   ) {
     render();
   }
@@ -4537,7 +4581,7 @@ async function loadConfiguration({ renderView = true } = {}) {
     if (
       renderView &&
       errorChanged &&
-      ["automation-tests", "configuration"].includes(currentView)
+      isConfigurationBackedView()
     ) {
       renderConfigurationPreservingEditorFocus();
     }
@@ -4599,6 +4643,18 @@ async function refreshConfirmationQueue({
   return applied;
 }
 
+async function loadConfigurationBackedView({ showConfirmation = true } = {}) {
+  await Promise.all([
+    loadConfiguration(),
+    ...(currentView === "configuration" ? [loadBrainProviderStatus()] : []),
+    refreshConfirmationQueue({
+      showConfirmation: false,
+      renderView: false,
+    }),
+  ]);
+  if (showConfirmation) queueMicrotask(showNextConfirmation);
+}
+
 async function restoreDeferredConfirmations() {
   if (deferredConfirmationRestore !== null) return;
   const deferred = [...deferredConfirmations];
@@ -4647,17 +4703,20 @@ async function refreshAfterDeferral() {
 }
 
 async function load({ showConfirmation = true } = {}) {
+  if (isConfigurationBackedView()) {
+    try {
+      await loadConfigurationBackedView({ showConfirmation });
+    } catch (error) {
+      statusBanner.hidden = false;
+      statusBanner.textContent = `${error.message}。页面会自动重试。`;
+    }
+    return;
+  }
   const sequence = ++requestSequence;
   const confirmationSequence = ++confirmationRequestSequence;
   void loadEmployeeRoles();
-  if (
-    !hasConfigurationState() ||
-    ["automation-tests", "configuration"].includes(currentView)
-  ) {
+  if (!hasConfigurationState()) {
     void loadConfiguration();
-  }
-  if (currentView === "configuration") {
-    void loadBrainProviderStatus();
   }
   if (currentView === "system") {
     void loadSystemStatus();
@@ -4670,13 +4729,11 @@ async function load({ showConfirmation = true } = {}) {
     applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
     if (showConfirmation) queueMicrotask(showNextConfirmation);
     if (!nextDashboard) {
-      if (!["automation-tests", "configuration"].includes(currentView)) render();
+      render();
       refreshLoadedConfirmationHistory();
       return;
     }
-    applyDashboard(nextDashboard, sequence, {
-      renderView: !["automation-tests", "configuration"].includes(currentView),
-    });
+    applyDashboard(nextDashboard, sequence);
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
     refreshLoadedConfirmationHistory();
@@ -4689,36 +4746,9 @@ async function load({ showConfirmation = true } = {}) {
 async function refresh() {
   refreshButton.disabled = true;
   refreshButton.classList.add("loading");
-  if (currentView === "configuration") {
+  if (isConfigurationBackedView()) {
     try {
-      await Promise.all([
-        loadConfiguration(),
-        loadBrainProviderStatus(),
-        refreshConfirmationQueue({
-          showConfirmation: false,
-          renderView: false,
-        }),
-      ]);
-      queueMicrotask(showNextConfirmation);
-    } catch (error) {
-      statusBanner.hidden = false;
-      statusBanner.textContent = error.message;
-    } finally {
-      refreshButton.disabled = false;
-      refreshButton.classList.remove("loading");
-    }
-    return;
-  }
-  if (currentView === "automation-tests") {
-    try {
-      await Promise.all([
-        loadConfiguration(),
-        refreshConfirmationQueue({
-          showConfirmation: false,
-          renderView: false,
-        }),
-      ]);
-      queueMicrotask(showNextConfirmation);
+      await loadConfigurationBackedView();
     } catch (error) {
       statusBanner.hidden = false;
       statusBanner.textContent = error.message;

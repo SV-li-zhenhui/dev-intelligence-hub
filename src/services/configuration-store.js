@@ -65,6 +65,27 @@ function normalizedTimestamp(clock) {
   return date.toISOString();
 }
 
+function assertReusableTestAssetVersions(before, after) {
+  const beforeProfiles = before.codeExecutor?.profiles || {};
+  const afterProfiles = after.codeExecutor?.profiles || {};
+  for (const [profileId, profile] of Object.entries(afterProfiles)) {
+    const previous = beforeProfiles[profileId];
+    if (profile?.kind !== "node-script" || previous?.kind !== "node-script") {
+      continue;
+    }
+    const changed = ["title", "description", "source"].some(
+      (field) => profile.asset[field] !== previous.asset[field],
+    );
+    if (changed && profile.asset.version <= previous.asset.version) {
+      throw invalid(
+        "CONFIGURATION_TEST_ASSET_VERSION_REQUIRED",
+        `自动化测试脚本 ${profileId} 的正文或说明变更后必须提高资产版本`,
+        409,
+      );
+    }
+  }
+}
+
 function identifiedVersion(content) {
   return identifiedConfigurationRecord(
     "versionId",
@@ -1027,6 +1048,7 @@ export class ConfigurationStore {
     expectedStateRevision,
     expectedActiveVersion,
   }) {
+    assertReusableTestAssetVersions(active.configuration, draft.configuration);
     const impact = configurationDocumentImpact(
       active.configuration,
       draft.configuration,

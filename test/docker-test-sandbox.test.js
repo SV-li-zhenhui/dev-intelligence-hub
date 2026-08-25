@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -237,6 +237,15 @@ test("approved Node script assets are materialized by digest and run read-only",
       },
     },
   );
+  const staleFingerprint = "f".repeat(64);
+  const staleSourcePath = path.join(
+    setup.root,
+    ".test-library",
+    staleFingerprint,
+    "test.mjs",
+  );
+  await mkdir(path.dirname(staleSourcePath), { recursive: true });
+  await writeFile(staleSourcePath, 'console.log("stale");', "utf8");
 
   const output = await setup.sandbox.run(
     request({ workspacePath: setup.workspacePath }),
@@ -256,6 +265,7 @@ test("approved Node script assets are materialized by digest and run read-only",
     .slice(assetMount.indexOf("source=") + "source=".length)
     .split(",target=")[0];
   assert.equal(await readFile(sourcePath, "utf8"), source);
+  await assert.rejects(readFile(staleSourcePath, "utf8"), { code: "ENOENT" });
 });
 
 test("script asset metadata and source are sealed into the profile fingerprint", async (t) => {
@@ -283,6 +293,124 @@ test("script asset metadata and source are sealed into the profile fingerprint",
     first.sandbox.getProfileFingerprint("node-tests"),
     changed.sandbox.getProfileFingerprint("node-tests"),
   );
+});
+
+test("cached script assets reject source that does not match the profile digest", async (t) => {
+  const source = 'console.log("approved");';
+  const setup = await fixture(t, [], {
+    profile: {
+      kind: "node-script",
+      image,
+      timeoutMs: 30_000,
+      asset: {
+        schemaVersion: 1,
+        title: "Reusable test",
+        description: "Rejects a tampered cache entry.",
+        version: 1,
+        source,
+      },
+    },
+  });
+  const sourcePath = path.join(
+    setup.root,
+    ".test-library",
+    setup.sandbox.getProfileFingerprint("node-tests"),
+    "test.mjs",
+  );
+  await mkdir(path.dirname(sourcePath), { recursive: true });
+  await writeFile(sourcePath, 'console.log("tampered");', "utf8");
+
+  await assert.rejects(
+    setup.sandbox.run(request({ workspacePath: setup.workspacePath })),
+    (error) => error instanceof DockerSandboxError &&
+      error.code === "INVALID_SANDBOX_REQUEST",
+  );
+  assert.equal(setup.processRunner.calls.length, 0);
+});
+
+test("script library preparation can retry after its cache is repaired", async (t) => {
+  const source = 'console.log("approved");';
+  const setup = await fixture(
+    t,
+    [
+      result({ stdout: "29.2.1" }),
+      result({ stdout: `sha256:${"b".repeat(64)}` }),
+      result({ stdout: "approved" }),
+    ],
+    {
+      profile: {
+        kind: "node-script",
+        image,
+        timeoutMs: 30_000,
+        asset: {
+          schemaVersion: 1,
+          title: "Reusable test",
+          description: "Retries after an invalid cache entry is repaired.",
+          version: 1,
+          source,
+        },
+      },
+    },
+  );
+  const invalidEntry = path.join(setup.root, ".test-library", "invalid");
+  await mkdir(path.dirname(invalidEntry), { recursive: true });
+  await writeFile(invalidEntry, "invalid", "utf8");
+
+  await assert.rejects(
+    setup.sandbox.run(request({ workspacePath: setup.workspacePath })),
+    (error) => error instanceof DockerSandboxError &&
+      error.code === "INVALID_SANDBOX_REQUEST",
+  );
+  await rm(invalidEntry);
+
+  const output = await setup.sandbox.run(
+    request({ workspacePath: setup.workspacePath }),
+  );
+  assert.equal(output.exitCode, 0);
+  assert.equal(setup.processRunner.calls.length, 3);
+});
+
+test("concurrent first runs share one script asset materialization", async (t) => {
+  const source = 'console.log("approved");';
+  const dockerResult = result({ stdout: `sha256:${"b".repeat(64)}` });
+  const setup = await fixture(
+    t,
+    Array.from({ length: 6 }, () => dockerResult),
+    {
+      profile: {
+        kind: "node-script",
+        image,
+        timeoutMs: 30_000,
+        asset: {
+          schemaVersion: 1,
+          title: "Reusable concurrent test",
+          description: "Shares first-use materialization across code jobs.",
+          version: 1,
+          source,
+        },
+      },
+    },
+  );
+
+  const [first, second] = await Promise.all([
+    setup.sandbox.run(request({ workspacePath: setup.workspacePath })),
+    setup.sandbox.run({
+      ...request({ workspacePath: setup.workspacePath }),
+      executionId: "run-two",
+      actionId: "action-two",
+    }),
+  ]);
+
+  assert.equal(first.exitCode, 0);
+  assert.equal(second.exitCode, 0);
+  const sourcePath = path.join(
+    setup.root,
+    ".test-library",
+    setup.sandbox.getProfileFingerprint("node-tests"),
+    "test.mjs",
+  );
+  assert.equal(await readFile(sourcePath, "utf8"), source);
+  assert.equal(setup.processRunner.calls.length, 6);
 });
 
 test("profile fingerprints use the sandbox's immutable validated configuration", async (t) => {

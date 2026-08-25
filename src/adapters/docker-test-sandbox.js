@@ -1,4 +1,12 @@
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { digestValue } from "../domain/code-executor-contract.js";
@@ -18,25 +26,26 @@ const RUN_KEYS = new Set([
   "signal",
 ]);
 const CLEANUP_KEYS = new Set(["executionId", "actionId"]);
-const NODE_TEST_ARGS = Object.freeze([
+const NODE_SHARED_READ_ARGS = Object.freeze([
   "--permission",
   "--allow-child-process",
   "--allow-fs-read=/workspace",
   "--allow-fs-read=/artifacts",
+]);
+const NODE_SHARED_RUNTIME_ARGS = Object.freeze([
   "--allow-fs-read=/tmp",
   "--allow-fs-write=/artifacts",
   "--allow-fs-write=/tmp",
+]);
+const NODE_TEST_ARGS = Object.freeze([
+  ...NODE_SHARED_READ_ARGS,
+  ...NODE_SHARED_RUNTIME_ARGS,
   "--test",
 ]);
 const NODE_SCRIPT_ARGS = Object.freeze([
-  "--permission",
-  "--allow-child-process",
-  "--allow-fs-read=/workspace",
-  "--allow-fs-read=/artifacts",
+  ...NODE_SHARED_READ_ARGS,
   "--allow-fs-read=/test-library",
-  "--allow-fs-read=/tmp",
-  "--allow-fs-write=/artifacts",
-  "--allow-fs-write=/tmp",
+  ...NODE_SHARED_RUNTIME_ARGS,
   "/test-library/test.mjs",
 ]);
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -254,16 +263,41 @@ async function ensurePlainDirectory(directory) {
   return realpath(directory);
 }
 
-async function materializeScriptAsset(allowedRoot, profile) {
-  const libraryRoot = await ensurePlainDirectory(
-    path.join(allowedRoot, ".test-library"),
-  );
+async function prepareScriptLibrary(allowedRoot, profiles) {
+  const libraryRoot = await ensurePlainDirectory(path.join(allowedRoot, ".test-library"));
   if (!isStrictDescendant(allowedRoot, libraryRoot)) {
     throw sandboxError(
       "INVALID_SANDBOX_REQUEST",
       "Sandbox test library directory is invalid",
     );
   }
+  const activeFingerprints = new Set(
+    [...profiles.values()]
+      .filter((profile) => profile.definition.kind === "node-script")
+      .map((profile) => profile.fingerprint),
+  );
+  for (const entry of await readdir(libraryRoot, { withFileTypes: true })) {
+    if (activeFingerprints.has(entry.name)) continue;
+    if (!/^[a-f0-9]{64}$/.test(entry.name) || !entry.isDirectory()) {
+      throw sandboxError(
+        "INVALID_SANDBOX_REQUEST",
+        "Sandbox test library contains an invalid asset",
+      );
+    }
+    const staleDirectory = path.join(libraryRoot, entry.name);
+    const stats = await lstat(staleDirectory);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw sandboxError(
+        "INVALID_SANDBOX_REQUEST",
+        "Sandbox test library contains an invalid asset",
+      );
+    }
+    await rm(staleDirectory, { recursive: true });
+  }
+  return libraryRoot;
+}
+
+async function materializeScriptAsset(libraryRoot, profile) {
   const assetDirectory = await ensurePlainDirectory(
     path.join(libraryRoot, profile.fingerprint),
   );
@@ -382,6 +416,8 @@ function retainCleanupState(error, cleanup) {
 
 export class DockerTestSandbox {
   #profiles;
+  #scriptAssetPreparations = new Map();
+  #scriptLibraryPreparation = null;
 
   constructor({
     dockerExecutable,
@@ -427,9 +463,33 @@ export class DockerTestSandbox {
     this.assertRunRequest(request);
     const profile = this.#profile(request.profileId);
     const workspace = await this.#resolveWorkspace(request.workspacePath);
-    const assetPath = profile.definition.kind === "node-script"
-      ? await materializeScriptAsset(workspace.allowedWorkspaceRoot, profile)
-      : null;
+    let assetPath = null;
+    if (profile.definition.kind === "node-script") {
+      const preparation = this.#scriptLibraryPreparation ??= prepareScriptLibrary(
+        workspace.allowedWorkspaceRoot,
+        this.#profiles,
+      );
+      const cachedAssetPreparation = this.#scriptAssetPreparations.get(
+        profile.fingerprint,
+      );
+      const assetPreparation = cachedAssetPreparation || preparation.then(
+        (libraryRoot) => materializeScriptAsset(libraryRoot, profile),
+      );
+      if (!cachedAssetPreparation) {
+        this.#scriptAssetPreparations.set(profile.fingerprint, assetPreparation);
+      }
+      try {
+        assetPath = await assetPreparation;
+      } catch (error) {
+        if (this.#scriptLibraryPreparation === preparation) {
+          this.#scriptLibraryPreparation = null;
+        }
+        if (this.#scriptAssetPreparations.get(profile.fingerprint) === assetPreparation) {
+          this.#scriptAssetPreparations.delete(profile.fingerprint);
+        }
+        throw error;
+      }
+    }
     const sanitizeBoundaryOutput = createOutputSanitizer([
       request.workspacePath,
       workspace.workspacePath,
