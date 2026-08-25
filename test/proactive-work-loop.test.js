@@ -805,6 +805,50 @@ test("explicit local owner requests take priority without reordering peers", asy
   assert.equal(ledger.items[0].status, "queued");
 });
 
+test("configured roots with more settled child work close before peer roots", async () => {
+  const time = controlledClock();
+  const firstRoot = workItem(31, { type: "role", id: "orchestrator" });
+  const laterRoot = workItem(32, { type: "role", id: "orchestrator" });
+  const children = [
+    [workItem(33, { type: "role", id: "developer" }), firstRoot],
+    [workItem(34, { type: "role", id: "developer" }), laterRoot],
+    [workItem(35, { type: "role", id: "tester" }), laterRoot],
+  ];
+  for (const [child, parent] of children) {
+    child.graph = { parentItemId: parent.itemId, dependsOnItemIds: [], deliveries: [] };
+    child.status = "completed";
+  }
+  const ledger = new FakeLedger({
+    source: [firstRoot, children[0][0], laterRoot, children[1][0], children[2][0]],
+    time,
+  });
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      decide: async () => completeDecision("完成根任务"),
+    }),
+    developer: worker({ roleId: "developer" }),
+    tester: worker({ roleId: "tester" }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+
+  assert.equal(ledger.calls.claim[0].itemId, laterRoot.itemId);
+  assert.equal(ledger.calls.stageIntent[0].itemId, laterRoot.itemId);
+});
+
 test("graph-blocked parents do not consume the claim budget before ready children", async () => {
   const time = controlledClock();
   const parent = workItem(1);

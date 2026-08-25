@@ -242,10 +242,38 @@ function ownerRequestPriority(item) {
 }
 
 function prioritizeWorkItems(items) {
+  const childrenByParent = new Map();
+  for (const item of items) {
+    const parentItemId = item.graph?.parentItemId;
+    if (typeof parentItemId !== "string") continue;
+    const children = childrenByParent.get(parentItemId) ?? [];
+    children.push(item);
+    childrenByParent.set(parentItemId, children);
+  }
   return items
-    .map((item, index) => ({ item, index, priority: ownerRequestPriority(item) }))
+    .map((item, index) => {
+      const children = item.currentTarget?.type === "role" &&
+          item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
+          item.graph?.parentItemId === null
+        ? childrenByParent.get(item.itemId) ?? []
+        : [];
+      return {
+        item,
+        index,
+        priority: ownerRequestPriority(item),
+        submittedChildren: children.filter((child) =>
+          child.graph?.deliveries?.at(-1)?.status === "submitted"
+        ).length,
+        satisfiedChildren: children.filter((child) =>
+          SATISFIED_GRAPH_STATUSES.has(child.status)
+        ).length,
+      };
+    })
     .sort((left, right) =>
-      right.priority - left.priority || left.index - right.index
+      right.priority - left.priority ||
+      right.submittedChildren - left.submittedChildren ||
+      right.satisfiedChildren - left.satisfiedChildren ||
+      left.index - right.index
     )
     .map(({ item }) => item);
 }
