@@ -532,6 +532,7 @@ function employeeRoleCard(role) {
       <div><dt>日常大脑</dt><dd>${escapeHtml(roleBrainLabel(role))}</dd></div>
       <div><dt>任务大脑</dt><dd>${escapeHtml(roleTaskBrainLabel(role))}</dd></div>
       <div><dt>最近行动</dt><dd>${lastRun?.at ? `${relativeTime(lastRun.at)} · ${escapeHtml(lastRun.trigger || "主动循环")}` : "尚未运行"}</dd></div>
+      ${lastRun?.summary ? `<div><dt>运行结果</dt><dd>${escapeHtml(lastRun.summary)}</dd></div>` : ""}
       <div><dt>权限</dt><dd>${escapeHtml(permissions.length ? permissions.join(" · ") : "岗位专用能力")}</dd></div>
     </dl>
     ${role.lastError || role.lastErrorCode ? `<p class="employee-error">${escapeHtml(role.lastError || role.lastErrorCode)}</p>` : ""}

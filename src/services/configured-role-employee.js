@@ -77,6 +77,54 @@ function safeTrigger(value) {
   return value;
 }
 
+function safeRunSummary(value) {
+  if (
+    typeof value !== "string" ||
+    INVALID_CONTROL.test(value) ||
+    Buffer.byteLength(value, "utf8") > 512
+  ) {
+    throw employeeError(
+      "CONFIGURED_ROLE_STATE_CORRUPTED",
+      "Configured role state is corrupted",
+      503,
+    );
+  }
+  return value;
+}
+
+function runSummary(value) {
+  const result = dataObject(value);
+  const stages = result && dataObject(result.stages);
+  const workStage = stages && dataObject(stages.work);
+  const work = workStage?.ok === true && dataObject(workStage.result);
+  if (!work) return "本轮未执行岗位任务扫描";
+  const scanned = Number.isSafeInteger(work.scanned) && work.scanned >= 0
+    ? work.scanned
+    : 0;
+  const attempts = Number.isSafeInteger(work.workAttempts) &&
+      work.workAttempts >= 0
+    ? work.workAttempts
+    : 0;
+  const counts = new Map();
+  if (Array.isArray(work.outcomes)) {
+    for (const entry of work.outcomes) {
+      const outcome = dataObject(entry);
+      const status = outcome?.status;
+      if (typeof status !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(status)) {
+        continue;
+      }
+      counts.set(status, (counts.get(status) ?? 0) + 1);
+    }
+  }
+  const statuses = [...counts.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, count]) => `${status} ${count}`)
+    .join("、");
+  return `扫描 ${scanned} 项，尝试 ${attempts} 项${
+    statuses ? `：${statuses}` : ""
+  }`;
+}
+
 function stableErrorCode(error) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(error, "code");
@@ -141,12 +189,16 @@ function exactData(value, keys) {
   return object;
 }
 
-function normalizeLastRun(value) {
+function normalizeLastRun(value, schemaVersion) {
   if (value === null) return null;
-  const lastRun = exactData(value, ["trigger", "at"]);
+  const lastRun = exactData(
+    value,
+    schemaVersion === 1 ? ["trigger", "at"] : ["trigger", "at", "summary"],
+  );
   return {
     trigger: safeTrigger(lastRun.trigger),
     at: isoTimestamp(lastRun.at),
+    summary: schemaVersion === 1 ? "" : safeRunSummary(lastRun.summary),
   };
 }
 
@@ -160,7 +212,7 @@ function normalizeState(value) {
     "lastErrorCode",
   ]);
   if (
-    state.schemaVersion !== 1 ||
+    ![1, 2].includes(state.schemaVersion) ||
     !Number.isSafeInteger(state.revision) ||
     state.revision < 0 ||
     typeof state.paused !== "boolean" ||
@@ -176,11 +228,11 @@ function normalizeState(value) {
     );
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: state.revision,
     paused: state.paused,
     runCount: state.runCount,
-    lastRun: normalizeLastRun(state.lastRun),
+    lastRun: normalizeLastRun(state.lastRun, state.schemaVersion),
     lastErrorCode: state.lastErrorCode,
   };
 }
@@ -380,7 +432,7 @@ export class ConfiguredRoleEmployee {
       ),
       operationQueue,
       createState: () => ({
-        schemaVersion: 1,
+        schemaVersion: 2,
         revision: 0,
         paused: initialPaused,
         runCount: 0,
@@ -421,8 +473,9 @@ export class ConfiguredRoleEmployee {
         throwIfDecisionAborted(signal);
         const normalizedTrigger = safeTrigger(trigger);
         let failure = null;
+        let outcome = null;
         try {
-          await onRun({
+          outcome = await onRun({
             roleId: this.roleId,
             workerId: this.workerId,
             trigger: normalizedTrigger,
@@ -436,8 +489,13 @@ export class ConfiguredRoleEmployee {
         throwIfDecisionAborted(signal);
         const next = await controller.writeState({
           ...state,
+          schemaVersion: 2,
           runCount: state.runCount + 1,
-          lastRun: { trigger: normalizedTrigger, at: isoTimestamp(clock()) },
+          lastRun: {
+            trigger: normalizedTrigger,
+            at: isoTimestamp(clock()),
+            summary: failure ? "本轮岗位运行失败" : runSummary(outcome),
+          },
           lastErrorCode: failure ? stableErrorCode(failure) : "",
         });
         if (failure) throw failure;

@@ -989,6 +989,40 @@ test("the explicit role worker port resolves and decide never deadlocks an onRun
   assert.equal((await employee.view()).runCount, 1);
 });
 
+test("a configured role exposes a bounded work-cycle outcome summary", async () => {
+  const employee = new ConfiguredRoleEmployee({
+    definition: definition("orchestrator"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    decisionEngine: fakeDecisionEngine("orchestrator"),
+    store: new MemoryStore(),
+    onRun: async () => ({
+      stages: {
+        work: {
+          ok: true,
+          result: {
+            scanned: 12,
+            workAttempts: 2,
+            outcomes: [
+              { itemId: "private-item-1", status: "degraded" },
+              { itemId: "private-item-2", status: "orchestrated" },
+            ],
+          },
+        },
+      },
+    }),
+  });
+
+  await employee.run({ trigger: "manual" });
+
+  const view = await employee.roleView();
+  assert.equal(
+    view.lastRun.summary,
+    "扫描 12 项，尝试 2 项：degraded 1、orchestrated 1",
+  );
+  assert.equal(JSON.stringify(view).includes("private-item"), false);
+});
+
 test("an employee run forwards its shutdown signal and performs no state write after abort", async () => {
   const store = new MemoryStore();
   const started = deferred();
