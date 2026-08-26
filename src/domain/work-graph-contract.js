@@ -334,6 +334,10 @@ function isSatisfiedTaskStatus(status) {
   return SATISFIED_TASK_STATUSES.has(status);
 }
 
+function isSettledChildTaskStatus(status) {
+  return status === "cancelled" || isSatisfiedTaskStatus(status);
+}
+
 function normalizeTask(value, limits, deliveryBudget) {
   exactObject(value, [
     "taskId",
@@ -458,7 +462,7 @@ function assertReferencesAndHierarchy(tasks, limits) {
       task.status === "completed" &&
       (
         childIds.some(
-          (childId) => !isSatisfiedTaskStatus(byId.get(childId).status),
+          (childId) => !isSettledChildTaskStatus(byId.get(childId).status),
         ) ||
         task.dependsOn.some(
           (dependencyId) =>
@@ -897,7 +901,7 @@ function blockingTaskIds(task, index) {
   );
   blockers.push(
     ...(index.children.get(task.taskId) ?? []).filter(
-      (childId) => !isSatisfiedTaskStatus(index.byId.get(childId).status),
+      (childId) => !isSettledChildTaskStatus(index.byId.get(childId).status),
     ),
   );
   const ancestor = terminalAncestor(task, index.byId);
@@ -989,7 +993,7 @@ export function deriveParentTaskOutcome(snapshot, taskId, options) {
   ) {
     outcome = "cancelled";
   } else if (
-    completedTaskIds.length + supersededTaskIds.length === children.length &&
+    children.every(({ status }) => isSettledChildTaskStatus(status)) &&
     parent.dependsOn.every(
       (dependencyId) =>
         isSatisfiedTaskStatus(index.byId.get(dependencyId).status),

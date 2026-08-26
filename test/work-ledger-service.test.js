@@ -7584,6 +7584,74 @@ test("graph dependencies and child ownership block work before a lease is issued
   );
 });
 
+test("a cancelled child settles parent claiming and completion", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [parent, cancelledChild] = durable.items;
+  cancelledChild.graph.parentItemId = parent.itemId;
+  cancelledChild.status = "cancelled";
+  cancelledChild.statusReason = "replaced-by-corrected-work";
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  const claimed = await recovered.claim({
+    itemId: parent.itemId,
+    expectedRevision: parent.revision,
+    workerId: "employee-orchestrator",
+    leaseDurationMs: 30_000,
+  });
+  const completed = await recovered.complete({
+    itemId: claimed.itemId,
+    expectedRevision: claimed.revision,
+    leaseId: claimed.leaseId,
+    actorId: "employee-orchestrator",
+    result: { outcome: "cancelled-child-settled" },
+  });
+
+  assert.equal(completed.status, "completed");
+});
+
+test("a cancelled dependency remains unsatisfied for real ledger claims", async () => {
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+  });
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  const [consumer, cancelledDependency] = durable.items;
+  consumer.graph.dependsOnItemIds = [cancelledDependency.itemId];
+  cancelledDependency.status = "cancelled";
+  cancelledDependency.statusReason = "dependency-was-cancelled";
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+
+  await assert.rejects(
+    recovered.claim({
+      itemId: consumer.itemId,
+      expectedRevision: consumer.revision,
+      workerId: "employee-orchestrator",
+      leaseDurationMs: 30_000,
+    }),
+    (error) => error.code === "WORK_LEDGER_GRAPH_BLOCKED",
+  );
+});
+
 test("completion reports an ordinary graph conflict before corrupt-state handling", async () => {
   const fixture = await createFixture({
     records: [assignment(1), assignment(2)],

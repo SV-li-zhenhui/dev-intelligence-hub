@@ -137,6 +137,10 @@ function isSatisfiedGraphTaskStatus(status) {
   return status === "completed" || status === "superseded";
 }
 
+function isSettledGraphChildStatus(status) {
+  return isSatisfiedGraphTaskStatus(status) || status === "cancelled";
+}
+
 function exactGraphMetadata(fields) {
   const graphEntries = ledgerDataEntries(fields.get("graph"));
   const graphKeys = graphEntries && new Set(graphEntries.map(([key]) => key));
@@ -605,7 +609,7 @@ export function assertWorkLedgerGraphClaimable(state, itemId) {
       !isSatisfiedGraphTaskStatus(byId.get(dependencyId).status),
   );
   const blockedByChild = children.some(
-    ({ status }) => !isSatisfiedGraphTaskStatus(status),
+    ({ status }) => !isSettledGraphChildStatus(status),
   );
   if (blockedByChild || blockedByDependency) {
     throw workLedgerError(
@@ -639,7 +643,7 @@ export function assertWorkLedgerGraphCompletable(state, itemId) {
       !isSatisfiedGraphTaskStatus(byId.get(dependencyId).status),
   );
   const hasIncompleteChild = children.some(
-    ({ status }) => !isSatisfiedGraphTaskStatus(status),
+    ({ status }) => !isSettledGraphChildStatus(status),
   );
   if (
     hasIncompleteDependency ||

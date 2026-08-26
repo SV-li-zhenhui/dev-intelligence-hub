@@ -1089,7 +1089,7 @@ test("paused tasks remain active blockers but are never graph-ready", () => {
   );
 });
 
-test("pending parents are blocked only until every direct child completes", () => {
+test("pending parents are blocked only until every direct child settles", () => {
   const pendingChild = createWorkGraphSnapshot(
     draft([
       task("root"),
@@ -1114,6 +1114,36 @@ test("pending parents are blocked only until every direct child completes", () =
   );
   assert.deepEqual(getReadyWorkGraphTaskIds(completedChild), ["root"]);
   assert.deepEqual(getBlockedWorkGraphTasks(completedChild), []);
+
+  const cancelledChild = createWorkGraphSnapshot(
+    draft([
+      task("root"),
+      task("peer"),
+      task("child", {
+        revision: 2,
+        parentTaskId: "root",
+        status: "cancelled",
+      }),
+    ]),
+  );
+  assert.deepEqual(getReadyWorkGraphTaskIds(cancelledChild), ["peer", "root"]);
+  assert.deepEqual(getParallelReadyWorkGraphTaskIds(cancelledChild), [
+    "peer",
+    "root",
+  ]);
+  assert.deepEqual(getBlockedWorkGraphTasks(cancelledChild), []);
+
+  const cancelledDependency = createWorkGraphSnapshot(
+    draft([
+      task("gate", { revision: 2, status: "cancelled" }),
+      task("dependent", { dependsOn: ["gate"] }),
+    ]),
+  );
+  assert.deepEqual(getReadyWorkGraphTaskIds(cancelledDependency), []);
+  assert.deepEqual(getParallelReadyWorkGraphTaskIds(cancelledDependency), []);
+  assert.deepEqual(getBlockedWorkGraphTasks(cancelledDependency), [
+    { taskId: "dependent", blockingTaskIds: ["gate"] },
+  ]);
 });
 
 test("superseded prerequisites are satisfied without waiving parent deliverables", () => {
@@ -1223,6 +1253,20 @@ test("derives parent pending, partial, completed, failed, cancelled, and superse
       graph([
         task("one", { revision: 2, status: "completed", deliveries: [delivery()] }),
         task("two", { revision: 2, status: "completed", deliveries: [delivery()] }),
+      ]),
+      "root",
+    ).outcome,
+    "completed",
+  );
+  assert.equal(
+    deriveParentTaskOutcome(
+      graph([
+        task("one", {
+          revision: 2,
+          status: "completed",
+          deliveries: [delivery()],
+        }),
+        task("replaced", { status: "cancelled" }),
       ]),
       "root",
     ).outcome,
