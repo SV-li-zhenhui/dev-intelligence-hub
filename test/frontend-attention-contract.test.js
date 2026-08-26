@@ -257,6 +257,43 @@ test("internal answers bind revision and digest and later is server-validated", 
   assert.match(submitter, /invalidateConfirmationQueueSnapshot/);
 });
 
+test("confirmation center explains the remaining count and each destination", async () => {
+  const { app } = await sources();
+  const start = app.indexOf("function confirmationPendingMarkup");
+  const end = app.indexOf("\nfunction deferredConfirmationMarkup", start);
+  const pending = app.slice(start, end);
+  const centerStart = app.indexOf("function confirmationCenterView");
+  const centerEnd = app.indexOf("\nfunction employeesView", centerStart);
+  const center = app.slice(centerStart, centerEnd);
+
+  assert.ok(start >= 0 && end > start);
+  assert.ok(centerStart >= 0 && centerEnd > centerStart);
+  assert.match(pending, /含当前项/);
+  assert.match(pending, /主动工作台账/);
+  assert.match(pending, /原任务转为阻塞/);
+  assert.match(pending, /只读确认历史/);
+  assert.match(center, /还剩.*项/);
+  assert.doesNotMatch(center, /pendingCount \|\| 0\} ITEMS/);
+});
+
+test("internal attention reports where answer, rejection, and deferral go", async () => {
+  const { app } = await sources();
+  const renderStart = app.indexOf("function showInternalAttention");
+  const renderEnd = app.indexOf("\nfunction setInternalButtonsDisabled", renderStart);
+  const renderer = app.slice(renderStart, renderEnd);
+  const submitStart = app.indexOf("async function submitInternalAttention");
+  const submitEnd = app.indexOf("\nfunction handleInternalAttentionClick", submitStart);
+  const submitter = app.slice(submitStart, submitEnd);
+
+  assert.ok(renderStart >= 0 && renderEnd > renderStart);
+  assert.ok(submitStart >= 0 && submitEnd > submitStart);
+  assert.match(renderer, /含当前项/);
+  assert.match(renderer, /主动工作台账/);
+  assert.match(submitter, /原任务将重新排队/);
+  assert.match(submitter, /原任务将转入“阻塞”/);
+  assert.match(submitter, /仍在待确认队列/);
+});
+
 test("external actions retain their separate confirmation endpoint", async () => {
   const { app } = await sources();
 

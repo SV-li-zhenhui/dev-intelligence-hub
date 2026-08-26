@@ -614,18 +614,25 @@ function confirmationPendingMarkup() {
   const title = item.display?.title || item.title || "待确认事项";
   const summary = item.display?.summary || item.summary || "等待你逐项判断";
   const roleId = item.requestedBy?.roleId || item.producer?.roleId || "未标注岗位";
+  const pendingCount = Number.isInteger(confirmationQueueState.pendingCount)
+    ? confirmationQueueState.pendingCount
+    : 1;
   const source = item.resolutionRequired === true
     ? "结果未知待封存"
     : confirmationQueueState.source === "internal_request"
       ? "员工咨询"
       : "动作授权";
+  const destination = confirmationQueueState.source === "internal_request"
+    ? `提交答复后，结果写入本地台账，原任务重新排队给 ${roleId} 继续处理；驳回后原任务转为阻塞。两者都可在“主动工作台账”追踪；选择“稍后”仍保留在待确认队列。`
+    : "确认或驳回后，结果会进入下方“只读确认历史”；选择“稍后”仍保留在待确认队列。";
   return `<article class="confirmation-pending-item">
     <div class="confirmation-history-row-heading">
       <strong>${escapeHtml(title)}</strong>
       <span class="status-pill status-waiting_user">下一项</span>
     </div>
     <p>${escapeHtml(summary)}</p>
-    <small>${escapeHtml(source)} · ${escapeHtml(roleId)}</small>
+    <small>${escapeHtml(source)} · ${escapeHtml(roleId)} · 当前还剩 ${pendingCount} 项（含当前项）</small>
+    <p><strong>处理去向：</strong>${escapeHtml(destination)}</p>
   </article>`;
 }
 
@@ -718,6 +725,12 @@ function confirmationCenterView() {
   const roleOptions = confirmationHistoryRoleOptionsMarkup();
   const historyMeta = confirmationHistoryMetaText();
   const paginationVisible = confirmationHistoryPaginationVisible();
+  const pendingCount = Number.isInteger(confirmationQueueState.pendingCount)
+    ? confirmationQueueState.pendingCount
+    : 0;
+  const pendingCountLabel = pendingCount > 0
+    ? `还剩 ${pendingCount} 项（含当前项）`
+    : "当前 0 项";
   return `<section class="section confirmation-center" aria-labelledby="confirmation-center-title">
     <div class="section-heading">
       <h2 id="confirmation-center-title">确认中心</h2>
@@ -727,7 +740,7 @@ function confirmationCenterView() {
       <section class="confirmation-center-panel" id="confirmation-pending-panel" aria-labelledby="confirmation-pending-title">
         <div class="confirmation-center-panel-heading">
           <div><p class="eyebrow">PENDING</p><h3 id="confirmation-pending-title">待你逐项确认</h3></div>
-          <span>${confirmationQueueState.pendingCount || 0} ITEMS</span>
+          <span>${pendingCountLabel}</span>
         </div>
         ${confirmationPendingMarkup()}
         ${deferredConfirmationMarkup()}
@@ -3885,9 +3898,9 @@ function showInternalAttention(entry, remaining) {
     .join("");
   confirmationContent.innerHTML = `
     <article class="confirmation internal-attention">
-      <p class="eyebrow">EMPLOYEE CONSULTATION / ${remaining} LEFT</p>
+      <p class="eyebrow">EMPLOYEE CONSULTATION / 还剩 ${remaining} 项（含当前项）</p>
       <h2>${escapeHtml(item.question || "员工需要你做一个决定")}</h2>
-      <p class="confirmation-reason">来自 ${escapeHtml(item.producer?.roleId || "orchestrator")} · 回答只会写入本地工作台账</p>
+      <p class="confirmation-reason">来自 ${escapeHtml(item.producer?.roleId || "orchestrator")} · 提交后写入本地台账，并唤醒原任务</p>
       ${internalContextMarkup(item.context)}
       ${choices ? `<div class="confirmation-actions internal-choice-actions">${choices}</div>` : ""}
       <form class="internal-answer-form">
@@ -3899,7 +3912,7 @@ function showInternalAttention(entry, remaining) {
           <button type="button" class="secondary wide" data-internal-operation="later">稍后再看</button>
         </div>
       </form>
-      <p class="confirmation-note">答复绑定当前请求版本和内容摘要；内容变化后必须重新确认。这里不会直接执行代码或写入 GitHub。</p>
+      <p class="confirmation-note">提交答复后，原任务重新排队给该岗位继续处理；驳回后，原任务转入阻塞；两者均可在“主动工作台账”追踪。选择“稍后再看”会继续留在待确认队列，本页暂不再弹出。这里不会直接执行代码或写入 GitHub。</p>
     </article>`;
   const root = confirmationContent.querySelector(".internal-attention");
   root.addEventListener("click", handleInternalAttentionClick);
@@ -3917,6 +3930,7 @@ function setInternalButtonsDisabled(disabled) {
 async function submitInternalAttention(operation, answer) {
   const item = activeInternalAttention;
   if (!item || !["answer", "reject", "later"].includes(operation)) return;
+  const roleId = item.producer?.roleId || "对应岗位";
   const submissionOwner = beginConfirmationSubmission(setInternalButtonsDisabled);
   if (submissionOwner === null) return;
   try {
@@ -3963,6 +3977,12 @@ async function submitInternalAttention(operation, answer) {
       await refreshConfirmationQueue({ showConfirmation: false });
     }
     if (currentView === "work") await workView.load();
+    statusBanner.hidden = false;
+    statusBanner.textContent = operation === "answer"
+      ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
+      : operation === "reject"
+        ? "驳回已写入本地台账，原任务将转入“阻塞”；可在“主动工作台账”追踪。"
+        : "此项仍在待确认队列，本页暂不再弹出；可点击“重新查看稍后项”恢复。";
     if (operation !== "later") queueMicrotask(showNextConfirmation);
   } catch (error) {
     if (!restoreConfirmationSubmission(
