@@ -18,6 +18,7 @@ import {
 
 const GITHUB_HOST = "github.com";
 const SEARCH_LIMIT = 1_000;
+const ISSUE_DETAIL_BATCH_SIZE = 100;
 const MILESTONE_PAGE_SIZE = 100;
 const MILESTONES_PER_REPOSITORY = 10;
 const SECOND_MS = 1_000;
@@ -659,13 +660,19 @@ export function summarizeCheckStatus(checks = []) {
 async function mapWithConcurrency(items, limit, transform) {
   const result = new Array(items.length);
   let cursor = 0;
+  let firstError;
   async function worker() {
-    while (cursor < items.length) {
+    while (!firstError && cursor < items.length) {
       const index = cursor++;
-      result[index] = await transform(items[index]);
+      try {
+        result[index] = await transform(items[index]);
+      } catch (error) {
+        firstError ??= error;
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (firstError) throw firstError;
   return result;
 }
 
@@ -991,26 +998,37 @@ export class GitHubAdapter {
       "--assignee=@me",
       "--state=open",
       "--limit",
-      "50",
+      `${SEARCH_LIMIT}`,
+      "--sort",
+      "updated",
+      "--order",
+      "desc",
       "--json",
       ISSUE_FIELDS,
     ], options);
     options.signal?.throwIfAborted();
-    if (!Array.isArray(records) || records.length > 50) {
+    if (!Array.isArray(records) || records.length > SEARCH_LIMIT) {
       throw new TypeError("GitHub issue search result count is invalid");
     }
     const ids = records.map((record) => issueNodeId(record?.id));
-    const detailsResponse = ids.length === 0
-      ? { data: { nodes: [] } }
-      : await this.run("gh", [
+    const requestedIds = new Set(ids);
+    const idBatches = [];
+    for (let index = 0; index < ids.length; index += ISSUE_DETAIL_BATCH_SIZE) {
+      idBatches.push(ids.slice(index, index + ISSUE_DETAIL_BATCH_SIZE));
+    }
+    const detailResponses = await mapWithConcurrency(idBatches, 4, (batch) =>
+      this.run("gh", [
           "api",
           "graphql",
           "-f",
           `query=${ISSUE_DETAIL_QUERY}`,
-          ...ids.flatMap((id) => ["-F", `ids[]=${id}`]),
-        ], options);
+          ...batch.flatMap((id) => ["-F", `ids[]=${id}`]),
+        ], options),
+    );
     options.signal?.throwIfAborted();
-    const detailNodes = detailsResponse?.data?.nodes;
+    const detailNodes = detailResponses.flatMap(
+      (response) => response?.data?.nodes || [],
+    );
     if (!Array.isArray(detailNodes) || detailNodes.length !== ids.length) {
       throw new TypeError("GitHub issue detail result is invalid");
     }
@@ -1019,7 +1037,7 @@ export class GitHubAdapter {
       const id = issueNodeId(detail?.id);
       if (
         detailsById.has(id) ||
-        !ids.includes(id) ||
+        !requestedIds.has(id) ||
         !Number.isSafeInteger(detail?.number) ||
         detail.number < 1
       ) {

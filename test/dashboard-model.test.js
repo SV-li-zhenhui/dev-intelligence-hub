@@ -110,3 +110,33 @@ test("tracked versions put the most recently published or active record first", 
     ["middle-milestone", "new-release", "old-milestone"],
   );
 });
+
+test("assigned issues are shown newest first even when stale items score higher", () => {
+  const dashboard = buildDashboard({
+    refreshedAt: "2026-08-26T09:00:00.000Z",
+    durationMs: 10,
+    sources: { github: 2, dingtalk: 0 },
+    errors: [],
+    items: [
+      {
+        id: "stale-issue",
+        kind: "issue",
+        relation: "assigned",
+        updatedAt: "2026-08-01T09:00:00.000Z",
+      },
+      {
+        id: "latest-issue",
+        kind: "issue",
+        relation: "assigned",
+        updatedAt: "2026-08-25T09:00:00.000Z",
+      },
+    ],
+    versions: [],
+  });
+
+  assert.deepEqual(
+    dashboard.groups.myIssues.map((issue) => issue.id),
+    ["latest-issue", "stale-issue"],
+  );
+  assert.equal(dashboard.groups.myIssues[1].score, 65);
+});

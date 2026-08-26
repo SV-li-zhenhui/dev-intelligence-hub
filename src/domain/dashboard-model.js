@@ -19,6 +19,14 @@ function newestVersionsFirst(versions) {
   );
 }
 
+function newestUpdatedFirst(items) {
+  return [...items].sort(
+    (left, right) =>
+      Date.parse(right.updatedAt || right.createdAt || 0) -
+      Date.parse(left.updatedAt || left.createdAt || 0),
+  );
+}
+
 export function buildDashboard(snapshot, previousSnapshot = null) {
   const prioritized = prioritize(snapshot.items, snapshot.refreshedAt);
   const completedIds = new Set(snapshot.items.map((item) => item.id));
@@ -69,9 +77,11 @@ export function buildDashboard(snapshot, previousSnapshot = null) {
           item.kind === "pull_request" &&
           item.relation === "review_requested",
       ),
-      myIssues: group(
-        prioritized,
-        (item) => item.kind === "issue" && item.relation === "assigned",
+      myIssues: newestUpdatedFirst(
+        group(
+          prioritized,
+          (item) => item.kind === "issue" && item.relation === "assigned",
+        ),
       ),
       myPullRequests: group(
         prioritized,

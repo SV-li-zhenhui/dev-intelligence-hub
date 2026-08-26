@@ -291,6 +291,112 @@ test("assigned issues include bounded context, milestone, and latest discussion"
   });
   const graphql = calls.find((args) => args[0] === "api");
   assert.ok(graphql.includes("ids[]=I_issue_12855"));
+  const search = calls.find((args) => args[0] === "search");
+  assert.deepEqual(
+    search.slice(search.indexOf("--limit"), search.indexOf("--json")),
+    ["--limit", "1000", "--sort", "updated", "--order", "desc"],
+  );
+});
+
+test("assigned issue details are enriched in GitHub's bounded node batches", async () => {
+  const records = Array.from({ length: 101 }, (_, index) => ({
+    id: `I_issue_${index + 1}`,
+    number: index + 1,
+    title: `Issue ${index + 1}`,
+    url: `https://github.com/acme/repo/issues/${index + 1}`,
+    repository: { nameWithOwner: "acme/repo" },
+    updatedAt: "2026-08-26T00:00:00Z",
+    createdAt: "2026-08-26T00:00:00Z",
+    author: { login: "author" },
+    state: "open",
+    labels: [],
+    assignees: [{ login: "local-owner" }],
+  }));
+  const graphqlBatchSizes = [];
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "search") return records;
+      if (args[0] === "api" && args[1] === "graphql") {
+        const ids = args
+          .filter((argument) => argument.startsWith("ids[]="))
+          .map((argument) => argument.slice("ids[]=".length));
+        graphqlBatchSizes.push(ids.length);
+        return {
+          data: {
+            nodes: ids.map((id) => ({
+              id,
+              number: Number(id.slice("I_issue_".length)),
+              body: "",
+              milestone: null,
+              comments: { totalCount: 0, nodes: [] },
+            })),
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${args.join(" ")}`);
+    },
+  });
+
+  const issues = await adapter.searchIssues();
+
+  assert.equal(issues.length, 101);
+  assert.deepEqual(graphqlBatchSizes, [100, 1]);
+});
+
+test("a failed issue detail batch stops new batches and waits for started work", async () => {
+  const records = Array.from({ length: 600 }, (_, index) => ({
+    id: `I_issue_${index + 1}`,
+    number: index + 1,
+    title: `Issue ${index + 1}`,
+    url: `https://github.com/acme/repo/issues/${index + 1}`,
+    repository: { nameWithOwner: "acme/repo" },
+    updatedAt: "2026-08-26T00:00:00Z",
+    createdAt: "2026-08-26T00:00:00Z",
+    author: { login: "author" },
+    state: "open",
+    labels: [],
+    assignees: [{ login: "local-owner" }],
+  }));
+  let releaseStartedBatches;
+  const startedBatchesMayFinish = new Promise((resolve) => {
+    releaseStartedBatches = resolve;
+  });
+  const startedBatchIds = [];
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (args[0] === "search") return records;
+      const ids = args
+        .filter((argument) => argument.startsWith("ids[]="))
+        .map((argument) => argument.slice("ids[]=".length));
+      startedBatchIds.push(ids[0]);
+      if (ids[0] === "I_issue_1") throw new Error("detail batch failed");
+      await startedBatchesMayFinish;
+      return {
+        data: {
+          nodes: ids.map((id) => ({
+            id,
+            number: Number(id.slice("I_issue_".length)),
+            body: "",
+            milestone: null,
+            comments: { totalCount: 0, nodes: [] },
+          })),
+        },
+      };
+    },
+  });
+
+  let rejected = false;
+  const search = adapter.searchIssues().catch((error) => {
+    rejected = true;
+    throw error;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(startedBatchIds, ["I_issue_1", "I_issue_101", "I_issue_201", "I_issue_301"]);
+  assert.equal(rejected, false);
+  releaseStartedBatches();
+  await assert.rejects(search, /detail batch failed/);
+  assert.equal(startedBatchIds.length, 4);
 });
 
 test("a GitHub refresh cannot continue command work after shutdown abort", async () => {
