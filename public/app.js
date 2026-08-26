@@ -20,6 +20,11 @@ import { githubItemDetailMarkup } from "./github-item-detail.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { announcementDetailMarkup } from "./announcement-markup.js";
+import { dingtalkDetailMarkup } from "./dingtalk-detail-markup.js";
+import {
+  manualWorkAssignmentMarkup,
+  ownerWorkRequestForItem,
+} from "./manual-work-assignment.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 import {
@@ -3201,14 +3206,56 @@ function showDetail(item) {
   dialogContent.innerHTML = `
     <article class="detail">
       <p class="eyebrow">${kindLabel(item)} / EVIDENCE</p>
-      ${item.kind === "announcement"
+      ${item.summaryStatus
+        ? `<h2>${escapeHtml(item.context || "钉钉今日摘要")}</h2>`
+        : item.kind === "announcement"
         ? announcementDetailMarkup(item.title)
         : `<h2>${escapeHtml(item.title)}</h2>`}
+      ${dingtalkDetailMarkup(item)}
       ${brainAssessment(item)}
       ${githubItemDetailMarkup(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
       ${item.url ? `<a class="detail-source-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${["issue", "pull_request"].includes(item.kind) ? "在 GitHub 查看完整内容" : "在来源中打开"} →</a>` : ""}
+      ${manualWorkAssignmentMarkup(item)}
     </article>`;
+  const assignmentForm = dialogContent.querySelector("[data-manual-work-assignment]");
+  assignmentForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector("button[type=submit]");
+    const status = form.querySelector("[data-manual-work-assignment-status]");
+    const data = new FormData(form);
+    button.disabled = true;
+    status.textContent = "正在创建共享任务…";
+    try {
+      const request = ownerWorkRequestForItem(item, {
+        workType: String(data.get("workType") || ""),
+        priority: String(data.get("priority") || ""),
+        requestId: crypto.randomUUID(),
+      });
+      const response = await fetch("/api/work/requests", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify(request),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.error || `分配失败（${response.status}）`);
+      }
+      form.closest(".manual-work-assignment").outerHTML =
+        manualWorkAssignmentMarkup(item, {
+          requestId: result.requestId,
+          workItemId: result.workItemId,
+          target: result.assignment?.target?.id,
+        });
+    } catch (error) {
+      status.textContent = error.message || "分配失败";
+      button.disabled = false;
+    }
+  });
   dialog.showModal();
 }
 

@@ -445,3 +445,81 @@ test("a slow refresh cannot renew the freshness age of earlier PR facts", async 
   assert.equal(observed.fresh, false);
   assert.equal(observed.value, null);
 });
+
+test("refresh publishes grouped DingTalk summaries instead of raw messages or unread conversations", async () => {
+  const store = new MemoryStore();
+  const summaryCalls = [];
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return []; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: {
+      async summarizeDingTalk(groups) {
+        summaryCalls.push(groups);
+        return groups.map((group) => ({
+          groupId: group.groupId,
+          important: true,
+          summary: "研发群完成版本发布，等待确认风险",
+          highlights: ["版本已经发布", "风险尚待确认"],
+          actionRequired: "确认发布风险",
+        }));
+      },
+    },
+    dingtalk: {
+      async collect() {
+        return {
+          errors: [],
+          items: [
+            {
+              id: "dingtalk:message:1",
+              kind: "message",
+              title: "版本已经发布",
+              author: "张三",
+              context: "研发群",
+              conversationId: "group-1",
+              updatedAt: "2026-08-26T08:00:00.000Z",
+            },
+            {
+              id: "dingtalk:message:2",
+              kind: "message",
+              title: "[图片消息](mediaId=@secret) 请确认风险",
+              author: "李四",
+              context: "研发群",
+              conversationId: "group-1",
+              updatedAt: "2026-08-26T09:00:00.000Z",
+            },
+            {
+              id: "dingtalk:conversation:old",
+              kind: "conversation",
+              title: "陈年未读会话",
+              updatedAt: "2023-01-01T00:00:00.000Z",
+            },
+          ],
+        };
+      },
+    },
+    store,
+    notifier: {},
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: true, provider: "ollama", model: "qwen3.5:9b" },
+    },
+  });
+
+  await service.refresh();
+
+  const snapshot = await store.read("snapshot");
+  assert.equal(summaryCalls.length, 1);
+  assert.equal(summaryCalls[0].length, 1);
+  assert.ok(!JSON.stringify(summaryCalls).includes("mediaId"));
+  assert.equal(snapshot.items.length, 1);
+  assert.equal(snapshot.items[0].title, "研发群完成版本发布，等待确认风险");
+  assert.equal(snapshot.items[0].summaryStatus, "ai");
+  assert.equal(snapshot.items[0].sourceMessages.length, 2);
+  assert.equal(snapshot.brain.dingtalkSummarized, 1);
+  assert.equal(snapshot.sources.dingtalk, 1);
+});

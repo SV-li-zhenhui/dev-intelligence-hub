@@ -187,7 +187,9 @@ test("owner request DTO exposes business fields only and creates a bound workflo
       },
     ],
   });
-  assert.deepEqual(routedDefinition.rules[0].targets, [
+  assert.deepEqual(routedDefinition.rules.find(
+    ({ id }) => id === "system-owner-request-to-orchestrator",
+  ).targets, [
     { type: "role", id: "orchestrator" },
   ]);
   const protectedResult = routeWorkflowEvent({
@@ -213,6 +215,34 @@ test("owner request DTO exposes business fields only and creates a bound workflo
     assert.throws(
       () => normalizeOwnerWorkRequest(invalid),
       (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+    );
+  }
+});
+
+test("owner capability requests route directly to their fixed least-authority roles", () => {
+  const definition = withOwnerWorkRequestDefaultRoute({
+    schemaVersion: 1,
+    enabled: true,
+    maxHops: 8,
+    rules: [],
+  });
+  const expectations = new Map([
+    ["development", "developer"],
+    ["testing", "tester"],
+    ["requirements", "requirements-analyst"],
+    ["general", "orchestrator"],
+  ]);
+
+  for (const [workType, roleId] of expectations) {
+    const event = createOwnerWorkRequestEvent(
+      request({ workType }),
+      "2026-08-08T01:00:00.000Z",
+    );
+    const routed = routeWorkflowEvent({ event, config: definition });
+
+    assert.deepEqual(
+      routed.assignments.map(({ target }) => target),
+      [{ type: "role", id: roleId }],
     );
   }
 });

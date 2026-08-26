@@ -6,6 +6,23 @@ export const OWNER_WORK_REQUEST_DEFAULT_RULE_ID =
   "system-owner-request-to-orchestrator";
 export const OWNER_PULL_REQUEST_RULE_ID =
   "system-owner-request-to-pr-engineer";
+const OWNER_CAPABILITY_ROUTES = Object.freeze([
+  Object.freeze({
+    ruleId: "system-owner-development-to-developer",
+    workType: "development",
+    roleId: "developer",
+  }),
+  Object.freeze({
+    ruleId: "system-owner-testing-to-tester",
+    workType: "testing",
+    roleId: "tester",
+  }),
+  Object.freeze({
+    ruleId: "system-owner-requirements-to-analyst",
+    workType: "requirements",
+    roleId: "requirements-analyst",
+  }),
+]);
 export const OWNER_WORK_REQUEST_TYPES = Object.freeze([
   "general",
   "requirements",
@@ -315,17 +332,43 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
 }
 
 export function withOwnerWorkRequestDefaultRoute(definition) {
+  const systemRuleIds = new Set([
+    OWNER_WORK_REQUEST_DEFAULT_RULE_ID,
+    OWNER_PULL_REQUEST_RULE_ID,
+    ...OWNER_CAPABILITY_ROUTES.map(({ ruleId }) => ruleId),
+  ]);
   const rules = Array.isArray(definition?.rules)
     ? definition.rules.filter(
-        (rule) => ![
-          OWNER_WORK_REQUEST_DEFAULT_RULE_ID,
-          OWNER_PULL_REQUEST_RULE_ID,
-        ].includes(rule?.id),
+        (rule) => !systemRuleIds.has(rule?.id),
       )
     : definition?.rules;
   return {
     ...definition,
     rules: [
+      ...OWNER_CAPABILITY_ROUTES.map(({ ruleId, workType, roleId }) => ({
+        id: ruleId,
+        source: "root",
+        enabled: true,
+        priority: 10_000,
+        fallback: false,
+        condition: {
+          op: "all",
+          conditions: [
+            {
+              op: "equals",
+              path: "eventType",
+              value: OWNER_WORK_REQUEST_EVENT_TYPE,
+            },
+            {
+              op: "equals",
+              path: "payload.workType",
+              value: workType,
+            },
+          ],
+        },
+        targets: [{ type: "role", id: roleId }],
+        onMatch: "stop",
+      })),
       {
         id: OWNER_WORK_REQUEST_DEFAULT_RULE_ID,
         source: "root",

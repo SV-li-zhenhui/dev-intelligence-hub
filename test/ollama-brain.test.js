@@ -278,3 +278,56 @@ test("an admitted assessment releases the cutover fence but a later retry is blo
   );
   assert.equal(calls, 1);
 });
+
+test("summarizes every DingTalk conversation with a constrained batch schema", async () => {
+  const requests = [];
+  const conversations = [{
+    groupId: "group-a",
+    context: "研发群",
+    messages: [
+      { author: "张三", content: "030A 已发布", updatedAt: "2026-08-26T08:00:00.000Z" },
+      { author: "李四", content: "需要统一后续架构", updatedAt: "2026-08-26T09:00:00.000Z" },
+    ],
+  }];
+  const expected = [{
+    groupId: "group-a",
+    important: true,
+    summary: "030A 已发布，后续架构尚待统一",
+    highlights: ["版本已发布", "架构待统一"],
+    actionRequired: "确认架构统一负责人",
+  }];
+  const brain = new OllamaBrain({
+    fetch: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return jsonResponse({ message: { content: JSON.stringify({ summaries: expected }) } });
+    },
+  });
+
+  const result = await brain.summarizeDingTalk(conversations);
+
+  assert.deepEqual(result, expected);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].format.properties.summaries.type, "array");
+  assert.match(requests[0].messages[0].content, /不能把最后一条消息直接当作摘要/);
+  assert.deepEqual(JSON.parse(requests[0].messages[1].content), conversations);
+});
+
+test("rejects a DingTalk digest that omits an input conversation", async () => {
+  let calls = 0;
+  const brain = new OllamaBrain({
+    fetch: async () => {
+      calls += 1;
+      return jsonResponse({ message: { content: JSON.stringify({ summaries: [] }) } });
+    },
+  });
+
+  await assert.rejects(
+    brain.summarizeDingTalk([{
+      groupId: "required-group",
+      context: "研发群",
+      messages: [{ author: "张三", content: "需要确认", updatedAt: "" }],
+    }]),
+    /invalid Ollama DingTalk digest after retry.*missing groupId/i,
+  );
+  assert.equal(calls, 2);
+});

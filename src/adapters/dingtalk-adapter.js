@@ -78,6 +78,8 @@ function dailyMessageItems(data, fallback) {
         title: content.slice(0, 240),
         author: message.sender || "",
         context: conversation.title || "钉钉消息",
+        conversationId:
+          conversation.openConversationId || conversation.title || "",
         updatedAt: messageTimestamp(message.createTime, fallback),
         url: firstWebLink(content),
         state: "open",
@@ -192,6 +194,12 @@ export class DingTalkAdapter {
           message.senderInfo?.name ||
           "",
         context: message.conversationTitle || message.title || "",
+        conversationId:
+          message.openConversationId ||
+          message.conversationId ||
+          message.conversationTitle ||
+          message.title ||
+          "",
         updatedAt:
           message.createAt || message.createTime || new Date().toISOString(),
         state: "open",

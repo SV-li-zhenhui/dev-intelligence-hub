@@ -8,6 +8,11 @@ import { diffSnapshots } from "../domain/snapshot-diff.js";
 import {
   resolveEffectivePullRequestUpdatedWindow,
 } from "../domain/pull-request-updated-window.js";
+import {
+  applyDingTalkSummaries,
+  dingTalkDigestFacts,
+  prepareDingTalkDigest,
+} from "../domain/dingtalk-digest.js";
 
 const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.ACTION_NOW,
@@ -269,6 +274,35 @@ export class RefreshService {
     return { items, meta };
   }
 
+  async #summarizeDingTalk(items, brainMeta, signal) {
+    const prepared = prepareDingTalkDigest(items);
+    brainMeta.dingtalkGroups = prepared.groups.length;
+    brainMeta.dingtalkSummarized = 0;
+    if (prepared.groups.length === 0) {
+      return applyDingTalkSummaries(prepared);
+    }
+    if (
+      !brainMeta.enabled ||
+      !this.brain ||
+      typeof this.brain.summarizeDingTalk !== "function"
+    ) {
+      return applyDingTalkSummaries(prepared);
+    }
+
+    try {
+      signal?.throwIfAborted();
+      const summaries = await this.brain.summarizeDingTalk(
+        dingTalkDigestFacts(prepared.groups),
+        { signal },
+      );
+      brainMeta.dingtalkSummarized = summaries.length;
+      return applyDingTalkSummaries(prepared, summaries);
+    } catch (error) {
+      brainMeta.errors.push(`钉钉摘要: ${error.message}`);
+      return applyDingTalkSummaries(prepared);
+    }
+  }
+
   async #performRefresh({ notify = false, signal } = {}) {
     signal?.throwIfAborted();
     const startedAt = clockMilliseconds(this.clock);
@@ -387,13 +421,21 @@ export class RefreshService {
     ]);
     signal?.throwIfAborted();
     errors.push(...dingtalkResult.errors);
+    const summarizedDingTalkItems = dingtalkResult.errors.length
+      ? dingtalkResult.items
+      : await this.#summarizeDingTalk(
+          dingtalkResult.items,
+          assessedPullRequests.meta,
+          signal,
+        );
+    signal?.throwIfAborted();
 
     const snapshot = {
       refreshedAt: observationLowerBound,
       sources: {
         github:
           assessedPullRequests.items.length + githubValues[1].length,
-        dingtalk: dingtalkResult.items.length,
+        dingtalk: summarizedDingTalkItems.length,
       },
       sourceStatus: {
         githubPullRequests: {
@@ -423,7 +465,7 @@ export class RefreshService {
       items: deduplicate([
         ...assessedPullRequests.items,
         ...githubValues[1],
-        ...dingtalkResult.items,
+        ...summarizedDingTalkItems,
       ]),
       versions: githubValues[2],
     };
