@@ -1,6 +1,7 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
+import { OrchestratorServiceError } from "./orchestrator-service.js";
 import {
   normalizeWorkCoordinationTiming,
   WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
@@ -1238,12 +1239,33 @@ export class ProactiveWorkLoop {
     throwIfLoopAborted(options.signal);
     if (decision.intent.type === "orchestrate") {
       throwIfLoopAborted(options.signal);
-      const executed = await this.orchestratorService.execute({
-        worker: { roleId: worker.roleId, workerId: worker.workerId },
-        item,
-        contextPacket: packet,
-        intent: decision.intent,
-      });
+      let executed;
+      try {
+        executed = await this.orchestratorService.execute({
+          worker: { roleId: worker.roleId, workerId: worker.workerId },
+          item,
+          contextPacket: packet,
+          intent: decision.intent,
+        });
+      } catch (error) {
+        throwIfLoopAborted(options.signal);
+        const code = stableFailureCode(error);
+        if (
+          !(error instanceof OrchestratorServiceError) ||
+          code !== "ORCHESTRATOR_AUTHORITY_DENIED"
+        ) {
+          throw error;
+        }
+        return {
+          claimAttempted: false,
+          claimed: false,
+          outcome: {
+            status: "orchestration_rejected",
+            workerId: worker.workerId,
+            code,
+          },
+        };
+      }
       throwIfLoopAborted(options.signal);
       return {
         claimAttempted: false,

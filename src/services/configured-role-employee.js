@@ -113,12 +113,22 @@ function runSummary(value) {
       if (typeof status !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(status)) {
         continue;
       }
-      counts.set(status, (counts.get(status) ?? 0) + 1);
+      const code = typeof outcome.code === "string" &&
+          /^[A-Z][A-Z0-9_]{0,127}$/.test(outcome.code)
+        ? outcome.code
+        : null;
+      const aggregate = counts.get(status) ?? { count: 0, codes: new Set() };
+      aggregate.count += 1;
+      if (code) aggregate.codes.add(code);
+      counts.set(status, aggregate);
     }
   }
   const statuses = [...counts.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([status, count]) => `${status} ${count}`)
+    .map(([status, aggregate]) => {
+      const codes = [...aggregate.codes].sort().join("、");
+      return `${status} ${aggregate.count}${codes ? `（${codes}）` : ""}`;
+    })
     .join("、");
   return `扫描 ${scanned} 项，尝试 ${attempts} 项${
     statuses ? `：${statuses}` : ""

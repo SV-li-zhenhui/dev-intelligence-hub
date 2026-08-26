@@ -12,6 +12,7 @@ const GUARD_NAME = "mydashboard-work-ledger-v1";
 const ORCHESTRATOR_PRINCIPAL_ID = "employee-orchestrator";
 const RUNTIME_METHODS = Object.freeze([
   "getSummary",
+  "getRoleWorkloads",
   "listItems",
   "listPendingPullRequestSources",
   "listTimeline",

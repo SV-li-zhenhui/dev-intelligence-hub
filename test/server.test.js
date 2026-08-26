@@ -4812,7 +4812,7 @@ test("work APIs expose only newest-first ledger projections", async () => {
     async ({ server }) => {
       const summary = await request(server, { path: "/api/work/summary" });
       const items = await request(server, {
-        path: "/api/work/items?limit=17&cursor=item%3A2&status=queued&order=newest&ignored=1",
+        path: "/api/work/items?limit=17&cursor=item%3A2&status=queued&order=newest&roleId=developer&ignored=1",
       });
       const timeline = await request(server, {
         path: "/api/work/timeline?limit=9&cursor=timeline%3A2&order=newest&status=blocked",
@@ -4844,6 +4844,7 @@ test("work APIs expose only newest-first ledger projections", async () => {
             cursor: "item:2",
             status: "queued",
             order: "newest",
+            roleId: "developer",
           },
         },
         {
@@ -7627,6 +7628,67 @@ test("employee discovery and dynamic routes work for every registered role", asy
         { operation: "analyst_tick", trigger: "manual" },
       ],
     );
+  });
+});
+
+test("employee discovery includes each role's current workload", async () => {
+  const workLedgerView = {
+    async getSummary() { return { itemCounts: {} }; },
+    async listItems() { return { items: [], nextCursor: null }; },
+    async listTimeline() { return { items: [], nextCursor: null }; },
+    async getRoleWorkloads() {
+      return {
+        items: [{
+          roleId: "requirements-analyst",
+          counts: { queued: 2, working: 1, waiting: 3, blocked: 4 },
+          tasks: [{
+            itemId: "work-item-visible",
+            status: "working",
+            title: "Clarify acceptance criteria",
+            updatedAt: "2026-08-26T10:00:00.000Z",
+            subject: null,
+          }],
+        }],
+      };
+    },
+  };
+
+  await withServer(async ({ server }) => {
+    const response = await request(server, { path: "/api/employees" });
+    const roles = JSON.parse(response.body).items;
+    const requirements = roles.find(({ id }) => id === "requirements-analyst");
+    const reviewer = roles.find(({ id }) => id === "pr-reviewer");
+
+    assert.equal(response.status, 200);
+    assert.equal(requirements.workload.counts.working, 1);
+    assert.equal(requirements.workload.tasks[0].title, "Clarify acceptance criteria");
+    assert.deepEqual(reviewer.workload, {
+      available: true,
+      counts: { queued: 0, working: 0, waiting: 0, blocked: 0 },
+      tasks: [],
+    });
+  }, { workLedgerView });
+
+  await withServer(async ({ server }) => {
+    const response = await request(server, { path: "/api/employees" });
+    const roles = JSON.parse(response.body).items;
+    assert.equal(response.status, 200);
+    assert.equal(roles[0].workload.available, false);
+  });
+
+  await withServer(async ({ server, reportedErrors }) => {
+    const response = await request(server, { path: "/api/employees" });
+    const roles = JSON.parse(response.body).items;
+    assert.equal(response.status, 200);
+    assert.equal(roles[0].workload.available, false);
+    assert.equal(reportedErrors.length, 1);
+  }, {
+    workLedgerView: {
+      async getSummary() { return { itemCounts: {} }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async listTimeline() { return { items: [], nextCursor: null }; },
+      async getRoleWorkloads() { throw new Error("ledger unavailable"); },
+    },
   });
 });
 

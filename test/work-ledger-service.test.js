@@ -543,6 +543,115 @@ test("intake atomically advances its cursor and preserves unresolved targets", a
   assert.equal(store.writes[0].value.items.length, 3);
 });
 
+test("role workloads expose exact counts and bounded recent task summaries", async () => {
+  const records = [
+    assignment(1, { type: "role", id: "developer" }),
+    assignment(2, { type: "role", id: "pr-engineer" }),
+    assignment(3, { type: "role", id: "developer" }),
+    assignment(4, { type: "node", id: "system-node" }),
+  ];
+  const { service } = await createFixture({ records });
+  await service.intake({ limit: 10 });
+
+  const workloads = await service.getRoleWorkloads();
+  const developerPage = await service.listItems({
+    roleId: "developer",
+    order: "newest",
+  });
+
+  assert.deepEqual(
+    workloads.items.map(({ roleId, counts }) => ({ roleId, counts })),
+    [
+      {
+        roleId: "developer",
+        counts: { queued: 2, working: 0, waiting: 0, blocked: 0 },
+      },
+      {
+        roleId: "pr-engineer",
+        counts: { queued: 1, working: 0, waiting: 0, blocked: 0 },
+      },
+    ],
+  );
+  assert.deepEqual(
+    workloads.items[0].tasks.map(({ title, status }) => ({ title, status })),
+    [
+      { title: "Work 3", status: "queued" },
+      { title: "Work 1", status: "queued" },
+    ],
+  );
+  assert.deepEqual(
+    developerPage.items.map(({ currentTarget }) => currentTarget.id),
+    ["developer", "developer"],
+  );
+  await assert.rejects(
+    service.listItems({ roleId: "../developer" }),
+    { code: "WORK_LEDGER_QUERY_INVALID" },
+  );
+  workloads.items[0].counts.queued = 999;
+  assert.equal((await service.getRoleWorkloads()).items[0].counts.queued, 2);
+});
+
+test("role workloads group active states and retain only the three highest-priority tasks", async () => {
+  const records = Array.from(
+    { length: 6 },
+    (_, index) => assignment(index + 1, { type: "role", id: "developer" }),
+  );
+  const fixture = await createFixture({ records });
+  await fixture.service.intake({ limit: 10 });
+  const items = (await fixture.service.listItems()).items;
+  const claim = (item, workerId) => fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId,
+    leaseDurationMs: 30_000,
+  });
+
+  await claim(items[0], "employee-working");
+  fixture.time.advance(1);
+  const waiting = await claim(items[1], "employee-waiting");
+  await fixture.service.transition({
+    itemId: waiting.itemId,
+    expectedRevision: waiting.revision,
+    leaseId: waiting.leaseId,
+    toStatus: "waiting_condition",
+    actorId: "employee-waiting",
+    reason: "await-test-condition",
+    details: { conditionRef: "test:role-workload" },
+  });
+  fixture.time.advance(1);
+  const retry = await claim(items[2], "employee-retry");
+  await fixture.service.scheduleRetry({
+    itemId: retry.itemId,
+    expectedRevision: retry.revision,
+    leaseId: retry.leaseId,
+    actorId: "employee-retry",
+    availableAt: "2026-08-02T02:02:00.000Z",
+    reason: "temporary-test-failure",
+  });
+  fixture.time.advance(1);
+  const blocked = await claim(items[3], "employee-blocked");
+  await fixture.service.transition({
+    itemId: blocked.itemId,
+    expectedRevision: blocked.revision,
+    leaseId: blocked.leaseId,
+    toStatus: "blocked",
+    actorId: "employee-blocked",
+    reason: "terminal-test-failure",
+  });
+
+  const workload = (await fixture.service.getRoleWorkloads()).items[0];
+  assert.deepEqual(workload.counts, {
+    queued: 2,
+    working: 1,
+    waiting: 2,
+    blocked: 1,
+  });
+  assert.deepEqual(
+    workload.tasks.map(({ status }) => status),
+    ["working", "retry_wait", "waiting_condition"],
+  );
+});
+
 test("PR execution context returns the current author with the verified binding", async () => {
   const fixture = await createFixture({
     records: [

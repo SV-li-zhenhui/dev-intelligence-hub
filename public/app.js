@@ -537,6 +537,62 @@ function roleTaskBrainLabel(role) {
   );
 }
 
+function roleWorkloadStatusLabel(status) {
+  return {
+    queued: "待领取",
+    working: "处理中",
+    dispatch_pending: "等待派发",
+    waiting_user: "等待答复",
+    waiting_condition: "等待条件",
+    waiting_external: "等待授权",
+    retry_wait: "等待重试",
+    blocked: "已阻塞",
+  }[status] || status || "未知";
+}
+
+function roleWorkloadTask(task) {
+  const subject = task?.subject;
+  const sourceUrl = githubTargetUrl({
+    resourceType: subject?.kind,
+    resourceId: `${subject?.repository || ""}#${subject?.number || ""}`,
+  });
+  const title = escapeHtml(task?.title || "未命名任务");
+  const titleMarkup = sourceUrl
+    ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${title}</a>`
+    : `<span>${title}</span>`;
+  return `<li>
+    <span class="status-pill status-${escapeHtml(task?.status || "unknown")}">${escapeHtml(roleWorkloadStatusLabel(task?.status))}</span>
+    ${titleMarkup}
+  </li>`;
+}
+
+function roleWorkloadMarkup(role) {
+  const workload = role.workload || {};
+  if (workload.available === false) {
+    return `<section class="employee-role-workload" aria-label="当前任务">
+      <div class="employee-role-workload-heading"><strong>当前任务</strong></div>
+      <p class="employee-role-task-empty">工作台账未启用，暂时无法判断该岗位是否有任务</p>
+    </section>`;
+  }
+  const counts = workload.counts || {};
+  const tasks = Array.isArray(workload.tasks) ? workload.tasks.slice(0, 3) : [];
+  return `<section class="employee-role-workload" aria-label="当前任务">
+    <div class="employee-role-workload-heading">
+      <strong>当前任务</strong>
+      <button type="button" class="secondary-button" data-role-work="${escapeHtml(role.id)}">查看该岗位任务</button>
+    </div>
+    <dl class="employee-role-workload-counts">
+      <div><dt>待领取</dt><dd>${Number(counts.queued) || 0}</dd></div>
+      <div><dt>处理中</dt><dd>${Number(counts.working) || 0}</dd></div>
+      <div><dt>等待</dt><dd>${Number(counts.waiting) || 0}</dd></div>
+      <div><dt>阻塞</dt><dd>${Number(counts.blocked) || 0}</dd></div>
+    </dl>
+    ${tasks.length
+      ? `<ul class="employee-role-task-list">${tasks.map(roleWorkloadTask).join("")}</ul>`
+      : '<p class="employee-role-task-empty">当前没有进行中的任务</p>'}
+  </section>`;
+}
+
 function employeeRoleCard(role) {
   const lastRun = role.lastRun;
   const permissions = role.permissions?.allowedIntents || [];
@@ -546,6 +602,7 @@ function employeeRoleCard(role) {
       <span class="status-pill status-${escapeHtml(role.state)}">${escapeHtml(employeeStateLabel(role.state))}</span>
     </div>
     <p>${escapeHtml(role.mission || "尚未配置岗位使命")}</p>
+    ${roleWorkloadMarkup(role)}
     <dl class="employee-role-meta">
       <div><dt>日常大脑</dt><dd>${escapeHtml(roleBrainLabel(role))}</dd></div>
       <div><dt>任务大脑</dt><dd>${escapeHtml(roleTaskBrainLabel(role))}</dd></div>
@@ -1603,6 +1660,9 @@ function render() {
   });
   content.querySelectorAll("[data-role-run]").forEach((button) => {
     button.addEventListener("click", handleRoleRun);
+  });
+  content.querySelectorAll("[data-role-work]").forEach((button) => {
+    button.addEventListener("click", handleRoleWork);
   });
   bindConfirmationHistoryView();
   content.querySelector("#memory-search-form")?.addEventListener(
@@ -2697,6 +2757,12 @@ async function handleRoleRun(event) {
     button.disabled = false;
     button.textContent = "立即运行";
   }
+}
+
+function handleRoleWork(event) {
+  const roleId = event.currentTarget.dataset.roleWork;
+  workView.setRoleFilter(roleId);
+  activateView("work");
 }
 
 function memoryTimestamp(date, endOfDay = false) {

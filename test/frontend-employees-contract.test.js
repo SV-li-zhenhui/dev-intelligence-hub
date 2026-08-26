@@ -51,6 +51,23 @@ test("employee cards display their assigned model, mission, and permissions", ()
   }
 });
 
+test("employee cards expose workload counts, current tasks, and a role ledger link", () => {
+  for (const value of [
+    "role.workload",
+    "待领取",
+    "处理中",
+    "等待",
+    "阻塞",
+    "data-role-work",
+    "查看该岗位任务",
+    "工作台账未启用",
+  ]) {
+    assert.equal(appSource.includes(value), true, value);
+  }
+  assert.match(appSource, /workView\.setRoleFilter\(roleId\)/);
+  assert.match(appSource, /activateView\("work"\)/);
+});
+
 test("main loading applies dashboard and confirmations independently of the employee roster", () => {
   const loadSource = functionSource("load");
   const mainRequests = loadSource.slice(

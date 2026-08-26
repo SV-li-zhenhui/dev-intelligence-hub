@@ -456,6 +456,94 @@ h1 {
   line-height: 1.65;
 }
 
+.employee-role-workload {
+  margin-top: 13px;
+  padding: 11px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.employee-role-workload-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.employee-role-workload-heading strong {
+  font-size: 11px;
+}
+
+.employee-role-workload-heading .secondary-button {
+  padding: 5px 8px;
+  font-size: 10px;
+}
+
+.employee-role-workload-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 10px 0 0;
+}
+
+.employee-role-workload-counts div {
+  min-width: 0;
+  text-align: center;
+  border-left: 1px solid var(--line);
+}
+
+.employee-role-workload-counts div:first-child {
+  border-left: 0;
+}
+
+.employee-role-workload-counts dt,
+.employee-role-workload-counts dd {
+  margin: 0;
+  font-size: 10px;
+}
+
+.employee-role-workload-counts dt {
+  color: var(--faint);
+}
+
+.employee-role-workload-counts dd {
+  margin-top: 2px;
+  font-weight: 700;
+}
+
+.employee-role-task-list {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 9px 0 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.employee-role-task-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 10px;
+}
+
+.employee-role-task-list a,
+.employee-role-task-list span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.employee-role-task-empty {
+  margin: 10px 0 0 !important;
+  color: var(--faint) !important;
+  font-size: 10px !important;
+}
+
 .employee-role-meta {
   display: grid;
   gap: 7px;
@@ -544,6 +632,19 @@ h1 {
   display: flex;
   gap: 9px;
   margin-top: 15px;
+}
+
+.work-role-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 0;
+  padding: 11px 13px;
+  color: var(--muted);
+  background: var(--blue-soft);
+  border-left: 3px solid var(--blue);
+  font-size: 11px;
 }
 
 .secondary-button {

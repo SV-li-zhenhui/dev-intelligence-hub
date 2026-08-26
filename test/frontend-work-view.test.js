@@ -1702,6 +1702,50 @@ test("work view reads only newest-first projection endpoints", async () => {
   assert.match(view.render(), /code-job-newest|已授权，等待执行/);
 });
 
+test("work view can filter recent items to one configured role", async () => {
+  const calls = [];
+  let clearRole;
+  const view = createWorkView({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return workProjectionResponse(
+        url.replace("&roleId=developer", ""),
+        [{ assignmentId: "developer-task", status: "queued" }],
+      );
+    },
+  });
+
+  view.setRoleFilter("developer");
+  await view.load();
+
+  assert.equal(
+    calls.includes("/api/work/items?limit=50&order=newest&roleId=developer"),
+    true,
+  );
+  assert.match(view.render(), /仅显示岗位 developer/);
+  assert.match(view.render(), /显示全部岗位/);
+
+  view.bind({
+    querySelectorAll(selector) {
+      if (selector === "[data-work-clear-role]") {
+        return [{
+          addEventListener(_type, handler) {
+            clearRole = handler;
+          },
+        }];
+      }
+      return [];
+    },
+  });
+  clearRole();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    calls.includes("/api/work/items?limit=50&order=newest"),
+    true,
+  );
+});
+
 test("work view renders loading, empty, and safe read failures", async () => {
   assert.match(renderWorkView({ loaded: false }), /正在读取/);
   assert.match(

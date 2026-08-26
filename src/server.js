@@ -1168,7 +1168,7 @@ async function readUnifiedAttention(application, options) {
   };
 }
 
-function queryOptions(url, { status = false, order = false } = {}) {
+function queryOptions(url, { status = false, order = false, roleId = false } = {}) {
   return {
     ...(url.searchParams.has("limit")
       ? { limit: url.searchParams.get("limit") }
@@ -1181,6 +1181,9 @@ function queryOptions(url, { status = false, order = false } = {}) {
       : {}),
     ...(order && url.searchParams.has("order")
       ? { order: url.searchParams.get("order") }
+      : {}),
+    ...(roleId && url.searchParams.has("roleId")
+      ? { roleId: url.searchParams.get("roleId") }
       : {}),
   };
 }
@@ -3010,7 +3013,39 @@ export function createDashboardServer(
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/employees") {
-        sendJson(response, 200, { items: await employeeRegistry.listRoles() });
+        const workloadPromise =
+          typeof application.workLedgerView?.getRoleWorkloads === "function"
+            ? application.workLedgerView.getRoleWorkloads()
+              .then((result) => Array.isArray(result?.items)
+                ? { available: true, items: result.items }
+                : { available: false, items: [] })
+              .catch((error) => {
+                reportError(error);
+                return { available: false, items: [] };
+              })
+            : Promise.resolve({ available: false, items: [] });
+        const [roles, workloadResult] = await Promise.all([
+          employeeRegistry.listRoles(),
+          workloadPromise,
+        ]);
+        const workloadsAvailable = workloadResult.available;
+        const workloads = new Map(
+          (Array.isArray(workloadResult?.items) ? workloadResult.items : [])
+            .map((workload) => [workload.roleId, workload]),
+        );
+        const emptyWorkload = Object.freeze({
+          available: workloadsAvailable,
+          counts: Object.freeze({ queued: 0, working: 0, waiting: 0, blocked: 0 }),
+          tasks: Object.freeze([]),
+        });
+        sendJson(response, 200, {
+          items: roles.map((role) => ({
+            ...role,
+            workload: workloads.has(role.id)
+              ? { available: true, ...workloads.get(role.id) }
+              : emptyWorkload,
+          })),
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/work/requests") {
@@ -3157,7 +3192,11 @@ export function createDashboardServer(
       ) {
         const view = requireWorkLedgerView(application);
         const result = url.pathname.endsWith("/items")
-          ? await view.listItems(queryOptions(url, { status: true, order: true }))
+          ? await view.listItems(queryOptions(url, {
+            status: true,
+            order: true,
+            roleId: true,
+          }))
           : await view.listTimeline(queryOptions(url, { order: true }));
         sendJson(response, 200, result);
         return;

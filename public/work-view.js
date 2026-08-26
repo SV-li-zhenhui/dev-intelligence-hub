@@ -10,6 +10,7 @@ function initialState() {
     loading: false,
     error: "",
     summary: null,
+    roleId: null,
     items: [],
     timeline: [],
     codeJobsEnabled: false,
@@ -972,6 +973,12 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
     count(summary, "waiting_external") +
     count(summary, "retry_wait");
   const safeguards = summary.safeguards || {};
+  const roleFilter = state.roleId
+    ? `<div class="work-role-filter" role="status">
+      <span>仅显示岗位 ${escapeWorkHtml(state.roleId)} 的最近工作；上方全局统计与共享任务图仍为全局。</span>
+      <button type="button" class="secondary-button" data-work-clear-role>显示全部岗位</button>
+    </div>`
+    : "";
   return `
     <section class="work-summary" aria-label="主动工作循环状态">
       <div><span>待领取</span><strong>${count(summary, "queued")}</strong></div>
@@ -992,6 +999,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       error: state.graphError,
       snapshot: state.graphSnapshot,
     }, { now })}
+    ${roleFilter}
     <div class="work-columns">
       <section class="section work-panel">
         <div class="section-heading"><h2>最近工作</h2><span>${items.length} ITEMS · 最新在前</span></div>
@@ -1389,9 +1397,12 @@ export function createWorkView({
       graphLoading: true,
       graphError: "",
     });
+    const roleQuery = state.roleId
+      ? `&roleId=${encodeURIComponent(state.roleId)}`
+      : "";
     const responsesPromise = Promise.all([
       fetchImpl("/api/work/summary", { cache: "no-store" }),
-      fetchImpl("/api/work/items?limit=50&order=newest", { cache: "no-store" }),
+      fetchImpl(`/api/work/items?limit=50&order=newest${roleQuery}`, { cache: "no-store" }),
       fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
     ]);
     const codeJobsPromise = readCodeJobs();
@@ -1438,8 +1449,26 @@ export function createWorkView({
     await loadWorkProjection();
   }
 
+  function setRoleFilter(roleId) {
+    const normalized = roleId === null ? null : String(roleId);
+    if (
+      normalized !== null &&
+      !/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(normalized)
+    ) {
+      throw new TypeError("roleId is invalid");
+    }
+    loadRequestSequence += 1;
+    change({ roleId: normalized, loaded: false, items: [], error: "" });
+  }
+
   return {
     bind(root) {
+      root.querySelectorAll("[data-work-clear-role]").forEach((button) => {
+        button.addEventListener("click", () => {
+          setRoleFilter(null);
+          void load();
+        });
+      });
       root.querySelectorAll("[data-code-job-id]").forEach((button) => {
         button.addEventListener("click", () => openCodeJob(button.dataset.codeJobId));
       });
@@ -1459,5 +1488,6 @@ export function createWorkView({
     render: () => renderWorkView(state, { now: clock() }),
     requestCodeJobChangePackageApply,
     retryDecisionExhaustion,
+    setRoleFilter,
   };
 }

@@ -177,6 +177,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
   assert.equal(Object.isFrozen(runtime), true);
   for (const method of [
     "getSummary",
+    "getRoleWorkloads",
     "listItems",
     "listPendingPullRequestSources",
     "listTimeline",

@@ -2380,7 +2380,14 @@ export async function createApplication({
       });
       workLedgerView = frozenPort(
         workLedgerRuntime,
-        ["getSummary", "listItems", "listTimeline"],
+        [
+          "getSummary",
+          ...(typeof workLedgerRuntime.getRoleWorkloads === "function"
+            ? ["getRoleWorkloads"]
+            : []),
+          "listItems",
+          "listTimeline",
+        ],
         "workLedgerRuntime",
       );
       workGraphView = frozenPort(

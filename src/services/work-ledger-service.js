@@ -55,6 +55,7 @@ import {
   activatePendingPullRequestWorkSource,
   applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
+  currentWorkItemEvent,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
   validatePullRequestSourceTransition,
@@ -250,6 +251,100 @@ function queryPage(records, idName, options = {}, allowedStatuses = null) {
   };
 }
 
+function queryWorkItemPage(records, options = {}) {
+  if (!isPlainLedgerObject(options)) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账查询无效");
+  }
+  const allowedKeys = new Set(["cursor", "limit", "status", "order", "roleId"]);
+  if (Object.keys(options).some((key) => !allowedKeys.has(key))) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账查询无效");
+  }
+  const { roleId, ...pageOptions } = options;
+  if (
+    roleId !== undefined &&
+    (
+      typeof roleId !== "string" ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(roleId)
+    )
+  ) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "岗位过滤无效");
+  }
+  const selected = roleId === undefined
+    ? records
+    : records.filter(
+      (record) =>
+        record.currentTarget?.type === "role" &&
+        record.currentTarget.id === roleId,
+    );
+  return queryPage(selected, "itemId", pageOptions, WORK_LEDGER_STATUSES);
+}
+
+const ROLE_WORKLOAD_STATUS = new Map([
+  ["working", { group: "working", priority: 0 }],
+  ["dispatch_pending", { group: "working", priority: 0 }],
+  ["waiting_user", { group: "waiting", priority: 1 }],
+  ["waiting_condition", { group: "waiting", priority: 1 }],
+  ["waiting_external", { group: "waiting", priority: 1 }],
+  ["retry_wait", { group: "waiting", priority: 1 }],
+  ["queued", { group: "queued", priority: 2 }],
+  ["blocked", { group: "blocked", priority: 3 }],
+]);
+
+function workloadTitle(item) {
+  const assignmentTitle = item.assignment?.work?.title;
+  if (typeof assignmentTitle === "string" && assignmentTitle.trim()) {
+    return assignmentTitle;
+  }
+  const event = currentWorkItemEvent(item);
+  const eventTitle = event?.payload?.title;
+  if (typeof eventTitle === "string" && eventTitle.trim()) return eventTitle;
+  const subject = event?.subject;
+  if (typeof subject?.repository === "string" && Number.isSafeInteger(subject.number)) {
+    return `${subject.repository} #${subject.number}`;
+  }
+  return item.assignmentId || item.itemId;
+}
+
+function workloadSubject(item) {
+  const event = currentWorkItemEvent(item);
+  const subject = event?.subject;
+  const repository = subject?.repository;
+  const number = subject?.number;
+  if (
+    typeof repository !== "string" ||
+    !repository ||
+    !Number.isSafeInteger(number) ||
+    number < 1
+  ) {
+    return null;
+  }
+  const eventType = event?.eventType;
+  const kind = typeof eventType === "string" && eventType.startsWith("pull_request.")
+    ? "pull_request"
+    : typeof eventType === "string" && eventType.startsWith("issue.")
+      ? "issue"
+      : item.source?.kind === "pull_request"
+        ? "pull_request"
+        : item.source?.kind === "issue"
+          ? "issue"
+          : null;
+  return kind ? { kind, repository, number } : null;
+}
+
+function compareRoleWorkloadItems(left, right) {
+  const priority = (ROLE_WORKLOAD_STATUS.get(left.status)?.priority ?? 99) -
+    (ROLE_WORKLOAD_STATUS.get(right.status)?.priority ?? 99);
+  if (priority !== 0) return priority;
+  const updated = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+  return updated || right.order - left.order;
+}
+
+function retainRecentRoleTask(tasks, task) {
+  tasks.push(task);
+  tasks.sort(compareRoleWorkloadItems);
+  if (tasks.length > 3) tasks.pop();
+}
+
 export class WorkLedgerService {
   constructor({
     store,
@@ -292,6 +387,7 @@ export class WorkLedgerService {
     this.idFactory = idFactory;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
+    this.roleWorkloadCache = null;
     this.ready = false;
     this.recoveryPromise = null;
   }
@@ -352,9 +448,49 @@ export class WorkLedgerService {
     });
   }
 
+  async getRoleWorkloads() {
+    this.#assertReady();
+    if (this.roleWorkloadCache?.revision === this.state.revision) {
+      return cloneLedgerValue(this.roleWorkloadCache.value);
+    }
+    const roles = new Map();
+    for (const [order, item] of this.state.items.entries()) {
+      if (item.currentTarget?.type !== "role") continue;
+      const roleId = item.currentTarget.id;
+      const workload = roles.get(roleId) ?? {
+        roleId,
+        counts: { queued: 0, working: 0, waiting: 0, blocked: 0 },
+        tasks: [],
+      };
+      const status = ROLE_WORKLOAD_STATUS.get(item.status);
+      if (status) {
+        workload.counts[status.group] += 1;
+        retainRecentRoleTask(workload.tasks, {
+          itemId: item.itemId,
+          status: item.status,
+          title: workloadTitle(item),
+          updatedAt: item.updatedAt,
+          subject: workloadSubject(item),
+          order,
+        });
+      }
+      roles.set(roleId, workload);
+    }
+    const items = [...roles.values()]
+      .sort((left, right) => left.roleId.localeCompare(right.roleId))
+      .map((workload) => ({
+        ...workload,
+        tasks: workload.tasks
+          .map(({ order: _order, ...task }) => task),
+      }));
+    const value = { items };
+    this.roleWorkloadCache = { revision: this.state.revision, value };
+    return cloneLedgerValue(value);
+  }
+
   async listItems(options = {}) {
     this.#assertReady();
-    return queryPage(this.state.items, "itemId", options, WORK_LEDGER_STATUSES);
+    return queryWorkItemPage(this.state.items, options);
   }
 
   async listPendingPullRequestSources(options = {}) {

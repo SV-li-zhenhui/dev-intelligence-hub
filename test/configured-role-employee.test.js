@@ -211,6 +211,10 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   );
   assert.match(
     calls[0].messages[0].content,
+    /dependsOn.*completed visible direct children/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
     /Never pause the current root merely to wait for normal child work/i,
   );
   assert.match(
@@ -1004,7 +1008,11 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
             scanned: 12,
             workAttempts: 2,
             outcomes: [
-              { itemId: "private-item-1", status: "degraded" },
+              {
+                itemId: "private-item-1",
+                status: "degraded",
+                code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+              },
               { itemId: "private-item-2", status: "orchestrated" },
             ],
           },
@@ -1018,7 +1026,7 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   const view = await employee.roleView();
   assert.equal(
     view.lastRun.summary,
-    "扫描 12 项，尝试 2 项：degraded 1、orchestrated 1",
+    "扫描 12 项，尝试 2 项：degraded 1（STRUCTURED_PROVIDER_UNAVAILABLE）、orchestrated 1",
   );
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });

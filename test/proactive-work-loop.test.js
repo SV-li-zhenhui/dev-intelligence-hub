@@ -3,6 +3,7 @@ import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { OrchestratorServiceError } from "../src/services/orchestrator-service.js";
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -2960,6 +2961,52 @@ test("root trusted failures use natural cycles without lease-based retry", async
       assert.equal(serviceCalls, failurePoint === "assembler" ? 1 : 2);
     });
   }
+});
+
+test("a pre-write root authority rejection stays local to one orchestration outcome", async () => {
+  const time = controlledClock();
+  const root = workItem(65, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [root], time });
+  const denied = new OrchestratorServiceError(
+    "ORCHESTRATOR_AUTHORITY_DENIED",
+    "invalid dependency",
+    403,
+  );
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({
+        roleId: "orchestrator",
+        workerId: "employee-orchestrator",
+        decide: async ({ item }) => orchestrationDecision(item),
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: {
+      async execute() {
+        throw denied;
+      },
+    },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.workAttempts, 1);
+  assert.deepEqual(cycle.outcomes, [{
+    itemId: root.itemId,
+    status: "orchestration_rejected",
+    workerId: "employee-orchestrator",
+    code: "ORCHESTRATOR_AUTHORITY_DENIED",
+  }]);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.equal(ledger.calls.transition.length, 0);
 });
 
 test("non-root orchestrator tasks never use the configured-root path", async (t) => {
