@@ -88,6 +88,7 @@ const LABELS = deepFreeze({
   githubLogin: "GitHub 登录名",
   githubRead: "GitHub 读取",
   pullRequestUpdatedWindow: "自动发现 PR 更新时间",
+  issueActiveWindowDays: "Issue 自动处理最近天数",
   mode: "时间范围模式",
   days: "最近天数",
   fromInclusive: "UTC 开始边界（含）",
@@ -242,6 +243,11 @@ const INTEGER_FIELDS = deepFreeze([
   { pattern: ["browserPollSeconds"], minimum: 1, maximum: 86_400 },
   {
     pattern: ["githubRead", "pullRequestUpdatedWindow", "days"],
+    minimum: 1,
+    maximum: 3_650,
+  },
+  {
+    pattern: ["githubRead", "issueActiveWindowDays"],
     minimum: 1,
     maximum: 3_650,
   },
@@ -543,6 +549,13 @@ const SLOTS = deepFreeze([
     operations: ["add", "remove", "replace"],
   },
   {
+    pattern: ["githubRead", "issueActiveWindowDays"],
+    label: "Issue 自动处理最近天数",
+    template: "issue-active-window-days",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
     pattern: ["brainProviders", "*", "credentialMode"],
     label: "认证方式",
     template: "provider-credential-mode",
@@ -605,6 +618,7 @@ const SLOTS = deepFreeze([
 
 const TEMPLATES = deepFreeze({
   "pr-updated-window-rolling": { mode: "rolling", days: 7 },
+  "issue-active-window-days": 14,
   repository: "owner/repository",
   provider: {
     kind: "openai-compatible",

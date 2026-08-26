@@ -1,4 +1,5 @@
 const DAY = 86_400_000;
+export const DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS = 14;
 
 function ageInDays(item, now) {
   const updatedAt = Date.parse(item.updatedAt || item.createdAt || now);
@@ -39,7 +40,18 @@ function scorePullRequestAction(item) {
   return null;
 }
 
-export function scoreItem(item, now = new Date().toISOString()) {
+function issueWindowDays(options) {
+  return Number.isSafeInteger(options?.issueActiveWindowDays) &&
+      options.issueActiveWindowDays > 0
+    ? options.issueActiveWindowDays
+    : DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS;
+}
+
+export function scoreItem(
+  item,
+  now = new Date().toISOString(),
+  options = {},
+) {
   if (item.kind === "pull_request") {
     const actionScore = scorePullRequestAction(item);
     if (actionScore) {
@@ -76,6 +88,16 @@ export function scoreItem(item, now = new Date().toISOString()) {
     reasons.push("需要你修改或推进");
   }
 
+  const staleDays = ageInDays(item, now);
+  if (
+    item.kind === "issue" &&
+    item.relation === "assigned" &&
+    staleDays >= issueWindowDays(options)
+  ) {
+    const days = issueWindowDays(options);
+    return { score: 15, reasons: [`超过 ${days} 天，稍后处理`] };
+  }
+
   if (item.reviewDecision === "CHANGES_REQUESTED") {
     score = Math.max(score, 95);
     reasons.unshift("审核要求修改");
@@ -110,8 +132,7 @@ export function scoreItem(item, now = new Date().toISOString()) {
     }
   }
 
-  const staleDays = ageInDays(item, now);
-  if (staleDays >= 5 && item.state !== "closed") {
+  if (staleDays >= 5 && item.state !== "closed" && item.kind !== "issue") {
     score = Math.max(score, 65);
     reasons.push(`${staleDays} 天未更新`);
   }
@@ -119,9 +140,13 @@ export function scoreItem(item, now = new Date().toISOString()) {
   return { score, reasons: [...new Set(reasons)] };
 }
 
-export function prioritize(items, now = new Date().toISOString()) {
+export function prioritize(
+  items,
+  now = new Date().toISOString(),
+  options = {},
+) {
   return items
-    .map((item) => ({ ...item, ...scoreItem(item, now) }))
+    .map((item) => ({ ...item, ...scoreItem(item, now, options) }))
     .sort(
       (left, right) =>
         right.score - left.score ||

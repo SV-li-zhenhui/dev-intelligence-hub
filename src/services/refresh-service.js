@@ -20,6 +20,12 @@ const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.HISTORICAL,
 ]);
 
+function dashboardOptions(config) {
+  return {
+    issueActiveWindowDays: config.githubRead?.issueActiveWindowDays ?? 14,
+  };
+}
+
 function serviceError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
 }
@@ -231,7 +237,11 @@ export class RefreshService {
       ),
     };
     const previousSnapshot = await this.store.read("previous-snapshot");
-    const dashboard = buildDashboard(nextSnapshot, previousSnapshot);
+    const dashboard = buildDashboard(
+      nextSnapshot,
+      previousSnapshot,
+      dashboardOptions(this.config),
+    );
 
     await this.store.write("pr-responsibility-overrides", nextOverrides);
     await this.store.write("snapshot", nextSnapshot);
@@ -474,7 +484,11 @@ export class RefreshService {
       clockMilliseconds(this.clock) - startedAt,
     );
     const diff = diffSnapshots(previous, snapshot);
-    const dashboard = buildDashboard(snapshot, previous);
+    const dashboard = buildDashboard(
+      snapshot,
+      previous,
+      dashboardOptions(this.config),
+    );
 
     let notification = { sent: false, reason: "disabled" };
     let notificationDiff = null;
@@ -482,7 +496,11 @@ export class RefreshService {
       notificationDiff = diffSnapshots(notificationBaseline, snapshot);
       notification = await this.notifier.send(
         notificationDiff,
-        prioritize(snapshot.items, snapshot.refreshedAt),
+        prioritize(
+          snapshot.items,
+          snapshot.refreshedAt,
+          dashboardOptions(this.config),
+        ),
         { signal },
       );
       signal?.throwIfAborted();

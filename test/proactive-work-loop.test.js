@@ -88,6 +88,22 @@ function workItem(number, target = { type: "role", id: "pr-reviewer" }) {
   };
 }
 
+function issueWorkItem(number, updatedAt, labels = []) {
+  const item = workItem(number);
+  item.event = {
+    eventId: `workflow-event-${number}`,
+    eventType: "issue.observed",
+    source: { provider: "github", scopeId: "github-dashboard" },
+    subject: {
+      id: `github:issue:acme/repo#${number}`,
+      repository: "acme/repo",
+      number,
+    },
+    payload: { updatedAt, labels },
+  };
+  return item;
+}
+
 function completeDecision(summary = "无需进一步操作") {
   return {
     schemaVersion: 1,
@@ -347,6 +363,56 @@ test("a cycle reliably intakes, claims, decides, and only stages an intent", asy
   assert.equal(ledger.calls.stageIntent[0].expectedRevision, 2);
   assert.equal(ledger.calls.stageIntent[0].leaseId, "lease-1");
   assert.equal(ledger.calls.stageIntent[0].roleId, "pr-reviewer");
+});
+
+test("automatic work skips issues outside the configurable active window", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [
+      issueWorkItem(1, "2026-06-01T08:00:00.000Z", ["p0"]),
+      issueWorkItem(2, "2026-08-01T08:00:00.000Z"),
+    ],
+    time,
+  });
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    issueActiveWindowDays: 14,
+  });
+
+  const result = await loop.runCycle({ trigger: "scheduled" });
+
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), ["work-item-2"]);
+  assert.equal(ledger.items[0].status, "queued");
+});
+
+test("automatic work chooses a high-priority recent issue before an ordinary one", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({
+    source: [
+      issueWorkItem(1, "2026-08-01T08:00:00.000Z"),
+      issueWorkItem(2, "2026-08-01T07:00:00.000Z", ["priority: high"]),
+    ],
+    time,
+  });
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    issueActiveWindowDays: 14,
+  });
+
+  await loop.runCycle({ trigger: "scheduled", workLimit: 1 });
+
+  assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), ["work-item-2"]);
 });
 
 test("a paused PR role leaves every PR queued without asking or deciding", async () => {

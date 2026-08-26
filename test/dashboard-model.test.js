@@ -111,7 +111,7 @@ test("tracked versions put the most recently published or active record first", 
   );
 });
 
-test("assigned issues are shown newest first even when stale items score higher", () => {
+test("assigned issues are shown newest first and old items are visibly deferred", () => {
   const dashboard = buildDashboard({
     refreshedAt: "2026-08-26T09:00:00.000Z",
     durationMs: 10,
@@ -138,5 +138,9 @@ test("assigned issues are shown newest first even when stale items score higher"
     dashboard.groups.myIssues.map((issue) => issue.id),
     ["latest-issue", "stale-issue"],
   );
-  assert.equal(dashboard.groups.myIssues[1].score, 65);
+  assert.equal(dashboard.groups.myIssues[1].score, 15);
+  assert.deepEqual(
+    dashboard.groups.myIssues[1].reasons,
+    ["超过 14 天，稍后处理"],
+  );
 });

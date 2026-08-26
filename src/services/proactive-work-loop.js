@@ -39,6 +39,13 @@ const OWNER_REQUEST_PRIORITIES = Object.freeze({
   high: 2,
   urgent: 3,
 });
+const HIGH_PRIORITY_ISSUE_LABELS = new Set([
+  "urgent",
+  "blocker",
+  "priority: high",
+  "p0",
+  "p1",
+]);
 
 function requirePort(value, methods, name) {
   if (
@@ -245,6 +252,58 @@ function ownerRequestPriority(item) {
   return OWNER_REQUEST_PRIORITIES[event.payload?.priority] ?? 0;
 }
 
+function issueEventFacts(item) {
+  let event;
+  try {
+    event = currentWorkItemEvent(item);
+  } catch {
+    return null;
+  }
+  if (
+    event?.source?.provider !== "github" ||
+    typeof event.eventType !== "string" ||
+    !event.eventType.startsWith("issue.") ||
+    !event.payload ||
+    typeof event.payload !== "object"
+  ) {
+    return null;
+  }
+  return event;
+}
+
+function issueUpdatedAt(event) {
+  const value = event?.payload?.updatedAt;
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? Date.parse(value)
+    : null;
+}
+
+function issueIsEligible(item, now, activeWindowDays) {
+  const event = issueEventFacts(item);
+  if (event === null) return true;
+  if (["issue.completed", "issue.left_scope"].includes(event.eventType)) {
+    return true;
+  }
+  const updatedAt = issueUpdatedAt(event);
+  if (updatedAt === null) return true;
+  return updatedAt > Date.parse(now) - activeWindowDays * 86_400_000;
+}
+
+function issuePriority(item) {
+  const event = issueEventFacts(item);
+  if (event === null) return 0;
+  const labels = Array.isArray(event.payload.labels)
+    ? event.payload.labels
+    : [];
+  return labels.some(
+    (label) =>
+      typeof label === "string" &&
+      HIGH_PRIORITY_ISSUE_LABELS.has(label.toLowerCase()),
+  )
+    ? 1
+    : 0;
+}
+
 function prioritizeWorkItems(items) {
   const childrenByParent = new Map();
   for (const item of items) {
@@ -256,6 +315,7 @@ function prioritizeWorkItems(items) {
   }
   return items
     .map((item, index) => {
+      const issueEvent = issueEventFacts(item);
       const children = item.currentTarget?.type === "role" &&
           item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
           item.graph?.parentItemId === null
@@ -265,6 +325,9 @@ function prioritizeWorkItems(items) {
         item,
         index,
         priority: ownerRequestPriority(item),
+        issuePriority: issuePriority(item),
+        issueUpdatedAt: issueUpdatedAt(issueEvent) ?? 0,
+        isIssue: issueEvent !== null,
         submittedChildren: children.filter((child) =>
           child.graph?.deliveries?.at(-1)?.status === "submitted"
         ).length,
@@ -277,6 +340,10 @@ function prioritizeWorkItems(items) {
       right.priority - left.priority ||
       right.submittedChildren - left.submittedChildren ||
       right.satisfiedChildren - left.satisfiedChildren ||
+      right.issuePriority - left.issuePriority ||
+      (left.isIssue && right.isIssue
+        ? right.issueUpdatedAt - left.issueUpdatedAt
+        : 0) ||
       left.index - right.index
     )
     .map(({ item }) => item);
@@ -475,6 +542,7 @@ export class ProactiveWorkLoop {
     roleContextAssembler,
     orchestratorService,
     memoryQueryService,
+    issueActiveWindowDays = 14,
   } = {}) {
     this.ledger = requirePort(
       ledger,
@@ -524,6 +592,11 @@ export class ProactiveWorkLoop {
       retryMaxMs,
       "retryMaxMs",
       24 * 60 * 60 * 1000,
+    );
+    this.issueActiveWindowDays = positiveInteger(
+      issueActiveWindowDays,
+      "issueActiveWindowDays",
+      3_650,
     );
     if (this.retryMaxMs < this.retryBaseMs) {
       throw new TypeError("retryMaxMs is invalid");
@@ -612,6 +685,15 @@ export class ProactiveWorkLoop {
       if (workAttempts >= options.workLimit) break;
       if (availabilityChecks >= availabilityCheckLimit) break;
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      if (
+        !issueIsEligible(
+          item,
+          normalizeLoopClock(this.clock),
+          this.issueActiveWindowDays,
+        )
+      ) {
+        continue;
+      }
       if (
         options.roleId !== null &&
         options.roleId !== ORCHESTRATOR_ROLE_ID &&

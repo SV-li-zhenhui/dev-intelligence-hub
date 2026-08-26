@@ -1748,6 +1748,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.loop.roleDirectory, roleDirectory);
   assert.strictEqual(calls.loop.roleContextAssembler, roleContextAssembler);
   assert.strictEqual(calls.loop.orchestratorService, orchestratorService);
+  assert.equal(calls.loop.issueActiveWindowDays, 14);
   assert.equal(calls.loop.decideTimeoutMs, 3_000);
   assert.strictEqual(calls.dispatcher.policy, policy);
   assert.strictEqual(calls.dispatcher.attentionProducer, attentionProducer);

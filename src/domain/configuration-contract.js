@@ -1442,11 +1442,21 @@ function normalizeGithubRead(value) {
   const config = fields(
     value,
     path,
-    ["enabled", "pullRequestUpdatedWindow"],
+    ["enabled", "pullRequestUpdatedWindow", "issueActiveWindowDays"],
     ["enabled"],
   );
   return {
     enabled: boolean(config.enabled, `${path}.enabled`),
+    ...(Object.hasOwn(config, "issueActiveWindowDays")
+      ? {
+          issueActiveWindowDays: integer(
+            config.issueActiveWindowDays,
+            `${path}.issueActiveWindowDays`,
+            1,
+            3_650,
+          ),
+        }
+      : {}),
     ...(Object.hasOwn(config, "pullRequestUpdatedWindow")
       ? {
           pullRequestUpdatedWindow: (() => {
@@ -1842,7 +1852,8 @@ function requiresInfrastructureRestart(path) {
     path === "githubLogin" ||
     (path === "githubRead" ||
       path === "githubRead.enabled" ||
-      path === "githubRead.pullRequestUpdatedWindow") ||
+      path === "githubRead.pullRequestUpdatedWindow" ||
+      path === "githubRead.issueActiveWindowDays") ||
     path.startsWith("brainProviders.") ||
     path.startsWith("codeExecutor.") ||
     path.startsWith("changePackages.") ||
@@ -1880,10 +1891,23 @@ export function configurationDocumentImpact(beforeValue, afterValue) {
     if (direction.expansion) categories.authority_expansion.add(windowPath);
     categories.restart_required.add(windowPath);
   }
+  const issueWindowPath = "githubRead.issueActiveWindowDays";
+  const beforeIssueWindow = before.githubRead?.issueActiveWindowDays ?? 14;
+  const afterIssueWindow = after.githubRead?.issueActiveWindowDays ?? 14;
+  const issueWindowChanged = beforeIssueWindow !== afterIssueWindow;
+  if (issueWindowChanged) {
+    if (afterIssueWindow < beforeIssueWindow) {
+      categories.security_tightening.add(issueWindowPath);
+    } else {
+      categories.authority_expansion.add(issueWindowPath);
+    }
+    categories.restart_required.add(issueWindowPath);
+  }
   for (const change of collectChanges(before, after)) {
     if (
-      windowChanged &&
-      (change.path === windowPath || change.path.startsWith(`${windowPath}.`))
+      (windowChanged &&
+        (change.path === windowPath || change.path.startsWith(`${windowPath}.`))) ||
+      (issueWindowChanged && change.path === issueWindowPath)
     ) {
       continue;
     }

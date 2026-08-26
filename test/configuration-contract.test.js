@@ -202,6 +202,41 @@ test("GitHub-read window omission remains omitted while rolling windows are exac
   assert.equal(proxyTrapCalls, 0);
 });
 
+test("Issue active window is optional, bounded, and classified by authority", () => {
+  const defaulted = normalizeConfigurationDocument(document());
+  assert.equal(
+    Object.hasOwn(defaulted.githubRead, "issueActiveWindowDays"),
+    false,
+  );
+
+  const configured = document();
+  configured.githubRead.issueActiveWindowDays = 14;
+  assert.equal(
+    normalizeConfigurationDocument(configured).githubRead.issueActiveWindowDays,
+    14,
+  );
+
+  for (const invalidDays of [0, -1, 3_651, 14.5, "14"]) {
+    const invalid = document();
+    invalid.githubRead.issueActiveWindowDays = invalidDays;
+    assertInvalid(invalid);
+  }
+
+  const narrower = structuredClone(configured);
+  narrower.githubRead.issueActiveWindowDays = 7;
+  assert.deepEqual(
+    configurationDocumentImpact(configured, narrower).security_tightening,
+    ["githubRead.issueActiveWindowDays"],
+  );
+
+  const wider = structuredClone(configured);
+  wider.githubRead.issueActiveWindowDays = 30;
+  assert.deepEqual(
+    configurationDocumentImpact(configured, wider).authority_expansion,
+    ["githubRead.issueActiveWindowDays"],
+  );
+});
+
 test("fixed GitHub-read windows require canonical UTC local midnights across DST", () => {
   const configured = document();
   configured.githubRead.pullRequestUpdatedWindow = {

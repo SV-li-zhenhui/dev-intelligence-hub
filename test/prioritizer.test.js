@@ -67,6 +67,33 @@ test("ordinary assigned issues do not flood the focus queue", () => {
   assert.equal(result.score, 55);
 });
 
+test("issues outside the active window are deferred instead of promoted as stale", () => {
+  const recent = scoreItem(
+    {
+      kind: "issue",
+      relation: "assigned",
+      labels: [],
+      updatedAt: "2026-07-25T09:00:00.000Z",
+    },
+    now,
+    { issueActiveWindowDays: 14 },
+  );
+  const old = scoreItem(
+    {
+      kind: "issue",
+      relation: "assigned",
+      labels: ["p0"],
+      updatedAt: "2026-07-01T09:00:00.000Z",
+    },
+    now,
+    { issueActiveWindowDays: 14 },
+  );
+
+  assert.equal(recent.score, 55);
+  assert.equal(old.score, 15);
+  assert.deepEqual(old.reasons, ["超过 14 天，稍后处理"]);
+});
+
 test("PR action state wins over legacy relation and stale urgency signals", () => {
   const waiting = scoreItem(
     {

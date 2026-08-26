@@ -2325,6 +2325,8 @@ export async function createApplication({
         retryMaxMs: coordinationConfig.retryMaxMs,
         resolveTimeoutMs: coordinationTiming.resolveTimeoutMs,
         decideTimeoutMs: coordinationTiming.decisionTimeoutMs,
+        issueActiveWindowDays:
+          config.githubRead?.issueActiveWindowDays ?? 14,
       });
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,

@@ -171,6 +171,33 @@ test("conflict preparation exposes an optional structured form instead of raw JS
   }
 });
 
+test("Issue automatic processing window is adjustable in the structured form", () => {
+  const path = ["githubRead", "issueActiveWindowDays"];
+  const slot = configurationSlotDescriptor(path);
+  assert.equal(slot.optional, true);
+  assert.deepEqual(slot.operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path), {
+    kind: "slot",
+    value: 14,
+  });
+  assert.deepEqual(
+    {
+      label: configurationFieldDescriptor(path, 14).label,
+      control: configurationFieldDescriptor(path, 14).control,
+      kind: configurationFieldDescriptor(path, 14).kind,
+      minimum: configurationFieldDescriptor(path, 14).minimum,
+      maximum: configurationFieldDescriptor(path, 14).maximum,
+    },
+    {
+      label: "Issue 自动处理最近天数",
+      control: "number",
+      kind: "integer",
+      minimum: 1,
+      maximum: 3_650,
+    },
+  );
+});
+
 test("schema identifies enum, numeric, boolean and environment-reference controls centrally", () => {
   const providerKind = configurationFieldDescriptor(
     ["brainProviders", "ollama", "kind"],

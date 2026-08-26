@@ -27,8 +27,8 @@ function newestUpdatedFirst(items) {
   );
 }
 
-export function buildDashboard(snapshot, previousSnapshot = null) {
-  const prioritized = prioritize(snapshot.items, snapshot.refreshedAt);
+export function buildDashboard(snapshot, previousSnapshot = null, options = {}) {
+  const prioritized = prioritize(snapshot.items, snapshot.refreshedAt, options);
   const completedIds = new Set(snapshot.items.map((item) => item.id));
   const recentlyCompleted = (previousSnapshot?.items || [])
     .filter((item) => !completedIds.has(item.id))
