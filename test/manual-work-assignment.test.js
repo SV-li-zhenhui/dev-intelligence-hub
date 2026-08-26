@@ -7,12 +7,12 @@ import {
 } from "../public/manual-work-assignment.js";
 
 const pullRequest = {
-  id: "github:pr:SVisions/OCT-Software#23991",
+  id: "github:pr:ExampleOrg/SoftwareApp#23991",
   kind: "pull_request",
-  repo: "SVisions/OCT-Software",
+  repo: "ExampleOrg/SoftwareApp",
   number: 23991,
   title: "新增 Retina Thickness-Trend 分析页面",
-  url: "https://github.com/SVisions/OCT-Software/pull/23991",
+  url: "https://github.com/ExampleOrg/SoftwareApp/pull/23991",
 };
 
 test("PR detail offers a manual assignment form with a direct review option", () => {
@@ -34,20 +34,20 @@ test("a PR review assignment freezes the structured PR target", () => {
 
   assert.equal(request.schemaVersion, 2);
   assert.deepEqual(request.pullRequest, {
-    repository: "SVisions/OCT-Software",
+    repository: "ExampleOrg/SoftwareApp",
     number: 23991,
   });
-  assert.match(request.description, /github\.com\/SVisions\/OCT-Software\/pull\/23991/);
+  assert.match(request.description, /github\.com\/ExampleOrg\/SoftwareApp\/pull\/23991/);
   assert.equal(request.acceptanceCriteria.length, 2);
 });
 
 test("an Issue development assignment becomes an audited capability request", () => {
   const request = ownerWorkRequestForItem({
     kind: "issue",
-    repo: "SVisions/OCT-Product",
+    repo: "ExampleOrg/ProductApp",
     number: 12917,
     title: "Retina Thickness Change 页面",
-    url: "https://github.com/SVisions/OCT-Product/issues/12917",
+    url: "https://github.com/ExampleOrg/ProductApp/issues/12917",
   }, {
     workType: "development",
     priority: "urgent",
@@ -57,7 +57,7 @@ test("an Issue development assignment becomes an audited capability request", ()
   assert.equal(request.schemaVersion, 1);
   assert.equal(request.pullRequest, undefined);
   assert.equal(request.workType, "development");
-  assert.match(request.description, /SVisions\/OCT-Product #12917/);
+  assert.match(request.description, /ExampleOrg\/ProductApp #12917/);
 });
 
 test("assignment result replaces the form with its durable work item", () => {

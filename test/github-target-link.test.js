@@ -41,22 +41,22 @@ test("GitHub target links reject ambiguous or unsafe targets", () => {
 
 test("GitHub source event links open the matching issue or pull request", () => {
   assert.equal(
-    githubSourceEventUrl("issue.observed · SVisions/OCT-Product#11651"),
-    "https://github.com/SVisions/OCT-Product/issues/11651",
+    githubSourceEventUrl("issue.observed · ExampleOrg/ProductApp#11651"),
+    "https://github.com/ExampleOrg/ProductApp/issues/11651",
   );
   assert.equal(
-    githubSourceEventUrl("pull_request.status · SVisions/OCT-Software#24193"),
-    "https://github.com/SVisions/OCT-Software/pull/24193",
+    githubSourceEventUrl("pull_request.status · ExampleOrg/SoftwareApp#24193"),
+    "https://github.com/ExampleOrg/SoftwareApp/pull/24193",
   );
 });
 
 test("GitHub source event links reject non-GitHub or ambiguous context", () => {
   for (const value of [
     null,
-    "workflow-event · SVisions/OCT-Product#11651",
-    "issue.observed · SVisions/OCT-Product",
+    "workflow-event · ExampleOrg/ProductApp#11651",
+    "issue.observed · ExampleOrg/ProductApp",
     "issue.observed · evil.example/repo#1",
-    "pull_request.status · SVisions/OCT-Software#1/../../settings",
+    "pull_request.status · ExampleOrg/SoftwareApp#1/../../settings",
   ]) {
     assert.equal(githubSourceEventUrl(value), null);
   }
