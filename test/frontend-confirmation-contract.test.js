@@ -153,6 +153,20 @@ test("external confirmation renders the exact authorization context", async () =
   );
 });
 
+test("employee consultations link a GitHub source event to its original page", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("function internalContextMarkup");
+  const end = app.indexOf("\nfunction showInternalAttention", start);
+  const renderer = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(renderer, /githubSourceEventUrl/);
+  assert.match(renderer, /label === "来源事件"/);
+  assert.match(renderer, /target="_blank"/);
+  assert.match(renderer, /rel="noreferrer"/);
+  assert.match(renderer, /打开 GitHub/);
+});
+
 test("all five PR action kinds have exact browser approval routes and details", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const routerStart = app.indexOf("function showExternalActionConfirmation");

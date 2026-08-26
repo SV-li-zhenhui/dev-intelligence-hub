@@ -28,3 +28,13 @@ export function githubTargetUrl(input) {
 
   return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/${route}/${number}`;
 }
+
+export function githubSourceEventUrl(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(issue|pull_request)\.[A-Za-z0-9._-]+ · (.+)$/.exec(value);
+  if (match === null) return null;
+  return githubTargetUrl({
+    resourceType: match[1],
+    resourceId: match[2],
+  });
+}

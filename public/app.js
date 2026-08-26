@@ -15,7 +15,10 @@ import {
   createConfigurationFormState,
 } from "./configuration-form-support.js";
 import { renderBrainProviderStatus } from "./brain-provider-status-view.js";
-import { githubTargetUrl } from "./github-target-link.js";
+import {
+  githubSourceEventUrl,
+  githubTargetUrl,
+} from "./github-target-link.js";
 import { githubItemDetailMarkup } from "./github-item-detail.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
@@ -3854,8 +3857,15 @@ function internalContextMarkup(context = []) {
   if (!context.length) return "";
   return `<dl class="detail-grid confirmation-grid">${context
     .map(
-      ({ label, value }) =>
-        `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`,
+      ({ label, value }) => {
+        const sourceUrl = label === "来源事件"
+          ? githubSourceEventUrl(value)
+          : null;
+        const valueMarkup = sourceUrl === null
+          ? escapeHtml(value)
+          : `<a class="confirmation-target-link" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(value)} · 打开 GitHub ↗</a>`;
+        return `<dt>${escapeHtml(label)}</dt><dd>${valueMarkup}</dd>`;
+      },
     )
     .join("")}</dl>`;
 }
