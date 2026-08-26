@@ -601,10 +601,16 @@ export class ProactiveWorkLoop {
     let claimedCount = 0;
     let claimAttempts = 0;
     let workAttempts = 0;
+    let availabilityChecks = 0;
+    const availabilityCheckLimit = Math.max(
+      options.workLimit + 3,
+      options.workLimit * 2,
+    );
 
     for (const item of prioritizeWorkItems(items)) {
       throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
+      if (availabilityChecks >= availabilityCheckLimit) break;
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
       if (
         options.roleId !== null &&
@@ -707,7 +713,7 @@ export class ProactiveWorkLoop {
       }
       this.inFlightItemIds.add(item.itemId);
       try {
-        workAttempts += 1;
+        availabilityChecks += 1;
         const availabilityOutcome = await this.#checkAvailability(
           item,
           resolution,
@@ -717,6 +723,7 @@ export class ProactiveWorkLoop {
           outcomes.push({ itemId: item.itemId, ...availabilityOutcome });
           continue;
         }
+        workAttempts += 1;
         if (
           this.roleContextAssembler !== null &&
           configuredRoot
@@ -764,6 +771,7 @@ export class ProactiveWorkLoop {
       roleId: options.roleId,
       intake,
       scanned: items.length,
+      availabilityChecks,
       workAttempts,
       claimAttempts,
       claimed: claimedCount,

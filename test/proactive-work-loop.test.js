@@ -457,6 +457,55 @@ test("availability remains item-specific while target resolution is cached", asy
   assert.equal(ledger.calls.claim.length, 0);
 });
 
+test("one unavailable task cannot consume the work budget and starve a ready task", async () => {
+  const time = controlledClock();
+  const unavailable = workItem(106, { type: "role", id: "orchestrator" });
+  const ready = workItem(107, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [unavailable, ready], time });
+  const checked = [];
+  const directory = new FakeRoleDirectory({
+    orchestrator: worker({
+      roleId: "orchestrator",
+      workerId: "employee-orchestrator",
+      async checkAvailability({ item }) {
+        checked.push(item.itemId);
+        if (item.itemId === unavailable.itemId) {
+          throw Object.assign(new Error("task brain missing"), {
+            code: "ROLE_TASK_BRAIN_NOT_CONFIGURED",
+          });
+        }
+      },
+      async decide() {
+        return completeDecision();
+      },
+    }),
+  });
+  const loop = createLoop({
+    ledger,
+    directory,
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+
+  assert.deepEqual(checked, [unavailable.itemId, ready.itemId]);
+  assert.equal(result.availabilityChecks, 2);
+  assert.equal(result.workAttempts, 1);
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(result.outcomes.map(({ status }) => status), [
+    "degraded",
+    "staged",
+  ]);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.items[1].status, "dispatch_pending");
+});
+
 test("unexpected availability errors remain resolution failures before claim", async () => {
   const time = controlledClock();
   const source = workItem(7, { type: "role", id: "developer" });
