@@ -140,7 +140,7 @@ test("external confirmation renders the exact authorization context", async () =
     "发布后立即交接",
     "下一责任岗位",
     "测试工程师 · 验证后交回合并门禁",
-    "开发工程师 · 修改并推送新 Head",
+    "开发工程师 · 自己修复、测试并推送新 Head",
     "确认发布并分配下一步",
     "版本类型",
     "具体测试负责人",

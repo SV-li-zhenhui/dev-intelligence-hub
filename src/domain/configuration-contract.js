@@ -1298,6 +1298,7 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
       "codeActionRoles",
       "configurationChangeRoles",
       "codeOperationsByRole",
+      "reviewOwnersByProduct",
       "testingOwnersByProduct",
       "workspaceByRepository",
     ],
@@ -1395,6 +1396,26 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
         },
       )
     : null;
+  const reviewOwnersByProduct = Object.hasOwn(
+    policy,
+    "reviewOwnersByProduct",
+  )
+    ? namedMap(
+        policy.reviewOwnersByProduct,
+        `${policyPath}.reviewOwnersByProduct`,
+        (owners, ownersPath, product) => {
+          safeId(product, ownersPath);
+          return uniqueArray(
+            owners,
+            ownersPath,
+            20,
+            (login, loginPath) =>
+              text(login, loginPath, 40, { pattern: SAFE_GITHUB_LOGIN }),
+            1,
+          );
+        },
+      )
+    : null;
   normalized.policy = {
     version: integer(policy.version, `${policyPath}.version`, 1, 1_000_000),
     capabilityRoles,
@@ -1404,6 +1425,7 @@ function normalizeWorkCoordination(value, roles, workspaceIds) {
       ? {}
       : { configurationChangeRoles }),
     codeOperationsByRole,
+    ...(reviewOwnersByProduct === null ? {} : { reviewOwnersByProduct }),
     ...(testingOwnersByProduct === null ? {} : { testingOwnersByProduct }),
     workspaceByRepository,
   };

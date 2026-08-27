@@ -30,6 +30,10 @@ import {
 } from "./manual-work-assignment.js";
 import {
   inferTestingProduct,
+  prLifecycleStatus,
+  prLifecycleStageLabel,
+  prReviewLifecycleRoute,
+  reviewerOwnerRouting,
   testingOwnerRouting,
 } from "./review-handoff-routing.js";
 import { createWorkflowView } from "./workflow-view.js";
@@ -514,6 +518,7 @@ function employeePanel({ expanded = false } = {}) {
       ${role.lastError ? `<p class="employee-error">${escapeHtml(role.lastError)}</p>` : ""}
       <div class="employee-actions">
         <button class="refresh-button" data-employee-run ${role.paused ? "disabled" : ""}>立即巡查</button>
+        ${pendingConfirmationCount > 0 ? `<button class="secondary-button" data-role-confirmations>处理待确认（${pendingConfirmationCount}）</button>` : ""}
         <button class="secondary-button" data-employee-control="${role.paused ? "resume" : "pause"}">${role.paused ? "恢复员工" : "暂停员工"}</button>
       </div>
       ${
@@ -691,23 +696,28 @@ function confirmationPendingMarkup() {
   if (!confirmationQueueLoaded) {
     return '<div class="empty">正在读取下一项确认…</div>';
   }
-  if (!confirmationQueueState.available || !confirmationQueueState.item) {
+  const [entry] = pendingConfirmations();
+  if (!entry) {
     return '<div class="empty">当前没有需要你处理的确认。</div>';
   }
-  const item = confirmationQueueState.item;
+  const item = entry.item || entry.job;
   const title = item.display?.title || item.title || "待确认事项";
   const summary = item.display?.summary || item.summary || "等待你逐项判断";
   const roleId = item.requestedBy?.roleId || item.producer?.roleId || "未标注岗位";
   const pendingCount = Number.isInteger(confirmationQueueState.pendingCount)
-    ? confirmationQueueState.pendingCount
-    : 1;
+    ? Math.max(confirmationQueueState.pendingCount, pendingConfirmations().length)
+    : pendingConfirmations().length;
   const source = item.resolutionRequired === true
     ? "结果未知待封存"
-    : confirmationQueueState.source === "internal_request"
+    : entry.kind === "internal_request"
       ? "员工咨询"
+      : entry.kind === "review_draft"
+        ? "本地 Review 草稿"
       : "动作授权";
-  const destination = confirmationQueueState.source === "internal_request"
+  const destination = entry.kind === "internal_request"
     ? `提交答复后，结果写入本地台账，原任务重新排队给 ${roleId} 继续处理；驳回后原任务转为阻塞。两者都可在“主动工作台账”追踪；选择“稍后”仍保留在待确认队列。`
+    : entry.kind === "review_draft"
+      ? "接受或驳回只处理这份本地 Review 草稿，不会直接写入 GitHub；如果存在受控发布动作，它会作为另一项授权单独确认。"
     : "确认或驳回后，结果会进入下方“只读确认历史”；选择“稍后”仍保留在待确认队列。";
   return `<article class="confirmation-pending-item">
     <div class="confirmation-history-row-heading">
@@ -717,6 +727,7 @@ function confirmationPendingMarkup() {
     <p>${escapeHtml(summary)}</p>
     <small>${escapeHtml(source)} · ${escapeHtml(roleId)} · 当前还剩 ${pendingCount} 项（含当前项）</small>
     <p><strong>处理去向：</strong>${escapeHtml(destination)}</p>
+    <button type="button" class="refresh-button" data-role-confirmations>处理下一项确认</button>
   </article>`;
 }
 
@@ -2495,6 +2506,21 @@ function brainAssessment(item) {
     </aside>`;
 }
 
+function prLifecycleStatusMarkup(item) {
+  if (item?.kind !== "pull_request") return "";
+  const lifecycle = prLifecycleStatus(item);
+  return `<section class="pr-lifecycle-status">
+    <div>
+      <strong>${escapeHtml(lifecycle.title)}</strong>
+      <span>${escapeHtml(prLifecycleStageLabel(lifecycle.stage))}</span>
+    </div>
+    <dl>
+      <dt>当前下一棒</dt><dd>${escapeHtml(lifecycle.nextOwner)}</dd>
+      <dt>闭环规则</dt><dd>${escapeHtml(lifecycle.nextStep)}</dd>
+    </dl>
+  </section>`;
+}
+
 function listMarkup(items) {
   if (!items?.length) return "";
   return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
@@ -2525,6 +2551,19 @@ function showEmployeeJob(job) {
         </div>
       </section>`
     : "";
+  const confirmationAction = [
+    "ready_for_human",
+    "waiting_confirmation",
+    "waiting_retry_confirmation",
+  ].includes(job.status)
+    ? `<section class="employee-job-confirmation">
+        <h3>需要你确认什么</h3>
+        <p>${job.status === "ready_for_human"
+          ? "确认是否接受这份 Review 草稿。接受或驳回都只记录本地结论，不会直接写入 GitHub；如有发布动作，会另行逐项确认。"
+          : "核对将要发布到 GitHub 的完整 Review、账号和绑定 Head，并决定确认发布、驳回或稍后处理。"}</p>
+        <button type="button" class="refresh-button" data-pr-job-confirmation>处理待确认</button>
+      </section>`
+    : "";
   dialogContent.innerHTML = `
     <article class="detail employee-detail">
       <p class="eyebrow">PR EMPLOYEE / ${escapeHtml(jobStateLabel(job.status))}</p>
@@ -2541,12 +2580,16 @@ function showEmployeeJob(job) {
         <dt>岗位大脑</dt><dd>${escapeHtml(job.brain?.provider || "")} / ${escapeHtml(job.brain?.model || "未记录")}</dd>
         <dt>状态</dt><dd>${escapeHtml(jobStateLabel(job.status))}</dd>
       </dl>
+      ${confirmationAction}
       ${recovery}
       ${job.url ? `<a href="${escapeHtml(job.url)}" target="_blank" rel="noreferrer">在 GitHub 中打开 →</a>` : ""}
     </article>`;
   dialogContent
     .querySelector("[data-pr-job-recovery]")
     ?.addEventListener("click", handleBlockedJobResolution);
+  dialogContent
+    .querySelector("[data-pr-job-confirmation]")
+    ?.addEventListener("click", handleRoleConfirmations);
   dialog.showModal();
 }
 
@@ -2814,11 +2857,15 @@ function handleRoleWork(event) {
 }
 
 function handleRoleConfirmations() {
+  if (dialog.open) closeDetailDialog();
   activateView("employees");
-  queueMicrotask(() => content.querySelector("#confirmation-pending-panel")?.scrollIntoView({
-    behavior: "smooth",
-    block: "start",
-  }));
+  queueMicrotask(() => {
+    content.querySelector("#confirmation-pending-panel")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+    showNextConfirmation();
+  });
 }
 
 function memoryTimestamp(date, endOfDay = false) {
@@ -3350,6 +3397,7 @@ function showDetail(item) {
         ? announcementDetailMarkup(item.title)
         : `<h2>${escapeHtml(item.title)}</h2>`}
       ${dingtalkDetailMarkup(item)}
+      ${prLifecycleStatusMarkup(item)}
       ${brainAssessment(item)}
       ${githubItemDetailMarkup(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
@@ -3616,20 +3664,30 @@ function reviewEventLabel(value) {
   }[value] || value || "未知动作";
 }
 
-function reviewFollowUpLabel(value) {
-  return {
-    APPROVE: "默认交给测试工程师验证；测试通过后由合并负责人继续。不会自动合并。",
-    REQUEST_CHANGES: "默认交给开发工程师修改并推送；出现新 Head 后，PR 工程师重新审查。",
-    COMMENT: "默认交给 PR 工程师继续跟进；该动作不会改变批准或合并状态。",
-  }[value] || "由 PR 作者或相关负责人继续推进。";
+function reviewHandoffPullRequest(item) {
+  const target = item?.display?.payload?.target || item?.target || {};
+  const match = /^([^#]+)#([1-9]\d*)$/.exec(target.resourceId || "");
+  if (!match) return null;
+  const groups = dashboard?.groups || {};
+  return uniqueItems(
+    Object.values(groups).flatMap((value) => Array.isArray(value) ? value : []),
+  ).find((candidate) =>
+    candidate.kind === "pull_request" &&
+    candidate.repo === match[1] &&
+    candidate.number === Number(match[2])
+  ) || null;
 }
 
-function reviewHandoffWorkType(reviewEvent) {
-  return reviewEvent === "APPROVE"
-    ? "testing"
-    : reviewEvent === "REQUEST_CHANGES"
-      ? "development"
-      : "pull_request";
+function reviewHandoffLifecycle(reviewEvent, item) {
+  const reviewIntent = item?.display?.payload?.reviewIntent;
+  return prReviewLifecycleRoute(
+    reviewHandoffPullRequest(item),
+    reviewIntent || reviewEvent,
+  );
+}
+
+function reviewFollowUpLabel(reviewEvent, item) {
+  return reviewHandoffLifecycle(reviewEvent, item).summary;
 }
 
 function reviewHandoffSearchText(item) {
@@ -3641,33 +3699,43 @@ function reviewHandoffSearchText(item) {
   });
 }
 
-function testingOwnerOptions(routing, product, selectedLogin = "") {
+function configuredOwnerOptions(routing, product, selectedLogin = "") {
   return (routing.ownersByProduct[product] || []).map((login, index) =>
     `<option value="${escapeHtml(login)}"${login === selectedLogin || (!selectedLogin && index === 0) ? " selected" : ""}>${escapeHtml(routing.ownerLabel(login))}</option>`
   ).join("");
 }
 
 function reviewHandoffMarkup(reviewEvent, item) {
-  const selected = reviewHandoffWorkType(reviewEvent);
+  const lifecycle = reviewHandoffLifecycle(reviewEvent, item);
+  const selected = lifecycle.workType;
   const option = (value, label) => `<option value="${value}"${selected === value ? " selected" : ""}>${label}</option>`;
-  const routing = testingOwnerRouting(activeConfigurationDocument());
+  const testingRouting = testingOwnerRouting(activeConfigurationDocument());
+  const reviewerRouting = reviewerOwnerRouting(activeConfigurationDocument());
   const product = inferTestingProduct(
     reviewHandoffSearchText(item),
-    routing.products,
+    testingRouting.products,
   );
-  const productOptions = routing.products.map((candidate) =>
-    `<option value="${escapeHtml(candidate)}"${candidate === product ? " selected" : ""}>${escapeHtml(routing.productLabel(candidate))}</option>`
+  const reviewerProduct = inferTestingProduct(
+    reviewHandoffSearchText(item),
+    reviewerRouting.products,
+  );
+  const productOptions = testingRouting.products.map((candidate) =>
+    `<option value="${escapeHtml(candidate)}"${candidate === product ? " selected" : ""}>${escapeHtml(testingRouting.productLabel(candidate))}</option>`
+  ).join("");
+  const reviewerProductOptions = reviewerRouting.products.map((candidate) =>
+    `<option value="${escapeHtml(candidate)}"${candidate === reviewerProduct ? " selected" : ""}>${escapeHtml(reviewerRouting.productLabel(candidate))}</option>`
   ).join("");
   return `<section class="review-handoff">
     <div>
       <strong>发布后立即交接</strong>
-      <small>系统会创建可追踪任务；测试岗位运行验证，具体负责人接收结论并推进验收。</small>
+      <small>${escapeHtml(lifecycle.summary)}</small>
+      <span class="review-lifecycle-badge">${lifecycle.ownership === "self" ? "我的 PR" : lifecycle.ownership === "other" ? "别人的 PR" : "待核对所有权"} · ${escapeHtml(prLifecycleStageLabel(lifecycle.stage))}</span>
     </div>
     <label>下一责任岗位
-      <select data-review-handoff>
+      <select data-review-handoff data-review-responsible-kind="${escapeHtml(lifecycle.responsibleKind)}">
         ${option("testing", "测试工程师 · 验证后交回合并门禁")}
-        ${option("development", "开发工程师 · 修改并推送新 Head")}
-        ${option("pull_request", "PR 工程师 · 继续跟进")}
+        ${option("development", "开发工程师 · 自己修复、测试并推送新 Head")}
+        ${option("pull_request", lifecycle.responsibleKind === "external_reviewer" ? "其他 Reviewer · 外部审核" : "PR 工程师 · 跟踪作者修复并复审")}
         <option value="">不创建下一步任务</option>
       </select>
     </label>
@@ -3676,9 +3744,18 @@ function reviewHandoffMarkup(reviewEvent, item) {
         <select data-review-testing-product>${productOptions}</select>
       </label>
       <label>具体测试负责人
-        <select data-review-testing-person>${testingOwnerOptions(routing, product)}</select>
+        <select data-review-testing-person>${configuredOwnerOptions(testingRouting, product)}</select>
       </label>
       <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。候选账号来自配置中心。</small>
+    </div>
+    <div class="review-testing-owner" data-review-external-owner${lifecycle.responsibleKind === "external_reviewer" ? "" : " hidden"}>
+      <label>版本类型
+        <select data-review-external-product>${reviewerProductOptions}</select>
+      </label>
+      <label>外部 Reviewer
+        <select data-review-external-person>${configuredOwnerOptions(reviewerRouting, reviewerProduct)}</select>
+      </label>
+      <small>将创建绑定该 GitHub 账号的本地跟进任务；不会直接调用 GitHub 的 Request review。对方提出问题后，任务会回到自己的开发闭环。</small>
     </div>
   </section>`;
 }
@@ -3686,17 +3763,31 @@ function reviewHandoffMarkup(reviewEvent, item) {
 function bindReviewHandoffControls(item) {
   const root = confirmationContent.querySelector(".review-handoff");
   if (!root) return;
-  const routing = testingOwnerRouting(activeConfigurationDocument());
+  const testingRouting = testingOwnerRouting(activeConfigurationDocument());
+  const reviewerRouting = reviewerOwnerRouting(activeConfigurationDocument());
   const workType = root.querySelector("[data-review-handoff]");
   const ownerControls = root.querySelector("[data-review-testing-owner]");
   const product = root.querySelector("[data-review-testing-product]");
   const person = root.querySelector("[data-review-testing-person]");
+  const reviewerControls = root.querySelector("[data-review-external-owner]");
+  const reviewerProduct = root.querySelector("[data-review-external-product]");
+  const reviewerPerson = root.querySelector("[data-review-external-person]");
   const updateVisibility = () => {
     ownerControls.hidden = workType.value !== "testing";
+    reviewerControls.hidden = !(
+      workType.value === "pull_request" &&
+      workType.dataset.reviewResponsibleKind === "external_reviewer"
+    );
   };
   workType.addEventListener("change", updateVisibility);
   product.addEventListener("change", () => {
-    person.innerHTML = testingOwnerOptions(routing, product.value);
+    person.innerHTML = configuredOwnerOptions(testingRouting, product.value);
+  });
+  reviewerProduct.addEventListener("change", () => {
+    reviewerPerson.innerHTML = configuredOwnerOptions(
+      reviewerRouting,
+      reviewerProduct.value,
+    );
   });
   updateVisibility();
 }
@@ -3726,14 +3817,15 @@ function mergeMethodLabel(value) {
   }[value] || value || "未知方式";
 }
 
-function pullRequestActionDetailRows(action) {
+function pullRequestActionDetailRows(action, item) {
   const rows = [
     `<dt>动作</dt><dd>${escapeHtml(pullRequestActionLabel(action.type))}</dd>`,
   ];
   if (action.type === "pull_request_review") {
+    const reviewIntent = item?.display?.payload?.reviewIntent;
     rows.push(
-      `<dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}</dd>`,
-      `<dt>发布后由谁推进</dt><dd>${escapeHtml(reviewFollowUpLabel(action.reviewEvent))}</dd>`,
+      `<dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}${reviewIntent && reviewIntent !== action.reviewEvent ? `（内部结论：${escapeHtml(reviewEventLabel(reviewIntent))}）` : ""}</dd>`,
+      `<dt>发布后由谁推进</dt><dd>${escapeHtml(reviewFollowUpLabel(action.reviewEvent, item))}</dd>`,
     );
   } else if (action.type === "pull_request_update_branch") {
     rows.push(
@@ -3804,7 +3896,7 @@ function showGitHubActionConfirmation(entry, remaining) {
         <dt>执行账号</dt><dd>${escapeHtml(actor.accountId || "未指定")}</dd>
         <dt>目标</dt><dd>${pullRequestTargetMarkup(target)}</dd>
         <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
-        ${pullRequestActionDetailRows(action)}
+        ${pullRequestActionDetailRows(action, item)}
       </dl>
       ${action.type === "pull_request_review" ? reviewHandoffMarkup(action.reviewEvent, item) : ""}
       ${pullRequestActionBodyMarkup(action)}
@@ -4425,6 +4517,41 @@ async function submitReviewHandoff(
   return result;
 }
 
+function selectedReviewHandoffPerson(item, workType) {
+  const root = confirmationContent.querySelector(".review-handoff");
+  if (!root) return null;
+  if (workType === "testing") {
+    return {
+      product: root.querySelector("[data-review-testing-product]")?.value || "qt",
+      login: root.querySelector("[data-review-testing-person]")?.value || "",
+    };
+  }
+  if (
+    workType === "pull_request" &&
+    root.querySelector("[data-review-handoff]")?.dataset.reviewResponsibleKind ===
+      "external_reviewer"
+  ) {
+    return {
+      product: root.querySelector("[data-review-external-product]")?.value || "qt",
+      login: root.querySelector("[data-review-external-person]")?.value || "",
+    };
+  }
+  if (
+    workType === "development" &&
+    reviewHandoffLifecycle(
+      (item.display?.payload?.action || item.action)?.reviewEvent,
+      item,
+    ).responsibleKind === "self"
+  ) {
+    const configuration = activeConfigurationDocument();
+    return {
+      product: inferTestingProduct(reviewHandoffSearchText(item)),
+      login: configuration.githubLogin || configuration.githubActions?.actorAccountId || "",
+    };
+  }
+  return null;
+}
+
 async function handleExternalConfirmation(event) {
   const button = event.target.closest("[data-external-operation]");
   if (!button) return;
@@ -4443,12 +4570,10 @@ async function handleExternalConfirmation(event) {
     ? ""
     : confirmationContent.querySelector("[data-review-handoff]")?.value || "";
   const handoffRequestId = handoffWorkType ? crypto.randomUUID() : null;
-  const handoffResponsiblePerson = handoffWorkType === "testing"
-    ? {
-        product: confirmationContent.querySelector("[data-review-testing-product]")?.value || "qt",
-        login: confirmationContent.querySelector("[data-review-testing-person]")?.value || "",
-      }
-    : null;
+  const handoffResponsiblePerson = selectedReviewHandoffPerson(
+    item,
+    handoffWorkType,
+  );
   const submissionOwner = beginExternalConfirmationSubmission();
   if (submissionOwner === null) return;
   try {
@@ -4537,7 +4662,7 @@ async function handleExternalConfirmation(event) {
     );
     if (handoffResult) {
       const personLabel = handoffResponsiblePerson?.login
-        ? `，具体负责人 @${handoffResponsiblePerson.login}`
+        ? `，负责人 @${handoffResponsiblePerson.login}`
         : "";
       outcomeMessage = `${outcomeMessage || "GitHub 已确认发布成功。"} 下一步已分配给 ${handoffResult.assignment?.target?.id || "对应岗位"}${personLabel}，工作项 ${handoffResult.workItemId || "已进入共享台账"}。`;
     } else if (handoffError) {

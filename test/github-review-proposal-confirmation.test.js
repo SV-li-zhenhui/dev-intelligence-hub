@@ -145,6 +145,10 @@ test("self-authored blocking verdicts become explicit COMMENT reviews", () => {
     );
 
     assert.equal(plan.action.reviewEvent, "COMMENT");
+    assert.equal(
+      plan.display.payload.reviewIntent,
+      verdict === "approve" ? "APPROVE" : "REQUEST_CHANGES",
+    );
     assert.notEqual(
       plan.id,
       createGitHubReviewProposalConfirmationPlan(

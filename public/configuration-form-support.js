@@ -673,6 +673,7 @@ function assertWorkCoordination(value, path) {
       "codeActionRoles",
       "configurationChangeRoles",
       "codeOperationsByRole",
+      "reviewOwnersByProduct",
       "testingOwnersByProduct",
       "workspaceByRepository",
     ],
@@ -695,6 +696,15 @@ function assertWorkCoordination(value, path) {
     );
     for (const [product, owners] of Object.entries(value.policy.testingOwnersByProduct)) {
       requireArray(owners, `${policyPath}.testingOwnersByProduct.${product}`);
+    }
+  }
+  if (Object.hasOwn(value.policy, "reviewOwnersByProduct")) {
+    requireRecord(
+      value.policy.reviewOwnersByProduct,
+      `${policyPath}.reviewOwnersByProduct`,
+    );
+    for (const [product, owners] of Object.entries(value.policy.reviewOwnersByProduct)) {
+      requireArray(owners, `${policyPath}.reviewOwnersByProduct.${product}`);
     }
   }
   requireArray(value.policy.githubReviewRoles, `${policyPath}.githubReviewRoles`);

@@ -513,7 +513,9 @@ function assertOwnerRequestSemantics(content) {
     new Set(content.payload.acceptanceCriteria).size !==
       content.payload.acceptanceCriteria.length ||
     (responsiblePerson !== undefined && (
-      content.payload.workType !== "testing" ||
+      !["testing", "pull_request", "development"].includes(
+        content.payload.workType,
+      ) ||
       responsiblePerson === null ||
       typeof responsiblePerson !== "object" ||
       Array.isArray(responsiblePerson) ||

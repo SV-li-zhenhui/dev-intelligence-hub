@@ -6,7 +6,16 @@ export const OWNER_WORK_REQUEST_DEFAULT_RULE_ID =
   "system-owner-request-to-orchestrator";
 export const OWNER_PULL_REQUEST_RULE_ID =
   "system-owner-request-to-pr-engineer";
+export const OWNER_PULL_REQUEST_DEVELOPMENT_RULE_ID =
+  "system-owner-pr-development-to-developer";
+export const OWNER_PULL_REQUEST_TESTING_RULE_ID =
+  "system-owner-pr-testing-to-tester";
 const OWNER_CAPABILITY_ROUTES = Object.freeze([
+  Object.freeze({
+    ruleId: "system-owner-review-to-pr-engineer",
+    workType: "pull_request",
+    roleId: "pr-engineer",
+  }),
   Object.freeze({
     ruleId: "system-owner-development-to-developer",
     workType: "development",
@@ -21,6 +30,23 @@ const OWNER_CAPABILITY_ROUTES = Object.freeze([
     ruleId: "system-owner-requirements-to-analyst",
     workType: "requirements",
     roleId: "requirements-analyst",
+  }),
+]);
+const OWNER_PULL_REQUEST_CAPABILITY_ROUTES = Object.freeze([
+  Object.freeze({
+    ruleId: OWNER_PULL_REQUEST_RULE_ID,
+    workType: "pull_request",
+    roleId: "pr-engineer",
+  }),
+  Object.freeze({
+    ruleId: OWNER_PULL_REQUEST_DEVELOPMENT_RULE_ID,
+    workType: "development",
+    roleId: "developer",
+  }),
+  Object.freeze({
+    ruleId: OWNER_PULL_REQUEST_TESTING_RULE_ID,
+    workType: "testing",
+    roleId: "tester",
   }),
 ]);
 export const OWNER_WORK_REQUEST_TYPES = Object.freeze([
@@ -46,7 +72,11 @@ const REQUEST_KEYS = Object.freeze([
   "acceptanceCriteria",
 ]);
 const PULL_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "pullRequest"]);
-const PERSON_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "responsiblePerson"]);
+const PERSON_PULL_REQUEST_KEYS = Object.freeze([
+  ...REQUEST_KEYS,
+  "pullRequest",
+  "responsiblePerson",
+]);
 const PULL_REQUEST_TARGET_KEYS = Object.freeze(["repository", "number"]);
 const RESPONSIBLE_PERSON_KEYS = Object.freeze(["login", "product"]);
 const REQUEST_ID =
@@ -162,11 +192,13 @@ export function normalizeOwnerWorkRequest(value) {
     value,
     version === 2
       ? PULL_REQUEST_KEYS
-      : version === 3 ? PERSON_REQUEST_KEYS : REQUEST_KEYS,
+      : [3, 4].includes(version)
+        ? PERSON_PULL_REQUEST_KEYS
+        : REQUEST_KEYS,
     "所有者工作请求",
   );
   if (
-    ![1, 2, 3].includes(version) ||
+    ![1, 2, 3, 4].includes(version) ||
     typeof value.requestId !== "string" ||
     !REQUEST_ID.test(value.requestId) ||
     !OWNER_WORK_REQUEST_TYPES.includes(value.workType) ||
@@ -181,6 +213,12 @@ export function normalizeOwnerWorkRequest(value) {
   }
   if (version === 3 && value.workType !== "testing") {
     throw invalid("具体负责人只能绑定测试交接请求");
+  }
+  if (
+    version === 4 &&
+    !["pull_request", "development"].includes(value.workType)
+  ) {
+    throw invalid("具体负责人只能绑定 Review 或开发交接请求");
   }
   const acceptanceCriteria = denseArray(
     value.acceptanceCriteria,
@@ -204,7 +242,7 @@ export function normalizeOwnerWorkRequest(value) {
     ),
     acceptanceCriteria,
   };
-  if (version === 2) {
+  if ([2, 3, 4].includes(version)) {
     exactKeys(value.pullRequest, PULL_REQUEST_TARGET_KEYS, "pullRequest");
     const repository = value.pullRequest.repository;
     const match = typeof repository === "string"
@@ -226,7 +264,7 @@ export function normalizeOwnerWorkRequest(value) {
       number: value.pullRequest.number,
     };
   }
-  if (version === 3) {
+  if ([3, 4].includes(version)) {
     exactKeys(
       value.responsiblePerson,
       RESPONSIBLE_PERSON_KEYS,
@@ -252,7 +290,7 @@ export function normalizeOwnerWorkRequest(value) {
 
 export function createOwnerWorkRequestEvent(requestValue, occurredAt) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (![1, 3].includes(request.schemaVersion)) {
+  if (request.schemaVersion !== 1) {
     throw invalid("PR 推进请求必须先解析可信 Git 目标");
   }
   return normalizeWorkflowEvent({
@@ -273,9 +311,6 @@ export function createOwnerWorkRequestEvent(requestValue, occurredAt) {
       workType: request.workType,
       priority: request.priority,
       acceptanceCriteria: [...request.acceptanceCriteria],
-      ...(request.schemaVersion === 3
-        ? { responsiblePerson: structuredClone(request.responsiblePerson) }
-        : {}),
     },
   });
 }
@@ -286,7 +321,9 @@ export function createOwnerPullRequestEvent(
   occurredAt,
 ) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (request.schemaVersion !== 2) throw invalid("PR 推进请求无效");
+  if (![2, 3, 4].includes(request.schemaVersion)) {
+    throw invalid("PR 推进请求无效");
+  }
   exactKeys(
     resolvedValue,
     ["repository", "number", "title", "state", "gitTarget"],
@@ -327,13 +364,16 @@ export function createOwnerPullRequestEvent(
       state: resolved.state,
       gitTargetAvailable: true,
       gitTarget: structuredClone(resolved.gitTarget),
+      ...([3, 4].includes(request.schemaVersion)
+        ? { responsiblePerson: structuredClone(request.responsiblePerson) }
+        : {}),
     },
   });
 }
 
 export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if ([1, 3].includes(request.schemaVersion)) {
+  if (request.schemaVersion === 1) {
     return JSON.stringify(eventValue) === JSON.stringify(
       createOwnerWorkRequestEvent(request, at),
     );
@@ -358,7 +398,10 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
       event.payload.workType === request.workType &&
       event.payload.priority === request.priority &&
       JSON.stringify(event.payload.acceptanceCriteria) ===
-        JSON.stringify(request.acceptanceCriteria)
+        JSON.stringify(request.acceptanceCriteria) &&
+      (![3, 4].includes(request.schemaVersion) ||
+        JSON.stringify(event.payload.responsiblePerson) ===
+          JSON.stringify(request.responsiblePerson))
     );
   } catch {
     return false;
@@ -368,7 +411,7 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
 export function withOwnerWorkRequestDefaultRoute(definition) {
   const systemRuleIds = new Set([
     OWNER_WORK_REQUEST_DEFAULT_RULE_ID,
-    OWNER_PULL_REQUEST_RULE_ID,
+    ...OWNER_PULL_REQUEST_CAPABILITY_ROUTES.map(({ ruleId }) => ruleId),
     ...OWNER_CAPABILITY_ROUTES.map(({ ruleId }) => ruleId),
   ]);
   const rules = Array.isArray(definition?.rules)
@@ -417,20 +460,32 @@ export function withOwnerWorkRequestDefaultRoute(definition) {
         targets: [{ type: "role", id: "orchestrator" }],
         onMatch: "stop",
       },
-      {
-        id: OWNER_PULL_REQUEST_RULE_ID,
-        source: "root",
-        enabled: true,
-        priority: 10_000,
-        fallback: false,
-        condition: {
-          op: "equals",
-          path: "eventType",
-          value: "pull_request.owner_requested",
-        },
-        targets: [{ type: "role", id: "pr-engineer" }],
-        onMatch: "stop",
-      },
+      ...OWNER_PULL_REQUEST_CAPABILITY_ROUTES.map(
+        ({ ruleId, workType, roleId }) => ({
+          id: ruleId,
+          source: "root",
+          enabled: true,
+          priority: 10_000,
+          fallback: false,
+          condition: {
+            op: "all",
+            conditions: [
+              {
+                op: "equals",
+                path: "eventType",
+                value: "pull_request.owner_requested",
+              },
+              {
+                op: "equals",
+                path: "payload.workType",
+                value: workType,
+              },
+            ],
+          },
+          targets: [{ type: "role", id: roleId }],
+          onMatch: "stop",
+        }),
+      ),
       ...rules,
     ],
   };

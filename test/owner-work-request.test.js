@@ -223,10 +223,28 @@ test("testing handoff preserves a structured GitHub responsible person", () => {
   const normalized = normalizeOwnerWorkRequest(request({
     schemaVersion: 3,
     workType: "testing",
+    pullRequest: { repository: "acme/repo", number: 42 },
     responsiblePerson: { login: "bs-tester", product: "bs" },
   }));
-  const event = createOwnerWorkRequestEvent(
+  const event = createOwnerPullRequestEvent(
     normalized,
+    {
+      repository: "acme/repo",
+      number: 42,
+      title: "PR 42",
+      state: "open",
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "d".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/testing-handoff",
+        headRefOid: "a".repeat(40),
+      },
+    },
     "2026-08-08T01:00:00.000Z",
   );
 
@@ -242,10 +260,66 @@ test("testing handoff preserves a structured GitHub responsible person", () => {
     () => normalizeOwnerWorkRequest(request({
       schemaVersion: 3,
       workType: "development",
+      pullRequest: { repository: "acme/repo", number: 42 },
       responsiblePerson: { login: "bs-tester", product: "bs" },
     })),
     (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
   );
+});
+
+test("review and development handoffs accept a named responsible person", () => {
+  const gitTarget = {
+    schemaVersion: 1,
+    provider: "github",
+    sourceAccountId: "runtime-user",
+    baseRepository: "acme/repo",
+    baseRefName: "main",
+    baseRefOid: "d".repeat(40),
+    headRepository: "contributor/repo",
+    headRefName: "fix/named-handoff",
+    headRefOid: "a".repeat(40),
+  };
+  for (const workType of ["pull_request", "development"]) {
+    const normalized = normalizeOwnerWorkRequest(request({
+      schemaVersion: 4,
+      workType,
+      pullRequest: { repository: "acme/repo", number: 42 },
+      responsiblePerson: { login: "named-owner", product: "qt" },
+    }));
+    const event = createOwnerPullRequestEvent(
+      normalized,
+      {
+        repository: "acme/repo",
+        number: 42,
+        title: "PR 42",
+        state: "open",
+        gitTarget,
+      },
+      "2026-08-08T01:00:00.000Z",
+    );
+
+    assert.deepEqual(normalized.responsiblePerson, {
+      login: "named-owner",
+      product: "qt",
+    });
+    assert.deepEqual(event.payload.responsiblePerson, {
+      login: "named-owner",
+      product: "qt",
+    });
+    const routed = routeWorkflowEvent({
+      event,
+      config: withOwnerWorkRequestDefaultRoute({
+        schemaVersion: 1,
+        enabled: true,
+        maxHops: 8,
+        rules: [],
+      }),
+    });
+    assert.equal(
+      routed.assignments[0].target.id,
+      workType === "development" ? "developer" : "pr-engineer",
+    );
+  }
 });
 
 test("owner capability requests route directly to their fixed least-authority roles", () => {
@@ -467,6 +541,26 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   assert.equal(item.source.scope.kind, "owner_requested");
   assert.equal(item.source.current.event.payload.headRefOid, "a".repeat(40));
   assert.equal(item.source.current.event.payload.state, "open");
+
+  const namedDevelopment = await owner.submit(pullRequest({
+    schemaVersion: 4,
+    requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    workType: "development",
+    responsiblePerson: { login: "runtime-user", product: "qt" },
+  }));
+  assert.equal(resolveCalls, 2);
+  assert.deepEqual(namedDevelopment.assignment.target, {
+    type: "role",
+    id: "developer",
+  });
+  assert.deepEqual(namedDevelopment.request.pullRequest, {
+    repository: "acme/repo",
+    number: 42,
+  });
+  assert.deepEqual(namedDevelopment.request.responsiblePerson, {
+    login: "runtime-user",
+    product: "qt",
+  });
 });
 
 test("restart resumes a staged request after a lost routing response without duplication", async (t) => {

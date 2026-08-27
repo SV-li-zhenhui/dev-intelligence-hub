@@ -103,13 +103,15 @@ function queuePlan(value) {
   return plan;
 }
 
-function confirmationId(proposal, downgradedSelfReview) {
+function confirmationId(proposal, selfReviewVersion) {
   const digest = createHash("sha256")
     .update(proposal.proposalId, "utf8")
     .update("\0", "utf8")
     .update(proposal.contentDigest, "utf8")
     .update(
-      downgradedSelfReview ? "\0self-authored-comment-v1" : "",
+      selfReviewVersion === 2
+        ? "\0self-authored-lifecycle-v2"
+        : selfReviewVersion === 1 ? "\0self-authored-comment-v1" : "",
       "utf8",
     )
     .digest("hex");
@@ -118,9 +120,18 @@ function confirmationId(proposal, downgradedSelfReview) {
 
 export function createGitHubReviewProposalConfirmationPlan(
   value,
-  { actorAccountId, legacyRecovery = false, selfAuthored = false } = {},
+  {
+    actorAccountId,
+    legacyRecovery = false,
+    selfAuthored = false,
+    legacySelfAuthored = false,
+  } = {},
 ) {
-  if (typeof selfAuthored !== "boolean") {
+  if (
+    typeof selfAuthored !== "boolean" ||
+    typeof legacySelfAuthored !== "boolean" ||
+    (selfAuthored && legacySelfAuthored)
+  ) {
     throw invalid("selfAuthored 无效");
   }
   const proposal = normalizedStoredProposal(value);
@@ -210,8 +221,9 @@ export function createGitHubReviewProposalConfirmationPlan(
   }
   const proposedReviewEvent = REVIEW_EVENTS[payload.verdict];
   if (!proposedReviewEvent) throw invalid("payload.verdict 无效");
+  const selfReview = selfAuthored || legacySelfAuthored;
   const downgradedSelfReview =
-    selfAuthored && proposedReviewEvent !== "COMMENT";
+    selfReview && proposedReviewEvent !== "COMMENT";
   const reviewEvent = downgradedSelfReview ? "COMMENT" : proposedReviewEvent;
   const body = text(payload.body, "payload.body", 16 * 1_024);
   const summary = text(payload.summary, "payload.summary", 2_048);
@@ -251,7 +263,10 @@ export function createGitHubReviewProposalConfirmationPlan(
     : { type: "pull_request_review", reviewEvent, body };
 
   return queuePlan({
-    id: confirmationId(proposal, downgradedSelfReview),
+    id: confirmationId(
+      proposal,
+      selfReview ? legacySelfAuthored ? 1 : 2 : 0,
+    ),
     kind: "github.work-proposal-review",
     requestedBy: proposal.requestedBy,
     actor,
@@ -264,9 +279,13 @@ export function createGitHubReviewProposalConfirmationPlan(
         ? "确认并以 COMMENT 发布到 GitHub"
         : "确认并发布到 GitHub",
       evidence: displayEvidence,
-      payload: inputBinding.schemaVersion === 2
-        ? { actor, target, action }
-        : { actor, target, action, inputBinding },
+      payload: {
+        actor,
+        target,
+        action,
+        ...(inputBinding.schemaVersion === 2 ? {} : { inputBinding }),
+        ...(selfAuthored ? { reviewIntent: proposedReviewEvent } : {}),
+      },
     },
   });
 }

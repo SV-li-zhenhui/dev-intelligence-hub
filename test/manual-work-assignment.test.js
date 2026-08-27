@@ -73,8 +73,45 @@ test("an approved PR testing handoff binds the configured GitHub test owner", ()
     login: "qt-tester-primary",
     product: "qt",
   });
+  assert.deepEqual(request.pullRequest, {
+    repository: pullRequest.repo,
+    number: pullRequest.number,
+  });
   assert.match(request.title, /负责人 @qt-tester-primary/);
   assert.match(request.description, /指定测试负责人/);
+});
+
+test("review and self-fix handoffs preserve their named responsible person", () => {
+  const reviewer = ownerWorkRequestForItem(pullRequest, {
+    workType: "pull_request",
+    priority: "high",
+    requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    responsiblePerson: { login: "qt-reviewer", product: "qt" },
+  });
+  const developer = ownerWorkRequestForItem(pullRequest, {
+    workType: "development",
+    priority: "high",
+    requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    responsiblePerson: { login: "local-owner", product: "qt" },
+  });
+
+  assert.equal(reviewer.schemaVersion, 4);
+  assert.deepEqual(reviewer.responsiblePerson, {
+    login: "qt-reviewer",
+    product: "qt",
+  });
+  assert.deepEqual(reviewer.pullRequest, {
+    repository: pullRequest.repo,
+    number: pullRequest.number,
+  });
+  assert.ok(
+    reviewer.acceptanceCriteria.includes(
+      "PR Review / 推进结果明确交付给 @qt-reviewer",
+    ),
+  );
+  assert.equal(developer.schemaVersion, 4);
+  assert.deepEqual(developer.pullRequest, reviewer.pullRequest);
+  assert.match(developer.description, /指定负责人：@local-owner/);
 });
 
 test("assignment result replaces the form with its durable work item", () => {

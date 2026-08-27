@@ -4430,6 +4430,20 @@ test("owner work request HTTP API is same-origin, structured, and read-back capa
       });
       assert.equal(prResponse.status, 200);
 
+      const namedPrHandoff = {
+        ...explicitPr,
+        schemaVersion: 4,
+        requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        responsiblePerson: { login: "named-reviewer", product: "qt" },
+      };
+      const namedPrResponse = await request(server, {
+        method: "POST",
+        path: "/api/work/requests",
+        headers: trustedHeaders,
+        body: JSON.stringify(namedPrHandoff),
+      });
+      assert.equal(namedPrResponse.status, 200);
+
       const listed = await request(server, {
         path: `/api/work/requests?limit=7&cursor=${id}`,
       });
@@ -4442,6 +4456,7 @@ test("owner work request HTTP API is same-origin, structured, and read-back capa
         { operation: "submit", input },
         { operation: "submit", input },
         { operation: "submit", input: explicitPr },
+        { operation: "submit", input: namedPrHandoff },
         { operation: "list", options: { limit: "7", cursor: id } },
         { operation: "get", requestId: id },
       ]);

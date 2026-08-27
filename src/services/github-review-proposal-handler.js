@@ -332,7 +332,7 @@ export class GitHubReviewProposalHandler {
       initialPlan.action.inputBinding ?? initialPlan.display.payload.inputBinding;
     const authority = await this.#currentAuthority(inputBinding);
     const selfAuthored =
-      authority?.author !== null &&
+      typeof authority?.author === "string" &&
       authority?.author.toLowerCase() === this.#actorAccountId.toLowerCase();
     const plan = selfAuthored
       ? createGitHubReviewProposalConfirmationPlan(input.proposal, {
@@ -341,12 +341,28 @@ export class GitHubReviewProposalHandler {
           selfAuthored: true,
         })
       : initialPlan;
+    const legacySelfPlan = selfAuthored
+      ? createGitHubReviewProposalConfirmationPlan(input.proposal, {
+          actorAccountId: this.#actorAccountId,
+          legacyRecovery: true,
+          legacySelfAuthored: true,
+        })
+      : null;
     const expected = normalizeConfirmationPlan(plan);
     const initialExpected = normalizeConfirmationPlan(initialPlan);
-    const migratesLegacySelfReview =
+    const legacySelfExpected = legacySelfPlan === null
+      ? null
+      : normalizeConfirmationPlan(legacySelfPlan);
+    const legacyMigrationExpected =
       input.downstreamRef !== null &&
-      plan.id !== initialPlan.id &&
-      input.downstreamRef === initialPlan.id;
+      plan.id !== input.downstreamRef
+        ? input.downstreamRef === initialPlan.id
+          ? initialExpected
+          : input.downstreamRef === legacySelfPlan?.id
+            ? legacySelfExpected
+            : null
+        : null;
+    const migratesLegacySelfReview = legacyMigrationExpected !== null;
     const legacyInputBinding =
       inputBinding !== null &&
       inputBinding !== undefined &&
@@ -363,7 +379,7 @@ export class GitHubReviewProposalHandler {
       try {
         item = normalizeConfirmationItem(
           await this.#get(input.downstreamRef),
-          migratesLegacySelfReview ? initialExpected : expected,
+          migratesLegacySelfReview ? legacyMigrationExpected : expected,
         );
       } catch (error) {
         if (!legacyInputBinding || error?.code !== "CONFIRMATION_NOT_FOUND") {
@@ -384,14 +400,14 @@ export class GitHubReviewProposalHandler {
       }
       return this.#invalidateChangedAuthorization(
         item,
-        migratesLegacySelfReview ? initialExpected : expected,
+        migratesLegacySelfReview ? legacyMigrationExpected : expected,
         input.proposal,
       );
     }
     if (migratesLegacySelfReview) {
       return this.#migrateLegacySelfReview(
         item,
-        initialExpected,
+        legacyMigrationExpected,
         plan,
         expected,
         input.proposal,

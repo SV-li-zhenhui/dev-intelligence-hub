@@ -81,6 +81,22 @@ test("PR engineer work exposes the review stage and next owner", () => {
   }
 });
 
+test("PR employee pending work has a direct, explained confirmation entry", () => {
+  for (const value of [
+    "处理待确认（",
+    "需要你确认什么",
+    "data-pr-job-confirmation",
+    "处理下一项确认",
+    "接受或驳回都只记录本地结论",
+  ]) {
+    assert.equal(appSource.includes(value), true, value);
+  }
+  assert.match(
+    appSource,
+    /function handleRoleConfirmations\(\)[\s\S]*closeDetailDialog\(\)[\s\S]*showNextConfirmation\(\)/,
+  );
+});
+
 test("main loading applies dashboard and confirmations independently of the employee roster", () => {
   const loadSource = functionSource("load");
   const mainRequests = loadSource.slice(

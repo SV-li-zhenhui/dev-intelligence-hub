@@ -323,7 +323,7 @@ export class OwnerWorkRequestService {
         );
       }
       const createdAt = this.#now();
-      const event = request.schemaVersion === 2
+      const event = [2, 3, 4].includes(request.schemaVersion)
         ? await this.#createPullRequestEvent(request, createdAt)
         : createOwnerWorkRequestEvent(request, createdAt);
       await this.#preflight(event);

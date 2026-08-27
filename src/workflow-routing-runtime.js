@@ -1,5 +1,6 @@
 import { createWorkflowRouter, normalizeWorkflowRoutingConfig } from "./domain/workflow-router.js";
 import { withOwnerWorkRequestDefaultRoute } from "./domain/owner-work-request.js";
+import { withPrLifecycleRoutes } from "./domain/pr-lifecycle-routing.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { WorkflowRoutingService } from "./services/workflow-routing-service.js";
 
@@ -35,7 +36,9 @@ export async function createWorkflowRoutingRuntime(
     config.workflowRouting,
   );
   const definition = normalizeWorkflowRoutingConfig(
-    withOwnerWorkRequestDefaultRoute(configuredDefinition),
+    withOwnerWorkRequestDefaultRoute(
+      withPrLifecycleRoutes(configuredDefinition),
+    ),
   );
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");

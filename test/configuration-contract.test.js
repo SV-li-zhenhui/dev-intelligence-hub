@@ -448,6 +448,24 @@ test("configuration change authority requires the same explicit role permission 
   assertInvalid(legacyReviewer);
 });
 
+test("work coordination accepts configurable external reviewers by product", () => {
+  const configured = document();
+  configured.workCoordination.policy.reviewOwnersByProduct = {
+    qt: ["qt-reviewer"],
+    bs: ["bs-reviewer-primary", "bs-reviewer-secondary"],
+  };
+
+  assert.deepEqual(
+    normalizeConfigurationDocument(configured).workCoordination.policy
+      .reviewOwnersByProduct,
+    configured.workCoordination.policy.reviewOwnersByProduct,
+  );
+
+  const invalid = structuredClone(configured);
+  invalid.workCoordination.policy.reviewOwnersByProduct.qt = ["bad login"];
+  assertInvalid(invalid);
+});
+
 test("Git Head snapshot configuration is opt-in and preserves legacy workspaces", () => {
   const legacy = document();
   legacy.codeExecutor = {

@@ -253,6 +253,35 @@ test("a pending legacy self-review is invalidated and replaced by COMMENT", asyn
   });
 });
 
+test("a pending v1 self-comment is migrated to the lifecycle-bound confirmation", async () => {
+  const producer = new FakeConfirmationProducer();
+  const legacyPlan = createGitHubReviewProposalConfirmationPlan(
+    handlerInput().proposal,
+    {
+      actorAccountId: "review-account",
+      legacyRecovery: true,
+      legacySelfAuthored: true,
+    },
+  );
+  await producer.enqueue(legacyPlan);
+  producer.enqueueCalls.length = 0;
+
+  const transition = await handler(producer, {
+    pullRequestContextReader: acceptingContextReader("review-account"),
+  }).handle(handlerInput({
+    status: "waiting_confirmation",
+    downstreamRef: legacyPlan.id,
+  }));
+
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(
+    producer.enqueueCalls[0].display.payload.reviewIntent,
+    "REQUEST_CHANGES",
+  );
+  assert.equal(transition.downstreamRef, legacyPlan.id);
+});
+
 test("a bound proposal polls get without enqueuing another action", async () => {
   const producer = new FakeConfirmationProducer();
   await handler(producer).handle(handlerInput());

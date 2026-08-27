@@ -26,6 +26,11 @@ import {
   PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
 } from "../src/domain/pull-request-scope-lifecycle.js";
 import {
+  AUTHORED_PR_APPROVED_RULE_ID,
+  AUTHORED_PR_SELF_FIX_RULE_ID,
+  REVIEWED_PR_APPROVED_RULE_ID,
+} from "../src/domain/pr-lifecycle-routing.js";
+import {
   createLegacyWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../src/domain/work-graph-memory-event.js";
@@ -1150,6 +1155,144 @@ test("an explicit owner PR source survives automatic left-scope and never reuses
   assert.deepEqual(
     await fixture.service.verifyPullRequestExecutionBinding(ownerBinding),
     ownerBinding,
+  );
+});
+
+test("owner-requested PR work reaches developer and tester with the exact PR source", async () => {
+  for (const roleId of ["developer", "tester"]) {
+    const assignment = ownerRequestedPrAssignment(1);
+    assignment.assignment.target = { type: "role", id: roleId };
+    assignment.assignment.reason = `owner-pr-${roleId}`;
+    const fixture = await createFixture({ records: [assignment] });
+
+    await fixture.service.intake({ limit: 10 });
+
+    const [item] = (await fixture.service.listItems({ limit: 10 })).items;
+    assert.deepEqual(
+      {
+        roleId: item.currentTarget.id,
+        targetRoleId: item.source.identity.targetRoleId,
+        headRefOid: item.source.current.headRefOid,
+        scopeKind: item.source.scope.kind,
+      },
+      {
+        roleId,
+        targetRoleId: roleId,
+        headRefOid: PR_HEAD_A,
+        scopeKind: "owner_requested",
+      },
+    );
+  }
+});
+
+test("trusted authored PR lifecycle work reaches its developer and tester", async () => {
+  const cases = [
+    {
+      roleId: "developer",
+      ruleId: AUTHORED_PR_SELF_FIX_RULE_ID,
+      payload: {
+        relation: "authored",
+        actionState: "action_now",
+        nextAction: "address_review",
+      },
+    },
+    {
+      roleId: "tester",
+      ruleId: AUTHORED_PR_APPROVED_RULE_ID,
+      payload: {
+        relation: "authored",
+        actionState: "waiting_other",
+        nextAction: "wait_merge",
+        reviewDecision: "APPROVED",
+      },
+    },
+    {
+      roleId: "tester",
+      ruleId: REVIEWED_PR_APPROVED_RULE_ID,
+      payload: {
+        relation: "review_requested",
+        actionState: "waiting_other",
+        nextAction: "wait_merge",
+        myReviewState: "APPROVED",
+      },
+    },
+  ];
+  for (const { roleId, ruleId, payload } of cases) {
+    const assignment = prAssignment(1, { gitFacts: payload });
+    assignment.assignment.target = { type: "role", id: roleId };
+    assignment.assignment.ruleId = ruleId;
+    assignment.assignment.reason = `authored-pr-${roleId}`;
+    const fixture = await createFixture({ records: [assignment] });
+
+    await fixture.service.intake({ limit: 10 });
+
+    const [item] = (await fixture.service.listItems({ limit: 10 })).items;
+    assert.equal(item.currentTarget.id, roleId);
+    assert.equal(item.source.identity.targetRoleId, roleId);
+    assert.equal(item.source.current.headRefOid, PR_HEAD_A);
+  }
+});
+
+test("an authored PR can hand off from review to self-fix and then testing", async () => {
+  const review = prAssignment(1, {
+    gitFacts: {
+      relation: "authored",
+      actionState: "waiting_other",
+      nextAction: "wait_review",
+    },
+  });
+  const fixture = await createFixture({ records: [review] });
+  await fixture.service.intake({ limit: 10 });
+
+  const selfFix = prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: {
+      relation: "authored",
+      actionState: "action_now",
+      nextAction: "address_review",
+      reviewDecision: "CHANGES_REQUESTED",
+    },
+  });
+  selfFix.assignment.target = { type: "role", id: "developer" };
+  selfFix.assignment.ruleId = AUTHORED_PR_SELF_FIX_RULE_ID;
+  selfFix.assignment.reason = "authored-pr-self-fix";
+  fixture.source.records.push(selfFix);
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake({ limit: 10 });
+
+  const testing = prAssignment(3, {
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    gitFacts: {
+      ...prGitFacts(PR_HEAD_B, { headRefName: "fix/review-feedback" }),
+      relation: "authored",
+      actionState: "waiting_other",
+      nextAction: "wait_merge",
+      reviewDecision: "APPROVED",
+    },
+  });
+  testing.assignment.target = { type: "role", id: "tester" };
+  testing.assignment.ruleId = AUTHORED_PR_APPROVED_RULE_ID;
+  testing.assignment.reason = "authored-pr-approved";
+  fixture.source.records.push(testing);
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake({ limit: 10 });
+
+  const roots = (await fixture.service.listItems({ limit: 10 })).items.filter(
+    (item) => item.kind === "source_root",
+  );
+  const active = roots.filter((item) => item.status === "queued");
+  assert.equal(active.length, 1);
+  assert.equal(active[0].currentTarget.id, "tester");
+  assert.equal(active[0].source.current.headRefOid, PR_HEAD_B);
+  assert.equal(
+    roots.filter(
+      (item) =>
+        item.status === "blocked" &&
+        item.statusReason === "pr_source_cross_root_cutover_retired",
+    ).length,
+    2,
   );
 });
 

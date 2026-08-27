@@ -82,7 +82,7 @@ export function ownerWorkRequestForItem(
       ? `https://github.com/${item.repo}/${item.kind === "pull_request" ? "pull" : "issues"}/${item.number}`
       : ""
   );
-  const assignedLogin = workType === "testing" && responsiblePerson?.login
+  const assignedLogin = responsiblePerson?.login
     ? String(responsiblePerson.login)
     : "";
   const title = truncateUtf8(
@@ -93,13 +93,16 @@ export function ownerWorkRequestForItem(
     `请处理 GitHub ${item.kind === "pull_request" ? "PR" : "Issue"}：${item.repo || ""} #${item.number || ""}。`,
     source ? `原始地址：${source}` : "",
     item.summary ? `当前摘要：${item.summary}` : `当前标题：${item.title || ""}`,
-    assignedLogin ? `指定测试负责人：@${assignedLogin}（${responsiblePerson.product || "未分类版本"}）。` : "",
+    assignedLogin
+      ? `${workType === "testing" ? "指定测试负责人" : "指定负责人"}：@${assignedLogin}（${responsiblePerson.product || "未分类版本"}）。`
+      : "",
     "基于来源的最新事实完成所选交付，并在共享任务图中留下可验证结果。",
   ].filter(Boolean).join("\n"), 12 * 1024);
   const request = {
-    schemaVersion: item.kind === "pull_request" && workType === "pull_request"
-      ? 2
-      : assignedLogin ? 3 : 1,
+    schemaVersion:
+      item.kind === "pull_request" && workType === "pull_request" && !assignedLogin
+        ? 2
+        : assignedLogin ? workType === "testing" ? 3 : 4 : 1,
     requestId,
     workType,
     priority,
@@ -108,13 +111,15 @@ export function ownerWorkRequestForItem(
     acceptanceCriteria: [
       "核对来源 GitHub 项目的最新状态与上下文",
       `提交可验证的${WORK_TYPE_LABELS[workType]}结果`,
-      ...(assignedLogin ? [`测试结论明确交付给 @${assignedLogin}`] : []),
+      ...(assignedLogin
+        ? [`${WORK_TYPE_LABELS[workType]}结果明确交付给 @${assignedLogin}`]
+        : []),
     ],
   };
-  if (request.schemaVersion === 2) {
+  if ([2, 3, 4].includes(request.schemaVersion)) {
     request.pullRequest = { repository: item.repo, number: item.number };
   }
-  if (request.schemaVersion === 3) {
+  if ([3, 4].includes(request.schemaVersion)) {
     request.responsiblePerson = {
       login: assignedLogin,
       product: String(responsiblePerson.product || "general"),

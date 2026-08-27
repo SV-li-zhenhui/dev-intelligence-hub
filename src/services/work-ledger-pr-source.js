@@ -13,6 +13,11 @@ import {
   isTrustedPullRequestScopeLifecycleAssignment,
 } from "../domain/pull-request-scope-lifecycle.js";
 import {
+  AUTHORED_PR_APPROVED_RULE_ID,
+  AUTHORED_PR_SELF_FIX_RULE_ID,
+  REVIEWED_PR_APPROVED_RULE_ID,
+} from "../domain/pr-lifecycle-routing.js";
+import {
   SHA256_PATTERN,
   boundedLedgerString,
   canonicalLedgerValue,
@@ -56,6 +61,50 @@ const IDENTITY_KEYS = [
   "pullRequestNumber",
   "targetRoleId",
 ];
+const OWNER_REQUESTED_PR_TARGET_ROLES = new Set([
+  "pr-engineer",
+  "developer",
+  "tester",
+]);
+const AUTHORED_PR_SELF_FIX_ACTIONS = new Set([
+  "address_review",
+  "fix_ci",
+  "resolve_conflict",
+  "continue_draft",
+]);
+
+function isTrustedPrRoleAssignment(assignment, event) {
+  if (
+    event?.source?.provider !== "github" ||
+    !["authored", "review_requested"].includes(event?.payload?.relation) ||
+    assignment?.target?.type !== "role"
+  ) {
+    return false;
+  }
+  if (
+    assignment.ruleId === AUTHORED_PR_SELF_FIX_RULE_ID &&
+    assignment.target.id === "developer" &&
+    event.payload.relation === "authored"
+  ) {
+    return event.payload.actionState === "action_now" &&
+      AUTHORED_PR_SELF_FIX_ACTIONS.has(event.payload.nextAction);
+  }
+  const authoredApproved =
+    assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID &&
+    assignment.target.id === "tester" &&
+    event.payload.relation === "authored" &&
+    event.payload.actionState === "waiting_other" &&
+    event.payload.nextAction === "wait_merge" &&
+    event.payload.reviewDecision === "APPROVED";
+  const reviewedApproved =
+    assignment.ruleId === REVIEWED_PR_APPROVED_RULE_ID &&
+    assignment.target.id === "tester" &&
+    event.payload.relation === "review_requested" &&
+    event.payload.actionState === "waiting_other" &&
+    event.payload.nextAction === "wait_merge" &&
+    event.payload.myReviewState === "APPROVED";
+  return authoredApproved || reviewedApproved;
+}
 const CURRENT_KEYS = [
   "sourceSequence",
   "eventId",
@@ -293,9 +342,16 @@ function identityFor(assignment, event, trustedLifecycle = false) {
   } catch {
     return null;
   }
+  const ownerRequested =
+    event.source.provider === "local-owner" &&
+    event.eventType === "pull_request.owner_requested";
+  const allowedRoleTarget =
+    target.type === "role" &&
+    (target.id === "pr-engineer" ||
+      (ownerRequested && OWNER_REQUESTED_PR_TARGET_ROLES.has(target.id)) ||
+      isTrustedPrRoleAssignment(assignment, event));
   if (
-    (!trustedLifecycle &&
-      (target.type !== "role" || target.id !== "pr-engineer")) ||
+    (!trustedLifecycle && !allowedRoleTarget) ||
     !event.eventType.startsWith("pull_request.") ||
     !(
       event.source.provider === "github" ||
@@ -314,7 +370,7 @@ function identityFor(assignment, event, trustedLifecycle = false) {
       event.subject.number,
       "pullRequestNumber",
     ),
-    targetRoleId: "pr-engineer",
+    targetRoleId: trustedLifecycle ? "pr-engineer" : target.id,
   };
 }
 
@@ -328,18 +384,39 @@ function normalizedEnvelope(value) {
   const rawEvent = canonical(value.event, "event");
   const ordinaryTarget = assignment.target?.type === "role" &&
     assignment.target?.id === "pr-engineer";
+  const ownerRequestedTarget =
+    assignment.target?.type === "role" &&
+    OWNER_REQUESTED_PR_TARGET_ROLES.has(assignment.target?.id) &&
+    rawEvent.source?.provider === "local-owner" &&
+    rawEvent.eventType === "pull_request.owner_requested";
+  const protectedRoleTarget =
+    assignment.target?.type === "role" &&
+    ((assignment.ruleId === AUTHORED_PR_SELF_FIX_RULE_ID &&
+      assignment.target.id === "developer") ||
+      (assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID &&
+        assignment.target.id === "tester") ||
+      (assignment.ruleId === REVIEWED_PR_APPROVED_RULE_ID &&
+        assignment.target.id === "tester"));
   const lifecycleTarget = assignment.target?.type === "node" &&
     assignment.target?.id === "system-pull-request-scope-lifecycle" &&
     assignment.ruleId === "system-pull-request-scope-lifecycle";
   if (typeof rawEvent.eventType !== "string" ||
       !rawEvent.eventType.startsWith("pull_request.") ||
-      (!ordinaryTarget && !lifecycleTarget)) {
+      (!ordinaryTarget &&
+        !ownerRequestedTarget &&
+        !protectedRoleTarget &&
+        !lifecycleTarget)) {
     return null;
   }
   const event = storedEvent(rawEvent);
   const trustedLifecycle =
     isTrustedPullRequestScopeLifecycleAssignment(assignment, event);
-  if (!trustedLifecycle && !ordinaryTarget) {
+  if (
+    !trustedLifecycle &&
+    !ordinaryTarget &&
+    !ownerRequestedTarget &&
+    !isTrustedPrRoleAssignment(assignment, event)
+  ) {
     return null;
   }
   const identity = identityFor(assignment, event, trustedLifecycle);
