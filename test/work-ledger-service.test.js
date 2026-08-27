@@ -573,10 +573,10 @@ test("role workloads expose exact counts and bounded recent task summaries", asy
     ],
   );
   assert.deepEqual(
-    workloads.items[0].tasks.map(({ title, status }) => ({ title, status })),
+    workloads.items[0].tasks.map(({ title, status, statusReason }) => ({ title, status, statusReason })),
     [
-      { title: "Work 3", status: "queued" },
-      { title: "Work 1", status: "queued" },
+      { title: "Work 3", status: "queued", statusReason: null },
+      { title: "Work 1", status: "queued", statusReason: null },
     ],
   );
   assert.deepEqual(

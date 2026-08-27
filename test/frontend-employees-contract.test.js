@@ -68,6 +68,19 @@ test("employee cards expose workload counts, current tasks, and a role ledger li
   assert.match(appSource, /activateView\("work"\)/);
 });
 
+test("PR engineer work exposes the review stage and next owner", () => {
+  for (const value of [
+    "PR Review 工作方式",
+    "Approve 不会自动发布，也不会自动合并",
+    "Review 建议已生成，等待你确认发布",
+    "下一责任人：",
+    "data-role-confirmations",
+    "处理确认队列",
+  ]) {
+    assert.equal(appSource.includes(value), true, value);
+  }
+});
+
 test("main loading applies dashboard and confirmations independently of the employee roster", () => {
   const loadSource = functionSource("load");
   const mainRequests = loadSource.slice(

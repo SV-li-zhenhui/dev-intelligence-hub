@@ -468,6 +468,7 @@ export class WorkLedgerService {
         retainRecentRoleTask(workload.tasks, {
           itemId: item.itemId,
           status: item.status,
+          statusReason: item.statusReason,
           title: workloadTitle(item),
           updatedAt: item.updatedAt,
           subject: workloadSubject(item),

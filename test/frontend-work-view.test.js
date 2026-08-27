@@ -255,6 +255,26 @@ test("work view escapes records and clearly displays safety posture", () => {
   assert.equal(escapeWorkHtml('"<&'), "&quot;&lt;&amp;");
 });
 
+test("PR engineer rows explain the current review stage and next owner", () => {
+  const html = renderWorkView(workProjectionState([{
+    assignmentId: "assignment-review",
+    status: "waiting_external",
+    statusReason: "intent_delivered",
+    currentTarget: { type: "role", id: "pr-engineer" },
+    event: {
+      eventType: "pull_request.status",
+      subject: { repository: "SVisions/OCT-Software", number: 24222 },
+    },
+    attempt: 1,
+    updatedAt: "2026-08-27T02:10:02.000Z",
+  }]));
+
+  assert.match(html, /第 4\/5 步/);
+  assert.match(html, /Review 建议已生成，等待你确认发布/);
+  assert.match(html, /下一责任人：你/);
+  assert.match(html, /台账原因：intent_delivered/);
+});
+
 test("owner retry renders only for the exact fail-closed public projection", () => {
   const eligibleHtml = renderWorkView(
     workProjectionState([eligibleOwnerRetryItem()]),

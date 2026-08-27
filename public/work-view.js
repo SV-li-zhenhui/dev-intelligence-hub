@@ -48,6 +48,21 @@ function targetLabel(target = {}) {
   return `${type} · ${target.id || "未指定"}`;
 }
 
+function reviewStage(item) {
+  if (!["pr-engineer", "pr-reviewer"].includes(item?.currentTarget?.id)) return null;
+  return {
+    queued: ["第 1/5 步", "已分配，等待领取", "PR 工程师"],
+    working: ["第 2/5 步", "正在审查当前 Head", "PR 工程师"],
+    dispatch_pending: ["第 3/5 步", "正在生成 Review 建议", "系统"],
+    waiting_user: ["第 4/5 步", "等待你补充判断", "你"],
+    waiting_condition: ["第 4/5 步", "等待检查或外部条件", "条件满足后由 PR 工程师继续"],
+    waiting_external: ["第 4/5 步", "Review 建议已生成，等待你确认发布", "你"],
+    retry_wait: ["第 3/5 步", "等待自动重试", "PR 工程师"],
+    blocked: ["链路受阻", "需要处理阻塞原因", "你或任务负责人"],
+    completed: ["第 5/5 步", "Review 已发布或任务已完成", "下一棒岗位 / 合并负责人"],
+  }[item.status] || null;
+}
+
 function subjectLabel(item) {
   const subject = item?.event?.subject || {};
   if (subject.repository && subject.number) {
@@ -367,18 +382,22 @@ function itemRows(items, now, state) {
     binding: bindings[index],
     item: workRowProjection(item),
   }));
-  return `<div class="work-list">${rows.map(({ binding, item }) => `
+  return `<div class="work-list">${rows.map(({ binding, item }) => {
+    const stage = reviewStage(item);
+    return `
     <article class="work-row">
       <div class="work-row-heading">
         <strong>${escapeWorkHtml(subjectLabel(item))}</strong>
         <span class="status-pill status-${escapeWorkHtml(item.status)}">${escapeWorkHtml(statusLabel(item.status))}</span>
       </div>
       <p>${escapeWorkHtml(targetLabel(item.currentTarget))}</p>
+      ${stage ? `<p class="work-row-stage"><strong>${escapeWorkHtml(stage[0])} · ${escapeWorkHtml(stage[1])}</strong><small>下一责任人：${escapeWorkHtml(stage[2])}</small></p>` : ""}
       <span>${escapeWorkHtml(item.event?.eventType || item.kind || "unknown")} · 尝试 ${escapeWorkHtml(item.attempt ?? 0)} 次 · ${relativeTime(item.updatedAt, now)}</span>
-      ${item.statusReason ? `<small>${escapeWorkHtml(item.statusReason)}</small>` : ""}
+      ${item.statusReason ? `<small>台账原因：${escapeWorkHtml(item.statusReason)}</small>` : ""}
       ${item.decisionContext ? `<small>已绑定继续处理上下文 · ${escapeWorkHtml(item.decisionContext.kind || "context")}</small>` : ""}
       ${ownerDecisionRetryMarkup(binding, state)}
-    </article>`).join("")}</div>`;
+    </article>`;
+  }).join("")}</div>`;
 }
 
 function timelineRows(entries, now) {

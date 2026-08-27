@@ -480,6 +480,13 @@ h1 {
   font-size: 10px;
 }
 
+.employee-role-workload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .employee-role-workload-counts {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -530,12 +537,97 @@ h1 {
 }
 
 .employee-role-task-list a,
-.employee-role-task-list span:last-child {
+.employee-role-task-copy > span {
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.employee-role-task-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.employee-role-task-copy small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.employee-role-task-diagnostic {
+  color: var(--faint) !important;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.review-flow-section {
+  padding-bottom: 4px;
+}
+
+.review-flow {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.review-flow li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+  padding: 13px;
+  border-left: 1px solid var(--line);
+}
+
+.review-flow li:first-child {
+  border-left: 0;
+}
+
+.review-flow li > span {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  color: var(--surface);
+  background: var(--green);
+  border-radius: 50%;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.review-flow div {
+  display: grid;
+  gap: 4px;
+}
+
+.review-flow strong {
+  font-size: 11px;
+}
+
+.review-flow small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.work-row-stage {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  color: var(--ink) !important;
+  background: var(--green-soft);
+  border-left: 3px solid var(--green);
+}
+
+.work-row-stage small {
+  color: var(--muted);
 }
 
 .employee-role-task-empty {
@@ -932,6 +1024,40 @@ h1 {
   padding: 13px;
   background: var(--blue-soft);
   border-left: 3px solid var(--blue);
+}
+
+.review-handoff {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(250px, 0.9fr);
+  gap: 14px;
+  align-items: end;
+  margin: 16px 0;
+  padding: 13px;
+  background: var(--green-soft);
+  border-left: 3px solid var(--green);
+}
+
+.review-handoff > div {
+  display: grid;
+  gap: 5px;
+}
+
+.review-handoff small,
+.review-handoff label {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.review-handoff select {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
 }
 
 .review-preview strong {
@@ -3790,6 +3916,23 @@ dialog::backdrop {
   }
 
   .confirmation-center-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .review-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .review-flow li {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .review-flow li:first-child {
+    border-top: 0;
+  }
+
+  .review-handoff {
     grid-template-columns: 1fr;
   }
 

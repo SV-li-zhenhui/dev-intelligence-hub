@@ -136,9 +136,18 @@ test("external confirmation renders the exact authorization context", async () =
     "将发布的完整正文",
     "依据",
     "确认并发布到 GitHub",
+    "发布后由谁推进",
+    "发布后立即交接",
+    "下一责任岗位",
+    "测试工程师 · 验证后交回合并门禁",
+    "开发工程师 · 修改并推送新 Head",
+    "确认发布并分配下一步",
   ]) {
     assert.equal(app.includes(visibleLabel), true, visibleLabel);
   }
+  assert.match(app, /submitReviewHandoff/);
+  assert.match(app, /\/api\/work\/requests/);
+  assert.match(app, /confirmationResult\?\.item\?\.status === "completed"/);
   assert.match(
     app,
     /external\\u0000\$\{confirmationQueueState\.item\.id\}\\u0000\$\{confirmationQueueState\.item\.approvalBindingDigest\}/,

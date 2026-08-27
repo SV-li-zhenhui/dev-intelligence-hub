@@ -550,7 +550,21 @@ function roleWorkloadStatusLabel(status) {
   }[status] || status || "未知";
 }
 
-function roleWorkloadTask(task) {
+function reviewWorkStage(status) {
+  return {
+    queued: { step: "第 1/5 步", label: "已分配，等待领取", owner: "PR 工程师" },
+    working: { step: "第 2/5 步", label: "正在审查当前 Head", owner: "PR 工程师" },
+    dispatch_pending: { step: "第 3/5 步", label: "正在生成 Review 建议", owner: "系统" },
+    waiting_user: { step: "第 4/5 步", label: "等待你补充判断", owner: "你" },
+    waiting_condition: { step: "第 4/5 步", label: "等待检查或外部条件", owner: "条件满足后由 PR 工程师继续" },
+    waiting_external: { step: "第 4/5 步", label: "Review 建议已生成，等待你确认发布", owner: "你" },
+    retry_wait: { step: "第 3/5 步", label: "审查暂未完成，等待自动重试", owner: "PR 工程师" },
+    blocked: { step: "链路受阻", label: "需要处理阻塞原因后继续", owner: "你或任务负责人" },
+    completed: { step: "第 5/5 步", label: "Review 已发布或任务已完成", owner: "下一棒岗位 / 合并负责人" },
+  }[status] || { step: "状态未知", label: roleWorkloadStatusLabel(status), owner: "待系统确认" };
+}
+
+function roleWorkloadTask(task, roleId) {
   const subject = task?.subject;
   const sourceUrl = githubTargetUrl({
     resourceType: subject?.kind,
@@ -560,9 +574,15 @@ function roleWorkloadTask(task) {
   const titleMarkup = sourceUrl
     ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${title}</a>`
     : `<span>${title}</span>`;
+  const isReviewRole = ["pr-engineer", "pr-reviewer"].includes(roleId);
+  const stage = isReviewRole ? reviewWorkStage(task?.status) : null;
   return `<li>
     <span class="status-pill status-${escapeHtml(task?.status || "unknown")}">${escapeHtml(roleWorkloadStatusLabel(task?.status))}</span>
-    ${titleMarkup}
+    <div class="employee-role-task-copy">
+      ${titleMarkup}
+      ${stage ? `<small><strong>${escapeHtml(stage.step)}</strong> · ${escapeHtml(stage.label)} · 下一责任人：${escapeHtml(stage.owner)}</small>` : ""}
+      ${task?.statusReason ? `<small class="employee-role-task-diagnostic">台账原因：${escapeHtml(task.statusReason)}</small>` : ""}
+    </div>
   </li>`;
 }
 
@@ -579,7 +599,10 @@ function roleWorkloadMarkup(role) {
   return `<section class="employee-role-workload" aria-label="当前任务">
     <div class="employee-role-workload-heading">
       <strong>当前任务</strong>
-      <button type="button" class="secondary-button" data-role-work="${escapeHtml(role.id)}">查看该岗位任务</button>
+      <span class="employee-role-workload-actions">
+        ${["pr-engineer", "pr-reviewer"].includes(role.id) && Number(counts.waiting) > 0 ? '<button type="button" class="secondary-button" data-role-confirmations>处理确认队列</button>' : ""}
+        <button type="button" class="secondary-button" data-role-work="${escapeHtml(role.id)}">查看该岗位任务</button>
+      </span>
     </div>
     <dl class="employee-role-workload-counts">
       <div><dt>待领取</dt><dd>${Number(counts.queued) || 0}</dd></div>
@@ -588,7 +611,7 @@ function roleWorkloadMarkup(role) {
       <div><dt>阻塞</dt><dd>${Number(counts.blocked) || 0}</dd></div>
     </dl>
     ${tasks.length
-      ? `<ul class="employee-role-task-list">${tasks.map(roleWorkloadTask).join("")}</ul>`
+      ? `<ul class="employee-role-task-list">${tasks.map((task) => roleWorkloadTask(task, role.id)).join("")}</ul>`
       : '<p class="employee-role-task-empty">当前没有进行中的任务</p>'}
   </section>`;
 }
@@ -824,6 +847,23 @@ function confirmationCenterView() {
   </section>`;
 }
 
+function reviewFlowMarkup() {
+  const steps = [
+    ["1", "分配", "主控或你把 PR 交给 PR 工程师"],
+    ["2", "审查", "PR 工程师读取当前 Head、改动和检查结果"],
+    ["3", "形成建议", "生成 Approve、Request changes 或 Comment"],
+    ["4", "你确认发布", "未确认前不会写入 GitHub"],
+    ["5", "交接推进", "按结论交给测试、开发或 PR 岗位；最终由合并负责人决定"],
+  ];
+  return `<section class="section review-flow-section" aria-labelledby="review-flow-title">
+    <div class="section-heading">
+      <h2 id="review-flow-title">PR Review 工作方式</h2>
+      <span>Approve 不会自动发布，也不会自动合并</span>
+    </div>
+    <ol class="review-flow">${steps.map(([number, title, detail]) => `<li><span>${number}</span><div><strong>${title}</strong><small>${detail}</small></div></li>`).join("")}</ol>
+  </section>`;
+}
+
 function employeesView() {
   if (!employeeRolesLoaded) {
     return '<section class="section"><div class="empty">正在读取岗位编制…</div></section>';
@@ -836,7 +876,8 @@ function employeesView() {
     : employeeRolesError
       ? '<div class="empty">暂时无法显示岗位编制。</div>'
       : '<div class="empty">尚未配置数字员工。</div>';
-  return `${confirmationCenterView()}
+  return `${reviewFlowMarkup()}
+    ${confirmationCenterView()}
     <section class="section">
       <div class="section-heading"><h2>岗位编制</h2><span>${employeeRoles.length} ROLES · 每个岗位可独立配置大脑与权限</span></div>
       ${loadError}
@@ -1663,6 +1704,9 @@ function render() {
   });
   content.querySelectorAll("[data-role-work]").forEach((button) => {
     button.addEventListener("click", handleRoleWork);
+  });
+  content.querySelectorAll("[data-role-confirmations]").forEach((button) => {
+    button.addEventListener("click", handleRoleConfirmations);
   });
   bindConfirmationHistoryView();
   content.querySelector("#memory-search-form")?.addEventListener(
@@ -2765,6 +2809,14 @@ function handleRoleWork(event) {
   activateView("work");
 }
 
+function handleRoleConfirmations() {
+  activateView("employees");
+  queueMicrotask(() => content.querySelector("#confirmation-pending-panel")?.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  }));
+}
+
 function memoryTimestamp(date, endOfDay = false) {
   if (!date) return "";
   const suffix = endOfDay ? "T23:59:59.999" : "T00:00:00.000";
@@ -3431,7 +3483,7 @@ function confirmationKey(kind, item) {
 }
 
 function setConfirmationButtonsDisabled(disabled) {
-  confirmationContent.querySelectorAll("button").forEach((control) => {
+  confirmationContent.querySelectorAll("button, select").forEach((control) => {
     control.disabled = disabled;
   });
 }
@@ -3560,6 +3612,41 @@ function reviewEventLabel(value) {
   }[value] || value || "未知动作";
 }
 
+function reviewFollowUpLabel(value) {
+  return {
+    APPROVE: "默认交给测试工程师验证；测试通过后由合并负责人继续。不会自动合并。",
+    REQUEST_CHANGES: "默认交给开发工程师修改并推送；出现新 Head 后，PR 工程师重新审查。",
+    COMMENT: "默认交给 PR 工程师继续跟进；该动作不会改变批准或合并状态。",
+  }[value] || "由 PR 作者或相关负责人继续推进。";
+}
+
+function reviewHandoffWorkType(reviewEvent) {
+  return reviewEvent === "APPROVE"
+    ? "testing"
+    : reviewEvent === "REQUEST_CHANGES"
+      ? "development"
+      : "pull_request";
+}
+
+function reviewHandoffMarkup(reviewEvent) {
+  const selected = reviewHandoffWorkType(reviewEvent);
+  const option = (value, label) => `<option value="${value}"${selected === value ? " selected" : ""}>${label}</option>`;
+  return `<section class="review-handoff">
+    <div>
+      <strong>发布后立即交接</strong>
+      <small>系统会创建一个可追踪的下一棒任务；当前按岗位领取，不绑定具体姓名。</small>
+    </div>
+    <label>下一责任岗位
+      <select data-review-handoff>
+        ${option("testing", "测试工程师 · 验证后交回合并门禁")}
+        ${option("development", "开发工程师 · 修改并推送新 Head")}
+        ${option("pull_request", "PR 工程师 · 继续跟进")}
+        <option value="">不创建下一步任务</option>
+      </select>
+    </label>
+  </section>`;
+}
+
 function pullRequestConfirmationActionType(kind) {
   return typeof kind === "string" &&
       Object.hasOwn(pullRequestConfirmationActionTypes, kind)
@@ -3592,6 +3679,7 @@ function pullRequestActionDetailRows(action) {
   if (action.type === "pull_request_review") {
     rows.push(
       `<dt>Review 类型</dt><dd>${escapeHtml(reviewEventLabel(action.reviewEvent))}</dd>`,
+      `<dt>发布后由谁推进</dt><dd>${escapeHtml(reviewFollowUpLabel(action.reviewEvent))}</dd>`,
     );
   } else if (action.type === "pull_request_update_branch") {
     rows.push(
@@ -3650,6 +3738,9 @@ function showGitHubActionConfirmation(entry, remaining) {
   const actionLabel = item.retryable
     ? "确认并重试发布到 GitHub"
     : item.display?.actionLabel || "确认并发布到 GitHub";
+  const primaryActionLabel = action.type === "pull_request_review"
+    ? item.retryable ? "重试发布并分配下一步" : "确认发布并分配下一步"
+    : actionLabel;
   confirmationContent.innerHTML = `
     <article class="confirmation external-confirmation">
       <p class="eyebrow">EXTERNAL ACTION / ${remaining} LEFT</p>
@@ -3661,15 +3752,16 @@ function showGitHubActionConfirmation(entry, remaining) {
         <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
         ${pullRequestActionDetailRows(action)}
       </dl>
+      ${action.type === "pull_request_review" ? reviewHandoffMarkup(action.reviewEvent) : ""}
       ${pullRequestActionBodyMarkup(action)}
       <p class="confirmation-reason"><strong>依据</strong></p>
       ${listMarkup(item.display?.evidence)}
       <div class="confirmation-actions" data-external-confirmation-id="${escapeHtml(item.id)}">
-        <button data-external-operation="${operation}">${escapeHtml(actionLabel)}</button>
+        <button data-external-operation="${operation}">${escapeHtml(primaryActionLabel)}</button>
         <button class="secondary" data-external-operation="reject">驳回，不发布</button>
         <button class="secondary wide" data-external-operation="later">稍后再看</button>
       </div>
-      <p class="confirmation-note">只有点击“${escapeHtml(actionLabel)}”才会执行当前这一项 GitHub 写入；动作、账号和 Head 均与本次展示内容绑定。</p>
+      <p class="confirmation-note">只有点击确认按钮才会执行当前这一项 GitHub 写入；发布成功后才创建所选的下一棒任务。动作、账号和 Head 均与本次展示内容绑定。</p>
     </article>`;
   confirmationContent
     .querySelector(".confirmation-actions")
@@ -4235,6 +4327,43 @@ function externalConfirmationOutcomeMessage(item, result, operation) {
   return null;
 }
 
+function reviewHandoffSource(item) {
+  const payload = item?.display?.payload || {};
+  const target = payload.target || item?.target || {};
+  const match = /^([^#]+)#([1-9]\d*)$/.exec(target.resourceId || "");
+  if (!match) throw new Error("Review 已发布，但无法解析 PR 目标，未创建下一棒任务");
+  return {
+    kind: "pull_request",
+    repo: match[1],
+    number: Number(match[2]),
+    title: item.display?.title || `${match[1]} #${match[2]}`,
+    summary: item.display?.summary || "GitHub Review 已发布，继续推进下一阶段。",
+    url: `https://github.com/${match[1]}/pull/${match[2]}`,
+  };
+}
+
+async function submitReviewHandoff(item, workType, requestId) {
+  if (!workType) return null;
+  const request = ownerWorkRequestForItem(reviewHandoffSource(item), {
+    workType,
+    priority: "high",
+    requestId,
+  });
+  const response = await fetch("/api/work/requests", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-mydashboard-action": "1",
+    },
+    body: JSON.stringify(request),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.error || `下一步分配失败（${response.status}）`);
+  }
+  return result;
+}
+
 async function handleExternalConfirmation(event) {
   const button = event.target.closest("[data-external-operation]");
   if (!button) return;
@@ -4249,6 +4378,10 @@ async function handleExternalConfirmation(event) {
   }
   const item = activeExternalConfirmation;
   if (!item || !["approve", "retry", "reject"].includes(operation)) return;
+  const handoffWorkType = operation === "reject"
+    ? ""
+    : confirmationContent.querySelector("[data-review-handoff]")?.value || "";
+  const handoffRequestId = handoffWorkType ? crypto.randomUUID() : null;
   const submissionOwner = beginExternalConfirmationSubmission();
   if (submissionOwner === null) return;
   try {
@@ -4308,15 +4441,39 @@ async function handleExternalConfirmation(event) {
       configurationPreview = null;
       configurationEditorDirty = false;
     }
+    let handoffResult = null;
+    let handoffError = null;
+    const reviewPublished =
+      ["approve", "retry"].includes(operation) &&
+      confirmationResult?.item?.status === "completed" &&
+      (item.display?.payload?.action || item.action)?.type === "pull_request_review";
+    if (reviewPublished && handoffWorkType) {
+      try {
+        handoffResult = await submitReviewHandoff(
+          item,
+          handoffWorkType,
+          handoffRequestId,
+        );
+      } catch (error) {
+        handoffError = error;
+      }
+    }
     invalidateConfirmationQueueSnapshot();
     if (!closeExternalConfirmation(submissionOwner)) return;
     await load({ showConfirmation: false });
     if (configurationCompleted) await loadConfiguration();
-    const outcomeMessage = externalConfirmationOutcomeMessage(
+    let outcomeMessage = externalConfirmationOutcomeMessage(
       item,
       confirmationResult,
       operation,
     );
+    if (handoffResult) {
+      outcomeMessage = `${outcomeMessage || "GitHub 已确认发布成功。"} 下一步已分配给 ${handoffResult.assignment?.target?.id || "对应岗位"}，工作项 ${handoffResult.workItemId || "已进入共享台账"}。`;
+    } else if (handoffError) {
+      outcomeMessage = `GitHub 已确认发布成功，但下一步未能分配：${handoffError.message}。请从 PR 卡片手动分配。`;
+    } else if (reviewPublished && !handoffWorkType) {
+      outcomeMessage = "GitHub 已确认发布成功；你选择了不创建下一步任务。";
+    }
     if (outcomeMessage) {
       statusBanner.hidden = false;
       statusBanner.textContent = outcomeMessage;
