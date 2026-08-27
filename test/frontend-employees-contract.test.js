@@ -86,6 +86,7 @@ test("PR employee pending work has a direct, explained confirmation entry", () =
     "处理待确认（",
     "需要你确认什么",
     "data-pr-job-confirmation",
+    "处理这项确认",
     "处理下一项确认",
     "接受或驳回都只记录本地结论",
   ]) {
@@ -93,7 +94,11 @@ test("PR employee pending work has a direct, explained confirmation entry", () =
   }
   assert.match(
     appSource,
-    /function handleRoleConfirmations\(\)[\s\S]*closeDetailDialog\(\)[\s\S]*showNextConfirmation\(\)/,
+    /async function handleRoleConfirmations\(event\)[\s\S]*requestedJob[\s\S]*showJobConfirmation\(requestedJob\)/,
+  );
+  assert.match(
+    appSource,
+    /async function showJobConfirmation\(job\)[\s\S]*kind: "review_draft"[\s\S]*showConfirmationEntry[\s\S]*\/api\/confirmations\/\$\{encodeURIComponent\(job\.confirmationId\)\}/,
   );
 });
 

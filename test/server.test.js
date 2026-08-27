@@ -1147,6 +1147,10 @@ async function withServer(
           item: structuredClone(confirmationItem),
         };
       },
+      async get(id) {
+        calls.push({ operation: "confirmation_get", id });
+        return structuredClone(confirmationItem);
+      },
       async approve(id, input) {
         calls.push({ operation: "confirmation_approve", id, input });
         return { ...structuredClone(confirmationItem), status: "completed" };
@@ -6316,6 +6320,25 @@ test("the confirmation API exposes only the next immutable projection", async ()
     assert.equal(body.item.display.payload.action.body, "Looks good.");
     assert.equal("action" in body.item, false);
     assert.deepEqual(calls, [{ operation: "confirmation_next" }]);
+  });
+});
+
+test("the confirmation API reads one immutable item for a bound job", async () => {
+  await withServer(async ({ server, calls }) => {
+    const response = await request(server, {
+      path: "/api/confirmations/confirmation-pr-work-1",
+    });
+
+    assert.equal(response.status, 200);
+    const body = JSON.parse(response.body);
+    assert.equal(body.available, true);
+    assert.equal(body.item.id, "confirmation-pr-work-1");
+    assert.equal(body.item.display.payload.action.body, "Looks good.");
+    assert.equal("action" in body.item, false);
+    assert.deepEqual(calls, [{
+      operation: "confirmation_get",
+      id: "confirmation-pr-work-1",
+    }]);
   });
 });
 

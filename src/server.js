@@ -3504,6 +3504,21 @@ export function createDashboardServer(
         sendJson(response, 200, { available: true, ...next });
         return;
       }
+      const confirmationRead = url.pathname.match(
+        /^\/api\/confirmations\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/,
+      );
+      if (request.method === "GET" && confirmationRead) {
+        requireNoQuery(url, "确认项读取查询参数无效");
+        if (!application.confirmationQueue) {
+          sendJson(response, 200, { available: false, item: null });
+          return;
+        }
+        const item = await runConfirmationOperation(backgroundWork, () =>
+          confirmationQueueForHttp(application).get(confirmationRead[1]),
+        );
+        sendJson(response, 200, { available: true, item });
+        return;
+      }
       const confirmationAction = url.pathname.match(
         /^\/api\/confirmations\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/(approve|retry|reject)$/,
       );

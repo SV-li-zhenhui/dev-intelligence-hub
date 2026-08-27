@@ -2561,7 +2561,7 @@ function showEmployeeJob(job) {
         <p>${job.status === "ready_for_human"
           ? "确认是否接受这份 Review 草稿。接受或驳回都只记录本地结论，不会直接写入 GitHub；如有发布动作，会另行逐项确认。"
           : "核对将要发布到 GitHub 的完整 Review、账号和绑定 Head，并决定确认发布、驳回或稍后处理。"}</p>
-        <button type="button" class="refresh-button" data-pr-job-confirmation>处理待确认</button>
+        <button type="button" class="refresh-button" data-pr-job-confirmation="${escapeHtml(job.id)}">处理这项确认</button>
       </section>`
     : "";
   dialogContent.innerHTML = `
@@ -2856,16 +2856,25 @@ function handleRoleWork(event) {
   activateView("work");
 }
 
-function handleRoleConfirmations() {
+async function handleRoleConfirmations(event) {
+  const jobId = event?.currentTarget?.dataset?.prJobConfirmation || "";
+  const requestedJob = jobId ? jobIndex.get(jobId) : null;
   if (dialog.open) closeDetailDialog();
   activateView("employees");
-  queueMicrotask(() => {
-    content.querySelector("#confirmation-pending-panel")?.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
-    showNextConfirmation();
+  content.querySelector("#confirmation-pending-panel")?.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
   });
+  if (!requestedJob) {
+    showNextConfirmation();
+    return;
+  }
+  try {
+    await showJobConfirmation(requestedJob);
+  } catch (error) {
+    statusBanner.hidden = false;
+    statusBanner.textContent = `${error.message}。该作业可能已经更新，请刷新后重试。`;
+  }
 }
 
 function memoryTimestamp(date, endOfDay = false) {
@@ -4359,29 +4368,69 @@ function showReviewDraftConfirmation(entry, remaining) {
     .addEventListener("click", handleReviewDraftDecision);
 }
 
-function showNextConfirmation() {
+function showConfirmationEntry(entry, remaining) {
   if (confirmationDialog.open || dialog.open) return;
-  const pending = pendingConfirmations();
-  const [entry] = pending;
   if (!entry) return;
   confirmationDialogOwnership.open();
   confirmationCloseButton.disabled = false;
   activeConfirmationKey = entry.key;
   confirmationDialog.removeAttribute("aria-labelledby");
   if (entry.kind === "external_action") {
-    showExternalActionConfirmation(entry, pending.length);
+    showExternalActionConfirmation(entry, remaining);
   } else if (entry.kind === "internal_request") {
-    showInternalAttention(entry, pending.length);
+    showInternalAttention(entry, remaining);
   } else if (entry.kind === "review_draft") {
     activeInternalAttention = null;
     activeExternalConfirmation = null;
-    showReviewDraftConfirmation(entry, pending.length);
+    showReviewDraftConfirmation(entry, remaining);
   } else {
     activeInternalAttention = null;
     activeExternalConfirmation = null;
-    showResponsibilityConfirmation(entry, pending.length);
+    showResponsibilityConfirmation(entry, remaining);
   }
   confirmationDialog.showModal();
+}
+
+async function showJobConfirmation(job) {
+  if (job.status === "ready_for_human") {
+    const entry = {
+      kind: "review_draft",
+      job,
+      key: confirmationKey("review", job),
+    };
+    showConfirmationEntry(entry, 1);
+    return;
+  }
+  if (typeof job.confirmationId === "string" && job.confirmationId) {
+    const response = await fetch(
+      `/api/confirmations/${encodeURIComponent(job.confirmationId)}`,
+      { cache: "no-store" },
+    );
+    if (!response.ok) {
+      throw new Error(`读取这项确认失败（${response.status}）`);
+    }
+    const result = await response.json();
+    const item = result.item;
+    if (
+      !item ||
+      item.id !== job.confirmationId ||
+      !["pending", "failed"].includes(item.status)
+    ) {
+      throw new Error("这项确认已经处理或失效");
+    }
+    showConfirmationEntry({
+      kind: "external_action",
+      item,
+      key: `external\u0000${item.id}\u0000${item.approvalBindingDigest}`,
+    }, 1);
+    return;
+  }
+  throw new Error("这项作业尚未生成可确认内容");
+}
+
+function showNextConfirmation() {
+  const pending = pendingConfirmations();
+  showConfirmationEntry(pending[0], pending.length);
 }
 
 async function handleConfirmation(event) {
