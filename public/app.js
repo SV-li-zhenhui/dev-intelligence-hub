@@ -4346,8 +4346,8 @@ function showReviewDraftConfirmation(entry, remaining) {
   const { job } = entry;
   confirmationContent.innerHTML = `
     <article class="confirmation review-confirmation">
-      <p class="eyebrow">LOCAL REVIEW / ${remaining} LEFT</p>
-      <h2>PR 推进员工准备了一份本地评审草稿</h2>
+      <p class="eyebrow">PR EMPLOYEE / 当前项 · 队列还剩 ${remaining} 项</p>
+      <h2>请确认是否接受这份 Review 草稿</h2>
       <p class="confirmation-title">${escapeHtml(job.repo)} #${job.number} · ${escapeHtml(job.title)}</p>
       <p class="confirmation-reason">${escapeHtml(job.summary || job.triggerReason || "")}</p>
       <div class="review-preview">
@@ -4361,7 +4361,10 @@ function showReviewDraftConfirmation(entry, remaining) {
         <button class="secondary" data-review-decision="reject">驳回草稿</button>
         <button class="secondary wide" data-review-decision="later">稍后再看</button>
       </div>
-      <p class="confirmation-note">当前未启用 GitHub 外部动作。接受或驳回只记录在本机，不会发布 GitHub Review。</p>
+      ${job.url ? `<a class="confirmation-target-link" href="${escapeHtml(job.url)}" target="_blank" rel="noreferrer">在 GitHub 中打开 ↗</a>` : ""}
+      <p class="confirmation-note">${confirmationQueueState.externalEnabled
+        ? "接受只确认本地 Review 内容，随后会生成一项独立的 GitHub 发布确认；本次点击不会直接写入 GitHub。"
+        : "当前未启用 GitHub 外部动作。接受或驳回只记录在本机，不会发布 GitHub Review。"}</p>
     </article>`;
   confirmationContent
     .querySelector(".confirmation-actions")

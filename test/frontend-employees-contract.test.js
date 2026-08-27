@@ -89,6 +89,7 @@ test("PR employee pending work has a direct, explained confirmation entry", () =
     "处理这项确认",
     "处理下一项确认",
     "接受或驳回都只记录本地结论",
+    "随后会生成一项独立的 GitHub 发布确认",
   ]) {
     assert.equal(appSource.includes(value), true, value);
   }
