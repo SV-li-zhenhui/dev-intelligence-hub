@@ -92,6 +92,7 @@ function representativeConfiguration() {
       },
       brokerLimits: {
         maxFiles: 100,
+        maxDirectories: 100,
         maxFileBytes: 1_048_576,
         maxTotalBytes: 8_388_608,
         maxSearchMatches: 2_000,

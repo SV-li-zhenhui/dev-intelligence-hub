@@ -263,7 +263,7 @@ test("PR engineer rows explain the current review stage and next owner", () => {
     currentTarget: { type: "role", id: "pr-engineer" },
     event: {
       eventType: "pull_request.status",
-      subject: { repository: "SVisions/OCT-Software", number: 24222 },
+      subject: { repository: "ExampleOrg/SoftwareApp", number: 24222 },
     },
     attempt: 1,
     updatedAt: "2026-08-27T02:10:02.000Z",

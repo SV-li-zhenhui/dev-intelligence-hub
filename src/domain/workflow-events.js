@@ -47,6 +47,10 @@ const OWNER_REQUEST_PAYLOAD_KEYS = Object.freeze([
   "title",
   "workType",
 ]);
+const OWNER_REQUEST_PERSON_PAYLOAD_KEYS = Object.freeze([
+  ...OWNER_REQUEST_PAYLOAD_KEYS,
+  "responsiblePerson",
+]);
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -88,6 +92,7 @@ const PAYLOAD_FIELDS = new Set([
   "pullRequestType",
   "priority",
   "relation",
+  "responsiblePerson",
   "requiresConfirmation",
   "reviewDecision",
   "reviewFactsAvailable",
@@ -480,11 +485,15 @@ function assertOwnerRequestSemantics(content) {
   const ownerRequest = content.eventType === "owner_request.created";
   if (!ownerRequest) return;
   const payloadKeys = Object.keys(content.payload);
+  const expectedKeys = Object.hasOwn(content.payload, "responsiblePerson")
+    ? OWNER_REQUEST_PERSON_PAYLOAD_KEYS
+    : OWNER_REQUEST_PAYLOAD_KEYS;
+  const responsiblePerson = content.payload.responsiblePerson;
   if (
     content.source.provider !== "local-owner" ||
     content.source.scopeId !== "owner-command-center" ||
-    payloadKeys.length !== OWNER_REQUEST_PAYLOAD_KEYS.length ||
-    OWNER_REQUEST_PAYLOAD_KEYS.some((key) => !payloadKeys.includes(key)) ||
+    payloadKeys.length !== expectedKeys.length ||
+    expectedKeys.some((key) => !payloadKeys.includes(key)) ||
     !["general", "requirements", "development", "testing", "pull_request"]
       .includes(content.payload.workType) ||
     !["normal", "high", "urgent"].includes(content.payload.priority) ||
@@ -502,7 +511,21 @@ function assertOwnerRequestSemantics(content) {
         Buffer.byteLength(criterion, "utf8") > 1_000,
     ) ||
     new Set(content.payload.acceptanceCriteria).size !==
-      content.payload.acceptanceCriteria.length
+      content.payload.acceptanceCriteria.length ||
+    (responsiblePerson !== undefined && (
+      content.payload.workType !== "testing" ||
+      responsiblePerson === null ||
+      typeof responsiblePerson !== "object" ||
+      Array.isArray(responsiblePerson) ||
+      Object.getPrototypeOf(responsiblePerson) !== Object.prototype ||
+      Object.keys(responsiblePerson).length !== 2 ||
+      !Object.hasOwn(responsiblePerson, "login") ||
+      !Object.hasOwn(responsiblePerson, "product") ||
+      typeof responsiblePerson.login !== "string" ||
+      !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(responsiblePerson.login) ||
+      typeof responsiblePerson.product !== "string" ||
+      !SAFE_TOKEN.test(responsiblePerson.product)
+    ))
   ) {
     throw invalid("owner request semantics");
   }

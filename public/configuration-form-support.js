@@ -554,6 +554,7 @@ function assertCodeExecutor(value, path) {
   if (value.brokerLimits) {
     assertFields(value.brokerLimits, `${path}.brokerLimits`, [
       "maxFiles",
+      "maxDirectories",
       "maxFileBytes",
       "maxTotalBytes",
       "maxSearchMatches",
@@ -672,6 +673,7 @@ function assertWorkCoordination(value, path) {
       "codeActionRoles",
       "configurationChangeRoles",
       "codeOperationsByRole",
+      "testingOwnersByProduct",
       "workspaceByRepository",
     ],
     [
@@ -685,6 +687,15 @@ function assertWorkCoordination(value, path) {
   );
   for (const name of ["capabilityRoles", "codeOperationsByRole", "workspaceByRepository"]) {
     requireRecord(value.policy[name], `${policyPath}.${name}`);
+  }
+  if (Object.hasOwn(value.policy, "testingOwnersByProduct")) {
+    requireRecord(
+      value.policy.testingOwnersByProduct,
+      `${policyPath}.testingOwnersByProduct`,
+    );
+    for (const [product, owners] of Object.entries(value.policy.testingOwnersByProduct)) {
+      requireArray(owners, `${policyPath}.testingOwnersByProduct.${product}`);
+    }
   }
   requireArray(value.policy.githubReviewRoles, `${policyPath}.githubReviewRoles`);
   requireArray(value.policy.codeActionRoles, `${policyPath}.codeActionRoles`);

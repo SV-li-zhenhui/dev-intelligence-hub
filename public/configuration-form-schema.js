@@ -124,6 +124,7 @@ const LABELS = deepFreeze({
   image: "固定镜像",
   timeoutMs: "超时（毫秒）",
   maxFiles: "最大文件数",
+  maxDirectories: "最大目录数",
   maxFileBytes: "单文件最大字节数",
   maxTotalBytes: "总读取最大字节数",
   maxSearchMatches: "最大搜索结果数",
@@ -184,6 +185,7 @@ const LABELS = deepFreeze({
   configurationChangeRoles: "配置变更提案岗位",
   codeOperationsByRole: "岗位代码操作映射",
   workspaceByRepository: "仓库工作区映射",
+  testingOwnersByProduct: "各版本测试负责人",
   memory: "记忆",
   maximumRecords: "最大记录数",
   maximumStateBytes: "最大状态字节数",
@@ -426,6 +428,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["workCoordination", "policy", "codeActionRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "configurationChangeRoles", "#"], kind: "text", format: "role-id", maximumBytes: 128 },
   { pattern: ["workCoordination", "policy", "workspaceByRepository", "*"], kind: "text", format: "workspace-id", maximumBytes: 64 },
+  { pattern: ["workCoordination", "policy", "testingOwnersByProduct", "*", "#"], kind: "text", format: "github-login", maximumBytes: 40 },
   { pattern: ["codeExecutor", "profiles", "*", "image"], kind: "text", format: "pinned-image", maximumBytes: 1_024 },
   { pattern: ["codeExecutor", "workspaces", "#", "id"], kind: "text", format: "workspace-id", maximumBytes: 64 },
   { pattern: ["codeExecutor", "workspaces", "#", "sourceRoot"], kind: "text", maximumBytes: 4_096 },
@@ -538,6 +541,8 @@ const COLLECTIONS = deepFreeze([
   { pattern: ["workCoordination", "policy", "codeOperationsByRole"], kind: "map", label: "岗位代码操作映射", template: "code-operations", keyTemplate: "role-id", maximum: 256, keyFormat: "role-id" },
   { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*"], kind: "array", label: "允许代码操作", template: "code-operation", minimum: 1, maximum: 3, uniqueBy: "value" },
   { pattern: ["workCoordination", "policy", "workspaceByRepository"], kind: "map", label: "仓库工作区映射", template: "workspace-id", keyTemplate: "owner/repository", maximum: 256, keyFormat: "repository" },
+  { pattern: ["workCoordination", "policy", "testingOwnersByProduct"], kind: "map", label: "各版本测试负责人", template: "testing-owner-list", keyTemplate: "qt", maximum: 20, keyFormat: "safe-id", optional: true },
+  { pattern: ["workCoordination", "policy", "testingOwnersByProduct", "*"], kind: "array", label: "GitHub 测试负责人", template: "github-login", minimum: 1, maximum: 20, uniqueBy: "value" },
 ]);
 
 const SLOTS = deepFreeze([
@@ -738,6 +743,8 @@ const TEMPLATES = deepFreeze({
   "code-operations": ["inspect"],
   "code-operation": "inspect",
   "workspace-id": "workspace-id",
+  "testing-owner-list": ["github-login"],
+  "github-login": "github-login",
 });
 
 export const CONFIGURATION_FORM_SCHEMA = deepFreeze({

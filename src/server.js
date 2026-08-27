@@ -3068,15 +3068,26 @@ export function createDashboardServer(
                 "acceptanceCriteria",
                 "pullRequest",
               ]
-            : [
-            "schemaVersion",
-            "requestId",
-            "workType",
-            "priority",
-            "title",
-            "description",
-            "acceptanceCriteria",
-              ],
+            : ownerRequestBody?.schemaVersion === 3
+              ? [
+                  "schemaVersion",
+                  "requestId",
+                  "workType",
+                  "priority",
+                  "title",
+                  "description",
+                  "acceptanceCriteria",
+                  "responsiblePerson",
+                ]
+              : [
+                  "schemaVersion",
+                  "requestId",
+                  "workType",
+                  "priority",
+                  "title",
+                  "description",
+                  "acceptanceCriteria",
+                ],
           "所有者工作请求字段无效",
         );
         const result = await requireOwnerWorkRequests(application).submit(input);

@@ -28,6 +28,10 @@ import {
   manualWorkAssignmentMarkup,
   ownerWorkRequestForItem,
 } from "./manual-work-assignment.js";
+import {
+  inferTestingProduct,
+  testingOwnerRouting,
+} from "./review-handoff-routing.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
 import {
@@ -3628,13 +3632,36 @@ function reviewHandoffWorkType(reviewEvent) {
       : "pull_request";
 }
 
-function reviewHandoffMarkup(reviewEvent) {
+function reviewHandoffSearchText(item) {
+  return JSON.stringify({
+    title: item?.display?.title,
+    summary: item?.display?.summary,
+    evidence: item?.display?.evidence,
+    action: item?.display?.payload?.action,
+  });
+}
+
+function testingOwnerOptions(routing, product, selectedLogin = "") {
+  return (routing.ownersByProduct[product] || []).map((login, index) =>
+    `<option value="${escapeHtml(login)}"${login === selectedLogin || (!selectedLogin && index === 0) ? " selected" : ""}>${escapeHtml(routing.ownerLabel(login))}</option>`
+  ).join("");
+}
+
+function reviewHandoffMarkup(reviewEvent, item) {
   const selected = reviewHandoffWorkType(reviewEvent);
   const option = (value, label) => `<option value="${value}"${selected === value ? " selected" : ""}>${label}</option>`;
+  const routing = testingOwnerRouting(activeConfigurationDocument());
+  const product = inferTestingProduct(
+    reviewHandoffSearchText(item),
+    routing.products,
+  );
+  const productOptions = routing.products.map((candidate) =>
+    `<option value="${escapeHtml(candidate)}"${candidate === product ? " selected" : ""}>${escapeHtml(routing.productLabel(candidate))}</option>`
+  ).join("");
   return `<section class="review-handoff">
     <div>
       <strong>发布后立即交接</strong>
-      <small>系统会创建一个可追踪的下一棒任务；当前按岗位领取，不绑定具体姓名。</small>
+      <small>系统会创建可追踪任务；测试岗位运行验证，具体负责人接收结论并推进验收。</small>
     </div>
     <label>下一责任岗位
       <select data-review-handoff>
@@ -3644,7 +3671,34 @@ function reviewHandoffMarkup(reviewEvent) {
         <option value="">不创建下一步任务</option>
       </select>
     </label>
+    <div class="review-testing-owner" data-review-testing-owner${selected === "testing" ? "" : " hidden"}>
+      <label>版本类型
+        <select data-review-testing-product>${productOptions}</select>
+      </label>
+      <label>具体测试负责人
+        <select data-review-testing-person>${testingOwnerOptions(routing, product)}</select>
+      </label>
+      <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。候选账号来自配置中心。</small>
+    </div>
   </section>`;
+}
+
+function bindReviewHandoffControls(item) {
+  const root = confirmationContent.querySelector(".review-handoff");
+  if (!root) return;
+  const routing = testingOwnerRouting(activeConfigurationDocument());
+  const workType = root.querySelector("[data-review-handoff]");
+  const ownerControls = root.querySelector("[data-review-testing-owner]");
+  const product = root.querySelector("[data-review-testing-product]");
+  const person = root.querySelector("[data-review-testing-person]");
+  const updateVisibility = () => {
+    ownerControls.hidden = workType.value !== "testing";
+  };
+  workType.addEventListener("change", updateVisibility);
+  product.addEventListener("change", () => {
+    person.innerHTML = testingOwnerOptions(routing, product.value);
+  });
+  updateVisibility();
 }
 
 function pullRequestConfirmationActionType(kind) {
@@ -3752,7 +3806,7 @@ function showGitHubActionConfirmation(entry, remaining) {
         <dt>绑定 Head</dt><dd><code>${escapeHtml(target.version || "未知")}</code></dd>
         ${pullRequestActionDetailRows(action)}
       </dl>
-      ${action.type === "pull_request_review" ? reviewHandoffMarkup(action.reviewEvent) : ""}
+      ${action.type === "pull_request_review" ? reviewHandoffMarkup(action.reviewEvent, item) : ""}
       ${pullRequestActionBodyMarkup(action)}
       <p class="confirmation-reason"><strong>依据</strong></p>
       ${listMarkup(item.display?.evidence)}
@@ -3766,6 +3820,7 @@ function showGitHubActionConfirmation(entry, remaining) {
   confirmationContent
     .querySelector(".confirmation-actions")
     .addEventListener("click", handleExternalConfirmation);
+  if (action.type === "pull_request_review") bindReviewHandoffControls(item);
 }
 
 function codeOperationLabel(value) {
@@ -4342,12 +4397,18 @@ function reviewHandoffSource(item) {
   };
 }
 
-async function submitReviewHandoff(item, workType, requestId) {
+async function submitReviewHandoff(
+  item,
+  workType,
+  requestId,
+  responsiblePerson = null,
+) {
   if (!workType) return null;
   const request = ownerWorkRequestForItem(reviewHandoffSource(item), {
     workType,
     priority: "high",
     requestId,
+    responsiblePerson,
   });
   const response = await fetch("/api/work/requests", {
     method: "POST",
@@ -4382,6 +4443,12 @@ async function handleExternalConfirmation(event) {
     ? ""
     : confirmationContent.querySelector("[data-review-handoff]")?.value || "";
   const handoffRequestId = handoffWorkType ? crypto.randomUUID() : null;
+  const handoffResponsiblePerson = handoffWorkType === "testing"
+    ? {
+        product: confirmationContent.querySelector("[data-review-testing-product]")?.value || "qt",
+        login: confirmationContent.querySelector("[data-review-testing-person]")?.value || "",
+      }
+    : null;
   const submissionOwner = beginExternalConfirmationSubmission();
   if (submissionOwner === null) return;
   try {
@@ -4453,6 +4520,7 @@ async function handleExternalConfirmation(event) {
           item,
           handoffWorkType,
           handoffRequestId,
+          handoffResponsiblePerson,
         );
       } catch (error) {
         handoffError = error;
@@ -4468,7 +4536,10 @@ async function handleExternalConfirmation(event) {
       operation,
     );
     if (handoffResult) {
-      outcomeMessage = `${outcomeMessage || "GitHub 已确认发布成功。"} 下一步已分配给 ${handoffResult.assignment?.target?.id || "对应岗位"}，工作项 ${handoffResult.workItemId || "已进入共享台账"}。`;
+      const personLabel = handoffResponsiblePerson?.login
+        ? `，具体负责人 @${handoffResponsiblePerson.login}`
+        : "";
+      outcomeMessage = `${outcomeMessage || "GitHub 已确认发布成功。"} 下一步已分配给 ${handoffResult.assignment?.target?.id || "对应岗位"}${personLabel}，工作项 ${handoffResult.workItemId || "已进入共享台账"}。`;
     } else if (handoffError) {
       outcomeMessage = `GitHub 已确认发布成功，但下一步未能分配：${handoffError.message}。请从 PR 卡片手动分配。`;
     } else if (reviewPublished && !handoffWorkType) {

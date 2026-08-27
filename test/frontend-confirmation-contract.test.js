@@ -142,10 +142,15 @@ test("external confirmation renders the exact authorization context", async () =
     "测试工程师 · 验证后交回合并门禁",
     "开发工程师 · 修改并推送新 Head",
     "确认发布并分配下一步",
+    "版本类型",
+    "具体测试负责人",
+    "候选账号来自配置中心",
   ]) {
     assert.equal(app.includes(visibleLabel), true, visibleLabel);
   }
   assert.match(app, /submitReviewHandoff/);
+  assert.match(app, /data-review-testing-person/);
+  assert.match(app, /handoffResponsiblePerson/);
   assert.match(app, /\/api\/work\/requests/);
   assert.match(app, /confirmationResult\?\.item\?\.status === "completed"/);
   assert.match(

@@ -60,6 +60,23 @@ test("an Issue development assignment becomes an audited capability request", ()
   assert.match(request.description, /ExampleOrg\/ProductApp #12917/);
 });
 
+test("an approved PR testing handoff binds the configured GitHub test owner", () => {
+  const request = ownerWorkRequestForItem(pullRequest, {
+    workType: "testing",
+    priority: "high",
+    requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    responsiblePerson: { login: "qt-tester-primary", product: "qt" },
+  });
+
+  assert.equal(request.schemaVersion, 3);
+  assert.deepEqual(request.responsiblePerson, {
+    login: "qt-tester-primary",
+    product: "qt",
+  });
+  assert.match(request.title, /负责人 @qt-tester-primary/);
+  assert.match(request.description, /指定测试负责人/);
+});
+
 test("assignment result replaces the form with its durable work item", () => {
   const markup = manualWorkAssignmentMarkup(pullRequest, {
     target: "pr-engineer",

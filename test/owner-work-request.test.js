@@ -219,6 +219,35 @@ test("owner request DTO exposes business fields only and creates a bound workflo
   }
 });
 
+test("testing handoff preserves a structured GitHub responsible person", () => {
+  const normalized = normalizeOwnerWorkRequest(request({
+    schemaVersion: 3,
+    workType: "testing",
+    responsiblePerson: { login: "bs-tester", product: "bs" },
+  }));
+  const event = createOwnerWorkRequestEvent(
+    normalized,
+    "2026-08-08T01:00:00.000Z",
+  );
+
+  assert.deepEqual(normalized.responsiblePerson, {
+    login: "bs-tester",
+    product: "bs",
+  });
+  assert.deepEqual(event.payload.responsiblePerson, {
+    login: "bs-tester",
+    product: "bs",
+  });
+  assert.throws(
+    () => normalizeOwnerWorkRequest(request({
+      schemaVersion: 3,
+      workType: "development",
+      responsiblePerson: { login: "bs-tester", product: "bs" },
+    })),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
+});
+
 test("owner capability requests route directly to their fixed least-authority roles", () => {
   const definition = withOwnerWorkRequestDefaultRoute({
     schemaVersion: 1,

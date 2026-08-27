@@ -46,7 +46,9 @@ const REQUEST_KEYS = Object.freeze([
   "acceptanceCriteria",
 ]);
 const PULL_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "pullRequest"]);
+const PERSON_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "responsiblePerson"]);
 const PULL_REQUEST_TARGET_KEYS = Object.freeze(["repository", "number"]);
+const RESPONSIBLE_PERSON_KEYS = Object.freeze(["login", "product"]);
 const REQUEST_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -56,6 +58,9 @@ const MAX_DESCRIPTION_BYTES = 12 * 1024;
 const MAX_CRITERIA = 20;
 const MAX_CRITERION_BYTES = 1_000;
 const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})$/;
+const SAFE_GITHUB_LOGIN =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const SAFE_PRODUCT = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 
 export class OwnerWorkRequestError extends Error {
   constructor(code, message, statusCode = 400, options = {}) {
@@ -155,11 +160,13 @@ export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
   exactKeys(
     value,
-    version === 2 ? PULL_REQUEST_KEYS : REQUEST_KEYS,
+    version === 2
+      ? PULL_REQUEST_KEYS
+      : version === 3 ? PERSON_REQUEST_KEYS : REQUEST_KEYS,
     "所有者工作请求",
   );
   if (
-    ![1, 2].includes(version) ||
+    ![1, 2, 3].includes(version) ||
     typeof value.requestId !== "string" ||
     !REQUEST_ID.test(value.requestId) ||
     !OWNER_WORK_REQUEST_TYPES.includes(value.workType) ||
@@ -171,6 +178,9 @@ export function normalizeOwnerWorkRequest(value) {
     version === 2 && value.workType !== "pull_request"
   ) {
     throw invalid("PR 推进必须提供结构化 PR 目标");
+  }
+  if (version === 3 && value.workType !== "testing") {
+    throw invalid("具体负责人只能绑定测试交接请求");
   }
   const acceptanceCriteria = denseArray(
     value.acceptanceCriteria,
@@ -216,12 +226,33 @@ export function normalizeOwnerWorkRequest(value) {
       number: value.pullRequest.number,
     };
   }
+  if (version === 3) {
+    exactKeys(
+      value.responsiblePerson,
+      RESPONSIBLE_PERSON_KEYS,
+      "responsiblePerson",
+    );
+    const login = boundedText(
+      value.responsiblePerson.login,
+      "responsiblePerson.login",
+      40,
+    );
+    const product = boundedText(
+      value.responsiblePerson.product,
+      "responsiblePerson.product",
+      128,
+    );
+    if (!SAFE_GITHUB_LOGIN.test(login) || !SAFE_PRODUCT.test(product)) {
+      throw invalid("responsiblePerson 无效");
+    }
+    normalized.responsiblePerson = { login, product };
+  }
   return deepFreeze(normalized);
 }
 
 export function createOwnerWorkRequestEvent(requestValue, occurredAt) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (request.schemaVersion !== 1) {
+  if (![1, 3].includes(request.schemaVersion)) {
     throw invalid("PR 推进请求必须先解析可信 Git 目标");
   }
   return normalizeWorkflowEvent({
@@ -242,6 +273,9 @@ export function createOwnerWorkRequestEvent(requestValue, occurredAt) {
       workType: request.workType,
       priority: request.priority,
       acceptanceCriteria: [...request.acceptanceCriteria],
+      ...(request.schemaVersion === 3
+        ? { responsiblePerson: structuredClone(request.responsiblePerson) }
+        : {}),
     },
   });
 }
@@ -299,7 +333,7 @@ export function createOwnerPullRequestEvent(
 
 export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (request.schemaVersion === 1) {
+  if ([1, 3].includes(request.schemaVersion)) {
     return JSON.stringify(eventValue) === JSON.stringify(
       createOwnerWorkRequestEvent(request, at),
     );

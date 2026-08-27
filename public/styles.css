@@ -1042,6 +1042,22 @@ h1 {
   gap: 5px;
 }
 
+.review-handoff .review-testing-owner {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--green) 24%, transparent);
+}
+
+.review-handoff .review-testing-owner[hidden] {
+  display: none;
+}
+
+.review-testing-owner small {
+  grid-column: 1 / -1;
+}
+
 .review-handoff small,
 .review-handoff label {
   color: var(--muted);
@@ -3934,6 +3950,14 @@ dialog::backdrop {
 
   .review-handoff {
     grid-template-columns: 1fr;
+  }
+
+  .review-handoff .review-testing-owner {
+    grid-template-columns: 1fr;
+  }
+
+  .review-testing-owner small {
+    grid-column: auto;
   }
 
   .memory-filters {

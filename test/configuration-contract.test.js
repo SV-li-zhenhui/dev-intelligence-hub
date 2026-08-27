@@ -19,7 +19,7 @@ const committedDocument = JSON.parse(
   await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 const LEGACY_GITHUB_CREDENTIAL_DIGEST =
-  "0b0eac25934c311360dc0ce88900d15caf8d6d67a7d7bfc4116f26fce396d927";
+  "3169fa64ec36bdf531405de5d640ed548d9b51a6c0cdb8d657e59630ee847526";
 
 function document() {
   return structuredClone(committedDocument);

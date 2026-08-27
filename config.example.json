@@ -106,6 +106,10 @@
         "developer": ["inspect", "modify", "verify"],
         "tester": ["inspect", "verify"]
       },
+      "testingOwnersByProduct": {
+        "qt": ["qt-tester-primary", "qt-tester-secondary"],
+        "bs": ["bs-tester"]
+      },
       "workspaceByRepository": {}
     }
   },
