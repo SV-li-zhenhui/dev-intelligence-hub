@@ -343,7 +343,19 @@ test("legacy Head-only work cannot treat a new target-aware snapshot as fresh", 
 
 test("issue facts remain readable without a Head binding", async () => {
   const value = snapshot({
-    items: [{ id: "github:issue:acme/repo#42", state: "open" }],
+    items: [{
+      id: "github:issue:acme/repo#42",
+      state: "open",
+      description: "Steps plus https://github.com/user-attachments/assets/image",
+      commentsCount: 3,
+      latestComment: {
+        author: "carol",
+        body: "Video attached; the problem reproduces after save",
+        createdAt: "2026-08-02T03:40:00.000Z",
+        updatedAt: "2026-08-02T03:40:00.000Z",
+        url: "https://github.com/acme/repo/issues/42#issuecomment-1",
+      },
+    }],
   });
   const issue = item("issue.updated");
   issue.event.subject.id = "github:issue:acme/repo#42";
@@ -354,6 +366,27 @@ test("issue facts remain readable without a Head binding", async () => {
     value: "open",
     observedAt: "2026-08-02T03:59:00.000Z",
   });
+  assert.equal(
+    (await source(value).read({ item: issue, fact: "issue-description" })).value,
+    "Steps plus https://github.com/user-attachments/assets/image",
+  );
+  assert.equal(
+    (await source(value).read({ item: issue, fact: "issue-comments-count" })).value,
+    "3",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      (await source(value).read({ item: issue, fact: "issue-latest-comment" })).value,
+    ),
+    value.items[0].latestComment,
+  );
+  assert.equal(
+    (await source(snapshot()).read({
+      item: item(),
+      fact: "issue-description",
+    })).value,
+    null,
+  );
 });
 
 test("malformed arrays and accessor-bearing inputs fail closed without execution", async () => {

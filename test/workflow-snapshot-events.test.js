@@ -47,8 +47,17 @@ function issue(number, overrides = {}) {
     state: "open",
     createdAt: "2026-08-01T03:00:00.000Z",
     updatedAt: "2026-08-01T04:00:00.000Z",
+    description: "Issue body with reproduction steps and an attachment URL",
     labels: ["bug"],
     assignees: ["local-owner"],
+    commentsCount: 1,
+    latestComment: {
+      author: "carol",
+      body: "Use the release branch when implementing the fix",
+      createdAt: "2026-08-01T04:00:00.000Z",
+      updatedAt: "2026-08-01T04:00:00.000Z",
+      url: `https://github.com/acme/repo/issues/${number}#issuecomment-1`,
+    },
     ...overrides,
   };
 }
@@ -121,6 +130,7 @@ test("snapshot projection is a deterministic safe replay checkpoint", () => {
 
 test("an initial healthy snapshot emits stable observed events with safe facts", () => {
   const unsafe = pullRequest(2, {
+    description: "PR body must stay in the dedicated PR context reader",
     token: "secret-token",
     env: { GH_TOKEN: "secret-token" },
     command: "gh pr merge",
@@ -156,6 +166,14 @@ test("an initial healthy snapshot emits stable observed events with safe facts",
   assert.equal(serialized.includes("secret-token"), false);
   assert.equal(serialized.includes('"env"'), false);
   assert.equal(serialized.includes('"command"'), false);
+  assert.equal(serialized.includes("PR body must stay"), false);
+  const issueEvent = events.find(
+    ({ eventType }) => eventType === "issue.observed",
+  );
+  assert.equal(issueEvent.payload.commentsCount, 1);
+  assert.match(issueEvent.payload.evidenceDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(serialized.includes("Issue body with reproduction steps"), false);
+  assert.equal(serialized.includes("Use the release branch"), false);
   assert.ok(events.every(Object.isFrozen));
 });
 
@@ -241,6 +259,53 @@ test("a changed PR Head carries its causal predecessor on the update event", () 
   assert.equal(events[0].payload.headRefOid, "head-b");
   assert.equal(events[0].payload.previousHeadRefOid, "head-a");
   assert.deepEqual(events[0].payload.changedFields, ["headRefOid"]);
+});
+
+test("newly available issue evidence emits an update for existing work", () => {
+  const previous = snapshot([
+    issue(12, {
+      description: undefined,
+      commentsCount: undefined,
+      latestComment: undefined,
+    }),
+  ], { refreshedAt: "2026-08-02T01:00:00.000Z" });
+  const current = snapshot([issue(12)]);
+
+  const events = workflowEventsFromSnapshots(previous, current);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].eventType, "issue.updated");
+  assert.deepEqual(events[0].payload.changedFields, [
+    "commentsCount",
+    "evidenceDigest",
+  ]);
+  assert.match(events[0].payload.evidenceDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(JSON.stringify(events[0]).includes("attachment URL"), false);
+});
+
+test("large issue evidence is digest-bound without entering routing state", () => {
+  const description = "复现步骤与附件".repeat(1_500);
+  const commentBody = "补充视频".repeat(1_000);
+  const items = Array.from({ length: 1_300 }, (_, index) => issue(index + 1, {
+    description,
+    latestComment: {
+      author: "carol",
+      body: commentBody,
+      createdAt: "2026-08-01T04:00:00.000Z",
+      updatedAt: "2026-08-01T04:00:00.000Z",
+      url: `https://github.com/acme/repo/issues/${index + 1}#issuecomment-1`,
+    },
+  }));
+  const current = snapshot(items);
+
+  const checkpoint = projectWorkflowSnapshot(current);
+  const events = workflowEventsFromSnapshots(null, current);
+  const serialized = JSON.stringify({ checkpoint, events });
+
+  assert.equal(events.length, 1_300);
+  assert.equal(serialized.includes(description.slice(0, 128)), false);
+  assert.equal(serialized.includes(commentBody.slice(0, 128)), false);
+  assert.ok(Buffer.byteLength(serialized, "utf8") < 4 * 1024 * 1024);
 });
 
 test("a changed PR base target emits a new event even when Head is unchanged", () => {

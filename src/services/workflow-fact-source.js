@@ -18,6 +18,9 @@ const FACT_FIELDS = new Map([
   ["next-action", "nextAction"],
   ["review-decision", "reviewDecision"],
   ["state", "state"],
+  ["issue-description", "description"],
+  ["issue-comments-count", "commentsCount"],
+  ["issue-latest-comment", "latestComment"],
 ]);
 const SAFE_FACT = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const DEFAULT_MAXIMUM_AGE_MS = 15 * 60 * 1_000;
@@ -275,6 +278,20 @@ function selectedFactValue(matched, field) {
       return null;
     }
   }
+  if (field === "latestComment") {
+    const comment = ownData(matched?.get(field));
+    const names = ["author", "body", "createdAt", "updatedAt", "url"];
+    if (
+      !comment ||
+      comment.size !== names.length ||
+      names.some((name) => typeof comment.get(name) !== "string")
+    ) {
+      return null;
+    }
+    return JSON.stringify(Object.fromEntries(
+      names.map((name) => [name, comment.get(name)]),
+    ));
+  }
   return field && matched ? normalizedFactValue(matched.get(field)) : null;
 }
 
@@ -399,6 +416,9 @@ export class WorkflowFactSource {
       }
     }
     const field = FACT_FIELDS.get(fact);
+    if (fact.startsWith("issue-") && expectedSource !== "githubIssues") {
+      return result({ healthy, fresh, observedAt });
+    }
     return result({
       healthy,
       fresh,

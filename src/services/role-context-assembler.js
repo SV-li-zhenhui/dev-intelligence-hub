@@ -44,6 +44,11 @@ const FACT_NAMES = Object.freeze([
   "review-decision",
   "state",
 ]);
+const ISSUE_FACT_NAMES = Object.freeze([
+  "issue-description",
+  "issue-comments-count",
+  "issue-latest-comment",
+]);
 const DATA_CLASS_BY_DELIVERABLE_KIND = new Map([
   ["requirement-spec", "requirements"],
   ["text-report", "requirements"],
@@ -937,7 +942,12 @@ function normalizeFactObservation(value, name) {
   ) {
     return null;
   }
-  const valueText = text(fields.get("value"), `fact ${name}.value`, 4_096);
+  const maximumBytes = name === "issue-description"
+    ? 16 * 1024
+    : name === "issue-latest-comment"
+      ? 8 * 1024
+      : 4 * 1024;
+  const valueText = text(fields.get("value"), `fact ${name}.value`, maximumBytes);
   const observedAt = fields.get("observedAt");
   if (
     typeof observedAt !== "string" ||
@@ -953,7 +963,10 @@ async function readFacts(factSource, event, signal) {
   signal?.throwIfAborted();
   if (!factSource) return [];
   const facts = [];
-  for (const name of FACT_NAMES) {
+  const names = event.eventType.startsWith("issue.")
+    ? [...FACT_NAMES, ...ISSUE_FACT_NAMES]
+    : FACT_NAMES;
+  for (const name of names) {
     signal?.throwIfAborted();
     let observation;
     try {

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { normalizeWorkflowEvent } from "./workflow-events.js";
 import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
 
@@ -12,7 +14,7 @@ const SOURCE_DEFINITIONS = Object.freeze([
   },
 ]);
 
-const FACT_FIELDS = Object.freeze([
+const COMMON_FACT_FIELDS = Object.freeze([
   "title",
   "author",
   "createdAt",
@@ -38,6 +40,17 @@ const FACT_FIELDS = Object.freeze([
   "myReviewCommitOid",
   "reviewFactsAvailable",
   "inactiveDays",
+]);
+const ISSUE_FACT_FIELDS = Object.freeze([
+  "commentsCount",
+  "evidenceDigest",
+]);
+const LATEST_COMMENT_FIELDS = Object.freeze([
+  "author",
+  "body",
+  "createdAt",
+  "updatedAt",
+  "url",
 ]);
 
 const CLASSIFICATION_FIELDS = new Set([
@@ -123,6 +136,45 @@ function sourceIsHealthy(snapshot, statusName) {
   return status?.ok === true && status.stale !== true;
 }
 
+function normalizedLatestComment(value) {
+  if (value === null) return null;
+  if (
+    !plainObject(value) ||
+    Object.keys(value).length !== LATEST_COMMENT_FIELDS.length ||
+    LATEST_COMMENT_FIELDS.some(
+      (name) => !Object.hasOwn(value, name) || typeof value[name] !== "string",
+    )
+  ) {
+    throw new TypeError("latestComment must be a complete GitHub comment");
+  }
+  return Object.fromEntries(
+    LATEST_COMMENT_FIELDS.map((name) => [name, value[name]]),
+  );
+}
+
+function issueEvidenceDigest(item) {
+  if (Object.hasOwn(item, "description") || Object.hasOwn(item, "latestComment")) {
+    const evidence = {};
+    if (item.description !== undefined) {
+      if (typeof item.description !== "string") {
+        throw new TypeError("description must be a string");
+      }
+      evidence.description = item.description;
+    }
+    if (item.latestComment !== undefined) {
+      evidence.latestComment = normalizedLatestComment(item.latestComment);
+    }
+    return createHash("sha256")
+      .update(JSON.stringify(evidence))
+      .digest("hex");
+  }
+  if (item.evidenceDigest === undefined) return undefined;
+  if (!/^[a-f0-9]{64}$/u.test(item.evidenceDigest)) {
+    throw new TypeError("evidenceDigest must be a SHA-256 digest");
+  }
+  return item.evidenceDigest;
+}
+
 function normalizedFactValue(value, field) {
   if (field === "gitTarget") {
     try {
@@ -148,22 +200,32 @@ function normalizedFactValue(value, field) {
   throw new TypeError(`${field} must be a JSON fact`);
 }
 
+function factFieldsFor(item) {
+  return item.kind === "issue"
+    ? [...COMMON_FACT_FIELDS, ...ISSUE_FACT_FIELDS]
+    : COMMON_FACT_FIELDS;
+}
+
 function factsFor(item) {
   const facts = {};
-  for (const field of FACT_FIELDS) {
-    if (!Object.hasOwn(item, field) || item[field] === undefined) continue;
-    facts[field] = normalizedFactValue(item[field], field);
+  for (const field of factFieldsFor(item)) {
+    const value = field === "evidenceDigest"
+      ? issueEvidenceDigest(item)
+      : item[field];
+    if (value === undefined) continue;
+    facts[field] = normalizedFactValue(value, field);
   }
   return facts;
 }
 
-function changedFields(before, after) {
+function changedFacts(before, after) {
   const previousFacts = factsFor(before);
   const currentFacts = factsFor(after);
-  return FACT_FIELDS.filter(
+  const fields = factFieldsFor(after).filter(
     (field) =>
       JSON.stringify(previousFacts[field]) !== JSON.stringify(currentFacts[field]),
   );
+  return { fields, currentFacts };
 }
 
 function compareStrings(left, right) {
@@ -296,10 +358,9 @@ function normalizedEvent(context) {
 }
 
 function changeEvents(before, after, context) {
-  const fields = changedFields(before, after);
+  const { fields, currentFacts: facts } = changedFacts(before, after);
   if (!fields.length) return [];
 
-  const facts = factsFor(after);
   const previousHeadRefOid = fields.includes("headRefOid")
     ? before.headRefOid
     : undefined;

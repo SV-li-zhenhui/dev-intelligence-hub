@@ -298,7 +298,11 @@ function graphFixture({ pullRequest = false } = {}) {
         eventId: "event-issue-1",
         eventType: "issue.updated",
         subject: { id: "issue-12" },
-        payload: { title: "Issue title", description: "Issue body", secretMarker: "NOT-IN-MINIMAL-SOURCE" },
+        payload: {
+          title: "Issue title",
+          evidenceDigest: DIGEST_A,
+          secretMarker: "NOT-IN-MINIMAL-SOURCE",
+        },
       };
   return {
     item: {
@@ -1177,6 +1181,24 @@ test("places fresh non-PR facts in requirements and omits an otherwise empty cod
       value: "open",
       observedAt: "2026-08-03T05:00:00.000Z",
     },
+    "issue-description": {
+      healthy: true,
+      fresh: true,
+      value: "Issue body with screenshot and video links",
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
+    "issue-comments-count": {
+      healthy: true,
+      fresh: true,
+      value: "2",
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
+    "issue-latest-comment": {
+      healthy: true,
+      fresh: true,
+      value: JSON.stringify({ author: "carol", body: "Use release branch" }),
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
   });
 
   const packet = await assemble(fixture, { factSource: facts });
@@ -1186,6 +1208,21 @@ test("places fresh non-PR facts in requirements and omits an otherwise empty cod
     {
       name: "state",
       value: "open",
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
+    {
+      name: "issue-description",
+      value: "Issue body with screenshot and video links",
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
+    {
+      name: "issue-comments-count",
+      value: "2",
+      observedAt: "2026-08-03T05:00:00.000Z",
+    },
+    {
+      name: "issue-latest-comment",
+      value: JSON.stringify({ author: "carol", body: "Use release branch" }),
       observedAt: "2026-08-03T05:00:00.000Z",
     },
   ]);

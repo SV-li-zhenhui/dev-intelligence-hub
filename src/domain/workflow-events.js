@@ -67,6 +67,7 @@ const PAYLOAD_FIELDS = new Set([
   "author",
   "changedFields",
   "ciStatus",
+  "commentsCount",
   "confidence",
   "createdAt",
   "description",
@@ -81,6 +82,7 @@ const PAYLOAD_FIELDS = new Set([
   "isDraft",
   "issueType",
   "labels",
+  "evidenceDigest",
   "mergeStateStatus",
   "milestone",
   "myReviewCommitOid",
@@ -122,6 +124,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "ciStatus",
   "createdAt",
   "description",
+  "evidenceDigest",
   "expectedHeadRefOid",
   "headRefOid",
   "issueType",
@@ -153,6 +156,7 @@ const BOOLEAN_PAYLOAD_FIELDS = new Set([
   "reviewFactsAvailable",
 ]);
 const NUMBER_PAYLOAD_FIELDS = new Set([
+  "commentsCount",
   "confidence",
   "inactiveDays",
   "number",
@@ -407,6 +411,9 @@ function assertPayloadShape(value) {
       if (entry === null) continue;
       if (STRING_PAYLOAD_FIELDS.has(key) && typeof entry !== "string") {
         throw invalid(`payload.${key}`);
+      }
+      if (key === "evidenceDigest" && !SHA256.test(entry)) {
+        throw invalid("payload.evidenceDigest");
       }
       if (BOOLEAN_PAYLOAD_FIELDS.has(key) && typeof entry !== "boolean") {
         throw invalid(`payload.${key}`);

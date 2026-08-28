@@ -81,6 +81,18 @@ test("PR and Issue events retain business fields that are also used by owner req
   }
 });
 
+test("issue evidence digests must be canonical SHA-256 values", () => {
+  const normalized = normalizeWorkflowEvent(event({
+    eventType: "issue.updated",
+    payload: { evidenceDigest: "a".repeat(64) },
+  }));
+  assert.equal(normalized.payload.evidenceDigest, "a".repeat(64));
+  assertInvalid(() => normalizeWorkflowEvent(event({
+    eventType: "issue.updated",
+    payload: { evidenceDigest: "not-a-digest" },
+  })));
+});
+
 test("normalizes key order into a stable content-addressed event", () => {
   const left = event({
     payload: {
