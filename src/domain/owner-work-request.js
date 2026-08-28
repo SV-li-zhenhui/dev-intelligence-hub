@@ -186,6 +186,61 @@ export function ownerWorkRequestDigest(value) {
     .digest("hex");
 }
 
+function deterministicRequestId(seed) {
+  const digest = createHash("sha256").update(seed, "utf8").digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    `4${digest.slice(13, 16)}`,
+    `8${digest.slice(17, 20)}`,
+    digest.slice(20, 32),
+  ].join("-");
+}
+
+export function createPrTriageWorkRequest({
+  requestKey,
+  targetRoleId,
+  repository,
+  number,
+  nextAction,
+}) {
+  if (
+    typeof requestKey !== "string" ||
+    requestKey.length < 1 ||
+    requestKey.length > 256 ||
+    !["pr-engineer", "developer"].includes(targetRoleId) ||
+    typeof repository !== "string" ||
+    !Number.isSafeInteger(number) ||
+    number < 1 ||
+    typeof nextAction !== "string" ||
+    nextAction.length < 1 ||
+    nextAction.length > 128
+  ) {
+    throw invalid("PR 初判分流请求无效");
+  }
+  return normalizeOwnerWorkRequest({
+    schemaVersion: 2,
+    requestId: deterministicRequestId(`pr-triage:${requestKey}`),
+    workType: targetRoleId === "developer" ? "development" : "pull_request",
+    priority: ["fix_ci", "resolve_conflict", "address_review"].includes(nextAction)
+      ? "urgent"
+      : "high",
+    title: `PR 初判分流：${repository} #${number}`,
+    description: [
+      `PR 推进员工已完成 ${repository} #${number} 的基础初判。`,
+      `下一动作：${nextAction}。`,
+      `请由 ${targetRoleId} 基于 GitHub 最新事实继续处理并留下可验证交付。`,
+    ].join("\n"),
+    acceptanceCriteria: [
+      "核对 PR 最新 Head、状态与检查结果",
+      targetRoleId === "developer"
+        ? "完成必要的代码修复与验证，并提交可追踪交付"
+        : "完成有证据的代码 Review，并明确下一推进岗位",
+    ],
+    pullRequest: { repository, number },
+  });
+}
+
 export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
   exactKeys(
@@ -207,9 +262,9 @@ export function normalizeOwnerWorkRequest(value) {
     throw invalid();
   }
   if (
-    version === 2 && value.workType !== "pull_request"
+    version === 2 && !["pull_request", "development"].includes(value.workType)
   ) {
-    throw invalid("PR 推进必须提供结构化 PR 目标");
+    throw invalid("PR Review 或开发分流必须提供结构化 PR 目标");
   }
   if (version === 3 && value.workType !== "testing") {
     throw invalid("具体负责人只能绑定测试交接请求");

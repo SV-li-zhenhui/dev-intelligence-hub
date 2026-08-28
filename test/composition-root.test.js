@@ -27,6 +27,7 @@ import {
   createConfiguredGitHubCredentialSource,
   createEmployeeRegistry,
   createPrEmployeeReviewer,
+  createPrTriageHandoff,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import {
@@ -88,6 +89,36 @@ function applicationConfig(codeExecutor = { enabled: false }) {
     codeExecutor,
   };
 }
+
+test("composition triage handoff creates durable role-bound PR work", async () => {
+  const requests = [];
+  const handoff = createPrTriageHandoff(() => ({
+    async submit(request) {
+      requests.push(request);
+      return { workItemId: "work-item-triage" };
+    },
+  }));
+
+  const result = await handoff.submit({
+    requestKey: "pr-work-review",
+    targetRoleId: "pr-engineer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "review",
+  });
+
+  assert.deepEqual(result, { workItemId: "work-item-triage" });
+  assert.equal(requests[0].schemaVersion, 2);
+  assert.equal(requests[0].workType, "pull_request");
+  assert.deepEqual(requests[0].pullRequest, {
+    repository: "acme/repo",
+    number: 42,
+  });
+  await assert.rejects(
+    createPrTriageHandoff(() => null).submit({}),
+    (error) => error.code === "PR_TRIAGE_HANDOFF_NOT_READY",
+  );
+});
 
 test("application exposes one operations runtime bound to explicit local directories", async () => {
   const calls = {};

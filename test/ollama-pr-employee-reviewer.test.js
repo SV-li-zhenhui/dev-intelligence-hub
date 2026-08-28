@@ -29,7 +29,10 @@ const EXPECTED_GENERATION_SCHEMA = {
     "requiresApproval",
   ],
   properties: {
-    workType: { type: "string", enum: ["review_draft", "owner_plan"] },
+    workType: {
+      type: "string",
+      enum: ["review_draft", "owner_plan", "triage_plan"],
+    },
     summary: { type: "string", minLength: 1, maxLength: 1_000 },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     evidence: {
@@ -739,6 +742,29 @@ test("owner work produces an internal plan that never enters approval", async ()
   );
 
   assert.deepEqual(result, plan);
+});
+
+test("routine PR triage produces no Review or owner action", async () => {
+  const triage = reviewDraft({
+    workType: "triage_plan",
+    reviewVerdict: "none",
+    reviewBody: "",
+    requiresApproval: false,
+  });
+  const reviewer = new OllamaPrEmployeeReviewer({
+    fetch: async () => response(triage),
+  });
+
+  const result = await reviewer.analyze(
+    context({
+      workMode: "triage",
+      patch: "",
+      files: [],
+      requestedAction: "review",
+    }),
+  );
+
+  assert.deepEqual(result, triage);
 });
 
 test("remote code context requires an explicit opt-in and never follows redirects", async () => {

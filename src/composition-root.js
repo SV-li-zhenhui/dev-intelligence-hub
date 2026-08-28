@@ -84,6 +84,7 @@ import { WorkflowFactSource } from "./services/workflow-fact-source.js";
 import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
+import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
 import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
@@ -128,6 +129,23 @@ export class ProductionCliCompositionGrant {
     }
     return consumer(this.#runtimeFacts);
   }
+}
+
+export function createPrTriageHandoff(readOwnerWorkRequests) {
+  if (typeof readOwnerWorkRequests !== "function") {
+    throw new TypeError("PR triage handoff runtime reader is invalid");
+  }
+  return Object.freeze({
+    async submit(input) {
+      const runtime = readOwnerWorkRequests();
+      if (!runtime || typeof runtime.submit !== "function") {
+        throw Object.assign(new Error("PR triage handoff runtime is not ready"), {
+          code: "PR_TRIAGE_HANDOFF_NOT_READY",
+        });
+      }
+      return runtime.submit(createPrTriageWorkRequest(input));
+    },
+  });
 }
 Object.freeze(ProductionCliCompositionGrant.prototype);
 Object.freeze(ProductionCliCompositionGrant);
@@ -2046,8 +2064,11 @@ export async function createApplication({
           )
         : null,
       store,
-      config: roleConfig,
+      // The legacy PR employee is the low-risk Ollama patrol/triage role.
+      // Evidence-bound code Review belongs exclusively to pr-engineer.
+      config: { ...roleConfig, triageOnly: true },
       operationQueue,
+      triageHandoff: createPrTriageHandoff(() => ownerWorkRequests),
       producerQueue: confirmationRuntime
         ? frozenPort(
             confirmationRuntime.producerQueue,

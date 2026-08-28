@@ -29,7 +29,7 @@ const DIRECT_ACTION_ADMISSION = Object.freeze({
     return operation();
   },
 });
-const WORK_TYPES = ["review_draft", "owner_plan"];
+const WORK_TYPES = ["review_draft", "owner_plan", "triage_plan"];
 const REVIEW_VERDICTS = ["approve", "comment", "request_changes", "none"];
 
 const RESULT_SCHEMA = {
@@ -426,7 +426,9 @@ function systemPrompt(mode, isRetry) {
   const modeInstruction =
     mode === "review"
       ? "Produce a review_draft. Choose approve, comment, or request_changes; requiresApproval must be true."
-      : "Produce an owner_plan. reviewVerdict must be none, reviewBody must be empty, and requiresApproval must be false.";
+      : mode === "owner"
+        ? "Produce an owner_plan. reviewVerdict must be none, reviewBody must be empty, and requiresApproval must be false."
+        : "Produce a triage_plan using only PR metadata and status facts. Identify urgency, blocking signals, and the next specialist; do not perform code review. reviewVerdict must be none, reviewBody must be empty, and requiresApproval must be false.";
   const retry = isRetry
     ? "The previous result violated the contract. Recheck every field. Steps must contain 1-8 items; if there are more, combine related steps without dropping safety, validation, or rollback requirements. Return only the corrected JSON object."
     : "";
@@ -524,6 +526,15 @@ function validateResult(value, context) {
   ) {
     issues.push("owner mode requires an internal owner_plan without approval");
   }
+  if (
+    context.workMode === "triage" &&
+    (value.workType !== "triage_plan" ||
+      value.reviewVerdict !== "none" ||
+      value.reviewBody !== "" ||
+      value.requiresApproval !== false)
+  ) {
+    issues.push("triage mode requires an internal triage_plan without Review or approval");
+  }
   if (context.patchTruncated && value.reviewVerdict === "approve") {
     issues.push("a truncated patch cannot be approved");
   }
@@ -581,8 +592,8 @@ export class OllamaPrEmployeeReviewer {
     const signal = analysisSignal(options);
     signal?.throwIfAborted();
     const selectedContext = selectContext(input);
-    if (!["review", "owner"].includes(selectedContext.workMode)) {
-      throw new Error("PR employee workMode must be review or owner");
+    if (!["review", "owner", "triage"].includes(selectedContext.workMode)) {
+      throw new Error("PR employee workMode must be review, owner, or triage");
     }
     const context = fitContext(selectedContext, this.contextTokens);
     let lastError = "unknown validation error";

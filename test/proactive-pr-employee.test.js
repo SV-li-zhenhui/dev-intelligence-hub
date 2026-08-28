@@ -239,6 +239,7 @@ function createService({
   reviewer,
   now,
   config = {},
+  triageHandoff,
   actionAdmissionGate,
 } = {}) {
   return new ProactivePrEmployeeService({
@@ -256,8 +257,18 @@ function createService({
       memoryLimit: 100,
       ...config,
     },
+    triageHandoff,
     actionAdmissionGate,
   });
+}
+
+function durableTriageHandoff(onSubmit = () => {}) {
+  return {
+    async submit(input) {
+      onSubmit(input);
+      return { workItemId: `work-item-${input.targetRoleId}` };
+    },
+  };
 }
 
 test("configuration-first admission creates no legacy PR employee job", async () => {
@@ -1004,6 +1015,181 @@ test("an authored PR produces an internal work plan without entering approval", 
   assert.equal(result.jobs[0].status, "ready");
   assert.equal(result.confirmationQueue.length, 0);
   assert.equal(result.role.lastRun.newJobs, 1);
+});
+
+test("triage-only PR promoter classifies work without reading patches or drafting Reviews", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  let includePatch = null;
+  let analysisContext = null;
+  let handoffInput = null;
+  const service = createService({
+    store,
+    config: { triageOnly: true },
+    triageHandoff: durableTriageHandoff((input) => {
+      handoffInput = input;
+    }),
+    github: {
+      async loadReviewContext(item, options) {
+        includePatch = options.includePatch;
+        return { ...item, patch: "", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: {
+      provider: "ollama",
+      model: "qwen3.5:9b",
+      async analyze(context) {
+        analysisContext = context;
+        return reviewResult({
+          workType: "triage_plan",
+          reviewVerdict: "none",
+          reviewBody: "",
+          requiresApproval: false,
+        });
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(includePatch, false);
+  assert.equal(analysisContext.workMode, "triage");
+  assert.equal(result.jobs[0].workType, "triage_plan");
+  assert.equal(result.jobs[0].targetRoleId, "pr-engineer");
+  assert.equal(result.jobs[0].handoffWorkItemId, "work-item-pr-engineer");
+  assert.deepEqual(handoffInput, {
+    requestKey: result.jobs[0].id,
+    targetRoleId: "pr-engineer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "review",
+  });
+  assert.equal(result.jobs[0].reviewVerdict, "none");
+  assert.equal(result.jobs[0].reviewBody, "");
+  assert.equal(result.jobs[0].requiresApproval, false);
+  assert.equal(result.jobs[0].status, "ready");
+  assert.equal(result.confirmationQueue.length, 0);
+});
+
+test("triage-only PR promoter durably routes authored fixes to developer", async () => {
+  const owned = pullRequest({
+    relation: "authored",
+    author: "local-owner",
+    nextAction: "fix_ci",
+    actionReasons: ["需要你处理检查失败"],
+  });
+  const store = new MemoryStore({ snapshot: snapshot([owned]) });
+  const handoffs = [];
+  const service = createService({
+    store,
+    config: { triageOnly: true },
+    triageHandoff: durableTriageHandoff((input) => handoffs.push(input)),
+    github: {
+      async loadReviewContext(item, options) {
+        assert.equal(options.includePatch, false);
+        return { ...item, patch: "", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        return reviewResult({
+          workType: "triage_plan",
+          reviewVerdict: "none",
+          reviewBody: "",
+          requiresApproval: false,
+        });
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].targetRoleId, "developer");
+  assert.equal(result.jobs[0].handoffWorkItemId, "work-item-developer");
+  assert.equal(result.confirmationQueue.length, 0);
+  assert.deepEqual(handoffs[0], {
+    requestKey: result.jobs[0].id,
+    targetRoleId: "developer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "fix_ci",
+  });
+});
+
+test("triage-only PR promoter does not finish when durable handoff fails", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  const service = createService({
+    store,
+    config: { triageOnly: true },
+    triageHandoff: {
+      async submit() {
+        throw Object.assign(new Error("ledger unavailable"), {
+          code: "PR_TRIAGE_HANDOFF_NOT_READY",
+        });
+      },
+    },
+    github: {
+      async loadReviewContext(item) {
+        return { ...item, patch: "", patchTruncated: false, files: [] };
+      },
+    },
+    reviewer: {
+      async analyze() {
+        return reviewResult({
+          workType: "triage_plan",
+          reviewVerdict: "none",
+          reviewBody: "",
+          requiresApproval: false,
+        });
+      },
+    },
+  });
+
+  const result = await service.tick();
+
+  assert.equal(result.jobs[0].status, "retry_wait");
+  assert.equal(result.jobs[0].error, "ledger unavailable");
+  assert.equal(result.jobs[0].handoffWorkItemId, undefined);
+});
+
+test("enabling triage retires legacy Review drafts before creating triage work", async () => {
+  const store = new MemoryStore({ snapshot: snapshot([pullRequest()]) });
+  const github = {
+    async loadReviewContext(item) {
+      return { ...item, patch: "", patchTruncated: false, files: [] };
+    },
+  };
+  await createService({
+    store,
+    github,
+    reviewer: { async analyze() { return reviewResult(); } },
+  }).tick();
+
+  const result = await createService({
+    store,
+    github,
+    config: { triageOnly: true },
+    triageHandoff: durableTriageHandoff(),
+    reviewer: {
+      async analyze() {
+        return reviewResult({
+          workType: "triage_plan",
+          reviewVerdict: "none",
+          reviewBody: "",
+          requiresApproval: false,
+        });
+      },
+    },
+  }).tick();
+
+  assert.equal(
+    result.jobs.filter((job) => job.workType === "review_draft")[0].status,
+    "superseded",
+  );
+  assert.equal(
+    result.jobs.filter((job) => job.workType === "triage_plan")[0].status,
+    "ready",
+  );
+  assert.equal(result.confirmationQueue.length, 0);
 });
 
 test("pausing is persistent and prevents new analysis until resumed", async () => {

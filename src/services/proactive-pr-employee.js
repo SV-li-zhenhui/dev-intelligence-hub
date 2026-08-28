@@ -23,42 +23,49 @@ const WORK_POLICY_BY_ACTION = Object.freeze({
     workType: "review_draft",
     requiresApproval: true,
     relations: ["review_requested"],
+    triageTargetRoleId: "pr-engineer",
   },
   rereview: {
     mode: "review",
     workType: "review_draft",
     requiresApproval: true,
     relations: ["review_requested"],
+    triageTargetRoleId: "pr-engineer",
   },
   complete_review: {
     mode: "review",
     workType: "review_draft",
     requiresApproval: true,
     relations: ["review_requested"],
+    triageTargetRoleId: "pr-engineer",
   },
   fix_ci: {
     mode: "owner",
     workType: "owner_plan",
     requiresApproval: false,
     relations: ["authored"],
+    triageTargetRoleId: "developer",
   },
   resolve_conflict: {
     mode: "owner",
     workType: "owner_plan",
     requiresApproval: false,
     relations: ["authored"],
+    triageTargetRoleId: "developer",
   },
   address_review: {
     mode: "owner",
     workType: "owner_plan",
     requiresApproval: false,
     relations: ["authored"],
+    triageTargetRoleId: "developer",
   },
   continue_draft: {
     mode: "owner",
     workType: "owner_plan",
     requiresApproval: false,
     relations: ["authored"],
+    triageTargetRoleId: "developer",
   },
 });
 const DECISIONS = new Set(["accept", "reject"]);
@@ -213,6 +220,18 @@ function workPolicy(item) {
   return policy?.relations.includes(item?.relation) ? policy : null;
 }
 
+function effectiveWorkPolicy(item, triageOnly) {
+  const policy = workPolicy(item);
+  if (!policy || triageOnly !== true) return policy;
+  return {
+    ...policy,
+    mode: "triage",
+    workType: "triage_plan",
+    requiresApproval: false,
+    targetRoleId: policy.triageTargetRoleId || "pr-engineer",
+  };
+}
+
 function isCandidate(item) {
   return Boolean(
     item?.kind === "pull_request" &&
@@ -335,6 +354,7 @@ export class ProactivePrEmployeeService {
     clock = () => new Date(),
     operationQueue = null,
     producerQueue = null,
+    triageHandoff = null,
     githubActions = { enabled: false },
     actionAdmissionGate,
   }) {
@@ -343,6 +363,9 @@ export class ProactivePrEmployeeService {
     this.reviewer = reviewer;
     this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     this.clock = clock;
+    const basePolicyVersion = Number.isSafeInteger(config.policyVersion)
+      ? config.policyVersion
+      : 1;
     this.config = {
       enabled: true,
       name: "PR 推进员工",
@@ -355,9 +378,23 @@ export class ProactivePrEmployeeService {
       memoryOutboxLimit: 100,
       jobLimit: 500,
       initialPaused: false,
+      triageOnly: false,
       ...config,
+      // Triage is a new responsibility contract. Advancing the effective
+      // policy retires persisted Review drafts and pre-handoff triage jobs
+      // instead of presenting either as actionable work after restart.
+      policyVersion: config.triageOnly === true
+        ? basePolicyVersion + 2
+        : basePolicyVersion,
     };
     this.producerQueue = producerQueue;
+    this.triageHandoff = triageHandoff;
+    if (
+      this.config.triageOnly === true &&
+      (!this.triageHandoff || typeof this.triageHandoff.submit !== "function")
+    ) {
+      throw new TypeError("Triage-only PR employee requires a durable handoff port");
+    }
     this.githubActions = { ...githubActions };
     if (
       this.githubActions.enabled === true &&
@@ -374,7 +411,9 @@ export class ProactivePrEmployeeService {
       definition: {
         id: "pr-reviewer",
         name: this.config.name,
-        mission: "主动巡查与你相关的 PR，生成评审草稿或推进方案",
+        mission: this.config.triageOnly
+          ? "主动发现相关 PR，完成基础筛选、优先级初判和岗位分流"
+          : "主动巡查与你相关的 PR，生成评审草稿或推进方案",
         enabled: this.config.enabled,
       },
       store,
@@ -1363,7 +1402,7 @@ export class ProactivePrEmployeeService {
       if (!item || !isCandidate(item)) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
-      const policy = workPolicy(item);
+      const policy = effectiveWorkPolicy(item, this.config.triageOnly);
       const context = await this.github.loadReviewContext(item, {
         includePatch: policy.mode === "review",
         ...(signal === null ? {} : { signal }),
@@ -1405,6 +1444,23 @@ export class ProactivePrEmployeeService {
 
       index = state.jobs.findIndex((job) => job.id === claimed.id);
       const completedAt = this.clock().toISOString();
+      const handoff = policy.targetRoleId
+        ? await this.triageHandoff.submit({
+            requestKey: claimed.id,
+            targetRoleId: policy.targetRoleId,
+            repository: item.repo,
+            number: item.number,
+            nextAction: item.nextAction,
+          })
+        : null;
+      if (
+        handoff !== null &&
+        (typeof handoff !== "object" ||
+          typeof handoff.workItemId !== "string" ||
+          handoff.workItemId.length < 1)
+      ) {
+        throw new Error("PR triage handoff did not return a durable work item");
+      }
       const completed = {
         ...state.jobs[index],
         workType: policy.workType,
@@ -1417,6 +1473,8 @@ export class ProactivePrEmployeeService {
           policy.mode === "review" ? analysis.reviewVerdict : "none",
         reviewBody: policy.mode === "review" ? analysis.reviewBody : "",
         requiresApproval: policy.requiresApproval,
+        ...(policy.targetRoleId ? { targetRoleId: policy.targetRoleId } : {}),
+        ...(handoff ? { handoffWorkItemId: handoff.workItemId } : {}),
         status: policy.requiresApproval ? "ready_for_human" : "ready",
         brain: { ...claimed.brain },
         updatedAt: completedAt,

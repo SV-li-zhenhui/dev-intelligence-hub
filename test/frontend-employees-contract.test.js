@@ -81,6 +81,18 @@ test("PR engineer work exposes the review stage and next owner", () => {
   }
 });
 
+test("PR promoter visibly stays within triage responsibility", () => {
+  assert.match(appSource, /正在初判/);
+  assert.match(
+    appSource,
+    /只做发现、初判和分流；代码 Review 交给 PR 工程师/,
+  );
+  assert.match(
+    appSource,
+    /pendingConfirmationCount = employee\.confirmationQueue\?\.length \|\| 0/,
+  );
+});
+
 test("PR employee pending work has a direct, explained confirmation entry", () => {
   for (const value of [
     "处理待确认（",

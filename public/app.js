@@ -494,11 +494,9 @@ function employeePanel({ expanded = false } = {}) {
     : "未配置大脑";
   const lastRun = role.lastRun;
   const activity = activeJob
-    ? `正在分析 ${activeJob.repo} #${activeJob.number}：${activeJob.triggerReason}`
+    ? `正在初判 ${activeJob.repo} #${activeJob.number}：${activeJob.triggerReason}`
     : lastRun?.summary || "等待第一次主动巡查";
-  const pendingConfirmationCount = confirmationQueueState.available
-    ? confirmationQueueState.pendingCount
-    : employee.confirmationQueue?.length || 0;
+  const pendingConfirmationCount = employee.confirmationQueue?.length || 0;
   return `
     <section class="section employee-panel" aria-labelledby="pr-employee-title">
       <div class="employee-heading">
@@ -513,7 +511,7 @@ function employeePanel({ expanded = false } = {}) {
         <div><dt>为什么启动</dt><dd>${escapeHtml(lastRun?.trigger || "等待事件")}${lastRun?.at ? ` · ${relativeTime(lastRun.at)}` : ""}</dd></div>
         <div><dt>正在做什么</dt><dd>${escapeHtml(activity)}</dd></div>
         <div><dt>当前大脑</dt><dd>${escapeHtml(brain)}</dd></div>
-        <div><dt>等待你确认</dt><dd>${pendingConfirmationCount} 条待确认动作</dd></div>
+        <div><dt>岗位边界</dt><dd>只做发现、初判和分流；代码 Review 交给 PR 工程师</dd></div>
       </dl>
       ${role.lastError ? `<p class="employee-error">${escapeHtml(role.lastError)}</p>` : ""}
       <div class="employee-actions">

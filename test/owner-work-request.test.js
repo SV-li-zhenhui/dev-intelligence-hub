@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   createOwnerPullRequestEvent,
+  createPrTriageWorkRequest,
   createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
   withOwnerWorkRequestDefaultRoute,
@@ -265,6 +266,39 @@ test("testing handoff preserves a structured GitHub responsible person", () => {
     })),
     (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
   );
+});
+
+test("automated PR triage creates deterministic role-bound work requests", () => {
+  const review = createPrTriageWorkRequest({
+    requestKey: "pr-work-review",
+    targetRoleId: "pr-engineer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "review",
+  });
+  const replay = createPrTriageWorkRequest({
+    requestKey: "pr-work-review",
+    targetRoleId: "pr-engineer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "review",
+  });
+  const development = createPrTriageWorkRequest({
+    requestKey: "pr-work-fix",
+    targetRoleId: "developer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "fix_ci",
+  });
+
+  assert.deepEqual(replay, review);
+  assert.match(review.requestId, /^[a-f0-9-]{36}$/);
+  assert.equal(review.schemaVersion, 2);
+  assert.equal(review.workType, "pull_request");
+  assert.equal(review.priority, "high");
+  assert.equal(development.schemaVersion, 2);
+  assert.equal(development.workType, "development");
+  assert.equal(development.priority, "urgent");
 });
 
 test("review and development handoffs accept a named responsible person", () => {
@@ -561,6 +595,19 @@ test("an explicit PR request resolves one immutable target before staging a PR e
     login: "runtime-user",
     product: "qt",
   });
+
+  const automatedDevelopment = await owner.submit(createPrTriageWorkRequest({
+    requestKey: "pr-work-fix-ci",
+    targetRoleId: "developer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "fix_ci",
+  }));
+  assert.deepEqual(automatedDevelopment.assignment.target, {
+    type: "role",
+    id: "developer",
+  });
+  assert.equal(automatedDevelopment.request.responsiblePerson, undefined);
 });
 
 test("restart resumes a staged request after a lost routing response without duplication", async (t) => {
