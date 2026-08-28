@@ -1307,6 +1307,37 @@ test("trusted authored PR lifecycle work reaches its developer and tester", asyn
   }
 });
 
+test("automatic scope lifecycle ignores a same-PR specialist root with a different work key", async () => {
+  const developer = prAssignment(1, {
+    gitFacts: {
+      relation: "authored",
+      actionState: "action_now",
+      nextAction: "address_review",
+    },
+  });
+  developer.assignment.target = { type: "role", id: "developer" };
+  developer.assignment.ruleId = AUTHORED_PR_SELF_FIX_RULE_ID;
+  developer.assignment.reason = "authored-pr-self-fix";
+  const fixture = await createFixture({ records: [developer] });
+  await fixture.service.intake();
+
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+
+  const result = await fixture.service.intake();
+  const [root] = (await fixture.service.listItems()).items;
+
+  assert.equal(result.cursor, 2);
+  assert.equal(root.currentTarget.id, "developer");
+  assert.equal(root.source.identity.targetRoleId, "developer");
+  assert.equal(root.source.scope.active, true);
+});
+
 test("an authored PR can hand off from review to self-fix and then testing", async () => {
   const review = prAssignment(1, {
     gitFacts: {

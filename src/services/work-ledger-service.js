@@ -61,6 +61,7 @@ import {
   applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
   currentWorkItemEvent,
+  pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
   validatePullRequestSourceTransition,
@@ -148,14 +149,12 @@ function samePullRequestSubject(left, right) {
   );
 }
 
-function pullRequestRootForLifecycle(itemsById, event) {
+function pullRequestRootForLifecycle(itemsById, envelope) {
+  const descriptor = pullRequestWorkDescriptor(envelope);
+  if (descriptor === null || !descriptor.trustedLifecycle) return null;
   return [...itemsById.values()].find((item) =>
     item?.source?.kind === "pull_request" &&
-    item.source.identity.provider === event.source?.provider &&
-    item.source.identity.scopeId === event.source?.scopeId &&
-    item.source.identity.subjectId === event.subject?.id &&
-    item.source.identity.repository === event.subject?.repository &&
-    item.source.identity.pullRequestNumber === event.subject?.number
+    item.source.workKey === descriptor.workKey
   ) ?? null;
 }
 
@@ -1256,7 +1255,7 @@ export class WorkLedgerService {
           candidate.assignment.target?.id === "pr-engineer",
       );
       if (trustedScopeLifecycle) {
-        let root = pullRequestRootForLifecycle(itemsById, envelope.event);
+        let root = pullRequestRootForLifecycle(itemsById, envelope);
         if (root !== null) {
           const applied = applyPullRequestScopeLifecycle(root.source, envelope);
           const active = applied.source.scope.active;
