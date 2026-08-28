@@ -227,6 +227,43 @@ function normalizeTrigger(value) {
   return boundedText(value, "trigger", 128);
 }
 
+function structuredInitialPrTriage(context, roleId) {
+  const event = context?.code?.sourceEvent ?? context?.code?.event;
+  const directChildren = context?.requirements?.coordination?.directChildren;
+  if (
+    roleId !== "orchestrator" ||
+    event?.eventType !== "pull_request.owner_requested" ||
+    event?.source?.provider !== "local-owner" ||
+    event?.payload?.workType !== "general" ||
+    !["development", "pr-review"].includes(
+      event?.payload?.suggestedCapability,
+    ) ||
+    typeof event?.payload?.nextAction !== "string" ||
+    typeof event?.payload?.expectedHeadRefOid !== "string" ||
+    !Array.isArray(directChildren) ||
+    directChildren.length !== 0
+  ) {
+    return null;
+  }
+  return event.payload;
+}
+
+function assertInitialPrTriageDecision(context, roleId, decision) {
+  const triage = structuredInitialPrTriage(context, roleId);
+  if (triage === null) return;
+  if (
+    decision.intent.type !== "orchestrate" ||
+    decision.intent.action?.type !== "decompose" ||
+    decision.intent.action.capability !== triage.suggestedCapability
+  ) {
+    throw engineError(
+      "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
+      "Initial structured PR triage must decompose exactly its trusted suggested capability",
+      409,
+    );
+  }
+}
+
 function throwIfAborted(signal) {
   if (!signal?.aborted) return;
   if (signal.reason instanceof Error) throw signal.reason;
@@ -382,6 +419,11 @@ export class RoleDecisionEngine {
       throwIfAborted(signal);
       try {
         decision = parseStructuredWorkDecision(response);
+        assertInitialPrTriageDecision(
+          context,
+          this.#definition.id,
+          decision,
+        );
         break;
       } catch (error) {
         if (attempt + 1 === maximumAttempts) throw error;

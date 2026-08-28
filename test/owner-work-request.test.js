@@ -9,6 +9,8 @@ import {
   createPrTriageWorkRequest,
   createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
+  normalizeStoredOwnerWorkRequest,
+  ownerWorkRequestEventMatches,
   withOwnerWorkRequestDefaultRoute,
 } from "../src/domain/owner-work-request.js";
 import { StateStore } from "../src/lib/state-store.js";
@@ -111,6 +113,20 @@ function roleReadiness(overrides = {}) {
     async read(roleId) {
       return {
         roleId,
+        enabled: true,
+        paused: false,
+        ...overrides,
+      };
+    },
+  };
+}
+
+function capabilityReadiness(overrides = {}) {
+  return {
+    async read(capability) {
+      return {
+        capability,
+        roleId: capability === "development" ? "developer" : "pr-engineer",
         enabled: true,
         paused: false,
         ...overrides,
@@ -233,6 +249,7 @@ test("owner request DTO exposes business fields only and creates a bound workflo
       (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
     );
   }
+
 });
 
 test("testing handoff preserves a structured GitHub responsible person", () => {
@@ -290,6 +307,7 @@ test("automated PR triage creates deterministic orchestrator-bound work requests
     repository: "acme/repo",
     number: 42,
     nextAction: "review",
+    expectedHeadRefOid: "a".repeat(40),
   });
   const replay = createPrTriageWorkRequest({
     requestKey: "pr-work-review",
@@ -297,6 +315,7 @@ test("automated PR triage creates deterministic orchestrator-bound work requests
     repository: "acme/repo",
     number: 42,
     nextAction: "review",
+    expectedHeadRefOid: "a".repeat(40),
   });
   const development = createPrTriageWorkRequest({
     requestKey: "pr-work-fix",
@@ -304,6 +323,7 @@ test("automated PR triage creates deterministic orchestrator-bound work requests
     repository: "acme/repo",
     number: 42,
     nextAction: "fix_ci",
+    expectedHeadRefOid: "a".repeat(40),
   });
 
   assert.deepEqual(replay, review);
@@ -316,14 +336,130 @@ test("automated PR triage creates deterministic orchestrator-bound work requests
     review.requestId,
     deterministicRequestId("pr-triage:pr-work-review"),
   );
+  assert.equal(
+    review.predecessorRequestId,
+    deterministicRequestId("pr-triage:pr-work-review"),
+  );
   assert.equal(review.schemaVersion, 5);
   assert.equal(review.workType, "general");
   assert.equal(review.priority, "high");
   assert.match(review.description, /建议能力：pr-review/);
+  assert.deepEqual(review.triage, {
+    nextAction: "review",
+    suggestedCapability: "pr-review",
+    expectedHeadRefOid: "a".repeat(40),
+  });
   assert.equal(development.schemaVersion, 5);
   assert.equal(development.workType, "general");
   assert.equal(development.priority, "urgent");
   assert.match(development.description, /建议能力：development/);
+
+  for (const invalid of [
+    { ...review, predecessorRequestId: review.requestId },
+    {
+      ...review,
+      triage: { ...review.triage, suggestedCapability: "testing" },
+    },
+    {
+      ...review,
+      triage: {
+        nextAction: review.triage.nextAction,
+        suggestedCapability: review.triage.suggestedCapability,
+      },
+    },
+    { ...review, triage: { ...review.triage, untrusted: true } },
+  ]) {
+    assert.throws(
+      () => normalizeOwnerWorkRequest(invalid),
+      (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+    );
+  }
+
+  const historicalUnstructuredV5 = Object.fromEntries(
+    Object.entries(review).filter(
+      ([key]) => !["predecessorRequestId", "triage"].includes(key),
+    ),
+  );
+  assert.throws(
+    () => normalizeOwnerWorkRequest(historicalUnstructuredV5),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
+  assert.equal(
+    normalizeStoredOwnerWorkRequest(historicalUnstructuredV5).schemaVersion,
+    5,
+  );
+  const historicalAt = "2026-08-08T01:00:00.000Z";
+  const structuredEvent = createOwnerPullRequestEvent(
+    review,
+    {
+      repository: "acme/repo",
+      number: 42,
+      title: "PR 42",
+      state: "open",
+      gitTarget: {
+        schemaVersion: 1,
+        provider: "github",
+        sourceAccountId: "runtime-user",
+        baseRepository: "acme/repo",
+        baseRefName: "main",
+        baseRefOid: "d".repeat(40),
+        headRepository: "contributor/repo",
+        headRefName: "fix/historical-v5",
+        headRefOid: "a".repeat(40),
+      },
+    },
+    historicalAt,
+  );
+  const historicalPayload = Object.fromEntries(
+    Object.entries(structuredEvent.payload).filter(
+      ([key]) => ![
+        "nextAction",
+        "suggestedCapability",
+        "expectedHeadRefOid",
+      ].includes(key),
+    ),
+  );
+  const historicalEvent = normalizeWorkflowEvent({
+    schemaVersion: structuredEvent.schemaVersion,
+    eventType: structuredEvent.eventType,
+    occurredAt: structuredEvent.occurredAt,
+    source: structuredEvent.source,
+    subject: structuredEvent.subject,
+    payload: historicalPayload,
+  });
+  assert.equal(
+    ownerWorkRequestEventMatches(
+      historicalUnstructuredV5,
+      historicalEvent,
+      historicalAt,
+    ),
+    true,
+  );
+
+  assert.throws(
+    () => createOwnerPullRequestEvent(
+      review,
+      {
+        repository: "acme/repo",
+        number: 42,
+        title: "PR 42",
+        state: "open",
+        gitTarget: {
+          schemaVersion: 1,
+          provider: "github",
+          sourceAccountId: "runtime-user",
+          baseRepository: "acme/repo",
+          baseRefName: "main",
+          baseRefOid: "d".repeat(40),
+          headRepository: "contributor/repo",
+          headRefName: "fix/head-changed",
+          headRefOid: "b".repeat(40),
+        },
+      },
+      "2026-08-08T01:00:00.000Z",
+    ),
+    (error) => error.code === "OWNER_WORK_REQUEST_INVALID",
+  );
 });
 
 test("review and development handoffs accept a named responsible person", () => {
@@ -576,6 +712,16 @@ test("an explicit PR request resolves one immutable target before staging a PR e
         };
       },
     },
+    capabilityReadiness: {
+      async read(capability) {
+        return {
+          capability,
+          roleId: capability === "development" ? "developer" : "pr-engineer",
+          enabled: true,
+          paused: false,
+        };
+      },
+    },
     clock,
     createGuard: guardFactory,
   });
@@ -627,6 +773,7 @@ test("an explicit PR request resolves one immutable target before staging a PR e
     repository: "acme/repo",
     number: 42,
     nextAction: "fix_ci",
+    expectedHeadRefOid: "a".repeat(40),
   }));
   assert.deepEqual(automatedDevelopment.assignment.target, {
     type: "role",
@@ -648,6 +795,14 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   );
   assert.equal(
     orchestratedItem.source.current.event.payload.gitTarget.headRefOid,
+    "a".repeat(40),
+  );
+  assert.equal(
+    orchestratedItem.source.current.event.payload.suggestedCapability,
+    "development",
+  );
+  assert.equal(
+    orchestratedItem.source.current.event.payload.expectedHeadRefOid,
     "a".repeat(40),
   );
 
@@ -785,6 +940,133 @@ test("restart resumes a staged request after a lost routing response without dup
     recovered.audit.map(({ type }) => type),
     ["request_staged", "request_routed", "request_intaken"],
   );
+  assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 1);
+  assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
+});
+
+test("new v5 triage rejects a missing trusted capability mapping before persistence", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-pr-capability-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  let resolveCalls = 0;
+  const owner = await createOwnerWorkRequestRuntime({
+    store,
+    workflowRouting: routing,
+    ledger,
+    roleReadiness: roleReadiness(),
+    capabilityReadiness: capabilityReadiness({
+      roleId: null,
+      enabled: false,
+      paused: true,
+    }),
+    pullRequestResolver: {
+      async resolvePullRequestTarget() {
+        resolveCalls += 1;
+        throw new Error("must not resolve before capability preflight");
+      },
+    },
+    clock,
+    createGuard: guardFactory,
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+
+  await assert.rejects(
+    owner.submit(createPrTriageWorkRequest({
+      requestKey: "pr-work-missing-capability",
+      targetRoleId: "pr-engineer",
+      repository: "acme/repo",
+      number: 42,
+      nextAction: "review",
+      expectedHeadRefOid: "a".repeat(40),
+    })),
+    (error) =>
+      error.code === "OWNER_WORK_REQUEST_CAPABILITY_NOT_READY" &&
+      /pr-review/.test(error.message),
+  );
+  assert.equal(resolveCalls, 0);
+  assert.equal((await owner.list({ limit: 10 })).items.length, 0);
+  assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 0);
+  assert.equal((await ledger.listItems({ limit: 10 })).items.length, 0);
+});
+
+test("v5 retry reuses a staged legacy deterministic PR handoff without a second root", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-pr-upgrade-replay-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  let loseFirstResponse = true;
+  const uncertainRouting = {
+    dryRun: routing.dryRun,
+    async ingest(input) {
+      const result = await routing.ingest(input);
+      if (loseFirstResponse) {
+        loseFirstResponse = false;
+        throw Object.assign(new Error("simulated pre-upgrade crash"), {
+          code: "SIMULATED_PRE_UPGRADE_CRASH",
+        });
+      }
+      return result;
+    },
+  };
+  const owner = await createOwnerWorkRequestRuntime({
+    store,
+    workflowRouting: uncertainRouting,
+    ledger,
+    roleReadiness: roleReadiness(),
+    pullRequestResolver: {
+      async resolvePullRequestTarget(target) {
+        return {
+          ...target,
+          title: "PR 42",
+          state: "open",
+          gitTarget: {
+            schemaVersion: 1,
+            provider: "github",
+            sourceAccountId: "runtime-user",
+            baseRepository: target.repository,
+            baseRefName: "main",
+            baseRefOid: "d".repeat(40),
+            headRepository: "contributor/repo",
+            headRefName: "fix/upgrade-replay",
+            headRefOid: "a".repeat(40),
+          },
+        };
+      },
+    },
+    clock,
+    createGuard: guardFactory,
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+  const requestKey = "pr-work-upgrade-replay";
+  const legacyRequestId = deterministicRequestId(`pr-triage:${requestKey}`);
+  const legacy = pullRequest({
+    requestId: legacyRequestId,
+    workType: "development",
+    title: "Legacy PR triage",
+    description: "Legacy deterministic development handoff.",
+  });
+
+  await assert.rejects(
+    owner.submit(legacy),
+    (error) => error.code === "SIMULATED_PRE_UPGRADE_CRASH",
+  );
+  const replay = await owner.submit(createPrTriageWorkRequest({
+    requestKey,
+    targetRoleId: "developer",
+    repository: "acme/repo",
+    number: 42,
+    nextAction: "fix_ci",
+    expectedHeadRefOid: "a".repeat(40),
+  }));
+
+  assert.equal(replay.deduplicated, true);
+  assert.equal(replay.requestId, legacyRequestId);
+  assert.equal(replay.request.schemaVersion, 2);
+  assert.deepEqual(replay.assignment.target, { type: "role", id: "developer" });
+  assert.equal((await owner.list({ limit: 10 })).items.length, 1);
   assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 1);
   assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
 });

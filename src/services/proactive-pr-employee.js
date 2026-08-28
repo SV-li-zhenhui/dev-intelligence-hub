@@ -1451,6 +1451,7 @@ export class ProactivePrEmployeeService {
             repository: item.repo,
             number: item.number,
             nextAction: item.nextAction,
+            expectedHeadRefOid: claimed.headRefOid,
           })
         : null;
       if (

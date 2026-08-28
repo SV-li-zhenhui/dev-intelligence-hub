@@ -1,5 +1,6 @@
 import {
   normalizeOwnerWorkRequest,
+  normalizeStoredOwnerWorkRequest,
   ownerWorkRequestEventMatches,
   ownerWorkRequestDigest,
 } from "../domain/owner-work-request.js";
@@ -239,7 +240,7 @@ export function normalizeOwnerWorkRequestRecord(value) {
   let request;
   let event;
   try {
-    request = normalizeOwnerWorkRequest(value.request);
+    request = normalizeStoredOwnerWorkRequest(value.request);
     event = normalizeStoredWorkflowEvent(value.event);
   } catch (cause) {
     throw stateError("所有者工作请求内容损坏", { cause });

@@ -105,6 +105,7 @@ test("composition triage handoff creates durable orchestrator-bound PR work", as
     repository: "acme/repo",
     number: 42,
     nextAction: "review",
+    expectedHeadRefOid: "a".repeat(40),
   });
 
   assert.deepEqual(result, { workItemId: "work-item-triage" });
@@ -114,6 +115,11 @@ test("composition triage handoff creates durable orchestrator-bound PR work", as
   assert.deepEqual(requests[0].pullRequest, {
     repository: "acme/repo",
     number: 42,
+  });
+  assert.deepEqual(requests[0].triage, {
+    nextAction: "review",
+    suggestedCapability: "pr-review",
+    expectedHeadRefOid: "a".repeat(40),
   });
   await assert.rejects(
     createPrTriageHandoff(() => null).submit({}),

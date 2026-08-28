@@ -2158,6 +2158,30 @@ export async function createApplication({
                 };
               },
             }),
+            capabilityReadiness: Object.freeze({
+              async read(capability) {
+                const roleId =
+                  coordinationConfig.policy?.capabilityRoles?.[capability];
+                const employee = typeof roleId === "string"
+                  ? employeeRegistry.get(roleId)
+                  : null;
+                if (!employee) {
+                  return {
+                    capability,
+                    roleId: roleId ?? null,
+                    enabled: false,
+                    paused: true,
+                  };
+                }
+                const role = await employee.roleView();
+                return {
+                  capability,
+                  roleId,
+                  enabled: role?.enabled === true,
+                  paused: role?.paused === true,
+                };
+              },
+            }),
             pullRequestResolver: frozenPort(
               github,
               ["resolvePullRequestTarget"],

@@ -61,6 +61,48 @@ function orchestrationDecision() {
   };
 }
 
+function triageDecompositionDecision(capability = "development") {
+  const reason = "Create the trusted PR triage child";
+  return {
+    schemaVersion: 1,
+    confidence: 91,
+    summary: "Create one specialist child",
+    intent: {
+      schemaVersion: 1,
+      type: "orchestrate",
+      summary: "Create one specialist child",
+      reason,
+      action: {
+        schemaVersion: 1,
+        type: "decompose",
+        sourceTaskId: "work-item-root",
+        sourceTaskRevision: 4,
+        expectedGraphRevision: 8,
+        reason,
+        childKey: "trusted-triage",
+        work: { title: "Handle PR", description: "Use trusted intake" },
+        capability,
+        dependsOn: [],
+        acceptanceContract: {
+          revision: 1,
+          acceptanceCriteria: [{
+            criterionId: "done",
+            description: "Trusted triage completed",
+          }],
+          expectedDeliverables: [{
+            deliverableId: "implementation",
+            kind: capability === "development"
+              ? "change-package"
+              : "github-review",
+            description: "Trusted specialist delivery",
+            required: true,
+          }],
+        },
+      },
+    },
+  };
+}
+
 function deliveryDecision() {
   return {
     schemaVersion: 1,
@@ -368,6 +410,49 @@ test("RoleDecisionEngine permits configured orchestration and delivery intents",
     "orchestrate",
     "submit_delivery",
   ]);
+});
+
+test("RoleDecisionEngine rejects premature completion of initial structured PR triage", async () => {
+  const responses = [completeDecision(), triageDecompositionDecision()];
+  const calls = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"),
+    permissions: permissions("complete", "orchestrate"),
+    brain: brain(),
+    brainRouter: {
+      async generate(request) {
+        calls.push(request);
+        return JSON.stringify(responses.shift());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+  const context = {
+    requirements: {
+      coordination: { directChildren: [] },
+    },
+    code: {
+      sourceEvent: {
+        eventType: "pull_request.owner_requested",
+        source: { provider: "local-owner" },
+        payload: {
+          workType: "general",
+          nextAction: "fix_ci",
+          suggestedCapability: "development",
+          expectedHeadRefOid: "a".repeat(40),
+        },
+      },
+    },
+  };
+
+  const result = await engine.decide({ context });
+
+  assert.equal(calls.length, 2);
+  assert.equal(result.intent.type, "orchestrate");
+  assert.equal(result.intent.action.type, "decompose");
+  assert.equal(result.intent.action.capability, "development");
 });
 
 test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {

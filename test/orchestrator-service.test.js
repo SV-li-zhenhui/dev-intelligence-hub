@@ -146,6 +146,7 @@ function packetFor(view, graphTask, {
   roleId = graphTask.responsibility.id,
   acceptedInputs = [],
   directChildren,
+  event,
 } = {}) {
   const requirements = {
     trigger: "scheduled",
@@ -183,9 +184,25 @@ function packetFor(view, graphTask, {
       graphContentDigest: view.graph.contentDigest,
       contractRevision: graphTask.acceptanceContracts.at(-1).revision,
     },
-    context: { requirements },
+    context: {
+      requirements,
+      ...(event === undefined ? {} : { code: { sourceEvent: event } }),
+    },
     acceptedInputs,
     contextDigest: CONTEXT_DIGEST,
+  };
+}
+
+function structuredTriageEvent(capability) {
+  return {
+    eventType: "pull_request.owner_requested",
+    source: { provider: "local-owner", scopeId: "owner-request:test" },
+    payload: {
+      workType: "general",
+      nextAction: capability === "development" ? "fix_ci" : "review",
+      suggestedCapability: capability,
+      expectedHeadRefOid: "d".repeat(40),
+    },
   };
 }
 
@@ -577,6 +594,121 @@ test("maps all eight orchestration actions to the least-authority planner comman
       assert.equal(Object.isFrozen(fakes.calls.planner[0].command), true);
       assert.equal(Object.isFrozen(result), true);
       assert.doesNotMatch(JSON.stringify(result), /private-owner|private-lease|evidence/);
+    });
+  }
+});
+
+test("structured PR triage creates exactly one child for its trusted capability", async (t) => {
+  for (const capability of ["development", "pr-review"]) {
+    await t.test(capability, async () => {
+      const root = task({ taskId: `root-${capability}`, revision: 1 });
+      const view = graphView([root], 1);
+      const item = itemFor(root);
+      const packet = packetFor(view, root, {
+        roleId: "orchestrator",
+        directChildren: [],
+        event: structuredTriageEvent(capability),
+      });
+      const fakes = fakePorts({ packet, views: view });
+      const reason = "Create the trusted triage child";
+      const result = await serviceFrom(fakes, {
+        development: "developer",
+        "pr-review": "pr-engineer",
+      }).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item,
+        contextPacket: packet,
+        intent: orchestrate({
+          ...commonAction("decompose", root, view, reason),
+          childKey: `triage-${capability}`,
+          work: { title: "Handle PR", description: "Use trusted PR intake" },
+          capability,
+          dependsOn: [],
+          acceptanceContract: contract({
+            kind: capability === "development"
+              ? "change-package"
+              : "github-review",
+          }),
+        }),
+      });
+
+      assert.equal(result.action, "decompose");
+      assert.deepEqual(fakes.calls.planner[0].command.target, {
+        type: "role",
+        id: capability === "development" ? "developer" : "pr-engineer",
+      });
+    });
+  }
+});
+
+test("structured PR triage rejects capability drift, a second child, and premature control", async (t) => {
+  const cases = [
+    {
+      name: "mismatched capability",
+      children: [],
+      action(root, view) {
+        return {
+          ...commonAction("decompose", root, view),
+          childKey: "wrong-capability",
+          work: { title: "Wrong", description: "Must be rejected" },
+          capability: "pr-review",
+          dependsOn: [],
+          acceptanceContract: contract({ kind: "github-review" }),
+        };
+      },
+    },
+    {
+      name: "second child",
+      children: [task({
+        taskId: "root/existing",
+        parentTaskId: "root",
+        role: "developer",
+      })],
+      action(root, view) {
+        return {
+          ...commonAction("decompose", root, view),
+          childKey: "duplicate",
+          work: { title: "Duplicate", description: "Must be rejected" },
+          capability: "development",
+          dependsOn: [],
+          acceptanceContract: contract(),
+        };
+      },
+    },
+    {
+      name: "premature pause",
+      children: [],
+      action: (root, view) => commonAction("pause", root, view),
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const root = task({ taskId: "root", revision: 1 });
+      const view = graphView([root, ...scenario.children], 1);
+      const item = itemFor(root);
+      const packet = packetFor(view, root, {
+        roleId: "orchestrator",
+        directChildren: scenario.children,
+        event: structuredTriageEvent("development"),
+      });
+      const fakes = fakePorts({ packet, views: view });
+      await assert.rejects(
+        serviceFrom(fakes, {
+          development: "developer",
+          "pr-review": "pr-engineer",
+        }).execute({
+          worker: {
+            roleId: "orchestrator",
+            workerId: "employee-orchestrator",
+          },
+          item,
+          contextPacket: packet,
+          intent: orchestrate(scenario.action(root, view)),
+        }),
+        (error) => error.code === "ORCHESTRATOR_AUTHORITY_DENIED",
+      );
+      assertNoTrustedMutation(fakes.calls);
     });
   }
 });

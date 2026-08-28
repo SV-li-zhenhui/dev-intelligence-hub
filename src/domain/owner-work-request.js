@@ -84,8 +84,18 @@ const PERSON_PULL_REQUEST_KEYS = Object.freeze([
   "pullRequest",
   "responsiblePerson",
 ]);
+const ORCHESTRATED_PULL_REQUEST_KEYS = Object.freeze([
+  ...PULL_REQUEST_KEYS,
+  "predecessorRequestId",
+  "triage",
+]);
 const PULL_REQUEST_TARGET_KEYS = Object.freeze(["repository", "number"]);
 const RESPONSIBLE_PERSON_KEYS = Object.freeze(["login", "product"]);
+const TRIAGE_KEYS = Object.freeze([
+  "nextAction",
+  "suggestedCapability",
+  "expectedHeadRefOid",
+]);
 const REQUEST_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -98,6 +108,8 @@ const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100}
 const SAFE_GITHUB_LOGIN =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const SAFE_PRODUCT = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const SAFE_CAPABILITY = /^(?:development|pr-review)$/;
+const GIT_OID = /^[a-f0-9]{40}$/;
 
 export class OwnerWorkRequestError extends Error {
   constructor(code, message, statusCode = 400, options = {}) {
@@ -210,6 +222,7 @@ export function createPrTriageWorkRequest({
   repository,
   number,
   nextAction,
+  expectedHeadRefOid,
 }) {
   if (
     typeof requestKey !== "string" ||
@@ -221,13 +234,16 @@ export function createPrTriageWorkRequest({
     number < 1 ||
     typeof nextAction !== "string" ||
     nextAction.length < 1 ||
-    nextAction.length > 128
+    nextAction.length > 128 ||
+    typeof expectedHeadRefOid !== "string" ||
+    !GIT_OID.test(expectedHeadRefOid)
   ) {
     throw invalid("PR 初判分流请求无效");
   }
   return normalizeOwnerWorkRequest({
     schemaVersion: 5,
     requestId: deterministicRequestId(`pr-triage-orchestrated:${requestKey}`),
+    predecessorRequestId: deterministicRequestId(`pr-triage:${requestKey}`),
     workType: "general",
     priority: ["fix_ci", "resolve_conflict", "address_review"].includes(nextAction)
       ? "urgent"
@@ -246,6 +262,12 @@ export function createPrTriageWorkRequest({
         : "完成有证据的代码 Review，并明确下一推进岗位",
     ],
     pullRequest: { repository, number },
+    triage: {
+      nextAction,
+      suggestedCapability:
+        targetRoleId === "developer" ? "development" : "pr-review",
+      expectedHeadRefOid,
+    },
   });
 }
 
@@ -253,7 +275,9 @@ export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
   exactKeys(
     value,
-    [2, 5].includes(version)
+    version === 5
+      ? ORCHESTRATED_PULL_REQUEST_KEYS
+      : version === 2
       ? PULL_REQUEST_KEYS
       : [3, 4].includes(version)
         ? PERSON_PULL_REQUEST_KEYS
@@ -276,6 +300,16 @@ export function normalizeOwnerWorkRequest(value) {
   }
   if (version === 5 && value.workType !== "general") {
     throw invalid("主控 PR 请求必须使用 general 工作类型");
+  }
+  if (
+    version === 5 &&
+    (
+      typeof value.predecessorRequestId !== "string" ||
+      !REQUEST_ID.test(value.predecessorRequestId) ||
+      value.predecessorRequestId === value.requestId
+    )
+  ) {
+    throw invalid("主控 PR 请求的前任幂等标识无效");
   }
   if (version === 3 && value.workType !== "testing") {
     throw invalid("具体负责人只能绑定测试交接请求");
@@ -330,6 +364,33 @@ export function normalizeOwnerWorkRequest(value) {
       number: value.pullRequest.number,
     };
   }
+  if (version === 5) {
+    exactKeys(value.triage, TRIAGE_KEYS, "triage");
+    const nextAction = boundedText(
+      value.triage.nextAction,
+      "triage.nextAction",
+      128,
+    );
+    const suggestedCapability = boundedText(
+      value.triage.suggestedCapability,
+      "triage.suggestedCapability",
+      64,
+    );
+    const expectedHeadRefOid = value.triage.expectedHeadRefOid;
+    if (
+      !SAFE_CAPABILITY.test(suggestedCapability) ||
+      typeof expectedHeadRefOid !== "string" ||
+      !GIT_OID.test(expectedHeadRefOid)
+    ) {
+      throw invalid("triage 无效");
+    }
+    normalized.predecessorRequestId = value.predecessorRequestId;
+    normalized.triage = {
+      nextAction,
+      suggestedCapability,
+      expectedHeadRefOid,
+    };
+  }
   if ([3, 4].includes(version)) {
     exactKeys(
       value.responsiblePerson,
@@ -352,6 +413,30 @@ export function normalizeOwnerWorkRequest(value) {
     normalized.responsiblePerson = { login, product };
   }
   return deepFreeze(normalized);
+}
+
+export function normalizeStoredOwnerWorkRequest(value) {
+  try {
+    return normalizeOwnerWorkRequest(value);
+  } catch (cause) {
+    if (value?.schemaVersion !== 5) throw cause;
+    try {
+      exactKeys(value, PULL_REQUEST_KEYS, "历史主控 PR 请求");
+      if (value.workType !== "general") throw cause;
+      const validated = normalizeOwnerWorkRequest({
+        ...value,
+        schemaVersion: 2,
+        workType: "pull_request",
+      });
+      return deepFreeze({
+        ...validated,
+        schemaVersion: 5,
+        workType: "general",
+      });
+    } catch {
+      throw cause;
+    }
+  }
 }
 
 export function createOwnerWorkRequestEvent(requestValue, occurredAt) {
@@ -403,7 +488,9 @@ export function createOwnerPullRequestEvent(
     resolved.title.trim() === "" ||
     resolved.state !== "open" ||
     resolved.gitTarget === null ||
-    typeof resolved.gitTarget !== "object"
+    typeof resolved.gitTarget !== "object" ||
+    (request.schemaVersion === 5 &&
+      resolved.gitTarget.headRefOid !== request.triage.expectedHeadRefOid)
   ) {
     throw invalid("PR 解析结果与请求不一致");
   }
@@ -430,6 +517,13 @@ export function createOwnerPullRequestEvent(
       state: resolved.state,
       gitTargetAvailable: true,
       gitTarget: structuredClone(resolved.gitTarget),
+      ...(request.schemaVersion === 5
+        ? {
+            nextAction: request.triage.nextAction,
+            suggestedCapability: request.triage.suggestedCapability,
+            expectedHeadRefOid: request.triage.expectedHeadRefOid,
+          }
+        : {}),
       ...([3, 4].includes(request.schemaVersion)
         ? { responsiblePerson: structuredClone(request.responsiblePerson) }
         : {}),
@@ -438,7 +532,7 @@ export function createOwnerPullRequestEvent(
 }
 
 export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
-  const request = normalizeOwnerWorkRequest(requestValue);
+  const request = normalizeStoredOwnerWorkRequest(requestValue);
   if (request.schemaVersion === 1) {
     return JSON.stringify(eventValue) === JSON.stringify(
       createOwnerWorkRequestEvent(request, at),
@@ -465,6 +559,14 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
       event.payload.priority === request.priority &&
       JSON.stringify(event.payload.acceptanceCriteria) ===
         JSON.stringify(request.acceptanceCriteria) &&
+      (request.triage === undefined ||
+        (
+          event.payload.nextAction === request.triage.nextAction &&
+          event.payload.suggestedCapability ===
+            request.triage.suggestedCapability &&
+          event.payload.expectedHeadRefOid ===
+            request.triage.expectedHeadRefOid
+        )) &&
       (![3, 4].includes(request.schemaVersion) ||
         JSON.stringify(event.payload.responsiblePerson) ===
           JSON.stringify(request.responsiblePerson))

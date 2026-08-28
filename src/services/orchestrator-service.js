@@ -493,6 +493,38 @@ function directChildIds(packet) {
   return new Set(coordination.directChildren.map(({ taskId }) => taskId));
 }
 
+function structuredPrTriage(packet) {
+  const event = packet.context?.code?.sourceEvent ?? packet.context?.code?.event;
+  if (
+    event?.eventType !== "pull_request.owner_requested" ||
+    event?.source?.provider !== "local-owner" ||
+    event?.payload?.workType !== "general" ||
+    !["development", "pr-review"].includes(
+      event?.payload?.suggestedCapability,
+    ) ||
+    typeof event?.payload?.nextAction !== "string" ||
+    typeof event?.payload?.expectedHeadRefOid !== "string"
+  ) {
+    return null;
+  }
+  return event.payload;
+}
+
+function assertStructuredPrTriageAction(packet, children, action) {
+  const triage = structuredPrTriage(packet);
+  if (triage === null) return;
+  if (children.size === 0 && action.type !== "decompose") {
+    throw denied("Initial structured PR triage must be decomposed");
+  }
+  if (action.type !== "decompose") return;
+  if (children.size !== 0) {
+    throw denied("Structured PR triage permits only one direct child");
+  }
+  if (action.capability !== triage.suggestedCapability) {
+    throw denied("Structured PR triage capability does not match trusted intake");
+  }
+}
+
 function hasVisibleSubmittedDelivery(packet, taskId, revision) {
   const payloads = [
     ...(packet.context?.requirements?.childDeliveries ?? []),
@@ -1386,6 +1418,7 @@ export class OrchestratorService {
     assertOrchestrator(worker, bindingTask);
     const children = directChildIds(packet);
     const action = intent.action;
+    assertStructuredPrTriageAction(packet, children, action);
     const source = assertActionSource(
       action,
       graph,

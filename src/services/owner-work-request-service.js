@@ -173,6 +173,7 @@ export class OwnerWorkRequestService {
     workflowRouting,
     ledger,
     roleReadiness,
+    capabilityReadiness,
     pullRequestResolver,
     exclusiveLease,
     actionAdmissionGate,
@@ -187,6 +188,13 @@ export class OwnerWorkRequestService {
     );
     this.ledger = requirePort(ledger, ["intake", "listItems"], "ledger");
     this.roleReadiness = requirePort(roleReadiness, ["read"], "roleReadiness");
+    this.capabilityReadiness = capabilityReadiness === undefined
+      ? null
+      : requirePort(
+          capabilityReadiness,
+          ["read"],
+          "capabilityReadiness",
+        );
     this.pullRequestResolver = pullRequestResolver === undefined
       ? null
       : requirePort(
@@ -300,8 +308,22 @@ export class OwnerWorkRequestService {
     let record = this.state.records.find(
       ({ requestId: id }) => id === request.requestId,
     );
+    if (!record && request.schemaVersion === 5) {
+      const predecessor = this.state.records.find(
+        ({ requestId: id }) => id === request.predecessorRequestId,
+      );
+      if (predecessor) {
+        this.#assertCompatiblePredecessor(request, predecessor);
+        const advanced = await this.#advance(predecessor);
+        return publicRecord(advanced, true);
+      }
+    }
     const deduplicated = record !== undefined;
     if (record && record.requestDigest !== requestDigest) {
+      if (this.#isCompatibleUnstructuredV5(request, record)) {
+        const advanced = await this.#advance(record);
+        return publicRecord(advanced, true);
+      }
       throw ownerRequestError(
         "OWNER_WORK_REQUEST_IDEMPOTENCY_CONFLICT",
         "requestId 已绑定到不同的所有者工作请求",
@@ -321,6 +343,9 @@ export class OwnerWorkRequestService {
           "所有者工作请求已达到本地容量上限",
           507,
         );
+      }
+      if (request.schemaVersion === 5) {
+        await this.#requireCapabilityReady(request.triage.suggestedCapability);
       }
       const createdAt = this.#now();
       const event = [2, 3, 4, 5].includes(request.schemaVersion)
@@ -401,6 +426,65 @@ export class OwnerWorkRequestService {
         503,
       );
     }
+  }
+
+  async #requireCapabilityReady(capability) {
+    const status = this.capabilityReadiness === null
+      ? null
+      : await this.capabilityReadiness.read(capability);
+    if (
+      !status ||
+      status.capability !== capability ||
+      typeof status.roleId !== "string" ||
+      status.roleId.length < 1 ||
+      status.enabled !== true ||
+      status.paused === true
+    ) {
+      throw ownerRequestError(
+        "OWNER_WORK_REQUEST_CAPABILITY_NOT_READY",
+        `PR 初判建议能力 ${capability} 没有可用的受信岗位映射`,
+        503,
+      );
+    }
+  }
+
+  #assertCompatiblePredecessor(request, predecessor) {
+    const legacy = predecessor.request;
+    const expectedWorkType = request.triage.suggestedCapability === "development"
+      ? "development"
+      : "pull_request";
+    if (
+      legacy.schemaVersion !== 2 ||
+      legacy.workType !== expectedWorkType ||
+      legacy.pullRequest.repository !== request.pullRequest.repository ||
+      legacy.pullRequest.number !== request.pullRequest.number ||
+      predecessor.event.payload.headRefOid !==
+        request.triage.expectedHeadRefOid
+    ) {
+      throw ownerRequestError(
+        "OWNER_WORK_REQUEST_IDEMPOTENCY_CONFLICT",
+        "PR 初判前任幂等标识已绑定到不同的工作请求",
+        409,
+      );
+    }
+  }
+
+  #isCompatibleUnstructuredV5(request, record) {
+    if (
+      request.schemaVersion !== 5 ||
+      record.request.schemaVersion !== 5 ||
+      record.request.triage !== undefined ||
+      record.request.pullRequest.repository !== request.pullRequest.repository ||
+      record.request.pullRequest.number !== request.pullRequest.number ||
+      record.event.payload.headRefOid !== request.triage.expectedHeadRefOid
+    ) {
+      return false;
+    }
+    const lines = record.request.description.split("\n");
+    return lines.includes(`下一动作：${request.triage.nextAction}。`) &&
+      lines.includes(
+        `建议能力：${request.triage.suggestedCapability}。`,
+      );
   }
 
   async #intakeAssignment(assignmentId) {

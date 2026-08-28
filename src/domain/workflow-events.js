@@ -72,6 +72,7 @@ const PAYLOAD_FIELDS = new Set([
   "description",
   "draft",
   "evidence",
+  "expectedHeadRefOid",
   "files",
   "gitTarget",
   "gitTargetAvailable",
@@ -100,6 +101,7 @@ const PAYLOAD_FIELDS = new Set([
   "riskScore",
   "state",
   "summary",
+  "suggestedCapability",
   "title",
   "tokenCount",
   "updatedAt",
@@ -120,6 +122,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "ciStatus",
   "createdAt",
   "description",
+  "expectedHeadRefOid",
   "headRefOid",
   "issueType",
   "mergeStateStatus",
@@ -137,6 +140,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "riskLevel",
   "state",
   "summary",
+  "suggestedCapability",
   "title",
   "updatedAt",
   "workType",
@@ -536,6 +540,11 @@ function assertOwnerRequestSemantics(content) {
 function assertOwnerPullRequestSemantics(content) {
   if (content.eventType !== "pull_request.owner_requested") return;
   const target = content.payload.gitTarget;
+  const hasStructuredTriage = [
+    "nextAction",
+    "suggestedCapability",
+    "expectedHeadRefOid",
+  ].some((field) => Object.hasOwn(content.payload, field));
   if (
     content.source.provider !== "local-owner" ||
     !/^owner-request:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
@@ -547,7 +556,22 @@ function assertOwnerPullRequestSemantics(content) {
     typeof target !== "object" ||
     target.provider !== "github" ||
     target.baseRepository !== content.subject.repository ||
-    target.headRefOid !== content.payload.headRefOid
+    target.headRefOid !== content.payload.headRefOid ||
+    (hasStructuredTriage &&
+      (
+        content.payload.workType !== "general" ||
+        !["development", "pr-review"].includes(
+          content.payload.suggestedCapability,
+        ) ||
+        typeof content.payload.nextAction !== "string" ||
+        !content.payload.nextAction.trim() ||
+        content.payload.expectedHeadRefOid !== target.headRefOid ||
+        ![
+          "nextAction",
+          "suggestedCapability",
+          "expectedHeadRefOid",
+        ].every((field) => Object.hasOwn(content.payload, field))
+      ))
   ) {
     throw invalid("owner requested pull request semantics");
   }

@@ -1062,6 +1062,7 @@ test("triage-only PR promoter classifies work without reading patches or draftin
     repository: "acme/repo",
     number: 42,
     nextAction: "review",
+    expectedHeadRefOid: HEAD_42,
   });
   assert.equal(result.jobs[0].reviewVerdict, "none");
   assert.equal(result.jobs[0].reviewBody, "");
@@ -1112,6 +1113,7 @@ test("triage-only PR promoter durably routes authored fixes to developer", async
     repository: "acme/repo",
     number: 42,
     nextAction: "fix_ci",
+    expectedHeadRefOid: HEAD_42,
   });
 });
 
