@@ -21,6 +21,8 @@ import {
 } from "../src/services/owner-work-request-state.js";
 import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
+import { OrchestratorService } from "../src/services/orchestrator-service.js";
+import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -646,6 +648,75 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   assert.equal(
     orchestratedItem.source.current.event.payload.gitTarget.headRefOid,
     "a".repeat(40),
+  );
+
+  const contextAssembler = new RoleContextAssembler({
+    graphReader: ledger.graphReader,
+  });
+  const contextPacket = await contextAssembler.assemble({
+    roleId: "orchestrator",
+    item: orchestratedItem,
+    trigger: "scheduled",
+  });
+  const orchestrator = new OrchestratorService({
+    contextAssembler,
+    graphReader: ledger.graphReader,
+    scopedGraphPlannerFactory: ledger.scopedGraphPlannerFactory,
+    graphDelivererFactory: ledger.graphDelivererFactory,
+    capabilityRoles: { development: "developer" },
+    clock,
+  });
+  const reason = "主控核对初判后分派开发修复";
+  const result = await orchestrator.execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: orchestratedItem,
+    contextPacket,
+    intent: {
+      schemaVersion: 1,
+      type: "orchestrate",
+      summary: "为 PR 创建开发子任务",
+      reason,
+      action: {
+        schemaVersion: 1,
+        type: "decompose",
+        sourceTaskId: contextPacket.context.requirements.currentTask.taskId,
+        sourceTaskRevision:
+          contextPacket.context.requirements.currentTask.revision,
+        expectedGraphRevision: contextPacket.context.requirements.graph.revision,
+        reason,
+        childKey: "fix-ci",
+        work: {
+          title: "修复 acme/repo #42 的 CI",
+          description: "基于绑定 Head 完成修复、验证并提交可追踪交付。",
+        },
+        capability: "development",
+        dependsOn: [],
+        acceptanceContract: {
+          revision: 1,
+          acceptanceCriteria: [
+            { criterionId: "head-checked", description: "核对绑定 Head" },
+            { criterionId: "tests-pass", description: "相关测试通过" },
+          ],
+          expectedDeliverables: [{
+            deliverableId: "implementation",
+            kind: "change-package",
+            description: "受控代码变更包",
+            required: true,
+          }],
+        },
+      },
+    },
+  });
+  assert.equal(result.action, "decompose");
+  assert.equal(result.rootTaskId, orchestratedItem.itemId);
+  const orchestratedGraph = await ledger.graphReader.getSnapshot();
+  const child = orchestratedGraph.graph.tasks.find(
+    ({ parentTaskId }) => parentTaskId === orchestratedItem.itemId,
+  );
+  assert.deepEqual(child.responsibility, { type: "role", id: "developer" });
+  assert.equal(
+    child.acceptanceContracts[0].expectedDeliverables[0].kind,
+    "change-package",
   );
 });
 
