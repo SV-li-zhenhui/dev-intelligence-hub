@@ -9,12 +9,12 @@ import {
 
 function smokePullRequest(overrides = {}) {
   return {
-    repository: "SVisions/OCT-Software",
+    repository: "acme/repo",
     number: 24231,
     title: "[MyDashboard E2E] assignment smoke — DO NOT MERGE",
     state: "OPEN",
-    author: "SV-li-zhenhui",
-    headRepository: "SVisions/OCT-Software",
+    author: "smoke-owner",
+    headRepository: "acme/repo",
     headRefName: "test/mydashboard-e2e-20260827-161028",
     ...overrides,
   };
@@ -25,7 +25,7 @@ test("live PR smoke cleanup closes the marked PR before deleting its branch", as
 
   const result = await cleanupSmokePullRequest({
     pullRequest: smokePullRequest(),
-    authenticatedLogin: "SV-li-zhenhui",
+    authenticatedLogin: "smoke-owner",
     closePullRequest: async () => operations.push("close"),
     deleteHeadBranch: async () => operations.push("delete"),
   });
@@ -45,7 +45,7 @@ test("live PR smoke cleanup rejects ordinary or foreign pull requests", async ()
     await assert.rejects(
       cleanupSmokePullRequest({
         pullRequest,
-        authenticatedLogin: "SV-li-zhenhui",
+        authenticatedLogin: "smoke-owner",
         closePullRequest: noOp,
         deleteHeadBranch: noOp,
       }),
@@ -58,7 +58,7 @@ test("live PR smoke cleanup deletes a marked branch without re-closing a closed 
   const events = [];
   const result = await cleanupSmokePullRequest({
     pullRequest: smokePullRequest({ state: "CLOSED" }),
-    authenticatedLogin: "SV-li-zhenhui",
+    authenticatedLogin: "smoke-owner",
     closePullRequest: async () => events.push("close"),
     deleteHeadBranch: async () => events.push("delete"),
   });
