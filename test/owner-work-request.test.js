@@ -23,6 +23,7 @@ import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { OrchestratorService } from "../src/services/orchestrator-service.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -717,6 +718,16 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   assert.equal(
     child.acceptanceContracts[0].expectedDeliverables[0].kind,
     "change-package",
+  );
+  const childItem = (await ledger.listItems({ limit: 20 })).items.find(
+    ({ itemId }) => itemId === child.taskId,
+  );
+  const childExecutionBinding = currentWorkItemExecutionBinding(childItem);
+  assert.equal(childExecutionBinding.rootItemId, orchestratedItem.itemId);
+  assert.equal(childExecutionBinding.headRefOid, "a".repeat(40));
+  assert.deepEqual(
+    await ledger.verifyPullRequestExecutionBinding(childExecutionBinding),
+    childExecutionBinding,
   );
 });
 
