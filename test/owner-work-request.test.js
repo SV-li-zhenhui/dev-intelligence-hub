@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,6 +23,17 @@ import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
+
+function deterministicRequestId(seed) {
+  const digest = createHash("sha256").update(seed, "utf8").digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    `4${digest.slice(13, 16)}`,
+    `8${digest.slice(17, 20)}`,
+    digest.slice(20, 32),
+  ].join("-");
+}
 
 function request(overrides = {}) {
   return {
@@ -293,6 +305,14 @@ test("automated PR triage creates deterministic orchestrator-bound work requests
 
   assert.deepEqual(replay, review);
   assert.match(review.requestId, /^[a-f0-9-]{36}$/);
+  assert.equal(
+    review.requestId,
+    deterministicRequestId("pr-triage-orchestrated:pr-work-review"),
+  );
+  assert.notEqual(
+    review.requestId,
+    deterministicRequestId("pr-triage:pr-work-review"),
+  );
   assert.equal(review.schemaVersion, 5);
   assert.equal(review.workType, "general");
   assert.equal(review.priority, "high");

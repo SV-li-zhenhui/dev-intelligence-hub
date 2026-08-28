@@ -227,7 +227,7 @@ export function createPrTriageWorkRequest({
   }
   return normalizeOwnerWorkRequest({
     schemaVersion: 5,
-    requestId: deterministicRequestId(`pr-triage:${requestKey}`),
+    requestId: deterministicRequestId(`pr-triage-orchestrated:${requestKey}`),
     workType: "general",
     priority: ["fix_ci", "resolve_conflict", "address_review"].includes(nextAction)
       ? "urgent"
