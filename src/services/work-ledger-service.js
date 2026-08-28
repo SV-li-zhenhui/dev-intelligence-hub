@@ -1256,6 +1256,30 @@ export class WorkLedgerService {
       );
       if (trustedScopeLifecycle) {
         let root = pullRequestRootForLifecycle(itemsById, envelope);
+        if (
+          root?.status === "superseded" &&
+          root.statusReason === CROSS_ROOT_REPLACED_REASON &&
+          envelope.event.eventType === "pull_request.left_scope"
+        ) {
+          knownAssignments.set(assignmentItem.assignmentId, {
+            inputDigest: assignmentItem.inputDigest,
+            sourceSequence: assignmentItem.sourceSequence,
+          });
+          received += 1;
+          timelineEvents.push({
+            itemId: root.itemId,
+            type: "pr_source_ignored",
+            at: now,
+            actorId: "work-ledger-system",
+            details: {
+              workKey: root.source.workKey,
+              sourceSequence: envelope.sequence,
+              disposition: "ignored_superseded_scope_exit",
+              scopeActive: root.source.scope.active,
+            },
+          });
+          continue;
+        }
         if (root !== null) {
           const applied = applyPullRequestScopeLifecycle(root.source, envelope);
           const active = applied.source.scope.active;

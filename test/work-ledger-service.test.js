@@ -3982,6 +3982,60 @@ test("an existing-root return supersedes an older cross-root candidate", async (
   assert.equal(claimed.status, "working");
 });
 
+test("a superseded automatic PR root ignores a later scope exit without blocking intake", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, {
+      sourceScopeId: "github-dashboard",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    })],
+  });
+  const sealed = await stageSealedPrReview(fixture);
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.source.records.push(prAssignment(3, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  const supersededBefore = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(
+      ({ source }) => source?.identity?.scopeId === "github-secondary",
+    );
+  assert.equal(supersededBefore.status, "superseded");
+  assert.equal(
+    supersededBefore.statusReason,
+    "pr_source_cross_root_cutover_replaced",
+  );
+
+  const leftEvent = prAssignment(4, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(4, leftEvent));
+  fixture.source.highWatermark = 4;
+
+  const result = await fixture.service.intake();
+  const supersededAfter = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ itemId }) => itemId === supersededBefore.itemId);
+
+  assert.equal(result.cursor, 4);
+  assert.equal(supersededAfter.status, "superseded");
+  assert.equal(supersededAfter.statusReason, supersededBefore.statusReason);
+  assert.equal(supersededAfter.revision, supersededBefore.revision);
+  assert.equal(supersededAfter.source.scope.active, true);
+});
+
 test("an existing root returning behind an active sealed provenance waits for settlement", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, {

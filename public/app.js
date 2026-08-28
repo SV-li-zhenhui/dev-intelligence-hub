@@ -5268,21 +5268,36 @@ async function load({ showConfirmation = true } = {}) {
     void loadSystemStatus();
   }
   try {
-    const [nextDashboard, nextConfirmationQueue] = await Promise.all([
+    const [dashboardResult, confirmationResult] = await Promise.allSettled([
       fetchDashboard(),
       fetchConfirmationQueue(),
     ]);
-    applyConfirmationQueue(nextConfirmationQueue, confirmationSequence);
-    if (showConfirmation) queueMicrotask(showNextConfirmation);
-    if (!nextDashboard) {
+    if (confirmationResult.status === "fulfilled") {
+      applyConfirmationQueue(confirmationResult.value, confirmationSequence);
+      if (showConfirmation) queueMicrotask(showNextConfirmation);
+    } else {
+      invalidateConfirmationQueueSnapshot();
+    }
+    if (dashboardResult.status === "rejected") throw dashboardResult.reason;
+    if (!dashboardResult.value) {
       render();
       refreshLoadedConfirmationHistory();
+      if (confirmationResult.status === "rejected") {
+        statusBanner.hidden = false;
+        statusBanner.textContent =
+          `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
+      }
       return;
     }
-    applyDashboard(nextDashboard, sequence);
+    applyDashboard(dashboardResult.value, sequence);
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
     refreshLoadedConfirmationHistory();
+    if (confirmationResult.status === "rejected") {
+      statusBanner.hidden = false;
+      statusBanner.textContent =
+        `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
+    }
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;

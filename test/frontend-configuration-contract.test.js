@@ -79,11 +79,11 @@ test("configuration and confirmation loading do not depend on a dashboard snapsh
   assert.match(app, /configurationFetch/);
   assert.ok(
     load.indexOf("applyConfirmationQueue") <
-      load.indexOf("if (!nextDashboard)"),
+      load.indexOf("if (!dashboardResult.value)"),
   );
   assert.ok(
     load.indexOf("queueMicrotask(showNextConfirmation)") <
-      load.indexOf("if (!nextDashboard)"),
+      load.indexOf("if (!dashboardResult.value)"),
   );
   assert.doesNotMatch(showNext, /!dashboard/);
   assert.match(pending, /const responsibilities = dashboard/);

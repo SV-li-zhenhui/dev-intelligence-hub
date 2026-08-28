@@ -118,8 +118,8 @@ test("PR employee pending work has a direct, explained confirmation entry", () =
 test("main loading applies dashboard and confirmations independently of the employee roster", () => {
   const loadSource = functionSource("load");
   const mainRequests = loadSource.slice(
-    loadSource.indexOf("await Promise.all(["),
-    loadSource.indexOf("]);", loadSource.indexOf("await Promise.all([")),
+    loadSource.indexOf("await Promise.allSettled(["),
+    loadSource.indexOf("]);", loadSource.indexOf("await Promise.allSettled([")),
   );
 
   assert.match(loadSource, /void loadEmployeeRoles\(\);/);

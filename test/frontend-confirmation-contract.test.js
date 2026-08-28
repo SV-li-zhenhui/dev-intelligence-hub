@@ -24,6 +24,28 @@ test("the dashboard keeps one confirmation dialog for local and external decisio
   );
 });
 
+test("dashboard loading remains available when the confirmation queue is degraded", async () => {
+  const app = await readFile(path.join(root, "public", "app.js"), "utf8");
+  const start = app.indexOf("async function load({ showConfirmation");
+  const end = app.indexOf("\nasync function refresh()", start);
+  const loader = app.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(loader, /Promise\.allSettled\(\[/);
+  assert.match(loader, /dashboardResult\.status === "rejected"/);
+  assert.match(loader, /confirmationResult\.status === "fulfilled"/);
+  assert.match(loader, /applyDashboard\(dashboardResult\.value, sequence\)/);
+  assert.match(loader, /confirmationResult\.reason\.message/);
+  assert.ok(
+    loader.indexOf("applyDashboard(dashboardResult.value, sequence)") <
+      loader.lastIndexOf("confirmationResult.reason.message"),
+  );
+  assert.doesNotMatch(
+    loader,
+    /const \[nextDashboard, nextConfirmationQueue\] = await Promise\.all\(/,
+  );
+});
+
 test("the employee view separates the next pending decision from read-only history", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("function confirmationCenterView");
