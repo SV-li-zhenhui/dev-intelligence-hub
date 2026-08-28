@@ -268,7 +268,7 @@ test("testing handoff preserves a structured GitHub responsible person", () => {
   );
 });
 
-test("automated PR triage creates deterministic role-bound work requests", () => {
+test("automated PR triage creates deterministic orchestrator-bound work requests", () => {
   const review = createPrTriageWorkRequest({
     requestKey: "pr-work-review",
     targetRoleId: "pr-engineer",
@@ -293,12 +293,14 @@ test("automated PR triage creates deterministic role-bound work requests", () =>
 
   assert.deepEqual(replay, review);
   assert.match(review.requestId, /^[a-f0-9-]{36}$/);
-  assert.equal(review.schemaVersion, 2);
-  assert.equal(review.workType, "pull_request");
+  assert.equal(review.schemaVersion, 5);
+  assert.equal(review.workType, "general");
   assert.equal(review.priority, "high");
-  assert.equal(development.schemaVersion, 2);
-  assert.equal(development.workType, "development");
+  assert.match(review.description, /建议能力：pr-review/);
+  assert.equal(development.schemaVersion, 5);
+  assert.equal(development.workType, "general");
   assert.equal(development.priority, "urgent");
+  assert.match(development.description, /建议能力：development/);
 });
 
 test("review and development handoffs accept a named responsible person", () => {
@@ -605,9 +607,26 @@ test("an explicit PR request resolves one immutable target before staging a PR e
   }));
   assert.deepEqual(automatedDevelopment.assignment.target, {
     type: "role",
-    id: "developer",
+    id: "orchestrator",
   });
+  assert.equal(automatedDevelopment.request.schemaVersion, 5);
+  assert.equal(automatedDevelopment.request.workType, "general");
   assert.equal(automatedDevelopment.request.responsiblePerson, undefined);
+  const orchestratedItem = (await ledger.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === automatedDevelopment.workItemId,
+  );
+  assert.deepEqual(orchestratedItem.currentTarget, {
+    type: "role",
+    id: "orchestrator",
+  });
+  assert.equal(
+    orchestratedItem.source.current.event.payload.workType,
+    "general",
+  );
+  assert.equal(
+    orchestratedItem.source.current.event.payload.gitTarget.headRefOid,
+    "a".repeat(40),
+  );
 });
 
 test("restart resumes a staged request after a lost routing response without duplication", async (t) => {

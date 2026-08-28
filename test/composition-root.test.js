@@ -90,7 +90,7 @@ function applicationConfig(codeExecutor = { enabled: false }) {
   };
 }
 
-test("composition triage handoff creates durable role-bound PR work", async () => {
+test("composition triage handoff creates durable orchestrator-bound PR work", async () => {
   const requests = [];
   const handoff = createPrTriageHandoff(() => ({
     async submit(request) {
@@ -108,8 +108,9 @@ test("composition triage handoff creates durable role-bound PR work", async () =
   });
 
   assert.deepEqual(result, { workItemId: "work-item-triage" });
-  assert.equal(requests[0].schemaVersion, 2);
-  assert.equal(requests[0].workType, "pull_request");
+  assert.equal(requests[0].schemaVersion, 5);
+  assert.equal(requests[0].workType, "general");
+  assert.match(requests[0].description, /建议能力：pr-review/);
   assert.deepEqual(requests[0].pullRequest, {
     repository: "acme/repo",
     number: 42,

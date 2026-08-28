@@ -10,6 +10,8 @@ export const OWNER_PULL_REQUEST_DEVELOPMENT_RULE_ID =
   "system-owner-pr-development-to-developer";
 export const OWNER_PULL_REQUEST_TESTING_RULE_ID =
   "system-owner-pr-testing-to-tester";
+export const OWNER_PULL_REQUEST_ORCHESTRATION_RULE_ID =
+  "system-owner-pr-coordination-to-orchestrator";
 const OWNER_CAPABILITY_ROUTES = Object.freeze([
   Object.freeze({
     ruleId: "system-owner-review-to-pr-engineer",
@@ -33,6 +35,11 @@ const OWNER_CAPABILITY_ROUTES = Object.freeze([
   }),
 ]);
 const OWNER_PULL_REQUEST_CAPABILITY_ROUTES = Object.freeze([
+  Object.freeze({
+    ruleId: OWNER_PULL_REQUEST_ORCHESTRATION_RULE_ID,
+    workType: "general",
+    roleId: "orchestrator",
+  }),
   Object.freeze({
     ruleId: OWNER_PULL_REQUEST_RULE_ID,
     workType: "pull_request",
@@ -219,9 +226,9 @@ export function createPrTriageWorkRequest({
     throw invalid("PR 初判分流请求无效");
   }
   return normalizeOwnerWorkRequest({
-    schemaVersion: 2,
+    schemaVersion: 5,
     requestId: deterministicRequestId(`pr-triage:${requestKey}`),
-    workType: targetRoleId === "developer" ? "development" : "pull_request",
+    workType: "general",
     priority: ["fix_ci", "resolve_conflict", "address_review"].includes(nextAction)
       ? "urgent"
       : "high",
@@ -229,7 +236,8 @@ export function createPrTriageWorkRequest({
     description: [
       `PR 推进员工已完成 ${repository} #${number} 的基础初判。`,
       `下一动作：${nextAction}。`,
-      `请由 ${targetRoleId} 基于 GitHub 最新事实继续处理并留下可验证交付。`,
+      `建议能力：${targetRoleId === "developer" ? "development" : "pr-review"}。`,
+      "请由主控调度员核对优先级、创建岗位子任务，并负责验收后续交付。",
     ].join("\n"),
     acceptanceCriteria: [
       "核对 PR 最新 Head、状态与检查结果",
@@ -245,7 +253,7 @@ export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
   exactKeys(
     value,
-    version === 2
+    [2, 5].includes(version)
       ? PULL_REQUEST_KEYS
       : [3, 4].includes(version)
         ? PERSON_PULL_REQUEST_KEYS
@@ -253,7 +261,7 @@ export function normalizeOwnerWorkRequest(value) {
     "所有者工作请求",
   );
   if (
-    ![1, 2, 3, 4].includes(version) ||
+    ![1, 2, 3, 4, 5].includes(version) ||
     typeof value.requestId !== "string" ||
     !REQUEST_ID.test(value.requestId) ||
     !OWNER_WORK_REQUEST_TYPES.includes(value.workType) ||
@@ -265,6 +273,9 @@ export function normalizeOwnerWorkRequest(value) {
     version === 2 && !["pull_request", "development"].includes(value.workType)
   ) {
     throw invalid("PR Review 或开发分流必须提供结构化 PR 目标");
+  }
+  if (version === 5 && value.workType !== "general") {
+    throw invalid("主控 PR 请求必须使用 general 工作类型");
   }
   if (version === 3 && value.workType !== "testing") {
     throw invalid("具体负责人只能绑定测试交接请求");
@@ -297,7 +308,7 @@ export function normalizeOwnerWorkRequest(value) {
     ),
     acceptanceCriteria,
   };
-  if ([2, 3, 4].includes(version)) {
+  if ([2, 3, 4, 5].includes(version)) {
     exactKeys(value.pullRequest, PULL_REQUEST_TARGET_KEYS, "pullRequest");
     const repository = value.pullRequest.repository;
     const match = typeof repository === "string"
@@ -376,7 +387,7 @@ export function createOwnerPullRequestEvent(
   occurredAt,
 ) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (![2, 3, 4].includes(request.schemaVersion)) {
+  if (![2, 3, 4, 5].includes(request.schemaVersion)) {
     throw invalid("PR 推进请求无效");
   }
   exactKeys(

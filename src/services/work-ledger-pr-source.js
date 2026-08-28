@@ -62,6 +62,7 @@ const IDENTITY_KEYS = [
   "targetRoleId",
 ];
 const OWNER_REQUESTED_PR_TARGET_ROLES = new Set([
+  "orchestrator",
   "pr-engineer",
   "developer",
   "tester",
