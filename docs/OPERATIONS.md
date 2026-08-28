@@ -494,3 +494,20 @@ Run `npm test` after upgrades. Configuration replacement and schema migration
 must complete before employees are resumed. Privileged settings remain disabled
 in `config.example.json`; review every enabled role, brain data class, workspace,
 GitHub action, and routing rule in the active version after an upgrade.
+
+## Live GitHub smoke-test cleanup
+
+Any test that creates a real GitHub pull request must register cleanup as soon
+as the PR exists and run verification through `withSmokePullRequestCleanup` from
+`scripts/github-smoke-pr-lifecycle.mjs`. The wrapper runs cleanup after both a
+successful assertion and a failed or interrupted verification path.
+
+Cleanup is intentionally narrow: it accepts only PRs owned by the authenticated
+account whose title begins with `[MyDashboard E2E]`, contains `DO NOT MERGE`,
+and whose same-repository head branch begins with
+`test/mydashboard-e2e-`. Ordinary PRs, forks, and product branches are refused.
+To reconcile an orphaned smoke PR explicitly, run:
+
+```powershell
+npm run cleanup:e2e-pr -- --repo owner/repository --pr 12345
+```
