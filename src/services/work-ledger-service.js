@@ -149,6 +149,27 @@ function samePullRequestSubject(left, right) {
   );
 }
 
+function sameIssueSubject(left, right) {
+  const leftEvent = currentWorkItemEvent(left);
+  const rightEvent = currentWorkItemEvent(right);
+  return Boolean(
+    leftEvent?.eventType?.startsWith("issue.") &&
+      rightEvent?.eventType?.startsWith("issue.") &&
+      leftEvent.subject?.id === rightEvent.subject?.id &&
+      leftEvent.source?.provider === rightEvent.source?.provider &&
+      leftEvent.source?.scopeId === rightEvent.source?.scopeId,
+  );
+}
+
+function hasNewerIssueAssignment(items, item) {
+  return items.some((candidate) =>
+    candidate.sourceSequence > item.sourceSequence &&
+    candidate.currentTarget?.type === item.currentTarget?.type &&
+    candidate.currentTarget?.id === item.currentTarget?.id &&
+    sameIssueSubject(candidate, item)
+  );
+}
+
 function pullRequestRootForLifecycle(itemsById, envelope) {
   const descriptor = pullRequestWorkDescriptor(envelope);
   if (descriptor === null || !descriptor.trustedLifecycle) return null;
@@ -599,7 +620,8 @@ export class WorkLedgerService {
       item?.status === "waiting_user" &&
         item.activeIntentId === requestKey &&
         item.currentTarget?.type === "role" &&
-        item.currentTarget.id === roleId,
+        item.currentTarget.id === roleId &&
+        !hasNewerIssueAssignment(this.state.items, item),
     );
   }
 

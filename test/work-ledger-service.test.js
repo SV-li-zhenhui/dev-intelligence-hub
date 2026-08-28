@@ -10335,6 +10335,41 @@ for (const lifecycle of [
   });
 }
 
+test("new Issue evidence revokes an older question for the same role", async () => {
+  const initial = issueAssignment(1);
+  const fixture = await createFixture({ records: [initial] });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "old answer" },
+    {
+      workerId: "configured-requirements-analyst",
+      roleId: "requirements-analyst",
+    },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const authority = {
+    requestKey: waiting.activeIntentId,
+    producer: {
+      roleId: "requirements-analyst",
+      workItemId: waiting.itemId,
+    },
+  };
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
+
+  fixture.source.records.push(issueAssignment(2, {
+    eventType: "issue.updated",
+    occurredAt: "2026-08-02T02:05:00.000Z",
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), false);
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  assert.equal(items.length, 2);
+  assert.equal(items.find(({ itemId }) => itemId === waiting.itemId).status, "waiting_user");
+  assert.equal(items.find(({ itemId }) => itemId !== waiting.itemId).status, "queued");
+});
+
 test("recovery retires a persisted Issue lifecycle task but preserves a later reopen", async () => {
   const fixture = await createFixture({ records: [issueAssignment(1)] });
   await prepareAttentionResult(
