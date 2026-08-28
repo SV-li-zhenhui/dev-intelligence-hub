@@ -1295,6 +1295,7 @@ export async function createApplication({
           ...runtimeDependencies(attentionInboxDependencies),
           store,
           operationQueue: new OperationQueue(),
+          authority: workLedgerRuntime,
         }),
       );
       workProposalRuntime = trackRuntime(

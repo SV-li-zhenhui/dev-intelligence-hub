@@ -40,6 +40,11 @@ import {
   planIntentStage,
 } from "./work-ledger-outbox-commands.js";
 import {
+  isIssueScopeLifecycleEvent,
+  planRecoveredIssueScopeSettlement,
+  settleIssueScope,
+} from "./work-ledger-issue-lifecycle.js";
+import {
   appendWorkLedgerTimeline,
   createAssignmentWorkItem,
   createGapAlertWorkItem,
@@ -100,6 +105,7 @@ import {
   validateWorkLedgerGraphTransition,
 } from "./work-ledger-graph.js";
 
+const SHA256 = /^[a-f0-9]{64}$/;
 const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
   run(operation) {
     return operation();
@@ -398,6 +404,7 @@ export class WorkLedgerService {
       this.exclusiveLease.run(async () => {
         try {
           this.state = await this.#readDurableState();
+          await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
           return this.getSummary();
         } catch (error) {
@@ -553,6 +560,119 @@ export class WorkLedgerService {
           (candidate) => candidate.itemId === itemId,
         );
         return item ? cloneLedgerValue(item) : null;
+      }),
+    );
+  }
+
+  async isAttentionRequestCurrent(input = {}) {
+    this.#assertReady();
+    if (
+      !hasExactLedgerKeys(input, ["requestKey", "producer"]) ||
+      !isPlainLedgerObject(input.producer) ||
+      !hasExactLedgerKeys(input.producer, ["roleId", "workItemId"])
+    ) {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "内部请示授权查询无效",
+      );
+    }
+    let requestKey;
+    let roleId;
+    let workItemId;
+    try {
+      requestKey = boundedLedgerString(input.requestKey, "requestKey", 128);
+      roleId = boundedLedgerString(input.producer.roleId, "roleId", 128);
+      workItemId = boundedLedgerString(
+        input.producer.workItemId,
+        "workItemId",
+        192,
+      );
+    } catch {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "内部请示授权查询无效",
+      );
+    }
+    const item = this.state.items.find(
+      (candidate) => candidate.itemId === workItemId,
+    );
+    return Boolean(
+      item?.status === "waiting_user" &&
+        item.activeIntentId === requestKey &&
+        item.currentTarget?.type === "role" &&
+        item.currentTarget.id === roleId,
+    );
+  }
+
+  async isIntentDispatchCurrent(input = {}) {
+    this.#assertReady();
+    if (
+      !hasExactLedgerKeys(input, [
+        "intentId",
+        "expectedRevision",
+        "dispatchLeaseId",
+        "bindingDigest",
+        "itemId",
+        "itemExpectedRevision",
+      ]) ||
+      !Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 1 ||
+      !Number.isSafeInteger(input.itemExpectedRevision) ||
+      input.itemExpectedRevision < 1
+    ) {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "工作意图派发授权查询无效",
+      );
+    }
+    let intentId;
+    let dispatchLeaseId;
+    let bindingDigest;
+    let itemId;
+    try {
+      intentId = boundedLedgerString(input.intentId, "intentId", 192);
+      dispatchLeaseId = boundedLedgerString(
+        input.dispatchLeaseId,
+        "dispatchLeaseId",
+        128,
+      );
+      bindingDigest = boundedLedgerString(
+        input.bindingDigest,
+        "bindingDigest",
+        64,
+      );
+      itemId = boundedLedgerString(input.itemId, "itemId", 192);
+    } catch {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "工作意图派发授权查询无效",
+      );
+    }
+    if (!SHA256.test(bindingDigest)) {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "工作意图派发授权查询无效",
+      );
+    }
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        const item = this.state.items.find(
+          (candidate) => candidate.itemId === itemId,
+        );
+        const outbox = this.state.outbox.find(
+          (candidate) => candidate.intentId === intentId,
+        );
+        return Boolean(
+          item?.status === "dispatch_pending" &&
+            item.revision === input.itemExpectedRevision &&
+            item.activeIntentId === intentId &&
+            outbox?.itemId === itemId &&
+            outbox.status === "dispatching" &&
+            outbox.revision === input.expectedRevision &&
+            outbox.dispatchLeaseId === dispatchLeaseId &&
+            outbox.dispatchBinding?.bindingDigest === bindingDigest,
+        );
       }),
     );
   }
@@ -1230,6 +1350,24 @@ export class WorkLedgerService {
         received += 1;
         continue;
       }
+      if (isIssueScopeLifecycleEvent(envelope.event)) {
+        for (const itemId of settleIssueScope({
+          event: envelope.event,
+          sourceSequence: envelope.sequence,
+          itemsById,
+          outboxById,
+          now,
+          timelineEvents,
+        })) {
+          touchedItemIds.add(itemId);
+        }
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        continue;
+      }
       if (envelope.event.eventType === "pull_request.left_scope") {
         knownAssignments.set(assignmentItem.assignmentId, {
           inputDigest: assignmentItem.inputDigest,
@@ -1856,6 +1994,21 @@ export class WorkLedgerService {
         { cause: error },
       );
     }
+  }
+
+  async #reconcileRecoveredIssueScopes() {
+    const plan = planRecoveredIssueScopeSettlement(this.state, this.#now());
+    if (plan === null) return;
+    const nextState = this.#candidateWithTimeline(
+      {
+        ...this.state,
+        revision: this.state.revision + 1,
+        items: plan.items,
+        outbox: plan.outbox,
+      },
+      plan.timelineEvents,
+    );
+    await this.#persist(nextState);
   }
 
   async #persist(candidate, { appendGraphMemory = true } = {}) {

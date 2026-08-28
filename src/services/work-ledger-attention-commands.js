@@ -29,6 +29,10 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^attention-[a-f0-9]{64}$/;
 const RESULT_ID = /^attention-result-[a-f0-9]{64}$/;
 const OUTBOX_ID = /^attention-outbox-[a-f0-9]{64}$/;
+const CLOSED_ISSUE_REASONS = new Set([
+  "issue_source_completed",
+  "issue_source_left_scope",
+]);
 
 function invalid(message = "内部请示结果批次无效") {
   return workLedgerError("WORK_LEDGER_ATTENTION_BATCH_INVALID", message, 502);
@@ -309,6 +313,10 @@ function requireBoundAskUser(state, entry) {
     durablyQuarantined &&
     item.status === "blocked" &&
     item.activeIntentId === null;
+  const closedIssueSettlement =
+    item.status === "cancelled" &&
+    item.activeIntentId === null &&
+    CLOSED_ISSUE_REASONS.has(item.statusReason);
   const sealedQuarantinedSettlement =
     !durablyQuarantined ||
     (outbox?.dispatchBinding !== null &&
@@ -321,7 +329,7 @@ function requireBoundAskUser(state, entry) {
     outbox.status !== "delivered" ||
     outbox.intent.type !== "ask_user" ||
     outbox.requestedBy.roleId !== entry.producer.roleId ||
-    (!waitingForResult && !quarantinedSettlement) ||
+    (!waitingForResult && !quarantinedSettlement && !closedIssueSettlement) ||
     outcome?.status !== "delivered" ||
     outcome.details?.questionRef !== entry.requestId
   ) {
@@ -334,6 +342,7 @@ function requireBoundAskUser(state, entry) {
   return {
     item,
     outbox,
+    discardClosedIssueResult: closedIssueSettlement,
     discardUnsealedLegacyResult:
       durablyQuarantined && !sealedQuarantinedSettlement,
   };
@@ -360,7 +369,12 @@ export function planAttentionBatchApplication({ state, input, clock }) {
   const appliedItemIds = [];
   for (const entry of batch.pending) {
     const workingState = { ...state, items, outbox: outboxEntries };
-    const { item, outbox, discardUnsealedLegacyResult } =
+    const {
+      item,
+      outbox,
+      discardClosedIssueResult,
+      discardUnsealedLegacyResult,
+    } =
       requireBoundAskUser(workingState, entry);
     if (Date.parse(entry.result.at) > Date.parse(now)) {
       throw invalid("内部请示结果时间晚于台账时钟");
@@ -384,6 +398,22 @@ export function planAttentionBatchApplication({ state, input, clock }) {
           intentId: outbox.intentId,
           resultRef: entry.result.resultId,
           reason: "unsealed_pr_source_quarantine",
+        },
+      });
+      continue;
+    }
+    if (discardClosedIssueResult) {
+      appliedItemIds.push(item.itemId);
+      timelineEvents.push({
+        itemId: item.itemId,
+        type: "stale_result_discarded",
+        at: now,
+        actorId: "attention-result-reconciler",
+        details: {
+          source: "attention",
+          intentId: outbox.intentId,
+          resultRef: entry.result.resultId,
+          reason: item.statusReason,
         },
       });
       continue;

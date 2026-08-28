@@ -69,17 +69,99 @@ function attentionRequest(overrides = {}) {
   };
 }
 
-async function readyInbox({ store = new MemoryStore(), clock = tickingClock() } = {}) {
+async function readyInbox({
+  store = new MemoryStore(),
+  clock = tickingClock(),
+  authority,
+} = {}) {
   const lease = new ExclusiveLease();
   const inbox = new AttentionInbox({
     store,
     clock,
     operationQueue: new OperationQueue(),
     exclusiveLease: lease,
+    ...(authority === undefined ? {} : { authority }),
   });
   await inbox.recover();
   return { inbox, store, lease };
 }
+
+test("stale producer authority hides a pending request and rejects late answers", async () => {
+  const checks = [];
+  const authority = {
+    async isCurrent(value) {
+      checks.push(structuredClone(value));
+      return false;
+    },
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  const created = await inbox.create(attentionRequest());
+  const writesAfterCreate = store.writeCount;
+
+  assert.equal(await inbox.next(), null);
+  await assert.rejects(
+    inbox.answer(response(created, { type: "text", text: "too late" })),
+    (error) =>
+      error.code === "ATTENTION_REQUEST_STALE" && error.statusCode === 409,
+  );
+  assert.equal(store.writeCount, writesAfterCreate);
+  assert.deepEqual(checks, [
+    {
+      requestKey: attentionRequest().requestKey,
+      producer: attentionRequest().producer,
+    },
+    {
+      requestKey: attentionRequest().requestKey,
+      producer: attentionRequest().producer,
+    },
+  ]);
+});
+
+test("work ledger authority exposes its canonical current-request method", async () => {
+  const checks = [];
+  const authority = {
+    async isAttentionRequestCurrent(value) {
+      checks.push(structuredClone(value));
+      return true;
+    },
+  };
+  const { inbox } = await readyInbox({ authority });
+  const created = await inbox.create(attentionRequest());
+
+  assert.equal((await inbox.next()).requestId, created.requestId);
+  assert.deepEqual(checks, [{
+    requestKey: attentionRequest().requestKey,
+    producer: attentionRequest().producer,
+  }]);
+});
+
+test("next skips a stale oldest request and later cannot defer it", async () => {
+  let currentRequestKey = null;
+  const authority = {
+    async isCurrent({ requestKey }) {
+      return requestKey === currentRequestKey;
+    },
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  const stale = await inbox.create(attentionRequest({
+    requestKey: "work-intent-stale",
+    question: "旧问题？",
+  }));
+  const current = await inbox.create(attentionRequest({
+    requestKey: "work-intent-current",
+    question: "当前问题？",
+  }));
+  currentRequestKey = "work-intent-current";
+  const writesBeforeLater = store.writeCount;
+
+  assert.equal((await inbox.next()).requestId, current.requestId);
+  await assert.rejects(
+    inbox.later(response(stale, { type: "later" })),
+    (error) =>
+      error.code === "ATTENTION_REQUEST_STALE" && error.statusCode === 409,
+  );
+  assert.equal(store.writeCount, writesBeforeLater);
+});
 
 function response(item, answer) {
   return {

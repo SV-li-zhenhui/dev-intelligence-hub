@@ -62,6 +62,7 @@ import {
   crossRootPullRequestCutoverCandidate,
 } from "../src/services/work-ledger-pr-cutover-commands.js";
 import {
+  appendWorkLedgerTimeline,
   createAssignmentWorkItem,
   createGraphChildWorkItem,
   createPullRequestSourceRootWorkItem,
@@ -193,6 +194,79 @@ function assignment(sequence, target = { type: "role", id: "pr-reviewer" }) {
       payload: { number: sequence, title: `Work ${sequence}` },
     },
   };
+}
+
+function issueAssignment(
+  sequence,
+  {
+    eventType = "issue.updated",
+    occurredAt = "2026-08-02T01:00:00.000Z",
+    repository = "acme/product",
+    issueNumber = 42,
+    state = "open",
+  } = {},
+) {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType,
+    occurredAt,
+    source: { provider: "github", scopeId: "github-dashboard" },
+    subject: {
+      id: `github:issue:${repository}#${issueNumber}`,
+      repository,
+      number: issueNumber,
+    },
+    payload: {
+      title: `Issue ${issueNumber}`,
+      state,
+      updatedAt: occurredAt,
+    },
+  });
+  return {
+    sequence,
+    assignment: {
+      assignmentId: `workflow-assignment-issue-${sequence}`,
+      eventId: event.eventId,
+      target: { type: "role", id: "requirements-analyst" },
+      reason: "issue-events-to-requirements",
+      createdAt: occurredAt,
+    },
+    event,
+  };
+}
+
+function persistLegacyIssueLifecycleAssignment(fixture, record) {
+  const durable = fixture.store.stored();
+  const createdAt = record.event.occurredAt;
+  const item = createAssignmentWorkItem(record, createdAt);
+  const appended = appendWorkLedgerTimeline(
+    durable,
+    [{
+      itemId: item.itemId,
+      type: "assignment_intaken",
+      at: createdAt,
+      actorId: "work-ledger-system",
+      details: {
+        assignmentId: item.assignmentId,
+        sourceSequence: item.sourceSequence,
+      },
+    }],
+    normalizeWorkLedgerLimits().timelineLimit,
+  );
+  durable.revision += 1;
+  durable.intakeCursor = record.sequence;
+  durable.sourceHighWatermark = record.sequence;
+  durable.items.push(item);
+  durable.timeline = appended.timeline;
+  durable.timelineStartSequence = appended.timelineStartSequence;
+  durable.nextTimelineSequence = appended.nextTimelineSequence;
+  durable.graphMemoryProjection = migrateWorkGraphMemoryProjection(
+    durable.items,
+    durable.revision,
+    normalizeWorkLedgerLimits(),
+  );
+  fixture.store.replaceStored(durable);
+  return item;
 }
 
 const PR_HEAD_A = "a".repeat(40);
@@ -10097,6 +10171,175 @@ async function prepareAttentionResult(
   ).outbox;
 }
 
+for (const lifecycle of [
+  { eventType: "issue.left_scope", reason: "issue_source_left_scope" },
+  { eventType: "issue.completed", reason: "issue_source_completed" },
+]) {
+  test(`${lifecycle.eventType} cancels its historical user question and revokes attention authority`, async () => {
+    const initial = issueAssignment(1);
+    const fixture = await createFixture({ records: [initial] });
+    await prepareAttentionResult(
+      fixture,
+      { type: "text", text: "already completed" },
+      {
+        workerId: "configured-requirements-analyst",
+        roleId: "requirements-analyst",
+      },
+    );
+    const waiting = (await fixture.service.listItems()).items[0];
+    assert.equal(waiting.status, "waiting_user");
+    assert.equal(
+      await fixture.service.isAttentionRequestCurrent({
+        requestKey: waiting.activeIntentId,
+        producer: {
+          roleId: "requirements-analyst",
+          workItemId: waiting.itemId,
+        },
+      }),
+      true,
+    );
+    for (const producer of [
+      { roleId: "developer", workItemId: waiting.itemId },
+      { roleId: "requirements-analyst", workItemId: `${waiting.itemId}-wrong` },
+    ]) {
+      assert.equal(
+        await fixture.service.isAttentionRequestCurrent({
+          requestKey: waiting.activeIntentId,
+          producer,
+        }),
+        false,
+      );
+    }
+    assert.equal(
+      await fixture.service.isAttentionRequestCurrent({
+        requestKey: `${waiting.activeIntentId}-wrong`,
+        producer: {
+          roleId: "requirements-analyst",
+          workItemId: waiting.itemId,
+        },
+      }),
+      false,
+    );
+
+    fixture.source.records.push(
+      issueAssignment(2, {
+        eventType: lifecycle.eventType,
+        occurredAt: "2026-08-02T02:05:00.000Z",
+        state: "closed",
+      }),
+    );
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+
+    const items = (await fixture.service.listItems({ limit: 10 })).items;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].itemId, waiting.itemId);
+    assert.equal(items[0].status, "cancelled");
+    assert.equal(items[0].statusReason, lifecycle.reason);
+    assert.equal(items[0].activeIntentId, null);
+    assert.equal(
+      await fixture.service.isAttentionRequestCurrent({
+        requestKey: waiting.activeIntentId,
+        producer: {
+          roleId: "requirements-analyst",
+          workItemId: waiting.itemId,
+        },
+      }),
+      false,
+    );
+  });
+}
+
+test("recovery retires a persisted Issue lifecycle task but preserves a later reopen", async () => {
+  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "already completed" },
+    {
+      workerId: "configured-requirements-analyst",
+      roleId: "requirements-analyst",
+    },
+  );
+  const completed = issueAssignment(2, {
+    eventType: "issue.completed",
+    occurredAt: "2026-08-02T02:05:00.000Z",
+    state: "closed",
+  });
+  const legacyLifecycle = persistLegacyIssueLifecycleAssignment(
+    fixture,
+    completed,
+  );
+  const writesBeforeRecovery = fixture.store.writes.length;
+  const reopened = issueAssignment(3, {
+    occurredAt: "2026-08-02T02:10:00.000Z",
+    state: "open",
+  });
+  const restarted = await createFixture({
+    store: fixture.store,
+    source: new FakeAssignmentSource([reopened]),
+    time: controlledClock("2026-08-02T02:10:00.000Z"),
+  });
+
+  assert.equal(fixture.store.writes.length, writesBeforeRecovery + 1);
+  const recovered = (await restarted.service.listItems({ limit: 10 })).items;
+  assert.equal(recovered.length, 2);
+  assert.equal(
+    recovered.find(({ itemId }) => itemId === legacyLifecycle.itemId).status,
+    "cancelled",
+  );
+  assert.equal(
+    recovered.every(({ statusReason }) => statusReason === "issue_source_completed"),
+    true,
+  );
+
+  await restarted.service.intake();
+  const afterReopen = (await restarted.service.listItems({ limit: 10 })).items;
+  const reopenedItem = afterReopen.find(
+    (item) => currentWorkItemEvent(item).eventId === reopened.event.eventId,
+  );
+  assert.equal(reopenedItem.status, "queued");
+  assert.equal(reopenedItem.statusReason, null);
+});
+
+test("a late answer for lifecycle-cancelled Issue work is discarded without blocking the cursor", async () => {
+  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  const result = await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "late answer" },
+    {
+      workerId: "configured-requirements-analyst",
+      roleId: "requirements-analyst",
+    },
+  );
+  fixture.source.records.push(
+    issueAssignment(2, {
+      eventType: "issue.left_scope",
+      occurredAt: "2026-08-02T02:05:00.000Z",
+      state: "closed",
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const applied = await fixture.service.applyAttentionBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+
+  assert.equal(applied.cursor, 1);
+  assert.equal(applied.applied, 1);
+  const item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.status, "cancelled");
+  assert.equal(item.decisionContext, null);
+  const timeline = await fixture.service.listTimeline({ limit: 100 });
+  const discarded = timeline.items.find(
+    ({ type }) => type === "stale_result_discarded",
+  );
+  assert.equal(discarded.details.reason, "issue_source_left_scope");
+});
+
 function boundAttentionIntent(item, outbox) {
   const content = {
     policyVersion: 1,
@@ -10120,6 +10363,61 @@ function boundAttentionIntent(item, outbox) {
     ...content,
   };
 }
+
+test("Issue lifecycle settlement revokes a persisted dispatch binding", async () => {
+  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "configured-requirements-analyst",
+    leaseDurationMs: 30_000,
+  });
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    leaseId: item.leaseId,
+    actorId: "configured-requirements-analyst",
+    roleId: "requirements-analyst",
+    intent: askUserIntent(),
+  });
+  const claimed = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher",
+    leaseDurationMs: 30_000,
+  });
+  const bound = await fixture.service.bindIntent({
+    intentId: claimed.intentId,
+    expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision,
+    dispatcherId: "work-intent-dispatcher",
+    dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundAttentionIntent(staged.item, staged.outbox),
+  });
+  const authority = {
+    intentId: bound.intentId,
+    expectedRevision: bound.revision,
+    dispatchLeaseId: bound.dispatchLeaseId,
+    bindingDigest: bound.dispatchBinding.bindingDigest,
+    itemId: staged.item.itemId,
+    itemExpectedRevision: staged.item.revision,
+  };
+  assert.equal(await fixture.service.isIntentDispatchCurrent(authority), true);
+
+  fixture.source.records.push(
+    issueAssignment(2, {
+      eventType: "issue.left_scope",
+      occurredAt: "2026-08-02T02:05:00.000Z",
+      state: "closed",
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  assert.equal(await fixture.service.isIntentDispatchCurrent(authority), false);
+});
 
 function quarantineStoredItem(
   durable,

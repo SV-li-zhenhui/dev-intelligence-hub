@@ -40,6 +40,15 @@ function validateDependency(value, methods, name) {
   }
 }
 
+function currentAuthority(value) {
+  if (value === undefined || value === null) return async () => true;
+  if (typeof value.isAttentionRequestCurrent === "function") {
+    return value.isAttentionRequestCurrent.bind(value);
+  }
+  validateDependency(value, ["isCurrent"], "authority");
+  return value.isCurrent.bind(value);
+}
+
 function sameValue(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -94,6 +103,7 @@ export class AttentionInbox {
     exclusiveLease,
     operationQueue = new OperationQueue(),
     clock = () => new Date(),
+    authority,
   } = {}) {
     validateDependency(store, ["read", "write"], "store");
     validateDependency(exclusiveLease, ["run"], "exclusiveLease");
@@ -103,6 +113,7 @@ export class AttentionInbox {
     this.exclusiveLease = exclusiveLease;
     this.operationQueue = operationQueue;
     this.clock = clock;
+    this.isCurrent = currentAuthority(authority);
     this.state = defaultAttentionState();
     this.ready = false;
   }
@@ -169,14 +180,14 @@ export class AttentionInbox {
   }
 
   next(options) {
-    return this.#query(() => {
+    return this.#query(async () => {
       const { deferred } = normalizeInternalDeferredOptions(options);
       const deferredBindings = new Set(
         deferred.map(
           (entry) => `${entry.requestId}\u0000${entry.contentDigest}`,
         ),
       );
-      const item = this.state.items
+      const candidates = this.state.items
         .filter(
           (entry) =>
             entry.status === "pending" &&
@@ -184,14 +195,14 @@ export class AttentionInbox {
               `${entry.requestId}\u0000${entry.contentDigest}`,
             ),
         )
-        .reduce(
-          (oldest, entry) =>
-            !oldest || entry.timeline[0].revision < oldest.timeline[0].revision
-              ? entry
-              : oldest,
-          null,
+        .sort(
+          (left, right) =>
+            left.timeline[0].revision - right.timeline[0].revision,
         );
-      return item ? projectAttentionRequest(item) : null;
+      for (const item of candidates) {
+        if (await this.#isCurrent(item)) return projectAttentionRequest(item);
+      }
+      return null;
     });
   }
 
@@ -216,7 +227,7 @@ export class AttentionInbox {
     if (response.answer.type !== "later") {
       return Promise.reject(responsePortError("later"));
     }
-    return this.#query(() => {
+    return this.#query(async () => {
       const item = this.#boundItem(this.state, response);
       if (item.status !== "pending") {
         throw inboxError(
@@ -225,6 +236,7 @@ export class AttentionInbox {
           409,
         );
       }
+      await this.#requireCurrent(item);
       return projectAttentionReceipt(item);
     });
   }
@@ -272,6 +284,7 @@ export class AttentionInbox {
           409,
         );
       }
+      await this.#requireCurrent(item);
       if (response.answer.type === "choice") {
         const validChoice = item.choices.some(
           (choice) => choice.id === response.answer.choiceId,
@@ -343,6 +356,22 @@ export class AttentionInbox {
       );
     }
     return item;
+  }
+
+  #isCurrent(item) {
+    return this.isCurrent({
+      requestKey: item.requestKey,
+      producer: cloneAttentionValue(item.producer),
+    });
+  }
+
+  async #requireCurrent(item) {
+    if (await this.#isCurrent(item)) return;
+    throw inboxError(
+      "ATTENTION_REQUEST_STALE",
+      "原任务已经结束或变化，不能继续回答该请示",
+      409,
+    );
   }
 
   #query(operation) {

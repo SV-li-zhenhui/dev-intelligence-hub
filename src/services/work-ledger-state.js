@@ -103,6 +103,7 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "intent_superseded",
   "superseded",
   "legacy_result_discarded",
+  "stale_result_discarded",
   "attention_answer_applied",
   "attention_rejection_applied",
   "proposal_result_applied",

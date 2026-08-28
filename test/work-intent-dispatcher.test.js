@@ -359,10 +359,17 @@ class FakeLedger {
     this.failAckAfterOnce = false;
     this.failBindAfterOnce = false;
     this.verifyInputAuthority = async (binding) => clone(binding);
+    this.verifyDispatchAuthority = async () => true;
   }
 
   async verifyPullRequestExecutionBinding(binding) {
     return this.verifyInputAuthority(binding);
+  }
+
+  async isIntentDispatchCurrent(input) {
+    const entry = this.outbox.find(({ intentId }) => intentId === input.intentId);
+    const item = this.items.find(({ itemId }) => itemId === input.itemId);
+    return this.verifyDispatchAuthority(clone(input), entry, item);
   }
 
   async listOutbox(options) {
@@ -692,6 +699,26 @@ test("ask_user is content-addressed in the internal inbox before waiting_user ac
   assert.equal(ledger.ackCalls[0].nextStatus, "waiting_user");
   assert.match(ledger.ackCalls[0].details.questionRef, /^attention-[a-f0-9]{64}$/);
   assert.match(ledger.ackCalls[0].details.downstreamRef, WORK_INTENT_REF);
+});
+
+test("a lifecycle cutover after binding prevents downstream attention creation", async () => {
+  const pair = workPair(1, askUserIntent());
+  const { dispatcher, ledger, attention } = fixture([pair]);
+  ledger.verifyDispatchAuthority = async (_input, _entry, item) => {
+    item.status = "cancelled";
+    item.activeIntentId = null;
+    item.revision += 1;
+    return false;
+  };
+
+  const result = await dispatcher.dispatchPending({ limit: 10 });
+
+  assert.equal(result.claimed, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.items[0].code, "dispatch-authority-stale");
+  assert.equal(ledger.bindCalls.length, 1);
+  assert.equal(attention.calls.length, 0);
+  assert.equal(ledger.ackCalls.length, 0);
 });
 
 const WORK_INTENT_REF = /^work-intent-[a-f0-9]{64}$/;
@@ -1650,6 +1677,7 @@ test("constructor and dispatch options reject incomplete ports and unsafe batch 
           claimIntent() {},
           bindIntent() {},
           ackIntent() {},
+          isIntentDispatchCurrent() {},
         },
         policy: { bind() {} },
         attentionProducer: { create() {} },
@@ -2237,6 +2265,7 @@ test("dispatcher rejects accessor and sparse ledger pages without invoking gette
         ackIntent: async () => {
           throw new Error("must not acknowledge");
         },
+        isIntentDispatchCurrent: async () => true,
       };
       const { dispatcher } = fixture([], { ledger });
 

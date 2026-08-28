@@ -23,6 +23,7 @@ export async function createAttentionInboxRuntime({
   store,
   clock,
   operationQueue,
+  authority,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
   if (typeof createGuard !== "function") {
@@ -41,6 +42,7 @@ export async function createAttentionInboxRuntime({
       exclusiveLease: guard,
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),
+      ...(authority ? { authority } : {}),
     });
     await inbox.recover();
     return Object.freeze({

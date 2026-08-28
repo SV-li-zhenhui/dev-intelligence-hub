@@ -936,6 +936,7 @@ export class WorkIntentDispatcher {
   #admitAction;
   #createAttention;
   #createProposal;
+  #isIntentDispatchCurrent;
   #verifyInputAuthority;
   #prepareConflictExecutionSource;
   #verifyControlledCommitEvidence;
@@ -963,9 +964,17 @@ export class WorkIntentDispatcher {
         : null;
     this.#ledger = validateDependency(
       ledger,
-      ["listOutbox", "listItems", "claimIntent", "bindIntent", "ackIntent"],
+      [
+        "listOutbox",
+        "listItems",
+        "claimIntent",
+        "bindIntent",
+        "ackIntent",
+        "isIntentDispatchCurrent",
+      ],
       "ledger",
     );
+    this.#isIntentDispatchCurrent = ledger.isIntentDispatchCurrent.bind(ledger);
     this.#bind = validateDependency(policy, ["bind"], "policy").bind;
     this.#admitAction = actionAdmissionRun(actionAdmissionGate);
     this.#createAttention = validateDependency(
@@ -1429,6 +1438,31 @@ export class WorkIntentDispatcher {
       }
       claimed = bindingReceipt;
       bound = persisted.bound;
+    }
+
+    let dispatchCurrent;
+    try {
+      dispatchCurrent = await this.#isIntentDispatchCurrent({
+        intentId: claimed.intentId,
+        expectedRevision: claimed.revision,
+        dispatchLeaseId: claimed.dispatchLeaseId,
+        bindingDigest: persisted.envelope.bindingDigest,
+        itemId: item.itemId,
+        itemExpectedRevision: item.revision,
+      });
+    } catch {
+      return bindingUncertain(claimed.intentId, "dispatch-authority-uncertain");
+    }
+    if (!dispatchCurrent) {
+      return {
+        claimed: true,
+        counter: "skipped",
+        result: {
+          intentId: claimed.intentId,
+          status: "skipped",
+          code: "dispatch-authority-stale",
+        },
+      };
     }
 
     if (bound.kind === "attention_request") {

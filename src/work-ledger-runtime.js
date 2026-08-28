@@ -18,6 +18,8 @@ const RUNTIME_METHODS = Object.freeze([
   "listTimeline",
   "listOutbox",
   "readItemForReconciliation",
+  "isAttentionRequestCurrent",
+  "isIntentDispatchCurrent",
   "verifyPullRequestExecutionBinding",
   "verifyPullRequestExecutionBindings",
   "readPullRequestExecutionContext",
