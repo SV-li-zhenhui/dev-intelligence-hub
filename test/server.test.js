@@ -302,6 +302,23 @@ function startupApplication({
         queueCalls.push("reject");
         return { ...structuredClone(item), status: "rejected" };
       },
+      async get() {
+        queueCalls.push("get");
+        return structuredClone(item);
+      },
+      historyReader: {
+        async list() {
+          queueCalls.push("history");
+          return {
+            queueRevision: 8,
+            filters: {},
+            limit: 20,
+            roleIdFacets: [],
+            items: [],
+            nextCursor: null,
+          };
+        },
+      },
     },
     close,
   };
@@ -892,6 +909,15 @@ async function exerciseConfirmationRefreshGate(trigger) {
     const nextDuringRefresh = await request(server, {
       path: "/api/confirmations/next",
     });
+    const attentionDuringRefresh = await request(server, {
+      path: "/api/attention/next",
+    });
+    const historyDuringRefresh = await request(server, {
+      path: "/api/confirmations/history",
+    });
+    const itemDuringRefresh = await request(server, {
+      path: `/api/confirmations/${pendingConfirmationItem().id}`,
+    });
     const approveDuringRefresh = await request(server, {
       method: "POST",
       path: `/api/confirmations/${pendingConfirmationItem().id}/approve`,
@@ -902,9 +928,20 @@ async function exerciseConfirmationRefreshGate(trigger) {
       },
       body: JSON.stringify(confirmationApprovalRequest()),
     });
-    assert.equal(nextDuringRefresh.status, 503);
+    const internalAnswerDuringRefresh = await request(server, {
+      method: "POST",
+      path: `/api/attention/internal/attention-${"a".repeat(64)}/later`,
+      headers: trustedConfigurationHeaders(),
+      body: JSON.stringify({ expectedRevision: 1 }),
+    });
+    assert.equal(nextDuringRefresh.status, 200);
+    assert.equal(attentionDuringRefresh.status, 200);
+    assert.equal(historyDuringRefresh.status, 200);
+    assert.equal(itemDuringRefresh.status, 200);
     assert.equal(approveDuringRefresh.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(internalAnswerDuringRefresh.status, 503);
+    assert.deepEqual(queueCalls, ["next", "next", "history", "get"]);
+    queueCalls.length = 0;
 
     releaseRefresh.resolve();
     await new Promise((resolve) => setImmediate(resolve));
@@ -1861,6 +1898,38 @@ test("configuration safe mode shutdown drains an accepted confirmation operation
 
   releaseOperation.resolve();
   assert.equal(await operation, "completed");
+  await stopping;
+  assert.equal(stopped, true);
+});
+
+test("configuration safe mode shutdown drains an accepted confirmation read", async () => {
+  const readStarted = deferred();
+  const releaseRead = deferred();
+  const application = startupApplication();
+  application.configuration = {
+    status: { safeMode: true, migrationError: null },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application);
+  const read = backgroundWork.runConfirmationRead(async () => {
+    readStarted.resolve();
+    await releaseRead.promise;
+    return "completed";
+  });
+  await readStarted.promise;
+
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  await assert.rejects(
+    backgroundWork.runConfirmationRead(async () => "must-not-run"),
+    (error) => error?.code === "CONFIRMATION_FACTS_NOT_READY",
+  );
+
+  releaseRead.resolve();
+  assert.equal(await read, "completed");
   await stopping;
   assert.equal(stopped, true);
 });

@@ -2203,11 +2203,23 @@ function createConfirmationAccessGate(enabled) {
   });
 }
 
-function runConfirmationOperation(backgroundWork, operation) {
-  if (typeof backgroundWork?.runConfirmationOperation !== "function") {
+function runConfirmationAccess(backgroundWork, method, operation) {
+  if (typeof backgroundWork?.[method] !== "function") {
     return operation();
   }
-  return backgroundWork.runConfirmationOperation(operation);
+  return backgroundWork[method](operation);
+}
+
+function runConfirmationOperation(backgroundWork, operation) {
+  return runConfirmationAccess(
+    backgroundWork,
+    "runConfirmationOperation",
+    operation,
+  );
+}
+
+function runConfirmationRead(backgroundWork, operation) {
+  return runConfirmationAccess(backgroundWork, "runConfirmationRead", operation);
 }
 
 function signalBackgroundAgency(backgroundWork, options, reportError) {
@@ -3432,7 +3444,7 @@ export function createDashboardServer(
         url.pathname === "/api/attention/next"
       ) {
         const options = unifiedAttentionOptions(url);
-        const next = await runConfirmationOperation(backgroundWork, () =>
+        const next = await runConfirmationRead(backgroundWork, () =>
           readUnifiedAttention(application, options),
         );
         sendJson(response, 200, next);
@@ -3448,10 +3460,12 @@ export function createDashboardServer(
           throw httpError(400, "requestId 只能来自请求路径");
         }
         const operation = internalAttentionAction[2];
-        const item = await requireAttentionBrowser(application)[operation]({
-          ...input,
-          requestId: internalAttentionAction[1],
-        });
+        const item = await runConfirmationOperation(backgroundWork, () =>
+          requireAttentionBrowser(application)[operation]({
+            ...input,
+            requestId: internalAttentionAction[1],
+          }),
+        );
         if (operation !== "later") {
           signalBackgroundAgency(
             backgroundWork,
@@ -3479,9 +3493,9 @@ export function createDashboardServer(
           });
           return;
         }
-        const history = await requireConfirmationHistoryReader(
-          application,
-        ).list(options);
+        const history = await runConfirmationRead(backgroundWork, () =>
+          requireConfirmationHistoryReader(application).list(options),
+        );
         sendJson(response, 200, { available: true, ...history });
         return;
       }
@@ -3498,7 +3512,7 @@ export function createDashboardServer(
           });
           return;
         }
-        const next = await runConfirmationOperation(backgroundWork, () =>
+        const next = await runConfirmationRead(backgroundWork, () =>
           confirmationQueueForHttp(application).next(),
         );
         sendJson(response, 200, { available: true, ...next });
@@ -3513,7 +3527,7 @@ export function createDashboardServer(
           sendJson(response, 200, { available: false, item: null });
           return;
         }
-        const item = await runConfirmationOperation(backgroundWork, () =>
+        const item = await runConfirmationRead(backgroundWork, () =>
           confirmationQueueForHttp(application).get(confirmationRead[1]),
         );
         sendJson(response, 200, { available: true, item });
@@ -3842,7 +3856,9 @@ function configurationSafeModeBackgroundWork(
   const skip = () => Promise.resolve(skipped);
   const confirmationEnabled = Boolean(application.confirmationQueue);
   const confirmationAccess = createConfirmationAccessGate(confirmationEnabled);
+  const confirmationReadAccess = createConfirmationAccessGate(confirmationEnabled);
   confirmationAccess.open();
+  confirmationReadAccess.open();
   const workController = new AbortController();
   let stopPromise = null;
   return Object.freeze({
@@ -3851,10 +3867,10 @@ function configurationSafeModeBackgroundWork(
     stop() {
       if (!stopPromise) {
         workController.abort(shutdownAbort());
-        stopPromise = drainBackgroundWork(
-          () => confirmationAccess.closeAndDrain(),
-          drainTimeoutMs,
-        );
+        stopPromise = drainBackgroundWork(() => Promise.all([
+          confirmationAccess.closeAndDrain(),
+          confirmationReadAccess.closeAndDrain(),
+        ]), drainTimeoutMs);
       }
       return stopPromise;
     },
@@ -3862,6 +3878,14 @@ function configurationSafeModeBackgroundWork(
     mutateFacts: skip,
     signalAgency: skip,
     runEmployee: skip,
+    runConfirmationRead(operation) {
+      return operationalAdmission.run(() => confirmationReadAccess.run(
+        () => runDrainParticipant(
+          DRAIN_PARTICIPANTS.confirmationOperation,
+          () => operation(workController.signal),
+        ),
+      ));
+    },
     runConfirmationOperation(operation) {
       return operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -3876,7 +3900,8 @@ function configurationSafeModeBackgroundWork(
       runDrainParticipant,
       activeTaskCount: 0,
       backgroundOperationActive: false,
-      confirmationOperationCount: confirmationAccess.activeCount(),
+      confirmationOperationCount:
+        confirmationAccess.activeCount() + confirmationReadAccess.activeCount(),
       queuedOperationCount: 0,
     }),
   });
@@ -3911,6 +3936,9 @@ export function startApplicationBackgroundWork(
   const confirmationAccess = createConfirmationAccessGate(
     Boolean(application.confirmationQueue),
   );
+  const confirmationReadAccess = createConfirmationAccessGate(
+    Boolean(application.confirmationQueue),
+  );
   const workController = new AbortController();
   let stopped = false;
   let stopPromise = null;
@@ -3923,6 +3951,7 @@ export function startApplicationBackgroundWork(
   );
   let backgroundOperationActive = false;
   let factsReady = false;
+  let confirmationReadReady = false;
   let pendingFactCycles = 0;
   let factCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
@@ -4231,6 +4260,8 @@ export function startApplicationBackgroundWork(
         signal.throwIfAborted();
         if (stopped) return result;
         factsReady = true;
+        confirmationReadReady = true;
+        confirmationReadAccess.open();
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
@@ -4323,11 +4354,15 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
+    confirmationReadReady = false;
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
     const tasksToDrain = [...activeTasks];
     stopPromise = drainBackgroundWork(async () => {
-      await confirmationAccess.closeAndDrain();
+      await Promise.all([
+        confirmationAccess.closeAndDrain(),
+        confirmationReadAccess.closeAndDrain(),
+      ]);
       const results = await Promise.allSettled(tasksToDrain);
       const failures = results
         .filter((result) =>
@@ -4351,7 +4386,8 @@ export function startApplicationBackgroundWork(
       runDrainParticipant,
       activeTaskCount: activeTasks.size,
       backgroundOperationActive,
-      confirmationOperationCount: confirmationAccess.activeCount(),
+      confirmationOperationCount:
+        confirmationAccess.activeCount() + confirmationReadAccess.activeCount(),
       queuedOperationCount: [...backgroundQueues.values()]
         .reduce((total, queue) => total + queue.length, 0),
     });
@@ -4381,6 +4417,14 @@ export function startApplicationBackgroundWork(
         backgroundPriority.factOrExplicit,
         { rethrow: true },
       ),
+    runConfirmationRead: (operation) =>
+      operationalAdmission.run(() => {
+        if (!confirmationReadReady) throw confirmationUnavailable();
+        return confirmationReadAccess.run(() => runDrainParticipant(
+          DRAIN_PARTICIPANTS.confirmationOperation,
+          () => operation(workController.signal),
+        ));
+      }),
     runConfirmationOperation: (operation) =>
       operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -4463,6 +4507,8 @@ function createDeferredBackgroundWork(
     mutateFacts: (...arguments_) => requireDelegate().mutateFacts(...arguments_),
     signalAgency: (...arguments_) => requireDelegate().signalAgency(...arguments_),
     runEmployee: (...arguments_) => requireDelegate().runEmployee(...arguments_),
+    runConfirmationRead: (...arguments_) =>
+      requireDelegate().runConfirmationRead(...arguments_),
     runConfirmationOperation: (...arguments_) =>
       requireDelegate().runConfirmationOperation(...arguments_),
     confirmationReady: () => delegate?.confirmationReady?.() === true,
