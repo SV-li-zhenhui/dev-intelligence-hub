@@ -129,6 +129,7 @@ class FakeLedger {
     this.time = time;
     this.calls = {
       intake: [],
+      retireInactiveIssues: [],
       listItems: [],
       claim: [],
       stageIntent: [],
@@ -156,6 +157,29 @@ class FakeLedger {
       itemIds: created.map(({ itemId }) => itemId),
       alertItemId: null,
     };
+  }
+
+  async retireInactiveIssues(input) {
+    this.calls.retireInactiveIssues.push(clone(input));
+    let retired = 0;
+    const selected = input.itemIds === undefined
+      ? null
+      : new Set(input.itemIds);
+    for (const item of this.items) {
+      const updatedAt = Date.parse(item.event?.payload?.updatedAt);
+      if (
+        (selected === null || selected.has(item.itemId)) &&
+        item.status === "queued" &&
+        item.event?.eventType?.startsWith("issue.") &&
+        Number.isFinite(updatedAt) &&
+        updatedAt < Date.parse(input.updatedBefore)
+      ) {
+        item.status = "cancelled";
+        item.statusReason = "issue_outside_active_window";
+        retired += 1;
+      }
+    }
+    return { retired, itemIds: [] };
   }
 
   async listItems(options = {}) {
@@ -389,7 +413,64 @@ test("automatic work skips issues outside the configurable active window", async
 
   assert.equal(result.claimed, 1);
   assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), ["work-item-2"]);
-  assert.equal(ledger.items[0].status, "queued");
+  assert.deepEqual(ledger.calls.retireInactiveIssues, [{
+    updatedBefore: "2026-07-19T08:00:00.000Z",
+  }]);
+  assert.equal(ledger.items[0].status, "cancelled");
+});
+
+test("same-day Issue intake retires new stale work with a targeted sweep", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [], time });
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+    time,
+    issueActiveWindowDays: 14,
+  });
+
+  await loop.runCycle({ trigger: "scheduled" });
+  ledger.source.push(issueWorkItem(1, "2026-06-01T08:00:00.000Z"));
+  await loop.runCycle({ trigger: "scheduled" });
+
+  assert.equal(ledger.calls.retireInactiveIssues.length, 2);
+  assert.deepEqual(ledger.calls.retireInactiveIssues[1], {
+    updatedBefore: "2026-07-19T08:00:00.000Z",
+    itemIds: ["work-item-1"],
+  });
+  assert.equal(ledger.items[0].status, "cancelled");
+});
+
+test("concurrent role cycles share one daily inactive-Issue sweep", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [], time });
+  const sweepStarted = deferred();
+  const releaseSweep = deferred();
+  const retireInactiveIssues = ledger.retireInactiveIssues.bind(ledger);
+  ledger.retireInactiveIssues = async (input) => {
+    sweepStarted.resolve();
+    await releaseSweep.promise;
+    return retireInactiveIssues(input);
+  };
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      developer: worker({ roleId: "developer" }),
+      tester: worker({ roleId: "tester" }),
+    }),
+    time,
+  });
+
+  const developer = loop.runCycle({ roleId: "developer" });
+  await sweepStarted.promise;
+  const tester = loop.runCycle({ roleId: "tester" });
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseSweep.resolve();
+  await Promise.all([developer, tester]);
+
+  assert.deepEqual(ledger.calls.retireInactiveIssues, [{
+    updatedBefore: "2026-07-19T08:00:00.000Z",
+  }]);
 });
 
 test("automatic work chooses a high-priority recent issue before an ordinary one", async () => {

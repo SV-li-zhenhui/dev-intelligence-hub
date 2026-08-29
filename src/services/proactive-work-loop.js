@@ -562,6 +562,11 @@ export class ProactiveWorkLoop {
       "readItemForReconciliation",
       "ledger.readItemForReconciliation",
     );
+    this.retireInactiveIssues = optionalPortMethod(
+      ledger,
+      "retireInactiveIssues",
+      "ledger.retireInactiveIssues",
+    );
     this.roleDirectory = requirePort(
       roleDirectory,
       ["resolve"],
@@ -644,6 +649,8 @@ export class ProactiveWorkLoop {
     this.inFlightByScope = new Map();
     this.inFlightItemIds = new Set();
     this.inFlightQuestionTargets = new Set();
+    this.lastIssueRetirementKey = null;
+    this.issueRetirementSweep = null;
   }
 
   runCycle(input = {}) {
@@ -664,7 +671,18 @@ export class ProactiveWorkLoop {
 
   async #executeCycle(options) {
     throwIfLoopAborted(options.signal);
+    const now = normalizeLoopClock(this.clock);
+    const issueRetirementCutoff = new Date(
+      Date.parse(now) - this.issueActiveWindowDays * 86_400_000,
+    ).toISOString();
     const intake = await this.ledger.intake({ limit: options.intakeLimit });
+    throwIfLoopAborted(options.signal);
+    await this.#retireInactiveIssueWork(
+      intake,
+      issueRetirementCutoff,
+      now,
+      options.signal,
+    );
     throwIfLoopAborted(options.signal);
     const items = await this.#listAllItems(options.signal);
     throwIfLoopAborted(options.signal);
@@ -1510,6 +1528,36 @@ export class ProactiveWorkLoop {
         code,
       };
     }
+  }
+
+  async #retireInactiveIssueWork(intake, updatedBefore, now, signal) {
+    if (this.retireInactiveIssues === null) return;
+    const retirementKey = now.slice(0, 10);
+    if (this.lastIssueRetirementKey !== retirementKey) {
+      let startedSweep = false;
+      if (this.issueRetirementSweep?.key !== retirementKey) {
+        startedSweep = true;
+        const promise = this.retireInactiveIssues({ updatedBefore })
+          .then(() => {
+            this.lastIssueRetirementKey = retirementKey;
+          })
+          .finally(() => {
+            if (this.issueRetirementSweep?.promise === promise) {
+              this.issueRetirementSweep = null;
+            }
+          });
+        this.issueRetirementSweep = { key: retirementKey, promise };
+      }
+      await this.issueRetirementSweep.promise;
+      throwIfLoopAborted(signal);
+      if (startedSweep) return;
+    }
+    if (intake.itemIds.length === 0) return;
+    await this.retireInactiveIssues({
+      updatedBefore,
+      itemIds: intake.itemIds,
+    });
+    throwIfLoopAborted(signal);
   }
 
   async #observeItem(itemId, intakeLimit, signal = null) {

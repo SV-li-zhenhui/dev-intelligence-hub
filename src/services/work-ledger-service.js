@@ -40,9 +40,16 @@ import {
   planIntentStage,
 } from "./work-ledger-outbox-commands.js";
 import {
+  createIssueSettlementIndex,
+  indexIssueSettlementItem,
+  issueAssignmentTargetKey,
+  issueSubjectIdentityKey,
   isIssueScopeLifecycleEvent,
+  isSameIssueSubject,
+  planInactiveIssueRetirement,
   planRecoveredIssueScopeSettlement,
   settleIssueScope,
+  settleSupersededIssueAssignments,
 } from "./work-ledger-issue-lifecycle.js";
 import {
   appendWorkLedgerTimeline,
@@ -149,24 +156,13 @@ function samePullRequestSubject(left, right) {
   );
 }
 
-function sameIssueSubject(left, right) {
-  const leftEvent = currentWorkItemEvent(left);
-  const rightEvent = currentWorkItemEvent(right);
-  return Boolean(
-    leftEvent?.eventType?.startsWith("issue.") &&
-      rightEvent?.eventType?.startsWith("issue.") &&
-      leftEvent.subject?.id === rightEvent.subject?.id &&
-      leftEvent.source?.provider === rightEvent.source?.provider &&
-      leftEvent.source?.scopeId === rightEvent.source?.scopeId,
-  );
-}
-
 function hasNewerIssueAssignment(items, item) {
+  const event = currentWorkItemEvent(item);
   return items.some((candidate) =>
     candidate.sourceSequence > item.sourceSequence &&
     candidate.currentTarget?.type === item.currentTarget?.type &&
     candidate.currentTarget?.id === item.currentTarget?.id &&
-    sameIssueSubject(candidate, item)
+    isSameIssueSubject(currentWorkItemEvent(candidate), event)
   );
 }
 
@@ -912,6 +908,49 @@ export class WorkLedgerService {
     }));
   }
 
+  async retireInactiveIssues(input = {}) {
+    this.#assertReady();
+    const exactKeys = Object.hasOwn(input, "itemIds")
+      ? ["updatedBefore", "itemIds"]
+      : ["updatedBefore"];
+    if (!hasExactLedgerKeys(input, exactKeys)) {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "Issue 活跃窗口维护参数无效",
+      );
+    }
+    let updatedBefore;
+    let itemIds;
+    try {
+      updatedBefore = normalizeLedgerTimestamp(
+        input.updatedBefore,
+        "updatedBefore",
+      );
+      if (Object.hasOwn(input, "itemIds")) {
+        if (
+          !Array.isArray(input.itemIds) ||
+          input.itemIds.length > MAX_WORK_LEDGER_INTAKE_BATCH
+        ) {
+          throw new TypeError("itemIds");
+        }
+        itemIds = input.itemIds.map((itemId) =>
+          boundedLedgerString(itemId, "itemId", 192));
+        if (new Set(itemIds).size !== itemIds.length) {
+          throw new TypeError("itemIds");
+        }
+      }
+    } catch {
+      throw workLedgerError(
+        "WORK_LEDGER_QUERY_INVALID",
+        "Issue 活跃窗口维护参数无效",
+      );
+    }
+    return this.#executeCommand(planInactiveIssueRetirement, {
+      updatedBefore,
+      ...(itemIds === undefined ? {} : { itemIds }),
+    });
+  }
+
   async reconcilePullRequestSource(input = {}) {
     return this.#executeCommand(planPullRequestSourceReconciliation, input);
   }
@@ -1203,6 +1242,7 @@ export class WorkLedgerService {
     const itemsById = new Map(
       this.state.items.map((item) => [item.itemId, item]),
     );
+    const issueSettlementIndex = createIssueSettlementIndex(itemsById);
     const outboxById = new Map(
       this.state.outbox.map((entry) => [entry.intentId, entry]),
     );
@@ -1248,6 +1288,24 @@ export class WorkLedgerService {
     };
     let received = 0;
     let deduplicated = 0;
+    const latestIssueAssignmentByTarget = new Map();
+    const latestIssueLifecycleBySubject = new Map();
+    for (const envelope of batch.items) {
+      if (!envelope.event.eventType.startsWith("issue.")) continue;
+      const subjectKey = issueSubjectIdentityKey(envelope.event);
+      if (subjectKey === null) continue;
+      if (isIssueScopeLifecycleEvent(envelope.event)) {
+        latestIssueLifecycleBySubject.set(subjectKey, envelope.sequence);
+        continue;
+      }
+      const targetKey = issueAssignmentTargetKey(
+        envelope.event,
+        envelope.assignment.target,
+      );
+      if (targetKey !== null) {
+        latestIssueAssignmentByTarget.set(targetKey, envelope.sequence);
+      }
+    }
     for (const envelope of batch.items) {
       const assignmentItem = createAssignmentWorkItem(envelope, now);
       const existing = knownAssignments.get(assignmentItem.assignmentId);
@@ -1403,6 +1461,7 @@ export class WorkLedgerService {
           outboxById,
           now,
           timelineEvents,
+          issueIndex: issueSettlementIndex,
         })) {
           touchedItemIds.add(itemId);
         }
@@ -1421,6 +1480,37 @@ export class WorkLedgerService {
         received += 1;
         continue;
       }
+      const issueSubjectKey = issueSubjectIdentityKey(envelope.event);
+      const issueTargetKey = issueAssignmentTargetKey(
+        envelope.event,
+        assignmentItem.currentTarget,
+      );
+      if (
+        issueSubjectKey !== null &&
+        ((latestIssueAssignmentByTarget.get(issueTargetKey) ?? 0) >
+            envelope.sequence ||
+          (latestIssueLifecycleBySubject.get(issueSubjectKey) ?? 0) >
+            envelope.sequence)
+      ) {
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        continue;
+      }
+      for (const itemId of settleSupersededIssueAssignments({
+        event: envelope.event,
+        sourceSequence: envelope.sequence,
+        target: assignmentItem.currentTarget,
+        itemsById,
+        outboxById,
+        now,
+        timelineEvents,
+        issueIndex: issueSettlementIndex,
+      })) {
+        touchedItemIds.add(itemId);
+      }
       const rootCandidate = createPullRequestSourceRootWorkItem(envelope, now);
       if (rootCandidate === null) {
         knownAssignments.set(assignmentItem.assignmentId, {
@@ -1428,6 +1518,7 @@ export class WorkLedgerService {
           sourceSequence: assignmentItem.sourceSequence,
         });
         itemsById.set(assignmentItem.itemId, assignmentItem);
+        indexIssueSettlementItem(issueSettlementIndex, assignmentItem);
         touchedItemIds.add(assignmentItem.itemId);
         received += 1;
         timelineEvents.push({

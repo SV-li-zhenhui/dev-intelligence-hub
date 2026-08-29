@@ -10366,8 +10366,177 @@ test("new Issue evidence revokes an older question for the same role", async () 
   assert.equal(await fixture.service.isAttentionRequestCurrent(authority), false);
   const items = (await fixture.service.listItems({ limit: 10 })).items;
   assert.equal(items.length, 2);
-  assert.equal(items.find(({ itemId }) => itemId === waiting.itemId).status, "waiting_user");
+  const retired = items.find(({ itemId }) => itemId === waiting.itemId);
+  assert.equal(retired.status, "cancelled");
+  assert.equal(retired.statusReason, "issue_assignment_superseded");
+  assert.equal(retired.activeIntentId, null);
   assert.equal(items.find(({ itemId }) => itemId !== waiting.itemId).status, "queued");
+});
+
+test("one intake batch keeps only the newest Issue assignment for one role", async () => {
+  const fixture = await createFixture({
+    records: [
+      issueAssignment(1),
+      issueAssignment(2, {
+        eventType: "issue.updated",
+        occurredAt: "2026-08-02T02:05:00.000Z",
+      }),
+    ],
+  });
+
+  const result = await fixture.service.intake({ limit: 10 });
+
+  assert.equal(result.received, 2);
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  assert.equal(items.length, 1);
+  assert.equal(items[0].sourceSequence, 2);
+  assert.equal(items[0].status, "queued");
+});
+
+test("inactive Issue maintenance retires work outside the configured active window", async () => {
+  const fixture = await createFixture({
+    records: [
+      issueAssignment(1, {
+        occurredAt: "2026-07-01T00:00:00.000Z",
+        issueNumber: 41,
+      }),
+      issueAssignment(2, {
+        occurredAt: "2026-08-20T00:00:00.000Z",
+        issueNumber: 42,
+      }),
+    ],
+  });
+  await fixture.service.intake({ limit: 10 });
+
+  const result = await fixture.service.retireInactiveIssues({
+    updatedBefore: "2026-08-15T00:00:00.000Z",
+  });
+
+  assert.equal(result.retired, 1);
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  const oldIssue = items.find(({ sourceSequence }) => sourceSequence === 1);
+  const recentIssue = items.find(({ sourceSequence }) => sourceSequence === 2);
+  assert.equal(oldIssue.status, "cancelled");
+  assert.equal(oldIssue.statusReason, "issue_outside_active_window");
+  assert.equal(recentIssue.status, "queued");
+});
+
+test("targeted Issue maintenance retires newly received stale work", async () => {
+  const fixture = await createFixture({
+    records: [issueAssignment(1, {
+      occurredAt: "2026-07-01T00:00:00.000Z",
+      issueNumber: 41,
+    })],
+  });
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const result = await fixture.service.retireInactiveIssues({
+    updatedBefore: "2026-08-15T00:00:00.000Z",
+    itemIds: intake.itemIds,
+  });
+
+  assert.equal(result.retired, 1);
+  const item = (await fixture.service.listItems({ limit: 10 })).items[0];
+  assert.equal(item.status, "cancelled");
+  assert.equal(item.statusReason, "issue_outside_active_window");
+});
+
+test("targeted Issue maintenance retires every selected role for one Issue", async () => {
+  const requirements = issueAssignment(1, {
+    occurredAt: "2026-07-01T00:00:00.000Z",
+  });
+  const developer = issueAssignment(2, {
+    eventType: "issue.updated",
+    occurredAt: "2026-07-01T00:05:00.000Z",
+  });
+  developer.assignment.target = { type: "role", id: "developer" };
+  const fixture = await createFixture({ records: [requirements, developer] });
+  const intake = await fixture.service.intake({ limit: 10 });
+
+  const result = await fixture.service.retireInactiveIssues({
+    updatedBefore: "2026-08-15T00:00:00.000Z",
+    itemIds: intake.itemIds,
+  });
+
+  assert.equal(result.retired, 2);
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  assert.equal(items.every(({ status }) => status === "cancelled"), true);
+});
+
+test("recovery retires a legacy Issue assignment superseded by newer evidence", async () => {
+  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "legacy answer" },
+    {
+      workerId: "configured-requirements-analyst",
+      roleId: "requirements-analyst",
+    },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const newer = persistLegacyIssueLifecycleAssignment(
+    fixture,
+    issueAssignment(2, {
+      eventType: "issue.updated",
+      occurredAt: "2026-08-02T02:05:00.000Z",
+    }),
+  );
+
+  const restarted = await createFixture({
+    store: fixture.store,
+    source: new FakeAssignmentSource([]),
+    time: controlledClock("2026-08-02T02:10:00.000Z"),
+  });
+
+  const items = (await restarted.service.listItems({ limit: 10 })).items;
+  const retired = items.find(({ itemId }) => itemId === waiting.itemId);
+  assert.equal(retired.status, "cancelled");
+  assert.equal(retired.statusReason, "issue_assignment_superseded");
+  assert.equal(items.find(({ itemId }) => itemId === newer.itemId).status, "queued");
+});
+
+test("recovery does not treat a newer Issue graph child as a root assignment", async () => {
+  const olderDeveloperRecord = issueAssignment(1);
+  olderDeveloperRecord.assignment.target = { type: "role", id: "developer" };
+  const fixture = await createFixture({ records: [olderDeveloperRecord] });
+  await fixture.service.intake();
+  const olderDeveloper = (await fixture.service.listItems()).items[0];
+  const newerRoot = persistLegacyIssueLifecycleAssignment(
+    fixture,
+    issueAssignment(2, {
+      eventType: "issue.updated",
+      occurredAt: "2026-08-02T02:05:00.000Z",
+    }),
+  );
+  const newerChildRecord = issueAssignment(3, {
+    eventType: "issue.updated",
+    occurredAt: "2026-08-02T02:06:00.000Z",
+  });
+  newerChildRecord.assignment.target = { type: "role", id: "developer" };
+  const newerChild = persistLegacyIssueLifecycleAssignment(
+    fixture,
+    newerChildRecord,
+  );
+  const durable = fixture.store.stored();
+  const child = durable.items.find(({ itemId }) => itemId === newerChild.itemId);
+  child.graph.parentItemId = newerRoot.itemId;
+  fixture.store.replaceStored(durable);
+
+  const restarted = await createFixture({
+    store: fixture.store,
+    source: new FakeAssignmentSource([]),
+    time: controlledClock("2026-08-02T02:10:00.000Z"),
+  });
+
+  const items = (await restarted.service.listItems({ limit: 10 })).items;
+  assert.equal(
+    items.find(({ itemId }) => itemId === olderDeveloper.itemId).status,
+    "queued",
+  );
+  assert.equal(
+    items.find(({ itemId }) => itemId === newerChild.itemId).status,
+    "queued",
+  );
 });
 
 test("recovery retires a persisted Issue lifecycle task but preserves a later reopen", async () => {
@@ -10458,6 +10627,68 @@ test("a late answer for lifecycle-cancelled Issue work is discarded without bloc
     ({ type }) => type === "stale_result_discarded",
   );
   assert.equal(discarded.details.reason, "issue_source_left_scope");
+});
+
+test("late answers for superseded or inactive Issue work are safely discarded", async (context) => {
+  for (const scenario of [
+    {
+      name: "superseded",
+      reason: "issue_assignment_superseded",
+      settle: async (fixture) => {
+        fixture.source.records.push(issueAssignment(2, {
+          eventType: "issue.updated",
+          occurredAt: "2026-08-02T02:05:00.000Z",
+        }));
+        fixture.source.highWatermark = 2;
+        await fixture.service.intake();
+      },
+    },
+    {
+      name: "inactive",
+      reason: "issue_outside_active_window",
+      settle: (fixture) => fixture.service.retireInactiveIssues({
+        updatedBefore: "2026-08-15T00:00:00.000Z",
+      }),
+    },
+  ]) {
+    await context.test(scenario.name, async () => {
+      const initial = scenario.name === "inactive"
+        ? issueAssignment(1, { occurredAt: "2026-07-01T00:00:00.000Z" })
+        : issueAssignment(1);
+      const fixture = await createFixture({ records: [initial] });
+      const result = await prepareAttentionResult(
+        fixture,
+        { type: "text", text: "late answer" },
+        {
+          workerId: "configured-requirements-analyst",
+          roleId: "requirements-analyst",
+        },
+      );
+      await scenario.settle(fixture);
+
+      const applied = await fixture.service.applyAttentionBatch({
+        items: [result],
+        nextSequence: 1,
+        highWatermark: 1,
+        oldestAvailableSequence: 1,
+      });
+
+      assert.equal(applied.cursor, 1);
+      assert.equal(applied.applied, 1);
+      const item = (await fixture.service.listItems()).items.find(
+        ({ itemId }) => itemId === result.producer.workItemId,
+      );
+      assert.equal(item.status, "cancelled");
+      assert.equal(item.statusReason, scenario.reason);
+      assert.equal(item.decisionContext, null);
+      const timeline = await fixture.service.listTimeline({ limit: 100 });
+      const discarded = timeline.items.filter(
+        ({ type }) => type === "stale_result_discarded",
+      );
+      assert.equal(discarded.length, 1);
+      assert.equal(discarded[0].details.reason, scenario.reason);
+    });
+  }
 });
 
 function boundAttentionIntent(item, outbox) {
@@ -11070,6 +11301,40 @@ async function prepareProposalResult(
     at: fixture.time.clock(),
   });
 }
+
+test("a late proposal result for retired Issue work is discarded and advances", async () => {
+  const record = issueAssignment(1, {
+    occurredAt: "2026-07-01T00:00:00.000Z",
+  });
+  record.assignment.target = { type: "role", id: "pr-reviewer" };
+  const fixture = await createFixture({ records: [record] });
+  const result = await prepareProposalResult(fixture);
+  const waiting = (await fixture.service.listItems()).items[0];
+  await fixture.service.retireInactiveIssues({
+    updatedBefore: "2026-08-15T00:00:00.000Z",
+    itemIds: [waiting.itemId],
+  });
+
+  const applied = await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+
+  assert.equal(applied.applied, 1);
+  assert.equal(applied.cursor, 1);
+  const item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.status, "cancelled");
+  assert.equal(item.statusReason, "issue_outside_active_window");
+  assert.equal(item.decisionContext, null);
+  const timeline = await fixture.service.listTimeline({ limit: 100 });
+  const discarded = timeline.items.find(
+    ({ type }) => type === "stale_result_discarded",
+  );
+  assert.equal(discarded.details.source, "proposal");
+  assert.equal(discarded.details.reason, "issue_outside_active_window");
+});
 
 test("a bound GitHub proposal id distinct from its staged intent completes work", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });

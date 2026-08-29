@@ -17,6 +17,7 @@ import {
 } from "./work-ledger-result-attestation.js";
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
+import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
 import {
   boundedLedgerString,
   hasExactLedgerKeys,
@@ -29,10 +30,6 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^attention-[a-f0-9]{64}$/;
 const RESULT_ID = /^attention-result-[a-f0-9]{64}$/;
 const OUTBOX_ID = /^attention-outbox-[a-f0-9]{64}$/;
-const CLOSED_ISSUE_REASONS = new Set([
-  "issue_source_completed",
-  "issue_source_left_scope",
-]);
 
 function invalid(message = "内部请示结果批次无效") {
   return workLedgerError("WORK_LEDGER_ATTENTION_BATCH_INVALID", message, 502);
@@ -316,7 +313,7 @@ function requireBoundAskUser(state, entry) {
   const closedIssueSettlement =
     item.status === "cancelled" &&
     item.activeIntentId === null &&
-    CLOSED_ISSUE_REASONS.has(item.statusReason);
+    isSettledIssueReason(item.statusReason);
   const sealedQuarantinedSettlement =
     !durablyQuarantined ||
     (outbox?.dispatchBinding !== null &&

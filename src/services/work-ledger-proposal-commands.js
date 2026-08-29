@@ -19,6 +19,7 @@ import {
 import {
   createProposalResultAttestation,
 } from "./work-ledger-result-attestation.js";
+import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import {
   hasExactLedgerKeys,
@@ -184,9 +185,14 @@ function requireBoundProposal(state, result) {
     durablyQuarantined &&
     item.status === "blocked" &&
     item.activeIntentId === null;
+  const settledIssueResult =
+    item.status === "cancelled" &&
+    item.activeIntentId === null &&
+    isSettledIssueReason(item.statusReason);
   const outbox = state.outbox.find(
     (candidate) => candidate.intentId === item.activeIntentId,
-  ) ?? (quarantinedSettlement && matchingDownstreams.length === 1
+  ) ?? ((quarantinedSettlement || settledIssueResult) &&
+      matchingDownstreams.length === 1
     ? matchingDownstreams[0]
     : null);
   const waitingForResult =
@@ -227,7 +233,7 @@ function requireBoundProposal(state, result) {
     outbox.status !== "delivered" ||
     outbox.intent.type !== expectedIntentType ||
     outbox.requestedBy.roleId !== result.requestedBy.roleId ||
-    (!waitingForResult && !quarantinedSettlement) ||
+    (!waitingForResult && !quarantinedSettlement && !settledIssueResult) ||
     outbox.outcome?.status !== "delivered" ||
     outbox.outcome.details?.downstreamRef !== result.proposalId ||
     outbox.outcome.details?.proposalDigest !== result.proposalContentDigest
@@ -266,6 +272,7 @@ function requireBoundProposal(state, result) {
     item,
     outbox,
     evidenceTarget,
+    discardSettledIssueResult: settledIssueResult,
     discardUnsealedLegacyResult:
       durablyQuarantined &&
       (outbox.dispatchBinding === null ||
@@ -300,6 +307,7 @@ export function planProposalBatchApplication({ state, input, clock }) {
       outbox,
       evidenceTarget,
       discardUnsealedLegacyResult,
+      discardSettledIssueResult,
     } = requireBoundProposal(workingState, result);
     const timelineInputBinding = proposalTimelineInputBinding(
       workingState,
@@ -308,6 +316,22 @@ export function planProposalBatchApplication({ state, input, clock }) {
     );
     if (Date.parse(result.at) > Date.parse(now)) {
       throw invalid("工作提案结果时间晚于台账时钟");
+    }
+    if (discardSettledIssueResult) {
+      appliedItemIds.push(item.itemId);
+      timelineEvents.push({
+        itemId: item.itemId,
+        type: "stale_result_discarded",
+        at: now,
+        actorId: "work-proposal-result-reconciler",
+        details: {
+          source: "proposal",
+          intentId: outbox.intentId,
+          resultRef: result.resultId,
+          reason: item.statusReason,
+        },
+      });
+      continue;
     }
     if (discardUnsealedLegacyResult) {
       const itemResult = moveWorkItem(item, {

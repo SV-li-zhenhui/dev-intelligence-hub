@@ -24,6 +24,7 @@ const RUNTIME_METHODS = Object.freeze([
   "verifyPullRequestExecutionBindings",
   "readPullRequestExecutionContext",
   "intake",
+  "retireInactiveIssues",
   "reconcilePullRequestSource",
   "reconcilePullRequestSourceBatch",
   "claim",
