@@ -38,6 +38,26 @@ function completeDecision(overrides = {}) {
   };
 }
 
+function askUserDecision() {
+  return {
+    schemaVersion: 1,
+    confidence: 82,
+    summary: "需要继续确认型号范围。",
+    intent: {
+      schemaVersion: 1,
+      type: "ask_user",
+      summary: "确认 RTX 5060 系列的具体型号范围",
+      reason: "系列可能包含不同型号和显存规格。",
+      question: "RTX 5060 系列具体包含哪些型号？",
+      choices: [{
+        id: "all-5060-models",
+        label: "全部 5060 系列",
+        description: "覆盖 RTX 5060、RTX 5060 Ti 及计划出货的显存规格。",
+      }],
+    },
+  };
+}
+
 function orchestrationDecision() {
   const reason = "等待依赖任务恢复";
   return {
@@ -442,6 +462,85 @@ test("RoleDecisionEngine rejects intents outside the independent role permission
     engine.decide({ item: { id: "work-1" }, trigger: "assigned" }),
     (error) => error.code === "ROLE_INTENT_NOT_PERMITTED",
   );
+});
+
+test("requirements analyst cannot ask again after the owner answered the task consultation", async () => {
+  const calls = [];
+  const responses = [askUserDecision(), completeDecision()];
+  const engine = new RoleDecisionEngine({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("ask_user", "handoff", "complete"),
+    brain: brain(),
+    brainRouter: {
+      async generate(request) {
+        calls.push(request);
+        return JSON.stringify(responses.shift());
+      },
+      describe() {
+        return { ...brain(), remote: false };
+      },
+    },
+  });
+  const result = await engine.decide({
+    item: { event: { eventType: "issue.updated" } },
+    context: {
+      requirements: {
+        decisionContext: {
+          source: "attention",
+          outcome: "answered",
+          value: { answer: { type: "text", text: "是 5060 系列" } },
+        },
+      },
+    },
+  });
+
+  assert.equal(result.intent.type, "complete");
+  assert.equal(calls.length, 2);
+  assert.match(
+    calls[1].messages.at(-1).content,
+    /do not return ask_user again/u,
+  );
+  assert.match(
+    calls[0].messages[0].content,
+    /family or series answer as an inclusive scope boundary/u,
+  );
+});
+
+test("requirements analyst repeated attention is rejected when correction also asks again", async () => {
+  let calls = 0;
+  const engine = new RoleDecisionEngine({
+    definition: definition("requirements-analyst"),
+    permissions: permissions("ask_user", "handoff", "complete"),
+    brain: brain(),
+    brainRouter: {
+      async generate() {
+        calls += 1;
+        return JSON.stringify(askUserDecision());
+      },
+      describe() {
+        return { ...brain(), remote: false, singleAttempt: true };
+      },
+    },
+  });
+
+  await assert.rejects(
+    engine.decide({
+      item: { event: { eventType: "issue.updated" } },
+      context: {
+        requirements: {
+          decisionContext: {
+            source: "attention",
+            outcome: "answered",
+            value: {
+              answer: { type: "choice", choiceId: "all-5060-models" },
+            },
+          },
+        },
+      },
+    }),
+    (error) => error.code === "ROLE_DECISION_REPEATED_ATTENTION",
+  );
+  assert.equal(calls, 1);
 });
 
 test("RoleDecisionEngine permits configured orchestration and delivery intents", async () => {

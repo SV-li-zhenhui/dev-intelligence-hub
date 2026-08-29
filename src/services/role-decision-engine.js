@@ -332,6 +332,7 @@ function systemPrompt(definition, permissions) {
     "Return exactly one JSON object matching the supplied WorkDecision schema.",
     "Do not call tools, perform writes, or claim permissions outside the configured allowed intents.",
     "When query_memory is allowed and authoritative history is needed, request one bounded cited-memory query. Use local mode unless the task specifically needs the configured memory brain. After memory appears in a later context, continue the original work and do not request another memory query for that work iteration.",
+    "For the requirements-analyst role, an answered attention decisionContext is the owner's authoritative clarification for the current task. Do not return ask_user again for that task. Treat a family or series answer as an inclusive scope boundary, continue with explicit assumptions where details remain open, and finish or hand off the requirements work instead of repeatedly narrowing the same question.",
     "Every choice id and workflow fact token must use only lowercase letters, digits, and hyphens; never use underscores.",
     "For an orchestrate intent, intent.reason and intent.action.reason must be exactly identical.",
     "Use decompose to create each new specialist child under the current root. In decompose, dependsOn may reference only completed visible direct children at the exact supplied revision; while ordinary child work is unfinished, use an empty dependsOn list. Use assign only to change an existing safe queued task to a different responsibility; never assign a task to its current role and never use assign as a substitute for creating a corrected child.",
@@ -343,6 +344,27 @@ function systemPrompt(definition, permissions) {
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,
     `WorkDecision schema: ${JSON.stringify(WORK_DECISION_JSON_SCHEMA)}.`,
   ].join(" ");
+}
+
+function assertNoRepeatedRequirementsConsultation(
+  definition,
+  context,
+  decision,
+) {
+  const decisionContext = context?.requirements?.decisionContext;
+  if (
+    definition.id !== "requirements-analyst" ||
+    decision.intent.type !== "ask_user" ||
+    decisionContext?.source !== "attention" ||
+    decisionContext?.outcome !== "answered"
+  ) {
+    return;
+  }
+  throw engineError(
+    "ROLE_DECISION_REPEATED_ATTENTION",
+    "An answered requirements consultation must be treated as authoritative; the same task cannot ask the owner again",
+    409,
+  );
 }
 
 export class RoleDecisionEngine {
@@ -434,7 +456,7 @@ export class RoleDecisionEngine {
                     {
                       role: "user",
                       content:
-                        "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. Do not include markdown fences or commentary.",
+                        "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. If requirements.decisionContext records an answered attention request, treat that answer as authoritative and do not return ask_user again for the same task; continue, complete, or hand off with explicit assumptions. Do not include markdown fences or commentary.",
                     },
                   ],
           }),
@@ -447,6 +469,11 @@ export class RoleDecisionEngine {
       throwIfAborted(signal);
       try {
         decision = parseStructuredWorkDecision(response);
+        assertNoRepeatedRequirementsConsultation(
+          this.#definition,
+          context,
+          decision,
+        );
         assertInitialPrTriageDecision(
           context,
           this.#definition.id,
