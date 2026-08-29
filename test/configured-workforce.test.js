@@ -362,6 +362,46 @@ test("configured routing forwards credential mode and provider availability", as
   assert.deepEqual(availabilityCalls, [{ signal: controller.signal }]);
 });
 
+test("configured Codex routing preserves stable entity sessions", async () => {
+  const calls = [];
+  const router = createOwnedTestConfiguredBrainRouter(
+    {
+      brainProviders: {
+        cli: { kind: "codex-cli", remote: true },
+      },
+    },
+    {
+      supervisedCliProviderFactory(options) {
+        return {
+          id: options.id,
+          remote: true,
+          singleAttempt: true,
+          supportsEntitySessions: true,
+          async generate(request) {
+            calls.push(request);
+            return '{"ok":true}';
+          },
+        };
+      },
+    },
+  );
+  const sessionKey = "github:issue:svisions/oct-product#12953";
+
+  await router.generate({
+    brain: {
+      provider: "cli",
+      model: "gpt-5.6-sol",
+      remoteData: { requirements: true, code: false, memory: false },
+    },
+    messages: MESSAGES,
+    schema: SCHEMA,
+    dataClasses: ["requirements"],
+    sessionKey,
+  });
+
+  assert.equal(calls[0].sessionKey, sessionKey);
+});
+
 test("configured routing preserves prototype-defined provider availability", async () => {
   let availabilityCalls = 0;
   class CliProvider {

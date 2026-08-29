@@ -4,6 +4,7 @@ import {
   parseStructuredCodeActionDecision,
 } from "../domain/structured-code-action-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
+import { normalizeSessionKey } from "../lib/session-key.js";
 import { normalizeBrainConfig } from "./brain-router.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { createConfiguredBrainRouter } from "./configured-workforce.js";
@@ -229,9 +230,19 @@ function normalizeObservations(value) {
 }
 
 function normalizeDecisionInput(value) {
+  const hasSessionKey = value !== null &&
+    typeof value === "object" &&
+    Object.hasOwn(value, "sessionKey");
   const input = exactData(
     value,
-    ["roleId", "task", "capabilities", "turn", "observations"],
+    [
+      "roleId",
+      ...(hasSessionKey ? ["sessionKey"] : []),
+      "task",
+      "capabilities",
+      "turn",
+      "observations",
+    ],
     "code brain input",
   );
   if (typeof input.roleId !== "string" || !SAFE_ROLE_ID.test(input.roleId)) {
@@ -246,7 +257,13 @@ function normalizeDecisionInput(value) {
     turn: input.turn,
     observations: normalizeObservations(input.observations),
   });
-  return { roleId: input.roleId, context };
+  return {
+    roleId: input.roleId,
+    context,
+    ...(hasSessionKey
+      ? { sessionKey: normalizeSessionKey(input.sessionKey) }
+      : {}),
+  };
 }
 
 function requireRouter(value) {
@@ -340,7 +357,7 @@ export class CodeJobBrainDirectory {
 
   async decide(value, authorization) {
     this.#assertOpen();
-    const { roleId, context } = normalizeDecisionInput(value);
+    const { roleId, context, sessionKey } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate } =
       requireDecisionAuthorization(authorization);
     if (!this.#taskBrains.has(roleId)) {
@@ -375,6 +392,7 @@ export class CodeJobBrainDirectory {
               brain,
               schema: CODE_ACTION_DECISION_JSON_SCHEMA,
               dataClasses: ["requirements", "code"],
+              ...(sessionKey === undefined ? {} : { sessionKey }),
               messages:
                 attempt === 0
                   ? messages

@@ -128,6 +128,20 @@ test("a role brain receives only bounded semantic code context", async () => {
   }
 });
 
+test("a code task forwards its stable GitHub entity session key", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({
+    brainRouter: router.port,
+    roles: roleBrain(),
+  });
+  const sessionKey = "github:issue:acme/widgets#17";
+
+  await directory.decide(input({ sessionKey }), authorized());
+
+  assert.equal(router.calls.length, 1);
+  assert.equal(router.calls[0].sessionKey, sessionKey);
+});
+
 test("one invalid model response gets exactly one local correction attempt", async () => {
   const router = fakeRouter(["not json", decision({ type: "run_profile" })]);
   const directory = new CodeJobBrainDirectory({

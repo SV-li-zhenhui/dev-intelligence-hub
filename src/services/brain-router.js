@@ -1,4 +1,5 @@
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { normalizeSessionKey } from "../lib/session-key.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -154,10 +155,17 @@ function normalizeProvider(value) {
   if (availability !== undefined && typeof availability !== "function") {
     throw new TypeError("brain provider is invalid");
   }
+  if (
+    value.supportsEntitySessions !== undefined &&
+    typeof value.supportsEntitySessions !== "boolean"
+  ) {
+    throw new TypeError("brain provider is invalid");
+  }
   return Object.freeze({
     id,
     remote: value.remote,
     singleAttempt: attemptDescriptor?.value === true,
+    supportsEntitySessions: value.supportsEntitySessions === true,
     generate: value.generate.bind(value),
     ...(availability
       ? { checkAvailability: availability.bind(value) }
@@ -204,6 +212,7 @@ export class BrainRouter {
     messages,
     schema,
     dataClasses = [],
+    sessionKey: sessionKeyValue = null,
     signal = null,
   } = {}) {
     const brain = normalizeBrainConfig(brainValue);
@@ -241,6 +250,9 @@ export class BrainRouter {
         : {}),
       messages,
       schema,
+      ...(sessionKeyValue === null || !provider.supportsEntitySessions
+        ? {}
+        : { sessionKey: normalizeSessionKey(sessionKeyValue) }),
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
   }

@@ -314,6 +314,10 @@ function providerWithBoundary(provider, remote, lifecycle) {
     provider,
     "singleAttempt",
   );
+  const sessionDescriptor = Object.getOwnPropertyDescriptor(
+    provider,
+    "supportsEntitySessions",
+  );
   const availability = provider.checkAvailability;
   if (
     attemptDescriptor &&
@@ -325,10 +329,20 @@ function providerWithBoundary(provider, remote, lifecycle) {
   if (availability !== undefined && typeof availability !== "function") {
     throw new TypeError("brain provider availability is invalid");
   }
+  if (
+    sessionDescriptor &&
+    (!("value" in sessionDescriptor) ||
+      typeof sessionDescriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain provider entity session support is invalid");
+  }
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
+    ...(sessionDescriptor?.value === true
+      ? { supportsEntitySessions: true }
+      : {}),
     generate: provider.generate.bind(provider),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }

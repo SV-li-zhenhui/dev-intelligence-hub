@@ -64,6 +64,54 @@ test("BrainRouter forwards an assigned reasoning effort to the provider", async 
   assert.equal(calls[0].reasoningEffort, "high");
 });
 
+test("BrainRouter forwards an entity session key to the provider", async () => {
+  const calls = [];
+  const router = new BrainRouter({
+    providers: [provider({
+      supportsEntitySessions: true,
+      async generate(request) {
+        calls.push(request);
+        return '{"ok":true}';
+      },
+    })],
+  });
+
+  await router.generate({
+    brain: BRAIN,
+    messages: [{ role: "user", content: "Return JSON." }],
+    schema: { type: "object" },
+    dataClasses: ["requirements"],
+    sessionKey: "github:pull_request:svisions/oct-software#24256",
+  });
+
+  assert.equal(
+    calls[0].sessionKey,
+    "github:pull_request:svisions/oct-software#24256",
+  );
+});
+
+test("BrainRouter keeps non-session providers stateless for entity work", async () => {
+  const calls = [];
+  const router = new BrainRouter({
+    providers: [provider({
+      async generate(request) {
+        calls.push(request);
+        return '{"ok":true}';
+      },
+    })],
+  });
+
+  await router.generate({
+    brain: BRAIN,
+    messages: [{ role: "user", content: "Return JSON." }],
+    schema: { type: "object" },
+    dataClasses: ["requirements"],
+    sessionKey: "github:issue:svisions/oct-product#12953",
+  });
+
+  assert.equal(Object.hasOwn(calls[0], "sessionKey"), false);
+});
+
 test("BrainRouter preserves prototype-defined availability", async () => {
   let calls = 0;
   class Provider {

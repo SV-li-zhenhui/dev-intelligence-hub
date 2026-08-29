@@ -1,5 +1,7 @@
 import { types as utilTypes } from "node:util";
 
+import { normalizeSessionKey } from "./session-key.js";
+
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES = 16;
 const MAX_MESSAGE_BYTES = 128 * 1024;
@@ -86,9 +88,9 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     required.some((key) => !keys.includes(key)) ||
     keys.some((key) =>
       typeof key !== "string" ||
-      ![...required, "reasoningEffort", "signal"].includes(key)
+      ![...required, "reasoningEffort", "sessionKey", "signal"].includes(key)
     ) ||
-    keys.length > required.length + 2
+    keys.length > required.length + 3
   ) {
     throw new TypeError("structured request is invalid");
   }
@@ -103,6 +105,7 @@ export function readStructuredBrainGenerateInput(rawRequest) {
   return Object.freeze({
     model: result.model,
     reasoningEffort: result.reasoningEffort ?? null,
+    sessionKey: result.sessionKey ?? null,
     messages: result.messages,
     schema: result.schema,
     signal: result.signal ?? null,
@@ -304,18 +307,21 @@ function deepFreeze(value) {
 
 export function normalizeStructuredBrainRequest(rawRequest, options) {
   const maxRequestBytes = maximumRequestBytes(options);
-  const hasReasoningEffort =
+  const hasOwnPlainDataField = (key) =>
     rawRequest !== null &&
     typeof rawRequest === "object" &&
     !Array.isArray(rawRequest) &&
     !utilTypes.isProxy(rawRequest) &&
     Object.getPrototypeOf(rawRequest) === Object.prototype &&
-    Object.hasOwn(rawRequest, "reasoningEffort");
+    Object.hasOwn(rawRequest, key);
+  const hasReasoningEffort = hasOwnPlainDataField("reasoningEffort");
+  const hasSessionKey = hasOwnPlainDataField("sessionKey");
   const request = exactDataObject(
     rawRequest,
     [
       "model",
       ...(hasReasoningEffort ? ["reasoningEffort"] : []),
+      ...(hasSessionKey ? ["sessionKey"] : []),
       "messages",
       "schema",
     ],
@@ -331,6 +337,9 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
     model: safeText(request.model, "model", MAX_MODEL_BYTES),
     ...(hasReasoningEffort
       ? { reasoningEffort: request.reasoningEffort }
+      : {}),
+    ...(hasSessionKey
+      ? { sessionKey: normalizeSessionKey(request.sessionKey) }
       : {}),
     messages: normalizeMessages(request.messages),
     schema: normalizeSchema(request.schema),

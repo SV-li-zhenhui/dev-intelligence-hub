@@ -560,6 +560,200 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
   await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
 });
 
+test("Codex resumes the persisted session for the same PR entity", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-codex-session-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const descriptor = testDescriptor("codex-cli");
+  const sessions = new Map();
+  const sessionStore = {
+    async stage({ sessionKey }) {
+      return { sessionId: sessions.get(sessionKey) ?? null };
+    },
+    async capture({ sessionKey, sessionId }) {
+      sessions.set(sessionKey, sessionId);
+    },
+  };
+  const runner = recordingRunner(async (invocation, index) => {
+    const args = invocation.args;
+    const resumeIndex = args.indexOf("resume");
+    if (index === 0) {
+      assert.equal(resumeIndex, -1);
+      assert.equal(args.includes("--ephemeral"), false);
+    } else {
+      assert.notEqual(resumeIndex, -1);
+      assert.equal(args[resumeIndex + 1], "019cfake-session-id");
+      assert.equal(args.at(-1), "-");
+    }
+    assert.equal(args.includes("--json"), true);
+    const resultFile = argumentValue(args, "--output-last-message");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
+    return successfulProcess(
+      Buffer.from(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: "019cfake-session-id",
+        })}\n`,
+      ),
+    );
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(descriptor),
+      environment: { OPENAI_API_KEY: "codex-test-credential" },
+      temporaryRoot,
+      codexSessionStore: sessionStore,
+    },
+  );
+  const request = brainRequest({
+    sessionKey: "github:pull_request:svisions/oct-software#24256",
+  });
+
+  assert.equal(await provider.generate(request), '{"ok":true}');
+  assert.equal(await provider.generate(request), '{"ok":true}');
+  assert.equal(runner.calls.length, 2);
+  assert.equal(
+    sessions.get("github:pull_request:svisions/oct-software#24256"),
+    "019cfake-session-id",
+  );
+});
+
+test("Codex serializes concurrent turns for the same PR session", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-codex-session-queue-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const descriptor = testDescriptor("codex-cli");
+  const sessions = new Map();
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  const sessionStore = {
+    async stage({ sessionKey }) {
+      return { sessionId: sessions.get(sessionKey) ?? null };
+    },
+    async capture({ sessionKey, sessionId }) {
+      sessions.set(sessionKey, sessionId);
+    },
+  };
+  const runner = recordingRunner(async (invocation, index) => {
+    if (index === 0) {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+      assert.equal(invocation.args.includes("resume"), false);
+    } else {
+      const resumeIndex = invocation.args.indexOf("resume");
+      assert.notEqual(resumeIndex, -1);
+      assert.equal(invocation.args[resumeIndex + 1], "019cfake-session-id");
+    }
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, codexOutput({ turn: index + 1 }), "utf8");
+    return successfulProcess(Buffer.from(
+      `${JSON.stringify({
+        type: "thread.started",
+        thread_id: "019cfake-session-id",
+      })}\n`,
+    ));
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(descriptor),
+      environment: { OPENAI_API_KEY: "codex-test-credential" },
+      temporaryRoot,
+      codexSessionStore: sessionStore,
+    },
+  );
+  const siblingProvider = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), id: "codex-cli-sibling" },
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(descriptor),
+      environment: { OPENAI_API_KEY: "codex-test-credential" },
+      temporaryRoot,
+      codexSessionStore: sessionStore,
+    },
+  );
+  const request = brainRequest({
+    sessionKey: "github:pull_request:svisions/oct-software#24256",
+  });
+
+  const first = provider.generate(request);
+  await firstStarted.promise;
+  const second = siblingProvider.generate(request);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runner.calls.length, 1);
+
+  releaseFirst.resolve();
+  assert.equal(await first, '{"turn":1}');
+  assert.equal(await second, '{"turn":2}');
+  assert.equal(runner.calls.length, 2);
+});
+
+test("a cancelled queued Codex turn cannot let a later same-PR turn overtake", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-codex-session-cancel-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const descriptor = testDescriptor("codex-cli");
+  const sessions = new Map();
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  const sessionStore = {
+    async stage({ sessionKey }) {
+      return { sessionId: sessions.get(sessionKey) ?? null };
+    },
+    async capture({ sessionKey, sessionId }) {
+      sessions.set(sessionKey, sessionId);
+    },
+  };
+  const runner = recordingRunner(async (invocation, index) => {
+    if (index === 0) {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+    } else {
+      const resumeIndex = invocation.args.indexOf("resume");
+      assert.notEqual(resumeIndex, -1);
+      assert.equal(invocation.args[resumeIndex + 1], "019cfake-session-id");
+    }
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, codexOutput({ turn: index + 1 }), "utf8");
+    return successfulProcess(Buffer.from(
+      `${JSON.stringify({
+        type: "thread.started",
+        thread_id: "019cfake-session-id",
+      })}\n`,
+    ));
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    providerOptions("codex-cli"),
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(descriptor),
+      environment: { OPENAI_API_KEY: "codex-test-credential" },
+      temporaryRoot,
+      codexSessionStore: sessionStore,
+    },
+  );
+  const sessionKey = "github:pull_request:svisions/oct-software#24256";
+  const first = provider.generate(brainRequest({ sessionKey }));
+  await firstStarted.promise;
+  const cancelled = new AbortController();
+  const middle = provider.generate(brainRequest({
+    sessionKey,
+    signal: cancelled.signal,
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  const last = provider.generate(brainRequest({ sessionKey }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  cancelled.abort();
+  await assert.rejects(middle, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  assert.equal(runner.calls.length, 1);
+
+  releaseFirst.resolve();
+  assert.equal(await first, '{"turn":1}');
+  assert.equal(await last, '{"turn":2}');
+  assert.equal(runner.calls.length, 2);
+});
+
 test("Codex login mode stages one isolated profile and omits every API credential", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-codex-login-");
   const temporaryRoot = path.join(parent, "runtime");

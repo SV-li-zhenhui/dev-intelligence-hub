@@ -874,6 +874,31 @@ test("a queued job is started and one semantic action is durably executed", asyn
   assert.equal(JSON.stringify(brainCalls[0]).includes("workspaceRevision"), false);
 });
 
+test("worker keeps every code turn for one Issue in the same brain session", async () => {
+  const initial = job({
+    grant: grant({
+      subject: { number: 17 },
+      inputBinding: null,
+    }),
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "read_text", path: "src/app.js" }], brainCalls),
+    grantVerifier: verifier([]),
+  });
+
+  await worker.runCycle({ limit: 1, roleId: "developer" });
+
+  assert.equal(
+    brainCalls[0].sessionKey,
+    "github:issue:acme/dashboard#17",
+  );
+});
+
 test("worker forwards an exact PR input binding when starting a session", async () => {
   const inputBinding = pullRequestInputBinding();
   const initial = job({ grant: grant({ inputBinding }) });

@@ -4,6 +4,7 @@ import {
   canCreateCodeJobChangePackageEvent,
 } from "../domain/code-job-change-package-event.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
+import { githubEntitySessionKey } from "../lib/session-key.js";
 import {
   assertSessionBinding,
   bindTrustedAction,
@@ -583,9 +584,18 @@ export class CodeJobWorkerService {
       turn: job.execution.turn + 1,
       observations,
     });
+    const sessionKey = Number.isSafeInteger(job.grant.subject?.number) &&
+        job.grant.subject.number > 0
+      ? githubEntitySessionKey({
+          kind: job.grant.inputBinding === null ? "issue" : "pull_request",
+          repository: job.grant.repository,
+          number: job.grant.subject.number,
+        })
+      : null;
     const decision = await this.#brain.decide(
       {
         roleId: job.grant.requestedBy.roleId,
+        ...(sessionKey === null ? {} : { sessionKey }),
         ...brainContext,
       },
       {

@@ -231,7 +231,16 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   });
 
   const result = await engine.decide({
-    item: { event: { subject: { title: "修复登录" } } },
+    item: {
+      event: {
+        eventType: "pull_request.updated",
+        subject: {
+          repository: "SVisions/OCT-Software",
+          number: 24256,
+          title: "修复登录",
+        },
+      },
+    },
     trigger: "assigned",
   });
 
@@ -272,6 +281,61 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
     code: { files: ["src/app.js"] },
   });
   assert.equal(engine.view().brain.remoteData.memory, false);
+  assert.equal(
+    calls[0].sessionKey,
+    "github:pull_request:svisions/oct-software#24256",
+  );
+});
+
+test("RoleDecisionEngine reuses one entity session across roles and event revisions", async () => {
+  const sessionKeys = [];
+  const router = {
+    async generate(request) {
+      sessionKeys.push(request.sessionKey);
+      return JSON.stringify(completeDecision());
+    },
+    describe(config) {
+      return { ...config, remote: false };
+    },
+  };
+  const developer = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: router,
+    contextFactory: async () => ({ requirements: { taskId: "task-1" } }),
+  });
+  const reviewer = new RoleDecisionEngine({
+    definition: definition("pr-engineer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: router,
+    contextFactory: async () => ({ requirements: { taskId: "task-2" } }),
+  });
+  const event = {
+    eventType: "issue.updated",
+    subject: {
+      repository: "SVisions/OCT-Product",
+      number: 12953,
+      title: "数据库保存问题",
+    },
+  };
+
+  await developer.decide({ item: { event }, trigger: "assigned" });
+  await reviewer.decide({
+    item: {
+      event: {
+        ...event,
+        eventType: "issue.commented",
+      },
+    },
+    trigger: "user_answered",
+  });
+
+  assert.deepEqual(sessionKeys, [
+    "github:issue:svisions/oct-product#12953",
+    "github:issue:svisions/oct-product#12953",
+  ]);
 });
 
 test("RoleDecisionEngine checks its configured provider without generating a decision", async () => {

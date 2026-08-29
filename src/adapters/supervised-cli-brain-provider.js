@@ -18,6 +18,7 @@ import { performance } from "node:perf_hooks";
 import { types as utilTypes } from "node:util";
 
 import { canonicalJsonStringify } from "../lib/canonical-json-digest.js";
+import { CodexCliSessionStore } from "./codex-cli-session-store.js";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { ProductionCliCompositionGrant } from "../composition-root.js";
@@ -38,6 +39,7 @@ const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const CLI_KINDS = new Set(["codex-cli", "claude-cli"]);
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SAFE_CLI_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
+const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const API_KEY = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
 const INVALID_PATH_TEXT = /[\u0000\r\n]/;
 const INVOCATION_MARKER = ".mydashboard-invocation.json";
@@ -52,6 +54,9 @@ const MAX_CLEANUP_DEPTH = 16;
 const MAX_CLEANUP_REGULAR_BYTES = 16n * 1024n * 1024n;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SHARED_ROOT_STATES = new Map();
+const SHARED_SESSION_STORES = new Map();
+const SESSION_STORE_BOUNDARIES = new WeakMap();
+const SESSION_TURNS_BY_STORE = new WeakMap();
 const PRODUCTION_CLEANUP_FILE_SYSTEM = Object.freeze({
   lstat,
   open,
@@ -471,12 +476,27 @@ function productionDependencies(runtimeFacts = []) {
   const supervisedCliTemporaryRoot = Array.isArray(runtimeFacts)
     ? null
     : runtimeFacts.supervisedCliTemporaryRoot;
+  const temporaryRoot = supervisedCliTemporaryRoot ??
+    path.join(homedir(), ".mydashboard-supervised-cli-v1");
+  const sessionRoot = `${temporaryRoot}-sessions`;
+  const sessionStoreKey = JSON.stringify([
+    canonicalPath(sessionRoot),
+    ...additionalProtectedRoots.map(canonicalPath).sort(),
+  ]);
+  let codexSessionStore = SHARED_SESSION_STORES.get(sessionStoreKey);
+  if (codexSessionStore === undefined) {
+    codexSessionStore = new CodexCliSessionStore({
+      root: sessionRoot,
+      protectedRoots: [temporaryRoot, ...additionalProtectedRoots],
+      directoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
+    });
+    SHARED_SESSION_STORES.set(sessionStoreKey, codexSessionStore);
+  }
   return Object.freeze({
     processRunner: new SupervisedProcessRunner(),
     commandLocator: new KnownCliLocator(),
     environment: process.env,
-    temporaryRoot: supervisedCliTemporaryRoot ??
-      path.join(homedir(), ".mydashboard-supervised-cli-v1"),
+    temporaryRoot,
     protectedRoots: protectedRootPaths([projectRoot, ...additionalProtectedRoots]),
     cleanupFileSystem: PRODUCTION_CLEANUP_FILE_SYSTEM,
     rootDirectoryManager: PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
@@ -488,7 +508,28 @@ function productionDependencies(runtimeFacts = []) {
     staleInvocationScavenger: scavengeStaleInvocations,
     codexResultReader: readCodexResult,
     codexLoginCredentialBroker,
+    codexSessionStore,
   });
+}
+
+function sessionStore(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    typeof value.stage !== "function" ||
+    typeof value.capture !== "function"
+  ) {
+    throw new TypeError("Codex session store is invalid");
+  }
+  const existing = SESSION_STORE_BOUNDARIES.get(value);
+  if (existing !== undefined) return existing;
+  const boundary = Object.freeze({
+    stage: value.stage.bind(value),
+    capture: value.capture.bind(value),
+  });
+  SESSION_STORE_BOUNDARIES.set(value, boundary);
+  return boundary;
 }
 
 function providerDependencies(constructionToken, rawDependencies) {
@@ -517,6 +558,7 @@ function providerDependencies(constructionToken, rawDependencies) {
       "cleanupFileSystem",
       "rootDirectoryManager",
       "codexLoginCredentialBroker",
+      "codexSessionStore",
     ],
     ["processRunner", "commandLocator", "environment", "temporaryRoot"],
     "Supervised CLI provider test dependencies are invalid",
@@ -540,6 +582,9 @@ function providerDependencies(constructionToken, rawDependencies) {
     codexResultReader: dependencies.codexResultReader ?? readCodexResult,
     codexLoginCredentialBroker:
       dependencies.codexLoginCredentialBroker ?? null,
+    codexSessionStore: dependencies.codexSessionStore === undefined
+      ? null
+      : sessionStore(dependencies.codexSessionStore),
   });
 }
 
@@ -652,6 +697,28 @@ function throwIfRequestAborted(signal) {
   throw signal.reason instanceof SupervisedCliBrainProviderError
     ? signal.reason
     : providerError("STRUCTURED_PROVIDER_CANCELLED");
+}
+
+async function waitForSessionTurn(turn, signal) {
+  throwIfRequestAborted(signal);
+  if (!signal) {
+    await turn;
+    return;
+  }
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(
+      signal.reason instanceof SupervisedCliBrainProviderError
+        ? signal.reason
+        : providerError("STRUCTURED_PROVIDER_CANCELLED"),
+    );
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([turn, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function inside(root, candidate) {
@@ -1476,9 +1543,10 @@ function childEnvironment(invocation, configuredCredential, codexHome = null) {
     TERM: "dumb",
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
-    ...(codexHome === null
-      ? { [configuredCredential.name]: configuredCredential.value }
-      : { CODEX_HOME: codexHome }),
+    ...(configuredCredential === null
+      ? {}
+      : { [configuredCredential.name]: configuredCredential.value }),
+    ...(codexHome === null ? {} : { CODEX_HOME: codexHome }),
   };
 }
 
@@ -1510,10 +1578,17 @@ function assertSafeCliModel(model) {
   }
 }
 
-function codexArguments({ request, invocation, schemaFile, resultFile }) {
+function codexArguments({
+  request,
+  invocation,
+  schemaFile,
+  resultFile,
+  sessionId = null,
+}) {
+  const persistentSession = request.sessionKey !== undefined;
   return [
     "exec",
-    "--ephemeral",
+    ...(persistentSession ? [] : ["--ephemeral"]),
     "--ignore-user-config",
     "--ignore-rules",
     "--skip-git-repo-check",
@@ -1546,6 +1621,7 @@ function codexArguments({ request, invocation, schemaFile, resultFile }) {
     "goals",
     "--color",
     "never",
+    ...(persistentSession ? ["--json"] : []),
     "--output-schema",
     schemaFile,
     "--output-last-message",
@@ -1557,8 +1633,41 @@ function codexArguments({ request, invocation, schemaFile, resultFile }) {
       : []),
     "-C",
     invocation.path,
+    ...(sessionId === null ? [] : ["resume", sessionId]),
     "-",
   ];
+}
+
+function codexThreadId(result, maximumBytes, previousSessionId) {
+  const text = fatalUtf8(processBytes(result, maximumBytes));
+  let found = null;
+  for (const line of text.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = parseJsonWithUniqueKeys(line);
+    } catch {
+      throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
+    }
+    if (
+      event !== null &&
+      typeof event === "object" &&
+      !Array.isArray(event) &&
+      event.type === "thread.started" &&
+      typeof event.thread_id === "string" &&
+      SAFE_SESSION_ID.test(event.thread_id)
+    ) {
+      found ??= event.thread_id;
+      if (found !== event.thread_id) {
+        throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
+      }
+    }
+  }
+  const sessionId = found ?? previousSessionId;
+  if (typeof sessionId !== "string" || !SAFE_SESSION_ID.test(sessionId)) {
+    throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
+  }
+  return sessionId;
 }
 
 function claudeArguments(request) {
@@ -1899,6 +2008,7 @@ async function verifiedResidue(
 export class SupervisedCliBrainProvider {
   #credentialMode;
   #credentialBroker;
+  #codexSessionStore;
   #timeoutMs;
   #maxResponseBytes;
   #maxRequestBytes;
@@ -1923,6 +2033,7 @@ export class SupervisedCliBrainProvider {
   #activeGenerations = 0;
   #closeAttempt = null;
   #closeResult = null;
+  #sessionTurns;
 
   constructor(rawOptions, constructionToken, rawDependencies) {
     if (
@@ -1940,10 +2051,22 @@ export class SupervisedCliBrainProvider {
     this.kind = options.cliKind;
     this.remote = true;
     this.singleAttempt = true;
+    this.supportsEntitySessions = this.kind === "codex-cli";
     this.#credentialMode = options.credentialMode;
     this.#credentialBroker = credentialBroker(
       dependencies.codexLoginCredentialBroker,
     );
+    this.#codexSessionStore = dependencies.codexSessionStore;
+    if (this.#codexSessionStore === null) {
+      this.#sessionTurns = new Map();
+    } else {
+      let turns = SESSION_TURNS_BY_STORE.get(this.#codexSessionStore);
+      if (turns === undefined) {
+        turns = new Map();
+        SESSION_TURNS_BY_STORE.set(this.#codexSessionStore, turns);
+      }
+      this.#sessionTurns = turns;
+    }
     if (
       this.#credentialMode === "codex-login" &&
       this.#credentialBroker === null
@@ -2082,6 +2205,42 @@ export class SupervisedCliBrainProvider {
     return this.#descriptorValue;
   }
 
+  async #acquireSessionTurn(sessionKey, deadline) {
+    if (sessionKey === undefined) return null;
+    const hasPrevious = this.#sessionTurns.has(sessionKey);
+    const previous = this.#sessionTurns.get(sessionKey) ?? Promise.resolve();
+    let releaseGate;
+    const gate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    this.#sessionTurns.set(sessionKey, gate);
+    try {
+      await deadline.run(({ signal }) => waitForSessionTurn(previous, signal));
+    } catch (error) {
+      const releaseAbandonedGate = () => {
+        releaseGate();
+        if (this.#sessionTurns.get(sessionKey) === gate) {
+          this.#sessionTurns.delete(sessionKey);
+        }
+      };
+      if (hasPrevious) {
+        void previous.then(releaseAbandonedGate, releaseAbandonedGate);
+      } else {
+        releaseAbandonedGate();
+      }
+      throw error;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseGate();
+      if (this.#sessionTurns.get(sessionKey) === gate) {
+        this.#sessionTurns.delete(sessionKey);
+      }
+    };
+  }
+
   async #runProcess(invocation, deadline, options) {
     return runConcurrentRootActivity(
       this.#rootState,
@@ -2174,6 +2333,22 @@ export class SupervisedCliBrainProvider {
         codexHome = staged.codexHome;
         credentialStaged = true;
       }
+      let sessionId = null;
+      if (request.sessionKey !== undefined) {
+        if (this.kind !== "codex-cli" || this.#codexSessionStore === null) {
+          throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
+        }
+        codexHome ??= path.join(invocation.path, "codex-home");
+        await deadline.run(async ({ signal }) => {
+          await mkdir(codexHome, { recursive: true, mode: 0o700 });
+          const stagedSession = await this.#codexSessionStore.stage({
+            sessionKey: request.sessionKey,
+            codexHome,
+            signal,
+          });
+          sessionId = stagedSession?.sessionId ?? null;
+        });
+      }
       const environment = childEnvironment(
         invocation,
         configuredCredential,
@@ -2199,13 +2374,14 @@ export class SupervisedCliBrainProvider {
         this.#assertRunnable();
         let processFailure = null;
         try {
-          await this.#runProcess(invocation, deadline, {
+          const processResult = await this.#runProcess(invocation, deadline, {
             executable: descriptor,
             args: codexArguments({
               request,
               invocation,
               schemaFile,
               resultFile,
+              sessionId,
             }),
             cwd: invocation.path,
             env: environment,
@@ -2214,6 +2390,20 @@ export class SupervisedCliBrainProvider {
             maxStderrBytes: this.#maxResponseBytes,
           });
           processReaped = true;
+          if (request.sessionKey !== undefined) {
+            const capturedSessionId = codexThreadId(
+              processResult,
+              this.#maxResponseBytes,
+              sessionId,
+            );
+            await deadline.run(({ signal }) =>
+              this.#codexSessionStore.capture({
+                sessionKey: request.sessionKey,
+                sessionId: capturedSessionId,
+                codexHome,
+                signal,
+              }));
+          }
         } catch (error) {
           processFailure = error;
           processReaped = error?.code !== "STRUCTURED_PROVIDER_REAP_FAILED";
@@ -2301,6 +2491,7 @@ export class SupervisedCliBrainProvider {
             : {}),
           messages: input.messages,
           schema: input.schema,
+          ...(input.sessionKey === null ? {} : { sessionKey: input.sessionKey }),
         },
         { maxRequestBytes: this.#maxRequestBytes },
       );
@@ -2321,8 +2512,13 @@ export class SupervisedCliBrainProvider {
     });
     this.#activeGenerations += 1;
     let credentialLease = null;
+    let releaseSessionTurn = null;
     let credentialLifecycleSafe = true;
     try {
+      releaseSessionTurn = await this.#acquireSessionTurn(
+        admitted.request.sessionKey,
+        deadline,
+      );
       if (this.#credentialMode === "codex-login") {
         credentialLease = await deadline.run(({ signal }) =>
           this.#credentialBroker.acquire({ signal }));
@@ -2374,12 +2570,14 @@ export class SupervisedCliBrainProvider {
     } finally {
       this.#activeGenerations -= 1;
       deadline.dispose();
-      if (credentialLease !== null) {
-        try {
+      try {
+        if (credentialLease !== null) {
           credentialLease.release({ safe: credentialLifecycleSafe });
-        } catch (error) {
-          throw sanitizeRuntimeFailure(error);
         }
+      } catch (error) {
+        throw sanitizeRuntimeFailure(error);
+      } finally {
+        releaseSessionTurn?.();
       }
     }
   }

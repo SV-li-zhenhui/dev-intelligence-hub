@@ -3,6 +3,7 @@ import {
   WORK_DECISION_JSON_SCHEMA,
 } from "../domain/structured-brain-contract.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { githubEntitySessionKey } from "../lib/session-key.js";
 import { normalizeBrainConfig } from "./brain-router.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
@@ -223,6 +224,31 @@ function defaultContext({ item, trigger }) {
   return { requirements };
 }
 
+function workEntitySessionKey(item) {
+  const event = currentWorkItemEvent(item);
+  const eventType = event?.eventType;
+  const subject = event?.subject;
+  const kind = typeof eventType === "string" && eventType.startsWith("pull_request.")
+    ? "pull_request"
+    : typeof eventType === "string" && eventType.startsWith("issue.")
+      ? "issue"
+      : null;
+  if (
+    kind === null ||
+    typeof subject?.repository !== "string" ||
+    !subject.repository.trim() ||
+    !Number.isSafeInteger(subject?.number) ||
+    subject.number < 1
+  ) {
+    return null;
+  }
+  return githubEntitySessionKey({
+    kind,
+    repository: subject.repository,
+    number: subject.number,
+  });
+}
+
 function normalizeTrigger(value) {
   return boundedText(value, "trigger", 128);
 }
@@ -367,6 +393,7 @@ export class RoleDecisionEngine {
     const signal = normalizeAbortSignal(signalValue);
     throwIfAborted(signal);
     const normalizedTrigger = normalizeTrigger(trigger);
+    const sessionKey = workEntitySessionKey(item);
     const context = normalizeContext(
       suppliedContext === undefined
         ? await this.#contextFactory({
@@ -388,6 +415,7 @@ export class RoleDecisionEngine {
       brain: this.#brain,
       schema: WORK_DECISION_JSON_SCHEMA,
       dataClasses: [...new Set(["requirements", ...Object.keys(context)])],
+      ...(sessionKey === null ? {} : { sessionKey }),
       ...(signal === null ? {} : { signal }),
     };
     let decision;
