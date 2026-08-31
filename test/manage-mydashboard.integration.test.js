@@ -1323,26 +1323,26 @@ test(
 );
 
 test(
-  "managed Stop tolerates a bounded liveness delay before validating identity",
+  "managed Stop accepts a 10.5-second liveness stall within the fifteen-second cap",
   { skip: WINDOWS_MANAGER_SKIP },
   async (t) => {
     const { root } = await createFixture(t, {
       livenessDelayAfterRequestCount: 2,
-      livenessDelayMilliseconds: 3_500,
+      livenessDelayMilliseconds: 10_500,
     });
     const started = invokeManager(root, "Start");
     assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
 
     const stopStartedAt = performance.now();
-    const stopped = invokeManager(root, "Stop");
+    const stopped = invokeManager(root, "Stop", 120);
     const stopDurationMilliseconds = performance.now() - stopStartedAt;
 
     assert.deepEqual(
       {
         exitCode: stopped.status,
         stoppedGracefully: /stopped gracefully/u.test(stopped.stdout),
-        observedDelay: stopDurationMilliseconds >= 3_200,
-        bounded: stopDurationMilliseconds < 8_000,
+        observedDelay: stopDurationMilliseconds >= 10_000,
+        bounded: stopDurationMilliseconds < 18_000,
       },
       {
         exitCode: 0,
@@ -1352,6 +1352,66 @@ test(
       },
       `${stopped.stderr}\n${stopped.stdout}`,
     );
+  },
+);
+
+test(
+  "managed Stop enforces the fifteen-second liveness cap and fails closed on timeout",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const timeoutDeclaration =
+      "$livenessRequestTimeoutSeconds = [int][Math]::Min($TimeoutSeconds, 15)";
+    const productionManager = await readFile(
+      path.join(projectRoot, "scripts", "Manage-MyDashboard.ps1"),
+      "utf8",
+    );
+    assert.match(
+      productionManager,
+      /^[$]livenessRequestTimeoutSeconds = \[int\]\[Math\]::Min\([$]TimeoutSeconds, 15\)$/mu,
+    );
+
+    const { root } = await createFixture(t, {
+      livenessDelayAfterRequestCount: 2,
+      livenessDelayMilliseconds: 2_500,
+    });
+    const started = invokeManager(root, "Start");
+    assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+    const runtime = readRuntimeInfo(root);
+    const controlPath = path.join(
+      runtime.runtimeDirectory,
+      "mydashboard-server-process.json",
+    );
+    const state = JSON.parse(await readFile(controlPath, "utf8"));
+
+    try {
+      // Exercise the production timeout path with a scaled fixture cap so this
+      // regression test proves fail-closed behavior without sleeping 15 seconds.
+      await rewriteFixtureManager(
+        root,
+        timeoutDeclaration,
+        "$livenessRequestTimeoutSeconds = [int][Math]::Min($TimeoutSeconds, 1)",
+      );
+      const stopStartedAt = performance.now();
+      const stopped = invokeManager(root, "Stop", 120);
+      const stopDurationMilliseconds = performance.now() - stopStartedAt;
+
+      assert.notEqual(stopped.status, 0, `${stopped.stderr}\n${stopped.stdout}`);
+      assert.match(
+        `${stopped.stderr}\n${stopped.stdout}`,
+        /recorded process does not expose matching MyDashboard identity; refusing to stop it/u,
+      );
+      assert.equal(stopDurationMilliseconds >= 750, true);
+      assert.equal(stopDurationMilliseconds < 8_000, true);
+      assert.doesNotThrow(() => process.kill(state.processId, 0));
+      assert.equal(await fileExists(controlPath), true);
+    } finally {
+      try {
+        process.kill(state.processId);
+        await waitForProcessExit(state.processId, 5_000);
+      } catch {
+        // The fixture process may already have exited during an assertion failure.
+      }
+    }
   },
 );
 

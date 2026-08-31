@@ -435,6 +435,53 @@ test("a role cycle scans only current claim candidates instead of durable histor
   assert.equal(ledger.calls.listItems.length, 0);
 });
 
+test("candidate scanning refreshes its fixed time after intake", async () => {
+  const time = controlledClock();
+  const candidate = workItem(1);
+  candidate.status = "retry_wait";
+  candidate.availableAt = "2026-08-02T08:00:01.000Z";
+  const ledger = new FakeLedger({ source: [candidate], time });
+  const intake = ledger.intake.bind(ledger);
+  ledger.intake = async (input) => {
+    const result = await intake(input);
+    time.advance(1_000);
+    return result;
+  };
+  const candidateCalls = [];
+  ledger.listClaimCandidates = async (options) => {
+    candidateCalls.push(clone(options));
+    const items = ledger.items.filter((item) =>
+      item.status === "retry_wait" &&
+      Date.parse(item.availableAt) <= Date.parse(options.at)
+    ).map(clone);
+    return {
+      items,
+      nextCursor: null,
+      facts: items.map(({ itemId }) => ({
+        itemId,
+        graphBlocked: false,
+        submittedChildren: 0,
+        satisfiedChildren: 0,
+      })),
+      activeQuestionTargets: [],
+    };
+  };
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+    time,
+  });
+
+  const result = await loop.runCycle({
+    trigger: "scheduled",
+    roleId: "pr-reviewer",
+  });
+
+  assert.equal(result.claimed, 1);
+  assert.equal(candidateCalls.length, 1);
+  assert.equal(candidateCalls[0].at, "2026-08-02T08:00:01.000Z");
+});
+
 test("automatic work skips issues outside the configurable active window", async () => {
   const time = controlledClock();
   const ledger = new FakeLedger({

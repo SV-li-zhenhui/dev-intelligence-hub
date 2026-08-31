@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { normalizeAttentionRequest } from "../src/domain/attention-contract.js";
@@ -41,7 +42,10 @@ import { MemoryAnswerService } from "../src/services/memory-answer-service.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
-import { createLocalWorkLedgerCandidateProcessor } from
+import {
+  createLocalWorkLedgerCandidateProcessor,
+  createWorkerWorkLedgerCandidateProcessor,
+} from
   "../src/services/work-ledger-candidate-processor.js";
 import {
   createWorkDecisionContext,
@@ -796,6 +800,118 @@ test("claim candidate pages exclude durable history and active leases by role", 
     }),
     { code: "WORK_LEDGER_QUERY_INVALID" },
   );
+});
+
+test("claim candidate pagination survives its cursor being claimed", async () => {
+  const fixture = await createFixture({
+    records: Array.from(
+      { length: 3 },
+      (_, index) => assignment(index + 1, { type: "role", id: "developer" }),
+    ),
+  });
+  await fixture.service.intake({ limit: 10 });
+  const expectedItemIds = (await fixture.service.listItems({ limit: 10 }))
+    .items.map(({ itemId }) => itemId);
+  const at = fixture.time.clock();
+
+  const firstPage = await fixture.service.listClaimCandidates({
+    at,
+    roleId: "developer",
+    limit: 1,
+  });
+  await fixture.service.claim({
+    itemId: firstPage.items[0].itemId,
+    expectedRevision: firstPage.items[0].revision,
+    workerId: "employee-developer-concurrent",
+    leaseDurationMs: 60_000,
+  });
+  const secondPage = await fixture.service.listClaimCandidates({
+    at,
+    roleId: "developer",
+    limit: 1,
+    cursor: firstPage.nextCursor,
+  });
+  const thirdPage = await fixture.service.listClaimCandidates({
+    at,
+    roleId: "developer",
+    limit: 1,
+    cursor: secondPage.nextCursor,
+  });
+  const observedItemIds = [
+    ...firstPage.items,
+    ...secondPage.items,
+    ...thirdPage.items,
+  ].map(({ itemId }) => itemId);
+
+  assert.deepEqual(observedItemIds, expectedItemIds);
+  assert.equal(new Set(observedItemIds).size, expectedItemIds.length);
+  assert.deepEqual(
+    [firstPage, secondPage, thirdPage].flatMap(({ facts }) => facts),
+    expectedItemIds.map((itemId) => ({
+      itemId,
+      graphBlocked: false,
+      submittedChildren: 0,
+      satisfiedChildren: 0,
+    })),
+  );
+  assert.equal(thirdPage.nextCursor, null);
+});
+
+test("claim candidate pages retain facts from the complete dependency graph", async () => {
+  const fixture = await createFixture({
+    records: Array.from(
+      { length: 4 },
+      (_, index) => assignment(index + 1, { type: "role", id: "developer" }),
+    ),
+  });
+  await fixture.service.intake({ limit: 10 });
+  const durable = fixture.store.stored();
+  const [parent, cancelledChild, cancelledDependency, consumer] = durable.items;
+  cancelledChild.graph.parentItemId = parent.itemId;
+  cancelledChild.status = "cancelled";
+  cancelledChild.statusReason = "child-scope-retired";
+  cancelledDependency.status = "cancelled";
+  cancelledDependency.statusReason = "dependency-retired";
+  consumer.graph.parentItemId = parent.itemId;
+  consumer.graph.dependsOnItemIds = [cancelledDependency.itemId];
+  fixture.store.replaceStored(durable);
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const at = fixture.time.clock();
+
+  const firstPage = await recovered.listClaimCandidates({
+    at,
+    roleId: "developer",
+    limit: 1,
+  });
+  const secondPage = await recovered.listClaimCandidates({
+    at,
+    roleId: "developer",
+    limit: 1,
+    cursor: firstPage.nextCursor,
+  });
+
+  assert.deepEqual(firstPage.items.map(({ itemId }) => itemId), [parent.itemId]);
+  assert.deepEqual(firstPage.facts, [{
+    itemId: parent.itemId,
+    graphBlocked: true,
+    submittedChildren: 0,
+    satisfiedChildren: 1,
+  }]);
+  assert.deepEqual(secondPage.items.map(({ itemId }) => itemId), [consumer.itemId]);
+  assert.deepEqual(secondPage.facts, [{
+    itemId: consumer.itemId,
+    graphBlocked: true,
+    submittedChildren: 0,
+    satisfiedChildren: 0,
+  }]);
+  assert.equal(secondPage.nextCursor, null);
 });
 
 test("role workloads group active states and retain only the three highest-priority tasks", async () => {
@@ -8076,6 +8192,53 @@ test("candidate processing commits only after durable write and discards failed 
     "write",
     "commit",
   ]);
+});
+
+test("malformed worker success cannot reach the durable store", async (t) => {
+  class MalformedCandidateWorker extends EventEmitter {
+    constructor() {
+      super();
+      this.terminationCount = 0;
+    }
+
+    postMessage(message) {
+      queueMicrotask(() => {
+        this.emit("message", { requestId: message.requestId, ok: true });
+      });
+    }
+
+    ref() {}
+
+    unref() {}
+
+    async terminate() {
+      this.terminationCount += 1;
+      return 1;
+    }
+  }
+
+  const worker = new MalformedCandidateWorker();
+  const candidateProcessor = createWorkerWorkLedgerCandidateProcessor({
+    workerFactory: () => worker,
+  });
+  t.after(() => candidateProcessor.close());
+  const store = new MemoryStore();
+  const { service } = await createFixture({
+    records: [assignment(1)],
+    store,
+    candidateProcessor,
+  });
+
+  await assert.rejects(
+    service.intake(),
+    (error) =>
+      error.code === "WORK_LEDGER_STATE_CORRUPTED" &&
+      error.statusCode === 503,
+  );
+
+  assert.equal(worker.terminationCount, 1);
+  assert.equal(store.writes.length, 0);
+  assert.equal(store.stored(), undefined);
 });
 
 test("a source retention gap creates a durable blocked system alert without skipping", async () => {

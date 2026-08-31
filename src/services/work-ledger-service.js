@@ -280,13 +280,7 @@ function queryPage(records, idName, options = {}, allowedStatuses = null) {
   if (Object.keys(options).some((key) => !allowedKeys.has(key))) {
     throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账查询无效");
   }
-  const requestedLimit = options.limit === undefined ? 50 : Number(options.limit);
-  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
-    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "查询条数无效");
-  }
-  if (options.cursor !== undefined && typeof options.cursor !== "string") {
-    throw workLedgerError("WORK_LEDGER_CURSOR_INVALID", "工作台账游标无效");
-  }
+  const boundary = queryPageBoundary(options);
   if (
     options.status !== undefined &&
     (!allowedStatuses || !allowedStatuses.has(options.status))
@@ -304,10 +298,36 @@ function queryPage(records, idName, options = {}, allowedStatuses = null) {
       options.status === undefined || record.status === options.status,
   );
   if (options.order === "newest") filtered.reverse();
+  const start = queryPageStart(filtered, idName, boundary.cursor);
+  const items = filtered.slice(start, start + boundary.limit).map(cloneLedgerValue);
+  return {
+    items,
+    nextCursor:
+      start + items.length < filtered.length && items.length
+        ? items.at(-1)[idName]
+        : null,
+  };
+}
+
+function queryPageBoundary(options) {
+  const requestedLimit = options.limit === undefined ? 50 : Number(options.limit);
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "查询条数无效");
+  }
+  if (options.cursor !== undefined && typeof options.cursor !== "string") {
+    throw workLedgerError("WORK_LEDGER_CURSOR_INVALID", "工作台账游标无效");
+  }
+  return {
+    cursor: options.cursor ?? null,
+    limit: Math.min(requestedLimit, MAX_WORK_LEDGER_QUERY_PAGE),
+  };
+}
+
+function queryPageStart(records, idName, cursor) {
   let start = 0;
-  if (options.cursor) {
-    const cursorIndex = filtered.findIndex(
-      (record) => record[idName] === options.cursor,
+  if (cursor) {
+    const cursorIndex = records.findIndex(
+      (record) => record[idName] === cursor,
     );
     if (cursorIndex < 0) {
       throw workLedgerError(
@@ -317,15 +337,7 @@ function queryPage(records, idName, options = {}, allowedStatuses = null) {
     }
     start = cursorIndex + 1;
   }
-  const limit = Math.min(requestedLimit, MAX_WORK_LEDGER_QUERY_PAGE);
-  const items = filtered.slice(start, start + limit).map(cloneLedgerValue);
-  return {
-    items,
-    nextCursor:
-      start + items.length < filtered.length && items.length
-        ? items.at(-1)[idName]
-        : null,
-  };
+  return start;
 }
 
 function queryWorkItemPage(records, options = {}) {
@@ -390,7 +402,9 @@ function queryClaimCandidatePage(records, options = {}) {
   ) {
     throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "岗位过滤无效");
   }
-  const selected = records.filter((item) =>
+  const boundary = queryPageBoundary(options);
+  const start = queryPageStart(records, "itemId", boundary.cursor);
+  const selected = records.slice(start).filter((item) =>
     isClaimCandidateAt(item, at) &&
     (
       roleId === undefined ||
@@ -400,10 +414,14 @@ function queryClaimCandidatePage(records, options = {}) {
       )
     )
   );
-  const page = queryPage(selected, "itemId", {
-    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
-    ...(options.limit === undefined ? {} : { limit: options.limit }),
-  });
+  const pageItems = selected.slice(0, boundary.limit).map(cloneLedgerValue);
+  const page = {
+    items: pageItems,
+    nextCursor:
+      selected.length > pageItems.length && pageItems.length > 0
+        ? pageItems.at(-1).itemId
+        : null,
+  };
   const statusById = new Map(records.map((item) => [item.itemId, item.status]));
   const childrenByParent = new Map();
   for (const item of records) {

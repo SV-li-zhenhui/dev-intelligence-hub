@@ -739,7 +739,11 @@ export class ProactiveWorkLoop {
       options.signal,
     );
     throwIfLoopAborted(options.signal);
-    const candidateWindow = await this.#listCandidateWindow(options, now);
+    const candidateAt = normalizeLoopClock(this.clock);
+    const candidateWindow = await this.#listCandidateWindow(
+      options,
+      candidateAt,
+    );
     const items = candidateWindow.items;
     throwIfLoopAborted(options.signal);
     const claimCycleSequence = ++this.claimCycleSequence;

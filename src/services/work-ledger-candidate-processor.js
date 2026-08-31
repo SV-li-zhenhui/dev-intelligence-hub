@@ -1,7 +1,13 @@
 import { Worker } from "node:worker_threads";
 import { prepareWorkLedgerCandidate } from
   "./work-ledger-candidate-validation.js";
-import { workLedgerError } from "./work-ledger-values.js";
+import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "./work-ledger-state.js";
+import {
+  hasExactLedgerKeys,
+  isPlainLedgerObject,
+  ledgerDataEntries,
+  workLedgerError,
+} from "./work-ledger-values.js";
 
 const WORKER_URL = new URL("./work-ledger-candidate-worker.js", import.meta.url);
 const WORKER_EXEC_ARGV = process.execArgv.filter(
@@ -10,6 +16,149 @@ const WORKER_EXEC_ARGV = process.execArgv.filter(
 const WORKER_OPTIONS = WORKER_EXEC_ARGV.length === process.execArgv.length
   ? undefined
   : { execArgv: WORKER_EXEC_ARGV };
+
+const WORK_LEDGER_STATE_KEYS = Object.freeze([
+  "schemaVersion",
+  "revision",
+  "intakeCursor",
+  "sourceHighWatermark",
+  "attentionCursor",
+  "attentionHighWatermark",
+  "proposalCursor",
+  "proposalHighWatermark",
+  "timelineStartSequence",
+  "nextTimelineSequence",
+  "items",
+  "timeline",
+  "outbox",
+  "graphMemoryProjection",
+]);
+const SERIALIZED_ERROR_KEYS = new Set([
+  "name",
+  "message",
+  "code",
+  "statusCode",
+  "cause",
+]);
+
+function transportDataError(message) {
+  return new TypeError(`work ledger candidate transport is unsafe: ${message}`);
+}
+
+function appendTransportArrayValues(value, pending) {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    throw transportDataError("array prototype is not preserved");
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) {
+    throw transportDataError("array fields are not dense enumerable data");
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw transportDataError("array fields are not dense enumerable data");
+    }
+    pending.push(descriptor.value);
+  }
+}
+
+function appendTransportObjectValues(value, pending) {
+  const entries = ledgerDataEntries(value);
+  if (entries === null) {
+    throw transportDataError("object fields are not plain enumerable data");
+  }
+  for (const [, child] of entries) pending.push(child);
+}
+
+function assertStructuredCloneStableLedgerData(...roots) {
+  const pending = [...roots];
+  const inspected = new WeakSet();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "boolean" ||
+      typeof value === "number"
+    ) {
+      continue;
+    }
+    if (typeof value !== "object") {
+      throw transportDataError("value is not JSON-compatible data");
+    }
+    if (inspected.has(value)) continue;
+    inspected.add(value);
+    if (Array.isArray(value)) {
+      appendTransportArrayValues(value, pending);
+      continue;
+    }
+    appendTransportObjectValues(value, pending);
+  }
+}
+
+function isDenseTransportArray(value) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) {
+    return false;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+  }
+  return true;
+}
+
+function isPreparedStateEnvelope(value, expectedRevision) {
+  return (
+    hasExactLedgerKeys(value, WORK_LEDGER_STATE_KEYS) &&
+    value.schemaVersion === WORK_LEDGER_STATE_SCHEMA_VERSION &&
+    value.revision === expectedRevision &&
+    Number.isSafeInteger(value.revision) &&
+    isDenseTransportArray(value.items) &&
+    isDenseTransportArray(value.timeline) &&
+    isDenseTransportArray(value.outbox) &&
+    isPlainLedgerObject(value.graphMemoryProjection)
+  );
+}
+
+function isSerializedCandidateError(value, depth = 0) {
+  const entries = ledgerDataEntries(value);
+  if (entries === null) return false;
+  const keys = new Set(entries.map(([key]) => key));
+  if (
+    !keys.has("name") ||
+    !keys.has("message") ||
+    [...keys].some((key) => !SERIALIZED_ERROR_KEYS.has(key)) ||
+    typeof value.name !== "string" ||
+    typeof value.message !== "string" ||
+    (keys.has("code") && typeof value.code !== "string") ||
+    (keys.has("statusCode") && !Number.isSafeInteger(value.statusCode))
+  ) {
+    return false;
+  }
+  if (!keys.has("cause")) return true;
+  return depth < 4 && isSerializedCandidateError(value.cause, depth + 1);
+}
+
+function isExpectedWorkerResponse(message, expectation) {
+  if (message?.ok === false) {
+    return hasExactLedgerKeys(message, ["requestId", "ok", "error"]) &&
+      isSerializedCandidateError(message.error);
+  }
+  if (message?.ok !== true) return false;
+  if (expectation.type === "prepare") {
+    return hasExactLedgerKeys(message, ["requestId", "ok", "normalized"]) &&
+      isPreparedStateEnvelope(message.normalized, expectation.expectedRevision);
+  }
+  return (
+    (expectation.type === "commit" || expectation.type === "discard") &&
+    hasExactLedgerKeys(message, ["requestId", "ok"])
+  );
+}
 
 function deserializeWorkLedgerCandidateError(value) {
   const cause = value?.cause === undefined
@@ -103,13 +252,23 @@ class WorkerWorkLedgerCandidateProcessor {
     const requestId = this.nextRequestId++;
     this.preparing = true;
     try {
+      const synchronizeState = previousState !== this.syncedState;
+      try {
+        assertStructuredCloneStableLedgerData(
+          candidate,
+          limits,
+          ...(synchronizeState ? [previousState] : []),
+        );
+      } catch (error) {
+        throw candidateProcessorUnavailable(error);
+      }
       const response = await this.#call({
         type: "prepare",
         requestId,
         candidate,
         limits,
         appendGraphMemory,
-        ...(previousState === this.syncedState ? {} : { previousState }),
+        ...(synchronizeState ? { previousState } : {}),
       });
       this.preparedState = response.normalized;
       this.preparedId = requestId;
@@ -189,7 +348,14 @@ class WorkerWorkLedgerCandidateProcessor {
     }
     worker.ref();
     return new Promise((resolve, reject) => {
-      this.pending.set(message.requestId, { resolve, reject });
+      this.pending.set(message.requestId, {
+        resolve,
+        reject,
+        type: message.type,
+        expectedRevision: message.type === "prepare"
+          ? message.candidate?.revision
+          : null,
+      });
       try {
         worker.postMessage(message);
       } catch (error) {
@@ -231,7 +397,10 @@ class WorkerWorkLedgerCandidateProcessor {
   #onMessage(worker, message) {
     if (this.worker !== worker) return;
     const response = this.pending.get(message?.requestId);
-    if (!response) return;
+    if (!response || !isExpectedWorkerResponse(message, response)) {
+      this.#invalidateWorkerProtocol(worker);
+      return;
+    }
     this.pending.delete(message.requestId);
     if (this.pending.size === 0) worker.unref();
     if (message.ok === true) {
@@ -239,6 +408,19 @@ class WorkerWorkLedgerCandidateProcessor {
       return;
     }
     response.reject(deserializeWorkLedgerCandidateError(message.error));
+  }
+
+  #invalidateWorkerProtocol(worker) {
+    this.#onWorkerFailure(
+      worker,
+      new TypeError("candidate worker returned an invalid response"),
+    );
+    try {
+      worker.unref();
+      Promise.resolve(worker.terminate()).catch(() => {});
+    } catch {
+      // The worker is already detached from authoritative state.
+    }
   }
 
   #onWorkerFailure(worker, error) {
