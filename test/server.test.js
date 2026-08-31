@@ -2986,6 +2986,183 @@ test("background work projects coordination before employees and their activity 
   }
 });
 
+test("background agency aggregate safely identifies both memory projection stages", async () => {
+  const beforeFailure = Object.assign(
+    new Error("before-memory-private-message"),
+    {
+      code: "MEMORY_BEFORE_FAILED",
+      stdout: "before-memory-private-stdout",
+      stderr: "before-memory-private-stderr",
+      command: "before-memory-private-command",
+      token: "before-memory-private-token",
+      details: "before-memory-private-details",
+    },
+  );
+  const afterFailure = new Error("after-memory-private-message");
+  let getterCalls = 0;
+  for (const property of [
+    "code",
+    "stdout",
+    "stderr",
+    "command",
+    "token",
+    "details",
+  ]) {
+    Object.defineProperty(afterFailure, property, {
+      get() {
+        getterCalls += 1;
+        return property === "code"
+          ? "MEMORY_AFTER_GETTER_MUST_NOT_RUN"
+          : `after-memory-private-${property}`;
+      },
+    });
+  }
+  const reportedErrors = [];
+  const application = startupApplication();
+  let projectionCalls = 0;
+  application.memoryProjector = {
+    async runCycle() {
+      projectionCalls += 1;
+      throw projectionCalls === 1 ? beforeFailure : afterFailure;
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+
+  try {
+    await backgroundWork.initialRefresh;
+
+    assert.equal(projectionCalls, 2);
+    assert.equal(reportedErrors.length, 1);
+    const [aggregate] = reportedErrors;
+    assert.equal(aggregate instanceof AggregateError, true);
+    assert.strictEqual(aggregate.errors[0], beforeFailure);
+    assert.strictEqual(aggregate.errors[1], afterFailure);
+    assert.equal(
+      aggregate.message,
+      "员工主动循环、旧岗位巡查或记忆投影失败: " +
+        "memory_before_employee [MEMORY_BEFORE_FAILED], " +
+        "memory_after_employee",
+    );
+    assert.equal(getterCalls, 0);
+    for (const secret of [
+      "before-memory-private-message",
+      "before-memory-private-stdout",
+      "before-memory-private-stderr",
+      "before-memory-private-command",
+      "before-memory-private-token",
+      "before-memory-private-details",
+      "MEMORY_AFTER_GETTER_MUST_NOT_RUN",
+    ]) {
+      assert.equal(aggregate.message.includes(secret), false, secret);
+    }
+  } finally {
+    await backgroundWork.stop();
+  }
+});
+
+test("background agency summary keeps mixed stages while filtering abort identity", async () => {
+  const coordinationFailure = Object.assign(
+    new Error("coordination-private-message"),
+    { code: "COORDINATION_FAILED", details: "coordination-private-details" },
+  );
+  const memoryFailure = Object.assign(
+    new Error("memory-private-message"),
+    { code: "memory-private-code", command: "memory-private-command" },
+  );
+  const employeeFailure = Object.assign(
+    new Error("employee-private-message"),
+    { code: "EMPLOYEE_FAILED", token: "employee-private-token" },
+  );
+  const afterMemoryStarted = deferred();
+  const reportedErrors = [];
+  let abortReason = null;
+  let projectionCalls = 0;
+  const application = startupApplication({
+    async runAll() {
+      throw employeeFailure;
+    },
+  });
+  application.workCoordination = {
+    async runCycle() {
+      throw coordinationFailure;
+    },
+  };
+  application.memoryProjector = {
+    async runCycle({ signal }) {
+      projectionCalls += 1;
+      if (projectionCalls === 1) throw memoryFailure;
+      afterMemoryStarted.resolve();
+      await new Promise((resolve, reject) => {
+        const rejectWithAbort = () => {
+          abortReason = signal.reason;
+          reject(abortReason);
+        };
+        if (signal.aborted) rejectWithAbort();
+        else signal.addEventListener("abort", rejectWithAbort, { once: true });
+      });
+    },
+  };
+  const backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 500,
+    reportError(error) {
+      reportedErrors.push(error);
+    },
+  });
+  const initialFailure = backgroundWork.initialRefresh.then(
+    () => null,
+    (error) => error,
+  );
+
+  try {
+    await afterMemoryStarted.promise;
+    const stoppingFailure = backgroundWork.stop().then(
+      () => null,
+      (error) => error,
+    );
+    const [aggregate, drainFailure] = await Promise.all([
+      initialFailure,
+      stoppingFailure,
+    ]);
+
+    assert.equal(aggregate instanceof AggregateError, true);
+    assert.strictEqual(drainFailure, aggregate);
+    assert.strictEqual(aggregate.errors[0], coordinationFailure);
+    assert.strictEqual(aggregate.errors[1], memoryFailure);
+    assert.strictEqual(aggregate.errors[2], employeeFailure);
+    assert.equal(aggregate.errors.includes(abortReason), false);
+    assert.equal(abortReason?.code, "LIFECYCLE_SHUTDOWN_ABORTED");
+    assert.equal(
+      aggregate.message,
+      "员工主动循环、旧岗位巡查或记忆投影失败: " +
+        "coordination [COORDINATION_FAILED], " +
+        "memory_before_employee, employee [EMPLOYEE_FAILED]",
+    );
+    for (const secret of [
+      "coordination-private-message",
+      "coordination-private-details",
+      "memory-private-message",
+      "memory-private-code",
+      "memory-private-command",
+      "employee-private-message",
+      "employee-private-token",
+      "LIFECYCLE_SHUTDOWN_ABORTED",
+      "memory_after_employee",
+    ]) {
+      assert.equal(aggregate.message.includes(secret), false, secret);
+    }
+    assert.deepEqual(reportedErrors, [aggregate]);
+  } finally {
+    await Promise.allSettled([
+      backgroundWork.stop(),
+      backgroundWork.initialRefresh,
+    ]);
+  }
+});
+
 test("workflow routing observes every refreshed snapshot before confirmations and employees", async () => {
   const calls = [];
   const timers = [];

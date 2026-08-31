@@ -4104,21 +4104,45 @@ export function startApplicationBackgroundWork(
     signal.throwIfAborted();
   }
 
+  function agencyCycleFailure(stage, error) {
+    return { stage, error };
+  }
+
+  function agencyCycleFailureCode(error) {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+      const code = descriptor.value;
+      if (typeof code !== "string") return null;
+      const match = /^[A-Z][A-Z0-9_]{0,127}$/.exec(code);
+      return match?.[0] === code ? code : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function agencyCycleFailureSummary({ stage, error }) {
+    const code = agencyCycleFailureCode(error);
+    return `${stage}${code ? ` [${code}]` : ""}`;
+  }
+
   function throwAgencyCycleFailures(failures, signal) {
     const reportableFailures = signal.aborted
-      ? failures.filter((error) => error !== signal.reason)
+      ? failures.filter(({ error }) => error !== signal.reason)
       : failures;
-    if (reportableFailures.length === 1) throw reportableFailures[0];
+    if (reportableFailures.length === 1) throw reportableFailures[0].error;
     if (reportableFailures.length > 1) {
       throw new AggregateError(
-        reportableFailures,
-        "员工主动循环、旧岗位巡查或记忆投影失败",
+        reportableFailures.map(({ error }) => error),
+        `员工主动循环、旧岗位巡查或记忆投影失败: ${
+          reportableFailures.map(agencyCycleFailureSummary).join(", ")
+        }`,
       );
     }
     signal.throwIfAborted();
   }
 
-  async function projectMemory(failures, signal) {
+  async function projectMemory(failures, signal, stage) {
     if (typeof application.memoryProjector?.runCycle !== "function" || stopped) {
       return;
     }
@@ -4128,7 +4152,7 @@ export function startApplicationBackgroundWork(
         () => application.memoryProjector.runCycle({ signal }),
       );
     } catch (error) {
-      failures.push(error);
+      failures.push(agencyCycleFailure(stage, error));
     }
   }
 
@@ -4165,7 +4189,7 @@ export function startApplicationBackgroundWork(
           ),
         );
       } catch (error) {
-        failures.push(error);
+        failures.push(agencyCycleFailure("coordination", error));
       }
     }
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
@@ -4174,7 +4198,7 @@ export function startApplicationBackgroundWork(
       ...employeeIds,
     ].filter((id, index, ids) => ids.indexOf(id) === index);
     if (selectedEmployeeIds.length > 0) {
-      await projectMemory(failures, signal);
+      await projectMemory(failures, signal, "memory_before_employee");
     }
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     if (selectedEmployeeIds.length > 0 && !stopped) {
@@ -4201,11 +4225,11 @@ export function startApplicationBackgroundWork(
           },
         );
       } catch (error) {
-        failures.push(error);
+        failures.push(agencyCycleFailure("employee", error));
       }
     }
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
-    await projectMemory(failures, signal);
+    await projectMemory(failures, signal, "memory_after_employee");
     throwAgencyCycleFailures(failures, signal);
     return { skipped: null };
   }
