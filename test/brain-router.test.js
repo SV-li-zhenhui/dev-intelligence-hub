@@ -81,12 +81,12 @@ test("BrainRouter forwards an entity session key to the provider", async () => {
     messages: [{ role: "user", content: "Return JSON." }],
     schema: { type: "object" },
     dataClasses: ["requirements"],
-    sessionKey: "github:pull_request:svisions/oct-software#24256",
+    sessionKey: "github:pull_request:example/software#24256",
   });
 
   assert.equal(
     calls[0].sessionKey,
-    "github:pull_request:svisions/oct-software#24256",
+    "github:pull_request:example/software#24256",
   );
 });
 
@@ -106,7 +106,7 @@ test("BrainRouter keeps non-session providers stateless for entity work", async 
     messages: [{ role: "user", content: "Return JSON." }],
     schema: { type: "object" },
     dataClasses: ["requirements"],
-    sessionKey: "github:issue:svisions/oct-product#12953",
+    sessionKey: "github:issue:example/product#12953",
   });
 
   assert.equal(Object.hasOwn(calls[0], "sessionKey"), false);

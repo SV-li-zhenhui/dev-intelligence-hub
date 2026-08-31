@@ -385,7 +385,7 @@ test("configured Codex routing preserves stable entity sessions", async () => {
       },
     },
   );
-  const sessionKey = "github:issue:svisions/oct-product#12953";
+  const sessionKey = "github:issue:example/product#12953";
 
   await router.generate({
     brain: {

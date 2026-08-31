@@ -255,7 +255,7 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
       event: {
         eventType: "pull_request.updated",
         subject: {
-          repository: "SVisions/OCT-Software",
+          repository: "example/software",
           number: 24256,
           title: "修复登录",
         },
@@ -303,7 +303,7 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   assert.equal(engine.view().brain.remoteData.memory, false);
   assert.equal(
     calls[0].sessionKey,
-    "github:pull_request:svisions/oct-software#24256",
+    "github:pull_request:example/software#24256",
   );
 });
 
@@ -335,7 +335,7 @@ test("RoleDecisionEngine reuses one entity session across roles and event revisi
   const event = {
     eventType: "issue.updated",
     subject: {
-      repository: "SVisions/OCT-Product",
+      repository: "example/product",
       number: 12953,
       title: "数据库保存问题",
     },
@@ -353,8 +353,8 @@ test("RoleDecisionEngine reuses one entity session across roles and event revisi
   });
 
   assert.deepEqual(sessionKeys, [
-    "github:issue:svisions/oct-product#12953",
-    "github:issue:svisions/oct-product#12953",
+    "github:issue:example/product#12953",
+    "github:issue:example/product#12953",
   ]);
 });
 

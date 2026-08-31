@@ -48,7 +48,7 @@ test("CodexCliSessionStore persists one isolated profile per entity across resta
   await writeFile(path.join(sourceHome, "session_index.jsonl"), "session index");
   await writeFile(path.join(sourceHome, "auth.json"), "must not persist");
   await writeFile(path.join(sourceHome, "config.toml"), "must not persist");
-  const key = "github:pull_request:svisions/oct-software#24256";
+  const key = "github:pull_request:example/software#24256";
   const store = new CodexCliSessionStore({ root });
 
   await store.capture({
@@ -110,7 +110,7 @@ test("CodexCliSessionStore never shares history between different entities", asy
   );
   const store = new CodexCliSessionStore({ root });
   await store.capture({
-    sessionKey: "github:pull_request:svisions/oct-software#1",
+    sessionKey: "github:pull_request:example/software#1",
     sessionId: "session-pr-1",
     codexHome: sourceHome,
   });
@@ -118,7 +118,7 @@ test("CodexCliSessionStore never shares history between different entities", asy
   const otherHome = path.join(parent, "other-home");
   await mkdir(otherHome);
   const other = await store.stage({
-    sessionKey: "github:pull_request:svisions/oct-software#2",
+    sessionKey: "github:pull_request:example/software#2",
     codexHome: otherHome,
   });
 
@@ -148,7 +148,7 @@ test("CodexCliSessionStore does not resume a rollout retained only in archived_s
     "archived history",
   );
   const store = new CodexCliSessionStore({ root });
-  const sessionKey = "github:issue:svisions/oct-product#2";
+  const sessionKey = "github:issue:example/product#2";
 
   await store.capture({ sessionKey, sessionId, codexHome: sourceHome });
 
@@ -179,7 +179,7 @@ test("CodexCliSessionStore preserves older entity sessions", async (t) => {
   await writeFile(rollout, "history");
   const store = new CodexCliSessionStore({ root });
   await store.capture({
-    sessionKey: "github:issue:svisions/oct-product#1",
+    sessionKey: "github:issue:example/product#1",
     sessionId: "session-1",
     codexHome: sourceHome,
   });
@@ -188,7 +188,7 @@ test("CodexCliSessionStore preserves older entity sessions", async (t) => {
     "history 2",
   );
   await store.capture({
-    sessionKey: "github:issue:svisions/oct-product#2",
+    sessionKey: "github:issue:example/product#2",
     sessionId: "session-2",
     codexHome: sourceHome,
   });
@@ -197,14 +197,14 @@ test("CodexCliSessionStore preserves older entity sessions", async (t) => {
   await mkdir(restoredHome);
   assert.equal(
     (await store.stage({
-      sessionKey: "github:issue:svisions/oct-product#1",
+      sessionKey: "github:issue:example/product#1",
       codexHome: restoredHome,
     })).sessionId,
     "session-1",
   );
   assert.equal(
     (await store.stage({
-      sessionKey: "github:issue:svisions/oct-product#2",
+      sessionKey: "github:issue:example/product#2",
       codexHome: restoredHome,
     })).sessionId,
     "session-2",
@@ -222,7 +222,7 @@ test("CodexCliSessionStore resets metadata whose rollout is missing", async (t) 
   );
   const store = new CodexCliSessionStore({ root });
   await store.capture({
-    sessionKey: "github:issue:svisions/oct-product#12953",
+    sessionKey: "github:issue:example/product#12953",
     sessionId: "session-missing",
     codexHome: sourceHome,
   });
@@ -233,7 +233,7 @@ test("CodexCliSessionStore resets metadata whose rollout is missing", async (t) 
   });
 
   const restored = await store.stage({
-    sessionKey: "github:issue:svisions/oct-product#12953",
+    sessionKey: "github:issue:example/product#12953",
     codexHome: path.join(parent, "restored-home"),
   });
 

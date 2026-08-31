@@ -607,14 +607,14 @@ test("Codex resumes the persisted session for the same PR entity", async (t) => 
     },
   );
   const request = brainRequest({
-    sessionKey: "github:pull_request:svisions/oct-software#24256",
+    sessionKey: "github:pull_request:example/software#24256",
   });
 
   assert.equal(await provider.generate(request), '{"ok":true}');
   assert.equal(await provider.generate(request), '{"ok":true}');
   assert.equal(runner.calls.length, 2);
   assert.equal(
-    sessions.get("github:pull_request:svisions/oct-software#24256"),
+    sessions.get("github:pull_request:example/software#24256"),
     "019cfake-session-id",
   );
 });
@@ -674,7 +674,7 @@ test("Codex serializes concurrent turns for the same PR session", async (t) => {
     },
   );
   const request = brainRequest({
-    sessionKey: "github:pull_request:svisions/oct-software#24256",
+    sessionKey: "github:pull_request:example/software#24256",
   });
 
   const first = provider.generate(request);
@@ -732,7 +732,7 @@ test("a cancelled queued Codex turn cannot let a later same-PR turn overtake", a
       codexSessionStore: sessionStore,
     },
   );
-  const sessionKey = "github:pull_request:svisions/oct-software#24256";
+  const sessionKey = "github:pull_request:example/software#24256";
   const first = provider.generate(brainRequest({ sessionKey }));
   await firstStarted.promise;
   const cancelled = new AbortController();

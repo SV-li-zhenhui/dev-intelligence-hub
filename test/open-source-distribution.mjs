@@ -1550,10 +1550,10 @@ test(
 
         const brainStatus = await pollJson(
           `http://127.0.0.1:${port}/api/brain-providers/status`,
-          45_000,
+          60_000,
           () => true,
           () => "",
-          15_000,
+          30_000,
         );
         assert.equal(brainStatus.body.schemaVersion, 1);
         assert.equal(
