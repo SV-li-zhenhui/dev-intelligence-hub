@@ -142,3 +142,60 @@ test("a same-key write waits for an active read before replacing its state", asy
   assert.equal(renameAttempts, 1);
   assert.deepEqual(await store.read("runtime"), { revision: 2 });
 });
+
+test("versioned reads report exact content changes without reparsing unchanged state", async (t) => {
+  const root = await fixture(t);
+  let readCalls = 0;
+  const store = new StateStore(root, {
+    fileSystem: {
+      ...realFileSystem,
+      async readFile(...arguments_) {
+        readCalls += 1;
+        return readFile(...arguments_);
+      },
+    },
+  });
+
+  const missing = await store.readVersioned("runtime");
+  const writtenVersion = await store.write("runtime", { revision: 1 });
+  const first = await store.readVersioned("runtime");
+  const unchanged = await store.readVersioned("runtime", null, {
+    ifVersion: first.version,
+  });
+
+  assert.equal(first.changed, true);
+  assert.notEqual(writtenVersion, missing.version);
+  assert.equal(first.version, writtenVersion);
+  assert.deepEqual(first.value, { revision: 1 });
+  assert.deepEqual(unchanged, {
+    changed: false,
+    version: first.version,
+  });
+  assert.equal(readCalls, 3);
+
+  await writeFile(
+    path.join(root, "runtime.json"),
+    '{"revision":1,"source":"external"}\n',
+    "utf8",
+  );
+  const changed = await store.readVersioned("runtime", null, {
+    ifVersion: first.version,
+  });
+
+  assert.equal(changed.changed, true);
+  assert.notEqual(changed.version, first.version);
+  assert.deepEqual(changed.value, { revision: 1, source: "external" });
+});
+
+test("versioned reads never hide invalid replacement content", async (t) => {
+  const root = await fixture(t);
+  const store = new StateStore(root);
+  await store.write("runtime", { revision: 1 });
+  const first = await store.readVersioned("runtime");
+  await writeFile(path.join(root, "runtime.json"), "{invalid\n", "utf8");
+
+  await assert.rejects(
+    store.readVersioned("runtime", null, { ifVersion: first.version }),
+    SyntaxError,
+  );
+});

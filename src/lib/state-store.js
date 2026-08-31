@@ -57,24 +57,30 @@ export class StateStore {
     this.fileSystem = fileSystem;
     this.wait = delay;
     this.operationQueues = new Map();
+    this.contentVersions = new Map();
   }
 
   async read(name, fallback = null, { signal } = {}) {
     return this.#queueFor(name).enqueue(async () => {
-      try {
-        return JSON.parse(
-          await this.fileSystem.readFile(
-            path.join(this.dataDirectory, `${name}.json`),
-            {
-              encoding: "utf8",
-              ...(signal === undefined ? {} : { signal }),
-            },
-          ),
-        );
-      } catch (error) {
-        if (error.code === "ENOENT") return fallback;
-        throw error;
-      }
+      const content = await this.#readContent(name, signal);
+      return content.exists ? JSON.parse(content.serialized) : fallback;
+    });
+  }
+
+  async readVersioned(name, fallback = null, { signal, ifVersion } = {}) {
+    return this.#queueFor(name).enqueue(async () => {
+      const content = await this.#readContent(name, signal);
+      const version = this.#contentVersion(
+        name,
+        content.exists,
+        content.serialized,
+      );
+      if (ifVersion === version) return { changed: false, version };
+      return {
+        changed: true,
+        version,
+        value: content.exists ? JSON.parse(content.serialized) : fallback,
+      };
     });
   }
 
@@ -83,19 +89,56 @@ export class StateStore {
       await this.fileSystem.mkdir(this.dataDirectory, { recursive: true });
       const target = path.join(this.dataDirectory, `${name}.json`);
       const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+      const serialized = `${JSON.stringify(value, null, 2)}\n`;
       let committed = false;
       try {
         await this.fileSystem.writeFile(
           temporary,
-          `${JSON.stringify(value, null, 2)}\n`,
+          serialized,
           "utf8",
         );
         await replaceFile(this.fileSystem, this.wait, temporary, target);
         committed = true;
+        return this.contentVersions.has(name)
+          ? this.#contentVersion(name, true, serialized)
+          : undefined;
       } finally {
         if (!committed) await discardTemporary(this.fileSystem, temporary);
       }
     });
+  }
+
+  async #readContent(name, signal) {
+    try {
+      return {
+        exists: true,
+        serialized: await this.fileSystem.readFile(
+          path.join(this.dataDirectory, `${name}.json`),
+          {
+            encoding: "utf8",
+            ...(signal === undefined ? {} : { signal }),
+          },
+        ),
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return { exists: false, serialized: null };
+      }
+      throw error;
+    }
+  }
+
+  #contentVersion(name, exists, serialized) {
+    const current = this.contentVersions.get(name);
+    if (
+      current?.exists === exists &&
+      current.serialized === serialized
+    ) {
+      return current.version;
+    }
+    const version = Object.freeze({});
+    this.contentVersions.set(name, { exists, serialized, version });
+    return version;
   }
 
   #queueFor(name) {

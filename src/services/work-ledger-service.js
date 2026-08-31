@@ -143,6 +143,29 @@ const PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES = new Set([
 ]);
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
+function isContentVersion(value) {
+  return (
+    isPlainLedgerObject(value) &&
+    Reflect.ownKeys(value).length === 0 &&
+    Object.isFrozen(value)
+  );
+}
+
+function normalizeVersionedRead(result, expectedVersion) {
+  const expectedKeys = result?.changed === true
+    ? ["changed", "version", "value"]
+    : ["changed", "version"];
+  if (
+    !hasExactLedgerKeys(result, expectedKeys) ||
+    !isContentVersion(result.version) ||
+    (result.changed !== true && result.changed !== false) ||
+    (result.changed === false && result.version !== expectedVersion)
+  ) {
+    throw new TypeError("StateStore versioned read result is invalid");
+  }
+  return result;
+}
+
 function canRequeueAdvancedPullRequestRoot(root) {
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
     (root.kind === "source_root" &&
@@ -432,6 +455,8 @@ export class WorkLedgerService {
     this.idFactory = idFactory;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
+    this.durableContentVersion = undefined;
+    this.graphSnapshotCache = null;
     this.roleWorkloadCache = null;
     this.ready = false;
     this.recoveryPromise = null;
@@ -805,7 +830,13 @@ export class WorkLedgerService {
         // from durable state so an applied write with a lost ACK is visible in
         // the same recovery cycle rather than only after another mutation.
         this.state = await this.#readDurableState();
-        return projectWorkLedgerGraphView(this.state);
+        if (this.graphSnapshotCache?.state !== this.state) {
+          this.graphSnapshotCache = {
+            state: this.state,
+            value: projectWorkLedgerGraphView(this.state),
+          };
+        }
+        return this.graphSnapshotCache.value;
       }),
     );
   }
@@ -2280,7 +2311,15 @@ export class WorkLedgerService {
       );
     }
     try {
-      await this.store.write(WORK_LEDGER_STATE_KEY, normalized);
+      const writtenVersion = await this.store.write(
+        WORK_LEDGER_STATE_KEY,
+        normalized,
+      );
+      this.durableContentVersion =
+        typeof this.store.readVersioned === "function" &&
+        isContentVersion(writtenVersion)
+          ? writtenVersion
+          : undefined;
     } catch (error) {
       throw workLedgerError(
         "WORK_LEDGER_STATE_WRITE_FAILED",
@@ -2293,7 +2332,21 @@ export class WorkLedgerService {
   }
 
   async #readDurableState() {
-    const stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    let stored;
+    let observedVersion;
+    if (typeof this.store.readVersioned === "function") {
+      const result = normalizeVersionedRead(
+        await this.store.readVersioned(WORK_LEDGER_STATE_KEY, null, {
+          ifVersion: this.durableContentVersion,
+        }),
+        this.durableContentVersion,
+      );
+      if (!result.changed) return this.state;
+      stored = result.value;
+      observedVersion = result.version;
+    } else {
+      stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    }
     if (stored === null) {
       if (this.ready && this.state.revision !== 0) {
         throw workLedgerError(
@@ -2302,6 +2355,7 @@ export class WorkLedgerService {
           503,
         );
       }
+      this.durableContentVersion = observedVersion;
       return emptyWorkLedgerState();
     }
     const durable = normalizeWorkLedgerPersistedState(stored, this.limits);
@@ -2318,6 +2372,7 @@ export class WorkLedgerService {
         409,
       );
     }
+    this.durableContentVersion = observedVersion;
     return durable;
   }
 

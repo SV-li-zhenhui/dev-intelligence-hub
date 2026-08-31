@@ -236,6 +236,46 @@ function issueAssignment(
   };
 }
 
+class ContentVersionMemoryStore extends MemoryStore {
+  constructor(entries = {}) {
+    super(entries);
+    this.versions = new Map();
+    this.versionedValueReads = 0;
+  }
+
+  async readVersioned(name, fallback = null, { ifVersion } = {}) {
+    const version = this.#versionFor(name);
+    if (ifVersion === version) return { changed: false, version };
+    this.versionedValueReads += 1;
+    return {
+      changed: true,
+      version,
+      value: await super.read(name, fallback),
+    };
+  }
+
+  async write(name, value) {
+    await super.write(name, value);
+    return this.#replaceVersion(name);
+  }
+
+  replaceStored(value, name = STATE_KEY) {
+    super.replaceStored(value, name);
+    this.#replaceVersion(name);
+  }
+
+  #versionFor(name) {
+    if (!this.versions.has(name)) this.#replaceVersion(name);
+    return this.versions.get(name);
+  }
+
+  #replaceVersion(name) {
+    const version = Object.freeze({});
+    this.versions.set(name, version);
+    return version;
+  }
+}
+
 function ownerRequestedIssueAssignment(sequence, issueNumber) {
   const occurredAt = `2026-08-02T01:${String(sequence).padStart(2, "0")}:00.000Z`;
   const event = createOwnerIssueEvent({
@@ -10629,6 +10669,111 @@ test("recovery retires a legacy Issue assignment superseded by newer evidence", 
   assert.equal(retired.status, "cancelled");
   assert.equal(retired.statusReason, "issue_assignment_superseded");
   assert.equal(items.find(({ itemId }) => itemId === newer.itemId).status, "queued");
+});
+
+test("content-version caching reuses validated graph state and still fails closed", async (t) => {
+  await t.test("unchanged durable content reuses the validated graph projection", async () => {
+    const store = new ContentVersionMemoryStore();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      store,
+    });
+    await fixture.service.intake();
+
+    const first = await fixture.service.getGraphSnapshot();
+    const readsAfterFirstProjection = store.versionedValueReads;
+    const second = await fixture.service.getGraphSnapshot();
+
+    assert.equal(second, first);
+    assert.equal(store.versionedValueReads, readsAfterFirstProjection);
+  });
+
+  await t.test("a durable rollback invalidates the cache", async () => {
+    const store = new ContentVersionMemoryStore();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      store,
+    });
+    await fixture.service.intake();
+    const rolledBack = store.stored();
+    const item = (await fixture.service.listItems()).items[0];
+    await fixture.service.claim({
+      itemId: item.itemId,
+      expectedRevision: item.revision,
+      workerId: "employee-pr-reviewer",
+      leaseDurationMs: 30_000,
+    });
+    await fixture.service.getGraphSnapshot();
+
+    store.replaceStored(rolledBack);
+    await assert.rejects(
+      fixture.service.getGraphSnapshot(),
+      (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+    );
+  });
+
+  await t.test("a same-revision fork invalidates the cache", async () => {
+    const store = new ContentVersionMemoryStore();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      store,
+    });
+    await fixture.service.intake();
+    await fixture.service.getGraphSnapshot();
+    const fork = store.stored();
+    fork.items[0].statusReason = "valid-but-forked";
+    store.replaceStored(fork);
+
+    await assert.rejects(
+      fixture.service.getGraphSnapshot(),
+      (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT",
+    );
+  });
+
+  await t.test("a lost write acknowledgement is visible on the next graph read", async () => {
+    const store = new ContentVersionMemoryStore();
+    const fixture = await createFixture({
+      records: [assignment(1)],
+      store,
+    });
+    await fixture.service.intake();
+    const waiting = await prepareWaitingCondition(fixture, {
+      kind: "workflow_fact",
+      fact: "ci-status",
+      oneOf: ["success"],
+    });
+    const before = await fixture.service.getGraphSnapshot();
+    const durableWrite = store.write.bind(store);
+    let loseAcknowledgement = true;
+    store.write = async (...arguments_) => {
+      const version = await durableWrite(...arguments_);
+      if (loseAcknowledgement) {
+        loseAcknowledgement = false;
+        throw new Error("durable acknowledgement lost");
+      }
+      return version;
+    };
+
+    await assert.rejects(
+      fixture.service.wakeCondition({
+        itemId: waiting.item.itemId,
+        expectedRevision: waiting.item.revision,
+        intentId: waiting.intentId,
+        actorId: "work-condition-waker",
+        observation: {
+          kind: "workflow_fact",
+          fact: "ci-status",
+          value: "success",
+          observedAt: "2026-08-02T02:00:00.000Z",
+        },
+      }),
+      (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
+    );
+
+    const recovered = await fixture.service.getGraphSnapshot();
+    assert.equal(recovered.graph.revision, before.graph.revision + 1);
+    assert.equal(recovered.graph.tasks[0].revision, waiting.item.revision + 1);
+  });
 });
 
 test("recovery preserves distinct manual Issues assigned to the same role", async () => {
