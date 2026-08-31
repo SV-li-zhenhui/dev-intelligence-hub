@@ -41,6 +41,8 @@ import { MemoryAnswerService } from "../src/services/memory-answer-service.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { createLocalWorkLedgerCandidateProcessor } from
+  "../src/services/work-ledger-candidate-processor.js";
 import {
   createWorkDecisionContext,
   emptyWorkLedgerState,
@@ -501,6 +503,7 @@ async function createFixture({
   limits,
   actionAdmissionGate,
   postCommitYield,
+  candidateProcessor,
 } = {}) {
   const service = new WorkLedgerService({
     store,
@@ -511,6 +514,7 @@ async function createFixture({
     ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
     ...(limits ? { limits } : {}),
     ...(postCommitYield === undefined ? {} : { postCommitYield }),
+    ...(candidateProcessor === undefined ? {} : { candidateProcessor }),
   });
   await service.recover();
   return { service, source, store, lease, time };
@@ -7971,6 +7975,52 @@ test("a failed intake write advances neither the durable cursor nor live items",
   assert.equal(retried.cursor, 1);
   assert.deepEqual(source.calls.map(({ afterSequence }) => afterSequence), [0, 0]);
   assert.equal(store.stored().items.length, 1);
+});
+
+test("candidate processing commits only after durable write and discards failed writes", async () => {
+  const events = [];
+  const local = createLocalWorkLedgerCandidateProcessor();
+  const candidateProcessor = {
+    async prepare(request) {
+      events.push("prepare");
+      return local.prepare(request);
+    },
+    async commit() {
+      events.push("commit");
+      return local.commit();
+    },
+    async discard() {
+      events.push("discard");
+      return local.discard();
+    },
+  };
+  const store = new MemoryStore();
+  const durableWrite = store.write.bind(store);
+  store.write = async (...arguments_) => {
+    events.push("write");
+    return durableWrite(...arguments_);
+  };
+  const { service } = await createFixture({
+    records: [assignment(1)],
+    store,
+    candidateProcessor,
+  });
+  store.failNextWrite();
+
+  await assert.rejects(
+    service.intake(),
+    (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
+  );
+  await service.intake();
+
+  assert.deepEqual(events, [
+    "prepare",
+    "write",
+    "discard",
+    "prepare",
+    "write",
+    "commit",
+  ]);
 });
 
 test("a source retention gap creates a durable blocked system alert without skipping", async () => {

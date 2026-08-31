@@ -18,6 +18,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$livenessRequestTimeoutSeconds = [int][Math]::Min($TimeoutSeconds, 15)
 $convertFromJsonPreservesDates = (Get-Command ConvertFrom-Json).Parameters.ContainsKey(
     "DateKind"
 )
@@ -836,9 +837,10 @@ function Invoke-BoundedLoopbackJsonGet {
 function Get-Liveness {
     param([Parameter(Mandatory = $true)][int]$Port)
     try {
+        # Liveness shares the application event loop, so allow bounded workload stalls.
         return Invoke-RestMethod `
             -Uri "http://127.0.0.1:$Port/api/live" `
-            -TimeoutSec 3
+            -TimeoutSec $livenessRequestTimeoutSeconds
     } catch {
         return $null
     }

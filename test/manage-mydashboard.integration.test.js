@@ -583,6 +583,8 @@ async function createFixture(
     spawnDescendantAfterFailedShutdown = false,
     claimMode = "normal",
     listenDelayMilliseconds = 0,
+    livenessDelayAfterRequestCount = Number.MAX_SAFE_INTEGER,
+    livenessDelayMilliseconds = 0,
     readinessMode = "ready",
   } = {},
 ) {
@@ -645,6 +647,7 @@ if (writerLease) await writerLease.acquire();
 if (holdsWriterLeaseAfterFailure) setInterval(() => {}, 1_000);
 let lifecycleState = managed ? "pending_claim" : "running";
 let livenessStartIdentity = environment.MYDASHBOARD_MANAGED_START_IDENTITY;
+let livenessRequestCount = 0;
 let watchdog = null;
 const readinessMode = ${JSON.stringify(readinessMode)};
 const readinessPrivateMarkers = ${JSON.stringify(READINESS_PRIVATE_MARKERS)};
@@ -698,19 +701,30 @@ function writeReceipt(phase, status, errorCode = null) {
 }
 const server = http.createServer((request, response) => {
   if (request.method === "GET" && request.url === "/api/live") {
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({
-      schemaVersion: 1,
-      live: true,
-      service: "mydashboard",
-      processId: process.pid,
-      managed,
-      lifecycleState,
-      ...(managed ? {
-        instanceId: environment.MYDASHBOARD_MANAGED_INSTANCE_ID,
-        startIdentity: livenessStartIdentity,
-      } : {}),
-    }));
+    livenessRequestCount += 1;
+    const sendLiveness = () => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        schemaVersion: 1,
+        live: true,
+        service: "mydashboard",
+        processId: process.pid,
+        managed,
+        lifecycleState,
+        ...(managed ? {
+          instanceId: environment.MYDASHBOARD_MANAGED_INSTANCE_ID,
+          startIdentity: livenessStartIdentity,
+        } : {}),
+      }));
+    };
+    if (
+      livenessRequestCount > ${JSON.stringify(livenessDelayAfterRequestCount)} &&
+      ${JSON.stringify(livenessDelayMilliseconds)} > 0
+    ) {
+      setTimeout(sendLiveness, ${JSON.stringify(livenessDelayMilliseconds)});
+    } else {
+      sendLiveness();
+    }
     return;
   }
   if (request.method === "GET" && request.url === "/api/system/status") {
@@ -1305,6 +1319,39 @@ test(
     const finalStatus = invokeManager(root, "Status");
     assert.equal(finalStatus.status, 3);
     assert.match(finalStatus.stdout, /is stopped/);
+  },
+);
+
+test(
+  "managed Stop tolerates a bounded liveness delay before validating identity",
+  { skip: WINDOWS_MANAGER_SKIP },
+  async (t) => {
+    const { root } = await createFixture(t, {
+      livenessDelayAfterRequestCount: 2,
+      livenessDelayMilliseconds: 3_500,
+    });
+    const started = invokeManager(root, "Start");
+    assert.equal(started.status, 0, `${started.stderr}\n${started.stdout}`);
+
+    const stopStartedAt = performance.now();
+    const stopped = invokeManager(root, "Stop");
+    const stopDurationMilliseconds = performance.now() - stopStartedAt;
+
+    assert.deepEqual(
+      {
+        exitCode: stopped.status,
+        stoppedGracefully: /stopped gracefully/u.test(stopped.stdout),
+        observedDelay: stopDurationMilliseconds >= 3_200,
+        bounded: stopDurationMilliseconds < 8_000,
+      },
+      {
+        exitCode: 0,
+        stoppedGracefully: true,
+        observedDelay: true,
+        bounded: true,
+      },
+      `${stopped.stderr}\n${stopped.stdout}`,
+    );
   },
 );
 

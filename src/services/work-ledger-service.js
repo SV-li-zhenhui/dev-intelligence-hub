@@ -31,7 +31,6 @@ import {
 } from "./work-ledger-delivery-commands.js";
 import {
   acknowledgeWorkGraphMemoryProjectionBatch,
-  appendWorkGraphMemoryEvents,
   readWorkGraphMemoryProjectionBatch,
 } from "./work-ledger-graph-memory.js";
 import {
@@ -73,7 +72,6 @@ import {
   pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
-  validatePullRequestSourceTransition,
 } from "./work-ledger-pr-source.js";
 import {
   appendPullRequestCutoverTimelineEvent,
@@ -93,7 +91,6 @@ import {
   retireCrossRootPullRequestPredecessor,
 } from "./work-ledger-pr-cutover-commands.js";
 import {
-  assertWorkLedgerCapacity,
   emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
   normalizeWorkLedgerPersistedState,
@@ -111,10 +108,9 @@ import {
   WORK_LEDGER_OUTBOX_STATUSES,
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
-import {
-  projectWorkLedgerGraphView,
-  validateWorkLedgerGraphTransition,
-} from "./work-ledger-graph.js";
+import { projectWorkLedgerGraphView } from "./work-ledger-graph.js";
+import { createLocalWorkLedgerCandidateProcessor } from
+  "./work-ledger-candidate-processor.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
@@ -427,6 +423,7 @@ export class WorkLedgerService {
     idFactory,
     limits,
     postCommitYield = DEFAULT_POST_COMMIT_YIELD,
+    candidateProcessor = createLocalWorkLedgerCandidateProcessor(),
   } = {}) {
     if (
       !store ||
@@ -453,6 +450,16 @@ export class WorkLedgerService {
     if (typeof postCommitYield !== "function") {
       throw new TypeError("postCommitYield must be a function");
     }
+    if (
+      !candidateProcessor ||
+      typeof candidateProcessor.prepare !== "function" ||
+      typeof candidateProcessor.commit !== "function" ||
+      typeof candidateProcessor.discard !== "function"
+    ) {
+      throw new TypeError(
+        "candidateProcessor must provide prepare, commit, and discard",
+      );
+    }
     this.store = store;
     this.assignmentSource = assignmentSource;
     this.exclusiveLease = exclusiveLease;
@@ -461,6 +468,7 @@ export class WorkLedgerService {
     this.clock = clock;
     this.idFactory = idFactory;
     this.postCommitYield = postCommitYield;
+    this.candidateProcessor = candidateProcessor;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -2277,46 +2285,12 @@ export class WorkLedgerService {
         409,
       );
     }
-    if (appendGraphMemory) {
-      candidate = appendWorkGraphMemoryEvents(
-        this.state,
-        candidate,
-        this.limits,
-      );
-    }
-    assertWorkLedgerCapacity(candidate, this.limits);
-    let normalized;
-    try {
-      normalized = normalizeWorkLedgerPersistedState(candidate, this.limits);
-    } catch (error) {
-      if (error?.code === "WORK_LEDGER_CAPACITY_EXCEEDED") throw error;
-      throw workLedgerError(
-        "WORK_LEDGER_STATE_CORRUPTED",
-        "拒绝写入不一致的员工工作台账",
-        503,
-        { cause: error },
-      );
-    }
-    try {
-      validateWorkLedgerGraphTransition(this.state, normalized);
-    } catch (error) {
-      throw workLedgerError(
-        "WORK_LEDGER_GRAPH_TRANSITION_INVALID",
-        "员工工作图转换与台账修订不一致",
-        409,
-        { cause: error },
-      );
-    }
-    try {
-      validatePullRequestSourceTransition(this.state.items, normalized.items);
-    } catch (error) {
-      throw workLedgerError(
-        "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",
-        "PR 来源历史与台账修订不一致",
-        409,
-        { cause: error },
-      );
-    }
+    const normalized = await this.candidateProcessor.prepare({
+      previousState: this.state,
+      candidate,
+      limits: this.limits,
+      appendGraphMemory,
+    });
     try {
       const writtenVersion = await this.store.write(
         WORK_LEDGER_STATE_KEY,
@@ -2328,6 +2302,7 @@ export class WorkLedgerService {
           ? writtenVersion
           : undefined;
     } catch (error) {
+      await this.#discardPreparedCandidate();
       throw workLedgerError(
         "WORK_LEDGER_STATE_WRITE_FAILED",
         "无法持久化员工工作台账",
@@ -2336,7 +2311,24 @@ export class WorkLedgerService {
       );
     }
     this.state = normalized;
+    await this.#commitPreparedCandidate();
     await this.#yieldAfterCommit();
+  }
+
+  async #discardPreparedCandidate() {
+    try {
+      await this.candidateProcessor.discard();
+    } catch {
+      // Durable state did not advance. A worker resynchronizes from this.state next time.
+    }
+  }
+
+  async #commitPreparedCandidate() {
+    try {
+      await this.candidateProcessor.commit();
+    } catch {
+      // The durable write is authoritative. Worker synchronization is recoverable.
+    }
   }
 
   #currentGraphSnapshot() {

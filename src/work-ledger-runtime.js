@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { WorkGraphStore } from "./services/work-graph-store.js";
+import { createWorkerWorkLedgerCandidateProcessor } from
+  "./services/work-ledger-candidate-processor.js";
 import { WorkLedgerService } from "./services/work-ledger-service.js";
 import {
   boundedLedgerString,
@@ -101,10 +103,14 @@ export async function createWorkLedgerRuntime({
   idFactory = randomUUID,
   limits,
   postCommitYield,
+  createCandidateProcessor = createWorkerWorkLedgerCandidateProcessor,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
   if (typeof createGuard !== "function") {
     throw new TypeError("createGuard must be a function");
+  }
+  if (typeof createCandidateProcessor !== "function") {
+    throw new TypeError("createCandidateProcessor must be a function");
   }
   const guard = createGuard({ name: GUARD_NAME });
   if (
@@ -117,6 +123,7 @@ export async function createWorkLedgerRuntime({
   }
   let closePromise = null;
   let accepting = true;
+  let candidateProcessor = null;
   const acceptedOperations = new Set();
   const admit = (operation) => {
     if (!accepting) return Promise.reject(runtimeClosedError());
@@ -135,19 +142,37 @@ export async function createWorkLedgerRuntime({
   };
   const close = () => {
     accepting = false;
-    closePromise ||= Promise.allSettled([...acceptedOperations]).then(() =>
-      guard.close(),
+    closePromise ||= Promise.allSettled([...acceptedOperations]).then(
+      async () => {
+        let processorFailure;
+        try {
+          await candidateProcessor?.close?.();
+        } catch (error) {
+          processorFailure = error;
+        }
+        try {
+          await guard.close();
+        } catch (error) {
+          if (processorFailure) {
+            throw new AggregateError([processorFailure, error]);
+          }
+          throw error;
+        }
+        if (processorFailure) throw processorFailure;
+      },
     );
     return closePromise;
   };
 
   try {
     await guard.acquire();
+    candidateProcessor = createCandidateProcessor();
     const service = new WorkLedgerService({
       store,
       assignmentSource,
       exclusiveLease: guard,
       idFactory,
+      candidateProcessor,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(operationQueue ? { operationQueue } : {}),
       ...(clock ? { clock } : {}),
