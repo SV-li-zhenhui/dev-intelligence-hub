@@ -454,6 +454,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
   };
   const ledger = {
     graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
+    graphBrowserReader: { async getSnapshot() { return { graphRevision: 0 }; } },
     graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),
     memoryAuthoritySource: memoryAuthoritySourcePort(),
     async getSummary() {},
@@ -1406,6 +1407,11 @@ test("enabled work coordination composes private runtimes into frozen applicatio
         throw new Error("graph writes must remain private");
       },
     },
+    graphBrowserReader: {
+      async getSnapshot() {
+        return { graphRevision: 8, tasks: [] };
+      },
+    },
     graphPlanner: {
       async createChild() {
         throw new Error("graph planner must remain private");
@@ -1825,6 +1831,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   assert.deepEqual(Object.keys(application.workGraphView), ["getSnapshot"]);
   assert.notStrictEqual(application.workGraphView, ledgerRuntime.graphReader);
+  assert.notStrictEqual(application.workGraphView, ledgerRuntime.graphBrowserReader);
   assert.equal("createChild" in application.workGraphView, false);
   assert.deepEqual(Object.keys(application.attentionBrowser).sort(), [
     "answer",
@@ -1877,7 +1884,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     source: "ledger",
   });
   assert.deepEqual(await application.workGraphView.getSnapshot(), {
-    graphRevision: 7,
+    graphRevision: 8,
     tasks: [],
   });
   assert.equal(await application.workCoordination.intake(), "intake-result");
@@ -2312,6 +2319,7 @@ test("enabled unified memory exposes search only and projects the existing work 
     }),
     workLedgerRuntimeFactory: async () => ({
       graphReader: { async getSnapshot() { return { graphRevision: 0 }; } },
+      graphBrowserReader: { async getSnapshot() { return { graphRevision: 0 }; } },
       scopedGraphPlannerFactory: { forRoot() {} },
       graphDelivererFactory: { forClaim() {} },
       graphMemoryProjectionSource: graphMemoryProjectionSourcePort(),

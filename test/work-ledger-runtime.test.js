@@ -202,12 +202,14 @@ test("runtime owns one named process guard and exposes least-authority graph por
     assert.equal(typeof runtime[method], "function", method);
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
+  assert.equal(Object.isFrozen(runtime.graphBrowserReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
   assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);
   assert.equal(Object.isFrozen(runtime.graphDelivererFactory), true);
   assert.equal(Object.isFrozen(runtime.graphMemoryProjectionSource), true);
   assert.equal(Object.isFrozen(runtime.memoryAuthoritySource), true);
   assert.deepEqual(Object.keys(runtime.graphReader), ["getSnapshot"]);
+  assert.deepEqual(Object.keys(runtime.graphBrowserReader), ["getSnapshot"]);
   assert.deepEqual(Object.keys(runtime.graphPlanner), [
     "createChild",
     "reviseAcceptanceContract",
@@ -233,6 +235,10 @@ test("runtime owns one named process guard and exposes least-authority graph por
 
   const graphSnapshot = await runtime.graphReader.getSnapshot();
   assert.equal(graphSnapshot.graph.revision, 0);
+  assert.equal(
+    (await runtime.graphBrowserReader.getSnapshot()).graph.revision,
+    graphSnapshot.graph.revision,
+  );
   assert.deepEqual(
     await runtime.graphMemoryProjectionSource.readBatch({ limit: 1 }),
     {

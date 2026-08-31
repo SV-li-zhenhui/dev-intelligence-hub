@@ -1,3 +1,4 @@
+import { scheduler } from "node:timers/promises";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -121,6 +122,8 @@ const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
     return operation();
   },
 });
+
+const DEFAULT_POST_COMMIT_YIELD = () => scheduler.yield();
 
 const MAX_PR_EXECUTION_BINDING_VERIFICATION_BATCH = 100_000;
 
@@ -423,6 +426,7 @@ export class WorkLedgerService {
     clock = () => new Date(),
     idFactory,
     limits,
+    postCommitYield = DEFAULT_POST_COMMIT_YIELD,
   } = {}) {
     if (
       !store ||
@@ -446,6 +450,9 @@ export class WorkLedgerService {
     if (typeof idFactory !== "function") {
       throw new TypeError("idFactory must be a function");
     }
+    if (typeof postCommitYield !== "function") {
+      throw new TypeError("postCommitYield must be a function");
+    }
     this.store = store;
     this.assignmentSource = assignmentSource;
     this.exclusiveLease = exclusiveLease;
@@ -453,6 +460,7 @@ export class WorkLedgerService {
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
     this.clock = clock;
     this.idFactory = idFactory;
+    this.postCommitYield = postCommitYield;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -830,15 +838,14 @@ export class WorkLedgerService {
         // from durable state so an applied write with a lost ACK is visible in
         // the same recovery cycle rather than only after another mutation.
         this.state = await this.#readDurableState();
-        if (this.graphSnapshotCache?.state !== this.state) {
-          this.graphSnapshotCache = {
-            state: this.state,
-            value: projectWorkLedgerGraphView(this.state),
-          };
-        }
-        return this.graphSnapshotCache.value;
+        return this.#currentGraphSnapshot();
       }),
     );
+  }
+
+  async getLastCommittedGraphSnapshot() {
+    this.#assertReady();
+    return this.#currentGraphSnapshot();
   }
 
   async readGraphMemoryProjectionBatch(options = {}) {
@@ -2329,6 +2336,25 @@ export class WorkLedgerService {
       );
     }
     this.state = normalized;
+    await this.#yieldAfterCommit();
+  }
+
+  #currentGraphSnapshot() {
+    if (this.graphSnapshotCache?.state !== this.state) {
+      this.graphSnapshotCache = {
+        state: this.state,
+        value: projectWorkLedgerGraphView(this.state),
+      };
+    }
+    return this.graphSnapshotCache.value;
+  }
+
+  async #yieldAfterCommit() {
+    try {
+      await this.postCommitYield();
+    } catch {
+      // Fair scheduling is non-authoritative and cannot invalidate a committed write.
+    }
   }
 
   async #readDurableState() {

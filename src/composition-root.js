@@ -2464,9 +2464,9 @@ export async function createApplication({
         "dailyWorkLedgerView",
       );
       workGraphView = frozenPort(
-        workLedgerRuntime.graphReader,
+        workLedgerRuntime.graphBrowserReader,
         ["getSnapshot"],
-        "workLedgerRuntime.graphReader",
+        "workLedgerRuntime.graphBrowserReader",
       );
       attentionBrowser = frozenPort(
         attentionInboxRuntime.browser,

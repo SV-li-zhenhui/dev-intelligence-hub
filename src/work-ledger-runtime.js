@@ -100,6 +100,7 @@ export async function createWorkLedgerRuntime({
   clock,
   idFactory = randomUUID,
   limits,
+  postCommitYield,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
   if (typeof createGuard !== "function") {
@@ -151,6 +152,7 @@ export async function createWorkLedgerRuntime({
       ...(operationQueue ? { operationQueue } : {}),
       ...(clock ? { clock } : {}),
       ...(limits ? { limits } : {}),
+      ...(postCommitYield === undefined ? {} : { postCommitYield }),
     });
     await service.recover();
     const graph = new WorkGraphStore({ ledger: service });
@@ -176,6 +178,10 @@ export async function createWorkLedgerRuntime({
     const runtime = {
       graphReader: Object.freeze({
         getSnapshot: () => admit(() => graphReader.getSnapshot()),
+      }),
+      graphBrowserReader: Object.freeze({
+        getSnapshot: () =>
+          admit(() => service.getLastCommittedGraphSnapshot()),
       }),
       graphPlanner: Object.freeze({
         createChild: (command) => admit(() => graphPlanner.createChild(command)),

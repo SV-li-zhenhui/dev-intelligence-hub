@@ -500,6 +500,7 @@ async function createFixture({
   time = controlledClock(),
   limits,
   actionAdmissionGate,
+  postCommitYield,
 } = {}) {
   const service = new WorkLedgerService({
     store,
@@ -509,6 +510,7 @@ async function createFixture({
     idFactory: incrementingIds(),
     ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
     ...(limits ? { limits } : {}),
+    ...(postCommitYield === undefined ? {} : { postCommitYield }),
   });
   await service.recover();
   return { service, source, store, lease, time };
@@ -10770,10 +10772,82 @@ test("content-version caching reuses validated graph state and still fails close
       (error) => error.code === "WORK_LEDGER_STATE_WRITE_FAILED",
     );
 
+    const browserSnapshot = await fixture.service.getLastCommittedGraphSnapshot();
+    assert.equal(browserSnapshot, before);
     const recovered = await fixture.service.getGraphSnapshot();
     assert.equal(recovered.graph.revision, before.graph.revision + 1);
     assert.equal(recovered.graph.tasks[0].revision, waiting.item.revision + 1);
   });
+});
+
+test("browser graph reads bypass an in-flight write without weakening authoritative reads", async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({
+    records: [assignment(1)],
+    store,
+    postCommitYield: async () => {},
+  });
+  await fixture.service.intake();
+  const before = await fixture.service.getLastCommittedGraphSnapshot();
+  const item = (await fixture.service.listItems()).items[0];
+  const writeStarted = deferred();
+  const releaseWrite = deferred();
+  const durableWrite = store.write.bind(store);
+  store.write = async (...arguments_) => {
+    writeStarted.resolve();
+    await releaseWrite.promise;
+    return durableWrite(...arguments_);
+  };
+
+  const claim = fixture.service.claim({
+    itemId: item.itemId,
+    expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer",
+    leaseDurationMs: 30_000,
+  });
+  await writeStarted.promise;
+  const browserSnapshot = await fixture.service.getLastCommittedGraphSnapshot();
+  const authoritativeSnapshot = fixture.service.getGraphSnapshot();
+  let authoritativeSettled = false;
+  authoritativeSnapshot.finally(() => {
+    authoritativeSettled = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(browserSnapshot, before);
+  assert.equal(authoritativeSettled, false);
+
+  releaseWrite.resolve();
+  await claim;
+  const after = await authoritativeSnapshot;
+  assert.equal(after.graph.revision, before.graph.revision + 1);
+});
+
+test("a committed ledger write yields after publishing its browser snapshot", async () => {
+  const yieldStarted = deferred();
+  const releaseYield = deferred();
+  const fixture = await createFixture({
+    records: [assignment(1)],
+    postCommitYield: async () => {
+      yieldStarted.resolve();
+      await releaseYield.promise;
+    },
+  });
+
+  const intake = fixture.service.intake();
+  await yieldStarted.promise;
+  const duringYield = await fixture.service.getLastCommittedGraphSnapshot();
+  let intakeSettled = false;
+  intake.finally(() => {
+    intakeSettled = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(duringYield.graph.revision, 1);
+  assert.equal(intakeSettled, false);
+
+  releaseYield.resolve();
+  await intake;
 });
 
 test("recovery preserves distinct manual Issues assigned to the same role", async () => {
