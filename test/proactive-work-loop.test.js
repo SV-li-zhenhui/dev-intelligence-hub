@@ -2699,7 +2699,7 @@ test("configured-root owner attention retries a stage failure only until one dur
   assert.equal(ledger.calls.transition.length, 0);
 });
 
-test("unclassified structured failures preserve generic specialist and root behavior", async (t) => {
+test("unclassified structured failures preserve generic specialist behavior and defer invalid root output", async (t) => {
   await t.test("specialist retries a provider timeout", async () => {
     const time = controlledClock();
     const source = workItem(87, { type: "role", id: "developer" });
@@ -2732,42 +2732,44 @@ test("unclassified structured failures preserve generic specialist and root beha
     assert.equal(ledger.outbox.length, 0);
   });
 
-  await t.test("root leaves an invalid response queued for a natural cycle", async () => {
-    const time = controlledClock();
-    const root = workItem(88, { type: "role", id: "orchestrator" });
-    const ledger = new FakeLedger({ source: [root], time });
-    const failure = structuredBrainFailure(
-      "STRUCTURED_PROVIDER_RESPONSE_INVALID",
-    );
-    const loop = createLoop({
-      ledger,
-      directory: new FakeRoleDirectory({
-        orchestrator: worker({
-          roleId: "orchestrator",
-          workerId: "employee-orchestrator",
-          decide: async () => {
-            throw failure;
-          },
+  for (const code of [
+    "STRUCTURED_BRAIN_RESPONSE_INVALID",
+    "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+  ]) {
+    await t.test(`root defers ${code} without failing the employee`, async () => {
+      const time = controlledClock();
+      const root = workItem(88, { type: "role", id: "orchestrator" });
+      const ledger = new FakeLedger({ source: [root], time });
+      const loop = createLoop({
+        ledger,
+        directory: new FakeRoleDirectory({
+          orchestrator: worker({
+            roleId: "orchestrator",
+            workerId: "employee-orchestrator",
+            decide: async () => {
+              throw structuredBrainFailure(code);
+            },
+          }),
         }),
-      }),
-      time,
-      roleContextAssembler: {
-        async assemble({ roleId, item }) {
-          return contextPacket(item, roleId);
+        time,
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            return contextPacket(item, roleId);
+          },
         },
-      },
-      orchestratorService: { async execute() {} },
-    });
+        orchestratorService: { async execute() {} },
+      });
 
-    await assert.rejects(
-      loop.runCycle({ roleId: "orchestrator" }),
-      (error) => error === failure,
-    );
-    assert.equal(ledger.items[0].status, "queued");
-    assert.equal(ledger.calls.claim.length, 0);
-    assert.equal(ledger.calls.stageIntent.length, 0);
-    assert.equal(ledger.outbox.length, 0);
-  });
+      const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+      assert.equal(cycle.outcomes[0].status, "decision_deferred");
+      assert.equal(cycle.outcomes[0].code, code);
+      assert.equal(ledger.items[0].status, "queued");
+      assert.equal(ledger.calls.claim.length, 0);
+      assert.equal(ledger.calls.stageIntent.length, 0);
+      assert.equal(ledger.outbox.length, 0);
+    });
+  }
 });
 
 test("cycle-signal cancellation wins over configured-root owner attention", async () => {

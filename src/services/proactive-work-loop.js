@@ -27,6 +27,10 @@ const RUNTIME_ADMISSION_ERROR_CODES = new Set([
   "RUNTIME_CONFIGURATION_NOT_READY",
   "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
 ]);
+const ROOT_DECISION_DEFERRED_ERROR_CODES = new Set([
+  "STRUCTURED_BRAIN_RESPONSE_INVALID",
+  "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+]);
 const NON_BUDGET_CLAIM_FAILURE_CODES = new Set([
   "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
 ]);
@@ -1401,6 +1405,18 @@ export class ProactiveWorkLoop {
       }
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         throw error;
+      }
+      const code = stableFailureCode(error);
+      if (ROOT_DECISION_DEFERRED_ERROR_CODES.has(code)) {
+        return {
+          claimAttempted: false,
+          claimed: false,
+          outcome: {
+            status: "decision_deferred",
+            workerId: worker.workerId,
+            code,
+          },
+        };
       }
       const attention = ownerBrainAttentionDecision(error, worker.roleId);
       if (attention === null) throw error;
