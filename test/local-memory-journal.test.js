@@ -10,6 +10,16 @@ import {
   MEMORY_JOURNAL_KEY,
 } from "../src/services/local-memory-journal.js";
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function record(index, overrides = {}) {
   return {
     schemaVersion: 1,
@@ -194,6 +204,7 @@ async function fixture(options = {}) {
     store,
     exclusiveLease: lease,
     ...(options.maximumRecords ? { maximumRecords: options.maximumRecords } : {}),
+    ...(options.postCommitYield ? { postCommitYield: options.postCommitYield } : {}),
   });
   await journal.recover();
   return { store, journal };
@@ -213,6 +224,33 @@ test("journal append is durable, content-idempotent, and persists a separate ind
   assert.equal(store.values.get(MEMORY_INDEX_KEY).journalRevision, 2);
   assert.equal(store.values.get(MEMORY_INDEX_KEY).complete, true);
   assert.equal(store.values.get(MEMORY_INDEX_KEY).entries["失败"].length, 2);
+});
+
+test("a committed memory append yields after publishing journal and index state", async () => {
+  const yieldStarted = deferred();
+  const releaseYield = deferred();
+  const { store, journal } = await fixture({
+    postCommitYield: async () => {
+      yieldStarted.resolve();
+      await releaseYield.promise;
+    },
+  });
+
+  const append = journal.append(record(1));
+  await yieldStarted.promise;
+  let appendSettled = false;
+  append.finally(() => {
+    appendSettled = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(store.values.get(MEMORY_JOURNAL_KEY).records.length, 1);
+  assert.equal(store.values.get(MEMORY_INDEX_KEY).journalRevision, 1);
+  assert.equal(journal.getHealth().recordCount, 1);
+  assert.equal(appendSettled, false);
+
+  releaseYield.resolve();
+  await append;
 });
 
 test("local search supports Chinese keywords, filters, newest order, and stable cursors", async () => {

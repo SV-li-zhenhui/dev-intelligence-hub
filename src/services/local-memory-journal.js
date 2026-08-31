@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { scheduler } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
@@ -23,6 +24,7 @@ const MAX_READ_RECORDS = 20;
 const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
 const CAPACITY_WARNING_RATIO = 0.8;
+const DEFAULT_POST_COMMIT_YIELD = () => scheduler.yield();
 const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
 const MAX_AUTHORITY_PROJECTION_ENTRIES = 100_000;
@@ -2029,6 +2031,7 @@ export class LocalMemoryJournal {
   #lastIndexError = "";
   #stateBytes = serializedBytes(emptyJournal());
   #reclaimableRecordCount = 0;
+  #postCommitYield;
 
   constructor({
     store,
@@ -2036,6 +2039,7 @@ export class LocalMemoryJournal {
     operationQueue = new OperationQueue(),
     maximumRecords = DEFAULT_MAX_RECORDS,
     maximumStateBytes = DEFAULT_MAX_STATE_BYTES,
+    postCommitYield = DEFAULT_POST_COMMIT_YIELD,
   } = {}) {
     if (!store || typeof store.read !== "function" || typeof store.write !== "function") {
       throw new TypeError("LocalMemoryJournal requires a durable store");
@@ -2046,9 +2050,13 @@ export class LocalMemoryJournal {
     if (!operationQueue || typeof operationQueue.enqueue !== "function") {
       throw new TypeError("operationQueue is invalid");
     }
+    if (typeof postCommitYield !== "function") {
+      throw new TypeError("postCommitYield must be a function");
+    }
     this.#store = store;
     this.#exclusiveLease = exclusiveLease;
     this.#operationQueue = operationQueue;
+    this.#postCommitYield = postCommitYield;
     this.#limits = Object.freeze({
       maximumRecords: positiveInteger(
         maximumRecords,
@@ -2844,6 +2852,7 @@ export class LocalMemoryJournal {
     this.#indexComplete = built.complete;
     this.#lastIndexError = "";
     await this.#persistIndex(built.persisted);
+    await this.#yieldAfterCommit();
     return {
       added,
       items: structuredClone(receipts),
@@ -2866,6 +2875,14 @@ export class LocalMemoryJournal {
         "统一记忆尚未恢复",
         503,
       );
+    }
+  }
+
+  async #yieldAfterCommit() {
+    try {
+      await this.#postCommitYield();
+    } catch {
+      // Fair scheduling is non-authoritative and cannot invalidate a committed write.
     }
   }
 }
