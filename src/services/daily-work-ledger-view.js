@@ -39,6 +39,7 @@ const WORKLOAD_STATUSES = new Map([
 
 const HISTORICAL_CONTROL_REASONS = [
   "pr_source_left_scope",
+  "pr_source_terminal",
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   "pr_source_cross_root_cutover_retired",
   "pr_source_cross_root_cutover_replaced",

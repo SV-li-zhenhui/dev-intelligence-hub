@@ -2376,6 +2376,21 @@ function structuredBrainFailure(code) {
   );
 }
 
+function terminalPullRequestFailure(state = "MERGED") {
+  const terminal = Object.assign(new Error(`PR is ${state}`), {
+    code: "PR_FACTS_TERMINAL",
+    terminalState: state,
+  });
+  const refresh = Object.assign(
+    new Error("Unable to refresh PR facts", { cause: terminal }),
+    { code: "PR_FACT_REFRESH_FAILED" },
+  );
+  return Object.assign(
+    new Error("Unable to assemble PR role context", { cause: refresh }),
+    { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
+  );
+}
+
 function assertSafeOwnerAttention({ ledger, roleId, code, remediation }) {
   assert.equal(ledger.outbox.length, 1);
   const intent = ledger.outbox[0].intent;
@@ -2394,6 +2409,74 @@ function assertSafeOwnerAttention({ ledger, roleId, code, remediation }) {
     assert.equal(publicCopy.includes(secret), false);
   }
 }
+
+test("a configured root closes a terminal PR task instead of retrying it", async () => {
+  const time = controlledClock();
+  const root = workItem(801, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [root], time });
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({
+        roleId: "orchestrator",
+        workerId: "employee-orchestrator",
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble() {
+        throw terminalPullRequestFailure("MERGED");
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "orchestrator" });
+
+  assert.equal(cycle.claimed, 1);
+  assert.equal(cycle.blocked, 1);
+  assert.equal(cycle.outcomes[0].code, "PR_FACTS_TERMINAL");
+  assert.equal(ledger.items[0].status, "blocked");
+  assert.equal(ledger.items[0].statusReason, "pr_source_terminal");
+  assert.equal(ledger.calls.claim.length, 1);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.deepEqual(ledger.calls.transition[0].details, {
+    code: "PR_FACTS_TERMINAL",
+    outcome: "MERGED",
+  });
+});
+
+test("a specialist closes a terminal PR task without consuming retry attempts", async () => {
+  const time = controlledClock();
+  const source = workItem(802, { type: "role", id: "pr-engineer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      "pr-engineer": worker({ roleId: "pr-engineer" }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble() {
+        throw terminalPullRequestFailure("CLOSED");
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const cycle = await loop.runCycle({ roleId: "pr-engineer" });
+
+  assert.equal(cycle.claimed, 1);
+  assert.equal(cycle.blocked, 1);
+  assert.equal(cycle.retried, 0);
+  assert.equal(ledger.items[0].status, "blocked");
+  assert.equal(ledger.items[0].statusReason, "pr_source_terminal");
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.deepEqual(ledger.calls.transition[0].details, {
+    code: "PR_FACTS_TERMINAL",
+    outcome: "CLOSED",
+  });
+});
 
 test("structured brain failures create one safe owner attention for a configured specialist", async (t) => {
   for (const { code, failurePoint, remediation } of STRUCTURED_BRAIN_ATTENTION_CASES) {

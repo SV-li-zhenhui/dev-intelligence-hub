@@ -132,6 +132,12 @@ function fixtureItems() {
       statusReason: "pr_source_left_scope",
     }),
     assignment({
+      id: "terminal-pr-root",
+      number: 16,
+      status: "blocked",
+      statusReason: "pr_source_terminal",
+    }),
+    assignment({
       id: "shadow-assignment",
       number: 12,
       updatedAt: "2026-08-30T06:00:00.000Z",
@@ -270,12 +276,12 @@ test("daily summary separates current work from immutable audit history", async 
   assert.deepEqual(summary.dailyScope, {
     activeWindowDays: 14,
     currentItems: 4,
-    historyItems: 3,
-    durableItems: 7,
+    historyItems: 4,
+    durableItems: 8,
   });
   assert.deepEqual(summary.durableItemCounts, {
     queued: 3,
-    blocked: 2,
+    blocked: 3,
     working: 1,
     completed: 1,
   });

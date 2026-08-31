@@ -436,6 +436,44 @@ function stableFailureCode(error) {
   return "ROLE_DECISION_FAILED";
 }
 
+function terminalPullRequestState(error) {
+  const visited = new Set();
+  let current = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (
+      current === null ||
+      (typeof current !== "object" && typeof current !== "function") ||
+      visited.has(current)
+    ) {
+      return null;
+    }
+    visited.add(current);
+    try {
+      const codeDescriptor = Object.getOwnPropertyDescriptor(current, "code");
+      const stateDescriptor = Object.getOwnPropertyDescriptor(
+        current,
+        "terminalState",
+      );
+      if (
+        codeDescriptor &&
+        "value" in codeDescriptor &&
+        codeDescriptor.value === "PR_FACTS_TERMINAL" &&
+        stateDescriptor &&
+        "value" in stateDescriptor &&
+        ["CLOSED", "MERGED"].includes(stateDescriptor.value)
+      ) {
+        return stateDescriptor.value;
+      }
+      const causeDescriptor = Object.getOwnPropertyDescriptor(current, "cause");
+      if (!causeDescriptor || !("value" in causeDescriptor)) return null;
+      current = causeDescriptor.value;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function claimFailureOutcome(claim) {
   return {
     status: claim.status,
@@ -1340,6 +1378,27 @@ export class ProactiveWorkLoop {
       ));
     } catch (error) {
       throwIfLoopAborted(options.signal);
+      const terminalState = terminalPullRequestState(error);
+      if (terminalState !== null) {
+        const claim = await this.#claim(item, worker, options);
+        if (!claim.item) {
+          return {
+            claimAttempted: true,
+            claimed: false,
+            outcome: claimFailureOutcome(claim),
+          };
+        }
+        return {
+          claimAttempted: true,
+          claimed: true,
+          outcome: await this.#blockTerminalPullRequest(
+            claim.item,
+            worker.workerId,
+            options,
+            terminalState,
+          ),
+        };
+      }
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         throw error;
       }
@@ -1479,6 +1538,15 @@ export class ProactiveWorkLoop {
       }
     } catch (error) {
       throwIfLoopAborted(options.signal);
+      const terminalState = terminalPullRequestState(error);
+      if (terminalState !== null) {
+        return this.#blockTerminalPullRequest(
+          item,
+          worker.workerId,
+          options,
+          terminalState,
+        );
+      }
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         // Configuration cutover is not an employee failure. Keep the durable
         // claim intact so the item can be recomputed after restart.
@@ -1503,6 +1571,55 @@ export class ProactiveWorkLoop {
       );
     }
     return this.#stageDecision(item, worker, options, decision);
+  }
+
+  async #blockTerminalPullRequest(item, actorId, options, terminalState) {
+    throwIfLoopAborted(options.signal);
+    try {
+      await this.ledger.transition({
+        itemId: item.itemId,
+        expectedRevision: item.revision,
+        leaseId: item.leaseId,
+        actorId,
+        toStatus: "blocked",
+        reason: "pr_source_terminal",
+        details: {
+          code: "PR_FACTS_TERMINAL",
+          outcome: terminalState,
+        },
+      });
+      throwIfLoopAborted(options.signal);
+      return {
+        status: "blocked",
+        workerId: actorId,
+        code: "PR_FACTS_TERMINAL",
+      };
+    } catch {
+      throwIfLoopAborted(options.signal);
+      const observed = await this.#observeItem(
+        item.itemId,
+        options.intakeLimit,
+        options.signal,
+      );
+      throwIfLoopAborted(options.signal);
+      if (
+        observed?.status === "blocked" &&
+        observed.statusReason === "pr_source_terminal"
+      ) {
+        return {
+          status: "blocked",
+          workerId: actorId,
+          code: "PR_FACTS_TERMINAL",
+        };
+      }
+      return {
+        status: observed
+          ? "terminal_state_unchanged"
+          : "terminal_state_uncertain",
+        workerId: actorId,
+        code: "PR_FACTS_TERMINAL",
+      };
+    }
   }
 
   async #decideAndStage(item, worker, options) {

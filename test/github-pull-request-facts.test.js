@@ -80,6 +80,7 @@ function viewTargetResponse(overrides = {}) {
       name: "Contributor",
       login: "contributor",
     },
+    state: "OPEN",
     ...overrides,
   };
 }
@@ -482,6 +483,46 @@ test("facts returned for another atomic target are discarded before final valida
   );
   assert.equal(
     fake.calls.filter(({ args }) => args[0] === "pr").length,
+    1,
+  );
+});
+
+test("a terminal PR is rejected before the detailed facts read", async () => {
+  const fake = fakeRun({
+    initialTarget: viewTargetResponse({ state: "MERGED" }),
+  });
+  const adapter = new GitHubAdapter({ run: fake.run });
+
+  await assert.rejects(
+    adapter.loadPullRequestFacts(readRequest()),
+    (error) =>
+      error.code === "PR_FACTS_TERMINAL" &&
+      error.terminalState === "MERGED",
+  );
+  assert.equal(
+    fake.calls.filter(
+      ({ args }) => args[0] === "api" && args[1] === "graphql",
+    ).length,
+    0,
+  );
+});
+
+test("a PR that closes during the bounded read is reported as terminal", async () => {
+  const fake = fakeRun({
+    finalTarget: viewTargetResponse({ state: "CLOSED" }),
+  });
+  const adapter = new GitHubAdapter({ run: fake.run });
+
+  await assert.rejects(
+    adapter.loadPullRequestFacts(readRequest()),
+    (error) =>
+      error.code === "PR_FACTS_TERMINAL" &&
+      error.terminalState === "CLOSED",
+  );
+  assert.equal(
+    fake.calls.filter(
+      ({ args }) => args[0] === "api" && args[1] === "graphql",
+    ).length,
     1,
   );
 });

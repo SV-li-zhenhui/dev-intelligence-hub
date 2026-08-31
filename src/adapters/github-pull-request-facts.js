@@ -113,6 +113,8 @@ const VIEW_TARGET_KEYS = Object.freeze([
   "headRepository",
   "headRepositoryOwner",
 ]);
+const VIEW_TARGET_STATE_KEYS = Object.freeze([...VIEW_TARGET_KEYS, "state"]);
+const PULL_REQUEST_STATES = new Set(["OPEN", "CLOSED", "MERGED"]);
 const VIEW_REPOSITORY_KEYS = Object.freeze(["id", "name", "nameWithOwner"]);
 const VIEW_OWNER_KEYS = Object.freeze(["id", "name", "login"]);
 const CONNECTION_KEYS = Object.freeze(["nodes", "pageInfo"]);
@@ -751,6 +753,35 @@ export function githubViewPullRequestTarget(response, identity) {
     "PR target response",
     headRepositoryName,
   );
+}
+
+export function githubViewPullRequestTargetState(response, identity) {
+  const fields = exactDataMap(
+    response,
+    VIEW_TARGET_STATE_KEYS,
+    "PR target response",
+  );
+  const state = fields.get("state");
+  if (typeof state !== "string" || !PULL_REQUEST_STATES.has(state)) {
+    throw invalid("PR target response.state is invalid");
+  }
+  const binding = identity.executionBinding;
+  const headRepositoryName = viewHeadRepositoryName(
+    fields.get("headRepository"),
+    fields.get("headRepositoryOwner"),
+  );
+  return {
+    target: targetFromFields(
+      fields,
+      {
+        baseRepository: binding.repository,
+        sourceAccountId: binding.gitTarget.sourceAccountId,
+      },
+      "PR target response",
+      headRepositoryName,
+    ),
+    state,
+  };
 }
 
 function factInputBytes(value) {

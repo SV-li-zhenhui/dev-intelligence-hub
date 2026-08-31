@@ -12,7 +12,7 @@ import { normalizeEffectivePullRequestUpdatedWindow } from "../domain/pull-reque
 import {
   GITHUB_PULL_REQUEST_FACTS_QUERY,
   githubGraphPullRequestTarget,
-  githubViewPullRequestTarget,
+  githubViewPullRequestTargetState,
   projectGitHubPullRequestFacts,
 } from "./github-pull-request-facts.js";
 
@@ -263,6 +263,18 @@ function staleReadFacts() {
       name: "GitHubReadError",
       code: "PR_FACTS_STALE",
       statusCode: 409,
+    },
+  );
+}
+
+function terminalReadFacts(state) {
+  return Object.assign(
+    new Error(`PR entered terminal state ${state} while reading facts`),
+    {
+      name: "GitHubReadError",
+      code: "PR_FACTS_TERMINAL",
+      statusCode: 409,
+      terminalState: state,
     },
   );
 }
@@ -1315,14 +1327,15 @@ export class GitHubAdapter {
       this.currentUser(commandOptions),
       this.run(
         "gh",
-        ["pr", "view", url, "--json", PR_TARGET_FIELDS],
+        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
         commandOptions,
       ),
     ]);
-    const initialTarget = githubViewPullRequestTarget(initialResponse, identity);
+    const initial = githubViewPullRequestTargetState(initialResponse, identity);
+    if (initial.state !== "OPEN") throw terminalReadFacts(initial.state);
     if (
       !sameGitHubAccount(initialAccount, target.sourceAccountId) ||
-      !sameObservedReadTarget(initialTarget, identity)
+      !sameObservedReadTarget(initial.target, identity)
     ) {
       throw staleReadFacts();
     }
@@ -1369,15 +1382,16 @@ export class GitHubAdapter {
     const [latestResponse, finalAccount] = await Promise.all([
       this.run(
         "gh",
-        ["pr", "view", url, "--json", PR_TARGET_FIELDS],
+        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
         commandOptions,
       ),
       this.currentUser(commandOptions),
     ]);
-    const latestTarget = githubViewPullRequestTarget(latestResponse, identity);
+    const latest = githubViewPullRequestTargetState(latestResponse, identity);
+    if (latest.state !== "OPEN") throw terminalReadFacts(latest.state);
     if (
       !sameGitHubAccount(finalAccount, target.sourceAccountId) ||
-      !sameObservedReadTarget(latestTarget, identity)
+      !sameObservedReadTarget(latest.target, identity)
     ) {
       throw staleReadFacts();
     }
