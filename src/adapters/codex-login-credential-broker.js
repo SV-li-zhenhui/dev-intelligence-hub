@@ -627,6 +627,8 @@ function createBroker(rawOptions, rawDependencies) {
   const dependencies = brokerDependencies(rawDependencies);
   const queue = createAdmissionQueue();
   let statusFlight = null;
+  let stagedTaskToken = null;
+  let closing = false;
 
   async function prepareProbeRoot(signal) {
     assertIsolatedProbeRoot(options.probeRoot, options.protectedRoots);
@@ -1069,6 +1071,7 @@ function createBroker(rawOptions, rawDependencies) {
         throwIfCancelled(signal);
         codexHome = await prepareCodexHome(invocation, signal);
         await dependencies.store.stageTask({ snapshot, codexHome, signal });
+        if (!released && !closing) stagedTaskToken = token;
         return Object.freeze({ codexHome: codexHome.path });
       } catch (error) {
         throw mapTaskFailure(error, signal);
@@ -1104,6 +1107,7 @@ function createBroker(rawOptions, rawDependencies) {
         throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
       }
       released = true;
+      if (stagedTaskToken === token) stagedTaskToken = null;
       queue.leave(token, { safe: request.safe });
     }
 
@@ -1278,8 +1282,18 @@ function createBroker(rawOptions, rawDependencies) {
     } catch (error) {
       return statusProjection(statusStateFor(error, callerSignal));
     }
-    const flight = statusFlight ?? beginStatusFlight();
-    return subscribeToStatusFlight(flight, callerSignal);
+    const flight = statusFlight;
+    if (flight !== null) return subscribeToStatusFlight(flight, callerSignal);
+    // A generation with a successfully staged credential lease already holds
+    // a validated credential snapshot. Waiting for its entire model call just
+    // to perform a second diagnostic probe makes the status endpoint block on
+    // normal work and provides no stronger readiness signal. Mere queue
+    // ownership is not enough: beginTask and stage may still fail.
+    if (!closing && stagedTaskToken !== null) {
+      return statusProjection("available");
+    }
+    const nextFlight = beginStatusFlight();
+    return subscribeToStatusFlight(nextFlight, callerSignal);
   }
 
   async function checkAvailability(rawRequest = {}) {
@@ -1371,7 +1385,9 @@ function createBroker(rawOptions, rawDependencies) {
     try {
       const request = exactRecord(rawRequest, [], ["signal"]);
       signal = normalizeSignal(request.signal, { optional: true });
+      closing = true;
       queue.closeAdmission();
+      stagedTaskToken = null;
       if (signal?.aborted) throw brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
       await queue.waitUntilIdle(signal);
     } catch (error) {

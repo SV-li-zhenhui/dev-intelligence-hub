@@ -44,6 +44,8 @@ test("CodexCliSessionStore persists one isolated profile per entity across resta
   );
   await mkdir(path.join(sourceHome, "sqlite"));
   await writeFile(path.join(sourceHome, "sqlite", "codex-dev.db"), "thread index");
+  await writeFile(path.join(sourceHome, "history.jsonl"), "history index");
+  await writeFile(path.join(sourceHome, "session_index.jsonl"), "session index");
   await writeFile(path.join(sourceHome, "auth.json"), "must not persist");
   await writeFile(path.join(sourceHome, "config.toml"), "must not persist");
   const key = "github:pull_request:svisions/oct-software#24256";
@@ -78,18 +80,17 @@ test("CodexCliSessionStore persists one isolated profile per entity across resta
     ),
     "session transcript",
   );
-  assert.equal(
-    await readFile(path.join(restoredHome, "state_5.sqlite"), "utf8"),
-    "sqlite state",
-  );
-  assert.equal(
-    await readFile(path.join(restoredHome, "thread_history_1.sqlite"), "utf8"),
-    "thread history",
-  );
-  assert.equal(
-    await readFile(path.join(restoredHome, "sqlite", "codex-dev.db"), "utf8"),
-    "thread index",
-  );
+  for (const unsupported of [
+    "state_5.sqlite",
+    "thread_history_1.sqlite",
+    path.join("sqlite", "codex-dev.db"),
+    "history.jsonl",
+    "session_index.jsonl",
+  ]) {
+    await assert.rejects(readFile(path.join(restoredHome, unsupported)), {
+      code: "ENOENT",
+    });
+  }
   await assert.rejects(readFile(path.join(restoredHome, "auth.json")), {
     code: "ENOENT",
   });
@@ -125,6 +126,48 @@ test("CodexCliSessionStore never shares history between different entities", asy
   await assert.rejects(readFile(path.join(otherHome, "sessions", "rollout.jsonl")), {
     code: "ENOENT",
   });
+});
+
+test("CodexCliSessionStore does not resume a rollout retained only in archived_sessions", async (t) => {
+  const parent = await temporaryDirectory(t, "codex-session-archive-");
+  const root = path.join(parent, "store");
+  const sourceHome = path.join(parent, "source-home");
+  const sessionId = "archived-session";
+  await mkdir(path.join(sourceHome, "archived_sessions", "2026", "08", "31"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(
+      sourceHome,
+      "archived_sessions",
+      "2026",
+      "08",
+      "31",
+      `rollout-${sessionId}.jsonl`,
+    ),
+    "archived history",
+  );
+  const store = new CodexCliSessionStore({ root });
+  const sessionKey = "github:issue:svisions/oct-product#2";
+
+  await store.capture({ sessionKey, sessionId, codexHome: sourceHome });
+
+  const restoredHome = path.join(parent, "restored-home");
+  assert.equal(
+    (await store.stage({ sessionKey, codexHome: restoredHome })).sessionId,
+    null,
+  );
+  await assert.rejects(
+    readFile(path.join(
+      restoredHome,
+      "archived_sessions",
+      "2026",
+      "08",
+      "31",
+      `rollout-${sessionId}.jsonl`,
+    )),
+    { code: "ENOENT" },
+  );
 });
 
 test("CodexCliSessionStore preserves older entity sessions", async (t) => {

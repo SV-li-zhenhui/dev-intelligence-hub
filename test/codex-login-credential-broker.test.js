@@ -639,6 +639,95 @@ test("checkAvailability treats an admitted credential operation as busy, not una
   assert.equal(current.calls.stageProbe.length, 0);
   assert.equal(current.calls.process.length, 0);
   lease.release({ safe: true });
+
+  assert.equal((await current.broker.readStatus({ signal })).state, "available");
+  assert.equal(current.calls.stageProbe.length, 1);
+  assert.equal(current.calls.process.length, 1);
+  await current.broker.close();
+});
+
+test("readStatus treats an admitted credential operation as available without queuing a probe", async (t) => {
+  const current = await fixture(t);
+  const signal = new AbortController().signal;
+  const lease = await current.broker.acquire({ signal });
+  await lease.stage({ invocation: current.invocation, signal });
+
+  const status = await current.broker.readStatus({ signal });
+
+  assert.deepEqual(status, {
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+  });
+  assert.equal(current.calls.beginTask.length, 1);
+  assert.equal(current.calls.stageTask.length, 1);
+  assert.equal(current.calls.stageProbe.length, 0);
+  assert.equal(current.calls.process.length, 0);
+  lease.release({ safe: true });
+  await current.broker.close();
+});
+
+test("readStatus waits for an un-staged active lease instead of reporting available", async (t) => {
+  const current = await fixture(t);
+  const signal = new AbortController().signal;
+  const lease = await current.broker.acquire({ signal });
+  const status = current.broker.readStatus({ signal });
+  const pending = Symbol("status is queued");
+
+  assert.equal(
+    await Promise.race([status, Promise.resolve(pending)]),
+    pending,
+  );
+  assert.equal(current.calls.stageProbe.length, 0);
+  assert.equal(current.calls.process.length, 0);
+
+  lease.release({ safe: true });
+  assert.deepEqual(await status, {
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+  });
+  assert.equal(current.calls.stageProbe.length, 1);
+  assert.equal(current.calls.process.length, 1);
+  await current.broker.close();
+});
+
+test("readStatus does not report available while beginTask is still failing", async (t) => {
+  const beginStarted = deferred();
+  const releaseBegin = deferred();
+  let probes = 0;
+  const current = await fixture(t, {
+    store: {
+      async beginTask() {
+        beginStarted.resolve();
+        await releaseBegin.promise;
+        throw brokerFailure("CODEX_LOGIN_FILE_UNAVAILABLE");
+      },
+      async stageTask() {},
+      async captureTask() {},
+      async stageProbe() { probes += 1; },
+    },
+  });
+  const signal = new AbortController().signal;
+  const acquisition = current.broker.acquire({ signal });
+  await beginStarted.promise;
+  const status = current.broker.readStatus({ signal });
+  const pending = Symbol("status is queued");
+
+  assert.equal(
+    await Promise.race([status, Promise.resolve(pending)]),
+    pending,
+  );
+  releaseBegin.resolve();
+
+  await assert.rejects(acquisition, {
+    code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+  });
+  assert.equal((await status).state, "available");
+  assert.equal(probes, 1);
+  assert.equal(current.calls.process.length, 1);
   await current.broker.close();
 });
 

@@ -15,7 +15,10 @@ import path from "node:path";
 
 import { normalizeSessionKey } from "../lib/session-key.js";
 
-const PROFILE_ENTRY = /^(?:sessions|archived_sessions|sqlite|history\.jsonl|session_index\.jsonl|(?:state|thread_history)(?:_\d+)?\.sqlite(?:-(?:shm|wal))?)$/u;
+// Codex's SQLite and JSON index files contain paths into the transient
+// invocation profile. Only active rollout files can be resumed from a new
+// isolated CODEX_HOME instance.
+const PROFILE_ENTRY = /^sessions$/u;
 const MAX_SESSION_ID_BYTES = 128;
 const MAX_PROFILE_FILES = 20_000;
 const MAX_PROFILE_BYTES = 512 * 1024 * 1024;
