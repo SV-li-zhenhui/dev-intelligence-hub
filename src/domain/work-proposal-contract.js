@@ -47,6 +47,7 @@ const TERMINAL_STATUSES = new Set(WORK_PROPOSAL_TERMINAL_STATUSES);
 const RUNNER_NEXT_STATUSES = new Set(
   WORK_PROPOSAL_STATUSES.filter((status) => status !== "pending_delivery"),
 );
+const DEFAULT_WORK_PROPOSAL_ERROR = Symbol("defaultWorkProposalError");
 
 function compareCodeUnits(left, right) {
   if (left < right) return -1;
@@ -71,6 +72,10 @@ function invalid(message = "工作提案无效") {
   return workProposalError("INVALID_WORK_PROPOSAL", message);
 }
 
+function resolvedWorkProposalError(error) {
+  return error === DEFAULT_WORK_PROPOSAL_ERROR ? invalid() : error;
+}
+
 function invalidRunnerRequest(message = "工作提案 runner 请求无效") {
   return workProposalError("INVALID_WORK_PROPOSAL_RUNNER_REQUEST", message);
 }
@@ -88,8 +93,11 @@ function isPlainObject(value) {
   );
 }
 
-export function workProposalDataEntries(value, error = invalid()) {
-  if (!isPlainObject(value)) throw error;
+export function workProposalDataEntries(
+  value,
+  error = DEFAULT_WORK_PROPOSAL_ERROR,
+) {
+  if (!isPlainObject(value)) throw resolvedWorkProposalError(error);
   const entries = [];
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -99,20 +107,24 @@ export function workProposalDataEntries(value, error = invalid()) {
       !descriptor?.enumerable ||
       !("value" in descriptor)
     ) {
-      throw error;
+      throw resolvedWorkProposalError(error);
     }
     entries.push([key, descriptor.value]);
   }
   return entries;
 }
 
-export function assertWorkProposalExactKeys(value, expected, error = invalid()) {
+export function assertWorkProposalExactKeys(
+  value,
+  expected,
+  error = DEFAULT_WORK_PROPOSAL_ERROR,
+) {
   const keys = workProposalDataEntries(value, error).map(([key]) => key);
   if (
     keys.length !== expected.length ||
     expected.some((key) => !keys.includes(key))
   ) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   return value;
 }
@@ -123,19 +135,25 @@ function assertAllowedKeys(value, allowed, error) {
   return value;
 }
 
-export function workProposalArrayValues(value, maximumLength, error = invalid()) {
+export function workProposalArrayValues(
+  value,
+  maximumLength,
+  error = DEFAULT_WORK_PROPOSAL_ERROR,
+) {
   if (
     !Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Array.prototype ||
     value.length > maximumLength ||
     Reflect.ownKeys(value).length !== value.length + 1
   ) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   const result = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, `${index}`);
-    if (!descriptor?.enumerable || !("value" in descriptor)) throw error;
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw resolvedWorkProposalError(error);
+    }
     result.push(descriptor.value);
   }
   return result;
@@ -148,11 +166,11 @@ export function boundedWorkProposalText(
     minimumBytes = 1,
     maximumBytes = 256,
     pattern = null,
-    error = invalid(),
+    error = DEFAULT_WORK_PROPOSAL_ERROR,
   } = {},
 ) {
   if (typeof value !== "string" || INVALID_TEXT_CONTROL.test(value)) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   const bytes = Buffer.byteLength(value, "utf8");
   if (
@@ -160,7 +178,7 @@ export function boundedWorkProposalText(
     bytes > maximumBytes ||
     (pattern && !pattern.test(value))
   ) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   return value;
 }
@@ -171,7 +189,7 @@ export function safeWorkProposalInteger(
   {
     minimum = 0,
     maximum = Number.MAX_SAFE_INTEGER,
-    error = invalid(),
+    error = DEFAULT_WORK_PROPOSAL_ERROR,
   } = {},
 ) {
   if (
@@ -180,7 +198,7 @@ export function safeWorkProposalInteger(
     value < minimum ||
     value > maximum
   ) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   return value;
 }
@@ -246,7 +264,10 @@ export function workProposalDigest(value) {
     .digest("hex");
 }
 
-export function normalizeWorkProposalDigest(value, error = invalid()) {
+export function normalizeWorkProposalDigest(
+  value,
+  error = DEFAULT_WORK_PROPOSAL_ERROR,
+) {
   return boundedWorkProposalText(value, "contentDigest", {
     maximumBytes: 64,
     pattern: SHA256,
@@ -289,12 +310,15 @@ export function assertWorkProposalAuthorityBinding(
   return target;
 }
 
-export function normalizeWorkProposalTimestamp(value, error = invalid()) {
+export function normalizeWorkProposalTimestamp(
+  value,
+  error = DEFAULT_WORK_PROPOSAL_ERROR,
+) {
   let timestamp;
   try {
     timestamp = value instanceof Date ? value.toISOString() : value;
   } catch {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   if (
     typeof timestamp !== "string" ||
@@ -302,7 +326,7 @@ export function normalizeWorkProposalTimestamp(value, error = invalid()) {
     !Number.isFinite(Date.parse(timestamp)) ||
     new Date(Date.parse(timestamp)).toISOString() !== timestamp
   ) {
-    throw error;
+    throw resolvedWorkProposalError(error);
   }
   return timestamp;
 }
@@ -310,7 +334,7 @@ export function normalizeWorkProposalTimestamp(value, error = invalid()) {
 export function normalizeWorkProposalReference(
   value,
   name,
-  { maximumBytes = 192, error = invalid() } = {},
+  { maximumBytes = 192, error = DEFAULT_WORK_PROPOSAL_ERROR } = {},
 ) {
   return boundedWorkProposalText(value, name, {
     maximumBytes,
@@ -319,7 +343,7 @@ export function normalizeWorkProposalReference(
   });
 }
 
-function normalizeRequestedBy(value, error = invalid()) {
+function normalizeRequestedBy(value, error = DEFAULT_WORK_PROPOSAL_ERROR) {
   assertWorkProposalExactKeys(value, ["roleId", "workItemId"], error);
   return {
     roleId: boundedWorkProposalText(value.roleId, "requestedBy.roleId", {
@@ -335,7 +359,7 @@ function normalizeRequestedBy(value, error = invalid()) {
   };
 }
 
-function normalizeSource(value, error = invalid()) {
+function normalizeSource(value, error = DEFAULT_WORK_PROPOSAL_ERROR) {
   assertWorkProposalExactKeys(value, ["assignmentId", "eventId"], error);
   return {
     assignmentId: boundedWorkProposalText(value.assignmentId, "source.assignmentId", {

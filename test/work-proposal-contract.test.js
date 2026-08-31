@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 import {
   assertWorkProposalAuthorityBinding,
   normalizeBoundWorkProposal,
@@ -24,6 +26,54 @@ function boundProposal(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+async function observePrimitiveErrorAllocation() {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const NativeError = globalThis.Error;
+    let allocations = 0;
+    globalThis.Error = class CountingError extends NativeError {
+      constructor(...args) {
+        super(...args);
+        allocations += 1;
+      }
+    };
+
+    void import(workerData).then((contract) => {
+      allocations = 0;
+      contract.workProposalDataEntries({ value: 1 });
+      contract.workProposalArrayValues([1], 1);
+      contract.boundedWorkProposalText("valid", "value");
+      contract.safeWorkProposalInteger(1, "value");
+      const validAllocations = allocations;
+      let failure = null;
+      try {
+        contract.boundedWorkProposalText("", "value");
+      } catch (error) {
+        failure = { code: error.code, name: error.name };
+      }
+      parentPort.postMessage({
+        validAllocations,
+        invalidAllocations: allocations - validAllocations,
+        failure,
+      });
+    }, (error) => {
+      parentPort.postMessage({ importError: error.message });
+    });
+  `, {
+    eval: true,
+    workerData: new URL(
+      "../src/domain/work-proposal-contract.js",
+      import.meta.url,
+    ).href,
+  });
+  const exit = once(worker, "exit");
+  const [observation] = await once(worker, "message");
+  const [exitCode] = await exit;
+  assert.equal(exitCode, 0);
+  assert.equal(observation.importError, undefined);
+  return observation;
 }
 
 test("proposal authority binding has one task, role, and dispatch validator", () => {
@@ -109,6 +159,19 @@ test("bound proposals are canonical pure data with a stable content digest", () 
       ),
     (error) => error.code === "INVALID_WORK_PROPOSAL",
   );
+});
+
+test("valid proposal primitives allocate their default error only on failure", async () => {
+  const observation = await observePrimitiveErrorAllocation();
+
+  assert.deepEqual(observation, {
+    validAllocations: 0,
+    invalidAllocations: 1,
+    failure: {
+      code: "INVALID_WORK_PROPOSAL",
+      name: "WorkProposalError",
+    },
+  });
 });
 
 test("runner transitions expose only bounded lifecycle variants", () => {

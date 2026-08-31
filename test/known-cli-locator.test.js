@@ -208,15 +208,15 @@ test("known CLI locator enforces tested package version ranges", async (t) => {
   const futureCodex = await npmCliLayout(futureCodexRoot, "codex-cli");
   await writeJson(path.join(futureCodex.packageRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.150.0",
+    version: "0.152.0",
     bin: { codex: "bin/codex.js" },
     optionalDependencies: {
-      "@openai/codex-win32-x64": "npm:@openai/codex@0.150.0-win32-x64",
+      "@openai/codex-win32-x64": "npm:@openai/codex@0.152.0-win32-x64",
     },
   });
   await writeJson(path.join(futureCodex.nativeRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.150.0-win32-x64",
+    version: "0.152.0-win32-x64",
     os: ["win32"],
     cpu: ["x64"],
   });
@@ -274,20 +274,20 @@ test("known CLI locator enforces tested package version ranges", async (t) => {
   );
 });
 
-test("known CLI locator accepts the validated Codex 0.149 line", async (t) => {
-  const directory = await temporaryDirectory(t, "known-cli-codex-0149-");
+test("known CLI locator accepts the validated Codex 0.151 line", async (t) => {
+  const directory = await temporaryDirectory(t, "known-cli-codex-0151-");
   const layout = await npmCliLayout(directory, "codex-cli");
   await writeJson(path.join(layout.packageRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.149.1",
+    version: "0.151.0",
     bin: { codex: "bin/codex.js" },
     optionalDependencies: {
-      "@openai/codex-win32-x64": "npm:@openai/codex@0.149.1-win32-x64",
+      "@openai/codex-win32-x64": "npm:@openai/codex@0.151.0-win32-x64",
     },
   });
   await writeJson(path.join(layout.nativeRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.149.1-win32-x64",
+    version: "0.151.0-win32-x64",
     os: ["win32"],
     cpu: ["x64"],
   });
