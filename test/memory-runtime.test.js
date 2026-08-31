@@ -137,7 +137,7 @@ test("memory runtime exposes least-authority frozen ports and closes once", asyn
   assert.deepEqual(events.filter((event) => event === "close"), ["close"]);
 });
 
-test("standalone memory rejects a recovered legacy PR journal", async () => {
+test("standalone memory stays available after dropping non-citable legacy PR history", async () => {
   const events = [];
   const persistedStore = store();
   const writer = await createMemoryRuntime({
@@ -154,18 +154,13 @@ test("standalone memory rejects a recovered legacy PR journal", async () => {
     store: persistedStore,
     createGuard: () => guard(events),
   });
-  for (const operation of [
-    () => restarted.search.search({ q: "Legacy PR" }),
-    () => restarted.search.getHealth(),
-    () => restarted.contextReader.readRecords({ recordIds: [legacy.recordId] }),
-  ]) {
-    await assert.rejects(
-      operation,
-      (error) =>
-        error.code === "MEMORY_AUTHORITY_NOT_CURRENT" &&
-        error.statusCode === 503,
-    );
-  }
+  assert.deepEqual((await restarted.search.search({ q: "Legacy PR" })).items, []);
+  assert.equal((await restarted.search.getHealth()).ready, true);
+  await assert.rejects(
+    restarted.contextReader.readRecords({ recordIds: [legacy.recordId] }),
+    (error) =>
+      error.code === "MEMORY_RECORD_NOT_FOUND" && error.statusCode === 404,
+  );
   await restarted.close();
 });
 

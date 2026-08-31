@@ -22,6 +22,7 @@ const MAX_WORK_ITEM_BATCH = 20_000;
 const MAX_READ_RECORDS = 20;
 const DEFAULT_MAX_RECORDS = 20_000;
 const DEFAULT_MAX_STATE_BYTES = 64 * 1024 * 1024;
+const CAPACITY_WARNING_RATIO = 0.8;
 const MAX_INDEX_ASSOCIATIONS = 250_000;
 const MAX_RECORD_INDEX_TOKENS = 4_096;
 const MAX_AUTHORITY_PROJECTION_ENTRIES = 100_000;
@@ -57,6 +58,10 @@ const AUTHORITY_BOUND_PROJECTION_SOURCES = new Set([
   "consultation-result",
   "confirmation",
   "external-result",
+]);
+const NON_CITABLE_HISTORY_SOURCES = new Set([
+  "work-timeline",
+  "legacy-pr-memory",
 ]);
 const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -1455,6 +1460,92 @@ function recordLabels(record, supersededIds) {
   };
 }
 
+function lifecycleProtectedRecordIds(lifecycleAuthority) {
+  return new Set([
+    ...lifecycleAuthority.graphReceipts.map(
+      ({ memoryRecordId }) => memoryRecordId,
+    ),
+    ...lifecycleAuthority.workItemAttestations.map(({ recordId }) => recordId),
+    ...lifecycleAuthority.authorityProjection.entries.map(
+      ({ recordId }) => recordId,
+    ),
+  ]);
+}
+
+function isNonCitableHistoryRecord(record) {
+  if (
+    !NON_CITABLE_HISTORY_SOURCES.has(record.source.kind) ||
+    !record.tags.includes("derived") ||
+    !record.tags.includes("obsolete")
+  ) {
+    return false;
+  }
+  try {
+    projectionRecord(record);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function nonCitableHistoryRecordIds(records, lifecycleAuthority) {
+  const protectedIds = lifecycleProtectedRecordIds(lifecycleAuthority);
+  return new Set(records.flatMap((record) => {
+    if (
+      !isNonCitableHistoryRecord(record) ||
+      protectedIds.has(record.recordId)
+    ) {
+      return [];
+    }
+    return [record.recordId];
+  }));
+}
+
+function overJournalCapacity(journal, stateBytes, limits) {
+  return journal.records.length > limits.maximumRecords ||
+    stateBytes > limits.maximumStateBytes;
+}
+
+function prepareJournalCandidate(
+  candidate,
+  limits,
+  { compactNonCitableHistory = false } = {},
+) {
+  let records = candidate.records;
+  const initialCompactionIds = compactNonCitableHistory
+    ? nonCitableHistoryRecordIds(records, candidate.lifecycleAuthority)
+    : new Set();
+  if (initialCompactionIds.size > 0) {
+    records = records.filter(
+      ({ recordId }) => !initialCompactionIds.has(recordId),
+    );
+  }
+  let journal = { ...candidate, records };
+  let stateBytes = journal.records.length > limits.maximumRecords
+    ? Number.POSITIVE_INFINITY
+    : serializedBytes(journal);
+  if (overJournalCapacity(journal, stateBytes, limits)) {
+    const compactableIds = nonCitableHistoryRecordIds(
+      journal.records,
+      journal.lifecycleAuthority,
+    );
+    if (compactableIds.size > 0) {
+      journal = {
+        ...journal,
+        records: journal.records.filter(
+          ({ recordId }) => !compactableIds.has(recordId),
+        ),
+      };
+      stateBytes = serializedBytes(journal);
+    }
+  }
+  return { journal, stateBytes };
+}
+
+function capacityRatio(used, maximum) {
+  return Math.round((used / maximum) * 10_000) / 10_000;
+}
+
 function newestFirst(left, right) {
   return (
     right.occurredAt.localeCompare(left.occurredAt, "en") ||
@@ -1885,17 +1976,15 @@ function applyMemoryAuthorityProjectionCandidateCore(
     records: [...recordsById.values()],
     lifecycleAuthority,
   };
-  if (
-    candidate.records.length > limits.maximumRecords ||
-    serializedBytes(candidate) > limits.maximumStateBytes
-  ) {
+  const prepared = prepareJournalCandidate(candidate, limits);
+  if (overJournalCapacity(prepared.journal, prepared.stateBytes, limits)) {
     throw memoryError(
       "MEMORY_CAPACITY_EXCEEDED",
       "统一记忆已达到本地容量上限",
       507,
     );
   }
-  return normalizeJournal(candidate, limits);
+  return normalizeJournal(prepared.journal, limits);
 }
 
 export function applyMemoryAuthorityProjectionCandidate(
@@ -1938,6 +2027,8 @@ export class LocalMemoryJournal {
   #ready = false;
   #recovering = null;
   #lastIndexError = "";
+  #stateBytes = serializedBytes(emptyJournal());
+  #reclaimableRecordCount = 0;
 
   constructor({
     store,
@@ -1988,6 +2079,11 @@ export class LocalMemoryJournal {
           journal.records,
           journal.lifecycleAuthority,
         );
+        this.#stateBytes = serializedBytes(journal);
+        this.#reclaimableRecordCount = nonCitableHistoryRecordIds(
+          journal.records,
+          journal.lifecycleAuthority,
+        ).size;
         this.#index = built.tokenMap;
         this.#indexComplete = built.complete;
         this.#lastIndexError = "";
@@ -2200,7 +2296,39 @@ export class LocalMemoryJournal {
     }
     records.forEach(projectionRecord);
     return this.#operationQueue.enqueue(() =>
-      this.#exclusiveLease.run(() => this.#append(records)),
+      this.#exclusiveLease.run(async () => {
+        const discardedIds = new Set(
+          records.filter(isNonCitableHistoryRecord).map(
+            ({ recordId }) => recordId,
+          ),
+        );
+        const retained = records.filter(
+          ({ recordId }) => !discardedIds.has(recordId),
+        );
+        const result = await this.#append(
+          retained,
+          this.#journal.lifecycleAuthority,
+          {
+            compactNonCitableHistory:
+              this.#reclaimableRecordCount > 0,
+          },
+        );
+        const receiptsById = new Map();
+        for (const receipt of result.items) {
+          const receipts = receiptsById.get(receipt.recordId) ?? [];
+          receipts.push(receipt);
+          receiptsById.set(receipt.recordId, receipts);
+        }
+        return {
+          ...result,
+          items: records.map((record) => {
+            if (discardedIds.has(record.recordId)) {
+              return { recordId: record.recordId, created: false };
+            }
+            return receiptsById.get(record.recordId).shift();
+          }),
+        };
+      }),
     );
   }
 
@@ -2429,10 +2557,27 @@ export class LocalMemoryJournal {
 
   getHealth() {
     this.#assertReady();
+    const recordCapacityRatio = capacityRatio(
+      this.#journal.records.length,
+      this.#limits.maximumRecords,
+    );
+    const stateCapacityRatio = capacityRatio(
+      this.#stateBytes,
+      this.#limits.maximumStateBytes,
+    );
     return Object.freeze({
       ready: true,
       revision: this.#journal.revision,
       recordCount: this.#journal.records.length,
+      maximumRecords: this.#limits.maximumRecords,
+      stateBytes: this.#stateBytes,
+      maximumStateBytes: this.#limits.maximumStateBytes,
+      recordCapacityRatio,
+      stateCapacityRatio,
+      capacityWarning:
+        recordCapacityRatio >= CAPACITY_WARNING_RATIO ||
+        stateCapacityRatio >= CAPACITY_WARNING_RATIO,
+      reclaimableRecordCount: this.#reclaimableRecordCount,
       indexHealthy: !this.#lastIndexError,
       lastIndexError: this.#lastIndexError,
     });
@@ -2615,55 +2760,86 @@ export class LocalMemoryJournal {
   async #append(
     records,
     lifecycleAuthority = this.#journal.lifecycleAuthority,
+    { compactNonCitableHistory = false } = {},
   ) {
     this.#assertReady();
+    const initialById = this.#recordsById;
     const byId = new Map(this.#recordsById);
-    const receipts = [];
-    let added = 0;
+    const requestedCreations = [];
     for (const record of records) {
       const existing = byId.get(record.recordId);
       if (existing) {
         if (existing.contentDigest !== record.contentDigest) {
           throw memoryError("MEMORY_ID_CONFLICT", "统一记忆 ID 冲突", 409);
         }
-        receipts.push({ recordId: record.recordId, created: false });
+        requestedCreations.push(false);
         continue;
       }
       byId.set(record.recordId, record);
-      receipts.push({ recordId: record.recordId, created: true });
-      added += 1;
+      requestedCreations.push(true);
     }
     const authorityChanged = !isDeepStrictEqual(
       lifecycleAuthority,
       this.#journal.lifecycleAuthority,
     );
-    if (!added && !authorityChanged) {
+    if (
+      !requestedCreations.some(Boolean) &&
+      !authorityChanged &&
+      !compactNonCitableHistory
+    ) {
+      const receipts = records.map(({ recordId }) => ({
+        recordId,
+        created: false,
+      }));
       return { added: 0, items: structuredClone(receipts), health: this.getHealth() };
     }
-    const candidate = {
+    const prepared = prepareJournalCandidate({
       schemaVersion: 2,
       revision: this.#journal.revision + 1,
       records: [...byId.values()],
       lifecycleAuthority,
-    };
-    if (
-      candidate.records.length > this.#limits.maximumRecords ||
-      serializedBytes(candidate) > this.#limits.maximumStateBytes
-    ) {
+    }, this.#limits, { compactNonCitableHistory });
+    if (overJournalCapacity(
+      prepared.journal,
+      prepared.stateBytes,
+      this.#limits,
+    )) {
       throw memoryError(
         "MEMORY_CAPACITY_EXCEEDED",
         "统一记忆已达到本地容量上限",
         507,
       );
     }
-    await this.#store.write(MEMORY_JOURNAL_KEY, candidate);
-    this.#journal = candidate;
-    this.#recordsById = byId;
-    this.#supersededIds = supersededRecordIds(
-      candidate.records,
-      candidate.lifecycleAuthority,
+    const persistedById = new Map(
+      prepared.journal.records.map((record) => [record.recordId, record]),
     );
-    const built = buildIndex(candidate.records, candidate.revision);
+    const receipts = records.map((record, index) => ({
+      recordId: record.recordId,
+      created:
+        requestedCreations[index] && persistedById.has(record.recordId),
+    }));
+    const added = receipts.filter(({ created }) => created).length;
+    const recordsChanged = persistedById.size !== initialById.size ||
+      [...persistedById.keys()].some((recordId) => !initialById.has(recordId));
+    if (!recordsChanged && !authorityChanged) {
+      return { added, items: structuredClone(receipts), health: this.getHealth() };
+    }
+    await this.#store.write(MEMORY_JOURNAL_KEY, prepared.journal);
+    this.#journal = prepared.journal;
+    this.#recordsById = persistedById;
+    this.#stateBytes = prepared.stateBytes;
+    this.#supersededIds = supersededRecordIds(
+      prepared.journal.records,
+      prepared.journal.lifecycleAuthority,
+    );
+    this.#reclaimableRecordCount = nonCitableHistoryRecordIds(
+      prepared.journal.records,
+      prepared.journal.lifecycleAuthority,
+    ).size;
+    const built = buildIndex(
+      prepared.journal.records,
+      prepared.journal.revision,
+    );
     this.#index = built.tokenMap;
     this.#indexComplete = built.complete;
     this.#lastIndexError = "";

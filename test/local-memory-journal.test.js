@@ -505,7 +505,7 @@ test("ordinary producers cannot forge lifecycle sources or supersession markers"
   assert.equal(journal.getHealth().recordCount, 0);
 });
 
-test("projector-only timeline and legacy PR records require the trusted port", async () => {
+test("projector-only history keeps citable timeline records and drops non-citable PR noise", async () => {
   const { store, journal } = await fixture();
   const timeline = record(1, {
     source: { kind: "work-timeline", id: "timeline-pr-42" },
@@ -545,36 +545,121 @@ test("projector-only timeline and legacy PR records require the trusted port", a
       (error) => error.code === "MEMORY_LIFECYCLE_AUTHORITY_REQUIRED",
     );
   }
-  assert.deepEqual(journal.getHealth(), {
+  const emptyHealth = journal.getHealth();
+  assert.deepEqual({
+    ready: emptyHealth.ready,
+    revision: emptyHealth.revision,
+    recordCount: emptyHealth.recordCount,
+    maximumRecords: emptyHealth.maximumRecords,
+    recordCapacityRatio: emptyHealth.recordCapacityRatio,
+    capacityWarning: emptyHealth.capacityWarning,
+    reclaimableRecordCount: emptyHealth.reclaimableRecordCount,
+    indexHealthy: emptyHealth.indexHealthy,
+    lastIndexError: emptyHealth.lastIndexError,
+  }, {
     ready: true,
     revision: 0,
     recordCount: 0,
+    maximumRecords: 20_000,
+    recordCapacityRatio: 0,
+    capacityWarning: false,
+    reclaimableRecordCount: 0,
     indexHealthy: true,
     lastIndexError: "",
   });
+  assert.ok(emptyHealth.stateBytes > 0);
+  assert.equal(emptyHealth.maximumStateBytes, 64 * 1024 * 1024);
+  assert.equal(emptyHealth.stateCapacityRatio, 0);
   assert.equal(store.writes.length, writesBefore);
 
   const appended = await journal.appendProjectionRecords({
     records: [timeline, legacy, currentTimeline],
   });
-  assert.equal(appended.added, 3);
+  assert.equal(appended.added, 1);
+  assert.deepEqual(appended.items.map(({ created }) => created), [
+    false,
+    false,
+    true,
+  ]);
+  const writesAfterFirstProjection = store.writes.length;
   assert.equal((await journal.appendProjectionRecords({
     records: [timeline, legacy, currentTimeline],
   })).added, 0);
+  assert.equal(store.writes.length, writesAfterFirstProjection);
+  assert.equal(journal.getHealth().recordCount, 1);
+  assert.throws(
+    () => journal.readRecords({
+      recordIds: [normalizeMemoryRecord(timeline).recordId],
+    }),
+    (error) => error.code === "MEMORY_RECORD_NOT_FOUND",
+  );
+  assert.throws(
+    () => journal.readRecords({
+      recordIds: [normalizeMemoryRecord(legacy).recordId],
+    }),
+    (error) => error.code === "MEMORY_RECORD_NOT_FOUND",
+  );
   assert.deepEqual(
     journal.readRecords({
-      recordIds: [
-        normalizeMemoryRecord(timeline).recordId,
-        normalizeMemoryRecord(legacy).recordId,
-        normalizeMemoryRecord(currentTimeline).recordId,
-      ],
+      recordIds: [normalizeMemoryRecord(currentTimeline).recordId],
     }).items.map(({ labels }) => labels),
-    [
-      { authority: "derived", lifecycle: "obsolete" },
-      { authority: "derived", lifecycle: "obsolete" },
-      { authority: "raw", lifecycle: "current" },
-    ],
+    [{ authority: "raw", lifecycle: "current" }],
   );
+});
+
+test("recovered projection noise is compacted once without repeated batch writes", async () => {
+  const store = memoryStore();
+  const timeline = normalizeMemoryRecord(record(1, {
+    source: { kind: "work-timeline", id: "historical-pr-timeline" },
+    eventType: "timeline.assignment_intaken",
+    content: JSON.stringify({
+      details: { sourceSequence: 1 },
+      historicalOnly: true,
+      citableConclusion: false,
+    }),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken", "derived", "obsolete"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  }));
+  const legacy = normalizeMemoryRecord(record(2, {
+    source: { kind: "legacy-pr-memory", id: "legacy-pr-review" },
+    roleId: "pr-reviewer",
+    eventType: "analysis_ready",
+    evidence: [],
+    tags: ["legacy", "pr-reviewer", "derived", "obsolete"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 2,
+    records: [timeline, legacy],
+  });
+  const { journal } = await fixture({ store });
+  assert.equal(journal.getHealth().reclaimableRecordCount, 2);
+  const projectionInputs = [timeline, legacy].map((stored) => {
+    const input = structuredClone(stored);
+    delete input.recordId;
+    delete input.contentDigest;
+    return input;
+  });
+
+  const first = await journal.appendProjectionRecords({
+    records: projectionInputs,
+  });
+  const writesAfterFirst = store.writes.length;
+  const second = await journal.appendProjectionRecords({
+    records: projectionInputs,
+  });
+
+  assert.equal(first.added, 0);
+  assert.deepEqual(first.items.map(({ created }) => created), [false, false]);
+  assert.equal(journal.getHealth().recordCount, 0);
+  assert.equal(journal.getHealth().reclaimableRecordCount, 0);
+  assert.equal(second.added, 0);
+  assert.deepEqual(second.items.map(({ created }) => created), [false, false]);
+  assert.equal(store.writes.length, writesAfterFirst);
 });
 
 test("trusted projector records reject citable PR history without writing", async () => {
@@ -1092,6 +1177,86 @@ test("capacity is fail-closed and malformed journal state refuses recovery", asy
   await assert.rejects(corrupted.recover(), /摘要不一致/);
 });
 
+test("capacity pressure compacts only non-citable projected history and survives restart", async () => {
+  const store = memoryStore();
+  const historicalTimeline = normalizeMemoryRecord(record(1, {
+    source: { kind: "work-timeline", id: "historical-pr-timeline" },
+    eventType: "timeline.assignment_intaken",
+    content: JSON.stringify({
+      details: { sourceSequence: 1 },
+      historicalOnly: true,
+      citableConclusion: false,
+    }),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken", "derived", "obsolete"],
+    sourceUrl: "https://github.com/acme/repo/pull/42",
+    subjectNumber: 42,
+  }));
+  const superseded = normalizeMemoryRecord(record(2, {
+    source: { kind: "local-session", id: "derived-old" },
+    tags: ["derived"],
+  }));
+  const correction = normalizeMemoryRecord(record(3, {
+    source: { kind: "local-session", id: "derived-correction" },
+    evidence: [`supersedes:${superseded.recordId}`],
+    tags: ["testing"],
+  }));
+  const rawObsolete = normalizeMemoryRecord(record(4, {
+    source: { kind: "local-session", id: "raw-obsolete" },
+    tags: ["obsolete"],
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 4,
+    records: [
+      historicalTimeline,
+      superseded,
+      correction,
+      rawObsolete,
+    ],
+  });
+  const { journal } = await fixture({ store, maximumRecords: 4 });
+
+  const latest = await journal.append(record(5, {
+    source: { kind: "local-session", id: "latest" },
+  }));
+
+  assert.equal(latest.created, true);
+  assert.equal(journal.getHealth().recordCount, 4);
+  assert.throws(
+    () => journal.readRecords({ recordIds: [historicalTimeline.recordId] }),
+    (error) => error.code === "MEMORY_RECORD_NOT_FOUND",
+  );
+  assert.deepEqual(
+    journal.readRecords({
+      recordIds: [
+        superseded.recordId,
+        correction.recordId,
+        rawObsolete.recordId,
+        latest.recordId,
+      ],
+    }).items.map(({ record: value }) => value.recordId),
+    [
+      superseded.recordId,
+      correction.recordId,
+      rawObsolete.recordId,
+      latest.recordId,
+    ],
+  );
+  assert.ok(
+    journal.readRecords({ recordIds: [correction.recordId] })
+      .items[0].record.evidence.includes(`supersedes:${superseded.recordId}`),
+  );
+
+  const recovered = await fixture({ store, maximumRecords: 4 });
+  assert.equal(recovered.journal.getHealth().recordCount, 4);
+  assert.deepEqual(
+    recovered.journal.readRecords({ recordIds: [latest.recordId] })
+      .items[0].labels,
+    { authority: "raw", lifecycle: "current" },
+  );
+});
+
 test("one atomic journal append accepts 160 records and rejects larger or over-capacity batches", async () => {
   const { store, journal } = await fixture({ maximumRecords: 200 });
   const writesBefore = store.writes.filter((key) => key === MEMORY_JOURNAL_KEY).length;
@@ -1099,13 +1264,31 @@ test("one atomic journal append accepts 160 records and rejects larger or over-c
   const appended = await journal.appendBatch({ records: batchRecords(160) });
 
   assert.equal(appended.added, 160);
-  assert.deepEqual(journal.getHealth(), {
+  const health = journal.getHealth();
+  assert.deepEqual({
+    ready: health.ready,
+    revision: health.revision,
+    recordCount: health.recordCount,
+    maximumRecords: health.maximumRecords,
+    recordCapacityRatio: health.recordCapacityRatio,
+    capacityWarning: health.capacityWarning,
+    reclaimableRecordCount: health.reclaimableRecordCount,
+    indexHealthy: health.indexHealthy,
+    lastIndexError: health.lastIndexError,
+  }, {
     ready: true,
     revision: 1,
     recordCount: 160,
+    maximumRecords: 200,
+    recordCapacityRatio: 0.8,
+    capacityWarning: true,
+    reclaimableRecordCount: 0,
     indexHealthy: true,
     lastIndexError: "",
   });
+  assert.ok(health.stateBytes > 0);
+  assert.equal(health.maximumStateBytes, 64 * 1024 * 1024);
+  assert.ok(health.stateCapacityRatio >= 0);
   assert.equal(
     store.writes.filter((key) => key === MEMORY_JOURNAL_KEY).length,
     writesBefore + 1,

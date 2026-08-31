@@ -1600,7 +1600,7 @@ test("schema 1 memory adopts a non-zero graph checkpoint before pending events",
   assert.equal(recovered.getAuthorityState().checkpointDigest, event.eventDigest);
 });
 
-test("schema 1 recovery preserves legacy pull request timelines as historical", async () => {
+test("schema 1 recovery adopts its checkpoint without retaining non-citable PR timelines", async () => {
   const values = new Map([
     ["unified-memory-records", {
       schemaVersion: 1,
@@ -1668,27 +1668,13 @@ test("schema 1 recovery preserves legacy pull request timelines as historical", 
   const first = await projector.runCycle();
   const second = await projector.runCycle();
 
-  assert.equal(first.added, 2);
+  assert.equal(first.added, 1);
   assert.equal(second.added, 0);
   assert.equal(journal.getAuthorityState().cursor, 7);
   assert.equal(journal.getAuthorityState().workLedgerRevision, 8);
-  const timelineMatch = journal.search({
+  assert.deepEqual(journal.search({
     eventType: "timeline.assignment_intaken",
-  }).items[0];
-  const timelineRecord = journal.readRecords({
-    recordIds: [timelineMatch.id],
-  }).items[0].record;
-  assert.deepEqual(timelineRecord.tags, [
-    "timeline",
-    "assignment_intaken",
-    "derived",
-    "obsolete",
-  ]);
-  assert.deepEqual(JSON.parse(timelineRecord.content), {
-    details: { sourceSequence: 12 },
-    historicalOnly: true,
-    citableConclusion: false,
-  });
+  }).items, []);
 });
 
 test("superseded work invalidates prior work revisions and every graph delivery without deleting history", async () => {
