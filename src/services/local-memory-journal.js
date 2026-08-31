@@ -65,8 +65,53 @@ const NON_CITABLE_HISTORY_SOURCES = new Set([
   "work-timeline",
   "legacy-pr-memory",
 ]);
+const MECHANICAL_TIMELINE_DETAIL_KEYS = new Map([
+  [
+    "assignment_intaken",
+    ["assignmentId", "inputDigest", "kind", "sourceSequence"],
+  ],
+  ["claimed", ["attempt", "inputDigest", "leaseId", "leaseUntil"]],
+  [
+    "intake_completed",
+    [
+      "afterSequence",
+      "deduplicated",
+      "highWatermark",
+      "nextSequence",
+      "received",
+    ],
+  ],
+  [
+    "intent_bound",
+    ["bindingDigest", "dispatchLeaseId", "intentId"],
+  ],
+  [
+    "intent_claimed",
+    [
+      "attempt",
+      "deliverySemantics",
+      "dispatchLeaseId",
+      "dispatchLeaseUntil",
+      "intentId",
+    ],
+  ],
+  [
+    "intent_lease_expired",
+    [
+      "intentId",
+      "previousDispatchLeaseId",
+      "previousDispatchLeaseUntil",
+      "previousDispatcherId",
+    ],
+  ],
+  [
+    "lease_expired",
+    ["previousLeaseId", "previousLeaseUntil", "previousOwnerId"],
+  ],
+]);
 const SAFE_SOURCE_KIND = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_RECEIPT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const MEMORY_RECORD_REFERENCE = /memory-[a-f0-9]{64}/gu;
 const RECEIPT_KEYS = ["recordId", "contentDigest", "source"];
 const RECEIPT_SOURCE_KEYS = ["kind", "id"];
 const QUERY_KEYS = [
@@ -1503,6 +1548,155 @@ function nonCitableHistoryRecordIds(records, lifecycleAuthority) {
   }));
 }
 
+function sortedKeys(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return null;
+  }
+  return Object.keys(value).sort((left, right) =>
+    left.localeCompare(right, "en")
+  );
+}
+
+function mechanicalTimelineType(record) {
+  if (
+    record.source.kind !== "work-timeline" ||
+    record.evidence.length !== 0
+  ) {
+    return null;
+  }
+  const type = record.eventType.startsWith("timeline.")
+    ? record.eventType.slice("timeline.".length)
+    : "";
+  const expectedKeys = MECHANICAL_TIMELINE_DETAIL_KEYS.get(type);
+  if (
+    expectedKeys === undefined ||
+    !isDeepStrictEqual(record.tags, ["timeline", type])
+  ) {
+    return null;
+  }
+  return type;
+}
+
+function mechanicalTimelineProjection(record, type) {
+  const expectedKeys = MECHANICAL_TIMELINE_DETAIL_KEYS.get(type);
+  let content;
+  try {
+    content = JSON.parse(record.content);
+  } catch {
+    return null;
+  }
+  const contentKeys = sortedKeys(content);
+  const canonical = isDeepStrictEqual(contentKeys, ["details"]);
+  const details = canonical ? content.details : content;
+  if (!isDeepStrictEqual(sortedKeys(details), [...expectedKeys].sort())) {
+    return null;
+  }
+  const identity = {
+    source: record.source,
+    occurredAt: record.occurredAt,
+    roleId: record.roleId,
+    repository: record.repository,
+    eventType: record.eventType,
+    title: record.title,
+    summary: record.summary,
+    details,
+    evidence: record.evidence,
+    tags: record.tags,
+    sourceUrl: record.sourceUrl,
+    subjectNumber: record.subjectNumber,
+  };
+  return { canonical, identity, identityDigest: digestValue(identity) };
+}
+
+function referencedCandidateIds(records, lifecycleAuthority, candidateIds) {
+  const referenced = new Set(
+    [...lifecycleProtectedRecordIds(lifecycleAuthority)].filter((recordId) =>
+      candidateIds.has(recordId)
+    ),
+  );
+  for (const record of records) {
+    const serialized = JSON.stringify(record);
+    for (const match of serialized.matchAll(MEMORY_RECORD_REFERENCE)) {
+      const recordId = match[0];
+      if (
+        recordId !== record.recordId &&
+        candidateIds.has(recordId)
+      ) {
+        referenced.add(recordId);
+      }
+    }
+  }
+  return referenced;
+}
+
+function duplicateMechanicalTimelineRecordIds(records, lifecycleAuthority) {
+  const projectionsBySource = new Map();
+  for (const record of records) {
+    const type = mechanicalTimelineType(record);
+    if (type === null) continue;
+    const sourceKey = `${type}\u0000${record.source.id}`;
+    const projections = projectionsBySource.get(sourceKey) ?? [];
+    projections.push({ record, type });
+    projectionsBySource.set(sourceKey, projections);
+  }
+  const groupsByDigest = new Map();
+  for (const sourceProjections of projectionsBySource.values()) {
+    if (sourceProjections.length < 2) continue;
+    for (const { record, type } of sourceProjections) {
+      const projection = mechanicalTimelineProjection(record, type);
+      if (projection === null) continue;
+      const digestGroups = groupsByDigest.get(projection.identityDigest) ?? [];
+      let group = digestGroups.find(({ identity }) =>
+        isDeepStrictEqual(identity, projection.identity)
+      );
+      if (group === undefined) {
+        group = { identity: projection.identity, projections: [] };
+        digestGroups.push(group);
+        groupsByDigest.set(projection.identityDigest, digestGroups);
+      }
+      group.projections.push({ record, canonical: projection.canonical });
+    }
+  }
+  const duplicateGroups = [...groupsByDigest.values()]
+    .flat()
+    .filter(({ projections }) => projections.length > 1);
+  if (duplicateGroups.length === 0) return new Set();
+  const candidateIds = new Set(duplicateGroups.flatMap(({ projections }) =>
+    projections.map(({ record }) => record.recordId)
+  ));
+  const referenced = referencedCandidateIds(
+    records,
+    lifecycleAuthority,
+    candidateIds,
+  );
+  const result = new Set();
+  for (const { projections } of duplicateGroups) {
+    projections.sort((left, right) =>
+      Number(right.canonical) - Number(left.canonical) ||
+      right.record.recordId.localeCompare(left.record.recordId, "en")
+    );
+    for (const { record } of projections.slice(1)) {
+      if (!referenced.has(record.recordId)) result.add(record.recordId);
+    }
+  }
+  return result;
+}
+
+function projectionNoiseRecordIds(records, lifecycleAuthority) {
+  const result = nonCitableHistoryRecordIds(records, lifecycleAuthority);
+  for (const recordId of duplicateMechanicalTimelineRecordIds(
+    records,
+    lifecycleAuthority,
+  )) {
+    result.add(recordId);
+  }
+  return result;
+}
+
 function overJournalCapacity(journal, stateBytes, limits) {
   return journal.records.length > limits.maximumRecords ||
     stateBytes > limits.maximumStateBytes;
@@ -1511,11 +1705,11 @@ function overJournalCapacity(journal, stateBytes, limits) {
 function prepareJournalCandidate(
   candidate,
   limits,
-  { compactNonCitableHistory = false } = {},
+  { compactProjectionNoise = false } = {},
 ) {
   let records = candidate.records;
-  const initialCompactionIds = compactNonCitableHistory
-    ? nonCitableHistoryRecordIds(records, candidate.lifecycleAuthority)
+  const initialCompactionIds = compactProjectionNoise
+    ? projectionNoiseRecordIds(records, candidate.lifecycleAuthority)
     : new Set();
   if (initialCompactionIds.size > 0) {
     records = records.filter(
@@ -1527,7 +1721,7 @@ function prepareJournalCandidate(
     ? Number.POSITIVE_INFINITY
     : serializedBytes(journal);
   if (overJournalCapacity(journal, stateBytes, limits)) {
-    const compactableIds = nonCitableHistoryRecordIds(
+    const compactableIds = projectionNoiseRecordIds(
       journal.records,
       journal.lifecycleAuthority,
     );
@@ -2088,7 +2282,7 @@ export class LocalMemoryJournal {
           journal.lifecycleAuthority,
         );
         this.#stateBytes = serializedBytes(journal);
-        this.#reclaimableRecordCount = nonCitableHistoryRecordIds(
+        this.#reclaimableRecordCount = projectionNoiseRecordIds(
           journal.records,
           journal.lifecycleAuthority,
         ).size;
@@ -2317,7 +2511,7 @@ export class LocalMemoryJournal {
           retained,
           this.#journal.lifecycleAuthority,
           {
-            compactNonCitableHistory:
+            compactProjectionNoise:
               this.#reclaimableRecordCount > 0,
           },
         );
@@ -2768,7 +2962,7 @@ export class LocalMemoryJournal {
   async #append(
     records,
     lifecycleAuthority = this.#journal.lifecycleAuthority,
-    { compactNonCitableHistory = false } = {},
+    { compactProjectionNoise = false } = {},
   ) {
     this.#assertReady();
     const initialById = this.#recordsById;
@@ -2793,7 +2987,7 @@ export class LocalMemoryJournal {
     if (
       !requestedCreations.some(Boolean) &&
       !authorityChanged &&
-      !compactNonCitableHistory
+      !compactProjectionNoise
     ) {
       const receipts = records.map(({ recordId }) => ({
         recordId,
@@ -2806,7 +3000,7 @@ export class LocalMemoryJournal {
       revision: this.#journal.revision + 1,
       records: [...byId.values()],
       lifecycleAuthority,
-    }, this.#limits, { compactNonCitableHistory });
+    }, this.#limits, { compactProjectionNoise });
     if (overJournalCapacity(
       prepared.journal,
       prepared.stateBytes,
@@ -2840,7 +3034,7 @@ export class LocalMemoryJournal {
       prepared.journal.records,
       prepared.journal.lifecycleAuthority,
     );
-    this.#reclaimableRecordCount = nonCitableHistoryRecordIds(
+    this.#reclaimableRecordCount = projectionNoiseRecordIds(
       prepared.journal.records,
       prepared.journal.lifecycleAuthority,
     ).size;

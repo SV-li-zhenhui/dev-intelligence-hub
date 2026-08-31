@@ -700,6 +700,165 @@ test("recovered projection noise is compacted once without repeated batch writes
   assert.equal(store.writes.length, writesAfterFirst);
 });
 
+test("mechanical timeline compaction removes only unreferenced duplicate projections", async () => {
+  const store = memoryStore();
+  const occurredAt = "2026-08-02T01:02:01.000Z";
+  const mechanicalDetails = {
+    assignmentId: "workflow-assignment-duplicate",
+    inputDigest: "a".repeat(64),
+    kind: "assignment",
+    sourceSequence: 7,
+  };
+  const mechanicalLegacy = normalizeMemoryRecord(record(1, {
+    source: { kind: "work-timeline", id: "timeline-assignment-duplicate" },
+    occurredAt,
+    roleId: "work-ledger-system",
+    eventType: "timeline.assignment_intaken",
+    title: "工作时间线：assignment_intaken",
+    summary: "work-item-duplicate",
+    content: JSON.stringify(mechanicalDetails),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken"],
+    sourceUrl: "https://github.com/acme/repo/issues/7",
+    subjectNumber: 7,
+  }));
+  const mechanicalCanonical = normalizeMemoryRecord(record(1, {
+    source: { kind: "work-timeline", id: "timeline-assignment-duplicate" },
+    occurredAt,
+    roleId: "work-ledger-system",
+    eventType: "timeline.assignment_intaken",
+    title: "工作时间线：assignment_intaken",
+    summary: "work-item-duplicate",
+    content: JSON.stringify({ details: mechanicalDetails }),
+    evidence: [],
+    tags: ["timeline", "assignment_intaken"],
+    sourceUrl: "https://github.com/acme/repo/issues/7",
+    subjectNumber: 7,
+  }));
+  const answerDetails = { answer: { type: "text", text: "保留用户答复" } };
+  const answerLegacy = normalizeMemoryRecord(record(2, {
+    source: { kind: "work-timeline", id: "timeline-answer-duplicate" },
+    occurredAt,
+    roleId: "owner",
+    eventType: "timeline.attention_answer_applied",
+    title: "工作时间线：attention_answer_applied",
+    summary: "work-item-answer",
+    content: JSON.stringify(answerDetails),
+    evidence: [],
+    tags: ["timeline", "attention_answer_applied"],
+    sourceUrl: "https://github.com/acme/repo/issues/8",
+    subjectNumber: 8,
+  }));
+  const answerCanonical = normalizeMemoryRecord(record(2, {
+    source: { kind: "work-timeline", id: "timeline-answer-duplicate" },
+    occurredAt,
+    roleId: "owner",
+    eventType: "timeline.attention_answer_applied",
+    title: "工作时间线：attention_answer_applied",
+    summary: "work-item-answer",
+    content: JSON.stringify({ details: answerDetails }),
+    evidence: [],
+    tags: ["timeline", "attention_answer_applied"],
+    sourceUrl: "https://github.com/acme/repo/issues/8",
+    subjectNumber: 8,
+  }));
+  const claimedDetails = {
+    attempt: 1,
+    inputDigest: "b".repeat(64),
+    leaseId: "lease-referenced",
+    leaseUntil: "2026-08-02T01:05:00.000Z",
+  };
+  const referencedLegacy = normalizeMemoryRecord(record(3, {
+    source: { kind: "work-timeline", id: "timeline-claim-referenced" },
+    occurredAt,
+    roleId: "configured-developer",
+    eventType: "timeline.claimed",
+    title: "工作时间线：claimed",
+    summary: "work-item-referenced",
+    content: JSON.stringify(claimedDetails),
+    evidence: [],
+    tags: ["timeline", "claimed"],
+    sourceUrl: "https://github.com/acme/repo/issues/9",
+    subjectNumber: 9,
+  }));
+  const referencedCanonical = normalizeMemoryRecord(record(3, {
+    source: { kind: "work-timeline", id: "timeline-claim-referenced" },
+    occurredAt,
+    roleId: "configured-developer",
+    eventType: "timeline.claimed",
+    title: "工作时间线：claimed",
+    summary: "work-item-referenced",
+    content: JSON.stringify({ details: claimedDetails }),
+    evidence: [],
+    tags: ["timeline", "claimed"],
+    sourceUrl: "https://github.com/acme/repo/issues/9",
+    subjectNumber: 9,
+  }));
+  const reference = normalizeMemoryRecord(record(4, {
+    source: { kind: "local-session", id: "mechanical-reference" },
+    evidence: [`depends-on:${referencedLegacy.recordId}`],
+  }));
+  store.values.set(MEMORY_JOURNAL_KEY, {
+    schemaVersion: 1,
+    revision: 7,
+    records: [
+      mechanicalLegacy,
+      mechanicalCanonical,
+      answerLegacy,
+      answerCanonical,
+      referencedLegacy,
+      referencedCanonical,
+      reference,
+    ],
+  });
+  const { journal } = await fixture({ store });
+  assert.equal(journal.getHealth().reclaimableRecordCount, 1);
+
+  const projectionInputs = [
+    mechanicalLegacy,
+    mechanicalCanonical,
+    answerLegacy,
+    answerCanonical,
+    referencedLegacy,
+    referencedCanonical,
+  ].map((stored) => {
+    const input = structuredClone(stored);
+    delete input.recordId;
+    delete input.contentDigest;
+    return input;
+  });
+  await journal.appendProjectionRecords({ records: projectionInputs });
+
+  assert.equal(journal.getHealth().recordCount, 6);
+  assert.equal(journal.getHealth().reclaimableRecordCount, 0);
+  assert.throws(
+    () => journal.readRecords({ recordIds: [mechanicalLegacy.recordId] }),
+    (error) => error.code === "MEMORY_RECORD_NOT_FOUND",
+  );
+  assert.deepEqual(
+    journal.readRecords({
+      recordIds: [
+        mechanicalCanonical.recordId,
+        answerLegacy.recordId,
+        answerCanonical.recordId,
+        referencedLegacy.recordId,
+        referencedCanonical.recordId,
+      ],
+    }).items.map(({ record: value }) => value.recordId),
+    [
+      mechanicalCanonical.recordId,
+      answerLegacy.recordId,
+      answerCanonical.recordId,
+      referencedLegacy.recordId,
+      referencedCanonical.recordId,
+    ],
+  );
+
+  const recovered = await fixture({ store });
+  assert.equal(recovered.journal.getHealth().recordCount, 6);
+  assert.equal(recovered.journal.getHealth().reclaimableRecordCount, 0);
+});
+
 test("trusted projector records reject citable PR history without writing", async () => {
   const { store, journal } = await fixture();
   const forged = [
