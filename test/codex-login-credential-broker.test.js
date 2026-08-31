@@ -694,6 +694,37 @@ test("readStatus waits for an un-staged active lease instead of reporting availa
   await current.broker.close();
 });
 
+test("readStatus resolves queued subscribers when the active lease finishes staging", async (t) => {
+  const current = await fixture(t);
+  const signal = new AbortController().signal;
+  const lease = await current.broker.acquire({ signal });
+  const statuses = Promise.all([
+    current.broker.readStatus({ signal }),
+    current.broker.readStatus({ signal }),
+  ]);
+  const pending = Symbol("status is queued");
+
+  assert.equal(
+    await Promise.race([statuses, Promise.resolve(pending)]),
+    pending,
+  );
+  await lease.stage({ invocation: current.invocation, signal });
+
+  assert.deepEqual(
+    await statuses,
+    Array.from({ length: 2 }, () => ({
+      schemaVersion: 1,
+      state: "available",
+      cliAvailable: true,
+      fileLoginAvailable: true,
+    })),
+  );
+  assert.equal(current.calls.stageProbe.length, 0);
+  assert.equal(current.calls.process.length, 0);
+  lease.release({ safe: true });
+  await current.broker.close();
+});
+
 test("readStatus does not report available while beginTask is still failing", async (t) => {
   const beginStarted = deferred();
   const releaseBegin = deferred();

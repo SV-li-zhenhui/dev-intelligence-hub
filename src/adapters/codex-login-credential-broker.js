@@ -1071,7 +1071,10 @@ function createBroker(rawOptions, rawDependencies) {
         throwIfCancelled(signal);
         codexHome = await prepareCodexHome(invocation, signal);
         await dependencies.store.stageTask({ snapshot, codexHome, signal });
-        if (!released && !closing) stagedTaskToken = token;
+        if (!released && !closing) {
+          stagedTaskToken = token;
+          settleQueuedStatusAsAvailable();
+        }
         return Object.freeze({ codexHome: codexHome.path });
       } catch (error) {
         throw mapTaskFailure(error, signal);
@@ -1200,18 +1203,36 @@ function createBroker(rawOptions, rawDependencies) {
 
   function beginStatusFlight() {
     const controller = new AbortController();
+    let resolveAvailable;
+    const available = new Promise((resolve) => {
+      resolveAvailable = resolve;
+    });
+    let settledAsAvailable = false;
     const flight = {
       controller,
       subscribers: 0,
       promise: null,
+      settleAsAvailable() {
+        if (settledAsAvailable) return;
+        settledAsAvailable = true;
+        resolveAvailable(statusProjection("available"));
+        controller.abort();
+      },
     };
-    flight.promise = executeStatusProbe(controller.signal);
+    flight.promise = Promise.race([
+      executeStatusProbe(controller.signal),
+      available,
+    ]);
     statusFlight = flight;
     void flight.promise.then(
       () => settleStatusFlight(flight),
       () => settleStatusFlight(flight),
     );
     return flight;
+  }
+
+  function settleQueuedStatusAsAvailable() {
+    statusFlight?.settleAsAvailable();
   }
 
   function settleStatusFlight(flight) {
