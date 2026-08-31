@@ -390,6 +390,51 @@ test("a cycle reliably intakes, claims, decides, and only stages an intent", asy
   assert.equal(ledger.calls.stageIntent[0].roleId, "pr-reviewer");
 });
 
+test("a role cycle scans only current claim candidates instead of durable history", async () => {
+  const time = controlledClock();
+  const current = workItem(1);
+  const history = Array.from({ length: 60 }, (_, index) => {
+    const item = workItem(index + 2);
+    item.status = "completed";
+    return item;
+  });
+  const ledger = new FakeLedger({ source: [current, ...history], time });
+  const candidateCalls = [];
+  ledger.listClaimCandidates = async (options) => {
+    candidateCalls.push(clone(options));
+    return {
+      items: [clone(current)],
+      nextCursor: null,
+      facts: [{
+        itemId: current.itemId,
+        graphBlocked: false,
+        submittedChildren: 0,
+        satisfiedChildren: 0,
+      }],
+      activeQuestionTargets: [],
+    };
+  };
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+    time,
+  });
+
+  const result = await loop.runCycle({
+    trigger: "scheduled",
+    roleId: "pr-reviewer",
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(candidateCalls, [{
+    at: time.clock(),
+    limit: 100,
+    roleId: "pr-reviewer",
+  }]);
+  assert.equal(ledger.calls.listItems.length, 0);
+});
+
 test("automatic work skips issues outside the configurable active window", async () => {
   const time = controlledClock();
   const ledger = new FakeLedger({

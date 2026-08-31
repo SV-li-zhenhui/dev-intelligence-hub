@@ -179,6 +179,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "getSummary",
     "getRoleWorkloads",
     "listItems",
+    "listClaimCandidates",
     "listPendingPullRequestSources",
     "listTimeline",
     "listOutbox",

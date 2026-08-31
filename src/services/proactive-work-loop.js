@@ -312,7 +312,7 @@ function issuePriority(item) {
     : 0;
 }
 
-function prioritizeWorkItems(items) {
+function prioritizeWorkItems(items, candidateFacts = null) {
   const childrenByParent = new Map();
   for (const item of items) {
     const parentItemId = item.graph?.parentItemId;
@@ -324,6 +324,7 @@ function prioritizeWorkItems(items) {
   return items
     .map((item, index) => {
       const issueEvent = issueEventFacts(item);
+      const facts = candidateFacts?.get(item.itemId);
       const children = item.currentTarget?.type === "role" &&
           item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
           item.graph?.parentItemId === null
@@ -336,10 +337,10 @@ function prioritizeWorkItems(items) {
         issuePriority: issuePriority(item),
         issueUpdatedAt: issueUpdatedAt(issueEvent) ?? 0,
         isIssue: issueEvent !== null,
-        submittedChildren: children.filter((child) =>
+        submittedChildren: facts?.submittedChildren ?? children.filter((child) =>
           child.graph?.deliveries?.at(-1)?.status === "submitted"
         ).length,
-        satisfiedChildren: children.filter((child) =>
+        satisfiedChildren: facts?.satisfiedChildren ?? children.filter((child) =>
           SETTLED_GRAPH_CHILD_STATUSES.has(child.status)
         ).length,
       };
@@ -384,6 +385,29 @@ function graphBlockedItemIds(items) {
       })
       .map(({ itemId }) => itemId),
   );
+}
+
+function candidatePriorityFacts(items) {
+  const childrenByParent = new Map();
+  for (const item of items) {
+    const parentItemId = item.graph?.parentItemId;
+    if (typeof parentItemId !== "string") continue;
+    const children = childrenByParent.get(parentItemId) ?? [];
+    children.push(item);
+    childrenByParent.set(parentItemId, children);
+  }
+  return new Map(items.map((item) => {
+    const children = childrenByParent.get(item.itemId) ?? [];
+    return [item.itemId, {
+      itemId: item.itemId,
+      submittedChildren: children.filter((child) =>
+        child.graph?.deliveries?.at(-1)?.status === "submitted"
+      ).length,
+      satisfiedChildren: children.filter((child) =>
+        SETTLED_GRAPH_CHILD_STATUSES.has(child.status)
+      ).length,
+    }];
+  }));
 }
 
 function isConfiguredRootItem(item, resolution) {
@@ -586,6 +610,11 @@ export class ProactiveWorkLoop {
       "readItemForReconciliation",
       "ledger.readItemForReconciliation",
     );
+    this.listClaimCandidates = optionalPortMethod(
+      ledger,
+      "listClaimCandidates",
+      "ledger.listClaimCandidates",
+    );
     this.retireInactiveIssues = optionalPortMethod(
       ledger,
       "retireInactiveIssues",
@@ -710,7 +739,8 @@ export class ProactiveWorkLoop {
       options.signal,
     );
     throwIfLoopAborted(options.signal);
-    const items = await this.#listAllItems(options.signal);
+    const candidateWindow = await this.#listCandidateWindow(options, now);
+    const items = candidateWindow.items;
     throwIfLoopAborted(options.signal);
     const claimCycleSequence = ++this.claimCycleSequence;
     const itemRevisions = new Map(
@@ -718,15 +748,17 @@ export class ProactiveWorkLoop {
     );
     for (const [itemId, deferral] of this.fencedClaimDeferrals) {
       if (
-        !itemRevisions.has(itemId) ||
-        itemRevisions.get(itemId) !== deferral.revision ||
+        (
+          itemRevisions.has(itemId) &&
+          itemRevisions.get(itemId) !== deferral.revision
+        ) ||
         deferral.retryAfterCycle < claimCycleSequence
       ) {
         this.fencedClaimDeferrals.delete(itemId);
       }
     }
-    const graphBlocked = graphBlockedItemIds(items);
-    const activeQuestions = activeQuestionTargets(items);
+    const graphBlocked = candidateWindow.graphBlocked;
+    const activeQuestions = candidateWindow.activeQuestions;
     const resolutions = new Map();
     const outcomes = [];
     let claimedCount = 0;
@@ -740,7 +772,7 @@ export class ProactiveWorkLoop {
     );
     const claimAttemptLimit = Math.max(availabilityCheckLimit * 8, 32);
 
-    for (const item of prioritizeWorkItems(items)) {
+    for (const item of prioritizeWorkItems(items, candidateWindow.facts)) {
       throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
       if (availabilityBudgetUsed >= availabilityCheckLimit) break;
@@ -1663,6 +1695,85 @@ export class ProactiveWorkLoop {
       const found = result.items.find((item) => item.itemId === itemId);
       if (found) return found;
       if (!result.nextCursor) return null;
+      if (result.nextCursor === cursor) {
+        throw new TypeError("ledger pagination did not advance");
+      }
+      cursor = result.nextCursor;
+    }
+    throw new TypeError("ledger pagination exceeded its safety bound");
+  }
+
+  async #listCandidateWindow(options, at) {
+    const roleId = options.roleId !== null &&
+        options.roleId !== ORCHESTRATOR_ROLE_ID
+      ? options.roleId
+      : null;
+    if (this.listClaimCandidates === null) {
+      const allItems = await this.#listAllItems(options.signal);
+      const items = allItems.filter((item) =>
+        isAvailable(item, at) &&
+        (
+          roleId === null ||
+          (
+            item.currentTarget.type === "role" &&
+            item.currentTarget.id === roleId
+          )
+        )
+      );
+      return {
+        items,
+        graphBlocked: graphBlockedItemIds(allItems),
+        activeQuestions: activeQuestionTargets(allItems),
+        facts: candidatePriorityFacts(allItems),
+      };
+    }
+
+    const items = [];
+    const facts = new Map();
+    const graphBlocked = new Set();
+    const activeQuestions = new Set();
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      throwIfLoopAborted(options.signal);
+      const result = await this.listClaimCandidates({
+        at,
+        limit: PAGE_SIZE,
+        ...(roleId === null ? {} : { roleId }),
+        ...(cursor ? { cursor } : {}),
+      });
+      throwIfLoopAborted(options.signal);
+      if (
+        !result ||
+        !Array.isArray(result.items) ||
+        !Array.isArray(result.facts) ||
+        !Array.isArray(result.activeQuestionTargets) ||
+        result.facts.length !== result.items.length
+      ) {
+        throw new TypeError("ledger listClaimCandidates result is invalid");
+      }
+      items.push(...result.items);
+      for (const [index, fact] of result.facts.entries()) {
+        if (
+          !fact ||
+          typeof fact.itemId !== "string" ||
+          fact.itemId !== result.items[index]?.itemId ||
+          typeof fact.graphBlocked !== "boolean" ||
+          !Number.isSafeInteger(fact.submittedChildren) ||
+          fact.submittedChildren < 0 ||
+          !Number.isSafeInteger(fact.satisfiedChildren) ||
+          fact.satisfiedChildren < 0
+        ) {
+          throw new TypeError("ledger listClaimCandidates result is invalid");
+        }
+        facts.set(fact.itemId, fact);
+        if (fact.graphBlocked) graphBlocked.add(fact.itemId);
+      }
+      for (const target of result.activeQuestionTargets) {
+        activeQuestions.add(targetKey(target));
+      }
+      if (!result.nextCursor) {
+        return { items, graphBlocked, activeQuestions, facts };
+      }
       if (result.nextCursor === cursor) {
         throw new TypeError("ledger pagination did not advance");
       }

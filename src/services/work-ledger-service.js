@@ -121,6 +121,16 @@ const DIRECT_NEW_WORK_ADMISSION = Object.freeze({
 
 const DEFAULT_POST_COMMIT_YIELD = () => scheduler.yield();
 
+const CLAIM_DEPENDENCY_SATISFIED_STATUSES = new Set([
+  "completed",
+  "superseded",
+]);
+const CLAIM_CHILD_SETTLED_STATUSES = new Set([
+  ...CLAIM_DEPENDENCY_SATISFIED_STATUSES,
+  "cancelled",
+]);
+const ACTIVE_QUESTION_STATUSES = new Set(["dispatch_pending", "waiting_user"]);
+
 const MAX_PR_EXECUTION_BINDING_VERIFICATION_BATCH = 100_000;
 
 const PR_SOURCE_REQUEUE_STATUSES = new Set([
@@ -344,6 +354,100 @@ function queryWorkItemPage(records, options = {}) {
         record.currentTarget.id === roleId,
     );
   return queryPage(selected, "itemId", pageOptions, WORK_LEDGER_STATUSES);
+}
+
+function isClaimCandidateAt(item, at) {
+  if (item.status === "queued") return true;
+  if (item.status === "retry_wait") {
+    return Date.parse(item.availableAt) <= Date.parse(at);
+  }
+  return item.status === "working" &&
+    typeof item.leaseUntil === "string" &&
+    Date.parse(item.leaseUntil) <= Date.parse(at);
+}
+
+function queryClaimCandidatePage(records, options = {}) {
+  if (!isPlainLedgerObject(options)) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账候选查询无效");
+  }
+  const allowedKeys = new Set(["at", "cursor", "limit", "roleId"]);
+  if (Object.keys(options).some((key) => !allowedKeys.has(key))) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作台账候选查询无效");
+  }
+  let at;
+  try {
+    at = normalizeLedgerTimestamp(options.at, "at");
+  } catch {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "候选查询时间无效");
+  }
+  const roleId = options.roleId;
+  if (
+    roleId !== undefined &&
+    (
+      typeof roleId !== "string" ||
+      !/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(roleId)
+    )
+  ) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "岗位过滤无效");
+  }
+  const selected = records.filter((item) =>
+    isClaimCandidateAt(item, at) &&
+    (
+      roleId === undefined ||
+      (
+        item.currentTarget?.type === "role" &&
+        item.currentTarget.id === roleId
+      )
+    )
+  );
+  const page = queryPage(selected, "itemId", {
+    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+    ...(options.limit === undefined ? {} : { limit: options.limit }),
+  });
+  const statusById = new Map(records.map((item) => [item.itemId, item.status]));
+  const childrenByParent = new Map();
+  for (const item of records) {
+    const parentItemId = item.graph?.parentItemId;
+    if (typeof parentItemId !== "string") continue;
+    const children = childrenByParent.get(parentItemId) ?? [];
+    children.push(item);
+    childrenByParent.set(parentItemId, children);
+  }
+  const facts = page.items.map((item) => {
+    const children = childrenByParent.get(item.itemId) ?? [];
+    const dependencies = item.graph?.dependsOnItemIds ?? [];
+    return {
+      itemId: item.itemId,
+      graphBlocked:
+        dependencies.some((dependencyId) =>
+          !CLAIM_DEPENDENCY_SATISFIED_STATUSES.has(statusById.get(dependencyId))
+        ) ||
+        children.some((child) =>
+          !CLAIM_CHILD_SETTLED_STATUSES.has(child.status)
+        ),
+      submittedChildren: children.filter((child) =>
+        child.graph?.deliveries?.at(-1)?.status === "submitted"
+      ).length,
+      satisfiedChildren: children.filter((child) =>
+        CLAIM_CHILD_SETTLED_STATUSES.has(child.status)
+      ).length,
+    };
+  });
+  const activeQuestionTargets = [];
+  const seenQuestionTargets = new Set();
+  for (const item of records) {
+    if (!ACTIVE_QUESTION_STATUSES.has(item.status)) continue;
+    const target = item.currentTarget;
+    const key = `${target.type}:${target.id}`;
+    if (seenQuestionTargets.has(key)) continue;
+    seenQuestionTargets.add(key);
+    activeQuestionTargets.push(cloneLedgerValue(target));
+  }
+  return {
+    ...page,
+    facts,
+    activeQuestionTargets,
+  };
 }
 
 const ROLE_WORKLOAD_STATUS = new Map([
@@ -580,6 +684,11 @@ export class WorkLedgerService {
   async listItems(options = {}) {
     this.#assertReady();
     return queryWorkItemPage(this.state.items, options);
+  }
+
+  async listClaimCandidates(options = {}) {
+    this.#assertReady();
+    return queryClaimCandidatePage(this.state.items, options);
   }
 
   async listPendingPullRequestSources(options = {}) {

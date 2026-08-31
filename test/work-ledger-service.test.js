@@ -743,6 +743,61 @@ test("role workloads expose exact counts and bounded recent task summaries", asy
   assert.equal((await service.getRoleWorkloads()).items[0].counts.queued, 2);
 });
 
+test("claim candidate pages exclude durable history and active leases by role", async () => {
+  const fixture = await createFixture({
+    records: [
+      assignment(1, { type: "role", id: "developer" }),
+      assignment(2, { type: "role", id: "developer" }),
+      assignment(3, { type: "role", id: "developer" }),
+      assignment(4, { type: "role", id: "tester" }),
+    ],
+  });
+  await fixture.service.intake({ limit: 10 });
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  await fixture.service.claim({
+    itemId: items[1].itemId,
+    expectedRevision: items[1].revision,
+    workerId: "employee-developer-active",
+    leaseDurationMs: 60_000,
+  });
+  await fixture.service.claim({
+    itemId: items[2].itemId,
+    expectedRevision: items[2].revision,
+    workerId: "employee-developer-expired",
+    leaseDurationMs: 1_000,
+  });
+  fixture.time.advance(2_000);
+
+  const page = await fixture.service.listClaimCandidates({
+    at: fixture.time.clock(),
+    roleId: "developer",
+    limit: 10,
+  });
+
+  assert.deepEqual(
+    page.items.map(({ itemId, status }) => ({ itemId, status })),
+    [
+      { itemId: items[0].itemId, status: "queued" },
+      { itemId: items[2].itemId, status: "working" },
+    ],
+  );
+  assert.deepEqual(page.facts, page.items.map(({ itemId }) => ({
+    itemId,
+    graphBlocked: false,
+    submittedChildren: 0,
+    satisfiedChildren: 0,
+  })));
+  assert.deepEqual(page.activeQuestionTargets, []);
+  assert.equal(page.nextCursor, null);
+  await assert.rejects(
+    fixture.service.listClaimCandidates({
+      at: fixture.time.clock(),
+      roleId: "../developer",
+    }),
+    { code: "WORK_LEDGER_QUERY_INVALID" },
+  );
+});
+
 test("role workloads group active states and retain only the three highest-priority tasks", async () => {
   const records = Array.from(
     { length: 6 },
