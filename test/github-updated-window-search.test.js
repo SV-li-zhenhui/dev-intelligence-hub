@@ -192,7 +192,7 @@ test("rolling PR windows include the exact millisecond lower bound and no earlie
     ranges.every(
       (range) =>
         range ===
-        "2026-08-06T12:34:56+00:00..9999-12-31T23:59:59+00:00",
+        "2026-08-06T12:34:56+00:00..2970-12-31T23:59:59+00:00",
     ),
   );
 });

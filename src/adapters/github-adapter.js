@@ -22,7 +22,9 @@ const ISSUE_DETAIL_BATCH_SIZE = 100;
 const MILESTONE_PAGE_SIZE = 100;
 const MILESTONES_PER_REPOSITORY = 10;
 const SECOND_MS = 1_000;
-const MAX_SEARCH_TIMESTAMP = Date.parse("9999-12-31T23:59:59.000Z");
+// GitHub search accepts years only through 2970. Keep rolling windows finite
+// at the transport boundary while retaining their open-ended domain meaning.
+const MAX_SEARCH_TIMESTAMP = Date.parse("2970-12-31T23:59:59.000Z");
 const SEARCH_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
 const PR_SEARCH_FIELDS =
