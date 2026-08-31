@@ -79,6 +79,7 @@ const REQUEST_KEYS = Object.freeze([
   "acceptanceCriteria",
 ]);
 const PULL_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "pullRequest"]);
+const ISSUE_KEYS = Object.freeze([...REQUEST_KEYS, "issue"]);
 const PERSON_PULL_REQUEST_KEYS = Object.freeze([
   ...REQUEST_KEYS,
   "pullRequest",
@@ -277,6 +278,8 @@ export function normalizeOwnerWorkRequest(value) {
     value,
     version === 5
       ? ORCHESTRATED_PULL_REQUEST_KEYS
+      : version === 6
+      ? ISSUE_KEYS
       : version === 2
       ? PULL_REQUEST_KEYS
       : [3, 4].includes(version)
@@ -285,7 +288,7 @@ export function normalizeOwnerWorkRequest(value) {
     "所有者工作请求",
   );
   if (
-    ![1, 2, 3, 4, 5].includes(version) ||
+    ![1, 2, 3, 4, 5, 6].includes(version) ||
     typeof value.requestId !== "string" ||
     !REQUEST_ID.test(value.requestId) ||
     !OWNER_WORK_REQUEST_TYPES.includes(value.workType) ||
@@ -300,6 +303,9 @@ export function normalizeOwnerWorkRequest(value) {
   }
   if (version === 5 && value.workType !== "general") {
     throw invalid("主控 PR 请求必须使用 general 工作类型");
+  }
+  if (version === 6 && value.workType === "pull_request") {
+    throw invalid("Issue 不能使用 PR Review 工作类型");
   }
   if (
     version === 5 &&
@@ -363,6 +369,25 @@ export function normalizeOwnerWorkRequest(value) {
       repository,
       number: value.pullRequest.number,
     };
+  }
+  if (version === 6) {
+    exactKeys(value.issue, PULL_REQUEST_TARGET_KEYS, "issue");
+    const repository = value.issue.repository;
+    const match = typeof repository === "string"
+      ? repository.match(REPOSITORY)
+      : null;
+    if (
+      !match ||
+      match[1].includes("--") ||
+      match[2].includes("..") ||
+      match[2].startsWith(".") ||
+      match[2].endsWith(".") ||
+      !Number.isSafeInteger(value.issue.number) ||
+      value.issue.number < 1
+    ) {
+      throw invalid("issue 无效");
+    }
+    normalized.issue = { repository, number: value.issue.number };
   }
   if (version === 5) {
     exactKeys(value.triage, TRIAGE_KEYS, "triage");
@@ -531,11 +556,44 @@ export function createOwnerPullRequestEvent(
   });
 }
 
+export function createOwnerIssueEvent(requestValue, occurredAt) {
+  const request = normalizeOwnerWorkRequest(requestValue);
+  if (request.schemaVersion !== 6) {
+    throw invalid("Issue 推进请求无效");
+  }
+  return normalizeWorkflowEvent({
+    schemaVersion: 1,
+    eventType: "issue.owner_requested",
+    occurredAt,
+    source: {
+      provider: "local-owner",
+      scopeId: `owner-request:${request.requestId}`,
+    },
+    subject: {
+      id: `github:issue:${request.issue.repository}#${request.issue.number}`,
+      repository: request.issue.repository,
+      number: request.issue.number,
+    },
+    payload: {
+      title: request.title,
+      description: request.description,
+      workType: request.workType,
+      priority: request.priority,
+      acceptanceCriteria: [...request.acceptanceCriteria],
+    },
+  });
+}
+
 export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
   const request = normalizeStoredOwnerWorkRequest(requestValue);
   if (request.schemaVersion === 1) {
     return JSON.stringify(eventValue) === JSON.stringify(
       createOwnerWorkRequestEvent(request, at),
+    );
+  }
+  if (request.schemaVersion === 6) {
+    return JSON.stringify(eventValue) === JSON.stringify(
+      createOwnerIssueEvent(request, at),
     );
   }
   try {
@@ -600,9 +658,9 @@ export function withOwnerWorkRequestDefaultRoute(definition) {
           op: "all",
           conditions: [
             {
-              op: "equals",
+              op: "globAny",
               path: "eventType",
-              value: OWNER_WORK_REQUEST_EVENT_TYPE,
+              patterns: [OWNER_WORK_REQUEST_EVENT_TYPE, "issue.owner_requested"],
             },
             {
               op: "equals",
@@ -621,9 +679,9 @@ export function withOwnerWorkRequestDefaultRoute(definition) {
         priority: 10_000,
         fallback: false,
         condition: {
-          op: "equals",
+          op: "globAny",
           path: "eventType",
-          value: OWNER_WORK_REQUEST_EVENT_TYPE,
+          patterns: [OWNER_WORK_REQUEST_EVENT_TYPE, "issue.owner_requested"],
         },
         targets: [{ type: "role", id: "orchestrator" }],
         onMatch: "stop",

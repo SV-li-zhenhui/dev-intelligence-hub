@@ -1100,6 +1100,150 @@ test("workLimit bounds claim attempts even when a claim is not acquired", async 
   assert.deepEqual(ledger.items.map(({ status }) => status), ["queued", "queued"]);
 });
 
+test("a fenced PR claim does not starve the next claimable task", async () => {
+  const time = controlledClock();
+  const fenced = Array.from({ length: 5 }, (_, index) => workItem(index + 1));
+  const ready = workItem(6);
+  const ledger = new FakeLedger({ source: [...fenced, ready], time });
+  const claim = ledger.claim.bind(ledger);
+  ledger.claim = async (input) => {
+    if (fenced.some(({ itemId }) => itemId === input.itemId)) {
+      ledger.calls.claim.push(clone(input));
+      throw Object.assign(new Error("PR source authority is fenced"), {
+        code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      });
+    }
+    return claim(input);
+  };
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ workLimit: 1 });
+
+  assert.equal(result.workAttempts, 1);
+  assert.equal(result.availabilityChecks, 6);
+  assert.equal(result.claimAttempts, 6);
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(
+    result.outcomes.map(({ status, code }) => ({ status, code })),
+    [
+      ...fenced.map(() => ({
+      status: "claim_not_acquired",
+      code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      })),
+      { status: "staged", code: undefined },
+    ],
+  );
+  assert.deepEqual(ledger.items.map(({ status }) => status), [
+    ...fenced.map(() => "queued"),
+    "dispatch_pending",
+  ]);
+});
+
+test("fenced PR claim scanning stops at its independent safety cap", async () => {
+  const time = controlledClock();
+  const fenced = Array.from({ length: 32 }, (_, index) => workItem(index + 1));
+  const ready = workItem(33);
+  const ledger = new FakeLedger({ source: [...fenced, ready], time });
+  ledger.claim = async (input) => {
+    ledger.calls.claim.push(clone(input));
+    throw Object.assign(new Error("PR source authority is fenced"), {
+      code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+    });
+  };
+  const directory = new FakeRoleDirectory({
+    "pr-reviewer": worker(),
+  });
+  const loop = createLoop({ ledger, directory, time });
+
+  const result = await loop.runCycle({ workLimit: 1 });
+
+  assert.equal(result.workAttempts, 0);
+  assert.equal(result.availabilityChecks, 32);
+  assert.equal(result.claimAttempts, 32);
+  assert.equal(result.claimed, 0);
+  assert.equal(ledger.calls.claim.length, 32);
+  assert.equal(ledger.items.at(-1).itemId, ready.itemId);
+  assert.equal(ledger.items.at(-1).status, "queued");
+});
+
+test("later work is claimed on the next cycle after fenced claim safety cap", async () => {
+  const time = controlledClock();
+  const fenced = Array.from({ length: 32 }, (_, index) => workItem(index + 1));
+  const ready = workItem(33);
+  const ledger = new FakeLedger({ source: [...fenced, ready], time });
+  const claim = ledger.claim.bind(ledger);
+  ledger.claim = async (input) => {
+    if (fenced.some(({ itemId }) => itemId === input.itemId)) {
+      ledger.calls.claim.push(clone(input));
+      throw Object.assign(new Error("PR source authority is fenced"), {
+        code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      });
+    }
+    return claim(input);
+  };
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+    time,
+  });
+
+  const first = await loop.runCycle({ workLimit: 1 });
+  const second = await loop.runCycle({ workLimit: 1 });
+
+  assert.equal(first.claimAttempts, 32);
+  assert.equal(first.claimed, 0);
+  assert.equal(second.claimAttempts, 1);
+  assert.equal(second.claimed, 1);
+  assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), [
+    ...fenced.map(({ itemId }) => itemId),
+    ready.itemId,
+  ]);
+  assert.equal(ledger.items.at(-1).status, "dispatch_pending");
+});
+
+test("fenced deferrals never bypass a newly arrived urgent owner request", async () => {
+  const time = controlledClock();
+  const fenced = Array.from({ length: 32 }, (_, index) => workItem(index + 1));
+  const ready = workItem(33);
+  const ledger = new FakeLedger({ source: [...fenced, ready], time });
+  const claim = ledger.claim.bind(ledger);
+  ledger.claim = async (input) => {
+    if (fenced.some(({ itemId }) => itemId === input.itemId)) {
+      ledger.calls.claim.push(clone(input));
+      throw Object.assign(new Error("PR source authority is fenced"), {
+        code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+      });
+    }
+    return claim(input);
+  };
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+    time,
+  });
+  await loop.runCycle({ workLimit: 1 });
+
+  const urgent = workItem(34);
+  urgent.event.eventType = "pull_request.owner_requested";
+  urgent.event.source = {
+    provider: "local-owner",
+    scopeId: `owner-request:${urgent.itemId}`,
+  };
+  urgent.event.payload.priority = "urgent";
+  ledger.items.push(urgent);
+  const second = await loop.runCycle({ workLimit: 1 });
+
+  assert.equal(second.claimed, 1);
+  assert.equal(ledger.calls.claim.at(-1).itemId, urgent.itemId);
+  assert.equal(
+    ledger.items.find(({ itemId }) => itemId === ready.itemId).status,
+    "queued",
+  );
+});
+
 test("a lost claim acknowledgement is recovered before one decision is staged", async () => {
   const time = controlledClock();
   const ledger = new FakeLedger({ source: [workItem(1)], time });

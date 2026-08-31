@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createOwnerIssueEvent,
   createOwnerPullRequestEvent,
   createPrTriageWorkRequest,
   createOwnerWorkRequestEvent,
@@ -63,6 +64,20 @@ function pullRequest(overrides = {}) {
     description: "Continue this PR even when it is outside automatic discovery.",
     acceptanceCriteria: ["Use a newly bound authority source"],
     pullRequest: { repository: "acme/repo", number: 42 },
+    ...overrides,
+  };
+}
+
+function issue(overrides = {}) {
+  return {
+    schemaVersion: 6,
+    requestId: REQUEST_ID,
+    workType: "development",
+    priority: "high",
+    title: "Implement an explicitly selected Issue",
+    description: "Continue this Issue even when it is outside automatic discovery.",
+    acceptanceCriteria: ["Keep the GitHub Issue identity"],
+    issue: { repository: "acme/repo", number: 43 },
     ...overrides,
   };
 }
@@ -250,6 +265,37 @@ test("owner request DTO exposes business fields only and creates a bound workflo
     );
   }
 
+});
+
+test("an explicit Issue request creates an event with canonical GitHub identity", () => {
+  const normalized = normalizeOwnerWorkRequest(issue());
+  const event = createOwnerIssueEvent(
+    normalized,
+    "2026-08-08T01:00:00.000Z",
+  );
+
+  assert.equal(event.eventType, "issue.owner_requested");
+  assert.deepEqual(event.subject, {
+    id: "github:issue:acme/repo#43",
+    repository: "acme/repo",
+    number: 43,
+  });
+  assert.equal(
+    ownerWorkRequestEventMatches(normalized, event, "2026-08-08T01:00:00.000Z"),
+    true,
+  );
+  const routing = routeWorkflowEvent({
+    event,
+    config: withOwnerWorkRequestDefaultRoute({
+      schemaVersion: 1,
+      enabled: true,
+      maxHops: 8,
+      rules: [],
+    }),
+  });
+  assert.deepEqual(routing.assignments.map(({ target }) => target), [
+    { type: "role", id: "developer" },
+  ]);
 });
 
 test("testing handoff preserves a structured GitHub responsible person", () => {
@@ -677,6 +723,35 @@ test("default route creates exactly one durable orchestrator root and replay is 
   );
   assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 1);
   assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
+});
+
+test("runtime persists a manual Issue with its canonical Issue event", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-issue-request-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  const owner = await createOwnerWorkRequestRuntime({
+    store,
+    workflowRouting: routing,
+    ledger,
+    roleReadiness: roleReadiness(),
+    clock,
+    createGuard: guardFactory,
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+
+  const result = await owner.submit(issue());
+  const item = (await ledger.listItems({ limit: 10 })).items[0];
+
+  assert.equal(result.request.schemaVersion, 6);
+  assert.equal(item.event.eventType, "issue.owner_requested");
+  assert.deepEqual(item.event.subject, {
+    id: "github:issue:acme/repo#43",
+    repository: "acme/repo",
+    number: 43,
+  });
+  assert.deepEqual(result.assignment.target, { type: "role", id: "developer" });
 });
 
 test("an explicit PR request resolves one immutable target before staging a PR engineer root", async (t) => {

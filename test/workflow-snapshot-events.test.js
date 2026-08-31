@@ -194,6 +194,67 @@ test("historical pull requests leave employee workflow scope but remain dashboar
   ]);
 });
 
+test("issues outside the active window stay in dashboard facts but never enter a new workflow", () => {
+  const old = issue(20, { updatedAt: "2026-07-01T02:00:00.000Z" });
+  const exactlyAtCutoff = issue(21, {
+    updatedAt: "2026-07-19T02:00:00.000Z",
+  });
+  const recent = issue(22, { updatedAt: "2026-07-19T02:00:00.001Z" });
+  const current = snapshot([old, exactlyAtCutoff, recent]);
+
+  const checkpoint = projectWorkflowSnapshot(current, {
+    issueActiveWindowDays: 14,
+  });
+  const events = workflowEventsFromSnapshots(null, current, {
+    issueActiveWindowDays: 14,
+  });
+
+  assert.deepEqual(checkpoint.items.map(({ id }) => id), [recent.id]);
+  assert.deepEqual(eventTypes(events), [
+    `${recent.id}:issue.observed`,
+  ]);
+  assert.deepEqual(current.items.map(({ id }) => id), [
+    old.id,
+    exactlyAtCutoff.id,
+    recent.id,
+  ]);
+});
+
+test("an issue emits one left-scope event when it naturally ages out", () => {
+  const item = issue(23, { updatedAt: "2026-08-01T04:00:00.000Z" });
+  const previous = snapshot([item]);
+  const current = snapshot([item], {
+    refreshedAt: "2026-08-16T04:00:00.000Z",
+  });
+
+  const events = workflowEventsFromSnapshots(previous, current, {
+    issueActiveWindowDays: 14,
+  });
+
+  assert.deepEqual(eventTypes(events), [
+    `${item.id}:issue.left_scope`,
+  ]);
+});
+
+test("an unhealthy issue source cannot synthesize age-based left-scope events", () => {
+  const item = issue(24, { updatedAt: "2026-08-01T04:00:00.000Z" });
+  const previous = snapshot([item]);
+  const current = snapshot([item], {
+    refreshedAt: "2026-08-16T04:00:00.000Z",
+    sourceStatus: {
+      githubPullRequests: { ok: true, stale: false },
+      githubIssues: { ok: false, stale: true },
+    },
+  });
+
+  assert.deepEqual(
+    workflowEventsFromSnapshots(previous, current, {
+      issueActiveWindowDays: 14,
+    }),
+    [],
+  );
+});
+
 test("additions and material changes emit granular events without flooding unchanged items", () => {
   const previous = snapshot([
     pullRequest(1),

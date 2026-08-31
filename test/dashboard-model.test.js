@@ -143,4 +143,52 @@ test("assigned issues are shown newest first and old items are visibly deferred"
     dashboard.groups.myIssues[1].reasons,
     ["超过 14 天，稍后处理"],
   );
+  assert.equal(dashboard.groups.myIssues[0].automaticWorkEligible, true);
+  assert.equal(dashboard.groups.myIssues[0].manualAddRecommended, false);
+  assert.equal(dashboard.groups.myIssues[1].automaticWorkEligible, false);
+  assert.equal(dashboard.groups.myIssues[1].manualAddRecommended, true);
+});
+
+test("dashboard marks historical PRs and the exact issue cutoff for manual opt-in", () => {
+  const dashboard = buildDashboard({
+    refreshedAt: "2026-08-31T09:00:00.000Z",
+    durationMs: 10,
+    sources: { github: 3, dingtalk: 0 },
+    errors: [],
+    items: [
+      {
+        id: "historical-pr",
+        kind: "pull_request",
+        repo: "acme/repo",
+        number: 1,
+        actionState: "historical",
+        updatedAt: "2026-08-01T09:00:00.000Z",
+      },
+      {
+        id: "cutoff-issue",
+        kind: "issue",
+        repo: "acme/repo",
+        number: 2,
+        relation: "assigned",
+        updatedAt: "2026-08-17T09:00:00.000Z",
+      },
+      {
+        id: "recent-issue",
+        kind: "issue",
+        repo: "acme/repo",
+        number: 3,
+        relation: "assigned",
+        updatedAt: "2026-08-17T09:00:00.001Z",
+      },
+    ],
+    versions: [],
+  }, null, { issueActiveWindowDays: 14 });
+
+  assert.equal(
+    dashboard.groups.historicalPullRequests[0].automaticWorkEligible,
+    false,
+  );
+  assert.equal(dashboard.groups.historicalPullRequests[0].manualAddRecommended, true);
+  assert.equal(dashboard.groups.myIssues[0].automaticWorkEligible, true);
+  assert.equal(dashboard.groups.myIssues[1].automaticWorkEligible, false);
 });

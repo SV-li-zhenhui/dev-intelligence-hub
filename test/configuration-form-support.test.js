@@ -51,7 +51,7 @@ function representativeConfiguration() {
     refreshMinutes: 10,
     browserPollSeconds: 60,
     githubLogin: "local-owner",
-    githubRead: { enabled: true },
+    githubRead: { enabled: true, issueActiveWindowDays: 14 },
     trackedRepositories: ["acme/command-center", "acme/product"],
     prResponsibility: { historicalAfterDays: 60 },
     codeExecutor: {
@@ -458,6 +458,26 @@ test("PR discovery windows round-trip explicitly without drifting legacy unlimit
     ),
     false,
   );
+});
+
+test("Issue automatic work window round-trips and remains directly editable", () => {
+  const path = ["githubRead", "issueActiveWindowDays"];
+  const initial = createConfigurationFormState(representativeConfiguration());
+
+  assert.equal(
+    configurationDocumentFromForm(initial).configuration.githubRead.issueActiveWindowDays,
+    14,
+  );
+
+  const changed = setConfigurationFormField(initial, {
+    path,
+    kind: "integer",
+    rawValue: "21",
+  });
+  const result = configurationDocumentFromForm(changed);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.configuration.githubRead.issueActiveWindowDays, 21);
 });
 
 test("Git Head snapshot scalar fields round-trip and remain directly editable", () => {

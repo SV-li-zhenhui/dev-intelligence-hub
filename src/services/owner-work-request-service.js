@@ -1,5 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
+  createOwnerIssueEvent,
   createOwnerPullRequestEvent,
   createOwnerWorkRequestEvent,
   normalizeOwnerWorkRequest,
@@ -350,6 +351,8 @@ export class OwnerWorkRequestService {
       const createdAt = this.#now();
       const event = [2, 3, 4, 5].includes(request.schemaVersion)
         ? await this.#createPullRequestEvent(request, createdAt)
+        : request.schemaVersion === 6
+        ? createOwnerIssueEvent(request, createdAt)
         : createOwnerWorkRequestEvent(request, createdAt);
       await this.#preflight(event);
       record = createStagedOwnerWorkRequestRecord(request, event, createdAt);

@@ -63,6 +63,23 @@ function definition(enabled = true) {
   };
 }
 
+function assignedIssue(number, updatedAt) {
+  return {
+    id: `github:issue:acme/repo#${number}`,
+    kind: "issue",
+    repo: "acme/repo",
+    number,
+    title: `Issue ${number}`,
+    author: "octocat",
+    relation: "assigned",
+    state: "open",
+    createdAt: updatedAt,
+    updatedAt,
+    labels: [],
+    assignees: ["local-owner"],
+  };
+}
+
 test("an absent workflow definition constructs no routing state", async () => {
   const store = new MemoryStore();
 
@@ -93,6 +110,38 @@ test("startup records the local definition once and reuses the same version", as
   assert.equal((await second.getConfig()).current.version, 1);
   assert.equal(store.writes, 1);
   await Promise.all([first.close(), second.close()]);
+});
+
+test("runtime injects the configured issue active window into snapshot routing", async () => {
+  const runtime = await createWorkflowRoutingRuntime(
+    {
+      workflowRouting: definition(),
+      githubRead: { issueActiveWindowDays: 3 },
+    },
+    {
+      store: new MemoryStore(),
+      router: createWorkflowRouter(),
+      clock: () => "2026-08-02T04:00:00.000Z",
+      createGuard: guardFactory(),
+    },
+  );
+
+  const result = await runtime.ingestSnapshot({
+    snapshot: {
+      refreshedAt: "2026-08-02T01:00:00.000Z",
+      sourceStatus: {
+        githubPullRequests: { ok: true, stale: false },
+        githubIssues: { ok: true, stale: false },
+      },
+      items: [
+        assignedIssue(1, "2026-07-28T00:00:00.000Z"),
+        assignedIssue(2, "2026-07-31T00:00:00.000Z"),
+      ],
+    },
+  });
+
+  assert.deepEqual(result.events.map(({ subject }) => subject.number), [2]);
+  await runtime.close();
 });
 
 test("a whole local replacement advances version and preserves history", async () => {

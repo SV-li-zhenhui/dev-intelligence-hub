@@ -726,7 +726,10 @@ test("committed privileged capabilities are disabled and secret-free", async () 
     credentialMode: "gh-login",
     enabledActions: [],
   });
-  assert.deepEqual(config.githubRead, { enabled: false });
+  assert.deepEqual(config.githubRead, {
+    enabled: false,
+    issueActiveWindowDays: 14,
+  });
   assert.equal(config.memory.enabled, false);
   assert.deepEqual(config.memory.imports, {
     localSessions: false,

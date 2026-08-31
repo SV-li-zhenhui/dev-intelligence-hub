@@ -74,7 +74,8 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
     ].filter((name) => Object.hasOwn(process.env, name)),
     hostRepositoryVisible: existsSync(path.join(cwd, ".git")),
     persistentSessionRequested: cliArguments.some((argument) =>
-      new Set(["resume", "--continue", "--session-id"]).has(argument)
+      new Set(["resume", "--continue", "--session-id", "--json"])
+        .has(argument)
     ),
   };
   await writeFile(
@@ -130,6 +131,10 @@ if (!new Set(["codex-cli", "claude-cli"]).has(kind)) {
         JSON.stringify({ result }),
         "utf8",
       );
+      process.stdout.write(`${JSON.stringify({
+        type: "thread.started",
+        thread_id: "fixture-session",
+      })}\n`);
     }
   } else {
     process.stdout.write(JSON.stringify({

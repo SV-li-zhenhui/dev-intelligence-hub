@@ -979,6 +979,7 @@ async function withServer(
     backgroundWork,
     workflowRouting,
     workLedgerView,
+    dailyWorkLedgerView,
     workGraphView,
     ownerWorkRequests,
     ownerWorkRetry,
@@ -1215,6 +1216,9 @@ async function withServer(
         : workflowRouting;
   }
   if (workLedgerView) application.workLedgerView = workLedgerView;
+  if (dailyWorkLedgerView) {
+    application.dailyWorkLedgerView = dailyWorkLedgerView;
+  }
   if (workGraphView) application.workGraphView = workGraphView;
   if (ownerWorkRequests) application.ownerWorkRequests = ownerWorkRequests;
   if (ownerWorkRetry) application.ownerWorkRetry = ownerWorkRetry;
@@ -4947,6 +4951,59 @@ test("work APIs expose only newest-first ledger projections", async () => {
     },
     { workLedgerView },
   );
+});
+
+test("daily work APIs expose the bounded daily projection without changing durable work APIs", async () => {
+  const calls = [];
+  const dailyWorkLedgerView = {
+    async getSummary() {
+      calls.push({ operation: "daily-summary" });
+      return {
+        revision: 8,
+        itemCounts: { queued: 2 },
+        dailyScope: { activeWindowDays: 14, currentItems: 2, historyItems: 7 },
+      };
+    },
+    async listItems(options) {
+      calls.push({ operation: "daily-items", options });
+      return { items: [{ itemId: "daily-work-1" }], nextCursor: null };
+    },
+  };
+
+  await withServer(async ({ server }) => {
+    const summary = await request(server, { path: "/api/work/daily/summary" });
+    const items = await request(server, {
+      path: "/api/work/daily/items?limit=17&status=queued&order=newest&roleId=developer",
+    });
+
+    assert.equal(summary.status, 200);
+    assert.deepEqual(JSON.parse(summary.body), {
+      revision: 8,
+      itemCounts: { queued: 2 },
+      dailyScope: { activeWindowDays: 14, currentItems: 2, historyItems: 7 },
+      safeguards: {
+        prEmployeePaused: true,
+        externalActionsEnabled: false,
+      },
+    });
+    assert.equal(items.status, 200);
+    assert.deepEqual(JSON.parse(items.body), {
+      items: [{ itemId: "daily-work-1" }],
+      nextCursor: null,
+    });
+    assert.deepEqual(calls, [
+      { operation: "daily-summary" },
+      {
+        operation: "daily-items",
+        options: {
+          limit: "17",
+          status: "queued",
+          order: "newest",
+          roleId: "developer",
+        },
+      },
+    ]);
+  }, { dailyWorkLedgerView });
 });
 
 test("work graph API exposes only the read-only graph snapshot", async () => {

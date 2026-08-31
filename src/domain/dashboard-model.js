@@ -1,4 +1,9 @@
-import { prioritize } from "./prioritizer.js";
+import {
+  DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+  prioritize,
+} from "./prioritizer.js";
+
+const DAY_MS = 86_400_000;
 
 function group(items, predicate) {
   return items.filter(predicate);
@@ -27,8 +32,34 @@ function newestUpdatedFirst(items) {
   );
 }
 
+function issueActiveWindowCutoff(refreshedAt, options) {
+  const days = Number.isSafeInteger(options?.issueActiveWindowDays) &&
+      options.issueActiveWindowDays > 0
+    ? options.issueActiveWindowDays
+    : DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS;
+  return Date.parse(refreshedAt) - days * DAY_MS;
+}
+
+function automaticWorkEligible(item, issueCutoff) {
+  if (item.kind === "pull_request") return item.actionState !== "historical";
+  if (item.kind !== "issue") return true;
+  const updatedAt = Date.parse(item.updatedAt || item.createdAt || "");
+  if (!Number.isFinite(updatedAt)) return true;
+  return updatedAt > issueCutoff;
+}
+
 export function buildDashboard(snapshot, previousSnapshot = null, options = {}) {
-  const prioritized = prioritize(snapshot.items, snapshot.refreshedAt, options);
+  const issueCutoff = issueActiveWindowCutoff(snapshot.refreshedAt, options);
+  const prioritized = prioritize(snapshot.items, snapshot.refreshedAt, options)
+    .map((item) => {
+      const eligible = automaticWorkEligible(item, issueCutoff);
+      return {
+        ...item,
+        automaticWorkEligible: eligible,
+        manualAddRecommended:
+          ["pull_request", "issue"].includes(item.kind) && !eligible,
+      };
+    });
   const completedIds = new Set(snapshot.items.map((item) => item.id));
   const recentlyCompleted = (previousSnapshot?.items || [])
     .filter((item) => !completedIds.has(item.id))

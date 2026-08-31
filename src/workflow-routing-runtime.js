@@ -1,6 +1,7 @@
 import { createWorkflowRouter, normalizeWorkflowRoutingConfig } from "./domain/workflow-router.js";
 import { withOwnerWorkRequestDefaultRoute } from "./domain/owner-work-request.js";
 import { withPrLifecycleRoutes } from "./domain/pr-lifecycle-routing.js";
+import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import { WorkflowRoutingService } from "./services/workflow-routing-service.js";
 
@@ -63,6 +64,9 @@ export async function createWorkflowRoutingRuntime(
       store,
       router,
       exclusiveLease: guard,
+      issueActiveWindowDays:
+        config.githubRead?.issueActiveWindowDays ??
+        DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),

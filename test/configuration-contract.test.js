@@ -19,7 +19,7 @@ const committedDocument = JSON.parse(
   await readFile(path.join(projectRoot, "config.example.json"), "utf8"),
 );
 const LEGACY_GITHUB_CREDENTIAL_DIGEST =
-  "3169fa64ec36bdf531405de5d640ed548d9b51a6c0cdb8d657e59630ee847526";
+  "c4a21c30ce1dd42089c12f4e10f2aeb4db6c093a30b8d4ac56dc80f15dd00c39";
 
 function document() {
   return structuredClone(committedDocument);
@@ -203,17 +203,22 @@ test("GitHub-read window omission remains omitted while rolling windows are exac
 });
 
 test("Issue active window is optional, bounded, and classified by authority", () => {
-  const defaulted = normalizeConfigurationDocument(document());
+  const legacy = document();
+  delete legacy.githubRead.issueActiveWindowDays;
+  const defaulted = normalizeConfigurationDocument(legacy);
   assert.equal(
     Object.hasOwn(defaulted.githubRead, "issueActiveWindowDays"),
     false,
   );
 
   const configured = document();
-  configured.githubRead.issueActiveWindowDays = 14;
   assert.equal(
     normalizeConfigurationDocument(configured).githubRead.issueActiveWindowDays,
     14,
+  );
+  assert.deepEqual(
+    configurationDocumentImpact(legacy, configured).authority_expansion,
+    [],
   );
 
   for (const invalidDays of [0, -1, 3_651, 14.5, "14"]) {

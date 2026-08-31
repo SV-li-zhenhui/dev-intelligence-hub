@@ -77,10 +77,10 @@ function workProjectionState(items, overrides = {}) {
 }
 
 function workProjectionResponse(url, items) {
-  if (url === "/api/work/summary") {
+  if (url === "/api/work/daily/summary") {
     return response({ itemCounts: {}, safeguards: {} });
   }
-  if (url === "/api/work/items?limit=50&order=newest") {
+  if (url === "/api/work/daily/items?limit=50&order=newest") {
     return response({ items });
   }
   if (url === "/api/work/timeline?limit=50&order=newest") {
@@ -190,6 +190,12 @@ test("work view escapes records and clearly displays safety posture", () => {
         completed: 4,
         cancelled: 1,
       },
+      dailyScope: {
+        activeWindowDays: 14,
+        currentItems: 16,
+        historyItems: 1907,
+        durableItems: 1923,
+      },
       safeguards: { prEmployeePaused: true, externalActionsEnabled: false },
     },
     items: [{
@@ -242,6 +248,10 @@ test("work view escapes records and clearly displays safety posture", () => {
 
   assert.match(html, /PR 新循环：暂停 \/ 旧员工独占/);
   assert.match(html, /GitHub 外部写：关闭/);
+  assert.match(html, /最近 14 天自动任务/);
+  assert.match(html, /1907 条历史审计记录/);
+  assert.match(html, /<details[^>]*class="work-audit-graph"/);
+  assert.match(html, /<h2>日常任务<\/h2>/);
   assert.match(html, /<span>暂停<\/span><strong>5<\/strong>/);
   assert.match(html, /<span>取消<\/span><strong>1<\/strong>/);
   assert.match(html, /status-paused[^>]*>已暂停/);
@@ -418,7 +428,7 @@ test("owner retry rejects accessor-backed top-level work item collections", asyn
   const view = createWorkView({
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      if (url === "/api/work/items?limit=50&order=newest") {
+      if (url === "/api/work/daily/items?limit=50&order=newest") {
         return {
           ok: true,
           status: 200,
@@ -474,7 +484,7 @@ test("owner retry cannot be enabled by a self-replacing row accessor", async () 
   const view = createWorkView({
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      if (url === "/api/work/items?limit=50&order=newest") {
+      if (url === "/api/work/daily/items?limit=50&order=newest") {
         return {
           ok: true,
           status: 200,
@@ -518,7 +528,7 @@ test("owner retry cannot be enabled by a nested row presentation accessor", asyn
   const view = createWorkView({
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      if (url === "/api/work/items?limit=50&order=newest") {
+      if (url === "/api/work/daily/items?limit=50&order=newest") {
         return {
           ok: true,
           status: 200,
@@ -683,7 +693,7 @@ test("owner retry counts ineligible and malformed readable duplicate IDs", async
       const view = createWorkView({
         fetchImpl: async (url, options = {}) => {
           calls.push({ url, options });
-          if (url === "/api/work/items?limit=50&order=newest") {
+          if (url === "/api/work/daily/items?limit=50&order=newest") {
             return {
               ok: true,
               status: 200,
@@ -788,7 +798,7 @@ test("owner retry reloads and notices on success or conflict, and escapes row er
       await view.retryDecisionExhaustion("work-item-owner-retry");
 
       assert.equal(
-        calls.filter(({ url }) => url === "/api/work/summary").length,
+        calls.filter(({ url }) => url === "/api/work/daily/summary").length,
         scenario.reloads,
       );
       if (scenario.notice) {
@@ -1710,8 +1720,8 @@ test("work view reads only newest-first projection endpoints", async () => {
   await view.load();
 
   assert.deepEqual(calls.map(([url]) => url), [
-    "/api/work/summary",
-    "/api/work/items?limit=50&order=newest",
+    "/api/work/daily/summary",
+    "/api/work/daily/items?limit=50&order=newest",
     "/api/work/timeline?limit=50&order=newest",
     "/api/code/jobs?limit=50&order=newest",
     "/api/work/graph",
@@ -1720,6 +1730,102 @@ test("work view reads only newest-first projection endpoints", async () => {
   assert.match(view.render(), /newest/);
   assert.match(view.render(), /latest/);
   assert.match(view.render(), /code-job-newest|已授权，等待执行/);
+});
+
+test("work view manually adds an old GitHub target without widening automatic scope", async () => {
+  const calls = [];
+  let notice = "";
+  const requestId = "12345678-1234-4123-8123-123456789abc";
+  const view = createWorkView({
+    requestIdFactory: () => requestId,
+    onNotice(message) {
+      notice = message;
+    },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === "/api/work/requests") {
+        return response({
+          requestId,
+          workItemId: "work-item-manual-old",
+          assignment: { target: { type: "role", id: "pr-engineer" } },
+        }, true, 201);
+      }
+      return workProjectionResponse(url, []);
+    },
+  });
+
+  const result = await view.addHistoricalWork({
+    sourceUrl: "https://github.com/ExampleOrg/SoftwareApp/pull/23991",
+    workType: "pull_request",
+    priority: "high",
+  });
+
+  const mutation = calls.find(({ url }) => url === "/api/work/requests");
+  assert.deepEqual(mutation.options.headers, {
+    "content-type": "application/json",
+    "x-mydashboard-action": "1",
+  });
+  assert.deepEqual(JSON.parse(mutation.options.body).pullRequest, {
+    repository: "ExampleOrg/SoftwareApp",
+    number: 23991,
+  });
+  assert.equal(JSON.parse(mutation.options.body).requestId, requestId);
+  assert.equal(result.workItemId, "work-item-manual-old");
+  assert.match(notice, /已人工加入日常任务/);
+  assert.equal(calls.some(({ url }) => url === "/api/work/daily/summary"), true);
+
+  await assert.rejects(
+    view.addHistoricalWork({
+      sourceUrl: "https://github.com/ExampleOrg/ProductApp/issues/12917",
+      workType: "pull_request",
+      priority: "high",
+    }),
+    /Issue 不能分配为 PR Review/,
+  );
+});
+
+test("manual historical work retry reuses its idempotency key until the request changes", async () => {
+  const requestIds = [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+  ];
+  const requests = [];
+  const view = createWorkView({
+    requestIdFactory: () => requestIds.shift(),
+    fetchImpl: async (url, options = {}) => {
+      if (url !== "/api/work/requests") {
+        return workProjectionResponse(url, []);
+      }
+      const body = JSON.parse(options.body);
+      requests.push(body);
+      if (requests.length === 1) {
+        return response({ error: "temporary failure" }, false, 503);
+      }
+      return response({
+        requestId: body.requestId,
+        workItemId: `work-${requests.length}`,
+        assignment: { target: { type: "role", id: "developer" } },
+      }, true, 201);
+    },
+  });
+  const base = {
+    sourceUrl: "https://github.com/ExampleOrg/ProductApp/issues/12917",
+    workType: "development",
+    priority: "high",
+  };
+
+  await assert.rejects(view.addHistoricalWork(base), /temporary failure/);
+  await view.addHistoricalWork(base);
+  await view.addHistoricalWork({ ...base, priority: "normal" });
+
+  assert.deepEqual(
+    requests.map(({ requestId }) => requestId),
+    [
+      "11111111-1111-4111-8111-111111111111",
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ],
+  );
 });
 
 test("work view can filter recent items to one configured role", async () => {
@@ -1739,7 +1845,7 @@ test("work view can filter recent items to one configured role", async () => {
   await view.load();
 
   assert.equal(
-    calls.includes("/api/work/items?limit=50&order=newest&roleId=developer"),
+    calls.includes("/api/work/daily/items?limit=50&order=newest&roleId=developer"),
     true,
   );
   assert.match(view.render(), /仅显示岗位 developer/);
@@ -1761,7 +1867,7 @@ test("work view can filter recent items to one configured role", async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(
-    calls.includes("/api/work/items?limit=50&order=newest"),
+    calls.includes("/api/work/daily/items?limit=50&order=newest"),
     true,
   );
 });
@@ -1814,7 +1920,7 @@ test("a code job read failure does not blank the core work ledger", async () => 
       if (url.startsWith("/api/code/jobs")) {
         return response({ error: "code subsystem unavailable" }, false, 503);
       }
-      if (url === "/api/work/summary") {
+      if (url === "/api/work/daily/summary") {
         return response({ itemCounts: {}, safeguards: {} });
       }
       return response({ items: [{ assignmentId: "core-still-visible", status: "queued" }] });

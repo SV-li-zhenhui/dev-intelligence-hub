@@ -12,7 +12,10 @@ test("the published example configuration is valid and disabled-safe", async () 
   const configuration = normalizeConfigurationDocument(JSON.parse(source));
 
   assert.deepEqual(configuration.trackedRepositories, []);
-  assert.deepEqual(configuration.githubRead, { enabled: false });
+  assert.deepEqual(configuration.githubRead, {
+    enabled: false,
+    issueActiveWindowDays: 14,
+  });
   assert.equal(configuration.brain.enabled, false);
   assert.equal(configuration.codeExecutor.enabled, false);
   assert.equal(configuration.changePackages.enabled, false);

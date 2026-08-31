@@ -4,11 +4,12 @@
   "browserPollSeconds": 60,
   "githubLogin": "local-user",
   "githubRead": {
-    "enabled": false
+    "enabled": false,
+    "issueActiveWindowDays": 14
   },
   "trackedRepositories": [],
   "prResponsibility": {
-    "historicalAfterDays": 30
+    "historicalAfterDays": 14
   },
   "codeExecutor": {
     "enabled": false

@@ -1,4 +1,5 @@
 import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
+import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "../domain/prioritizer.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import {
   projectWorkflowSnapshot,
@@ -79,6 +80,7 @@ export class WorkflowRoutingService {
     stateByteBudget = MAX_WORKFLOW_STATE_BYTES,
     auditByteBudget = MAX_WORKFLOW_AUDIT_BYTES,
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
+    issueActiveWindowDays = DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
   } = {}) {
     if (
       !store ||
@@ -94,9 +96,13 @@ export class WorkflowRoutingService {
       throw new TypeError("Workflow routing requires an exclusiveLease");
     }
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
+    if (!Number.isSafeInteger(issueActiveWindowDays) || issueActiveWindowDays < 1) {
+      throw new TypeError("issueActiveWindowDays is invalid");
+    }
     this.store = store;
     this.router = router;
     this.clock = clock;
+    this.issueActiveWindowDays = issueActiveWindowDays;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
@@ -126,6 +132,7 @@ export class WorkflowRoutingService {
         MAX_WORKFLOW_BUNDLE_BYTES,
         "bundleByteBudget",
       ),
+      issueActiveWindowDays,
     });
     this.state = emptyWorkflowState();
     this.ready = false;
@@ -278,7 +285,13 @@ export class WorkflowRoutingService {
 
   async ingestSnapshot({ snapshot, sourceScopeId = "github-dashboard" } = {}) {
     this.#assertReady();
-    const currentCheckpoint = projectWorkflowSnapshot(snapshot);
+    const projectionOptions = {
+      issueActiveWindowDays: this.issueActiveWindowDays,
+    };
+    const currentCheckpoint = projectWorkflowSnapshot(
+      snapshot,
+      projectionOptions,
+    );
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
       if (replay) return replay;
@@ -289,7 +302,7 @@ export class WorkflowRoutingService {
       const events = workflowEventsFromSnapshots(
         this.state.checkpoint,
         currentCheckpoint,
-        { sourceScopeId },
+        { sourceScopeId, ...projectionOptions },
       ).filter((event) => !existingEventIds.has(event.eventId));
       const assignments = [];
       const audit = [];
@@ -313,6 +326,7 @@ export class WorkflowRoutingService {
           checkpoint: mergeWorkflowCheckpoint(
             this.state.checkpoint,
             currentCheckpoint,
+            projectionOptions,
           ),
           lastSnapshot: cloneWorkflowValue(currentCheckpoint),
         },

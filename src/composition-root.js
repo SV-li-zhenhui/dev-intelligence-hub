@@ -40,6 +40,7 @@ import { AttentionResultReconciler } from "./services/attention-result-reconcile
 import { ConfigurationActivationExecutor } from "./services/configuration-activation-executor.js";
 import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
 import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js";
+import { createDailyWorkLedgerView } from "./services/daily-work-ledger-view.js";
 import { NotificationService } from "./services/notification-service.js";
 import { OwnerWorkRetryService } from "./services/owner-work-retry-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
@@ -85,6 +86,7 @@ import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
+import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
@@ -811,6 +813,7 @@ export async function createApplication({
   ownerWorkRequestRuntimeFactory = createOwnerWorkRequestRuntime,
   ownerWorkRequestDependencies = {},
   workLedgerRuntimeFactory = createWorkLedgerRuntime,
+  dailyWorkLedgerViewFactory = createDailyWorkLedgerView,
   workLedgerDependencies = {},
   ownerWorkRetryServiceFactory = (options) =>
     new OwnerWorkRetryService(options),
@@ -2119,6 +2122,7 @@ export async function createApplication({
       ...configuredWorkforce.employees,
     ]);
     let workLedgerView = null;
+    let dailyWorkLedgerView = null;
     let workGraphView = null;
     let attentionBrowser = null;
     let attentionCoordinator = null;
@@ -2372,7 +2376,8 @@ export async function createApplication({
         resolveTimeoutMs: coordinationTiming.resolveTimeoutMs,
         decideTimeoutMs: coordinationTiming.decisionTimeoutMs,
         issueActiveWindowDays:
-          config.githubRead?.issueActiveWindowDays ?? 14,
+          config.githubRead?.issueActiveWindowDays ??
+            DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
       });
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,
@@ -2424,6 +2429,16 @@ export async function createApplication({
         externalQueue: confirmationRuntime?.queue || null,
         internalInbox: attentionInboxRuntime.browser,
       });
+      dailyWorkLedgerView = dailyWorkLedgerViewFactory({
+        ledger: frozenPort(
+          workLedgerRuntime,
+          ["getSummary", "listItems", "listTimeline"],
+          "daily work ledger source",
+        ),
+        activeWindowDays:
+          config.githubRead?.issueActiveWindowDays ??
+          DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+      });
       workLedgerView = frozenPort(
         workLedgerRuntime,
         [
@@ -2435,6 +2450,18 @@ export async function createApplication({
           "listTimeline",
         ],
         "workLedgerRuntime",
+      );
+      dailyWorkLedgerView = frozenPort(
+        dailyWorkLedgerView,
+        [
+          "getSummary",
+          ...(typeof dailyWorkLedgerView.getRoleWorkloads === "function"
+            ? ["getRoleWorkloads"]
+            : []),
+          "listItems",
+          "listTimeline",
+        ],
+        "dailyWorkLedgerView",
       );
       workGraphView = frozenPort(
         workLedgerRuntime.graphReader,
@@ -2624,6 +2651,7 @@ export async function createApplication({
       codeJobControl,
       codeJobEvidenceReader,
       workLedgerView,
+      dailyWorkLedgerView,
       workGraphView,
       attentionBrowser,
       attentionCoordinator,

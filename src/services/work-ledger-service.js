@@ -68,6 +68,7 @@ import {
   applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
   currentWorkItemEvent,
+  pullRequestHeadAdmission,
   pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
@@ -79,6 +80,7 @@ import {
   applyReadyPullRequestSourceCutover,
   createPullRequestCutoverTimelineIndex,
   CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON,
+  PR_SOURCE_AUTHORITY_FENCED_REASON,
   crossRootPullRequestCutoverCandidate,
   crossRootPullRequestCutoverActivation,
   crossRootPullRequestCutoverBlockerReason,
@@ -135,6 +137,10 @@ const PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS = new Set([
   "ignored_legacy_downgrade",
   "ignored_unproven_head",
 ]);
+const PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES = new Set([
+  "queued",
+  "retry_wait",
+]);
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
 function canRequeueAdvancedPullRequestRoot(root) {
@@ -143,6 +149,23 @@ function canRequeueAdvancedPullRequestRoot(root) {
       root.source?.kind === "pull_request" &&
       root.status === "superseded" &&
       root.statusReason === CROSS_ROOT_REPLACED_REASON);
+}
+
+function fencedPullRequestRootPatch(root, disposition) {
+  if (
+    !PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS.has(disposition) ||
+    !PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES.has(root.status)
+  ) {
+    return {};
+  }
+  return {
+    status: "blocked",
+    ownerId: null,
+    leaseId: null,
+    leaseUntil: null,
+    availableAt: null,
+    statusReason: PR_SOURCE_AUTHORITY_FENCED_REASON,
+  };
 }
 
 function samePullRequestSubject(left, right) {
@@ -420,6 +443,7 @@ export class WorkLedgerService {
       this.exclusiveLease.run(async () => {
         try {
           this.state = await this.#readDurableState();
+          await this.#reconcileRecoveredPullRequestAuthorityFences();
           await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
           return this.getSummary();
@@ -1978,6 +2002,7 @@ export class WorkLedgerService {
                   : "pr_source_revised",
               }
             : {}),
+          ...fencedPullRequestRootPatch(root, appended.disposition),
           updatedAt: now,
         };
         revisedItemIds.add(root.itemId);
@@ -2145,6 +2170,65 @@ export class WorkLedgerService {
       plan.timelineEvents,
     );
     await this.#persist(nextState);
+  }
+
+  async #reconcileRecoveredPullRequestAuthorityFences() {
+    const now = this.#now();
+    const rootsBySubject = new Map();
+    for (const item of this.state.items) {
+      if (item?.kind !== "source_root" || item.source?.kind !== "pull_request") {
+        continue;
+      }
+      const identity = item.source.identity;
+      const subjectKey = JSON.stringify([
+        identity.subjectId,
+        identity.repository,
+        identity.pullRequestNumber,
+      ]);
+      const roots = rootsBySubject.get(subjectKey) ?? [];
+      roots.push(item);
+      rootsBySubject.set(subjectKey, roots);
+    }
+
+    const fencedItems = [];
+    for (const roots of rootsBySubject.values()) {
+      const subjectState = { ...this.state, items: roots };
+      for (const item of roots) {
+        if (!PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES.has(item.status)) {
+          continue;
+        }
+        const admission = pullRequestHeadAdmission(subjectState, item);
+        if (!admission.applies || admission.current || admission.pending) {
+          continue;
+        }
+        fencedItems.push(item);
+      }
+    }
+    if (fencedItems.length === 0) return;
+
+    let items = this.state.items;
+    const timelineEvents = [];
+    for (const item of fencedItems) {
+      const transition = planWorkItemTransition({
+        state: { ...this.state, items },
+        input: {
+          itemId: item.itemId,
+          expectedRevision: item.revision,
+          actorId: "work-ledger-system",
+          toStatus: "blocked",
+          reason: PR_SOURCE_AUTHORITY_FENCED_REASON,
+          details: { code: "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING" },
+        },
+        clock: () => now,
+      });
+      items = transition.patch.items;
+      timelineEvents.push(...transition.timelineEvents);
+    }
+    await this.#commitMutation({
+      patch: { items },
+      timelineEvents,
+      result: null,
+    });
   }
 
   async #persist(candidate, { appendGraphMemory = true } = {}) {

@@ -781,6 +781,19 @@ function requireWorkLedgerView(application) {
   return view;
 }
 
+function requireDailyWorkLedgerView(application) {
+  const view = application.dailyWorkLedgerView;
+  if (
+    !view ||
+    !["getSummary", "listItems"].every(
+      (method) => typeof view[method] === "function",
+    )
+  ) {
+    throw httpError(503, "日常员工任务视图尚未启用");
+  }
+  return view;
+}
+
 function requireWorkGraphView(application) {
   const view = application.workGraphView;
   if (!view || typeof view.getSnapshot !== "function") {
@@ -3025,9 +3038,11 @@ export function createDashboardServer(
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/employees") {
+        const employeeWorkView = application.dailyWorkLedgerView ??
+          application.workLedgerView;
         const workloadPromise =
-          typeof application.workLedgerView?.getRoleWorkloads === "function"
-            ? application.workLedgerView.getRoleWorkloads()
+          typeof employeeWorkView?.getRoleWorkloads === "function"
+            ? employeeWorkView.getRoleWorkloads()
               .then((result) => Array.isArray(result?.items)
                 ? { available: true, items: result.items }
                 : { available: false, items: [] })
@@ -3151,6 +3166,24 @@ export function createDashboardServer(
         });
         return;
       }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/work/daily/summary"
+      ) {
+        const summary = await requireDailyWorkLedgerView(application).getSummary();
+        const prRole = employeeRegistry.get("pr-reviewer")
+          ? await employeeRegistry.get("pr-reviewer").roleView()
+          : null;
+        sendJson(response, 200, {
+          ...summary,
+          safeguards: {
+            prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
+            externalActionsEnabled:
+              application.config.githubActions?.enabled === true,
+          },
+        });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/work/graph") {
         const snapshot = await requireWorkGraphView(application).getSnapshot();
         sendJson(
@@ -3213,6 +3246,20 @@ export function createDashboardServer(
             roleId: true,
           }))
           : await view.listTimeline(queryOptions(url, { order: true }));
+        sendJson(response, 200, result);
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname === "/api/work/daily/items"
+      ) {
+        const result = await requireDailyWorkLedgerView(application).listItems(
+          queryOptions(url, {
+            status: true,
+            order: true,
+            roleId: true,
+          }),
+        );
         sendJson(response, 200, result);
         return;
       }

@@ -438,6 +438,7 @@ function normalizeWorkflowPersistedStateInternal(
     stateByteBudget = MAX_WORKFLOW_STATE_BYTES,
     auditByteBudget = MAX_WORKFLOW_AUDIT_BYTES,
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
+    issueActiveWindowDays,
   } = {},
   { allowLegacyMigrationOverflow = false } = {},
 ) {
@@ -523,20 +524,25 @@ function normalizeWorkflowPersistedStateInternal(
     checkpoint:
       value.checkpoint === null
         ? null
-        : cloneWorkflowValue(projectWorkflowSnapshot(value.checkpoint)),
+        : cloneWorkflowValue(projectWorkflowSnapshot(value.checkpoint, {
+          issueActiveWindowDays,
+        })),
     lastSnapshot:
       value.lastSnapshot === null
         ? null
-        : cloneWorkflowValue(projectWorkflowSnapshot(value.lastSnapshot)),
+        : cloneWorkflowValue(projectWorkflowSnapshot(value.lastSnapshot, {
+          issueActiveWindowDays,
+        })),
   };
   if (
     (state.checkpoint === null) !== (state.lastSnapshot === null) ||
     (state.checkpoint &&
-      state.checkpoint.refreshedAt !== state.lastSnapshot.refreshedAt)
+      Date.parse(state.checkpoint.refreshedAt) >
+        Date.parse(state.lastSnapshot.refreshedAt))
   ) {
     throw workflowServiceError(
       "WORKFLOW_STATE_CORRUPTED",
-      "工作流快照检查点不一致",
+      "工作流源检查点晚于最后接收的快照",
       503,
     );
   }
@@ -599,7 +605,7 @@ export function migrateWorkflowPersistedState(value) {
   return normalizeWorkflowPersistedState(retained);
 }
 
-export function mergeWorkflowCheckpoint(previous, current) {
+export function mergeWorkflowCheckpoint(previous, current, projectionOptions = {}) {
   if (!previous) return cloneWorkflowValue(current);
   const definitions = [
     { kind: "pull_request", status: "githubPullRequests" },
@@ -607,8 +613,11 @@ export function mergeWorkflowCheckpoint(previous, current) {
   ];
   const items = [];
   const sourceStatus = {};
+  let refreshedAt = current.refreshedAt;
   for (const definition of definitions) {
-    const currentHealthy = current.sourceStatus[definition.status]?.ok === true;
+    const currentStatus = current.sourceStatus[definition.status];
+    const currentHealthy = currentStatus?.ok === true &&
+      currentStatus.stale !== true;
     const source = currentHealthy ? current : previous;
     items.push(
       ...source.items.filter((item) => item.kind === definition.kind),
@@ -616,12 +625,15 @@ export function mergeWorkflowCheckpoint(previous, current) {
     sourceStatus[definition.status] = cloneWorkflowValue(
       source.sourceStatus[definition.status],
     );
+    if (definition.kind === "issue" && !currentHealthy) {
+      refreshedAt = previous.refreshedAt;
+    }
   }
   return cloneWorkflowValue(
     projectWorkflowSnapshot({
-      refreshedAt: current.refreshedAt,
+      refreshedAt,
       sourceStatus,
       items,
-    }),
+    }, projectionOptions),
   );
 }

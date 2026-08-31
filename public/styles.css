@@ -1580,6 +1580,79 @@ h1 {
   font-weight: 500;
 }
 
+.work-daily-scope {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px 18px;
+  align-items: baseline;
+  margin-bottom: 14px;
+  padding: 13px 15px;
+  color: var(--green);
+  background: var(--green-soft);
+  border-left: 3px solid var(--green);
+}
+
+.work-daily-scope span {
+  color: var(--ink);
+}
+
+.work-daily-scope small {
+  color: var(--muted);
+  text-align: right;
+}
+
+.manual-historical-work {
+  margin-bottom: 24px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+
+.manual-historical-work > p,
+.manual-historical-work > small {
+  display: block;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.manual-historical-work form {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(140px, 0.45fr) minmax(100px, 0.25fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 14px;
+}
+
+.manual-historical-work label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.manual-historical-work input,
+.manual-historical-work select {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 9px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  font: inherit;
+}
+
+.manual-historical-work .manual-work-assignment-status {
+  grid-column: 1 / -1;
+}
+
+.manual-historical-work > button {
+  margin-top: 14px;
+}
+
 .work-safeguards {
   display: flex;
   gap: 8px;
@@ -1627,6 +1700,27 @@ h1 {
 
 .work-graph-panel {
   margin-bottom: 28px;
+}
+
+.work-audit-graph {
+  margin-bottom: 28px;
+}
+
+.work-audit-graph > summary {
+  padding: 12px 14px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.work-audit-graph[open] > summary {
+  margin-bottom: 14px;
+}
+
+.work-audit-graph .work-graph-panel {
+  margin-bottom: 0;
 }
 
 .work-graph-read-note {
@@ -3954,6 +4048,24 @@ dialog::backdrop {
     width: 100%;
     margin-left: 0;
     text-align: left;
+  }
+
+  .work-daily-scope {
+    grid-template-columns: 1fr;
+  }
+
+  .work-daily-scope small {
+    text-align: left;
+  }
+
+  .manual-historical-work form {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .manual-historical-work-source,
+  .manual-historical-work form > button,
+  .manual-historical-work .manual-work-assignment-status {
+    grid-column: 1 / -1;
   }
 
   .work-graph-children {

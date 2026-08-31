@@ -777,7 +777,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.githubRead,
     "configuration.githubRead",
-    ["enabled", "pullRequestUpdatedWindow"],
+    ["enabled", "pullRequestUpdatedWindow", "issueActiveWindowDays"],
     ["enabled"],
   );
   if (Object.hasOwn(value.githubRead, "pullRequestUpdatedWindow")) {

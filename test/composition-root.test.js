@@ -1494,6 +1494,14 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       calls.ledger = options;
       return ledgerRuntime;
     },
+    dailyWorkLedgerViewFactory: ({ ledger, activeWindowDays }) => {
+      calls.dailyWorkLedgerView = { ledger, activeWindowDays };
+      return {
+        getSummary: ledger.getSummary,
+        listItems: ledger.listItems,
+        listTimeline: ledger.listTimeline,
+      };
+    },
     ownerWorkRetryServiceFactory: (options) => {
       serviceOrder.push("owner-work-retry");
       calls.ownerWorkRetry = options;
@@ -1787,6 +1795,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.loop.roleContextAssembler, roleContextAssembler);
   assert.strictEqual(calls.loop.orchestratorService, orchestratorService);
   assert.equal(calls.loop.issueActiveWindowDays, 14);
+  assert.equal(calls.dailyWorkLedgerView.activeWindowDays, 14);
+  assert.equal(Object.isFrozen(calls.dailyWorkLedgerView.ledger), true);
   assert.equal(calls.loop.decideTimeoutMs, 3_000);
   assert.strictEqual(calls.dispatcher.policy, policy);
   assert.strictEqual(calls.dispatcher.attentionProducer, attentionProducer);
@@ -1804,6 +1814,11 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.strictEqual(calls.coordinator.internalInbox, attentionBrowser);
 
   assert.deepEqual(Object.keys(application.workLedgerView).sort(), [
+    "getSummary",
+    "listItems",
+    "listTimeline",
+  ]);
+  assert.deepEqual(Object.keys(application.dailyWorkLedgerView).sort(), [
     "getSummary",
     "listItems",
     "listTimeline",
@@ -1828,6 +1843,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.equal("transition" in application.ownerWorkRetry, false);
   for (const port of [
     application.workLedgerView,
+    application.dailyWorkLedgerView,
     application.workGraphView,
     application.attentionBrowser,
     application.attentionCoordinator,
@@ -1855,6 +1871,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     assert.equal(privateName in application, false);
   }
   assert.deepEqual(await application.workLedgerView.getSummary(), {
+    source: "ledger",
+  });
+  assert.deepEqual(await application.dailyWorkLedgerView.getSummary(), {
     source: "ledger",
   });
   assert.deepEqual(await application.workGraphView.getSnapshot(), {
@@ -2241,6 +2260,7 @@ test("disabled work coordination does not acquire private runtimes or services",
 
   assert.equal(workFactoryCalls, 0);
   assert.equal(application.workLedgerView, null);
+  assert.equal(application.dailyWorkLedgerView, null);
   assert.equal(application.workGraphView, null);
   assert.equal(application.attentionBrowser, null);
   assert.equal(application.attentionCoordinator, null);

@@ -31,6 +31,86 @@ function option(value, selected) {
   return `<option value="${value}"${selected === value ? " selected" : ""}>${WORK_TYPE_LABELS[value]}</option>`;
 }
 
+function invalidGitHubWorkUrl() {
+  return new TypeError("GitHub PR 或 Issue 地址无效");
+}
+
+export function githubWorkItemFromUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || "").trim());
+  } catch {
+    throw invalidGitHubWorkUrl();
+  }
+  if (
+    url.protocol !== "https:" || url.hostname !== "github.com" || url.port ||
+    url.username || url.password
+  ) {
+    throw invalidGitHubWorkUrl();
+  }
+  const match = url.pathname.match(
+    /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(pull|issues)\/([1-9][0-9]*)\/?$/u,
+  );
+  if (!match) throw invalidGitHubWorkUrl();
+  const [, owner, repository, resource, numberText] = match;
+  if ([owner, repository].some((segment) =>
+    segment === "." || segment === ".." || segment.length > 100
+  )) {
+    throw invalidGitHubWorkUrl();
+  }
+  const number = Number(numberText);
+  if (!Number.isSafeInteger(number)) throw invalidGitHubWorkUrl();
+  const repo = `${owner}/${repository}`;
+  const kind = resource === "pull" ? "pull_request" : "issue";
+  return {
+    id: `github:${kind === "pull_request" ? "pr" : "issue"}:${repo}#${number}`,
+    kind,
+    repo,
+    number,
+    title: `${repo} #${number}`,
+    url: `https://github.com/${repo}/${resource}/${number}`,
+    summary: "由你通过 GitHub 地址人工加入日常任务",
+  };
+}
+
+export function manualHistoricalWorkMarkup(result = null) {
+  if (result) {
+    return `<section class="section manual-historical-work" data-manual-historical-work-result>
+      <div class="section-heading"><h2>已加入日常任务</h2><span>OWNER OVERRIDE</span></div>
+      <p>${escapeHtml(result.source || "GitHub 任务")} 已进入共享任务图，将由 ${escapeHtml(result.target || "配置的岗位")} 领取。</p>
+      <small>工作项 ${escapeHtml(result.workItemId || "正在接入台账")} · 请求 ${escapeHtml(result.requestId)}</small>
+      <button type="button" class="secondary-button" data-manual-historical-work-reset>继续添加</button>
+    </section>`;
+  }
+  return `<section class="section manual-historical-work">
+    <div class="section-heading"><h2>人工加入历史任务</h2><span>OWNER OVERRIDE</span></div>
+    <p>自动范围外的 GitHub PR 或 Issue 可以显式加入日常任务；这不会扩大自动扫描范围。</p>
+    <form data-manual-historical-work>
+      <label class="manual-historical-work-source">GitHub 地址
+        <input name="sourceUrl" type="url" required autocomplete="url" placeholder="https://github.com/org/repo/pull/123 或 /issues/123">
+      </label>
+      <label>交付类型
+        <select name="workType">
+          ${option("pull_request", "pull_request")}
+          ${option("development")}
+          ${option("testing")}
+          ${option("requirements")}
+          ${option("general")}
+        </select>
+      </label>
+      <label>优先级
+        <select name="priority">
+          <option value="normal">普通</option>
+          <option value="high" selected>高</option>
+          <option value="urgent">紧急</option>
+        </select>
+      </label>
+      <button class="refresh-button" type="submit">加入日常任务</button>
+      <p class="manual-work-assignment-status" data-manual-historical-work-status aria-live="polite"></p>
+    </form>
+  </section>`;
+}
+
 export function manualWorkAssignmentMarkup(item, result = null) {
   if (!item || !["pull_request", "issue"].includes(item.kind)) return "";
   if (result) {
@@ -102,6 +182,8 @@ export function ownerWorkRequestForItem(
     schemaVersion:
       item.kind === "pull_request" && workType === "pull_request" && !assignedLogin
         ? 2
+        : item.kind === "issue"
+        ? 6
         : assignedLogin ? workType === "testing" ? 3 : 4 : 1,
     requestId,
     workType,
@@ -118,6 +200,9 @@ export function ownerWorkRequestForItem(
   };
   if ([2, 3, 4].includes(request.schemaVersion)) {
     request.pullRequest = { repository: item.repo, number: item.number };
+  }
+  if (request.schemaVersion === 6) {
+    request.issue = { repository: item.repo, number: item.number };
   }
   if ([3, 4].includes(request.schemaVersion)) {
     request.responsiblePerson = {

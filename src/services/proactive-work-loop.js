@@ -27,6 +27,9 @@ const RUNTIME_ADMISSION_ERROR_CODES = new Set([
   "RUNTIME_CONFIGURATION_NOT_READY",
   "RUNTIME_CONFIGURATION_STATE_UNKNOWN",
 ]);
+const NON_BUDGET_CLAIM_FAILURE_CODES = new Set([
+  "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+]);
 const DECISION_FAILURE_REASONS = Object.freeze({
   retry: "decision_failed",
   exhausted: "decision_attempts_exhausted",
@@ -244,7 +247,11 @@ function ownerRequestPriority(item) {
   }
   if (
     event?.source?.provider !== "local-owner" ||
-    !["owner_request.created", "pull_request.owner_requested"].includes(
+    ![
+      "owner_request.created",
+      "pull_request.owner_requested",
+      "issue.owner_requested",
+    ].includes(
       event.eventType,
     )
   ) {
@@ -403,6 +410,23 @@ function stableFailureCode(error) {
     // Errors are untrusted; fall through to one stable local classification.
   }
   return "ROLE_DECISION_FAILED";
+}
+
+function claimFailureOutcome(claim) {
+  return {
+    status: claim.status,
+    ...(claim.code ? { code: claim.code } : {}),
+  };
+}
+
+function claimFailureConsumesWorkBudget(claim) {
+  return !NON_BUDGET_CLAIM_FAILURE_CODES.has(claim.code);
+}
+
+function configuredResultConsumesWorkBudget(result) {
+  return result.claimed ||
+    !result.claimAttempted ||
+    claimFailureConsumesWorkBudget(result.outcome);
 }
 
 function ownerBrainAttentionDecision(error, roleId) {
@@ -651,6 +675,8 @@ export class ProactiveWorkLoop {
     this.inFlightQuestionTargets = new Set();
     this.lastIssueRetirementKey = null;
     this.issueRetirementSweep = null;
+    this.fencedClaimDeferrals = new Map();
+    this.claimCycleSequence = 0;
   }
 
   runCycle(input = {}) {
@@ -686,6 +712,19 @@ export class ProactiveWorkLoop {
     throwIfLoopAborted(options.signal);
     const items = await this.#listAllItems(options.signal);
     throwIfLoopAborted(options.signal);
+    const claimCycleSequence = ++this.claimCycleSequence;
+    const itemRevisions = new Map(
+      items.map((item) => [item.itemId, item.revision]),
+    );
+    for (const [itemId, deferral] of this.fencedClaimDeferrals) {
+      if (
+        !itemRevisions.has(itemId) ||
+        itemRevisions.get(itemId) !== deferral.revision ||
+        deferral.retryAfterCycle < claimCycleSequence
+      ) {
+        this.fencedClaimDeferrals.delete(itemId);
+      }
+    }
     const graphBlocked = graphBlockedItemIds(items);
     const activeQuestions = activeQuestionTargets(items);
     const resolutions = new Map();
@@ -694,15 +733,25 @@ export class ProactiveWorkLoop {
     let claimAttempts = 0;
     let workAttempts = 0;
     let availabilityChecks = 0;
+    let availabilityBudgetUsed = 0;
     const availabilityCheckLimit = Math.max(
       options.workLimit + 3,
       options.workLimit * 2,
     );
+    const claimAttemptLimit = Math.max(availabilityCheckLimit * 8, 32);
 
     for (const item of prioritizeWorkItems(items)) {
       throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
-      if (availabilityChecks >= availabilityCheckLimit) break;
+      if (availabilityBudgetUsed >= availabilityCheckLimit) break;
+      if (claimAttempts >= claimAttemptLimit) break;
+      const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
+      if (
+        fencedDeferral?.revision === item.revision &&
+        fencedDeferral.retryAfterCycle >= claimCycleSequence
+      ) {
+        continue;
+      }
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
       if (
         !issueIsEligible(
@@ -815,6 +864,7 @@ export class ProactiveWorkLoop {
       this.inFlightItemIds.add(item.itemId);
       try {
         availabilityChecks += 1;
+        availabilityBudgetUsed += 1;
         const availabilityOutcome = await this.#checkAvailability(
           item,
           resolution,
@@ -824,7 +874,6 @@ export class ProactiveWorkLoop {
           outcomes.push({ itemId: item.itemId, ...availabilityOutcome });
           continue;
         }
-        workAttempts += 1;
         if (
           this.roleContextAssembler !== null &&
           configuredRoot
@@ -835,6 +884,18 @@ export class ProactiveWorkLoop {
             options,
             graphBlocked: isGraphBlocked,
           });
+          if (configuredResultConsumesWorkBudget(processed)) {
+            workAttempts += 1;
+          } else {
+            availabilityBudgetUsed -= 1;
+            this.fencedClaimDeferrals.set(item.itemId, {
+              revision: item.revision,
+              retryAfterCycle: claimCycleSequence + 1,
+            });
+          }
+          if (configuredResultConsumesWorkBudget(processed)) {
+            this.fencedClaimDeferrals.delete(item.itemId);
+          }
           claimAttempts += processed.claimAttempted ? 1 : 0;
           claimedCount += processed.claimed ? 1 : 0;
           outcomes.push({ itemId: item.itemId, ...processed.outcome });
@@ -844,9 +905,21 @@ export class ProactiveWorkLoop {
         claimAttempts += 1;
         const claim = await this.#claim(item, resolution, options);
         if (!claim.item) {
-          outcomes.push({ itemId: item.itemId, status: claim.status });
+          if (claimFailureConsumesWorkBudget(claim)) {
+            workAttempts += 1;
+            this.fencedClaimDeferrals.delete(item.itemId);
+          } else {
+            availabilityBudgetUsed -= 1;
+            this.fencedClaimDeferrals.set(item.itemId, {
+              revision: item.revision,
+              retryAfterCycle: claimCycleSequence + 1,
+            });
+          }
+          outcomes.push({ itemId: item.itemId, ...claimFailureOutcome(claim) });
           continue;
         }
+        this.fencedClaimDeferrals.delete(item.itemId);
+        workAttempts += 1;
         claimedCount += 1;
         const outcome = this.roleContextAssembler === null || resolution.orchestrator
           ? await this.#decideAndStage(claim.item, resolution, options)
@@ -1018,6 +1091,7 @@ export class ProactiveWorkLoop {
       }
       return {
         status: observed ? "claim_not_acquired" : "claim_uncertain",
+        code: stableFailureCode(error),
         item: null,
       };
     }
@@ -1240,7 +1314,7 @@ export class ProactiveWorkLoop {
         return {
           claimAttempted: true,
           claimed: false,
-          outcome: { status: claim.status },
+          outcome: claimFailureOutcome(claim),
         };
       }
       return {
@@ -1314,7 +1388,7 @@ export class ProactiveWorkLoop {
       return {
         claimAttempted: true,
         claimed: false,
-        outcome: { status: claim.status },
+        outcome: claimFailureOutcome(claim),
       };
     }
     return {

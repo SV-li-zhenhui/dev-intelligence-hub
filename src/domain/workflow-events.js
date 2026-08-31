@@ -19,6 +19,7 @@ const EVENT_TYPES = new Set(
 );
 EVENT_TYPES.add("owner_request.created");
 EVENT_TYPES.add("pull_request.owner_requested");
+EVENT_TYPES.add("issue.owner_requested");
 const BASE_KEYS = Object.freeze([
   "schemaVersion",
   "eventType",
@@ -494,7 +495,8 @@ function normalizePayload(value) {
 
 function assertOwnerRequestSemantics(content) {
   const ownerRequest = content.eventType === "owner_request.created";
-  if (!ownerRequest) return;
+  const ownerIssue = content.eventType === "issue.owner_requested";
+  if (!ownerRequest && !ownerIssue) return;
   const payloadKeys = Object.keys(content.payload);
   const expectedKeys = Object.hasOwn(content.payload, "responsiblePerson")
     ? OWNER_REQUEST_PERSON_PAYLOAD_KEYS
@@ -502,10 +504,15 @@ function assertOwnerRequestSemantics(content) {
   const responsiblePerson = content.payload.responsiblePerson;
   if (
     content.source.provider !== "local-owner" ||
-    content.source.scopeId !== "owner-command-center" ||
+    (ownerRequest
+      ? content.source.scopeId !== "owner-command-center"
+      : !/^owner-request:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+        .test(content.source.scopeId)) ||
     payloadKeys.length !== expectedKeys.length ||
     expectedKeys.some((key) => !payloadKeys.includes(key)) ||
-    !["general", "requirements", "development", "testing", "pull_request"]
+    !(ownerIssue
+      ? ["general", "requirements", "development", "testing"]
+      : ["general", "requirements", "development", "testing", "pull_request"])
       .includes(content.payload.workType) ||
     !["normal", "high", "urgent"].includes(content.payload.priority) ||
     !content.payload.title.trim() ||

@@ -64,6 +64,7 @@ async function createCliHarness(t, name) {
   await copyFile(FIXTURE_SOURCE, fixtureExecutable);
 
   const invocations = [];
+  const codexSessionStore = persistentCodexSessionStore();
   const processRunner = createTestSupervisedProcessRunner({
     descriptorMaterializer: async (descriptor) => descriptor,
   });
@@ -102,6 +103,7 @@ async function createCliHarness(t, name) {
       commandLocator,
       environment,
       temporaryRoot,
+      codexSessionStore,
       ...(runtimeFacts.codexLoginCredentialBroker
         ? {
             codexLoginCredentialBroker:
@@ -113,8 +115,36 @@ async function createCliHarness(t, name) {
   return {
     invocations,
     temporaryRoot,
+    codexSessionStore,
     supervisedCliProviderFactory,
   };
+}
+
+function persistentCodexSessionStore() {
+  const sessions = new Map();
+  const stages = [];
+  const captures = [];
+  return Object.freeze({
+    async stage({ sessionKey }) {
+      stages.push(sessionKey);
+      return Object.freeze({ sessionId: sessions.get(sessionKey) ?? null });
+    },
+    async capture({ sessionKey, sessionId }) {
+      sessions.set(sessionKey, sessionId);
+      captures.push(Object.freeze({ sessionKey, sessionId }));
+    },
+    view() {
+      return Object.freeze({
+        sessions: Object.freeze(
+          [...sessions.entries()].map(([sessionKey, sessionId]) =>
+            Object.freeze({ sessionKey, sessionId })
+          ),
+        ),
+        stages: Object.freeze([...stages]),
+        captures: Object.freeze([...captures]),
+      });
+    },
+  });
 }
 
 function persistentLoginBroker() {
@@ -482,6 +512,10 @@ test("a production-composed orchestrator decision persists in ledger and memory 
   t.after(() => rm(root, { recursive: true, force: true }));
   const harness = await createCliHarness(t, "supervised-cli-composition-process");
   const stateRoot = path.join(root, "state");
+  const session = Object.freeze({
+    sessionKey: "github:issue:fixture/repository#42",
+    sessionId: "fixture-session",
+  });
   let now = Date.parse("2026-08-09T01:00:00.000Z");
   const clock = () => new Date(now);
   const create = () => createApplication({
@@ -527,6 +561,14 @@ test("a production-composed orchestrator decision persists in ledger and memory 
     assert.equal(ledger.items.length, 1);
     assert.equal(ledger.items[0].status, "completed");
     assert.equal(harness.invocations.length, 1);
+    assert.equal(harness.invocations[0].args.includes("--ephemeral"), false);
+    assert.equal(harness.invocations[0].args.includes("--json"), true);
+    assert.equal(harness.invocations[0].args.includes("resume"), false);
+    assert.deepEqual(harness.codexSessionStore.view(), {
+      sessions: [session],
+      stages: [session.sessionKey],
+      captures: [session],
+    });
     await application.memoryProjector.runCycle();
     const memory = await application.memorySearch.search({
       q: "Supervised CLI fixture issue",
@@ -549,6 +591,11 @@ test("a production-composed orchestrator decision persists in ledger and memory 
     });
     assert.equal(memory.items.some(({ source }) => source.kind === "work-item"), true);
     assert.equal(harness.invocations.length, invocationsBeforeRestart);
+    assert.deepEqual(harness.codexSessionStore.view(), {
+      sessions: [session],
+      stages: [session.sessionKey],
+      captures: [session],
+    });
   } finally {
     await application.close();
   }

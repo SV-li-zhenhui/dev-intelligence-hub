@@ -147,10 +147,10 @@ function graphSnapshot({ revision = 7, title = "总任务" } = {}) {
 
 function readFetch(graphResult) {
   return async (url) => {
-    if (url === "/api/work/summary") {
+    if (url === "/api/work/daily/summary") {
       return response({ itemCounts: {}, safeguards: {} });
     }
-    if (url === "/api/work/items?limit=50&order=newest") {
+    if (url === "/api/work/daily/items?limit=50&order=newest") {
       return response({ items: [{ assignmentId: "ledger-stays-visible", status: "queued" }] });
     }
     if (url === "/api/work/timeline?limit=50&order=newest") {

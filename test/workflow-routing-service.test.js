@@ -240,13 +240,14 @@ function workflowEvent(overrides = {}) {
 function workflowSnapshot({
   refreshedAt = "2026-08-02T01:00:00.000Z",
   pullRequestsOk = true,
+  issuesOk = true,
   items = [],
 } = {}) {
   return {
     refreshedAt,
     sourceStatus: {
       githubPullRequests: { ok: pullRequestsOk, stale: !pullRequestsOk },
-      githubIssues: { ok: true, stale: false },
+      githubIssues: { ok: issuesOk, stale: !issuesOk },
     },
     items,
   };
@@ -262,6 +263,24 @@ function pullRequest(number, overrides = {}) {
     author: "octocat",
     state: "OPEN",
     labels: [],
+    ...overrides,
+  };
+}
+
+function issue(number, overrides = {}) {
+  return {
+    id: `github:issue:acme/repo#${number}`,
+    kind: "issue",
+    repo: "acme/repo",
+    number,
+    title: `Issue ${number}`,
+    author: "octocat",
+    relation: "assigned",
+    state: "open",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+    labels: [],
+    assignees: ["local-owner"],
     ...overrides,
   };
 }
@@ -282,12 +301,16 @@ async function createFixture({
   auditByteBudget,
   bundleByteBudget,
   actionAdmissionGate,
+  issueActiveWindowDays,
 } = {}) {
   const service = new WorkflowRoutingService({
     store,
     router,
     clock: incrementingClock(),
     exclusiveLease,
+    ...(issueActiveWindowDays === undefined
+      ? {}
+      : { issueActiveWindowDays }),
     ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
     ...(recordLimit === undefined ? {} : { recordLimit }),
     ...(configHistoryLimit === undefined ? {} : { configHistoryLimit }),
@@ -921,6 +944,80 @@ test("snapshot ingestion checkpoints facts and does not flood unchanged items", 
   assert.equal((await service.listAssignments()).items.length, 1);
 });
 
+test("snapshot ingestion never routes an issue outside the configured active window", async () => {
+  const { service, router } = await createFixture({
+    issueActiveWindowDays: 3,
+  });
+  await configure(service, workflowConfig({
+    rules: [{
+      id: "issue-analysis",
+      source: "root",
+      enabled: true,
+      priority: 100,
+      fallback: false,
+      condition: {
+        op: "globAny",
+        path: "eventType",
+        patterns: ["issue.*"],
+      },
+      targets: [{ type: "role", id: "requirements-analyst" }],
+      onMatch: "stop",
+    }],
+  }));
+
+  const result = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      items: [
+        issue(40, { updatedAt: "2026-07-28T00:00:00.000Z" }),
+        issue(41, { updatedAt: "2026-07-31T00:00:00.000Z" }),
+      ],
+    }),
+  });
+
+  assert.deepEqual(result.events.map(({ subject }) => subject.number), [41]);
+  assert.equal(result.assignments.length, 1);
+  assert.equal(result.audit.length, 1);
+  assert.equal(router.calls.length, 1);
+  assert.equal((await service.listAssignments()).items.length, 1);
+  assert.equal((await service.listAudit()).items.length, 1);
+});
+
+test("configured Issue window survives persistence and recovery without duplicate creation", async () => {
+  const store = new MemoryStore();
+  const first = await createFixture({
+    store,
+    issueActiveWindowDays: 30,
+  });
+  await configure(first.service, issueOnlyConfig());
+  const activeIssue = issue(52, {
+    updatedAt: "2026-08-11T01:00:00.000Z",
+  });
+  await first.service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-31T01:00:00.000Z",
+      items: [activeIssue],
+    }),
+  });
+  assert.equal(store.stored(STATE_KEY).checkpoint.items.length, 1);
+
+  const recovered = new WorkflowRoutingService({
+    store,
+    router: new StubRouter(),
+    clock: incrementingClock(),
+    exclusiveLease: new ExclusiveLease(),
+    issueActiveWindowDays: 30,
+  });
+  await recovered.recover();
+  const repeated = await recovered.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-09-01T01:00:00.000Z",
+      items: [activeIssue],
+    }),
+  });
+
+  assert.deepEqual(repeated.events, []);
+});
+
 test("a failed snapshot write preserves the old checkpoint for exact retry", async () => {
   const store = new MemoryStore();
   const fixture = await createFixture({ store });
@@ -999,6 +1096,48 @@ test("an unhealthy refresh retains the last healthy routing baseline", async () 
     recovered.events.some((event) => event.eventType.endsWith(".observed")),
     false,
   );
+});
+
+test("an unhealthy Issue refresh preserves freshness until a healthy refresh settles scope once", async () => {
+  const { service } = await createFixture({ issueActiveWindowDays: 3 });
+  await configure(service, issueOnlyConfig());
+  const activeIssue = issue(77, {
+    updatedAt: "2026-08-01T12:00:00.000Z",
+  });
+  await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-02T01:00:00.000Z",
+      items: [activeIssue],
+    }),
+  });
+
+  const unhealthy = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-06T01:00:00.000Z",
+      issuesOk: false,
+      items: [],
+    }),
+  });
+  const settled = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-06T01:05:00.000Z",
+      items: [],
+    }),
+  });
+  const repeated = await service.ingestSnapshot({
+    snapshot: workflowSnapshot({
+      refreshedAt: "2026-08-06T01:10:00.000Z",
+      items: [],
+    }),
+  });
+
+  assert.deepEqual(unhealthy.events, []);
+  assert.equal(unhealthy.checkpointRefreshedAt, "2026-08-02T01:00:00.000Z");
+  assert.deepEqual(
+    settled.events.map(({ eventType }) => eventType),
+    ["issue.left_scope"],
+  );
+  assert.deepEqual(repeated.events, []);
 });
 
 test("shared exclusive leases re-read durable revision before every write", async () => {

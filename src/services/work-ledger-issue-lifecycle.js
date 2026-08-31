@@ -368,6 +368,7 @@ export function planRecoveredIssueScopeSettlement(state, now) {
   const assignmentsByTarget = new Map();
   for (const entry of issueItems) {
     const subjectKey = issueSubjectKey(entry.event);
+    if (subjectKey === null) continue;
     if (isIssueScopeLifecycleEvent(entry.event)) {
       latestLifecycleBySubject.set(subjectKey, entry);
       continue;

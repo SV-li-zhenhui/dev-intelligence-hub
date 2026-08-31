@@ -3,6 +3,13 @@ import {
   renderWorkGraph,
 } from "./work-graph-view.js";
 import { escapeHtml, relativeTime } from "./view-format.js";
+import {
+  githubWorkItemFromUrl,
+  manualHistoricalWorkMarkup,
+  ownerWorkRequestForItem,
+} from "./manual-work-assignment.js";
+
+const MAX_HISTORICAL_REQUEST_IDS = 100;
 
 function initialState() {
   return {
@@ -22,6 +29,7 @@ function initialState() {
     ownerRetryPendingItemId: null,
     ownerRetryErrorItemId: null,
     ownerRetryError: "",
+    historicalWorkResult: null,
   };
 }
 
@@ -986,6 +994,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
   const items = ownerRetryArrayValues(state.items) || [];
   const renderedItemRows = itemRows(items, now, state);
   const summary = state.summary || {};
+  const dailyScope = summary.dailyScope || null;
   const waiting =
     count(summary, "waiting_user") +
     count(summary, "waiting_condition") +
@@ -998,7 +1007,16 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       <button type="button" class="secondary-button" data-work-clear-role>显示全部岗位</button>
     </div>`
     : "";
+  const dailyScopeNote = dailyScope
+    ? `<div class="work-daily-scope" role="note">
+      <strong>日常范围</strong>
+      <span>最近 ${escapeWorkHtml(dailyScope.activeWindowDays)} 天自动任务 + 你人工加入的历史任务</span>
+      <small>${escapeWorkHtml(dailyScope.historyItems)} 条历史审计记录未计入当前工作量；完整记录仍保留在下方审计视图。</small>
+    </div>`
+    : "";
   return `
+    ${dailyScopeNote}
+    ${manualHistoricalWorkMarkup(state.historicalWorkResult)}
     <section class="work-summary" aria-label="主动工作循环状态">
       <div><span>待领取</span><strong>${count(summary, "queued")}</strong></div>
       <div><span>暂停</span><strong>${count(summary, "paused")}</strong></div>
@@ -1013,19 +1031,22 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
       <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
       <small>模型只生成结构化判断；代码执行和外部写入不能绕过受控执行器与确认队列。</small>
     </div>
-    ${renderWorkGraph({
-      loading: state.graphLoading,
-      error: state.graphError,
-      snapshot: state.graphSnapshot,
-    }, { now })}
+    <details class="work-audit-graph">
+      <summary>完整共享任务图（审计）</summary>
+      ${renderWorkGraph({
+        loading: state.graphLoading,
+        error: state.graphError,
+        snapshot: state.graphSnapshot,
+      }, { now })}
+    </details>
     ${roleFilter}
     <div class="work-columns">
       <section class="section work-panel">
-        <div class="section-heading"><h2>最近工作</h2><span>${items.length} ITEMS · 最新在前</span></div>
+        <div class="section-heading"><h2>日常任务</h2><span>${items.length} ITEMS · 最新在前</span></div>
         ${renderedItemRows}
       </section>
       <section class="section work-panel">
-        <div class="section-heading"><h2>审计时间线</h2><span>${state.timeline.length} EVENTS · 最新在前</span></div>
+        <div class="section-heading"><h2>完整审计时间线</h2><span>${state.timeline.length} EVENTS · 最新在前</span></div>
         ${timelineRows(state.timeline, now)}
       </section>
     </div>
@@ -1062,6 +1083,7 @@ export function createWorkView({
   onNotice = () => {},
   onApplyRequested = async () => {},
   clock = () => Date.now(),
+  requestIdFactory = () => globalThis.crypto.randomUUID(),
 } = {}) {
   let state = initialState();
   let detailState = null;
@@ -1069,6 +1091,26 @@ export function createWorkView({
   let loadRequestSequence = 0;
   let ownerRetryRequestSequence = 0;
   let ownerRetryInFlight = false;
+  let historicalWorkInFlight = false;
+  const historicalRequestIds = new Map();
+  if (typeof requestIdFactory !== "function") {
+    throw new TypeError("requestIdFactory must be a function");
+  }
+
+  function historicalRequestId(requestKey) {
+    if (historicalRequestIds.has(requestKey)) {
+      const requestId = historicalRequestIds.get(requestKey);
+      historicalRequestIds.delete(requestKey);
+      historicalRequestIds.set(requestKey, requestId);
+      return requestId;
+    }
+    const requestId = requestIdFactory();
+    if (historicalRequestIds.size >= MAX_HISTORICAL_REQUEST_IDS) {
+      historicalRequestIds.delete(historicalRequestIds.keys().next().value);
+    }
+    historicalRequestIds.set(requestKey, requestId);
+    return requestId;
+  }
 
   function change(patch) {
     state = { ...state, ...patch };
@@ -1420,8 +1462,8 @@ export function createWorkView({
       ? `&roleId=${encodeURIComponent(state.roleId)}`
       : "";
     const responsesPromise = Promise.all([
-      fetchImpl("/api/work/summary", { cache: "no-store" }),
-      fetchImpl(`/api/work/items?limit=50&order=newest${roleQuery}`, { cache: "no-store" }),
+      fetchImpl("/api/work/daily/summary", { cache: "no-store" }),
+      fetchImpl(`/api/work/daily/items?limit=50&order=newest${roleQuery}`, { cache: "no-store" }),
       fetchImpl("/api/work/timeline?limit=50&order=newest", { cache: "no-store" }),
     ]);
     const codeJobsPromise = readCodeJobs();
@@ -1468,6 +1510,48 @@ export function createWorkView({
     await loadWorkProjection();
   }
 
+  async function addHistoricalWork({ sourceUrl, workType, priority } = {}) {
+    if (historicalWorkInFlight) {
+      throw new Error("历史任务正在加入，请稍候");
+    }
+    const item = githubWorkItemFromUrl(sourceUrl);
+    if (item.kind === "issue" && workType === "pull_request") {
+      throw new TypeError("Issue 不能分配为 PR Review，请选择开发、测试或需求梳理");
+    }
+    const requestKey = `${item.url}\u0000${workType}\u0000${priority}`;
+    const requestId = historicalRequestId(requestKey);
+    const request = ownerWorkRequestForItem(item, {
+      workType,
+      priority,
+      requestId,
+    });
+    historicalWorkInFlight = true;
+    try {
+      const response = await fetchImpl("/api/work/requests", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-mydashboard-action": "1",
+        },
+        body: JSON.stringify(request),
+      });
+      const result = await responseJson(response, "人工加入历史任务");
+      await loadWorkProjection();
+      change({
+        historicalWorkResult: {
+          source: item.url,
+          requestId: result.requestId,
+          workItemId: result.workItemId,
+          target: result.assignment?.target?.id,
+        },
+      });
+      onNotice(`${item.repo} #${item.number} 已人工加入日常任务。`);
+      return result;
+    } finally {
+      historicalWorkInFlight = false;
+    }
+  }
+
   function setRoleFilter(roleId) {
     const normalized = roleId === null ? null : String(roleId);
     if (
@@ -1495,7 +1579,33 @@ export function createWorkView({
         button.addEventListener("click", () =>
           retryDecisionExhaustion(button.dataset.ownerDecisionRetryItemId));
       });
+      root.querySelectorAll("[data-manual-historical-work]").forEach((form) => {
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const button = form.querySelector("button[type=submit]");
+          const status = form.querySelector("[data-manual-historical-work-status]");
+          const data = new FormData(form);
+          button.disabled = true;
+          status.textContent = "正在加入共享任务图…";
+          try {
+            await addHistoricalWork({
+              sourceUrl: String(data.get("sourceUrl") || ""),
+              workType: String(data.get("workType") || ""),
+              priority: String(data.get("priority") || ""),
+            });
+          } catch (error) {
+            status.textContent = errorMessage(error);
+            button.disabled = false;
+          }
+        });
+      });
+      root.querySelectorAll("[data-manual-historical-work-reset]").forEach((button) => {
+        button.addEventListener("click", () => {
+          change({ historicalWorkResult: null });
+        });
+      });
     },
+    addHistoricalWork,
     closeDetail,
     controlCodeJob,
     load,

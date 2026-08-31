@@ -15,6 +15,7 @@ import {
   createDeliveryEvidenceTarget,
 } from "../src/domain/delivery-evidence-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerIssueEvent } from "../src/domain/owner-work-request.js";
 import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import {
   createPullRequestExecutionBinding,
@@ -229,6 +230,32 @@ function issueAssignment(
       eventId: event.eventId,
       target: { type: "role", id: "requirements-analyst" },
       reason: "issue-events-to-requirements",
+      createdAt: occurredAt,
+    },
+    event,
+  };
+}
+
+function ownerRequestedIssueAssignment(sequence, issueNumber) {
+  const occurredAt = `2026-08-02T01:${String(sequence).padStart(2, "0")}:00.000Z`;
+  const event = createOwnerIssueEvent({
+    schemaVersion: 6,
+    requestId:
+      `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+    workType: "requirements",
+    priority: "high",
+    title: `Owner Issue ${issueNumber}`,
+    description: "Keep this manually selected Issue in daily work.",
+    acceptanceCriteria: ["Preserve the selected Issue independently"],
+    issue: { repository: "acme/product", number: issueNumber },
+  }, occurredAt);
+  return {
+    sequence,
+    assignment: {
+      assignmentId: `workflow-assignment-owner-issue-${sequence}`,
+      eventId: event.eventId,
+      target: { type: "role", id: "requirements-analyst" },
+      reason: "owner-issue-to-requirements",
       createdAt: occurredAt,
     },
     event,
@@ -5901,6 +5928,111 @@ test("an unproven newer PR Head is audited but never activated", async () => {
     item.source.revisions.at(-1).disposition,
     "ignored_unproven_head",
   );
+  assert.equal(item.status, "blocked");
+  assert.equal(item.statusReason, "pr_source_authority_fenced");
+});
+
+test("recovery blocks legacy queued PR roots whose source authority is fenced", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const legacy = fixture.store.stored();
+  legacy.items[0].status = "queued";
+  legacy.items[0].statusReason = null;
+  fixture.store.replaceStored(legacy);
+
+  const recovered = await createFixture({
+    records: fixture.source.records,
+    store: fixture.store,
+  });
+  const item = (await recovered.service.listItems()).items[0];
+
+  assert.equal(item.status, "blocked");
+  assert.equal(item.statusReason, "pr_source_authority_fenced");
+  assert.equal(item.revision, legacy.items[0].revision + 1);
+  assert.equal((await recovered.service.getSummary()).revision, legacy.revision + 1);
+});
+
+test("recovery blocks legacy retry-wait PR roots whose source authority is fenced", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(2, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  const legacy = fixture.store.stored();
+  legacy.items[0].status = "retry_wait";
+  legacy.items[0].availableAt = "2026-08-02T01:00:00.000Z";
+  legacy.items[0].statusReason = "decision_failed";
+  fixture.store.replaceStored(legacy);
+
+  const recovered = await createFixture({
+    records: fixture.source.records,
+    store: fixture.store,
+  });
+  const item = (await recovered.service.listItems()).items[0];
+
+  assert.equal(item.status, "blocked");
+  assert.equal(item.statusReason, "pr_source_authority_fenced");
+  assert.equal(item.availableAt, null);
+});
+
+test("recovery isolates PR authority fences by subject", async () => {
+  const fixture = await createFixture({
+    records: [
+      prAssignment(1),
+      prAssignment(2, {
+        pullRequestNumber: 43,
+        title: "PR 43 remains trusted",
+      }),
+    ],
+  });
+  await fixture.service.intake();
+  fixture.source.records.push(
+    prAssignment(3, {
+      occurredAt: "2026-08-02T01:05:00.000Z",
+      headRefOid: PR_HEAD_B,
+      changedFields: ["headRefOid"],
+    }),
+  );
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+
+  const legacy = fixture.store.stored();
+  const fenced = legacy.items.find(
+    ({ source }) => source?.identity?.pullRequestNumber === 42,
+  );
+  fenced.status = "queued";
+  fenced.statusReason = null;
+  fixture.store.replaceStored(legacy);
+
+  const recovered = await createFixture({
+    records: fixture.source.records,
+    store: fixture.store,
+  });
+  const roots = (await recovered.service.listItems({ limit: 10 })).items;
+  const byNumber = new Map(
+    roots.map((item) => [item.source.identity.pullRequestNumber, item]),
+  );
+
+  assert.equal(byNumber.get(42).status, "blocked");
+  assert.equal(byNumber.get(42).statusReason, "pr_source_authority_fenced");
+  assert.equal(byNumber.get(43).status, "queued");
 });
 
 test("a legitimate A to B to A force-push creates three distinct Head epochs", async () => {
@@ -6341,6 +6473,9 @@ test("future unavailable facts fence locally and exact normal-time recovery surv
   fixture.source.records.push(exactRecovery);
   fixture.source.highWatermark = 3;
   await fixture.service.intake({ limit: 10 });
+  const recoveredBeforeRestart = (await fixture.service.listItems({ limit: 10 }))
+    .items.find(({ kind }) => kind === "source_root");
+  assert.equal(recoveredBeforeRestart.status, "queued");
   const recovered = await createFixture({
     records: [initial, unavailableFuture, exactRecovery],
     store: fixture.store,
@@ -6353,6 +6488,7 @@ test("future unavailable facts fence locally and exact normal-time recovery surv
     currentRoot.source.revisions.map(({ disposition }) => disposition),
     ["accepted", "ignored_authority_fence", "accepted"],
   );
+  assert.equal(currentRoot.status, "queued");
   assert.equal(currentRoot.source.headRevision, 2);
   await assert.rejects(
     recovered.service.verifyPullRequestExecutionBinding(oldBinding),
@@ -10493,6 +10629,33 @@ test("recovery retires a legacy Issue assignment superseded by newer evidence", 
   assert.equal(retired.status, "cancelled");
   assert.equal(retired.statusReason, "issue_assignment_superseded");
   assert.equal(items.find(({ itemId }) => itemId === newer.itemId).status, "queued");
+});
+
+test("recovery preserves distinct manual Issues assigned to the same role", async () => {
+  const fixture = await createFixture({
+    records: [
+      ownerRequestedIssueAssignment(1, 101),
+      ownerRequestedIssueAssignment(2, 102),
+    ],
+  });
+  await fixture.service.intake({ limit: 10 });
+  assert.deepEqual(
+    (await fixture.service.listItems({ limit: 10 })).items.map(({ status }) => status),
+    ["queued", "queued"],
+  );
+
+  const restarted = await createFixture({
+    store: fixture.store,
+    source: new FakeAssignmentSource([]),
+    time: controlledClock("2026-08-02T02:10:00.000Z"),
+  });
+  const recovered = (await restarted.service.listItems({ limit: 10 })).items;
+
+  assert.deepEqual(recovered.map(({ status }) => status), ["queued", "queued"]);
+  assert.deepEqual(
+    recovered.map(({ event }) => event.subject.number).sort((left, right) => left - right),
+    [101, 102],
+  );
 });
 
 test("recovery does not treat a newer Issue graph child as a root assignment", async () => {

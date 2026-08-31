@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  githubWorkItemFromUrl,
+  manualHistoricalWorkMarkup,
   manualWorkAssignmentMarkup,
   ownerWorkRequestForItem,
 } from "../public/manual-work-assignment.js";
@@ -54,8 +56,11 @@ test("an Issue development assignment becomes an audited capability request", ()
     requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   });
 
-  assert.equal(request.schemaVersion, 1);
-  assert.equal(request.pullRequest, undefined);
+  assert.equal(request.schemaVersion, 6);
+  assert.deepEqual(request.issue, {
+    repository: "ExampleOrg/ProductApp",
+    number: 12917,
+  });
   assert.equal(request.workType, "development");
   assert.match(request.description, /ExampleOrg\/ProductApp #12917/);
 });
@@ -125,4 +130,76 @@ test("assignment result replaces the form with its durable work item", () => {
   assert.match(markup, /pr-engineer/);
   assert.match(markup, /work-item-123/);
   assert.ok(!markup.includes("<form"));
+});
+
+test("a GitHub PR or Issue URL becomes a bounded manual work item", () => {
+  assert.deepEqual(
+    githubWorkItemFromUrl(
+      "https://github.com/ExampleOrg/SoftwareApp/pull/23991?notification_referrer_id=1#discussion",
+    ),
+    {
+      id: "github:pr:ExampleOrg/SoftwareApp#23991",
+      kind: "pull_request",
+      repo: "ExampleOrg/SoftwareApp",
+      number: 23991,
+      title: "ExampleOrg/SoftwareApp #23991",
+      url: "https://github.com/ExampleOrg/SoftwareApp/pull/23991",
+      summary: "由你通过 GitHub 地址人工加入日常任务",
+    },
+  );
+  assert.deepEqual(
+    githubWorkItemFromUrl("https://github.com/ExampleOrg/ProductApp/issues/12917/"),
+    {
+      id: "github:issue:ExampleOrg/ProductApp#12917",
+      kind: "issue",
+      repo: "ExampleOrg/ProductApp",
+      number: 12917,
+      title: "ExampleOrg/ProductApp #12917",
+      url: "https://github.com/ExampleOrg/ProductApp/issues/12917",
+      summary: "由你通过 GitHub 地址人工加入日常任务",
+    },
+  );
+});
+
+test("manual GitHub URL parsing rejects ambiguous or untrusted targets", () => {
+  for (const value of [
+    "http://github.com/acme/repo/pull/1",
+    "https://evil.example/acme/repo/pull/1",
+    "https://user@github.com/acme/repo/pull/1",
+    "https://github.com/acme/repo/pulls/1",
+    "https://github.com/acme/repo/issues/not-a-number",
+    "https://github.com/acme/repo/issues/1/comments",
+  ]) {
+    assert.throws(
+      () => githubWorkItemFromUrl(value),
+      /GitHub PR 或 Issue 地址无效/,
+    );
+  }
+});
+
+test("work view exposes an explicit historical task form", () => {
+  const markup = manualHistoricalWorkMarkup();
+
+  assert.match(markup, /人工加入历史任务/);
+  assert.match(markup, /name="sourceUrl"/);
+  assert.match(markup, /name="workType"/);
+  assert.match(markup, /data-manual-historical-work/);
+  assert.match(markup, /不会扩大自动扫描范围/);
+});
+
+test("manual Issue work keeps its canonical GitHub identity", () => {
+  const request = ownerWorkRequestForItem(
+    githubWorkItemFromUrl("https://github.com/ExampleOrg/ProductApp/issues/12917"),
+    {
+      workType: "development",
+      priority: "high",
+      requestId: "123e4567-e89b-42d3-a456-426614174000",
+    },
+  );
+
+  assert.equal(request.schemaVersion, 6);
+  assert.deepEqual(request.issue, {
+    repository: "ExampleOrg/ProductApp",
+    number: 12917,
+  });
 });

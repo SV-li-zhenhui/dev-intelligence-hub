@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 
 import { normalizeWorkflowEvent } from "./workflow-events.js";
 import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
+import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./prioritizer.js";
+
+const DAY_MS = 86_400_000;
 
 const SOURCE_DEFINITIONS = Object.freeze([
   {
@@ -129,6 +132,21 @@ function requireSourceScopeId(value) {
     throw new TypeError("sourceScopeId must be a non-empty identifier");
   }
   return value;
+}
+
+function requireIssueActiveWindowDays(value) {
+  const days = value ?? DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS;
+  if (!Number.isSafeInteger(days) || days < 1) {
+    throw new TypeError("issueActiveWindowDays must be a positive integer");
+  }
+  return days;
+}
+
+function issueIsWithinActiveWindow(item, cutoff) {
+  if (item.kind !== "issue") return true;
+  const updatedAt = Date.parse(item.updatedAt || item.createdAt || "");
+  if (!Number.isFinite(updatedAt)) return true;
+  return updatedAt > cutoff;
 }
 
 function sourceIsHealthy(snapshot, statusName) {
@@ -287,14 +305,21 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
-export function projectWorkflowSnapshot(snapshot) {
+export function projectWorkflowSnapshot(
+  snapshot,
+  { issueActiveWindowDays } = {},
+) {
   const source = requireSnapshot(snapshot, "snapshot");
+  const refreshedAt = requireTimestamp(source.refreshedAt);
+  const activeWindowDays = requireIssueActiveWindowDays(issueActiveWindowDays);
+  const issueCutoff = Date.parse(refreshedAt) - activeWindowDays * DAY_MS;
   const items = source.items
     .filter(
       (item) =>
         plainObject(item) &&
         SOURCE_DEFINITIONS.some(({ kind }) => kind === item.kind) &&
-        !(item.kind === "pull_request" && item.actionState === "historical"),
+        !(item.kind === "pull_request" && item.actionState === "historical") &&
+        issueIsWithinActiveWindow(item, issueCutoff),
     )
     .map(projectItem)
     .sort(compareItems);
@@ -306,7 +331,7 @@ export function projectWorkflowSnapshot(snapshot) {
     ids.add(item.id);
   }
   return deepFreeze({
-    refreshedAt: requireTimestamp(source.refreshedAt),
+    refreshedAt,
     sourceStatus: {
       githubPullRequests: projectedSourceStatus(
         source,
@@ -488,13 +513,17 @@ function eventsForSource({
 export function workflowEventsFromSnapshots(
   previousSnapshot,
   currentSnapshot,
-  { sourceScopeId = "github-dashboard" } = {},
+  {
+    sourceScopeId = "github-dashboard",
+    issueActiveWindowDays,
+  } = {},
 ) {
-  const current = projectWorkflowSnapshot(currentSnapshot);
+  const projectionOptions = { issueActiveWindowDays };
+  const current = projectWorkflowSnapshot(currentSnapshot, projectionOptions);
   const previous =
     previousSnapshot === null || previousSnapshot === undefined
       ? null
-      : projectWorkflowSnapshot(previousSnapshot);
+      : projectWorkflowSnapshot(previousSnapshot, projectionOptions);
   const occurredAt = current.refreshedAt;
   const scopeId = requireSourceScopeId(sourceScopeId);
 

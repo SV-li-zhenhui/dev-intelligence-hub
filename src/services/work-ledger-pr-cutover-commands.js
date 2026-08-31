@@ -49,6 +49,8 @@ export const CROSS_ROOT_PR_SOURCE_CUTOVER_PENDING_REASON =
   "pr_source_cross_root_cutover_pending";
 export const CROSS_ROOT_PR_SOURCE_CUTOVER_BLOCKER_REASON =
   "pr_source_cross_root_cutover_blocker";
+export const PR_SOURCE_AUTHORITY_FENCED_REASON =
+  "pr_source_authority_fenced";
 
 const pullRequestCutoverTimelineIndexes = new WeakMap();
 
@@ -276,10 +278,9 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
   if ([
     "pr_source_left_scope",
     "pr_source_reentered_scope_without_route",
+    "pr_source_cross_root_cutover_retired",
+    PR_SOURCE_AUTHORITY_FENCED_REASON,
   ].includes(item.statusReason)) {
-    return { proposalProof: null };
-  }
-  if (item.statusReason === "pr_source_cross_root_cutover_retired") {
     return { proposalProof: null };
   }
   if (item.statusReason === "decision_attempts_exhausted") {
