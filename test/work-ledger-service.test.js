@@ -1260,6 +1260,94 @@ test("a completed automatic PR root can leave scope without blocking later intak
   assert.equal(reentered.statusReason, "pr_source_reentered_scope");
 });
 
+test("a batch of old completed PR roots leaves scope with mixed Head proof", async () => {
+  const fixture = await createFixture({
+    records: [
+      prAssignment(1, {
+        pullRequestNumber: 41,
+        gitFacts: prGitFacts(PR_HEAD_A),
+      }),
+      prAssignment(2, {
+        pullRequestNumber: 42,
+        gitFacts: prGitFacts(PR_HEAD_A),
+      }),
+    ],
+  });
+  await fixture.service.intake({ limit: 10 });
+  const completedRoots = [];
+  for (const queued of (await fixture.service.listItems({ limit: 10 })).items) {
+    const claimed = await fixture.service.claim({
+      itemId: queued.itemId,
+      expectedRevision: queued.revision,
+      workerId: "employee-pr-engineer",
+      leaseDurationMs: 30_000,
+    });
+    completedRoots.push(await fixture.service.complete({
+      itemId: claimed.itemId,
+      expectedRevision: claimed.revision,
+      leaseId: claimed.leaseId,
+      actorId: "employee-pr-engineer",
+      result: { outcome: "completed-before-batch-scope-exit" },
+    }));
+  }
+  const previousByNumber = new Map(
+    completedRoots.map((root) => [root.source.identity.pullRequestNumber, root]),
+  );
+  const acceptedLeftEvent = prAssignment(3, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    pullRequestNumber: 41,
+    headRefOid: PR_HEAD_A,
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  const unprovenLeftEvent = prAssignment(4, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    pullRequestNumber: 42,
+    headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(3, acceptedLeftEvent),
+    prScopeLifecycleAssignment(4, unprovenLeftEvent),
+  );
+  fixture.source.highWatermark = 4;
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const inactiveByNumber = new Map(
+    (await fixture.service.listItems({ limit: 10 })).items.map((root) => [
+      root.source.identity.pullRequestNumber,
+      root,
+    ]),
+  );
+  const accepted = inactiveByNumber.get(41);
+  const unproven = inactiveByNumber.get(42);
+
+  assert.equal(intake.received, 2);
+  assert.equal(intake.cursor, 4);
+  assert.equal(accepted.status, "blocked");
+  assert.equal(accepted.statusReason, "pr_source_left_scope");
+  assert.equal(unproven.source.scope.active, false);
+  assert.equal(
+    unproven.source.activeRevision,
+    previousByNumber.get(42).source.activeRevision,
+  );
+  assert.equal(
+    unproven.source.authorityEpoch,
+    previousByNumber.get(42).source.authorityEpoch,
+  );
+  assert.equal(
+    unproven.source.revisions.at(-1).disposition,
+    "ignored_unproven_head",
+  );
+  assert.equal(
+    unproven.source.revisions.at(-1).scopeRevocationApplied,
+    true,
+  );
+  assert.equal(unproven.status, "blocked");
+  assert.equal(unproven.statusReason, "pr_source_left_scope");
+});
+
 test("an explicit owner PR source survives automatic left-scope and never reuses its old binding", async () => {
   const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
   const fixture = await createFixture({ records: [initial] });
@@ -3275,13 +3363,7 @@ for (const cutover of ["same-root-head", "cross-provenance-root"]) {
       q: "工作时间线",
       repository: "acme/repo",
     });
-    assert.equal(prTimeline.items.length > 0, true);
-    assert.equal(
-      memory.journal.readRecords({
-        recordIds: prTimeline.items.map(({ id }) => id),
-      }).items.every(({ labels }) => labels.lifecycle === "obsolete"),
-      true,
-    );
+    assert.equal(prTimeline.items.length, 0);
     assert.deepEqual(
       memory.journal.readRecords({ recordIds: [oldWorkId, oldContractId] })
         .items.map(({ labels }) => labels.lifecycle),
@@ -5171,6 +5253,68 @@ for (const predecessorStatus of ["queued", "working", "completed", "sealed"]) {
   assert.equal(claimedB.status, "working");
   });
 }
+
+test("a durable replaced root activates its pending return after successor settlement", async () => {
+  const { fixture, rootB: replacedB, rootC: queuedC } =
+    await createReplacedPendingRootScenario();
+  const sealedC = await stageSealedPrReview(fixture, queuedC.itemId);
+  fixture.source.records.push(prAssignment(4, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    sourceScopeId: "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+
+  const durable = fixture.store.stored();
+  const pendingB = durable.items.find(
+    ({ itemId }) => itemId === replacedB.itemId,
+  );
+  assert.equal(pendingB.status, "blocked");
+  assert.equal(pendingB.source.pendingRevision, 2);
+  pendingB.status = "superseded";
+  pendingB.statusReason = "pr_source_cross_root_cutover_replaced";
+  fixture.store.replaceStored(durable);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  let roots = (await recovered.listItems({ limit: 10 })).items;
+  let rootC = roots.find(({ itemId }) => itemId === queuedC.itemId);
+  await recovered.ackIntent({
+    intentId: sealedC.outbox.intentId,
+    expectedRevision: sealedC.outbox.revision,
+    itemExpectedRevision: rootC.revision,
+    dispatchLeaseId: sealedC.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher",
+    outcome: "delivered",
+    nextStatus: "completed",
+    details: { downstreamRef: "settled-before-durable-return" },
+  });
+  roots = (await recovered.listItems({ limit: 10 })).items;
+  const rootB = roots.find(({ itemId }) => itemId === replacedB.itemId);
+
+  await recovered.reconcilePullRequestSource({
+    itemId: rootB.itemId,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedRevision: rootB.revision,
+    expectedPendingRevision: rootB.source.pendingRevision,
+  });
+
+  const activated = (await recovered.listItems({ limit: 10 })).items.find(
+    ({ itemId }) => itemId === rootB.itemId,
+  );
+  assert.equal(activated.status, "queued");
+  assert.equal(activated.statusReason, "pr_source_cutover_activated");
+  assert.equal(activated.source.activeRevision, 2);
+  assert.equal(activated.source.pendingRevision, null);
+});
 
 test("reactivating a replaced source root never revives its old child or intent", async () => {
   const fixture = await createFixture({

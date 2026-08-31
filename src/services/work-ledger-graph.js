@@ -437,7 +437,9 @@ function isReplacedPullRequestRootCutover(previous, next) {
   }
   const activated =
     next.status === "queued" &&
-    next.statusReason === "pr_source_revised" &&
+    ["pr_source_revised", "pr_source_cutover_activated"].includes(
+      next.statusReason,
+    ) &&
     next.source.pendingRevision === null &&
     next.source.activeRevision > previous.source.activeRevision;
   const deferred =
@@ -448,18 +450,22 @@ function isReplacedPullRequestRootCutover(previous, next) {
     next.source.activeRevision === previous.source.activeRevision &&
     next.source.pendingRevision > previous.source.activeRevision;
   if (!activated && !deferred) return false;
-  const previousSequence = previous.source.bindings.at(-1)?.sourceSequence;
-  const candidateRevision = next.source.pendingRevision ??
-    next.source.activeRevision;
-  const nextSequence = next.source.bindings
-    .filter(({ inputRevision }) => inputRevision === candidateRevision)
-    .at(-1)?.sourceSequence;
+  const previousSequence = previous.source.current.sourceSequence;
+  const nextSequence = (next.source.pending ?? next.source.current)
+    .sourceSequence;
   return Number.isSafeInteger(previousSequence) &&
     Number.isSafeInteger(nextSequence) &&
     nextSequence > previousSequence;
 }
 
 function isCompletedPullRequestRootScopeExit(previous, next) {
+  const rejectedScopeRevocation =
+    next?.source?.revisions?.at(-1)?.scopeRevocationApplied === true &&
+    next.source.authorityEpoch === previous.source.authorityEpoch &&
+    next.source.activeRevision === previous.source.activeRevision;
+  const acceptedScopeRevocation =
+    next?.source?.authorityEpoch > previous.source.authorityEpoch &&
+    next.source.activeRevision > previous.source.activeRevision;
   return (
     previous.kind === "source_root" &&
     previous.source?.kind === "pull_request" &&
@@ -478,9 +484,8 @@ function isCompletedPullRequestRootScopeExit(previous, next) {
     next.leaseUntil === null &&
     next.activeIntentId === null &&
     next.availableAt === null &&
-    next.source.authorityEpoch > previous.source.authorityEpoch &&
     next.source.inputRevision > previous.source.inputRevision &&
-    next.source.activeRevision > previous.source.activeRevision
+    (acceptedScopeRevocation || rejectedScopeRevocation)
   );
 }
 
