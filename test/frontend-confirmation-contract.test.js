@@ -404,7 +404,10 @@ test("external confirmation completion only cleans up its own modal", async () =
   const handler = app.slice(start, end);
 
   assert.ok(start >= 0 && end > start);
-  assert.match(handler, /const submissionOwner = beginExternalConfirmationSubmission\(\)/);
+  assert.match(
+    handler,
+    /const submissionOwner = beginExternalConfirmationSubmission\(button, operation\)/,
+  );
   assert.match(handler, /closeExternalConfirmation\(submissionOwner\)/);
   assert.match(handler, /restoreExternalConfirmation\(submissionOwner\)/);
   assert.match(
@@ -412,6 +415,9 @@ test("external confirmation completion only cleans up its own modal", async () =
     /beginConfirmationSubmission\(setConfirmationButtonsDisabled\)/,
   );
   assert.match(app, /confirmationCloseButton\.disabled = true/);
+  assert.match(app, /setAttribute\("aria-busy", "true"\)/);
+  assert.match(app, /"正在封存…"/);
+  assert.match(app, /removeAttribute\("aria-busy"\)/);
   assert.match(app, /if \(confirmationCloseButton\.disabled\) return;/);
 });
 

@@ -3567,12 +3567,32 @@ function closeConfirmationSubmission(owner) {
   return closeConfirmationDialog(owner);
 }
 
-function beginExternalConfirmationSubmission() {
-  return beginConfirmationSubmission(setConfirmationButtonsDisabled);
+function beginExternalConfirmationSubmission(button, operation) {
+  const owner = beginConfirmationSubmission(setConfirmationButtonsDisabled);
+  if (owner === null) return null;
+  const actions = button.closest(".confirmation-actions");
+  if (actions) actions.setAttribute("aria-busy", "true");
+  button.dataset.externalIdleLabel = button.textContent;
+  button.textContent =
+    operation === "reject" && activeExternalConfirmation?.resolutionRequired === true
+      ? "正在封存…"
+      : "正在提交…";
+  return owner;
 }
 
 function restoreExternalConfirmation(owner) {
-  return restoreConfirmationSubmission(owner, setConfirmationButtonsDisabled);
+  if (!restoreConfirmationSubmission(owner, setConfirmationButtonsDisabled)) {
+    return false;
+  }
+  confirmationContent
+    .querySelector(".confirmation-actions")
+    ?.removeAttribute("aria-busy");
+  const button = confirmationContent.querySelector("[data-external-idle-label]");
+  if (button) {
+    button.textContent = button.dataset.externalIdleLabel;
+    delete button.dataset.externalIdleLabel;
+  }
+  return true;
 }
 
 function closeConfirmationDialog(
@@ -4624,7 +4644,7 @@ async function handleExternalConfirmation(event) {
     item,
     handoffWorkType,
   );
-  const submissionOwner = beginExternalConfirmationSubmission();
+  const submissionOwner = beginExternalConfirmationSubmission(button, operation);
   if (submissionOwner === null) return;
   try {
     const response = await fetch(

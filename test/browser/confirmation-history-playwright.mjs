@@ -9,6 +9,7 @@ import { validationBrowserLaunchOptions } from
 const publicDirectory = path.resolve("public");
 const deferredConfirmationStorageKey = "mydashboard.deferred-confirmations.v1";
 const historyDelayMs = 120;
+const unknownConfirmationDelayMs = 300;
 let appendFailuresRemaining = 1;
 let attentionFailuresRemaining = 0;
 let confirmationEnabled = false;
@@ -368,6 +369,11 @@ function createFixtureServer() {
         confirmationEnabled = false;
         historyMutation += 1;
         queueRevision += 1;
+        if (confirmationFixtureName === "unknown") {
+          await new Promise((resolve) =>
+            setTimeout(resolve, unknownConfirmationDelayMs),
+          );
+        }
         json(response, 200, {
           item: confirmationFixtureName === "failed"
             ? {
@@ -532,7 +538,7 @@ try {
 
   for (const fixture of [
     ["comment", /PR 评论.*将发布的完整正文/s, "确认并发布评论"],
-    ["review", /PR Review.*Review 类型.*将发布的完整正文/s, "确认并发布 Review"],
+    ["review", /PR Review.*Review 类型.*将发布的完整正文/s, "确认发布并分配下一步"],
     ["update", /更新 PR 分支.*预期 Head.*预期 Base/s, "确认并更新分支"],
     ["push", /推送受控 commit.*目标分支.*受控 commit/s, "确认并推送 commit"],
     ["merge", /合并 PR.*合并方式.*预期 Head/s, "确认并合并 PR"],
@@ -653,12 +659,12 @@ try {
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
 
-  await page.getByRole("button", { name: "Approve fixture" }).click();
+  await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
   assert.equal(
     confirmationSubmissions.at(-1).path,
     "/api/confirmations/confirmation-active/approve",
   );
-  await page.getByText("GitHub 已确认发布成功。", { exact: true }).waitFor();
+  await page.getByText(/GitHub 已确认发布成功/u).waitFor();
   await page
     .locator(".confirmation-history-item strong")
     .filter({ hasText: "History mutation 1" })
@@ -673,7 +679,7 @@ try {
   );
   await page.locator("#refresh-button").click();
   await page.locator("#confirmation-dialog[open]").waitFor();
-  await page.getByRole("button", { name: "Publish failing fixture" }).click();
+  await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
   await page.getByText(
     "GitHub 不允许 PR 作者批准或请求修改自己的 PR，本次确认未产生外部写入；新提案将改为 COMMENT Review。",
     { exact: true },
@@ -694,6 +700,13 @@ try {
     0,
   );
   await page.getByRole("button", { name: "承认结果未知并封存" }).click();
+  const sealingButton = page.getByRole("button", { name: "正在封存…" });
+  await sealingButton.waitFor({ timeout: unknownConfirmationDelayMs });
+  assert.equal(await sealingButton.isDisabled(), true);
+  assert.equal(
+    await page.locator('.confirmation-actions[aria-busy="true"]').count(),
+    1,
+  );
   await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
   assert.equal(
     confirmationSubmissions.at(-1).path,

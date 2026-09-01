@@ -2161,6 +2161,30 @@ async function syncConfirmationOutcome(employeeRegistry, item) {
   return true;
 }
 
+function syncConfirmationOutcomeBeforeResponse(
+  employeeRegistry,
+  item,
+  reportError,
+) {
+  const sync = Promise.resolve()
+    .then(() => syncConfirmationOutcome(employeeRegistry, item))
+    .then(
+      () => false,
+      (error) => {
+        try {
+          reportError(error);
+        } catch {
+          // A diagnostic failure must not change the durable owner decision.
+        }
+        return true;
+      },
+    );
+  return Promise.race([
+    sync,
+    new Promise((resolve) => setImmediate(() => resolve(true))),
+  ]);
+}
+
 function confirmationUnavailable() {
   return Object.assign(new Error("外部动作正在核对最新事实，请稍后重试"), {
     statusCode: 503,
@@ -3592,12 +3616,11 @@ export function createDashboardServer(
             confirmationAction[1],
             input,
           );
-          let employeeSyncPending = false;
-          try {
-            await syncConfirmationOutcome(employeeRegistry, item);
-          } catch {
-            employeeSyncPending = true;
-          }
+          const employeeSyncPending = await syncConfirmationOutcomeBeforeResponse(
+            employeeRegistry,
+            item,
+            reportError,
+          );
           sendJson(response, 200, {
             item,
             next: await queue.next(),

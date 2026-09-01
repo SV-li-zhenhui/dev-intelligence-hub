@@ -995,6 +995,7 @@ async function withServer(
     changePackageApplicationStatusReader,
     codeJobEvidenceReader,
     runtimeSourceIdentity,
+    onRecordConfirmationOutcome,
   } = {},
 ) {
   const calls = [];
@@ -1053,6 +1054,9 @@ async function withServer(
     },
     async recordConfirmationOutcome(item) {
       calls.push({ operation: "employee_confirmation_outcome", item });
+      if (onRecordConfirmationOutcome) {
+        return onRecordConfirmationOutcome(item);
+      }
     },
   };
   const requirementsAnalyst = {
@@ -6773,6 +6777,50 @@ test("confirmation mutations forward only bound requests and sync the employee",
       trigger: "confirmation_answered",
     })));
   }, { backgroundWork });
+});
+
+test("confirmation mutation response does not wait for a busy employee queue", async () => {
+  const syncStarted = deferred();
+  const releaseSync = deferred();
+  let responsePromise;
+  let quickResponse;
+  await withServer(async ({ server }) => {
+    responsePromise = request(server, {
+      method: "POST",
+      path: "/api/confirmations/confirmation-pr-work-1/reject",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "x-mydashboard-action": "1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        requestId: "request-confirmation-busy-employee",
+        expectedQueueRevision: 8,
+        expectedItemRevision: 2,
+        displayedPayloadDigest: "b".repeat(64),
+        approvalBindingDigest: "c".repeat(64),
+        reason: "承认结果未知并封存",
+      }),
+    });
+    await syncStarted.promise;
+    try {
+      quickResponse = await Promise.race([
+        responsePromise,
+        new Promise((resolve) => setTimeout(() => resolve(null), 250)),
+      ]);
+    } finally {
+      releaseSync.resolve();
+      await responsePromise;
+    }
+    assert.notEqual(quickResponse, null);
+    assert.equal(quickResponse.status, 200);
+    assert.equal(JSON.parse(quickResponse.body).employeeSyncPending, true);
+  }, {
+    onRecordConfirmationOutcome() {
+      syncStarted.resolve();
+      return releaseSync.promise;
+    },
+  });
 });
 
 test("confirmation writes reject untrusted callers and expose no enqueue route", async () => {
