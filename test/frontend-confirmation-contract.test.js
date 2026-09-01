@@ -266,6 +266,7 @@ test("code authorization uses local-only wording and an exact kind branch", asyn
   const renderer = app.slice(start, end);
   assert.ok(start >= 0 && end > start);
   assert.match(renderer, /grant\.inputBinding/);
+  assert.match(renderer, /pullRequestTargetMarkup/);
   assert.match(renderer, /inputBinding\.repository/);
   assert.match(renderer, /inputBinding\.pullRequestNumber/);
   assert.match(renderer, /inputBinding\.headRefOid/);

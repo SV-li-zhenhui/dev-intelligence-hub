@@ -3954,7 +3954,7 @@ function showCodeJobConfirmation(entry, remaining) {
         <dt>请求岗位</dt><dd>${escapeHtml(item.requestedBy?.roleId || "未指定")}</dd>
         <dt>仓库</dt><dd>${escapeHtml(grant.repository || "未知")}</dd>
         <dt>可信工作区</dt><dd>${escapeHtml(grant.workspaceId || "未知")}</dd>
-        ${inputBinding ? `<dt>PR 输入</dt><dd>${escapeHtml(inputBinding.repository)} #${escapeHtml(inputBinding.pullRequestNumber)}</dd><dt>精确 Head</dt><dd><code>${escapeHtml(inputBinding.headRefOid)}</code></dd>` : ""}
+        ${inputBinding ? `<dt>PR 输入</dt><dd>${pullRequestTargetMarkup({ resourceId: `${inputBinding.repository}#${inputBinding.pullRequestNumber}` })}</dd><dt>精确 Head</dt><dd><code>${escapeHtml(inputBinding.headRefOid)}</code></dd>` : ""}
         <dt>代码操作</dt><dd>${escapeHtml(codeOperationLabel(grant.operation))}</dd>
         <dt>绑定提案</dt><dd><code>${escapeHtml(grant.contentDigest || item.target?.version || "未知")}</code></dd>
         <dt>授权大脑</dt><dd><code>${escapeHtml(grant.brainDigest || "未知")}</code></dd>
