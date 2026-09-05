@@ -41,6 +41,7 @@ const OPERATOR_PAUSE_CODES = new Set([
   "CODE_BRAIN_ACTION_NOT_PERMITTED",
   "CODE_BRAIN_CHECKS_ALREADY_PASSED",
   "CODE_BRAIN_COMPLETION_NOT_READY",
+  "CODE_BRAIN_INCOMPLETE_READ",
   "CODE_BRAIN_PATH_INVALID",
   "CODE_BRAIN_ROLE_NOT_CONFIGURED",
   "CODE_TASK_BRAIN_NOT_CONFIGURED",
@@ -213,8 +214,7 @@ function compactExecutorResult(action, result) {
       sha256: isSha256(result?.sha256) ? result.sha256 : null,
       bytes: Number.isSafeInteger(result?.bytes) ? result.bytes : 0,
       truncated:
-        Buffer.byteLength(String(result?.content ?? ""), "utf8") >
-        Buffer.byteLength(content, "utf8"),
+        result?.truncated === true || content !== String(result?.content ?? ""),
       error,
     };
   }
@@ -305,10 +305,11 @@ export function modelObservation(observation) {
   if (action.type === "list_files") {
     detail = { path: action.path, ...result };
   } else if (action.type === "read_text") {
+    const content = cleanText(result.content, 24 * 1_024);
     detail = {
       path: action.path,
-      content: cleanText(result.content, 24 * 1_024),
-      truncated: result.truncated === true,
+      content,
+      truncated: result.truncated === true || content !== result.content,
       error: result.error ?? null,
     };
   } else if (action.type === "search_text") {
@@ -393,7 +394,14 @@ export function successfulProfiles(job, session) {
   return result;
 }
 
-function expectedWriteSha(job, path, workspaceRevision) {
+function incompleteReadError(path) {
+  return workerError(
+    "CODE_BRAIN_INCOMPLETE_READ",
+    `无法覆盖 ${cleanText(path, 1_024)}：当前模型上下文未包含该文件的完整读取结果，请完整读取文件或调整任务范围后重试`,
+  );
+}
+
+function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
   for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
     const observation = job.execution.observations[index];
     if (
@@ -404,10 +412,35 @@ function expectedWriteSha(job, path, workspaceRevision) {
       continue;
     }
     const action = trustedObservationAction(observation);
-    const sha256 = observation.detail?.result?.sha256;
-    if (action.path === path && isSha256(sha256)) return sha256;
+    if (action.path !== path) continue;
+    const result = observation.detail?.result;
+    const visible = visibleObservations.some((entry) => {
+      if (entry.actionType !== "read_text" || entry.status !== "succeeded") return false;
+      try {
+        const detail = JSON.parse(entry.detail);
+        return detail?.compacted !== true && detail?.path === path &&
+          detail.content === result?.content && detail.truncated === false &&
+          detail.error == null;
+      } catch {
+        return false;
+      }
+    });
+    if (
+      !isSha256(result?.sha256) || typeof result.content !== "string" ||
+      result.truncated !== false || result.error != null || !visible
+    ) {
+      throw incompleteReadError(path);
+    }
+    return result.sha256;
   }
   return null;
+}
+
+export function assertPreparedWriteRead(job, session, action, visibleObservations) {
+  if (action.type !== "write_text" || action.expectedSha256 === null) return;
+  if (expectedWriteSha(job, action.path, session.workspaceRevision, visibleObservations) !== action.expectedSha256) {
+    throw incompleteReadError(action.path);
+  }
 }
 
 function actionId(job, semanticAction) {
@@ -420,7 +453,7 @@ function actionId(job, semanticAction) {
   return `action-${digest.slice(0, 55)}`;
 }
 
-export function bindTrustedAction(job, session, semanticAction, remainingProfiles) {
+export function bindTrustedAction(job, session, semanticAction, remainingProfiles, visibleObservations = []) {
   if (!job.grant.allowedActions.includes(semanticAction.type)) {
     throw workerError(
       "CODE_BRAIN_ACTION_NOT_PERMITTED",
@@ -469,6 +502,7 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
         job,
         path,
         session.workspaceRevision,
+        visibleObservations,
       ),
     };
   }

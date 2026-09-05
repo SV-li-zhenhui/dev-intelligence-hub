@@ -7,6 +7,7 @@ import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { githubEntitySessionKey } from "../lib/session-key.js";
 import {
   assertSessionBinding,
+  assertPreparedWriteRead,
   bindTrustedAction,
   cleanText,
   isAuthorityErrorCode,
@@ -564,26 +565,8 @@ export class CodeJobWorkerService {
     const remainingProfiles = job.grant.requiredProfiles.filter(
       ({ id }) => !passedProfiles.has(id),
     );
-    const observations = job.execution.observations
-      .slice(-this.#observationLimit)
-      .map(modelObservation);
     await this.#verifyAuthority(job.grant);
-    const brainContext = packCodeJobBrainContext({
-      task: {
-        operation: job.grant.operation,
-        repository: job.grant.repository,
-        objective: job.grant.objective,
-        acceptanceCriteria: job.grant.acceptanceCriteria,
-        evidence: job.grant.evidence,
-      },
-      capabilities: {
-        allowedActions: job.grant.allowedActions,
-        writablePaths: job.grant.writablePaths,
-        requiredProfilesRemaining: remainingProfiles.length,
-      },
-      turn: job.execution.turn + 1,
-      observations,
-    });
+    const brainContext = this.#brainContext(job, remainingProfiles);
     const sessionKey = Number.isSafeInteger(job.grant.subject?.number) &&
         job.grant.subject.number > 0
       ? githubEntitySessionKey({
@@ -608,6 +591,7 @@ export class CodeJobWorkerService {
       session,
       decision.action,
       remainingProfiles,
+      brainContext.observations,
     );
     await this.#verifyAuthority(job.grant);
     job = (await this.#jobs.prepareAction({
@@ -617,6 +601,27 @@ export class CodeJobWorkerService {
     })).job;
     await this.#verifyAuthority(job.grant);
     return this.#performPending(job, session);
+  }
+
+  #brainContext(job, remainingProfiles) {
+    return packCodeJobBrainContext({
+      task: {
+        operation: job.grant.operation,
+        repository: job.grant.repository,
+        objective: job.grant.objective,
+        acceptanceCriteria: job.grant.acceptanceCriteria,
+        evidence: job.grant.evidence,
+      },
+      capabilities: {
+        allowedActions: job.grant.allowedActions,
+        writablePaths: job.grant.writablePaths,
+        requiredProfilesRemaining: remainingProfiles.length,
+      },
+      turn: job.execution.turn + 1,
+      observations: job.execution.observations
+        .slice(-this.#observationLimit)
+        .map(modelObservation),
+    });
   }
 
   async #reconcileStartingPause(job, knownSession = null) {
@@ -790,6 +795,15 @@ export class CodeJobWorkerService {
       );
     }
     assertJobSessionBinding(job, session);
+    const pending = job.execution.pendingAction;
+    if (
+      job.execution.actionAdmission === null &&
+      pending.action.type === "write_text" && pending.action.expectedSha256 !== null
+    ) {
+      const passed = successfulProfiles(job, session);
+      const remaining = job.grant.requiredProfiles.filter(({ id }) => !passed.has(id));
+      assertPreparedWriteRead(job, session, pending.action, this.#brainContext(job, remaining).observations);
+    }
     return this.#performPending(job, session);
   }
 
@@ -1319,7 +1333,9 @@ export class CodeJobWorkerService {
         const changed = await this.#jobs.pause({
           jobId,
           expectedRevision: current.revision,
-          reason: `等待人工处理（${code}）`,
+          reason: code === "CODE_BRAIN_INCOMPLETE_READ"
+            ? `等待人工处理（${code}）：${cleanText(error.message, 1_536)}`
+            : `等待人工处理（${code}）`,
         });
         return {
           jobId,

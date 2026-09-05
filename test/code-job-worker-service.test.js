@@ -12,6 +12,7 @@ import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
+import { modelObservation, observationDetail } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
 const REVISION_B = "b".repeat(64);
@@ -1554,6 +1555,121 @@ test("write actions receive only a trusted current-revision file hash", async ()
   for (const forbidden of [FILE_SHA, "actionId", "profileId", "workspaceRevision"]) {
     assert.equal(modelContext.includes(forbidden), false);
   }
+});
+
+function trustedRead(content, { id = "read-current", truncated = false } = {}) {
+  return observation({
+    type: "read_text",
+    actionId: id,
+    expectedWorkspaceRevision: REVISION_A,
+    path: "src/app.js",
+  }, { result: {
+    path: "src/app.js", content, sha256: FILE_SHA,
+    bytes: Buffer.byteLength(content), truncated,
+  } });
+}
+
+test("read observations report every content truncation to the model", async (t) => {
+  for (const content of ["x".repeat(30 * 1024), "字".repeat(10 * 1024)]) {
+    await t.test(`UTF-8 bytes ${Buffer.byteLength(content)}`, () => {
+      const rendered = JSON.parse(modelObservation(trustedRead(content)).detail);
+      assert.equal(rendered.truncated, true);
+      assert.ok(Buffer.byteLength(rendered.content) <= 24 * 1024);
+      assert.equal(rendered.content.includes("\uFFFD"), false);
+    });
+  }
+  const read = trustedRead("prefix", { truncated: true });
+  const detail = observationDetail(read.action, {
+    session: { status: "active", attempt: { number: 1 } },
+    action: { status: "succeeded", attemptNumber: 1 },
+  }, read.detail.result);
+  assert.equal(detail.result.truncated, true);
+});
+
+test("whole-file writes pause when the latest trusted read is not fully visible", async (t) => {
+  const large = "x".repeat(30 * 1024);
+  const unrelated = observation({
+    type: "list_files", path: "", actionId: "list-later",
+    expectedWorkspaceRevision: REVISION_A,
+  }, { result: { files: ["src/app.js"] } });
+  const cases = [
+    { name: "30 KiB read", observations: [trustedRead(large)] },
+    { name: "UTF-8 read", observations: [trustedRead("字".repeat(10 * 1024))] },
+    { name: "executor truncated read", observations: [trustedRead("prefix", { truncated: true })] },
+    { name: "escaped JSON exceeds detail limit", observations: [trustedRead("\"".repeat(20 * 1024))] },
+    { name: "latest incomplete read shadows complete read", observations: [trustedRead("old", { id: "older-read" }), trustedRead(large)] },
+    { name: "observation history omitted", observations: [trustedRead("old"), unrelated], observationLimit: 1 },
+    { name: "packer summarizes read", observations: [trustedRead("old"), ...Array.from({ length: 6 }, (_, i) => observation({
+      type: "read_text", path: `test/other-${i}.js`, actionId: `other-${i}`,
+      expectedWorkspaceRevision: REVISION_A,
+    }, { result: { content: "x".repeat(24 * 1024), truncated: false } }))] },
+    { name: "packer omits all observations", observations: [trustedRead("old")], fillFixedContext: true },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const initial = job({ status: "active", execution: {
+        ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+        turn: scenario.observations.length, observations: scenario.observations,
+      } });
+      if (scenario.fillFixedContext) {
+        const fixed = {
+          task: {
+            operation: initial.grant.operation, repository: initial.grant.repository,
+            objective: "", acceptanceCriteria: initial.grant.acceptanceCriteria,
+            evidence: initial.grant.evidence,
+          },
+          capabilities: {
+            allowedActions: initial.grant.allowedActions, writablePaths: initial.grant.writablePaths,
+            requiredProfilesRemaining: 1,
+          },
+          turn: initial.execution.turn + 1, observations: [],
+        };
+        initial.grant.objective = "x".repeat(128 * 1024 - Buffer.byteLength(JSON.stringify(fixed)) - 10);
+      }
+      const store = new FakeJobStore([initial]);
+      const executor = new FakeExecutor(initial);
+      const calls = [];
+      const worker = new CodeJobWorkerService({
+        jobStore: store, executor, grantVerifier: verifier([]),
+        brainDirectory: brain([{ type: "write_text", path: "src/app.js", content: "replacement" }], calls),
+        ...(scenario.observationLimit ? { observationLimit: scenario.observationLimit } : {}),
+      });
+      const result = await worker.runCycle();
+      assert.equal(result.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+      assert.equal(result.outcomes[0].status, "paused");
+      assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+      const stored = await store.getForWorker(initial.jobId);
+      assert.match(stored.execution.pause.reason, /src\/app\.js/);
+      assert.equal(stored.execution.pause.reason.includes("replacement"), false);
+    });
+  }
+});
+
+test("absent legacy prepared overwrite requires a fully visible trusted read", async () => {
+  const action = {
+    type: "write_text", path: "src/app.js", content: "replacement",
+    actionId: "legacy-overwrite", expectedWorkspaceRevision: REVISION_A,
+    expectedSha256: FILE_SHA,
+  };
+  const initial = job({ status: "active", execution: {
+    ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+    turn: 1, observations: [trustedRead("x".repeat(30 * 1024))],
+    pendingAction: {
+      turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action,
+      preparedAt: "2026-08-01T00:00:01.000Z",
+    },
+  } });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({
+    jobStore: store, executor, grantVerifier: verifier([]), brainDirectory: brain([]),
+  });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+  assert.equal(result.outcomes[0].status, "paused");
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.deepEqual(executor.calls.find(({ method }) => method === "reconcileAction").value.action, action);
+  assert.deepEqual((await store.getForWorker(initial.jobId)).execution.pendingAction.action, action);
 });
 
 test("a prepared action is retried exactly without asking the brain again", async () => {
