@@ -11,6 +11,14 @@ function attention(code, summary, remediation) {
 
 const OWNER_ATTENTION_BY_CODE = new Map([
   [
+    "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+    attention(
+      "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+      "岗位 CLI 会话进度未能安全归档",
+      "保留隔离目录中的会话历史，不要删除；确认 CLI 已结束后检查会话存储并恢复该任务的原会话",
+    ),
+  ],
+  [
     "ROLE_TASK_BRAIN_NOT_CONFIGURED",
     attention(
       "ROLE_TASK_BRAIN_NOT_CONFIGURED",

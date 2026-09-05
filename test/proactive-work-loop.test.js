@@ -2378,6 +2378,11 @@ test("task-brain owner decisions enter one durable attention request without fal
 
 const STRUCTURED_BRAIN_ATTENTION_CASES = Object.freeze([
   Object.freeze({
+    code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+    failurePoint: "brain",
+    remediation: /保留.*会话历史.*不要删除/,
+  }),
+  Object.freeze({
     code: "STRUCTURED_PROVIDER_UNAVAILABLE",
     failurePoint: "context",
     remediation: /安装|配置|可执行/,

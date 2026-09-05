@@ -5263,7 +5263,7 @@ test("application close stays bounded and incomplete while a configured provider
         properties: { ok: { type: "boolean" } },
       },
     }),
-    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+    { code: "STRUCTURED_PROVIDER_REAP_FAILED" },
   );
   try {
     const admission = await waitForCausalOutcome(
@@ -5277,6 +5277,12 @@ test("application close stays bounded and incomplete while a configured provider
     if (admission.error) throw admission.error;
     assert.equal(admission.name, "process-started");
     t.mock.timers.runAll();
+    const recovery = await waitForCausalOutcome(
+      [["public-result", request]],
+      async () => { t.mock.timers.runAll(); await access(temporaryRoot); },
+      "configured provider bounded recovery deadline",
+    );
+    if (recovery.error) throw recovery.error;
   } finally {
     t.mock.timers.reset();
   }
@@ -5465,12 +5471,18 @@ test("application close stays bounded when a non-versioned Code Job CLI never se
       admission.value?.stack,
     );
     t.mock.timers.runAll();
+    const recovery = await waitForCausalOutcome(
+      [["decision-outcome", decisionOutcome]],
+      async () => { t.mock.timers.runAll(); await access(temporaryRoot); },
+      "Code Job bounded recovery deadline",
+    );
+    if (recovery.error) throw recovery.error;
   } finally {
     t.mock.timers.reset();
   }
   assert.equal(
     (await within(500, decisionOutcome))?.code,
-    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    "STRUCTURED_PROVIDER_REAP_FAILED",
   );
 
   const closeFailure = await within(250, application.close()).then(
