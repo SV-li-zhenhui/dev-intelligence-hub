@@ -95,6 +95,30 @@ class FakeLedger {
   }
 }
 
+test("round-robin condition scan reaches due work beyond a full waiting prefix", async () => {
+  const ledger = new FakeLedger(Array.from({ length: 51 }, (_, index) => waitingPair({
+    kind: "time", notBefore: index === 50 ? "2026-08-01T00:00:00.000Z" : "2027-08-01T00:00:00.000Z",
+  }, index + 1)));
+  const waker = new WorkConditionWaker({ ledger, clock: () => "2026-08-02T00:00:00.000Z" });
+  assert.equal((await waker.runCycle()).woken, 0);
+  assert.equal((await waker.runCycle()).woken, 1);
+  assert.equal(ledger.wakeCalls[0].itemId, "work-item-51");
+});
+
+test("round-robin advances past invalid bindings and wraps without dropping work", async () => {
+  const ledger = new FakeLedger([1, 2, 3].map((index) => waitingPair({ kind: "time", notBefore: "2027-08-01T00:00:00.000Z" }, index)));
+  ledger.outbox = ledger.outbox.filter(({ itemId }) => itemId !== "work-item-1");
+  const waker = new WorkConditionWaker({ ledger, clock: () => "2026-08-02T00:00:00.000Z" });
+  const visited = [];
+  for (let cycle = 0; cycle < 4; cycle++) visited.push((await waker.runCycle({ limit: 1 })).outcomes[0].itemId);
+  assert.deepEqual(visited, ["work-item-1", "work-item-2", "work-item-3", "work-item-1"]);
+  ledger.items = ledger.items.filter(({ itemId }) => itemId !== "work-item-1");
+  assert.equal((await waker.runCycle({ limit: 1 })).outcomes[0].itemId, "work-item-2");
+  assert.equal((await waker.runCycle({ limit: 1 })).outcomes[0].itemId, "work-item-3");
+  ledger.items = [];
+  assert.equal((await waker.runCycle()).scanned, 0);
+});
+
 test("submitted child delivery wakes a paused orchestrator root", async () => {
   const ledger = new FakeLedger([]);
   const parent = {

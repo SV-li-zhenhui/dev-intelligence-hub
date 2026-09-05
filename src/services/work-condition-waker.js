@@ -123,6 +123,7 @@ export class WorkConditionWaker {
   #clock;
   #admitWake;
   #inFlight = null;
+  #lastExaminedItemId = null;
 
   constructor({
     ledger,
@@ -190,7 +191,13 @@ export class WorkConditionWaker {
       delivered.map((entry) => [entry.intentId, entry]),
     );
     const outcomes = [];
-    for (const item of waiting.slice(0, limit)) {
+    const previousIndex = waiting.findIndex(({ itemId }) => itemId === this.#lastExaminedItemId);
+    const start = previousIndex < 0 ? 0 : (previousIndex + 1) % waiting.length;
+    for (let offset = 0; offset < Math.min(waiting.length, limit); offset += 1) {
+      const item = waiting[(start + offset) % waiting.length];
+      // Advance even for unmet or invalid conditions so a stable waiting
+      // prefix cannot prevent later tasks from being observed.
+      this.#lastExaminedItemId = item.itemId;
       const outbox = outboxById.get(item.activeIntentId);
       if (!outbox || outbox.intent?.type !== "wait_condition") {
         outcomes.push({ itemId: item.itemId, status: "binding_invalid" });
