@@ -8,6 +8,7 @@ import {
   WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
 } from "./work-coordination-timing.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { isPreWriteGraphRevisionConflict } from "./work-ledger-graph-command-support.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const DEFAULT_INTAKE_LIMIT = 100;
@@ -31,6 +32,17 @@ const ROOT_DECISION_DEFERRED_ERROR_CODES = new Set([
   "STRUCTURED_BRAIN_RESPONSE_INVALID",
   "STRUCTURED_PROVIDER_RESPONSE_INVALID",
 ]);
+const CONTEXT_CONTENTION_ERROR_CODES = new Set([
+  "ROLE_CONTEXT_STALE",
+  "ROLE_DECISION_INPUT_STALE",
+  "ORCHESTRATOR_CONTEXT_STALE",
+  "WORK_LEDGER_REVISION_CONFLICT",
+]);
+
+function isContextContention(error) {
+  return CONTEXT_CONTENTION_ERROR_CODES.has(stableFailureCode(error)) ||
+    isPreWriteGraphRevisionConflict(error);
+}
 const NON_BUDGET_CLAIM_FAILURE_CODES = new Set([
   "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
 ]);
@@ -1409,7 +1421,7 @@ export class ProactiveWorkLoop {
         throw error;
       }
       const code = stableFailureCode(error);
-      if (ROOT_DECISION_DEFERRED_ERROR_CODES.has(code)) {
+      if (ROOT_DECISION_DEFERRED_ERROR_CODES.has(code) || isContextContention(error)) {
         return {
           claimAttempted: false,
           claimed: false,
@@ -1455,6 +1467,13 @@ export class ProactiveWorkLoop {
       } catch (error) {
         throwIfLoopAborted(options.signal);
         const code = stableFailureCode(error);
+        if (isContextContention(error)) {
+          return {
+            claimAttempted: false,
+            claimed: false,
+            outcome: { status: "decision_deferred", workerId: worker.workerId, code },
+          };
+        }
         if (
           !(error instanceof OrchestratorServiceError) ||
           code !== "ORCHESTRATOR_AUTHORITY_DENIED"
@@ -1718,19 +1737,20 @@ export class ProactiveWorkLoop {
   ) {
     throwIfLoopAborted(options.signal);
     const code = stableFailureCode(error);
+    const contention = isContextContention(error);
     const input = {
       itemId: item.itemId,
       expectedRevision: item.revision,
       leaseId: item.leaseId,
       actorId,
       reason:
-        item.attempt >= this.maxAttempts
+        contention ? "context_changed" : item.attempt >= this.maxAttempts
           ? reasons.exhausted
           : reasons.retry,
     };
     try {
       throwIfLoopAborted(options.signal);
-      if (item.attempt >= this.maxAttempts) {
+      if (!contention && item.attempt >= this.maxAttempts) {
         await this.ledger.transition({
           ...input,
           toStatus: "blocked",
@@ -1739,13 +1759,14 @@ export class ProactiveWorkLoop {
         throwIfLoopAborted(options.signal);
         return { status: "blocked", workerId: actorId, code };
       }
-      const exponent = Math.min(item.attempt - 1, 30);
+      const exponent = contention ? 0 : Math.min(item.attempt - 1, 30);
       const delay = Math.min(
         this.retryMaxMs,
         this.retryBaseMs * 2 ** exponent,
       );
       await this.ledger.scheduleRetry({
         ...input,
+        ...(contention ? { consumeAttempt: false } : {}),
         details: { code },
         availableAt: new Date(
           Date.parse(normalizeLoopClock(this.clock)) + delay,

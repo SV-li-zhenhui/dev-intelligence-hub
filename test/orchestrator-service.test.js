@@ -1085,6 +1085,98 @@ function submitIntent(fixture, {
   };
 }
 
+function signedContextPacket(packet, view) {
+  const result = structuredClone(packet);
+  result.binding.graphRevision = view.graph.revision;
+  result.binding.graphContentDigest = view.graph.contentDigest;
+  result.context.requirements.graph = {
+    graphId: view.graph.graphId,
+    revision: view.graph.revision,
+    contentDigest: view.graph.contentDigest,
+  };
+  result.contextDigest = digest({
+    domain: "mydashboard-role-context/v1",
+    binding: result.binding,
+    dataClasses: Object.keys(result.context).sort(),
+    context: result.context,
+  });
+  return result;
+}
+
+test("scoped decisions survive unrelated graph changes with authenticated context", async (t) => {
+  for (const role of ["orchestrator", "developer"]) {
+    await t.test(role, async () => {
+      const fixture = role === "orchestrator" ? rootFixture() : specialistFixture();
+      const changed = graphView([
+        ...fixture.view.graph.tasks,
+        task({ taskId: "unrelated-root" }),
+      ], fixture.view.graph.revision + 1);
+      const original = signedContextPacket(fixture.packet, fixture.view);
+      const fresh = signedContextPacket(original, changed);
+      const fakes = fakePorts({ packet: fresh, views: changed });
+      await serviceFrom(fakes).execute({
+        worker: { roleId: role, workerId: `employee-${role}` },
+        item: fixture.item,
+        contextPacket: original,
+        intent: role === "orchestrator"
+          ? orchestrate(commonAction("pause", fixture.child, fixture.view))
+          : submitIntent(fixture),
+      });
+      const command = role === "orchestrator"
+        ? fakes.calls.planner[0].command
+        : fakes.calls.delivery[0];
+      assert.equal(command.expectedGraphRevision, changed.graph.revision);
+      assert.equal(original.binding.graphRevision, fixture.view.graph.revision);
+    });
+  }
+});
+
+test("scoped rebase rejects changed inputs, forged digests and intent revisions", async (t) => {
+  for (const mutation of [
+    "task", "source", "acceptedInputs", "contract", "originalDigest",
+    "freshDigest", "intentRevision", "sameRevision", "rollback", "inconsistentGraph",
+  ]) {
+    await t.test(mutation, async () => {
+      const fixture = rootFixture();
+      if (mutation === "rollback") {
+        fixture.view = graphView(fixture.view.graph.tasks, fixture.view.graph.revision + 1);
+      }
+      const changed = graphView([
+        ...fixture.view.graph.tasks,
+        task({ taskId: "unrelated-root" }),
+      ], fixture.view.graph.revision + (mutation === "sameRevision" ? 0 : mutation === "rollback" ? -1 : 1));
+      const original = signedContextPacket(fixture.packet, fixture.view);
+      let fresh = signedContextPacket(original, changed);
+      if (mutation === "task") fresh.binding.taskRevision += 1;
+      if (mutation === "source") fresh.context.requirements.source = { head: "new" };
+      if (mutation === "acceptedInputs") fresh.acceptedInputs = [{ changed: true }];
+      if (mutation === "contract") fresh.binding.contractRevision += 1;
+      fresh = signedContextPacket(fresh, changed);
+      if (mutation === "inconsistentGraph") {
+        fresh.context.requirements.graph.revision += 1;
+        fresh.contextDigest = digest({
+          domain: "mydashboard-role-context/v1",
+          binding: fresh.binding,
+          dataClasses: Object.keys(fresh.context).sort(),
+          context: fresh.context,
+        });
+      }
+      if (mutation === "originalDigest") original.contextDigest = "f".repeat(64);
+      if (mutation === "freshDigest") fresh.contextDigest = "f".repeat(64);
+      const action = commonAction("pause", fixture.child, fixture.view);
+      if (mutation === "intentRevision") action.expectedGraphRevision = changed.graph.revision;
+      const fakes = fakePorts({ packet: fresh, views: changed });
+      await assert.rejects(serviceFrom(fakes).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: fixture.item,
+        contextPacket: original,
+        intent: orchestrate(action),
+      }), (error) => error.code === "ORCHESTRATOR_CONTEXT_STALE");
+      assertNoTrustedMutation(fakes.calls);
+    });
+  }
+});
+
 test("submits ordinary and requirement-spec deliveries with trusted evidence", async (t) => {
   await t.test("ordinary delivery", async () => {
     const fixture = specialistFixture();

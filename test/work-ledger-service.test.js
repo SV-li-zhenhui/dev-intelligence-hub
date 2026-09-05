@@ -9369,6 +9369,36 @@ test("transition requires the exact item revision and active work lease", async 
   );
 });
 
+test("contention retry restores only an owned active claim attempt", async (t) => {
+  for (const variant of ["refund", "default", "invalidBoolean", "wrongOwner", "wrongLease", "wrongRevision"]) {
+    await t.test(variant, async () => {
+      const fixture = await createFixture({ records: [assignment(1)] });
+      await fixture.service.intake();
+      let item = (await fixture.service.listItems()).items[0];
+      item = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision, workerId: "employee-pr-reviewer", leaseDurationMs: 30_000 });
+      const input = {
+        itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+        actorId: "employee-pr-reviewer", availableAt: "2026-08-02T02:01:00.000Z",
+        reason: "context_changed", consumeAttempt: false,
+      };
+      if (variant === "default") delete input.consumeAttempt;
+      if (variant === "invalidBoolean") input.consumeAttempt = "false";
+      if (variant === "wrongOwner") input.actorId = "other-worker";
+      if (variant === "wrongLease") input.leaseId = "wrong-lease";
+      if (variant === "wrongRevision") input.expectedRevision -= 1;
+      if (!["refund", "default"].includes(variant)) {
+        await assert.rejects(fixture.service.scheduleRetry(input));
+        assert.equal((await fixture.service.listItems()).items[0].attempt, 1);
+        return;
+      }
+      const retried = await fixture.service.scheduleRetry(input);
+      assert.equal(retried.status, "retry_wait");
+      assert.equal(retried.attempt, variant === "refund" ? 0 : 1);
+      assert.equal(retried.leaseId, null);
+    });
+  }
+});
+
 test("retry, handoff, and completion are explicit durable timeline events", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   await fixture.service.intake();

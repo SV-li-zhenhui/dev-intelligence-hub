@@ -4,6 +4,7 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
 import { OrchestratorServiceError } from "../src/services/orchestrator-service.js";
+import { assertExpectedWorkGraphRevision } from "../src/services/work-ledger-graph-command-support.js";
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -270,6 +271,7 @@ class FakeLedger {
   async scheduleRetry(input) {
     this.calls.scheduleRetry.push(clone(input));
     const item = this.#leasedItem(input);
+    if (input.consumeAttempt === false) item.attempt -= 1;
     item.status = "retry_wait";
     item.revision += 1;
     item.ownerId = null;
@@ -2408,6 +2410,137 @@ function structuredBrainFailure(code) {
     },
   );
 }
+
+test("root context contention defers one item and continues the cycle", async (t) => {
+  for (const failurePoint of ["assemble", "execute"]) {
+    await t.test(failurePoint, async () => {
+      const time = controlledClock();
+      const ledger = new FakeLedger({
+        source: [
+          workItem(401, { type: "role", id: "orchestrator" }),
+          workItem(402, { type: "role", id: "orchestrator" }),
+        ],
+        time,
+      });
+      let assemblies = 0;
+      let executions = 0;
+      const loop = createLoop({
+        ledger,
+        time,
+        directory: new FakeRoleDirectory({
+          orchestrator: worker({
+            roleId: "orchestrator",
+            workerId: "employee-orchestrator",
+            decide: async ({ item }) => orchestrationDecision(item),
+          }),
+        }),
+        roleContextAssembler: {
+          async assemble({ roleId, item }) {
+            assemblies += 1;
+            if (failurePoint === "assemble" && assemblies === 1) {
+              throw Object.assign(new Error("context changed"), { code: "ROLE_CONTEXT_STALE" });
+            }
+            return contextPacket(item, roleId);
+          },
+        },
+        orchestratorService: {
+          async execute() {
+            executions += 1;
+            if (failurePoint === "execute" && executions === 1) {
+              throw new OrchestratorServiceError("ORCHESTRATOR_CONTEXT_STALE", "changed", 409);
+            }
+            return { applied: true };
+          },
+        },
+      });
+      const cycle = await loop.runCycle({ roleId: "orchestrator" });
+      assert.equal(executions, failurePoint === "execute" ? 2 : 1);
+      assert.deepEqual(cycle.outcomes.map(({ status }) => status), ["decision_deferred", "orchestrated"]);
+      assert.equal(ledger.calls.claim.length, 0);
+    });
+  }
+});
+
+test("specialist context contention never exhausts the business attempt budget", async (t) => {
+  for (const priorFailures of [0, 2]) {
+    await t.test(`prior failures: ${priorFailures}`, async () => {
+      const time = controlledClock();
+      const source = workItem(403, { type: "role", id: "developer" });
+      source.attempt = priorFailures;
+      const ledger = new FakeLedger({ source: [source], time });
+      const loop = createLoop({
+        ledger,
+        time,
+        directory: new FakeRoleDirectory({
+          developer: worker({
+            roleId: "developer",
+            decide: async ({ item }) => deliveryDecision(item),
+          }),
+        }),
+        roleContextAssembler: {
+          async assemble({ roleId, item }) { return contextPacket(item, roleId); },
+        },
+        orchestratorService: {
+          async execute() {
+            if (priorFailures === 2) assertExpectedWorkGraphRevision(1, { revision: 2 });
+            throw new OrchestratorServiceError("ORCHESTRATOR_CONTEXT_STALE", "changed", 409);
+          },
+        },
+      });
+      for (let cycle = 0; cycle < 5; cycle += 1) {
+        const result = await loop.runCycle({ roleId: "developer" });
+        assert.equal(result.retried, 1);
+        assert.equal(ledger.items[0].attempt, priorFailures);
+        assert.equal(ledger.items[0].status, "retry_wait");
+        time.advance(1_000);
+      }
+      assert.equal(ledger.calls.transition.length, 0);
+      assert.equal(ledger.calls.scheduleRetry.every(({ consumeAttempt }) => consumeAttempt === false), true);
+    });
+  }
+});
+
+test("only authentic pre-write graph conflicts defer root decisions", async (t) => {
+  for (const authentic of [true, false]) {
+    await t.test(`authentic: ${authentic}`, async () => {
+      const time = controlledClock();
+      const ledger = new FakeLedger({
+        source: [workItem(404, { type: "role", id: "orchestrator" })],
+        time,
+      });
+      let conflict = Object.assign(new Error("durable state fork or untrusted error"), {
+        code: "WORK_LEDGER_STATE_REVISION_CONFLICT", contextContention: true,
+      });
+      if (authentic) {
+        try {
+          assertExpectedWorkGraphRevision(1, { revision: 2 });
+        } catch (error) {
+          conflict = error;
+        }
+      }
+      const loop = createLoop({
+        ledger,
+        time,
+        directory: new FakeRoleDirectory({
+          orchestrator: worker({
+            roleId: "orchestrator", workerId: "employee-orchestrator",
+            decide: async ({ item }) => orchestrationDecision(item),
+          }),
+        }),
+        roleContextAssembler: {
+          async assemble({ roleId, item }) { return contextPacket(item, roleId); },
+        },
+        orchestratorService: { async execute() { throw conflict; } },
+      });
+      if (authentic) {
+        assert.equal((await loop.runCycle({ roleId: "orchestrator" })).outcomes[0].status, "decision_deferred");
+      } else {
+        await assert.rejects(loop.runCycle({ roleId: "orchestrator" }), (error) => error === conflict);
+      }
+      assert.equal(ledger.calls.scheduleRetry.length, 0);
+    });
+  }
+});
 
 function terminalPullRequestFailure(state = "MERGED") {
   const terminal = Object.assign(new Error(`PR is ${state}`), {

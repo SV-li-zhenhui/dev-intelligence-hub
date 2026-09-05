@@ -233,6 +233,10 @@ export function planWorkItemTransition({ state, input, clock }) {
 }
 
 export function planWorkItemRetry({ state, input, clock }) {
+  const consumeAttempt = input.consumeAttempt === undefined ? true : input.consumeAttempt;
+  if (typeof consumeAttempt !== "boolean") {
+    throw workLedgerError("WORK_LEDGER_RETRY_INVALID", "consumeAttempt must be a boolean");
+  }
   const itemId = boundedLedgerString(input.itemId, "itemId", 192);
   const actorId = normalizeWorkActor(input.actorId);
   const reason = normalizeWorkReason(input.reason);
@@ -244,6 +248,9 @@ export function planWorkItemRetry({ state, input, clock }) {
   const now = clock();
   assertWorkLease(item, input.leaseId, now);
   assertRetryTransition(item.status);
+  if (!consumeAttempt && (item.status !== "working" || item.ownerId !== actorId)) {
+    throw workLedgerError("WORK_LEDGER_LEASE_CONFLICT", "Only the active claim owner can restore an attempt", 409);
+  }
   const availableAt = normalizeRetryAt(input.availableAt, now);
   const itemResult = moveWorkItem(item, {
     status: "retry_wait",
@@ -251,6 +258,7 @@ export function planWorkItemRetry({ state, input, clock }) {
     reason,
     availableAt,
   });
+  if (!consumeAttempt) itemResult.attempt = Math.max(0, item.attempt - 1);
   return {
     patch: {
       items: replaceWorkLedgerRecord(state.items, "itemId", itemResult),

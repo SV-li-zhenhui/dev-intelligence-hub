@@ -412,12 +412,59 @@ function normalizeGraphView(value) {
   return normalizeWorkGraphSnapshot(fields.get("graph"));
 }
 
+function roleContextDigest(packet) {
+  return sha256({
+    domain: "mydashboard-role-context/v1",
+    binding: packet.binding,
+    dataClasses: Object.keys(packet.context).sort(),
+    context: packet.context,
+  });
+}
+
+function hasConsistentContextGraph(packet) {
+  const graph = packet.context?.requirements?.graph;
+  const binding = packet.binding;
+  return graph !== undefined && graph !== null &&
+    graph.graphId === binding?.graphId &&
+    graph.revision === binding?.graphRevision &&
+    graph.contentDigest === binding?.graphContentDigest;
+}
+
 function assertPacketIsFresh(original, fresh) {
   const normalizedFresh = checkedClone(fresh);
-  if (!sameValue(original, normalizedFresh)) {
+  if (sameValue(original, normalizedFresh)) return normalizedFresh;
+  if (
+    !hasConsistentContextGraph(original) ||
+    !hasConsistentContextGraph(normalizedFresh) ||
+    normalizedFresh.binding.graphRevision <= original.binding.graphRevision ||
+    original.contextDigest !== roleContextDigest(original) ||
+    normalizedFresh.contextDigest !== roleContextDigest(normalizedFresh)
+  ) {
+    throw stale("Role context changed before the requested action could execute");
+  }
+  // Only global graph metadata may advance without changing this role's inputs.
+  // Validate both digests before recomputing; all scoped fields still compare.
+  const rebased = checkedClone(original);
+  rebased.binding.graphRevision = normalizedFresh.binding.graphRevision;
+  rebased.binding.graphContentDigest = normalizedFresh.binding.graphContentDigest;
+  rebased.context.requirements.graph.revision = normalizedFresh.context.requirements.graph.revision;
+  rebased.context.requirements.graph.contentDigest = normalizedFresh.context.requirements.graph.contentDigest;
+  rebased.contextDigest = roleContextDigest(rebased);
+  if (!sameValue(rebased, normalizedFresh)) {
     throw stale("Role context changed before the requested action could execute");
   }
   return normalizedFresh;
+}
+
+function rebaseIntentGraphRevision(intent, original, fresh) {
+  if (sameValue(original, fresh)) return intent;
+  const action = intent.type === "orchestrate" ? intent.action : intent;
+  if (action.expectedGraphRevision !== original.binding.graphRevision) {
+    throw stale("The decision does not reference its original context graph");
+  }
+  return intent.type === "orchestrate"
+    ? { ...intent, action: { ...action, expectedGraphRevision: fresh.binding.graphRevision } }
+    : { ...intent, expectedGraphRevision: fresh.binding.graphRevision };
 }
 
 function assertGraphBinding(packet, graph) {
@@ -1319,7 +1366,7 @@ export class OrchestratorService {
     const { packet: originalPacket, trigger } = packetTrigger(
       fields.get("contextPacket"),
     );
-    const intent = normalizeWorkIntent(checkedClone(fields.get("intent")));
+    let intent = normalizeWorkIntent(checkedClone(fields.get("intent")));
     let evidenceDeadlineAt = null;
     if (intent.type === "submit_delivery") {
       assertLocalSubmissionClaim({ worker, item, intent });
@@ -1336,6 +1383,7 @@ export class OrchestratorService {
       this.#remainingEvidenceBudget(evidenceDeadlineAt),
     );
     const packet = assertPacketIsFresh(originalPacket, freshPacket);
+    intent = rebaseIntentGraphRevision(intent, originalPacket, packet);
 
     let graph;
     try {

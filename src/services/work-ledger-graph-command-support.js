@@ -10,6 +10,12 @@ function invalidGraphCommand(message) {
   return workLedgerError("WORK_LEDGER_GRAPH_COMMAND_INVALID", message);
 }
 
+const preWriteGraphRevisionConflicts = new WeakSet();
+
+export function isPreWriteGraphRevisionConflict(error) {
+  return preWriteGraphRevisionConflicts.has(error);
+}
+
 export function normalizeWorkGraphCommandAuthority(value) {
   if (!hasExactLedgerKeys(value, ["actorId", "scopeRootTaskId"])) {
     throw invalidGraphCommand("工作图权限上下文无效");
@@ -65,11 +71,13 @@ export function assertExpectedWorkGraphRevision(expectedRevision, state) {
     throw invalidGraphCommand("工作图 revision 无效");
   }
   if (expectedRevision !== state.revision) {
-    throw workLedgerError(
+    const error = workLedgerError(
       "WORK_LEDGER_STATE_REVISION_CONFLICT",
       "工作图已被其他员工更新",
       409,
     );
+    preWriteGraphRevisionConflicts.add(error);
+    throw error;
   }
 }
 
