@@ -1,4 +1,5 @@
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
+import { normalizeReviewHandoff } from "../domain/review-handoff.js";
 import { createGitHubReviewProposalConfirmationPlan } from "../domain/github-review-proposal-confirmation.js";
 import {
   WORK_PROPOSAL_STATUSES,
@@ -46,6 +47,7 @@ const OPTIONAL_CONFIRMATION_KEYS = new Set([
   "failure",
   "rejection",
   "invalidation",
+  "reviewHandoff",
 ]);
 const FACTORY_KEYS = new Set([
   "enabled",
@@ -201,7 +203,10 @@ function normalizeConfirmationItem(value, expected) {
   ) {
     throw error;
   }
-  const optional = keys.filter((key) => OPTIONAL_CONFIRMATION_KEYS.has(key));
+  if (item.reviewHandoff !== undefined) {
+    normalizeReviewHandoff(item.reviewHandoff, { ...expected, action: expected.display.payload.action });
+  }
+  const optional = keys.filter((key) => OPTIONAL_CONFIRMATION_KEYS.has(key) && key !== "reviewHandoff");
   const allowedOptional = {
     pending: [],
     executing: [],

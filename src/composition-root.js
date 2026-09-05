@@ -15,6 +15,7 @@ import { createChangePackageRuntime } from "./change-package-runtime.js";
 import { createCodeExecutorRuntime } from "./code-executor-runtime.js";
 import { createCodeJobRuntime } from "./code-job-runtime.js";
 import { createConfirmationRuntime } from "./confirmation-runtime.js";
+import { ReviewHandoffReconciler } from "./services/review-handoff-reconciler.js";
 import { createConfigurationRuntime } from "./configuration-runtime.js";
 import {
   productionCodexLoginLocations,
@@ -2658,6 +2659,9 @@ export async function createApplication({
       workCoordination,
       ownerWorkRetry,
       ownerWorkRequests,
+      reviewHandoffReconciler: ownerWorkRequests && confirmationRuntime?.reviewHandoffs
+        ? new ReviewHandoffReconciler({ confirmations: confirmationRuntime.reviewHandoffs, ownerWorkRequests })
+        : null,
       deliveryEvidence,
       memorySearch,
       memoryAnswer,

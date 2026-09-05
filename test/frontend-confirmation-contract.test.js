@@ -170,7 +170,9 @@ test("external confirmation renders the exact authorization context", async () =
   ]) {
     assert.equal(app.includes(visibleLabel), true, visibleLabel);
   }
-  assert.match(app, /submitReviewHandoff/);
+  assert.doesNotMatch(app, /submitReviewHandoff/);
+  assert.match(app, /reviewHandoff: item\.reviewHandoff\?\.selection/);
+  assert.match(app, /关闭页面不影响推进/);
   assert.match(app, /data-review-testing-person/);
   assert.match(app, /handoffResponsiblePerson/);
   assert.match(app, /\/api\/work\/requests/);

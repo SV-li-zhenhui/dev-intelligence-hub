@@ -25,6 +25,8 @@ function enabledConfig(overrides = {}) {
 
 function queuePort(events = []) {
   return {
+    readReviewHandoffs() { return []; },
+    recordReviewHandoff() {},
     async recover() {
       events.push("recover");
     },
@@ -270,6 +272,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     executor: router,
     operationQueue,
     exclusiveLease: guard,
+    reviewHandoffPolicy: {},
   });
   assert.deepEqual(Object.keys(routerOptions.executors).sort(), [
     "github.pull-request-review",
@@ -296,6 +299,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.deepEqual(Object.keys(runtime), [
     "queue",
     "historyReader",
+    "reviewHandoffs",
     "producerQueue",
     "applicationResultSource",
     "memoryProjectionSource",

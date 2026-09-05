@@ -40,6 +40,7 @@ const MEMORY_PROJECTION_SOURCE_METHODS = [
   "readMemoryStatus",
 ];
 const RECOVERY_STATUS_READER_METHODS = ["readRecoveryStatus"];
+const REVIEW_HANDOFF_METHODS = ["readReviewHandoffs", "recordReviewHandoff"];
 const CONFIGURATION_ACTIVATION_KIND = "local.configuration-activate";
 const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabled",
@@ -525,6 +526,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       executor,
       operationQueue,
       exclusiveLease: guard,
+      reviewHandoffPolicy: config.workCoordination?.policy || {},
       ...(clock === undefined ? {} : { clock }),
     };
     const queue = assertPort(
@@ -538,6 +540,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           ...APPLICATION_RESULT_SOURCE_METHODS,
           ...MEMORY_PROJECTION_SOURCE_METHODS,
           ...RECOVERY_STATUS_READER_METHODS,
+          ...REVIEW_HANDOFF_METHODS,
         ]),
       ],
       "queue",
@@ -551,6 +554,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
         historyReader,
       }),
       historyReader,
+      reviewHandoffs: createQueueFacade(queue, REVIEW_HANDOFF_METHODS),
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),
       applicationResultSource: createQueueFacade(
         queue,

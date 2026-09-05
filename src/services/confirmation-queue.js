@@ -19,6 +19,7 @@ import {
   normalizeExternalDeferredOptions,
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { createReviewHandoff, normalizeReviewHandoff, reviewHandoffWorkRequest } from "../domain/review-handoff.js";
 
 export const CONFIRMATION_QUEUE_STATE_KEY = "confirmation-queue";
 const STATE_KEY = CONFIRMATION_QUEUE_STATE_KEY;
@@ -377,6 +378,7 @@ function projectHistoryItem(item) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     retryable: Boolean(item.failure?.retryable),
+    ...(item.reviewHandoff ? { reviewHandoff: clone(item.reviewHandoff) } : {}),
     ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
     ...(ownerDecision === null ? {} : { ownerDecision }),
   };
@@ -623,6 +625,7 @@ export class ConfirmationQueue {
     operationQueue = new OperationQueue(),
     exclusiveLease,
     clock = () => new Date(),
+    reviewHandoffPolicy = {},
   }) {
     if (!store || typeof store.read !== "function" || typeof store.write !== "function") {
       throw new TypeError("store must provide read and write");
@@ -646,6 +649,7 @@ export class ConfirmationQueue {
     this.operationQueue = operationQueue;
     this.exclusiveLease = exclusiveLease;
     this.clock = clock;
+    this.reviewHandoffPolicy = structuredClone(reviewHandoffPolicy);
     this.state = defaultConfirmationState();
     this.ready = false;
     this.recoveryPromise = null;
@@ -879,6 +883,36 @@ export class ConfirmationQueue {
     );
   }
 
+  async readReviewHandoffs() {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      return this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && item.reviewHandoff.status !== "completed")
+        .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts)
+        .slice(0, 25).map((item) => ({ id: item.id, request: reviewHandoffWorkRequest(item) }));
+    }));
+  }
+
+  async recordReviewHandoff(id, requestId, outcome) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      const item = this.#requireItem(id);
+      if (item.status !== "completed" || item.reviewHandoff?.requestId !== requestId) throw queueError("CONFIRMATION_HANDOFF_CONFLICT", "交接绑定已变化", 409);
+      if (item.reviewHandoff.status === "completed") return this.#projectItem(item);
+      const reviewHandoff = normalizeReviewHandoff({ ...item.reviewHandoff, ...outcome, attempts: item.reviewHandoff.attempts + 1 }, item);
+      await this.#replaceItem(id, { ...item, reviewHandoff, itemRevision: item.itemRevision + 1, updatedAt: this.#now() });
+      return this.#projectItem(this.#requireItem(id));
+    }));
+  }
+
+  #assertHandoffBinding(item, request) {
+    if (item.execution !== null && request.reviewHandoff !== undefined &&
+        digestValue(request.reviewHandoff) !== digestValue(item.reviewHandoff?.selection ?? null)) {
+      throw queueError("CONFIRMATION_HANDOFF_CONFLICT", "已接受的 Review 交接不能更换", 409);
+    }
+  }
+
   async retry(id, input) {
     this.#assertReady();
     const request = normalizeConfirmationRequest(input);
@@ -929,6 +963,7 @@ export class ConfirmationQueue {
       request.requestId,
       request.displayedPayloadDigest,
       request.approvalBindingDigest,
+      digestValue(request.reviewHandoff ?? null),
     ].join("\u0000");
     const active = this.liveRequests.get(key);
     if (active) return active;
@@ -949,6 +984,7 @@ export class ConfirmationQueue {
   async #approve(id, request) {
     const item = this.#requireItem(id);
     this.#assertBinding(item, request, { revisions: item.status === "pending" });
+    this.#assertHandoffBinding(item, request);
     if (["completed", "stale"].includes(item.status)) {
       return this.#projectItem(item);
     }
@@ -966,6 +1002,7 @@ export class ConfirmationQueue {
   async #retry(id, request) {
     let item = this.#requireItem(id);
     this.#assertBinding(item, request, { revisions: true });
+    this.#assertHandoffBinding(item, request);
     this.#assertNotProducerVetoed(item);
     if (item.status !== "failed" || !item.failure?.retryable) {
       throw queueError(
@@ -1079,6 +1116,9 @@ export class ConfirmationQueue {
     const timestamp = this.#now();
     const executing = {
       ...item,
+      ...(item.execution === null && request.reviewHandoff !== undefined
+        ? { reviewHandoff: createReviewHandoff(item, request, this.reviewHandoffPolicy) }
+        : {}),
       status: "executing",
       itemRevision: item.itemRevision + 1,
       updatedAt: timestamp,
@@ -1317,6 +1357,7 @@ export class ConfirmationQueue {
       displayedPayloadDigest: item.displayedPayloadDigest,
       approvalBindingDigest: item.approvalBindingDigest,
       retryable: Boolean(item.failure?.retryable),
+      ...(item.reviewHandoff ? { reviewHandoff: item.reviewHandoff } : {}),
       ...(item.status === "failed" && item.failure?.outcome === "unknown"
         ? { resolutionRequired: true }
         : {}),

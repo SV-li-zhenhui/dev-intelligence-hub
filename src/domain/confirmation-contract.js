@@ -1,4 +1,5 @@
 import { digestValue } from "./code-executor-contract.js";
+import { normalizeReviewHandoff, normalizeReviewHandoffSelection } from "./review-handoff.js";
 
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -322,12 +323,13 @@ export function normalizeConfirmationRequest(value, { allowReason = false } = {}
     "displayedPayloadDigest",
     "approvalBindingDigest",
   ];
-  const allowed = allowReason ? [...required, "reason"] : required;
+  const allowed = allowReason ? [...required, "reason"] : [...required, "reviewHandoff"];
   assertAllowedKeys(value, allowed, required);
   if (value.reason !== undefined && typeof value.reason !== "string") {
     throw invalidRequest("reason 无效");
   }
   return {
+    ...(value.reviewHandoff === undefined ? {} : { reviewHandoff: normalizeReviewHandoffSelection(value.reviewHandoff) }),
     requestId: boundedString(value.requestId, {
       name: "requestId",
       maxBytes: 128,
@@ -530,7 +532,7 @@ function normalizePersistedItem(value) {
     "failure",
     "rejection",
   ];
-  assertAllowedKeys(value, [...requiredKeys, "invalidation"], requiredKeys);
+  assertAllowedKeys(value, [...requiredKeys, "invalidation", "reviewHandoff"], requiredKeys);
   if (!STATUSES.has(value.status)) throw invalidRequest();
   if (!validIsoTimestamp(value.createdAt) || !validIsoTimestamp(value.updatedAt)) {
     throw invalidRequest();
@@ -552,6 +554,7 @@ function normalizePersistedItem(value) {
   }
   const item = {
     ...normalizedPlan,
+    ...(value.reviewHandoff === undefined ? {} : { reviewHandoff: normalizeReviewHandoff(value.reviewHandoff, normalizedPlan) }),
     status: value.status,
     itemRevision: safeInteger(value.itemRevision, "itemRevision", { minimum: 1 }),
     createdAt: value.createdAt,
@@ -588,6 +591,8 @@ function normalizePersistedItem(value) {
         )
       ),
   }[item.status];
+  if (item.reviewHandoff && (item.status === "pending" ||
+      (item.reviewHandoff.status === "completed" && item.status !== "completed"))) throw invalidRequest();
   if (!validShape) throw invalidRequest();
   const validOutcome = {
     pending: true,

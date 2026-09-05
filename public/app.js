@@ -751,6 +751,7 @@ function confirmationHistoryItemMarkup(item) {
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
     ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
     ${item.ownerDecision?.type === "seal_unknown_and_forbid_replay" ? '<small class="confirmation-history-resolution">已承认结果未知并封存（禁止重放）</small>' : ""}
+    ${item.reviewHandoff ? `<small class="confirmation-history-resolution">${escapeHtml(reviewHandoffStatusText(item))}</small>` : ""}
   </article>`;
 }
 
@@ -3733,6 +3734,8 @@ function configuredOwnerOptions(routing, product, selectedLogin = "") {
 }
 
 function reviewHandoffMarkup(reviewEvent, item) {
+  if (item.reviewHandoff) return `<section class="review-handoff"><strong>已确认的交接选择</strong><p>${escapeHtml(reviewHandoffStatusText(item))}</p><small>交接选择已绑定本次批准，重试不会更换负责人。</small></section>`;
+  if (item.status !== "pending") return '<section class="review-handoff"><small>本次历史批准未绑定交接选择；重试仅恢复原动作。发布完成后可在 PR 卡片手动分配。</small></section>';
   const lifecycle = reviewHandoffLifecycle(reviewEvent, item);
   const selected = lifecycle.workType;
   const option = (value, label) => `<option value="${value}"${selected === value ? " selected" : ""}>${label}</option>`;
@@ -4544,47 +4547,15 @@ function externalConfirmationOutcomeMessage(item, result, operation) {
   return null;
 }
 
-function reviewHandoffSource(item) {
-  const payload = item?.display?.payload || {};
-  const target = payload.target || item?.target || {};
-  const match = /^([^#]+)#([1-9]\d*)$/.exec(target.resourceId || "");
-  if (!match) throw new Error("Review 已发布，但无法解析 PR 目标，未创建下一棒任务");
-  return {
-    kind: "pull_request",
-    repo: match[1],
-    number: Number(match[2]),
-    title: item.display?.title || `${match[1]} #${match[2]}`,
-    summary: item.display?.summary || "GitHub Review 已发布，继续推进下一阶段。",
-    url: `https://github.com/${match[1]}/pull/${match[2]}`,
-  };
-}
-
-async function submitReviewHandoff(
-  item,
-  workType,
-  requestId,
-  responsiblePerson = null,
-) {
-  if (!workType) return null;
-  const request = ownerWorkRequestForItem(reviewHandoffSource(item), {
-    workType,
-    priority: "high",
-    requestId,
-    responsiblePerson,
-  });
-  const response = await fetch("/api/work/requests", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-mydashboard-action": "1",
-    },
-    body: JSON.stringify(request),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(result.error || `下一步分配失败（${response.status}）`);
-  }
-  return result;
+function reviewHandoffStatusText(item) {
+  const handoff = item?.reviewHandoff;
+  if (!handoff) return "";
+  const person = handoff.selection.responsiblePerson?.login;
+  const destination = `${handoff.selection.workType}${person ? ` · @${person}` : ""}`;
+  if (handoff.status === "completed") return `下一步已分配：${destination}；工作项 ${handoff.workItemId}。`;
+  if (item.status !== "completed") return `已保存交接选择：${destination}；只有 GitHub Review 明确完成后才会分配。`;
+  if (handoff.status === "retrying") return `交接待重试：${destination}（${handoff.diagnosticCode}）。服务端会继续恢复，不会重新发布 Review。`;
+  return `交接已持久保存：${destination}；服务端正在分配，关闭页面不影响推进。可在确认历史查看结果。`;
 }
 
 function selectedReviewHandoffPerson(item, workType) {
@@ -4639,7 +4610,6 @@ async function handleExternalConfirmation(event) {
   const handoffWorkType = operation === "reject"
     ? ""
     : confirmationContent.querySelector("[data-review-handoff]")?.value || "";
-  const handoffRequestId = handoffWorkType ? crypto.randomUUID() : null;
   const handoffResponsiblePerson = selectedReviewHandoffPerson(
     item,
     handoffWorkType,
@@ -4661,6 +4631,9 @@ async function handleExternalConfirmation(event) {
         expectedItemRevision: item.itemRevision,
         displayedPayloadDigest: item.displayedPayloadDigest,
         approvalBindingDigest: item.approvalBindingDigest,
+        ...(operation !== "reject" && (item.reviewHandoff || handoffWorkType)
+          ? { reviewHandoff: item.reviewHandoff?.selection || { workType: handoffWorkType, responsiblePerson: handoffResponsiblePerson } }
+          : {}),
         ...(operation === "reject"
           ? {
               reason: item.resolutionRequired === true
@@ -4703,24 +4676,10 @@ async function handleExternalConfirmation(event) {
       configurationPreview = null;
       configurationEditorDirty = false;
     }
-    let handoffResult = null;
-    let handoffError = null;
     const reviewPublished =
       ["approve", "retry"].includes(operation) &&
       confirmationResult?.item?.status === "completed" &&
       (item.display?.payload?.action || item.action)?.type === "pull_request_review";
-    if (reviewPublished && handoffWorkType) {
-      try {
-        handoffResult = await submitReviewHandoff(
-          item,
-          handoffWorkType,
-          handoffRequestId,
-          handoffResponsiblePerson,
-        );
-      } catch (error) {
-        handoffError = error;
-      }
-    }
     invalidateConfirmationQueueSnapshot();
     if (!closeExternalConfirmation(submissionOwner)) return;
     await load({ showConfirmation: false });
@@ -4730,13 +4689,8 @@ async function handleExternalConfirmation(event) {
       confirmationResult,
       operation,
     );
-    if (handoffResult) {
-      const personLabel = handoffResponsiblePerson?.login
-        ? `，负责人 @${handoffResponsiblePerson.login}`
-        : "";
-      outcomeMessage = `${outcomeMessage || "GitHub 已确认发布成功。"} 下一步已分配给 ${handoffResult.assignment?.target?.id || "对应岗位"}${personLabel}，工作项 ${handoffResult.workItemId || "已进入共享台账"}。`;
-    } else if (handoffError) {
-      outcomeMessage = `GitHub 已确认发布成功，但下一步未能分配：${handoffError.message}。请从 PR 卡片手动分配。`;
+    if (confirmationResult.item?.reviewHandoff) {
+      outcomeMessage = `${outcomeMessage || "确认结果已记录。"} ${reviewHandoffStatusText(confirmationResult.item)}`;
     } else if (reviewPublished && !handoffWorkType) {
       outcomeMessage = "GitHub 已确认发布成功；你选择了不创建下一步任务。";
     }

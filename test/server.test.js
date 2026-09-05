@@ -1780,6 +1780,27 @@ test("a shutdown drain failure sets a nonzero process outcome", async () => {
   }
 });
 
+test("durable Review handoffs recover at startup and ticks even while refresh is unavailable", async () => {
+  const application = startupApplication({ refresh: async () => { throw new Error("offline"); } });
+  let recovered = 0;
+  application.reviewHandoffReconciler = { async runCycle() { recovered++; } };
+  application.workCoordination = { async runCycle() {} };
+  application.config.workCoordination = { tickSeconds: 30 };
+  const timers = [];
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback, delay) { timers.push({ callback, delay }); return { unref() {} }; },
+    clearIntervalFn() {},
+    reportError() {},
+  });
+  try {
+    await assert.rejects(background.initialRefresh, /offline/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(recovered, 1);
+    await timers.find((timer) => timer.delay === 30_000).callback();
+    assert.equal(recovered, 2);
+  } finally { await background.stop(); }
+});
+
 test("a background drain timeout identifies the active participant without payloads", async () => {
   const memoryStarted = deferred();
   const releaseMemory = deferred();

@@ -4101,6 +4101,14 @@ export function startApplicationBackgroundWork(
     }
   }
 
+  async function recoverReviewHandoffs() {
+    if (typeof application.reviewHandoffReconciler?.runCycle !== "function") return;
+    await runDrainParticipant(
+      DRAIN_PARTICIPANTS.workCoordinationCycle,
+      () => application.reviewHandoffReconciler.runCycle(),
+    );
+  }
+
   async function routeWorkflowSnapshot() {
     if (typeof application.workflowRouting?.ingestSnapshot !== "function") {
       return;
@@ -4189,6 +4197,9 @@ export function startApplicationBackgroundWork(
   }) {
     signal.throwIfAborted();
     if (stopped) return { skipped: "stopped" };
+    // Completed Review receipts can settle local handoffs even if a refresh is
+    // unavailable. The owner request resolver still checks current PR facts.
+    try { await recoverReviewHandoffs(); } catch (error) { reportBackgroundError(error); }
     if (!factsReady) return { skipped: "facts_not_ready" };
     if (
       discardWhenFactsPending &&
@@ -4400,6 +4411,7 @@ export function startApplicationBackgroundWork(
     );
   }
 
+  if (application.reviewHandoffReconciler) runTracked(() => recoverReviewHandoffs());
   const initialRefresh = runCoalescedRefresh(
     { notify: false },
     { rethrow: true },

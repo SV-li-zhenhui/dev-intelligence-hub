@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { createReviewHandoff } from "../src/domain/review-handoff.js";
 import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import {
@@ -172,6 +173,24 @@ function handler(producer, overrides = {}) {
     ...overrides,
   });
 }
+
+test("durable local handoff metadata does not change successful Review settlement", async () => {
+  const producer = new FakeConfirmationProducer();
+  const reviewHandler = handler(producer);
+  const waiting = await reviewHandler.handle(handlerInput());
+  producer.status = "completed";
+  producer.overrides = {
+    receipt: { id: "published-review" },
+    reviewHandoff: createReviewHandoff(normalizeConfirmationPlan(producer.plan), {
+      requestId: "approve-request-42",
+      reviewHandoff: { workType: "development", responsiblePerson: null },
+    }, {}),
+  };
+  const result = await reviewHandler.handle(handlerInput({ downstreamRef: waiting.downstreamRef }));
+  assert.equal(result.status, "succeeded");
+  producer.overrides.reviewHandoff.requestId = "00000000-0000-4000-8000-000000000000";
+  await assert.rejects(reviewHandler.handle(handlerInput({ downstreamRef: waiting.downstreamRef })));
+});
 
 test("a pending proposal is idempotently enqueued and waits on its exact confirmation", async () => {
   const producer = new FakeConfirmationProducer();
