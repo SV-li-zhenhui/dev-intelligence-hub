@@ -1540,7 +1540,7 @@ test("cleanup inventory closes its directory handle after cancellation", async (
 
   await assert.rejects(
     provider.generate(brainRequest({ signal: controller.signal })),
-    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
   );
   assert.equal(closeCalls, 1);
 });
@@ -2648,7 +2648,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   assert.equal(secondRunner.calls.length, 0);
 });
 
-test("cancellation with no cleanup budget retains the invocation and reports cleanup failure", async (t) => {
+test("cancellation uses an independent cleanup budget after safe process settlement", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-cancel-");
   const temporaryRoot = path.join(parent, "runtime");
   const controller = new AbortController();
@@ -2673,11 +2673,11 @@ test("cancellation with no cleanup budget retains the invocation and reports cle
   await assert.rejects(
     provider.generate(brainRequest({ signal: controller.signal })),
     (error) =>
-      error?.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED" &&
+      error?.code === "STRUCTURED_PROVIDER_CANCELLED" &&
       !error.message.includes("private cancellation") &&
       !error.message.includes(temporaryRoot),
   );
-  assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
+  await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
 });
 
 async function assertCleanupLinkRejected(t, attack) {
@@ -2919,7 +2919,7 @@ test("Windows production cleanup cancellation settles after native handles close
   assert.equal(await readFile(moved, "utf8"), "private");
 });
 
-test("provider cancellation after native READY retains the root lease until handles close", async (t) => {
+test("provider cancellation after native READY completes verified cleanup before releasing the lease", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2957,19 +2957,19 @@ test("provider cancellation after native READY retains the root lease until hand
 
   await assert.rejects(
     provider.generate(brainRequest({ signal: controller.signal })),
-    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
   );
   assert.equal(typeof checkedFile, "string");
-  const moved = `${checkedFile}.after-close`;
-  await assert.rejects(rename(checkedFile, moved), (error) =>
-    ["EPERM", "EACCES", "EBUSY"].includes(error?.code));
+  await assert.rejects(lstat(checkedFile), { code: "ENOENT" });
 
   let secondPreflights = 0;
   const secondLocator = recordingLocator(testDescriptor("claude-cli"));
   const second = createTestSupervisedCliBrainProvider(
     providerOptions("claude-cli"),
     {
-      processRunner: recordingRunner(async () => successfulProcess()),
+      processRunner: recordingRunner(async () => successfulProcess(
+        Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))),
+      )),
       commandLocator: secondLocator,
       environment: { ANTHROPIC_API_KEY: "credential" },
       temporaryRoot,
@@ -2981,12 +2981,9 @@ test("provider cancellation after native READY retains the root lease until hand
       }),
     },
   );
-  await second.generate(brainRequest()).catch(() => {});
-  assert.equal(secondPreflights, 0);
-  assert.equal(secondLocator.calls.length, 0);
-
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  await rename(checkedFile, moved);
+  assert.equal(await second.generate(brainRequest()), '{"ok":true}');
+  assert.equal(secondPreflights, 1);
+  assert.equal(secondLocator.calls.length, 1);
 });
 
 test("Windows production cleanup preflights every stale tree before deleting any", async (t) => {
@@ -3053,7 +3050,7 @@ test("an unprovable process reap remains visible when the total deadline expires
   assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
 });
 
-test("provider returns at its total deadline while the real Windows runner settles a local child", async (t) => {
+test("provider waits within its recovery budget for the Windows runner to settle a local child", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("the production containment path is Windows x64 only");
     return;
@@ -3108,13 +3105,13 @@ test("provider returns at its total deadline while the real Windows runner settl
   const startedAt = performance.now();
 
   await assert.rejects(provider.generate(brainRequest()), {
-    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    code: "STRUCTURED_PROVIDER_TIMEOUT",
   });
   const elapsedMs = performance.now() - startedAt;
   assert.equal(await readFile(childStarted, "utf8"), "started");
   assert.ok(elapsedMs >= 3_000, elapsedMs);
-  assert.ok(elapsedMs < 4_750, elapsedMs);
-  assert.equal(runnerSettled, false);
+  assert.ok(elapsedMs < 8_000, elapsedMs);
+  assert.equal(runnerSettled, true);
 
   const nextLocator = recordingLocator(testDescriptor("claude-cli"));
   const nextRunner = recordingRunner(async () => successfulProcess(
@@ -3129,11 +3126,6 @@ test("provider returns at its total deadline while the real Windows runner settl
       temporaryRoot,
     },
   );
-  await assert.rejects(next.generate(brainRequest()), {
-    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
-  });
-  assert.equal(nextLocator.calls.length, 0);
-
   await within(5_000, runnerSettlement);
   assert.equal(runnerSettled, true);
   assert.equal(await next.generate(brainRequest()), '{"ok":true}');
@@ -3142,10 +3134,8 @@ test("provider returns at its total deadline while the real Windows runner settl
 });
 
 test("a never-settling process stays handled and permanently blocks close and cross-kind routing", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
   const parent = await temporaryDirectory(t, "supervised-cli-never-settles-");
   const temporaryRoot = path.join(parent, "runtime");
-  let clockReads = 0;
   const processStarted = deferred();
   const unhandled = [];
   const onUnhandled = (error) => unhandled.push(error);
@@ -3161,35 +3151,14 @@ test("a never-settling process stays handled and permanently blocks close and cr
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
-      monotonicClock: () => clockReads++ === 0 ? 0 : 600,
     },
   );
   const publicResult = assert.rejects(
     provider.generate(brainRequest()),
-    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+    { code: "STRUCTURED_PROVIDER_REAP_FAILED" },
   );
-  try {
-    const admission = await waitForCausalOutcome(
-      [
-        ["process-started", processStarted.promise],
-        ["public-result", publicResult],
-      ],
-      async () => {
-        try {
-          await lstat(temporaryRoot);
-        } catch (error) {
-          if (error?.code !== "ENOENT") throw error;
-        }
-      },
-      "never-settling runner admission",
-    );
-    if (admission.error) throw admission.error;
-    assert.equal(admission.name, "process-started");
-    t.mock.timers.runAll();
-  } finally {
-    t.mock.timers.reset();
-  }
-  await within(250, publicResult);
+  await within(1_000, processStarted.promise);
+  await within(3_000, publicResult);
 
   await assert.rejects(
     within(250, provider.close()),
@@ -3276,14 +3245,14 @@ test("close fences a generation paused before root admission and retries after i
   });
 });
 
-test("a sibling blocked after final recovery reaches neither locator nor runner", async (t) => {
+test("an expired process recovery keeps sibling admission fenced even after late settlement", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-atomic-root-admission-");
   const temporaryRoot = path.join(parent, "runtime");
   const firstRunnerStarted = deferred();
   const firstRunnerSettlement = deferred();
   const firstController = new AbortController();
   const firstProvider = createTestSupervisedCliBrainProvider(
-    providerOptions("codex-cli"),
+    { ...providerOptions("codex-cli"), timeoutMs: 1_000 },
     {
       processRunner: recordingRunner(async () => {
         firstRunnerStarted.resolve();
@@ -3372,7 +3341,7 @@ test("a sibling blocked after final recovery reaches neither locator nor runner"
   firstController.abort();
   assert.equal(
     (await within(2_000, firstOutcome))?.code,
-    "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    "STRUCTURED_PROVIDER_REAP_FAILED",
   );
   releaseLease.resolve();
   assert.equal(
@@ -3390,12 +3359,12 @@ test("a sibling blocked after final recovery reaches neither locator nor runner"
 
   firstRunnerSettlement.resolve(successfulProcess());
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(await nextProvider.generate(brainRequest()), '{"ok":true}');
-  assert.equal(nextLocator.calls.length, 1);
-  assert.equal(nextRunner.calls.length, 1);
-  await firstProvider.close();
-  await nextProvider.close();
-  await leaseProvider.close();
+  await assert.rejects(nextProvider.generate(brainRequest()), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  assert.equal(nextLocator.calls.length, 0);
+  assert.equal(nextRunner.calls.length, 0);
+  for (const provider of [firstProvider, nextProvider, leaseProvider]) {
+    await assert.rejects(provider.close(), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  }
 });
 
 test("a reap failure blocks every CLI kind sharing the root before discovery", async (t) => {
@@ -3466,7 +3435,7 @@ test("a critical stale-cleanup failure is not hidden by the total deadline", asy
   assert.equal(runner.calls.length, 0);
 });
 
-test("cancellation bounds an unresolved Codex result read and retains the invocation", async (t) => {
+test("cancellation bounds an unresolved Codex result read and cleans the reaped invocation", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-result-cancel-");
   const temporaryRoot = path.join(parent, "runtime");
   let invocationDirectory;
@@ -3494,14 +3463,14 @@ test("cancellation bounds an unresolved Codex result read and retains the invoca
   const controller = new AbortController();
   const cancelled = assert.rejects(
     provider.generate(brainRequest({ signal: controller.signal })),
-    { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" },
+    { code: "STRUCTURED_PROVIDER_CANCELLED" },
   );
   await started;
   controller.abort();
 
   await within(2_000, cancelled);
   assert.equal(readerSignal?.aborted, true);
-  assert.equal((await lstat(invocationDirectory)).isDirectory(), true);
+  await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
 });
 
 test("production provider construction requires a lexical grant and has no replacement seam", () => {

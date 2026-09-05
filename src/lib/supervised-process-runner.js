@@ -22,6 +22,15 @@ const WINDOWS_WRAPPER_PATH = fileURLToPath(
   new URL("./windows-process-tree-wrapper.ps1", import.meta.url),
 );
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
+const REAPED_FAILURE_OUTPUT = new WeakMap();
+
+// Failure output remains process-private instead of becoming loggable Error data.
+export function readReapedProcessFailureOutput(error) {
+  const stdoutBytes = REAPED_FAILURE_OUTPUT.get(error);
+  return stdoutBytes === undefined
+    ? null
+    : Object.freeze({ stdoutBytes: Buffer.from(stdoutBytes) });
+}
 
 export class SupervisedProcessError extends Error {
   constructor(code, message, statusCode = 500) {
@@ -605,6 +614,12 @@ export class SupervisedProcessRunner {
         if (settled) return;
         settled = true;
         cleanup();
+        if (
+          operation === reject && closed &&
+          value?.code !== "STRUCTURED_PROVIDER_REAP_FAILED"
+        ) {
+          REAPED_FAILURE_OUTPUT.set(value, Buffer.concat(stdout.chunks));
+        }
         operation(value);
       };
       const waitForClose = async () => {

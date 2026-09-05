@@ -33,7 +33,10 @@ import {
   readStructuredBrainGenerateInput,
 } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
-import { SupervisedProcessRunner } from "../lib/supervised-process-runner.js";
+import {
+  readReapedProcessFailureOutput,
+  SupervisedProcessRunner,
+} from "../lib/supervised-process-runner.js";
 
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const CLI_KINDS = new Set(["codex-cli", "claude-cli"]);
@@ -52,6 +55,7 @@ const MAX_RESULT_KEYS = 20_000;
 const MAX_CLEANUP_ENTRIES = 256;
 const MAX_CLEANUP_DEPTH = 16;
 const MAX_CLEANUP_REGULAR_BYTES = 16n * 1024n * 1024n;
+const MAX_RECOVERY_MS = 30_000;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SHARED_ROOT_STATES = new Map();
 const SHARED_SESSION_STORES = new Map();
@@ -162,10 +166,15 @@ const FAILURE_DEFINITIONS = Object.freeze({
     message: "Structured CLI provider cleanup failed",
     statusCode: 500,
   }),
+  STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED: Object.freeze({
+    message: "Structured CLI session progress could not be saved; isolated history was retained for recovery",
+    statusCode: 500,
+  }),
 });
 const FAILURE_PRECEDES_DEADLINE = new Set([
   "STRUCTURED_PROVIDER_REAP_FAILED",
   "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
 ]);
 
 export class SupervisedCliBrainProviderError extends Error {
@@ -1638,8 +1647,9 @@ function codexArguments({
   ];
 }
 
-function codexThreadId(result, maximumBytes, previousSessionId) {
-  const text = fatalUtf8(processBytes(result, maximumBytes));
+function codexThreadId(result, maximumBytes, previousSessionId, { allowMissing = false } = {}) {
+  const bytes = processBytes(result, maximumBytes);
+  const text = allowMissing ? bytes.toString("utf8") : fatalUtf8(bytes);
   let found = null;
   for (const line of text.split(/\r?\n/u)) {
     if (!line.trim()) continue;
@@ -1647,6 +1657,9 @@ function codexThreadId(result, maximumBytes, previousSessionId) {
     try {
       event = parseJsonWithUniqueKeys(line);
     } catch {
+      // A failed process may leave its final event incomplete. Only complete,
+      // validated thread.started events establish a recoverable first thread.
+      if (allowMissing) continue;
       throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
     }
     if (
@@ -1664,10 +1677,34 @@ function codexThreadId(result, maximumBytes, previousSessionId) {
     }
   }
   const sessionId = found ?? previousSessionId;
+  if (allowMissing && sessionId === null) return null;
   if (typeof sessionId !== "string" || !SAFE_SESSION_ID.test(sessionId)) {
     throw providerError("STRUCTURED_PROVIDER_RESPONSE_INVALID");
   }
   return sessionId;
+}
+
+async function containsSessionRollout(directory, signal, budget = { entries: 0 }, depth = 0) {
+  throwIfRequestAborted(signal);
+  let details;
+  try {
+    details = await lstat(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (++budget.entries > MAX_CLEANUP_ENTRIES || depth > MAX_CLEANUP_DEPTH || details.isSymbolicLink()) {
+    throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  }
+  if (details.isFile()) return path.extname(directory).toLowerCase() === ".jsonl";
+  if (!details.isDirectory()) {
+    throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  }
+  const handle = await opendir(directory);
+  for await (const entry of handle) {
+    if (await containsSessionRollout(path.join(directory, entry.name), signal, budget, depth + 1)) return true;
+  }
+  return false;
 }
 
 function claudeArguments(request) {
@@ -1953,7 +1990,7 @@ async function runConcurrentRootActivity(
   rootState,
   deadline,
   operation,
-  { blocking = false, requireSafe = false } = {},
+  { blocking = false, requireSafe = false, recoveryDeadline } = {},
 ) {
   let attempt = null;
   try {
@@ -1976,6 +2013,20 @@ async function runConcurrentRootActivity(
   } catch (error) {
     if (attempt !== null && rootState.pending.has(attempt)) {
       rootState.blocked = true;
+    }
+    if (attempt !== null && recoveryDeadline !== undefined) {
+      let settlement;
+      try {
+        settlement = await recoveryDeadline().run(() => attempt.then(
+          (value) => ({ value }),
+          (failure) => ({ failure }),
+        ));
+      } catch {
+        rootState.unprovable = true;
+        throw providerError("STRUCTURED_PROVIDER_REAP_FAILED");
+      }
+      if (Object.hasOwn(settlement, "failure")) throw settlement.failure;
+      return settlement.value;
     }
     throw error;
   }
@@ -2241,7 +2292,7 @@ export class SupervisedCliBrainProvider {
     };
   }
 
-  async #runProcess(invocation, deadline, options) {
+  async #runProcess(invocation, deadline, recoveryDeadline, options) {
     return runConcurrentRootActivity(
       this.#rootState,
       deadline,
@@ -2259,7 +2310,7 @@ export class SupervisedCliBrainProvider {
           throw error;
         });
       },
-      { blocking: true, requireSafe: true },
+      { blocking: true, requireSafe: true, recoveryDeadline },
     );
   }
 
@@ -2299,6 +2350,14 @@ export class SupervisedCliBrainProvider {
     let processReaped = credentialLease === null;
     let credentialCaptured = credentialLease === null;
     let cleanupCompleted = false;
+    let recovery = null;
+    const recoveryDeadline = () => recovery ??= createRequestDeadline({
+      signal: null,
+      timeoutMs: Math.min(MAX_RECOVERY_MS, this.#timeoutMs),
+      monotonicClock: this.#monotonicClock,
+      startedAt: this.#monotonicClock(),
+    });
+    let retainSession = false;
     try {
       invocation = await runRootOperation(
         this.#rootState,
@@ -2373,8 +2432,9 @@ export class SupervisedCliBrainProvider {
           ));
         this.#assertRunnable();
         let processFailure = null;
+        let processResult = null;
         try {
-          const processResult = await this.#runProcess(invocation, deadline, {
+          processResult = await this.#runProcess(invocation, deadline, recoveryDeadline, {
             executable: descriptor,
             args: codexArguments({
               request,
@@ -2390,26 +2450,37 @@ export class SupervisedCliBrainProvider {
             maxStderrBytes: this.#maxResponseBytes,
           });
           processReaped = true;
-          if (request.sessionKey !== undefined) {
-            const capturedSessionId = codexThreadId(
-              processResult,
-              this.#maxResponseBytes,
-              sessionId,
-            );
-            await deadline.run(({ signal }) =>
-              this.#codexSessionStore.capture({
+        } catch (error) {
+          processFailure = error;
+          processReaped = error?.code !== "STRUCTURED_PROVIDER_REAP_FAILED";
+        }
+        if (processReaped && request.sessionKey !== undefined) {
+          try {
+            const output = processResult ?? readReapedProcessFailureOutput(processFailure);
+            let capturedSessionId = sessionId;
+            if (output !== null && (processResult !== null || sessionId === null)) {
+              capturedSessionId = codexThreadId(output, this.#maxResponseBytes, sessionId, {
+                allowMissing: processFailure !== null,
+              });
+            }
+            if (capturedSessionId !== null) {
+              await recoveryDeadline().run(({ signal }) => this.#codexSessionStore.capture({
                 sessionKey: request.sessionKey,
                 sessionId: capturedSessionId,
                 codexHome,
                 signal,
               }));
+            } else if (await recoveryDeadline().run(({ signal }) =>
+              containsSessionRollout(path.join(codexHome, "sessions"), signal))) {
+              throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+            }
+          } catch {
+            retainSession = true;
+            processFailure = providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
           }
-        } catch (error) {
-          processFailure = error;
-          processReaped = error?.code !== "STRUCTURED_PROVIDER_REAP_FAILED";
         }
         if (credentialLease !== null && processReaped) {
-          await deadline.run(({ signal }) =>
+          await recoveryDeadline().run(({ signal }) =>
             credentialLease.capture({ signal }));
           credentialCaptured = true;
         }
@@ -2424,7 +2495,7 @@ export class SupervisedCliBrainProvider {
           ),
         );
       } else {
-        const processResult = await this.#runProcess(invocation, deadline, {
+        const processResult = await this.#runProcess(invocation, deadline, recoveryDeadline, {
           executable: descriptor,
           args: claudeArguments(request),
           cwd: invocation.path,
@@ -2443,15 +2514,16 @@ export class SupervisedCliBrainProvider {
     }
 
     if (invocation === null) {
+      recovery?.dispose();
       if (failure) throw failure;
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
     }
-    if (failure?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
+    if (failure?.code === "STRUCTURED_PROVIDER_REAP_FAILED" || retainSession) {
       recordResidue(this.#rootState, invocation);
       this.#rootState.unprovable = true;
     } else {
       try {
-        await this.#cleanup(invocation, root, deadline);
+        await this.#cleanup(invocation, root, recoveryDeadline());
         cleanupCompleted = true;
       } catch (cleanupError) {
         failure = cleanupError;
@@ -2466,6 +2538,7 @@ export class SupervisedCliBrainProvider {
     ) {
       onCredentialSettled();
     }
+    recovery?.dispose();
     if (failure) throw failure;
     return result;
   }

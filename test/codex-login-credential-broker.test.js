@@ -18,6 +18,7 @@ import {
   createProductionCodexLoginCredentialBroker,
   createTestCodexLoginCredentialBroker,
 } from "../src/adapters/codex-login-credential-broker.js";
+import { createTestSupervisedCliBrainProvider } from "../src/adapters/supervised-cli-brain-provider.js";
 import {
   createTestCodexLoginCredentialStore,
 } from "../src/lib/codex-login-credential-store.js";
@@ -194,6 +195,36 @@ async function fixture(t, overrides = {}) {
     root,
   };
 }
+
+test("a safely cancelled provider turn leaves the real shared broker available", async (t) => {
+  const current = await fixture(t);
+  const controller = new AbortController();
+  let first = true;
+  const provider = createTestSupervisedCliBrainProvider({
+    id: "broker-recovery", cliKind: "codex-cli", credentialMode: "codex-login",
+  }, {
+    temporaryRoot: path.join(current.root, "provider-runs"),
+    environment: {},
+    commandLocator: { async resolve() { return current.descriptor; } },
+    codexLoginCredentialBroker: current.broker,
+    processRunner: { async run() {
+      return { exitCode: 0, signal: null, stdoutBytes: Buffer.alloc(0), stderrBytes: Buffer.alloc(0) };
+    } },
+    codexResultReader: async () => {
+      if (first) { first = false; controller.abort(); }
+      return '{"ok":true}';
+    },
+  });
+  const request = {
+    model: "fixture-model", messages: [{ role: "user", content: "fixture" }],
+    schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+  };
+  await assert.rejects(provider.generate({ ...request, signal: controller.signal }), { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  assert.equal(await provider.generate(request), '{"ok":true}');
+  assert.equal(current.calls.captureTask.length, 2);
+  await provider.close();
+  await current.broker.close();
+});
 
 function realStoreHarness({ root, probeRoot, protectedRoot }) {
   const locations = {
