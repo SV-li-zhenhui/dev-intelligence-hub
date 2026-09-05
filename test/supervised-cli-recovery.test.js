@@ -116,6 +116,23 @@ test("recovery captures the bound session after a safely reaped nonzero exit", a
   assert.deepEqual(current.events, ["credential-captured", "release:true"]);
 });
 
+test("retained session recovery diagnostics survive a later credential deadline", async (t) => {
+  let monotonicTime = 10_000;
+  const current = await fixture(t, {
+    monotonicClock: () => monotonicTime,
+    processRunner: { async run() { throw failure(); } },
+    codexSessionStore: {
+      async stage() { return { sessionId: "existing-thread" }; },
+      async capture() { monotonicTime += 1_001; throw failure("STRUCTURED_PROVIDER_TIMEOUT"); },
+    },
+  });
+  await assert.rejects(current.provider.generate(request({ sessionKey: "github:issue:owner/repo#1" })), {
+    code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+  });
+  assert.deepEqual(current.events, ["release:false"]);
+  assert.equal((await readdir(current.temporaryRoot)).length, 1);
+});
+
 test("recovery captures the first failed thread from private supervised output", async (t) => {
   const captures = [];
   let calls = 0;

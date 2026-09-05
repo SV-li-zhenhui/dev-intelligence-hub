@@ -2521,6 +2521,9 @@ export class SupervisedCliBrainProvider {
     if (failure?.code === "STRUCTURED_PROVIDER_REAP_FAILED" || retainSession) {
       recordResidue(this.#rootState, invocation);
       this.#rootState.unprovable = true;
+      // A later credential-capture deadline must not hide the retained history
+      // or send the owner down an ordinary timeout/cleanup recovery path.
+      if (retainSession) failure = providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
     } else {
       try {
         await this.#cleanup(invocation, root, recoveryDeadline());
