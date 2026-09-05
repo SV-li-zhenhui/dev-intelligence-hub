@@ -48,6 +48,8 @@ const OPTIONAL_CONFIRMATION_KEYS = new Set([
   "rejection",
   "invalidation",
   "reviewHandoff",
+  "resolutionRequired",
+  "ownerDecision",
 ]);
 const FACTORY_KEYS = new Set([
   "enabled",
@@ -211,21 +213,31 @@ function normalizeConfirmationItem(value, expected) {
     pending: [],
     executing: [],
     completed: ["receipt"],
-    failed: ["failure"],
+    failed: ["failure", "resolutionRequired"],
     stale: ["invalidation"],
-    rejected: ["rejection"],
+    rejected: ["rejection", "ownerDecision", "failure"],
   }[item.status];
   if (optional.some((key) => !allowedOptional.includes(key))) throw error;
   if (
     (item.status === "completed" && !optional.includes("receipt")) ||
     (item.status === "failed" && !optional.includes("failure")) ||
-    (item.status === "rejected" && !optional.includes("rejection")) ||
+    (item.status === "rejected" && !optional.includes("rejection") && !optional.includes("ownerDecision")) ||
     (item.status !== "failed" && item.retryable)
   ) {
     throw error;
   }
-  const failure = item.status === "failed" ? normalizeFailure(item.failure, error) : null;
+  const failure = optional.includes("failure") ? normalizeFailure(item.failure, error) : null;
   if (failure && item.retryable !== failure.retryable) throw error;
+  if (optional.includes("resolutionRequired") &&
+      (item.resolutionRequired !== true || failure?.outcome !== "unknown")) throw error;
+  if (optional.includes("ownerDecision")) {
+    assertWorkProposalExactKeys(item.ownerDecision, ["type", "at"], error);
+    if (item.ownerDecision.type !== "seal_unknown_and_forbid_replay" ||
+        failure?.outcome !== "unknown" || optional.includes("rejection")) throw error;
+    normalizeWorkProposalTimestamp(item.ownerDecision.at, error);
+  } else if (item.status === "rejected" && failure !== null) {
+    throw error;
+  }
   return { ...item, failure };
 }
 
@@ -259,6 +271,9 @@ function transitionFor(item, clock, pollIntervalMs) {
     return terminal("succeeded", "GitHub Review 已完成", item);
   }
   if (item.status === "rejected") {
+    if (item.ownerDecision) {
+      return terminal("rejected", "用户已承认 GitHub Review 结果未知并封存，禁止重放", item, [item.failure.code]);
+    }
     return terminal("rejected", "用户已拒绝 GitHub Review 提案", item);
   }
   if (item.status === "stale") {
@@ -271,6 +286,9 @@ function transitionFor(item, clock, pollIntervalMs) {
       nextAttemptAt: nextAttemptAt(clock, pollIntervalMs),
     };
   }
+  // Keep polling the local confirmation until the owner resolves the unknown
+  // result. This never retries the external Review or loses the later seal.
+  if (item.resolutionRequired === true) return waitingConfirmation(item, clock, pollIntervalMs);
   return terminal(
     "unknown",
     "GitHub Review 外部结果无法确认",

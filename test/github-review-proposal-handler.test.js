@@ -9,6 +9,7 @@ import {
   createGitHubReviewProposalRunnerService,
 } from "../src/services/github-review-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
+import { ConfirmationQueue, ConfirmationExecutionError } from "../src/services/confirmation-queue.js";
 
 const HEAD_REF_OID = "b".repeat(40);
 
@@ -545,6 +546,77 @@ class Guard {
   }
   async close() {}
 }
+
+test("real unknown confirmation waits for owner sealing then settles without replay", async () => {
+  let now = Date.parse("2026-08-02T03:00:00.000Z");
+  const clock = () => new Date(now);
+  let executions = 0;
+  const queue = new ConfirmationQueue({
+    store: new MemoryStore(), exclusiveLease: new Guard(), clock,
+    executor: {
+      async execute() { executions++; throw new ConfirmationExecutionError("GITHUB_MARKER_ABSENT", "unknown"); },
+      async reconcile() { return { status: "unknown", code: "GITHUB_MARKER_ABSENT" }; },
+    },
+  });
+  await queue.recover();
+  const store = new MemoryStore();
+  const runtime = await createWorkProposalRuntime({
+    store, clock, idFactory: () => "github-lease",
+    runnerScopes: [{ runnerId: "github-runner", allowedKinds: ["github_review_proposal"], allowedRoleIds: ["pr-reviewer"] }],
+    createGuard: () => new Guard(),
+  });
+  try {
+    const service = createGitHubReviewProposalRunnerService({
+      enabled: true, runner: runtime.runners["github-runner"], confirmationProducer: queue,
+      inputAuthorityVerifier: acceptingVerifier(), actorAccountId: "review-account", clock,
+      pollIntervalMs: 1_000, leaseDurationMs: 30_000,
+    });
+    const { contentDigest: _, ...input } = proposal();
+    await runtime.producer.create(input);
+    await service.runCycle({ limit: 1 });
+    const approval = (item, requestId) => ({
+      requestId, expectedQueueRevision: item.queueRevision, expectedItemRevision: item.itemRevision,
+      displayedPayloadDigest: item.displayedPayloadDigest, approvalBindingDigest: item.approvalBindingDigest,
+    });
+    const pending = (await queue.next()).item;
+    const unknown = await queue.approve(pending.id, approval(pending, "request-approve-unknown"));
+    assert.equal(unknown.resolutionRequired, true);
+    now += 1_000;
+    await service.runCycle({ limit: 1 });
+    assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+    assert.equal(store.value.results.length, 0);
+    const sealed = await queue.reject(unknown.id, {
+      ...approval(unknown, "request-seal-unknown"), reason: "承认结果未知并封存",
+    });
+    assert.equal(sealed.ownerDecision.type, "seal_unknown_and_forbid_replay");
+    now += 1_000;
+    await service.runCycle({ limit: 1 });
+    const batch = await runtime.consumer.readResultBatch();
+    assert.equal(batch.items.length, 1);
+    assert.equal(batch.items[0].outcome, "rejected");
+    assert.match(batch.items[0].summary, /封存/);
+    assert.equal(executions, 1);
+    now += 1_000;
+    await service.runCycle({ limit: 1 });
+    assert.equal(executions, 1);
+  } finally { await runtime.close(); }
+});
+
+test("unknown resolution metadata is accepted only in valid confirmation states", async (t) => {
+  const failure = { code: "GITHUB_MARKER_ABSENT", outcome: "unknown", retryable: false, at: "2026-08-02T03:00:00.000Z" };
+  const ownerDecision = { type: "seal_unknown_and_forbid_replay", at: failure.at };
+  for (const [status, fields] of [
+    ["pending", { resolutionRequired: true }],
+    ["failed", { failure, resolutionRequired: false }],
+    ["failed", { failure: { ...failure, outcome: "absent", retryable: true }, retryable: true, resolutionRequired: true }],
+    ["rejected", { failure, ownerDecision: { ...ownerDecision, type: "replay" } }],
+    ["rejected", { failure, ownerDecision, rejection: { reason: "conflicting semantics" } }],
+  ]) {
+    await t.test(`${status}:${JSON.stringify(fields)}`, async () => {
+      await assert.rejects(handler(new FakeConfirmationProducer(status, fields)).handle(handlerInput()));
+    });
+  }
+});
 
 test("the enabled service closes the real proposal loop through confirmation", async () => {
   const store = new MemoryStore();
