@@ -34,10 +34,17 @@ Full repository regression at `03e6b88bec`: **3937 tests, 3922 passed, 12 skippe
 
 Both cases passed when rerun together with test concurrency 1: **3 passed, 0 failed, 2 capability skips**. Their implementation and tests were not changed by these repairs. This is not evidence of a clean full-suite run; concurrency-sensitive Windows integration coverage remains a verification limitation.
 
-Final review additionally reproduced and fixed a recovery diagnostic being overwritten by a later credential-capture timeout. The retained-session diagnostic now takes precedence so the owner is told to preserve history. Its CLI regression suite and distribution checks are recorded in the final handoff.
+Final review additionally reproduced and fixed a recovery diagnostic being overwritten by a later credential-capture timeout. The retained-session diagnostic now takes precedence so the owner is told to preserve history.
+
+Final checks:
+
+- Five-file CLI/provider/runner/session-store/broker regression: exit 0 after the final diagnostic fix.
+- Retained-session diagnostic and both bounded application-close cases: 3 passed, 0 failed.
+- Distribution and clean-source installation/composition checks: 19 passed, 0 failed, in 51 seconds.
+- JavaScript syntax checks for the changed frontend and new handoff modules, plus `git diff --check`: passed.
 
 No lint or typecheck command is configured in `package.json`.
 
 ## Deployment and acceptance limits
 
-This repair does not establish that production employees have completed a real development → test → push → Review cycle. Production service startup, real model execution, repository build profiles and human-approved GitHub writes require separate operational acceptance. The reviewed configuration had only repository-preflight profiles, not a proven Qt/application test suite. Historical unknown outcomes and unsafe cleanup fences were not silently reset.
+This repair does not establish that production employees have completed a real development → test → push → Review cycle. Production service startup, real model execution, repository build profiles and human-approved GitHub writes require separate operational acceptance. The reviewed configuration had only repository-preflight profiles, not a proven Qt/application test suite. Historical unknown outcomes and unsafe cleanup fences were not silently reset. The production `127.0.0.1:4173/api/live` check was unavailable during this repair; the production service was not restarted.
