@@ -54,6 +54,7 @@ import {
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
+import { validateWorkLedgerGraphTransition } from "../src/services/work-ledger-graph.js";
 import {
   migrateWorkGraphMemoryProjection,
 } from "../src/services/work-ledger-graph-memory.js";
@@ -4362,6 +4363,131 @@ test("a superseded automatic PR root ignores a later scope exit without blocking
   assert.equal(supersededAfter.source.scope.active, true);
 });
 
+for (const sameScopeRoleTransfer of [false, true]) {
+test(`a completed PR root returning behind sealed provenance waits without poisoning intake (same scope role transfer=${sameScopeRoleTransfer})`, async () => {
+  const approvedFacts = {
+    ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "waiting_other",
+    nextAction: "wait_merge", reviewDecision: "APPROVED",
+  };
+  const initial = prAssignment(1, {
+    sourceScopeId: "github-dashboard", gitFacts: approvedFacts,
+  });
+  if (sameScopeRoleTransfer) {
+    initial.assignment.target.id = "tester";
+    initial.assignment.ruleId = AUTHORED_PR_APPROVED_RULE_ID;
+  }
+  const fixture = await createFixture({
+    records: [initial],
+  });
+  await fixture.service.intake();
+  let rootA = (await fixture.service.listItems()).items[0];
+  rootA = await fixture.service.claim({
+    itemId: rootA.itemId, expectedRevision: rootA.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000,
+  });
+  rootA = await fixture.service.complete({
+    itemId: rootA.itemId, expectedRevision: rootA.revision,
+    leaseId: rootA.leaseId, actorId: "employee-pr-engineer",
+    result: { outcome: "completed-before-provenance-return" },
+  });
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    sourceScopeId: sameScopeRoleTransfer ? "github-dashboard" : "github-secondary",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const rootB = (await fixture.service.listItems()).items.find(
+    ({ itemId }) => itemId !== rootA.itemId,
+  );
+  const sealed = await stageSealedPrReview(fixture, rootB.itemId);
+  const before = fixture.store.stored();
+  assert.equal(before.items.find(({ itemId }) => itemId === rootA.itemId).status, "completed");
+  const returned = prAssignment(3, {
+    eventType: "pull_request.status", occurredAt: "2026-08-02T01:10:00.000Z",
+    sourceScopeId: "github-dashboard", gitFacts: approvedFacts,
+  });
+  if (sameScopeRoleTransfer) {
+    returned.assignment.target.id = "tester";
+    returned.assignment.ruleId = AUTHORED_PR_APPROVED_RULE_ID;
+  }
+  fixture.source.records.push(returned, assignment(4));
+  if (sameScopeRoleTransfer) {
+    fixture.source.records.push(prScopeLifecycleAssignment(5, prAssignment(5, {
+      eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:15:00.000Z",
+      sourceScopeId: "github-dashboard", gitFacts: prGitFacts(PR_HEAD_A),
+    }).event));
+  }
+  fixture.source.highWatermark = sameScopeRoleTransfer ? 5 : 4;
+  const intake = await fixture.service.intake();
+  assert.equal(intake.cursor, fixture.source.highWatermark);
+  const after = fixture.store.stored();
+  const pending = after.items.find(({ itemId }) => itemId === rootA.itemId);
+  assert.equal(pending.status, "blocked");
+  assert.equal(pending.source.activeRevision, rootA.source.activeRevision);
+  assert.ok(pending.source.pendingRevision > pending.source.activeRevision);
+  assert.equal(pending.statusReason, `pr_source_cross_root_cutover_pending:${rootB.itemId}`);
+  assert.deepEqual(pending.source.current, rootA.source.current);
+  assert.equal(pending.activeIntentId, null);
+  assert.equal(pending.leaseId, null);
+  for (const mutate of [
+    (item) => { item.statusReason = "pr_source_cross_root_cutover_pending:missing-root"; },
+    (item) => { item.source.pendingRevision = item.source.activeRevision; },
+    (item) => { item.source.pending.sourceSequence = item.source.current.sourceSequence; },
+    (item) => { item.source.current.headRefOid = PR_HEAD_B; },
+    (item) => { item.ownerId = "unreleased-owner"; },
+    (item) => { item.activeIntentId = "unsettled-intent"; },
+  ]) {
+    const invalid = clone(after);
+    mutate(invalid.items.find(({ itemId }) => itemId === rootA.itemId));
+    assert.throws(() => validateWorkLedgerGraphTransition(before, invalid));
+  }
+  const recovered = (await createFixture({ store: fixture.store, source: fixture.source })).service;
+  const pendingAfterRestart = (await recovered.listItems()).items.find(({ itemId }) => itemId === pending.itemId);
+  if (sameScopeRoleTransfer) {
+    const exited = after.items.find(({ itemId }) => itemId === rootB.itemId);
+    assert.equal(exited.source.scope.active, false);
+    assert.equal(exited.statusReason, "pr_source_left_scope_pending_settlement");
+    assert.equal(exited.activeIntentId, sealed.outbox.intentId);
+    for (const mutate of [
+      (item) => { item.activeIntentId = null; },
+      (item) => { item.source.scope.active = true; },
+      (item) => { item.source.scope.revision -= 1; },
+    ]) {
+      const invalid = clone(after);
+      mutate(invalid.items.find(({ itemId }) => itemId === rootB.itemId));
+      assert.throws(() => validateWorkLedgerGraphTransition(before, invalid));
+    }
+    // The newer scope exit must not grant stale pending work execution rights.
+    // A new trusted source observation is required before it can be activated.
+    await assert.rejects(recovered.claim({
+      itemId: pending.itemId, expectedRevision: pendingAfterRestart.revision,
+      workerId: "employee-tester", leaseDurationMs: 30_000,
+    }));
+    return;
+  }
+  const blocked = await recovered.reconcilePullRequestSource({
+    itemId: pending.itemId, expectedRevision: pendingAfterRestart.revision,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedPendingRevision: pendingAfterRestart.source.pendingRevision,
+  });
+  assert.equal(blocked.applied, false);
+  const predecessor = (await recovered.listItems()).items.find(({ itemId }) => itemId === rootB.itemId);
+  await recovered.ackIntent({
+    intentId: sealed.outbox.intentId, expectedRevision: sealed.outbox.revision,
+    itemExpectedRevision: predecessor.revision, dispatchLeaseId: sealed.outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher", outcome: "delivered", nextStatus: "completed",
+    details: { downstreamRef: "completed-root-return-review" },
+  });
+  const activated = await recovered.reconcilePullRequestSource({
+    itemId: pending.itemId, expectedRevision: pendingAfterRestart.revision,
+    expectedGraphRevision: (await recovered.getSummary()).revision,
+    expectedPendingRevision: pendingAfterRestart.source.pendingRevision,
+  });
+  assert.equal(activated.applied, true);
+});
+}
+
 test("an existing root returning behind an active sealed provenance waits for settlement", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, {
@@ -8146,6 +8272,65 @@ test("a failed intake write advances neither the durable cursor nor live items",
   assert.equal(retried.cursor, 1);
   assert.deepEqual(source.calls.map(({ afterSequence }) => afterSequence), [0, 0]);
   assert.equal(store.stored().items.length, 1);
+});
+
+test("invalid intake transitions retain the batch and durable diagnostic while existing work can proceed", async () => {
+  const local = createLocalWorkLedgerCandidateProcessor();
+  let rejectIntake = false;
+  const fixture = await createFixture({
+    records: [assignment(1), assignment(2)],
+    candidateProcessor: {
+      commit: () => local.commit(),
+      discard: () => local.discard(),
+      async prepare(input) {
+        if (rejectIntake && input.candidate.intakeCursor > input.previousState.intakeCursor) {
+          const candidate = clone(input.candidate);
+          const terminal = candidate.items.find(({ status }) => status === "completed");
+          terminal.status = "queued";
+          terminal.revision += 1;
+          return local.prepare({ ...input, candidate });
+        }
+        return local.prepare(input);
+      },
+    },
+  });
+  await fixture.service.intake();
+  let terminal = (await fixture.service.listItems()).items[0];
+  terminal = await fixture.service.claim({
+    itemId: terminal.itemId, expectedRevision: terminal.revision,
+    workerId: "test-worker", leaseDurationMs: 30_000,
+  });
+  await fixture.service.complete({
+    itemId: terminal.itemId, expectedRevision: terminal.revision,
+    leaseId: terminal.leaseId, actorId: "test-worker", result: { outcome: "done" },
+  });
+  fixture.source.records.push(assignment(3));
+  fixture.source.highWatermark = 3;
+  rejectIntake = true;
+  const result = await fixture.service.intake();
+  assert.equal(result.error.code, "WORK_LEDGER_GRAPH_TRANSITION_INVALID");
+  assert.equal(result.cursor, 2);
+  assert.equal(result.received, 0);
+  const after = fixture.store.stored();
+  assert.equal(after.intakeCursor, 2);
+  assert.equal(after.items.length, 2);
+  assert.equal(after.items[0].status, "completed");
+  const diagnostic = after.timeline.at(-1);
+  assert.equal(diagnostic.type, "intake_rejected");
+  assert.equal(diagnostic.details.afterSequence, 2);
+  assert.equal(diagnostic.details.nextSequence, 3);
+  assert.equal(diagnostic.details.batchDigest.length, 64);
+  await fixture.service.intake();
+  assert.equal(fixture.store.stored().revision, after.revision, "unchanged rejection does not generate noise");
+  const available = (await fixture.service.listItems()).items[1];
+  const claimed = await fixture.service.claim({
+    itemId: available.itemId, expectedRevision: available.revision,
+    workerId: "test-worker", leaseDurationMs: 30_000,
+  });
+  assert.equal(claimed.status, "working");
+  rejectIntake = false;
+  assert.equal((await fixture.service.intake()).cursor, 3);
+  assert.equal(fixture.store.stored().items.length, 3);
 });
 
 test("candidate processing commits only after durable write and discards failed writes", async () => {

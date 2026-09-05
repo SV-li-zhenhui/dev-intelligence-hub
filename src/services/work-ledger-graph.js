@@ -8,6 +8,7 @@ import {
   boundedLedgerString,
   cloneLedgerValue,
   ledgerDataEntries,
+  ledgerDigest,
   normalizeLedgerTimestamp,
   workLedgerError,
 } from "./work-ledger-values.js";
@@ -489,6 +490,60 @@ function isCompletedPullRequestRootScopeExit(previous, next) {
   );
 }
 
+function isCompletedPullRequestRootPendingCutover(previous, next, previousItems, nextItems) {
+  const prefix = "pr_source_cross_root_cutover_pending:";
+  if (
+    previous.kind !== "source_root" || previous.source?.kind !== "pull_request" ||
+    previous.status !== "completed" ||
+    next?.kind !== "source_root" || next.source?.kind !== "pull_request" ||
+    next.status !== "blocked" || !next.statusReason?.startsWith(prefix) ||
+    next.revision !== previous.revision + 1 ||
+    next.ownerId !== null || next.leaseId !== null || next.leaseUntil !== null ||
+    next.activeIntentId !== null || next.decisionContext !== null || next.availableAt !== null ||
+    next.source.activeRevision !== previous.source.activeRevision ||
+    next.source.pendingRevision !== next.source.inputRevision ||
+    next.source.pendingRevision <= previous.source.inputRevision ||
+    ledgerDigest(next.source.current) !== ledgerDigest(previous.source.current) ||
+    ledgerDigest(next.source.identity) !== ledgerDigest(previous.source.identity)
+  ) return false;
+
+  // This is a deferred provenance transfer, not permission to revive arbitrary
+  // terminal work. The old active binding remains fenced until its real
+  // predecessor (or one of that predecessor's children) has settled.
+  const predecessorId = next.statusReason.slice(prefix.length);
+  const predecessor = previousItems.get(predecessorId);
+  const nextPredecessor = nextItems.get(predecessorId);
+  const identity = next.source.identity;
+  if (
+    predecessorId === next.itemId || predecessor?.source?.kind !== "pull_request" ||
+    nextPredecessor?.source?.kind !== "pull_request" ||
+    predecessor.source.workKey === next.source.workKey ||
+    predecessor.source.identity.subjectId !== identity.subjectId ||
+    predecessor.source.identity.repository !== identity.repository ||
+    predecessor.source.identity.pullRequestNumber !== identity.pullRequestNumber ||
+    !Number.isSafeInteger(next.source.pending?.sourceSequence) ||
+    next.source.pending.sourceSequence <= previous.source.current.sourceSequence ||
+    next.source.pending.sourceSequence <=
+      (predecessor.source.pending ?? predecessor.source.current).sourceSequence
+  ) return false;
+
+  const scopeExitStillAwaitingSettlement =
+    nextPredecessor.statusReason === "pr_source_left_scope_pending_settlement" &&
+    nextPredecessor.source.scope.active === false &&
+    nextPredecessor.source.scope.revision > predecessor.source.scope.revision &&
+    nextPredecessor.source.current.sourceSequence > next.source.pending.sourceSequence &&
+    predecessor.activeIntentId !== null &&
+    nextPredecessor.activeIntentId === predecessor.activeIntentId &&
+    nextPredecessor.status === predecessor.status;
+  // A later trusted scope-exit in this same batch can replace the blocker
+  // marker. It must still retain the predecessor's unsettled action.
+  return scopeExitStillAwaitingSettlement || [...nextItems.values()].some((item) =>
+    item.statusReason === `pr_source_cross_root_cutover_blocker:${next.itemId}` &&
+    (item.itemId === predecessorId ||
+      currentWorkItemInputBinding(item)?.rootItemId === predecessorId)
+  );
+}
+
 export function validateWorkLedgerGraphTransition(previousState, nextState) {
   const previous = projectWorkLedgerGraphSnapshot(previousState);
   const next = projectWorkLedgerGraphSnapshot(nextState);
@@ -516,7 +571,10 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
         (
           (nextItem.status === "queued" &&
             nextItem.source.activeRevision > item.source.activeRevision) ||
-          isCompletedPullRequestRootScopeExit(item, nextItem)
+          isCompletedPullRequestRootScopeExit(item, nextItem) ||
+          isCompletedPullRequestRootPendingCutover(
+            item, nextItem, previousItemsById, nextItemsById,
+          )
         )
       );
     })

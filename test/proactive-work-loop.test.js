@@ -390,6 +390,39 @@ test("a cycle reliably intakes, claims, decides, and only stages an intent", asy
   assert.equal(ledger.calls.stageIntent[0].roleId, "pr-reviewer");
 });
 
+test("a deferred intake is observable without preventing existing tasks from running", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(1)], time });
+  await ledger.intake({ limit: 100 });
+  ledger.intake = async () => ({
+    received: 0, deduplicated: 0, cursor: 1, highWatermark: 2,
+    gap: null, itemIds: [], alertItemId: null,
+    error: { code: "WORK_LEDGER_GRAPH_TRANSITION_INVALID", afterSequence: 1, nextSequence: 2 },
+  });
+  const loop = createLoop({
+    ledger, time, directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+  });
+  const result = await loop.runCycle();
+  assert.equal(result.claimed, 1);
+  assert.equal(result.staged, 1);
+  assert.ok(result.outcomes.some(({ status, code }) =>
+    status === "intake_deferred" && code === "WORK_LEDGER_GRAPH_TRANSITION_INVALID"));
+});
+
+test("unsafe intake storage errors still stop the role cycle", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(1)], time });
+  await ledger.intake({ limit: 100 });
+  ledger.intake = async () => {
+    throw Object.assign(new Error("write failed"), { code: "WORK_LEDGER_STATE_WRITE_FAILED" });
+  };
+  const loop = createLoop({
+    ledger, time, directory: new FakeRoleDirectory({ "pr-reviewer": worker() }),
+  });
+  await assert.rejects(loop.runCycle(), { code: "WORK_LEDGER_STATE_WRITE_FAILED" });
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
 test("a role cycle scans only current claim candidates instead of durable history", async () => {
   const time = controlledClock();
   const current = workItem(1);

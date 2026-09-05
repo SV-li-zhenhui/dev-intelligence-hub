@@ -99,6 +99,7 @@ import {
 } from "./work-ledger-state.js";
 import {
   boundedLedgerString,
+  ledgerDigest,
   cloneLedgerValue,
   hasExactLedgerKeys,
   isPlainLedgerObject,
@@ -1099,9 +1100,18 @@ export class WorkLedgerService {
       this.#assertSourceHighWatermark(batch.highWatermark);
       const now = this.#now();
       const gap = findAssignmentBatchGap(batch, afterSequence);
-      return gap
-        ? this.#recordGap(batch, gap, now)
-        : this.#recordBatch(batch, now);
+      if (gap) return this.#recordGap(batch, gap, now);
+      try {
+        return await this.#recordBatch(batch, now);
+      } catch (error) {
+        // Only a rejected, pre-commit graph transition is isolated. Storage,
+        // corruption, and admission failures must still stop the cycle.
+        if (
+          error?.code !== "WORK_LEDGER_GRAPH_TRANSITION_INVALID" ||
+          error.cause?.code !== "WORK_GRAPH_INVALID_TRANSITION"
+        ) throw error;
+        return this.#recordRejectedIntake(batch, now, error.code);
+      }
     }));
   }
 
@@ -1393,6 +1403,39 @@ export class WorkLedgerService {
       gap,
       itemIds: existing ? [] : [alert.itemId],
       alertItemId: alert.itemId,
+    });
+  }
+
+  async #recordRejectedIntake(batch, now, code) {
+    const details = {
+      code,
+      afterSequence: this.state.intakeCursor,
+      nextSequence: batch.nextSequence,
+      highWatermark: batch.highWatermark,
+      batchDigest: ledgerDigest(batch.items),
+    };
+    const alreadyRecorded = this.state.timeline.some((entry) =>
+      entry.type === "intake_rejected" &&
+      entry.details.afterSequence === details.afterSequence &&
+      entry.details.batchDigest === details.batchDigest &&
+      entry.details.code === code
+    );
+    if (!alreadyRecorded) {
+      await this.#commitMutation({
+        patch: {},
+        timelineEvents: [{
+          itemId: null, type: "intake_rejected", at: now,
+          actorId: "work-ledger-system", details,
+        }],
+        result: null,
+      });
+    }
+    // Do not acknowledge or discard the offending envelopes. Their source
+    // cursor stays unchanged so they can be replayed after the fault is fixed.
+    return cloneLedgerValue({
+      received: 0, deduplicated: 0,
+      cursor: this.state.intakeCursor, highWatermark: batch.highWatermark,
+      gap: null, itemIds: [], alertItemId: null, error: details,
     });
   }
 

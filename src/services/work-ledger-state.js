@@ -89,6 +89,7 @@ export const WORK_LEDGER_TIMELINE_TYPES = new Set([
   "assignment_intaken",
   "intake_completed",
   "intake_gap",
+  "intake_rejected",
   "claimed",
   "lease_expired",
   "transitioned",

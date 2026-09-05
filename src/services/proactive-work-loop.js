@@ -806,7 +806,9 @@ export class ProactiveWorkLoop {
     const graphBlocked = candidateWindow.graphBlocked;
     const activeQuestions = candidateWindow.activeQuestions;
     const resolutions = new Map();
-    const outcomes = [];
+    const outcomes = intake.error
+      ? [{ status: "intake_deferred", code: intake.error.code }]
+      : [];
     let claimedCount = 0;
     let claimAttempts = 0;
     let workAttempts = 0;
