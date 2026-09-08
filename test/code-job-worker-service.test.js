@@ -1672,6 +1672,33 @@ test("absent legacy prepared overwrite requires a fully visible trusted read", a
   assert.deepEqual((await store.getForWorker(initial.jobId)).execution.pendingAction.action, action);
 });
 
+test("admitted legacy overwrite pauses after absent reconciliation without performing", async () => {
+  const action = {
+    type: "write_text", path: "src/app.js", content: "replacement",
+    actionId: "admitted-legacy-overwrite", expectedWorkspaceRevision: REVISION_A,
+    expectedSha256: FILE_SHA,
+  };
+  const initial = job({ status: "active", execution: {
+    ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+    turn: 1, observations: [trustedRead("x".repeat(30 * 1024))],
+    pendingAction: { turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action, preparedAt: "2026-08-01T00:00:01.000Z" },
+    actionAdmission: { actionId: action.actionId, actionDigest: digestValue(action), epoch: 2, admittedAt: "2026-08-01T00:00:01.500Z" },
+  } });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, grantVerifier: verifier([]), brainDirectory: brain([]) });
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+  // Existing recovery first reconciles the durable admission, then pauses.
+  await worker.runCycle();
+  await worker.runCycle();
+  const stored = await store.getForWorker(initial.jobId);
+  assert.equal(stored.status, "paused");
+  assert.equal(stored.execution.actionAdmission, null);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+  assert.deepEqual(stored.execution.pendingAction.action, action);
+});
+
 test("a prepared action is retried exactly without asking the brain again", async () => {
   const pendingAction = {
     type: "list_files",

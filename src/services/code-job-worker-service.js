@@ -797,7 +797,6 @@ export class CodeJobWorkerService {
     assertJobSessionBinding(job, session);
     const pending = job.execution.pendingAction;
     if (
-      job.execution.actionAdmission === null &&
       pending.action.type === "write_text" && pending.action.expectedSha256 !== null
     ) {
       const passed = successfulProfiles(job, session);
