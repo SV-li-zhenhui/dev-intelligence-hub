@@ -11,6 +11,34 @@ const PRODUCT_LABELS = Object.freeze({ qt: "Qt 桌面版", bs: "B/S 版本" });
 const GITHUB_LOGIN =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
+// History is read-only. Preserve only validated fields from the API projection.
+export function normalizeReviewHandoffHistory(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const selection = value.selection;
+  if (!selection || !["development", "testing", "pull_request"].includes(selection.workType)) return null;
+  const person = selection.responsiblePerson;
+  if (person !== null && (!person || typeof person !== "object" ||
+      typeof person.login !== "string" || !GITHUB_LOGIN.test(person.login) ||
+      typeof person.product !== "string" || !/^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/.test(person.product))) return null;
+  if (selection.workType === "testing" && person === null) return null;
+  if (!["pending", "retrying", "completed"].includes(value.status) ||
+      !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
+      typeof value.requestId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.requestId) ||
+      typeof value.acceptedRequestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{6,127}$/.test(value.acceptedRequestId)) return null;
+  if (value.diagnosticCode !== null && (typeof value.diagnosticCode !== "string" ||
+      !/^[A-Z][A-Z0-9_]{0,127}$/.test(value.diagnosticCode))) return null;
+  if (value.status === "completed") {
+    if (value.diagnosticCode !== null || [value.workItemId, value.roleId].some((id) =>
+      typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(id))) return null;
+  } else if (value.workItemId !== null || value.roleId !== null) return null;
+  return {
+    selection: { workType: selection.workType, responsiblePerson: person === null ? null : { login: person.login, product: person.product } },
+    requestId: value.requestId, acceptedRequestId: value.acceptedRequestId,
+    status: value.status, attempts: value.attempts, diagnosticCode: value.diagnosticCode,
+    workItemId: value.workItemId, roleId: value.roleId,
+  };
+}
+
 function configuredOwners(configuration, field) {
   const value = configuration?.workCoordination?.policy
     ?.[field];

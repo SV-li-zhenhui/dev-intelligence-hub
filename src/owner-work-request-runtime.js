@@ -74,7 +74,7 @@ export async function createOwnerWorkRequestRuntime({
     });
     await service.recover();
     return Object.freeze({
-      submit: (request) => admit(() => service.submit(request)),
+      submit: (request, options) => admit(() => service.submit(request, options)),
       get: (requestId) => admit(() => service.get(requestId)),
       list: (options) => admit(() => service.list(options)),
       resumePending: () => admit(() => service.resumePending()),

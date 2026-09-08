@@ -25,7 +25,7 @@ export function normalizeReviewHandoffSelection(value) {
     if (typeof login !== "string" || !LOGIN.test(login) || typeof product !== "string" || !PRODUCT.test(product)) throw invalid();
     responsiblePerson = { login, product };
   }
-  if ((value.workType === "testing" && !responsiblePerson) || (value.workType === "development" && responsiblePerson)) throw invalid();
+  if (value.workType === "testing" && !responsiblePerson) throw invalid();
   return { workType: value.workType, responsiblePerson };
 }
 export function reviewHandoffRequestId(item) {
@@ -47,7 +47,11 @@ export function createReviewHandoff(item, request, policy) {
   if (!REVIEW_KINDS.has(item.kind) || item.action?.type !== "pull_request_review") throw invalid("只有 GitHub Review 可以绑定交接");
   const selection = normalizeReviewHandoffSelection(request.reviewHandoff);
   const person = selection.responsiblePerson;
-  if (person) {
+  if (person && selection.workType === "development") {
+    if (person.login.toLowerCase() !== item.actor.accountId.toLowerCase()) {
+      throw invalid("开发交接负责人必须是本次批准绑定的账号");
+    }
+  } else if (person) {
     const field = selection.workType === "testing" ? "testingOwnersByProduct" : "reviewOwnersByProduct";
     if (!policy?.[field]?.[person.product]?.some((login) => login.toLowerCase() === person.login.toLowerCase())) throw invalid("负责人不在当前配置的交接名单中");
   }

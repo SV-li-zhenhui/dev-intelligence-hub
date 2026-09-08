@@ -883,13 +883,15 @@ export class ConfirmationQueue {
     );
   }
 
-  async readReviewHandoffs() {
+  async readReviewHandoffs({ afterId = null } = {}) {
     this.#assertReady();
     return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
       await this.#reload();
-      return this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && item.reviewHandoff.status !== "completed")
-        .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts)
-        .slice(0, 25).map((item) => ({ id: item.id, request: reviewHandoffWorkRequest(item) }));
+      const pending = this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && item.reviewHandoff.status !== "completed")
+        .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts);
+      const start = pending.findIndex((item) => item.id === afterId) + 1;
+      return [...pending.slice(start), ...pending.slice(0, start)].slice(0, 25)
+        .map((item) => ({ id: item.id, request: reviewHandoffWorkRequest(item) }));
     }));
   }
 

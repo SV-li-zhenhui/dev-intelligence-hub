@@ -30,6 +30,7 @@ import {
 } from "./manual-work-assignment.js";
 import {
   inferTestingProduct,
+  normalizeReviewHandoffHistory,
   prLifecycleStatus,
   prLifecycleStageLabel,
   prReviewLifecycleRoute,
@@ -3003,6 +3004,7 @@ function normalizedConfirmationHistoryItems(value) {
       return [];
     }
     const ownerDecision = item.ownerDecision;
+    const reviewHandoff = normalizeReviewHandoffHistory(item.reviewHandoff);
     const validOwnerDecision =
       item.status === "rejected" &&
       ownerDecision &&
@@ -3025,6 +3027,7 @@ function normalizedConfirmationHistoryItems(value) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       retryable: item.retryable === true,
+      ...(reviewHandoff ? { reviewHandoff } : {}),
       ...(typeof item.diagnosticCode === "string" &&
           /^[A-Z][A-Z0-9_]{2,63}$/.test(item.diagnosticCode)
         ? { diagnosticCode: item.diagnosticCode }
@@ -3793,9 +3796,10 @@ function reviewHandoffMarkup(reviewEvent, item) {
 function bindReviewHandoffControls(item) {
   const root = confirmationContent.querySelector(".review-handoff");
   if (!root) return;
+  const workType = root.querySelector("[data-review-handoff]");
+  if (!workType) return;
   const testingRouting = testingOwnerRouting(activeConfigurationDocument());
   const reviewerRouting = reviewerOwnerRouting(activeConfigurationDocument());
-  const workType = root.querySelector("[data-review-handoff]");
   const ownerControls = root.querySelector("[data-review-testing-owner]");
   const product = root.querySelector("[data-review-testing-product]");
   const person = root.querySelector("[data-review-testing-person]");

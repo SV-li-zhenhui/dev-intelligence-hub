@@ -18,6 +18,7 @@ import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
+import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconciler.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 import { ConfigurationStore } from "../src/services/configuration-store.js";
 import {
@@ -1801,6 +1802,70 @@ test("durable Review handoffs recover at startup and ticks even while refresh is
   } finally { await background.stop(); }
 });
 
+test("shutdown signals the registered Review handoff participant", async () => {
+  const started = deferred();
+  const application = startupApplication();
+  let handoffSignal;
+  const participants = [];
+  application.reviewHandoffReconciler = { runCycle({ signal }) {
+    handoffSignal = signal;
+    started.resolve();
+    return new Promise((resolve) => {
+      signal.addEventListener("abort", resolve, { once: true });
+      if (signal.aborted) resolve();
+    });
+  } };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {},
+    observeDrainParticipant(participant) { participants.push(participant.id); },
+  });
+  await started.promise;
+  await background.stop();
+  assert.equal(handoffSignal.aborted, true);
+  assert.ok(participants.includes(DRAIN_PARTICIPANTS.reviewHandoffRecovery.id));
+});
+
+test("a timed-out handoff keeps its unfinished operation in the shutdown drain", async () => {
+  const started = deferred();
+  const release = deferred();
+  const cycleFinished = deferred();
+  const application = startupApplication();
+  const reconciler = new ReviewHandoffReconciler({
+    timeoutMs: 15,
+    confirmations: {
+      async readReviewHandoffs() { return [{ id: "review-42", request: { requestId: "request-42" } }]; },
+      async recordReviewHandoff() {},
+    },
+    ownerWorkRequests: { async submit() {
+      started.resolve();
+      await release.promise;
+      return { phase: "intaken", workItemId: "work-42", assignment: { target: { id: "tester" } } };
+    } },
+  });
+  application.reviewHandoffReconciler = { async runCycle(options) {
+    const results = await reconciler.runCycle(options);
+    cycleFinished.resolve();
+    return results;
+  } };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {},
+  });
+  try {
+    await started.promise;
+    await cycleFinished.promise;
+    assert.ok(background.drainStatus().activeParticipants.some(
+      ({ id }) => id === DRAIN_PARTICIPANTS.reviewHandoffRecovery.id,
+    ));
+    let stopped = false;
+    const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false);
+    release.resolve();
+    await stopping;
+    assert.equal(stopped, true);
+  } finally { release.resolve(); await background.stop(); }
+});
+
 test("a background drain timeout identifies the active participant without payloads", async () => {
   const memoryStarted = deferred();
   const releaseMemory = deferred();
@@ -1969,7 +2034,9 @@ test("production drain participants reject every public trigger before execution
   const releaseAgency = deferred();
   const reportedErrors = [];
   const executed = [];
-  const participantIds = Object.values(DRAIN_PARTICIPANTS).map(
+  const participantIds = Object.values(DRAIN_PARTICIPANTS).filter(
+    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery,
+  ).map(
     (participant) => participant.id,
   );
   let employeeCycles = 0;

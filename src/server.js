@@ -61,6 +61,7 @@ export const DRAIN_PARTICIPANTS = Object.freeze({
     "prReviewer.recoverConfirmations",
   ),
   workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
+  reviewHandoffRecovery: drainParticipant("reviewHandoffReconciler.runCycle"),
   employeeExecution: drainParticipant(
     "employeeRegistry.runSelected/runAll/run",
   ),
@@ -4101,11 +4102,19 @@ export function startApplicationBackgroundWork(
     }
   }
 
-  async function recoverReviewHandoffs() {
+  async function recoverReviewHandoffs(signal = workController.signal) {
     if (typeof application.reviewHandoffReconciler?.runCycle !== "function") return;
     await runDrainParticipant(
-      DRAIN_PARTICIPANTS.workCoordinationCycle,
-      () => application.reviewHandoffReconciler.runCycle(),
+      DRAIN_PARTICIPANTS.reviewHandoffRecovery,
+      () => application.reviewHandoffReconciler.runCycle({
+        signal,
+        // A bounded cycle may return before uncooperative I/O settles. Keep the
+        // actual operation admitted and visible to backup/shutdown drain.
+        runOperation: (operation) => runTracked(
+          () => runDrainParticipant(DRAIN_PARTICIPANTS.reviewHandoffRecovery, operation),
+          { rethrow: true },
+        ),
+      }),
     );
   }
 
@@ -4199,7 +4208,7 @@ export function startApplicationBackgroundWork(
     if (stopped) return { skipped: "stopped" };
     // Completed Review receipts can settle local handoffs even if a refresh is
     // unavailable. The owner request resolver still checks current PR facts.
-    try { await recoverReviewHandoffs(); } catch (error) { reportBackgroundError(error); }
+    try { await recoverReviewHandoffs(signal); } catch (error) { reportBackgroundError(error); }
     if (!factsReady) return { skipped: "facts_not_ready" };
     if (
       discardWhenFactsPending &&

@@ -1,4 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+
 import {
   createOwnerIssueEvent,
   createOwnerPullRequestEvent,
@@ -16,6 +18,10 @@ import {
   OWNER_WORK_REQUEST_STATE_KEY,
   routeOwnerWorkRequestRecord,
 } from "./owner-work-request-state.js";
+
+function throwIfCancelled(signal) {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Owner request cancelled", "AbortError");
+}
 
 const INTAKE_BATCH_LIMIT = 100;
 const MAX_INTAKE_PAGES = 50;
@@ -249,12 +255,14 @@ export class OwnerWorkRequestService {
     return { resumed, ...this.#recoveryStatus() };
   }
 
-  async submit(value) {
+  async submit(value, { signal = null } = {}) {
+    normalizeAbortSignal(signal);
+    throwIfCancelled(signal);
     this.#assertReady();
     const request = normalizeOwnerWorkRequest(value);
     const admitted = await this.runNewWorkAdmission(() => ({
       operation: this.operationQueue.enqueue(() =>
-        this.exclusiveLease.run(() => this.#submitLocked(request)),
+        this.exclusiveLease.run(() => this.#submitLocked(request, signal)),
       ),
     }));
     return admitted.operation;
@@ -303,8 +311,10 @@ export class OwnerWorkRequestService {
     );
   }
 
-  async #submitLocked(request) {
+  async #submitLocked(request, signal = null) {
+    throwIfCancelled(signal);
     this.state = await this.#readState();
+    throwIfCancelled(signal);
     const requestDigest = ownerWorkRequestDigest(request);
     let record = this.state.records.find(
       ({ requestId: id }) => id === request.requestId,
@@ -315,14 +325,14 @@ export class OwnerWorkRequestService {
       );
       if (predecessor) {
         this.#assertCompatiblePredecessor(request, predecessor);
-        const advanced = await this.#advance(predecessor);
+        const advanced = await this.#advance(predecessor, signal);
         return publicRecord(advanced, true);
       }
     }
     const deduplicated = record !== undefined;
     if (record && record.requestDigest !== requestDigest) {
       if (this.#isCompatibleUnstructuredV5(request, record)) {
-        const advanced = await this.#advance(record);
+        const advanced = await this.#advance(record, signal);
         return publicRecord(advanced, true);
       }
       throw ownerRequestError(
@@ -350,19 +360,21 @@ export class OwnerWorkRequestService {
       }
       const createdAt = this.#now();
       const event = [2, 3, 4, 5].includes(request.schemaVersion)
-        ? await this.#createPullRequestEvent(request, createdAt)
+        ? await this.#createPullRequestEvent(request, createdAt, signal)
         : request.schemaVersion === 6
         ? createOwnerIssueEvent(request, createdAt)
         : createOwnerWorkRequestEvent(request, createdAt);
       await this.#preflight(event);
+      throwIfCancelled(signal);
       record = createStagedOwnerWorkRequestRecord(request, event, createdAt);
       await this.#persistRecord(record);
     }
-    record = await this.#advance(record);
+    record = await this.#advance(record, signal);
     return publicRecord(record, deduplicated);
   }
 
-  async #createPullRequestEvent(request, createdAt) {
+  async #createPullRequestEvent(request, createdAt, signal) {
+    throwIfCancelled(signal);
     if (this.pullRequestResolver === null) {
       throw ownerRequestError(
         "OWNER_PULL_REQUEST_RESOLVER_NOT_READY",
@@ -374,9 +386,12 @@ export class OwnerWorkRequestService {
     try {
       resolved = await this.pullRequestResolver.resolvePullRequestTarget(
         request.pullRequest,
+        { signal },
       );
+      throwIfCancelled(signal);
       return createOwnerPullRequestEvent(request, resolved, createdAt);
     } catch (cause) {
+      throwIfCancelled(signal);
       if (cause?.code === "OWNER_WORK_REQUEST_INVALID") throw cause;
       throw ownerRequestError(
         "OWNER_PULL_REQUEST_RESOLUTION_FAILED",
@@ -387,7 +402,8 @@ export class OwnerWorkRequestService {
     }
   }
 
-  async #advance(recordValue) {
+  async #advance(recordValue, signal = null) {
+    throwIfCancelled(signal);
     let record = recordValue;
     if (record.phase === "staged") {
       const routed = await this.workflowRouting.ingest({
@@ -399,8 +415,10 @@ export class OwnerWorkRequestService {
       await this.#persistRecord(record);
     }
     if (record.phase === "routed") {
+      throwIfCancelled(signal);
       const workItemId = await this.#intakeAssignment(
         record.assignment.assignmentId,
+        signal,
       );
       record = intakeOwnerWorkRequestRecord(record, workItemId, this.#now());
       await this.#persistRecord(record);
@@ -490,9 +508,10 @@ export class OwnerWorkRequestService {
       );
   }
 
-  async #intakeAssignment(assignmentId) {
+  async #intakeAssignment(assignmentId, signal) {
     let previousCursor = -1;
     for (let page = 0; page < MAX_INTAKE_PAGES; page += 1) {
+      throwIfCancelled(signal);
       const result = await this.ledger.intake({ limit: INTAKE_BATCH_LIMIT });
       if (!validIntakeResult(result) || result.cursor < previousCursor) {
         throw ownerRequestError(
@@ -501,7 +520,7 @@ export class OwnerWorkRequestService {
           503,
         );
       }
-      const item = await this.#findWorkItem(assignmentId);
+      const item = await this.#findWorkItem(assignmentId, signal);
       if (item) return item.itemId;
       if (result.cursor >= result.highWatermark) break;
       if (result.cursor === previousCursor) {
@@ -520,10 +539,11 @@ export class OwnerWorkRequestService {
     );
   }
 
-  async #findWorkItem(assignmentId) {
+  async #findWorkItem(assignmentId, signal) {
     let cursor;
     const seen = new Set();
     for (let page = 0; page < MAX_ITEM_PAGES; page += 1) {
+      throwIfCancelled(signal);
       const result = await this.ledger.listItems({
         limit: 100,
         ...(cursor === undefined ? {} : { cursor }),

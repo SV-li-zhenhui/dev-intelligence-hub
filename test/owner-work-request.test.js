@@ -754,6 +754,33 @@ test("runtime persists a manual Issue with its canonical Issue event", async (t)
   assert.deepEqual(result.assignment.target, { type: "role", id: "developer" });
 });
 
+test("owner request cancellation reaches the PR resolver and does not stage cancelled work", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-pr-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  const controller = new AbortController();
+  let observedSignal;
+  let calls = 0;
+  const owner = await createOwnerWorkRequestRuntime({
+    store, workflowRouting: routing, ledger, roleReadiness: roleReadiness(), clock,
+    createGuard: guardFactory,
+    pullRequestResolver: { async resolvePullRequestTarget(_target, options) {
+      calls++;
+      observedSignal = options?.signal;
+      controller.abort(new Error("handoff stopped"));
+      throw controller.signal.reason;
+    } },
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+  await assert.rejects(owner.submit(pullRequest(), { signal: controller.signal }), /handoff stopped/);
+  assert.equal(observedSignal, controller.signal);
+  assert.deepEqual((await owner.list({})).items, []);
+  await assert.rejects(owner.submit(pullRequest(), { signal: controller.signal }), /handoff stopped/);
+  assert.equal(calls, 1);
+});
+
 test("an explicit PR request resolves one immutable target before staging a PR engineer root", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "owner-pr-request-"));
   t.after(() => rm(root, { recursive: true, force: true }));

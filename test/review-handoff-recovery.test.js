@@ -73,6 +73,26 @@ test("old clients work without handoff and cannot attach one after publication",
   await assert.rejects(queue.approve(item.id, request(item, { reviewHandoff: selection })), { code: "CONFIRMATION_HANDOFF_CONFLICT" });
 });
 
+test("own-PR development handoff preserves the trusted actor without requiring an external reviewer", async () => {
+  const f = fixture(); const queue = f.create(); await queue.recover();
+  const item = await queue.enqueue(plan());
+  const development = { workType: "development", responsiblePerson: { login: "OWNER", product: "qt" } };
+  await queue.approve(item.id, request(item, { reviewHandoff: development }));
+  const [pending] = await queue.readReviewHandoffs();
+  assert.equal(pending.request.schemaVersion, 4);
+  assert.deepEqual(pending.request.responsiblePerson, development.responsiblePerson);
+  assert.equal(f.executions, 1);
+});
+
+test("development handoff cannot nominate a different identity", async () => {
+  const f = fixture(); const queue = f.create(); await queue.recover();
+  const item = await queue.enqueue(plan());
+  await assert.rejects(queue.approve(item.id, request(item, {
+    reviewHandoff: { workType: "development", responsiblePerson: { login: "tester-one", product: "qt" } },
+  })), { code: "INVALID_REVIEW_HANDOFF" });
+  assert.equal(f.executions, 0);
+});
+
 test("local submit success followed by acknowledgement crash recovers the same idempotent task", async () => {
   const f = fixture(); let queue = f.create(); await queue.recover();
   const item = await queue.enqueue(plan());
@@ -84,7 +104,7 @@ test("local submit success followed by acknowledgement crash recovers the same i
     return requests.get(value.requestId);
   } };
   const crashing = new ReviewHandoffReconciler({ confirmations: { readReviewHandoffs: queue.readReviewHandoffs.bind(queue), recordReviewHandoff: async () => { throw new Error("power loss"); } }, ownerWorkRequests });
-  await assert.rejects(crashing.runCycle(), /power loss/);
+  assert.equal((await crashing.runCycle())[0].diagnosticCode, "REVIEW_HANDOFF_ACK_FAILED");
   queue = f.create(); await queue.recover();
   const recovered = new ReviewHandoffReconciler({ confirmations: queue, ownerWorkRequests });
   await Promise.all([recovered.runCycle(), recovered.runCycle()]);
@@ -105,6 +125,19 @@ test("temporary dispatch failure persists diagnostics and retries after restart"
   await new ReviewHandoffReconciler({ confirmations: queue, ownerWorkRequests: { async submit() { return { phase: "intaken", workItemId: "work-testing-42", assignment: { target: { id: "tester" } } }; } } }).runCycle();
   assert.equal((await queue.get(item.id)).reviewHandoff.status, "completed");
   assert.equal(f.executions, 1);
+});
+
+test("handoff recovery rotates beyond a full page of unacknowledged failures", async () => {
+  const f = fixture(); const queue = f.create(); await queue.recover();
+  for (let index = 0; index < 26; index++) {
+    const item = await queue.enqueue(plan({ id: `review-${index}` }));
+    await queue.approve(item.id, request(item, { requestId: `approve-${index}`, reviewHandoff: selection }));
+  }
+  const firstPage = await queue.readReviewHandoffs();
+  assert.equal(firstPage.length, 25);
+  const nextPage = await queue.readReviewHandoffs({ afterId: firstPage.at(-1).id });
+  assert.equal(nextPage[0].id, "review-25");
+  assert.equal(new Set(nextPage.map((item) => item.id)).size, 25);
 });
 
 test("unknown, rejected and stale Reviews never create follow-up tasks", async () => {
