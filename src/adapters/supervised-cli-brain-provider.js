@@ -1257,18 +1257,21 @@ function markerValue(value, cliKind) {
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== 4
+    Object.getPrototypeOf(value) !== Object.prototype
   ) {
     return null;
   }
-  for (const key of ["schemaVersion", "kind", "ownerPid", "createdAt"]) {
+  const keys = ["schemaVersion", "kind", "ownerPid", "createdAt"];
+  if (value.schemaVersion === 2) keys.push("sessionRecoveryRequired");
+  if (Reflect.ownKeys(value).length !== keys.length) return null;
+  for (const key of keys) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor?.enumerable || !("value" in descriptor)) return null;
   }
   const createdAt = Date.parse(value.createdAt);
   if (
-    value.schemaVersion !== 1 ||
+    ![1, 2].includes(value.schemaVersion) ||
+    (value.schemaVersion === 2 && value.sessionRecoveryRequired !== true) ||
     value.kind !== cliKind ||
     !Number.isSafeInteger(value.ownerPid) ||
     value.ownerPid < 1 ||
@@ -1404,7 +1407,7 @@ async function scavengeStaleInvocations({
           continue;
         }
         const marker = markerValue(parsed, cliKind);
-        if (!marker || clock() - marker.createdAtMs < STALE_AFTER_MS) {
+        if (!marker) {
           if (cleanupEntry) {
             throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
           }
@@ -1422,6 +1425,16 @@ async function scavengeStaleInvocations({
           }
           continue;
         }
+        // This invocation may contain the only copy of an interrupted task's
+        // history. Age and a dead PID cannot prove that session capture succeeded.
+        if (marker.sessionRecoveryRequired ||
+            (cliKind === "codex-cli" && await containsSessionRollout(path.join(directory, "codex-home", "sessions"), signal))) {
+          throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+        }
+        if (clock() - marker.createdAtMs < STALE_AFTER_MS) {
+          if (cleanupEntry) throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+          continue;
+        }
         throwIfRequestAborted(signal);
         if (!rootState) {
           throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
@@ -1429,6 +1442,7 @@ async function scavengeStaleInvocations({
         staleInvocations.push(identity);
       } catch (error) {
         throwIfRequestAborted(signal);
+        if (error?.code === "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED") throw error;
         if (cleanupEntry || error?.code === "STRUCTURED_PROVIDER_CLEANUP_FAILED") {
           throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
         }
@@ -1456,6 +1470,7 @@ async function createInvocation({
   signal,
   cleanupFileSystem: fileSystem,
   rootState,
+  sessionRecoveryRequired = false,
 }) {
   throwIfRequestAborted(signal);
   const directory = await mkdtemp(path.join(root, invocationPrefix(cliKind)));
@@ -1471,10 +1486,11 @@ async function createInvocation({
     identity = await trustedDirectory(directory, root, signal);
     assertRootAdmissionSafe(rootState);
     const marker = {
-      schemaVersion: 1,
+      schemaVersion: sessionRecoveryRequired ? 2 : 1,
       kind: cliKind,
       ownerPid: processId,
       createdAt: new Date(clock()).toISOString(),
+      ...(sessionRecoveryRequired ? { sessionRecoveryRequired: true } : {}),
     };
     await writeNewFile(
       path.join(directory, INVOCATION_MARKER),
@@ -2370,6 +2386,7 @@ export class SupervisedCliBrainProvider {
           signal,
           cleanupFileSystem: this.#cleanupFileSystem,
           rootState: this.#rootState,
+          sessionRecoveryRequired: this.kind === "codex-cli" && Boolean(request.sessionKey),
         }),
         { blocking: true, requireSafe: true },
       );

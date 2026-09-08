@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -132,6 +132,50 @@ test("retained session recovery diagnostics survive a later credential deadline"
   assert.deepEqual(current.events, ["release:false"]);
   assert.equal((await readdir(current.temporaryRoot)).length, 1);
 });
+
+for (const legacyMarker of [false, true]) {
+test(`a cold provider preserves a dead invocation's unarchived session (legacy marker: ${legacyMarker})`, async (t) => {
+  const createdAt = Date.parse("2026-09-01T00:00:00Z");
+  const current = await fixture(t, {
+    clock: () => createdAt,
+    processRunner: { async run(value) {
+      const sessions = path.join(value.env.CODEX_HOME, "sessions");
+      await mkdir(sessions);
+      await writeFile(path.join(sessions, "rollout-unknown.jsonl"), "only copy of task progress");
+      throw failure();
+    } },
+    codexSessionStore: { async stage() { return { sessionId: null }; }, async capture() { assert.fail("no trusted thread id"); } },
+  });
+  const input = request({ sessionKey: "github:issue:owner/repo#3" });
+  await assert.rejects(current.provider.generate(input), { code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" });
+  const [invocation] = await readdir(current.temporaryRoot);
+  if (legacyMarker) {
+    await writeFile(path.join(current.temporaryRoot, invocation, ".mydashboard-invocation.json"), JSON.stringify({
+      schemaVersion: 1, kind: "codex-cli", ownerPid: process.pid, createdAt: new Date(createdAt).toISOString(),
+    }));
+  }
+  // A fresh module has no in-memory root fences, just as after a service restart.
+  const cold = await import(`../src/adapters/supervised-cli-brain-provider.js?cold-recovery=${Date.now()}`);
+  let runs = 0;
+  const provider = cold.createTestSupervisedCliBrainProvider({
+    id: "cold-recovery", cliKind: "codex-cli", credentialMode: "codex-login", timeoutMs: 1_000,
+  }, {
+    environment: {}, temporaryRoot: current.temporaryRoot,
+    commandLocator: { async resolve() { return descriptor; } },
+    codexLoginCredentialBroker: { async readStatus() { return { state: "available", cliAvailable: true, fileLoginAvailable: true }; }, async acquire() {
+      return { async stage({ invocation }) { const codexHome = path.join(invocation.path, "codex-home"); await mkdir(codexHome); return { codexHome }; }, async capture() {}, release() {} };
+    } },
+    clock: () => createdAt + 48 * 60 * 60 * 1_000,
+    isProcessAlive: () => false,
+    processRunner: { async run() { runs++; return success(); } },
+    codexResultReader: async () => '{"ok":true}',
+    codexSessionStore: { async stage() { return { sessionId: null }; }, async capture() {} },
+  });
+  await assert.rejects(provider.generate(input), { code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" });
+  assert.equal(runs, 0);
+  assert.equal(await readFile(path.join(current.temporaryRoot, invocation, "codex-home", "sessions", "rollout-unknown.jsonl"), "utf8"), "only copy of task progress");
+});
+}
 
 test("recovery captures the first failed thread from private supervised output", async (t) => {
   const captures = [];

@@ -291,9 +291,15 @@ says a confirmed active version is pending restart.
 
 Each claimed task starts at most one vendor process. It runs in a fresh private
 directory with tools, plugins, browser integration, MCP, slash commands, host
-rules, Git/GitHub/SSH context, and session persistence disabled. MyDashboard
-removes the directory after a verified exit and keeps durable task context in
-its own ledger and memory. This is reasoning only: any code or GitHub action
+rules, and host Git/GitHub/SSH context disabled. Codex requests bound to the same
+PR or Issue restore their private task session; the isolated invocation is
+removed only after verified exit and successful session capture. An unarchived
+session is retained across service restarts, including legacy invocations with
+rollout files, and blocks fresh invocation with
+`STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED`. Do not delete it to clear the
+error: preserve the only copy of task history and investigate capture recovery.
+MyDashboard also keeps durable task context in its own ledger and memory.
+This is reasoning only: any code or GitHub action
 still crosses its independent policy, isolated execution, and owner-confirmation
 boundary.
 
