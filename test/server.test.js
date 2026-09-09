@@ -4811,6 +4811,47 @@ test("owner work request HTTP API is same-origin, structured, and read-back capa
   );
 });
 
+test("owner intake failures expose safe retry guidance without internal error details", async () => {
+  let code = "OWNER_WORK_REQUEST_LEDGER_REJECTED";
+  await withServer(async ({ server }) => {
+    for (const failureCode of [
+      "OWNER_WORK_REQUEST_LEDGER_REJECTED",
+      "OWNER_WORK_REQUEST_LEDGER_STALLED",
+      "OWNER_WORK_REQUEST_LEDGER_MISSING",
+      "PRIVATE_DATABASE_FAILURE",
+    ]) {
+      code = failureCode;
+      const response = await request(server, {
+        method: "POST", path: "/api/work/requests",
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1", "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          schemaVersion: 1, requestId: "123e4567-e89b-42d3-a456-426614174000",
+          workType: "general", priority: "high", title: "Coordinate",
+          description: "Retry the same request", acceptanceCriteria: ["One root"],
+        }),
+      });
+      assert.equal(response.status, 503);
+      assert.doesNotMatch(response.body, /private-credential-path/);
+      const body = JSON.parse(response.body);
+      if (failureCode === "PRIVATE_DATABASE_FAILURE") {
+        assert.deepEqual(body, { error: "服务器内部错误" });
+      } else {
+        assert.equal(body.code, failureCode);
+        assert.match(body.error, /已保存.*重试原请求/);
+      }
+    }
+  }, { ownerWorkRequests: {
+    async submit() {
+      throw Object.assign(new Error("private-credential-path"), { code, statusCode: 503 });
+    },
+    async list() { return { items: [], nextCursor: null }; },
+    async get() { return null; },
+  } });
+});
+
 test("owner work request HTTP limit accepts the largest canonical contract and rejects excess bytes", async () => {
   const submissions = [];
   const maximumRequest = normalizeOwnerWorkRequest({

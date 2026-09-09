@@ -1226,6 +1226,44 @@ test("restart reconciles a lost ledger intake response to the existing work item
   assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
 });
 
+test("a rejected intake preserves the routed request and retry resumes it exactly once", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-intake-rejected-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new StateStore(path.join(root, "state"));
+  const clock = clockFixture();
+  const { routing, ledger } = await createRoutingAndLedger(store, clock);
+  let blocked = true;
+  let intakeCalls = 0;
+  const owner = await createOwnerWorkRequestRuntime({
+    store, workflowRouting: routing, roleReadiness: roleReadiness(),
+    clock, createGuard: guardFactory,
+    ledger: {
+      async intake(input) {
+        intakeCalls += 1;
+        return blocked ? {
+          received: 0, cursor: 0, highWatermark: 1,
+          error: { code: "WORK_LEDGER_GRAPH_TRANSITION_INVALID" },
+        } : ledger.intake(input);
+      },
+      listItems: ledger.listItems,
+    },
+  });
+  t.after(() => Promise.all([owner.close(), ledger.close(), routing.close()]));
+
+  await assert.rejects(owner.submit(request()),
+    (error) => error.code === "OWNER_WORK_REQUEST_LEDGER_REJECTED" && error.statusCode === 503);
+  assert.equal(intakeCalls, 1);
+  assert.equal((await owner.get(REQUEST_ID)).phase, "routed");
+  assert.equal((await ledger.listItems({ limit: 10 })).items.length, 0);
+
+  blocked = false;
+  const resumed = await owner.submit(request());
+  assert.equal(resumed.phase, "intaken");
+  assert.equal((await owner.list({ limit: 10 })).items.length, 1);
+  assert.equal((await routing.listAssignments({ limit: 10 })).items.length, 1);
+  assert.equal((await ledger.listItems({ limit: 10 })).items.length, 1);
+});
+
 test("routing and role readiness fail before staging owner-controlled work", async (t) => {
   for (const fixture of [
     { enabled: false, readiness: roleReadiness(), code: "OWNER_WORK_REQUEST_ROUTING_NOT_READY" },

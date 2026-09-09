@@ -212,3 +212,25 @@ export function ownerWorkRequestForItem(
   }
   return request;
 }
+
+export function createManualWorkAssignmentAttempts(createRequestId = () => crypto.randomUUID()) {
+  const pending = new Map();
+  return {
+    requestFor(item, { workType, priority }) {
+      const key = JSON.stringify([item.kind, item.repo, item.number, workType, priority]);
+      if (!pending.has(key)) {
+        pending.set(key, ownerWorkRequestForItem(item, {
+          workType, priority, requestId: createRequestId(),
+        }));
+      }
+      // Keep the whole payload, not only the ID: refreshed titles/summaries
+      // must not conflict with the server's durable idempotency binding.
+      return structuredClone(pending.get(key));
+    },
+    complete(requestId) {
+      for (const [key, request] of pending) {
+        if (request.requestId === requestId) pending.delete(key);
+      }
+    },
+  };
+}

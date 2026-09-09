@@ -121,6 +121,11 @@ const browserSecurityHeaders = {
   "x-frame-options": "DENY",
 };
 const internalServerErrorMessage = "服务器内部错误";
+const ownerIntakeBlockedCodes = new Set([
+  "OWNER_WORK_REQUEST_LEDGER_REJECTED",
+  "OWNER_WORK_REQUEST_LEDGER_STALLED",
+  "OWNER_WORK_REQUEST_LEDGER_MISSING",
+]);
 const configurationRequestMaximumBytes = 2 * 1024 * 1024 + 64 * 1024;
 const configurationInitializationKind = "local.configuration-activate";
 const configurationInitializationAction = "initialize_from_draft";
@@ -2565,6 +2570,7 @@ export function createDashboardServer(
     response,
     operationallyAdmitted = false,
   ) => {
+    let isOwnerWorkSubmission = false;
     try {
       assertTrustedHost(request, expectedOrigin);
       const url = new URL(request.url, expectedOrigin);
@@ -3134,6 +3140,7 @@ export function createDashboardServer(
               ],
           "所有者工作请求字段无效",
         );
+        isOwnerWorkSubmission = true;
         const result = await requireOwnerWorkRequests(application).submit(input);
         sendJson(response, result.deduplicated ? 200 : 201, result);
         if (!result.deduplicated) {
@@ -3838,8 +3845,13 @@ export function createDashboardServer(
           // Diagnostics must never replace the safe HTTP response.
         }
       }
+      const ownerIntakeBlocked = status === 503 && isOwnerWorkSubmission &&
+        ownerIntakeBlockedCodes.has(error.code);
       sendJson(response, status, {
-        error: status >= 500 ? internalServerErrorMessage : error.message,
+        error: ownerIntakeBlocked
+          ? "请求已保存并路由，但尚未进入工作台账。请重试原请求，不要重复创建。"
+          : status >= 500 ? internalServerErrorMessage : error.message,
+        ...(ownerIntakeBlocked ? { code: error.code } : {}),
       });
     }
   };

@@ -522,6 +522,13 @@ export class OwnerWorkRequestService {
       }
       const item = await this.#findWorkItem(assignmentId, signal);
       if (item) return item.itemId;
+      if (result.error?.code === "WORK_LEDGER_GRAPH_TRANSITION_INVALID") {
+        throw ownerRequestError(
+          "OWNER_WORK_REQUEST_LEDGER_REJECTED",
+          "请求已路由，但工作台账拒绝了当前入账批次",
+          503,
+        );
+      }
       if (result.cursor >= result.highWatermark) break;
       if (result.cursor === previousCursor) {
         throw ownerRequestError(

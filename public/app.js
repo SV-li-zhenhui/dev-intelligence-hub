@@ -26,7 +26,7 @@ import { announcementDetailMarkup } from "./announcement-markup.js";
 import { dingtalkDetailMarkup } from "./dingtalk-detail-markup.js";
 import {
   manualWorkAssignmentMarkup,
-  ownerWorkRequestForItem,
+  createManualWorkAssignmentAttempts,
 } from "./manual-work-assignment.js";
 import {
   inferTestingProduct,
@@ -90,6 +90,7 @@ let employeeRolesError = "";
 let employeeRolesRequestSequence = 0;
 let lastAppliedEmployeeRolesRequest = 0;
 let employeeRolesAbortController = null;
+const manualWorkAssignmentAttempts = createManualWorkAssignmentAttempts();
 let currentView = "overview";
 let itemIndex = new Map();
 let jobIndex = new Map();
@@ -3420,15 +3421,16 @@ function showDetail(item) {
     event.preventDefault();
     const form = event.currentTarget;
     const button = form.querySelector("button[type=submit]");
+    if (button.disabled) return;
     const status = form.querySelector("[data-manual-work-assignment-status]");
     const data = new FormData(form);
     button.disabled = true;
     status.textContent = "正在创建共享任务…";
+    let request;
     try {
-      const request = ownerWorkRequestForItem(item, {
+      request = manualWorkAssignmentAttempts.requestFor(item, {
         workType: String(data.get("workType") || ""),
         priority: String(data.get("priority") || ""),
-        requestId: crypto.randomUUID(),
       });
       const response = await fetch("/api/work/requests", {
         method: "POST",
@@ -3442,6 +3444,7 @@ function showDetail(item) {
       if (!response.ok) {
         throw new Error(result.error || `分配失败（${response.status}）`);
       }
+      manualWorkAssignmentAttempts.complete(request.requestId);
       form.closest(".manual-work-assignment").outerHTML =
         manualWorkAssignmentMarkup(item, {
           requestId: result.requestId,
@@ -3449,7 +3452,10 @@ function showDetail(item) {
           target: result.assignment?.target?.id,
         });
     } catch (error) {
-      status.textContent = error.message || "分配失败";
+      status.textContent = `${error.message || "分配失败"}${request
+        ? ` 本页重试会继续原请求（${request.requestId}）。`
+        : ""}`;
+      if (request) button.textContent = "重试原请求";
       button.disabled = false;
     }
   });

@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
   githubWorkItemFromUrl,
   manualHistoricalWorkMarkup,
   manualWorkAssignmentMarkup,
   ownerWorkRequestForItem,
+  createManualWorkAssignmentAttempts,
 } from "../public/manual-work-assignment.js";
 
 const pullRequest = {
@@ -16,6 +19,88 @@ const pullRequest = {
   title: "新增 Retina Thickness-Trend 分析页面",
   url: "https://github.com/ExampleOrg/SoftwareApp/pull/23991",
 };
+
+test("manual assignment retry keeps its request ID and frozen payload until success", () => {
+  let nextId = 0;
+  const attempts = createManualWorkAssignmentAttempts(() => `request-${++nextId}`);
+  const options = { workType: "pull_request", priority: "high" };
+  const first = attempts.requestFor(pullRequest, options);
+  const retry = attempts.requestFor({ ...pullRequest, summary: "Refreshed while retrying" }, options);
+  assert.deepEqual(retry, first);
+  first.description = "Caller mutation must not change the saved retry";
+  assert.deepEqual(attempts.requestFor(pullRequest, options), retry);
+  assert.equal(nextId, 1);
+  const otherPriority = attempts.requestFor(pullRequest, { ...options, priority: "urgent" });
+  const otherPr = attempts.requestFor({ ...pullRequest, number: 1 }, options);
+  const development = attempts.requestFor(pullRequest, { ...options, workType: "development" });
+  assert.equal(new Set([retry, otherPriority, otherPr, development].map((entry) => entry.requestId)).size, 4);
+  attempts.complete(retry.requestId);
+  assert.notEqual(attempts.requestFor(pullRequest, options).requestId, retry.requestId);
+  attempts.complete(retry.requestId);
+  assert.equal(attempts.requestFor(pullRequest, options).requestId, "request-5");
+});
+
+test("detail form coalesces double submits and reuses a failed request after reopening", async () => {
+  const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("function showDetail(item)");
+  const end = app.indexOf("\nfunction codeJobActionFocusIntent", start);
+  assert.ok(start >= 0 && end > start);
+  let activeForm;
+  function createForm() {
+    const button = { disabled: false };
+    const status = { textContent: "" };
+    const section = { outerHTML: "" };
+    return {
+      button, status, section,
+      values: { workType: "pull_request", priority: "high" },
+      querySelector(selector) { return selector.startsWith("button") ? button : status; },
+      closest() { return section; },
+      addEventListener(_type, handler) { this.submit = handler; },
+    };
+  }
+  let resolveFirst;
+  const firstResponse = new Promise((resolve) => { resolveFirst = resolve; });
+  const bodies = [];
+  let requestIds = 0;
+  const context = {
+    manualWorkAssignmentAttempts: createManualWorkAssignmentAttempts(() => `id-${++requestIds}`),
+    manualWorkAssignmentMarkup,
+    dialogContent: { querySelector() { return activeForm; } },
+    dialog: { showModal() {} },
+    FormData: class { constructor(form) { this.form = form; } get(key) { return this.form.values[key]; } },
+    kindLabel: () => "PR",
+    escapeHtml: (value) => String(value ?? ""),
+    dingtalkDetailMarkup: () => "", prLifecycleStatusMarkup: () => "",
+    brainAssessment: () => "", githubItemDetailMarkup: () => "", detailRows: () => "",
+    async fetch(_url, options) {
+      bodies.push(JSON.parse(options.body));
+      return bodies.length === 1 ? firstResponse : {
+        ok: true, status: 200,
+        async json() { return { requestId: bodies.at(-1).requestId, workItemId: "one-work-item", assignment: { target: { id: "pr-engineer" } } }; },
+      };
+    },
+  };
+  runInNewContext(app.slice(start, end), context);
+  activeForm = createForm();
+  context.showDetail(pullRequest);
+  const firstForm = activeForm;
+  const submit = (form) => form.submit({ currentTarget: form, preventDefault() {} });
+  const pending = submit(firstForm);
+  await submit(firstForm);
+  assert.equal(bodies.length, 1);
+  resolveFirst({ ok: false, status: 503, async json() { return { error: "请求已保存" }; } });
+  await pending;
+  assert.match(firstForm.status.textContent, /请求已保存.*id-1/);
+  assert.equal(firstForm.button.disabled, false);
+  assert.equal(firstForm.button.textContent, "重试原请求");
+
+  activeForm = createForm();
+  context.showDetail({ ...pullRequest, title: "Updated title" });
+  await submit(activeForm);
+  assert.deepEqual(bodies[1], bodies[0]);
+  assert.match(activeForm.section.outerHTML, /one-work-item/);
+  assert.equal(requestIds, 1);
+});
 
 test("PR detail offers a manual assignment form with a direct review option", () => {
   const markup = manualWorkAssignmentMarkup(pullRequest);

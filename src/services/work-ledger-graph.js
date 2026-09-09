@@ -490,6 +490,38 @@ function isCompletedPullRequestRootScopeExit(previous, next) {
   );
 }
 
+function isCompletedPullRequestRootRetiredAfterAdvance(previous, next, nextItems) {
+  if (
+    previous.kind !== "source_root" || previous.source?.kind !== "pull_request" ||
+    previous.status !== "completed" ||
+    next?.kind !== "source_root" || next.source?.kind !== "pull_request" ||
+    next.status !== "blocked" ||
+    next.statusReason !== "pr_source_cross_root_cutover_retired" ||
+    next.revision !== previous.revision + 1 ||
+    next.ownerId !== null || next.leaseId !== null || next.leaseUntil !== null ||
+    next.activeIntentId !== null || next.decisionContext !== null || next.availableAt !== null ||
+    next.source.activeRevision <= previous.source.activeRevision ||
+    next.source.current.sourceSequence <= previous.source.current.sourceSequence ||
+    ledgerDigest(next.source.identity) !== ledgerDigest(previous.source.identity)
+  ) return false;
+
+  // Intake can advance a completed root, then retire it behind a later source
+  // in the same transaction. Require both observations; this only revokes work.
+  const identity = next.source.identity;
+  for (const successor of nextItems.values()) {
+    if (
+      successor.kind === "source_root" && successor.source?.kind === "pull_request" &&
+      successor.source.workKey !== next.source.workKey &&
+      successor.source.identity.subjectId === identity.subjectId &&
+      successor.source.identity.repository === identity.repository &&
+      successor.source.identity.pullRequestNumber === identity.pullRequestNumber &&
+      Number.isSafeInteger(successor.source.current.sourceSequence) &&
+      successor.source.current.sourceSequence > next.source.current.sourceSequence
+    ) return true;
+  }
+  return false;
+}
+
 function isCompletedPullRequestRootPendingCutover(previous, next, previousItems, nextItems) {
   const prefix = "pr_source_cross_root_cutover_pending:";
   if (
@@ -572,6 +604,7 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
           (nextItem.status === "queued" &&
             nextItem.source.activeRevision > item.source.activeRevision) ||
           isCompletedPullRequestRootScopeExit(item, nextItem) ||
+          isCompletedPullRequestRootRetiredAfterAdvance(item, nextItem, nextItemsById) ||
           isCompletedPullRequestRootPendingCutover(
             item, nextItem, previousItemsById, nextItemsById,
           )

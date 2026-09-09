@@ -2817,6 +2817,105 @@ for (const nextStatus of ["blocked", "retry_wait"]) {
   });
 }
 
+for (const [destination, initialStatus] of [
+  ["new", "queued"], ["existing", "queued"],
+  ["new", "completed"], ["existing", "completed"],
+]) {
+  test(`one intake batch revises and retires a ${initialStatus} PR root once when moving to a ${destination} root`, async () => {
+    const fixture = await createFixture({
+      records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+    });
+    await fixture.service.intake();
+    let sequence = 1;
+    if (destination === "existing") {
+      for (const sourceScopeId of ["github-secondary", "github-dashboard"]) {
+        sequence += 1;
+        fixture.source.records.push(prAssignment(sequence, {
+          sourceScopeId,
+          occurredAt: `2026-08-02T01:0${sequence}:00.000Z`,
+          gitFacts: prGitFacts(PR_HEAD_A),
+        }));
+        fixture.source.highWatermark = sequence;
+        await fixture.service.intake();
+      }
+    }
+    fixture.source.records.push(issueAssignment(++sequence, { issueNumber: 99 }));
+    fixture.source.highWatermark = sequence;
+    await fixture.service.intake();
+    let before = (await fixture.service.listItems({ limit: 10 })).items.find(
+      ({ source }) => source?.identity.scopeId === "github-dashboard",
+    );
+    if (initialStatus === "completed") {
+      const claimed = await fixture.service.claim({
+        itemId: before.itemId,
+        expectedRevision: before.revision,
+        workerId: "employee-pr-engineer",
+        leaseDurationMs: 30_000,
+      });
+      before = await fixture.service.complete({
+        itemId: claimed.itemId,
+        expectedRevision: claimed.revision,
+        leaseId: claimed.leaseId,
+        actorId: "employee-pr-engineer",
+        result: { outcome: "completed-before-new-observations" },
+      });
+    }
+    const previousState = fixture.store.stored();
+    const update = prAssignment(++sequence, {
+      occurredAt: "2026-08-02T01:10:00.000Z",
+      ciStatus: "SUCCESS",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    });
+    const replacement = prAssignment(++sequence, {
+      sourceScopeId: "github-secondary",
+      occurredAt: "2026-08-02T01:11:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A),
+    });
+    const following = issueAssignment(++sequence);
+    fixture.source.records.push(update, replacement, following);
+    fixture.source.highWatermark = sequence;
+
+    const result = await fixture.service.intake();
+
+    assert.equal(result.error, undefined);
+    assert.equal(result.received, 3);
+    assert.equal(result.cursor, sequence);
+    const items = (await fixture.service.listItems({ limit: 10 })).items;
+    const retired = items.find(({ itemId }) => itemId === before.itemId);
+    assert.equal(retired.revision, before.revision + 1);
+    assert.equal(retired.statusReason, "pr_source_cross_root_cutover_retired");
+    assert.ok(retired.source.bindings.some(
+      ({ assignmentId }) => assignmentId === update.assignment.assignmentId,
+    ));
+    assert.ok(items.some(
+      ({ assignmentId }) => assignmentId === following.assignment.assignmentId,
+    ));
+    assert.equal(items.filter(({ source }) =>
+      source?.kind === "pull_request" && source.identity.scopeId === "github-secondary"
+    ).length, 1);
+    if (initialStatus === "completed") {
+      const committed = fixture.store.stored();
+      for (const tamper of [
+        (state) => {
+          state.items.find(({ itemId }) => itemId === retired.itemId)
+            .source.activeRevision = before.source.activeRevision;
+        },
+        (state) => {
+          const successor = state.items.find(({ source }) =>
+            source?.identity.scopeId === "github-secondary"
+          );
+          successor.source.current.sourceSequence = retired.source.current.sourceSequence;
+        },
+      ]) {
+        const forged = clone(committed);
+        tamper(forged);
+        assert.throws(() => validateWorkLedgerGraphTransition(previousState, forged));
+      }
+    }
+    assert.equal((await fixture.service.intake()).received, 0);
+  });
+}
+
 for (const predecessorStatus of ["queued", "working"]) {
   test(`cross-root cutover retires a ${predecessorStatus} predecessor atomically`, async () => {
     const fixture = await createFixture({

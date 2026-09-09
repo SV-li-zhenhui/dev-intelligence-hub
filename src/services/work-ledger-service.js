@@ -1488,6 +1488,21 @@ export class WorkLedgerService {
     );
     const touchedItemIds = new Set();
     const revisedItemIds = new Set();
+    const retirePredecessorInBatch = (predecessor, locallySettled) => {
+      const retired = retireCrossRootPullRequestPredecessor(locallySettled, now);
+      const persisted = initialItemIds.has(predecessor.itemId);
+      const settled = {
+        ...retired,
+        revision: !persisted || revisedItemIds.has(predecessor.itemId)
+          ? predecessor.revision
+          : retired.revision,
+        ...(!persisted ? { status: "blocked" } : {}),
+      };
+      if (persisted && settled.revision !== predecessor.revision) {
+        revisedItemIds.add(settled.itemId);
+      }
+      return settled;
+    };
     const timelineEvents = [];
     const cutoverTimelineIndex = createPullRequestCutoverTimelineIndex(
       this.state.timeline,
@@ -1864,23 +1879,7 @@ export class WorkLedgerService {
               now,
               timelineEvents,
             });
-            const retired = retireCrossRootPullRequestPredecessor(
-              locallySettled,
-              now,
-            );
-            const settled = initialItemIds.has(predecessor.itemId)
-              ? retired
-              : {
-                  ...retired,
-                  status: "blocked",
-                  revision: predecessor.revision,
-                };
-            if (
-              initialItemIds.has(settled.itemId) &&
-              settled.revision !== predecessor.revision
-            ) {
-              revisedItemIds.add(settled.itemId);
-            }
+            const settled = retirePredecessorInBatch(predecessor, locallySettled);
             itemsById.set(settled.itemId, settled);
             rootByWorkKey.set(settled.source.workKey, settled);
           }
@@ -2124,23 +2123,7 @@ export class WorkLedgerService {
                 now,
                 timelineEvents,
               });
-              const retired = retireCrossRootPullRequestPredecessor(
-                locallySettled,
-                now,
-              );
-              const settled = initialItemIds.has(currentPredecessor.itemId)
-                ? retired
-                : {
-                    ...retired,
-                    status: "blocked",
-                    revision: currentPredecessor.revision,
-                  };
-              if (
-                initialItemIds.has(settled.itemId) &&
-                settled.revision !== currentPredecessor.revision
-              ) {
-                revisedItemIds.add(settled.itemId);
-              }
+              const settled = retirePredecessorInBatch(currentPredecessor, locallySettled);
               itemsById.set(settled.itemId, settled);
               rootByWorkKey.set(settled.source.workKey, settled);
               const activated = activatePendingPullRequestWorkSource(
