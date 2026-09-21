@@ -1652,7 +1652,7 @@ function bindConfirmationHistoryView() {
 
 function render() {
   pageTitle.textContent = viewTitles[currentView];
-  document.title = `${viewTitles[currentView]} · MyDashboard`;
+  document.title = `${viewTitles[currentView]} · Development Intelligence Hub`;
   if (!isConfigurationBackedView() && currentView !== "system" && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;

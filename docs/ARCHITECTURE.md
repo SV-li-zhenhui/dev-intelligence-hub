@@ -1,6 +1,6 @@
 # Architecture
 
-MyDashboard is a single-user, local-first command center. It combines observed
+Development Intelligence Hub is a single-user, local-first command center. It combines observed
 engineering signals with durable work, autonomous role decisions, controlled
 execution, explicit human decisions, cited memory, and recoverable operations.
 

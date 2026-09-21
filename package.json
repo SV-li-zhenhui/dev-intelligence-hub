@@ -1,17 +1,36 @@
 {
-  "name": "my-dashboard",
+  "name": "dev-intelligence-hub",
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
   "description": "Local-first engineering command center with autonomous roles, cited memory, controlled execution, and owner-confirmed actions.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huihuangnumber1/dev-intelligence-hub.git"
+  },
+  "homepage": "https://github.com/huihuangnumber1/dev-intelligence-hub#readme",
+  "bugs": {
+    "url": "https://github.com/huihuangnumber1/dev-intelligence-hub/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "developer-tools",
+    "github",
+    "local-first",
+    "ollama",
+    "workflow-automation"
+  ],
   "files": [
+    "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "SECURITY.md",
+    "SUPPORT.md",
     "config.example.json",
     "docs/ARCHITECTURE.md",
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
+    "docs/PROJECT_STATUS.md",
     "npm-shrinkwrap.json",
     "public/",
     "scripts/",

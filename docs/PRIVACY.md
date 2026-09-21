@@ -1,8 +1,8 @@
 # Privacy
 
-MyDashboard is local-first. Its state, work ledger, memory index, confirmation
+Development Intelligence Hub is local-first. Its state, work ledger, memory index, confirmation
 history, executor evidence, backups, and logs are stored on the machine running
-the service. It does not require a hosted MyDashboard account.
+the service. It does not require a hosted Development Intelligence Hub account.
 
 ## Data the system can process
 

@@ -715,12 +715,15 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
   for (const filePath of files) assertPortablePackagePath(filePath);
 
   for (const required of [
+    "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
+    "SUPPORT.md",
     "config.example.json",
     "docs/ARCHITECTURE.md",
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
+    "docs/PROJECT_STATUS.md",
     "npm-shrinkwrap.json",
     "package.json",
     "README.md",
@@ -805,7 +808,11 @@ test("packed manager resolves the packaged writer lease probe in a clean runtime
     `packed manager install failed:\n${diagnostic(installed)}`,
   );
 
-  const packageRoot = path.join(installRoot, "node_modules", "my-dashboard");
+  const packageRoot = path.join(
+    installRoot,
+    "node_modules",
+    "dev-intelligence-hub",
+  );
   assert.equal(
     existsSync(path.join(packageRoot, "scripts", "Manage-MyDashboard.ps1")),
     true,

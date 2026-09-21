@@ -11,7 +11,7 @@ const STATE_PRESENTATION = Object.freeze({
     tone: "attention",
     label: "登录不可用",
     summary: "CLI 已就绪，但没有发现可代理的文件式登录。",
-    guidance: "请使用运行 MyDashboard 的同一 Windows 用户执行 codex login，然后重新检查。",
+    guidance: "请使用运行 Development Intelligence Hub 的同一 Windows 用户执行 codex login，然后重新检查。",
   }),
   unsafe_source: Object.freeze({
     tone: "blocked",
@@ -23,7 +23,7 @@ const STATE_PRESENTATION = Object.freeze({
     tone: "blocked",
     label: "凭据代理已封闭",
     summary: "本次进程中的安全边界已关闭，CLI 登录不会继续使用。",
-    guidance: "请重启 MyDashboard；若仍失败，再检查本机登录文件权限。",
+    guidance: "请重启 Development Intelligence Hub；若仍失败，再检查本机登录文件权限。",
   }),
   cli_unavailable: Object.freeze({
     tone: "blocked",

@@ -251,7 +251,8 @@ async function validate(name, viewport) {
   }
   await page.locator('[data-view="prs"]').click();
   const { viewTitleUpdated, viewHeadingFocused } = await page.evaluate(() => ({
-    viewTitleUpdated: document.title === "Pull Requests · MyDashboard",
+    viewTitleUpdated:
+      document.title === "Pull Requests · Development Intelligence Hub",
     viewHeadingFocused:
       document.activeElement === document.querySelector("#page-title"),
   }));
