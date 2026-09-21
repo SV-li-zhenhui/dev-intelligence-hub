@@ -1,6 +1,6 @@
 # Operations
 
-MyDashboard is a single-user, loopback-only service. Keep the project, active
+Development Intelligence Hub is a single-user, loopback-only service. Keep the project, active
 data, backups, restore control state, and managed-process runtime on trusted
 local storage. Do not publish port 4173 through a proxy, port forward, or LAN
 listener.

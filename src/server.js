@@ -4750,7 +4750,7 @@ export async function startDashboardServer(
   const port = typeof address === "object" && address
     ? address.port
     : application.config.port;
-  log(`MyDashboard: http://127.0.0.1:${port}`);
+  log(`Development Intelligence Hub: http://127.0.0.1:${port}`);
   return server;
 }
 
@@ -4825,7 +4825,7 @@ export async function startDashboardFromVerifiedRuntime(
 
 if (import.meta.url === invokedModule) {
   console.error(
-    "MyDashboard must be started through scripts/run-dashboard.mjs or the managed launcher.",
+    "Development Intelligence Hub must be started through scripts/run-dashboard.mjs or the managed launcher.",
   );
   process.exitCode = 1;
 }

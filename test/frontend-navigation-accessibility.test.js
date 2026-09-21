@@ -75,7 +75,7 @@ test("client-side view changes update the document title and focus the page head
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
   assert.match(
     render,
-    /document\.title = `\$\{viewTitles\[currentView\]\} · MyDashboard`/u,
+    /document\.title = `\$\{viewTitles\[currentView\]\} · Development Intelligence Hub`/u,
   );
   assert.match(activate, /focusHeading = true/u);
   assert.match(activate, /pageTitle\.focus\(\{ preventScroll: true \}\)/u);
