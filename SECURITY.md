@@ -22,7 +22,7 @@ coordinate disclosure after a fix is available.
 
 ## Security model
 
-MyDashboard is a single-user, loopback-only application. It is not designed to
+Development Intelligence Hub is a single-user, loopback-only application. It is not designed to
 be exposed to a LAN or the public internet. A process that can access the same
 user account, local data directory, or loopback endpoint is inside the local
 trust boundary.

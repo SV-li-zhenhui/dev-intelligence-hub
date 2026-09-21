@@ -1,9 +1,15 @@
-# Contributing to MyDashboard
+# Contributing to Development Intelligence Hub
 
-MyDashboard is a local-first engineering command center. Contributions are
-welcome when they preserve its core trust boundaries: model output is
-untrusted, source workspaces are not mutated implicitly, and every external or
-irreversible action requires explicit owner confirmation.
+Development Intelligence Hub is a local-first engineering command center.
+Contributions are welcome when they preserve its core trust boundaries: model
+output is untrusted, source workspaces are not mutated implicitly, and every
+external or irreversible action requires explicit owner confirmation.
+
+Participation in this project is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md). Use the repository issue and pull request
+templates so reports include the minimum reproducible information without
+exposing private data. Security vulnerabilities follow the private process in
+[SECURITY.md](SECURITY.md), never a public issue.
 
 Contributions intentionally submitted for inclusion are provided under
 Apache-2.0 unless explicitly stated otherwise.

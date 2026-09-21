@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a scoped improvement and explain its authority boundary.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the user problem without including private project data.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful workflow and its observable result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: authority
+    attributes:
+      label: Data and authority impact
+      description: List any new model, data class, repository, tool, external write, confirmation, or recovery behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance examples
+      description: Give concrete success, failure, and stale or unauthorized cases.
+    validations:
+      required: true

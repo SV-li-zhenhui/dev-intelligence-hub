@@ -23,7 +23,7 @@ test("Codex login status renderer covers every sanitized state", () => {
     ["available", ["能力可用", "CLI 已安装且受支持", "文件式登录可安全代理"]],
     ["file_login_unavailable", ["登录不可用", "同一 Windows 用户", "codex login"]],
     ["unsafe_source", ["登录源不安全", "文件所有者、ACL 或链接"]],
-    ["broker_blocked", ["凭据代理已封闭", "重启 MyDashboard"]],
+    ["broker_blocked", ["凭据代理已封闭", "重启 Development Intelligence Hub"]],
     ["cli_unavailable", ["CLI 不可用", "安装项目支持的 Codex CLI"]],
   ]);
 

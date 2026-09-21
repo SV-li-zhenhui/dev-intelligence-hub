@@ -1,8 +1,22 @@
 # 开发智能中枢 (Development Intelligence Hub)
 
-> **开发中 / Development in Progress** — This project is actively being built. APIs, workflows, and documentation may change before the first stable release.
+> **开发中 / Development in Progress** — 当前版本为 `0.1.0`，接口、工作流和文档在首个稳定版本前仍可能调整。
+
+[![CI](https://github.com/huihuangnumber1/dev-intelligence-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/huihuangnumber1/dev-intelligence-hub/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 本地优先的研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与协作消息合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及可独立配置职责、权限、调度和大脑的主控、需求、PR、开发与测试岗位。
+
+项目与 npm 包统一使用公开名称 Development Intelligence Hub / `dev-intelligence-hub`。为保持已有安装的数据目录、管理脚本、HTTP 头和恢复协议兼容，这些技术标识暂时保留 `MyDashboard`，不代表另一个项目。
+
+## 项目状态
+
+- U1–U10 的本地实现和自动化验收已收口，覆盖受控代码执行、持久工作流、多岗位协作、可引用记忆、版本化配置以及备份恢复。
+- U11 已完成 Apache-2.0 许可证、隐私扫描、安全示例配置和干净环境安装等开源分发基线。
+- U12 整体验收与由产品自身执行的真实 PR 所有者确认仍待完成；当前版本不应被描述为稳定生产版本。
+- 示例配置默认关闭 GitHub 读写、远程模型、代码执行和主动岗位。外部写入与高风险动作必须逐项确认。
+
+能力、限制与发布门槛的简表见[项目状态](docs/PROJECT_STATUS.md)，完整实施记录见[开发计划](DEVELOPMENT_PLAN.md)。
 
 PR 责任语义遵循团队当前流程：
 
@@ -242,7 +256,7 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
     "gitTimeoutMs": 30000,
     "workspaces": [
       {
-        "id": "my-dashboard",
+        "id": "dev-intelligence-hub",
         "sourceRoot": ".",
         "gitHeadSnapshot": true,
         "writablePaths": ["src", "test"]
@@ -268,7 +282,7 @@ Git 提交和本地会话导入默认关闭。需要时只在不入库的 `confi
       }
     },
     "requiredProfilesByWorkspace": {
-      "my-dashboard": ["node-tests", "repository-contract"]
+      "dev-intelligence-hub": ["node-tests", "repository-contract"]
     }
   }
 }
@@ -306,4 +320,4 @@ PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对�
 
 ## 许可证
 
-MyDashboard 使用 [Apache-2.0](LICENSE) 许可证。
+Development Intelligence Hub 使用 [Apache-2.0](LICENSE) 许可证。
