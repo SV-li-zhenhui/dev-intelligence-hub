@@ -1,4 +1,6 @@
-# MyDashboard
+# 开发智能中枢 (Development Intelligence Hub)
+
+> **开发中 / Development in Progress** — This project is actively being built. APIs, workflows, and documentation may change before the first stable release.
 
 本地优先的研发指挥中枢，把 GitHub PR、Issue、里程碑/Release 与协作消息合并为行动队列。系统包含可配置路由、持久化工作台账、主动员工循环、统一请示/确认队列，以及可独立配置职责、权限、调度和大脑的主控、需求、PR、开发与测试岗位。
 
