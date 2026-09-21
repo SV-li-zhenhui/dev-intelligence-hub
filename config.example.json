@@ -1,0 +1,307 @@
+{
+  "port": 4173,
+  "refreshMinutes": 10,
+  "browserPollSeconds": 60,
+  "githubLogin": "local-user",
+  "githubRead": {
+    "enabled": false,
+    "issueActiveWindowDays": 14
+  },
+  "trackedRepositories": [],
+  "prResponsibility": {
+    "historicalAfterDays": 14
+  },
+  "codeExecutor": {
+    "enabled": false
+  },
+  "changePackages": {
+    "enabled": false
+  },
+  "githubActions": {
+    "enabled": false,
+    "credentialMode": "gh-login",
+    "enabledActions": []
+  },
+  "workflowRouting": {
+    "schemaVersion": 1,
+    "enabled": false,
+    "maxHops": 8,
+    "rules": [
+      {
+        "id": "pr-events-to-pr-engineer",
+        "source": "root",
+        "enabled": true,
+        "priority": 100,
+        "fallback": false,
+        "condition": {
+          "op": "oneOf",
+          "path": "eventType",
+          "values": [
+            "pull_request.observed",
+            "pull_request.created",
+            "pull_request.updated",
+            "pull_request.completed",
+            "pull_request.left_scope",
+            "pull_request.classified",
+            "pull_request.status"
+          ]
+        },
+        "targets": [
+          { "type": "role", "id": "pr-engineer" }
+        ],
+        "onMatch": "stop"
+      },
+      {
+        "id": "issue-events-to-requirements",
+        "source": "root",
+        "enabled": true,
+        "priority": 90,
+        "fallback": false,
+        "condition": {
+          "op": "oneOf",
+          "path": "eventType",
+          "values": [
+            "issue.observed",
+            "issue.created",
+            "issue.updated",
+            "issue.completed",
+            "issue.left_scope",
+            "issue.classified",
+            "issue.status"
+          ]
+        },
+        "targets": [
+          { "type": "role", "id": "requirements-analyst" }
+        ],
+        "onMatch": "stop"
+      },
+      {
+        "id": "local-owner-triage",
+        "source": "root",
+        "enabled": true,
+        "priority": 0,
+        "fallback": true,
+        "condition": null,
+        "targets": [
+          { "type": "person", "id": "local-user" }
+        ],
+        "onMatch": "stop"
+      }
+    ]
+  },
+  "workCoordination": {
+    "enabled": false,
+    "policy": {
+      "version": 1,
+      "capabilityRoles": {
+        "coordination": "orchestrator",
+        "requirements": "requirements-analyst",
+        "pr-review": "pr-engineer",
+        "development": "developer",
+        "testing": "tester"
+      },
+      "githubReviewRoles": ["pr-engineer"],
+      "codeActionRoles": ["pr-engineer", "developer", "tester"],
+      "codeOperationsByRole": {
+        "pr-engineer": ["inspect", "modify", "verify"],
+        "developer": ["inspect", "modify", "verify"],
+        "tester": ["inspect", "verify"]
+      },
+      "testingOwnersByProduct": {
+        "qt": ["qt-tester-primary", "qt-tester-secondary"],
+        "bs": ["bs-tester"]
+      },
+      "workspaceByRepository": {}
+    }
+  },
+  "memory": {
+    "enabled": false,
+    "imports": {
+      "localSessions": false,
+      "git": false
+    },
+    "answering": {
+      "enabled": false
+    }
+  },
+  "brain": {
+    "enabled": false,
+    "provider": "ollama",
+    "model": "qwen3.5:9b",
+    "baseUrl": "http://127.0.0.1:11434"
+  },
+  "brainProviders": {
+    "ollama": {
+      "kind": "ollama",
+      "baseUrl": "http://127.0.0.1:11434",
+      "remote": false
+    },
+    "codex-local-cli": {
+      "kind": "codex-cli",
+      "credentialMode": "codex-login",
+      "remote": true,
+      "timeoutMs": 300000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    },
+    "claude-local-cli": {
+      "kind": "claude-cli",
+      "credentialMode": "api-key",
+      "remote": true,
+      "timeoutMs": 300000,
+      "maxResponseBytes": 131072,
+      "maxRequestBytes": 262144
+    }
+  },
+  "employees": {
+    "prReviewer": {
+      "enabled": false,
+      "name": "PR reviewer",
+      "initialPaused": true,
+      "policyVersion": 1,
+      "tickMinutes": 2,
+      "maxJobsPerTick": 2,
+      "maxAttempts": 3,
+      "retryMinutes": [1, 5, 30],
+      "maxPatchCharacters": 24000,
+      "memoryLimit": 1000,
+      "memoryOutboxLimit": 100,
+      "jobLimit": 500,
+      "allowRemoteCodeContext": false,
+      "brain": {}
+    },
+    "roles": {
+      "pr-engineer": {
+        "name": "PR 工程师",
+        "mission": "主动分析相关 PR，形成证据绑定的评审、代码和推进建议；所有外部动作逐项等待所有者确认。",
+        "enabled": true,
+        "scheduleMinutes": 2,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_github_review",
+            "propose_github_pull_request_action",
+            "propose_code_action",
+            "handoff",
+            "submit_delivery",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "orchestrator": {
+        "name": "主控调度员",
+        "mission": "主动观察共享任务图，按验收契约拆分、分派、验收、退回、升级或结束工作。",
+        "enabled": true,
+        "scheduleMinutes": 2,
+        "initialPaused": true,
+        "workerId": "employee-orchestrator",
+        "permissions": {
+          "allowedIntents": ["orchestrate", "complete"]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "requirements-analyst": {
+        "name": "需求分析师",
+        "mission": "主动澄清需求、风险和验收条件，提交可修订的需求交付；只把真正需要产品决定的问题交给所有者。",
+        "enabled": true,
+        "scheduleMinutes": 3,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "handoff",
+            "submit_delivery",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "developer": {
+        "name": "开发工程师",
+        "mission": "主动读取已验收输入，提出受策略约束的代码动作并提交可验证的变更交付。",
+        "enabled": true,
+        "scheduleMinutes": 3,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_code_action",
+            "handoff",
+            "submit_delivery",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      },
+      "tester": {
+        "name": "测试工程师",
+        "mission": "主动依据验收标准验证交付，提交可复现的测试证据，并把失败返回共享任务图。",
+        "enabled": true,
+        "scheduleMinutes": 4,
+        "initialPaused": true,
+        "permissions": {
+          "allowedIntents": [
+            "ask_user",
+            "wait_condition",
+            "propose_code_action",
+            "handoff",
+            "submit_delivery",
+            "complete"
+          ]
+        },
+        "brain": {
+          "provider": "ollama",
+          "model": "qwen3.5:9b",
+          "remoteData": {
+            "requirements": false,
+            "code": false,
+            "memory": false
+          }
+        }
+      }
+    }
+  },
+  "dingtalk": {
+    "enabled": false,
+    "selfUserId": "local-user",
+    "notifyMinimumScore": 80,
+    "maxNotificationsPerRun": 5
+  }
+}

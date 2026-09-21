@@ -1,0 +1,36 @@
+{
+  "name": "my-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Local-first engineering command center with autonomous roles, cited memory, controlled execution, and owner-confirmed actions.",
+  "files": [
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "SECURITY.md",
+    "config.example.json",
+    "docs/ARCHITECTURE.md",
+    "docs/OPERATIONS.md",
+    "docs/PRIVACY.md",
+    "npm-shrinkwrap.json",
+    "public/",
+    "scripts/",
+    "src/"
+  ],
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/run-dashboard.mjs",
+    "refresh": "node src/cli.js refresh",
+    "refresh:notify": "node src/cli.js refresh --notify",
+    "cleanup:e2e-pr": "node scripts/cleanup-github-smoke-pr.mjs",
+    "setup:validation-browser": "node scripts/install-validation-browser.mjs",
+    "test": "node --test --test-concurrency=4 --test-reporter=tap test/00-u9-priority.mjs \"test/*.test.js\" \"test/*.test.mjs\" && node --test --test-concurrency=1 --test-reporter=tap test/open-source-distribution.mjs",
+    "validate:system": "node scripts/validate-system.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.0"
+  }
+}

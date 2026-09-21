@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>研发雷达 · MyDashboard</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主内容</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <div>
+            <strong>研发雷达</strong>
+            <span>Personal engineering desk</span>
+          </div>
+        </div>
+
+        <p class="nav-scroll-hint" id="nav-scroll-hint">左右滑动查看更多导航</p>
+        <nav class="nav" aria-label="主导航" aria-describedby="nav-scroll-hint">
+          <button class="nav-item active" data-view="overview" aria-current="page">
+            <span>总览</span><kbd>1</kbd>
+          </button>
+          <button class="nav-item" data-view="prs">
+            <span>Pull Requests</span><kbd>2</kbd>
+          </button>
+          <button class="nav-item" data-view="issues">
+            <span>Issues</span><kbd>3</kbd>
+          </button>
+          <button class="nav-item" data-view="versions">
+            <span>版本</span><kbd>4</kbd>
+          </button>
+          <button class="nav-item" data-view="signals">
+            <span>钉钉信号</span><kbd>5</kbd>
+          </button>
+          <button class="nav-item" data-view="employees">
+            <span>数字员工</span><kbd>6</kbd>
+          </button>
+          <button class="nav-item" data-view="memory">
+            <span>记忆搜索</span><kbd>7</kbd>
+          </button>
+          <button class="nav-item" data-view="workflow">
+            <span>工作流</span><kbd>8</kbd>
+          </button>
+          <button class="nav-item" data-view="work">
+            <span>工作台账</span><kbd>9</kbd>
+          </button>
+          <button class="nav-item" data-view="automation-tests">
+            <span>自动化测试库</span><kbd>T</kbd>
+          </button>
+          <button class="nav-item" data-view="configuration">
+            <span>配置中心</span><kbd>0</kbd>
+          </button>
+          <button class="nav-item" data-view="system">
+            <span>系统状态</span><kbd>S</kbd>
+          </button>
+        </nav>
+
+        <div class="source-health" id="source-health">
+          <span class="pulse"></span>
+          <div>
+            <strong>正在连接数据源</strong>
+            <span>等待第一次刷新</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main" id="main-content" tabindex="-1">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">MY WORKSPACE / TODAY</p>
+            <h1 id="page-title" tabindex="-1">今天需要你推动什么</h1>
+          </div>
+          <div class="topbar-actions">
+            <span id="last-updated" class="last-updated">尚未刷新</span>
+            <button class="refresh-button" id="refresh-button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 6v5h-5M4 18v-5h5M18.4 9A7 7 0 0 0 6.7 6.7L4 9m16 6-2.7 2.3A7 7 0 0 1 5.6 15" />
+              </svg>
+              刷新
+            </button>
+          </div>
+        </header>
+
+        <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
+        <section id="content" aria-live="polite">
+          <div class="skeleton-header"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row short"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="detail-dialog" aria-label="详情">
+      <button class="dialog-close" aria-label="关闭详情">×</button>
+      <div id="dialog-content"></div>
+    </dialog>
+
+    <dialog id="confirmation-dialog" aria-label="待确认操作">
+      <button class="dialog-close confirmation-close" aria-label="稍后确认">×</button>
+      <div id="confirmation-content"></div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
