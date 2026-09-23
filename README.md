@@ -33,6 +33,8 @@ npm test
 .\scripts\Manage-MyDashboard.ps1 -Action Start -OpenBrowser
 ```
 
+GitHub Actions 会在干净的托管 Windows 环境运行可移植回归。真实 Codex/GitHub 登录生命周期、Windows 私有 ACL 和 PowerShell 服务管理器测试仍保留在 `npm test`，需要在配置好的 Windows 工作站执行；发布验收必须运行完整的 `npm test`，不能用托管 CI 代替。
+
 这是日常使用的推荐启动方式：受管生命周期会认证唯一进程、保留可诊断状态并安全停止。`npm start` 只用于前台开发诊断，不属于受管生命周期，也不能满足 `validate:system -- --all`；不要同时运行两种启动方式。
 
 发布或升级前可运行可重复的整体验收。基础命令执行提交中的完整 Node 回归、全部 JavaScript 语法检查和两组真实浏览器行为测试；`--all` 还要求 Docker Desktop 可用，并要求已经由受管生命周期启动且健康的 `127.0.0.1:4173` 服务完成桌面/移动端验收：

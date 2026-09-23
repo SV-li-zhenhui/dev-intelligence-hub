@@ -68,6 +68,9 @@ const COMMITTED_CONFIGURATION = JSON.parse(
   await readFile(path.join(import.meta.dirname, "..", "config.example.json"), "utf8"),
 );
 const OFFLINE_FIXTURE_COMMAND_TIMEOUT_MS = 30_000;
+const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+  ? "requires a configured Windows workstation"
+  : false;
 const OFFLINE_FIXTURE_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const POWERSHELL_EXE = path.join(
   process.env.SystemRoot || process.env.WINDIR || "C:\\Windows",
@@ -5698,15 +5701,21 @@ async function assertDefaultCodeJobLifecycle(t, {
   if (teardownFailure) throw teardownFailure;
 }
 
-test("default non-versioned Code Job owns one real offline CLI lifecycle", async (t) => {
+test("default non-versioned Code Job owns one real offline CLI lifecycle", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   await assertDefaultCodeJobLifecycle(t, { versioned: false });
 });
 
-test("default versioned Code Job owns one lazy real offline CLI lifecycle", async (t) => {
+test("default versioned Code Job owns one lazy real offline CLI lifecycle", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   await assertDefaultCodeJobLifecycle(t, { versioned: true });
 });
 
-test("real offline CLI teardown survives an injected post-start failure", async (t) => {
+test("real offline CLI teardown survives an injected post-start failure", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI composition is Windows x64 only");
     return;

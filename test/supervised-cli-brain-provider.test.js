@@ -40,6 +40,9 @@ const SCHEMA = Object.freeze({
   },
 });
 const PRIVATE_PROMPT = "PRIVATE_PROMPT_MUST_STAY_IN_STDIN";
+const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+  ? "requires native Windows ACL timing guarantees"
+  : false;
 
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
@@ -1823,7 +1826,9 @@ test("Windows production root creation rejects unsupported deny ACE shapes", asy
   await assertProductionRootAclRejected(t, "deny-shape", "(D;OICI;0x2;;;BU)");
 });
 
-test("Windows production root creation binds parent ACL trust to its creation handle across ABA", async (t) => {
+test("Windows production root creation binds parent ACL trust to its creation handle across ABA", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
