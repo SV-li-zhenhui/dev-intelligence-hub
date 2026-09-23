@@ -32,18 +32,25 @@ jobs:
       - name: Prepare canonical Windows workspace
         shell: pwsh
         run: |
-          $projectRoot = 'C:\dev-intelligence-hub-ci'
+          $workspaceRoot = 'C:\dev-intelligence-hub-ci-root'
+          $projectRoot = Join-Path $workspaceRoot 'repo'
           $temporaryRoot = 'C:\dev-intelligence-hub-temp'
           $localAppDataRoot = 'C:\dev-intelligence-hub-localappdata'
-          New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
-          New-Item -ItemType Directory -Path $localAppDataRoot -Force | Out-Null
+          $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          foreach ($root in @($workspaceRoot, $temporaryRoot, $localAppDataRoot)) {
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            & icacls.exe $root /inheritance:r /grant:r "${currentUser}:(OI)(CI)F" "SYSTEM:(OI)(CI)F"
+            if ($LASTEXITCODE -ne 0) { throw "Unable to secure $root" }
+          }
           git clone --no-hardlinks "$env:GITHUB_WORKSPACE" $projectRoot
           git -C $projectRoot fetch "$env:GITHUB_WORKSPACE" $env:GITHUB_SHA
           git -C $projectRoot checkout --detach FETCH_HEAD
-          $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-          foreach ($root in @($projectRoot, $temporaryRoot, $localAppDataRoot)) {
-            & icacls.exe $root /inheritance:r /grant:r "${currentUser}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" /T /C
-            if ($LASTEXITCODE -ne 0) { throw "Unable to secure $root" }
+          $actualHead = git -C $projectRoot rev-parse HEAD
+          if ($actualHead -ne $env:GITHUB_SHA) {
+            throw "Canonical checkout is $actualHead instead of $env:GITHUB_SHA"
+          }
+          if (-not (Test-Path (Join-Path $projectRoot 'npm-shrinkwrap.json') -PathType Leaf)) {
+            throw 'Canonical checkout is missing npm-shrinkwrap.json'
           }
           "CI_PROJECT_ROOT=$projectRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TEMP=$temporaryRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
