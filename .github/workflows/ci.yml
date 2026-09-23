@@ -34,13 +34,21 @@ jobs:
         run: |
           $projectRoot = 'C:\dev-intelligence-hub-ci'
           $temporaryRoot = 'C:\dev-intelligence-hub-temp'
+          $localAppDataRoot = 'C:\dev-intelligence-hub-localappdata'
           New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path $localAppDataRoot -Force | Out-Null
           git clone --no-hardlinks "$env:GITHUB_WORKSPACE" $projectRoot
           git -C $projectRoot fetch "$env:GITHUB_WORKSPACE" $env:GITHUB_SHA
           git -C $projectRoot checkout --detach FETCH_HEAD
+          $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          foreach ($root in @($projectRoot, $temporaryRoot, $localAppDataRoot)) {
+            & icacls.exe $root /inheritance:r /grant:r "${currentUser}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" /T /C
+            if ($LASTEXITCODE -ne 0) { throw "Unable to secure $root" }
+          }
           "CI_PROJECT_ROOT=$projectRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TEMP=$temporaryRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$temporaryRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LOCALAPPDATA=$localAppDataRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install structured CLI
         run: npm install --global @openai/codex
@@ -51,4 +59,8 @@ jobs:
 
       - name: Run committed regression suite
         working-directory: ${{ env.CI_PROJECT_ROOT }}
-        run: npm test
+        shell: pwsh
+        run: |
+          node --test --test-concurrency=2 --test-reporter=tap test/00-u9-priority.mjs "test/*.test.js" "test/*.test.mjs"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-concurrency=1 --test-reporter=tap test/open-source-distribution.mjs

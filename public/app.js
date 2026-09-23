@@ -3822,7 +3822,7 @@ function reviewHandoffMarkup(reviewEvent, item) {
       <label>具体测试负责人
         <select data-review-testing-person>${configuredOwnerOptions(testingRouting, product)}</select>
       </label>
-      <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。Review 发布成功后，GitHub Assignee 会转交给该测试负责人。</small>
+      <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。候选账号来自配置中心；Review 发布成功后，GitHub Assignee 会转交给该测试负责人。</small>
     </div>
     <div class="review-testing-owner" data-review-external-owner${lifecycle.responsibleKind === "external_reviewer" ? "" : " hidden"}>
       <label>版本类型
