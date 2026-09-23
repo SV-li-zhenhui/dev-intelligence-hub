@@ -2660,7 +2660,11 @@ export async function createApplication({
       ownerWorkRetry,
       ownerWorkRequests,
       reviewHandoffReconciler: ownerWorkRequests && confirmationRuntime?.reviewHandoffs
-        ? new ReviewHandoffReconciler({ confirmations: confirmationRuntime.reviewHandoffs, ownerWorkRequests })
+        ? new ReviewHandoffReconciler({
+            confirmations: confirmationRuntime.reviewHandoffs,
+            ownerWorkRequests,
+            githubAssignee: confirmationRuntime.reviewHandoffAssignee,
+          })
         : null,
       deliveryEvidence,
       memorySearch,

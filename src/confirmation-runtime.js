@@ -555,6 +555,15 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       }),
       historyReader,
       reviewHandoffs: createQueueFacade(queue, REVIEW_HANDOFF_METHODS),
+      reviewHandoffAssignee: typeof githubExecutor?.assignAssignee === "function"
+        ? Object.freeze({
+            assignAssignee: (input, options) =>
+              actionAdmissionGate === null
+                ? githubExecutor.assignAssignee(input, options)
+                : actionAdmissionGate.run(() =>
+                    githubExecutor.assignAssignee(input, options)),
+          })
+        : null,
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),
       applicationResultSource: createQueueFacade(
         queue,

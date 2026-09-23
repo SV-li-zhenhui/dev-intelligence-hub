@@ -23,6 +23,7 @@ PR 责任语义遵循团队当前流程：
 - 他人创建、Assignee 是我：等待我 Review。
 - 我创建的 PR：等待我修改或继续推进。
 - GitHub Review request 不作为任务归属依据；避免 Assignee 已移除后仍残留在审核队列。
+- Review 通过并选择测试负责人后，系统先创建可恢复的内部测试工作项，再把 GitHub Assignee 转交给该负责人；重复恢复不会重复创建任务或 Review。
 
 ## 使用
 

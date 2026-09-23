@@ -20,6 +20,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const REPOSITORY = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})#([1-9][0-9]*)$/;
+const REPOSITORY_NAME = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9_.-]{1,100})$/;
 const REQUEST_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{6,126}[A-Za-z0-9])$/;
 const REVIEW_EVENTS = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
 const REVIEW_STATES = Object.freeze({
@@ -133,6 +134,35 @@ function parseTarget(value) {
     repo: `${match[1]}/${match[2]}`,
     number,
   };
+}
+
+function normalizeAssigneeRequest(value) {
+  exactObject(value, [
+    "actorAccountId",
+    "repository",
+    "pullRequestNumber",
+    "assigneeLogin",
+  ]);
+  const actorAccountId = exactString(value.actorAccountId, GITHUB_LOGIN, 39);
+  const assigneeLogin = exactString(value.assigneeLogin, GITHUB_LOGIN, 39);
+  const repository = exactString(value.repository, REPOSITORY_NAME, 140);
+  const match = repository.match(REPOSITORY_NAME);
+  if (
+    match[1].includes("--") ||
+    match[2].includes("..") ||
+    match[2].startsWith(".") ||
+    match[2].endsWith(".") ||
+    !Number.isSafeInteger(value.pullRequestNumber) ||
+    value.pullRequestNumber < 1
+  ) {
+    throw actionError("INVALID_GITHUB_ACTION", "trusted");
+  }
+  return Object.freeze({
+    actor: Object.freeze({ accountId: actorAccountId }),
+    repository,
+    pullRequestNumber: value.pullRequestNumber,
+    assigneeLogin,
+  });
 }
 
 function normalizeAction(kind, value, { allowLegacyWorkProposal = false } = {}) {
@@ -642,9 +672,12 @@ class GitHubActionAdapter {
     };
   }
 
-  #beginOperation() {
+  #beginOperation(parentSignal = null) {
     const controller = new AbortController();
     this.#activeOperations.add(controller);
+    const abortFromParent = () => controller.abort();
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    if (parentSignal?.aborted) controller.abort();
     if (this.#closed) controller.abort();
     const deadline = this.#clock() + this.#timeoutMs;
     const timer = setTimeout(
@@ -652,12 +685,135 @@ class GitHubActionAdapter {
       Math.max(0, deadline - this.#clock()),
     );
     timer.unref?.();
-    return Object.freeze({ controller, signal: controller.signal, deadline, timer });
+    return Object.freeze({
+      controller,
+      signal: controller.signal,
+      deadline,
+      timer,
+      parentSignal,
+      abortFromParent,
+    });
   }
 
   #finishOperation(operation) {
     clearTimeout(operation.timer);
+    operation.parentSignal?.removeEventListener(
+      "abort",
+      operation.abortFromParent,
+    );
     this.#activeOperations.delete(operation.controller);
+  }
+
+  async assignAssignee(input, { signal = null } = {}) {
+    const request = normalizeAssigneeRequest(input);
+    if (
+      signal !== null &&
+      !(signal instanceof AbortSignal)
+    ) {
+      throw new TypeError("signal must be an AbortSignal");
+    }
+    const operation = this.#beginOperation(signal);
+    try {
+      return await this.#withCredential(
+        request,
+        async (childEnvironment, credentialOperation) => {
+          await this.#assertActor(
+            request.actor.accountId,
+            childEnvironment,
+            credentialOperation,
+          );
+          const route =
+            `repos/${request.repository}/issues/${request.pullRequestNumber}`;
+          const current = await this.#runJson(
+            ["api", "--method", "GET", route],
+            { childEnvironment, operation: credentialOperation },
+          );
+          this.#assertAssignablePullRequest(current, request);
+          let observed = current;
+          let changed = false;
+          if (!this.#hasAssignee(observed, request.assigneeLogin)) {
+            await this.#assertActor(
+              request.actor.accountId,
+              childEnvironment,
+              credentialOperation,
+            );
+            observed = await this.#runJson(
+              ["api", "--method", "POST", `${route}/assignees`, "--input", "-"],
+              {
+                input: JSON.stringify({ assignees: [request.assigneeLogin] }),
+                childEnvironment,
+                operation: credentialOperation,
+              },
+            );
+            this.#assertAssignablePullRequest(observed, request);
+            if (!this.#hasAssignee(observed, request.assigneeLogin)) {
+              throw actionError("GITHUB_PROTOCOL");
+            }
+            changed = true;
+          }
+          if (
+            request.actor.accountId.toLowerCase() !==
+              request.assigneeLogin.toLowerCase() &&
+            this.#hasAssignee(observed, request.actor.accountId)
+          ) {
+            await this.#assertActor(
+              request.actor.accountId,
+              childEnvironment,
+              credentialOperation,
+            );
+            observed = await this.#runJson(
+              ["api", "--method", "DELETE", `${route}/assignees`, "--input", "-"],
+              {
+                input: JSON.stringify({
+                  assignees: [request.actor.accountId],
+                }),
+                childEnvironment,
+                operation: credentialOperation,
+              },
+            );
+            this.#assertAssignablePullRequest(observed, request);
+            if (
+              !this.#hasAssignee(observed, request.assigneeLogin) ||
+              this.#hasAssignee(observed, request.actor.accountId)
+            ) {
+              throw actionError("GITHUB_PROTOCOL");
+            }
+            changed = true;
+          }
+          return Object.freeze({
+            status: changed ? "applied" : "already",
+            assigneeLogin: request.assigneeLogin,
+          });
+        },
+        operation,
+      );
+    } finally {
+      this.#finishOperation(operation);
+    }
+  }
+
+  #assertAssignablePullRequest(value, request) {
+    const expectedUrl =
+      `https://github.com/${request.repository}/pull/${request.pullRequestNumber}`;
+    if (
+      !isPlainObject(value) ||
+      value.number !== request.pullRequestNumber ||
+      value.state !== "open" ||
+      typeof value.html_url !== "string" ||
+      value.html_url.toLowerCase() !== expectedUrl.toLowerCase() ||
+      !Array.isArray(value.assignees)
+    ) {
+      throw actionError("GITHUB_HANDOFF_TARGET_UNAVAILABLE", "absent");
+    }
+  }
+
+  #hasAssignee(value, login) {
+    return value.assignees.some(
+      (assignee) =>
+        isPlainObject(assignee) &&
+        typeof assignee.login === "string" &&
+        assignee.login.toLowerCase() === login.toLowerCase(),
+    );
   }
 
   async #withCredential(envelope, callback, operation) {
@@ -967,6 +1123,7 @@ export function createGitHubActionExecutor(options) {
   return Object.freeze({
     execute: (input) => adapter.execute(input),
     reconcile: (input) => adapter.reconcile(input),
+    assignAssignee: (input, options) => adapter.assignAssignee(input, options),
     close: () => adapter.close(),
   });
 }

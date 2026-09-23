@@ -265,6 +265,15 @@ function pages(records = []) {
   return { __jsonLines: records };
 }
 
+function pullRequestIssue(assignees = []) {
+  return {
+    number: 42,
+    html_url: "https://github.com/acme/command-center/pull/42",
+    state: "open",
+    assignees: assignees.map((login) => ({ login })),
+  };
+}
+
 function markerFromPost(call) {
   const body = JSON.parse(call.input).body;
   return body.match(/<!-- mydashboard-action:v1:([a-f0-9]{64}) -->$/)?.[0];
@@ -335,6 +344,77 @@ test("the configured actor is checked before target or marker queries", async ()
   assert.deepEqual(runner.calls.map((call) => call.args), [
     ["api", "--hostname", "github.com", "--method", "GET", "user"],
   ]);
+});
+
+test("a confirmed testing handoff adds its named GitHub assignee idempotently", async () => {
+  const runner = new FakeRunner([
+    actor(),
+    pullRequestIssue(["local-owner"]),
+    actor(),
+    pullRequestIssue(["local-owner", "qt-tester"]),
+    actor(),
+    pullRequestIssue(["qt-tester"]),
+  ]);
+  const adapter = createAdapter(runner);
+  const request = {
+    actorAccountId: "local-owner",
+    repository: "acme/command-center",
+    pullRequestNumber: 42,
+    assigneeLogin: "qt-tester",
+  };
+
+  assert.deepEqual(await adapter.assignAssignee(request), {
+    status: "applied",
+    assigneeLogin: "qt-tester",
+  });
+  const post = runner.calls.find((call) => call.args.includes("POST"));
+  assert.deepEqual(post.args, [
+    "api",
+    "--hostname",
+    "github.com",
+    "--method",
+    "POST",
+    "repos/acme/command-center/issues/42/assignees",
+    "--input",
+    "-",
+  ]);
+  assert.deepEqual(JSON.parse(post.input), {
+    assignees: ["qt-tester"],
+  });
+  const remove = runner.calls.find((call) => call.args.includes("DELETE"));
+  assert.deepEqual(remove.args, [
+    "api",
+    "--hostname",
+    "github.com",
+    "--method",
+    "DELETE",
+    "repos/acme/command-center/issues/42/assignees",
+    "--input",
+    "-",
+  ]);
+  assert.deepEqual(JSON.parse(remove.input), {
+    assignees: ["local-owner"],
+  });
+
+  const already = createAdapter(new FakeRunner([
+    actor(),
+    pullRequestIssue(["QT-TESTER"]),
+  ]));
+  assert.deepEqual(await already.assignAssignee(request), {
+    status: "already",
+    assigneeLogin: "qt-tester",
+  });
+
+  const partialRetry = createAdapter(new FakeRunner([
+    actor(),
+    pullRequestIssue(["local-owner", "qt-tester"]),
+    actor(),
+    pullRequestIssue(["qt-tester"]),
+  ]));
+  assert.deepEqual(await partialRetry.assignAssignee(request), {
+    status: "applied",
+    assigneeLogin: "qt-tester",
+  });
 });
 
 test("work proposal reviews use the same sealed GitHub review protocol", async () => {
