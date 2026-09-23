@@ -124,7 +124,7 @@ Copy-Item config.example.json config.json
 
 首个完整版本还支持把 Codex CLI 或 Claude CLI 配置为主控或任一员工的 `brain` / `taskBrain`。它们不是常驻代理，而是“一个已领取任务对应一个受监管进程”：MyDashboard 传入有界结构化上下文，校验结构化结果，把跨任务台账和记忆留在本地，然后关闭该进程。持久 CLI 会话暂不属于首版。
 
-首版运行平台和经过验证的版本范围是 Windows x64、Codex CLI `0.147.x`（`>=0.147.0 <0.148.0`）及 Claude CLI `>=2.1.222 <2.2.0`。CLI 必须以官方 npm 包安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统会核对包清单、平台包、版本、真实路径、文件身份与摘要，不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
+首版运行平台是 Windows x64；Codex CLI 使用官方 npm 包，不绑定发行版本范围，Claude CLI 需要 `>=2.1.222 <2.2.0`。CLI 必须安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统通过包清单、平台包、父包与原生包版本一致性、真实路径、文件身份与摘要校验安装来源，并在每次调用时验证命令协议、结构化响应、进程退出与清理契约；不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
 
 Codex 有两种明确且不自动切换的认证方式。推荐的 `codex-login` 受管代理读取“运行 MyDashboard 的同一 Windows 用户”的文件式 Codex 登录；宿主根只来自服务启动时已有的 `CODEX_HOME`，否则固定为该用户的 `.codex`，页面和配置都不能提供路径。代理不挂载完整宿主 profile，只在每个任务边界校验直接子文件 `auth.json` 的普通文件身份、owner、ACL、硬链接数和大小，再通过 MyDashboard 私有镜像把认证材料放入一次性 profile。旧配置及显式 `api-key` 模式仍只读取服务环境的 `OPENAI_API_KEY`，不会静默改用 ChatGPT 登录或改变计费路径。
 
