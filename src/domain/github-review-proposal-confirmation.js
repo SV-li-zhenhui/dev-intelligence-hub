@@ -125,12 +125,15 @@ export function createGitHubReviewProposalConfirmationPlan(
     legacyRecovery = false,
     selfAuthored = false,
     legacySelfAuthored = false,
+    legacyUnversionedSelfAuthored = false,
   } = {},
 ) {
   if (
     typeof selfAuthored !== "boolean" ||
     typeof legacySelfAuthored !== "boolean" ||
-    (selfAuthored && legacySelfAuthored)
+    typeof legacyUnversionedSelfAuthored !== "boolean" ||
+    [selfAuthored, legacySelfAuthored, legacyUnversionedSelfAuthored]
+      .filter(Boolean).length > 1
   ) {
     throw invalid("selfAuthored 无效");
   }
@@ -221,7 +224,8 @@ export function createGitHubReviewProposalConfirmationPlan(
   }
   const proposedReviewEvent = REVIEW_EVENTS[payload.verdict];
   if (!proposedReviewEvent) throw invalid("payload.verdict 无效");
-  const selfReview = selfAuthored || legacySelfAuthored;
+  const selfReview =
+    selfAuthored || legacySelfAuthored || legacyUnversionedSelfAuthored;
   const downgradedSelfReview =
     selfReview && proposedReviewEvent !== "COMMENT";
   const reviewEvent = downgradedSelfReview ? "COMMENT" : proposedReviewEvent;
@@ -265,7 +269,7 @@ export function createGitHubReviewProposalConfirmationPlan(
   return queuePlan({
     id: confirmationId(
       proposal,
-      selfReview ? legacySelfAuthored ? 1 : 2 : 0,
+      selfAuthored ? 2 : legacySelfAuthored ? 1 : 0,
     ),
     kind: "github.work-proposal-review",
     requestedBy: proposal.requestedBy,

@@ -176,7 +176,16 @@ function normalizeVersionedRead(result, expectedVersion) {
   return result;
 }
 
-function canRequeueAdvancedPullRequestRoot(root) {
+function canRequeueAdvancedPullRequestRoot(root, nextSource) {
+  const sameHead =
+    root.source?.current?.headRefOid === nextSource?.current?.headRefOid;
+  if (
+    sameHead &&
+    root.status === "blocked" &&
+    root.statusReason === "proposal_rejected"
+  ) {
+    return false;
+  }
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
     (root.kind === "source_root" &&
       root.source?.kind === "pull_request" &&
@@ -2210,7 +2219,8 @@ export class WorkLedgerService {
           ...(firstRevisionInBatch
             ? { revision: root.revision + 1 }
             : {}),
-          ...((appended.activeAdvanced && canRequeueAdvancedPullRequestRoot(root)) ||
+          ...((appended.activeAdvanced &&
+              canRequeueAdvancedPullRequestRoot(root, appended.source)) ||
             restoresLifecycleRoute
             ? {
                 status: "queued",

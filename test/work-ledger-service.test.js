@@ -3083,6 +3083,48 @@ async function rejectSealedPullRequestProposal(fixture) {
   );
 }
 
+test("same-Head PR observations do not repeat a rejected Review decision", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  let root = await rejectSealedPullRequestProposal(fixture);
+  const settledDecision = structuredClone(root.decisionContext);
+
+  fixture.source.records.push(prAssignment(2, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_A,
+    changedFields: ["ciStatus"],
+    ciStatus: "SUCCESS",
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items[0];
+  assert.ok(root.source.activeRevision >= 1);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "proposal_rejected");
+  assert.deepEqual(root.decisionContext, settledDecision);
+});
+
+test("a new PR Head reopens a rejected Review decision", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  let root = await rejectSealedPullRequestProposal(fixture);
+
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.decisionContext, null);
+});
+
 test("an owner-requested PR root retires a durably rejected proposal predecessor", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
