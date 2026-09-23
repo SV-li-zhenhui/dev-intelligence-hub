@@ -1487,9 +1487,11 @@ test(
     await context.test(
       "the clean payload starts, reports status, and stops through its trusted manager",
       {
-        skip: process.platform !== "win32" && powershell === null
-          ? "requires PowerShell manager availability"
-          : false,
+        skip: process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+          ? "requires configured Windows workstation service lifecycle"
+          : process.platform !== "win32" && powershell === null
+            ? "requires PowerShell manager availability"
+            : false,
       },
       async () => {
         const port = await availablePort();
