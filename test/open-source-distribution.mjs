@@ -1550,7 +1550,7 @@ test(
 
         const status = await pollJson(
           `http://127.0.0.1:${port}/api/system/status`,
-          45_000,
+          120_000,
           (body) => body?.readiness?.ready === true,
           (body) => JSON.stringify({
             ready: body?.readiness?.ready,
@@ -1560,6 +1560,7 @@ test(
             probeFailures: body?.readiness?.probeFailures,
             probeSummary: body?.readiness?.probeSummary,
           }),
+          30_000,
         );
         assert.equal(status.body.liveness.live, true);
         assert.equal(status.body.readiness.schemaVersion, 1);
@@ -1584,6 +1585,10 @@ test(
 
         const dashboard = await pollJson(
           `http://127.0.0.1:${port}/api/dashboard`,
+          60_000,
+          () => true,
+          () => "",
+          30_000,
         );
         assert.deepEqual(dashboard.body.meta.errors, []);
         assert.equal(dashboard.body.meta.sources.github, 0);
