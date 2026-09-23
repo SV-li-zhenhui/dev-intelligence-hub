@@ -1449,6 +1449,60 @@ test("a completed automatic PR root can leave scope without blocking later intak
   assert.equal(reentered.statusReason, "pr_source_reentered_scope");
 });
 
+test("a redundant scope-created event preserves completed PR work", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  root = await fixture.service.complete({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    result: { outcome: "completed-before-redundant-created" },
+  });
+
+  const repeatedCreated = prAssignment(2, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, repeatedCreated),
+    assignment(3),
+  );
+  fixture.source.highWatermark = 3;
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  const preserved = items.find(({ itemId }) => itemId === root.itemId);
+
+  assert.equal(intake.received, 2);
+  assert.equal(intake.cursor, 3);
+  assert.equal(preserved.status, "completed");
+  assert.equal(preserved.revision, root.revision);
+  assert.deepEqual(preserved.source, root.source);
+  assert.notEqual(
+    items.find(({ assignmentId }) => assignmentId === "workflow-assignment-3"),
+    undefined,
+  );
+  const timeline = await fixture.service.listTimeline({ limit: 100 });
+  assert.notEqual(
+    timeline.items.find((entry) =>
+      entry.type === "pr_source_ignored" &&
+      entry.details.disposition === "ignored_redundant_scope_lifecycle"
+    ),
+    undefined,
+  );
+});
+
 test("a batch of old completed PR roots leaves scope with mixed Head proof", async () => {
   const fixture = await createFixture({
     records: [
