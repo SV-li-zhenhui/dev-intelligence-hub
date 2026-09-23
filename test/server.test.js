@@ -6684,6 +6684,47 @@ test("internal attention mutations are source-bound and only signal background w
   );
 });
 
+test("internal attention exposes the temporary fact gate for safe browser retry", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  let mutations = 0;
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/answer`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          expectedRevision: 1,
+          contentDigest: "b".repeat(64),
+          answer: { type: "text", text: "继续" },
+        }),
+      });
+      assert.equal(response.status, 503);
+      assert.equal(JSON.parse(response.body).code, "CONFIRMATION_FACTS_NOT_READY");
+      assert.equal(mutations, 0);
+    },
+    {
+      attentionBrowser: {
+        answer() { mutations += 1; },
+        reject() { mutations += 1; },
+        later() { mutations += 1; },
+      },
+      backgroundWork: {
+        runConfirmationOperation() {
+          throw Object.assign(new Error("facts pending"), {
+            code: "CONFIRMATION_FACTS_NOT_READY",
+            statusCode: 503,
+          });
+        },
+      },
+    },
+  );
+});
+
 test("internal attention rejects untrusted callers and body-supplied request ids", async () => {
   const requestId = `attention-${"a".repeat(64)}`;
   const body = JSON.stringify({

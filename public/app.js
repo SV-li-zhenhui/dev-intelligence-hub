@@ -9,6 +9,7 @@ import {
   createConfirmationDialogOwnership,
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
+import { postAttentionDuringFactRefresh } from "./attention-submission.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
   configurationDocumentFromForm,
@@ -4316,7 +4317,7 @@ async function submitInternalAttention(operation, answer) {
   const submissionOwner = beginConfirmationSubmission(setInternalButtonsDisabled);
   if (submissionOwner === null) return;
   try {
-    const response = await fetch(
+    const response = await postAttentionDuringFactRefresh(
       `/api/attention/internal/${encodeURIComponent(item.requestId)}/${operation}`,
       {
         method: "POST",
@@ -4330,7 +4331,15 @@ async function submitInternalAttention(operation, answer) {
           answer,
         }),
       },
+      {
+        isCurrent: () => confirmationDialogOwnership.ownsSubmission(submissionOwner),
+        onWaiting: () => {
+          statusBanner.hidden = false;
+          statusBanner.textContent = "正在核对最新事实，将自动重试提交这条请示…";
+        },
+      },
     );
+    if (response === null) return;
     if (response.status === 409) {
       if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       if (!closeConfirmationSubmission(submissionOwner)) return;

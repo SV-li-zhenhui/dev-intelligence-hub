@@ -57,6 +57,7 @@ import { ledgerDigest } from "../src/services/work-ledger-values.js";
 import { validateWorkLedgerGraphTransition } from "../src/services/work-ledger-graph.js";
 import {
   migrateWorkGraphMemoryProjection,
+  appendWorkGraphMemoryEvents,
 } from "../src/services/work-ledger-graph-memory.js";
 import {
   appendPullRequestWorkSource,
@@ -12219,6 +12220,161 @@ test("PR ask_user answers and rejections retain the exact immutable execution bi
       );
     });
   }
+});
+
+test("a same-Head PR fact update does not strand an answered user question", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const result = await prepareAttentionResult(
+    fixture,
+    { type: "choice", choiceId: "yes" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const originalBinding = prExecutionBinding(waiting);
+  const updatedAssignment = prAssignment(2, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_A,
+    changedFields: ["ciStatus"],
+    ciStatus: "SUCCESS",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  });
+  const stored = fixture.store.stored();
+  const candidate = structuredClone(stored);
+  candidate.revision += 1;
+  const revised = candidate.items.find(({ itemId }) => itemId === waiting.itemId);
+  const appended = appendPullRequestWorkSource(revised.source, updatedAssignment);
+  assert.equal(appended.activeAdvanced, true);
+  revised.source = appended.source;
+  revised.inputDigest = appended.source.current.inputDigest;
+  fixture.store.replaceStored(appendWorkGraphMemoryEvents(
+    stored,
+    candidate,
+    normalizeWorkLedgerLimits(),
+  ));
+  assert.equal(revised.status, "waiting_user");
+  assert.equal(revised.source.activeRevision, 2);
+  assert.notEqual(revised.inputDigest, waiting.inputDigest);
+
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  const applied = await recovered.applyAttentionBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  assert.equal(applied.cursor, 1);
+  const settled = (await recovered.listItems()).items[0];
+  assert.equal(settled.status, "queued");
+  assert.deepEqual(settled.decisionContext.value.answer, {
+    type: "choice",
+    choiceId: "yes",
+  });
+  const timeline = (await recovered.listTimeline({ limit: 100 })).items;
+  const answer = timeline.find(({ type }) => type === "attention_answer_applied");
+  assert.deepEqual(answer.details.inputBinding, originalBinding);
+  assert.equal(answer.details.inputDigest, waiting.inputDigest);
+
+  const restarted = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await restarted.recover();
+});
+
+test("an answered question for an old PR Head cannot settle the new Head", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const result = await prepareAttentionResult(
+    fixture,
+    { type: "choice", choiceId: "yes" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  const stored = fixture.store.stored();
+  const candidate = structuredClone(stored);
+  candidate.revision += 1;
+  const item = candidate.items[0];
+  const appended = appendPullRequestWorkSource(item.source, prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+    gitFacts: prGitFacts(PR_HEAD_B),
+  }));
+  assert.equal(appended.activeAdvanced, true);
+  item.source = appended.source;
+  item.inputDigest = appended.source.current.inputDigest;
+  fixture.store.replaceStored(appendWorkGraphMemoryEvents(
+    stored,
+    candidate,
+    normalizeWorkLedgerLimits(),
+  ));
+  const recovered = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await recovered.recover();
+  await assert.rejects(
+    recovered.applyAttentionBatch({
+      items: [result],
+      nextSequence: 1,
+      highWatermark: 1,
+      oldestAvailableSequence: 1,
+    }),
+    (error) => error.code === "WORK_LEDGER_ATTENTION_BINDING_CONFLICT",
+  );
+});
+
+test("a question answered after its PR leaves scope is recorded without requeueing", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  const result = await prepareAttentionResult(
+    fixture,
+    { type: "choice", choiceId: "yes" },
+    { workerId: "employee-pr-engineer", roleId: "pr-engineer" },
+  );
+  const leftEvent = prAssignment(2, {
+    eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const waiting = (await fixture.service.listItems()).items[0];
+  assert.equal(waiting.source.scope.active, false);
+  assert.equal(waiting.statusReason, "pr_source_left_scope_pending_settlement");
+
+  await fixture.service.applyAttentionBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const settled = (await fixture.service.listItems()).items[0];
+  assert.equal(settled.status, "blocked");
+  assert.equal(settled.statusReason, "pr_source_left_scope");
+  assert.deepEqual(settled.decisionContext.value.answer, {
+    type: "choice",
+    choiceId: "yes",
+  });
 });
 
 test("a sealed attention result advances its cursor without reviving legacy PR-source work", async () => {

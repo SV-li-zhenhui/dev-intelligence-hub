@@ -3847,11 +3847,15 @@ export function createDashboardServer(
       }
       const ownerIntakeBlocked = status === 503 && isOwnerWorkSubmission &&
         ownerIntakeBlockedCodes.has(error.code);
+      const confirmationFactsPending = status === 503 &&
+        error.code === "CONFIRMATION_FACTS_NOT_READY";
       sendJson(response, status, {
         error: ownerIntakeBlocked
           ? "请求已保存并路由，但尚未进入工作台账。请重试原请求，不要重复创建。"
           : status >= 500 ? internalServerErrorMessage : error.message,
-        ...(ownerIntakeBlocked ? { code: error.code } : {}),
+        ...(ownerIntakeBlocked || confirmationFactsPending
+          ? { code: error.code }
+          : {}),
       });
     }
   };

@@ -3,6 +3,10 @@ import {
   normalizeAttentionAnswer,
 } from "../domain/attention-contract.js";
 import {
+  normalizePullRequestExecutionBinding,
+} from "../domain/pull-request-execution-binding.js";
+import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import {
   isWorkItemInLegacyPullRequestCutover,
   replaceWorkLedgerRecord,
   requireWorkLedgerItem,
@@ -296,6 +300,66 @@ function normalizeBatch(input, state) {
   return { items, pending, nextSequence, highWatermark, oldest };
 }
 
+function attentionResultInputBinding(state, item, outbox) {
+  if (outbox.inputDigest === item.inputDigest) {
+    return currentWorkItemExecutionBinding(item);
+  }
+  const sourceBinding = outbox.sourceBinding;
+  if (
+    item.status !== "waiting_user" ||
+    item.source?.kind !== "pull_request" ||
+    sourceBinding?.rootItemId !== item.itemId ||
+    item.source.current.headRefOid !== sourceBinding.headRefOid ||
+    (item.source.scope.active !== true &&
+      item.statusReason !== "pr_source_left_scope_pending_settlement")
+  ) {
+    return undefined;
+  }
+  const revision = item.source.revisions[sourceBinding.inputRevision - 1];
+  if (
+    revision?.disposition !== "accepted" ||
+    ["headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"]
+      .some((field) => revision[field] !== sourceBinding[field])
+  ) {
+    return undefined;
+  }
+  const staged = state.timeline.findLast(
+    (event) => event.type === "intent_staged" &&
+      event.itemId === item.itemId &&
+      event.details.intentId === outbox.intentId,
+  );
+  const candidate = staged?.details.inputBinding ??
+    outbox.dispatchBinding?.boundIntent?.binding?.inputBinding;
+  if (candidate === undefined || candidate === null) return undefined;
+  let historical;
+  try {
+    historical = normalizePullRequestExecutionBinding(candidate);
+  } catch {
+    return undefined;
+  }
+  if (
+    historical.repository !== item.source.identity.repository ||
+    historical.pullRequestNumber !== item.source.identity.pullRequestNumber ||
+    historical.rootItemId !== sourceBinding.rootItemId ||
+    historical.workKey !== sourceBinding.workKey ||
+    historical.inputRevision !== sourceBinding.inputRevision ||
+    historical.headRevision !== sourceBinding.headRevision ||
+    ["headRefOid", "eventId", "eventDigest", "inputDigest"]
+      .some((field) => historical[field] !== sourceBinding[field])
+  ) {
+    return undefined;
+  }
+  const current = currentWorkItemExecutionBinding(item);
+  if (
+    current?.schemaVersion !== historical.schemaVersion ||
+    (historical.schemaVersion === 2 &&
+      !samePullRequestGitTarget(historical.gitTarget, current.gitTarget))
+  ) {
+    return undefined;
+  }
+  return historical;
+}
+
 function requireBoundAskUser(state, entry) {
   const item = requireWorkLedgerItem(state, entry.producer.workItemId);
   const outbox = state.outbox.find(
@@ -319,10 +383,13 @@ function requireBoundAskUser(state, entry) {
     (outbox?.dispatchBinding !== null &&
       outbox?.dispatchBinding !== undefined &&
       Object.hasOwn(outbox.dispatchBinding, "boundIntent"));
+  const inputBinding = outbox === undefined
+    ? undefined
+    : attentionResultInputBinding(state, item, outbox);
   if (
     !outbox ||
     outbox.itemId !== item.itemId ||
-    outbox.inputDigest !== item.inputDigest ||
+    inputBinding === undefined ||
     outbox.status !== "delivered" ||
     outbox.intent.type !== "ask_user" ||
     outbox.requestedBy.roleId !== entry.producer.roleId ||
@@ -339,6 +406,7 @@ function requireBoundAskUser(state, entry) {
   return {
     item,
     outbox,
+    inputBinding,
     discardClosedIssueResult: closedIssueSettlement,
     discardUnsealedLegacyResult:
       durablyQuarantined && !sealedQuarantinedSettlement,
@@ -369,6 +437,7 @@ export function planAttentionBatchApplication({ state, input, clock }) {
     const {
       item,
       outbox,
+      inputBinding,
       discardClosedIssueResult,
       discardUnsealedLegacyResult,
     } =
@@ -451,8 +520,10 @@ export function planAttentionBatchApplication({ state, input, clock }) {
     );
     const rejected = entry.result.kind === "rejected";
     const sealedByLegacyCutover = isWorkItemInLegacyPullRequestCutover(item);
+    const leftPullRequestScope = item.source?.kind === "pull_request" &&
+      item.source.scope.active === false;
     const itemResult = moveWorkItem(item, {
-      status: sealedByLegacyCutover
+      status: sealedByLegacyCutover || leftPullRequestScope
         ? "blocked"
         : rejected
           ? "blocked"
@@ -460,6 +531,8 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       now,
       reason: sealedByLegacyCutover
         ? LEGACY_PR_SOURCE_CUTOVER_REASON
+        : leftPullRequestScope
+          ? "pr_source_left_scope"
         : rejected
           ? "attention_rejected"
           : "attention_answered",
@@ -476,9 +549,9 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       at: now,
       actorId: "attention-result-reconciler",
       details: {
-        inputBinding: currentWorkItemExecutionBinding(item),
+        inputBinding,
         workItemRevision: itemResult.revision,
-        inputDigest: item.inputDigest,
+        inputDigest: outbox.inputDigest,
         intentId: entry.requestKey,
         resultAttestationDigest: resultAttestation.attestationDigest,
         questionRef: entry.requestId,
