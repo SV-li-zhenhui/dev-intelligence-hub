@@ -182,7 +182,7 @@ test("known CLI locator rejects an oversized sparse manifest before parsing", as
   );
 });
 
-test("known CLI locator enforces tested package version ranges", async (t) => {
+test("known CLI locator does not bind official Codex packages to a release range", async (t) => {
   const codexRoot = await temporaryDirectory(t, "known-cli-old-codex-");
   const codex = await npmCliLayout(codexRoot, "codex-cli");
   await writeJson(path.join(codex.packageRoot, "package.json"), {
@@ -199,31 +199,29 @@ test("known CLI locator enforces tested package version ranges", async (t) => {
     os: ["win32"],
     cpu: ["x64"],
   });
-  await assert.rejects(
-    windowsLocator(codexRoot).resolve("codex-cli"),
-    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
-  );
+  const resolvedOldCodex = await windowsLocator(codexRoot).resolve("codex-cli");
+  assert.equal(resolvedOldCodex.command, codex.executable);
 
   const futureCodexRoot = await temporaryDirectory(t, "known-cli-future-codex-");
   const futureCodex = await npmCliLayout(futureCodexRoot, "codex-cli");
   await writeJson(path.join(futureCodex.packageRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.152.0",
+    version: "0.155.1",
     bin: { codex: "bin/codex.js" },
     optionalDependencies: {
-      "@openai/codex-win32-x64": "npm:@openai/codex@0.152.0-win32-x64",
+      "@openai/codex-win32-x64": "npm:@openai/codex@0.155.1-win32-x64",
     },
   });
   await writeJson(path.join(futureCodex.nativeRoot, "package.json"), {
     name: "@openai/codex",
-    version: "0.152.0-win32-x64",
+    version: "0.155.1-win32-x64",
     os: ["win32"],
     cpu: ["x64"],
   });
-  await assert.rejects(
-    windowsLocator(futureCodexRoot).resolve("codex-cli"),
-    { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
+  const resolvedFutureCodex = await windowsLocator(futureCodexRoot).resolve(
+    "codex-cli",
   );
+  assert.equal(resolvedFutureCodex.command, futureCodex.executable);
 
   const futureMinorClaudeRoot = await temporaryDirectory(
     t,

@@ -23,10 +23,6 @@ const TARGETS = Object.freeze({
 
 const CLI_IDENTITIES = new Set(["codex-cli", "claude-cli"]);
 const SUPPORTED_VERSION_RANGES = Object.freeze({
-  "codex-cli": Object.freeze({
-    minimum: Object.freeze([0, 147, 0]),
-    maximumExclusive: Object.freeze([0, 152, 0]),
-  }),
   "claude-cli": Object.freeze({
     minimum: Object.freeze([2, 1, 222]),
     maximumExclusive: Object.freeze([2, 2, 0]),
@@ -262,6 +258,7 @@ function supportedVersion(kind, value) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(value);
   if (!match) return false;
   const version = match.slice(1).map(Number);
+  if (kind === "codex-cli") return true;
   const range = SUPPORTED_VERSION_RANGES[kind];
   if (!range) return false;
   const compare = (left, right) => {
@@ -271,10 +268,9 @@ function supportedVersion(kind, value) {
     }
     return 0;
   };
-  return (
-    compare(version, range.minimum) >= 0 &&
-    compare(version, range.maximumExclusive) < 0
-  );
+  if (compare(version, range.minimum) < 0) return false;
+  return range.maximumExclusive === undefined ||
+    compare(version, range.maximumExclusive) < 0;
 }
 
 function sameFileIdentity(left, right, { includeDigest = true } = {}) {
