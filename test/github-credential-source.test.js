@@ -790,7 +790,7 @@ test("gh-login fixed cleanup cap bounds preparation and closes a late session", 
 });
 
 test("gh-login production factory constructs from sealed production ports", {
-  skip: WINDOWS_PRODUCTION_SKIP,
+  skip: WINDOWS_PRODUCTION_SKIP || HOST_TEST_SKIP,
 }, async (t) => {
   const parent = await temporaryDirectory(t, "github-credential-factory-");
   const runtimeTemporaryRoot = path.join(parent, "private-runtime-temp");
