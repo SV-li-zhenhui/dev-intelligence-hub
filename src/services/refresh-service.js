@@ -21,6 +21,12 @@ import {
 } from "../domain/dingtalk-report.js";
 
 const DINGTALK_REPORT_STATE_KEY = "dingtalk-report-state";
+const DINGTALK_KINDS_BY_SOURCE = Object.freeze({
+  "daily messages": ["announcement", "message"],
+  unread: ["conversation"],
+  mentions: ["mention"],
+  todos: ["todo"],
+});
 
 const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.ACTION_NOW,
@@ -439,8 +445,15 @@ export class RefreshService {
     ]);
     signal?.throwIfAborted();
     errors.push(...dingtalkResult.errors);
+    const staleDingTalkKinds = new Set(
+      (dingtalkResult.failedSources || [])
+        .flatMap((source) => DINGTALK_KINDS_BY_SOURCE[source] || []),
+    );
     const summarizedDingTalkItems = dingtalkResult.errors.length
-      ? dingtalkResult.items
+      ? deduplicate([
+          ...dingtalkResult.items,
+          ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
+        ])
       : await this.#summarizeDingTalk(
           dingtalkResult.items,
           assessedPullRequests.meta,

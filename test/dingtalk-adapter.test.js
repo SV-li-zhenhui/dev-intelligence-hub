@@ -86,3 +86,16 @@ test("DingTalk notification forwards shutdown to the CLI writer", async () => {
   assert.equal(call.options.timeoutMs, 60_000);
   assert.strictEqual(call.options.signal, controller.signal);
 });
+
+test("a failed DingTalk subsource is identified without discarding successful sources", async () => {
+  const adapter = new DingTalkAdapter({
+    async run(_command, args) {
+      if (args.includes("search-advanced")) throw new Error("RATE_LIMIT_ERROR");
+      return { result: {} };
+    },
+  });
+  const result = await adapter.collect(null);
+  assert.deepEqual(result.failedSources, ["mentions"]);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /^mentions:/u);
+});

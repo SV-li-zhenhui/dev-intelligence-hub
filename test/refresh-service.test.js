@@ -275,6 +275,57 @@ test("a failed source retains its last known data instead of reporting completio
   assert.equal(snapshot.sourceStatus.githubPullRequests.complete, false);
 });
 
+test("a failed DingTalk subsource retains only its old items while other sources refresh", async () => {
+  const oldMention = {
+    id: "dingtalk:mention:old",
+    kind: "mention",
+    title: "Old mention",
+    updatedAt: "2026-08-12T00:00:00.000Z",
+  };
+  const oldTodo = {
+    id: "dingtalk:todo:old",
+    kind: "todo",
+    title: "Old todo",
+    updatedAt: "2026-08-12T00:00:00.000Z",
+  };
+  const newTodo = { ...oldTodo, id: "dingtalk:todo:new", title: "New todo" };
+  const store = new MemoryStore({
+    snapshot: {
+      refreshedAt: "2026-08-12T01:00:00.000Z",
+      items: [oldMention, oldTodo],
+      versions: [],
+    },
+  });
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return []; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    dingtalk: {
+      async collect() {
+        return {
+          items: [newTodo],
+          errors: ["mentions: RATE_LIMIT_ERROR"],
+          failedSources: ["mentions"],
+        };
+      },
+    },
+    store,
+    notifier: {},
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+  });
+  await service.refresh();
+  const snapshot = await store.read("snapshot");
+  assert.deepEqual(snapshot.items.map((item) => item.id).sort(), [oldMention.id, newTodo.id].sort());
+  assert.equal(snapshot.sourceStatus.dingtalk.stale, true);
+});
+
 test("refresh freezes one effective PR window and publishes its completeness", async () => {
   const store = new MemoryStore();
   let receivedOptions;

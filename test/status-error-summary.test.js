@@ -25,3 +25,24 @@ test("other diagnostics remain visible within a bounded banner", () => {
   assert.ok(summary[0].length <= 180);
   assert.equal(summary[3], "另有 1 项异常");
 });
+
+test("DingTalk mention rate limits produce a short retry message without raw diagnostics", () => {
+  const error = `mentions: dws failed with exit code 1: ${JSON.stringify({
+    error: {
+      category: "api",
+      code: 1,
+      reason: "business_error",
+      retryable: true,
+      server_error_code: "RATE_LIMIT_ERROR",
+      trace_id: "private-trace-id",
+      message: "business error: success=false",
+    },
+  })}`;
+  const summary = summarizeDashboardErrors([error]);
+  assert.deepEqual(summary, ["钉钉 @我消息查询被限流，本轮未更新；系统将在下次定时刷新时重试。"]);
+  assert.doesNotMatch(summary.join(""), /trace|JSON|exit code|RATE_LIMIT_ERROR/u);
+  assert.deepEqual(
+    summarizeDashboardErrors([error, error.replace(/^mentions:/u, "todos:")]),
+    ["钉钉 @我消息、待办查询被限流，本轮未更新；系统将在下次定时刷新时重试。"],
+  );
+});

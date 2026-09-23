@@ -107,9 +107,11 @@ export class DingTalkAdapter {
       this.todos(commandOptions),
     ]);
     const errors = [];
+    const failedSources = [];
     const value = (result, label) => {
       if (result.status === "fulfilled") return result.value;
       errors.push(`${label}: ${result.reason.message}`);
+      failedSources.push(label);
       return [];
     };
     return {
@@ -120,6 +122,7 @@ export class DingTalkAdapter {
         ...value(todos, "todos"),
       ],
       errors,
+      failedSources,
     };
   }
 
