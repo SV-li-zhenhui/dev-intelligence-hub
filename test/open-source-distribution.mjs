@@ -1528,7 +1528,18 @@ test(
           runManager({ ...managerOptions, action: "Stop" });
 
         managedLiveUrl = `http://127.0.0.1:${port}/api/live`;
-        const live = await pollJson(managedLiveUrl);
+        let live;
+        try {
+          live = await pollJson(managedLiveUrl, 120_000);
+        } catch (error) {
+          const managedLog = await readFile(
+            path.join(runtimeInfo.runtimeDirectory, "logs", "server.log"),
+            "utf8",
+          ).catch(() => "<managed log unavailable>");
+          assert.fail(
+            `clean managed service did not become live: ${error?.message ?? "unknown error"}\n${managedLog.slice(-maximumDiagnosticCharacters)}`,
+          );
+        }
         assert.equal(live.body.schemaVersion, 1);
         assert.equal(live.body.live, true);
         assert.equal(live.body.service, "mydashboard");
