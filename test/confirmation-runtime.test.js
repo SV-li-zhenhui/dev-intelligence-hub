@@ -300,6 +300,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "queue",
     "historyReader",
     "reviewHandoffs",
+    "reviewHandoffAssignee",
     "producerQueue",
     "applicationResultSource",
     "memoryProjectionSource",
@@ -308,6 +309,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
   assert.equal(Object.isFrozen(runtime.historyReader), true);
+  assert.equal(runtime.reviewHandoffAssignee, null);
   assert.equal(Object.isFrozen(runtime.producerQueue), true);
   assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
   assert.equal(Object.isFrozen(runtime.memoryProjectionSource), true);

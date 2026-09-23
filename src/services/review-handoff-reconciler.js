@@ -20,12 +20,25 @@ function bounded(operation, timeoutMs, signal, controller = new AbortController(
 // The confirmation owns the durable intent; the owner-request service owns the
 // idempotent local dispatch. A lost acknowledgement replays only local submit.
 export class ReviewHandoffReconciler {
-  constructor({ confirmations, ownerWorkRequests, timeoutMs = 10_000, cycleTimeoutMs = 15_000 }) {
+  constructor({
+    confirmations,
+    ownerWorkRequests,
+    githubAssignee = null,
+    timeoutMs = 10_000,
+    cycleTimeoutMs = 15_000,
+  }) {
     if (![timeoutMs, cycleTimeoutMs].every((value) => Number.isSafeInteger(value) && value > 0)) {
       throw new TypeError("handoff deadlines must be positive integers");
     }
     this.confirmations = confirmations;
     this.ownerWorkRequests = ownerWorkRequests;
+    if (
+      githubAssignee !== null &&
+      typeof githubAssignee?.assignAssignee !== "function"
+    ) {
+      throw new TypeError("githubAssignee must provide assignAssignee");
+    }
+    this.githubAssignee = githubAssignee;
     this.operations = new OperationQueue();
     this.timeoutMs = timeoutMs;
     this.cycleTimeoutMs = cycleTimeoutMs;
@@ -77,6 +90,18 @@ export class ReviewHandoffReconciler {
       const result = await this.ownerWorkRequests.submit(item.request, { signal });
       if (result?.phase !== "intaken" || !result.workItemId || !result.assignment?.target?.id) {
         throw failure("REVIEW_HANDOFF_NOT_INTAKEN");
+      }
+      if (
+        this.githubAssignee !== null &&
+        item.request.workType === "testing" &&
+        item.request.responsiblePerson
+      ) {
+        await this.githubAssignee.assignAssignee({
+          actorAccountId: item.actorAccountId,
+          repository: item.request.pullRequest.repository,
+          pullRequestNumber: item.request.pullRequest.number,
+          assigneeLogin: item.request.responsiblePerson.login,
+        }, { signal });
       }
       outcome = { status: "completed", diagnosticCode: null, workItemId: result.workItemId, roleId: result.assignment.target.id };
     } catch (error) {

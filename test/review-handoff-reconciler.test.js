@@ -87,3 +87,45 @@ test("the actual acknowledgement remains tracked after the cycle deadline", asyn
     assert.equal(active, 0);
   } finally { release(); }
 });
+
+test("a testing handoff assigns the confirmed GitHub user before acknowledgement", async () => {
+  const events = [];
+  const reconciler = new ReviewHandoffReconciler({
+    confirmations: {
+      async readReviewHandoffs() {
+        return [{
+          id: "testing-handoff",
+          actorAccountId: "local-owner",
+          request: {
+            requestId: "testing-handoff",
+            workType: "testing",
+            pullRequest: { repository: "acme/project", number: 42 },
+            responsiblePerson: { login: "qt-tester", product: "qt" },
+          },
+        }];
+      },
+      async recordReviewHandoff(_id, _requestId, outcome) {
+        events.push(["ack", outcome.status]);
+      },
+    },
+    ownerWorkRequests: {
+      async submit() {
+        events.push(["work"]);
+        return delivered;
+      },
+    },
+    githubAssignee: {
+      async assignAssignee(input) {
+        events.push(["github", input.assigneeLogin]);
+        return { status: "applied" };
+      },
+    },
+  });
+
+  assert.equal((await reconciler.runCycle())[0].status, "completed");
+  assert.deepEqual(events, [
+    ["work"],
+    ["github", "qt-tester"],
+    ["ack", "completed"],
+  ]);
+});

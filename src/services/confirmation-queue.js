@@ -891,7 +891,11 @@ export class ConfirmationQueue {
         .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts);
       const start = pending.findIndex((item) => item.id === afterId) + 1;
       return [...pending.slice(start), ...pending.slice(0, start)].slice(0, 25)
-        .map((item) => ({ id: item.id, request: reviewHandoffWorkRequest(item) }));
+        .map((item) => ({
+          id: item.id,
+          actorAccountId: item.actor.accountId,
+          request: reviewHandoffWorkRequest(item),
+        }));
     }));
   }
 
