@@ -1188,6 +1188,19 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
     await fixture.service.verifyPullRequestExecutionBinding(currentBinding),
     currentBinding,
   );
+
+  fixture.source.records.push(prAssignment(5, {
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 5;
+  const updatedIntake = await fixture.service.intake();
+  const updated = (await fixture.service.listItems()).items[0];
+
+  assert.equal(updatedIntake.cursor, 5);
+  assert.equal(updated.source.current.event.eventType, "pull_request.updated");
+  assert.deepEqual(updated.source.scope, active.source.scope);
+  assert.equal(updated.source.authorityEpoch, active.source.authorityEpoch);
 });
 
 test("a changed Head cannot restore automatic PR scope without causal proof", async () => {
