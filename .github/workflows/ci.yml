@@ -29,8 +29,26 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Prepare canonical Windows workspace
+        shell: pwsh
+        run: |
+          $projectRoot = 'C:\dev-intelligence-hub-ci'
+          $temporaryRoot = 'C:\dev-intelligence-hub-temp'
+          New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+          git clone --no-hardlinks "$env:GITHUB_WORKSPACE" $projectRoot
+          git -C $projectRoot fetch "$env:GITHUB_WORKSPACE" $env:GITHUB_SHA
+          git -C $projectRoot checkout --detach FETCH_HEAD
+          "CI_PROJECT_ROOT=$projectRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=$temporaryRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$temporaryRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install structured CLI
+        run: npm install --global @openai/codex
+
       - name: Install dependencies
+        working-directory: ${{ env.CI_PROJECT_ROOT }}
         run: npm ci
 
       - name: Run committed regression suite
+        working-directory: ${{ env.CI_PROJECT_ROOT }}
         run: npm test
