@@ -10,6 +10,7 @@ import {
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
 import { postAttentionDuringFactRefresh } from "./attention-submission.js";
+import { summarizeDashboardErrors } from "./status-error-summary.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
   configurationDocumentFromForm,
@@ -4847,7 +4848,7 @@ function updateChrome() {
     </div>`;
   statusBanner.hidden = errors.length === 0;
   statusBanner.textContent = errors.length
-    ? `部分数据未能刷新：${errors.join("；")}`
+    ? `部分数据未能刷新：${summarizeDashboardErrors(errors).join("；")}`
       : "";
 }
 
