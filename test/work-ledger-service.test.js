@@ -1188,6 +1188,19 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
     await fixture.service.verifyPullRequestExecutionBinding(currentBinding),
     currentBinding,
   );
+
+  fixture.source.records.push(prAssignment(5, {
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 5;
+  const updatedIntake = await fixture.service.intake();
+  const updated = (await fixture.service.listItems()).items[0];
+
+  assert.equal(updatedIntake.cursor, 5);
+  assert.equal(updated.source.current.event.eventType, "pull_request.updated");
+  assert.deepEqual(updated.source.scope, active.source.scope);
+  assert.equal(updated.source.authorityEpoch, active.source.authorityEpoch);
 });
 
 test("a changed Head cannot restore automatic PR scope without causal proof", async () => {
@@ -1434,6 +1447,60 @@ test("a completed automatic PR root can leave scope without blocking later intak
   assert.equal(reentered.source.authorityEpoch, inactive.source.authorityEpoch + 1);
   assert.equal(reentered.status, "queued");
   assert.equal(reentered.statusReason, "pr_source_reentered_scope");
+});
+
+test("a redundant scope-created event preserves completed PR work", async () => {
+  const fixture = await createFixture({
+    records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
+  });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.claim({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    workerId: "employee-pr-engineer",
+    leaseDurationMs: 30_000,
+  });
+  root = await fixture.service.complete({
+    itemId: root.itemId,
+    expectedRevision: root.revision,
+    leaseId: root.leaseId,
+    actorId: "employee-pr-engineer",
+    result: { outcome: "completed-before-redundant-created" },
+  });
+
+  const repeatedCreated = prAssignment(2, {
+    eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event;
+  fixture.source.records.push(
+    prScopeLifecycleAssignment(2, repeatedCreated),
+    assignment(3),
+  );
+  fixture.source.highWatermark = 3;
+
+  const intake = await fixture.service.intake({ limit: 10 });
+  const items = (await fixture.service.listItems({ limit: 10 })).items;
+  const preserved = items.find(({ itemId }) => itemId === root.itemId);
+
+  assert.equal(intake.received, 2);
+  assert.equal(intake.cursor, 3);
+  assert.equal(preserved.status, "completed");
+  assert.equal(preserved.revision, root.revision);
+  assert.deepEqual(preserved.source, root.source);
+  assert.notEqual(
+    items.find(({ assignmentId }) => assignmentId === "workflow-assignment-3"),
+    undefined,
+  );
+  const timeline = await fixture.service.listTimeline({ limit: 100 });
+  assert.notEqual(
+    timeline.items.find((entry) =>
+      entry.type === "pr_source_ignored" &&
+      entry.details.disposition === "ignored_redundant_scope_lifecycle"
+    ),
+    undefined,
+  );
 });
 
 test("a batch of old completed PR roots leaves scope with mixed Head proof", async () => {
@@ -3015,6 +3082,48 @@ async function rejectSealedPullRequestProposal(fixture) {
     await stageSealedPrReview(fixture),
   );
 }
+
+test("same-Head PR observations do not repeat a rejected Review decision", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  let root = await rejectSealedPullRequestProposal(fixture);
+  const settledDecision = structuredClone(root.decisionContext);
+
+  fixture.source.records.push(prAssignment(2, {
+    eventType: "pull_request.status",
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_A,
+    changedFields: ["ciStatus"],
+    ciStatus: "SUCCESS",
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items[0];
+  assert.ok(root.source.activeRevision >= 1);
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.status, "blocked");
+  assert.equal(root.statusReason, "proposal_rejected");
+  assert.deepEqual(root.decisionContext, settledDecision);
+});
+
+test("a new PR Head reopens a rejected Review decision", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)] });
+  let root = await rejectSealedPullRequestProposal(fixture);
+
+  fixture.source.records.push(prAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.decisionContext, null);
+});
 
 test("an owner-requested PR root retires a durably rejected proposal predecessor", async () => {
   const fixture = await createFixture({

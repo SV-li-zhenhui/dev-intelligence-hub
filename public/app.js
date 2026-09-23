@@ -457,6 +457,42 @@ function section(title, items, emptyText, caption = "") {
     </section>`;
 }
 
+function dingtalkReportView() {
+  const report = dashboard.dingtalkReport;
+  if (!report) {
+    return `
+      <section class="section">
+        <div class="section-heading">
+          <h2>定时工作汇报</h2>
+          <span>09:00–20:00</span>
+        </div>
+        <div class="empty">首份每日总览将在 09:00 生成，之后于 12:00、15:00、18:00 和 20:00 更新。</div>
+      </section>`;
+  }
+  const status = report.status === "sent"
+    ? "已发送"
+    : report.status === "failed"
+      ? "发送失败"
+      : "发送中";
+  const highlights = (report.highlights || [])
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join("");
+  return `
+    <section class="section">
+      <div class="section-heading">
+        <h2>定时工作汇报</h2>
+        <span>${escapeHtml(report.time || "")} · ${escapeHtml(status)}</span>
+      </div>
+      <article class="dingtalk-report-card ${report.status === "failed" ? "is-failed" : ""}">
+        <p class="eyebrow">${escapeHtml(report.kind === "daily_overview" ? "DAILY OVERVIEW" : report.kind === "daily_close" ? "DAILY CLOSE" : "PROGRESS REPORT")}</p>
+        <h3>${escapeHtml(report.title)}</h3>
+        <p>${escapeHtml(report.summary)}</p>
+        ${highlights ? `<ul>${highlights}</ul>` : ""}
+        ${report.error ? `<p class="dingtalk-report-error">${escapeHtml(report.error)}</p>` : ""}
+      </article>
+    </section>`;
+}
+
 function metrics(counts) {
   return `
     <section class="metrics" aria-label="工作量概览">
@@ -1678,6 +1714,7 @@ function render() {
       section("开放 Issues", dashboard.groups.myIssues, "没有分配给你的开放 Issue。"),
     versions: versionsView,
     signals: () =>
+      dingtalkReportView() +
       section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、公告、@我或待办。"),
     employees: employeesView,
     memory: memoryView,
@@ -3785,7 +3822,7 @@ function reviewHandoffMarkup(reviewEvent, item) {
       <label>具体测试负责人
         <select data-review-testing-person>${configuredOwnerOptions(testingRouting, product)}</select>
       </label>
-      <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。候选账号来自配置中心。</small>
+      <small data-review-testing-recommendation>已按 PR 内容推荐；可在此切换。候选账号来自配置中心；Review 发布成功后，GitHub Assignee 会转交给该测试负责人。</small>
     </div>
     <div class="review-testing-owner" data-review-external-owner${lifecycle.responsibleKind === "external_reviewer" ? "" : " hidden"}>
       <label>版本类型

@@ -23,6 +23,7 @@ PR 责任语义遵循团队当前流程：
 - 他人创建、Assignee 是我：等待我 Review。
 - 我创建的 PR：等待我修改或继续推进。
 - GitHub Review request 不作为任务归属依据；避免 Assignee 已移除后仍残留在审核队列。
+- Review 通过并选择测试负责人后，系统先创建可恢复的内部测试工作项，再把 GitHub Assignee 转交给该负责人；重复恢复不会重复创建任务或 Review。
 
 ## 使用
 
@@ -31,6 +32,8 @@ npm ci
 npm test
 .\scripts\Manage-MyDashboard.ps1 -Action Start -OpenBrowser
 ```
+
+GitHub Actions 会在干净的托管 Windows 环境运行可移植回归。真实 Codex/GitHub 登录生命周期、Windows 私有 ACL 和 PowerShell 服务管理器测试仍保留在 `npm test`，需要在配置好的 Windows 工作站执行；发布验收必须运行完整的 `npm test`，不能用托管 CI 代替。
 
 这是日常使用的推荐启动方式：受管生命周期会认证唯一进程、保留可诊断状态并安全停止。`npm start` 只用于前台开发诊断，不属于受管生命周期，也不能满足 `validate:system -- --all`；不要同时运行两种启动方式。
 
@@ -124,7 +127,7 @@ Copy-Item config.example.json config.json
 
 首个完整版本还支持把 Codex CLI 或 Claude CLI 配置为主控或任一员工的 `brain` / `taskBrain`。它们不是常驻代理，而是“一个已领取任务对应一个受监管进程”：MyDashboard 传入有界结构化上下文，校验结构化结果，把跨任务台账和记忆留在本地，然后关闭该进程。持久 CLI 会话暂不属于首版。
 
-首版运行平台和经过验证的版本范围是 Windows x64、Codex CLI `0.147.x`（`>=0.147.0 <0.148.0`）及 Claude CLI `>=2.1.222 <2.2.0`。CLI 必须以官方 npm 包安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统会核对包清单、平台包、版本、真实路径、文件身份与摘要，不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
+首版运行平台是 Windows x64；Codex CLI 使用官方 npm 包，不绑定发行版本范围，Claude CLI 需要 `>=2.1.222 <2.2.0`。CLI 必须安装在启动 MyDashboard 的服务账号 `PATH` 可发现的位置；页面不能填写任意可执行文件路径。系统通过包清单、平台包、父包与原生包版本一致性、真实路径、文件身份与摘要校验安装来源，并在每次调用时验证命令协议、结构化响应、进程退出与清理契约；不符合时稳定返回“Provider 不可用”，不会尝试其他命令。
 
 Codex 有两种明确且不自动切换的认证方式。推荐的 `codex-login` 受管代理读取“运行 MyDashboard 的同一 Windows 用户”的文件式 Codex 登录；宿主根只来自服务启动时已有的 `CODEX_HOME`，否则固定为该用户的 `.codex`，页面和配置都不能提供路径。代理不挂载完整宿主 profile，只在每个任务边界校验直接子文件 `auth.json` 的普通文件身份、owner、ACL、硬链接数和大小，再通过 MyDashboard 私有镜像把认证材料放入一次性 profile。旧配置及显式 `api-key` 模式仍只读取服务环境的 `OPENAI_API_KEY`，不会静默改用 ChatGPT 登录或改变计费路径。
 
@@ -306,6 +309,8 @@ PR 绑定任务启用 `gitHeadSnapshot` 后只会从已确认的 Git commit 对�
 - 仅新增事项或关键状态变化参与通知。
 - 仅优先级不低于 80 的变化发送钉钉消息。
 - 每次最多 5 项，不重复播报静止状态。
+- 钉钉定时汇报按 Asia/Shanghai 时间运行：09:00 发送每日总览，12:00、15:00、18:00 发送阶段进展，20:00 发送今日收口。
+- 每个时间档先持久记录再发送；服务重启或刷新重叠时不会重复发送同一档汇报。最新汇报同时显示在“钉钉中的行动信号”页面。
 
 `config.example.json`、`config.json` 和 `config.local.json` 只负责首次安全导入；活动配置版本保存在本机 `data/` 中，并通过“配置”页面的草稿、确认、回滚和审计管理。私人文件均不入库。
 

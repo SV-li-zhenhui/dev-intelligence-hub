@@ -176,7 +176,16 @@ function normalizeVersionedRead(result, expectedVersion) {
   return result;
 }
 
-function canRequeueAdvancedPullRequestRoot(root) {
+function canRequeueAdvancedPullRequestRoot(root, nextSource) {
+  const sameHead =
+    root.source?.current?.headRefOid === nextSource?.current?.headRefOid;
+  if (
+    sameHead &&
+    root.status === "blocked" &&
+    root.statusReason === "proposal_rejected"
+  ) {
+    return false;
+  }
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
     (root.kind === "source_root" &&
       root.source?.kind === "pull_request" &&
@@ -1615,6 +1624,28 @@ export class WorkLedgerService {
           });
           continue;
         }
+        const lifecycleActive =
+          envelope.event.eventType === "pull_request.created";
+        if (root !== null && root.source.scope.active === lifecycleActive) {
+          knownAssignments.set(assignmentItem.assignmentId, {
+            inputDigest: assignmentItem.inputDigest,
+            sourceSequence: assignmentItem.sourceSequence,
+          });
+          received += 1;
+          timelineEvents.push({
+            itemId: root.itemId,
+            type: "pr_source_ignored",
+            at: now,
+            actorId: "work-ledger-system",
+            details: {
+              workKey: root.source.workKey,
+              sourceSequence: envelope.sequence,
+              disposition: "ignored_redundant_scope_lifecycle",
+              scopeActive: root.source.scope.active,
+            },
+          });
+          continue;
+        }
         if (root !== null) {
           const applied = applyPullRequestScopeLifecycle(root.source, envelope);
           const active = applied.source.scope.active;
@@ -2188,7 +2219,8 @@ export class WorkLedgerService {
           ...(firstRevisionInBatch
             ? { revision: root.revision + 1 }
             : {}),
-          ...((appended.activeAdvanced && canRequeueAdvancedPullRequestRoot(root)) ||
+          ...((appended.activeAdvanced &&
+              canRequeueAdvancedPullRequestRoot(root, appended.source)) ||
             restoresLifecycleRoute
             ? {
                 status: "queued",

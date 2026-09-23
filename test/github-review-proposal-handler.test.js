@@ -434,6 +434,69 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
   );
 });
 
+test("a completed self-authored Review settles after its source authority becomes stale", async () => {
+  const producer = new FakeConfirmationProducer();
+  const selfAuthoredHandler = handler(producer, {
+    pullRequestContextReader: acceptingContextReader("REVIEW-ACCOUNT"),
+  });
+  const waiting = await selfAuthoredHandler.handle(handlerInput());
+  producer.status = "completed";
+  producer.overrides = { receipt: { id: "published-self-review" } };
+
+  const transition = await handler(producer, {
+    pullRequestContextReader: {
+      async readCurrent() {
+        throw Object.assign(new Error("stale"), {
+          code: "WORK_LEDGER_PR_BINDING_STALE",
+        });
+      },
+    },
+  }).handle(handlerInput({
+    status: "waiting_retry",
+    downstreamRef: waiting.downstreamRef,
+  }));
+
+  assert.equal(transition.status, "succeeded");
+  assert.equal(producer.invalidateCalls.length, 0);
+});
+
+test("a rejected unversioned self-authored Review settles after its source changes", async () => {
+  const producer = new FakeConfirmationProducer();
+  const legacyPlan = createGitHubReviewProposalConfirmationPlan(
+    handlerInput().proposal,
+    {
+      actorAccountId: "review-account",
+      legacyRecovery: true,
+      legacyUnversionedSelfAuthored: true,
+    },
+  );
+  await producer.enqueue(legacyPlan);
+  producer.status = "rejected";
+  producer.overrides = {
+    rejection: {
+      requestId: "reject-legacy-self-review",
+      reason: "不发布",
+      at: "2026-08-02T03:00:00.000Z",
+    },
+  };
+
+  const transition = await handler(producer, {
+    pullRequestContextReader: {
+      async readCurrent() {
+        throw Object.assign(new Error("stale"), {
+          code: "WORK_LEDGER_PR_BINDING_STALE",
+        });
+      },
+    },
+  }).handle(handlerInput({
+    status: "waiting_retry",
+    downstreamRef: legacyPlan.id,
+  }));
+
+  assert.equal(transition.status, "rejected");
+  assert.equal(producer.invalidateCalls.length, 0);
+});
+
 test("the legacy verifier remains the authority fallback without a context reader", async () => {
   const producer = new FakeConfirmationProducer();
   const verifier = acceptingVerifier();

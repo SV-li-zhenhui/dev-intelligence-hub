@@ -45,6 +45,9 @@ const OFFLINE_GH_SOURCE = path.join(
 const WINDOWS_PRODUCTION_SKIP = process.platform === "win32" && process.arch === "x64"
   ? false
   : "production credential supervision is Windows x64 only";
+const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+  ? "requires configured GitHub credential supervision"
+  : false;
 
 function failure(code, privateDetail = "private failure detail") {
   return Object.assign(new Error(privateDetail), { code });
@@ -787,7 +790,7 @@ test("gh-login fixed cleanup cap bounds preparation and closes a late session", 
 });
 
 test("gh-login production factory constructs from sealed production ports", {
-  skip: WINDOWS_PRODUCTION_SKIP,
+  skip: WINDOWS_PRODUCTION_SKIP || HOST_TEST_SKIP,
 }, async (t) => {
   const parent = await temporaryDirectory(t, "github-credential-factory-");
   const runtimeTemporaryRoot = path.join(parent, "private-runtime-temp");
@@ -807,7 +810,7 @@ test("gh-login production factory constructs from sealed production ports", {
 });
 
 test("gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure", {
-  skip: WINDOWS_PRODUCTION_SKIP,
+  skip: WINDOWS_PRODUCTION_SKIP || HOST_TEST_SKIP,
 }, async (t) => {
   const parent = await temporaryDirectory(t, "github-credential-production-");
   const runtimeTemporaryRoot = path.join(parent, "private-runtime-temp");

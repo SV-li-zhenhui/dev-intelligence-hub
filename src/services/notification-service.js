@@ -87,4 +87,23 @@ export class NotificationService {
       return { sent: true, count: candidates.length };
     });
   }
+
+  async sendReport(report, { signal = null } = {}) {
+    if (
+      !report ||
+      typeof report.title !== "string" ||
+      typeof report.message !== "string"
+    ) {
+      throw new TypeError("DingTalk report is invalid");
+    }
+    return this.actionAdmissionGate.run(async () => {
+      await this.dingtalk.notifySelf(
+        this.config.selfUserId,
+        report.title,
+        report.message,
+        signal === null ? {} : { signal },
+      );
+      return { sent: true, reportId: report.reportId, slotKey: report.slotKey };
+    });
+  }
 }

@@ -351,64 +351,91 @@ export class GitHubReviewProposalHandler {
       actorAccountId: this.#actorAccountId,
       legacyRecovery: true,
     });
+    const selfPlan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
+      actorAccountId: this.#actorAccountId,
+      legacyRecovery: true,
+      selfAuthored: true,
+    });
+    const legacySelfPlan = createGitHubReviewProposalConfirmationPlan(
+      input.proposal,
+      {
+        actorAccountId: this.#actorAccountId,
+        legacyRecovery: true,
+        legacySelfAuthored: true,
+      },
+    );
+    const legacyUnversionedSelfPlan =
+      createGitHubReviewProposalConfirmationPlan(input.proposal, {
+        actorAccountId: this.#actorAccountId,
+        legacyRecovery: true,
+        legacyUnversionedSelfAuthored: true,
+      });
     const inputBinding =
       initialPlan.action.inputBinding ?? initialPlan.display.payload.inputBinding;
     const authority = await this.#currentAuthority(inputBinding);
     const selfAuthored =
       typeof authority?.author === "string" &&
       authority?.author.toLowerCase() === this.#actorAccountId.toLowerCase();
-    const plan = selfAuthored
-      ? createGitHubReviewProposalConfirmationPlan(input.proposal, {
-          actorAccountId: this.#actorAccountId,
-          legacyRecovery: true,
-          selfAuthored: true,
-        })
-      : initialPlan;
-    const legacySelfPlan = selfAuthored
-      ? createGitHubReviewProposalConfirmationPlan(input.proposal, {
-          actorAccountId: this.#actorAccountId,
-          legacyRecovery: true,
-          legacySelfAuthored: true,
-        })
-      : null;
+    const plan = selfAuthored ? selfPlan : initialPlan;
     const expected = normalizeConfirmationPlan(plan);
     const initialExpected = normalizeConfirmationPlan(initialPlan);
-    const legacySelfExpected = legacySelfPlan === null
-      ? null
-      : normalizeConfirmationPlan(legacySelfPlan);
-    const legacyMigrationExpected =
-      input.downstreamRef !== null &&
-      plan.id !== input.downstreamRef
-        ? input.downstreamRef === initialPlan.id
-          ? initialExpected
-          : input.downstreamRef === legacySelfPlan?.id
-            ? legacySelfExpected
-            : null
-        : null;
-    const migratesLegacySelfReview = legacyMigrationExpected !== null;
+    const selfExpected = normalizeConfirmationPlan(selfPlan);
+    const legacySelfExpected = normalizeConfirmationPlan(legacySelfPlan);
+    const legacyUnversionedSelfExpected = normalizeConfirmationPlan(
+      legacyUnversionedSelfPlan,
+    );
+    const referencedExpecteds = input.downstreamRef === null
+      ? []
+      : [
+          initialExpected,
+          selfExpected,
+          legacySelfExpected,
+          legacyUnversionedSelfExpected,
+        ].filter((candidate) => candidate.id === input.downstreamRef);
     const legacyInputBinding =
       inputBinding !== null &&
       inputBinding !== undefined &&
       inputBinding.schemaVersion !== 2;
     if (
       input.downstreamRef !== null &&
-      input.downstreamRef !== expected.id &&
-      !migratesLegacySelfReview
+      referencedExpecteds.length === 0
     ) {
       throw invalidConfirmation("GitHub Review 确认绑定已变化");
     }
     let item = null;
+    let referencedExpected = null;
     if (input.downstreamRef !== null) {
       try {
-        item = normalizeConfirmationItem(
-          await this.#get(input.downstreamRef),
-          migratesLegacySelfReview ? legacyMigrationExpected : expected,
-        );
+        const stored = await this.#get(input.downstreamRef);
+        for (const candidate of referencedExpecteds) {
+          try {
+            item = normalizeConfirmationItem(stored, candidate);
+            referencedExpected = candidate;
+            break;
+          } catch (error) {
+            if (error?.code !== "INVALID_GITHUB_REVIEW_CONFIRMATION") {
+              throw error;
+            }
+          }
+        }
+        if (item === null) throw invalidConfirmation();
       } catch (error) {
         if (!legacyInputBinding || error?.code !== "CONFIRMATION_NOT_FOUND") {
           throw error;
         }
       }
+    }
+    const migratesLegacySelfReview =
+      selfAuthored &&
+      referencedExpected !== null &&
+      referencedExpected.approvalBindingDigest !== expected.approvalBindingDigest;
+    if (
+      authority !== null &&
+      referencedExpected !== null &&
+      referencedExpected.approvalBindingDigest !== expected.approvalBindingDigest &&
+      !migratesLegacySelfReview
+    ) {
+      throw invalidConfirmation("GitHub Review 确认绑定已变化");
     }
     if (authority === null) {
       if (item === null) {
@@ -421,16 +448,19 @@ export class GitHubReviewProposalHandler {
           ],
         };
       }
+      if (["completed", "rejected", "stale"].includes(item.status)) {
+        return transitionFor(item, this.#clock, this.#pollIntervalMs);
+      }
       return this.#invalidateChangedAuthorization(
         item,
-        migratesLegacySelfReview ? legacyMigrationExpected : expected,
+        referencedExpected ?? expected,
         input.proposal,
       );
     }
     if (migratesLegacySelfReview) {
       return this.#migrateLegacySelfReview(
         item,
-        legacyMigrationExpected,
+        referencedExpected,
         plan,
         expected,
         input.proposal,

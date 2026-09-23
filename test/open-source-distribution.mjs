@@ -1487,9 +1487,11 @@ test(
     await context.test(
       "the clean payload starts, reports status, and stops through its trusted manager",
       {
-        skip: process.platform !== "win32" && powershell === null
-          ? "requires PowerShell manager availability"
-          : false,
+        skip: process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+          ? "requires configured Windows workstation service lifecycle"
+          : process.platform !== "win32" && powershell === null
+            ? "requires PowerShell manager availability"
+            : false,
       },
       async () => {
         const port = await availablePort();
@@ -1528,7 +1530,18 @@ test(
           runManager({ ...managerOptions, action: "Stop" });
 
         managedLiveUrl = `http://127.0.0.1:${port}/api/live`;
-        const live = await pollJson(managedLiveUrl);
+        let live;
+        try {
+          live = await pollJson(managedLiveUrl, 120_000);
+        } catch (error) {
+          const managedLog = await readFile(
+            path.join(runtimeInfo.runtimeDirectory, "logs", "server.log"),
+            "utf8",
+          ).catch(() => "<managed log unavailable>");
+          assert.fail(
+            `clean managed service did not become live: ${error?.message ?? "unknown error"}\n${managedLog.slice(-maximumDiagnosticCharacters)}`,
+          );
+        }
         assert.equal(live.body.schemaVersion, 1);
         assert.equal(live.body.live, true);
         assert.equal(live.body.service, "mydashboard");
@@ -1539,7 +1552,7 @@ test(
 
         const status = await pollJson(
           `http://127.0.0.1:${port}/api/system/status`,
-          45_000,
+          120_000,
           (body) => body?.readiness?.ready === true,
           (body) => JSON.stringify({
             ready: body?.readiness?.ready,
@@ -1549,6 +1562,7 @@ test(
             probeFailures: body?.readiness?.probeFailures,
             probeSummary: body?.readiness?.probeSummary,
           }),
+          30_000,
         );
         assert.equal(status.body.liveness.live, true);
         assert.equal(status.body.readiness.schemaVersion, 1);
@@ -1573,6 +1587,10 @@ test(
 
         const dashboard = await pollJson(
           `http://127.0.0.1:${port}/api/dashboard`,
+          60_000,
+          () => true,
+          () => "",
+          30_000,
         );
         assert.deepEqual(dashboard.body.meta.errors, []);
         assert.equal(dashboard.body.meta.sources.github, 0);

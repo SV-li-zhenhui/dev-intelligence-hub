@@ -18,8 +18,7 @@ listener.
   private configuration.
 - For supervised CLI brains, the first release requires Windows x64 and an
   official npm installation discoverable from the managed service account's
-  `PATH`: Codex CLI `>=0.147.0 <0.148.0`, or Claude CLI
-  `>=2.1.222 <2.2.0`.
+  `PATH`: an official Codex CLI package, or Claude CLI `>=2.1.222 <2.2.0`.
 
 Install and verify before the first managed start:
 
@@ -216,7 +215,9 @@ state may contain private engineering data; sanitize them before sharing.
 The configuration UI contains safe templates for `codex-cli` and `claude-cli`.
 Do not configure an executable, command, arguments, working directory, base URL,
 API-key name, plugin, or MCP server. Production discovery accepts only the
-tested official npm package shape and native executable. An unsupported,
+official npm package shape and native executable. Codex discovery does not pin
+a release range; each invocation validates the command protocol, structured
+response, process exit, and cleanup contract. An unsupported,
 missing, replaced, linked, or unverifiable binary remains unavailable.
 
 Choose one explicit credential mode before `Start` or `Restart`:

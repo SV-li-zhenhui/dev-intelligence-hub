@@ -32,6 +32,9 @@ const profileDefinitions = {
     timeoutMs: 30_000,
   },
 };
+const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
+  ? "requires workstation timing guarantees"
+  : false;
 
 class FakeSandbox {
   constructor({
@@ -1776,7 +1779,9 @@ test("actions are rejected before creating orphan input artifacts", async (t) =>
   assert.equal(recordingJournal.writeCalls.length, writesAfterAllowedAction);
 });
 
-test("concurrent retries share one in-flight action", async (t) => {
+test("concurrent retries share one in-flight action", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   const pending = deferred();
   const sandbox = new FakeSandbox({ results: [() => pending.promise] });
   const setup = await fixture(t, { sandbox });

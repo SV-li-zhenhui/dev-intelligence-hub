@@ -32,6 +32,11 @@ npm test
 npm start
 ```
 
+Hosted GitHub Actions runs the portable regression set. Tests that exercise real
+Codex/GitHub login lifecycles, Windows private ACLs, and the PowerShell service
+manager remain part of `npm test` and require a configured Windows workstation.
+Run the complete `npm test` before release; hosted CI does not replace that gate.
+
 The source checkout uses `package-lock.json`; the published/offline payload
 uses `npm-shrinkwrap.json`. Dependency updates must regenerate the checkout
 lock and then copy it byte-for-byte to the shrinkwrap. Distribution acceptance
