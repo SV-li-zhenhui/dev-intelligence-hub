@@ -142,3 +142,28 @@ test("collected DingTalk messages never notify back into DingTalk", async () => 
   assert.deepEqual(result, { sent: false, reason: "no-important-change" });
   assert.deepEqual(calls, []);
 });
+
+test("scheduled report delivery uses the same admitted DingTalk writer", async () => {
+  const calls = [];
+  const controller = new AbortController();
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective(CONFIGURATION_A);
+  const notifier = service(gate, calls);
+
+  const result = await notifier.sendReport({
+    reportId: "dingtalk-report-1",
+    slotKey: "2026-09-23@09:00",
+    title: "钉钉每日总览 · 2026-09-23",
+    message: "今日共有 3 项待办。",
+  }, { signal: controller.signal });
+
+  assert.deepEqual(result, {
+    sent: true,
+    reportId: "dingtalk-report-1",
+    slotKey: "2026-09-23@09:00",
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "local-owner");
+  assert.equal(calls[0][1], "钉钉每日总览 · 2026-09-23");
+  assert.strictEqual(calls[0][3].signal, controller.signal);
+});
