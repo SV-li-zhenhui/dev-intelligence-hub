@@ -1141,6 +1141,10 @@ export function normalizePullRequestWorkSource(value) {
     ) &&
     scope.active ===
       (source.current.event.eventType === "pull_request.created");
+  const historicalLifecycleMatches =
+    lastLifecycleRevision?.disposition === "accepted" &&
+    lastLifecycleRevision.authorityEpochChanged === true &&
+    lastLifecycleRevision.revision < source.activeRevision;
   const rejectedRevocationMatches =
     scope.active === false &&
     lastLifecycleRevision?.scopeRevocationApplied === true &&
@@ -1148,11 +1152,13 @@ export function normalizePullRequestWorkSource(value) {
   if (
     scope.lastLifecycleEventId !== null &&
     !currentLifecycleMatches &&
+    !historicalLifecycleMatches &&
     !rejectedRevocationMatches
   ) {
     throw invalid("PR scope 生命周期绑定无效");
   }
   if (scope.active === false && !currentLifecycleMatches &&
+      !historicalLifecycleMatches &&
       !rejectedRevocationMatches) {
     throw invalid("PR scope 非活动状态缺少生命周期绑定");
   }
