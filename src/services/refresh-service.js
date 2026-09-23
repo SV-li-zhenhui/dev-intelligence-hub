@@ -13,6 +13,14 @@ import {
   dingTalkDigestFacts,
   prepareDingTalkDigest,
 } from "../domain/dingtalk-digest.js";
+import {
+  createDingTalkReport,
+  dueDingTalkReportSlot,
+  normalizeDingTalkReportState,
+  projectDingTalkReportState,
+} from "../domain/dingtalk-report.js";
+
+const DINGTALK_REPORT_STATE_KEY = "dingtalk-report-state";
 
 const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.ACTION_NOW,
@@ -490,6 +498,61 @@ export class RefreshService {
       dashboardOptions(this.config),
     );
 
+    let reportState = normalizeDingTalkReportState(
+      await this.store.read(DINGTALK_REPORT_STATE_KEY),
+    );
+    let scheduledReportError = "";
+    if (
+      this.config.dingtalk.enabled &&
+      !errors.length &&
+      typeof this.notifier.sendReport === "function"
+    ) {
+      const reportNow = new Date(clockMilliseconds(this.clock));
+      const slot = dueDingTalkReportSlot(reportNow, reportState.lastSlotKey);
+      if (slot) {
+        const report = createDingTalkReport(
+          dashboard,
+          slot,
+          reportState,
+          reportNow,
+        );
+        reportState = {
+          schemaVersion: 1,
+          revision: reportState.revision + 1,
+          lastSlotKey: slot.slotKey,
+          baseline: report.baseline,
+          latest: { status: "sending", report },
+        };
+        await this.store.write(DINGTALK_REPORT_STATE_KEY, reportState);
+        try {
+          await this.notifier.sendReport(report, { signal });
+          reportState = {
+            ...reportState,
+            revision: reportState.revision + 1,
+            latest: {
+              status: "sent",
+              report,
+              sentAt: new Date(clockMilliseconds(this.clock)).toISOString(),
+            },
+          };
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          reportState = {
+            ...reportState,
+            revision: reportState.revision + 1,
+            latest: {
+              status: "failed",
+              report,
+              error: "本时段汇报发送失败；为避免重复发送，系统不会自动重发。",
+            },
+          };
+          scheduledReportError = `钉钉定时汇报: ${error.message}`;
+        }
+        await this.store.write(DINGTALK_REPORT_STATE_KEY, reportState);
+      }
+    }
+    dashboard.dingtalkReport = projectDingTalkReportState(reportState);
+
     let notification = { sent: false, reason: "disabled" };
     let notificationDiff = null;
     if (notify && this.config.dingtalk.enabled && !errors.length) {
@@ -506,6 +569,7 @@ export class RefreshService {
       signal?.throwIfAborted();
       await this.store.write("notification-snapshot", snapshot);
     }
+    if (scheduledReportError) errors.push(scheduledReportError);
 
     await this.store.write("previous-snapshot", previous);
     signal?.throwIfAborted();

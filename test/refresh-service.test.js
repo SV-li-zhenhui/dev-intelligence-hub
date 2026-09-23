@@ -523,3 +523,96 @@ test("refresh publishes grouped DingTalk summaries instead of raw messages or un
   assert.equal(snapshot.brain.dingtalkSummarized, 1);
   assert.equal(snapshot.sources.dingtalk, 1);
 });
+
+test("a scheduled DingTalk report is durably claimed and sent once per slot", async () => {
+  const store = new MemoryStore();
+  const reports = [];
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return []; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: null,
+    dingtalk: {
+      async collect() {
+        return {
+          errors: [],
+          items: [{
+            id: "dingtalk:todo:daily-report",
+            kind: "todo",
+            relation: "assigned",
+            title: "提交日报",
+            updatedAt: "2026-09-23T00:30:00.000Z",
+            state: "open",
+          }],
+        };
+      },
+    },
+    store,
+    notifier: {
+      async sendReport(report) { reports.push(report); },
+    },
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date("2026-09-23T01:05:00.000Z"),
+  });
+
+  await service.refresh();
+  await service.refresh();
+
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].slotKey, "2026-09-23@09:00");
+  const state = await store.read("dingtalk-report-state");
+  assert.equal(state.lastSlotKey, "2026-09-23@09:00");
+  assert.equal(state.latest.status, "sent");
+  const dashboard = await store.read("dashboard");
+  assert.equal(dashboard.dingtalkReport.status, "sent");
+  assert.equal(dashboard.dingtalkReport.counts.todos, 1);
+});
+
+test("an uncertain DingTalk report failure is not retried in the same slot", async () => {
+  const store = new MemoryStore();
+  let attempts = 0;
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return []; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: null,
+    dingtalk: {
+      async collect() { return { errors: [], items: [] }; },
+    },
+    store,
+    notifier: {
+      async sendReport() {
+        attempts += 1;
+        throw new Error("transport outcome unknown");
+      },
+    },
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date("2026-09-23T04:05:00.000Z"),
+  });
+
+  await service.refresh();
+  await service.refresh();
+
+  assert.equal(attempts, 1);
+  const state = await store.read("dingtalk-report-state");
+  assert.equal(state.lastSlotKey, "2026-09-23@12:00");
+  assert.equal(state.latest.status, "failed");
+  assert.match(
+    (await store.read("dashboard")).dingtalkReport.error,
+    /不会自动重发/,
+  );
+});
