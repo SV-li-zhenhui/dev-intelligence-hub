@@ -1718,7 +1718,9 @@ test("protected roots reject equality and both ancestor directions before discov
   }
 });
 
-test("Windows rejects a weak owner or DACL before CLI discovery", async (t) => {
+test("Windows rejects a weak owner or DACL before CLI discovery", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows owner and DACL semantics are platform-specific");
     return;
@@ -1748,7 +1750,9 @@ test("Windows rejects a weak owner or DACL before CLI discovery", async (t) => {
   assert.equal(runner.calls.length, 0);
 });
 
-test("Windows production root creation allows only supported non-mutating broad ACEs", async (t) => {
+test("Windows production root creation allows only supported non-mutating broad ACEs", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
@@ -1772,7 +1776,9 @@ test("Windows production root creation allows only supported non-mutating broad 
   assert.equal((await lstat(root)).isDirectory(), true);
 });
 
-test("Windows production directory preparation accepts an omitted optional signal", async (t) => {
+test("Windows production directory preparation accepts an omitted optional signal", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
@@ -1818,11 +1824,15 @@ async function assertProductionRootAclRejected(t, name, extraAce) {
   await assert.rejects(lstat(root), { code: "ENOENT" });
 }
 
-test("Windows production root creation rejects broad child mutation rights", async (t) => {
+test("Windows production root creation rejects broad child mutation rights", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   await assertProductionRootAclRejected(t, "child-create", "(A;OICI;0x6;;;BU)");
 });
 
-test("Windows production root creation rejects unsupported deny ACE shapes", async (t) => {
+test("Windows production root creation rejects unsupported deny ACE shapes", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   await assertProductionRootAclRejected(t, "deny-shape", "(D;OICI;0x2;;;BU)");
 });
 
@@ -2860,7 +2870,9 @@ test("cleanup rejects a parent swap after a file check without deleting the repl
   assert.equal(await readFile(victimFile, "utf8"), "retain-me");
 });
 
-test("Windows production cleanup pins checked entries until same-handle deletion", async (t) => {
+test("Windows production cleanup pins checked entries until same-handle deletion", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2895,7 +2907,9 @@ test("Windows production cleanup pins checked entries until same-handle deletion
   assert.equal(await readFile(victim, "utf8"), "retain-me");
 });
 
-test("Windows production cleanup cancellation settles after native handles close", async (t) => {
+test("Windows production cleanup cancellation settles after native handles close", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2924,7 +2938,9 @@ test("Windows production cleanup cancellation settles after native handles close
   assert.equal(await readFile(moved, "utf8"), "private");
 });
 
-test("provider cancellation after native READY completes verified cleanup before releasing the lease", async (t) => {
+test("provider cancellation after native READY completes verified cleanup before releasing the lease", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2991,7 +3007,9 @@ test("provider cancellation after native READY completes verified cleanup before
   assert.equal(secondLocator.calls.length, 1);
 });
 
-test("Windows production cleanup preflights every stale tree before deleting any", async (t) => {
+test("Windows production cleanup preflights every stale tree before deleting any", {
+  skip: HOST_TEST_SKIP,
+}, async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
