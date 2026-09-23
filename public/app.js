@@ -22,6 +22,7 @@ import {
   githubTargetUrl,
 } from "./github-target-link.js";
 import { githubItemDetailMarkup } from "./github-item-detail.js";
+import { issuePrDetailMarkup, issuePrSummary } from "./issue-pr-status.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { announcementDetailMarkup } from "./announcement-markup.js";
@@ -429,6 +430,7 @@ function workItem(item) {
   const source = item.repo
     ? `${escapeHtml(item.repo)} #${item.number}`
     : escapeHtml(item.context || kindLabel(item));
+  const issueProgress = issuePrSummary(item);
   return `
     <button class="work-item" data-item-id="${escapeHtml(item.id)}">
       <span class="priority ${priorityClass}">${item.score ?? "—"}</span>
@@ -439,6 +441,7 @@ function workItem(item) {
           <span>${source}</span>
           <span>${relativeTime(item.updatedAt)}</span>
         </span>
+        ${issueProgress ? `<span class="item-progress">${escapeHtml(issueProgress.label)} · 关闭判断：${escapeHtml(issueProgress.closeAdvice)}</span>` : ""}
       </span>
       <span class="reason ${reasonClass}">${escapeHtml(reason)}</span>
     </button>`;
@@ -507,7 +510,9 @@ function metrics(counts) {
 
 function employeeJob(job) {
   jobIndex.set(job.id, job);
-  const summary = job.summary || job.triggerReason || job.error || "等待员工处理";
+  const summary = job.status === "superseded"
+    ? "历史快照：后续 PR 状态已替代这次判断"
+    : job.summary || job.triggerReason || job.error || "等待员工处理";
   return `
     <button class="employee-job" data-job-id="${escapeHtml(job.id)}">
       <span class="employee-job-main">
@@ -518,6 +523,14 @@ function employeeJob(job) {
     </button>`;
 }
 
+const historicalPrJobStatuses = new Set([
+  "published",
+  "accepted",
+  "rejected",
+  "dismissed",
+  "superseded",
+]);
+
 function employeePanel({ expanded = false } = {}) {
   const employee = dashboard.employee;
   if (!employee?.role) {
@@ -527,8 +540,14 @@ function employeePanel({ expanded = false } = {}) {
     </section>`;
   }
   const { role } = employee;
-  const activeJob = employee.jobs.find((job) => job.status === "running");
-  const recentJobs = expanded ? employee.jobs : employee.jobs.slice(0, 3);
+  const currentJobs = employee.jobs.filter(
+    (job) => !historicalPrJobStatuses.has(job.status),
+  );
+  const historicalJobs = employee.jobs.filter((job) =>
+    historicalPrJobStatuses.has(job.status),
+  );
+  const activeJob = currentJobs.find((job) => job.status === "running");
+  const recentJobs = expanded ? currentJobs : currentJobs.slice(0, 3);
   const brain = role.brain?.provider
     ? `${role.brain.provider} / ${role.brain.model || "默认模型"}${role.brain.remoteCodeContext ? " · 代码上下文将发送到远程服务" : ""}`
     : "未配置大脑";
@@ -562,8 +581,11 @@ function employeePanel({ expanded = false } = {}) {
       ${
         recentJobs.length
           ? `<div class="employee-jobs">${recentJobs.map(employeeJob).join("")}</div>`
-          : `<div class="empty">员工正在持续观察，尚未发现需要启动的新作业。</div>`
+          : `<div class="empty">当前没有需要推进的 PR 作业。</div>`
       }
+      ${expanded && historicalJobs.length
+        ? `<details class="employee-job-history"><summary>历史作业（${historicalJobs.length}）</summary><div class="employee-jobs">${historicalJobs.map(employeeJob).join("")}</div></details>`
+        : ""}
     </section>`;
 }
 
@@ -2569,6 +2591,8 @@ function listMarkup(items) {
 function showEmployeeJob(job) {
   if (!job) return;
   codeJobDetailFocusIntent = null;
+  const historical = historicalPrJobStatuses.has(job.status);
+  const summary = job.summary || job.triggerReason || job.error || "";
   const review = job.reviewBody
     ? `<section class="review-preview">
         <strong>${escapeHtml(reviewVerdictLabel(job.reviewVerdict))}</strong>
@@ -2608,7 +2632,8 @@ function showEmployeeJob(job) {
     <article class="detail employee-detail">
       <p class="eyebrow">PR EMPLOYEE / ${escapeHtml(jobStateLabel(job.status))}</p>
       <h2>${escapeHtml(job.repo)} #${job.number} · ${escapeHtml(job.title)}</h2>
-      <p>${escapeHtml(job.summary || job.triggerReason || job.error || "")}</p>
+      ${historical ? "<p>这是历史作业。以下判断和触发原因记录的是当时的 PR 状态，不代表当前仍需处理。</p>" : ""}
+      ${summary ? `<p>${historical ? "当时判断：" : ""}${escapeHtml(summary)}</p>` : ""}
       <h3>依据</h3>
       ${listMarkup(job.evidence)}
       <h3>建议步骤</h3>
@@ -3450,6 +3475,7 @@ function showDetail(item) {
       ${dingtalkDetailMarkup(item)}
       ${prLifecycleStatusMarkup(item)}
       ${brainAssessment(item)}
+      ${issuePrDetailMarkup(item)}
       ${githubItemDetailMarkup(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
       ${item.url ? `<a class="detail-source-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${["issue", "pull_request"].includes(item.kind) ? "在 GitHub 查看完整内容" : "在来源中打开"} →</a>` : ""}

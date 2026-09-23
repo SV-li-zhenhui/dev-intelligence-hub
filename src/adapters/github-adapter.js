@@ -18,7 +18,7 @@ import {
 
 const GITHUB_HOST = "github.com";
 const SEARCH_LIMIT = 1_000;
-const ISSUE_DETAIL_BATCH_SIZE = 100;
+const ISSUE_DETAIL_BATCH_SIZE = 25;
 const MILESTONE_PAGE_SIZE = 100;
 const MILESTONES_PER_REPOSITORY = 10;
 const SECOND_MS = 1_000;
@@ -40,7 +40,7 @@ const PR_OPEN_TARGET_FIELDS = `${PR_TARGET_FIELDS},state`;
 const ISSUE_FIELDS =
   "id,number,title,body,url,repository,updatedAt,createdAt,author,state,labels,assignees,commentsCount";
 const ISSUE_DETAIL_QUERY =
-  "query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number body milestone{title} comments(last:1){totalCount nodes{author{login} body createdAt updatedAt url}}}}}";
+  "query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number body milestone{title} comments(last:1){totalCount nodes{author{login} body createdAt updatedAt url}} closedByPullRequestsReferences(first:20,includeClosedPrs:true){pageInfo{hasNextPage} nodes{number title state mergedAt repository{nameWithOwner}}} timelineItems(last:20,itemTypes:[CROSS_REFERENCED_EVENT]){pageInfo{hasPreviousPage} nodes{... on CrossReferencedEvent{source{... on PullRequest{number title state mergedAt repository{nameWithOwner}}}}}}}}}";
 const GITHUB_DESCRIPTION_MAXIMUM_BYTES = 12 * 1024;
 const ISSUE_COMMENT_MAXIMUM_BYTES = 4 * 1024;
 const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
@@ -127,6 +127,39 @@ function issueLatestComment(connection) {
           url: typeof comment.url === "string" ? comment.url : "",
         }
       : null,
+  };
+}
+
+function issuePullRequestLinks(detail) {
+  const formal = detail.closedByPullRequestsReferences;
+  const mentions = detail.timelineItems;
+  if (!formal || !mentions) return null;
+  const links = new Map();
+  const add = (node, relation) => {
+    const repo = node?.repository?.nameWithOwner;
+    const number = node?.number;
+    if (
+      typeof repo !== "string" ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repo) ||
+      !Number.isSafeInteger(number) || number < 1
+    ) return;
+    const key = `${repo.toLowerCase()}#${number}`;
+    if (links.has(key) && relation !== "formal") return;
+    links.set(key, {
+      repo,
+      number,
+      title: boundedGitHubText(node.title, 512),
+      state: node.mergedAt ? "merged" : String(node.state || "").toLowerCase(),
+      relation,
+      url: `https://github.com/${repo}/pull/${number}`,
+    });
+  };
+  for (const node of mentions.nodes || []) add(node?.source, "mention");
+  for (const node of formal.nodes || []) add(node, "formal");
+  return {
+    links: [...links.values()],
+    complete: formal.pageInfo?.hasNextPage === false &&
+      mentions.pageInfo?.hasPreviousPage === false,
   };
 }
 
@@ -1087,6 +1120,7 @@ export class GitHubAdapter {
         milestone: detail.milestone?.title || "",
         commentsCount: discussion.commentsCount,
         latestComment: discussion.latestComment,
+        pullRequestLinks: issuePullRequestLinks(detail),
       };
     });
   }

@@ -724,6 +724,7 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
     "docs/PROJECT_STATUS.md",
+    "docs/USER_GUIDE.zh-CN.md",
     "npm-shrinkwrap.json",
     "package.json",
     "README.md",

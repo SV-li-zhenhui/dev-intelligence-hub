@@ -269,6 +269,24 @@ test("assigned issues include bounded context, milestone, and latest discussion"
                   url: "https://github.com/example/comment",
                 }],
               },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false },
+                nodes: [{
+                  number: 7,
+                  title: "Fix initialization",
+                  state: "MERGED",
+                  mergedAt: "2026-08-09T00:00:00Z",
+                  repository: { nameWithOwner: "example-medical/example-product" },
+                }],
+              },
+              timelineItems: {
+                pageInfo: { hasPreviousPage: false },
+                nodes: [
+                  { source: { number: 7, title: "Fix initialization", state: "MERGED", mergedAt: "2026-08-09T00:00:00Z", repository: { nameWithOwner: "example-medical/example-product" } } },
+                  { source: { number: 8, title: "Mention only", state: "OPEN", mergedAt: null, repository: { nameWithOwner: "example-medical/another-repo" } } },
+                  { source: {} },
+                ],
+              },
             }],
           },
         };
@@ -288,6 +306,27 @@ test("assigned issues include bounded context, milestone, and latest discussion"
     createdAt: "2026-08-08T09:12:06Z",
     updatedAt: "2026-08-08T09:12:06Z",
     url: "https://github.com/example/comment",
+  });
+  assert.deepEqual(issue.pullRequestLinks, {
+    complete: true,
+    links: [
+      {
+        repo: "example-medical/example-product",
+        number: 7,
+        title: "Fix initialization",
+        state: "merged",
+        relation: "formal",
+        url: "https://github.com/example-medical/example-product/pull/7",
+      },
+      {
+        repo: "example-medical/another-repo",
+        number: 8,
+        title: "Mention only",
+        state: "open",
+        relation: "mention",
+        url: "https://github.com/example-medical/another-repo/pull/8",
+      },
+    ],
   });
   const graphql = calls.find((args) => args[0] === "api");
   assert.ok(graphql.includes("ids[]=I_issue_12855"));
@@ -340,7 +379,7 @@ test("assigned issue details are enriched in GitHub's bounded node batches", asy
   const issues = await adapter.searchIssues();
 
   assert.equal(issues.length, 101);
-  assert.deepEqual(graphqlBatchSizes, [100, 1]);
+  assert.deepEqual(graphqlBatchSizes, [25, 25, 25, 25, 1]);
 });
 
 test("a failed issue detail batch stops new batches and waits for started work", async () => {
@@ -392,7 +431,7 @@ test("a failed issue detail batch stops new batches and waits for started work",
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(startedBatchIds, ["I_issue_1", "I_issue_101", "I_issue_201", "I_issue_301"]);
+  assert.deepEqual(startedBatchIds, ["I_issue_1", "I_issue_26", "I_issue_51", "I_issue_76"]);
   assert.equal(rejected, false);
   releaseStartedBatches();
   await assert.rejects(search, /detail batch failed/);

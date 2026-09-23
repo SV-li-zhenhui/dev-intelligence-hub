@@ -846,6 +846,16 @@ h1 {
   border-top: 1px solid var(--line-strong);
 }
 
+.employee-job-history {
+  margin-top: 18px;
+}
+
+.employee-job-history summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
 .employee-job {
   display: flex;
   align-items: center;
@@ -2450,6 +2460,15 @@ h1 {
   content: "·";
 }
 
+.item-progress {
+  display: block;
+  margin-top: 6px;
+  color: var(--blue);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+}
+
 .reason {
   max-width: 150px;
   padding: 4px 7px;
@@ -3470,6 +3489,26 @@ dialog::backdrop {
   background: var(--paper);
   border-radius: 3px;
   font-size: 11px;
+}
+
+.issue-pr-status ul {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.issue-pr-status li,
+.issue-pr-status p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.issue-pr-status li span {
+  display: block;
+  color: var(--muted);
 }
 
 .dingtalk-digest-detail {

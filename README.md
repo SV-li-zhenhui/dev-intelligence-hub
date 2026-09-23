@@ -27,6 +27,8 @@ PR 责任语义遵循团队当前流程：
 
 ## 使用
 
+日常操作从[中文使用手册](docs/USER_GUIDE.zh-CN.md)开始：按页面介绍总览、岗位、确认队列、工作台账，以及常见“阻塞”和数据源错误。
+
 ```powershell
 npm ci
 npm test
