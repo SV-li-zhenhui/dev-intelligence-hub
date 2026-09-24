@@ -28,6 +28,12 @@ For each PR or Issue task, show the current responsible party, source status, bl
 
 **Done when:** an owner can identify and act on one queued, waiting, or blocked item without pausing an entire role; a merged PR cannot remain presented as an active action; independent tasks continue when one task blocks.
 
+## P1 — Make manual role runs observable and bounded
+
+The current `立即巡查` request waits for the whole role cycle. A PR-role run exceeded a 180-second client timeout while a scheduled cycle was also active; the HTTP result did not explain whether work was queued, still running, or finished. Return a short-lived run identity promptly, show queued/running/terminal state and the latest result, and make repeated clicks attach to the same in-flight cycle when appropriate.
+
+**Done when:** a manual run receives a prompt, stable acknowledgement; the UI can follow its final outcome after a slow cycle or client disconnect; a timed-out browser request cannot create an ambiguous duplicate run.
+
 ## P2 — Remove duplicate attention without weakening confirmations
 
 Consultations and external actions stay in the one-at-a-time queue. Coalesce only duplicate requests for the same semantic action, target, source revision, and authority; preserve separate confirmations for distinct Review, code application, push, and merge actions.
