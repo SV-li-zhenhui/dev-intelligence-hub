@@ -6,6 +6,8 @@ This list records gaps identified in the September 2026 product and requirements
 
 The service can be healthy while a configured high-capability role cannot run because the Codex login broker reports `broker_blocked` and role cycles report `STRUCTURED_PROVIDER_CLEANUP_FAILED`. Diagnose the failed private mirror, process reap, or cleanup step without deleting retained sessions or changing the owner's login and configuration. Keep service readiness separate from role/provider execution readiness in the API and UI.
 
+**Progress (2026-09-24):** A normal Codex CLI invocation exceeded the old 16 MiB cleanup bound. Commit `486f2c9564` raises the bounded cleanup limit to 64 MiB and adds regression coverage. After a consistent recovery snapshot, the retained invocation was preserved, the service restarted, the broker reported `available`, and a manual developer cycle completed without a new cleanup failure. The remaining readiness presentation, forced-failure acceptance check, and per-item reconciliation still need verification.
+
 **Done when:** the bounded no-model readiness check reports `available`; one real configured role completes a bounded task and records its result; a forced broker failure leaves work unclaimed, explains the blocker to the owner, and preserves private evidence. Confirm that previously blocked work is reconciled by its own reason rather than bulk-retried.
 
 ## P1 — Prevent sensitive imported sessions from reaching remote brains
