@@ -18,7 +18,8 @@ import { performance } from "node:perf_hooks";
 import { types as utilTypes } from "node:util";
 
 import { canonicalJsonStringify } from "../lib/canonical-json-digest.js";
-import { CodexCliSessionStore } from "./codex-cli-session-store.js";
+import { CodexCliSessionStore, CODEX_SESSION_PROFILE_MAX_BYTES } from "./codex-cli-session-store.js";
+import { normalizeSessionKey } from "../lib/session-key.js";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { ProductionCliCompositionGrant } from "../composition-root.js";
@@ -46,6 +47,7 @@ const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const API_KEY = /^[^\s\u0000-\u001f\u007f]{1,4096}$/;
 const INVALID_PATH_TEXT = /[\u0000\r\n]/;
 const INVOCATION_MARKER = ".mydashboard-invocation.json";
+const SESSION_CAPTURE_RECEIPT = ".mydashboard-session-capture.json";
 const STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 const MAX_SCAVENGE_ENTRIES = 128;
 const MAX_MARKER_BYTES = 4 * 1024;
@@ -54,7 +56,8 @@ const MAX_RESULT_NODES = 20_000;
 const MAX_RESULT_KEYS = 20_000;
 const MAX_CLEANUP_ENTRIES = 256;
 const MAX_CLEANUP_DEPTH = 16;
-// A normal Codex turn can retain a rollout plus SQLite state above 16 MiB.
+// Captured session bytes have their own storage budget. This bounds only the
+// additional transient state (SQLite, caches, output, and invocation metadata).
 const MAX_CLEANUP_REGULAR_BYTES = 64n * 1024n * 1024n;
 const MAX_RECOVERY_MS = 30_000;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -537,6 +540,9 @@ function sessionStore(value) {
   const boundary = Object.freeze({
     stage: value.stage.bind(value),
     capture: value.capture.bind(value),
+    ...(typeof value.verifyCapture === "function"
+      ? { verifyCapture: value.verifyCapture.bind(value) }
+      : {}),
   });
   SESSION_STORE_BOUNDARIES.set(value, boundary);
   return boundary;
@@ -931,6 +937,9 @@ function residueIdentity(invocation, filePath) {
     path: filePath,
     device: invocation.device,
     inode: invocation.inode,
+    ...(invocation.capturedSessionBytes !== undefined
+      ? { capturedSessionBytes: invocation.capturedSessionBytes }
+      : {}),
   });
 }
 
@@ -1050,6 +1059,7 @@ async function boundedCleanupInventory(
   const nodes = [rootNode];
   const pendingDirectories = [rootNode];
   let totalBytes = 0n;
+  const maximumBytes = cleanupByteLimit([target]);
 
   while (pendingDirectories.length > 0) {
     const directory = pendingDirectories.pop();
@@ -1106,7 +1116,7 @@ async function boundedCleanupInventory(
             throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
           }
           totalBytes += node.size;
-          if (totalBytes > MAX_CLEANUP_REGULAR_BYTES) {
+          if (totalBytes > maximumBytes) {
             throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
           }
         } else if (node.directory) {
@@ -1218,7 +1228,7 @@ async function removeVerifiedInvocations(
     const session = await fileSystem.prepareCleanupTrees(invocations, {
         maximumEntries: MAX_CLEANUP_ENTRIES,
         maximumDepth: MAX_CLEANUP_DEPTH,
-        maximumBytes: Number(MAX_CLEANUP_REGULAR_BYTES),
+        maximumBytes: Number(cleanupByteLimit(invocations)),
         signal,
       });
     if (
@@ -1250,6 +1260,55 @@ async function removeVerifiedInvocations(
       fileSystem,
       rootState,
     );
+  }
+}
+
+function capturedProfileBytes(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= CODEX_SESSION_PROFILE_MAX_BYTES;
+}
+
+function cleanupByteLimit(invocations) {
+  return invocations.reduce((limit, invocation) => {
+    const bytes = invocation.capturedSessionBytes ?? 0;
+    if (!capturedProfileBytes(bytes)) throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+    return limit + BigInt(bytes);
+  }, MAX_CLEANUP_REGULAR_BYTES);
+}
+
+async function recordSessionCapture(invocation, capture, signal, rootState) {
+  const details = await lstat(invocation.path, { bigint: true });
+  if (!sameDirectoryIdentity(invocation, details)) throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+  await writeNewFile(
+    path.join(invocation.path, SESSION_CAPTURE_RECEIPT),
+    Buffer.from(JSON.stringify({ schemaVersion: 1, createdAt: invocation.marker.createdAt, ...capture }), "utf8"),
+    signal,
+    () => assertRootAdmissionSafe(rootState),
+  );
+  return Object.freeze({ ...invocation, capturedSessionBytes: capture.profileBytes });
+}
+
+async function verifiedSessionCapture(directory, marker, store, signal, fileSystem, rootState) {
+  if (typeof store?.verifyCapture !== "function") return null;
+  const bytes = await readSmallRegularFile(
+    path.join(directory, SESSION_CAPTURE_RECEIPT), MAX_MARKER_BYTES, signal, fileSystem, rootState,
+  );
+  if (!bytes) return null;
+  try {
+    const receipt = parseJsonWithUniqueKeys(fatalUtf8(bytes));
+    const keys = ["schemaVersion", "createdAt", "sessionKey", "sessionId", "profileBytes"];
+    if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt) ||
+        Object.keys(receipt).length !== keys.length || keys.some((key) => !Object.hasOwn(receipt, key)) ||
+        receipt.schemaVersion !== 1 || receipt.createdAt !== marker.createdAt ||
+        !SAFE_SESSION_ID.test(receipt.sessionId) || !capturedProfileBytes(receipt.profileBytes)) return null;
+    const sessionKey = normalizeSessionKey(receipt.sessionKey);
+    const verified = await store.verifyCapture({
+      sessionKey, sessionId: receipt.sessionId, codexHome: path.join(directory, "codex-home"), signal,
+    });
+    if (verified?.profileBytes !== receipt.profileBytes) return null;
+    return receipt.profileBytes;
+  } catch {
+    throwIfRequestAborted(signal);
+    return null;
   }
 }
 
@@ -1339,6 +1398,7 @@ async function scavengeStaleInvocations({
   signal = null,
   cleanupFileSystem: fileSystem = PRODUCTION_CLEANUP_FILE_SYSTEM,
   rootState = null,
+  codexSessionStore = null,
 }) {
   throwIfRequestAborted(signal);
   const prefix = invocationPrefix(cliKind);
@@ -1426,13 +1486,15 @@ async function scavengeStaleInvocations({
           }
           continue;
         }
-        // This invocation may contain the only copy of an interrupted task's
-        // history. Age and a dead PID cannot prove that session capture succeeded.
+        let capturedSessionBytes = null;
+        // A receipt is written only after process reap and credential capture.
+        // Recheck the saved history; the receipt alone does not permit deletion.
         if (marker.sessionRecoveryRequired ||
             (cliKind === "codex-cli" && await containsSessionRollout(path.join(directory, "codex-home", "sessions"), signal))) {
-          throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+          capturedSessionBytes = await verifiedSessionCapture(directory, marker, codexSessionStore, signal, fileSystem, rootState);
+          if (capturedSessionBytes === null) throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
         }
-        if (clock() - marker.createdAtMs < STALE_AFTER_MS) {
+        if (capturedSessionBytes === null && clock() - marker.createdAtMs < STALE_AFTER_MS) {
           if (cleanupEntry) throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
           continue;
         }
@@ -1440,7 +1502,7 @@ async function scavengeStaleInvocations({
         if (!rootState) {
           throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
         }
-        staleInvocations.push(identity);
+        staleInvocations.push(capturedSessionBytes === null ? identity : Object.freeze({ ...identity, capturedSessionBytes }));
       } catch (error) {
         throwIfRequestAborted(signal);
         if (error?.code === "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED") throw error;
@@ -1520,7 +1582,7 @@ async function createInvocation({
       }
     }
     throwIfRequestAborted(signal);
-    return Object.freeze({ ...identity, profiles: Object.freeze(profiles) });
+    return Object.freeze({ ...identity, marker: Object.freeze(marker), profiles: Object.freeze(profiles) });
   } catch (failure) {
     rootState.blocked = true;
     let cleanupAttempt = null;
@@ -2198,6 +2260,7 @@ export class SupervisedCliBrainProvider {
         signal,
         cleanupFileSystem: this.#cleanupFileSystem,
         rootState: state,
+        codexSessionStore: this.#codexSessionStore,
       }));
     if (this.#rootState.blocked) {
       throw providerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
@@ -2223,7 +2286,21 @@ export class SupervisedCliBrainProvider {
           this.#cleanupFileSystem,
           state,
         );
-        if (current) verified.push(current);
+        if (current) {
+          if (current.capturedSessionBytes !== undefined) {
+            const bytes = await readSmallRegularFile(
+              path.join(current.path, INVOCATION_MARKER), MAX_MARKER_BYTES, signal, this.#cleanupFileSystem, state,
+            );
+            const marker = bytes && markerValue(parseJsonWithUniqueKeys(fatalUtf8(bytes)), this.kind);
+            const savedBytes = marker && await verifiedSessionCapture(
+              current.path, marker, this.#codexSessionStore, signal, this.#cleanupFileSystem, state,
+            );
+            if (savedBytes !== current.capturedSessionBytes) {
+              throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+            }
+          }
+          verified.push(current);
+        }
       }
       await removeVerifiedInvocations(
         verified,
@@ -2451,6 +2528,7 @@ export class SupervisedCliBrainProvider {
         this.#assertRunnable();
         let processFailure = null;
         let processResult = null;
+        let completedCapture = null;
         try {
           processResult = await this.#runProcess(invocation, deadline, recoveryDeadline, {
             executable: descriptor,
@@ -2482,12 +2560,15 @@ export class SupervisedCliBrainProvider {
               });
             }
             if (capturedSessionId !== null) {
-              await recoveryDeadline().run(({ signal }) => this.#codexSessionStore.capture({
+              const captured = await recoveryDeadline().run(({ signal }) => this.#codexSessionStore.capture({
                 sessionKey: request.sessionKey,
                 sessionId: capturedSessionId,
                 codexHome,
                 signal,
               }));
+              if (capturedProfileBytes(captured?.profileBytes)) {
+                completedCapture = { sessionKey: request.sessionKey, sessionId: capturedSessionId, profileBytes: captured.profileBytes };
+              }
             } else if (await recoveryDeadline().run(({ signal }) =>
               containsSessionRollout(path.join(codexHome, "sessions"), signal))) {
               throw providerError("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
@@ -2501,6 +2582,13 @@ export class SupervisedCliBrainProvider {
           await recoveryDeadline().run(({ signal }) =>
             credentialLease.capture({ signal }));
           credentialCaptured = true;
+        }
+        if (completedCapture !== null && processReaped && credentialCaptured && !retainSession) {
+          invocation = await runRootOperation(
+            this.#rootState, recoveryDeadline(),
+            (signal) => recordSessionCapture(invocation, completedCapture, signal, this.#rootState),
+            { blocking: true, requireSafe: true },
+          );
         }
         if (processFailure !== null) throw processFailure;
         deadline.throwIfExpired();

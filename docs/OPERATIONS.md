@@ -301,6 +301,23 @@ rollout files, and blocks fresh invocation with
 error: preserve the only copy of task history and investigate capture recovery.
 MyDashboard also keeps durable task context in its own ledger and memory.
 
+Invocation directories are temporary workspaces, not the permanent session
+store. Normal completion removes them automatically after process exit, session
+capture, and credential capture. A completed capture now writes a private
+receipt. On a later invocation after restart, a dead owner's residue can be
+removed only after verifying every retained session file against its saved copy
+(an unchanged prefix is accepted when the saved history has newer turns).
+Missing archives, changed history, live owners, and legacy residues without a
+receipt remain intact for maintenance.
+
+The cleanup byte budget distinguishes captured session files from transient
+SQLite, cache, and output files. Captured bytes use the existing 512 MiB session
+storage limit; additional transient bytes remain bounded at 64 MiB. Unverified
+directories receive no session allowance. Do not periodically delete the entire
+runtime or permanent session store. Routine invocation cleanup is automatic;
+retained failure evidence requires verified maintenance and must be preserved
+before any manual recovery.
+
 Internal attention state now writes schema version 2 and accepts version 1
 without losing existing questions or answers. Startup and coordination cycles
 archive pending questions only when the ledger proves their bound producer task
