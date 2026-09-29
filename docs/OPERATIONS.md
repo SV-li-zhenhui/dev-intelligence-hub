@@ -300,6 +300,18 @@ rollout files, and blocks fresh invocation with
 `STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED`. Do not delete it to clear the
 error: preserve the only copy of task history and investigate capture recovery.
 MyDashboard also keeps durable task context in its own ledger and memory.
+
+Internal attention state now writes schema version 2 and accepts version 1
+without losing existing questions or answers. Startup and coordination cycles
+archive pending questions only when the ledger proves their bound producer task
+is cancelled, completed, or superseded. Archives retain the original question,
+creation event, producer binding, retirement reason, and task revision; they do
+not create answer outbox entries or requeue work. Temporary authority loss,
+provider failure, and browser deferral are not retirement evidence. This is
+logical archiving, not disk compaction: the bounded local audit history remains.
+After the first schema 2 write, older versions of the attention inbox reader
+cannot read the new state; use the preserved pre-upgrade data snapshot when
+performing an intentional code and data rollback.
 This is reasoning only: any code or GitHub action
 still crosses its independent policy, isolated execution, and owner-confirmation
 boundary.

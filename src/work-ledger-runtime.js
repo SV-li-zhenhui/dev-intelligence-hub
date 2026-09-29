@@ -22,6 +22,7 @@ const RUNTIME_METHODS = Object.freeze([
   "listOutbox",
   "readItemForReconciliation",
   "isAttentionRequestCurrent",
+  "readAttentionRequestRetirement",
   "isIntentDispatchCurrent",
   "verifyPullRequestExecutionBinding",
   "verifyPullRequestExecutionBindings",

@@ -15,6 +15,7 @@ import { OperationQueue } from "../lib/operation-queue.js";
 import {
   ATTENTION_INBOX_STATE_KEY,
   ATTENTION_STATE_LIMITS,
+  archiveAttentionItem,
   attentionStateBytes,
   createAttentionItem,
   defaultAttentionState,
@@ -114,6 +115,9 @@ export class AttentionInbox {
     this.operationQueue = operationQueue;
     this.clock = clock;
     this.isCurrent = currentAuthority(authority);
+    this.readRetirement = typeof authority?.readAttentionRequestRetirement === "function"
+      ? authority.readAttentionRequestRetirement.bind(authority)
+      : async () => null;
     this.state = defaultAttentionState();
     this.ready = false;
   }
@@ -241,6 +245,30 @@ export class AttentionInbox {
     });
   }
 
+  archiveRetired() {
+    return this.#mutate(async (state) => {
+      let candidate = state;
+      let archived = 0;
+      for (const item of state.items) {
+        if (item.status !== "pending") continue;
+        const retirement = await this.readRetirement({
+          requestKey: item.requestKey,
+          producer: cloneAttentionValue(item.producer),
+        });
+        if (retirement === null) continue;
+        const revision = candidate.revision + 1;
+        const retired = archiveAttentionItem(item, retirement, revision, this.#nextTimestamp(candidate));
+        candidate = {
+          ...candidate, revision,
+          items: candidate.items.map((entry) => entry.requestId === item.requestId ? retired : entry),
+        };
+        archived += 1;
+      }
+      if (archived > 0) this.#assertCapacity(candidate);
+      return { state: candidate, value: { archived }, write: archived > 0 };
+    });
+  }
+
   readOutbox(options = {}) {
     return this.#query(() => {
       const { afterSequence, limit } = normalizeCursor(options);
@@ -337,6 +365,9 @@ export class AttentionInbox {
         "内部请示不存在",
         404,
       );
+    }
+    if (item.status === "archived") {
+      throw inboxError("ATTENTION_REQUEST_STALE", "原任务已经结束，该请示已归档", 409);
     }
     if (item.contentDigest !== response.contentDigest) {
       throw inboxError(

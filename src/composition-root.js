@@ -2338,6 +2338,7 @@ export async function createApplication({
       });
       const attentionResultReconciler = attentionResultReconcilerFactory({
         attentionConsumer: attentionInboxRuntime.consumer,
+        attentionMaintenance: attentionInboxRuntime.maintenance ?? null,
         ledger: workLedgerRuntime,
       });
       const proposalResultReconciler = workProposalResultReconcilerFactory({

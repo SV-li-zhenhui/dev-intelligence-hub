@@ -10,6 +10,7 @@ import {
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
 import { postAttentionDuringFactRefresh } from "./attention-submission.js";
+import { internalAttentionDisplay } from "./internal-attention-display.js";
 import { summarizeDashboardErrors } from "./status-error-summary.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
@@ -4295,9 +4296,10 @@ function internalContextMarkup(context = []) {
 
 function showInternalAttention(entry, remaining) {
   const item = structuredClone(entry.item);
+  const display = internalAttentionDisplay(item);
   activeInternalAttention = item;
   activeExternalConfirmation = null;
-  const choices = (item.choices || [])
+  const choices = display.choices
     .map(
       (choice) => `
         <button type="button" data-internal-choice="${escapeHtml(choice.id)}">
@@ -4309,7 +4311,7 @@ function showInternalAttention(entry, remaining) {
   confirmationContent.innerHTML = `
     <article class="confirmation internal-attention">
       <p class="eyebrow">EMPLOYEE CONSULTATION / 还剩 ${remaining} 项（含当前项）</p>
-      <h2>${escapeHtml(item.question || "员工需要你做一个决定")}</h2>
+      <h2>${escapeHtml(display.question || "员工需要你做一个决定")}</h2>
       <p class="confirmation-reason">来自 ${escapeHtml(item.producer?.roleId || "orchestrator")} · 提交后写入本地台账，并唤醒原任务</p>
       ${internalContextMarkup(item.context)}
       ${choices ? `<div class="confirmation-actions internal-choice-actions">${choices}</div>` : ""}

@@ -2570,6 +2570,11 @@ function assertSafeOwnerAttention({ ledger, roleId, code, remediation }) {
   assert.match(intent.reason, new RegExp(code));
   assert.match(intent.question, remediation);
   assert.equal(intent.choices[0].id, "configured-retry");
+  if (code === "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED") {
+    assert.equal(intent.choices[0].label, "修复后重试");
+    assert.match(intent.question, /系统会话保存或恢复故障/);
+    assert.match(intent.question, /不会修复会话/);
+  }
   const publicCopy = JSON.stringify(intent);
   for (const secret of [
     "raw stderr",

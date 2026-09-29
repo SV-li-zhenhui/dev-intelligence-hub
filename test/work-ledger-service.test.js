@@ -11287,6 +11287,11 @@ for (const lifecycle of [
     );
     const waiting = (await fixture.service.listItems()).items[0];
     assert.equal(waiting.status, "waiting_user");
+    const authority = {
+      requestKey: waiting.activeIntentId,
+      producer: { roleId: "requirements-analyst", workItemId: waiting.itemId },
+    };
+    assert.equal(await fixture.service.readAttentionRequestRetirement(authority), null);
     assert.equal(
       await fixture.service.isAttentionRequestCurrent({
         requestKey: waiting.activeIntentId,
@@ -11336,6 +11341,15 @@ for (const lifecycle of [
     assert.equal(items[0].status, "cancelled");
     assert.equal(items[0].statusReason, lifecycle.reason);
     assert.equal(items[0].activeIntentId, null);
+    assert.deepEqual(await fixture.service.readAttentionRequestRetirement(authority), {
+      status: "cancelled", workItemRevision: items[0].revision, reason: lifecycle.reason,
+    });
+    assert.equal(await fixture.service.readAttentionRequestRetirement({
+      ...authority, requestKey: "unknown-question",
+    }), null);
+    assert.equal(await fixture.service.readAttentionRequestRetirement({
+      ...authority, producer: { ...authority.producer, roleId: "developer" },
+    }), null);
     assert.equal(
       await fixture.service.isAttentionRequestCurrent({
         requestKey: waiting.activeIntentId,

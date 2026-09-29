@@ -988,6 +988,21 @@ export class WorkLedgerService {
     );
   }
 
+  async readAttentionRequestRetirement(input = {}) {
+    // A temporarily non-current question is not proof that its task ended.
+    await this.isAttentionRequestCurrent(input);
+    const item = this.state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
+    const intent = this.state.outbox.find((candidate) => candidate.intentId === input.requestKey);
+    if (
+      !item || !["cancelled", "completed", "superseded"].includes(item.status) ||
+      item.activeIntentId !== null || intent?.itemId !== item.itemId ||
+      intent.intent.type !== "ask_user" || intent.requestedBy.roleId !== input.producer.roleId
+    ) return null;
+    return {
+      status: item.status, workItemRevision: item.revision, reason: item.statusReason,
+    };
+  }
+
   async getLastCommittedGraphSnapshot() {
     this.#assertReady();
     return this.#currentGraphSnapshot();

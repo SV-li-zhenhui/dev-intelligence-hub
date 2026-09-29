@@ -237,7 +237,8 @@ test("internal renderer cannot manufacture an external action control", async ()
   assert.match(internalRenderer, /data-internal-choice/);
   assert.match(internalRenderer, /data-internal-operation="reject"/);
   assert.match(internalRenderer, /data-internal-operation="later"/);
-  assert.match(internalRenderer, /escapeHtml\(item\.question/);
+  assert.match(internalRenderer, /escapeHtml\(display\.question/);
+  assert.match(internalRenderer, /internalAttentionDisplay\(item\)/);
   assert.doesNotMatch(internalRenderer, /data-external-operation/);
   assert.doesNotMatch(internalRenderer, /\/api\/confirmations\//);
 });

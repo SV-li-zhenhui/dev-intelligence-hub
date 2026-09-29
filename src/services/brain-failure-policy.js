@@ -5,8 +5,8 @@ const SHARED_OPERATOR_PAUSE_CODES = new Set([
   "REMOTE_DATA_NOT_AUTHORIZED",
 ]);
 
-function attention(code, summary, remediation) {
-  return Object.freeze({ code, summary, remediation });
+function attention(code, summary, remediation, retryLabel = "已配置，重试") {
+  return Object.freeze({ code, summary, remediation, retryLabel });
 }
 
 const OWNER_ATTENTION_BY_CODE = new Map([
@@ -15,7 +15,8 @@ const OWNER_ATTENTION_BY_CODE = new Map([
     attention(
       "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
       "岗位 CLI 会话进度未能安全归档",
-      "保留隔离目录中的会话历史，不要删除；确认 CLI 已结束后检查会话存储并恢复该任务的原会话",
+      "这是系统会话保存或恢复故障，请先由维护人员修复；保留隔离目录中的会话历史，不要删除。修复前可选择“稍后再看”，重试只会重新排队，不会修复会话",
+      "修复后重试",
     ),
   ],
   [

@@ -38,6 +38,8 @@ The current `立即巡查` request waits for the whole role cycle. A PR-role run
 
 Consultations and external actions stay in the one-at-a-time queue. Coalesce only duplicate requests for the same semantic action, target, source revision, and authority; preserve separate confirmations for distinct Review, code application, push, and merge actions.
 
+**Progress (2026-09-29):** Pending internal consultations now gain an explicit archive record after a historically bound producer task is cancelled, completed, or superseded. Startup and coordination maintenance retain the question and audit evidence without emitting an answer or retry. Browser deferral bindings now reach the inbox runtime. Session recovery failures show maintenance instructions and “retry after repair”; the underlying session recovery fault and shared fault presentation still need repair. This change does not compact retained audit history or coalesce distinct approvals.
+
 **Done when:** repeated refreshes and employee cycles show one pending request per unchanged action, while a changed Head or changed proposal requires a new decision and old requests become stale.
 
 ## P2 — Define DingTalk report quality and task intake

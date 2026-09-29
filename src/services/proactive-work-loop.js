@@ -521,11 +521,11 @@ function ownerBrainAttentionDecision(error, roleId) {
       type: "ask_user",
       summary,
       reason: `真实任务不得回退到例行大脑；系统已安全停止（${attention.code}）`,
-      question: `${attention.remediation}。完成后请选择“已配置，重试”；若不再继续该任务，请拒绝本次请示。`,
+      question: `${attention.remediation}。完成后请选择“${attention.retryLabel}”；驳回请示会将原任务转入阻塞。`,
       choices: [
         {
           id: "configured-retry",
-          label: "已配置，重试",
+          label: attention.retryLabel,
           description: "重新唤醒原任务，并再次核验任务大脑和授权。",
         },
       ],

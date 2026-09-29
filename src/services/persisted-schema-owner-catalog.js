@@ -177,8 +177,8 @@ const OWNER_BASELINES = Object.freeze([
     ownerId: "attention-inbox",
     key: "attention-inbox",
     mode: "validate",
-    currentVersion: 1,
-    supportedVersions: frozenVersions(1),
+    currentVersion: 2,
+    supportedVersions: frozenVersions(1, 2),
     optional: true,
   }),
   Object.freeze({
