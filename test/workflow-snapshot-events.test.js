@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeStoredWorkflowEvent } from "../src/domain/workflow-events.js";
 import {
   projectWorkflowSnapshot,
   workflowEventsFromSnapshots,
@@ -77,6 +78,24 @@ function snapshot(items, overrides = {}) {
 function eventTypes(events) {
   return events.map((event) => `${event.subject.id}:${event.eventType}`);
 }
+
+test("incoming review receipt facts survive snapshot routing and stored event validation", () => {
+  const receipt = {
+    incomingReviewFactsAvailable: true,
+    reviewRecipient: "local-owner",
+    reviewReceivedAt: "2026-08-02T01:30:00Z",
+    reviewReceivedFrom: "alice",
+    reviewReceivedVia: "assignee",
+    reviewRequestEventId: "AE_node_1",
+  };
+  const events = workflowEventsFromSnapshots(snapshot([pullRequest(1)]), snapshot([pullRequest(1, receipt)]));
+  assert.ok(events.length > 0);
+  for (const event of events) {
+    assert.deepEqual(normalizeStoredWorkflowEvent(event), event);
+    for (const [key, value] of Object.entries(receipt)) assert.equal(event.payload[key], value);
+  }
+  assert.throws(() => workflowEventsFromSnapshots(snapshot([]), snapshot([pullRequest(1, { ...receipt, incomingReviewFactsAvailable: "true" })])), /payload.incomingReviewFactsAvailable/);
+});
 
 test("snapshot projection is a deterministic safe replay checkpoint", () => {
   const input = snapshot(

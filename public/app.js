@@ -931,13 +931,13 @@ function reviewFlowMarkup() {
     ["1", "分配", "主控或你把 PR 交给 PR 工程师"],
     ["2", "审查", "PR 工程师读取当前 Head、改动和检查结果"],
     ["3", "形成建议", "生成 Approve、Request changes 或 Comment"],
-    ["4", "你确认发布", "未确认前不会写入 GitHub"],
+    ["4", "发布 Review", "开启自动 Review 后，近期收到的 PR 自动发布；其他 Review 逐项确认"],
     ["5", "交接推进", "按结论交给测试、开发或 PR 岗位；最终由合并负责人决定"],
   ];
   return `<section class="section review-flow-section" aria-labelledby="review-flow-title">
     <div class="section-heading">
       <h2 id="review-flow-title">PR Review 工作方式</h2>
-      <span>Approve 不会自动发布，也不会自动合并</span>
+      <span>自动 Review 和后续分配可在配置中心关闭；记录在下方查看</span>
     </div>
     <ol class="review-flow">${steps.map(([number, title, detail]) => `<li><span>${number}</span><div><strong>${title}</strong><small>${detail}</small></div></li>`).join("")}</ol>
   </section>`;
