@@ -55,6 +55,7 @@ const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
   "confirmationProducer",
+  "automaticReviewPublisher",
   "inputAuthorityVerifier",
   "pullRequestContextReader",
   "actorAccountId",
@@ -306,6 +307,7 @@ export class GitHubReviewProposalHandler {
   #actorAccountId;
   #clock;
   #pollIntervalMs;
+  #automaticReviewPublisher;
 
   constructor({
     confirmationProducer,
@@ -314,6 +316,7 @@ export class GitHubReviewProposalHandler {
     actorAccountId,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
+    automaticReviewPublisher = null,
   } = {}) {
     const producer = requirePort(
       confirmationProducer,
@@ -343,6 +346,7 @@ export class GitHubReviewProposalHandler {
       "pollIntervalMs",
       MAX_POLL_INTERVAL_MS,
     );
+    this.#automaticReviewPublisher = automaticReviewPublisher;
   }
 
   async handle(value) {
@@ -468,6 +472,10 @@ export class GitHubReviewProposalHandler {
     }
     if (item === null) {
       item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
+    }
+    if (this.#automaticReviewPublisher !== null && !selfAuthored && item.status === "pending") {
+      const published = await this.#automaticReviewPublisher.publish(item);
+      if (published !== item) item = normalizeConfirmationItem(published, expected);
     }
     return transitionFor(item, this.#clock, this.#pollIntervalMs);
   }
@@ -627,6 +635,7 @@ export function createGitHubReviewProposalRunnerService(value = {}) {
     actorAccountId: options.actorAccountId,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,
+    automaticReviewPublisher: options.automaticReviewPublisher,
   });
   return new WorkProposalRunnerService({
     runner: options.runner,

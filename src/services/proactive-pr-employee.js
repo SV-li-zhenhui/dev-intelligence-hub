@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
+import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { createPrReviewConfirmationPlan } from "../domain/pr-review-confirmation.js";
 import { EmployeeController } from "./employee-controller.js";
@@ -345,6 +346,12 @@ function projectWork(state) {
 
 export class ProactivePrEmployeeService {
   #admitAction;
+
+  #isCandidate(item) {
+    const policy = this.config.automaticReviewPolicy;
+    return isCandidate(item) && (policy == null || item.relation !== "review_requested" ||
+      (policy.enabled && automaticReviewEligibility(item, policy.account, this.clock()) === null));
+  }
 
   constructor({
     store,
@@ -790,7 +797,7 @@ export class ProactivePrEmployeeService {
     const snapshot = await this.store.read("snapshot", null);
     if (snapshot?.sourceStatus?.githubPullRequests?.ok !== true) return state;
     const currentBySubject = new Map(
-      snapshot.items.filter(isCandidate).map((item) => [item.id, item]),
+      snapshot.items.filter((item) => this.#isCandidate(item)).map((item) => [item.id, item]),
     );
     const ids = state.jobs
       .filter((job) => ACTIVE_JOB_STATES.has(job.status))
@@ -1004,7 +1011,7 @@ export class ProactivePrEmployeeService {
       !current ||
       current.headRefOid !== job.headRefOid ||
       !sameJobGitTarget(job, current) ||
-      !isCandidate(current)
+      !this.#isCandidate(current)
     ) {
       state.jobs[index] = {
         ...job,
@@ -1200,7 +1207,7 @@ export class ProactivePrEmployeeService {
       return state;
     }
 
-    const candidates = snapshot.items.filter(isCandidate);
+    const candidates = snapshot.items.filter((item) => this.#isCandidate(item));
     const currentBySubject = new Map(candidates.map((item) => [item.id, item]));
     let jobsChanged = false;
     const unresolvedSubjects = new Set(
@@ -1399,7 +1406,7 @@ export class ProactivePrEmployeeService {
           candidate.nextAction === claimed.nextAction &&
           candidate.relation === claimed.relation,
       );
-      if (!item || !isCandidate(item)) {
+      if (!item || !this.#isCandidate(item)) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
       const policy = effectiveWorkPolicy(item, this.config.triageOnly);
@@ -1437,7 +1444,7 @@ export class ProactivePrEmployeeService {
         !sameJobGitTarget(claimed, current) ||
         current.nextAction !== claimed.nextAction ||
         current.relation !== claimed.relation ||
-        !isCandidate(current)
+        !this.#isCandidate(current)
       ) {
         return this.#finishAsSuperseded(state, claimed.id);
       }

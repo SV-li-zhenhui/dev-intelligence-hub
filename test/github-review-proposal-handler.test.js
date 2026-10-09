@@ -10,8 +10,41 @@ import {
 } from "../src/services/github-review-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 import { ConfirmationQueue, ConfirmationExecutionError } from "../src/services/confirmation-queue.js";
+import { AutomaticReviewPublisher } from "../src/services/automatic-review-publisher.js";
 
 const HEAD_REF_OID = "b".repeat(40);
+
+test("automatic proposals publish once, persist history and recover their handoff without user confirmation", async () => {
+  const clock = () => new Date("2026-10-09T10:00:00.000Z");
+  const store = new MemoryStore();
+  let writes = 0;
+  const executor = {
+    async execute() { writes++; return { status: "applied", receipt: { id: "42", url: "https://github.com/acme/repo/pull/42#pullrequestreview-42", createdAt: clock().toISOString() } }; },
+    async reconcile() { return { status: "unknown", code: "GITHUB_UNAVAILABLE" }; },
+  };
+  const queue = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor });
+  await queue.recover();
+  const publisher = new AutomaticReviewPublisher({ enabled: true, queue, clock,
+    github: { async readIncomingReviewRequest() { return { kind: "pull_request", state: "open", isDraft: false, author: "developer", currentUser: "review-account", headRefOid: HEAD_REF_OID,
+      incomingReviewFactsAvailable: true, reviewRecipient: "review-account", reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedVia: "assignee", reviewReceivedFrom: "developer", reviewRequestEventId: "AE_42" }; } },
+  });
+  const handler = new GitHubReviewProposalHandler({ confirmationProducer: queue, inputAuthorityVerifier: acceptingVerifier(), actorAccountId: "review-account", clock, automaticReviewPublisher: publisher });
+  const first = await handler.handle(handlerInput());
+  assert.equal(first.status, "succeeded", JSON.stringify(await queue.list({})));
+  assert.equal((await handler.handle(handlerInput())).status, "succeeded");
+  assert.equal(writes, 1);
+  const history = await queue.list({ automatic: true });
+  assert.equal(history.items.length, 1);
+  assert.equal(history.items[0].automaticReview.event, "REQUEST_CHANGES");
+  assert.equal(history.items[0].automaticReview.headRefOid, HEAD_REF_OID);
+  assert.equal(history.items[0].automaticReview.publishedUrl, "https://github.com/acme/repo/pull/42#pullrequestreview-42");
+  const restarted = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor });
+  await restarted.recover();
+  const pending = await restarted.readReviewHandoffs();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].automaticReview.reviewEvent, "REQUEST_CHANGES");
+  assert.equal(writes, 1);
+});
 
 function inputBindingFor(number, { schemaVersion = 2 } = {}) {
   const binding = {

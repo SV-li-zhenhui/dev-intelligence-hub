@@ -20,6 +20,7 @@ import {
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { createReviewHandoff, normalizeReviewHandoff, reviewHandoffWorkRequest } from "../domain/review-handoff.js";
+import { isAutomaticReviewExecution } from "../domain/automatic-review-policy.js";
 
 export const CONFIRMATION_QUEUE_STATE_KEY = "confirmation-queue";
 const STATE_KEY = CONFIRMATION_QUEUE_STATE_KEY;
@@ -178,6 +179,16 @@ function requiresRecovery(item) {
     (item.status === "failed" && item.failure?.outcome === "unknown");
 }
 
+function blocksAutomaticReview(previous, item) {
+  if (previous.id === item.id || previous.action.type !== "pull_request_review" ||
+      previous.actor.accountId.toLowerCase() !== item.actor.accountId.toLowerCase() ||
+      previous.target.resourceId.toLowerCase() !== item.target.resourceId.toLowerCase() ||
+      previous.target.version !== item.target.version) return false;
+  return previous.failure?.outcome === "unknown" || previous.status === "executing" ||
+    (previous.status === "completed" && (isAutomaticReviewExecution(previous) ||
+      ["APPROVE", "REQUEST_CHANGES"].includes(previous.action.reviewEvent)));
+}
+
 function permitsGitHubCredentialRecoveryActivation(item, items) {
   const unresolved = items.filter(
     (candidate) => candidate.id !== item.id && requiresRecovery(candidate),
@@ -274,6 +285,7 @@ function historyFilterDigest(filters) {
     status: filters.status ?? null,
     kind: filters.kind ?? null,
     roleId: filters.roleId ?? null,
+    ...(filters.automatic === true ? { automatic: true } : {}),
   });
 }
 
@@ -326,10 +338,14 @@ function normalizeHistoryQuery(value) {
   );
   const fields = optionalDataFields(
     value,
-    ["status", "kind", "roleId", "limit", "cursor"],
+    ["status", "kind", "roleId", "limit", "cursor", "automatic"],
     error,
   );
   const filters = {};
+  if (fields.has("automatic")) {
+    if (fields.get("automatic") !== true) throw error;
+    filters.automatic = true;
+  }
   if (fields.has("status")) {
     const status = fields.get("status");
     if (!HISTORY_STATUS_SET.has(status)) throw error;
@@ -378,6 +394,10 @@ function projectHistoryItem(item) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     retryable: Boolean(item.failure?.retryable),
+    ...(isAutomaticReviewExecution(item) ? { automaticReview: {
+      event: item.action.reviewEvent, headRefOid: item.target.version,
+      resourceId: item.target.resourceId, publishedUrl: item.receipt?.url || null,
+    } } : {}),
     ...(item.reviewHandoff ? { reviewHandoff: clone(item.reviewHandoff) } : {}),
     ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
     ...(ownerDecision === null ? {} : { ownerDecision }),
@@ -887,7 +907,7 @@ export class ConfirmationQueue {
     this.#assertReady();
     return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
       await this.#reload();
-      const pending = this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && item.reviewHandoff.status !== "completed")
+      const pending = this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && ["pending", "retrying"].includes(item.reviewHandoff.status))
         .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts);
       const start = pending.findIndex((item) => item.id === afterId) + 1;
       return [...pending.slice(start), ...pending.slice(0, start)].slice(0, 25)
@@ -895,6 +915,7 @@ export class ConfirmationQueue {
           id: item.id,
           actorAccountId: item.actor.accountId,
           request: reviewHandoffWorkRequest(item),
+          ...(isAutomaticReviewExecution(item) ? { automaticReview: { reviewEvent: item.action.reviewEvent, headRefOid: item.target.version } } : {}),
         }));
     }));
   }
@@ -905,7 +926,7 @@ export class ConfirmationQueue {
       await this.#reload();
       const item = this.#requireItem(id);
       if (item.status !== "completed" || item.reviewHandoff?.requestId !== requestId) throw queueError("CONFIRMATION_HANDOFF_CONFLICT", "交接绑定已变化", 409);
-      if (item.reviewHandoff.status === "completed") return this.#projectItem(item);
+      if (["completed", "stale"].includes(item.reviewHandoff.status)) return this.#projectItem(item);
       const reviewHandoff = normalizeReviewHandoff({ ...item.reviewHandoff, ...outcome, attempts: item.reviewHandoff.attempts + 1 }, item);
       await this.#replaceItem(id, { ...item, reviewHandoff, itemRevision: item.itemRevision + 1, updatedAt: this.#now() });
       return this.#projectItem(this.#requireItem(id));
@@ -1106,6 +1127,10 @@ export class ConfirmationQueue {
   }
 
   async #execute(item, request) {
+    if (isAutomaticReviewExecution({ ...item, execution: { requestId: request.requestId } }) &&
+        this.state.items.some((other) => blocksAutomaticReview(other, item))) {
+      return this.#invalidate(item.id, { requestedBy: item.requestedBy, approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
+    }
     if (
       item.kind === CONFIGURATION_ACTIVATION_KIND &&
       this.state.items.some(
@@ -1384,6 +1409,7 @@ export class ConfirmationQueue {
         (item) =>
           (!filters.status || item.status === filters.status) &&
           (!filters.kind || item.kind === filters.kind) &&
+          (!filters.automatic || isAutomaticReviewExecution(item)) &&
           (!filters.roleId || item.requestedBy.roleId === filters.roleId),
       )
       .sort(byNewestCreation);

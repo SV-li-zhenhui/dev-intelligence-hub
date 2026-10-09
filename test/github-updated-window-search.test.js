@@ -97,7 +97,7 @@ test("finite PR search uses official updated sorting and filters locally before 
 
   assert.deepEqual(items.map(({ number }) => number), [3, 1]);
   assert.deepEqual(detailCalls.sort(), [records[0].url, records[2].url].sort());
-  assert.equal(searchCalls.length, 2);
+  assert.equal(searchCalls.length, 3);
   for (const args of searchCalls) {
     assert.equal(
       updatedArgument(args),
@@ -120,10 +120,10 @@ test("a saturated PR search splits inclusive ranges and deduplicates the overlap
   const run = async (_command, args) => {
     if (args[0] === "api") return { login: "runtime-user" };
     if (args[0] === "search") {
-      const relation = args.includes("--assignee=@me") ? "assigned" : "authored";
+      const relation = args.includes("--assignee=@me") ? "assigned" : args.includes("--author=@me") ? "authored" : "requested";
       const range = updatedArgument(args);
       searchCalls.push({ relation, range });
-      if (relation === "authored") return [];
+      if (relation !== "assigned") return [];
       if (range === rootRange) return rootRecords;
       return [overlap];
     }
@@ -375,7 +375,7 @@ test("aborting after a saturated segment prevents every child search", async () 
     }),
     /stop segmented search/u,
   );
-  assert.equal(searchCalls, 2);
+  assert.equal(searchCalls, 3);
 });
 
 test("an impossible calendar timestamp is rejected before details", async () => {

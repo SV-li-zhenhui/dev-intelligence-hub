@@ -2416,6 +2416,26 @@ function structuredBrainFailure(code) {
   );
 }
 
+test("automatic Review skips old incoming work and a disabled switch without consuming claims", async () => {
+  for (const enabled of [true, false]) {
+    const time = controlledClock();
+    const source = [1, 2].map((number) => {
+      const item = workItem(number, { type: "role", id: "pr-engineer" });
+      item.event.source = { provider: "github", scopeId: "github-dashboard" };
+      item.event.payload = { relation: "review_requested", state: "open", isDraft: false, author: "dev", headRefOid: "a".repeat(40),
+        incomingReviewFactsAvailable: true, reviewRecipient: "me", reviewReceivedFrom: "dev", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_1",
+        reviewReceivedAt: number === 1 ? "2026-07-01T00:00:00Z" : "2026-08-02T07:00:00Z" };
+      return item;
+    });
+    const ledger = new FakeLedger({ source, time });
+    const directory = new FakeRoleDirectory({ "pr-engineer": worker({ roleId: "pr-engineer" }) });
+    const loop = createLoop({ ledger, directory, time, automaticReviewPolicy: { enabled, account: "me" } });
+    const result = await loop.runCycle();
+    assert.equal(result.claimed, enabled ? 1 : 0);
+    assert.deepEqual(ledger.calls.claim.map((call) => call.itemId), enabled ? ["work-item-2"] : []);
+  }
+});
+
 test("root context contention defers one item and continues the cycle", async (t) => {
   for (const failurePoint of ["assemble", "execute"]) {
     await t.test(failurePoint, async () => {

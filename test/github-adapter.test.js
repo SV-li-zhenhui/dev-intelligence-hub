@@ -224,7 +224,7 @@ test("refresh-facing GitHub reads forward one shutdown signal to every command",
   await adapter.searchIssues(options);
   await adapter.versions(["acme/repo"], options);
 
-  assert.equal(calls.length, 7);
+  assert.equal(calls.length, 8);
   assert.ok(calls.every((call) => call.command === "gh"));
   assert.ok(calls.every((call) => call.options.signal === controller.signal));
 });
@@ -487,6 +487,7 @@ test("relevant PR search uses the active account, returns every result, and fetc
       return [own, assigned];
     }
     if (args[0] === "search" && args.includes("--author=@me")) return [own];
+    if (args[0] === "search" && args.includes("--review-requested=@me")) return [assigned];
     if (args[0] === "pr") {
       const suffix = args[2].endsWith("/7") ? "7" : "8";
       return {

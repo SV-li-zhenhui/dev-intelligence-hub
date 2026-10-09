@@ -811,6 +811,7 @@ function confirmationHistoryItemMarkup(item) {
       <span class="status-pill status-${escapeHtml(item.status)}">${escapeHtml(confirmationHistoryStatusLabel(item.status))}</span>
     </div>
     <p>${escapeHtml(item.summary || "")}</p>
+    ${item.automaticReview ? `<p><strong>自动 Review · ${escapeHtml({ APPROVE: "通过", REQUEST_CHANGES: "需修改", COMMENT: "评论" }[item.automaticReview.event] || "待核对")}</strong> · Head ${escapeHtml(item.automaticReview.headRefOid.slice(0, 8))} · <a href="${escapeHtml(item.automaticReview.url)}" target="_blank" rel="noreferrer">在 GitHub 查看</a></p>` : ""}
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
     ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
     ${item.ownerDecision?.type === "seal_unknown_and_forbid_replay" ? '<small class="confirmation-history-resolution">已承认结果未知并封存（禁止重放）</small>' : ""}
@@ -891,7 +892,7 @@ function confirmationCenterView() {
   return `<section class="section confirmation-center" aria-labelledby="confirmation-center-title">
     <div class="section-heading">
       <h2 id="confirmation-center-title">确认中心</h2>
-      <span>授权与咨询始终逐项处理</span>
+      <span>自动 Review 可在历史记录中追踪；其他授权与咨询逐项处理</span>
     </div>
     <div class="confirmation-center-grid">
       <section class="confirmation-center-panel" id="confirmation-pending-panel" aria-labelledby="confirmation-pending-title">
@@ -912,6 +913,7 @@ function confirmationCenterView() {
           <label for="confirmation-history-status">状态<select id="confirmation-history-status" name="status">${statusOptions}</select></label>
           <label for="confirmation-history-kind">类型<select id="confirmation-history-kind" name="kind">${kindOptions}</select></label>
           <label for="confirmation-history-role">岗位<select id="confirmation-history-role" name="roleId">${roleOptions}</select></label>
+          <label for="confirmation-history-automatic">记录<select id="confirmation-history-automatic" name="automatic"><option value="">全部记录</option><option value="true" ${confirmationHistoryFilters.automatic ? "selected" : ""}>自动 Review 记录</option></select></label>
           <button class="secondary-button" id="confirmation-history-apply" type="submit">应用筛选</button>
         </form>
         <p class="employee-error" id="confirmation-history-error" role="status" ${confirmationHistoryError ? "" : "hidden"}>${escapeHtml(confirmationHistoryError)}</p>
@@ -3039,6 +3041,7 @@ function normalizedConfirmationHistoryFilters(filters = {}) {
     status: allowedStatuses.has(status) ? status : "",
     kind: allowedKinds.has(kind) ? kind : "",
     roleId: validConfirmationHistoryRoleId(roleId) ? roleId : "",
+    ...(filters.automatic === true || filters.automatic === "true" ? { automatic: "true" } : {}),
   };
 }
 
@@ -3058,7 +3061,7 @@ function confirmationHistoryFiltersFromForm(form) {
 }
 
 function sameConfirmationHistoryFilters(left, right) {
-  return ["status", "kind", "roleId"].every(
+  return ["status", "kind", "roleId", "automatic"].every(
     (key) => left[key] === right[key],
   );
 }
@@ -3111,6 +3114,14 @@ function normalizedConfirmationHistoryItems(value) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       retryable: item.retryable === true,
+      ...(item.automaticReview && ["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.event) &&
+        /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.automaticReview.headRefOid || "") &&
+        /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(item.automaticReview.resourceId || "")
+        ? { automaticReview: { event: item.automaticReview.event, headRefOid: item.automaticReview.headRefOid,
+            url: (() => {
+              const prUrl = `https://github.com/${item.automaticReview.resourceId.replace("#", "/pull/")}`;
+              return typeof item.automaticReview.publishedUrl === "string" && item.automaticReview.publishedUrl.startsWith(`${prUrl}#pullrequestreview-`) && /^\d+$/.test(item.automaticReview.publishedUrl.slice(`${prUrl}#pullrequestreview-`.length)) ? item.automaticReview.publishedUrl : prUrl;
+            })() } } : {}),
       ...(reviewHandoff ? { reviewHandoff } : {}),
       ...(typeof item.diagnosticCode === "string" &&
           /^[A-Z][A-Z0-9_]{2,63}$/.test(item.diagnosticCode)
@@ -3142,6 +3153,8 @@ function updateConfirmationHistoryView({ syncFilters = false } = {}) {
   const role = form?.querySelector("#confirmation-history-role");
   if (syncFilters && status) status.value = confirmationHistoryFilters.status;
   if (syncFilters && kind) kind.value = confirmationHistoryFilters.kind;
+  const automatic = form?.querySelector("#confirmation-history-automatic");
+  if (syncFilters && automatic) automatic.value = confirmationHistoryFilters.automatic || "";
   if (role) {
     const options = confirmationHistoryRoleOptionsMarkup();
     if (role.innerHTML !== options) role.innerHTML = options;
@@ -4660,9 +4673,10 @@ function externalConfirmationOutcomeMessage(item, result, operation) {
 function reviewHandoffStatusText(item) {
   const handoff = item?.reviewHandoff;
   if (!handoff) return "";
-  const person = handoff.selection.responsiblePerson?.login;
+  const person = handoff.assignedLogin || handoff.selection.responsiblePerson?.login;
   const destination = `${handoff.selection.workType}${person ? ` · @${person}` : ""}`;
   if (handoff.status === "completed") return `下一步已分配：${destination}；工作项 ${handoff.workItemId}。`;
+  if (handoff.status === "stale") return `交接已停止：PR 状态、Head 或分配策略已变化（${handoff.diagnosticCode}），请核对最新 PR。`;
   if (item.status !== "completed") return `已保存交接选择：${destination}；只有 GitHub Review 明确完成后才会分配。`;
   if (handoff.status === "retrying") return `交接待重试：${destination}（${handoff.diagnosticCode}）。服务端会继续恢复，不会重新发布 Review。`;
   return `交接已持久保存：${destination}；服务端正在分配，关闭页面不影响推进。可在确认历史查看结果。`;

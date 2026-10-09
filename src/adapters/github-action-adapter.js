@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isAutomaticReviewExecution } from "../domain/automatic-review-policy.js";
 import { types as utilTypes } from "node:util";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
@@ -142,6 +143,7 @@ function normalizeAssigneeRequest(value) {
     "repository",
     "pullRequestNumber",
     "assigneeLogin",
+    ...(Object.hasOwn(value, "expectedHeadOid") ? ["expectedHeadOid"] : []),
   ]);
   const actorAccountId = exactString(value.actorAccountId, GITHUB_LOGIN, 39);
   const assigneeLogin = exactString(value.assigneeLogin, GITHUB_LOGIN, 39);
@@ -162,6 +164,7 @@ function normalizeAssigneeRequest(value) {
     repository,
     pullRequestNumber: value.pullRequestNumber,
     assigneeLogin,
+    ...(Object.hasOwn(value, "expectedHeadOid") ? { expectedHeadOid: exactString(value.expectedHeadOid, SHA, 64) } : {}),
   });
 }
 
@@ -438,6 +441,7 @@ class GitHubActionAdapter {
   #clock;
   #timeoutMs;
   #verifyInputAuthority;
+  #automaticReviewGuard;
   #activeOperations;
   #closed;
 
@@ -456,6 +460,7 @@ class GitHubActionAdapter {
     ghCommand,
     timeoutMs = 60_000,
     inputAuthorityVerifier,
+    automaticReviewGuard = null,
   } = {}) {
     if (!runner || typeof runner.run !== "function") {
       throw new TypeError("runner must provide run");
@@ -528,6 +533,7 @@ class GitHubActionAdapter {
     this.#verifyInputAuthority = inputAuthorityVerifier?.verify.bind(
       inputAuthorityVerifier,
     ) ?? null;
+    this.#automaticReviewGuard = automaticReviewGuard;
   }
 
   async reconcile(input) {
@@ -665,6 +671,8 @@ class GitHubActionAdapter {
     if (!(await this.#inputAuthorityCurrent(envelope, operation))) {
       return { status: "stale" };
     }
+    if (isAutomaticReviewExecution(envelope) &&
+        (!this.#automaticReviewGuard || await this.#awaitOperation(operation, () => this.#automaticReviewGuard.verify(envelope)) !== true)) return { status: "stale" };
     markPostStarted();
     return {
       status: "applied",
@@ -732,6 +740,7 @@ class GitHubActionAdapter {
           let observed = current;
           let changed = false;
           if (!this.#hasAssignee(observed, request.assigneeLogin)) {
+            await this.#assertHandoffHead(request, childEnvironment, credentialOperation);
             await this.#assertActor(
               request.actor.accountId,
               childEnvironment,
@@ -756,6 +765,7 @@ class GitHubActionAdapter {
               request.assigneeLogin.toLowerCase() &&
             this.#hasAssignee(observed, request.actor.accountId)
           ) {
+            await this.#assertHandoffHead(request, childEnvironment, credentialOperation);
             await this.#assertActor(
               request.actor.accountId,
               childEnvironment,
@@ -790,6 +800,32 @@ class GitHubActionAdapter {
     } finally {
       this.#finishOperation(operation);
     }
+  }
+
+  async #assertHandoffHead(request, childEnvironment, operation) {
+    if (!request.expectedHeadOid) return;
+    const pr = await this.#runJson(["api", "--method", "GET", `repos/${request.repository}/pulls/${request.pullRequestNumber}`], { childEnvironment, operation });
+    if (pr?.state !== "open" || pr?.head?.sha !== request.expectedHeadOid) throw actionError("GITHUB_HANDOFF_HEAD_CHANGED", "absent");
+  }
+
+  async assignReviewOutcome(input, { signal = null } = {}) {
+    exactObject(input, ["actorAccountId", "repository", "pullRequestNumber", "headRefOid", "reviewEvent", "testingOwnerLogin"]);
+    if (!["APPROVE", "REQUEST_CHANGES"].includes(input.reviewEvent)) throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    const request = normalizeAssigneeRequest({ actorAccountId: input.actorAccountId, repository: input.repository, pullRequestNumber: input.pullRequestNumber,
+      assigneeLogin: input.reviewEvent === "APPROVE" ? input.testingOwnerLogin : input.actorAccountId, expectedHeadOid: input.headRefOid });
+    const operation = this.#beginOperation(signal);
+    let author;
+    try {
+      author = await this.#withCredential(request, async (childEnvironment, credentialOperation) => {
+        await this.#assertActor(request.actor.accountId, childEnvironment, credentialOperation);
+        const pr = await this.#runJson(["api", "--method", "GET", `repos/${request.repository}/pulls/${request.pullRequestNumber}`], { childEnvironment, operation: credentialOperation });
+        if (pr?.number !== request.pullRequestNumber || pr?.html_url?.toLowerCase() !== `https://github.com/${request.repository}/pull/${request.pullRequestNumber}`.toLowerCase() || pr?.state !== "open" || pr?.head?.sha !== request.expectedHeadOid) throw actionError("GITHUB_HANDOFF_HEAD_CHANGED", "absent");
+        return exactString(pr.user?.login, GITHUB_LOGIN, 39);
+      }, operation);
+    } finally { this.#finishOperation(operation); }
+    if (author.toLowerCase() === input.actorAccountId.toLowerCase()) throw actionError("GITHUB_HANDOFF_SELF_AUTHORED", "absent");
+    return this.assignAssignee({ actorAccountId: input.actorAccountId, repository: input.repository, pullRequestNumber: input.pullRequestNumber,
+      assigneeLogin: input.reviewEvent === "REQUEST_CHANGES" ? author : input.testingOwnerLogin, expectedHeadOid: input.headRefOid }, { signal });
   }
 
   #assertAssignablePullRequest(value, request) {
@@ -1124,6 +1160,7 @@ export function createGitHubActionExecutor(options) {
     execute: (input) => adapter.execute(input),
     reconcile: (input) => adapter.reconcile(input),
     assignAssignee: (input, options) => adapter.assignAssignee(input, options),
+    assignReviewOutcome: (input, options) => adapter.assignReviewOutcome(input, options),
     close: () => adapter.close(),
   });
 }

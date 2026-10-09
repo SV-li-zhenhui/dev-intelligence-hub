@@ -417,6 +417,34 @@ test("a confirmed testing handoff adds its named GitHub assignee idempotently", 
   });
 });
 
+test("automatic failed Review assigns the author and refuses a changed Head", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center", pullRequestNumber: 42, headRefOid: HEAD, reviewEvent: "REQUEST_CHANGES", testingOwnerLogin: null };
+  const runner = new FakeRunner([
+    actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: HEAD }, user: { login: "developer" } },
+    actor(), pullRequestIssue(["local-owner"]),
+    { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["local-owner", "developer"]),
+    { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["developer"]),
+  ]);
+  const result = await createAdapter(runner).assignReviewOutcome(request);
+  assert.equal(result.assigneeLogin, "developer");
+  assert.deepEqual(JSON.parse(runner.calls.find((call) => call.args.includes("POST")).input), { assignees: ["developer"] });
+  const changed = new FakeRunner([actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: OTHER_HEAD }, user: { login: "developer" } }]);
+  await assert.rejects(createAdapter(changed).assignReviewOutcome(request), { code: "GITHUB_HANDOFF_HEAD_CHANGED" });
+  assert.equal(changed.calls.some((call) => call.args.includes("POST")), false);
+});
+
+test("automatic publication rechecks its scope immediately before POST", async () => {
+  const envelope = workProposalEnvelope();
+  envelope.execution.requestId = `auto-review-v1-${"a".repeat(48)}`;
+  const target = { number: 42, url: "https://github.com/acme/command-center/pull/42", state: "OPEN", baseRefName: "main", baseRefOid: BASE_HEAD, headRefName: "fix/conflict", headRefOid: HEAD, headRepository: { nameWithOwner: "contributor/command-center" } };
+  for (const guard of [null, { verify: async () => false }]) {
+    const runner = new FakeRunner([actor(), pages([]), target, actor(), target]);
+    const adapter = createAdapter(runner, { inputAuthorityVerifier: { verify: async (binding) => binding }, automaticReviewGuard: guard });
+    assert.equal((await adapter.execute(envelope)).status, "stale");
+    assert.equal(runner.calls.some((call) => call.args.includes("POST")), false);
+  }
+});
+
 test("work proposal reviews use the same sealed GitHub review protocol", async () => {
   const runner = new FakeRunner([actor("different-user")]);
   const result = await createAdapter(runner).reconcile(

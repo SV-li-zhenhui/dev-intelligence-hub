@@ -51,6 +51,8 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "networkEnv",
   "timeoutMs",
   "enabledActions",
+  "automaticReview",
+  "assignAfterAutomaticReview",
 ]);
 const GITHUB_EXTERNAL_ACTIONS = new Set(
   Object.keys(PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS),
@@ -455,6 +457,9 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       ghCommand: enabledConfig.ghCommand,
       credentialSource,
       networkEnv: enabledConfig.networkEnv,
+      ...(dataProperty(dependencies, "automaticReviewGuard") === undefined ? {} : {
+        automaticReviewGuard: assertPort(dataProperty(dependencies, "automaticReviewGuard"), ["verify"], "automaticReviewGuard"),
+      }),
       ...(inputAuthorityVerifier === null
         ? {}
         : { inputAuthorityVerifier }),
@@ -562,6 +567,11 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
                 ? githubExecutor.assignAssignee(input, options)
                 : actionAdmissionGate.run(() =>
                     githubExecutor.assignAssignee(input, options)),
+            ...(typeof githubExecutor.assignReviewOutcome === "function" ? {
+              assignReviewOutcome: (input, options) => actionAdmissionGate === null
+                ? githubExecutor.assignReviewOutcome(input, options)
+                : actionAdmissionGate.run(() => githubExecutor.assignReviewOutcome(input, options)),
+            } : {}),
           })
         : null,
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),

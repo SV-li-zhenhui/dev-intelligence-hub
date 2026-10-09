@@ -422,7 +422,7 @@ export function normalizeConfirmationReceipt(value) {
       parsed.username ||
       parsed.password ||
       parsed.search ||
-      parsed.hash ||
+      (parsed.hash && !(parsed.hostname === "github.com" && /^\/[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9]\d*$/.test(parsed.pathname) && /^#pullrequestreview-[1-9]\d*$/.test(parsed.hash))) ||
       parsed.href !== url
     ) {
       throw invalidRequest("receipt.url 无效");

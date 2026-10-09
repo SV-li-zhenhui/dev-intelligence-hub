@@ -43,6 +43,12 @@ const COMMON_FACT_FIELDS = Object.freeze([
   "myReviewCommitOid",
   "reviewFactsAvailable",
   "inactiveDays",
+  "incomingReviewFactsAvailable",
+  "reviewRecipient",
+  "reviewReceivedAt",
+  "reviewReceivedFrom",
+  "reviewReceivedVia",
+  "reviewRequestEventId",
 ]);
 const ISSUE_FACT_FIELDS = Object.freeze([
   "commentsCount",

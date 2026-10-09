@@ -1061,7 +1061,7 @@ function memoryQueryOptions(url) {
 }
 
 function confirmationHistoryQueryOptions(url) {
-  const allowed = new Set(["status", "kind", "roleId", "limit", "cursor"]);
+  const allowed = new Set(["status", "kind", "roleId", "limit", "cursor", "automatic"]);
   const keys = [...url.searchParams.keys()];
   if (
     keys.some(
@@ -1073,6 +1073,10 @@ function confirmationHistoryQueryOptions(url) {
   }
 
   const options = {};
+  if (url.searchParams.has("automatic")) {
+    if (url.searchParams.get("automatic") !== "true") throw httpError(400, "自动 Review 筛选无效");
+    options.automatic = true;
+  }
   if (url.searchParams.has("status")) {
     const status = url.searchParams.get("status");
     if (!confirmationHistoryStatuses.has(status)) {
@@ -1120,6 +1124,7 @@ function confirmationHistoryQueryOptions(url) {
 
 function confirmationHistoryFilters(options) {
   return {
+    ...(options.automatic ? { automatic: true } : {}),
     ...(options.status ? { status: options.status } : {}),
     ...(options.kind ? { kind: options.kind } : {}),
     ...(options.roleId ? { roleId: options.roleId } : {}),

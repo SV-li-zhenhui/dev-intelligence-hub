@@ -5,6 +5,7 @@ import {
 } from "./adapters/codex-login-credential-broker.js";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
+import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
@@ -1085,6 +1086,7 @@ export async function createApplication({
     const roleConfig = config.employees?.prReviewer || { enabled: false };
     const github = new GitHubAdapter({
       maxPatchCharacters: roleConfig.maxPatchCharacters,
+      readIncomingReviews: Object.hasOwn(config.githubActions || {}, "automaticReview"),
       ...(workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
         : {}),
@@ -1857,6 +1859,11 @@ export async function createApplication({
           ...(githubCredentialSource === null
             ? {}
             : { credentialSource: githubCredentialSource }),
+          automaticReviewGuard: new AutomaticReviewPublisher({
+            enabled: config.githubActions?.automaticReview === true,
+            github,
+            ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+          }),
         }),
       );
       pullRequestExternalActionExecutorOwned = confirmationRuntime !== null;
@@ -1970,6 +1977,14 @@ export async function createApplication({
           runner:
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
+          automaticReviewPublisher: new AutomaticReviewPublisher({
+            enabled: config.githubActions.automaticReview === true,
+            assignAfterReview: config.githubActions.assignAfterAutomaticReview !== false,
+            queue: confirmationRuntime.queue,
+            github,
+            testingOwnersByProduct: coordinationConfig.policy?.testingOwnersByProduct || {},
+            ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+          }),
           inputAuthorityVerifier,
           pullRequestContextReader: Object.freeze({
             readCurrent: (binding) =>
@@ -2070,7 +2085,10 @@ export async function createApplication({
       store,
       // The legacy PR employee is the low-risk Ollama patrol/triage role.
       // Evidence-bound code Review belongs exclusively to pr-engineer.
-      config: { ...roleConfig, triageOnly: true },
+      config: { ...roleConfig, triageOnly: true,
+        automaticReviewPolicy: Object.hasOwn(config.githubActions || {}, "automaticReview")
+          ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId } : null,
+      },
       operationQueue,
       triageHandoff: createPrTriageHandoff(() => ownerWorkRequests),
       producerQueue: confirmationRuntime
@@ -2380,6 +2398,9 @@ export async function createApplication({
         issueActiveWindowDays:
           config.githubRead?.issueActiveWindowDays ??
             DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+        automaticReviewPolicy: Object.hasOwn(config.githubActions || {}, "automaticReview")
+          ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId }
+          : null,
       });
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,
@@ -2665,6 +2686,8 @@ export async function createApplication({
             confirmations: confirmationRuntime.reviewHandoffs,
             ownerWorkRequests,
             githubAssignee: confirmationRuntime.reviewHandoffAssignee,
+            testingOwnersByProduct: config.workCoordination?.policy?.testingOwnersByProduct || {},
+            automaticAssignmentsEnabled: config.githubActions?.automaticReview === true && config.githubActions?.assignAfterAutomaticReview !== false,
           })
         : null,
       deliveryEvidence,

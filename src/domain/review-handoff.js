@@ -33,10 +33,11 @@ export function reviewHandoffRequestId(item) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 export function normalizeReviewHandoff(value, item = null) {
-  exact(value, ["selection", "requestId", "acceptedRequestId", "status", "attempts", "diagnosticCode", "workItemId", "roleId"]);
+  exact(value, ["selection", "requestId", "acceptedRequestId", "status", "attempts", "diagnosticCode", "workItemId", "roleId", ...(Object.hasOwn(value, "assignedLogin") ? ["assignedLogin"] : [])]);
+  if (Object.hasOwn(value, "assignedLogin") && (value.status !== "completed" || !LOGIN.test(value.assignedLogin))) throw invalid();
   const selection = normalizeReviewHandoffSelection(value.selection);
   if (!UUID.test(value.requestId) || typeof value.acceptedRequestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{6,127}$/.test(value.acceptedRequestId) ||
-      !["pending", "retrying", "completed"].includes(value.status) || !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
+      !["pending", "retrying", "completed", "stale"].includes(value.status) || !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
       (value.diagnosticCode !== null && (typeof value.diagnosticCode !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/.test(value.diagnosticCode))) ||
       [value.workItemId, value.roleId].some((entry) => entry !== null && (typeof entry !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(entry)))) throw invalid();
   if (value.status === "completed" ? !value.workItemId || !value.roleId || value.diagnosticCode !== null : value.workItemId !== null || value.roleId !== null) throw invalid();

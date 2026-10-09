@@ -19,6 +19,8 @@
   },
   "githubActions": {
     "enabled": false,
+    "automaticReview": true,
+    "assignAfterAutomaticReview": true,
     "credentialMode": "gh-login",
     "enabledActions": []
   },

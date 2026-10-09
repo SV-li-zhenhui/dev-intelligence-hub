@@ -24,6 +24,8 @@ export class ReviewHandoffReconciler {
     confirmations,
     ownerWorkRequests,
     githubAssignee = null,
+    testingOwnersByProduct = null,
+    automaticAssignmentsEnabled = true,
     timeoutMs = 10_000,
     cycleTimeoutMs = 15_000,
   }) {
@@ -39,6 +41,8 @@ export class ReviewHandoffReconciler {
       throw new TypeError("githubAssignee must provide assignAssignee");
     }
     this.githubAssignee = githubAssignee;
+    this.testingOwners = testingOwnersByProduct;
+    this.automaticAssignmentsEnabled = automaticAssignmentsEnabled;
     this.operations = new OperationQueue();
     this.timeoutMs = timeoutMs;
     this.cycleTimeoutMs = cycleTimeoutMs;
@@ -86,12 +90,26 @@ export class ReviewHandoffReconciler {
 
   async #dispatch(item, signal) {
     let outcome;
+    let assignedLogin;
     try {
+      if (item.automaticReview && !this.automaticAssignmentsEnabled) throw failure("REVIEW_HANDOFF_AUTOMATION_DISABLED");
+      if (item.automaticReview?.reviewEvent === "APPROVE" && this.testingOwners !== null) {
+        const person = item.request.responsiblePerson;
+        if (!person || !this.testingOwners[person.product]?.some((login) => login.toLowerCase() === person.login.toLowerCase())) throw failure("REVIEW_HANDOFF_OWNER_REMOVED");
+      }
       const result = await this.ownerWorkRequests.submit(item.request, { signal });
       if (result?.phase !== "intaken" || !result.workItemId || !result.assignment?.target?.id) {
         throw failure("REVIEW_HANDOFF_NOT_INTAKEN");
       }
-      if (
+      if (item.automaticReview && ["APPROVE", "REQUEST_CHANGES"].includes(item.automaticReview.reviewEvent)) {
+        if (typeof this.githubAssignee?.assignReviewOutcome !== "function") throw failure("REVIEW_HANDOFF_ASSIGNMENT_UNAVAILABLE");
+        const assignment = await this.githubAssignee.assignReviewOutcome({
+          actorAccountId: item.actorAccountId, repository: item.request.pullRequest.repository,
+          pullRequestNumber: item.request.pullRequest.number, ...item.automaticReview,
+          testingOwnerLogin: item.request.responsiblePerson?.login || null,
+        }, { signal });
+        assignedLogin = assignment.assigneeLogin;
+      } else if (
         this.githubAssignee !== null &&
         item.request.workType === "testing" &&
         item.request.responsiblePerson
@@ -103,10 +121,10 @@ export class ReviewHandoffReconciler {
           assigneeLogin: item.request.responsiblePerson.login,
         }, { signal });
       }
-      outcome = { status: "completed", diagnosticCode: null, workItemId: result.workItemId, roleId: result.assignment.target.id };
+      outcome = { status: "completed", diagnosticCode: null, workItemId: result.workItemId, roleId: result.assignment.target.id, ...(assignedLogin ? { assignedLogin } : {}) };
     } catch (error) {
       if (signal.aborted) throw error;
-      outcome = { status: "retrying", diagnosticCode: diagnostic(error, "REVIEW_HANDOFF_SUBMIT_FAILED"), workItemId: null, roleId: null };
+      outcome = { status: ["GITHUB_HANDOFF_HEAD_CHANGED", "GITHUB_HANDOFF_SELF_AUTHORED", "REVIEW_HANDOFF_OWNER_REMOVED", "REVIEW_HANDOFF_AUTOMATION_DISABLED"].includes(error?.code) ? "stale" : "retrying", diagnosticCode: diagnostic(error, "REVIEW_HANDOFF_SUBMIT_FAILED"), workItemId: null, roleId: null };
     }
     // Keep the accepted request ID even if the acknowledgement cannot be saved.
     try {

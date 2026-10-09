@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
@@ -349,7 +350,7 @@ function prioritizeWorkItems(items, candidateFacts = null) {
       return {
         item,
         index,
-        priority: ownerRequestPriority(item),
+        priority: Math.max(ownerRequestPriority(item), currentWorkItemEvent(item)?.payload?.reviewReceivedAt ? 2 : 0),
         issuePriority: issuePriority(item),
         issueUpdatedAt: issueUpdatedAt(issueEvent) ?? 0,
         isIssue: issueEvent !== null,
@@ -646,7 +647,9 @@ export class ProactiveWorkLoop {
     orchestratorService,
     memoryQueryService,
     issueActiveWindowDays = 14,
+    automaticReviewPolicy = null,
   } = {}) {
+    this.automaticReviewPolicy = automaticReviewPolicy;
     this.ledger = requirePort(
       ledger,
       [
@@ -845,6 +848,11 @@ export class ProactiveWorkLoop {
         continue;
       }
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
+        const event = currentWorkItemEvent(item);
+        if (event.source?.provider === "github" && event.payload?.relation === "review_requested" &&
+            (!this.automaticReviewPolicy.enabled || automaticReviewEligibility({ ...event.payload, kind: "pull_request" }, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock)) !== null)) continue;
+      }
       if (
         !issueIsEligible(
           item,

@@ -1,6 +1,7 @@
 import { types as utilTypes } from "node:util";
 
 import { runCommand, runJson } from "../lib/command-runner.js";
+import { INCOMING_REVIEW_QUERY, projectIncomingReview } from "./github-incoming-review.js";
 import {
   normalizePullRequestGitTarget,
   samePullRequestGitTarget,
@@ -545,7 +546,7 @@ function discoveryOptions(options) {
   };
 }
 
-export function combinePullRequestRecords(assigned, authored, currentUser) {
+export function combinePullRequestRecords(assigned, authored, currentUser, requested = []) {
   const records = new Map();
   const addRecords = (items, source) => {
     for (const item of items) {
@@ -563,6 +564,7 @@ export function combinePullRequestRecords(assigned, authored, currentUser) {
 
   addRecords(assigned, "assignee");
   addRecords(authored, "author");
+  addRecords(requested, "reviewer");
 
   return [...records.values()]
     .map((record) => {
@@ -574,7 +576,7 @@ export function combinePullRequestRecords(assigned, authored, currentUser) {
       return {
         ...record,
         relation,
-        assignmentSource: relation === "authored" ? "author" : "assignee",
+        assignmentSource: relation === "authored" ? "author" : record.relationSources.includes("assignee") ? "assignee" : "reviewer",
       };
     })
     .sort(
@@ -741,6 +743,7 @@ export class GitHubAdapter {
     maxReadChecks,
     maxReadBodyBytes,
     maxReadFactBytes,
+    readIncomingReviews = false,
     clock = () => new Date(),
   } = {}) {
     const commandEnvironment = Object.freeze({ ...env, GH_HOST: GITHUB_HOST });
@@ -750,6 +753,7 @@ export class GitHubAdapter {
       Number.isFinite(maxPatchCharacters) && maxPatchCharacters > 0
         ? maxPatchCharacters
         : 24_000;
+    this.readIncomingReviews = readIncomingReviews;
     if (typeof clock !== "function") {
       throw new TypeError("GitHubAdapter clock is invalid");
     }
@@ -815,6 +819,7 @@ export class GitHubAdapter {
     const filter = {
       assigned: "--assignee=@me",
       authored: "--author=@me",
+      requested: "--review-requested=@me",
     }[relation];
     return [
       "search",
@@ -931,6 +936,19 @@ export class GitHubAdapter {
       repository: repo,
       account: currentUser,
     });
+    let incoming = {};
+    if (this.readIncomingReviews && author.toLowerCase() !== currentUser.toLowerCase()) {
+      try {
+        // The enclosing discovery verifies the account before and after the
+        // whole batch. Each PR needs only one additional facts read here.
+        incoming = await this.#readIncomingReviewRequest({ repository: repo, number: record.number, account: currentUser }, options);
+        if (incoming.headRefOid !== detail.headRefOid) throw new Error("GitHub incoming Review head changed");
+        incoming = projectIncomingReview(incoming.raw, currentUser);
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        incoming = { incomingReviewFactsAvailable: false };
+      }
+    }
     return {
       id: `github:pr:${repo}#${record.number}`,
       kind: "pull_request",
@@ -968,6 +986,7 @@ export class GitHubAdapter {
         ? { ...gitFacts, gitTarget: gitTargetFromFacts(gitFacts) }
         : {}),
       reviewFactsAvailable: true,
+      ...incoming,
       ...summarizeReviewFacts(detail.reviews, currentUser),
     };
   }
@@ -975,7 +994,7 @@ export class GitHubAdapter {
   async searchRelevantPullRequests(options = {}) {
     const { commandOptions, effectiveUpdatedWindow } = discoveryOptions(options);
     const currentUser = await this.currentUser(commandOptions);
-    const [assigned, authored] = await Promise.all([
+    const [assigned, authored, requested] = await Promise.all([
       this.#searchPullRequestRecords(
         "assigned",
         effectiveUpdatedWindow,
@@ -986,14 +1005,16 @@ export class GitHubAdapter {
         effectiveUpdatedWindow,
         commandOptions,
       ),
+      this.#searchPullRequestRecords("requested", effectiveUpdatedWindow, commandOptions),
     ]);
     if (effectiveUpdatedWindow && effectiveUpdatedWindow.mode !== "unlimited") {
-      mergeSearchRecords([assigned, authored]);
+      mergeSearchRecords([assigned, authored, requested]);
     }
     const records = combinePullRequestRecords(
       assigned,
       authored,
       currentUser,
+      requested,
     );
     const items = await mapWithConcurrency(records, 4, (record) =>
       this.#enrichPullRequest(record, currentUser, commandOptions),
@@ -1003,6 +1024,29 @@ export class GitHubAdapter {
       throw new Error("GitHub account changed during PR refresh");
     }
     return items;
+  }
+
+  async readIncomingReviewRequest({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1) throw new TypeError("Invalid incoming Review target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await this.#readIncomingReviewRequest({ repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async #readIncomingReviewRequest({ repository, number, account }, options) {
+    const [owner, name] = repository.split("/");
+    const result = await this.run("gh", ["api", "graphql", "-f", `query=${INCOMING_REVIEW_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`], options);
+    const pr = result?.data?.repository?.pullRequest;
+    if (result?.errors?.length || pr?.number !== number || pr?.url?.toLowerCase() !== `https://github.com/${repository}/pull/${number}`.toLowerCase()) throw new Error("GitHub incoming Review target changed");
+    return {
+      ...projectIncomingReview(pr, account), kind: "pull_request", state: pr.state.toLowerCase(),
+      author: pr.author?.login || "", currentUser: account, headRefOid: pr.headRefOid,
+      isDraft: pr.isDraft, title: pr.title, repo: repository, labels: pr.labels?.nodes?.map((label) => label.name) || [],
+      ciStatus: pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state || "NONE",
+      gitTarget: { baseRefName: pr.baseRefName, headRefName: pr.headRefName },
+      ...summarizeReviewFacts(pr.reviews?.nodes || [], account), raw: pr,
+    };
   }
 
   async searchPullRequests(relation, currentUser, options = {}) {

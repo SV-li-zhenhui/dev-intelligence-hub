@@ -4,6 +4,20 @@ import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconcil
 
 const items = ["first", "second"].map((id) => ({ id, request: { requestId: id } }));
 const delivered = { phase: "intaken", workItemId: "work-42", assignment: { target: { id: "tester" } } };
+
+test("automatic verdicts route assignment and changed Heads stop further handoff retries", async () => {
+  const outcomes = [];
+  const calls = [];
+  const reconciler = new ReviewHandoffReconciler({
+    confirmations: { readReviewHandoffs: async () => [{ id: "auto-1", actorAccountId: "me", request: { requestId: "request-1", workType: "pull_request", pullRequest: { repository: "acme/repo", number: 1 } }, automaticReview: { reviewEvent: "REQUEST_CHANGES", headRefOid: "a".repeat(40) } }],
+      recordReviewHandoff: async (_id, _request, outcome) => outcomes.push(outcome) },
+    ownerWorkRequests: { submit: async () => delivered },
+    githubAssignee: { assignAssignee() { throw new Error("legacy assignment must not run"); }, async assignReviewOutcome(input) { calls.push(input); throw Object.assign(new Error("changed"), { code: "GITHUB_HANDOFF_HEAD_CHANGED" }); } },
+  });
+  await reconciler.runCycle();
+  assert.equal(calls[0].reviewEvent, "REQUEST_CHANGES");
+  assert.equal(outcomes[0].status, "stale");
+});
 function fixture(submit, recordReviewHandoff = async () => {}) {
   return new ReviewHandoffReconciler({
     confirmations: { readReviewHandoffs: async () => items, recordReviewHandoff },

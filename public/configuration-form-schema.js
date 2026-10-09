@@ -135,6 +135,8 @@ const LABELS = deepFreeze({
   gitCommand: "固定 Git 命令",
   gitTimeoutMs: "Git 超时（毫秒）",
   githubActions: "GitHub 动作",
+  automaticReview: "自动 Review（最近 24 小时交给我的 PR，自动发布）",
+  assignAfterAutomaticReview: "自动分配 Review 后续（通过交测试，不通过交作者）",
   enabledActions: "启用的 PR 外部动作",
   actorAccountId: "GitHub 操作账号",
   credentialMode: "GitHub 凭据来源",
@@ -346,6 +348,8 @@ const FIELD_RULES = deepFreeze([
     },
   },
   { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
+  { pattern: ["githubActions", "automaticReview"], control: "checkbox", kind: "boolean" },
+  { pattern: ["githubActions", "assignAfterAutomaticReview"], control: "checkbox", kind: "boolean" },
   { pattern: ["codeExecutor", "workspaces", "#", "gitHeadSnapshot"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "initialPaused"], control: "checkbox", kind: "boolean" },
   { pattern: ["employees", "prReviewer", "allowRemoteCodeContext"], control: "checkbox", kind: "boolean" },
@@ -550,6 +554,8 @@ const COLLECTIONS = deepFreeze([
 ]);
 
 const SLOTS = deepFreeze([
+  { pattern: ["githubActions", "automaticReview"], label: "自动 Review", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
+  { pattern: ["githubActions", "assignAfterAutomaticReview"], label: "Review 后自动分配", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
   {
     pattern: ["githubRead", "pullRequestUpdatedWindow"],
     label: "自动发现 PR 更新时间",
@@ -628,6 +634,7 @@ const SLOTS = deepFreeze([
 const TEMPLATES = deepFreeze({
   "pr-updated-window-rolling": { mode: "rolling", days: 7 },
   "issue-active-window-days": 14,
+  "automatic-review-enabled": true,
   repository: "owner/repository",
   provider: {
     kind: "openai-compatible",

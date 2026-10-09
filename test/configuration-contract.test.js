@@ -28,6 +28,8 @@ function document() {
 function legacyGithubCredentialDocument() {
   const value = document();
   delete value.githubActions.credentialMode;
+  delete value.githubActions.automaticReview;
+  delete value.githubActions.assignAfterAutomaticReview;
   return value;
 }
 
