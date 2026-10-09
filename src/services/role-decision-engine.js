@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   parseStructuredWorkDecision,
   WORK_DECISION_JSON_SCHEMA,
@@ -24,6 +25,10 @@ const INTENT_TYPES = Object.freeze([
 ]);
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
 const MAXIMUM_CONTEXT_BYTES = 128 * 1024;
+const QUICK_PR_REVIEW_SKILL = readFileSync(
+  new URL("../skills/quick-pr-review/SKILL.md", import.meta.url),
+  "utf8",
+);
 const DIRECT_ACTION_ADMISSION = Object.freeze({
   run: (operation) => operation(),
 });
@@ -340,6 +345,12 @@ function systemPrompt(definition, permissions) {
     "Never pause the current root merely to wait for normal child work or submitted deliveries; leave ordinary child progress to the scheduler so the root remains eligible for acceptance. Use pause only for an intentional suspension that must require a later explicit resume.",
     "For read-only analysis, consultation, or prose-only specialist work, decompose with a text-report deliverable; text-report is accepted from the specialist's trusted work-input binding and needs no external evidence. Never use test-report, review-report, github-review, or change-package for prose-only work: those kinds require matching authoritative evidence from their controlled producer. If an existing prose-only child was incorrectly contracted with an authoritative kind and has no matching authoritative evidence, first return any submitted delivery so its waiting result is settled; in a later orchestration cycle cancel the now-settled child, then create a corrected text-report child. Never accept or repeatedly return the impossible delivery.",
     "For authoritative proposal delivery, propose_code_action modify produces change-package, verify produces test-report, inspect produces no authoritative evidence, and propose_github_review produces review-report or github-review. propose_github_pull_request_action requests exactly one separately confirmed GitHub PR action; push may reference only a controlledCommitEvidenceId already supplied by trusted task context. propose_configuration_change may replace only existing non-credential scalar configuration fields, may not disable workCoordination, and always requires separate owner activation confirmation. Include deliverableId whenever the current task has multiple compatible expected deliverables; omit it only for legacy/direct work or when exactly one compatible deliverable can be selected automatically.",
+    ...(permissions.allowedIntents.includes("propose_github_review")
+      ? [
+          "Apply the bundled quick-pr-review skill below when proposing a GitHub Review:\n",
+          QUICK_PR_REVIEW_SKILL,
+        ]
+      : []),
     `Role definition: ${JSON.stringify(definition)}.`,
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,
     `WorkDecision schema: ${JSON.stringify(WORK_DECISION_JSON_SCHEMA)}.`,

@@ -734,6 +734,7 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "src/lib/config.js",
     "src/lib/windows-codex-credential-helper.ps1",
     "src/server.js",
+    "src/skills/quick-pr-review/SKILL.md",
   ]) {
     assert.equal(included.has(required), true, `missing ${required}`);
   }

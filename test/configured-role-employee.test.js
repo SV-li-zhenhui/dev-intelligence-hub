@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
@@ -305,6 +306,66 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
     calls[0].sessionKey,
     "github:pull_request:example/software#24256",
   );
+});
+
+test("Review decisions load the bundled skill and preserve Markdown through validation", async () => {
+  const body = "## 结论\n\n**暂无法判断**：代码差异读取范围不完整。\n\n## 下一步\n\n- 继续检查尚未覆盖的年龄来源逻辑。";
+  const decision = completeDecision({
+    intent: {
+      schemaVersion: 1,
+      type: "propose_github_review",
+      verdict: "comment",
+      summary: "需继续检查年龄来源",
+      reason: "系统读取范围有限",
+      body,
+      evidence: ["reviewMaterial.patchTruncated=true"],
+    },
+  });
+  let request;
+  const router = {
+    async generate(value) {
+      request = value;
+      return JSON.stringify(decision);
+    },
+    describe() {
+      return { ...brain(), remote: false };
+    },
+  };
+  const engine = new RoleDecisionEngine({
+    definition: definition("pr-engineer"),
+    permissions: permissions("propose_github_review"),
+    brain: brain(),
+    brainRouter: router,
+  });
+  const result = await engine.decide({
+    item: {},
+    context: { requirements: { title: "年龄来源" } },
+  });
+  assert.equal(result.intent.body, body);
+  const prompt = request.messages[0].content;
+  const skill = await readFile(
+    new URL("../src/skills/quick-pr-review/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    prompt.includes(skill), true,
+    "provider receives the complete packaged skill",
+  );
+
+  const otherRole = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      ...router,
+      async generate(value) {
+        request = value;
+        return JSON.stringify(completeDecision());
+      },
+    },
+  });
+  await otherRole.decide({ item: {}, context: { requirements: {} } });
+  assert.equal(request.messages[0].content.includes(skill), false);
 });
 
 test("RoleDecisionEngine reuses one entity session across roles and event revisions", async () => {
