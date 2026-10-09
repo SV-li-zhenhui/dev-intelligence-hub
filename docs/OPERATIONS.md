@@ -121,6 +121,12 @@ returns a non-zero exit code for stopped, retained-uncertain, identity-mismatch,
 or otherwise unhealthy managed state. Treat retained control state as evidence
 to investigate; do not delete it merely to make `Start` succeed.
 
+On Windows, the launcher explicitly detaches from the command host's Job Object
+so closing the terminal or automation command does not terminate the service.
+If the host forbids job breakaway, startup fails before application code runs;
+use a standalone PowerShell terminal that permits breakaway. The service remains
+managed through the authenticated `Status` and `Stop` commands above.
+
 ### Failed-shutdown recovery
 
 `Restart` never overrides retained lifecycle uncertainty. Recovery preparation

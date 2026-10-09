@@ -2964,11 +2964,113 @@ function Invoke-OfflineRestoreRecoveryIfPresent {
     [void](Invoke-OfflineRestore -Mode Recover)
 }
 
+function Initialize-WindowsLauncher {
+    if (-not ("MyDashboard.DetachedLauncher" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MyDashboard {
+    public static class DetachedLauncher {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo {
+            public uint Size;
+            public string Reserved, Desktop, Title;
+            public uint X, Y, Width, Height, CharacterWidth, CharacterHeight, Fill, Flags;
+            public ushort ShowWindow, ReservedSize;
+            public IntPtr ReservedBytes, StandardInput, StandardOutput, StandardError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInfo {
+            public IntPtr Process, Thread;
+            public uint ProcessId, ThreadId;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcess(
+            string application, StringBuilder command, IntPtr processAttributes,
+            IntPtr threadAttributes, bool inheritHandles, uint flags,
+            IntPtr environment, string directory, ref StartupInfo startup,
+            out ProcessInfo process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool inJob);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static string QuoteFilePath(string value) {
+            // These arguments are file paths, never arbitrary command text.
+            if (value.IndexOf('"') >= 0 || value.IndexOf('\0') >= 0 || value.EndsWith("\\"))
+                throw new ArgumentException("Invalid launcher file path.");
+            return "\"" + value + "\"";
+        }
+
+        public static void Run(string executable, string script, string result, string directory) {
+            var command = new StringBuilder(
+                QuoteFilePath(executable) + " " + QuoteFilePath(script) + " " + QuoteFilePath(result));
+            var startup = new StartupInfo();
+            startup.Size = (uint)Marshal.SizeOf(typeof(StartupInfo));
+            ProcessInfo process;
+            const uint createSuspended = 0x00000004;
+            const uint createNewProcessGroup = 0x00000200;
+            const uint createBreakawayFromJob = 0x01000000;
+            const uint createNoWindow = 0x08000000;
+            // Node's detached:true does not escape KILL_ON_JOB_CLOSE containers.
+            // Start the launcher outside the command host's job, with no inherited handles.
+            if (!CreateProcess(executable, command, IntPtr.Zero, IntPtr.Zero, false,
+                createSuspended | createNewProcessGroup | createBreakawayFromJob | createNoWindow,
+                IntPtr.Zero, directory, ref startup, out process)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Unable to detach MyDashboard launcher. Use a standalone terminal that permits job breakaway.");
+            }
+            try {
+                bool inJob;
+                if (!IsProcessInJob(process.Process, IntPtr.Zero, out inJob))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                // Check before executing any application code, including in nested jobs.
+                if (inJob) throw new InvalidOperationException(
+                    "MyDashboard launcher is still tied to a command job; refusing an unsafe start.");
+                if (ResumeThread(process.Thread) == uint.MaxValue)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint wait = WaitForSingleObject(process.Process, 10000);
+                if (wait == 258) throw new TimeoutException("The detached MyDashboard process launcher timed out.");
+                if (wait != 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint exitCode;
+                if (!GetExitCodeProcess(process.Process, out exitCode))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (exitCode != 0) throw new InvalidOperationException("The detached MyDashboard process launcher failed.");
+            } catch {
+                // This handle belongs only to the short launcher created above, never a listener.
+                TerminateProcess(process.Process, 1);
+                throw;
+            } finally {
+                CloseHandle(process.Thread);
+                CloseHandle(process.Process);
+            }
+        }
+    }
+}
+'@
+    }
+}
+
 function Invoke-Launcher {
     param(
         [Parameter(Mandatory = $true)][string]$ResultPath,
         [Parameter(Mandatory = $true)][string]$Token
     )
+    if ($isWindowsRuntime) {
+        # Compile native interop before placing control credentials in the environment.
+        Initialize-WindowsLauncher
+    }
     $environment = @{
         MYDASHBOARD_MANAGED_TOKEN = $Token
         MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY = $runtimeDirectory
@@ -2993,22 +3095,9 @@ function Invoke-Launcher {
     }
     try {
         if ($isWindowsRuntime) {
-            $launcherProcess = Start-Process `
-                -FilePath $nodePath `
-                -ArgumentList @(
-                    ('"' + $launcherScript + '"'),
-                    ('"' + $ResultPath + '"')
-                ) `
-                -WorkingDirectory $projectDirectory `
-                -WindowStyle Hidden `
-                -PassThru
-            if (-not $launcherProcess.WaitForExit(10000)) {
-                Stop-Process -Id $launcherProcess.Id -ErrorAction SilentlyContinue
-                throw "The detached MyDashboard process launcher timed out."
-            }
-            if ($launcherProcess.ExitCode -ne 0) {
-                throw "The detached MyDashboard process launcher failed."
-            }
+            [MyDashboard.DetachedLauncher]::Run(
+                $nodePath, $launcherScript, $ResultPath, $projectDirectory
+            )
         } else {
             & $nodePath $launcherScript $ResultPath
             if ($LASTEXITCODE -ne 0) {

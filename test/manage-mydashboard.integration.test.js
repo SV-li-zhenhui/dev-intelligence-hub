@@ -131,6 +131,22 @@ function invokeManager(
   );
 }
 
+async function invokeManagerInJob(root, executable, extraArguments = []) {
+  const resultPath = path.join(root, "job launch result.json");
+  const host = spawnSync(executable, [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+    path.join(projectRoot, "test", "fixtures", "managed-launch-job.ps1"),
+    "-ProjectDirectory", root,
+    "-PowerShellPath", executable,
+    "-ResultPath", resultPath,
+    ...extraArguments,
+  ], { cwd: root, encoding: "utf8", timeout: 45_000, windowsHide: true });
+  assert.equal(host.error, undefined, `${host.stderr}\n${host.stdout}`);
+  assert.equal(host.status, 0, `${host.stderr}\n${host.stdout}`);
+  const result = JSON.parse((await readFile(resultPath, "utf8")).replace(/^\uFEFF/u, ""));
+  return { ...host, managerExitCode: result.managerExitCode };
+}
+
 function isolatedRealServerEnvironment() {
   const environment = {};
   for (const [name, value] of Object.entries(process.env)) {
@@ -1321,6 +1337,46 @@ test(
     assert.match(finalStatus.stdout, /is stopped/);
   },
 );
+
+for (const [label, executable, skip] of [
+  ["Windows PowerShell", powershell, WINDOWS_MANAGER_SKIP],
+  ["PowerShell 7", powershell7, POWERSHELL_7_MANAGER_SKIP],
+]) {
+  test(
+    `${label} managed server survives the launching command job closing`,
+    { skip },
+    async (t) => {
+      const { root, port } = await createFixture(t);
+      const host = await invokeManagerInJob(root, executable);
+      assert.equal(host.managerExitCode, 0, `${host.stderr}\n${host.stdout}`);
+      const runtime = readRuntimeInfo(root);
+      const state = JSON.parse(await readFile(
+        path.join(runtime.runtimeDirectory, "mydashboard-server-process.json"),
+        "utf8",
+      ));
+      await waitForHealth(port, state.processId);
+      const stopped = invokeManager(root, "Stop", 10, executable);
+      assert.equal(stopped.status, 0, `${stopped.stderr}\n${stopped.stdout}`);
+      await assertPortUnavailable(port);
+    },
+  );
+  test(
+    `${label} refuses to start inside a job that forbids breakaway`,
+    { skip },
+    async (t) => {
+      const { root, port } = await createFixture(t);
+      const host = await invokeManagerInJob(root, executable, ["-DenyBreakaway"]);
+      assert.notEqual(host.managerExitCode, 0, `${host.stderr}\n${host.stdout}`);
+      assert.match(`${host.stderr}\n${host.stdout}`, /Unable to detach MyDashboard launcher/u);
+      await assertPortUnavailable(port);
+      const runtime = readRuntimeInfo(root);
+      await assert.rejects(readFile(
+        path.join(runtime.runtimeDirectory, "mydashboard-server-process.json"),
+        "utf8",
+      ), { code: "ENOENT" });
+    },
+  );
+}
 
 test(
   "managed Stop accepts a 10.5-second liveness stall within the fifteen-second cap",
