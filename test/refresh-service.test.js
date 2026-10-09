@@ -79,6 +79,112 @@ test("an explicitly disabled GitHub read boundary makes no adapter call", async 
   );
 });
 
+test("notification failure keeps fresh facts while preserving the retry baseline", async () => {
+  const previous = { refreshedAt: "2026-08-12T00:00:00.000Z", items: [], versions: [] };
+  const baseline = { refreshedAt: "2026-08-11T00:00:00.000Z", items: [], versions: [] };
+  const store = new MemoryStore({ snapshot: previous, "notification-snapshot": baseline });
+  let attempts = 0;
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return [pullRequest()]; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    dingtalk: { async collect() { return { items: [], errors: [] }; } },
+    store,
+    notifier: {
+      async send() {
+        attempts += 1;
+        if (attempts === 1) throw new Error("notification timeout");
+        return { sent: true, count: 1 };
+      },
+    },
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+    clock: () => new Date(REFRESH_STARTED_AT),
+  });
+
+  const first = await service.refresh({ notify: true });
+  assert.equal(first.notification.sent, false);
+  assert.match(first.notification.error, /notification timeout/);
+  assert.deepEqual(await store.read("notification-snapshot"), baseline);
+  assert.deepEqual(await store.read("previous-snapshot"), previous);
+  assert.equal((await store.read("snapshot")).items.length, 1);
+  assert.equal((await store.read("dashboard")).meta.refreshedAt, REFRESH_STARTED_AT);
+  assert.equal((await store.read("last-run")).notification.sent, false);
+
+  const second = await service.refresh({ notify: true });
+  assert.equal(second.notification.sent, true);
+  assert.equal((await store.read("notification-snapshot")).refreshedAt, REFRESH_STARTED_AT);
+  assert.equal(attempts, 2);
+});
+
+test("notification baseline advances only for delivery or a known no-send outcome", async () => {
+  for (const [reason, shouldAdvance] of [
+    ["no-important-change", true],
+    ["deferred", false],
+  ]) {
+    const baseline = { refreshedAt: "2026-08-11T00:00:00.000Z", items: [] };
+    const store = new MemoryStore({ "notification-snapshot": baseline });
+    const service = new RefreshService({
+      github: {
+        async searchRelevantPullRequests() { return []; },
+        async searchIssues() { return []; },
+        async versions() { return []; },
+      },
+      dingtalk: { async collect() { return { items: [], errors: [] }; } },
+      store,
+      notifier: { async send() { return { sent: false, reason }; } },
+      config: {
+        trackedRepositories: [],
+        dingtalk: { enabled: true },
+        prResponsibility: { historicalAfterDays: 60 },
+        brain: { enabled: false },
+      },
+      clock: () => new Date(REFRESH_STARTED_AT),
+    });
+
+    await service.refresh({ notify: true });
+    assert.equal(
+      (await store.read("notification-snapshot")).refreshedAt,
+      shouldAdvance ? REFRESH_STARTED_AT : baseline.refreshedAt,
+    );
+  }
+});
+
+test("refresh cancellation during notification still propagates", async () => {
+  const controller = new AbortController();
+  const store = new MemoryStore();
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return []; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    dingtalk: { async collect() { return { items: [], errors: [] }; } },
+    store,
+    notifier: {
+      async send() {
+        controller.abort(new Error("refresh cancelled"));
+        throw controller.signal.reason;
+      },
+    },
+    config: {
+      trackedRepositories: [],
+      dingtalk: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 },
+      brain: { enabled: false },
+    },
+  });
+
+  await assert.rejects(service.refresh({ notify: true, signal: controller.signal }), /refresh cancelled/);
+  assert.equal(await store.read("notification-snapshot"), null);
+});
+
 test("refresh classifies complete PR facts and asks the brain only about uncertain items", async () => {
   const store = new MemoryStore();
   const brainCalls = [];
@@ -119,6 +225,7 @@ test("refresh classifies complete PR facts and asks the brain only about uncerta
     dingtalk: {},
     store,
     notifier: {},
+    clock: () => new Date(REFRESH_STARTED_AT),
     config: {
       trackedRepositories: [],
       dingtalk: { enabled: false },
@@ -182,6 +289,7 @@ test("an uncertain PR is reassessed when material facts change on the same head"
     dingtalk: {},
     store,
     notifier: {},
+    clock: () => new Date(REFRESH_STARTED_AT),
     config: {
       trackedRepositories: [],
       dingtalk: { enabled: false },

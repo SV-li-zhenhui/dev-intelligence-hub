@@ -1,3 +1,5 @@
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
 const MAX_CYCLE = 100;
@@ -250,20 +252,33 @@ export class WorkConditionWaker {
     if (!graph || !Array.isArray(graph.tasks) || !Number.isSafeInteger(graph.revision)) {
       throw new TypeError("graphReader returned an invalid snapshot");
     }
-    const submittedParents = new Set(
+    const wakeCandidateParents = new Set(
       graph.tasks
         .filter((task) =>
           task?.parentTaskId !== null &&
-          task?.deliveries?.at(-1)?.status === "submitted"
+          (task?.deliveries?.at(-1)?.status === "submitted" ||
+            ["completed", "cancelled"].includes(task?.status))
         )
         .map(({ parentTaskId }) => parentTaskId),
     );
-    const parent = graph.tasks.find((task) =>
-      submittedParents.has(task?.taskId) &&
+    const candidates = graph.tasks.filter((task) =>
+      wakeCandidateParents.has(task?.taskId) &&
       task?.status === "paused" &&
       task?.responsibility?.type === "role" &&
       task.responsibility.id === "orchestrator"
     );
+    if (candidates.length === 0) return;
+    const pausedItems = await this.#readAll(this.#ledger.listItems, {
+      status: "paused",
+    });
+    const pausedById = new Map(pausedItems.map((item) => [item.itemId, item]));
+    const parent = candidates.find((task) => {
+      const item = pausedById.get(task.taskId);
+      // The graph projection omits statusReason. Only a durable wait marker,
+      // at the same revision, permits automatic resume after child delivery.
+      return item?.revision === task.revision &&
+        item.statusReason === AUTO_RESUME_ON_CHILD_DELIVERY;
+    });
     if (!parent) return;
     const command = {
       taskId: parent.taskId,

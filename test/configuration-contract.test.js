@@ -736,6 +736,53 @@ test("versioned code executor profiles accept reusable Node script assets", () =
   );
 });
 
+test("executor profile IDs and bindings match the sandbox ID boundary", () => {
+  const valid = () => {
+    const value = document();
+    value.codeExecutor = {
+      enabled: true,
+      docker: {
+        executable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+        host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+      },
+      workspaces: [{ id: "dashboard", sourceRoot: "." }],
+      profiles: {
+        "node-test": {
+          kind: "node-test",
+          image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+          timeoutMs: 30_000,
+        },
+      },
+      requiredProfilesByWorkspace: { dashboard: ["node-test"] },
+    };
+    return value;
+  };
+
+  for (const profileId of ["node_test", "node.test", "a".repeat(65)]) {
+    const value = valid();
+    value.codeExecutor.profiles = {
+      [profileId]: value.codeExecutor.profiles["node-test"],
+    };
+    value.codeExecutor.requiredProfilesByWorkspace.dashboard = [profileId];
+    assertInvalid(value);
+
+    const invalidBinding = valid();
+    invalidBinding.codeExecutor.requiredProfilesByWorkspace.dashboard = [profileId];
+    assertInvalid(invalidBinding);
+  }
+
+  const boundary = valid();
+  const longestId = "a".repeat(64);
+  boundary.codeExecutor.profiles = {
+    [longestId]: boundary.codeExecutor.profiles["node-test"],
+  };
+  boundary.codeExecutor.requiredProfilesByWorkspace.dashboard = [longestId];
+  assert.deepEqual(
+    normalizeConfigurationDocument(boundary).codeExecutor.requiredProfilesByWorkspace,
+    { dashboard: [longestId] },
+  );
+});
+
 test("reusable test assets reject unversioned, empty, oversized, or extra content", () => {
   const valid = () => {
     const value = document();

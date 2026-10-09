@@ -297,9 +297,9 @@ export function normalizeOwnerWorkRequest(value) {
     throw invalid();
   }
   if (
-    version === 2 && !["pull_request", "development"].includes(value.workType)
+    version === 2 && !["pull_request", "development", "testing"].includes(value.workType)
   ) {
-    throw invalid("PR Review 或开发分流必须提供结构化 PR 目标");
+    throw invalid("PR Review、开发或测试分流必须提供结构化 PR 目标");
   }
   if (version === 5 && value.workType !== "general") {
     throw invalid("主控 PR 请求必须使用 general 工作类型");

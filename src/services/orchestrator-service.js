@@ -1251,6 +1251,9 @@ function planTaskControl({ action, source, rootId }) {
       reason: action.reason,
       expectedGraphRevision: action.expectedGraphRevision,
       expectedTaskRevision: action.sourceTaskRevision,
+      ...(action.type === "pause" && action.waitForChildren === true
+        ? { waitForChildren: true }
+        : {}),
     },
     recover: null,
     result: projectActionResult(action.type, rootId, source.taskId),

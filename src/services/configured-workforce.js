@@ -308,7 +308,7 @@ function declaredRemote(config, name) {
   return config.remote === true;
 }
 
-function providerWithBoundary(provider, remote, lifecycle) {
+function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey = null) {
   const runtime = lifecycle.admit(provider);
   const attemptDescriptor = Object.getOwnPropertyDescriptor(
     provider,
@@ -341,7 +341,7 @@ function providerWithBoundary(provider, remote, lifecycle) {
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     ...(sessionDescriptor?.value === true
-      ? { supportsEntitySessions: true }
+      ? { supportsEntitySessions: true, sessionIsolationKey }
       : {}),
     generate: provider.generate.bind(provider),
     ...(availability
@@ -407,6 +407,7 @@ function providerOptions(
       }, cliRuntimeFacts(dependencies)),
       remote,
       lifecycle,
+      `${config.kind}:${config.credentialMode ?? "api-key"}`,
     );
   }
   throw new TypeError(

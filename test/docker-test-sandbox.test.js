@@ -167,6 +167,7 @@ test("Docker profiles run pinned Node tests with a read-only, offline boundary",
   assert.equal(setup.processRunner.calls.length, 3);
   const invocation = setup.processRunner.calls[2];
   assert.equal(invocation.command.endsWith("docker.exe"), true);
+  assert.equal(invocation.args.includes("--test-reporter=tap"), true);
   assert.equal(invocation.args.includes("none"), true);
   assert.equal(invocation.args.includes("--read-only"), true);
   assert.deepEqual(
@@ -258,6 +259,7 @@ test("approved Node script assets are materialized by digest and run read-only",
   );
   assert.ok(assetMount);
   assert.equal(invocation.args.includes("--allow-fs-read=/test-library"), true);
+  assert.equal(invocation.args.includes("--test-reporter=tap"), false);
   assert.equal(invocation.args.at(-1), "/test-library/test.mjs");
   assert.equal(invocation.args.includes(source), false);
 

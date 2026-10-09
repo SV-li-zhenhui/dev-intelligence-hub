@@ -3,6 +3,8 @@ import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { getReadyWorkGraphTaskIds } from "../src/domain/work-graph-contract.js";
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
+import { WorkConditionWaker } from "../src/services/work-condition-waker.js";
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "../src/services/work-graph-wait-marker.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
@@ -1011,6 +1013,106 @@ test("a parent becomes claimable after every direct child completes", async () =
     result: { outcome: "all-children-complete" },
   });
   assert.equal(completedParent.status, "completed");
+});
+
+test("a parent explicitly waiting for child delivery resumes after a real child completion", async () => {
+  const { store, lease, source, service } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { reader, planner } = graphPorts(service, "employee-orchestrator", null);
+  const created = await planner.createChild(createCommand({
+    parent,
+    graphRevision: 1,
+    contract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+  }));
+  const waiting = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  const pauseRevision = (await reader.getSnapshot()).graph.revision;
+  const paused = await planner.pauseTask(scopedTaskCommand(waiting, pauseRevision, {
+    reason: "等待直属子任务交付",
+    waitForChildren: true,
+  }));
+  assert.equal(paused.status, "paused");
+
+  let child = (await service.listItems()).items.find(({ itemId }) => itemId === created.taskId);
+  child = await service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  await service.complete({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "child-complete" },
+  });
+  const recovered = new WorkLedgerService({
+    store,
+    assignmentSource: source,
+    exclusiveLease: lease,
+    clock: () => "2026-08-03T01:00:00.000Z",
+    idFactory: () => "recovered-lease",
+  });
+  await recovered.recover();
+  const recoveredGraph = graphPorts(recovered, "employee-orchestrator", null);
+  const waker = new WorkConditionWaker({
+    ledger: recovered,
+    graphReader: recoveredGraph.reader,
+    graphPlanner: recoveredGraph.planner,
+  });
+  await waker.runCycle();
+  const resumed = (await recovered.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  assert.equal(resumed.status, "queued");
+});
+
+test("an intentionally paused parent stays paused after a real child completion until explicit resume", async () => {
+  const { service } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { reader, planner } = graphPorts(service, "employee-orchestrator", null);
+  const created = await planner.createChild(createCommand({
+    parent,
+    graphRevision: 1,
+    contract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+  }));
+  const waiting = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  const pauseRevision = (await reader.getSnapshot()).graph.revision;
+  await planner.pauseTask(scopedTaskCommand(waiting, pauseRevision, { reason: "主动暂停，等待人工恢复" }));
+  let child = (await service.listItems()).items.find(({ itemId }) => itemId === created.taskId);
+  child = await service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  await service.complete({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "child-complete" },
+  });
+  const waker = new WorkConditionWaker({ ledger: service, graphReader: reader, graphPlanner: planner });
+  await waker.runCycle();
+  let current = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  assert.equal(current.status, "paused");
+  current = await planner.resumeTask(scopedTaskCommand(current, (await reader.getSnapshot()).graph.revision));
+  assert.equal(current.status, "queued");
+});
+
+test("child-wait pauses require a decomposed parent and reserve the durable marker", async () => {
+  const { service, store } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { planner } = graphPorts(service, "employee-orchestrator", null);
+  const writes = store.writes.length;
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(parent, 1, { waitForChildren: true })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(parent, 1, { reason: AUTO_RESUME_ON_CHILD_DELIVERY })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_COMMAND_INVALID",
+  );
+  assert.equal(store.writes.length, writes);
 });
 
 test("combined parent and dependency cycles fail atomically", async () => {

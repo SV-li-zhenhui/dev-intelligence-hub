@@ -300,7 +300,7 @@ function normalizeBatch(input, state) {
   return { items, pending, nextSequence, highWatermark, oldest };
 }
 
-function attentionResultInputBinding(state, item, outbox) {
+export function attentionResultInputBinding(state, item, outbox) {
   if (outbox.inputDigest === item.inputDigest) {
     return currentWorkItemExecutionBinding(item);
   }

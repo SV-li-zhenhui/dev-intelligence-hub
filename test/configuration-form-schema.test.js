@@ -381,6 +381,17 @@ test("test library profiles expose a dedicated script template and source editor
   assert.equal(source.maximumBytes, 65_536);
 });
 
+test("profile form fields use the sandbox ID boundary", () => {
+  const profiles = configurationCollectionDescriptor(["codeExecutor", "profiles"]);
+  assert.equal(profiles.keyFormat, "profile-id");
+  const binding = configurationFieldDescriptor(
+    ["codeExecutor", "requiredProfilesByWorkspace", "dashboard", 0],
+    "node-contract",
+  );
+  assert.equal(binding.format, "profile-id");
+  assert.equal(binding.maximumBytes, 64);
+});
+
 test("router-backed brain references declare a dynamic provider option source", () => {
   for (const path of [
     ["employees", "roles", "developer", "brain", "provider"],

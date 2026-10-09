@@ -1187,6 +1187,53 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
   return value;
 }
 
+function nodeTestSummary(stdout) {
+  const lines = stdout.split(/\r?\n/u);
+  if (lines[0] !== "TAP version 13") return null;
+  const plans = lines.flatMap((line, index) =>
+    /^1\.\.(\d+)$/u.test(line) ? [index] : [],
+  );
+  if (plans.length !== 1) return null;
+  const planIndex = plans[0];
+  const rootPlan = Number(lines[planIndex].slice(3));
+  if (!Number.isSafeInteger(rootPlan)) return null;
+  const counts = {};
+  const labels = {
+    tests: "total",
+    pass: "passed",
+    fail: "failed",
+    cancelled: "cancelled",
+    skipped: "skipped",
+    todo: "todo",
+  };
+  for (const line of lines.slice(planIndex + 1)) {
+    const match = /^# (tests|pass|fail|cancelled|skipped|todo) (\d+)$/u.exec(line);
+    if (!match) continue;
+    const name = labels[match[1]];
+    const count = Number(match[2]);
+    if (Object.hasOwn(counts, name) || !Number.isSafeInteger(count)) return null;
+    counts[name] = count;
+  }
+  if (
+    Object.keys(counts).length !== 6 ||
+    counts.total < rootPlan ||
+    counts.passed + counts.failed + counts.cancelled + counts.skipped + counts.todo !== counts.total
+  ) {
+    return null;
+  }
+  return { ...counts, executed: counts.passed + counts.failed };
+}
+
+function isNodeTestSummary(value) {
+  return hasExactKeys(value, [
+    "total", "passed", "failed", "cancelled", "skipped", "todo", "executed",
+  ]) &&
+    ["total", "passed", "failed", "cancelled", "skipped", "todo", "executed"]
+      .every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0) &&
+    value.executed === value.passed + value.failed &&
+    value.total === value.executed + value.cancelled + value.skipped + value.todo;
+}
+
 function validateExecutionCreation(
   value,
   reference,
@@ -1362,6 +1409,7 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
       "imageId",
       "profileFingerprint",
       "timedOut",
+      ...(Object.hasOwn(value || {}, "testSummary") ? ["testSummary"] : []),
     ]) ||
     value.exitCode !== 0 ||
     !(
@@ -1373,7 +1421,8 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
     typeof value.imageId !== "string" ||
     !IMAGE_ID.test(value.imageId) ||
     value.profileFingerprint !== expectedFingerprint ||
-    value.timedOut !== false
+    value.timedOut !== false ||
+    (Object.hasOwn(value, "testSummary") && !isNodeTestSummary(value.testSummary))
   ) {
     throw executorError("EXECUTOR_STATE_INVALID", "测试证明审计产物无效");
   }
@@ -1475,9 +1524,12 @@ function validateSucceededActionResult(session, action, input, result) {
         "timedOut",
         "stdout",
         "stderr",
+        ...(Object.hasOwn(result || {}, "testSummary") ? ["testSummary"] : []),
       ]) ||
       typeof result.stdout !== "string" ||
-      typeof result.stderr !== "string"
+      typeof result.stderr !== "string" ||
+      (Object.hasOwn(result, "testSummary") &&
+        digestValue(result.testSummary) !== digestValue(nodeTestSummary(result.stdout)))
     ) {
       invalidPersistedActionResult();
     }
@@ -1508,12 +1560,14 @@ function validateFailedActionResult(session, action, input, result) {
       "error",
       "stdout",
       "stderr",
+      ...(Object.hasOwn(result || {}, "testSummary") ? ["testSummary"] : []),
     ])
   ) {
     assertArtifactKinds(action, ["output", "stdout", "stderr"]);
     if (
-      result.exitCode === 0 ||
-      !recordedErrorsMatch(result.error, action.error)
+      !recordedErrorsMatch(result.error, action.error) ||
+      (Object.hasOwn(result, "testSummary") &&
+        digestValue(result.testSummary) !== digestValue(nodeTestSummary(result.stdout)))
     ) {
       invalidPersistedActionResult();
     }
@@ -1649,6 +1703,9 @@ export class ControlledCodeExecutor {
     this.requiredProfiles = normalizeProfileConfiguration(
       profileDefinitions,
       requiredProfilesByWorkspace,
+    );
+    this.profileKinds = new Map(
+      Object.entries(profileDefinitions).map(([id, definition]) => [id, definition.kind]),
     );
     validateDependency(
       sandbox,
@@ -2495,19 +2552,29 @@ export class ControlledCodeExecutor {
         locked.result,
         profile.configDigest,
       );
-      const succeeded = result.exitCode === 0;
+      const summary = this.profileKinds.get(action.profileId) === "node-test"
+        ? nodeTestSummary(result.stdout)
+        : null;
+      const succeeded = result.exitCode === 0 && (
+        this.profileKinds.get(action.profileId) !== "node-test" ||
+        (summary !== null && summary.passed > 0 && summary.failed === 0 && summary.cancelled === 0)
+      );
+      const auditedResult = {
+        ...result,
+        ...(summary === null ? {} : { testSummary: summary }),
+      };
       return {
         succeeded,
         workspaceRevision: locked.afterWorkspaceRevision,
-        profileResult: result,
+        profileResult: auditedResult,
         error: succeeded
           ? null
-          : { code: "TESTS_FAILED", message: "测试未通过" },
+          : { code: "TESTS_FAILED", message: "测试未通过或缺少有效通过用例" },
         result: succeeded
-          ? result
+          ? auditedResult
           : {
-              ...result,
-              error: { code: "TESTS_FAILED", message: "测试未通过" },
+              ...auditedResult,
+              error: { code: "TESTS_FAILED", message: "测试未通过或缺少有效通过用例" },
             },
       };
     }
@@ -2668,6 +2735,19 @@ export class ControlledCodeExecutor {
     if (validatedOutput.imageId !== proof.imageId) {
       throw executorError("EXECUTION_AUDIT_INVALID", "测试镜像证明不匹配");
     }
+    if (this.profileKinds.get(profile.id) === "node-test") {
+      const summary = nodeTestSummary(stdout);
+      if (
+        summary === null ||
+        summary.passed < 1 ||
+        summary.failed !== 0 ||
+        summary.cancelled !== 0 ||
+        !isNodeTestSummary(validatedOutput.testSummary) ||
+        digestValue(validatedOutput.testSummary) !== digestValue(summary)
+      ) {
+        throw executorError("EXECUTION_AUDIT_INVALID", "有效测试数证明无效");
+      }
+    }
   }
 
   async #writeResultArtifacts(sessionId, action, outcome) {
@@ -2697,6 +2777,7 @@ export class ControlledCodeExecutor {
             imageId: result.imageId,
             profileFingerprint: result.profileFingerprint,
             timedOut: Boolean(result.timedOut),
+            ...(result.testSummary ? { testSummary: result.testSummary } : {}),
             ...(result.error ? { error: result.error } : {}),
           },
         }),

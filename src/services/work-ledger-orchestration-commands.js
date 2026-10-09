@@ -27,6 +27,7 @@ import {
   workLedgerError,
 } from "./work-ledger-values.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
 
 const PAUSABLE_STATUSES = new Set(["queued", "blocked"]);
 const ESCALATABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
@@ -81,17 +82,24 @@ function coordinatorEnvelope(input, commandKeys, message) {
   };
 }
 
-function normalizeTaskCommand(input, message) {
+function normalizeTaskCommand(input, message, { allowChildWait = false } = {}) {
+  const commandKeys = [
+    "taskId",
+    "reason",
+    "expectedGraphRevision",
+    "expectedTaskRevision",
+  ];
+  const childWait = allowChildWait &&
+    hasExactLedgerKeys(input, ["authority", "command"]) &&
+    hasExactLedgerKeys(input.command, [...commandKeys, "waitForChildren"]);
   const { authority, command } = coordinatorEnvelope(
     input,
-    [
-      "taskId",
-      "reason",
-      "expectedGraphRevision",
-      "expectedTaskRevision",
-    ],
+    childWait ? [...commandKeys, "waitForChildren"] : commandKeys,
     message,
   );
+  if (childWait && command.waitForChildren !== true) {
+    throw invalidCommand("waitForChildren 无效");
+  }
   return {
     authority,
     command: {
@@ -102,6 +110,7 @@ function normalizeTaskCommand(input, message) {
         command.expectedTaskRevision,
         "expectedTaskRevision",
       ),
+      ...(childWait ? { waitForChildren: true } : {}),
     },
   };
 }
@@ -242,6 +251,7 @@ export function planWorkGraphTaskPause({ state, input, clock }) {
   const { authority, command } = normalizeTaskCommand(
     input,
     "暂停任务请求无效",
+    { allowChildWait: true },
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
@@ -254,11 +264,30 @@ export function planWorkGraphTaskPause({ state, input, clock }) {
       409,
     );
   }
+  if (
+    command.waitForChildren &&
+    (item.status !== "queued" ||
+      item.statusReason !== "waiting_for_children" ||
+      !state.items.some((candidate) =>
+        candidate.graph?.parentItemId === item.itemId &&
+        !["completed", "cancelled", "superseded"].includes(candidate.status)))
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+      "只有已拆分且仍有未完成直属子任务的父任务可以等待交付",
+      409,
+    );
+  }
+  if (!command.waitForChildren && command.reason === AUTO_RESUME_ON_CHILD_DELIVERY) {
+    throw invalidCommand("reason 是保留的子任务等待标记");
+  }
   const now = clock();
   const updated = moveWorkItem(item, {
     status: "paused",
     now,
-    reason: command.reason,
+    reason: command.waitForChildren
+      ? AUTO_RESUME_ON_CHILD_DELIVERY
+      : command.reason,
   });
   const items = replaceAndValidate(state, updated);
   return {

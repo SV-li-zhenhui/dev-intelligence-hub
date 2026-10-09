@@ -21,6 +21,7 @@ const MAX_ARRAY_ITEMS = 4_096;
 const MAX_OBJECT_FIELDS = 4_096;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const SAFE_PROFILE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SAFE_GITHUB_LOGIN =
@@ -944,7 +945,7 @@ function normalizeCodeExecutor(value) {
       config.profiles,
       `${path}.profiles`,
       (profile, profilePath, id) => {
-        safeId(id, profilePath);
+        text(id, profilePath, 64, { pattern: SAFE_PROFILE_ID });
         profileIds.add(id);
         const isScript = profile?.kind === "node-script";
         const item = fields(
@@ -1018,7 +1019,7 @@ function normalizeCodeExecutor(value) {
           profilesPath,
           100,
           (profileId, profilePath) => {
-            const id = safeId(profileId, profilePath);
+            const id = text(profileId, profilePath, 64, { pattern: SAFE_PROFILE_ID });
             if (!profileIds.has(id)) throw invalid(profilePath);
             return id;
           },

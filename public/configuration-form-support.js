@@ -15,6 +15,7 @@ const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SAFE_GITHUB_LOGIN =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const SAFE_PROFILE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ID_INSENSITIVE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_WORKSPACE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -986,6 +987,7 @@ function validFieldFormat(value, format) {
     repository: (entry) => SAFE_REPOSITORY.test(entry),
     "controlled-git-repository": validControlledGitRepository,
     "safe-id": (entry) => SAFE_ID.test(entry),
+    "profile-id": (entry) => SAFE_PROFILE_ID.test(entry),
     "safe-id-insensitive": (entry) => SAFE_ID_INSENSITIVE.test(entry),
     "role-id": (entry) => SAFE_ROLE_ID.test(entry),
     "workspace-id": (entry) => SAFE_WORKSPACE_ID.test(entry),

@@ -598,6 +598,32 @@ test("maps all eight orchestration actions to the least-authority planner comman
   }
 });
 
+test("an explicit child-wait pause forwards its durable wake contract", async () => {
+  const fixture = rootFixture();
+  const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+  const action = {
+    ...commonAction("pause", fixture.root, fixture.view),
+    waitForChildren: true,
+  };
+  await serviceFrom(fakes).execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: fixture.item,
+    contextPacket: fixture.packet,
+    intent: orchestrate(action),
+  });
+
+  assert.deepEqual(fakes.calls.planner, [{
+    method: "pauseTask",
+    command: {
+      taskId: fixture.root.taskId,
+      reason: action.reason,
+      expectedGraphRevision: fixture.view.graph.revision,
+      expectedTaskRevision: fixture.root.revision,
+      waitForChildren: true,
+    },
+  }]);
+});
+
 test("structured PR triage creates exactly one child for its trusted capability", async (t) => {
   for (const capability of ["development", "pr-review"]) {
     await t.test(capability, async () => {

@@ -4,6 +4,9 @@ import { createConflictPreparationBinding } from "../src/domain/conflict-prepara
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerPullRequestEvent, withOwnerWorkRequestDefaultRoute } from "../src/domain/owner-work-request.js";
+import { routeWorkflowEvent } from "../src/domain/workflow-router.js";
+import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
 import {
   WorkIntentPolicyError,
   createWorkIntentPolicy,
@@ -523,6 +526,67 @@ test("maps code workspaces and handoff roles from policy rather than model outpu
   assert.equal(handoff.kind, "handoff");
   assert.equal(handoff.binding.targetRoleId, "tester");
   assert.equal(handoff.payload.capability, "testing");
+});
+
+test("manual PR development and testing retain trusted repository and Git target through routing and code policy", () => {
+  const gitTarget = gitContext().event.payload.gitTarget;
+  const config = withOwnerWorkRequestDefaultRoute({
+    schemaVersion: 1,
+    enabled: true,
+    maxHops: 8,
+    rules: [],
+  });
+  const codePolicy = policy({
+    codeActionRoles: ["developer", "tester"],
+    codeOperationsByRole: {
+      developer: ["modify"],
+      tester: ["verify"],
+    },
+  });
+  for (const [workType, roleId, operation] of [
+    ["development", "developer", "modify"],
+    ["testing", "tester", "verify"],
+  ]) {
+    const request = ownerWorkRequestForItem({
+      kind: "pull_request",
+      repo: "acme/repo",
+      number: 42,
+      title: "Fix race",
+    }, {
+      workType,
+      priority: "high",
+      requestId: "123e4567-e89b-42d3-a456-426614174000",
+    });
+    const trustedEvent = createOwnerPullRequestEvent(request, {
+      repository: "acme/repo",
+      number: 42,
+      title: "Fix race",
+      state: "open",
+      gitTarget,
+    }, "2026-08-02T01:02:03.000Z");
+    const routed = routeWorkflowEvent({ event: trustedEvent, config });
+    assert.deepEqual(routed.assignments.map(({ target }) => target), [
+      { type: "role", id: roleId },
+    ]);
+    const binding = {
+      ...inputBinding(trustedEvent, `work-item-${"b".repeat(64)}`),
+      schemaVersion: 2,
+      gitTarget,
+    };
+    const bound = codePolicy.bind({
+      context: context({ event: trustedEvent, roleId, inputBinding: binding }),
+      intent: {
+        ...common("propose_code_action"),
+        operation,
+        objective: "Complete the selected PR work",
+        acceptanceCriteria: ["Relevant checks pass"],
+        evidence: [],
+      },
+    });
+    assert.equal(bound.binding.repository, "acme/repo");
+    assert.equal(bound.binding.workspaceId, "acme-workspace");
+    assert.deepEqual(bound.binding.inputBinding.gitTarget, gitTarget);
+  }
 });
 
 test("legacy PR bindings are recovery-only and cannot create code proposals", () => {

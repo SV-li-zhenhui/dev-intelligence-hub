@@ -381,6 +381,7 @@ export class RefreshService {
       const classified = {
         ...item,
         ...assessPullRequestResponsibility(item, {
+          now: observationLowerBound,
           historicalAfterDays:
             this.config.prResponsibility?.historicalAfterDays ?? 30,
         }),
@@ -570,17 +571,31 @@ export class RefreshService {
     let notificationDiff = null;
     if (notify && this.config.dingtalk.enabled && !errors.length) {
       notificationDiff = diffSnapshots(notificationBaseline, snapshot);
-      notification = await this.notifier.send(
-        notificationDiff,
-        prioritize(
-          snapshot.items,
-          snapshot.refreshedAt,
-          dashboardOptions(this.config),
-        ),
-        { signal },
-      );
+      try {
+        notification = await this.notifier.send(
+          notificationDiff,
+          prioritize(
+            snapshot.items,
+            snapshot.refreshedAt,
+            dashboardOptions(this.config),
+          ),
+          { signal },
+        );
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        notification = {
+          sent: false,
+          reason: "send-failed",
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
       signal?.throwIfAborted();
-      await this.store.write("notification-snapshot", snapshot);
+      if (
+        notification.sent === true ||
+        ["baseline", "no-important-change"].includes(notification.reason)
+      ) {
+        await this.store.write("notification-snapshot", snapshot);
+      }
     }
     if (scheduledReportError) errors.push(scheduledReportError);
 

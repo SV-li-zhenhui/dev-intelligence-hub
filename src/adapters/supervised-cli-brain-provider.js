@@ -2182,6 +2182,9 @@ export class SupervisedCliBrainProvider {
     this.remote = true;
     this.singleAttempt = true;
     this.supportsEntitySessions = this.kind === "codex-cli";
+    if (this.supportsEntitySessions) {
+      this.sessionIsolationKey = `${this.kind}:${options.credentialMode}`;
+    }
     this.#credentialMode = options.credentialMode;
     this.#credentialBroker = credentialBroker(
       dependencies.codexLoginCredentialBroker,

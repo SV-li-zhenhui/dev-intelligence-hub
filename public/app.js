@@ -1259,14 +1259,21 @@ function automationTestsView() {
       .filter(([, workspaceId]) => workspaceIds.includes(workspaceId))
       .map(([repository]) => repository)
       .sort();
-    const automatic = activeVersion !== null && workspaceIds.length > 0;
+    const automatic = activeVersion !== null && executor.enabled === true && workspaceIds.length > 0;
+    const statusLabel = executor.enabled !== true
+      ? "执行器已关闭"
+      : activeVersion === null
+        ? "运行时未载入"
+        : automatic
+          ? "自动执行"
+          : "尚未绑定";
     return `<article class="automation-test-card">
       <header>
         <div>
           <p class="eyebrow">TEST ASSET / ${escapeHtml(profileId)}</p>
           <h2>${escapeHtml(asset.title)}</h2>
         </div>
-        <span class="status-pill ${automatic ? "status-active" : "status-waiting_user"}">${automatic ? "自动执行" : "尚未绑定"}</span>
+        <span class="status-pill ${automatic ? "status-active" : "status-waiting_user"}">${statusLabel}</span>
       </header>
       <p>${escapeHtml(asset.description)}</p>
       <dl>
@@ -1287,7 +1294,7 @@ function automationTestsView() {
       <div>
         <p class="eyebrow">LOCAL / VERSIONED / REUSABLE</p>
         <h2>受控自动化测试资产</h2>
-        <p>脚本正文和版本随配置摘要封印。绑定工作区后，开发或测试岗位处理该仓库的每个代码任务时都会自动执行；脚本不能从模型返回值临时替换。</p>
+        <p>脚本正文和版本随配置摘要封印。执行器启用并绑定工作区后，开发或测试岗位处理该仓库的每个代码任务时都会自动执行；脚本不能从模型返回值临时替换。</p>
       </div>
       <button type="button" class="secondary-button" data-open-test-library-configuration>在配置中心管理</button>
     </div>
@@ -2743,7 +2750,11 @@ function applyDashboard(
 }
 
 function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSequence) {
-  if (!nextState || sequence < lastAppliedConfirmationRequest) return false;
+  if (
+    !nextState ||
+    sequence < confirmationRequestSequence ||
+    sequence < lastAppliedConfirmationRequest
+  ) return false;
   lastAppliedConfirmationRequest = sequence;
   confirmationQueueState = {
     available: Boolean(nextState.available),
@@ -2758,8 +2769,14 @@ function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSeque
   return true;
 }
 
-function invalidateConfirmationQueueSnapshot() {
-  lastAppliedConfirmationRequest = ++confirmationRequestSequence;
+function invalidateConfirmationQueueSnapshot(
+  sequence = ++confirmationRequestSequence,
+) {
+  if (
+    sequence < confirmationRequestSequence ||
+    sequence < lastAppliedConfirmationRequest
+  ) return false;
+  lastAppliedConfirmationRequest = sequence;
   confirmationQueueLoaded = false;
   confirmationQueueState = {
     available: false,
@@ -2769,6 +2786,7 @@ function invalidateConfirmationQueueSnapshot() {
     pendingCount: 0,
     item: null,
   };
+  return true;
 }
 
 async function handleEmployeeControl(event) {
@@ -4377,33 +4395,16 @@ async function submitInternalAttention(operation, answer) {
       invalidateConfirmationQueueSnapshot();
       statusBanner.hidden = false;
       statusBanner.textContent = "员工请示内容已经变化，请查看最新问题后重新答复。";
-      await refreshConfirmationQueue({ showConfirmation: false });
+      try {
+        await refreshConfirmationQueue({ showConfirmation: false });
+      } catch (error) {
+        statusBanner.textContent += ` ${error.message}。页面会自动重试。`;
+      }
       queueMicrotask(showNextConfirmation);
       return;
     }
     if (!response.ok) throw new Error(`员工请示处理失败（${response.status}）`);
     await response.json();
-    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
-    if (operation === "later") {
-      rememberDeferredConfirmation(activeConfirmationKey);
-    }
-    if (!closeConfirmationSubmission(submissionOwner)) return;
-    activeInternalAttention = null;
-    activeConfirmationKey = "";
-    invalidateConfirmationQueueSnapshot();
-    if (operation === "later") {
-      await refreshAfterDeferral();
-    } else {
-      await refreshConfirmationQueue({ showConfirmation: false });
-    }
-    if (currentView === "work") await workView.load();
-    statusBanner.hidden = false;
-    statusBanner.textContent = operation === "answer"
-      ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
-      : operation === "reject"
-        ? "驳回已写入本地台账，原任务将转入“阻塞”；可在“主动工作台账”追踪。"
-        : "此项仍在待确认队列，本页暂不再弹出；可点击“重新查看稍后项”恢复。";
-    if (operation !== "later") queueMicrotask(showNextConfirmation);
   } catch (error) {
     if (!restoreConfirmationSubmission(
       submissionOwner,
@@ -4413,7 +4414,31 @@ async function submitInternalAttention(operation, answer) {
     }
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
+    return;
   }
+  if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+  if (operation === "later") rememberDeferredConfirmation(activeConfirmationKey);
+  if (!closeConfirmationSubmission(submissionOwner)) return;
+  activeInternalAttention = null;
+  activeConfirmationKey = "";
+  invalidateConfirmationQueueSnapshot();
+  const completedMessage = operation === "answer"
+    ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
+    : operation === "reject"
+      ? "驳回已写入本地台账，原任务将转入“阻塞”；可在“主动工作台账”追踪。"
+      : "此项仍在待确认队列，本页暂不再弹出；可点击“重新查看稍后项”恢复。";
+  let refreshError = null;
+  try {
+    await refreshConfirmationQueue({ showConfirmation: false });
+    if (currentView === "work") await workView.load();
+  } catch (error) {
+    refreshError = error;
+  }
+  statusBanner.hidden = false;
+  statusBanner.textContent = refreshError
+    ? `${completedMessage} ${refreshError.message}。页面会自动重试。`
+    : completedMessage;
+  queueMicrotask(showNextConfirmation);
 }
 
 function handleInternalAttentionClick(event) {
@@ -4736,16 +4761,21 @@ async function handleExternalConfirmation(event) {
       statusBanner.hidden = false;
       statusBanner.textContent = "确认内容或目标状态已经变化，请查看最新内容后重新确认。";
       try {
-        await refreshConfirmationQueue({ showConfirmation: false });
+        const applied = await refreshConfirmationQueue({ showConfirmation: false });
+        if (applied) queueMicrotask(showNextConfirmation);
+      } catch (error) {
+        statusBanner.textContent += ` ${error.message}。成功读取最新确认内容前不会再次弹出。`;
+        return;
+      }
+      try {
         if (item.kind === "local.configuration-activate") {
           await loadConfiguration();
         }
         const sequence = ++requestSequence;
         const nextDashboard = await fetchDashboard();
         if (nextDashboard) applyDashboard(nextDashboard, sequence);
-        queueMicrotask(showNextConfirmation);
       } catch (error) {
-        statusBanner.textContent = `${error.message}。成功读取最新确认内容前不会再次弹出。`;
+        statusBanner.textContent += ` ${error.message}。其他页面数据会自动重试。`;
       }
       return;
     }
@@ -4767,8 +4797,15 @@ async function handleExternalConfirmation(event) {
       (item.display?.payload?.action || item.action)?.type === "pull_request_review";
     invalidateConfirmationQueueSnapshot();
     if (!closeExternalConfirmation(submissionOwner)) return;
-    await load({ showConfirmation: false });
-    if (configurationCompleted) await loadConfiguration();
+    const loadResult = await load({ showConfirmation: false });
+    let refreshError = loadResult?.refreshError || null;
+    if (configurationCompleted) {
+      try {
+        await loadConfiguration();
+      } catch (error) {
+        refreshError ||= error;
+      }
+    }
     let outcomeMessage = externalConfirmationOutcomeMessage(
       item,
       confirmationResult,
@@ -4778,6 +4815,9 @@ async function handleExternalConfirmation(event) {
       outcomeMessage = `${outcomeMessage || "确认结果已记录。"} ${reviewHandoffStatusText(confirmationResult.item)}`;
     } else if (reviewPublished && !handoffWorkType) {
       outcomeMessage = "GitHub 已确认发布成功；你选择了不创建下一步任务。";
+    }
+    if (refreshError) {
+      outcomeMessage = `${outcomeMessage || "确认结果已记录。"} ${refreshError.message}。页面会自动重试。`;
     }
     if (outcomeMessage) {
       statusBanner.hidden = false;
@@ -5244,7 +5284,7 @@ async function refreshConfirmationQueue({
   const applied = applyConfirmationQueue(nextState, sequence);
   if (applied && dashboard && renderView) render();
   if (applied) refreshLoadedConfirmationHistory();
-  if (showConfirmation) queueMicrotask(showNextConfirmation);
+  if (applied && showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
 }
 
@@ -5273,16 +5313,21 @@ async function restoreDeferredConfirmations() {
   deferredConfirmationStore.clear();
   if (dashboard && currentView === "employees") render();
   try {
-    await refreshConfirmationQueue({
+    const applied = await refreshConfirmationQueue({
       showConfirmation: false,
       sequence: restore.sequence,
     });
     const superseded = lastAppliedConfirmationRequest > restore.sequence;
+    if (!applied && !superseded) {
+      for (const key of restore.deferred) rememberDeferredConfirmation(key);
+      statusBanner.hidden = false;
+      statusBanner.textContent = "确认列表正在更新；稍后项已保留，请再次点击重新查看。";
+    }
     if (deferredConfirmationRestore === restore) {
       deferredConfirmationRestore = null;
       if (dashboard && currentView === "employees") render();
     }
-    if (!superseded) queueMicrotask(showNextConfirmation);
+    if (applied && !superseded) queueMicrotask(showNextConfirmation);
   } catch (error) {
     const superseded = lastAppliedConfirmationRequest > restore.sequence;
     if (!superseded) {
@@ -5331,35 +5376,46 @@ async function load({ showConfirmation = true } = {}) {
       fetchDashboard(),
       fetchConfirmationQueue(),
     ]);
+    let currentConfirmationFailure = false;
     if (confirmationResult.status === "fulfilled") {
-      applyConfirmationQueue(confirmationResult.value, confirmationSequence);
-      if (showConfirmation) queueMicrotask(showNextConfirmation);
+      const applied = applyConfirmationQueue(
+        confirmationResult.value,
+        confirmationSequence,
+      );
+      if (applied && showConfirmation) queueMicrotask(showNextConfirmation);
     } else {
-      invalidateConfirmationQueueSnapshot();
+      currentConfirmationFailure = invalidateConfirmationQueueSnapshot(
+        confirmationSequence,
+      );
     }
     if (dashboardResult.status === "rejected") throw dashboardResult.reason;
+    const refreshError = currentConfirmationFailure
+      ? confirmationResult.reason
+      : null;
     if (!dashboardResult.value) {
       render();
       refreshLoadedConfirmationHistory();
-      if (confirmationResult.status === "rejected") {
+      if (confirmationResult.status === "rejected" && currentConfirmationFailure) {
         statusBanner.hidden = false;
         statusBanner.textContent =
           `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
       }
-      return;
+      return { refreshError };
     }
     applyDashboard(dashboardResult.value, sequence);
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
     refreshLoadedConfirmationHistory();
-    if (confirmationResult.status === "rejected") {
+    if (confirmationResult.status === "rejected" && currentConfirmationFailure) {
       statusBanner.hidden = false;
       statusBanner.textContent =
         `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
     }
+    return { refreshError };
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;
+    return { refreshError: error };
   }
 }
 

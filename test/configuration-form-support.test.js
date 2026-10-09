@@ -1950,6 +1950,30 @@ test("provider, role, workspace and profile support add, replace and remove", ()
   assert.equal(state.dirty, true);
 });
 
+test("profile form rejects IDs outside the sandbox boundary", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  for (const id of ["node_test", "node.test", "a".repeat(65)]) {
+    assert.throws(() => applyConfigurationStructureOperation(initial, {
+      operation: "add",
+      path: ["codeExecutor", "profiles"],
+      key: id,
+      value: configurationStructureTemplate(["codeExecutor", "profiles"]).value,
+    }));
+    const edited = setConfigurationFormField(initial, {
+      path: ["codeExecutor", "requiredProfilesByWorkspace", "dashboard", 0],
+      kind: "text",
+      rawValue: id,
+    });
+    const result = configurationDocumentFromForm(edited);
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.issues.some((issue) => issue.path?.includes("requiredProfilesByWorkspace")),
+      true,
+      JSON.stringify(result.issues),
+    );
+  }
+});
+
 test("the Responses provider variant materializes as a closed structured configuration", () => {
   const initial = createConfigurationFormState(representativeConfiguration());
   const template = configurationStructureTemplate(

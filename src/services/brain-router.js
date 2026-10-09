@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { normalizeSessionKey } from "../lib/session-key.js";
 
@@ -161,16 +162,45 @@ function normalizeProvider(value) {
   ) {
     throw new TypeError("brain provider is invalid");
   }
+  if (
+    value.supportsEntitySessions === true &&
+    (typeof value.sessionIsolationKey !== "string" ||
+      !value.sessionIsolationKey.trim() ||
+      INVALID_CONTROL.test(value.sessionIsolationKey) ||
+      Buffer.byteLength(value.sessionIsolationKey, "utf8") > 128)
+  ) {
+    throw new TypeError("brain provider session isolation key is invalid");
+  }
   return Object.freeze({
     id,
     remote: value.remote,
     singleAttempt: attemptDescriptor?.value === true,
     supportsEntitySessions: value.supportsEntitySessions === true,
+    ...(value.supportsEntitySessions === true
+      ? { sessionIsolationKey: value.sessionIsolationKey }
+      : {}),
     generate: value.generate.bind(value),
     ...(availability
       ? { checkAvailability: availability.bind(value) }
       : {}),
   });
+}
+
+function authorizedSessionKey(entityKey, provider, brain, dataClasses) {
+  // Every turn under this key has the same authorization and classified input
+  // set. Thus the union of all prior turns' classes remains authorized. A
+  // versioned key also leaves older, unattested entity archives untouched.
+  const scope = JSON.stringify([
+    normalizeSessionKey(entityKey),
+    provider.id,
+    provider.sessionIsolationKey,
+    brain.model,
+    brain.reasoningEffort ?? null,
+    provider.remote,
+    DATA_CLASSES.map((name) => brain.remoteData[name]),
+    DATA_CLASSES.filter((name) => dataClasses.includes(name)),
+  ]);
+  return `auth-v2:${createHash("sha256").update(scope, "utf8").digest("hex")}`;
 }
 
 function frozenDescription(provider, brain) {
@@ -252,7 +282,7 @@ export class BrainRouter {
       schema,
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
-        : { sessionKey: normalizeSessionKey(sessionKeyValue) }),
+        : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
   }

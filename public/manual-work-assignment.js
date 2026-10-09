@@ -85,6 +85,7 @@ export function manualHistoricalWorkMarkup(result = null) {
   return `<section class="section manual-historical-work">
     <div class="section-heading"><h2>人工加入历史任务</h2><span>OWNER OVERRIDE</span></div>
     <p>自动范围外的 GitHub PR 或 Issue 可以显式加入日常任务；这不会扩大自动扫描范围。</p>
+    <small>PR Review、开发和测试需要 PR 处于 OPEN 状态并能读取当前 Git 目标；已关闭或已合并的 PR 可选择需求梳理或中枢协调。</small>
     <form data-manual-historical-work>
       <label class="manual-historical-work-source">GitHub 地址
         <input name="sourceUrl" type="url" required autocomplete="url" placeholder="https://github.com/org/repo/pull/123 或 /issues/123">
@@ -120,16 +121,21 @@ export function manualWorkAssignmentMarkup(item, result = null) {
       <small>工作项 ${escapeHtml(result.workItemId || "正在接入台账")} · 请求 ${escapeHtml(result.requestId)}</small>
     </section>`;
   }
-  const selected = item.kind === "pull_request" ? "pull_request" : "requirements";
+  const closedPullRequest = item.kind === "pull_request" &&
+    ["closed", "merged"].includes(String(item.state || "").toLowerCase());
+  const selected = item.kind === "pull_request" && !closedPullRequest
+    ? "pull_request" : "requirements";
   return `<section class="manual-work-assignment">
     <h3>手动分配工作</h3>
-    <p>创建真实共享任务；岗位权限、代码执行和 GitHub 写入仍受现有门禁约束。</p>
+    <p>${closedPullRequest
+      ? "此 PR 已关闭或已合并，可创建需求梳理或中枢协调任务。"
+      : "创建真实共享任务；岗位权限、代码执行和 GitHub 写入仍受现有门禁约束。"}</p>
     <form data-manual-work-assignment>
       <label>交付类型
         <select name="workType">
-          ${item.kind === "pull_request" ? option("pull_request", selected) : ""}
-          ${option("development", selected)}
-          ${option("testing", selected)}
+          ${item.kind === "pull_request" && !closedPullRequest ? option("pull_request", selected) : ""}
+          ${closedPullRequest ? "" : option("development", selected)}
+          ${closedPullRequest ? "" : option("testing", selected)}
           ${option("requirements", selected)}
           ${option("general", selected)}
         </select>
@@ -180,7 +186,9 @@ export function ownerWorkRequestForItem(
   ].filter(Boolean).join("\n"), 12 * 1024);
   const request = {
     schemaVersion:
-      item.kind === "pull_request" && workType === "pull_request" && !assignedLogin
+      item.kind === "pull_request" &&
+      ["pull_request", "development", "testing"].includes(workType) &&
+      !assignedLogin
         ? 2
         : item.kind === "issue"
         ? 6

@@ -27,6 +27,7 @@ import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js
 import { OrchestratorService } from "../src/services/orchestrator-service.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
 import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -868,6 +869,28 @@ test("an explicit PR request resolves one immutable target before staging a PR e
     login: "runtime-user",
     product: "qt",
   });
+
+  for (const [workType, roleId, requestId] of [
+    ["development", "developer", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    ["testing", "tester", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"],
+  ]) {
+    const manualRequest = ownerWorkRequestForItem({
+      kind: "pull_request",
+      repo: "acme/repo",
+      number: 42,
+      title: "PR 42",
+    }, { workType, priority: "high", requestId });
+    const submitted = await owner.submit(manualRequest);
+    assert.deepEqual(submitted.assignment.target, { type: "role", id: roleId });
+    const manualItem = (await ledger.listItems({ limit: 10 })).items.find(
+      ({ itemId }) => itemId === submitted.workItemId,
+    );
+    assert.equal(manualItem.source.current.event.subject.repository, "acme/repo");
+    assert.deepEqual(
+      currentWorkItemExecutionBinding(manualItem).gitTarget,
+      manualItem.source.current.event.payload.gitTarget,
+    );
+  }
 
   const automatedDevelopment = await owner.submit(createPrTriageWorkRequest({
     requestKey: "pr-work-fix-ci",

@@ -38,6 +38,7 @@ import {
 } from "../src/domain/work-graph-memory-event.js";
 import { createMemoryRuntime } from "../src/memory-runtime.js";
 import { LocalMemoryJournal } from "../src/services/local-memory-journal.js";
+import { AttentionInbox } from "../src/services/attention-inbox.js";
 import { MemoryAnswerService } from "../src/services/memory-answer-service.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
@@ -11270,6 +11271,55 @@ async function prepareAttentionResult(
   ).outbox;
 }
 
+test("orchestrator takeover question stays answerable for an unconfigured target", async () => {
+  for (const target of [
+    { type: "role", id: "developer" },
+    { type: "person", id: "missing-owner" },
+  ]) {
+    const fixture = await createFixture({ records: [assignment(1, target)] });
+    await prepareAttentionResult(
+      fixture,
+      { type: "text", text: "Assign a configured owner" },
+      { workerId: "employee-orchestrator", roleId: "orchestrator" },
+    );
+    const waiting = (await fixture.service.listItems()).items[0];
+    const authority = {
+      requestKey: waiting.activeIntentId,
+      producer: { roleId: "orchestrator", workItemId: waiting.itemId },
+    };
+    assert.equal(waiting.status, "waiting_user");
+    assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
+    assert.equal(await fixture.service.isAttentionRequestCurrent({
+      ...authority,
+      producer: { ...authority.producer, roleId: "developer" },
+    }), false);
+
+    const inbox = new AttentionInbox({
+      store: new MemoryStore(),
+      exclusiveLease: new ExclusiveLease(),
+      authority: fixture.service,
+    });
+    await inbox.recover();
+    const intent = askUserIntent();
+    const request = normalizeAttentionRequest({
+      ...authority,
+      type: "ask_user",
+      question: intent.question,
+      context: [],
+      choices: intent.choices,
+    });
+    const receipt = await inbox.create(request);
+    assert.equal((await inbox.next()).requestId, receipt.requestId);
+    await inbox.answer({
+      requestId: receipt.requestId,
+      expectedRevision: receipt.revision,
+      contentDigest: receipt.contentDigest,
+      answer: { type: "text", text: "Assign a configured owner" },
+    });
+    assert.equal((await inbox.readOutbox()).items.length, 1);
+  }
+});
+
 for (const lifecycle of [
   { eventType: "issue.left_scope", reason: "issue_source_left_scope" },
   { eventType: "issue.completed", reason: "issue_source_completed" },
@@ -11399,6 +11449,44 @@ test("new Issue evidence revokes an older question for the same role", async () 
   assert.equal(retired.statusReason, "issue_assignment_superseded");
   assert.equal(retired.activeIntentId, null);
   assert.equal(items.find(({ itemId }) => itemId !== waiting.itemId).status, "queued");
+});
+
+test("attention authority reads a newer durable ledger written by another instance", async () => {
+  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "old answer" },
+    { workerId: "configured-requirements-analyst", roleId: "requirements-analyst" },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const authority = {
+    requestKey: waiting.activeIntentId,
+    producer: { roleId: "requirements-analyst", workItemId: waiting.itemId },
+  };
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
+
+  const other = new WorkLedgerService({
+    store: fixture.store,
+    assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock,
+    idFactory: incrementingIds(),
+  });
+  await other.recover();
+  fixture.source.records.push(issueAssignment(2, {
+    eventType: "issue.updated",
+    occurredAt: "2026-08-02T02:05:00.000Z",
+  }));
+  fixture.source.highWatermark = 2;
+  await other.intake();
+
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), false);
+  const retired = (await other.listItems()).items.find(
+    (item) => item.itemId === waiting.itemId,
+  );
+  assert.deepEqual(await fixture.service.readAttentionRequestRetirement(authority), {
+    status: "cancelled", workItemRevision: retired.revision, reason: "issue_assignment_superseded",
+  });
 });
 
 test("one intake batch keeps only the newest Issue assignment for one role", async () => {
@@ -12280,6 +12368,10 @@ test("a same-Head PR fact update does not strand an answered user question", asy
     idFactory: incrementingIds(),
   });
   await recovered.recover();
+  assert.equal(await recovered.isAttentionRequestCurrent({
+    requestKey: waiting.activeIntentId,
+    producer: { roleId: "pr-engineer", workItemId: waiting.itemId },
+  }), true);
   const applied = await recovered.applyAttentionBatch({
     items: [result],
     nextSequence: 1,
@@ -12344,6 +12436,10 @@ test("an answered question for an old PR Head cannot settle the new Head", async
     idFactory: incrementingIds(),
   });
   await recovered.recover();
+  assert.equal(await recovered.isAttentionRequestCurrent({
+    requestKey: result.requestKey,
+    producer: { roleId: "pr-engineer", workItemId: item.itemId },
+  }), false);
   await assert.rejects(
     recovered.applyAttentionBatch({
       items: [result],

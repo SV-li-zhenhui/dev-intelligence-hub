@@ -32,6 +32,34 @@ const profileDefinitions = {
     timeoutMs: 30_000,
   },
 };
+const passedTap = [
+  "TAP version 13",
+  "ok 1 - runs a real assertion",
+  "1..1",
+  "# tests 1",
+  "# suites 0",
+  "# pass 1",
+  "# fail 0",
+  "# cancelled 0",
+  "# skipped 0",
+  "# todo 0",
+  "# duration_ms 5",
+].join("\n");
+
+function tapSummary({ tests, pass, fail = 0, cancelled = 0, skipped = 0, todo = 0 }) {
+  return [
+    "TAP version 13",
+    `1..${tests}`,
+    `# tests ${tests}`,
+    "# suites 0",
+    `# pass ${pass}`,
+    `# fail ${fail}`,
+    `# cancelled ${cancelled}`,
+    `# skipped ${skipped}`,
+    `# todo ${todo}`,
+    "# duration_ms 5",
+  ].join("\n");
+}
 
 class FakeSandbox {
   constructor({
@@ -124,7 +152,7 @@ function sandboxResult(overrides = {}) {
   return {
     exitCode: 0,
     signal: null,
-    stdout: "tests passed",
+    stdout: passedTap,
     stderr: "",
     durationMs: 5,
     imageId: `sha256:${"a".repeat(64)}`,
@@ -796,7 +824,7 @@ test("writes, tests, and completion stay bound to an exact workspace revision", 
     results: [
       sandboxResult(),
       sandboxResult({ exitCode: 1, stdout: "", stderr: "assertion failed" }),
-      sandboxResult({ stdout: "fixed" }),
+      sandboxResult(),
     ],
   });
   const setup = await fixture(t, { sandbox });
@@ -903,6 +931,122 @@ test("writes, tests, and completion stay bound to an exact workspace revision", 
     await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
     "export const value = 1;\n",
   );
+});
+
+test("node-test proof requires an actual passing test in a complete TAP report", async (t) => {
+  const cases = [
+    { name: "zero tests", stdout: tapSummary({ tests: 0, pass: 0 }), passed: false, executed: 0 },
+    { name: "all skipped", stdout: tapSummary({ tests: 2, pass: 0, skipped: 2 }), passed: false, executed: 0 },
+    { name: "all todo", stdout: tapSummary({ tests: 1, pass: 0, todo: 1 }), passed: false, executed: 0 },
+    { name: "missing summary", stdout: "TAP version 13\nok 1 - incomplete", passed: false },
+    { name: "truncated summary", stdout: "TAP version 13\nok 1 - incomplete\n1..1\n# tests 1\n# pass 1", passed: false },
+    { name: "one pass", stdout: passedTap, passed: true, executed: 1 },
+    { name: "nested passes", stdout: "TAP version 13\n    ok 1 - nested\n    1..1\nok 1 - suite\n1..1\n# tests 2\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0", passed: true, executed: 2 },
+    { name: "one failure", stdout: tapSummary({ tests: 2, pass: 1, fail: 1 }), passed: false, executed: 2 },
+  ];
+  for (const entry of cases) {
+    const sandbox = new FakeSandbox({
+      results: [sandboxResult({ stdout: entry.stdout, stderr: "diagnostic output" })],
+    });
+    const setup = await fixture(t, { sandbox });
+    const { executor } = setup.createExecutor();
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const checked = await executor.perform(actionRequest(session, {
+      type: "run_profile",
+      actionId: "run-tests",
+      profileId: "node-tests",
+    }));
+    assert.equal(checked.action.status, entry.passed ? "succeeded" : "failed", entry.name);
+    if (entry.passed) {
+      assert.equal(checked.result.testSummary.executed, entry.executed);
+      const state = await setup.innerStore.read("code-executor-state");
+      const auditedAction = state.sessions[session.id].actions.find((action) => action.id === "run-tests");
+      const output = await setup.journal.readJson(auditedAction.outputArtifacts.output);
+      assert.equal(output.testSummary.executed, entry.executed);
+      const completed = await executor.perform(actionRequest(checked.session, {
+        type: "complete",
+        actionId: "complete-tests",
+      }));
+      assert.equal(completed.action.status, "succeeded", entry.name);
+    } else {
+      assert.equal(checked.result.error.code, "TESTS_FAILED", entry.name);
+      if (entry.executed !== undefined) {
+        assert.equal(checked.result.testSummary.executed, entry.executed);
+      }
+      const completion = await executor.perform(actionRequest(checked.session, {
+        type: "complete",
+        actionId: "complete-tests",
+      }));
+      assert.equal(completion.action.status, "failed", entry.name);
+      assert.equal(completion.result.error.code, "CHECKS_NOT_PASSED", entry.name);
+    }
+  }
+});
+
+test("node-script proof still follows its fixed script exit code", async (t) => {
+  const profiles = {
+    "script-check": {
+      kind: "node-script",
+      image: profileImage,
+      timeoutMs: 30_000,
+      asset: {
+        schemaVersion: 1,
+        title: "Script",
+        description: "Fixed script",
+        version: 1,
+        source: "process.exit(0);",
+      },
+    },
+  };
+  const sandbox = new FakeSandbox({
+    profiles,
+    results: [sandboxResult({
+      stdout: "script passed without TAP",
+      profileFingerprint: digestValue(profiles["script-check"]),
+    })],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({
+    profiles,
+    workspaceProfiles: { dashboard: ["script-check"] },
+  });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const checked = await executor.perform(actionRequest(session, {
+    type: "run_profile",
+    actionId: "run-script",
+    profileId: "script-check",
+  }));
+  assert.equal(checked.action.status, "succeeded");
+  assert.equal(Object.hasOwn(checked.result, "testSummary"), false);
+  const completed = await executor.perform(actionRequest(checked.session, {
+    type: "complete",
+    actionId: "complete-script",
+  }));
+  assert.equal(completed.action.status, "succeeded");
+
+  const failedSandbox = new FakeSandbox({
+    profiles,
+    results: [sandboxResult({
+      exitCode: 1,
+      stdout: passedTap,
+      profileFingerprint: digestValue(profiles["script-check"]),
+    })],
+  });
+  const failedSetup = await fixture(t, { sandbox: failedSandbox });
+  const failedExecutor = failedSetup.createExecutor({
+    profiles,
+    workspaceProfiles: { dashboard: ["script-check"] },
+  }).executor;
+  await failedExecutor.recover();
+  const failedSession = await failedExecutor.start(startRequest());
+  const failedCheck = await failedExecutor.perform(actionRequest(failedSession, {
+    type: "run_profile",
+    actionId: "run-script",
+    profileId: "script-check",
+  }));
+  assert.equal(failedCheck.action.status, "failed");
 });
 
 test("completed change export rebuilds exact package material after scratch loss", async (t) => {

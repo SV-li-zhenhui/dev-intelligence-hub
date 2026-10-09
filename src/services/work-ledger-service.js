@@ -10,7 +10,10 @@ import {
   planWorkItemRetry,
   planWorkItemTransition,
 } from "./work-ledger-item-commands.js";
-import { planAttentionBatchApplication } from "./work-ledger-attention-commands.js";
+import {
+  attentionResultInputBinding,
+  planAttentionBatchApplication,
+} from "./work-ledger-attention-commands.js";
 import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
 import {
@@ -811,15 +814,29 @@ export class WorkLedgerService {
         "内部请示授权查询无效",
       );
     }
-    const item = this.state.items.find(
+    const state = await this.#readAttentionAuthorityState();
+    const item = state.items.find(
       (candidate) => candidate.itemId === workItemId,
     );
+    const intent = state.outbox.find(
+      (candidate) => candidate.intentId === requestKey,
+    );
+    const ownsTarget =
+      item?.currentTarget?.type === "role" &&
+      item.currentTarget.id === roleId;
+    const orchestratorTakeover =
+      roleId === "orchestrator" &&
+      intent?.requestedBy?.workerId === "employee-orchestrator";
     return Boolean(
       item?.status === "waiting_user" &&
         item.activeIntentId === requestKey &&
-        item.currentTarget?.type === "role" &&
-        item.currentTarget.id === roleId &&
-        !hasNewerIssueAssignment(this.state.items, item),
+        intent?.itemId === workItemId &&
+        attentionResultInputBinding(state, item, intent) !== undefined &&
+        intent.status === "delivered" &&
+        intent.intent?.type === "ask_user" &&
+        intent.requestedBy?.roleId === roleId &&
+        (ownsTarget || orchestratorTakeover) &&
+        !hasNewerIssueAssignment(state.items, item),
     );
   }
 
@@ -991,8 +1008,9 @@ export class WorkLedgerService {
   async readAttentionRequestRetirement(input = {}) {
     // A temporarily non-current question is not proof that its task ended.
     await this.isAttentionRequestCurrent(input);
-    const item = this.state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
-    const intent = this.state.outbox.find((candidate) => candidate.intentId === input.requestKey);
+    const state = await this.#readAttentionAuthorityState();
+    const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
+    const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
     if (
       !item || !["cancelled", "completed", "superseded"].includes(item.status) ||
       item.activeIntentId !== null || intent?.itemId !== item.itemId ||
@@ -2592,6 +2610,23 @@ export class WorkLedgerService {
     }
     this.durableContentVersion = observedVersion;
     return durable;
+  }
+
+  async #readAttentionAuthorityState() {
+    // AttentionInbox can call this while holding its own lease. Read the
+    // committed ledger directly without taking another lease or changing the
+    // work ledger's version cache, so another instance cannot leave an old
+    // question authorized and no nested lease can deadlock.
+    const stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    if (stored === null) {
+      if (this.state.revision === 0) return emptyWorkLedgerState();
+      throw workLedgerError(
+        "WORK_LEDGER_STATE_CORRUPTED",
+        "员工工作台账持久状态意外消失",
+        503,
+      );
+    }
+    return normalizeWorkLedgerPersistedState(stored, this.limits);
   }
 
   #writeTransaction(operation) {

@@ -399,7 +399,8 @@ test("configured Codex routing preserves stable entity sessions", async () => {
     sessionKey,
   });
 
-  assert.equal(calls[0].sessionKey, sessionKey);
+  assert.match(calls[0].sessionKey, /^auth-v2:[a-f0-9]{64}$/u);
+  assert.notEqual(calls[0].sessionKey, sessionKey);
 });
 
 test("configured routing preserves prototype-defined provider availability", async () => {

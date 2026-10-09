@@ -12,13 +12,24 @@ const historyDelayMs = 120;
 const unknownConfirmationDelayMs = 300;
 let appendFailuresRemaining = 1;
 let attentionFailuresRemaining = 0;
+let dashboardFailuresRemaining = 0;
+let externalConflictRemaining = 0;
 let confirmationEnabled = false;
+let internalAttentionEnabled = false;
 let confirmationFixtureName = "active";
 let historyMutation = 0;
 let queueRevision = 1;
 let historyRequestCount = 0;
 let deferredRestoreRace = null;
+let queueLoadRace = null;
 const confirmationSubmissions = [];
+const internalSubmissions = [];
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
 
 function json(response, status, value) {
   response.writeHead(status, {
@@ -253,6 +264,24 @@ function confirmationItem() {
 }
 
 function attentionFixture() {
+  if (internalAttentionEnabled) {
+    return {
+      available: true,
+      source: "internal_request",
+      pendingCount: 1,
+      externalEnabled: true,
+      externalQueueRevision: queueRevision,
+      item: {
+        requestId: `attention-${"a".repeat(64)}`,
+        revision: 1,
+        contentDigest: "b".repeat(64),
+        producer: { roleId: "orchestrator", workItemId: "work-local" },
+        question: "Who should own this work?",
+        context: [],
+        choices: [],
+      },
+    };
+  }
   if (confirmationEnabled) {
     return {
       available: true,
@@ -299,6 +328,11 @@ function createFixtureServer() {
     try {
       const url = new URL(request.url, "http://127.0.0.1");
       if (url.pathname === "/api/dashboard") {
+        if (dashboardFailuresRemaining > 0) {
+          dashboardFailuresRemaining -= 1;
+          json(response, 503, { error: "fixture dashboard failure" });
+          return;
+        }
         json(response, 200, dashboardFixture());
         return;
       }
@@ -320,8 +354,26 @@ function createFixtureServer() {
         json(response, 200, { ok: true });
         return;
       }
+      if (url.pathname === "/fixture/enable-internal") {
+        internalAttentionEnabled = true;
+        queueRevision += 1;
+        json(response, 200, { ok: true });
+        return;
+      }
       if (url.pathname === "/fixture/deferred-restore-race") {
         deferredRestoreRace = { requests: 0, releaseOlder: null };
+        json(response, 200, { ok: true });
+        return;
+      }
+      if (url.pathname === "/fixture/deferred-restore-issued-race") {
+        deferredRestoreRace = {
+          mode: "newer-in-flight-fails",
+          requests: 0,
+          olderSeen: deferred(),
+          newerSeen: deferred(),
+          releaseOlder: deferred(),
+          releaseNewer: deferred(),
+        };
         json(response, 200, { ok: true });
         return;
       }
@@ -336,22 +388,71 @@ function createFixtureServer() {
           json(response, 503, { error: "fixture attention failure" });
           return;
         }
+        if (queueLoadRace !== null) {
+          const race = queueLoadRace;
+          race.requests += 1;
+          if (race.requests === 1) {
+            const olderSnapshot = attentionFixture();
+            race.olderSeen.resolve();
+            await race.releaseOlder.promise;
+            if (race.olderStatus === 200) {
+              json(response, 200, olderSnapshot);
+            } else {
+              json(response, 503, { error: "older refresh failed" });
+            }
+            return;
+          }
+          if (race.requests === 2) {
+            race.newerSeen.resolve();
+            await race.releaseNewer.promise;
+            queueLoadRace = null;
+            json(response, 200, attentionFixture());
+            return;
+          }
+        }
         if (deferredRestoreRace !== null) {
-          deferredRestoreRace.requests += 1;
-          if (deferredRestoreRace.requests === 1) {
+          const race = deferredRestoreRace;
+          race.requests += 1;
+          if (race.mode === "newer-in-flight-fails") {
+            if (race.requests === 1) {
+              const olderSnapshot = attentionFixture();
+              race.olderSeen.resolve();
+              await race.releaseOlder.promise;
+              json(response, 200, olderSnapshot);
+              return;
+            }
+            race.newerSeen.resolve();
+            await race.releaseNewer.promise;
+            deferredRestoreRace = null;
+            json(response, 503, { error: "newer refresh failed" });
+            return;
+          }
+          if (race.requests === 1) {
             await new Promise((resolve) => {
-              deferredRestoreRace.releaseOlder = resolve;
+              race.releaseOlder = resolve;
             });
             json(response, 503, { error: "older restore failed" });
             return;
           }
-          const race = deferredRestoreRace;
           deferredRestoreRace = null;
           json(response, 200, attentionFixture());
           setTimeout(() => race.releaseOlder(), 300);
           return;
         }
         json(response, 200, attentionFixture());
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        /^\/api\/attention\/internal\/attention-[a-f0-9]{64}\/(answer|reject)$/.test(url.pathname)
+      ) {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        internalSubmissions.push({ path: url.pathname, body: JSON.parse(body) });
+        internalAttentionEnabled = false;
+        attentionFailuresRemaining = 1;
+        queueRevision += 1;
+        json(response, 200, { accepted: true });
         return;
       }
       if (
@@ -366,6 +467,12 @@ function createFixtureServer() {
           path: url.pathname,
           body: JSON.parse(body),
         });
+        if (externalConflictRemaining > 0) {
+          externalConflictRemaining -= 1;
+          dashboardFailuresRemaining = 1;
+          json(response, 409, { error: "fixture stale confirmation" });
+          return;
+        }
         confirmationEnabled = false;
         historyMutation += 1;
         queueRevision += 1;
@@ -646,6 +753,39 @@ try {
       );
       await page.getByRole("button", { name: "稍后再看" }).click();
       await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+
+      await page.evaluate(() =>
+        fetch("/fixture/deferred-restore-issued-race", { method: "POST" })
+      );
+      const issuedRace = deferredRestoreRace;
+      await page.locator("#confirmation-deferred-restore").click();
+      await issuedRace.olderSeen.promise;
+      await page.locator("#refresh-button").dispatchEvent("click");
+      await issuedRace.newerSeen.promise;
+      const olderRestored = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === "/api/attention/next" &&
+        response.status() === 200
+      );
+      issuedRace.releaseOlder.resolve();
+      await olderRestored;
+      await page.getByText(/稍后项已保留，请再次点击重新查看/u).waitFor();
+      assert.equal(
+        await page.evaluate(
+          (storageKey) => sessionStorage.getItem(storageKey),
+          deferredConfirmationStorageKey,
+        ),
+        JSON.stringify([deferredKey]),
+      );
+      const newerFailed = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === "/api/attention/next" &&
+        response.status() === 503
+      );
+      issuedRace.releaseNewer.resolve();
+      await newerFailed;
+      await page.locator("#confirmation-deferred-restore").click();
+      await page.locator("#confirmation-dialog[open]").waitFor();
+      await page.getByRole("button", { name: "稍后再看" }).click();
+      await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
     }
   }
 
@@ -673,6 +813,16 @@ try {
   assert.equal(await stableIdentity(page, form, "#confirmation-history-filter"), true);
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
+
+  await page.evaluate(() =>
+    fetch("/fixture/enable-confirmation?fixture=active", { method: "POST" })
+  );
+  await page.locator("#refresh-button").click();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  attentionFailuresRemaining = 1;
+  await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
+  await page.getByText(/GitHub 已确认发布成功.*读取确认队列失败（503）/u).waitFor();
+  assert.equal(await page.locator("#confirmation-dialog[open]").count(), 0);
 
   await page.evaluate(() =>
     fetch("/fixture/enable-confirmation?fixture=failed", { method: "POST" })
@@ -716,6 +866,103 @@ try {
     confirmationSubmissions.at(-1).body.reason,
     "用户确认结果仍未知并封存，禁止重试",
   );
+
+  await page.evaluate(() =>
+    fetch("/fixture/enable-confirmation?fixture=active", { method: "POST" })
+  );
+  await page.locator("#refresh-button").click();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  externalConflictRemaining = 1;
+  await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
+  await page.getByText(/确认内容或目标状态已经变化.*其他页面数据会自动重试/u).waitFor();
+  await page.locator("#confirmation-dialog[open]").waitFor();
+  await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
+  await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+
+  for (const operation of ["answer", "reject"]) {
+    await page.evaluate(() => fetch("/fixture/enable-internal", { method: "POST" }));
+    await page.locator("#refresh-button").click();
+    await page.locator("#confirmation-dialog[open] .internal-attention").waitFor();
+    if (operation === "answer") {
+      await page.locator("#internal-answer-text").fill("Assign a configured owner");
+      await page.getByRole("button", { name: "提交文字答复" }).click();
+    } else {
+      await page.getByRole("button", { name: "驳回请示" }).click();
+    }
+    await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+    await page.getByText(/已写入本地台账.*读取确认队列失败（503）/u).waitFor({ timeout: 3_000 });
+    assert.ok(internalSubmissions.at(-1).path.endsWith(`/${operation}`));
+  }
+
+  await page.evaluate(() => fetch("/fixture/enable-confirmation?fixture=active", { method: "POST" }));
+  queueLoadRace = {
+    requests: 0,
+    olderSeen: deferred(),
+    newerSeen: deferred(),
+    releaseOlder: deferred(),
+    releaseNewer: deferred(),
+  };
+  const race = queueLoadRace;
+  await page.locator("#refresh-button").dispatchEvent("click");
+  await race.olderSeen.promise;
+  await page.locator("#refresh-button").dispatchEvent("click");
+  await race.newerSeen.promise;
+  const olderFailure = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/attention/next" && response.status() === 503
+  );
+  race.releaseOlder.resolve();
+  await olderFailure;
+  const newerSuccess = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/attention/next" && response.status() === 200
+  );
+  race.releaseNewer.resolve();
+  await newerSuccess;
+  await page.locator("#confirmation-dialog[open]").waitFor({ timeout: 3_000 });
+  assert.match(await page.locator("#confirmation-dialog").textContent(), /Fixture confirmation/u);
+
+  // A successful older read must not open an obsolete item while a newer read
+  // is in flight. Once a dialog opens, later queue reads cannot replace it.
+  confirmationEnabled = false;
+  internalAttentionEnabled = false;
+  const racePage = await browser.newPage();
+  racePage.on("pageerror", (error) => pageErrors.push(error.message));
+  await racePage.goto(`http://127.0.0.1:${address.port}`, {
+    waitUntil: "networkidle",
+  });
+  confirmationEnabled = true;
+  confirmationFixtureName = "comment";
+  queueLoadRace = {
+    requests: 0,
+    olderStatus: 200,
+    olderSeen: deferred(),
+    newerSeen: deferred(),
+    releaseOlder: deferred(),
+    releaseNewer: deferred(),
+  };
+  const successRace = queueLoadRace;
+  await racePage.locator("#refresh-button").dispatchEvent("click");
+  await successRace.olderSeen.promise;
+  await racePage.evaluate(() => fetch("/fixture/enable-confirmation?fixture=active", { method: "POST" }));
+  await racePage.locator("#refresh-button").dispatchEvent("click");
+  await successRace.newerSeen.promise;
+  const olderSuccess = racePage.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/attention/next" &&
+    response.status() === 200
+  );
+  successRace.releaseOlder.resolve();
+  await olderSuccess;
+  const currentSuccess = racePage.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/attention/next" &&
+    response.status() === 200
+  );
+  successRace.releaseNewer.resolve();
+  await currentSuccess;
+  await racePage.locator("#confirmation-dialog[open]").waitFor({ timeout: 3_000 });
+  assert.match(
+    await racePage.locator("#confirmation-dialog").textContent(),
+    /Fixture confirmation/u,
+  );
+  await racePage.close();
   assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
 } finally {
   await browser.close();

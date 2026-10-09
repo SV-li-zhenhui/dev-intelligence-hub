@@ -113,6 +113,18 @@ test("PR detail offers a manual assignment form with a direct review option", ()
   assert.match(markup, /data-manual-work-assignment/);
 });
 
+test("closed PR manual assignment offers only non-code coordination work", () => {
+  for (const state of ["closed", "MERGED"]) {
+    const markup = manualWorkAssignmentMarkup({ ...pullRequest, state });
+
+    assert.doesNotMatch(markup, /PR Review \/ 推进/);
+    assert.doesNotMatch(markup, /开发实现/);
+    assert.doesNotMatch(markup, /测试验证/);
+    assert.match(markup, /需求梳理/);
+    assert.match(markup, /已关闭/);
+  }
+});
+
 test("a PR review assignment freezes the structured PR target", () => {
   const request = ownerWorkRequestForItem(pullRequest, {
     workType: "pull_request",
@@ -127,6 +139,23 @@ test("a PR review assignment freezes the structured PR target", () => {
   });
   assert.match(request.description, /github\.com\/ExampleOrg\/SoftwareApp\/pull\/23991/);
   assert.equal(request.acceptanceCriteria.length, 2);
+});
+
+test("unassigned PR development and testing keep the structured PR target", () => {
+  for (const workType of ["development", "testing"]) {
+    const request = ownerWorkRequestForItem(pullRequest, {
+      workType,
+      priority: "high",
+      requestId: "12345678-1234-4123-8123-123456789abc",
+    });
+
+    assert.equal(request.schemaVersion, 2);
+    assert.deepEqual(request.pullRequest, {
+      repository: pullRequest.repo,
+      number: pullRequest.number,
+    });
+    assert.equal("responsiblePerson" in request, false);
+  }
 });
 
 test("an Issue development assignment becomes an audited capability request", () => {
@@ -271,6 +300,7 @@ test("work view exposes an explicit historical task form", () => {
   assert.match(markup, /name="workType"/);
   assert.match(markup, /data-manual-historical-work/);
   assert.match(markup, /不会扩大自动扫描范围/);
+  assert.match(markup, /OPEN/);
 });
 
 test("manual Issue work keeps its canonical GitHub identity", () => {

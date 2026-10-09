@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { WorkConditionWaker } from "../src/services/work-condition-waker.js";
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "../src/services/work-graph-wait-marker.js";
 
 function deferred() {
   let resolve;
@@ -119,7 +120,7 @@ test("round-robin advances past invalid bindings and wraps without dropping work
   assert.equal((await waker.runCycle()).scanned, 0);
 });
 
-test("submitted child delivery wakes a paused orchestrator root", async () => {
+test("submitted child delivery wakes only a parent explicitly marked as waiting for children", async () => {
   const ledger = new FakeLedger([]);
   const parent = {
     taskId: "work-item-root",
@@ -137,6 +138,7 @@ test("submitted child delivery wakes a paused orchestrator root", async () => {
     responsibility: { type: "role", id: "developer" },
     deliveries: [{ status: "submitted" }],
   };
+  ledger.items.push({ itemId: parent.taskId, revision: parent.revision, status: "paused", statusReason: AUTO_RESUME_ON_CHILD_DELIVERY });
   const resumeCalls = [];
   const waker = new WorkConditionWaker({
     ledger,
@@ -164,6 +166,76 @@ test("submitted child delivery wakes a paused orchestrator root", async () => {
     expectedGraphRevision: 9,
     expectedTaskRevision: 4,
   }]);
+});
+
+test("submitted child delivery does not undo an intentional orchestrator pause", async () => {
+  const ledger = new FakeLedger([]);
+  const parent = {
+    taskId: "work-item-root",
+    revision: 4,
+    parentTaskId: null,
+    status: "paused",
+    responsibility: { type: "role", id: "orchestrator" },
+    deliveries: [],
+  };
+  const child = {
+    taskId: "work-item-child",
+    revision: 3,
+    parentTaskId: parent.taskId,
+    status: "waiting_external",
+    responsibility: { type: "role", id: "developer" },
+    deliveries: [{ status: "submitted" }],
+  };
+  ledger.items.push({ itemId: parent.taskId, revision: parent.revision, status: "paused", statusReason: "owner-paused" });
+  const calls = [];
+  const waker = new WorkConditionWaker({
+    ledger,
+    graphReader: { async getSnapshot() { return { graph: { revision: 9, tasks: [parent, child] } }; } },
+    graphPlanner: { async resumeTask(command) { calls.push(command); } },
+  });
+
+  await waker.runCycle();
+  assert.deepEqual(calls, []);
+  ledger.items[0].statusReason = "waiting_for_children";
+  await waker.runCycle();
+  assert.deepEqual(calls, []);
+  assert.equal(parent.status, "paused");
+});
+
+test("an intentional pause cannot hide another parent marked waiting for children", async () => {
+  const ledger = new FakeLedger([]);
+  const parents = ["owner-paused", AUTO_RESUME_ON_CHILD_DELIVERY].map((statusReason, index) => ({
+    taskId: `root-${index}`,
+    revision: 4,
+    parentTaskId: null,
+    status: "paused",
+    responsibility: { type: "role", id: "orchestrator" },
+    deliveries: [],
+    statusReason,
+  }));
+  const children = parents.map((parent, index) => ({
+    taskId: `child-${index}`,
+    revision: 3,
+    parentTaskId: parent.taskId,
+    status: "waiting_external",
+    responsibility: { type: "role", id: "developer" },
+    deliveries: [{ status: "submitted" }],
+  }));
+  ledger.items.push(...parents.map(({ taskId, revision, statusReason }) => ({
+    itemId: taskId,
+    revision,
+    status: "paused",
+    statusReason,
+  })));
+  const resumed = [];
+  const waker = new WorkConditionWaker({
+    ledger,
+    graphReader: { async getSnapshot() { return { graph: { revision: 9, tasks: [...parents, ...children] } }; } },
+    graphPlanner: { async resumeTask({ taskId }) { resumed.push(taskId); } },
+  });
+
+  await waker.runCycle();
+  assert.deepEqual(resumed, ["root-1"]);
 });
 
 test("time conditions wake only at the exact durable notBefore boundary", async () => {

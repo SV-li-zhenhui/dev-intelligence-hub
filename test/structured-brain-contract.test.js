@@ -40,7 +40,7 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     intentVariants.find(
       ({ properties }) => properties?.type?.const === "orchestrate",
     ).properties.action.oneOf.length,
-    8,
+    9,
   );
   assert.equal(
     intentVariants.find(
