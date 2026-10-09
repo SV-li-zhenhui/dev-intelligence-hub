@@ -5227,6 +5227,7 @@ test("work APIs expose only newest-first ledger projections", async () => {
         safeguards: {
           prEmployeePaused: true,
           externalActionsEnabled: false,
+          automaticReviewEnabled: false,
         },
       });
       assert.deepEqual(JSON.parse(items.body), {
@@ -5294,6 +5295,7 @@ test("daily work APIs expose the bounded daily projection without changing durab
       safeguards: {
         prEmployeePaused: true,
         externalActionsEnabled: false,
+        automaticReviewEnabled: false,
       },
     });
     assert.equal(items.status, 200);

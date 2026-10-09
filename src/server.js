@@ -3199,6 +3199,10 @@ export function createDashboardServer(
             prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
             externalActionsEnabled:
               application.config.githubActions?.enabled === true,
+            automaticReviewEnabled:
+              application.config.githubActions?.enabled === true &&
+              application.config.githubActions?.enabledActions?.includes("review") === true &&
+              application.config.githubActions?.automaticReview === true,
           },
         });
         return;
@@ -3217,6 +3221,10 @@ export function createDashboardServer(
             prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
             externalActionsEnabled:
               application.config.githubActions?.enabled === true,
+            automaticReviewEnabled:
+              application.config.githubActions?.enabled === true &&
+              application.config.githubActions?.enabledActions?.includes("review") === true &&
+              application.config.githubActions?.automaticReview === true,
           },
         });
         return;
