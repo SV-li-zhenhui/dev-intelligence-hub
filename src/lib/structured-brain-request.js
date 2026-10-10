@@ -12,6 +12,7 @@ const MAX_SCHEMA_KEYS = 20_000;
 const MAX_SCHEMA_STRING_BYTES = 1024 * 1024;
 const MAX_CONTAINER_KEYS = 4_096;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
+const INVALID_MESSAGE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MESSAGE_ROLES = new Set(["system", "user", "assistant"]);
 const REASONING_EFFORTS = new Set([
@@ -128,11 +129,11 @@ function maximumRequestBytes(options) {
   return normalized.maxRequestBytes;
 }
 
-function safeText(value, name, maximumBytes) {
+function safeText(value, name, maximumBytes, invalidControl = INVALID_CONTROL) {
   if (
     typeof value !== "string" ||
     !value.trim() ||
-    INVALID_CONTROL.test(value) ||
+    invalidControl.test(value) ||
     Buffer.byteLength(value, "utf8") > maximumBytes
   ) {
     throw new TypeError(`${name} is invalid`);
@@ -170,7 +171,9 @@ function normalizeMessages(value) {
     }
     messages.push({
       role: message.role,
-      content: safeText(message.content, "message.content", MAX_MESSAGE_BYTES),
+      content: safeText(
+        message.content, "message.content", MAX_MESSAGE_BYTES, INVALID_MESSAGE_CONTROL,
+      ),
     });
   }
   return messages;

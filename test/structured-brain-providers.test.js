@@ -84,6 +84,43 @@ test("the shared structured request normalizer returns a detached deep-frozen re
   assert.equal(Object.isFrozen(normalized.schema.properties.nested.items), true);
 });
 
+test("structured messages preserve multiline prompts and code indentation", () => {
+  const messages = [
+    { role: "system", content: "# Review\r\n\r\n- 检查代码\n\t保留缩进" },
+    { role: "user", content: "diff --git a/app.js b/app.js\n+\treturn true;\n" },
+  ];
+  const normalized = normalizeStructuredBrainRequest({
+    model: "bounded-model", messages, schema: SCHEMA,
+  }, { maxRequestBytes: 8 * 1024 });
+
+  assert.deepEqual(normalized.messages, messages);
+});
+
+test("structured messages reject non-text controls and keep identifier validation strict", () => {
+  const normalize = (overrides) => normalizeStructuredBrainRequest({
+    model: "bounded-model", messages: MESSAGES, schema: SCHEMA, ...overrides,
+  }, { maxRequestBytes: 8 * 1024 });
+  const forbiddenCodes = [...Array(32).keys(), 127]
+    .filter((code) => ![9, 10, 13].includes(code));
+  for (const code of forbiddenCodes) {
+    assert.throws(
+      () => normalize({ messages: [{ role: "user", content: `text${String.fromCharCode(code)}text` }] }),
+      /message\.content is invalid/,
+      `reject control character ${code}`,
+    );
+  }
+  for (const content of ["", " \t\r\n"]) {
+    assert.throws(
+      () => normalize({ messages: [{ role: "user", content }] }),
+      /message\.content is invalid/,
+    );
+  }
+  for (const control of ["\t", "\n", "\r"]) {
+    assert.throws(() => normalize({ model: `model${control}name` }), /model is invalid/);
+    assert.throws(() => normalize({ sessionKey: `session${control}key` }), /sessionKey is invalid/);
+  }
+});
+
 test("the shared structured request normalizer rejects hostile data before touching it", () => {
   let proxyTraps = 0;
   const hostileSchema = new Proxy({}, {

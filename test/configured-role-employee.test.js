@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { normalizeStructuredBrainRequest } from "../src/lib/structured-brain-request.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
@@ -308,7 +309,7 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   );
 });
 
-test("Review decisions load the bundled skill and preserve Markdown through validation", async () => {
+test("Review Skill prompts pass provider input validation and preserve Markdown", async () => {
   const body = "## 结论\n\n**暂无法判断**：代码差异读取范围不完整。\n\n## 下一步\n\n- 继续检查尚未覆盖的年龄来源逻辑。";
   const decision = completeDecision({
     intent: {
@@ -324,6 +325,11 @@ test("Review decisions load the bundled skill and preserve Markdown through vali
   let request;
   const router = {
     async generate(value) {
+      normalizeStructuredBrainRequest({
+        model: value.brain.model,
+        messages: value.messages,
+        schema: value.schema,
+      }, { maxRequestBytes: 2 * 1024 * 1024 });
       request = value;
       return JSON.stringify(decision);
     },
