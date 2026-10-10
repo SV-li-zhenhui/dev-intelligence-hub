@@ -146,13 +146,13 @@ test("mail output cannot turn feature reuse into resolution or another person's 
   const options = { mailbox, ownerLogin: "owner" };
   const reuse = mailItem(message("reuse", { markdownBody: "@owner 这个功能在角膜地形图已经做了，同样的功能可以应用于眼底曲率地形图。" }), options);
   const prepared = prepareDingTalkDigest([reuse]);
-  for (const completion of ["已解决", "已经解决"]) {
+  for (const completion of ["已解决", "已经解决", "已实现", "无需额外开发"]) {
     for (const field of ["summary", "highlights", "actionRequired"]) {
       const generated = { groupId: prepared.groups[0].groupId, important: true,
         summary: "建议复用已有功能", highlights: [], actionRequired: "" };
       generated[field] = field === "highlights" ? [`Issue ${completion}，可以关闭`] : `Issue ${completion}，可以关闭`;
       const [item] = applyDingTalkSummaries(prepared, [generated]);
-      assert.doesNotMatch([item.summary, ...item.highlights, item.actionRequired].join("\n"), /已(?:经)?解决/);
+      assert.doesNotMatch([item.summary, ...item.highlights, item.actionRequired].join("\n"), /已(?:经)?解决|已实现|无需额外开发/);
       assert.equal(item.summaryStatus, "fallback");
       assert.match(item.sourceMessages[0].content, /可以应用/);
     }

@@ -157,9 +157,9 @@ function groundedMailSummary(group, result) {
   const content = group.messages.map((message) => message.content).join("\n");
   const generatedText = [result.summary, ...(result.highlights || []), result.actionRequired || ""].join("\n");
   const sourceText = content.replace(/已经/gu, "已");
-  const unsupportedCompletion = (generatedText.match(/已(?:经)?(?:解决|修复|关闭|合并|完成)/gu) || [])
+  const unsupportedConclusion = (generatedText.match(/已(?:经)?(?:解决|修复|关闭|合并|完成|实现)|(?:无需|不需要)(?:额外)?开发/gu) || [])
     .some((claim) => !sourceText.includes(claim.replace("已经", "已")));
-  const grounded = unsupportedCompletion
+  const grounded = unsupportedConclusion
     ? { ...fallbackResult(group), important: result.important, summaryStatus: "fallback" }
     : { ...result };
   const action = grounded.actionRequired || "";
