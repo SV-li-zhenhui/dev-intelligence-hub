@@ -931,7 +931,7 @@ function reviewFlowMarkup() {
     ["1", "分配", "主控或你把 PR 交给 PR 工程师"],
     ["2", "审查", "PR 工程师读取当前 Head、改动和检查结果"],
     ["3", "形成建议", "生成 Approve、Request changes 或 Comment"],
-    ["4", "发布 Review", "开启自动 Review 后，近期收到的 PR 自动发布；其他 Review 逐项确认"],
+    ["4", "发布 Review", "开启自动 Review 后，近期 Assign 给你的 PR 自动发布；按自动分配开关执行后续交接"],
     ["5", "交接推进", "按结论交给测试、开发或 PR 岗位；最终由合并负责人决定"],
   ];
   return `<section class="section review-flow-section" aria-labelledby="review-flow-title">

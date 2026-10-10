@@ -810,7 +810,7 @@ class GitHubActionAdapter {
 
   async assignReviewOutcome(input, { signal = null } = {}) {
     exactObject(input, ["actorAccountId", "repository", "pullRequestNumber", "headRefOid", "reviewEvent", "testingOwnerLogin"]);
-    if (!["APPROVE", "REQUEST_CHANGES"].includes(input.reviewEvent)) throw actionError("INVALID_GITHUB_ACTION", "trusted");
+    if (!["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(input.reviewEvent)) throw actionError("INVALID_GITHUB_ACTION", "trusted");
     const request = normalizeAssigneeRequest({ actorAccountId: input.actorAccountId, repository: input.repository, pullRequestNumber: input.pullRequestNumber,
       assigneeLogin: input.reviewEvent === "APPROVE" ? input.testingOwnerLogin : input.actorAccountId, expectedHeadOid: input.headRefOid });
     const operation = this.#beginOperation(signal);
@@ -825,7 +825,7 @@ class GitHubActionAdapter {
     } finally { this.#finishOperation(operation); }
     if (author.toLowerCase() === input.actorAccountId.toLowerCase()) throw actionError("GITHUB_HANDOFF_SELF_AUTHORED", "absent");
     return this.assignAssignee({ actorAccountId: input.actorAccountId, repository: input.repository, pullRequestNumber: input.pullRequestNumber,
-      assigneeLogin: input.reviewEvent === "REQUEST_CHANGES" ? author : input.testingOwnerLogin, expectedHeadOid: input.headRefOid }, { signal });
+      assigneeLogin: input.reviewEvent === "APPROVE" ? input.testingOwnerLogin : author, expectedHeadOid: input.headRefOid }, { signal });
   }
 
   #assertAssignablePullRequest(value, request) {

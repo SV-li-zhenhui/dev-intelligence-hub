@@ -5,6 +5,34 @@ import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconcil
 const items = ["first", "second"].map((id) => ({ id, request: { requestId: id } }));
 const delivered = { phase: "intaken", workItemId: "work-42", assignment: { target: { id: "tester" } } };
 
+test("all automatic Review verdicts complete their GitHub handoff before acknowledgement", async (t) => {
+  for (const reviewEvent of ["APPROVE", "REQUEST_CHANGES", "COMMENT"]) {
+    await t.test(reviewEvent, async () => {
+      const events = [];
+      const reconciler = new ReviewHandoffReconciler({
+        confirmations: {
+          readReviewHandoffs: async () => [{
+            id: "auto-1", actorAccountId: "me",
+            request: { requestId: "request-1", workType: reviewEvent === "APPROVE" ? "testing" : "pull_request", pullRequest: { repository: "acme/repo", number: 1 } },
+            automaticReview: { reviewEvent, headRefOid: "a".repeat(40) },
+          }],
+          recordReviewHandoff: async (_id, _requestId, outcome) => events.push(["ack", outcome.status, outcome.assignedLogin]),
+        },
+        ownerWorkRequests: { submit: async () => { events.push(["work"]); return delivered; } },
+        githubAssignee: {
+          assignAssignee() { throw new Error("legacy assignment must not run"); },
+          async assignReviewOutcome(input) {
+            events.push(["github", input.reviewEvent]);
+            return { assigneeLogin: reviewEvent === "APPROVE" ? "tester" : "developer" };
+          },
+        },
+      });
+      assert.equal((await reconciler.runCycle())[0].status, "completed");
+      assert.deepEqual(events, [["work"], ["github", reviewEvent], ["ack", "completed", reviewEvent === "APPROVE" ? "tester" : "developer"]]);
+    });
+  }
+});
+
 test("automatic verdicts route assignment and changed Heads stop further handoff retries", async () => {
   const outcomes = [];
   const calls = [];

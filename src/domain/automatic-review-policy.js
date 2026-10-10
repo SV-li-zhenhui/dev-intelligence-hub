@@ -2,7 +2,7 @@ const DAY_MS = 86_400_000;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const sameLogin = (left, right) => typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
 
-// These facts come from GitHub assignment/review-request events. PR activity
+// These facts come from GitHub assignment events. PR activity or review requests
 // and local observation times are deliberately not substitutes for receipt time.
 export function automaticReviewEligibility(item, account, now = new Date()) {
   if (!LOGIN.test(account || "") || item?.kind !== "pull_request") return "INVALID_TARGET";
@@ -11,12 +11,14 @@ export function automaticReviewEligibility(item, account, now = new Date()) {
   if (!LOGIN.test(item.author || "") || sameLogin(item.author, account)) return "SELF_AUTHORED";
   if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
       !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||
-      !["assignee", "reviewer"].includes(item.reviewReceivedVia) || !item.reviewRequestEventId) return "NO_CURRENT_INCOMING_REQUEST";
+      item.reviewReceivedVia !== "assignee" || !item.reviewRequestEventId) return "NO_CURRENT_INCOMING_REQUEST";
   const received = Date.parse(item.reviewReceivedAt || "");
   const timestamp = now instanceof Date ? now.getTime() : Date.parse(now);
   if (!Number.isFinite(received) || !Number.isFinite(timestamp) || received > timestamp || timestamp - received > DAY_MS) return "OUTSIDE_RECEIVED_WINDOW";
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.headRefOid || "")) return "HEAD_UNKNOWN";
   if (["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+  const published = Date.parse(item.myLatestPublishedReviewAt || "");
+  if (Number.isFinite(published) && published >= received) return "ASSIGNMENT_ALREADY_REVIEWED";
   return null;
 }
 

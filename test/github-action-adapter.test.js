@@ -417,20 +417,47 @@ test("a confirmed testing handoff adds its named GitHub assignee idempotently", 
   });
 });
 
-test("automatic failed Review assigns the author and refuses a changed Head", async () => {
+test("every published automatic Review assigns its next owner before removing the reviewer", async (t) => {
+  for (const [reviewEvent, assigneeLogin] of [["APPROVE", "qt-tester"], ["REQUEST_CHANGES", "developer"], ["COMMENT", "developer"]]) {
+    await t.test(reviewEvent, async () => {
+      const request = {
+        actorAccountId: "local-owner", repository: "acme/command-center", pullRequestNumber: 42,
+        headRefOid: HEAD, reviewEvent, testingOwnerLogin: reviewEvent === "APPROVE" ? "qt-tester" : null,
+      };
+      const runner = new FakeRunner([
+        actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: HEAD }, user: { login: "developer" } },
+        actor(), pullRequestIssue(["local-owner", "other-owner"]),
+        { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["local-owner", "other-owner", assigneeLogin]),
+        { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["other-owner", assigneeLogin]),
+      ]);
+      assert.equal((await createAdapter(runner).assignReviewOutcome(request)).assigneeLogin, assigneeLogin);
+      const writes = runner.calls.filter((call) => call.args.includes("POST") || call.args.includes("DELETE"));
+      assert.equal(writes.length, 2);
+      assert.ok(writes[0].args.includes("POST"));
+      assert.deepEqual(JSON.parse(writes[0].input), { assignees: [assigneeLogin] });
+      assert.ok(writes[1].args.includes("DELETE"));
+      assert.deepEqual(JSON.parse(writes[1].input), { assignees: ["local-owner"] });
+    });
+  }
+});
+
+test("automatic Review handoff refuses a changed Head", async () => {
   const request = { actorAccountId: "local-owner", repository: "acme/command-center", pullRequestNumber: 42, headRefOid: HEAD, reviewEvent: "REQUEST_CHANGES", testingOwnerLogin: null };
-  const runner = new FakeRunner([
-    actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: HEAD }, user: { login: "developer" } },
-    actor(), pullRequestIssue(["local-owner"]),
-    { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["local-owner", "developer"]),
-    { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["developer"]),
-  ]);
-  const result = await createAdapter(runner).assignReviewOutcome(request);
-  assert.equal(result.assigneeLogin, "developer");
-  assert.deepEqual(JSON.parse(runner.calls.find((call) => call.args.includes("POST")).input), { assignees: ["developer"] });
   const changed = new FakeRunner([actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: OTHER_HEAD }, user: { login: "developer" } }]);
   await assert.rejects(createAdapter(changed).assignReviewOutcome(request), { code: "GITHUB_HANDOFF_HEAD_CHANGED" });
   assert.equal(changed.calls.some((call) => call.args.includes("POST")), false);
+});
+
+test("a failed next-owner assignment never removes the reviewer", async () => {
+  const runner = new FakeRunner([
+    actor(), pullRequestIssue(["local-owner"]), actor(),
+    pullRequestIssue(["local-owner"]),
+  ]);
+  await assert.rejects(createAdapter(runner).assignAssignee({
+    actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, assigneeLogin: "developer",
+  }), { code: "GITHUB_PROTOCOL" });
+  assert.equal(runner.calls.some((call) => call.args.includes("DELETE")), false);
 });
 
 test("automatic publication rechecks its scope immediately before POST", async () => {

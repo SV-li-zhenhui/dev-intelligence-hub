@@ -19,11 +19,17 @@ test("automatic Review uses incoming request time rather than PR creation or act
 test("missing, revoked, self-authored, draft and already reviewed heads do not auto publish", () => {
   for (const patch of [
     { incomingReviewFactsAvailable: false }, { reviewRecipient: "other" },
+    { reviewReceivedVia: "reviewer" },
     { author: "REVIEWER" }, { reviewReceivedFrom: "reviewer" }, { state: "merged" },
     { isDraft: true }, { myReviewState: "APPROVED", myReviewCommitOid: item.headRefOid },
     { ciStatus: "PENDING" }, { ciStatus: "FAILURE" },
   ]) assert.ok(automaticReviewEligibility({ ...item, ...patch }, "reviewer", now));
   assert.equal(automaticReviewEligibility({ ...item, myReviewState: "CHANGES_REQUESTED", myReviewCommitOid: "b".repeat(40) }, "reviewer", now), null);
+});
+
+test("a published Review consumes its assignment until a later Assign arrives", () => {
+  assert.equal(automaticReviewEligibility({ ...item, myLatestPublishedReviewAt: "2026-10-09T09:30:00Z" }, "reviewer", now), "ASSIGNMENT_ALREADY_REVIEWED");
+  assert.equal(automaticReviewEligibility({ ...item, myLatestPublishedReviewAt: "2026-10-09T09:30:00Z", reviewReceivedAt: "2026-10-09T09:45:00Z" }, "reviewer", now), null);
 });
 test("testing routing uses explicit product evidence and configured owners only", () => {
   const owners = { qt: ["qt-tester"], bs: ["bs-tester"] };

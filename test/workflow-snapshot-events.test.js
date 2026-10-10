@@ -87,6 +87,7 @@ test("incoming review receipt facts survive snapshot routing and stored event va
     reviewReceivedFrom: "alice",
     reviewReceivedVia: "assignee",
     reviewRequestEventId: "AE_node_1",
+    myLatestPublishedReviewAt: "2026-08-01T09:30:00Z",
   };
   const events = workflowEventsFromSnapshots(snapshot([pullRequest(1)]), snapshot([pullRequest(1, receipt)]));
   assert.ok(events.length > 0);

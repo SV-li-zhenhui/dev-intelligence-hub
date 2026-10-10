@@ -2,23 +2,25 @@ export const INCOMING_REVIEW_QUERY = `query($owner:String!,$name:String!,$number
 
 export function projectIncomingReview(pr, account) {
   const same = (login) => typeof login === "string" && login.toLowerCase() === account.toLowerCase();
-  if (!pr || !Array.isArray(pr.timelineItems?.nodes) || !Array.isArray(pr.assignees?.nodes) || !Array.isArray(pr.reviewRequests?.nodes)) throw new Error("GitHub incoming Review facts are incomplete");
-  const events = pr.timelineItems.nodes.filter((event) => event && same(event.assignee?.login || event.requestedReviewer?.login))
+  if (!pr || !Array.isArray(pr.timelineItems?.nodes) || !Array.isArray(pr.assignees?.nodes) || !Array.isArray(pr.reviews?.nodes)) throw new Error("GitHub incoming Review facts are incomplete");
+  const events = pr.timelineItems.nodes.filter((event) => event &&
+    ["AssignedEvent", "UnassignedEvent"].includes(event.__typename) && same(event.assignee?.login))
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-  const active = [
-    ["assignee", pr.assignees.nodes.some((user) => same(user?.login)), "AssignedEvent", "UnassignedEvent"],
-    ["reviewer", pr.reviewRequests.nodes.some((request) => same(request?.requestedReviewer?.login)), "ReviewRequestedEvent", "ReviewRequestRemovedEvent"],
-  ].flatMap(([via, current, added, removed]) => {
-    const latest = events.find((event) => event.__typename === added || event.__typename === removed);
-    return current && latest?.__typename === added ? [{ ...latest, via }] : [];
-  }).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-  const received = active[0];
+  const latest = events[0];
+  // An outstanding Request review must not reopen a cycle after unassignment.
+  const received = pr.assignees.nodes.some((user) => same(user?.login)) &&
+    latest?.__typename === "AssignedEvent" ? latest : null;
+  const latestPublishedReview = pr.reviews.nodes.filter((review) =>
+    same(review?.author?.login) && ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state) &&
+    Number.isFinite(Date.parse(review.submittedAt)))
+    .sort((a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt))[0];
   return {
     incomingReviewFactsAvailable: true,
     reviewRecipient: received ? account : null,
     reviewReceivedAt: received?.createdAt || null,
     reviewReceivedFrom: received?.actor?.login || null,
-    reviewReceivedVia: received?.via || null,
+    reviewReceivedVia: received ? "assignee" : null,
     reviewRequestEventId: received?.id || null,
+    myLatestPublishedReviewAt: latestPublishedReview?.submittedAt || null,
   };
 }

@@ -7,7 +7,7 @@ function fixture({ enabled = true, event = "APPROVE", facts = {}, owners = { qt:
   const calls = [];
   const current = { kind: "pull_request", state: "open", author: "dev", currentUser: "me", headRefOid: head, isDraft: false,
     title: "Qt fix", incomingReviewFactsAvailable: true, reviewRecipient: "me", reviewReceivedFrom: "dev",
-    reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedVia: "reviewer", reviewRequestEventId: "RRE_1", ...facts };
+    reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_1", ...facts };
   const queue = { approve: async (...args) => { calls.push(args); return { ...item, status: "completed" }; } };
   const item = { id: "confirmation-1", kind: "github.work-proposal-review", status: "pending", actor: { accountId: "me" },
     target: { resourceId: "acme/repo#1", version: head }, queueRevision: 1, itemRevision: 1,
@@ -28,9 +28,16 @@ test("request_changes retains PR follow-up and automatic developer assignment", 
   await publisher.publish(item);
   assert.deepEqual(calls[0][1].reviewHandoff, { workType: "pull_request", responsiblePerson: null });
 });
+
+test("comment prepares the same durable author handoff as request_changes", async () => {
+  const { publisher, item, calls } = fixture({ event: "COMMENT" });
+  assert.equal((await publisher.publish(item)).status, "completed");
+  assert.deepEqual(calls[0][1].reviewHandoff, { workType: "pull_request", responsiblePerson: null });
+});
 test("disabled, old, changed, revoked, already published and unknown outcomes never auto approve", async () => {
   for (const options of [ { enabled: false }, { facts: { reviewReceivedAt: "2026-10-01T09:00:00Z" } },
     { facts: { headRefOid: "d".repeat(40) } }, { facts: { reviewRecipient: null } },
+    { facts: { reviewReceivedVia: "reviewer" } },
     { facts: { myReviewState: "APPROVED", myReviewCommitOid: head } }, { owners: {} } ]) {
     const { publisher, item, calls } = fixture(options);
     assert.equal(await publisher.publish(item), item);

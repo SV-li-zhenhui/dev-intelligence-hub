@@ -101,7 +101,7 @@ export class ReviewHandoffReconciler {
       if (result?.phase !== "intaken" || !result.workItemId || !result.assignment?.target?.id) {
         throw failure("REVIEW_HANDOFF_NOT_INTAKEN");
       }
-      if (item.automaticReview && ["APPROVE", "REQUEST_CHANGES"].includes(item.automaticReview.reviewEvent)) {
+      if (item.automaticReview && ["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.reviewEvent)) {
         if (typeof this.githubAssignee?.assignReviewOutcome !== "function") throw failure("REVIEW_HANDOFF_ASSIGNMENT_UNAVAILABLE");
         const assignment = await this.githubAssignee.assignReviewOutcome({
           actorAccountId: item.actorAccountId, repository: item.request.pullRequest.repository,

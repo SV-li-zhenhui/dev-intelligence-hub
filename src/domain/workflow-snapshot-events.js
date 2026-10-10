@@ -40,6 +40,7 @@ const COMMON_FACT_FIELDS = Object.freeze([
   "isDraft",
   "headRefOid",
   "myReviewState",
+  "myLatestPublishedReviewAt",
   "myReviewCommitOid",
   "reviewFactsAvailable",
   "inactiveDays",
