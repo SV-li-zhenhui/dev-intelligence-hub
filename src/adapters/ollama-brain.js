@@ -272,6 +272,7 @@ function dingTalkSystemPrompt(isRetry) {
     "邮件relation也可能是authored（本人创建的PR/Issue）、review_requested（请求本人评审）或participated（本人参与讨论）；自己的PR收到具体修改意见同样属于本人需要关注的工作。",
     "邮件要综合主题和全部正文，保留最新结论及不确定性；bodyIncomplete为true时须说明正文不完整，不得断言已读完整邮件或臆测附件内容。",
     "邮件中的引用块可能包含当前要求，不能遗漏；On ... wrote/某人写道之后的旧邮件只是历史上下文，不应当作本轮新增待办。",
+    "仅总结来信所述，不推断GitHub当前状态。已有类似功能、建议复用、提供方案都不等于当前Issue已解决；被Assign不等于要求本人开发或评审。仅在正文明确请当前用户执行时填写actionRequired，别人收到的具体要求不得列为当前用户待办。",
     "不重要的会话也必须返回完整记录，important 设为 false，不能省略；由调用方负责过滤。",
     "不得补充输入中没有的事实。每个 groupId 必须且只能返回一次。",
     retryInstruction,

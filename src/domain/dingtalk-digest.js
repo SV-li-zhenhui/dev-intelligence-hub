@@ -153,6 +153,27 @@ function fallbackResult(group) {
   };
 }
 
+function groundedMailSummary(group, result) {
+  const content = group.messages.map((message) => message.content).join("\n");
+  const generatedText = [result.summary, ...(result.highlights || []), result.actionRequired || ""].join("\n");
+  const sourceText = content.replace(/已经/gu, "已");
+  const unsupportedCompletion = (generatedText.match(/已(?:经)?(?:解决|修复|关闭|合并|完成)/gu) || [])
+    .some((claim) => !sourceText.includes(claim.replace("已经", "已")));
+  const grounded = unsupportedCompletion
+    ? { ...fallbackResult(group), important: result.important, summaryStatus: "fallback" }
+    : { ...result };
+  const action = grounded.actionRequired || "";
+  const mentionedUsers = [...content.matchAll(/@([\w-]+)/gu)].map((match) => match[1]);
+  const asksSomeoneElse = mentionedUsers.some((user) => user.toLowerCase() !== group.currentUser?.toLowerCase() &&
+    new RegExp(`^\\s*(?:请\\s*)?@?${user}(?![\\w-])`, "iu").test(action));
+  const ownerMentioned = group.currentUser && new RegExp(
+    `@${group.currentUser.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?![\\w-])`, "iu",
+  ).test(content.split(/\n(?:On .+wrote:|在.+写道[：:])/u)[0]);
+  if (asksSomeoneElse ||
+      (["assigned", "participated"].includes(group.relation) && !ownerMentioned)) grounded.actionRequired = "";
+  return grounded;
+}
+
 function digestItem(group, result, summaryStatus) {
   const newest = group.messages[0];
   const authors = [...new Set(group.messages.map((message) => message.author).filter(Boolean))];
@@ -190,9 +211,10 @@ export function applyDingTalkSummaries(prepared, summaries = null) {
   const digests = [];
   for (const group of prepared.groups) {
     const generated = summaryById.get(group.groupId);
-    const result = generated || fallbackResult(group);
+    const candidate = generated || fallbackResult(group);
+    const result = group.kinds.includes("mail") ? groundedMailSummary(group, candidate) : candidate;
     if (!result.important) continue;
-    digests.push(digestItem(group, result, generated ? "ai" : "fallback"));
+    digests.push(digestItem(group, result, result.summaryStatus || (generated ? "ai" : "fallback")));
   }
   return [...prepared.passthrough, ...digests];
 }
