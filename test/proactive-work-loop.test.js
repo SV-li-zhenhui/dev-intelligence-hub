@@ -800,9 +800,33 @@ test("unexpected availability errors remain resolution failures before claim", a
   assert.deepEqual(result.outcomes, [{
     itemId: source.itemId,
     status: "resolution_failed",
+    code: "ROLE_DECISION_FAILED",
   }]);
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.items[0].status, "queued");
+});
+
+test("availability failures preserve their safe cause without claiming the task", async () => {
+  const time = controlledClock();
+  const source = workItem(7, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory({
+    developer: worker({
+      roleId: "developer",
+      async checkAvailability() {
+        throw Object.assign(new Error("private diagnostic must not be exposed"), {
+          code: "ROLE_TASK_BINDING_INVALID",
+        });
+      },
+    }),
+  });
+  const result = await createLoop({ ledger, directory, time }).runCycle({ roleId: "developer" });
+  assert.deepEqual(result.outcomes, [{
+    itemId: source.itemId,
+    status: "resolution_failed",
+    code: "ROLE_TASK_BINDING_INVALID",
+  }]);
+  assert.equal(ledger.calls.claim.length, 0);
 });
 
 test("ten assignments for one missing role create only one durable question", async () => {

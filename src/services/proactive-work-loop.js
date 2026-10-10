@@ -897,7 +897,7 @@ export class ProactiveWorkLoop {
         continue;
       }
       if (resolution.status === "resolution_failed") {
-        outcomes.push({ itemId: item.itemId, status: "resolution_failed" });
+        outcomes.push({ itemId: item.itemId, status: "resolution_failed", code: stableFailureCode(resolution.error) });
         continue;
       }
       if (options.roleId !== null && resolution.roleId !== options.roleId) {
@@ -1157,7 +1157,7 @@ export class ProactiveWorkLoop {
       if (brainFailureOwnerAttention(code) !== null) {
         return { status: "degraded", code };
       }
-      return { status: "resolution_failed" };
+      return { status: "resolution_failed", code };
     }
   }
 
