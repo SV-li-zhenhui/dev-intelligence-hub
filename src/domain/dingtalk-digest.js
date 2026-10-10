@@ -128,14 +128,18 @@ export function dingTalkDigestFacts(groups) {
 
 function fallbackSummary(group) {
   const [newest, second] = group.messages;
+  const topic = (message) => group.kinds.includes("mail")
+    ? message.content.replace(/^\*\*[^*\n]+\*\* left a comment \([^\n)]+\)\s*/u, "")
+    : message.content;
+  const newestTopic = topic(newest);
   const author = newest.author ? `${newest.author}反馈` : "会话动态";
   if (group.messages.length === 1) {
-    return `${author}：${newest.content}`.slice(0, 100);
+    return `${author}：${newestTopic}`.slice(0, 100);
   }
   const secondTopic = second?.content && second.content !== newest.content
-    ? `；另涉及 ${second.content}`
+    ? `；另涉及 ${topic(second)}`
     : "";
-  return `${group.context}今日 ${group.messages.length} 条相关消息：${newest.content}${secondTopic}`
+  return `${group.context}今日 ${group.messages.length} 条相关消息：${newestTopic}${secondTopic}`
     .slice(0, 100);
 }
 

@@ -144,7 +144,7 @@ test("own PR feedback, requested reviews and current quoted mentions are retaine
 
 test("mail output cannot turn feature reuse into resolution or another person's work into mine", () => {
   const options = { mailbox, ownerLogin: "owner" };
-  const reuse = mailItem(message("reuse", { markdownBody: "@owner 这个功能在角膜地形图已经做了，同样的功能可以应用于眼底曲率地形图。" }), options);
+  const reuse = mailItem(message("reuse", { markdownBody: "**teammate** left a comment (acme/repo#42)\n\n@owner 这个功能在角膜地形图已经做了，同样的功能可以应用于眼底曲率地形图。" }), options);
   const prepared = prepareDingTalkDigest([reuse]);
   for (const completion of ["已解决", "已经解决", "已实现", "无需额外开发"]) {
     for (const field of ["summary", "highlights", "actionRequired"]) {
@@ -154,7 +154,10 @@ test("mail output cannot turn feature reuse into resolution or another person's 
       const [item] = applyDingTalkSummaries(prepared, [generated]);
       assert.doesNotMatch([item.summary, ...item.highlights, item.actionRequired].join("\n"), /已(?:经)?解决|已实现|无需额外开发/);
       assert.equal(item.summaryStatus, "fallback");
+      assert.doesNotMatch(item.summary, /left a comment/);
+      assert.match(item.summary, /眼底曲率地形图/);
       assert.match(item.sourceMessages[0].content, /可以应用/);
+      assert.match(item.sourceMessages[0].content, /left a comment/);
     }
   }
   const delegated = mailItem(message("delegated", { markdownBody: "请 @teammate 检查 700B 版本。\n\n---\nReply to this email directly,\nYou are receiving this because you were assigned." }), options);
