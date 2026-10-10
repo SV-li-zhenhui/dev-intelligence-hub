@@ -79,6 +79,70 @@ test("a stalled dispatch is bounded, aborted and not duplicated while still sett
   } finally { release(delivered); }
 });
 
+test("the cycle does not truncate a longer configured handoff budget", async (t) => {
+  let release;
+  let markStarted;
+  let dispatchSignal;
+  const submission = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const reconciler = new ReviewHandoffReconciler({
+    confirmations: { readReviewHandoffs: async () => items.slice(0, 1), async recordReviewHandoff() {} },
+    ownerWorkRequests: {
+      submit(_request, { signal }) {
+        dispatchSignal = signal;
+        markStarted();
+        return submission;
+      },
+    },
+    timeoutMs: 60_000,
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const cycle = reconciler.runCycle();
+  try {
+    await started;
+    t.mock.timers.tick(16_000);
+    assert.equal(dispatchSignal.aborted, false);
+    release(delivered);
+    assert.equal((await cycle)[0].status, "completed");
+  } finally {
+    release(delivered);
+    await cycle;
+    t.mock.timers.reset();
+  }
+});
+
+test("a slow retry leaves the next handoff its full budget in the following cycle", async (t) => {
+  let now = 0;
+  const cursors = [];
+  t.mock.method(performance, "now", () => now);
+  const reconciler = new ReviewHandoffReconciler({
+    confirmations: {
+      async readReviewHandoffs({ afterId }) {
+        cursors.push(afterId);
+        return afterId === "first" ? [items[1], items[0]] : items;
+      },
+      async recordReviewHandoff() {},
+    },
+    ownerWorkRequests: {
+      async submit(request) {
+        if (request.requestId === "first") {
+          now += 60;
+          throw Object.assign(new Error("temporarily unavailable"), { code: "GITHUB_UNAVAILABLE" });
+        }
+        return delivered;
+      },
+    },
+    timeoutMs: 100,
+    cycleTimeoutMs: 105,
+  });
+
+  assert.deepEqual(await reconciler.runCycle(), [
+    { id: "first", status: "retrying" },
+  ]);
+  assert.equal((await reconciler.runCycle())[0].id, "second");
+  assert.deepEqual(cursors, [null, "first"]);
+});
+
 test("one acknowledgement failure does not prevent another handoff", async () => {
   const calls = [];
   const reconciler = fixture(async (request) => { calls.push(request.requestId); return delivered; },

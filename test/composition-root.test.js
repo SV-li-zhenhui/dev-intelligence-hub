@@ -582,6 +582,30 @@ function memoryStore() {
   };
 }
 
+test("review handoff admits the configured GitHub and local resolution budgets", async () => {
+  const config = workCoordinationConfig();
+  config.githubActions.timeoutMs = 60_000;
+  const application = await createApplication({
+    config, store: memoryStore(),
+    ...localCoordinationStubs({
+      calls: {}, closeCalls: [],
+      runners: { "github-review-runner": { async claim() {}, async advance() {} } },
+    }),
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
+      reviewHandoffs: { async readReviewHandoffs() { return []; }, async recordReviewHandoff() {} },
+      async close() {},
+    }),
+    githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+  try {
+    const handoff = application.reviewHandoffReconciler;
+    assert.ok(handoff.timeoutMs >= 2 * config.githubActions.timeoutMs + config.workCoordination.resolveTimeoutMs);
+    assert.ok(handoff.cycleTimeoutMs > handoff.timeoutMs);
+  } finally { await application.close(); }
+});
+
 async function within(milliseconds, promise) {
   let timer;
   try {

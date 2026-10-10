@@ -2688,6 +2688,9 @@ export async function createApplication({
             githubAssignee: confirmationRuntime.reviewHandoffAssignee,
             testingOwnersByProduct: config.workCoordination?.policy?.testingOwnersByProduct || {},
             automaticAssignmentsEnabled: config.githubActions?.automaticReview === true && config.githubActions?.assignAfterAutomaticReview !== false,
+            // Local intake, target verification, then assignment each need their budget.
+            timeoutMs: 2 * (config.githubActions?.timeoutMs ?? 60_000) +
+              (coordinationTiming?.resolveTimeoutMs ?? 30_000),
           })
         : null,
       deliveryEvidence,

@@ -27,7 +27,7 @@ export class ReviewHandoffReconciler {
     testingOwnersByProduct = null,
     automaticAssignmentsEnabled = true,
     timeoutMs = 10_000,
-    cycleTimeoutMs = 15_000,
+    cycleTimeoutMs = timeoutMs + 5_000,
   }) {
     if (![timeoutMs, cycleTimeoutMs].every((value) => Number.isSafeInteger(value) && value > 0)) {
       throw new TypeError("handoff deadlines must be positive integers");
@@ -66,7 +66,10 @@ export class ReviewHandoffReconciler {
       const pending = await bounded(() => read, this.cycleTimeoutMs, signal);
       const results = [];
       for (const item of pending) {
-        if (signal?.aborted || performance.now() >= deadline) break;
+        const remainingMs = deadline - performance.now();
+        // Leave the cursor before a deferred item so a slow retry cannot keep
+        // giving the next handoff only the tail of this cycle's budget.
+        if (signal?.aborted || remainingMs <= 0 || (results.length > 0 && remainingMs < this.timeoutMs)) break;
         this.afterId = item.id;
         // A deadline does not release the submit service's durable lease. Never
         // start a second attempt while the original operation is still settling.
