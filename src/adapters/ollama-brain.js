@@ -267,6 +267,7 @@ function dingTalkSystemPrompt(isRetry) {
     "忽略点赞、表情、图片占位符和无意义的状态词。",
     "summary 用简洁中文说明主题、进展或结论；highlights 最多三项；actionRequired 仅在明确需要当前用户行动时填写，否则返回空字符串。",
     "important 仅在消息涉及工作进展、风险、决策、版本、研发、客户、明确提醒或待办时为 true；闲聊、点赞和无上下文图片为 false。",
+    "不重要的会话也必须返回完整记录，important 设为 false，不能省略；由调用方负责过滤。",
     "不得补充输入中没有的事实。每个 groupId 必须且只能返回一次。",
     retryInstruction,
     `返回严格满足以下 JSON Schema 的一个对象：${JSON.stringify(DINGTALK_DIGEST_SCHEMA)}`,
@@ -397,12 +398,17 @@ export class OllamaBrain {
   async summarizeDingTalk(conversations, { signal = null } = {}) {
     if (!Array.isArray(conversations) || conversations.length === 0) return [];
     const groupIds = conversations.map((conversation) => conversation.groupId);
+    const schema = structuredClone(DINGTALK_DIGEST_SCHEMA);
+    const summaries = schema.properties.summaries;
+    summaries.minItems = groupIds.length;
+    summaries.maxItems = groupIds.length;
+    summaries.items.properties.groupId.enum = groupIds;
     let lastValidationError = "unknown validation error";
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const response = await this.requestStructured({
-          schema: DINGTALK_DIGEST_SCHEMA,
+          schema,
           system: dingTalkSystemPrompt(attempt === 1),
           facts: conversations,
           InvalidResponseError: InvalidDingTalkDigestError,

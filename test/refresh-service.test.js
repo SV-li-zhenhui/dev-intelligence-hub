@@ -683,6 +683,43 @@ test("refresh publishes grouped DingTalk summaries instead of raw messages or un
   assert.equal(snapshot.sources.dingtalk, 1);
 });
 
+test("DingTalk summary failure preserves collected messages and shows a readable fallback notice", async () => {
+  const store = new MemoryStore();
+  const diagnostic = "Invalid Ollama DingTalk digest after retry: missing groupId: opaque-id";
+  const service = new RefreshService({
+    github: {
+      async searchRelevantPullRequests() { return [pullRequest()]; },
+      async searchIssues() { return []; },
+      async versions() { return []; },
+    },
+    brain: { async summarizeDingTalk() { throw new Error(diagnostic); } },
+    dingtalk: {
+      async collect() {
+        return { errors: [], items: [{
+          id: "message:release", kind: "message", context: "研发群", author: "张三",
+          title: "版本已发布，等待测试确认", updatedAt: REFRESH_STARTED_AT,
+        }] };
+      },
+    },
+    store, notifier: {},
+    config: {
+      trackedRepositories: [], dingtalk: { enabled: true },
+      brain: { enabled: true, provider: "ollama", model: "qwen3.5:9b" },
+    },
+  });
+  await service.refresh();
+  const snapshot = await store.read("snapshot");
+  assert.deepEqual(snapshot.errors, []);
+  assert.deepEqual(snapshot.brain.errors, ["钉钉 AI 摘要暂时不可用，已显示消息摘录；系统将自动重试。"]);
+  assert.deepEqual(snapshot.brain.dingtalkSummaryError, { message: diagnostic });
+  assert.equal(snapshot.brain.dingtalkSummarized, 0);
+  assert.equal(snapshot.sourceStatus.dingtalk.ok, true);
+  const digest = snapshot.items.find(({ summaryStatus }) => summaryStatus === "fallback");
+  assert.match(digest.title, /版本已发布/);
+  assert.equal(digest.sourceMessages[0].content, "版本已发布，等待测试确认");
+  assert.equal(snapshot.items.some(({ kind }) => kind === "pull_request"), true);
+});
+
 test("a scheduled DingTalk report is durably claimed and sent once per slot", async () => {
   const store = new MemoryStore();
   const reports = [];

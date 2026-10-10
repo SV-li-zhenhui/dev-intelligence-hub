@@ -308,8 +308,41 @@ test("summarizes every DingTalk conversation with a constrained batch schema", a
   assert.deepEqual(result, expected);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].format.properties.summaries.type, "array");
+  assert.equal(requests[0].format.properties.summaries.minItems, 1);
+  assert.equal(requests[0].format.properties.summaries.maxItems, 1);
+  assert.deepEqual(requests[0].format.properties.summaries.items.properties.groupId.enum, ["group-a"]);
   assert.match(requests[0].messages[0].content, /不能把最后一条消息直接当作摘要/);
+  assert.match(requests[0].messages[0].content, /不重要.*important.*false.*不能省略/);
   assert.deepEqual(JSON.parse(requests[0].messages[1].content), conversations);
+});
+
+test("DingTalk schema requires all current groups, including unimportant conversations, on both attempts", async () => {
+  const requests = [];
+  const conversations = ["work", "reaction", "small-talk"].map((groupId) => ({
+    groupId, context: groupId, messages: [{ author: "张三", content: groupId, updatedAt: "" }],
+  }));
+  const expected = conversations.map(({ groupId }, index) => ({
+    groupId, important: index === 0, summary: index === 0 ? "发布完成" : "无工作行动",
+    highlights: [], actionRequired: "",
+  }));
+  const brain = new OllamaBrain({
+    fetch: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return jsonResponse({ message: { content: JSON.stringify({
+        summaries: requests.length === 1 ? expected.slice(0, 1) : expected,
+      }) } });
+    },
+  });
+  assert.deepEqual(await brain.summarizeDingTalk(conversations), expected);
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    const summaries = request.format.properties.summaries;
+    assert.equal(summaries.minItems, conversations.length);
+    assert.equal(summaries.maxItems, conversations.length);
+    assert.deepEqual(summaries.items.properties.groupId.enum, conversations.map(({ groupId }) => groupId));
+    assert.deepEqual(JSON.parse(request.messages[1].content), conversations);
+  }
+  assert.match(requests[1].messages[0].content, /上一次响应/);
 });
 
 test("rejects a DingTalk digest that omits an input conversation", async () => {

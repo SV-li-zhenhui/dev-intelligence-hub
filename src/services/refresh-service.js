@@ -325,7 +325,8 @@ export class RefreshService {
       brainMeta.dingtalkSummarized = summaries.length;
       return applyDingTalkSummaries(prepared, summaries);
     } catch (error) {
-      brainMeta.errors.push(`钉钉摘要: ${error.message}`);
+      brainMeta.dingtalkSummaryError = { message: error.message };
+      brainMeta.errors.push("钉钉 AI 摘要暂时不可用，已显示消息摘录；系统将自动重试。");
       return applyDingTalkSummaries(prepared);
     }
   }
