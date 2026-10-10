@@ -148,13 +148,47 @@ function workflowEventInput(event) {
   };
 }
 
+function normalizeSourceUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw ownerRequestError("OWNER_WORK_REQUEST_QUERY_INVALID", "工作来源地址无效");
+  }
+  const match = url.pathname.match(/^\/([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})\/(pull|issues)\/([1-9][0-9]*)\/?$/u);
+  if (
+    typeof value !== "string" || url.protocol !== "https:" ||
+    url.hostname !== "github.com" || url.port || url.username || url.password ||
+    !match || match.slice(1, 3).some((part) => [".", ".."].includes(part)) ||
+    !Number.isSafeInteger(Number(match[4]))
+  ) {
+    throw ownerRequestError("OWNER_WORK_REQUEST_QUERY_INVALID", "工作来源地址无效");
+  }
+  return {
+    repository: `${match[1]}/${match[2]}`.toLowerCase(),
+    number: Number(match[4]),
+    kind: match[3] === "pull" ? "pullRequest" : "issue",
+    url: `https://github.com/${match[1]}/${match[2]}/${match[3]}/${match[4]}`.toLowerCase(),
+  };
+}
+
+function matchesSource(record, source) {
+  const target = record.request[source.kind];
+  if (target) {
+    return target.repository.toLowerCase() === source.repository && target.number === source.number;
+  }
+  // Older detail forms stored the origin as a dedicated line, before structured targets existed.
+  return record.request.schemaVersion === 1 && record.request.description.split(/\r?\n/u)
+    .some((line) => line.trim().toLowerCase() === `原始地址：${source.url}`);
+}
+
 function listOptions(value = {}) {
   if (
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some((key) => !["limit", "cursor"].includes(key))
+    Object.keys(value).some((key) => !["limit", "cursor", "sourceUrl"].includes(key))
   ) {
     throw ownerRequestError(
       "OWNER_WORK_REQUEST_QUERY_INVALID",
@@ -171,6 +205,7 @@ function listOptions(value = {}) {
   return {
     limit,
     cursor: value.cursor === undefined ? null : requestId(value.cursor),
+    source: value.sourceUrl === undefined ? null : normalizeSourceUrl(value.sourceUrl),
   };
 }
 
@@ -288,7 +323,9 @@ export class OwnerWorkRequestService {
     return this.operationQueue.enqueue(() =>
       this.exclusiveLease.run(async () => {
         this.state = await this.#readState();
-        const records = [...this.state.records].reverse();
+        const records = [...this.state.records].reverse().filter(
+          (record) => options.source === null || matchesSource(record, options.source),
+        );
         const cursorIndex = options.cursor === null
           ? -1
           : records.findIndex(({ requestId: id }) => id === options.cursor);

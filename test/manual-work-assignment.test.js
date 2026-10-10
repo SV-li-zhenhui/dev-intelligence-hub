@@ -9,6 +9,7 @@ import {
   manualWorkAssignmentMarkup,
   ownerWorkRequestForItem,
   createManualWorkAssignmentAttempts,
+  bindManualWorkAssignment,
 } from "../public/manual-work-assignment.js";
 
 const pullRequest = {
@@ -40,50 +41,64 @@ test("manual assignment retry keeps its request ID and frozen payload until succ
   assert.equal(attempts.requestFor(pullRequest, options).requestId, "request-5");
 });
 
-test("detail form coalesces double submits and reuses a failed request after reopening", async () => {
+test("detail retries preserve their request and reopening restores the durable assignment", async () => {
   const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = app.indexOf("function showDetail(item)");
   const end = app.indexOf("\nfunction codeJobActionFocusIntent", start);
   assert.ok(start >= 0 && end > start);
   let activeForm;
+  let activeContainer;
   function createForm() {
     const button = { disabled: false };
     const status = { textContent: "" };
-    const section = { outerHTML: "" };
     return {
-      button, status, section,
+      button, status,
       values: { workType: "pull_request", priority: "high" },
+      elements: { namedItem(name) { return { value: activeForm.values[name] }; } },
       querySelector(selector) { return selector.startsWith("button") ? button : status; },
-      closest() { return section; },
       addEventListener(_type, handler) { this.submit = handler; },
     };
   }
   let resolveFirst;
   const firstResponse = new Promise((resolve) => { resolveFirst = resolve; });
   const bodies = [];
+  let savedRecords = [];
   let requestIds = 0;
   const context = {
     manualWorkAssignmentAttempts: createManualWorkAssignmentAttempts(() => `id-${++requestIds}`),
-    manualWorkAssignmentMarkup,
-    dialogContent: { querySelector() { return activeForm; } },
+    bindManualWorkAssignment,
+    dialogContent: { querySelector() { return activeContainer; } },
     dialog: { showModal() {} },
-    FormData: class { constructor(form) { this.form = form; } get(key) { return this.form.values[key]; } },
     kindLabel: () => "PR",
     escapeHtml: (value) => String(value ?? ""),
     dingtalkDetailMarkup: () => "", prLifecycleStatusMarkup: () => "",
     brainAssessment: () => "", issuePrDetailMarkup: () => "",
     githubItemDetailMarkup: () => "", detailRows: () => "",
-    async fetch(_url, options) {
+    async fetch(url, options) {
+      if (options.method !== "POST") {
+        assert.equal(new URL(url, "http://localhost").searchParams.get("sourceUrl"), pullRequest.url);
+        assert.equal(options.cache, "no-store");
+        return { ok: true, async json() { return { items: savedRecords, nextCursor: null }; } };
+      }
       bodies.push(JSON.parse(options.body));
       return bodies.length === 1 ? firstResponse : {
         ok: true, status: 200,
-        async json() { return { requestId: bodies.at(-1).requestId, workItemId: "one-work-item", assignment: { target: { id: "pr-engineer" } } }; },
+        async json() {
+          const result = { requestId: bodies.at(-1).requestId, phase: "intaken", request: bodies.at(-1), workItemId: "one-work-item", assignment: { target: { id: "pr-engineer" } } };
+          savedRecords = [result];
+          return result;
+        },
       };
     },
   };
   runInNewContext(app.slice(start, end), context);
-  activeForm = createForm();
-  context.showDetail(pullRequest);
+  function reopen(item) {
+    if (activeContainer) activeContainer.isConnected = false;
+    activeForm = createForm();
+    activeContainer = { isConnected: true, innerHTML: "", querySelectorAll() { return [activeForm]; } };
+    return context.showDetail(item);
+  }
+  await reopen(pullRequest);
   const firstForm = activeForm;
   const submit = (form) => form.submit({ currentTarget: form, preventDefault() {} });
   const pending = submit(firstForm);
@@ -95,12 +110,92 @@ test("detail form coalesces double submits and reuses a failed request after reo
   assert.equal(firstForm.button.disabled, false);
   assert.equal(firstForm.button.textContent, "重试原请求");
 
-  activeForm = createForm();
-  context.showDetail({ ...pullRequest, title: "Updated title" });
+  await reopen({ ...pullRequest, title: "Updated title" });
   await submit(activeForm);
   assert.deepEqual(bodies[1], bodies[0]);
-  assert.match(activeForm.section.outerHTML, /one-work-item/);
+  assert.match(activeContainer.innerHTML, /one-work-item/);
   assert.equal(requestIds, 1);
+
+  // Even a fresh browser controller must recover the assignment from the server.
+  context.manualWorkAssignmentAttempts = createManualWorkAssignmentAttempts(() => `fresh-${++requestIds}`);
+  await reopen({ ...pullRequest, title: "Reopened after assignment" });
+  assert.match(activeContainer.innerHTML, /已分配工作/);
+  assert.match(activeContainer.innerHTML, /one-work-item/);
+  assert.match(activeContainer.innerHTML, /PR 工程师/);
+  assert.match(activeContainer.innerHTML, /<details>\s*<summary>另行分配工作/);
+  assert.doesNotMatch(activeContainer.innerHTML, /<details open/);
+  assert.equal(bodies.length, 2);
+});
+
+test("assignment history loads every page and ignores detached dialogs", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  const calls = [];
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl(url) {
+      calls.push(new URL(url, "http://localhost").searchParams.get("cursor"));
+      return { ok: true, async json() { return { items: [{ requestId: `record-${calls.length}`, request: { workType: "testing" }, phase: "intaken", assignment: { target: { id: "tester" } } }], nextCursor: calls.length === 1 ? "next-page" : null }; } };
+    },
+  });
+  assert.deepEqual(calls, [null, "next-page"]);
+  assert.match(container.innerHTML, /record-1/);
+  assert.match(container.innerHTML, /record-2/);
+  let resolve;
+  const pending = bindManualWorkAssignment(container, pullRequest, {
+    fetchImpl: () => new Promise((done) => { resolve = done; }),
+  });
+  container.isConnected = false;
+  container.innerHTML = "different dialog";
+  resolve({ ok: true, async json() { return { items: [], nextCursor: null }; } });
+  await pending;
+  assert.equal(container.innerHTML, "different dialog");
+});
+
+test("failed assignment lookup offers a read retry without an unverified create form", async () => {
+  let retry;
+  let reads = 0;
+  const container = { isConnected: true, innerHTML: "", querySelector() { return { addEventListener(_event, handler) { retry = handler; } }; } };
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() {
+      reads++;
+      return { ok: false, status: 503 };
+    },
+  });
+  assert.match(container.innerHTML, /未能读取分配记录/);
+  assert.doesNotMatch(container.innerHTML, /<form/);
+  assert.equal(reads, 1);
+  assert.equal(typeof retry, "function");
+});
+
+test("reopened pending assignment resumes its stored urgent development request", async () => {
+  const input = ownerWorkRequestForItem(pullRequest, {
+    workType: "development", priority: "urgent", requestId: "saved-request-id",
+  });
+  const saved = { phase: "routed", requestId: input.requestId, request: input, assignment: { target: { id: "developer" } } };
+  let submit;
+  const button = { disabled: false };
+  const status = { textContent: "" };
+  const form = {
+    dataset: { manualWorkAssignmentResume: input.requestId },
+    querySelector(selector) { return selector.startsWith("button") ? button : status; },
+    addEventListener(_event, handler) { submit = handler; },
+  };
+  const container = { isConnected: true, innerHTML: "", querySelector() { return form; }, querySelectorAll() { return [form]; } };
+  const posts = [];
+  await bindManualWorkAssignment(container, pullRequest, {
+    attempts: createManualWorkAssignmentAttempts(() => { throw new Error("Must reuse the saved request"); }),
+    async fetchImpl(_url, options) {
+      if (options.method !== "POST") return { ok: true, async json() { return { items: [saved], nextCursor: null }; } };
+      posts.push(JSON.parse(options.body));
+      return { ok: true, async json() { return { ...saved, phase: "intaken", workItemId: "resumed-work" }; } };
+    },
+  });
+  assert.match(container.innerHTML, /分配请求已保存/);
+  assert.match(container.innerHTML, /继续原分配/);
+  assert.doesNotMatch(container.innerHTML, /<h3>已分配工作/);
+  await submit({ preventDefault() {} });
+  assert.deepEqual(posts, [input]);
+  assert.match(container.innerHTML, /已分配工作/);
+  assert.match(container.innerHTML, /resumed-work/);
 });
 
 test("PR detail offers a manual assignment form with a direct review option", () => {

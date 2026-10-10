@@ -753,6 +753,29 @@ test("runtime persists a manual Issue with its canonical Issue event", async (t)
     number: 43,
   });
   assert.deepEqual(result.assignment.target, { type: "role", id: "developer" });
+
+  const legacy = await owner.submit(request({
+    requestId: deterministicRequestId("legacy-issue-assignment"),
+    description: "原始地址：https://github.com/acme/repo/issues/43\n当前摘要：Legacy assignment",
+  }));
+  await owner.submit(request({
+    requestId: deterministicRequestId("different-source-assignment"),
+    description: "原始地址：https://github.com/acme/repo/pull/43\n当前摘要：https://github.com/acme/repo/issues/43",
+  }));
+  await owner.submit(issue({
+    requestId: deterministicRequestId("different-issue-assignment"),
+    issue: { repository: "acme/repo", number: 430 },
+  }));
+  const sourceUrl = "https://github.com/ACME/REPO/issues/43";
+  const firstPage = await owner.list({ sourceUrl, limit: 1 });
+  assert.deepEqual(firstPage.items.map(({ requestId }) => requestId), [legacy.requestId]);
+  assert.equal(firstPage.nextCursor, legacy.requestId);
+  const secondPage = await owner.list({ sourceUrl, limit: 1, cursor: firstPage.nextCursor });
+  assert.deepEqual(secondPage.items.map(({ requestId }) => requestId), [result.requestId]);
+  assert.equal(secondPage.nextCursor, null);
+  for (const invalidUrl of ["https://evil.example/acme/repo/issues/43", "https://github.com/acme/repo/issues/0"]) {
+    await assert.rejects(owner.list({ sourceUrl: invalidUrl }), { statusCode: 400 });
+  }
 });
 
 test("owner request cancellation reaches the PR resolver and does not stage cancelled work", async (t) => {

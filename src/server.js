@@ -818,7 +818,7 @@ function requireOwnerWorkRequests(application) {
 }
 
 function ownerWorkRequestQueryOptions(url) {
-  const allowed = new Set(["limit", "cursor"]);
+  const allowed = new Set(["limit", "cursor", "sourceUrl"]);
   const keys = [...url.searchParams.keys()];
   if (
     keys.some(
@@ -834,6 +834,9 @@ function ownerWorkRequestQueryOptions(url) {
       : {}),
     ...(url.searchParams.has("cursor")
       ? { cursor: url.searchParams.get("cursor") }
+      : {}),
+    ...(url.searchParams.has("sourceUrl")
+      ? { sourceUrl: url.searchParams.get("sourceUrl") }
       : {}),
   };
 }

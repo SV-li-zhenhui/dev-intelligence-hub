@@ -341,6 +341,22 @@ test("manual Issue requirements crosses HTTP intake and replays one durable task
     body: { ...input, priority: "urgent" },
   });
   assert.equal(conflict.status, 409);
+  const sourceUrl = "https://github.com/ExampleOrg/ProductApp/issues/13303";
+  const history = await request(server, {
+    pathname: `/api/work/requests?sourceUrl=${encodeURIComponent(sourceUrl)}`,
+  });
+  assert.equal(history.status, 200);
+  assert.deepEqual(history.body.items.map(({ requestId }) => requestId), [input.requestId]);
+  assert.equal(history.body.items[0].workItemId, created.body.workItemId);
+  for (const query of [
+    `sourceUrl=${encodeURIComponent(sourceUrl.replace("issues", "pull"))}`,
+    `sourceUrl=${encodeURIComponent(sourceUrl.replace("13303", "133030"))}`,
+  ]) {
+    assert.deepEqual((await request(server, { pathname: `/api/work/requests?${query}` })).body.items, []);
+  }
+  for (const query of ["sourceUrl=invalid", `sourceUrl=${encodeURIComponent(sourceUrl)}&sourceUrl=invalid`]) {
+    assert.equal((await request(server, { pathname: `/api/work/requests?${query}` })).status, 400);
+  }
   assert.equal((await request(server, {
     pathname: "/api/work/items?limit=10",
   })).body.items.length, 1);

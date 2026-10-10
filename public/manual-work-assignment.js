@@ -242,3 +242,111 @@ export function createManualWorkAssignmentAttempts(createRequestId = () => crypt
     },
   };
 }
+
+const ROLE_LABELS = Object.freeze({
+  "pr-engineer": "PR 工程师",
+  developer: "开发工程师",
+  tester: "测试工程师",
+  "requirements-analyst": "需求分析师",
+  orchestrator: "主控调度员",
+});
+
+function assignmentHistoryMarkup(item, records) {
+  if (!records.length) return manualWorkAssignmentMarkup(item);
+  return `<section class="manual-work-assignment" data-manual-work-assignment-result>
+    <h3>${records.some((record) => record.phase === "intaken") ? "已分配工作" : "分配请求已保存"}</h3>
+    ${records.map((record) => {
+      const target = record.assignment?.target?.id;
+      return `<p><strong>${escapeHtml(WORK_TYPE_LABELS[record.request?.workType] || "工作任务")}</strong> · ${escapeHtml(ROLE_LABELS[target] || target || "等待岗位分派")}<br>
+        <small>${record.phase === "intaken" ? "已接入台账" : "请求已保存，等待接入台账"} · 工作项 ${escapeHtml(record.workItemId || "待生成")} · 请求 ${escapeHtml(record.requestId)}</small></p>
+        ${record.phase !== "intaken" ? `<form data-manual-work-assignment-resume="${escapeHtml(record.requestId)}">
+          <button class="secondary-button" type="submit">继续原分配</button>
+          <p data-manual-work-assignment-status aria-live="polite"></p>
+        </form>` : ""}`;
+    }).join("")}
+    <p>可在左侧“工作台账”查看任务进度；已分配不代表已完成。</p>
+    <details>
+      <summary>另行分配工作</summary>
+      <p>这会额外创建一个任务，不会修改已有分配。请确认是否确实需要。</p>
+      ${manualWorkAssignmentMarkup(item)}
+    </details>
+  </section>`;
+}
+
+async function readAssignments(item, fetchImpl) {
+  const source = githubWorkItemFromUrl(item.url ||
+    `https://github.com/${item.repo}/${item.kind === "pull_request" ? "pull" : "issues"}/${item.number}`);
+  const records = [];
+  let cursor = null;
+  do {
+    const query = new URLSearchParams({ sourceUrl: source.url, limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await fetchImpl(`/api/work/requests?${query}`, {
+      cache: "no-store", signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error("读取分配记录失败");
+    const page = await response.json();
+    records.push(...page.items);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return records;
+}
+
+export async function bindManualWorkAssignment(container, item, { fetchImpl = fetch, attempts } = {}) {
+  if (!container || !["pull_request", "issue"].includes(item?.kind)) return;
+  container.innerHTML = '<p aria-live="polite">正在读取分配记录…</p>';
+  function render(records) {
+    if (!container.isConnected) return;
+    container.innerHTML = assignmentHistoryMarkup(item, records);
+    for (const form of container.querySelectorAll("[data-manual-work-assignment], [data-manual-work-assignment-resume]")) {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = form.querySelector("button[type=submit]");
+        if (button.disabled) return;
+        const status = form.querySelector("[data-manual-work-assignment-status]");
+        button.disabled = true;
+        status.textContent = "正在创建共享任务…";
+        let request;
+        try {
+          const resumeId = form.dataset?.manualWorkAssignmentResume;
+          request = resumeId
+            ? records.find((record) => record.requestId === resumeId)?.request
+            : attempts.requestFor(item, {
+              workType: form.elements.namedItem("workType").value,
+              priority: form.elements.namedItem("priority").value,
+            });
+          if (!request) throw new Error("原分配请求不可用，请重新打开详情");
+          const response = await fetchImpl("/api/work/requests", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-mydashboard-action": "1" },
+            body: JSON.stringify(request),
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(result.error || `分配失败（${response.status}）`);
+          attempts.complete(request.requestId);
+          render([
+            { ...result, request: result.request || request },
+            ...records.filter((record) => record.requestId !== result.requestId),
+          ]);
+        } catch (error) {
+          status.textContent = `${error.message || "分配失败"}${request
+            ? ` 本页重试会继续原请求（${request.requestId}）。` : ""}`;
+          if (request) button.textContent = "重试原请求";
+          button.disabled = false;
+        }
+      });
+    }
+  }
+  try {
+    render(await readAssignments(item, fetchImpl));
+  } catch {
+    if (!container.isConnected) return;
+    container.innerHTML = `<section class="manual-work-assignment">
+      <p role="status">未能读取分配记录，请重试后再分配。</p>
+      <button type="button" class="secondary-button" data-manual-assignment-reload>重新读取</button>
+    </section>`;
+    container.querySelector("[data-manual-assignment-reload]")?.addEventListener("click", () => {
+      void bindManualWorkAssignment(container, item, { fetchImpl, attempts });
+    });
+  }
+}
