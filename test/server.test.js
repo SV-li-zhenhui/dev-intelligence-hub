@@ -4252,7 +4252,7 @@ test("manual refresh fences facts but reopens confirmations before slow agency",
   await exerciseConfirmationRefreshGate("manual");
 });
 
-test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () => {
+test("an unhealthy GitHub refresh leaves local confirmation reads available and writes closed", async () => {
   const queueCalls = [];
   const application = startupApplication({
     port: 4173,
@@ -4287,6 +4287,7 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
 
   try {
     const next = await request(server, { path: "/api/confirmations/next" });
+    const history = await request(server, { path: "/api/confirmations/history" });
     const approve = await request(server, {
       method: "POST",
       path: `/api/confirmations/${pendingConfirmationItem().id}/approve`,
@@ -4306,13 +4307,40 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
       },
     });
 
-    assert.equal(next.status, 503);
+    assert.equal(next.status, 200);
+    assert.equal(history.status, 200);
     assert.equal(approve.status, 503);
     assert.equal(manualEmployee.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.deepEqual(queueCalls, ["next", "history"]);
   } finally {
     await server.shutdown();
   }
+});
+
+test("shutdown drains a local confirmation read accepted before initial refresh completes", async () => {
+  const refreshRelease = deferred();
+  const readStarted = deferred();
+  const readRelease = deferred();
+  const backgroundWork = startApplicationBackgroundWork(startupApplication({
+    async refresh() { await refreshRelease.promise; return healthyRefreshResult(); },
+  }), { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  const reading = backgroundWork.runConfirmationRead(async () => {
+    readStarted.resolve();
+    await readRelease.promise;
+    return "local history";
+  });
+  await readStarted.promise;
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => { stopped = true; });
+  try {
+    await assert.rejects(backgroundWork.runConfirmationRead(async () => "must not run"), { code: "CONFIRMATION_FACTS_NOT_READY" });
+    assert.equal(stopped, false);
+  } finally {
+    refreshRelease.resolve();
+    readRelease.resolve();
+    await stopping;
+  }
+  assert.equal(await reading, "local history");
 });
 
 test("server rejects an untrusted Host before exposing local data", async () => {
@@ -7864,7 +7892,7 @@ test("awaited shutdown releases a delayed runtime before an immediate restart", 
   assert.equal(runtimeHeld, false);
 });
 
-test("startup listens immediately but confirmations stay closed until initial reconcile finishes", async () => {
+test("startup allows local confirmation reads while writes wait for initial reconciliation", async () => {
   const port = await availablePort();
   const refreshStarted = deferred();
   const releaseRefresh = deferred();
@@ -7916,8 +7944,16 @@ test("startup listens immediately but confirmations stay closed until initial re
     const confirmationDuringRefresh = await requestPort(port, {
       path: "/api/confirmations/next",
     });
-    assert.equal(confirmationDuringRefresh.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(confirmationDuringRefresh.status, 200);
+    const historyDuringRefresh = await requestPort(port, { path: "/api/confirmations/history" });
+    assert.equal(historyDuringRefresh.status, 200);
+    const approvalDuringRefresh = await requestPort(port, {
+      method: "POST", path: "/api/confirmations/confirmation-pr-work-1/approve",
+      headers: { origin: `http://127.0.0.1:${port}`, "x-mydashboard-action": "1", "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(approvalDuringRefresh.status, 503);
+    assert.deepEqual(queueCalls, ["next", "history"]);
 
     releaseRefresh.resolve();
     await reconcileStarted.promise;
@@ -7925,8 +7961,8 @@ test("startup listens immediately but confirmations stay closed until initial re
     const confirmationDuringReconcile = await requestPort(port, {
       path: "/api/confirmations/next",
     });
-    assert.equal(confirmationDuringReconcile.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(confirmationDuringReconcile.status, 200);
+    assert.deepEqual(queueCalls, ["next", "history", "next"]);
 
     releaseReconcile.resolve();
     server = await starting;
@@ -7935,7 +7971,7 @@ test("startup listens immediately but confirmations stay closed until initial re
     });
     assert.equal(confirmation.status, 200);
     assert.equal(JSON.parse(confirmation.body).pendingCount, 1);
-    assert.deepEqual(queueCalls, ["next"]);
+    assert.deepEqual(queueCalls, ["next", "history", "next", "next"]);
     assert.equal(runAllCalls, 1);
   } finally {
     releaseRefresh.resolve();

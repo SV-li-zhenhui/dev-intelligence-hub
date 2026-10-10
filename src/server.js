@@ -4039,6 +4039,9 @@ export function startApplicationBackgroundWork(
   const confirmationReadAccess = createConfirmationAccessGate(
     Boolean(application.confirmationQueue),
   );
+  // Local projections can be read during external refresh. Mutation admission
+  // still waits for fresh facts and confirmation reconciliation below.
+  confirmationReadAccess.open();
   const workController = new AbortController();
   let stopped = false;
   let stopPromise = null;
@@ -4051,7 +4054,6 @@ export function startApplicationBackgroundWork(
   );
   let backgroundOperationActive = false;
   let factsReady = false;
-  let confirmationReadReady = false;
   let pendingFactCycles = 0;
   let factCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
@@ -4403,8 +4405,6 @@ export function startApplicationBackgroundWork(
         signal.throwIfAborted();
         if (stopped) return result;
         factsReady = true;
-        confirmationReadReady = true;
-        confirmationReadAccess.open();
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
@@ -4498,7 +4498,6 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
-    confirmationReadReady = false;
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
     const tasksToDrain = [...activeTasks];
@@ -4563,7 +4562,6 @@ export function startApplicationBackgroundWork(
       ),
     runConfirmationRead: (operation) =>
       operationalAdmission.run(() => {
-        if (!confirmationReadReady) throw confirmationUnavailable();
         return confirmationReadAccess.run(() => runDrainParticipant(
           DRAIN_PARTICIPANTS.confirmationOperation,
           () => operation(workController.signal),
