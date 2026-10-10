@@ -683,9 +683,9 @@ class GitHubActionAdapter {
   #beginOperation(parentSignal = null) {
     const controller = new AbortController();
     this.#activeOperations.add(controller);
-    const abortFromParent = () => controller.abort();
+    const abortFromParent = () => controller.abort(parentSignal.reason);
     parentSignal?.addEventListener("abort", abortFromParent, { once: true });
-    if (parentSignal?.aborted) controller.abort();
+    if (parentSignal?.aborted) abortFromParent();
     if (this.#closed) controller.abort();
     const deadline = this.#clock() + this.#timeoutMs;
     const timer = setTimeout(
@@ -1121,6 +1121,9 @@ class GitHubActionAdapter {
           : { signal: operation.signal }),
       });
     } catch (error) {
+      if (operation?.signal.aborted && error instanceof ManagedProcessError && error.code === "PROCESS_ABORTED") {
+        throw operation.signal.reason;
+      }
       throw stableError(error);
     }
     if (!result || result.exitCode !== 0) {

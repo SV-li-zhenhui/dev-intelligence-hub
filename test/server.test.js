@@ -19,6 +19,9 @@ import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
 import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconciler.js";
+import { createGitHubActionExecutor } from "../src/adapters/github-action-adapter.js";
+import { githubCredentialSourceError } from "../src/lib/github-credential-source.js";
+import { ManagedProcessError } from "../src/lib/managed-process.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 import { ConfigurationStore } from "../src/services/configuration-store.js";
 import {
@@ -1823,6 +1826,64 @@ test("shutdown signals the registered Review handoff participant", async () => {
   await background.stop();
   assert.equal(handoffSignal.aborted, true);
   assert.ok(participants.includes(DRAIN_PARTICIPANTS.reviewHandoffRecovery.id));
+});
+
+test("shutdown drains a cancelled GitHub handoff while retaining cleanup failures", async (t) => {
+  for (const cleanupFails of [false, true]) {
+    await t.test(cleanupFails ? "cleanup failure remains authoritative" : "cooperative cancellation succeeds", async () => {
+      const started = deferred();
+      const application = startupApplication();
+      const githubAssignee = createGitHubActionExecutor({
+        ghCommand: process.platform === "win32" ? "C:\\Program Files\\GitHub CLI\\gh.exe" : "/usr/bin/gh",
+        runner: {
+          async run({ signal }) {
+            started.resolve();
+            await new Promise((resolve) => {
+              signal.addEventListener("abort", resolve, { once: true });
+              if (signal.aborted) resolve();
+            });
+            throw new ManagedProcessError("PROCESS_ABORTED", "cancelled");
+          },
+        },
+        credentialSource: Object.freeze({
+          async acquire() {
+            return Object.freeze({
+              async use(callback) { return callback("fictional_test_token"); },
+              release() {
+                if (cleanupFails) throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
+              },
+            });
+          },
+        }),
+      });
+      application.reviewHandoffReconciler = new ReviewHandoffReconciler({
+        confirmations: {
+          async readReviewHandoffs() {
+            return [{
+              id: "review-42", actorAccountId: "local-owner",
+              request: { requestId: "request-42", pullRequest: { repository: "acme/repo", number: 42 } },
+              automaticReview: { reviewEvent: "COMMENT", headRefOid: "a".repeat(40) },
+            }];
+          },
+          async recordReviewHandoff() {},
+        },
+        ownerWorkRequests: { async submit() {
+          return { phase: "intaken", workItemId: "work-42", assignment: { target: { id: "tester" } } };
+        } },
+        githubAssignee,
+      });
+      const background = startApplicationBackgroundWork(application, {
+        setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {},
+      });
+      await started.promise;
+      if (cleanupFails) {
+        await assert.rejects(background.stop(), { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" });
+      } else {
+        await background.stop();
+      }
+      await githubAssignee.close();
+    });
+  }
 });
 
 test("a timed-out handoff keeps its unfinished operation in the shutdown drain", async () => {

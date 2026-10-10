@@ -75,6 +75,9 @@ export class ReviewHandoffReconciler {
         // start a second attempt while the original operation is still settling.
         if (this.inFlight.has(item.request.requestId)) continue;
         const controller = new AbortController();
+        const abortFromParent = () => controller.abort(signal.reason);
+        signal?.addEventListener("abort", abortFromParent, { once: true });
+        if (signal?.aborted) abortFromParent();
         try {
           const outcome = await bounded(() => {
             const attempt = Promise.resolve().then(() => runOperation(() => this.#dispatch(item, controller.signal)));
@@ -85,6 +88,8 @@ export class ReviewHandoffReconciler {
           results.push({ id: item.id, status: outcome.status });
         } catch (error) {
           results.push({ id: item.id, status: "retrying", diagnosticCode: diagnostic(error, "REVIEW_HANDOFF_SUBMIT_FAILED") });
+        } finally {
+          signal?.removeEventListener("abort", abortFromParent);
         }
       }
       return results;
