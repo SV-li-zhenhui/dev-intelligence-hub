@@ -3910,3 +3910,79 @@ test("stale scavenging fails closed before mutation when the root exceeds 128 en
     129,
   );
 });
+
+
+test("PR review can read complete file artifacts through a scoped MCP reader", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-complete-review-");
+  const target = { pullRequestNumber: 42, gitTarget: {
+    schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40),
+  } };
+  let closed = false;
+  let checked = false;
+  const diffText = "complete diff\n".repeat(10_000);
+  const manifestText = JSON.stringify({ files: Array.from({ length: 117 }, (_, i) => ({ path: `src/${i}.js` })) });
+  const runner = recordingRunner(async (invocation) => {
+    assert.equal(await readFile(path.join(invocation.cwd, "review.diff"), "utf8"), diffText);
+    assert.equal(await readFile(path.join(invocation.cwd, "review-manifest.json"), "utf8"), manifestText);
+    const marker = JSON.parse(await readFile(path.join(invocation.cwd, ".mydashboard-invocation.json"), "utf8"));
+    assert.equal(marker.schemaVersion, 3);
+    assert.equal(marker.stagedReviewBytes, Buffer.byteLength(diffText) + Buffer.byteLength(manifestText));
+    assert.ok(invocation.args.includes('mcp_servers.pr_review.url="http://127.0.0.1:12345/read-only-fixture"'));
+    for (const tool of ["read_document", "read_source", "list_directory"]) {
+      assert.ok(invocation.args.includes(`mcp_servers.pr_review.tools.${tool}.approval_mode="approve"`));
+      assert.ok(invocation.args.includes(`mcp_servers.pr_review.tools.${tool}.output_token_limit=65536`));
+    }
+    assert.ok(invocation.args.includes("shell_tool"));
+    assert.match(Buffer.from(invocation.input).toString("utf8"), /pr_review/);
+    await writeFile(argumentValue(invocation.args, "--output-last-message"), JSON.stringify({ result: JSON.stringify({ intent: { type: "propose_github_review" } }) }));
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: runner, commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot: path.join(parent, "runtime"),
+    reviewReaderFactory: async (observed) => {
+      assert.deepEqual(observed, target);
+      return { url: "http://127.0.0.1:12345/read-only-fixture", diffText, manifestText,
+        assertComplete() { checked = true; }, async close() { closed = true; } };
+    },
+  });
+  await provider.generate(brainRequest({ reviewTarget: target }));
+  assert.equal(checked, true);
+  assert.equal(closed, true);
+  await provider.close();
+});
+
+test("a complete staged diff beyond the transient cleanup budget is removed after review", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-large-review-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: recordingRunner(async (invocation) => {
+      await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput({ ok: true }));
+      return successfulProcess();
+    }), commandLocator: recordingLocator(testDescriptor("codex-cli")), environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot,
+    reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "d".repeat(65 * 1024 * 1024), manifestText: "{}", async assertComplete() {}, async close() {} }),
+  });
+  assert.deepEqual(JSON.parse(await provider.generate(brainRequest({ reviewTarget: { gitTarget, pullRequestNumber: 42 } }))), { ok: true });
+  assert.equal((await readdir(temporaryRoot)).filter((name) => name.startsWith("invocation-") || name.startsWith(".cleanup-")).length, 0);
+  await provider.close();
+});
+
+
+test("an incomplete CLI review is rejected before its proposal can reach GitHub", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-incomplete-review-");
+  let closed = false;
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: recordingRunner(async (invocation) => {
+      await writeFile(argumentValue(invocation.args, "--output-last-message"), JSON.stringify({ result: JSON.stringify({ intent: { type: "propose_github_review", verdict: "comment" } }) }));
+      return successfulProcess();
+    }), commandLocator: recordingLocator(testDescriptor("codex-cli")), environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot: path.join(parent, "runtime"),
+    reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "complete", manifestText: "{}", async assertComplete() { throw Object.assign(new Error("incomplete"), { code: "PR_REVIEW_READ_INCOMPLETE" }); }, async close() { closed = true; } }),
+  });
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
+  await assert.rejects(provider.generate(brainRequest({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  assert.equal(closed, true);
+  await provider.close();
+});

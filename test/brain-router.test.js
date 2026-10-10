@@ -268,3 +268,17 @@ test("BrainRouter propagates a stable provider availability failure", async () =
 
   await assert.rejects(router.checkAvailability(BRAIN), (error) => error === expected);
 });
+
+
+test("PR read access requires code authorization and is forwarded only to a capable provider", async () => {
+  const requests = [];
+  const router = new BrainRouter({ providers: [provider({ supportsReviewReading: true, async generate(request) { requests.push(request); return '{"ok":true}'; } })] });
+  const reviewTarget = { pullRequestNumber: 42 };
+  const request = { brain: BRAIN, messages: [], schema: { type: "object" }, reviewTarget };
+  await assert.rejects(router.generate({ ...request, dataClasses: ["requirements"] }), { code: "REMOTE_DATA_CLASSIFICATION_REQUIRED" });
+  await assert.rejects(router.generate({ ...request, brain: { ...BRAIN, remoteData: { ...BRAIN.remoteData, code: false } }, dataClasses: ["code"] }), { code: "REMOTE_DATA_NOT_AUTHORIZED" });
+  assert.equal(requests.length, 0);
+  await router.generate({ ...request, dataClasses: ["code"] });
+  assert.deepEqual(requests[0].reviewTarget, reviewTarget);
+  assert.equal(router.describe(BRAIN).supportsReviewReading, true);
+});

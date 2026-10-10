@@ -1,6 +1,7 @@
 import { types as utilTypes } from "node:util";
 
 import { normalizeSessionKey } from "./session-key.js";
+import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES = 16;
@@ -89,9 +90,9 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     required.some((key) => !keys.includes(key)) ||
     keys.some((key) =>
       typeof key !== "string" ||
-      ![...required, "reasoningEffort", "sessionKey", "signal"].includes(key)
+      ![...required, "reasoningEffort", "sessionKey", "signal", "reviewTarget"].includes(key)
     ) ||
-    keys.length > required.length + 3
+    keys.length > required.length + 4
   ) {
     throw new TypeError("structured request is invalid");
   }
@@ -110,6 +111,7 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     messages: result.messages,
     schema: result.schema,
     signal: result.signal ?? null,
+    reviewTarget: result.reviewTarget ?? null,
   });
 }
 
@@ -319,12 +321,14 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
     Object.hasOwn(rawRequest, key);
   const hasReasoningEffort = hasOwnPlainDataField("reasoningEffort");
   const hasSessionKey = hasOwnPlainDataField("sessionKey");
+  const hasReviewTarget = hasOwnPlainDataField("reviewTarget");
   const request = exactDataObject(
     rawRequest,
     [
       "model",
       ...(hasReasoningEffort ? ["reasoningEffort"] : []),
       ...(hasSessionKey ? ["sessionKey"] : []),
+      ...(hasReviewTarget ? ["reviewTarget"] : []),
       "messages",
       "schema",
     ],
@@ -345,6 +349,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
       ? { sessionKey: normalizeSessionKey(request.sessionKey) }
       : {}),
     messages: normalizeMessages(request.messages),
+    ...(hasReviewTarget ? { reviewTarget: normalizeReviewReadTarget(request.reviewTarget) } : {}),
     schema: normalizeSchema(request.schema),
   };
   if (

@@ -297,8 +297,14 @@ in the managed service account's `PATH`. Restart only when configuration state
 says a confirmed active version is pending restart.
 
 Each claimed task starts at most one vendor process. It runs in a fresh private
-directory with tools, plugins, browser integration, MCP, slash commands, host
-rules, and host Git/GitHub/SSH context disabled. Codex requests bound to the same
+directory with shell tools, plugins, browser integration, slash commands, host
+rules, and host Git/GitHub/SSH context disabled. PR reviews using Codex receive
+one invocation-scoped, read-only MCP endpoint. It supplies the complete file
+manifest and final diff, plus related source and directory listings at pinned
+head/base commits. Inline material is only a preview. GitHub credentials remain
+in the parent service; the endpoint has no write operations and closes when the
+invocation ends. Review proposals require complete manifest/diff reads and an
+unchanged target. Codex requests bound to the same
 PR or Issue restore their private task session; the isolated invocation is
 removed only after verified exit and successful session capture. An unarchived
 session is retained across service restarts, including legacy invocations with
@@ -316,7 +322,8 @@ removed only after verifying every retained session file against its saved copy
 Missing archives, changed history, live owners, and legacy residues without a
 receipt remain intact for maintenance.
 
-The cleanup byte budget distinguishes captured session files from transient
+The cleanup byte budget distinguishes captured session files and staged review
+artifacts (whose byte count is persisted in the invocation marker) from transient
 SQLite, cache, and output files. Captured bytes use the existing 512 MiB session
 storage limit; additional transient bytes remain bounded at 64 MiB. Unverified
 directories receive no session allowance. Do not periodically delete the entire

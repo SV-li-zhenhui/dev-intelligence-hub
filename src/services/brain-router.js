@@ -176,6 +176,7 @@ function normalizeProvider(value) {
     remote: value.remote,
     singleAttempt: attemptDescriptor?.value === true,
     supportsEntitySessions: value.supportsEntitySessions === true,
+    supportsReviewReading: value.supportsReviewReading === true,
     ...(value.supportsEntitySessions === true
       ? { sessionIsolationKey: value.sessionIsolationKey }
       : {}),
@@ -213,6 +214,7 @@ function frozenDescription(provider, brain) {
     remote: provider.remote,
     remoteData: Object.freeze({ ...brain.remoteData }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
+    ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
   });
 }
 
@@ -244,10 +246,14 @@ export class BrainRouter {
     dataClasses = [],
     sessionKey: sessionKeyValue = null,
     signal = null,
+    reviewTarget = null,
   } = {}) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
     const classes = normalizeDataClasses(dataClasses);
+    if (reviewTarget !== null && !classes.includes("code")) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "PR reading requires code classification", 403);
+    }
     const requestSignal = normalizeAbortSignal(signal);
     if (requestSignal?.aborted) {
       throw routerError(
@@ -280,6 +286,7 @@ export class BrainRouter {
         : {}),
       messages,
       schema,
+      ...(reviewTarget !== null && provider.supportsReviewReading ? { reviewTarget } : {}),
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
         : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),
