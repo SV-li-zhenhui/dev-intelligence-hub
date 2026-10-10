@@ -165,4 +165,11 @@ test("mail output cannot turn feature reuse into resolution or another person's 
   const [implicit] = applyDingTalkSummaries(second, [{ groupId: second.groups[0].groupId, important: true,
     summary: "等待 teammate 检查", highlights: [], actionRequired: "修改源码完成回归" }]);
   assert.equal(implicit.actionRequired, "");
+  const historicalMention = mailItem(message("historical", { markdownBody: "@teammate\n看下 Web 的 700B 版本是否仍存在这个问题。\n\n---\nReply to this email directly,\nYou are receiving this because you were mentioned." }), options);
+  const third = prepareDingTalkDigest([historicalMention]);
+  const [generic] = applyDingTalkSummaries(third, [{ groupId: third.groups[0].groupId, important: true,
+    summary: "请检查 Web 700B 版本", highlights: ["检查 Web 700B 版本"], actionRequired: "检查 Web 700B 版本并反馈" }]);
+  assert.equal(generic.actionRequired, "");
+  assert.equal(generic.summaryStatus, "fallback");
+  assert.match(generic.summary, /@teammate/);
 });

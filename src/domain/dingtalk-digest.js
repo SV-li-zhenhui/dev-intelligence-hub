@@ -169,6 +169,9 @@ function groundedMailSummary(group, result) {
   const ownerMentioned = group.currentUser && new RegExp(
     `@${group.currentUser.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?![\\w-])`, "iu",
   ).test(content.split(/\n(?:On .+wrote:|在.+写道[：:])/u)[0]);
+  if (action && mentionedUsers.length && !ownerMentioned) {
+    return { ...fallbackResult(group), important: result.important, summaryStatus: "fallback" };
+  }
   if (asksSomeoneElse ||
       (["assigned", "participated"].includes(group.relation) && !ownerMentioned)) grounded.actionRequired = "";
   return grounded;
